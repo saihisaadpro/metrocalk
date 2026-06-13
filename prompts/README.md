@@ -1,54 +1,57 @@
 # Metrocalk prompts — run order & parallel-safety
 
-One prompt = one focused Opus session (system prompt: `00-orchestrator.md` v2). This is the run map: what's done, what's next, what can run at the same time, and **how to run two at once without the git/doc collisions we've already hit.**
-
-## M1 run graph
-
-```
-M1.2 ✓  (/ecs — World trait + Flecs backend)
-  │
-  ├── M1.3  (07 · /core: metadata registry)        ⏳ in flight ─┐
-  └── M1.4  (08 · /tools/scene-gen: stress scene)  ───────────────┤   PAIR A:  07 ∥ 08
-                                                                  │
-        ── once Pair A lands ──                                   │
-  ├── M1.5  (09 · .github + query bench)  [needs 08's fixture] ──┐
-  └── M1→2  (10 · /core: commit pipeline) [needs 07's registry] ─┘   PAIR B:  09 ∥ 10
-                                                                  │
-        ── once Pair B lands ──  M1 complete  →  M2 (authored from M1 evidence; not pre-written)
-```
-
-## Parallel-safe pairs (code-disjoint AND dependencies satisfied)
-
-- **Pair A — M1.3 (07) ∥ M1.4 (08).** 07 owns `/core` (registry); 08 owns a **new `/tools/scene-gen` crate** and drives the `/ecs` `World` trait via raw pairs/tags — it does **not** need the registry. Disjoint crates, both unblocked by M1.2. **07 is already running → launch 08 alongside.**
-- **Pair B — M1.5 (09) ∥ M1→2 (10).** 09 owns `.github/` + a criterion bench (kept **outside `/core`**); 10 owns the `/core` commit pipeline. Disjoint. Start once Pair A lands (09 needs M1.4's fixture; 10 needs M1.3's registry).
-
-**Not parallel:** 07 and 10 both own `/core` → 10 runs strictly after 07. 08→09 is a dependency chain (09 reuses 08's 5k fixture).
-
-## How to run a pair safely (the discipline that prevents the collisions)
-
-The collisions we've hit — `index.lock` races, `progress.md` churn — come from **two sessions sharing one git index and one working copy.** Two ways to avoid them:
-
-**Recommended — git worktrees (full isolation):**
-
-```
-# give the second session its own working copy + branch + index
-git worktree add ../metrocalk-m1.4 -b m1.4     # session 08 runs in here
-#   (session 07 keeps running in the main checkout, on its own branch)
-# when both pass:
-git checkout main && git merge m1.3 && git merge m1.4
-git worktree remove ../metrocalk-m1.4
-```
-
-Separate indexes → no lock race; separate working copies → no file collision. Expect at most one trivial merge nit: both sessions prepend to `progress/M1.md` (newest-first), so the top of the log can conflict — resolve by keeping both entries.
-
-**Zero-overhead fallback — interleave.** The pair is independent, so just run the two sessions back-to-back (07 then 08). You give up wall-clock but get the planning clarity with zero git risk.
-
-**Never** run two sessions in the **same** working copy at the same time — that is exactly the `index.lock` race.
-
-## Lane rule
-
-Each prompt's header declares the crate/paths it **Owns**. A parallel pair must own disjoint paths (Pairs A and B do). Each session updates `progress.md` / `architecture.md` normally **on its own branch**; the merge reconciles them.
+One prompt = one focused Opus session (system prompt: `00-orchestrator.md` v2). This is the run map: what's done, what's next, what can run at the same time, and how to run several at once **without** the git/doc collisions we've hit.
 
 ## Status
 
-`05` M1.1 ✓ · `06` M1.2 ✓ · `07` M1.3 ⏳ · `08` M1.4 · `09` M1.5 · `10` M1→2 · **M2** = not yet authored (write from M1 evidence — Tauri WebView2 IPC + real-scene render are the M2 gates).
+`05` M1.1 ✓ · `06` M1.2 ✓ · `07` M1.3 ✓ · `08` M1.4 ✓ · `09` M1.5 ✓ · `10` M1→2 (commit pipeline) ⏳ *landing (committing)*
+→ **M1 foundation complete** once `10` is committed.
+Audit-driven: `11` M1.6 (pipeline hardening). Risk-first M2 exit gates: `12` M2.1 (Tauri shell), `13` M2.2 (render).
+**M2 build** (real shell + transport impls): NOT yet authored — write it from the `12`/`13` gate evidence (the shell's transport choice depends on the Tauri-go/CEF verdict).
+
+## Run graph
+
+```
+M1.1–M1.5 ✓   →   M1→2 (10) ⏳ commit
+                        │
+        ── once 10 is committed: a 3-way parallel set (disjoint paths) ──
+        ├── 11  M1.6  (/core: pipeline hardening — audit fixes)   [blocked by 10 committed]
+        ├── 12  M2.1  (/spikes/tauri-shell — IPC + compositing gate, Windows)   [independent]
+        └── 13  M2.2  (/spikes/render-scene — wgpu native+wasm gate)            [independent]
+                        │
+        ── once 12 + 13 pass ──  M2 BUILD (shell + transport 3 impls + binary delta protocol),
+                                 authored from the gate evidence (Tauri-go or CEF)
+```
+
+## Parallel-safe trio (once M1→2 is committed)
+
+- **`11` M1.6** — owns `/core` (`pipeline.rs`, `undo.rs`). Blocked by M1→2 being committed (it edits the same files).
+- **`12` M2.1** — owns a throwaway `/spikes/tauri-shell`; the ADR-003 exit gate (IPC + compositing). **Windows-only.**
+- **`13` M2.2** — owns a throwaway `/spikes/render-scene`; the real-scene wgpu gate (native + wasm).
+
+All three own **disjoint paths**, so they're a genuine 3-way parallel set. `12` and `13` are the M2 *exit gates* (risk-first — the M0 playbook); `11` fixes the audit findings before the editor builds on the pipeline. **Not parallel:** the M2 *build* waits on `12` + `13`'s verdicts.
+
+## The discipline (prevents the collisions we've hit) — worktrees, or interleave
+
+Two sessions sharing one git index + working copy is what caused the `index.lock` races and `progress.md` churn. Avoid it:
+
+**Recommended — git worktrees (full isolation):**
+```
+git worktree add ../metrocalk-m2.1 -b m2.1     # session 12 here
+git worktree add ../metrocalk-m2.2 -b m2.2     # session 13 here
+# (11 in the main checkout on its own branch, AFTER 10 is committed)
+# when each passes: git checkout main && git merge <branch>   (resolve the trivial progress/M1.md top-of-log nit)
+```
+Separate indexes → no lock race; separate working copies → no file collision.
+
+**Zero-overhead fallback — interleave:** run them back-to-back; you lose wall-clock, gain zero git risk.
+
+**Never** run two sessions in the **same** working copy at once.
+
+## Why `11` (M1.6) exists
+
+An orchestrator audit of the M1→2 code found real gaps that green CI missed (the failing cases are untested): (1) undoing an *added* field to a component that already held other fields **over-removed the whole component** (data loss on undo); (2) `commit` wasn't actually atomic on a mid-transaction failure (partial, un-revertable mutation — the plugin/AI path); plus a perf O(n) reverse lookup and pervasive `.unwrap()` on the mutation path; and a Phase-2 hole (capabilities vanish after a merge). `11` fixes 1–4 before the editor (M3+) relies on the pipeline; the merge hole is recorded for Phase-2. Details in `11-m1.6-pipeline-hardening.md`.
+
+## Lane rule
+
+Each prompt's header declares the crate/paths it **Owns**; a parallel set must own disjoint paths (this trio does). Each session updates `progress.md` / `architecture.md` on its own branch; the merge reconciles them.
