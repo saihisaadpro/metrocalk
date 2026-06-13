@@ -28,6 +28,8 @@ The engine is **free forever** — desktop download and browser lite editor (the
 1. Add a HealthBar → click → ranked compatible targets → one click binds → undo works → reload preserves everything. **≤2 interactions, <16 ms, every "no" explained.**
 2. Empty scene → type "rusty medieval sword" → working, pick-up-able sword in the character's hand within minutes. **File-to-playable in one sentence.**
 
+> Detailed, manually-checkable suite — these two plus complex **physics → audio → gameplay** workflows → [north-star-tests.md](north-star-tests.md).
+
 ## Where things live
 
 - `Metrocalk-Engine-Feasibility-and-Hosting-Plan.md` — the full plan (stack, product model, risks, hosting, roadmap)
@@ -36,5 +38,6 @@ The engine is **free forever** — desktop download and browser lite editor (the
 - `progress.md` — now / next; per-milestone logs sharded under `progress/`
 - `M0-gate-review.md` — M0 consolidation: gate verdicts, frame-budget arithmetic, adversarial pass
 - `physics-audio-networking-plan.md` — runtime-systems plan (physics · audio · netcode), pending spikes
+- `north-star-tests.md` — manually-checkable UX targets (physics → audio → gameplay)
 - `hosting.md` — providers, costs, setup tasks
 - `prompts/` — operating prompts for AI dev sessions (Opus 4.8)
