@@ -95,6 +95,13 @@ fn main() {
         );
     }
 
+    // Emit the runner's measurement as a GitHub annotation (one line), so the calibration baseline
+    // is read back from a real CI run via the check-runs API — never hand-typed. See the README.
+    println!(
+        "::notice title=compat-query perf gate::median={median:.2} us  p99={p99:.2} us  max={max:.2} us  budget={budget:.0} us  headroom={:.0}x under budget  (matched={matched})",
+        budget / p99
+    );
+
     if p99 > budget {
         eprintln!(
             "::error::compat-query p99 {p99:.2} us EXCEEDS the {budget:.0} us budget — north-star test #1 (<16 ms) regressed"
