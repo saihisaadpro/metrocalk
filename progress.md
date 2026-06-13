@@ -6,7 +6,6 @@
 
 ## Next
 - **M0 gate review** (prompt 04): cross-spike reconciliation + frame-budget arithmetic; settle the browser-ECS path (flecs doesn't compile to wasm32 — decide Loro-backed query layer vs wasi/emscripten Flecs vs thin-client)
-- Trigger + verify the wasm-tripwire CI on the GitHub repo (green once + fail-on-break once) — see spike ③ blocker
 - Monorepo + ECS wrapper API + component metadata registry (M0–1) — wrapper must hide all `flecs_ecs` types, expose deferred mutation + safe query surface
 - ECS↔Loro commit pipeline + merge-validation layer (M1–2) — validation-layer spec in `spikes/loro/README.md`
 - M1 follow-ups: `DontFragment`/sparse for capability pairs (spike ②); engine-side inverse-op undo stack (spike ① F2); getrandom `js` for Loro-in-browser (spike ③)
@@ -28,7 +27,7 @@
 - **Sizes (funnel baseline):** raw cargo wasm 1361 KB → wasm-bindgen 378 KB → wasm-opt -Oz 335 KB → **brotli 118 KB**; +12 KB brotli JS glue = **~130 KB transfer** for a minimal wgpu triangle. (wasm-opt needs `--enable-reference-types --enable-bulk-memory …` for wasm-bindgen 0.2.125 output.)
 - **Adapter diff (bindless flagged):** native Vulkan exposes all binding-array/non-uniform-indexing (bindless) features + huge limits (1 TB buffers, 8 bind groups); **WebGPU exposes none** (2 GB buffers, 4 bind groups, 16 storage buffers/stage) → non-bindless web path mandatory.
 - **Critical finding (flagged vs ADR-001):** `flecs_ecs` 0.2.2 **does not build for wasm32-unknown-unknown** (C core needs clang + a wasm libc/sysroot; verbatim `cc-rs: failed to find tool "clang"`). `loro` 1.13.1 **does** build (needs getrandom `js` at runtime). → browser lite-editor can't run Flecs client-side as-is; resolve in M0 gate review / M1. Desktop unaffected.
-- CI tripwire `.github/workflows/wasm-tripwire.yml` written (builds wasm32 every push, `Swatinem/rust-cache`, <5 min). **Blocker:** not yet triggered/observed — repo had no remote and `gh` is unauthenticated; user provided `github.com/saihisaadpro/metrocalk`. Needs a push + auth to verify green/fail-on-break. Toolchain note: this env had no `rustup` and no wasm32 std; installed the official `rust-std` wasm32 component + `wasm-bindgen-cli` 0.2.125 + binaryen 130 manually.
+- CI tripwire `.github/workflows/wasm-tripwire.yml` (builds wasm32 every push, `Swatinem/rust-cache`). **Verified on `github.com/saihisaadpro/metrocalk` (public): green in 54 s cold; a deliberate wasm32 break failed at the build step; branch reverted.** Repo pushed to `main` this session (had no remote before; user provided it). Toolchain note: this env had no `rustup` and no wasm32 std; installed the official `rust-std` wasm32 component + `wasm-bindgen-cli` 0.2.125 + binaryen 130 manually.
 
 ### 2026-06-13 (M0 spike ② — Flecs)
 - **ADR-001 query/binding spike PASSED → ADOPT Flecs v4.1.2 via `flecs_ecs` 0.2.2** (behind the wrapper, safety locks ON). Built `spikes/flecs` (throwaway): seeded 5k/20k scene with `(Provides,cap)` + `(BindsTo,target)` pairs and role tags; 5 benchmarks + churn-correctness + a criterion cross-check. Two runs each for safety ON and OFF, all structurally identical (matched 211/5k, 830/20k; 1,999 edges).
