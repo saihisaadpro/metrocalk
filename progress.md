@@ -1,14 +1,16 @@
 # Progress
 
 ## Now
-- M0 spikes (2-week box) **ALL DONE**: ① Loro — ADOPT; ② Flecs — ADOPT; ③ wasm/WebGPU — browser-render leg PROVEN (CI tripwire added)
-- M0 gate review next: reconcile the three spikes, settle the browser-ECS question
+- **M1.1 — Monorepo skeleton.** Workspace `/core /editor /transport /plugins /spikes`; CI builds the workspace + keeps the wasm-tripwire green. **Acceptance:** `cargo build` + `cargo test` green on the workspace; `wasm-tripwire` still green; one trivial test runs in `/core`.
+- M0 gate review DONE (2026-06-13): all three gates passed, ADRs settled, browser-ECS resolved by ADR-006. Full reasoning + frame-budget arithmetic + adversarial pass in `M0-gate-review.md`.
 
-## Next
-- **M0 gate review** (prompt 04): cross-spike reconciliation + frame-budget arithmetic; settle the browser-ECS path (flecs doesn't compile to wasm32 — decide Loro-backed query layer vs wasi/emscripten Flecs vs thin-client)
-- Monorepo + ECS wrapper API + component metadata registry (M0–1) — wrapper must hide all `flecs_ecs` types, expose deferred mutation + safe query surface
-- ECS↔Loro commit pipeline + merge-validation layer (M1–2) — validation-layer spec in `spikes/loro/README.md`
-- M1 follow-ups: `DontFragment`/sparse for capability pairs (spike ②); engine-side inverse-op undo stack (spike ① F2); getrandom `js` for Loro-in-browser (spike ③)
+## Next (M1, ordered — each one focused session, with acceptance test)
+- **M1.2 — ECS wrapper API + Flecs backend.** Hide ALL `flecs_ecs` types behind our trait; expose entity/pair add·remove·set, build+iterate query, read-target; deferred mutation; safety locks ON. *Absorbs spike fallout:* the Flecs ergonomics sharp edges (`with`/`without` value-vs-type — expose ONE clear form) **and** the ADR-006 two-backend constraint (API must be a backend-agnostic relational-query surface a pure-Rust browser backend can also implement). **Acceptance:** spike ②'s compat query expressed through the wrapper; `grep` finds no `flecs_ecs::` outside the wrapper crate; safety locks ON.
+- **M1.3 — Component metadata registry (JSON Schema).** provides/requires/observes; runtime component registration. **Acceptance:** register N component kinds from JSON Schema; "what provides Health?" returns them; malformed schema rejected with a clear error.
+- **M1.4 — Seeded stress-scene generator + DontFragment memory re-measure.** Shared deterministic 5k & 20k scene (CI fixture, same SplitMix64 seed as the spikes); mark capability relationships `DontFragment`/sparse and re-measure (spike ② F1). **Acceptance:** byte-identical scene across runs; bytes/entity with DontFragment recorded and **< the 14.8 KB/entity baseline**; cached compat query still <16 ms p99.
+- **M1.5 — 16 ms compatibility-query CI gate.** Wire the stress-scene query in as a perf gate. **Acceptance:** CI fails if cached compat-query p99 > 16 ms on the 5k scene (currently ~12 µs).
+- **M1–2 — ECS↔Loro commit pipeline + merge-validation + engine-side undo stack.** Every mutation = one transaction; regular Loro containers (not `ensure_mergeable_*`, F1-loro); peer-namespaced entity IDs (F3-loro); **engine-side in-memory inverse-op undo stack** for interactive undo (F2-loro — NOT Loro `checkout`, which is 50–62 ms for bulk undo); merge-validation re-checks the 8 invalid-state classes from spike ①. **Acceptance:** 100% undo/redo property tests incl. entity resurrection; latest-op undo <5 ms p99; two-fork merge converges + validator repairs every injected invalid state; flecs_ecs M1 integration go/no-go recorded.
+- **Carry-forward (later):** getrandom `js` for Loro-in-browser + the Phase-2 pure-Rust query backend (ADR-006); real-scene render cost @ ≥5k entities (M2 stress scene); Tauri WebView2 IPC (M2 gate).
 
 ## Done
 - Feasibility plan v1 (stack assessment, hosting, browser-vs-desktop analysis)
@@ -21,6 +23,12 @@
 ## Log
 
 *Append-only. Newest first. One entry per working session: date — what happened, decisions made (link ADR), blockers. Archive to `progress-YYYY.md` when this slows you down.*
+
+### 2026-06-13 (M0 gate review)
+- **All three M0 gates PASS on measured numbers; M1 may start.** Verdicts (quoted): ① Loro undo 0.13 ms p99 / 10k-run 0.56 s / snapshot 4.51 MB → ADOPT ([ADR-002] confirmed); ② Flecs cached query 12.2 µs p99 @5k, 58.3 µs @20k, 41 µs under mutation, zero stale → ADOPT ([ADR-001] confirmed); ③ wasm/WebGPU native+Chrome+Edge render, CI green 54 s/19 s + verified fail-on-break → PASS (ADR-003 browser-render leg).
+- **Browser-ECS fork SETTLED → [ADR-006](decisions/006-browser-query-backend.md):** `flecs_ecs` doesn't build for wasm32; browser runs a pure-Rust query backend over the Loro projection (Flecs native-only). ADR-004 funnel preserved (browser = Loro + pure-Rust queries + wgpu, all wasm-proven). No ADR left pending.
+- **Frame-budget arithmetic written** (`M0-gate-review.md` §2b): worst-case edit path mutate→Loro-commit(192 µs p99)→cache+query(41 µs p99) ≈ 0.24 ms Rust-side, ~1.2 ms with a generous UI budget — ~7% of 16 ms. Two things explicitly out-of-budget: interactive undo must use an engine-side inverse-op stack (Loro checkout is 50–62 ms), and real-scene render cost is unmeasured (triangle only → M2). Memory at 5k: Loro 56 MB + Flecs ~74 MB ≈ 130 MB — comfortable on desktop.
+- Adversarial pass written ("the composed ECS↔Loro pipeline was never measured") — fair on sequencing, not on verdicts (100–1300× headroom); no re-run triggered (no two reports contradict). Docs: ADR-001/006, architecture.md (open-questions pruned to genuinely-open: Tauri M2 IPC, real-scene render), plan §2/§4/§7, M1 breakdown above.
 
 ### 2026-06-13 (M0 spike ③ — wasm32 + WebGPU)
 - **Browser-render leg of ADR-003 PROVEN.** One wgpu 29.0.3 / winit 0.30 crate (`spikes/wasm`) renders a spinning triangle on **native** (Vulkan, RTX 4060: 8.3 ms median / 9.9 ms p99, ~120 fps) and in **Chrome 149 + Edge 149** via WebGPU. `crossOriginIsolated === true` under a COOP/COEP dev server; 512×512 render verified by pixel readback (118/119 distinct colors) + screenshots. Browser TTFF 0.4–0.8 s. Chose raw `wasm-bindgen` over trunk (transparent, measurable steps).

@@ -31,6 +31,7 @@
 | Shell + UI | Tauri 2 + React/TS; viewport in Rust/wgpu | [003](decisions/003-desktop-first-tauri-exit-gate.md) |
 | Rendering | wgpu 29 + WGSL (non-bindless path required for web — confirmed: WebGPU exposes no binding-array features) | [003](decisions/003-desktop-first-tauri-exit-gate.md) |
 | Browser target | **CI-enforced**: `wasm32-unknown-unknown` builds on every push (`.github/workflows/wasm-tripwire.yml`); native+browser render proven from one wgpu crate (`spikes/wasm`) | [003](decisions/003-desktop-first-tauri-exit-gate.md) |
+| Query backend | Native: Flecs (behind the wrapper). Browser: pure-Rust index over the Loro projection — Flecs is native-only (won't compile to wasm32) | [006](decisions/006-browser-query-backend.md) |
 | Plugins / scripting | Extism WASM plugins | plan §2 |
 | AI layer | MCP server + JSON-Schema-constrained JSON Patch | plan §2 |
 | Scene format | Own format; BSN-compatible where cheap; BRP interop | plan §2 |
@@ -59,7 +60,13 @@
 
 ## Open questions (gated, not debated)
 
-- `flecs_ecs` binding viability → **M0 query/binding spike PASSED 2026-06-13, ADOPT** ([ADR-001](decisions/001-flecs-over-bevy-ecs.md), `spikes/flecs`): compatibility query 12–58 µs p99 (≪16 ms gate), safety locks ON, zero stale under churn. M1 integration gate still applies; wrapper must hide all `flecs_ecs` types. Open M1 items: `DontFragment`/sparse for capability pairs (memory ~14.8 KB/entity otherwise); fallback `bevy_ecs` stays viable behind the wrapper.
-- Tauri IPC on Windows WebView2 → M2 gate (fallback: CEF shell)
-- ~~Loro history size / merge semantics at scale~~ → **resolved 2026-06-13, ADOPT** ([ADR-002](decisions/002-loro-over-custom-wal.md), `spikes/loro`). M1 must honor: regular containers + merge-validation layer (not `ensure_mergeable_*`), small transaction groups (undo uses full-doc checkouts), peer-namespaced entity IDs.
-- **Browser ECS path (NEW, gated to M1/Phase-2)** → `flecs_ecs` does **not** compile to `wasm32-unknown-unknown` (C core needs a wasm libc/sysroot; `spikes/wasm`). The browser lite-editor can't run Flecs client-side as-is. Options: Flecs via wasm32-wasi/emscripten, or a Loro-document-backed pure-Rust query layer in-browser, or thin-client. Loro itself builds for wasm32 ✓. Desktop unaffected.
+Resolved at the M0 gate review (2026-06-13) — kept here struck-through for traceability:
+
+- ~~`flecs_ecs` binding viability~~ → **ADOPT, confirmed** ([ADR-001](decisions/001-flecs-over-bevy-ecs.md), `spikes/flecs`): 12–58 µs p99 (≪16 ms), safety locks ON, zero stale. (M1 integration go/no-go is a roadmap milestone, not an open question.)
+- ~~Loro history size / merge semantics at scale~~ → **ADOPT, confirmed** ([ADR-002](decisions/002-loro-over-custom-wal.md), `spikes/loro`).
+- ~~Browser ECS path~~ → **resolved** ([ADR-006](decisions/006-browser-query-backend.md)): browser runs a pure-Rust query backend over the Loro projection; Flecs is native-only. `loro`+`wgpu` reach wasm; `flecs_ecs` does not.
+
+Genuinely open (gated, not debated):
+
+- **Tauri IPC on Windows WebView2** → M2 gate (60 Hz drag, worst-case delta payload; fallback: CEF shell). Not tested in M0.
+- **Real-scene render cost at ≥5k entities** → M2 stress-scene measurement. Spike ③ proved the wgpu pipeline with a *triangle* (≈0 render work); the editor scene's actual frame cost is unmeasured.

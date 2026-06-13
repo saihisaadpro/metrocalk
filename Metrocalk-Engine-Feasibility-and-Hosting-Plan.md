@@ -35,7 +35,7 @@ All of §1.5 is Phase 2 build scope. The M0–M6 vertical slice (§7) is unchang
 | Layer | Decision | Why (June 2026 state) |
 |---|---|---|
 | Language | **Rust** | Perf + safety + the only credible native↔WASM dual-target story |
-| Semantic ECS | **Flecs v4.1 core via `flecs_ecs` (MIT)**, wrapped behind our own query API | The only shipping ECS with first-class many-to-many relationships, wildcard queries (`(Provides, *)` = "find all providers of Health"), transitive traits, reflection, JSON ser. Bevy relationships are still one-to-many only (many-to-many open issue #18121). Our product *is* relationship queries — use the engine that has them today |
+| Semantic ECS | **Flecs v4.1 core via `flecs_ecs` (MIT)**, wrapped behind our own query API | The only shipping ECS with first-class many-to-many relationships, wildcard queries (`(Provides, *)` = "find all providers of Health"), transitive traits, reflection, JSON ser. Bevy relationships are still one-to-many only (many-to-many open issue #18121). Our product *is* relationship queries — use the engine that has them today. **[M0 gate 2026-06-13: ADOPT confirmed — 12–58 µs p99 queries. Native-only for wasm (C core won't build for `wasm32-unknown-unknown`); the browser uses a pure-Rust query backend over Loro — ADR-006.]** |
 | ECS fallback | `bevy_ecs` 0.19 standalone | If the `flecs_ecs` binding (0.x, single maintainer) fails the M1 gate. The wrapper API makes the swap survivable |
 | Scene format | Own format, **BSN-compatible where cheap** + **BRP interop** | Bevy 0.19 (landing now) ships BSN; speaking it lets us ride the Bevy ecosystem without adopting Bevy |
 | Document/undo/collab/persistence | **Loro 1.13 (MIT)** | UndoManager (collab-aware), time-travel checkout, git-like fork/merge, snapshot+oplog export, and a **MovableTree CRDT** that solves concurrent scene-graph reparenting — the hardest data problem on the roadmap. Its oplog *is* the WAL we were going to write |
@@ -68,7 +68,7 @@ All of §1.5 is Phase 2 build scope. The M0–M6 vertical slice (§7) is unchang
 Browser-hosted engines of this complexity are now proven — Figma (C++→WASM), PlayCanvas (editor frontend MIT-open-sourced July 2025), Rerun (same Rust viewer native **and** WASM), Graphite (Rust core→WASM, web UI). We follow the same trajectory:
 
 - **Phase 1 (M0–6):** desktop vertical slice. Browser exists only as a CI target — `wasm32` build must compile and render the stress scene from M2 onward, so web-incompatible decisions are caught the week they're made.
-- **Phase 2:** browser **lite editor / shared-project viewer** as the adoption funnel (open a link, inspect bindings, tweak, run). wasm32 only (Memory64 still absent in Safari, perf-penalized elsewhere; 4 GB ceiling). Non-bindless render path. COOP/COEP headers required for threads — hosting must control headers (Vercel/Cloudflare do; GitHub Pages doesn't).
+- **Phase 2:** browser **lite editor / shared-project viewer** as the adoption funnel (open a link, inspect bindings, tweak, run). wasm32 only (Memory64 still absent in Safari, perf-penalized elsewhere; 4 GB ceiling). Non-bindless render path. COOP/COEP headers required for threads — hosting must control headers (Vercel/Cloudflare do; GitHub Pages doesn't). **[M0 gate 2026-06-13: `loro`+`wgpu` reach wasm; `flecs_ecs` does NOT. Browser runs Loro (source of truth) + a pure-Rust query backend + wgpu — no Flecs client-side (ADR-006). Funnel intact; new Phase-2 scope = build+benchmark the pure-Rust backend. Funnel transfer baseline ≈ 130 KB brotli for a bare wgpu app. `crossOriginIsolated` verified under COOP/COEP.]**
 - **Phase 3:** full collab authoring in browser when limits ease; the Loro + WebSocket transport already built makes this incremental, not a project.
 - **Rejected:** cloud-streamed editor (GPU-per-user economics + latency kill a "vibe" product).
 
@@ -113,7 +113,7 @@ Cost: ≈ £100–200/mo through the slice; £500–2k/mo in Phase 2. Immaterial
 
 | Phase | Work | Gate |
 |---|---|---|
-| **M0 (2 wks)** | Three parallel spikes: ① Loro — model the scene doc, benchmark undo + file size; ② `flecs_ecs` — wildcard pair queries on 5k-entity scene; ③ wasm32 — core compiles, renders a triangle via WebGPU | Each spike: adopt / fallback decision in writing |
+| **M0 (2 wks)** | Three parallel spikes: ① Loro — model the scene doc, benchmark undo + file size; ② `flecs_ecs` — wildcard pair queries on 5k-entity scene; ③ wasm32 — core compiles, renders a triangle via WebGPU | ✅ **DONE 2026-06-13** — ① ADOPT, ② ADOPT, ③ browser-render PROVEN + CI tripwire live. Gate review: `M0-gate-review.md`. New decision: ADR-006 (browser query backend). Surfaced for later phases: Flecs won't build to wasm (browser uses pure-Rust queries); real-scene render cost still unmeasured (M2) |
 | **M0–1** | Monorepo, ECS wrapper API, component metadata registry (JSON Schema), stress scene | Compatibility query <16 ms |
 | **M1–2** | ECS↔Loro commit pipeline, merge-validation layer, transactions | 100% undo/redo property tests incl. entity resurrection; **flecs_ecs go/no-go** |
 | **M2–3** | Tauri shell, transport trait (3 impls stubbed), binary delta protocol | 60 Hz drag, zero stutter, **benchmarked on Windows WebView2**; Tauri go / CEF fallback decision; wasm32 target green in CI |
