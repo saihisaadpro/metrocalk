@@ -187,11 +187,27 @@ and by a reproducing run. **Decision:** the document layer uses regular containe
 merge-validation layer, not the mergeable helper. Worth an upstream issue.
 
 **F2 — undo computes its inverse via full-document `checkout`s, so undo cost tracks checkout
-distance, not change size.** `LoroDoc::undo_internal` checks out `from`→`to` and back
-(`loro-internal/src/loro.rs`). Undoing the *latest* op is ~70 µs (near the tip), but undoing a
-50-op group, or many ops in a row, is tens of ms because each spans a longer checkout. **Decision
-for M1:** keep transaction groups small (one user action = one small commit) so undo stays
-interactive; do not build features that rely on cheap deep/bulk undo.
+*distance from the tip*, not change size.** `LoroDoc::undo_internal` checks out `from`→`to` and back
+(`loro-internal/src/loro.rs`). There are **two independent cost axes**, both visible in Bench 2 —
+do not conflate them:
+
+- *Group size* — undoing a single 50-op transaction group is tens of ms (52–61 ms median) because
+  one undo spans a 50-op checkout. **Mitigant:** keep transaction groups small (one user action =
+  one small commit) so a single undo stays one short step from the tip.
+- *Walk-back depth* — the headline ~70 µs is undo-of-the-latest-op *while sitting at the tip* (the
+  benchmark redoes back to the tip after each measured undo, so every sample reverts one step). Real
+  multi-level Ctrl-Z never sits at the tip: it walks backward, each step further away, so
+  *consecutive* undo reaches **~53 ms median / 240 ms p99 by ~50 steps in a row** (the
+  `consecutive undo (1→100 back)` row, and the ~52 s full unwind of 465 steps in Bench 5). Small
+  transaction groups do **not** help this axis — N small commits still cost N increasingly-distant
+  checkouts.
+
+The walk-back figure (~53 ms) is the *same order of magnitude* as the 16 ms interactive frame
+budget, so undo is **not** "solved at 70 µs" — that number is the best case only. **Decision for
+M1:** interactive multi-level undo needs an engine-side fast path — an ECS-authoritative in-memory
+inverse-op stack for recent undo (consistent with invariant 1: ECS authoritative, Loro is its
+durable mirror) — with Loro `checkout`/`UndoManager` reserved for deep history and time-travel. Do
+not ship an interactive undo that calls Loro `checkout` once per Ctrl-Z.
 
 **F3 — concurrent entity creation collides on eids.** Two forked peers minted the *same* `eid`
 strings (`e005000…`) for *different* tree nodes, producing 23 duplicate-eid violations after merge.
@@ -206,11 +222,17 @@ forks simultaneously) was ~221 MB; the isolated 5k-scene + 10.5k-mutation workin
 
 | criterion | threshold | measured | result |
 |---|---|---|---|
-| single-op undo p99 @ 10k history | < 5 ms | 0.13 ms (latest-op) | ✅ PASS |
+| single-op undo p99 @ 10k history — **latest op, at tip** | < 5 ms | 0.13 ms | ✅ PASS\* |
 | 10k-mutation run | < 10 s | 0.56–0.65 s | ✅ PASS |
 | full snapshot of 5k-entity scene | < 20 MB | 4.51 MB | ✅ PASS |
 | post-merge invalid states detectable & repairable | all | all 8 classes; 0 undetectable | ✅ PASS |
 
+\* The undo criterion measures undo-of-the-latest-op while sitting at the tip — the right metric for
+"is the CRDT undo path viable" (it is, decisively). It is **not** the cost of interactive multi-level
+Ctrl-Z, which walks back from the tip at ~53 ms median / 240 ms p99 (see **F2**). ADOPT stands; the
+walk-back cost is an M1 *implementation* directive (engine-side undo fast path), not a Loro defect.
+
 **Recommendation: ADOPT Loro 1.13.1 as the document layer (confirms ADR-002).** Carry F1–F3 into
-M1: regular containers + a merge-validation layer (already planned), small transaction groups for
-interactive undo, and peer-namespaced entity IDs.
+M1: regular containers + a merge-validation layer (already planned); peer-namespaced entity IDs; and
+for undo, small transaction groups **plus** an engine-side in-memory inverse-op stack for interactive
+multi-level undo (F2) — Loro `checkout` is for deep history / time-travel, not per-Ctrl-Z.

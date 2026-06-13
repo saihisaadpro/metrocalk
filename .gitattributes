@@ -1,0 +1,29 @@
+# Line-ending policy: text files are stored LF in the repo regardless of OS checkout.
+# This stops the phantom CRLF/BOM diffs seen on the spike results files on Windows.
+* text=auto eol=lf
+
+# Explicit text types
+*.md     text eol=lf
+*.rs     text eol=lf
+*.toml   text eol=lf
+*.lock   text eol=lf
+*.json   text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.wgsl   text eol=lf
+*.sh     text eol=lf
+*.gitattributes text eol=lf
+*.gitignore     text eol=lf
+
+# Binary assets — never normalize line endings or diff as text
+*.glb    binary
+*.gltf   binary
+*.fbx    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.ktx2   binary
+*.wav    binary
+*.ogg    binary
+*.exe    binary
+*.pdb    binary
