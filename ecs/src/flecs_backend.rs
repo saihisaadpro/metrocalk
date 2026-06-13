@@ -167,4 +167,11 @@ impl World for FlecsWorld {
         f(self);
         let _ = self.world.defer_end();
     }
+
+    fn set_sparse(&mut self, kind: Entity) {
+        // DontFragment: sparse storage, pairs/tags of `kind` no longer fragment archetypes (F1).
+        self.world
+            .entity_from_id(kind.0)
+            .add_trait::<flecs::DontFragment>();
+    }
 }

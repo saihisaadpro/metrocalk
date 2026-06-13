@@ -1,0 +1,14 @@
+[package]
+name = "scene-bench"
+description = "F1 measurement harness: scene memory (RSS/entity) + compat-query latency per storage variant."
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+metrocalk-ecs = { path = "../../ecs" }
+memory-stats = "1"
+
+# No `[lints] workspace = true`: this is a measurement tool, not production code — it skips the
+# strict pedantic/unsafe-forbid set (cast-heavy timing math, etc.) and uses default lints.

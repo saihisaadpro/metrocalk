@@ -8,24 +8,14 @@
     clippy::many_single_char_names
 )] // timing math + conventional w/s/q bench locals
 
-use metrocalk_ecs::scene::build_compat_scene;
-use metrocalk_ecs::{Clause, FlecsWorld, Target, Term, World};
+use metrocalk_ecs::scene::{build_scene, compat_clauses, SceneParams};
+use metrocalk_ecs::{FlecsWorld, World};
 use std::time::Instant;
 
 fn main() {
     let mut w = FlecsWorld::new();
-    let s = build_compat_scene(&mut w, 5000, 2000);
-    let clauses = [
-        Clause::with(Term::Pair {
-            rel: s.provides,
-            target: Target::Exact(s.health),
-        }),
-        Clause::without(Term::Pair {
-            rel: s.binds_to,
-            target: Target::Any,
-        }),
-    ];
-    let q = w.build_query(&clauses);
+    let s = build_scene(&mut w, &SceneParams::preset_5k(), false);
+    let q = w.build_query(&compat_clauses(&s));
 
     // warm up (cache populates on first eval)
     for _ in 0..200 {

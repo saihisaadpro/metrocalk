@@ -28,6 +28,8 @@
 //!   (required terms) and difference (negated terms) over the indexes. Flecs maintains the match set
 //!   incrementally; a Loro backend maintains the same indexes incrementally. Same matches, both ways.
 //! - [`World::defer`] → bracket structural mutations (Flecs deferred mode; Loro: batch into one commit).
+//! - [`World::set_sparse`] → a storage *hint*: Flecs marks the kind `DontFragment` (sparse, no
+//!   archetype fragmentation — spike ② F1); a Loro backend ignores it (it never fragments).
 //!
 //! None of these requires a capability only Flecs has.
 //!
@@ -170,4 +172,12 @@ pub trait World {
     /// Run `f` with structural mutations deferred, so they are safe to issue during/around query
     /// iteration (Flecs deferred mode; a Loro backend batches into one commit).
     fn defer(&mut self, f: &mut dyn FnMut(&mut Self));
+
+    // --- storage hint ---
+
+    /// Hint that pairs/components of `kind` should use sparse, non-fragmenting storage. Call BEFORE
+    /// adding any pair/tag of `kind`. This is a storage hint, not a query feature: native Flecs marks
+    /// `kind` `DontFragment` (no archetype fragmentation — spike ② F1); a Loro-projection backend may
+    /// ignore it (it doesn't fragment). Query results are identical either way.
+    fn set_sparse(&mut self, kind: Entity);
 }
