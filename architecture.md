@@ -1,6 +1,6 @@
 # Architecture — Current State
 
-> Rules for this file: current state only, max ~2 pages. No rationale — link the ADR instead. Prune on every change. Status: **pre-code (M0 spikes pending)**.
+> Rules for this file: current state only, max ~2 pages. No rationale — link the ADR instead. Prune on every change. Status: **M1 — foundation build** (M0 spikes passed; see `M0-gate-review.md`).
 
 ## System shape
 
@@ -48,15 +48,21 @@
 4. Hot path never crosses the JS boundary.
 5. Every pre-1.0 dependency lives behind our own trait.
 
-## Repository (planned)
+## Repository
+
+Cargo workspace at root (`Cargo.toml`); members `core` + `transport` + `plugins`. Skeletons as of M1.1.
 
 ```
-/core        Rust: ECS wrapper, registry, commit pipeline, renderer
-/editor      React/TS UI
-/transport   protocol trait + 3 impls
-/plugins     Extism host + SDK
-/spikes      M0 throwaway spikes (loro, flecs, wasm)
+/core        Rust lib — ECS wrapper, registry, commit pipeline, renderer   (workspace member)
+/transport   Rust lib — deltas-only protocol trait; 3 impls land M2+        (workspace member)
+/plugins     Rust lib — Extism host + MCP seam (Phase 2+, stub)             (workspace member)
+/editor      React/TS UI — NOT a cargo member (scaffolded M2–3)
+/spikes      M0 throwaway spikes (loro, flecs, wasm) — excluded from the workspace; build standalone
 ```
+
+Shared lints in `[workspace.lints]`: `clippy::pedantic` (tuned) + `unsafe_code = "forbid"` — the
+future ecs-wrapper crate is the documented exception (opts out, uses `deny` + scoped `expect`). CI:
+`ci.yml` (fmt + clippy `-D warnings` + test) and `wasm-tripwire.yml` (wasm32 build; never `core`/Flecs, per ADR-006).
 
 ## Open questions (gated, not debated)
 

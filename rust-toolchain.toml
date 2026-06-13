@@ -1,0 +1,6 @@
+# Pins the toolchain for contributors + CI reproducibility (clean-clone build works as documented).
+# `channel = "stable"` tracks latest stable; CI's dtolnay action resolves to the same.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

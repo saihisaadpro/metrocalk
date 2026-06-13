@@ -1,0 +1,12 @@
+[package]
+name = "metrocalk-plugins"
+description = "Extism WASM plugin host + SDK surface and the MCP server seam (Phase 2+). Stub."
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

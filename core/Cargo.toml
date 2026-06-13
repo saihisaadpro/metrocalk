@@ -1,0 +1,12 @@
+[package]
+name = "metrocalk-core"
+description = "Deterministic engine core: ECS wrapper, registry, commit pipeline, renderer (skeleton)."
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

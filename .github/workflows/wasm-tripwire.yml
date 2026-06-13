@@ -1,7 +1,10 @@
 name: wasm-tripwire
 
-# Web-compatibility tripwire (ADR-003): the Rust core must keep compiling to wasm32 so
-# web-incompatible changes are caught the week they land, not at Phase 2. Fails loudly.
+# Web-compatibility tripwire (ADR-003): the crates that cross to the browser must keep compiling to
+# wasm32 so web-incompatible changes are caught the week they land, not at Phase 2. Fails loudly.
+# Per ADR-006 this builds only the crates that actually cross (today: spikes/wasm = wgpu; loro also
+# proven). It must NEVER build flecs_ecs / metrocalk-core (native-only) for wasm32 — as the real
+# crossable crates appear in M1.2+, add them here, not the Flecs-backed core.
 on:
   push:
   pull_request:

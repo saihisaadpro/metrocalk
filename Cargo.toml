@@ -1,0 +1,35 @@
+# Metrocalk Rust workspace (M1.1). Real, production-lint'd crates live here; the M0 spikes are
+# excluded (see below). Build everything: `cargo build` · test: `cargo test` · lint: `cargo clippy`.
+[workspace]
+resolver = "2"
+members = ["core", "transport", "plugins"]
+
+# Spikes are M0 throwaways: heavy/independent deps, their own pinned lockfiles, and they use
+# `unsafe` (peak-RSS counters) which this workspace forbids. Excluding them keeps the workspace the
+# real code, keeps `cargo build` from dragging in the Flecs C core, and lets them keep building
+# standalone in their own dirs (the wasm-tripwire CI cd's into `spikes/wasm`).
+exclude = ["spikes/loro", "spikes/flecs", "spikes/wasm"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+rust-version = "1.92"
+publish = false
+
+# One shared lint config (deliverable 2). Member crates opt in with `[lints] workspace = true`.
+[workspace.lints.rust]
+# Invariant-adjacent: no unsafe in our code. This is `forbid`, which an inner `allow` CANNOT
+# downgrade. The future ecs-wrapper crate (M1.2) needs targeted `unsafe` to call `flecs_ecs`, so it
+# must NOT set `[lints] workspace = true`; instead it defines its own `[lints.rust]` with
+# `unsafe_code = "deny"` and `#[expect(unsafe_code)]` at each FFI boundary. Recorded now (the
+# wrapper crate doesn't exist yet) so M1.2 doesn't fight this.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Tuned pedantic — silence the lints that are noise for this codebase (each with a reason):
+doc_markdown = "allow"             # our doc charters are prose, not API reference; backticking every term is noise
+module_name_repetitions = "allow"  # `metrocalk_core::CoreError`-style names are intentional
+missing_errors_doc = "allow"       # error docs ship with the real APIs, not the skeletons
+missing_panics_doc = "allow"       # ditto
+must_use_candidate = "allow"       # we annotate `#[must_use]` deliberately, not under lint pressure

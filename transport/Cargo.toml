@@ -1,0 +1,12 @@
+[package]
+name = "metrocalk-transport"
+description = "The one protocol trait carried across every boundary — deltas only (trait sketch)."
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
