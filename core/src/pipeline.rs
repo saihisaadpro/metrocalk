@@ -2,7 +2,9 @@
 //!
 //! Every mutation — editor, plugin, AI — enters through [`Engine::commit`]. The ECS [`World`] stays
 //! authoritative at runtime; each committed transaction mirrors to the Loro document as **deltas**
-//! (invariant 2). A transaction = one `defer`'d `World` batch ↔ one Loro commit.
+//! (invariant 2). Every op is pre-validated before any is applied, so a commit is all-or-nothing —
+//! a single invalid op rejects the whole batch with no partial mutation. One transaction ↔ one Loro
+//! commit; per-op inverses are captured for the engine-side undo stack ([`crate::undo`]).
 //!
 //! Loro types are internal — nothing from `loro::` appears in the public API.
 
@@ -70,6 +72,13 @@ pub enum Op {
     },
     /// Remove an entire component record from an entity.
     RemoveComponent { entity: EntityId, component: String },
+    /// Remove a single component field, leaving sibling fields intact (and dropping the component
+    /// record if it becomes empty). The precise inverse of an additive [`Op::SetField`].
+    RemoveField {
+        entity: EntityId,
+        component: String,
+        field: String,
+    },
     /// Add a tag to an entity (ECS-only, for query support).
     AddTag { entity: EntityId, tag: Entity },
     /// Remove a tag from an entity.
@@ -131,6 +140,7 @@ pub struct Engine<W: World> {
     eid_to_ecs: HashMap<EntityId, Entity>,
     ecs_to_eid: HashMap<Entity, EntityId>,
     eid_to_tid: HashMap<EntityId, TreeID>,
+    tid_to_eid_map: HashMap<TreeID, EntityId>,
 
     // ECS-side tracking (needed for delete-inverse capture)
     entity_tags: HashMap<EntityId, HashSet<Entity>>,
@@ -158,6 +168,7 @@ impl<W: World> Engine<W> {
             eid_to_ecs: HashMap::new(),
             ecs_to_eid: HashMap::new(),
             eid_to_tid: HashMap::new(),
+            tid_to_eid_map: HashMap::new(),
             entity_tags: HashMap::new(),
             entity_pairs: HashMap::new(),
             undo_stack: Vec::new(),
@@ -215,8 +226,15 @@ impl<W: World> Engine<W> {
     // ── commit (the sole mutation path) ────────────────────────────────
 
     /// Apply a transaction. This is the **sole** entry point for scene mutations (invariant 3).
-    /// Ops are applied atomically to the ECS world (via `defer`) and mirrored to the Loro
-    /// document as deltas (invariant 2).
+    ///
+    /// **Atomic / all-or-nothing:** every op is pre-validated (entity/parent existence, no duplicate
+    /// ids) against the transaction's own running state *before* any op is applied; a single invalid
+    /// op rejects the whole batch — no partial mutation, no undo entry. Valid ops are then applied to
+    /// the authoritative ECS world and mirrored to the Loro document as deltas (invariant 2), with
+    /// per-op inverses captured for undo, sealed as one Loro commit.
+    ///
+    /// The only non-atomic residual is a Loro-internal error mid-apply (bug-class, not caller-
+    /// controllable); it surfaces as [`PipelineError::Loro`] and is intentionally loud.
     // Takes the op batch by value: `commit` owns the transaction the caller hands it
     // (ergonomic `commit("label", vec![..])` at every call site); not consumed today but the
     // ownership is the intended contract.
@@ -226,16 +244,16 @@ impl<W: World> Engine<W> {
             return Ok(());
         }
 
-        // 1. Compute inverse ops (reads current state before mutation)
-        let inverse_ops = self.compute_inverse(&ops)?;
+        // 1. Pre-validate the WHOLE batch — all-or-nothing (no partial mutation on a bad op).
+        self.validate_transaction(&ops)?;
 
-        // 2. Apply to ECS world + Loro mirror
-        self.apply_ops(&ops)?;
+        // 2. Apply, capturing per-op inverses (interleaved; see apply_transaction).
+        let inverse_ops = self.apply_transaction(&ops)?;
 
-        // 3. Loro commit boundary (one transaction = one commit)
+        // 3. One transaction ↔ one Loro commit.
         self.doc.commit();
 
-        // 4. Push undo, clear redo
+        // 4. Push undo, clear redo.
         self.undo_stack.push(InverseTransaction {
             label: label.to_string(),
             ops: inverse_ops,
@@ -250,12 +268,13 @@ impl<W: World> Engine<W> {
         let Some(inv) = self.undo_stack.pop() else {
             return false;
         };
-        // Convert inverse ops to forward ops, apply them, capture the NEW inverse for redo.
         let forward_ops = inv.to_forward_ops();
+        // Undo/redo replay the inverse of an already-valid transaction, so they are trusted: a
+        // failure here is a logic bug (not caller input), and we surface it loudly rather than
+        // silently corrupt the undo/redo stacks.
         let redo_inverse = self
-            .compute_inverse(&forward_ops)
-            .expect("undo inverse computation");
-        self.apply_ops(&forward_ops).expect("undo apply");
+            .apply_transaction(&forward_ops)
+            .expect("undo: replaying the inverse of a valid transaction must not fail");
         self.doc.commit();
         self.redo_stack.push(InverseTransaction {
             label: inv.label,
@@ -270,10 +289,10 @@ impl<W: World> Engine<W> {
             return false;
         };
         let forward_ops = inv.to_forward_ops();
+        // See `undo`: replaying a trusted, already-valid transaction — fail loudly on a logic bug.
         let undo_inverse = self
-            .compute_inverse(&forward_ops)
-            .expect("redo inverse computation");
-        self.apply_ops(&forward_ops).expect("redo apply");
+            .apply_transaction(&forward_ops)
+            .expect("redo: replaying the inverse of a valid transaction must not fail");
         self.doc.commit();
         self.undo_stack.push(InverseTransaction {
             label: inv.label,
@@ -330,11 +349,124 @@ impl<W: World> Engine<W> {
 
     // ── internals ──────────────────────────────────────────────────────
 
-    fn apply_ops(&mut self, ops: &[Op]) -> Result<(), PipelineError> {
+    /// Pre-validate the whole batch against a running "alive" set (existing entities + in-batch
+    /// creates − in-batch deletes) so an op may legally reference an entity created earlier in the
+    /// *same* transaction. Any failed precondition rejects the transaction before a single op is
+    /// applied — this is what makes [`commit`](Self::commit) all-or-nothing.
+    fn validate_transaction(&self, ops: &[Op]) -> Result<(), PipelineError> {
+        let mut alive: HashSet<EntityId> = self.eid_to_ecs.keys().copied().collect();
+        let mut in_tx_children: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
+
         for op in ops {
-            self.apply_one(op)?;
+            match op {
+                Op::CreateEntity { id, parent } => {
+                    if alive.contains(id) {
+                        return Err(PipelineError::DuplicateEntity(*id));
+                    }
+                    if let Some(p) = parent {
+                        if !alive.contains(p) {
+                            return Err(PipelineError::UnknownEntity(*p));
+                        }
+                        in_tx_children.entry(*p).or_default().push(*id);
+                    }
+                    alive.insert(*id);
+                }
+                Op::DeleteEntity { id } => {
+                    if !alive.contains(id) {
+                        return Err(PipelineError::UnknownEntity(*id));
+                    }
+                    // A delete cascades; drop the whole subtree from `alive` so a later op that
+                    // references a cascade-deleted descendant is correctly rejected.
+                    for e in self.validation_subtree(*id, &in_tx_children) {
+                        alive.remove(&e);
+                    }
+                }
+                Op::SetField { entity, .. }
+                | Op::RemoveComponent { entity, .. }
+                | Op::RemoveField { entity, .. }
+                | Op::AddTag { entity, .. }
+                | Op::RemoveTag { entity, .. }
+                | Op::AddPair { entity, .. }
+                | Op::RemovePair { entity, .. } => {
+                    if !alive.contains(entity) {
+                        return Err(PipelineError::UnknownEntity(*entity));
+                    }
+                }
+                Op::Reparent { entity, new_parent } => {
+                    if !alive.contains(entity) {
+                        return Err(PipelineError::UnknownEntity(*entity));
+                    }
+                    if let Some(p) = new_parent {
+                        if !alive.contains(p) {
+                            return Err(PipelineError::UnknownEntity(*p));
+                        }
+                    }
+                }
+                Op::AddBinding { from, to, .. } => {
+                    if !alive.contains(from) {
+                        return Err(PipelineError::UnknownEntity(*from));
+                    }
+                    if !alive.contains(to) {
+                        return Err(PipelineError::UnknownEntity(*to));
+                    }
+                }
+                // `apply_remove_binding` tolerates a missing edge / endpoints (no-op if absent), so
+                // it can never fail — nothing to pre-validate.
+                Op::RemoveBinding { .. } => {}
+            }
         }
         Ok(())
+    }
+
+    /// The set of entities a `DeleteEntity` would cascade-remove: the real subtree (already-applied
+    /// tree nodes) unioned with descendants created earlier in this same (not-yet-applied)
+    /// transaction. Used by [`validate_transaction`](Self::validate_transaction) only.
+    ///
+    /// Note: an in-batch `Reparent` is not reflected here, so a delete that targets an entity whose
+    /// in-batch-moved child should cascade may under-approximate — a pathological self-contradicting
+    /// batch. It stays *sound* (never rejects a valid batch); the worst case is that such a batch is
+    /// caught at apply time (loud Loro/unknown-entity error) rather than at validation.
+    fn validation_subtree(
+        &self,
+        root: EntityId,
+        in_tx_children: &HashMap<EntityId, Vec<EntityId>>,
+    ) -> HashSet<EntityId> {
+        let tree = self.doc.get_tree("hierarchy");
+        let mut result = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(e) = stack.pop() {
+            if !result.insert(e) {
+                continue;
+            }
+            if let Some(&tid) = self.eid_to_tid.get(&e) {
+                if let Some(children) = tree.children(TreeParentId::Node(tid)) {
+                    for ctid in children {
+                        if let Some(ceid) = self.tid_to_eid(ctid) {
+                            stack.push(ceid);
+                        }
+                    }
+                }
+            }
+            if let Some(kids) = in_tx_children.get(&e) {
+                stack.extend(kids.iter().copied());
+            }
+        }
+        result
+    }
+
+    /// Apply each op in order, capturing its inverse against the live state *just before* it runs.
+    /// Interleaving compute+apply (vs. compute-all-then-apply-all) is what lets an op reference an
+    /// entity created earlier in the same transaction — e.g. resurrection's create-then-set-field,
+    /// or a create-then-delete batch. [`commit`](Self::commit) pre-validates, so no caller-
+    /// controllable op fails here; the only possible error is a Loro-internal failure (loud).
+    fn apply_transaction(&mut self, ops: &[Op]) -> Result<Vec<InverseOp>, PipelineError> {
+        let mut inverses = Vec::with_capacity(ops.len());
+        for op in ops {
+            let inv = self.inverse_of(op)?;
+            self.apply_one(op)?;
+            inverses.push(inv);
+        }
+        Ok(inverses)
     }
 
     fn apply_one(&mut self, op: &Op) -> Result<(), PipelineError> {
@@ -362,6 +494,11 @@ impl<W: World> Engine<W> {
             Op::RemoveComponent { entity, component } => {
                 self.apply_remove_component(*entity, component)
             }
+            Op::RemoveField {
+                entity,
+                component,
+                field,
+            } => self.apply_remove_field(*entity, component, field),
             Op::Reparent { entity, new_parent } => self.apply_reparent(*entity, *new_parent),
             Op::AddBinding { from, kind, to } => self.apply_add_binding(*from, kind, *to),
             Op::RemoveBinding { from, kind, to } => self.apply_remove_binding(*from, kind, *to),
@@ -392,20 +529,21 @@ impl<W: World> Engine<W> {
             }
             None => TreeParentId::Root,
         };
-        let tid = tree.create(parent_tid).unwrap();
+        let tid = tree.create(parent_tid).map_err(loro_err)?;
         tree.get_meta(tid)
-            .unwrap()
+            .map_err(loro_err)?
             .insert("eid", id.to_loro_key().as_str())
-            .unwrap();
+            .map_err(loro_err)?;
 
         // Loro components placeholder
         let components = self.doc.get_map("components");
-        let _ = child_map(&components, &id.to_loro_key());
+        let _ = try_child_map(&components, &id.to_loro_key())?;
 
         // Mapping
         self.eid_to_ecs.insert(id, ecs_entity);
         self.ecs_to_eid.insert(ecs_entity, id);
         self.eid_to_tid.insert(id, tid);
+        self.tid_to_eid_map.insert(tid, id);
         self.entity_tags.insert(id, HashSet::new());
         self.entity_pairs.insert(id, HashSet::new());
 
@@ -427,7 +565,7 @@ impl<W: World> Engine<W> {
 
         // Loro: delete tree node (children auto-cascade to "under deleted ancestor")
         let tree = self.doc.get_tree("hierarchy");
-        tree.delete(tid).unwrap();
+        tree.delete(tid).map_err(loro_err)?;
 
         // Loro: clean up component records + bindings for all subtree entities
         let components = self.doc.get_map("components");
@@ -436,7 +574,7 @@ impl<W: World> Engine<W> {
         for eid in &subtree {
             let key = eid.to_loro_key();
             if components.get(&key).is_some() {
-                components.delete(&key).unwrap();
+                components.delete(&key).map_err(loro_err)?;
             }
         }
         // Remove bindings that reference any entity in the subtree
@@ -450,7 +588,7 @@ impl<W: World> Engine<W> {
             .map(|k| k.to_string())
             .collect();
         for k in &binding_keys {
-            bindings.delete(k).unwrap();
+            bindings.delete(k).map_err(loro_err)?;
         }
 
         // ECS: delete all entities in subtree
@@ -459,7 +597,9 @@ impl<W: World> Engine<W> {
                 self.world.delete_entity(e);
                 self.ecs_to_eid.remove(&e);
             }
-            self.eid_to_tid.remove(eid);
+            if let Some(t) = self.eid_to_tid.remove(eid) {
+                self.tid_to_eid_map.remove(&t);
+            }
             self.entity_tags.remove(eid);
             self.entity_pairs.remove(eid);
         }
@@ -480,9 +620,9 @@ impl<W: World> Engine<W> {
         }
         let key = entity.to_loro_key();
         let components = self.doc.get_map("components");
-        let rec = child_map(&components, &key);
-        let cmap = child_map(&rec, component);
-        cmap.insert(field, value.to_loro()).unwrap();
+        let rec = try_child_map(&components, &key)?;
+        let cmap = try_child_map(&rec, component)?;
+        cmap.insert(field, value.to_loro()).map_err(loro_err)?;
         Ok(())
     }
 
@@ -498,7 +638,36 @@ impl<W: World> Engine<W> {
         let components = self.doc.get_map("components");
         if let Some(ValueOrContainer::Container(Container::Map(rec))) = components.get(&key) {
             if rec.get(component).is_some() {
-                rec.delete(component).unwrap();
+                rec.delete(component).map_err(loro_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a single field, leaving sibling fields intact. If the component record is left with no
+    /// fields, drop it too — so undoing the creation of a component's first field restores the exact
+    /// prior state (no lingering empty component). This is the precise inverse of an additive
+    /// [`Op::SetField`]; the old over-broad [`Op::RemoveComponent`] inverse destroyed sibling fields
+    /// written by earlier transactions (the M1 audit bug).
+    fn apply_remove_field(
+        &mut self,
+        entity: EntityId,
+        component: &str,
+        field: &str,
+    ) -> Result<(), PipelineError> {
+        if !self.eid_to_ecs.contains_key(&entity) {
+            return Err(PipelineError::UnknownEntity(entity));
+        }
+        let key = entity.to_loro_key();
+        let components = self.doc.get_map("components");
+        if let Some(ValueOrContainer::Container(Container::Map(rec))) = components.get(&key) {
+            if let Some(ValueOrContainer::Container(Container::Map(cmap))) = rec.get(component) {
+                if cmap.get(field).is_some() {
+                    cmap.delete(field).map_err(loro_err)?;
+                }
+                if cmap.is_empty() {
+                    rec.delete(component).map_err(loro_err)?;
+                }
             }
         }
         Ok(())
@@ -576,10 +745,10 @@ impl<W: World> Engine<W> {
                     .eid_to_tid
                     .get(&pid)
                     .ok_or(PipelineError::UnknownEntity(pid))?;
-                tree.mov(tid, parent_tid).unwrap();
+                tree.mov(tid, parent_tid).map_err(loro_err)?;
             }
             None => {
-                tree.mov_to(tid, TreeParentId::Root, 0).unwrap();
+                tree.mov_to(tid, TreeParentId::Root, 0).map_err(loro_err)?;
             }
         }
         Ok(())
@@ -599,16 +768,15 @@ impl<W: World> Engine<W> {
         }
         let key = binding_key(&from, kind, &to);
         let bindings = self.doc.get_map("bindings");
-        let em = child_map(&bindings, &key);
-        em.insert("from", from.to_loro_key().as_str()).unwrap();
-        em.insert("to", to.to_loro_key().as_str()).unwrap();
-        em.insert("kind", kind).unwrap();
+        let em = try_child_map(&bindings, &key)?;
+        em.insert("from", from.to_loro_key().as_str())
+            .map_err(loro_err)?;
+        em.insert("to", to.to_loro_key().as_str())
+            .map_err(loro_err)?;
+        em.insert("kind", kind).map_err(loro_err)?;
         Ok(())
     }
 
-    // Returns `Result` to stay uniform with the sibling `apply_*` arms in the dispatch match
-    // (every op handler has the same signature); this one happens to be infallible today.
-    #[allow(clippy::unnecessary_wraps)]
     fn apply_remove_binding(
         &mut self,
         from: EntityId,
@@ -618,20 +786,12 @@ impl<W: World> Engine<W> {
         let key = binding_key(&from, kind, &to);
         let bindings = self.doc.get_map("bindings");
         if bindings.get(&key).is_some() {
-            bindings.delete(&key).unwrap();
+            bindings.delete(&key).map_err(loro_err)?;
         }
         Ok(())
     }
 
     // ── inverse computation (reads current state) ──────────────────────
-
-    fn compute_inverse(&self, ops: &[Op]) -> Result<Vec<InverseOp>, PipelineError> {
-        let mut inverses = Vec::with_capacity(ops.len());
-        for op in ops {
-            inverses.push(self.inverse_of(op)?);
-        }
-        Ok(inverses)
-    }
 
     #[allow(clippy::too_many_lines)] // one match arm per Op variant; splitting would fragment the inverse logic
     fn inverse_of(&self, op: &Op) -> Result<InverseOp, PipelineError> {
@@ -708,11 +868,19 @@ impl<W: World> Engine<W> {
                 Ok(InverseOp::ResurrectSubtree { entities, bindings })
             }
 
+            // Setting a field and removing a field share one inverse: restore the field's prior
+            // value (`SetField{old:Some}`), or — if it had none — `SetField{old:None}`, whose
+            // forward form is a precise single-field `RemoveField`.
             Op::SetField {
                 entity,
                 component,
                 field,
                 ..
+            }
+            | Op::RemoveField {
+                entity,
+                component,
+                field,
             } => {
                 let old = self.get_field(*entity, component, field);
                 Ok(InverseOp::SetField {
@@ -791,10 +959,7 @@ impl<W: World> Engine<W> {
     // ── helpers ─────────────────────────────────────────────────────────
 
     fn tid_to_eid(&self, tid: TreeID) -> Option<EntityId> {
-        self.eid_to_tid
-            .iter()
-            .find(|(_, t)| **t == tid)
-            .map(|(eid, _)| *eid)
+        self.tid_to_eid_map.get(&tid).copied()
     }
 
     fn collect_subtree(&self, root: EntityId) -> Vec<EntityId> {
@@ -869,6 +1034,7 @@ impl<W: World> Engine<W> {
         }
         self.ecs_to_eid.clear();
         self.eid_to_tid.clear();
+        self.tid_to_eid_map.clear();
         self.entity_tags.clear();
         self.entity_pairs.clear();
 
@@ -899,6 +1065,7 @@ impl<W: World> Engine<W> {
             self.eid_to_ecs.insert(eid, ecs_entity);
             self.ecs_to_eid.insert(ecs_entity, eid);
             self.eid_to_tid.insert(eid, *tid);
+            self.tid_to_eid_map.insert(*tid, eid);
             self.entity_tags.insert(eid, HashSet::new());
             self.entity_pairs.insert(eid, HashSet::new());
         }
@@ -918,11 +1085,27 @@ impl<W: World> Engine<W> {
 
 // ── Loro helpers (crate-internal, no public leak) ──────────────────────────
 
-pub(crate) fn child_map(parent: &LoroMap, key: &str) -> LoroMap {
+/// Get-or-create a child map, propagating a Loro failure as [`PipelineError::Loro`]. Used on the
+/// `apply_*` mutation path (deliverable 4: no `.unwrap()` on a fallible Loro op there).
+pub(crate) fn try_child_map(parent: &LoroMap, key: &str) -> Result<LoroMap, PipelineError> {
     match parent.get(key) {
-        Some(ValueOrContainer::Container(Container::Map(m))) => m,
-        _ => parent.insert_container(key, LoroMap::new()).unwrap(),
+        Some(ValueOrContainer::Container(Container::Map(m))) => Ok(m),
+        _ => parent
+            .insert_container(key, LoroMap::new())
+            .map_err(loro_err),
     }
+}
+
+/// Infallible get-or-create for the merge-repair path (merge.rs), where a get-or-create failure
+/// would be a Loro-internal bug rather than a recoverable condition. The `apply_*` mutation path
+/// uses [`try_child_map`] and propagates instead.
+pub(crate) fn child_map(parent: &LoroMap, key: &str) -> LoroMap {
+    try_child_map(parent, key).expect("loro get-or-create container (repair path)")
+}
+
+/// Map any Loro error into [`PipelineError::Loro`]. Keeps the `apply_*` call sites terse.
+fn loro_err<E: std::fmt::Display>(e: E) -> PipelineError {
+    PipelineError::Loro(e.to_string())
 }
 
 fn get_child_map(parent: &LoroMap, key: &str) -> Option<LoroMap> {

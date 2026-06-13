@@ -108,9 +108,12 @@ impl InverseOp {
                     field: field.clone(),
                     value: v.clone(),
                 },
-                None => Op::RemoveComponent {
+                // Precise inverse of an additive set: remove ONLY this field (not the whole
+                // component — that was the M1 over-removal bug that destroyed sibling fields).
+                None => Op::RemoveField {
                     entity: *entity,
                     component: component.clone(),
+                    field: field.clone(),
                 },
             },
 
@@ -243,28 +246,8 @@ impl InverseTransaction {
                     }
                 }
 
-                InverseOp::SetField {
-                    entity,
-                    component,
-                    field,
-                    old_value: None,
-                } => {
-                    // Field didn't exist before — remove the whole component record if this was
-                    // the only field set. Simplified: just remove the field by removing the
-                    // component (conservative but correct for single-field undo).
-                    // Actually, we need a finer approach: removing a field means setting it back.
-                    // For now, use RemoveComponent as a coarse approximation. The SetField inverse
-                    // with None means "the field didn't exist before this op added it."
-                    // We express this as RemoveComponent which removes the whole component record.
-                    // This is safe because: if the component existed with other fields, those
-                    // fields would have their own SetField ops with old_value=Some(...).
-                    result.push(Op::RemoveComponent {
-                        entity: *entity,
-                        component: component.clone(),
-                    });
-                    let _ = field;
-                }
-
+                // Primitive inverses (incl. SetField{old:None}, whose forward form is a precise
+                // single-field RemoveField — see `to_forward_op`) map 1:1.
                 other => {
                     result.push(other.to_forward_op());
                 }

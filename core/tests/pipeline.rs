@@ -299,3 +299,121 @@ fn sole_mutation_path_enforced_by_visibility() {
                                                     // e.world is private — the following would not compile:
                                                     // e.world.create_entity();  // ERROR: field `world` is private
 }
+
+// ── M1.6 atomic commit ─────────────────────────────────────────────────
+
+/// A multi-op transaction whose middle op is invalid must leave ZERO state change and push NO undo
+/// entry (all-or-nothing). Pre-fix, ops applied one-by-one with no rollback would leave op1's
+/// mutation behind and push no undo entry — an un-revertable partial mutation.
+#[test]
+fn failed_multi_op_transaction_is_atomic() {
+    let mut e = engine();
+    let seed = e.alloc_entity_id();
+    e.commit(
+        "seed",
+        vec![Op::CreateEntity {
+            id: seed,
+            parent: None,
+        }],
+    )
+    .unwrap();
+    assert_eq!(e.entity_count(), 1);
+    assert!(e.can_undo());
+
+    let new1 = e.alloc_entity_id();
+    let ghost = EntityId {
+        peer: 7,
+        counter: 999,
+    }; // never created
+    let new2 = e.alloc_entity_id();
+
+    // 3-op tx: op1 valid (create new1), op2 INVALID (set field on a nonexistent entity),
+    // op3 valid (create new2). The whole batch must be rejected.
+    let err = e
+        .commit(
+            "bad",
+            vec![
+                Op::CreateEntity {
+                    id: new1,
+                    parent: None,
+                },
+                Op::SetField {
+                    entity: ghost,
+                    component: "Health".into(),
+                    field: "hp".into(),
+                    value: FieldValue::Integer(1),
+                },
+                Op::CreateEntity {
+                    id: new2,
+                    parent: None,
+                },
+            ],
+        )
+        .unwrap_err();
+    assert!(matches!(err, PipelineError::UnknownEntity(_)));
+
+    // Zero state change: neither new1 (before the bad op) nor new2 (after) was created.
+    assert_eq!(e.entity_count(), 1);
+    assert!(!e.entity_exists(new1));
+    assert!(!e.entity_exists(new2));
+
+    // No undo entry was pushed by the failed transaction: the only thing on the stack is "seed".
+    assert!(e.undo()); // undoes "seed"
+    assert_eq!(e.entity_count(), 0);
+    assert!(!e.undo()); // nothing else → the bad tx pushed no entry
+}
+
+/// A transaction may legally reference an entity created earlier in the *same* batch (validation
+/// simulates the running state), and create-then-delete in one batch is valid + atomic.
+#[test]
+fn intra_transaction_references_are_valid() {
+    let mut e = engine();
+    let parent = e.alloc_entity_id();
+    let child = e.alloc_entity_id();
+    // child references parent created in the same batch; then set a field on the just-created child.
+    e.commit(
+        "tree-in-one-tx",
+        vec![
+            Op::CreateEntity {
+                id: parent,
+                parent: None,
+            },
+            Op::CreateEntity {
+                id: child,
+                parent: Some(parent),
+            },
+            Op::SetField {
+                entity: child,
+                component: "Health".into(),
+                field: "hp".into(),
+                value: FieldValue::Integer(10),
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(e.entity_count(), 2);
+    assert_eq!(
+        e.get_field(child, "Health", "hp"),
+        Some(FieldValue::Integer(10))
+    );
+
+    // create-then-delete in one batch: valid, nets to nothing, and is undoable.
+    let tmp = e.alloc_entity_id();
+    e.commit(
+        "create-then-delete",
+        vec![
+            Op::CreateEntity {
+                id: tmp,
+                parent: None,
+            },
+            Op::DeleteEntity { id: tmp },
+        ],
+    )
+    .unwrap();
+    assert!(!e.entity_exists(tmp));
+    assert_eq!(e.entity_count(), 2);
+    // Undo brings the net-zero batch back to its prior state (still 2 entities, tmp absent).
+    assert!(e.undo());
+    assert_eq!(e.entity_count(), 2);
+    assert!(!e.entity_exists(tmp));
+}

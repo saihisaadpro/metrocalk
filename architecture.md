@@ -57,8 +57,9 @@ Cargo workspace at root (`Cargo.toml`); members `core` + `ecs` + `transport` + `
 ```
 /ecs         Rust lib — the `World` query trait + native Flecs backend; the ONE crate with
              flecs_ecs + unsafe (ADR-001/006). M1.2 real.                   (workspace member)
-/core        Rust lib — component metadata registry (real, M1.3); commit pipeline + engine-side
-             undo/redo + merge-validation (real, M1–2); renderer later; depends on /ecs  (workspace member)
+/core        Rust lib — component metadata registry (real, M1.3); commit pipeline (atomic /
+             pre-validated, M1.6) + engine-side undo/redo + merge-validation (real, M1–2);
+             renderer later; depends on /ecs                                  (workspace member)
 /transport   Rust lib — deltas-only protocol trait; 3 impls land M2+        (workspace member)
 /plugins     Rust lib — Extism host + MCP seam (Phase 2+, stub)             (workspace member)
 /tools       Rust bins — measurement only: scene-bench (F1 memory), query-gate (the <16 ms
@@ -81,7 +82,7 @@ preset through the wrapper — north-star test #1; ~776× runner headroom; calib
 
 Resolved at the M0 gate review (2026-06-13) — kept here struck-through for traceability:
 
-- ~~`flecs_ecs` binding viability~~ → **ADOPT, confirmed** ([ADR-001](decisions/001-flecs-over-bevy-ecs.md), `spikes/flecs`): 12–58 µs p99 (≪16 ms), safety locks ON, zero stale. **M1 integration go/no-go: GO.** The commit pipeline (200 entities + 600 fields + 100 undo/redo ops) runs through the wrapper with undo p99 0.145 ms (34× under the 5 ms budget) and entity-resurrection p99 0.282 ms (17× under). Two-fork merge converges; all 8 invalid-state classes detected+repaired. 44 tests green. No `flecs_ecs` type leaks past `/ecs`.
+- ~~`flecs_ecs` binding viability~~ → **ADOPT, confirmed** ([ADR-001](decisions/001-flecs-over-bevy-ecs.md), `spikes/flecs`): 12–58 µs p99 (≪16 ms), safety locks ON, zero stale. **M1 integration go/no-go: GO.** The commit pipeline runs through the wrapper with latest-op undo p99 0.24–0.30 ms and entity-resurrection undo p99 0.72 ms — both ≫ under the 5 ms budget (n=500, under parallel test load; M1.6). Two-fork merge converges; all 8 invalid-state classes detected+repaired. 49 tests green. No `flecs_ecs` type leaks past `/ecs`.
 - ~~Loro history size / merge semantics at scale~~ → **ADOPT, confirmed** ([ADR-002](decisions/002-loro-over-custom-wal.md), `spikes/loro`).
 - ~~Browser ECS path~~ → **resolved** ([ADR-006](decisions/006-browser-query-backend.md)): browser runs a pure-Rust query backend over the Loro projection; Flecs is native-only. `loro`+`wgpu` reach wasm; `flecs_ecs` does not.
 
