@@ -32,7 +32,9 @@ The engine is **free forever** — desktop download and browser lite editor (the
 
 - `Metrocalk-Engine-Feasibility-and-Hosting-Plan.md` — the full plan (stack, product model, risks, hosting, roadmap)
 - `architecture.md` — current state of the system
-- `decisions/` — why we chose what we chose (ADRs, one page each, immutable)
-- `progress.md` — now / next / log
+- `decisions/` — why we chose what we chose (ADRs, one page each, immutable; 001–006)
+- `progress.md` — now / next; per-milestone logs sharded under `progress/`
+- `M0-gate-review.md` — M0 consolidation: gate verdicts, frame-budget arithmetic, adversarial pass
+- `physics-audio-networking-plan.md` — runtime-systems plan (physics · audio · netcode), pending spikes
 - `hosting.md` — providers, costs, setup tasks
 - `prompts/` — operating prompts for AI dev sessions (Opus 4.8)
