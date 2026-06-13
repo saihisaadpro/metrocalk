@@ -38,7 +38,7 @@
 | Logic layer | Rules (When/If/Then) + state machines as data, registry-fed builder; code behavior via WASM plugins (post-slice) | plan §2 |
 | Asset pipeline | Import anything (FBX/glTF/PNG…) → glTF + KTX2, LODs, colliders, rig detection; local now, server-side Phase 2 | plan §1.5 |
 | Asset generation + marketplace | Text-to-3D providers wrapped behind our API; token economy; local → marketplace → generate (Phase 2) | [004](decisions/004-free-engine-token-economy.md) |
-| Deferred | Physics (Rapier), audio (kira), netcode (lightyear) | plan §2 |
+| Physics / Audio / Netcode | Picks **revised, pending spikes** → Rapier (physics) · Firewheel (audio, was kira) · tiered Loro/renet2/GGRS (netcode, was lightyear — Bevy-coupled). Determinism = enabling substrate. | [physics-audio-networking-plan.md](physics-audio-networking-plan.md) |
 
 ## Invariants (non-negotiable)
 
