@@ -57,7 +57,7 @@ Cargo workspace at root (`Cargo.toml`); members `core` + `ecs` + `transport` + `
 ```
 /ecs         Rust lib — the `World` query trait + native Flecs backend; the ONE crate with
              flecs_ecs + unsafe (ADR-001/006). M1.2 real.                   (workspace member)
-/core        Rust lib — registry, commit pipeline, renderer (depends on /ecs); skeleton  (workspace member)
+/core        Rust lib — component metadata registry (real, M1.3); commit pipeline + renderer later; depends on /ecs  (workspace member)
 /transport   Rust lib — deltas-only protocol trait; 3 impls land M2+        (workspace member)
 /plugins     Rust lib — Extism host + MCP seam (Phase 2+, stub)             (workspace member)
 /editor      React/TS UI — NOT a cargo member (scaffolded M2–3)

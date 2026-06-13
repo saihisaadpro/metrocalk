@@ -1,12 +1,20 @@
 [package]
 name = "metrocalk-core"
-description = "Deterministic engine core: ECS wrapper, registry, commit pipeline, renderer (skeleton)."
+description = "Deterministic engine core: component metadata registry, commit pipeline, renderer."
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+metrocalk-ecs = { path = "../ecs" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+# integration tests construct a concrete World backend (FlecsWorld)
+metrocalk-ecs = { path = "../ecs" }
 
 [lints]
 workspace = true
