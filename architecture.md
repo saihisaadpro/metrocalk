@@ -29,7 +29,8 @@
 | Semantic ECS | Flecs v4.1 via `flecs_ecs`, behind our own query API | [001](decisions/001-flecs-over-bevy-ecs.md) |
 | Document / undo / collab / persistence | Loro 1.x | [002](decisions/002-loro-over-custom-wal.md) |
 | Shell + UI | Tauri 2 + React/TS; viewport in Rust/wgpu | [003](decisions/003-desktop-first-tauri-exit-gate.md) |
-| Rendering | wgpu + WGSL (non-bindless path required for web) | plan §2 |
+| Rendering | wgpu 29 + WGSL (non-bindless path required for web — confirmed: WebGPU exposes no binding-array features) | [003](decisions/003-desktop-first-tauri-exit-gate.md) |
+| Browser target | **CI-enforced**: `wasm32-unknown-unknown` builds on every push (`.github/workflows/wasm-tripwire.yml`); native+browser render proven from one wgpu crate (`spikes/wasm`) | [003](decisions/003-desktop-first-tauri-exit-gate.md) |
 | Plugins / scripting | Extism WASM plugins | plan §2 |
 | AI layer | MCP server + JSON-Schema-constrained JSON Patch | plan §2 |
 | Scene format | Own format; BSN-compatible where cheap; BRP interop | plan §2 |
@@ -61,3 +62,4 @@
 - `flecs_ecs` binding viability → **M0 query/binding spike PASSED 2026-06-13, ADOPT** ([ADR-001](decisions/001-flecs-over-bevy-ecs.md), `spikes/flecs`): compatibility query 12–58 µs p99 (≪16 ms gate), safety locks ON, zero stale under churn. M1 integration gate still applies; wrapper must hide all `flecs_ecs` types. Open M1 items: `DontFragment`/sparse for capability pairs (memory ~14.8 KB/entity otherwise); fallback `bevy_ecs` stays viable behind the wrapper.
 - Tauri IPC on Windows WebView2 → M2 gate (fallback: CEF shell)
 - ~~Loro history size / merge semantics at scale~~ → **resolved 2026-06-13, ADOPT** ([ADR-002](decisions/002-loro-over-custom-wal.md), `spikes/loro`). M1 must honor: regular containers + merge-validation layer (not `ensure_mergeable_*`), small transaction groups (undo uses full-doc checkouts), peer-namespaced entity IDs.
+- **Browser ECS path (NEW, gated to M1/Phase-2)** → `flecs_ecs` does **not** compile to `wasm32-unknown-unknown` (C core needs a wasm libc/sysroot; `spikes/wasm`). The browser lite-editor can't run Flecs client-side as-is. Options: Flecs via wasm32-wasi/emscripten, or a Loro-document-backed pure-Rust query layer in-browser, or thin-client. Loro itself builds for wasm32 ✓. Desktop unaffected.

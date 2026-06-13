@@ -1,0 +1,42 @@
+name: wasm-tripwire
+
+# Web-compatibility tripwire (ADR-003): the Rust core must keep compiling to wasm32 so
+# web-incompatible changes are caught the week they land, not at Phase 2. Fails loudly.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  wasm32-build:
+    name: build wasm32 (spikes/wasm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Caches the cargo registry + target dir keyed on Cargo.lock → keeps reruns well under 5 min.
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes/wasm
+
+      - name: Build wasm32 (release)
+        working-directory: spikes/wasm
+        run: |
+          cargo build --release --target wasm32-unknown-unknown
+          echo "wasm32 build OK"
+
+      - name: Verify the cdylib .wasm artifact was produced
+        working-directory: spikes/wasm
+        run: |
+          test -f target/wasm32-unknown-unknown/release/metrocalk_wasm_spike.wasm \
+            && echo "artifact present" \
+            || (echo "::error::no wasm32 cdylib produced — web target is broken" && exit 1)

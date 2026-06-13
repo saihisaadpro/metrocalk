@@ -1,15 +1,15 @@
 # Progress
 
 ## Now
-- M0 spikes (2-week box): ① Loro scene document — **DONE, ADOPT**; ② Flecs wildcard queries — **DONE, ADOPT**; ③ wasm32 + WebGPU triangle — pending
-- Each spike ends with an adopt/fallback ADR
+- M0 spikes (2-week box) **ALL DONE**: ① Loro — ADOPT; ② Flecs — ADOPT; ③ wasm/WebGPU — browser-render leg PROVEN (CI tripwire added)
+- M0 gate review next: reconcile the three spikes, settle the browser-ECS question
 
 ## Next
-- M0 spike ③ wasm/WebGPU triangle (last remaining spike)
-- Monorepo + ECS wrapper API + component metadata registry (M0–1) — wrapper must hide all `flecs_ecs` types and expose deferred mutation + a safe query surface
+- **M0 gate review** (prompt 04): cross-spike reconciliation + frame-budget arithmetic; settle the browser-ECS path (flecs doesn't compile to wasm32 — decide Loro-backed query layer vs wasi/emscripten Flecs vs thin-client)
+- Trigger + verify the wasm-tripwire CI on the GitHub repo (green once + fail-on-break once) — see spike ③ blocker
+- Monorepo + ECS wrapper API + component metadata registry (M0–1) — wrapper must hide all `flecs_ecs` types, expose deferred mutation + safe query surface
 - ECS↔Loro commit pipeline + merge-validation layer (M1–2) — validation-layer spec in `spikes/loro/README.md`
-- M1 follow-ups from spike ②: validate `DontFragment`/sparse for capability pairs (memory); engine-side inverse-op undo stack from spike ① (F2)
-- Gate: compatibility query <16 ms on stress scene — **pre-validated at 12–58 µs p99 in spike ②**
+- M1 follow-ups: `DontFragment`/sparse for capability pairs (spike ②); engine-side inverse-op undo stack (spike ① F2); getrandom `js` for Loro-in-browser (spike ③)
 
 ## Done
 - Feasibility plan v1 (stack assessment, hosting, browser-vs-desktop analysis)
@@ -22,6 +22,13 @@
 ## Log
 
 *Append-only. Newest first. One entry per working session: date — what happened, decisions made (link ADR), blockers. Archive to `progress-YYYY.md` when this slows you down.*
+
+### 2026-06-13 (M0 spike ③ — wasm32 + WebGPU)
+- **Browser-render leg of ADR-003 PROVEN.** One wgpu 29.0.3 / winit 0.30 crate (`spikes/wasm`) renders a spinning triangle on **native** (Vulkan, RTX 4060: 8.3 ms median / 9.9 ms p99, ~120 fps) and in **Chrome 149 + Edge 149** via WebGPU. `crossOriginIsolated === true` under a COOP/COEP dev server; 512×512 render verified by pixel readback (118/119 distinct colors) + screenshots. Browser TTFF 0.4–0.8 s. Chose raw `wasm-bindgen` over trunk (transparent, measurable steps).
+- **Sizes (funnel baseline):** raw cargo wasm 1361 KB → wasm-bindgen 378 KB → wasm-opt -Oz 335 KB → **brotli 118 KB**; +12 KB brotli JS glue = **~130 KB transfer** for a minimal wgpu triangle. (wasm-opt needs `--enable-reference-types --enable-bulk-memory …` for wasm-bindgen 0.2.125 output.)
+- **Adapter diff (bindless flagged):** native Vulkan exposes all binding-array/non-uniform-indexing (bindless) features + huge limits (1 TB buffers, 8 bind groups); **WebGPU exposes none** (2 GB buffers, 4 bind groups, 16 storage buffers/stage) → non-bindless web path mandatory.
+- **Critical finding (flagged vs ADR-001):** `flecs_ecs` 0.2.2 **does not build for wasm32-unknown-unknown** (C core needs clang + a wasm libc/sysroot; verbatim `cc-rs: failed to find tool "clang"`). `loro` 1.13.1 **does** build (needs getrandom `js` at runtime). → browser lite-editor can't run Flecs client-side as-is; resolve in M0 gate review / M1. Desktop unaffected.
+- CI tripwire `.github/workflows/wasm-tripwire.yml` written (builds wasm32 every push, `Swatinem/rust-cache`, <5 min). **Blocker:** not yet triggered/observed — repo had no remote and `gh` is unauthenticated; user provided `github.com/saihisaadpro/metrocalk`. Needs a push + auth to verify green/fail-on-break. Toolchain note: this env had no `rustup` and no wasm32 std; installed the official `rust-std` wasm32 component + `wasm-bindgen-cli` 0.2.125 + binaryen 130 manually.
 
 ### 2026-06-13 (M0 spike ② — Flecs)
 - **ADR-001 query/binding spike PASSED → ADOPT Flecs v4.1.2 via `flecs_ecs` 0.2.2** (behind the wrapper, safety locks ON). Built `spikes/flecs` (throwaway): seeded 5k/20k scene with `(Provides,cap)` + `(BindsTo,target)` pairs and role tags; 5 benchmarks + churn-correctness + a criterion cross-check. Two runs each for safety ON and OFF, all structurally identical (matched 211/5k, 830/20k; 1,999 edges).

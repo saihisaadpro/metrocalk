@@ -1,6 +1,10 @@
 # ADR-003: Desktop-first delivery, Tauri 2 shell with a hard exit gate
 
-**Date:** 2026-06-12 · **Status:** Accepted (gated at M2) · **Supersedes:** —
+**Date:** 2026-06-12 · **Status:** Accepted (gated at M2) — **browser-render leg PROVEN 2026-06-13** (`spikes/wasm`); Tauri WebView2 IPC gate still pending at M2 · **Supersedes:** —
+
+> **Browser-leg result (2026-06-13):** One wgpu 29.0.3 crate renders a spinning triangle on **native** (Vulkan, RTX 4060: 8.3 ms/frame p99 9.9 ms, ~120 fps) and in **Chrome 149 + Edge 149** via WebGPU (`crossOriginIsolated === true` under COOP/COEP; browser TTFF 0.4–0.8 s; 512×512 render verified by pixel readback + screenshot). Minimal-triangle transfer size ≈ **130 KB brotli** (118 KB wasm + 12 KB JS glue) — the funnel's load-time baseline. Native vs WebGPU adapter diff confirms **no bindless on the web** (all binding-array/non-uniform features false in-browser vs true on native) → the renderer's non-bindless path is mandatory, as this ADR already requires. CI tripwire `.github/workflows/wasm-tripwire.yml` builds wasm32 on every push. **Browser matrix gap:** only Dawn-based browsers (Chrome/Edge) verified; Firefox/Safari (2nd engine) not testable on this Windows machine — fast follow-up, low risk (Firefox WebGPU is built on `wgpu`).
+>
+> **Web-incompatibility flagged against [ADR-001](001-flecs-over-bevy-ecs.md) "revisit when":** `flecs_ecs` 0.2.2 **does not build for `wasm32-unknown-unknown`** — its C core needs clang + a wasm libc/sysroot the bare target lacks (verbatim: `cc-rs: failed to find tool "clang"`; fundamentally, no libc on `wasm32-unknown-unknown`). `loro` 1.13.1 **does** build (needs `getrandom` `js` backend at runtime). Consequence: the browser lite-editor cannot run the Flecs ECS client-side as-is. Resolve in M1/Phase-2 planning — options: compile Flecs via `wasm32-wasi`/emscripten + sysroot, OR run a different (Loro-document-backed, pure-Rust) query layer in the browser, OR thin-client. Desktop is unaffected (native Flecs validated in `spikes/flecs`). Details + numbers in `spikes/wasm/CONSTRAINTS.md`.
 
 ## Context
 

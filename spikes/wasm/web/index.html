@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Metrocalk — wasm + WebGPU spike</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0d0d14; overflow: hidden; }
+      #app { display: block; width: 512px; height: 512px; }
+      #fallback { color: #f55; font: 14px monospace; padding: 16px; }
+    </style>
+  </head>
+  <body>
+    <noscript>This spike needs JavaScript + WebGPU.</noscript>
+    <!-- Explicitly-sized canvas handed to winit (with_canvas) so the surface isn't 1x1. -->
+    <canvas id="app" width="512" height="512"></canvas>
+    <div id="fallback" hidden></div>
+    <script type="module">
+      // Raw wasm-bindgen (--target web) glue. The #[wasm_bindgen(start)] fn runs inside init().
+      import init from "./pkg/metrocalk_wasm_spike.js";
+      const fb = document.getElementById("fallback");
+      if (!("gpu" in navigator)) {
+        fb.hidden = false;
+        fb.textContent =
+          "navigator.gpu is undefined — this browser/build has no WebGPU. " +
+          "Use Chrome/Edge 113+ (or Firefox with dom.webgpu.enabled).";
+      } else {
+        init().catch((e) => {
+          fb.hidden = false;
+          fb.textContent = "wasm init failed: " + e;
+          console.error(e);
+        });
+      }
+    </script>
+  </body>
+</html>
