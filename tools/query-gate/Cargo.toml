@@ -1,0 +1,13 @@
+[package]
+name = "query-gate"
+description = "M1.5 CI perf gate: fails the build if the cached compatibility query's p99 blows the 16 ms budget (north-star test #1)."
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+metrocalk-ecs = { path = "../../ecs" }
+
+# No `[lints] workspace = true`: a measurement/gate tool, not production code (cast-heavy timing
+# math) — same posture as tools/scene-bench. Default lints keep `cargo clippy -D warnings` clean.

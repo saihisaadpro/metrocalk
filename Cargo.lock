@@ -295,6 +295,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "query-gate"
+version = "0.1.0"
+dependencies = [
+ "metrocalk-ecs",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"

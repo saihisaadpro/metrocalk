@@ -1,0 +1,35 @@
+name: perf-gate
+
+# Performance tripwire (M1.5): the product's core interactivity promise — an edit re-answers the
+# compatibility query within one 60 Hz frame (<16 ms, north-star test #1) — must never silently
+# regress. Runs the cached compat query on M1.4's shared 5k preset, through the World wrapper, and
+# FAILS the build if p99 blows the 16 ms budget. The huge (~hundreds×) headroom is intentional:
+# this catches order-of-magnitude regressions (an accidental uncached path, an archetype-
+# fragmentation blowup), not runner jitter — so it stays rock-solid on a shared 2-core runner.
+# Calibration (runner baseline + margin + why an absolute gate, not criterion): tools/query-gate/README.md.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  query-gate:
+    name: compat-query <16 ms p99 (5k, through the wrapper)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # Release is mandatory: debug timings are meaningless (10-50x slower). Exits non-zero — and so
+      # fails this step — iff p99 > budget. The deliberate-regression (red) proof injects a slowdown
+      # via METROCALK_GATE_INJECT_SLOW_US on a throwaway branch; main never carries it.
+      - name: Run the compat-query perf gate (release)
+        run: cargo run --release -p query-gate
