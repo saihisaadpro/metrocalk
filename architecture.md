@@ -52,7 +52,7 @@
 
 ## Repository
 
-Cargo workspace at root (`Cargo.toml`); members `core` + `ecs` + `transport` + `plugins`.
+Cargo workspace at root (`Cargo.toml`); members `core` + `ecs` + `transport` + `plugins` + `tools/*` (measurement crates).
 
 ```
 /ecs         Rust lib — the `World` query trait + native Flecs backend; the ONE crate with
@@ -60,6 +60,8 @@ Cargo workspace at root (`Cargo.toml`); members `core` + `ecs` + `transport` + `
 /core        Rust lib — component metadata registry (real, M1.3); commit pipeline + renderer later; depends on /ecs  (workspace member)
 /transport   Rust lib — deltas-only protocol trait; 3 impls land M2+        (workspace member)
 /plugins     Rust lib — Extism host + MCP seam (Phase 2+, stub)             (workspace member)
+/tools       Rust bins — measurement only: scene-bench (F1 memory), query-gate (the <16 ms
+             compat-query CI perf gate, M1.5). Default lints, not production. (workspace members)
 /editor      React/TS UI — NOT a cargo member (scaffolded M2–3)
 /spikes      M0 throwaway spikes (loro, flecs, wasm) — excluded from the workspace; build standalone
 ```
@@ -67,9 +69,11 @@ Cargo workspace at root (`Cargo.toml`); members `core` + `ecs` + `transport` + `
 The `World` trait is the backend-agnostic relational-query surface (pair-match / wildcard / negation
 / read-target); native = Flecs, browser (Phase 2) = pure-Rust over Loro, behind the **same** trait
 (ADR-006). Shared lints in `[workspace.lints]`: `clippy::pedantic` (tuned) + `unsafe_code = "forbid"`;
-`/ecs` is the documented exception (own lints: `deny` unsafe + pedantic). CI: `ci.yml` (fmt + clippy
-`-D warnings` + test + a grep forbidding `flecs_ecs` outside `/ecs`) and `wasm-tripwire.yml` (wasm32
-build; never `ecs`/`core`/Flecs, per ADR-006).
+`/ecs` is the documented exception (own lints: `deny` unsafe + pedantic). CI — three gates: `ci.yml`
+(fmt + clippy `-D warnings` + test + a grep forbidding `flecs_ecs` outside `/ecs`),
+`wasm-tripwire.yml` (wasm32 build; never `ecs`/`core`/Flecs, per ADR-006), and `perf-gate.yml`
+(M1.5: **fails the build if the cached compat query's p99 > 16 ms** on M1.4's 5k preset through the
+wrapper — north-star test #1; ~776× runner headroom; calibration in `tools/query-gate/README.md`).
 
 ## Open questions (gated, not debated)
 
