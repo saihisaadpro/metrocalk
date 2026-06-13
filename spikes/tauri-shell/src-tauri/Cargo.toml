@@ -1,0 +1,51 @@
+# Standalone spike: its own workspace root so the parent metrocalk workspace (unsafe-forbid lints,
+# `cargo build` membership) doesn't claim it — mirrors spikes/* being root-excluded, but keeps the
+# spike fully self-contained (no edit to the shared root Cargo.toml).
+[workspace]
+
+[package]
+name = "metrocalk-tauri-shell-spike"
+version = "0.0.0"
+edition = "2021"
+description = "M2.1 throwaway spike — ADR-003 Tauri/WebView2 exit gate (IPC 1a + compositing 1b)"
+publish = false
+
+# Standalone spike: its own lockfile, NOT a workspace member (root Cargo.toml excludes spikes/*).
+# Deliberately not [lints] workspace = true — measurement code, not production-lint'd.
+
+[[bin]]
+name = "metrocalk-shell-spike"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# REAL delta source — drive the actual core commit pipeline; ship its Loro update bytes.
+metrocalk-core = { path = "../../../core" }
+metrocalk-ecs = { path = "../../../ecs" }
+# Receive-side mirror (decode+integrate the delta, the real apply cost). loro is fine in a spike
+# (the no-loro-outside-core CI gate only scans transport/plugins/ecs, not spikes/*).
+loro = "1.13.1"
+
+# Local-WebSocket transport (the CEF-style alternative).
+tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "io-util", "sync"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+# Sub-gate 1b — native wgpu surface under the webview. Versions match the project's render spike.
+# DX12 backend disabled: wgpu-hal 29.0.3's DX12 code won't compile against the `windows` crate
+# version Tauri/webview2-com pin (a diamond conflict the standalone render spike never hit). Vulkan
+# is the project's native backend anyway (ADR-003); GLES/ANGLE is the fallback. Neither needs the
+# DX12 `windows` bindings.
+wgpu = { version = "29.0.3", default-features = false, features = ["vulkan", "gles", "wgsl"] }
+pollster = "0.4.0"
+raw-window-handle = "0.6.2"
+
+[profile.dev]
+# keep iteration fast; the spike is throwaway
+opt-level = 1
