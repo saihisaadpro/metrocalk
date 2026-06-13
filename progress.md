@@ -1,17 +1,15 @@
 # Progress
 
 ## Now
-- **M1–2 — ECS↔Loro commit pipeline + merge-validation + engine-side undo stack.** Every mutation = one transaction; regular Loro containers (not `ensure_mergeable_*`, F1-loro); peer-namespaced entity IDs (F3-loro); engine-side in-memory inverse-op undo stack (F2-loro — NOT Loro `checkout`, 50–62 ms for bulk undo); merge-validation re-checks the 8 invalid-state classes from spike ①. **Acceptance:** 100% undo/redo property tests incl. entity resurrection; latest-op undo <5 ms p99; two-fork merge converges + validator repairs every injected invalid state; flecs_ecs M1 integration go/no-go recorded. Prompt: `prompts/10-commit-pipeline.md`. *(In progress in `/core` — parallel lane.)*
-- **M1.5 — 16 ms compat-query CI perf gate DONE (2026-06-13):** `perf-gate.yml` fails the build if the cached compat query's p99 > 16 ms on M1.4's 5k preset, through the wrapper (`tools/query-gate`). Proven **green** (runner p99 20.6 µs, 776× headroom) AND **red** (inject 17 ms → p99 17.06 ms → exit 1, on a since-deleted branch). Calibration + margin rationale: `tools/query-gate/README.md`. Detail → `progress/M1.md`.
-- M1.4 stress-scene + F1 **DONE (2026-06-13):** one shared seeded generator (`ecs::scene`, byte-identical, digest-pinned cross-OS via CI, 5k/20k presets) used by ecs bench + core tests + `tools/scene-bench`. **F1 verdict: keep DENSE storage.** DontFragment cuts memory 3.6× (8.8→2.4 KB/entity @20k) but **breaks per-entity `targets()`** (Flecs `target_for` limitation) and slows the query 3.5–8× (still ≪16 ms); the win doesn't bite at M1 scale and the browser uses Loro not Flecs (ADR-006). `set_sparse` kept as a measured lever for large native scenes once `targets()` is sparse-safe. Table + numbers: `progress/M1.md`.
+- **M1 complete.** All deliverables verified — see Done below.
 
-## Next (after M1–2 → milestone M2)
+## Next (milestone M2)
 - **Carry-forward (later):** getrandom `js` for Loro-in-browser + the Phase-2 pure-Rust query backend (ADR-006); real-scene render cost @ ≥5k entities (M2 stress scene); Tauri WebView2 IPC (M2 gate).
 
 ## Done (milestone-level)
 - Pre-M0: feasibility plan v2 (locked stack), research sweep (~30 sources), doc structure + ADRs 001–005 + Opus 4.8 prompt set.
 - **M0 complete (2026-06-13):** 3 spikes — ① Loro ADOPT, ② Flecs ADOPT, ③ wasm/WebGPU browser-render PROVEN + CI tripwire live — and the gate review. New decision: ADR-006 (browser query backend). Detail → `progress/M0.md`, consolidation → `M0-gate-review.md`.
-- **M1 foundation complete (M1.1–M1.5, 2026-06-13):** monorepo + CI · ECS `World` wrapper + Flecs backend · component-metadata registry · shared seeded stress-scene + F1 storage verdict (keep dense) · 16 ms compat-query CI perf gate (3rd CI tripwire). Remaining in M1: the ECS↔Loro commit pipeline (**M1–2**, in progress). Detail → `progress/M1.md`.
+- **M1 complete (M1.1–M1.5 + M1–2, 2026-06-13):** monorepo + CI · ECS `World` wrapper + Flecs backend · component-metadata registry · shared seeded stress-scene + F1 storage verdict (keep dense) · 16 ms compat-query CI perf gate (3rd CI tripwire) · **ECS↔Loro commit pipeline + engine-side undo/redo + merge-validation (M1–2)**. **flecs_ecs M1 go/no-go: GO** — undo p99 0.145 ms (34× under 5 ms target), resurrection p99 0.282 ms, two-fork merge converges, all 8 invalid-state classes detected+repaired, 44 tests green. Detail → `progress/M1.md`.
 
 ---
 

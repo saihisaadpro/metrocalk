@@ -40,5 +40,13 @@ jobs:
           fi
           echo "no flecs_ecs outside ecs/ — wrapper boundary intact"
 
+      - name: No loro leakage outside the core crate (invariant 5)
+        run: |
+          if grep -rn "loro" transport plugins ecs --include='*.rs' --include='*.toml' | grep -v '// loro' | grep -v '#.*loro'; then
+            echo "::error::loro leaked outside the core crate — Loro types must stay behind the commit pipeline (invariant 5)"
+            exit 1
+          fi
+          echo "no loro outside core/ — pipeline boundary intact"
+
       - name: test
         run: cargo test --workspace

@@ -57,7 +57,8 @@ Cargo workspace at root (`Cargo.toml`); members `core` + `ecs` + `transport` + `
 ```
 /ecs         Rust lib — the `World` query trait + native Flecs backend; the ONE crate with
              flecs_ecs + unsafe (ADR-001/006). M1.2 real.                   (workspace member)
-/core        Rust lib — component metadata registry (real, M1.3); commit pipeline + renderer later; depends on /ecs  (workspace member)
+/core        Rust lib — component metadata registry (real, M1.3); commit pipeline + engine-side
+             undo/redo + merge-validation (real, M1–2); renderer later; depends on /ecs  (workspace member)
 /transport   Rust lib — deltas-only protocol trait; 3 impls land M2+        (workspace member)
 /plugins     Rust lib — Extism host + MCP seam (Phase 2+, stub)             (workspace member)
 /tools       Rust bins — measurement only: scene-bench (F1 memory), query-gate (the <16 ms
@@ -70,16 +71,17 @@ The `World` trait is the backend-agnostic relational-query surface (pair-match /
 / read-target); native = Flecs, browser (Phase 2) = pure-Rust over Loro, behind the **same** trait
 (ADR-006). Shared lints in `[workspace.lints]`: `clippy::pedantic` (tuned) + `unsafe_code = "forbid"`;
 `/ecs` is the documented exception (own lints: `deny` unsafe + pedantic). CI — three gates: `ci.yml`
-(fmt + clippy `-D warnings` + test + a grep forbidding `flecs_ecs` outside `/ecs`),
-`wasm-tripwire.yml` (wasm32 build; never `ecs`/`core`/Flecs, per ADR-006), and `perf-gate.yml`
-(M1.5: **fails the build if the cached compat query's p99 > 16 ms** on M1.4's 5k preset through the
-wrapper — north-star test #1; ~776× runner headroom; calibration in `tools/query-gate/README.md`).
+(fmt + clippy `-D warnings` + test + greps forbidding `flecs_ecs` outside `/ecs` AND `loro` outside
+`/core`), `wasm-tripwire.yml` (wasm32 build; never `ecs`/`core`/Flecs, per ADR-006), and
+`perf-gate.yml` (M1.5: **fails the build if the cached compat query's p99 > 16 ms** on M1.4's 5k
+preset through the wrapper — north-star test #1; ~776× runner headroom; calibration in
+`tools/query-gate/README.md`).
 
 ## Open questions (gated, not debated)
 
 Resolved at the M0 gate review (2026-06-13) — kept here struck-through for traceability:
 
-- ~~`flecs_ecs` binding viability~~ → **ADOPT, confirmed** ([ADR-001](decisions/001-flecs-over-bevy-ecs.md), `spikes/flecs`): 12–58 µs p99 (≪16 ms), safety locks ON, zero stale. (M1 integration go/no-go is a roadmap milestone, not an open question.)
+- ~~`flecs_ecs` binding viability~~ → **ADOPT, confirmed** ([ADR-001](decisions/001-flecs-over-bevy-ecs.md), `spikes/flecs`): 12–58 µs p99 (≪16 ms), safety locks ON, zero stale. **M1 integration go/no-go: GO.** The commit pipeline (200 entities + 600 fields + 100 undo/redo ops) runs through the wrapper with undo p99 0.145 ms (34× under the 5 ms budget) and entity-resurrection p99 0.282 ms (17× under). Two-fork merge converges; all 8 invalid-state classes detected+repaired. 44 tests green. No `flecs_ecs` type leaks past `/ecs`.
 - ~~Loro history size / merge semantics at scale~~ → **ADOPT, confirmed** ([ADR-002](decisions/002-loro-over-custom-wal.md), `spikes/loro`).
 - ~~Browser ECS path~~ → **resolved** ([ADR-006](decisions/006-browser-query-backend.md)): browser runs a pure-Rust query backend over the Loro projection; Flecs is native-only. `loro`+`wgpu` reach wasm; `flecs_ecs` does not.
 
