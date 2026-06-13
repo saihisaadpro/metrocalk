@@ -2,7 +2,7 @@
 //!
 //! Charter (filled in across M1, nothing here yet but the skeleton + a smoke test):
 //! - the semantic-ECS wrapper API over Flecs (M1.2) — the one crate allowed `unsafe`, behind its
-//!   own lint config, so `flecs_ecs` types never leak past it (ADR-001, invariant 5);
+//!   own lint config, so Flecs types never leak past it (ADR-001, invariant 5);
 //! - the component metadata registry, JSON-Schema-fed (M1.3);
 //! - the single transactional ECS to Loro commit pipeline + merge-validation layer (M1-2,
 //!   invariant 3) and an engine-side inverse-op undo stack (spike-1 finding F2);

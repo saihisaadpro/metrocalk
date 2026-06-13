@@ -22,6 +22,8 @@
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+> **The query layer is backend-split** ([ADR-006](decisions/006-browser-query-backend.md)): the diagram's *Semantic ECS (Flecs)* is the **native** backend; the **browser** build runs a pure-Rust index over the Loro projection behind the *same* query-API trait (Flecs doesn't compile to wasm32). Invariant 1 holds per-target — ECS authoritative on native, Loro-projection authoritative in the browser.
+
 ## Layers and choices
 
 | Layer | Choice | ADR |
@@ -50,19 +52,24 @@
 
 ## Repository
 
-Cargo workspace at root (`Cargo.toml`); members `core` + `transport` + `plugins`. Skeletons as of M1.1.
+Cargo workspace at root (`Cargo.toml`); members `core` + `ecs` + `transport` + `plugins`.
 
 ```
-/core        Rust lib — ECS wrapper, registry, commit pipeline, renderer   (workspace member)
+/ecs         Rust lib — the `World` query trait + native Flecs backend; the ONE crate with
+             flecs_ecs + unsafe (ADR-001/006). M1.2 real.                   (workspace member)
+/core        Rust lib — registry, commit pipeline, renderer (depends on /ecs); skeleton  (workspace member)
 /transport   Rust lib — deltas-only protocol trait; 3 impls land M2+        (workspace member)
 /plugins     Rust lib — Extism host + MCP seam (Phase 2+, stub)             (workspace member)
 /editor      React/TS UI — NOT a cargo member (scaffolded M2–3)
 /spikes      M0 throwaway spikes (loro, flecs, wasm) — excluded from the workspace; build standalone
 ```
 
-Shared lints in `[workspace.lints]`: `clippy::pedantic` (tuned) + `unsafe_code = "forbid"` — the
-future ecs-wrapper crate is the documented exception (opts out, uses `deny` + scoped `expect`). CI:
-`ci.yml` (fmt + clippy `-D warnings` + test) and `wasm-tripwire.yml` (wasm32 build; never `core`/Flecs, per ADR-006).
+The `World` trait is the backend-agnostic relational-query surface (pair-match / wildcard / negation
+/ read-target); native = Flecs, browser (Phase 2) = pure-Rust over Loro, behind the **same** trait
+(ADR-006). Shared lints in `[workspace.lints]`: `clippy::pedantic` (tuned) + `unsafe_code = "forbid"`;
+`/ecs` is the documented exception (own lints: `deny` unsafe + pedantic). CI: `ci.yml` (fmt + clippy
+`-D warnings` + test + a grep forbidding `flecs_ecs` outside `/ecs`) and `wasm-tripwire.yml` (wasm32
+build; never `ecs`/`core`/Flecs, per ADR-006).
 
 ## Open questions (gated, not debated)
 

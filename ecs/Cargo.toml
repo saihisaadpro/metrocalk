@@ -1,0 +1,26 @@
+[package]
+name = "metrocalk-ecs"
+description = "The engine's relational query surface (the World trait) + the native Flecs backend. The ONE crate where flecs_ecs and unsafe are permitted (ADR-001/006)."
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Default features → flecs_base, which pulls flecs_safety_locks ON (the shipping config per spike ②).
+flecs_ecs = "0.2.2"
+
+# This crate does NOT do `[lints] workspace = true`: the workspace forbids `unsafe_code`, and this is
+# the designated exception (ADR-001 — the one place flecs_ecs / unsafe may live). It re-states the
+# tuned pedantic set and downgrades unsafe to `deny` (overridable by a scoped `#[expect]`), so a
+# future flecs interop that needs `unsafe` is possible without fighting `forbid`. Today: zero unsafe.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"

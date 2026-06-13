@@ -32,5 +32,13 @@ jobs:
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: No flecs_ecs leakage outside the ecs wrapper crate (ADR-001/006)
+        run: |
+          if grep -rn "flecs_ecs" core transport plugins --include='*.rs'; then
+            echo "::error::flecs_ecs leaked outside the ecs wrapper crate — see ADR-001 (no Flecs types past the wrapper)"
+            exit 1
+          fi
+          echo "no flecs_ecs outside ecs/ — wrapper boundary intact"
+
       - name: test
         run: cargo test --workspace
