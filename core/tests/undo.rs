@@ -4,8 +4,8 @@
 #![allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
 
 use metrocalk_core::{Engine, FieldValue, Op};
-use metrocalk_ecs::FlecsWorld;
 use metrocalk_ecs::rng::Rng;
+use metrocalk_ecs::FlecsWorld;
 
 fn engine() -> Engine<FlecsWorld> {
     Engine::new(FlecsWorld::new(), 1)
@@ -223,8 +223,14 @@ fn undo_delete_resurrects_bindings() {
     e.commit(
         "setup",
         vec![
-            Op::CreateEntity { id: a, parent: None },
-            Op::CreateEntity { id: b, parent: None },
+            Op::CreateEntity {
+                id: a,
+                parent: None,
+            },
+            Op::CreateEntity {
+                id: b,
+                parent: None,
+            },
             Op::AddBinding {
                 from: a,
                 kind: "bindsTo".into(),
@@ -235,7 +241,8 @@ fn undo_delete_resurrects_bindings() {
     .unwrap();
 
     // Delete a (binding from a should be captured)
-    e.commit("delete-a", vec![Op::DeleteEntity { id: a }]).unwrap();
+    e.commit("delete-a", vec![Op::DeleteEntity { id: a }])
+        .unwrap();
     assert!(!e.entity_exists(a));
 
     // Undo → a resurrected, binding restored
@@ -330,10 +337,7 @@ fn commit_after_undo_clears_redo() {
     )
     .unwrap();
     assert!(!e.can_redo());
-    assert_eq!(
-        e.get_field(id, "X", "v"),
-        Some(FieldValue::Integer(3))
-    );
+    assert_eq!(e.get_field(id, "X", "v"), Some(FieldValue::Integer(3)));
 }
 
 // ── empty undo/redo ────────────────────────────────────────────────────

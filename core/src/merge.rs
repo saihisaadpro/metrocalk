@@ -58,7 +58,14 @@ pub(crate) fn validate_and_repair(doc: &LoroDoc) -> MergeReport {
 
 #[allow(clippy::too_many_lines)] // one linear scan over the 8 invalid-state classes; splitting it would scatter shared state
 fn detect(doc: &LoroDoc, rep: &mut MergeReport) {
-    const ASSET_FIELDS: &[&str] = &["mesh", "material", "texture", "source", "clip", "controller"];
+    const ASSET_FIELDS: &[&str] = &[
+        "mesh",
+        "material",
+        "texture",
+        "source",
+        "clip",
+        "controller",
+    ];
     const ASSET_EXTS: &[&str] = &["glb", "png", "wav", "wgsl"];
 
     let tree = doc.get_tree("hierarchy");

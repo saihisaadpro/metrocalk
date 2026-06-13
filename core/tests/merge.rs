@@ -18,8 +18,14 @@ fn two_fork_merge_converges() {
     e1.commit(
         "setup",
         vec![
-            Op::CreateEntity { id: a, parent: None },
-            Op::CreateEntity { id: b, parent: Some(a) },
+            Op::CreateEntity {
+                id: a,
+                parent: None,
+            },
+            Op::CreateEntity {
+                id: b,
+                parent: Some(a),
+            },
             Op::SetField {
                 entity: a,
                 component: "Health".into(),
@@ -59,7 +65,10 @@ fn two_fork_merge_converges() {
     e2.commit(
         "p2-edit",
         vec![
-            Op::CreateEntity { id: c, parent: None },
+            Op::CreateEntity {
+                id: c,
+                parent: None,
+            },
             Op::SetField {
                 entity: c,
                 component: "Tag".into(),
@@ -119,7 +128,10 @@ fn concurrent_field_edit_lww() {
     e1.commit(
         "setup",
         vec![
-            Op::CreateEntity { id: a, parent: None },
+            Op::CreateEntity {
+                id: a,
+                parent: None,
+            },
             Op::SetField {
                 entity: a,
                 component: "Health".into(),
@@ -190,7 +202,9 @@ fn class1_dangling_edge_endpoint() {
     let _ = comps.insert_container("1_1", loro::LoroMap::new()).unwrap();
 
     // Add binding
-    let edge = bindings.insert_container("1_0|bindsTo|1_1", loro::LoroMap::new()).unwrap();
+    let edge = bindings
+        .insert_container("1_0|bindsTo|1_1", loro::LoroMap::new())
+        .unwrap();
     edge.insert("from", "1_0").unwrap();
     edge.insert("kind", "bindsTo").unwrap();
     edge.insert("to", "1_1").unwrap();
@@ -224,7 +238,9 @@ fn class2_orphan_component_record() {
     let _ = doc.get_map("bindings");
 
     // Create orphan component record (no tree node for "99_0")
-    let orphan = comps.insert_container("99_0", loro::LoroMap::new()).unwrap();
+    let orphan = comps
+        .insert_container("99_0", loro::LoroMap::new())
+        .unwrap();
     orphan
         .insert_container("Health", loro::LoroMap::new())
         .unwrap()
@@ -307,7 +323,9 @@ fn class7_corrupt_asset_ref() {
     tree.get_meta(tid).unwrap().insert("eid", "1_0").unwrap();
 
     let rec = comps.insert_container("1_0", loro::LoroMap::new()).unwrap();
-    let comp = rec.insert_container("Renderer", loro::LoroMap::new()).unwrap();
+    let comp = rec
+        .insert_container("Renderer", loro::LoroMap::new())
+        .unwrap();
     comp.insert("mesh", "not/a/valid/asset.xyz").unwrap(); // corrupt asset ref
     doc.commit();
 
@@ -330,7 +348,9 @@ fn class8_malformed_edge() {
     let _ = doc.get_map("components");
     let bindings = doc.get_map("bindings");
 
-    let edge = bindings.insert_container("bad_edge", loro::LoroMap::new()).unwrap();
+    let edge = bindings
+        .insert_container("bad_edge", loro::LoroMap::new())
+        .unwrap();
     edge.insert("from", "1_0").unwrap();
     // missing "kind" and "to" → malformed
     doc.commit();
@@ -355,7 +375,10 @@ fn merge_clears_undo_stack() {
     e1.commit(
         "create",
         vec![
-            Op::CreateEntity { id: a, parent: None },
+            Op::CreateEntity {
+                id: a,
+                parent: None,
+            },
             Op::SetField {
                 entity: a,
                 component: "X".into(),
@@ -372,7 +395,10 @@ fn merge_clears_undo_stack() {
     let b = e2.alloc_entity_id();
     e2.commit(
         "remote",
-        vec![Op::CreateEntity { id: b, parent: None }],
+        vec![Op::CreateEntity {
+            id: b,
+            parent: None,
+        }],
     )
     .unwrap();
     let u2 = e2.export_updates();
@@ -390,7 +416,10 @@ fn clean_merge_zero_violations() {
     e1.commit(
         "setup",
         vec![
-            Op::CreateEntity { id: a, parent: None },
+            Op::CreateEntity {
+                id: a,
+                parent: None,
+            },
             Op::SetField {
                 entity: a,
                 component: "Health".into(),

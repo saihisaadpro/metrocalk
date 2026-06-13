@@ -22,9 +22,9 @@ pub mod stdlib;
 pub mod undo;
 
 pub use entity_id::{EntityId, IdGenerator};
+pub use merge::MergeReport;
 pub use pipeline::{Engine, FieldValue, Op, PipelineError};
 pub use registry::{Builder, ComponentMeta, FieldSpec, FieldType, Registry, RegistryError};
-pub use merge::MergeReport;
 
 /// Engine identifier — one constant shared by downstream crates, logs, and file headers.
 pub const ENGINE_NAME: &str = "metrocalk";

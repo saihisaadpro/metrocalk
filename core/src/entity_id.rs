@@ -81,7 +81,10 @@ mod tests {
     fn no_collision_across_peers() {
         let mut g1 = IdGenerator::new(1);
         let mut g2 = IdGenerator::new(2);
-        let ids: Vec<EntityId> = (0..100).map(|_| g1.next_id()).chain((0..100).map(|_| g2.next_id())).collect();
+        let ids: Vec<EntityId> = (0..100)
+            .map(|_| g1.next_id())
+            .chain((0..100).map(|_| g2.next_id()))
+            .collect();
         let set: std::collections::HashSet<EntityId> = ids.iter().copied().collect();
         assert_eq!(set.len(), 200);
     }

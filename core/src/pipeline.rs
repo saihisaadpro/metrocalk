@@ -9,7 +9,9 @@
 use crate::entity_id::{EntityId, IdGenerator};
 use crate::merge::{self, MergeReport};
 use crate::undo::{InverseOp, InverseTransaction};
-use loro::{Container, ExportMode, LoroDoc, LoroMap, LoroValue, TreeID, TreeParentId, ValueOrContainer};
+use loro::{
+    Container, ExportMode, LoroDoc, LoroMap, LoroValue, TreeID, TreeParentId, ValueOrContainer,
+};
 use metrocalk_ecs::{Entity, World};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -67,10 +69,7 @@ pub enum Op {
         value: FieldValue,
     },
     /// Remove an entire component record from an entity.
-    RemoveComponent {
-        entity: EntityId,
-        component: String,
-    },
+    RemoveComponent { entity: EntityId, component: String },
     /// Add a tag to an entity (ECS-only, for query support).
     AddTag { entity: EntityId, tag: Entity },
     /// Remove a tag from an entity.
@@ -253,7 +252,9 @@ impl<W: World> Engine<W> {
         };
         // Convert inverse ops to forward ops, apply them, capture the NEW inverse for redo.
         let forward_ops = inv.to_forward_ops();
-        let redo_inverse = self.compute_inverse(&forward_ops).expect("undo inverse computation");
+        let redo_inverse = self
+            .compute_inverse(&forward_ops)
+            .expect("undo inverse computation");
         self.apply_ops(&forward_ops).expect("undo apply");
         self.doc.commit();
         self.redo_stack.push(InverseTransaction {
@@ -269,7 +270,9 @@ impl<W: World> Engine<W> {
             return false;
         };
         let forward_ops = inv.to_forward_ops();
-        let undo_inverse = self.compute_inverse(&forward_ops).expect("redo inverse computation");
+        let undo_inverse = self
+            .compute_inverse(&forward_ops)
+            .expect("redo inverse computation");
         self.apply_ops(&forward_ops).expect("redo apply");
         self.doc.commit();
         self.undo_stack.push(InverseTransaction {
@@ -644,9 +647,7 @@ impl<W: World> Engine<W> {
                 // Capture parent
                 let tree = self.doc.get_tree("hierarchy");
                 let parent = match tree.parent(tid) {
-                    Some(TreeParentId::Node(ptid)) => {
-                        self.tid_to_eid(ptid)
-                    }
+                    Some(TreeParentId::Node(ptid)) => self.tid_to_eid(ptid),
                     _ => None,
                 };
 
@@ -671,11 +672,9 @@ impl<W: World> Engine<W> {
                         parent
                     } else {
                         let e_tid = self.eid_to_tid.get(eid);
-                        e_tid.and_then(|t| {
-                            match tree.parent(*t) {
-                                Some(TreeParentId::Node(ptid)) => self.tid_to_eid(ptid),
-                                _ => None,
-                            }
+                        e_tid.and_then(|t| match tree.parent(*t) {
+                            Some(TreeParentId::Node(ptid)) => self.tid_to_eid(ptid),
+                            _ => None,
                         })
                     };
                     entities.push(crate::undo::CapturedEntity {
@@ -697,18 +696,16 @@ impl<W: World> Engine<W> {
                     if parts.len() == 3
                         && (subtree_keys.contains(parts[0]) || subtree_keys.contains(parts[2]))
                     {
-                        if let (Some(from), Some(to)) =
-                            (EntityId::from_loro_key(parts[0]), EntityId::from_loro_key(parts[2]))
-                        {
+                        if let (Some(from), Some(to)) = (
+                            EntityId::from_loro_key(parts[0]),
+                            EntityId::from_loro_key(parts[2]),
+                        ) {
                             bindings.push((from, parts[1].to_string(), to));
                         }
                     }
                 }
 
-                Ok(InverseOp::ResurrectSubtree {
-                    entities,
-                    bindings,
-                })
+                Ok(InverseOp::ResurrectSubtree { entities, bindings })
             }
 
             Op::SetField {

@@ -26,7 +26,9 @@ pub struct CapturedEntity {
 #[derive(Clone, Debug)]
 pub enum InverseOp {
     /// Inverse of CreateEntity — destroy the entity.
-    DestroyEntity { id: EntityId },
+    DestroyEntity {
+        id: EntityId,
+    },
 
     /// Inverse of DeleteEntity — resurrect the full subtree with all state.
     ResurrectSubtree {
@@ -49,13 +51,38 @@ pub enum InverseOp {
         fields: HashMap<String, FieldValue>,
     },
 
-    AddTag { entity: EntityId, tag: Entity },
-    RemoveTag { entity: EntityId, tag: Entity },
-    AddPair { entity: EntityId, rel: Entity, target: Entity },
-    RemovePair { entity: EntityId, rel: Entity, target: Entity },
-    Reparent { entity: EntityId, old_parent: Option<EntityId> },
-    AddBinding { from: EntityId, kind: String, to: EntityId },
-    RemoveBinding { from: EntityId, kind: String, to: EntityId },
+    AddTag {
+        entity: EntityId,
+        tag: Entity,
+    },
+    RemoveTag {
+        entity: EntityId,
+        tag: Entity,
+    },
+    AddPair {
+        entity: EntityId,
+        rel: Entity,
+        target: Entity,
+    },
+    RemovePair {
+        entity: EntityId,
+        rel: Entity,
+        target: Entity,
+    },
+    Reparent {
+        entity: EntityId,
+        old_parent: Option<EntityId>,
+    },
+    AddBinding {
+        from: EntityId,
+        kind: String,
+        to: EntityId,
+    },
+    RemoveBinding {
+        from: EntityId,
+        kind: String,
+        to: EntityId,
+    },
 }
 
 impl InverseOp {

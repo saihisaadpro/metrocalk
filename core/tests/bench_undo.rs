@@ -90,10 +90,7 @@ fn measure_undo_latencies(label: &str) -> (f64, f64) {
 #[test]
 fn undo_latency_run_1() {
     let (median, p99) = measure_undo_latencies("run-1");
-    assert!(
-        p99 < 5.0,
-        "run-1: undo p99 = {p99:.3}ms exceeds 5ms target"
-    );
+    assert!(p99 < 5.0, "run-1: undo p99 = {p99:.3}ms exceeds 5ms target");
     assert!(
         median < 2.0,
         "run-1: undo median = {median:.3}ms unexpectedly high"
@@ -103,10 +100,7 @@ fn undo_latency_run_1() {
 #[test]
 fn undo_latency_run_2() {
     let (median, p99) = measure_undo_latencies("run-2");
-    assert!(
-        p99 < 5.0,
-        "run-2: undo p99 = {p99:.3}ms exceeds 5ms target"
-    );
+    assert!(p99 < 5.0, "run-2: undo p99 = {p99:.3}ms exceeds 5ms target");
     assert!(
         median < 2.0,
         "run-2: undo median = {median:.3}ms unexpectedly high"

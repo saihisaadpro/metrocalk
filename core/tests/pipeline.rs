@@ -62,7 +62,10 @@ fn duplicate_entity_errors() {
 #[test]
 fn unknown_entity_errors() {
     let mut e = engine();
-    let id = EntityId { peer: 99, counter: 99 };
+    let id = EntityId {
+        peer: 99,
+        counter: 99,
+    };
     let err = e
         .commit(
             "set",
@@ -155,8 +158,14 @@ fn bindings_round_trip() {
     e.commit(
         "create",
         vec![
-            Op::CreateEntity { id: a, parent: None },
-            Op::CreateEntity { id: b, parent: None },
+            Op::CreateEntity {
+                id: a,
+                parent: None,
+            },
+            Op::CreateEntity {
+                id: b,
+                parent: None,
+            },
             Op::AddBinding {
                 from: a,
                 kind: "bindsTo".into(),
@@ -187,8 +196,14 @@ fn reparent_entity() {
     e.commit(
         "tree",
         vec![
-            Op::CreateEntity { id: a, parent: None },
-            Op::CreateEntity { id: b, parent: None },
+            Op::CreateEntity {
+                id: a,
+                parent: None,
+            },
+            Op::CreateEntity {
+                id: b,
+                parent: None,
+            },
             Op::CreateEntity {
                 id: c,
                 parent: Some(a),
@@ -267,7 +282,10 @@ fn deltas_only_no_snapshot() {
     let hp = doc2.get_map("components").get_deep_value();
     // Verify the data arrived
     if let loro::LoroValue::Map(m) = hp {
-        assert!(!m.is_empty(), "imported delta should contain component data");
+        assert!(
+            !m.is_empty(),
+            "imported delta should contain component data"
+        );
     }
 }
 
@@ -278,6 +296,6 @@ fn sole_mutation_path_enforced_by_visibility() {
     // This test documents the invariant.
     let e = engine();
     let _w: &metrocalk_ecs::FlecsWorld = e.world(); // &W — read-only ✓
-    // e.world is private — the following would not compile:
-    // e.world.create_entity();  // ERROR: field `world` is private
+                                                    // e.world is private — the following would not compile:
+                                                    // e.world.create_entity();  // ERROR: field `world` is private
 }
