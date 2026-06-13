@@ -29,6 +29,10 @@ frame — the number that actually defines the interactivity promise. We deliber
 | **runner** (ubuntu-latest, 2 vCPU) | 10.6 µs | **20.6 µs** | 35.4 µs | 16 000 µs | **776×** |
 | dev (Windows, desktop class) | 9.7 µs | 28.1 µs | 135 µs | 16 000 µs | ~570× |
 
+*Two CI runs (`b77587d`, `8d28618`) measured runner p99 = **20.6 µs** and **21.8 µs** — a ~6%
+spread, far inside the orchestrator's 25% investigate threshold and < 0.14% of budget either way:
+the gate is non-flaky.*
+
 The runner is *slower hardware than the i9 the M0 spikes used*, yet the cached query is
 hundreds× under budget — the query is `O(matches)`, not `O(entities)`, and the compiled
 query is cached (ADR-001 / 006).
