@@ -1,0 +1,57 @@
+[package]
+name = "flecs-spike"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# default-features = false so `flecs_safety_locks` is NOT pulled in transitively by `flecs_base`.
+# We re-enable flecs's full default feature set below, but expand `flecs_base` into its components
+# (everything EXCEPT `flecs_safety_locks`) so that safety-locks is the ONLY difference between the
+# two benchmark builds. (`flecs_alerts`/`flecs_meta`/etc. are kept because the pre-generated sys
+# binding references their types unconditionally; dropping them fails to compile.)
+flecs_ecs = { version = "0.2.2", default-features = false, features = [
+    # flecs_base components, minus flecs_safety_locks (gated below):
+    "std",
+    "flecs_module",
+    "flecs_system",
+    "flecs_pipeline",
+    "flecs_timer",
+    "flecs_os_api_impl",
+    # remaining flecs default features:
+    "flecs_script",
+    "flecs_stats",
+    "flecs_metrics",
+    "flecs_alerts",
+    "flecs_meta",
+    "flecs_units",
+    "flecs_json",
+    "flecs_doc",
+    "flecs_log",
+    "flecs_app",
+    "flecs_http",
+    "flecs_rest",
+    "flecs_query_rust_traits",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_ProcessStatus",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "compat"
+harness = false
+
+[features]
+# safety ON (default): `cargo run --release`
+# safety OFF:          `cargo run --release --no-default-features`
+default = ["safety"]
+safety = ["flecs_ecs/flecs_safety_locks"]
+
+[profile.release]
+debug = false

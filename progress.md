@@ -1,14 +1,15 @@
 # Progress
 
 ## Now
-- M0 spikes (2-week box): ① Loro scene document — **DONE, ADOPT (gate passed)**; ② Flecs wildcard queries @5k entities — pending; ③ wasm32 + WebGPU triangle — pending
+- M0 spikes (2-week box): ① Loro scene document — **DONE, ADOPT**; ② Flecs wildcard queries — **DONE, ADOPT**; ③ wasm32 + WebGPU triangle — pending
 - Each spike ends with an adopt/fallback ADR
 
 ## Next
-- M0 spikes ② Flecs and ③ wasm/WebGPU
-- Monorepo + ECS wrapper API + component metadata registry (M0–1)
-- ECS↔Loro commit pipeline + merge-validation layer (M1–2) — spec for the validation layer is now in `spikes/loro/README.md`
-- Gate: compatibility query <16 ms on stress scene
+- M0 spike ③ wasm/WebGPU triangle (last remaining spike)
+- Monorepo + ECS wrapper API + component metadata registry (M0–1) — wrapper must hide all `flecs_ecs` types and expose deferred mutation + a safe query surface
+- ECS↔Loro commit pipeline + merge-validation layer (M1–2) — validation-layer spec in `spikes/loro/README.md`
+- M1 follow-ups from spike ②: validate `DontFragment`/sparse for capability pairs (memory); engine-side inverse-op undo stack from spike ① (F2)
+- Gate: compatibility query <16 ms on stress scene — **pre-validated at 12–58 µs p99 in spike ②**
 
 ## Done
 - Feasibility plan v1 (stack assessment, hosting, browser-vs-desktop analysis)
@@ -21,6 +22,12 @@
 ## Log
 
 *Append-only. Newest first. One entry per working session: date — what happened, decisions made (link ADR), blockers. Archive to `progress-YYYY.md` when this slows you down.*
+
+### 2026-06-13 (M0 spike ② — Flecs)
+- **ADR-001 query/binding spike PASSED → ADOPT Flecs v4.1.2 via `flecs_ecs` 0.2.2** (behind the wrapper, safety locks ON). Built `spikes/flecs` (throwaway): seeded 5k/20k scene with `(Provides,cap)` + `(BindsTo,target)` pairs and role tags; 5 benchmarks + churn-correctness + a criterion cross-check. Two runs each for safety ON and OFF, all structurally identical (matched 211/5k, 830/20k; 1,999 edges).
+- Latency table (cached compatibility query `(Provides,Health)` without `(BindsTo,*)`, safety ON): **@5k 8.7 µs median / 12.2 µs p99**; **@20k 39.8 µs median / 58.3 µs p99**; **under 100-mutation churn 25/41 µs**; wildcard traversal of all edges 130/162 µs; uncached @20k 0.9 ms. All ≪16 ms (≥275× margin). Churn: **zero stale results**. Criterion cross-check: ~15 µs mean (mean-vs-median skew vs the 9 µs hand-rolled median). Safety-lock ON↔OFF delta 0–10% (noise) → ship ON.
+- Finding F1 (not a blocker): capabilities-as-pairs fragments archetypes → ~14.8 KB/entity at 20k (~1 table/entity); query latency unaffected. M1: mark relationships `DontFragment`/sparse or model capability sets as data — validate then.
+- Binding assessment: ~1,180 unsafe sites (FFI + iteration pointer deref); `flecs_safety_locks` = per-(id,table) read/write counter = runtime borrow-check, contains the aliasing landmine at ~0–10% cost; deferred mode makes mutation-during-iteration safe. 1-maintainer 0.x crate → adopt only behind the wrapper (ADR-001's condition). API sharp edge: `with`/`without` take values, wildcard via `id::<flecs::Wildcard>()`.
 
 ### 2026-06-13 (M0 spike ① — Loro)
 - **ADR-002 M0 gate PASSED → ADOPT Loro 1.13.1 as the document layer.** Built `spikes/loro` (throwaway): 5k-entity / 2k-edge synthetic scene in a MovableTree + nested component maps + binding-edge map, seeded SplitMix64 (`0x4D4554524F434131`), 5 benchmarks + a doc-only invalid-state validator. Two full runs, structurally identical.

@@ -58,6 +58,6 @@
 
 ## Open questions (gated, not debated)
 
-- `flecs_ecs` binding viability → M1 gate (fallback: `bevy_ecs`)
+- `flecs_ecs` binding viability → **M0 query/binding spike PASSED 2026-06-13, ADOPT** ([ADR-001](decisions/001-flecs-over-bevy-ecs.md), `spikes/flecs`): compatibility query 12–58 µs p99 (≪16 ms gate), safety locks ON, zero stale under churn. M1 integration gate still applies; wrapper must hide all `flecs_ecs` types. Open M1 items: `DontFragment`/sparse for capability pairs (memory ~14.8 KB/entity otherwise); fallback `bevy_ecs` stays viable behind the wrapper.
 - Tauri IPC on Windows WebView2 → M2 gate (fallback: CEF shell)
 - ~~Loro history size / merge semantics at scale~~ → **resolved 2026-06-13, ADOPT** ([ADR-002](decisions/002-loro-over-custom-wal.md), `spikes/loro`). M1 must honor: regular containers + merge-validation layer (not `ensure_mergeable_*`), small transaction groups (undo uses full-doc checkouts), peer-namespaced entity IDs.

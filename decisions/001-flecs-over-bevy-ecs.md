@@ -1,6 +1,8 @@
 # ADR-001: Flecs over Bevy ECS for the semantic core
 
-**Date:** 2026-06-12 · **Status:** Accepted (gated at M1) · **Supersedes:** —
+**Date:** 2026-06-12 · **Status:** Accepted — **M0 query/binding spike PASSED 2026-06-13** (`spikes/flecs`); M1 integration gate still pending · **Supersedes:** —
+
+> **Spike result (2026-06-13):** `flecs_ecs` 0.2.2 / Flecs C v4.1.2. All adopt criteria met with safety locks ON (the shipping config): compatibility query `(Provides,Health)` without `(BindsTo,*)` cached **12 µs p99 @5k / 58 µs p99 @20k** (≪16 ms), **41 µs p99 under mutation**, churn produced **zero stale results**, criterion cross-check confirms ~15 µs mean. `flecs_safety_locks` ON costs 0–10% (noise) and contains the aliasing landmine at runtime → ship ON. One finding for M1, not a blocker: **(F1)** modeling capabilities as `(Provides, cap)` pairs fragments archetypes (~14.8 KB/entity at 20k, ~one table/entity); query latency is unaffected, but mark relationships `DontFragment`/sparse or store capability sets as data — validate in M1. Binding is a 1-maintainer 0.x crate with ~1,180 unsafe sites: adopt **only behind the wrapper** (this ADR's condition); fallback (`bevy_ecs` + hand-built index) stays viable because nothing Flecs-shaped leaks past it. See `spikes/flecs/README.md`.
 
 ## Context
 
