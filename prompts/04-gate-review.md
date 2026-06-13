@@ -3,7 +3,7 @@
 > Use with `00-orchestrator.md` (v2) as system prompt, AFTER spikes 01–03 have all reported. Effort `max` — this is the highest-judgment session of M0: it converts three reports into the decisions M1 is built on.
 
 ---
-
+ 
 <task>
 Consolidate the results of the three M0 spikes (`/spikes/loro`, `/spikes/flecs`, `/spikes/wasm` — their READMEs, CONSTRAINTS.md, and the progress.md entries) into final gate decisions, reconciled ADRs, and a concrete M1 work breakdown. The intent: M1 must start on settled ground — no "we'll decide later" carried forward.
 </task>
