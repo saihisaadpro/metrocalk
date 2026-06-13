@@ -60,4 +60,4 @@
 
 - `flecs_ecs` binding viability → M1 gate (fallback: `bevy_ecs`)
 - Tauri IPC on Windows WebView2 → M2 gate (fallback: CEF shell)
-- Loro history size / merge semantics at scale → M0 spike
+- ~~Loro history size / merge semantics at scale~~ → **resolved 2026-06-13, ADOPT** ([ADR-002](decisions/002-loro-over-custom-wal.md), `spikes/loro`). M1 must honor: regular containers + merge-validation layer (not `ensure_mergeable_*`), small transaction groups (undo uses full-doc checkouts), peer-namespaced entity IDs.

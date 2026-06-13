@@ -1,6 +1,8 @@
 # ADR-002: Loro CRDT over custom WAL/ARIES undo system
 
-**Date:** 2026-06-12 · **Status:** Accepted (gated at M0 spike) · **Supersedes:** the WAL/ARIES design in the v1 plan and engineering deep-dive doc
+**Date:** 2026-06-12 · **Status:** Accepted — **M0 gate PASSED 2026-06-13** (`spikes/loro`) · **Supersedes:** the WAL/ARIES design in the v1 plan and engineering deep-dive doc
+
+> **Gate result (2026-06-13):** All four adopt criteria met on the 5k-entity scene — single-op undo 0.13 ms p99 (≪5 ms), 10k-mutation run 0.56 s (<10 s), full snapshot 4.51 MB (<20 MB), every post-merge invalid state mechanically detectable + repairable. Merge converged; MovableTree produced no cycles under conflicting reparents; asset-ref strings survived merges intact. Three implementation constraints surfaced (do not change this decision): **(F1)** Loro's `ensure_mergeable_*` helper does not survive undo/redo → use regular containers + the merge-validation layer below; **(F2)** undo computes its inverse via full-document checkouts → undoing the latest op is ~70 µs but bulk/group undo is tens of ms → keep transaction groups small; **(F3)** application entity IDs must be peer-namespaced (Loro's `TreeID` is `(peer,counter)`; a peer-local counter collides on concurrent create). See `spikes/loro/README.md`.
 
 ## Context
 
