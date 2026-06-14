@@ -1,0 +1,26 @@
+{
+  "name": "metrocalk-tauri-shell-spike",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "M2.1 throwaway spike — ADR-003 Tauri/WebView2 exit gate (IPC delta wire 1a + transparent-webview-over-wgpu compositing 1b).",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "tauri": "tauri",
+    "gate:bench": "tauri build --no-bundle -- --features bench && echo run the binary with MODE=bench",
+    "gate:1a": "tauri dev -- -- bench",
+    "gate:1b": "tauri dev -- -- composite"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

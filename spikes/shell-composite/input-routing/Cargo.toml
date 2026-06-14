@@ -1,0 +1,13 @@
+[package]
+name = "shell-input-routing"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone, dependency-free: the per-pixel UI-vs-viewport hit test is pure geometry, so it carries
+# unchanged to ANY shell (single-window / DComp / CEF) and tests in milliseconds without the Tauri
+# build. The shell crate depends on this by path.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
