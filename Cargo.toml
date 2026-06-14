@@ -8,8 +8,7 @@ members = ["core", "ecs", "transport", "plugins", "tools/scene-bench", "tools/qu
 # `unsafe` (peak-RSS counters) which this workspace forbids. Excluding them keeps the workspace the
 # real code, keeps `cargo build` from dragging in the Flecs C core, and lets them keep building
 # standalone in their own dirs (the wasm-tripwire CI cd's into `spikes/wasm`).
-exclude = ["spikes/loro", "spikes/flecs", "spikes/wasm", "spikes/render-scene"]
-exclude = ["spikes/loro", "spikes/flecs", "spikes/wasm", "spikes/shell-composite"]
+exclude = ["spikes/loro", "spikes/flecs", "spikes/wasm", "spikes/render-scene", "spikes/shell-composite", "spikes/tauri-shell"]
 
 [workspace.package]
 edition = "2021"
