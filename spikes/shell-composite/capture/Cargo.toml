@@ -1,0 +1,23 @@
+[package]
+name = "dd-capture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Swapchain-aware capture via DXGI Desktop Duplication — it grabs the DWM's FINAL composited output
+# (including hardware overlay / flip-model swapchains), which is exactly what GDI BitBlt cannot see
+# and what misled M2.1's automated 1b read. Standalone bin; not a workspace member.
+
+[[bin]]
+name = "dd-capture"
+path = "src/main.rs"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+]
