@@ -1,0 +1,13 @@
+# spike build artifacts
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# generated icon set (regenerate with: pnpm tauri icon app-icon.png)
+# kept out of git — large and reproducible
+src-tauri/icons/android/
+src-tauri/icons/ios/
+
+# gate evidence is regenerated per run; keep the committed snapshot under evidence/ instead
+src-tauri/_gate_out/

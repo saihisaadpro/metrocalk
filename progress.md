@@ -19,6 +19,12 @@
 ## Next (milestone M2)
 - **M2.6 convergence**: mount the M2.5 editor in the M2.3 single-window shell; point the desktop transport binding at the real Tauri Channel (M2.4) + swap `MockCore` → WASM/Rust core; wire the viewport input hand-off; integrate the M2.2 render verdict; run the deferred DPI/min-spec cases.
 - **Carry-forward (later):** getrandom `js` for Loro-in-browser + the Phase-2 pure-Rust query backend (ADR-006).
+- **M2 underway — M2.1 Tauri exit-gate RESOLVED (2026-06-14).** Risk-first M2 entry ([ADR-007](decisions/007-m2.1-tauri-gate-result.md), `spikes/tauri-shell`). **IPC PASS:** real 103-byte Loro deltas at 60 Hz over WebView2 — Channel p99 3.4–3.6 ms / WebSocket p99 1.3–1.7 ms RTT, 0 dropped (overhead-bound, *not* the "~200 ms / 10 MB" bandwidth case ADR-003 feared). **Compositing FAIL:** transparent WebView2 works on its own, but a native wgpu surface on the same window HWND blacks/collapses it — Graphite's problem, reproduced → plan the shell around **self-composite** (UI-as-texture in wgpu), child-webview/DComp follow-up before any CEF pivot. *(Next M2 gate: M2.2 render cost — prompt 13.)*
+- **M1 complete + hardened.** All deliverables verified; M1.6 pipeline-hardening pass closed four audit gaps (precise additive-undo, atomic pre-validated commit, O(1) `tid→eid`, Loro-error propagation) before M2 builds on the pipeline — see Done below.
+
+## Next (milestone M2)
+- **M2.2 render gate** (prompt 13): real-scene wgpu cost @ ≥5k entities (native + wasm). **M2 build** (real shell + transport impls): author from the M2.1/M2.2 evidence — shell is **self-composite** per ADR-007; transport is deltas-only over Channel/WebSocket (proven on Windows).
+- **Carry-forward (later):** getrandom `js` for Loro-in-browser + the Phase-2 pure-Rust query backend (ADR-006); the Tauri child-webview/DComp compositing follow-up (ADR-007).
 - **Carry-forward (Phase 2, with collab):** `merge()` rebuilds entities from Loro but **not their ECS tags/pairs** — capabilities are ECS-only, never written to Loro, so the **compatibility query is empty after a merge**. Fix wires the registry (component-kind → capabilities) into `rebuild_ecs_from_loro`; schedule with collab. (Surfaced by M1.6 audit; see `progress/M1.md`.)
 
 ## Done (milestone-level)
@@ -43,5 +49,6 @@ numbers + ADR links. Live state stays here in Now/Next above.
 - [progress/M2.md](progress/M2.md) — **current milestone** (M2 risk-gates → build)
 >>>>>>> m2.3
 =======
+- [progress/M2.md](progress/M2.md) — **current milestone** (M2 — risk-first exit gates + build)
 - [progress/M1.md](progress/M1.md) — foundation build (M1.1–M1.6)
 - [progress/M0.md](progress/M0.md) — foundation, 3 spikes, gate review (2026-06-12 → 06-13)
