@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Metrocalk render spike</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0a0a0f; overflow: hidden; }
+      #app { display: block; width: 100vw; height: 100vh; }
+    </style>
+  </head>
+  <body>
+    <!-- Explicitly-sized canvas so winit's web backend doesn't leave the surface at 1x1. -->
+    <canvas id="app" width="960" height="600"></canvas>
+    <script type="module">
+      import init from "./pkg/metrocalk_render_spike.js";
+      init().catch((e) => {
+        const d = document.createElement("div");
+        d.id = "fallback";
+        d.style.cssText = "position:fixed;top:40%;left:0;right:0;text-align:center;color:#f66;font:14px monospace";
+        d.textContent = "init failed: " + e;
+        document.body.appendChild(d);
+        console.error(e);
+      });
+    </script>
+  </body>
+</html>
