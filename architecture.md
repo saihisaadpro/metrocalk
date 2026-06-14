@@ -1,6 +1,6 @@
 # Architecture — Current State
 
-> Rules for this file: current state only, max ~2 pages. No rationale — link the ADR instead. Prune on every change. Status: **M1 — foundation build** (M0 spikes passed; see `M0-gate-review.md`).
+> Rules for this file: current state only, max ~2 pages. No rationale — link the ADR instead. Prune on every change. Status: **M2 — build** (M0+M1 complete; M2 gates passed; transport wire real — M2.4).
 
 ## System shape
 
@@ -8,10 +8,10 @@
 ┌─────────────────────────────── Editor UI (React + TS) ───────────────────────────────┐
 │  panels · schema-driven inspector · React Flow binding graph · optimistic local echo │
 └──────────────────────────────────────┬───────────────────────────────────────────────┘
-                          transport trait (deltas only)
+              DeltaTransport (deltas only · Loro-Protocol-v1 framing, M2.4)
             ┌─────────────────────────┼─────────────────────────┐
-      in-process WASM call      Tauri channels             WebSocket
-        (browser build)        (desktop build)           (collab/remote)
+      in-process WASM call      Tauri Channel (default)      WebSocket
+        (browser build)         (desktop build)           (collab/remote)
             └─────────────────────────┼─────────────────────────┘
 ┌──────────────────────────────────────▼───────────────────────────────────────────────┐
 │                                 Rust Core                                            │
@@ -34,6 +34,7 @@
 | Rendering | wgpu 29 + WGSL (non-bindless path required for web — confirmed: WebGPU exposes no binding-array features) | [003](decisions/003-desktop-first-tauri-exit-gate.md) |
 | Browser target | **CI-enforced**: `wasm32-unknown-unknown` builds on every push (`.github/workflows/wasm-tripwire.yml`); native+browser render proven from one wgpu crate (`spikes/wasm`) | [003](decisions/003-desktop-first-tauri-exit-gate.md) |
 | Query backend | Native: Flecs (behind the wrapper). Browser: pure-Rust index over the Loro projection — Flecs is native-only (won't compile to wasm32) | [006](decisions/006-browser-query-backend.md) |
+| Transport / wire | **real (M2.4)**: Loro-Protocol-v1 framing + opaque Loro-`update` payload behind the byte-only `DeltaTransport` trait; shared session does coalescing/ACK/backpressure/fragments; impls = Tauri Channel (default) · WebSocket · in-proc-WASM. `/transport` links no Loro | [009](decisions/009-transport-protocol-loro-framing.md) |
 | Plugins / scripting | Extism WASM plugins | plan §2 |
 | AI layer | MCP server + JSON-Schema-constrained JSON Patch | plan §2 |
 | Scene format | Own format; BSN-compatible where cheap; BRP interop | plan §2 |
@@ -60,7 +61,9 @@ Cargo workspace at root (`Cargo.toml`); members `core` + `ecs` + `transport` + `
 /core        Rust lib — component metadata registry (real, M1.3); commit pipeline (atomic /
              pre-validated, M1.6) + engine-side undo/redo + merge-validation (real, M1–2);
              renderer later; depends on /ecs                                  (workspace member)
-/transport   Rust lib — deltas-only protocol trait; 3 impls land M2+        (workspace member)
+/transport   Rust lib — deltas-only `DeltaTransport` + Loro-Protocol-v1 framing + shared session
+             (coalesce/ACK/backpressure/fragments); 3 impls (Channel/WS/in-proc). Links no Loro.
+             Real (M2.4, ADR-009)                                            (workspace member)
 /plugins     Rust lib — Extism host + MCP seam (Phase 2+, stub)             (workspace member)
 /tools       Rust bins — measurement only: scene-bench (F1 memory), query-gate (the <16 ms
              compat-query CI perf gate, M1.5). Default lints, not production. (workspace members)

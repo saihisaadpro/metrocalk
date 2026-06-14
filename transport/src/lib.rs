@@ -1,33 +1,55 @@
-//! `metrocalk-transport` — the one protocol trait carried across every boundary
-//! (core to UI, client to server). Three concrete impls land in M2+ (in-process WASM call,
-//! Tauri channels, WebSocket); this is the trait sketch only — no impls, no encoding decided.
+//! `metrocalk-transport` — the deltas-only wire (invariant 2). Real as of M2.4.
 //!
-//! Invariant 2 (deltas only): every boundary carries *changes*, never full-state snapshots. The
-//! trait is shaped so the only thing you can move is a [`Delta`] — there is deliberately no
-//! `send_state` / `snapshot` method, so "ship the whole world" is never the easy path.
+//! Three layers, bottom-up:
+//! 1. [`frame`] — the **Loro Syncing Protocol v1** envelope (kinds, batch id, fragments). No Loro dep.
+//! 2. [`DeltaTransport`] — a byte-oriented trait (`send` / `set_on_recv` / `connection_state`) with
+//!    three impls (in-process, Tauri Channel, local WebSocket). The transport only moves bytes.
+//! 3. [`session::DeltaSession`] — the shared logic written ONCE above the trait: frame-tick
+//!    coalescing, batch-id/ACK, **outbox-collapse backpressure**, fragmentation/reassembly, and the
+//!    reconciliation hook. It drives a [`DeltaSource`] (export) + [`DeltaSink`] (apply), both of
+//!    which are byte-only so this crate links no Loro/Flecs — `/core` implements them on `Engine`.
+//!
+//! Invariant 2 is structural: the only thing you can move is a *delta* (a Loro `update` blob inside a
+//! `DocUpdate`); there is no `send_snapshot`. The initial catch-up is still a delta-from-empty,
+//! fragmented when large.
 
-/// An ordered change on a boundary. The payload — a revision counter plus a binary / JSON-Patch
-/// encoding — is defined alongside the commit pipeline in M1-2; the invariant fixed now is that a
-/// `Delta` represents a *change*, never a snapshot.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct Delta;
+pub mod frame;
+pub mod impls;
+pub mod session;
 
-/// Moves [`Delta`]s across one boundary. Implementations must not coalesce into full-state
-/// transfers (invariant 2).
-pub trait Transport {
-    /// Transport-specific error type.
-    type Error;
+pub use session::{
+    ApplyError, ApplyOutcome, DeltaSession, DeltaSink, DeltaSource, InstantAck, Reconciler,
+    SessionStats,
+};
 
-    /// Send one delta toward the peer.
+/// Liveness of a transport's underlying channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    Connecting,
+    Connected,
+    Disconnected,
+}
+
+/// A received-frame callback. Installed by the session; invoked by the transport's recv source
+/// (the WebSocket reader thread, the in-process peer, or the Tauri `invoke` handler).
+pub type OnRecv = Box<dyn FnMut(&[u8]) + Send>;
+
+/// Moves opaque enveloped frames across one boundary. Deliberately byte-only and snapshot-free:
+/// all protocol logic (envelope, ACK, backpressure, fragments) lives in [`session::DeltaSession`]
+/// above this trait, so each impl is just a byte pump.
+pub trait DeltaTransport {
+    /// Transport-specific send error.
+    type Error: std::error::Error + Send + 'static;
+
+    /// Send one already-enveloped frame toward the peer.
     ///
     /// # Errors
-    /// Returns [`Self::Error`] if the underlying channel fails to accept the delta.
-    fn send_delta(&mut self, delta: &Delta) -> Result<(), Self::Error>;
+    /// Returns [`Self::Error`] if the underlying channel rejects the bytes.
+    fn send(&mut self, frame: &[u8]) -> Result<(), Self::Error>;
 
-    /// Take the deltas received from the peer since the last call.
-    ///
-    /// # Errors
-    /// Returns [`Self::Error`] if the underlying channel fails while draining.
-    fn drain_incoming(&mut self) -> Result<Vec<Delta>, Self::Error>;
+    /// Install the received-frame callback. The session installs one that enqueues into its inbox.
+    fn set_on_recv(&mut self, cb: OnRecv);
+
+    /// Current liveness of the channel.
+    fn connection_state(&self) -> ConnectionState;
 }

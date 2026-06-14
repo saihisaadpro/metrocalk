@@ -17,6 +17,7 @@
 pub mod entity_id;
 pub mod merge;
 pub mod pipeline;
+pub mod producer;
 pub mod registry;
 pub mod stdlib;
 pub mod undo;
@@ -24,6 +25,7 @@ pub mod undo;
 pub use entity_id::{EntityId, IdGenerator};
 pub use merge::MergeReport;
 pub use pipeline::{Engine, FieldValue, Op, PipelineError};
+pub use producer::ProducerHook;
 pub use registry::{Builder, ComponentMeta, FieldSpec, FieldType, Registry, RegistryError};
 
 /// Engine identifier — one constant shared by downstream crates, logs, and file headers.

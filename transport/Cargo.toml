@@ -7,6 +7,14 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Local WebSocket transport (fallback + Phase-2 collab foundation). Native-only, opt-in via the `ws`
+# feature so the default build/test path needs no networking dep. default-features off → no TLS pull
+# (loopback ws:// only). This crate links NO `loro` — payloads are opaque `&[u8]` (CI grep stays green).
+tungstenite = { version = "0.24", optional = true, default-features = false, features = ["handshake"] }
+
+[features]
+default = []
+ws = ["dep:tungstenite"]
 
 [lints]
 workspace = true
