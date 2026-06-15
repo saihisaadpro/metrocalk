@@ -18,7 +18,7 @@ use render::{Instance, SceneState, Shared};
 use tauri::ipc::Channel;
 use tauri::{Manager, State};
 
-const SCENE_N: usize = 2000;
+const SCENE_N: usize = 5000; // the real M1.4 stress scene (the M2 gate target)
 
 /// Commands to the engine thread (which owns the `!Send` Engine).
 enum EngineCmd {

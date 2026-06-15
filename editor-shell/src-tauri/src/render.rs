@@ -187,7 +187,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     eprintln!("[viewport] render loop started");
     let mut cur_rev = u64::MAX;
     let mut n_inst: u32 = 0;
+    // frame-budget instrumentation (CPU submit time = encode+submit; the integrated viewport's cost)
+    let mut acc_ms = 0.0f64;
+    let mut acc_n = 0u32;
+    let mut last_report = std::time::Instant::now();
+    let mut cpu_samples: Vec<f64> = Vec::new();
     loop {
+        let frame_t0 = std::time::Instant::now();
         // resize tracking
         if let Ok(s) = window.inner_size() {
             if (s.width.max(1), s.height.max(1)) != (w, h) {
@@ -282,6 +288,24 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         }
         queue.submit([enc.finish()]);
         frame.present();
+
+        let cpu_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
+        acc_ms += cpu_ms;
+        acc_n += 1;
+        cpu_samples.push(cpu_ms);
+        if last_report.elapsed().as_secs_f64() >= 2.0 {
+            cpu_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p50 = cpu_samples[cpu_samples.len() / 2];
+            let p99 = cpu_samples[cpu_samples.len() * 99 / 100];
+            eprintln!(
+                "[viewport] n={n_inst} frames={acc_n} cpu-submit p50={p50:.3}ms p99={p99:.3}ms avg={:.3}ms",
+                acc_ms / f64::from(acc_n.max(1))
+            );
+            acc_ms = 0.0;
+            acc_n = 0;
+            cpu_samples.clear();
+            last_report = std::time::Instant::now();
+        }
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
 }
