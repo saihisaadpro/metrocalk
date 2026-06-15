@@ -13,6 +13,12 @@
 //! instance also gets the matching Loro component (`Health` / `HealthBar`) so the inspector names it
 //! and the projection carries it; the component (data) and the pair (queryable capability) are kept
 //! consistent at the seam.
+//!
+//! Scope note: the capability *web* here (Health/HealthBar, `provides`/`requires`) mirrors the `/core`
+//! stdlib (`stdlib.rs`), but the `Transform` seeded is a minimal `x`/`y`/`z` viewport placeholder, not
+//! the full stdlib `Transform` schema (`px`/`py`/`pz` + `provides Spatial`) — the shell's renderer
+//! reads `x`/`y`/`z`. Reconciling the two is a later cleanup; it doesn't affect the reveal (which keys
+//! off the capability pairs, not the Transform fields).
 
 // Scene positions are visual coordinates drawn from a PRNG, not precise arithmetic: the f64→f32
 // truncation (the viewport + reveal both work in f32) and the i64→f32 read are intentional here.
@@ -205,6 +211,14 @@ pub fn seed(
 /// the ECS `(BindsTo, bar)` pair on the provider, so the reveal correctly treats the provider as
 /// consumed — it leaves the compatible set, and a re-reveal greys it "already bound". Undo reverses
 /// both atomically.
+///
+/// **Reload constraint (carry-forward):** the reveal's exclusion depends on the ECS `BindsTo` pair,
+/// which `Engine::merge` does NOT rebuild (it restores entities from Loro but not their ECS
+/// tags/pairs). So a binding's exclusion survives undo and full re-projection, but a *merge*/reload
+/// would drop it (the Loro edge persists, the ECS pair does not), and the reveal would re-offer the
+/// bound provider. The live shell never merges (single peer; undo re-projects), so this is latent
+/// today; the fix is to re-derive `(BindsTo, *)` from the Loro `bindings` map in
+/// `rebuild_ecs_from_loro` (scheduled with collab).
 ///
 /// # Errors
 /// [`PipelineError::UnknownEntity`] if either endpoint isn't a live scene entity, propagated from the

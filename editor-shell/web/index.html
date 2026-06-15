@@ -70,6 +70,10 @@
             store.delete(op.id);
           } else if (op.op === "setField") {
             const e = store.get(op.id); if (e) { (e.components[op.component] ||= {})[op.field] = op.value; }
+          } else if (op.op === "addEdge") {
+            const e = store.get(op.from); if (e) { (e.edges ||= []).push({ rel: op.rel, to: op.to }); }
+          } else if (op.op === "removeEdge") {
+            const e = store.get(op.from); if (e && e.edges) { e.edges = e.edges.filter((x) => !(x.rel === op.rel && x.to === op.to)); }
           }
         }
         for (const c of d.confirms || []) pending.delete(c);

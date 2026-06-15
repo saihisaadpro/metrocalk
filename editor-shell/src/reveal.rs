@@ -175,9 +175,12 @@ pub fn why_not<W: World>(
     } else if provided.is_empty() {
         Some(WhyNot::NoCapability)
     } else {
+        // Name a required capability the candidate is *actually* missing (not merely the first one
+        // required) — so a multi-capability requirer's greyed reason is specific, not arbitrary.
         let missing = required
             .iter()
-            .find_map(|c| cap_name.get(c).cloned())
+            .find(|c| !provided.contains(c))
+            .and_then(|c| cap_name.get(c).cloned())
             .unwrap_or_else(|| "the required capability".to_string());
         Some(WhyNot::MissingCapability(missing))
     }
