@@ -190,6 +190,9 @@ fn ctx<'a>(
     }
 }
 
+// The acceptance script is one linear sequence (reveal → explain → bind → undo → reload); splitting
+// it across functions would fragment the very flow it asserts.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn north_star_1_full_acceptance_through_the_real_engine() {
     let mut w = scene1();

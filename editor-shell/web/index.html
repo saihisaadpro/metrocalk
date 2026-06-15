@@ -17,6 +17,14 @@
       .field span { width: 70px; opacity: 0.8; }
       .field input { width: 90px; background: #11131a; color: #cfe; border: 1px solid #333; border-radius: 3px; padding: 2px 4px; }
       button { background: #2a4365; color: #fff; border: none; border-radius: 4px; padding: 4px 10px; margin: 8px 12px; cursor: pointer; }
+      .req { padding: 2px 12px 6px; opacity: .7; }
+      .cand { padding: 4px 12px; cursor: pointer; border-left: 3px solid #34d399; }
+      .cand:hover { background: #163a2e; }
+      .cand .meta { opacity: .55; font-size: 11px; }
+      .grey { padding: 4px 12px; color: #8a8a8a; border-left: 3px solid #3a3a3a; }
+      .grey .why { color: #d08a8a; font-size: 11px; }
+      .boundrow { padding: 4px 12px; color: #9fe; border-left: 3px solid #2a4365; }
+      .sectlabel { padding: 6px 12px 2px; font-size: 11px; opacity: .5; text-transform: uppercase; }
       #status { position: fixed; bottom: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #9fe; padding: 4px 8px; border-radius: 4px; }
       #reject { position: fixed; bottom: 8px; right: 8px; max-width: 360px; background: rgba(120,20,20,0.92); color: #ffe8e8; border: 1px solid #f87171; padding: 8px 10px; border-radius: 6px; display: none; }
       #hint { position: absolute; top: 8px; left: 8px; color: rgba(255,255,255,0.4); }
@@ -30,6 +38,8 @@
         <button id="undo">⟲ Undo (Ctrl-Z)</button>
         <h3>Inspector</h3>
         <div id="inspector" style="padding:0 12px 12px;opacity:.6">Click an entity in the viewport.</div>
+        <h3>Bind by intent</h3>
+        <div id="reveal" style="padding:0 12px 12px;opacity:.6">Select a HealthBar to see compatible targets.</div>
         <h3>Hierarchy</h3>
         <div id="list"></div>
       </div>
@@ -92,7 +102,53 @@
       }
       const parseMaybeNumber = (s) => { const n = Number(s); return s.trim() !== "" && !isNaN(n) ? n : s; };
 
-      function select(id) { selected = id; renderList(); renderInspector(); }
+      function select(id) { selected = id; renderList(); renderInspector(); revealFor(id); }
+
+      // ── binding by intent (north-star test #1) ─────────────────────────────────
+      // On select, ask the core what this entity can connect to: ranked compatible targets, every
+      // incompatible greyed with its reason, plus what it already tracks. Computed in Rust over the
+      // engine's world (the M1.5 query); the hot path never crosses JS (inv. 4).
+      async function revealFor(id) {
+        const box = $("reveal");
+        if (!id) { box.innerHTML = "Select a HealthBar to see compatible targets."; return; }
+        let r;
+        try { r = await invoke("reveal_targets", { id }); }
+        catch (e) { box.innerHTML = "reveal failed: " + e; return; }
+        renderReveal(id, r);
+      }
+
+      function renderReveal(id, r) {
+        const box = $("reveal");
+        if ((r.required || []).length === 0) {
+          box.innerHTML = `<div class="req">No required capabilities — nothing to bind.</div>`;
+          return;
+        }
+        let html = `<div class="req">requires <b>${r.required.join(", ")}</b></div>`;
+        if ((r.bound || []).length) {
+          html += `<div class="sectlabel">tracking</div>`;
+          html += r.bound.map((b) => `<div class="boundrow">✓ ${b.name}</div>`).join("");
+        }
+        html += `<div class="sectlabel">compatible (${r.compatible.length}) — click to bind</div>`;
+        html += r.compatible.length
+          ? r.compatible.map((c) =>
+              `<div class="cand" data-to="${c.id}">${c.name}
+                 <div class="meta">${c.distance.toFixed(1)}m · fit ${c.affinity}</div></div>`).join("")
+          : `<div class="grey">none available</div>`;
+        if ((r.greyed || []).length) {
+          html += `<div class="sectlabel">incompatible</div>`;
+          html += r.greyed.slice(0, 12).map((g) =>
+              `<div class="grey">${g.name}<div class="why">✕ ${g.reason}</div></div>`).join("");
+        }
+        box.innerHTML = html;
+        for (const el of box.querySelectorAll(".cand")) el.onclick = () => doBind(id, el.dataset.to);
+      }
+
+      async function doBind(from, to) {
+        await invoke("bind_target", { from, to });
+        status("bound → " + to);
+        // re-reveal: the just-bound target is now consumed and shows under "tracking"
+        setTimeout(() => revealFor(from), 30);
+      }
 
       function editField(id, component, field, value) {
         const clientOpId = "ui-" + (++opSeq);
@@ -116,8 +172,9 @@
         if (id) select(id); else { selected = null; renderList(); renderInspector(); }
       });
 
-      $("undo").onclick = () => { invoke("undo"); status("undo"); };
-      window.addEventListener("keydown", (e) => { if ((e.ctrlKey||e.metaKey) && e.key === "z") { invoke("undo"); status("undo"); } });
+      function doUndo() { invoke("undo"); status("undo"); if (selected) setTimeout(() => revealFor(selected), 40); }
+      $("undo").onclick = doUndo;
+      window.addEventListener("keydown", (e) => { if ((e.ctrlKey||e.metaKey) && e.key === "z") doUndo(); });
 
       // connect: the core pushes ProjectionDeltas over the Channel (desktop binding of the M2.4 wire)
       const channel = new Channel();
