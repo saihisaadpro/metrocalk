@@ -1,0 +1,22 @@
+[package]
+name = "metrocalk-editor-shell"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# M2.6 convergence — the Rust side of the desktop editor shell. This `bridge` lib is the seam between
+# the REAL `/core` (Engine: commit pipeline + World + Loro) and the M2.5 editor's `ProjectionDelta` /
+# `EditTx` contract — NO MockCore. It's a workspace member (CI-tested); the Tauri app (`src-tauri`,
+# wgpu viewport + transparent WebView2 per ADR-008) is built on top of it and excluded from the
+# workspace like the other shells.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+metrocalk-core = { path = "../core" }
+metrocalk-ecs = { path = "../ecs" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

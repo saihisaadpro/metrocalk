@@ -923,6 +923,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrocalk-editor-shell"
+version = "0.1.0"
+dependencies = [
+ "metrocalk-core",
+ "metrocalk-ecs",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "metrocalk-plugins"
 version = "0.1.0"
 
