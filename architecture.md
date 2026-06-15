@@ -1,6 +1,6 @@
 # Architecture — Current State
 
-> Rules for this file: current state only, max ~2 pages. No rationale — link the ADR instead. Prune on every change. Status: **M2 — build** (M0+M1 complete; lanes M2.1–M2.5 landed + assembled on `m2-integration`; the M2.6 shell↔viewport integration build is the remaining M2-close work).
+> Rules for this file: current state only, max ~2 pages. No rationale — link the ADR instead. Prune on every change. Status: **M2 — integrated** (M0+M1 complete; M2.1–M2.5 on `master`; **M2.6 `/editor-shell` runs live** — real `/core` scene composites in the wgpu viewport under the WebView2 editor, ADR-008, 5k @ CPU-submit p50 0.74 ms; the interactive round-trip + zero-IPC-drag + 6 residuals await a human/driver pass before M2 is declared complete).
 
 ## System shape
 
@@ -31,6 +31,7 @@
 | Semantic ECS | Flecs v4.1 via `flecs_ecs`, behind our own query API | [001](decisions/001-flecs-over-bevy-ecs.md) |
 | Document / undo / collab / persistence | Loro 1.x | [002](decisions/002-loro-over-custom-wal.md) |
 | Shell + UI | Tauri 2 + React/TS; viewport in Rust/wgpu. **Composition: single-window** — transparent WebView2 over the native wgpu surface on one HWND (no DComp / no CEF; M2.1 1b "FAIL" was a GDI capture artifact, disproven on dGPU+iGPU). Per-pixel input routing splits UI vs viewport. | [003](decisions/003-desktop-first-tauri-exit-gate.md) · [008](decisions/008-shell-composition.md) |
+| Editor shell | **live (M2.6, `/editor-shell`)**: Tauri 2 — transparent WebView2 editor over a native wgpu viewport on one HWND, OS-composited (ADR-008). The `!Send` Flecs `Engine` runs on a dedicated thread; editor `EditTx`→`invoke`→commit, `ProjectionDelta`→Tauri `Channel` (desktop binding of the M2.4 wire). Viewport = M2.2 instanced render of `/core` Transforms; camera + ray-pick in Rust (inv. 4). | [008](decisions/008-shell-composition.md) |
 | Editor UI | **real scaffold (M2.5)**: a projection of the core (invariant 1) — Zustand/`useSyncExternalStore` store (entity-keyed, immutable per-entity, summary projection) · JSON Forms inspector (over RJSF) · React Flow neighborhood graph · optimistic echo + rejection-as-UX · JSON-Patch edit language. Viewport hot-input stays native (invariant 4). | [010](decisions/010-editor-projection-architecture.md) |
 | Rendering | wgpu 29 + WGSL (non-bindless path required for web — confirmed: WebGPU exposes no binding-array features) | [003](decisions/003-desktop-first-tauri-exit-gate.md) |
 | Browser target | **CI-enforced**: `wasm32-unknown-unknown` builds on every push (`.github/workflows/wasm-tripwire.yml`); native+browser render proven from one wgpu crate (`spikes/wasm`) | [003](decisions/003-desktop-first-tauri-exit-gate.md) |
