@@ -115,7 +115,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
     // Live persistence: re-seeding is deterministic (same SEED → identical ids), so replay the
     // append-only edit log on top to restore the user's prior binds/edits. clear_history again so the
     // restored scene is non-undoable too (same Ctrl-Z guard as the seed).
-    let log = Log::open(log_path());
+    let log = Log::open(log_path(), capscene::fingerprint(SCENE_N));
     let (restored, skipped) = log.replay(&mut engine, &scene);
     engine.clear_history();
     eprintln!(
@@ -439,25 +439,31 @@ fn viewport_pick(state: State<AppState>, x: f32, y: f32) -> Option<String> {
         let mut st = state.shared.lock().unwrap();
         st.cursor = (x, y);
         st.pick_request = true;
+        st.pick_done = false;
         st.picked = None;
     }
-    // wait briefly for the render loop to service the pick
+    // Wait for the render loop to service the pick. `pick_done` distinguishes "serviced, missed" from
+    // "not yet serviced", so a click on empty space returns at once instead of spinning the timeout.
     for _ in 0..60 {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let mut st = state.shared.lock().unwrap();
-        if let Some(i) = st.picked.take() {
-            if let Some(p) = st.selected {
-                if p < st.instances.len() {
-                    st.instances[p].selected = 0.0;
-                }
-            }
-            st.selected = Some(i);
-            if i < st.instances.len() {
-                st.instances[i].selected = 1.0;
-            }
-            st.revision = st.revision.wrapping_add(1);
-            return st.ids.get(i).cloned();
+        if !st.pick_done {
+            continue;
         }
+        let Some(i) = st.picked.take() else {
+            return None; // serviced, nothing hit
+        };
+        if let Some(p) = st.selected {
+            if p < st.instances.len() {
+                st.instances[p].selected = 0.0;
+            }
+        }
+        st.selected = Some(i);
+        if i < st.instances.len() {
+            st.instances[i].selected = 1.0;
+        }
+        st.revision = st.revision.wrapping_add(1);
+        return st.ids.get(i).cloned();
     }
     None
 }

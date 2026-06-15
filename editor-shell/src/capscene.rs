@@ -99,6 +99,15 @@ impl CapScene {
     }
 }
 
+/// A fingerprint of the deterministic scene this build produces, persisted as the replay log's header.
+/// Replay refuses (and discards) a log written by an incompatible build — different seed, scene size,
+/// or `seed()` algorithm — rather than replaying saved ids against a divergent id space (which would
+/// silently bind the wrong entities). **Bump `mtkscene1` whenever [`seed`]'s draw sequence changes.**
+#[must_use]
+pub fn fingerprint(n: usize) -> String {
+    format!("mtkscene1 seed={SEED:#x} n={n}")
+}
+
 /// Seed `n` entities through the commit pipeline: each gets a `Transform` (spread in a volume, the
 /// viewport's geometry) and a deterministic role drawn from the stdlib web — most are Health
 /// providers or other-capability providers, a small fraction are HealthBars (the requirers), and some

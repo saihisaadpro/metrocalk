@@ -20,6 +20,11 @@ fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("metrocalk-{name}.jsonl"))
 }
 
+/// The fingerprint for the 500-entity test scene (matches what `make`/`relaunch` seed).
+fn fp() -> String {
+    capscene::fingerprint(500)
+}
+
 fn has_binding(engine: &Engine<FlecsWorld>, from: EntityId, to: EntityId) -> bool {
     engine
         .bindings()
@@ -61,7 +66,7 @@ fn relaunch(log: &Log) -> (Engine<FlecsWorld>, usize, usize) {
 
 #[test]
 fn a_bind_survives_a_fresh_process_via_replay_log() {
-    let log = Log::open(tmp("persist-bind"));
+    let log = Log::open(tmp("persist-bind"), fp());
     log.clear();
 
     // "Run A": bind a provider and persist it.
@@ -103,7 +108,7 @@ fn seed_is_deterministic_across_runs() {
 
 #[test]
 fn undo_in_the_log_nets_out_on_replay() {
-    let log = Log::open(tmp("persist-undo"));
+    let log = Log::open(tmp("persist-undo"), fp());
     log.clear();
     let (_, _, bar, provider) = make();
     log.append(&Record::Bind {
@@ -125,7 +130,7 @@ fn undo_in_the_log_nets_out_on_replay() {
 fn a_divergent_record_is_skipped_not_fatal() {
     // The adversarial case: a record the fresh seed can't honour (here, ids absent from the scene).
     // It must be skipped, not crash the restore — the valid records still apply.
-    let log = Log::open(tmp("persist-diverge"));
+    let log = Log::open(tmp("persist-diverge"), fp());
     log.clear();
     let (_, _, bar, provider) = make();
     log.append(&Record::Bind {
@@ -145,4 +150,38 @@ fn a_divergent_record_is_skipped_not_fatal() {
     );
     assert!(has_binding(&e, bar, provider));
     log.clear();
+}
+
+#[test]
+fn an_incompatible_fingerprint_log_is_discarded() {
+    // A log written by one build, then opened by an incompatible build (different scene size → a
+    // different deterministic id space). Replay must discard it, not replay saved ids against the
+    // wrong entities.
+    let path = tmp("persist-fp");
+    let log_a = Log::open(path.clone(), capscene::fingerprint(500));
+    log_a.clear();
+    let (_, _, bar, provider) = make();
+    log_a.append(&Record::Bind {
+        from: bar.to_loro_key(),
+        to: provider.to_loro_key(),
+    });
+
+    // "new build": same file, different fingerprint.
+    let log_b = Log::open(path, capscene::fingerprint(999));
+    let mut world = FlecsWorld::new();
+    let scene = CapScene::intern(&mut world);
+    let mut e = Engine::new(world, 1);
+    capscene::seed(&mut e, &scene, 500).unwrap();
+    e.clear_history();
+    let (applied, skipped) = log_b.replay(&mut e, &scene);
+    assert_eq!(
+        (applied, skipped),
+        (0, 0),
+        "incompatible-build log is discarded"
+    );
+    assert!(
+        !has_binding(&e, bar, provider),
+        "no saved bind is restored from an incompatible log"
+    );
+    log_b.clear();
 }

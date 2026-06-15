@@ -35,45 +35,69 @@ pub enum Record {
     Undo,
 }
 
-/// An append-only edit log at `path` — one JSON record per line.
+/// Header marking the build that wrote a log — its first line, `#mtk <fingerprint>`.
+const HEADER_PREFIX: &str = "#mtk ";
+
+/// An append-only edit log at `path` — a `#mtk <fingerprint>` header line then one JSON record per
+/// line. The fingerprint ([`capscene::fingerprint`]) ties the log to the deterministic build that
+/// wrote it; replay discards a log from an incompatible build rather than mis-binding saved ids.
 pub struct Log {
     path: PathBuf,
+    fingerprint: String,
 }
 
 impl Log {
-    /// Open (lazily — the file is created on first append) a log at `path`.
+    /// Open (lazily — the file is created on first append) a log at `path`, tied to `fingerprint`.
     #[must_use]
-    pub fn open(path: PathBuf) -> Self {
-        Self { path }
+    pub fn open(path: PathBuf, fingerprint: String) -> Self {
+        Self { path, fingerprint }
     }
 
-    /// Append one record (one JSON line). Best-effort: a serialization or IO failure is dropped, never
-    /// fatal — losing a persisted edit must not crash the editor.
+    /// Append one record (one JSON line), writing the `#mtk` header first if the file is new/empty.
+    /// Best-effort: a serialization or IO failure is dropped, never fatal — losing a persisted edit
+    /// must not crash the editor.
     pub fn append(&self, rec: &Record) {
         let Ok(line) = serde_json::to_string(rec) else {
             return;
         };
+        let is_empty = self.path.metadata().map_or(true, |m| m.len() == 0);
         if let Ok(mut f) = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
         {
+            if is_empty {
+                let _ = writeln!(f, "{HEADER_PREFIX}{}", self.fingerprint);
+            }
             let _ = writeln!(f, "{line}");
         }
     }
 
     /// Replay the log onto `engine` (already deterministically seeded), each record back through the
-    /// commit pipeline. Returns `(applied, skipped)`. A record that cannot apply — a malformed line, a
-    /// rejected edit, or a bind referencing an id absent from the fresh seed (the **divergence** case)
-    /// — is counted as skipped and never panics. The caller should `clear_history()` **after** replay
-    /// so the restored scene is non-undoable.
+    /// commit pipeline. Returns `(applied, skipped)`. **Fingerprint guard:** if the header is missing
+    /// or names a different build, the log is from an incompatible id space — it is discarded (the
+    /// file is cleared) and `(0, 0)` returned, rather than mis-binding saved ids. Otherwise a record
+    /// that cannot apply — a malformed line, a rejected edit, or a bind referencing an id absent from
+    /// the fresh seed (the **divergence** case) — is counted as skipped and never panics. The caller
+    /// should `clear_history()` **after** replay so the restored scene is non-undoable.
     pub fn replay(&self, engine: &mut Engine<FlecsWorld>, scene: &CapScene) -> (usize, usize) {
         let Ok(file) = File::open(&self.path) else {
             return (0, 0); // no log yet → nothing to restore
         };
+        let mut lines = BufReader::new(file).lines().map_while(Result::ok);
+        let expected = format!("{HEADER_PREFIX}{}", self.fingerprint);
+        match lines.next() {
+            Some(h) if h == expected => {} // compatible build — replay below
+            _ => {
+                // missing/mismatched header → a log from an incompatible build. Discard it rather
+                // than replay saved ids against a divergent scene (which would bind the wrong things).
+                self.clear();
+                return (0, 0);
+            }
+        }
         let (mut applied, mut skipped) = (0usize, 0usize);
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            if line.trim().is_empty() {
+        for line in lines {
+            if line.trim().is_empty() || line.starts_with(HEADER_PREFIX) {
                 continue;
             }
             let Ok(rec) = serde_json::from_str::<Record>(&line) else {

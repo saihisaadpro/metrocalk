@@ -33,7 +33,9 @@ fn m2_end_to_end_budget_on_5k() {
     let mut commit_t = Vec::new();
     for i in 0..200 {
         let t0 = Instant::now();
-        engine.commit("edit", vec![set_x(bar, f64::from(i))]).unwrap();
+        engine
+            .commit("edit", vec![set_x(bar, f64::from(i))])
+            .unwrap();
         commit_t.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     let (c50, c99) = pct(commit_t);
@@ -69,7 +71,10 @@ fn m2_end_to_end_budget_on_5k() {
     );
 
     // A single committed edit + its echo must fit a frame; project_full is not per-frame (connect/undo).
-    assert!(c99 < 16.0, "commit must fit the frame budget: p99={c99:.3}ms");
+    assert!(
+        c99 < 16.0,
+        "commit must fit the frame budget: p99={c99:.3}ms"
+    );
 }
 
 fn set_x(entity: metrocalk_core::EntityId, x: f64) -> Op {

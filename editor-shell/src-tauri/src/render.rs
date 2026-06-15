@@ -54,7 +54,11 @@ pub struct SceneState {
     /// picking is correct at any display scaling. `pick_request` toggles a pick.
     pub cursor: (f32, f32),
     pub pick_request: bool,
-    /// Result of the last pick: instance index, or `usize::MAX` for none. Read by the app.
+    /// Set true by the render loop once a pick is serviced — distinguishes "serviced, missed"
+    /// (`pick_done = true`, `picked = None`) from "not yet serviced", so a miss returns promptly
+    /// instead of spinning the poll's full timeout.
+    pub pick_done: bool,
+    /// Result of the last serviced pick: `Some(index)` on a hit, `None` on a miss. Read by the app.
     pub picked: Option<usize>,
 }
 
@@ -275,7 +279,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         if do_pick {
             // CPU ray-pick against instance spheres — stays in Rust (invariant 4). Result back to app.
             let hit = pick_nearest(&shared, &cam);
-            shared.lock().unwrap().picked = hit;
+            let mut st = shared.lock().unwrap();
+            st.picked = hit;
+            st.pick_done = true; // signal completion (Some=hit, None=miss) so the app stops polling
         }
 
         let frame = match surface.get_current_texture() {
