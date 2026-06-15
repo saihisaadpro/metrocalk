@@ -183,10 +183,13 @@
         setTimeout(() => (r.style.display = "none"), 4000);
       }
 
-      // viewport click → native Rust pick (invariant 4: hot path in Rust)
+      // viewport click → native Rust pick (invariant 4: hot path in Rust). Send a NORMALIZED [0,1]
+      // window fraction (not pixels), so picking is correct at any display scaling — the wgpu surface
+      // spans the whole window, so we normalize against innerWidth/innerHeight.
       $("viewport").addEventListener("mousedown", async (ev) => {
-        const dpr = window.devicePixelRatio || 1;
-        const id = await invoke("viewport_pick", { x: ev.clientX * dpr, y: ev.clientY * dpr });
+        const x = ev.clientX / window.innerWidth;
+        const y = ev.clientY / window.innerHeight;
+        const id = await invoke("viewport_pick", { x, y });
         if (id) select(id); else { selected = null; renderList(); renderInspector(); }
       });
 

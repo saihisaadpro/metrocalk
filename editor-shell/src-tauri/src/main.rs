@@ -366,7 +366,8 @@ fn bind_target(state: State<AppState>, from: String, to: String) {
     let _ = state.tx.send(EngineCmd::Bind { from, to });
 }
 
-/// Pixel ray-pick in the viewport (Rust — invariant 4). Returns the picked entity's id, or `None`.
+/// Ray-pick in the viewport (Rust — invariant 4). `x`/`y` are a normalized [0,1] window fraction
+/// (DPI/offset-free), not pixels. Returns the picked entity's id, or `None`.
 #[tauri::command]
 fn viewport_pick(state: State<AppState>, x: f32, y: f32) -> Option<String> {
     {

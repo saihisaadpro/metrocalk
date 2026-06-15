@@ -37,7 +37,8 @@ pub struct SceneState {
     pub orbit: f32,
     pub elevation: f32,
     pub distance: f32,
-    /// Cursor in physical pixels for picking; `pick_request` toggles a pick.
+    /// Cursor as a normalized fraction [0,1] of the window (x right, y down) — DPI/offset-free, so
+    /// picking is correct at any display scaling. `pick_request` toggles a pick.
     pub cursor: (f32, f32),
     pub pick_request: bool,
     /// Result of the last pick: instance index, or `usize::MAX` for none. Read by the app.
@@ -241,7 +242,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
 
         if do_pick {
             // CPU ray-pick against instance spheres — stays in Rust (invariant 4). Result back to app.
-            let hit = pick_nearest(&shared, &cam, (w, h));
+            let hit = pick_nearest(&shared, &cam);
             shared.lock().unwrap().picked = hit;
         }
 
@@ -318,12 +319,14 @@ fn camera_matrix(orbit: f32, elevation: f32, distance: f32, aspect: f32) -> Mat4
 
 /// CPU ray-pick: unproject the cursor to a world ray, return the nearest instance whose bounding
 /// sphere it hits. Pure Rust — the hot picking path never touches JS (invariant 4).
-fn pick_nearest(shared: &Shared, view_proj: &Mat4, (w, h): (u32, u32)) -> Option<usize> {
+fn pick_nearest(shared: &Shared, view_proj: &Mat4) -> Option<usize> {
     let st = shared.lock().unwrap();
-    let (cx, cy) = st.cursor;
+    // Cursor is a normalized [0,1] window fraction (set by the app from the click); map straight to
+    // NDC. No DPI/physical-pixel coupling, so picking is correct at any display scaling.
+    let (nx, ny) = st.cursor;
     let inv = view_proj.inverse();
-    let ndc_x = (cx / w as f32) * 2.0 - 1.0;
-    let ndc_y = 1.0 - (cy / h as f32) * 2.0;
+    let ndc_x = nx * 2.0 - 1.0;
+    let ndc_y = 1.0 - ny * 2.0;
     let near = inv.project_point3(Vec3::new(ndc_x, ndc_y, 0.0));
     let far = inv.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
     let dir = (far - near).normalize_or_zero();
