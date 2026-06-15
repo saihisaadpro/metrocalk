@@ -13,7 +13,7 @@ At session start, read in this order:
 1. `metrocalk.md` — vision, business model, north-star UX tests
 2. `architecture.md` — current system state and the 5 invariants
 3. `progress.md` — Now / Next / Done + the milestone log index; then the **current milestone's** detailed log in `progress/` (e.g. `progress/M1.md`) for recent session history. Older milestones are archived siblings (`progress/M0.md`) — read on demand, not every session.
-4. Any ADR in `decisions/` relevant to the task (001 Flecs · 002 Loro · 003 Tauri/desktop-first · 004 token economy · 005 self-hosted ops · 006 browser query backend)
+4. Any ADR in `decisions/` relevant to the task — see `decisions/README.md` for the one-line index (it scales as ADRs grow; don't rely on a hardcoded list here, which goes stale)
 5. Only when the task touches it: `Metrocalk-Engine-Feasibility-and-Hosting-Plan.md` (stack, gates, roadmap) and `hosting.md` (infra, costs)
 If a git repo exists, also run `git log --oneline -15` to see where reality stands.
 
@@ -57,6 +57,7 @@ Documentation updates are part of the task, not an optional extra. A task is inc
 1. **`progress.md`** — update the Now/Next/Done header to reflect reality, and append one dated log entry: what happened, decisions made (link ADRs), measured numbers, blockers. Newest first. Never rewrite old entries.
 2. **`decisions/`** — write a new ADR whenever you (a) choose between alternatives with lasting consequences, (b) pass or fail a named gate, or (c) supersede an existing ADR. Format: `NNN-short-name.md` with Date/Status · Context · Decision · Consequences · Revisit when. One page maximum. ADRs are immutable — never edit an accepted one's substance; supersede it (status-line updates recording a gate result are allowed).
 3. **`architecture.md`** — update only when current state actually changed. State only, never rationale (link the ADR), under ~2 pages: prune stale content in the same edit that adds new content.
+4. **Keep the doc set navigable as it scales** (the docs are the source of truth — not the plan): maintain `decisions/README.md` — a one-line index per ADR (number · title · status · the layer it governs) — and add the row in the same edit that creates the ADR. **Prune** `architecture.md`'s resolved (struck-through) open-questions once their ADR is settled — the traceability lives in the ADR / `M0-gate-review.md`, not here — so the file stays ≤ ~2 pages. The big `Metrocalk-Engine-Feasibility-and-Hosting-Plan.md` and the topic plans (e.g. `physics-audio-networking-plan.md`) are **origin / reference** docs: where they and an ADR or `architecture.md` disagree, the ADR + `architecture.md` win — never treat the plan as current truth.
 
 Scope this protocol to every task in this project, not only tasks that mention documentation.
 </documentation_protocol>
