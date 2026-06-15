@@ -362,18 +362,27 @@ fn color_for(key: &str) -> [f32; 3] {
 
 // ── tauri commands (UI → core) ─────────────────────────────────────────────────
 
+/// Count one UI→core boundary crossing (render::IPC_CALLS) — the instrumentation behind the
+/// zero-per-frame-IPC claim (invariant 4). Every command calls this exactly once.
+fn ipc() {
+    render::IPC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[tauri::command]
 fn connect(state: State<AppState>, channel: Channel<ProjectionDelta>) {
+    ipc();
     let _ = state.tx.send(EngineCmd::Connect(channel));
 }
 
 #[tauri::command]
 fn submit_edit(state: State<AppState>, tx: EditTx) {
+    ipc();
     let _ = state.tx.send(EngineCmd::Edit(tx));
 }
 
 #[tauri::command]
 fn undo(state: State<AppState>) {
+    ipc();
     let _ = state.tx.send(EngineCmd::Undo);
 }
 
@@ -381,6 +390,7 @@ fn undo(state: State<AppState>) {
 /// thread's reply (a read).
 #[tauri::command]
 fn reveal_targets(state: State<AppState>, id: String) -> RevealResponse {
+    ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Reveal { id, reply }).is_err() {
         return RevealResponse::default();
@@ -391,13 +401,40 @@ fn reveal_targets(state: State<AppState>, id: String) -> RevealResponse {
 /// Bind the selection to a chosen compatible target (one undoable transaction).
 #[tauri::command]
 fn bind_target(state: State<AppState>, from: String, to: String) {
+    ipc();
     let _ = state.tx.send(EngineCmd::Bind { from, to });
+}
+
+/// Begin a right-drag orbit. The render loop then polls the cursor and orbits natively — **zero IPC
+/// per frame** (invariant 4); only this call and `drag_end` cross the boundary, once per gesture.
+#[tauri::command]
+fn drag_start(state: State<AppState>) {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.dragging = true;
+    st.drag_last = None;
+}
+
+/// End the orbit drag.
+#[tauri::command]
+fn drag_end(state: State<AppState>) {
+    ipc();
+    state.shared.lock().unwrap().dragging = false;
+}
+
+/// Wheel zoom — folded into the camera distance natively next frame (one call per wheel tick, not
+/// per frame).
+#[tauri::command]
+fn zoom(state: State<AppState>, delta: f32) {
+    ipc();
+    state.shared.lock().unwrap().zoom_delta += delta;
 }
 
 /// Ray-pick in the viewport (Rust — invariant 4). `x`/`y` are a normalized [0,1] window fraction
 /// (DPI/offset-free), not pixels. Returns the picked entity's id, or `None`.
 #[tauri::command]
 fn viewport_pick(state: State<AppState>, x: f32, y: f32) -> Option<String> {
+    ipc();
     {
         let mut st = state.shared.lock().unwrap();
         st.cursor = (x, y);
@@ -450,6 +487,9 @@ fn main() {
             undo,
             reveal_targets,
             bind_target,
+            drag_start,
+            drag_end,
+            zoom,
             viewport_pick
         ])
         .run(tauri::generate_context!())

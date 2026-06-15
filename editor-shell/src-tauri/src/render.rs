@@ -8,10 +8,16 @@
 //! authoritative core (deltas), and writes the picked entity back. Hot interaction stays in Rust
 //! (invariant 4): camera + picking never cross the JS boundary.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use glam::{Mat4, Vec3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+
+/// Total UI→core IPC calls (every `#[tauri::command]` bumps this). The render loop reports it next to
+/// the frame count so a sustained drag can be shown to cross the JS boundary **zero times per frame**
+/// (invariant 4) — orbit/zoom update natively in the loop; only the start/end of a gesture are IPC.
+pub static IPC_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// One renderable entity instance. 32 bytes, std430-clean (matches the WGSL `Instance`).
 #[repr(C)]
@@ -37,6 +43,13 @@ pub struct SceneState {
     pub orbit: f32,
     pub elevation: f32,
     pub distance: f32,
+    /// Right-drag orbit: while true, the render loop polls the cursor and orbits — zero per-frame IPC
+    /// (only the gesture's start/end are commands). Set by `drag_start`/`drag_end`.
+    pub dragging: bool,
+    /// Last polled cursor (physical screen px) during a drag, for the per-frame delta.
+    pub drag_last: Option<(f64, f64)>,
+    /// Pending wheel-zoom to fold into `distance` (one command per wheel tick, not per frame).
+    pub zoom_delta: f32,
     /// Cursor as a normalized fraction [0,1] of the window (x right, y down) — DPI/offset-free, so
     /// picking is correct at any display scaling. `pick_request` toggles a pick.
     pub cursor: (f32, f32),
@@ -193,6 +206,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let mut acc_n = 0u32;
     let mut last_report = std::time::Instant::now();
     let mut cpu_samples: Vec<f64> = Vec::new();
+    let mut last_ipc = IPC_CALLS.load(Ordering::Relaxed);
     loop {
         let frame_t0 = std::time::Instant::now();
         // resize tracking
@@ -213,6 +227,24 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             if st.distance == 0.0 {
                 st.distance = 60.0;
                 st.elevation = 0.4;
+            }
+            // Camera input — entirely native (invariant 4): fold in any wheel zoom, and while a
+            // right-drag is active, poll the OS cursor and orbit by its per-frame delta. No `invoke`
+            // here; the JS side only sent drag_start/drag_end (2 calls per gesture), never per frame.
+            if st.zoom_delta != 0.0 {
+                st.distance = (st.distance + st.zoom_delta).clamp(5.0, 400.0);
+                st.zoom_delta = 0.0;
+            }
+            if st.dragging {
+                if let Ok(p) = window.cursor_position() {
+                    if let Some((lx, ly)) = st.drag_last {
+                        st.orbit += (p.x - lx) as f32 * 0.01;
+                        st.elevation = (st.elevation + (p.y - ly) as f32 * 0.01).clamp(-1.45, 1.45);
+                    }
+                    st.drag_last = Some((p.x, p.y));
+                }
+            } else {
+                st.drag_last = None;
             }
             if st.revision != cur_rev {
                 cur_rev = st.revision;
@@ -298,8 +330,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             cpu_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let p50 = cpu_samples[cpu_samples.len() / 2];
             let p99 = cpu_samples[cpu_samples.len() * 99 / 100];
+            let ipc_now = IPC_CALLS.load(Ordering::Relaxed);
+            let ipc_window = ipc_now - last_ipc;
+            last_ipc = ipc_now;
+            let ipc_per_frame = ipc_window as f64 / f64::from(acc_n.max(1));
             eprintln!(
-                "[viewport] n={n_inst} frames={acc_n} cpu-submit p50={p50:.3}ms p99={p99:.3}ms avg={:.3}ms",
+                "[viewport] n={n_inst} frames={acc_n} cpu-submit p50={p50:.3}ms p99={p99:.3}ms avg={:.3}ms | ipc={ipc_window} ({ipc_per_frame:.3}/frame)",
                 acc_ms / f64::from(acc_n.max(1))
             );
             acc_ms = 0.0;

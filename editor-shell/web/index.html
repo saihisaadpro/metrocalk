@@ -183,15 +183,24 @@
         setTimeout(() => (r.style.display = "none"), 4000);
       }
 
-      // viewport click → native Rust pick (invariant 4: hot path in Rust). Send a NORMALIZED [0,1]
-      // window fraction (not pixels), so picking is correct at any display scaling — the wgpu surface
-      // spans the whole window, so we normalize against innerWidth/innerHeight.
-      $("viewport").addEventListener("mousedown", async (ev) => {
+      // Viewport input (invariant 4: the hot path stays in Rust).
+      //  • LEFT click → native ray-pick. Send a NORMALIZED [0,1] window fraction (not pixels), so
+      //    picking is correct at any display scaling (the wgpu surface spans the whole window).
+      //  • RIGHT drag → orbit: we send only drag_start / drag_end (2 calls per gesture); the render
+      //    loop polls the cursor and orbits natively — ZERO invokes per frame.
+      //  • WHEEL → zoom (one call per tick, not per frame).
+      const vp = $("viewport");
+      vp.addEventListener("contextmenu", (ev) => ev.preventDefault());
+      vp.addEventListener("mousedown", async (ev) => {
+        if (ev.button === 2) { invoke("drag_start"); return; }   // right-drag = native orbit
+        if (ev.button !== 0) return;
         const x = ev.clientX / window.innerWidth;
         const y = ev.clientY / window.innerHeight;
         const id = await invoke("viewport_pick", { x, y });
         if (id) select(id); else { selected = null; renderList(); renderInspector(); }
       });
+      window.addEventListener("mouseup", () => invoke("drag_end")); // end any orbit on release
+      vp.addEventListener("wheel", (ev) => { ev.preventDefault(); invoke("zoom", { delta: ev.deltaY * 0.04 }); }, { passive: false });
 
       function doUndo() { invoke("undo"); status("undo"); if (selected) setTimeout(() => revealFor(selected), 40); }
       $("undo").onclick = doUndo;
