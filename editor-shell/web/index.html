@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>metrocalk editor</title>
+    <style>
+      /* transparent so the native wgpu viewport composites through (ADR-008 single-window) */
+      html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; font: 13px ui-monospace, monospace; color: #e8e8e8; }
+      #app { display: grid; grid-template-columns: 280px 1fr; height: 100vh; }
+      .panel { background: rgba(20,22,28,0.92); border-right: 1px solid #2a2d35; overflow-y: auto; }
+      .viewport { background: transparent; position: relative; } /* clicks here = native pick */
+      h3 { margin: 10px 12px 6px; font-size: 12px; opacity: 0.7; text-transform: uppercase; }
+      .row { padding: 3px 12px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .row.sel { background: #2a4365; color: #fff; }
+      .field { display: flex; gap: 8px; align-items: center; padding: 3px 12px; }
+      .field span { width: 70px; opacity: 0.8; }
+      .field input { width: 90px; background: #11131a; color: #cfe; border: 1px solid #333; border-radius: 3px; padding: 2px 4px; }
+      button { background: #2a4365; color: #fff; border: none; border-radius: 4px; padding: 4px 10px; margin: 8px 12px; cursor: pointer; }
+      #status { position: fixed; bottom: 8px; left: 8px; background: rgba(0,0,0,0.55); color: #9fe; padding: 4px 8px; border-radius: 4px; }
+      #reject { position: fixed; bottom: 8px; right: 8px; max-width: 360px; background: rgba(120,20,20,0.92); color: #ffe8e8; border: 1px solid #f87171; padding: 8px 10px; border-radius: 6px; display: none; }
+      #hint { position: absolute; top: 8px; left: 8px; color: rgba(255,255,255,0.4); }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div class="panel">
+        <h3>metrocalk · editor (M2.6)</h3>
+        <div style="padding:0 12px 6px;opacity:.6" id="count">connecting…</div>
+        <button id="undo">⟲ Undo (Ctrl-Z)</button>
+        <h3>Inspector</h3>
+        <div id="inspector" style="padding:0 12px 12px;opacity:.6">Click an entity in the viewport.</div>
+        <h3>Hierarchy</h3>
+        <div id="list"></div>
+      </div>
+      <div class="viewport" id="viewport"><div id="hint">native wgpu viewport — click an entity to select</div></div>
+    </div>
+    <div id="status">booting</div>
+    <div id="reject"></div>
+
+    <script>
+      const { invoke, Channel } = window.__TAURI__.core;
+      // projection store: id -> { name, parentId, components }
+      const store = new Map();
+      let selected = null;
+      let opSeq = 0;
+      const pending = new Map(); // clientOpId -> intent (for optimistic display, dropped on confirm)
+
+      const $ = (id) => document.getElementById(id);
+      const status = (s) => ($("status").textContent = s);
+
+      function applyDelta(d) {
+        for (const op of d.ops || []) {
+          if (op.op === "upsert") {
+            const e = store.get(op.id) || { name: op.id, parentId: null, components: {} };
+            if (op.name != null) e.name = op.name;
+            if (op.parentId !== undefined) e.parentId = op.parentId;
+            store.set(op.id, e);
+          } else if (op.op === "remove") {
+            store.delete(op.id);
+          } else if (op.op === "setField") {
+            const e = store.get(op.id); if (e) { (e.components[op.component] ||= {})[op.field] = op.value; }
+          }
+        }
+        for (const c of d.confirms || []) pending.delete(c);
+        for (const r of d.rejects || []) { pending.delete(r.clientOpId); showReject(r.reason); }
+        renderList(); renderInspector();
+      }
+
+      function renderList() {
+        $("count").textContent = store.size + " entities";
+        const ids = [...store.keys()].slice(0, 400);
+        $("list").innerHTML = ids.map((id) =>
+          `<div class="row ${id===selected?'sel':''}" data-id="${id}">${(store.get(id).name)}</div>`).join("");
+        for (const el of $("list").querySelectorAll(".row")) el.onclick = () => select(el.dataset.id);
+      }
+
+      function renderInspector() {
+        if (!selected || !store.has(selected)) { $("inspector").innerHTML = "Click an entity in the viewport."; return; }
+        const e = store.get(selected);
+        let html = `<div style="font-weight:700;margin-bottom:6px">${e.name}</div>`;
+        for (const [comp, fields] of Object.entries(e.components)) {
+          html += `<div style="opacity:.7;margin-top:4px">${comp}</div>`;
+          for (const [f, v] of Object.entries(fields)) {
+            html += `<div class="field"><span>${f}</span><input data-c="${comp}" data-f="${f}" value="${v}"/></div>`;
+          }
+        }
+        $("inspector").innerHTML = html;
+        for (const inp of $("inspector").querySelectorAll("input")) {
+          inp.onchange = () => editField(selected, inp.dataset.c, inp.dataset.f, parseMaybeNumber(inp.value));
+        }
+      }
+      const parseMaybeNumber = (s) => { const n = Number(s); return s.trim() !== "" && !isNaN(n) ? n : s; };
+
+      function select(id) { selected = id; renderList(); renderInspector(); }
+
+      function editField(id, component, field, value) {
+        const clientOpId = "ui-" + (++opSeq);
+        const intent = { kind: "setField", id, component, field, value };
+        pending.set(clientOpId, intent);
+        // optimistic local apply
+        const e = store.get(id); if (e) { (e.components[component] ||= {})[field] = value; }
+        invoke("submit_edit", { tx: { clientOpId, label: `set ${component}.${field}`, patches: [], intent } });
+        status(`edit ${component}.${field} = ${value}`);
+      }
+
+      function showReject(reason) {
+        const r = $("reject"); r.textContent = "✕ rejected — " + reason; r.style.display = "block";
+        setTimeout(() => (r.style.display = "none"), 4000);
+      }
+
+      // viewport click → native Rust pick (invariant 4: hot path in Rust)
+      $("viewport").addEventListener("mousedown", async (ev) => {
+        const dpr = window.devicePixelRatio || 1;
+        const id = await invoke("viewport_pick", { x: ev.clientX * dpr, y: ev.clientY * dpr });
+        if (id) select(id); else { selected = null; renderList(); renderInspector(); }
+      });
+
+      $("undo").onclick = () => { invoke("undo"); status("undo"); };
+      window.addEventListener("keydown", (e) => { if ((e.ctrlKey||e.metaKey) && e.key === "z") { invoke("undo"); status("undo"); } });
+
+      // connect: the core pushes ProjectionDeltas over the Channel (desktop binding of the M2.4 wire)
+      const channel = new Channel();
+      channel.onmessage = (delta) => applyDelta(delta);
+      invoke("connect", { channel }).then(() => status("connected to /core")).catch((e) => status("connect failed: " + e));
+    </script>
+  </body>
+</html>

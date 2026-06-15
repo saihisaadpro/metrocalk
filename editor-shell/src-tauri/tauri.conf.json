@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "metrocalk-editor",
+  "version": "0.1.0",
+  "identifier": "dev.metrocalk.editor",
+  "build": {
+    "frontendDist": "../web"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "metrocalk editor",
+        "width": 1280,
+        "height": 800,
+        "resizable": true,
+        "transparent": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}
