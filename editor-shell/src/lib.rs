@@ -11,5 +11,7 @@
 //! remaining convergence work — see `progress/M2.md`.
 
 pub mod bridge;
+pub mod reveal;
 
 pub use bridge::{apply_edit, project_full, EditIntent, EditTx, ProjectionDelta, ProjectionOp};
+pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
