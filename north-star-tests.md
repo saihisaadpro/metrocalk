@@ -19,6 +19,8 @@
 
 **Pass:** ☐ ranked targets on click ☐ ≤2 interactions to bind ☐ every greyed "no" explains itself ☐ single-step undo ☐ survives reload.
 
+> **Status (M3.1, 2026-06-15).** *Engine-proven + live-wired; the manual boxes above await the live human run.* The full §1 sequence passes **headless through the real `/core` engine** (`editor-shell/tests/north_star_1.rs`): ranked-compatible-nearest-first ✓ · ≤2-interaction bind ✓ · every greyed "no" explained specifically (`AlreadyBound`/`MissingCapability("Health")`/`NoCapability`) ✓ · single-step undo ✓ · survives-reload via export→fresh-engine→merge ✓. It is **surfaced live** in the Tauri shell ("Bind by intent" panel + `reveal_targets`/`bind_target`). Universal `<16 ms` condition **met**: live per-click reveal **p99 1.523 ms @5k** (release; ADR-011). **Two gaps before the boxes can be ticked:** (1) a human runs it *in the window* + records the dogfood verdict (the felt-experience judgment); (2) **"survives reload" is not yet delivered live** — the shell has no persistence layer (re-seeds each launch), entangled with the capability-rebuild carry-forward. See `progress/M3.md`.
+
 ---
 
 ## 2 — Describe to create  *(core)*
