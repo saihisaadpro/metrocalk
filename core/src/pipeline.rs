@@ -223,6 +223,49 @@ impl<W: World> Engine<W> {
         self.id_gen.peer()
     }
 
+    // ── projection reads (M2.6: feed the editor's ProjectionDelta) ──────
+
+    /// All live scene entity ids (order not guaranteed).
+    #[must_use]
+    pub fn entity_ids(&self) -> Vec<EntityId> {
+        self.eid_to_ecs.keys().copied().collect()
+    }
+
+    /// The parent of `id` in the scene hierarchy (`None` = root).
+    #[must_use]
+    pub fn parent_of(&self, id: EntityId) -> Option<EntityId> {
+        let tid = *self.eid_to_tid.get(&id)?;
+        match self.doc.get_tree("hierarchy").parent(tid) {
+            Some(TreeParentId::Node(ptid)) => self.tid_to_eid(ptid),
+            _ => None,
+        }
+    }
+
+    /// All component field values for `id` as `component → field → value`.
+    #[must_use]
+    pub fn components_of(&self, id: EntityId) -> HashMap<String, HashMap<String, FieldValue>> {
+        self.capture_components(id)
+    }
+
+    /// All binding edges in the scene as `(from, kind, to)`.
+    #[must_use]
+    pub fn bindings(&self) -> Vec<(EntityId, String, EntityId)> {
+        let bindings = self.doc.get_map("bindings");
+        let mut out = Vec::new();
+        for k in bindings.keys() {
+            let parts: Vec<&str> = k.split('|').collect();
+            if parts.len() == 3 {
+                if let (Some(f), Some(t)) = (
+                    EntityId::from_loro_key(parts[0]),
+                    EntityId::from_loro_key(parts[2]),
+                ) {
+                    out.push((f, parts[1].to_string(), t));
+                }
+            }
+        }
+        out
+    }
+
     // ── commit (the sole mutation path) ────────────────────────────────
 
     /// Apply a transaction. This is the **sole** entry point for scene mutations (invariant 3).

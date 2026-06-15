@@ -176,6 +176,56 @@ pub fn apply_edit<W: World>(engine: &mut Engine<W>, tx: &EditTx) -> ProjectionDe
     }
 }
 
+/// Project the whole live scene from the real engine into a single `ProjectionDelta` (the initial
+/// load the editor's store applies). Each entity becomes an `upsert` (id as name until a `Name`
+/// component lands) with one `setField` per component field; each binding becomes an `addEdge`. This
+/// is the `/core` → editor seam the desktop shell sends over the M2.4 Channel on connect; the browser
+/// WASM core projects the
+/// same way (ADR-006). No `confirms`/`rejects` — it's a server-initiated load, not an echo.
+pub fn project_full<W: World>(engine: &Engine<W>) -> ProjectionDelta {
+    let mut ops = Vec::new();
+    for id in engine.entity_ids() {
+        let key = id.to_loro_key();
+        let parent = engine.parent_of(id).map(|p| p.to_loro_key());
+        ops.push(ProjectionOp::Upsert {
+            id: key.clone(),
+            name: Some(key.clone()),
+            parent_id: Some(parent),
+        });
+        for (component, fields) in engine.components_of(id) {
+            for (field, value) in fields {
+                ops.push(ProjectionOp::SetField {
+                    id: key.clone(),
+                    component: component.clone(),
+                    field,
+                    value: field_to_json(&value),
+                });
+            }
+        }
+    }
+    for (from, rel, to) in engine.bindings() {
+        ops.push(ProjectionOp::AddEdge {
+            from: from.to_loro_key(),
+            rel,
+            to: to.to_loro_key(),
+        });
+    }
+    ProjectionDelta {
+        ops,
+        confirms: vec![],
+        rejects: vec![],
+    }
+}
+
+fn field_to_json(v: &FieldValue) -> Json {
+    match v {
+        FieldValue::Integer(i) => Json::from(*i),
+        FieldValue::Number(n) => Json::from(*n),
+        FieldValue::Bool(b) => Json::from(*b),
+        FieldValue::Str(s) => Json::from(s.clone()),
+    }
+}
+
 fn reject(client_op_id: &str, reason: String) -> ProjectionDelta {
     ProjectionDelta {
         ops: vec![],

@@ -4,7 +4,9 @@
 
 use metrocalk_core::{Engine, EntityId, FieldValue, Op};
 use metrocalk_ecs::FlecsWorld;
-use metrocalk_editor_shell::{apply_edit, EditIntent, EditTx, ProjectionDelta, ProjectionOp};
+use metrocalk_editor_shell::{
+    apply_edit, project_full, EditIntent, EditTx, ProjectionDelta, ProjectionOp,
+};
 use serde_json::json;
 
 fn engine_with_entity() -> (Engine<FlecsWorld>, EntityId) {
@@ -118,6 +120,62 @@ fn valid_bind_confirms() {
     let delta = apply_edit(&mut e, &tx);
     assert_eq!(delta.confirms, vec!["op3"]);
     assert!(delta.rejects.is_empty());
+}
+
+#[test]
+fn project_full_emits_the_whole_scene_for_initial_load() {
+    let mut e = Engine::new(FlecsWorld::new(), 1);
+    let a = e.alloc_entity_id();
+    let b = e.alloc_entity_id();
+    e.commit(
+        "seed",
+        vec![
+            Op::CreateEntity {
+                id: a,
+                parent: None,
+            },
+            Op::CreateEntity {
+                id: b,
+                parent: Some(a),
+            },
+            Op::SetField {
+                entity: a,
+                component: "Transform".into(),
+                field: "x".into(),
+                value: FieldValue::Integer(3),
+            },
+            Op::AddBinding {
+                from: a,
+                kind: "BindsTo".into(),
+                to: b,
+            },
+        ],
+    )
+    .unwrap();
+
+    let delta = project_full(&e);
+    let upserts = delta
+        .ops
+        .iter()
+        .filter(|o| matches!(o, ProjectionOp::Upsert { .. }))
+        .count();
+    let setfields = delta
+        .ops
+        .iter()
+        .filter(|o| matches!(o, ProjectionOp::SetField { .. }))
+        .count();
+    let edges = delta
+        .ops
+        .iter()
+        .filter(|o| matches!(o, ProjectionOp::AddEdge { .. }))
+        .count();
+    assert_eq!(upserts, 2, "one upsert per entity");
+    assert!(setfields >= 1, "the Transform.x field is projected");
+    assert_eq!(edges, 1, "the binding is projected as an edge");
+    assert!(
+        delta.confirms.is_empty() && delta.rejects.is_empty(),
+        "initial load is server-initiated"
+    );
 }
 
 #[test]

@@ -12,4 +12,4 @@
 
 pub mod bridge;
 
-pub use bridge::{apply_edit, EditIntent, EditTx, ProjectionDelta, ProjectionOp};
+pub use bridge::{apply_edit, project_full, EditIntent, EditTx, ProjectionDelta, ProjectionOp};
