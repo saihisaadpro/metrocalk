@@ -12,8 +12,10 @@
 
 pub mod bridge;
 pub mod capscene;
+pub mod persist;
 pub mod reveal;
 
 pub use bridge::{apply_edit, project_full, EditIntent, EditTx, ProjectionDelta, ProjectionOp};
 pub use capscene::{bind, positions, seed, CapScene, SeedIndex, TRACKS};
+pub use persist::{Log, Record};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};

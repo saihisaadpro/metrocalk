@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_ecs::{Entity, FlecsWorld};
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
-use metrocalk_editor_shell::{apply_edit, capscene, project_full, CapScene, EditTx, ProjectionDelta};
+use metrocalk_editor_shell::{
+    apply_edit, capscene, project_full, CapScene, EditTx, Log, ProjectionDelta, Record,
+};
 use render::{Instance, SceneState, Shared};
 use serde::Serialize;
 use tauri::ipc::Channel;
@@ -89,6 +91,16 @@ struct AppState {
 
 // ── engine thread: owns the real Engine + the capability scene + the bridge ─────
 
+/// The persistence log path — next to the executable, so it's stable across launches of the same
+/// build (close→reopen restores). Falls back to the working dir if the exe path is unavailable.
+fn log_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("metrocalk-scene.jsonl")
+}
+
 fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
     let mut world = FlecsWorld::new();
     // Intern the capability relationships BEFORE the engine takes the world (they are metadata, like
@@ -99,8 +111,15 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
     // The seed is scene construction, not a user edit — drop it from the undo stack so Ctrl-Z can
     // never undo past the user's binds and delete the whole world (the bug a live Ctrl-Z surfaced).
     engine.clear_history();
+
+    // Live persistence: re-seeding is deterministic (same SEED → identical ids), so replay the
+    // append-only edit log on top to restore the user's prior binds/edits. clear_history again so the
+    // restored scene is non-undoable too (same Ctrl-Z guard as the seed).
+    let log = Log::open(log_path());
+    let (restored, skipped) = log.replay(&mut engine, &scene);
+    engine.clear_history();
     eprintln!(
-        "[shell] seeded {} entities — {} HealthBars, {} unbound Health providers",
+        "[shell] seeded {} entities — {} HealthBars, {} unbound Health providers; restored {restored} edits ({skipped} skipped)",
         engine.entity_count(),
         index.health_bars.len(),
         index.unbound_health_providers
@@ -121,13 +140,18 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
             }
             EngineCmd::Edit(tx) => {
                 let delta = apply_edit(&mut engine, &tx);
+                let ok = delta.rejects.is_empty();
                 if let Some(ch) = &channel {
                     let _ = ch.send(delta);
+                }
+                if ok {
+                    log.append(&Record::Edit(tx)); // persist the committed edit
                 }
                 rebuild(&engine, &shared, &mut positions);
             }
             EngineCmd::Undo => {
                 if engine.undo() {
+                    log.append(&Record::Undo); // persist the undo so replay reproduces the net state
                     if let Some(ch) = &channel {
                         let _ = ch.send(project_full(&engine)); // simplest correct post-undo sync
                     }
@@ -145,6 +169,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                     (EntityId::from_loro_key(&from), EntityId::from_loro_key(&to))
                 {
                     if capscene::bind(&mut engine, &scene, f, t).is_ok() {
+                        log.append(&Record::Bind {
+                            from: from.clone(),
+                            to: to.clone(),
+                        }); // persist the bind
                         if let Some(ch) = &channel {
                             // echo the new edge so the projection (and a reload) carries it
                             let _ = ch.send(ProjectionDelta {
