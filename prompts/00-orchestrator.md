@@ -46,7 +46,7 @@ Applies to every task that produces a measurement:
 <orchestration>
 Do not spawn a subagent for work you can complete directly in a single pass (e.g., implementing or refactoring code you can already see). Spawn multiple subagents in the same turn when work fans out across independent units — reading a large dependency's source, researching API docs, or an independent verification review. Always run an independent verification step before declaring a task done: tests pass, benchmarks reproduce per the discipline above, and the diff is re-read against the task's success criteria. For gate-critical results (anything an ADR will cite), verify on the target platform stated in the task — a benchmark run on the wrong OS is a failed verification, not a partial result.
 
-Git discipline: commit at meaningful milestones with messages of the form `area: what changed` (e.g., `spike/loro: add merge-conflict benchmark`). Small commits over one giant one. Never leave the working tree dirty at session end.
+Git discipline: commit at meaningful milestones with messages of the form `area: what changed` (e.g., `spike/loro: add merge-conflict benchmark`). Small commits over one giant one. Never leave the working tree dirty at session end. **Single tree on master — no worktrees, no parallel lanes.** At session end, after the final clean commit, `git push` to origin/main (GitHub is the single backup).
 
 When blocked: timebox any single blocker to ~45 minutes of attempts. Then stop, document the blocker precisely (error, versions, what you tried) in the report and progress.md, and move to the next independent piece of the task. Do not thrash, and do not quietly substitute an easier task for the blocked one.
 </orchestration>
