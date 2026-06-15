@@ -219,6 +219,14 @@ impl<W: World> Engine<W> {
         !self.redo_stack.is_empty()
     }
 
+    /// Drop the undo/redo history without touching scene state — call after the initial
+    /// seed/scene-load so the user can't Ctrl-Z *past* their own edits and undo scene construction
+    /// itself (which would delete every seeded entity). Only the inverse-op stacks are cleared.
+    pub fn clear_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
     pub fn peer_id(&self) -> u64 {
         self.id_gen.peer()
     }

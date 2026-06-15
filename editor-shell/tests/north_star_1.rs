@@ -363,3 +363,46 @@ fn seed_generator_reveals_exactly_its_unbound_providers() {
         .windows(2)
         .all(|w| w[0].distance <= w[1].distance));
 }
+
+#[test]
+fn clear_history_makes_the_seed_non_undoable_but_later_edits_still_undo() {
+    // Regression for the live Ctrl-Z bug: the seed is one big transaction, so without clearing the
+    // history the user could Ctrl-Z past their binds and undo scene construction itself — deleting
+    // every entity. `clear_history` (called by the shell right after seeding) must drop the seed from
+    // the undo stack without touching the scene, while leaving later user edits undoable.
+    let mut world = FlecsWorld::new();
+    let scene = CapScene::intern(&mut world);
+    let mut engine = Engine::new(world, 1);
+    let index = capscene::seed(&mut engine, &scene, 500).expect("seed commits");
+    let n = engine.entity_count();
+
+    engine.clear_history();
+    assert!(
+        !engine.undo(),
+        "after clear_history the seed is NOT undoable"
+    );
+    assert_eq!(engine.entity_count(), n, "the scene is fully intact");
+
+    // a subsequent user edit is still a normal undoable transaction
+    let bar = index.health_bars[0];
+    engine
+        .commit(
+            "edit width",
+            vec![Op::SetField {
+                entity: bar,
+                component: "HealthBar".into(),
+                field: "width".into(),
+                value: FieldValue::Number(2.0),
+            }],
+        )
+        .expect("edit commits");
+    assert!(
+        engine.undo(),
+        "a real edit after clear_history undoes normally"
+    );
+    assert_eq!(
+        engine.entity_count(),
+        n,
+        "still intact after the edit's undo"
+    );
+}

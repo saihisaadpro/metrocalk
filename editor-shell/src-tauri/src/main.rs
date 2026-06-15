@@ -96,6 +96,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
     let scene = CapScene::intern(&mut world);
     let mut engine = Engine::new(world, 1);
     let index = capscene::seed(&mut engine, &scene, SCENE_N).expect("seed capability scene");
+    // The seed is scene construction, not a user edit — drop it from the undo stack so Ctrl-Z can
+    // never undo past the user's binds and delete the whole world (the bug a live Ctrl-Z surfaced).
+    engine.clear_history();
     eprintln!(
         "[shell] seeded {} entities — {} HealthBars, {} unbound Health providers",
         engine.entity_count(),
