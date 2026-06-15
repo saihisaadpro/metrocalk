@@ -247,6 +247,23 @@ impl<W: World> Engine<W> {
         self.capture_components(id)
     }
 
+    /// The ECS handle backing a live scene entity id — the bridge from the projection/edit world
+    /// (logical [`EntityId`]) to the relational query world (raw [`Entity`]), so a query that takes a
+    /// raw handle (e.g. the M3.1 reveal / compatibility query) can be run for a selected entity.
+    /// `None` if `id` is not a live scene entity.
+    #[must_use]
+    pub fn ecs_entity(&self, id: EntityId) -> Option<Entity> {
+        self.eid_to_ecs.get(&id).copied()
+    }
+
+    /// The scene entity id backing an ECS handle — the inverse of [`ecs_entity`](Self::ecs_entity),
+    /// mapping a query result back to a projectable/bindable id. `None` for non-scene handles (e.g. the
+    /// interned relationship/capability entities the reveal query matches against).
+    #[must_use]
+    pub fn entity_id_of(&self, e: Entity) -> Option<EntityId> {
+        self.ecs_to_eid.get(&e).copied()
+    }
+
     /// All binding edges in the scene as `(from, kind, to)`.
     #[must_use]
     pub fn bindings(&self) -> Vec<(EntityId, String, EntityId)> {
