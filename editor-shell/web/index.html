@@ -36,6 +36,8 @@
         <h3>metrocalk · editor (M2.6)</h3>
         <div style="padding:0 12px 6px;opacity:.6" id="count">connecting…</div>
         <button id="undo">⟲ Undo (Ctrl-Z)</button>
+        <h3>Requirers — click one to bind</h3>
+        <div id="requirers" style="padding:0 12px 6px;opacity:.6">scanning…</div>
         <h3>Inspector</h3>
         <div id="inspector" style="padding:0 12px 12px;opacity:.6">Click an entity in the viewport.</div>
         <h3>Bind by intent</h3>
@@ -87,6 +89,18 @@
         $("list").innerHTML = ids.map((id) =>
           `<div class="row ${id===selected?'sel':''}" data-id="${id}">${(store.get(id).name)}</div>`).join("");
         for (const el of $("list").querySelectorAll(".row")) el.onclick = () => select(el.dataset.id);
+        renderRequirers();
+      }
+
+      // The requirers (entities that require a capability — here HealthBars) are the bindable starting
+      // points for test #1. They're rare in the scene, so surface them directly: one click reveals
+      // their compatible targets. Identified from the projection (entities carrying a HealthBar component).
+      function renderRequirers() {
+        const reqs = [...store.entries()].filter(([, e]) => e.components && e.components.HealthBar).slice(0, 40);
+        $("requirers").innerHTML = reqs.length
+          ? reqs.map(([id]) => `<div class="cand ${id===selected?'sel':''}" data-id="${id}">HealthBar · ${id}</div>`).join("")
+          : "none found";
+        for (const el of $("requirers").querySelectorAll(".cand")) el.onclick = () => select(el.dataset.id);
       }
 
       function renderInspector() {
