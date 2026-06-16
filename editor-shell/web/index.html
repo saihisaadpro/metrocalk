@@ -197,7 +197,8 @@
         const x = ev.clientX / window.innerWidth;
         const y = ev.clientY / window.innerHeight;
         const id = await invoke("viewport_pick", { x, y });
-        if (id) select(id); else { selected = null; renderList(); renderInspector(); }
+        if (id) { select(id); status("picked " + id); }
+        else { selected = null; renderList(); renderInspector(); revealFor(null); status("picked nothing here"); }
       });
       window.addEventListener("mouseup", () => invoke("drag_end")); // end any orbit on release
       vp.addEventListener("wheel", (ev) => { ev.preventDefault(); invoke("zoom", { delta: ev.deltaY * 0.04 }); }, { passive: false });

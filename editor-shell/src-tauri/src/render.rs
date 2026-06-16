@@ -366,25 +366,27 @@ fn pick_nearest(shared: &Shared, view_proj: &Mat4) -> Option<usize> {
     // Cursor is a normalized [0,1] window fraction (set by the app from the click); map straight to
     // NDC. No DPI/physical-pixel coupling, so picking is correct at any display scaling.
     let (nx, ny) = st.cursor;
-    let inv = view_proj.inverse();
-    let ndc_x = nx * 2.0 - 1.0;
-    let ndc_y = 1.0 - ny * 2.0;
-    let near = inv.project_point3(Vec3::new(ndc_x, ndc_y, 0.0));
-    let far = inv.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
-    let dir = (far - near).normalize_or_zero();
-    let mut best: Option<(usize, f32)> = None;
+    let click_x = nx * 2.0 - 1.0;
+    let click_y = 1.0 - ny * 2.0;
+    // Screen-space pick: project each instance centre to NDC and take the FRONTMOST whose projection
+    // falls within a small tolerance of the click. This is robust where a 3D ray-vs-sphere test fails
+    // — a dense cloud looks solid (cubes overlap in screen space) but the ray threads the gaps between
+    // bounding spheres. Tolerance ≈ 5% of the half-NDC extent; frontmost (min depth) wins ties so you
+    // select the cube you actually see on top.
+    const TOL2: f32 = 0.05 * 0.05;
+    let mut best: Option<(usize, f32)> = None; // (index, depth)
     for (i, inst) in st.instances.iter().enumerate() {
-        let c = Vec3::from(inst.center);
-        let r = inst.scale * 1.8;
-        let oc = near - c;
-        let b = oc.dot(dir);
-        let cc = oc.dot(oc) - r * r;
-        let disc = b * b - cc;
-        if disc >= 0.0 {
-            let t = -b - disc.sqrt();
-            if t > 0.0 && best.is_none_or(|(_, bt)| t < bt) {
-                best = Some((i, t));
-            }
+        let clip = *view_proj * Vec3::from(inst.center).extend(1.0);
+        if clip.w <= 0.0 {
+            continue; // behind the camera
+        }
+        let ndc = clip.truncate() / clip.w;
+        let d2 = (ndc.x - click_x).powi(2) + (ndc.y - click_y).powi(2);
+        if d2 > TOL2 {
+            continue;
+        }
+        if best.is_none_or(|(_, bd)| ndc.z < bd) {
+            best = Some((i, ndc.z));
         }
     }
     best.map(|(i, _)| i)
