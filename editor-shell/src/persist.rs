@@ -31,6 +31,9 @@ pub enum Record {
     Edit(EditTx),
     /// A binding-by-intent (HealthBar → provider).
     Bind { from: String, to: String },
+    /// A describe-to-create (M3.2): a free-text query resolved + instantiated at a position. Replayed
+    /// deterministically (same resolve + same id allocation) so the described entity is recreated.
+    Describe { query: String, pos: [f32; 3] },
     /// A single-step undo of the most recent action.
     Undo,
 }
@@ -107,6 +110,9 @@ impl Log {
             let ok = match rec {
                 Record::Edit(tx) => apply_edit(engine, &tx).rejects.is_empty(),
                 Record::Bind { from, to } => replay_bind(engine, scene, &from, &to),
+                Record::Describe { query, pos } => {
+                    capscene::describe_create(engine, scene, &query, pos).is_some()
+                }
                 Record::Undo => engine.undo(),
             };
             if ok {

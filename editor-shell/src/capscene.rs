@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use metrocalk_core::{Engine, EntityId, FieldValue, Op, PipelineError};
+use metrocalk_core::{ComponentMeta, Engine, EntityId, FieldType, FieldValue, Op, PipelineError};
 use metrocalk_ecs::rng::Rng;
 use metrocalk_ecs::{Entity, FlecsWorld, World};
 
@@ -72,18 +72,19 @@ impl CapScene {
         };
         let mut caps = HashMap::new();
         let mut cap_name = HashMap::new();
-        // The capabilities the stdlib's relational web is built on (stdlib.rs).
-        for name in [
-            "Health",
-            "Spatial",
-            "Renderable",
-            "UIElement",
-            "Physics",
-            "Audio",
-        ] {
+        // Intern EVERY capability the stdlib uses (provides + requires), deterministically (sorted), so
+        // any resolved kind (M3.2 describe-to-create) can be instantiated with its real capability
+        // pairs — not just the handful the seed scene needs.
+        let mut names: Vec<String> = metrocalk_core::stdlib::standard_components()
+            .iter()
+            .flat_map(|m| m.provides.iter().chain(m.requires.iter()).cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        for name in names {
             let e = world.create_entity();
-            caps.insert(name.to_string(), e);
-            cap_name.insert(e, name.to_string());
+            caps.insert(name.clone(), e);
+            cap_name.insert(e, name);
         }
         Self {
             rels,
@@ -279,4 +280,87 @@ pub fn positions(engine: &Engine<FlecsWorld>) -> HashMap<Entity, [f32; 3]> {
         out.insert(ecs, [g("x"), g("y"), g("z")]);
     }
     out
+}
+
+/// Instantiate a resolved component KIND as a new pre-componentized scene entity — a `Transform` (so it
+/// renders) + the kind's own component (default fields) + its capability pairs (provides/requires) —
+/// all through the commit pipeline as ONE undoable transaction. This is the "working object, not dead
+/// geometry" the describe-to-create loop drops in; its `requires` drive the M3.1 reveal for attach.
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the create transaction fails (it shouldn't — ops are consistent).
+pub fn instantiate(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    meta: &ComponentMeta,
+    pos: [f32; 3],
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    for (f, v) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        });
+    }
+    // the kind's own component, with default field values — a real, inspectable component record
+    for field in &meta.fields {
+        ops.push(Op::SetField {
+            entity: id,
+            component: meta.name.clone(),
+            field: field.name.clone(),
+            value: default_value(field.ty),
+        });
+    }
+    // the working capabilities: provides/requires as ECS pairs the reveal + attach use
+    for cap in &meta.provides {
+        if let Some(&c) = scene.caps.get(cap) {
+            ops.push(Op::AddPair {
+                entity: id,
+                rel: scene.rels.provides,
+                target: c,
+            });
+        }
+    }
+    for cap in &meta.requires {
+        if let Some(&c) = scene.caps.get(cap) {
+            ops.push(Op::AddPair {
+                entity: id,
+                rel: scene.rels.requires,
+                target: c,
+            });
+        }
+    }
+    engine.commit("describe-create", ops)?;
+    Ok(id)
+}
+
+/// Describe-to-create, end to end (local tier): resolve `query` over the stdlib and, on a confident
+/// match, [`instantiate`] it pre-componentized at `pos` (one undoable transaction). Returns the new
+/// entity + the resolved kind name, or `None` for an honest no-match (→ the marketplace seam).
+pub fn describe_create(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    query: &str,
+    pos: [f32; 3],
+) -> Option<(EntityId, String)> {
+    let lib = metrocalk_core::stdlib::standard_components();
+    let top = metrocalk_core::resolve::resolve_local(&lib, query)
+        .matches
+        .into_iter()
+        .next()?;
+    let meta = lib.iter().find(|m| m.name == top.kind)?;
+    let id = instantiate(engine, scene, meta, pos).ok()?;
+    Some((id, top.kind))
+}
+
+fn default_value(ty: FieldType) -> FieldValue {
+    match ty {
+        FieldType::Integer => FieldValue::Integer(0),
+        FieldType::Number => FieldValue::Number(0.0),
+        FieldType::Boolean => FieldValue::Bool(false),
+        FieldType::String => FieldValue::Str(String::new()),
+    }
 }
