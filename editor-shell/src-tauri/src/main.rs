@@ -125,7 +125,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
         index.unbound_health_providers
     );
     if let Some(first) = index.health_bars.first() {
-        eprintln!("[shell] click HealthBar {} to reveal bindable targets", first.to_loro_key());
+        eprintln!(
+            "[shell] click HealthBar {} to reveal bindable targets",
+            first.to_loro_key()
+        );
     }
 
     let mut positions: HashMap<Entity, [f32; 3]> = HashMap::new();
@@ -305,7 +308,11 @@ fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
 /// Rebuild the viewport instance list AND the cached `positions` map from the engine's `Transform`
 /// components in one pass (scene truth → viewport + reveal input). The only place scene geometry flows
 /// core → viewport.
-fn rebuild(engine: &Engine<FlecsWorld>, shared: &Shared, positions: &mut HashMap<Entity, [f32; 3]>) {
+fn rebuild(
+    engine: &Engine<FlecsWorld>,
+    shared: &Shared,
+    positions: &mut HashMap<Entity, [f32; 3]>,
+) {
     positions.clear();
     let mut instances = Vec::new();
     let mut ids = Vec::new();
@@ -430,42 +437,51 @@ fn zoom(state: State<AppState>, delta: f32) {
     state.shared.lock().unwrap().zoom_delta += delta;
 }
 
-/// Ray-pick in the viewport (Rust — invariant 4). `x`/`y` are a normalized [0,1] window fraction
-/// (DPI/offset-free), not pixels. Returns the picked entity's id, or `None`.
+/// Diagnostics for the last serviced viewport pick (instance count, in-front count, nearest screen
+/// distances). Used by the E2E to see *why* a pick hit or missed.
 #[tauri::command]
-fn viewport_pick(state: State<AppState>, x: f32, y: f32) -> Option<String> {
+fn pick_debug(state: State<AppState>) -> String {
+    state.shared.lock().unwrap().pick_dbg.clone()
+}
+
+/// Pick in the viewport (Rust — invariant 4). `x`/`y` are a normalized [0,1] window fraction
+/// (DPI/offset-free), not pixels. Computed **synchronously** here — a pure projection over the current
+/// instances + camera — so it never races the render loop's frame cadence (the bug a hidden/throttled
+/// window exposed). Returns the picked entity's id, or `None` (only when the scene is empty).
+#[tauri::command]
+fn viewport_pick(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    x: f32,
+    y: f32,
+) -> Option<String> {
     ipc();
-    {
-        let mut st = state.shared.lock().unwrap();
-        st.cursor = (x, y);
-        st.pick_request = true;
-        st.pick_done = false;
-        st.picked = None;
+    let aspect = window.inner_size().map_or(16.0 / 9.0, |s| {
+        s.width.max(1) as f32 / s.height.max(1) as f32
+    });
+    let mut st = state.shared.lock().unwrap();
+    // Mirror the render loop's camera init so the pick uses the same view as what's drawn.
+    if st.distance == 0.0 {
+        st.distance = 60.0;
+        st.elevation = 0.4;
     }
-    // Wait for the render loop to service the pick. `pick_done` distinguishes "serviced, missed" from
-    // "not yet serviced", so a click on empty space returns at once instead of spinning the timeout.
-    for _ in 0..60 {
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let mut st = state.shared.lock().unwrap();
-        if !st.pick_done {
-            continue;
+    let cam = render::camera_matrix(st.orbit, st.elevation, st.distance, aspect);
+    let (hit, dbg) = render::pick_nearest(&st.instances, (x, y), &cam);
+    st.pick_dbg = dbg;
+    // update the highlight
+    if let Some(p) = st.selected {
+        if p < st.instances.len() {
+            st.instances[p].selected = 0.0;
         }
-        let Some(i) = st.picked.take() else {
-            return None; // serviced, nothing hit
-        };
-        if let Some(p) = st.selected {
-            if p < st.instances.len() {
-                st.instances[p].selected = 0.0;
-            }
-        }
-        st.selected = Some(i);
+    }
+    st.selected = hit;
+    if let Some(i) = hit {
         if i < st.instances.len() {
             st.instances[i].selected = 1.0;
         }
-        st.revision = st.revision.wrapping_add(1);
-        return st.ids.get(i).cloned();
     }
-    None
+    st.revision = st.revision.wrapping_add(1);
+    hit.and_then(|i| st.ids.get(i).cloned())
 }
 
 fn main() {
@@ -496,6 +512,7 @@ fn main() {
             drag_start,
             drag_end,
             zoom,
+            pick_debug,
             viewport_pick
         ])
         .run(tauri::generate_context!())

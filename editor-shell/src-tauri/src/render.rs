@@ -5,8 +5,9 @@
 //! frustum-cull→indirect refinement is also proven in `spikes/render-scene` and ports in on top.
 //!
 //! The render loop owns no scene truth — it reads a shared [`SceneState`] the app updates from the
-//! authoritative core (deltas), and writes the picked entity back. Hot interaction stays in Rust
-//! (invariant 4): camera + picking never cross the JS boundary.
+//! authoritative core (deltas). Hot interaction stays in Rust (invariant 4): camera orbit/zoom update
+//! natively in the loop (zero per-frame IPC), and picking is a pure projection ([`pick_nearest`]) run
+//! synchronously inside the `viewport_pick` command — neither crosses the JS boundary per frame.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -50,24 +51,19 @@ pub struct SceneState {
     pub drag_last: Option<(f64, f64)>,
     /// Pending wheel-zoom to fold into `distance` (one command per wheel tick, not per frame).
     pub zoom_delta: f32,
-    /// Cursor as a normalized fraction [0,1] of the window (x right, y down) — DPI/offset-free, so
-    /// picking is correct at any display scaling. `pick_request` toggles a pick.
-    pub cursor: (f32, f32),
-    pub pick_request: bool,
-    /// Set true by the render loop once a pick is serviced — distinguishes "serviced, missed"
-    /// (`pick_done = true`, `picked = None`) from "not yet serviced", so a miss returns promptly
-    /// instead of spinning the poll's full timeout.
-    pub pick_done: bool,
-    /// Result of the last serviced pick: `Some(index)` on a hit, `None` on a miss. Read by the app.
-    pub picked: Option<usize>,
+    /// Diagnostic string for the last pick (instance count, in-front count, nearest dist) — read by
+    /// the `pick_debug` command / E2E. Picking itself is done synchronously in the `viewport_pick`
+    /// command (pure function over these instances + the camera), NOT serviced by the render loop, so
+    /// it never races the frame cadence.
+    pub pick_dbg: String,
 }
 
 pub type Shared = Arc<Mutex<SceneState>>;
 
 const SHADER: &str = include_str!("scene.wgsl");
 const CUBE_INDICES: [u16; 36] = [
-    0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6, 0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4, 2, 6, 7,
-    2, 7, 3,
+    0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6, 0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4, 2, 6,
+    7, 2, 7, 3,
 ];
 const GRID_VERTS: u32 = (2 * (40 + 1) * 2) as u32;
 
@@ -82,12 +78,16 @@ struct WinHandle {
     window: tauri::WebviewWindow,
 }
 impl HasWindowHandle for WinHandle {
-    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
         self.window.window_handle()
     }
 }
 impl HasDisplayHandle for WinHandle {
-    fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
         self.window.display_handle()
     }
 }
@@ -102,7 +102,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let (mut w, mut h) = (size.width.max(1), size.height.max(1));
 
     let instance = wgpu::Instance::default();
-    let target = Arc::new(WinHandle { window: window.clone() });
+    let target = Arc::new(WinHandle {
+        window: window.clone(),
+    });
     let surface = match instance.create_surface(target) {
         Ok(s) => s,
         Err(e) => {
@@ -118,7 +120,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         })
         .await
         .expect("no adapter");
-    eprintln!("[viewport] adapter='{}' backend={:?}", adapter.get_info().name, adapter.get_info().backend);
+    eprintln!(
+        "[viewport] adapter='{}' backend={:?}",
+        adapter.get_info().name,
+        adapter.get_info().backend
+    );
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("viewport"),
@@ -132,7 +138,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         .expect("device");
 
     let caps = surface.get_capabilities(&adapter);
-    let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+    let format = caps
+        .formats
+        .iter()
+        .copied()
+        .find(|f| !f.is_srgb())
+        .unwrap_or(caps.formats[0]);
     let mut config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
@@ -167,20 +178,36 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
 
     let cam_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("cam-bgl"),
-        entries: &[bgl_entry(0, wgpu::ShaderStages::VERTEX, wgpu::BufferBindingType::Uniform)],
+        entries: &[bgl_entry(
+            0,
+            wgpu::ShaderStages::VERTEX,
+            wgpu::BufferBindingType::Uniform,
+        )],
     });
     let inst_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("inst-bgl"),
-        entries: &[bgl_entry(0, wgpu::ShaderStages::VERTEX, wgpu::BufferBindingType::Storage { read_only: true })],
+        entries: &[bgl_entry(
+            0,
+            wgpu::ShaderStages::VERTEX,
+            wgpu::BufferBindingType::Storage { read_only: true },
+        )],
     });
     let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("cam-bg"),
         layout: &cam_bgl,
-        entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() }],
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: camera_buf.as_entire_binding(),
+        }],
     });
     let mut inst_bg = make_inst_bg(&device, &inst_bgl, &instance_buf);
 
-    let index_buf = create_init_buffer(&device, "cube-idx", bytemuck::cast_slice(&CUBE_INDICES), wgpu::BufferUsages::INDEX);
+    let index_buf = create_init_buffer(
+        &device,
+        "cube-idx",
+        bytemuck::cast_slice(&CUBE_INDICES),
+        wgpu::BufferUsages::INDEX,
+    );
 
     let depth_state = wgpu::DepthStencilState {
         format: wgpu::TextureFormat::Depth32Float,
@@ -194,13 +221,33 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         bind_group_layouts: &[Some(&cam_bgl), Some(&inst_bgl)],
         immediate_size: 0,
     });
-    let cube_pipeline = make_pipeline(&device, &shader, &cube_layout, format, &depth_state, "vs_cube", wgpu::PrimitiveTopology::TriangleList, Some(wgpu::Face::Back), "cube");
+    let cube_pipeline = make_pipeline(
+        &device,
+        &shader,
+        &cube_layout,
+        format,
+        &depth_state,
+        "vs_cube",
+        wgpu::PrimitiveTopology::TriangleList,
+        Some(wgpu::Face::Back),
+        "cube",
+    );
     let grid_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("grid-layout"),
         bind_group_layouts: &[Some(&cam_bgl)],
         immediate_size: 0,
     });
-    let grid_pipeline = make_pipeline(&device, &shader, &grid_layout, format, &depth_state, "vs_grid", wgpu::PrimitiveTopology::LineList, None, "grid");
+    let grid_pipeline = make_pipeline(
+        &device,
+        &shader,
+        &grid_layout,
+        format,
+        &depth_state,
+        "vs_grid",
+        wgpu::PrimitiveTopology::LineList,
+        None,
+        "grid",
+    );
 
     eprintln!("[viewport] render loop started");
     let mut cur_rev = u64::MAX;
@@ -225,8 +272,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             }
         }
 
-        // read shared state; re-upload instances on revision change; service a pick request
-        let (cam, do_pick) = {
+        // read shared state; re-upload instances on revision change (picking is NOT serviced here —
+        // it's done synchronously in the viewport_pick command, decoupled from the frame cadence)
+        let cam = {
             let mut st = shared.lock().unwrap();
             if st.distance == 0.0 {
                 st.distance = 60.0;
@@ -269,23 +317,19 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 }
             }
             let aspect = w as f32 / h.max(1) as f32;
-            let cam = camera_matrix(st.orbit, st.elevation, st.distance, aspect);
-            let pick = st.pick_request;
-            st.pick_request = false;
-            (cam, pick)
+            camera_matrix(st.orbit, st.elevation, st.distance, aspect)
         };
-        queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&Camera { view_proj: cam.to_cols_array_2d() }));
-
-        if do_pick {
-            // CPU ray-pick against instance spheres — stays in Rust (invariant 4). Result back to app.
-            let hit = pick_nearest(&shared, &cam);
-            let mut st = shared.lock().unwrap();
-            st.picked = hit;
-            st.pick_done = true; // signal completion (Some=hit, None=miss) so the app stops polling
-        }
+        queue.write_buffer(
+            &camera_buf,
+            0,
+            bytemuck::bytes_of(&Camera {
+                view_proj: cam.to_cols_array_2d(),
+            }),
+        );
 
         let frame = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 surface.configure(&device, &config);
                 continue;
@@ -295,8 +339,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 continue;
             }
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
@@ -304,11 +351,22 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     view: &view,
                     resolve_target: None,
                     depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.04, g: 0.05, b: 0.08, a: 1.0 }), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.04,
+                            g: 0.05,
+                            b: 0.08,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
@@ -353,48 +411,77 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     }
 }
 
-fn camera_matrix(orbit: f32, elevation: f32, distance: f32, aspect: f32) -> Mat4 {
-    let eye = Vec3::new(orbit.cos() * distance * elevation.cos(), distance * elevation.sin(), orbit.sin() * distance * elevation.cos());
+#[must_use]
+pub fn camera_matrix(orbit: f32, elevation: f32, distance: f32, aspect: f32) -> Mat4 {
+    let eye = Vec3::new(
+        orbit.cos() * distance * elevation.cos(),
+        distance * elevation.sin(),
+        orbit.sin() * distance * elevation.cos(),
+    );
     let proj = Mat4::perspective_rh(55f32.to_radians(), aspect, 0.1, distance * 8.0 + 100.0);
     proj * Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y)
 }
 
-/// CPU ray-pick: unproject the cursor to a world ray, return the nearest instance whose bounding
-/// sphere it hits. Pure Rust — the hot picking path never touches JS (invariant 4).
-fn pick_nearest(shared: &Shared, view_proj: &Mat4) -> Option<usize> {
-    let st = shared.lock().unwrap();
-    // Cursor is a normalized [0,1] window fraction (set by the app from the click); map straight to
-    // NDC. No DPI/physical-pixel coupling, so picking is correct at any display scaling.
-    let (nx, ny) = st.cursor;
+/// Pick the instance nearest the click in screen space — a pure function over the instance list +
+/// camera, so the `viewport_pick` command can run it synchronously (no render-loop round-trip, no
+/// frame-cadence race). `cursor` is a normalized [0,1] window fraction (DPI/offset-free). Returns the
+/// hit index (or `None` only if there are no instances) + a diagnostic string.
+#[must_use]
+pub fn pick_nearest(
+    instances: &[Instance],
+    cursor: (f32, f32),
+    view_proj: &Mat4,
+) -> (Option<usize>, String) {
+    let (nx, ny) = cursor;
     let click_x = nx * 2.0 - 1.0;
     let click_y = 1.0 - ny * 2.0;
-    // Screen-space pick: project each instance centre to NDC and select the one NEAREST the click —
-    // no tolerance, so a click always selects the closest cube (intuitive in a dense cloud, immune to
-    // the ray-vs-sphere gap problem AND to clicking a big cube's face far from its centre). In-front
-    // test uses ndc.z ∈ [0,1] (wgpu depth) so it's robust to the clip.w sign convention.
-    let mut best: Option<(usize, f32)> = None; // (index, screen_dist²)
-    for (i, inst) in st.instances.iter().enumerate() {
+    // Screen-space pick: project each instance centre to NDC and select the one NEAREST the click — no
+    // tolerance, so a click always selects the closest cube (immune to the ray-vs-sphere gap problem
+    // AND to clicking a big cube's face far from its centre). `best` requires ndc.z ∈ [0,1] (in front);
+    // `best_nc` ignores that (fallback) so a wrong depth convention can never make picking return None.
+    let n = instances.len();
+    let (mut in_front, mut nan) = (0u32, 0u32);
+    let mut best: Option<(usize, f32)> = None; // in-front nearest
+    let mut best_nc: Option<(usize, f32)> = None; // nearest ignoring the depth cull
+    for (i, inst) in instances.iter().enumerate() {
         let clip = *view_proj * Vec3::from(inst.center).extend(1.0);
         if clip.w.abs() < 1e-6 {
             continue;
         }
         let ndc = clip.truncate() / clip.w;
-        if !(0.0..=1.0).contains(&ndc.z) {
-            continue; // behind the camera / outside the depth frustum
+        if ndc.x.is_nan() || ndc.y.is_nan() {
+            nan += 1;
+            continue;
         }
         let d2 = (ndc.x - click_x).powi(2) + (ndc.y - click_y).powi(2);
-        if best.is_none_or(|(_, bd)| d2 < bd) {
-            best = Some((i, d2));
+        if best_nc.is_none_or(|(_, bd)| d2 < bd) {
+            best_nc = Some((i, d2));
+        }
+        if (0.0..=1.0).contains(&ndc.z) {
+            in_front += 1;
+            if best.is_none_or(|(_, bd)| d2 < bd) {
+                best = Some((i, d2));
+            }
         }
     }
-    best.map(|(i, _)| i)
+    let pick = best.or(best_nc); // prefer in-front; fall back so the cull can never zero out picking
+    let dbg = format!(
+        "n={n} infront={in_front} nan={nan} click=({click_x:.3},{click_y:.3}) culled={:?} nocull={:?}",
+        best.map(|(_, d)| d),
+        best_nc.map(|(_, d)| d)
+    );
+    (pick.map(|(i, _)| i), dbg)
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
-            size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -405,24 +492,48 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
         .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-fn make_inst_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, buf: &wgpu::Buffer) -> wgpu::BindGroup {
+fn make_inst_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buf: &wgpu::Buffer,
+) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("inst-bg"),
         layout,
-        entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buf.as_entire_binding(),
+        }],
     })
 }
 
-fn create_init_buffer(device: &wgpu::Device, label: &str, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+fn create_init_buffer(
+    device: &wgpu::Device,
+    label: &str,
+    data: &[u8],
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: data, usage })
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: data,
+        usage,
+    })
 }
 
-fn bgl_entry(binding: u32, vis: wgpu::ShaderStages, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
+fn bgl_entry(
+    binding: u32,
+    vis: wgpu::ShaderStages,
+    ty: wgpu::BufferBindingType,
+) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: vis,
-        ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+        ty: wgpu::BindingType::Buffer {
+            ty,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
         count: None,
     }
 }
@@ -441,9 +552,23 @@ fn make_pipeline(
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
-        vertex: wgpu::VertexState { module: shader, entry_point: Some(vs), buffers: &[], compilation_options: Default::default() },
-        fragment: Some(wgpu::FragmentState { module: shader, entry_point: Some("fs_main"), targets: &[Some(format.into())], compilation_options: Default::default() }),
-        primitive: wgpu::PrimitiveState { topology, cull_mode: cull, ..Default::default() },
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(vs),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(format.into())],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology,
+            cull_mode: cull,
+            ..Default::default()
+        },
         depth_stencil: Some(depth.clone()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
