@@ -217,6 +217,34 @@ pub fn project_full<W: World>(engine: &Engine<W>) -> ProjectionDelta {
     }
 }
 
+/// Project a **single** entity into a delta — an `upsert` + one `setField` per component field. The
+/// targeted echo for a newly-created entity (e.g. M3.2 describe-to-create), so the editor learns the
+/// new entity without re-projecting the whole scene (deltas only, invariant 2).
+pub fn project_entity<W: World>(engine: &Engine<W>, id: EntityId) -> ProjectionDelta {
+    let key = id.to_loro_key();
+    let parent = engine.parent_of(id).map(|p| p.to_loro_key());
+    let mut ops = vec![ProjectionOp::Upsert {
+        id: key.clone(),
+        name: Some(key.clone()),
+        parent_id: Some(parent),
+    }];
+    for (component, fields) in engine.components_of(id) {
+        for (field, value) in fields {
+            ops.push(ProjectionOp::SetField {
+                id: key.clone(),
+                component: component.clone(),
+                field,
+                value: field_to_json(&value),
+            });
+        }
+    }
+    ProjectionDelta {
+        ops,
+        confirms: vec![],
+        rejects: vec![],
+    }
+}
+
 fn field_to_json(v: &FieldValue) -> Json {
     match v {
         FieldValue::Integer(i) => Json::from(*i),

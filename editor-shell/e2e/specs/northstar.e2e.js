@@ -79,4 +79,31 @@ describe("Metrocalk editor — north-star #1 live", () => {
     });
     expect(await $("#status").getText()).toContain("edit");
   });
+
+  // ── north-star test #2: describe-to-create (live) ──────────────────────────────────────────────
+  it("describes a component into existence and offers its attach", async () => {
+    await $("#describe").setValue("health bar");
+    await $("#describeBtn").click();
+    await browser.waitUntil(async () => (await $("#status").getText()).includes("created"), {
+      timeout: 10000,
+      timeoutMsg: "no 'created' status after describe",
+    });
+    expect(await $("#status").getText()).toContain("HealthBar"); // resolved to the right kind
+    // the created HealthBar is selected → its reveal panel offers Health providers to attach (≤2 total)
+    await browser.waitUntil(async () => (await $("#reveal").getText()).includes("requires"), {
+      timeout: 10000,
+      timeoutMsg: "the described entity's attach panel never populated",
+    });
+    expect(await $("#reveal").getText()).toContain("Health");
+  });
+
+  it("a no-local-match describe falls through to the marketplace seam (never fakes it)", async () => {
+    await $("#describe").setValue("rusty medieval sword");
+    await $("#describeBtn").click();
+    await browser.waitUntil(async () => (await $("#status").getText()).includes("marketplace"), {
+      timeout: 10000,
+      timeoutMsg: "no marketplace seam on a no-local-match describe",
+    });
+    expect(await $("#status").getText()).toContain("no local match");
+  });
 });

@@ -36,6 +36,11 @@
         <h3>metrocalk · editor (M2.6)</h3>
         <div style="padding:0 12px 6px;opacity:.6" id="count">connecting…</div>
         <button id="undo">⟲ Undo (Ctrl-Z)</button>
+        <h3>Describe to create</h3>
+        <div style="padding:0 12px 6px;display:flex;gap:6px">
+          <input id="describe" placeholder="e.g. health bar" style="flex:1" />
+          <button id="describeBtn" style="margin:0;padding:3px 10px">Create</button>
+        </div>
         <h3>Requirers — click one to bind</h3>
         <div id="requirers" style="padding:0 12px 6px;opacity:.6">scanning…</div>
         <h3>Inspector</h3>
@@ -182,6 +187,22 @@
         const r = $("reject"); r.textContent = "✕ rejected — " + reason; r.style.display = "block";
         setTimeout(() => (r.style.display = "none"), 4000);
       }
+
+      // Describe-to-create (north-star test #2): free text → the core resolves it locally + drops in a
+      // pre-componentized entity (one undoable transaction), then selects it so its attach targets reveal.
+      async function doDescribe() {
+        const q = $("describe").value.trim();
+        if (!q) return;
+        const r = await invoke("describe", { query: q });
+        if (r.created) {
+          status("created " + r.kind + " · " + r.created);
+          setTimeout(() => select(r.created), 60); // let the echoed delta land in the store, then focus it
+        } else {
+          status('no local match for "' + q + '" — would query ' + (r.seam || "marketplace"));
+        }
+      }
+      $("describeBtn").onclick = doDescribe;
+      $("describe").addEventListener("keydown", (e) => { if (e.key === "Enter") doDescribe(); });
 
       // Viewport input (invariant 4: the hot path stays in Rust).
       //  • LEFT click → native ray-pick. Send a NORMALIZED [0,1] window fraction (not pixels), so

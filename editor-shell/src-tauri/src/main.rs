@@ -23,7 +23,8 @@ use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_ecs::{Entity, FlecsWorld};
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
 use metrocalk_editor_shell::{
-    apply_edit, capscene, project_full, CapScene, EditIntent, EditTx, Log, ProjectionDelta, Record,
+    apply_edit, capscene, project_entity, project_full, CapScene, EditIntent, EditTx, Log,
+    ProjectionDelta, Record,
 };
 use render::{Instance, SceneState, Shared};
 use serde::Serialize;
@@ -67,6 +68,16 @@ struct RevealResponse {
     bound: Vec<Bound>,
 }
 
+/// The describe-to-create result (M3.2): the created entity + kind on a local match, or the seam tier
+/// ("marketplace") on an honest no-match.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct DescribeResponse {
+    created: Option<String>,
+    kind: Option<String>,
+    seam: Option<String>,
+}
+
 /// Commands to the engine thread (which owns the `!Send` Engine).
 enum EngineCmd {
     Connect(Channel<ProjectionDelta>),
@@ -81,6 +92,11 @@ enum EngineCmd {
     Bind {
         from: String,
         to: String,
+    },
+    /// Describe-to-create (M3.2): resolve a free-text query + instantiate the top local match.
+    Describe {
+        query: String,
+        reply: Sender<DescribeResponse>,
     },
 }
 
@@ -210,6 +226,37 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                         rebuild(&engine, &shared, &mut positions);
                     }
                 }
+            }
+            EngineCmd::Describe { query, reply } => {
+                // resolve + instantiate the top local match (one undoable transaction); honest
+                // no-match → the marketplace seam (never on the happy path).
+                let resp = match capscene::describe_create(&mut engine, &scene, &query, [0.0; 3]) {
+                    Some((id, kind)) => {
+                        log.append(&Record::Describe {
+                            query: query.clone(),
+                            pos: [0.0; 3],
+                        });
+                        if let Some(e) = engine.ecs_entity(id) {
+                            touch += 1;
+                            recency.insert(e, touch);
+                        }
+                        if let Some(ch) = &channel {
+                            let _ = ch.send(project_entity(&engine, id)); // targeted echo (inv. 2)
+                        }
+                        rebuild(&engine, &shared, &mut positions);
+                        DescribeResponse {
+                            created: Some(id.to_loro_key()),
+                            kind: Some(kind),
+                            seam: None,
+                        }
+                    }
+                    None => DescribeResponse {
+                        created: None,
+                        kind: None,
+                        seam: Some("marketplace".into()),
+                    },
+                };
+                let _ = reply.send(resp);
             }
         }
     }
@@ -431,6 +478,18 @@ fn bind_target(state: State<AppState>, from: String, to: String) {
     let _ = state.tx.send(EngineCmd::Bind { from, to });
 }
 
+/// Describe-to-create (M3.2): resolve a free-text query + instantiate the top local match. Blocks
+/// briefly on the engine thread's reply.
+#[tauri::command]
+fn describe(state: State<AppState>, query: String) -> DescribeResponse {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Describe { query, reply }).is_err() {
+        return DescribeResponse::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 /// Begin a right-drag orbit. The render loop then polls the cursor and orbits natively — **zero IPC
 /// per frame** (invariant 4); only this call and `drag_end` cross the boundary, once per gesture.
 #[tauri::command]
@@ -520,6 +579,7 @@ fn main() {
             undo,
             reveal_targets,
             bind_target,
+            describe,
             drag_start,
             drag_end,
             zoom,
