@@ -368,25 +368,23 @@ fn pick_nearest(shared: &Shared, view_proj: &Mat4) -> Option<usize> {
     let (nx, ny) = st.cursor;
     let click_x = nx * 2.0 - 1.0;
     let click_y = 1.0 - ny * 2.0;
-    // Screen-space pick: project each instance centre to NDC and take the FRONTMOST whose projection
-    // falls within a small tolerance of the click. This is robust where a 3D ray-vs-sphere test fails
-    // — a dense cloud looks solid (cubes overlap in screen space) but the ray threads the gaps between
-    // bounding spheres. Tolerance ≈ 5% of the half-NDC extent; frontmost (min depth) wins ties so you
-    // select the cube you actually see on top.
-    const TOL2: f32 = 0.05 * 0.05;
-    let mut best: Option<(usize, f32)> = None; // (index, depth)
+    // Screen-space pick: project each instance centre to NDC and select the one NEAREST the click —
+    // no tolerance, so a click always selects the closest cube (intuitive in a dense cloud, immune to
+    // the ray-vs-sphere gap problem AND to clicking a big cube's face far from its centre). In-front
+    // test uses ndc.z ∈ [0,1] (wgpu depth) so it's robust to the clip.w sign convention.
+    let mut best: Option<(usize, f32)> = None; // (index, screen_dist²)
     for (i, inst) in st.instances.iter().enumerate() {
         let clip = *view_proj * Vec3::from(inst.center).extend(1.0);
-        if clip.w <= 0.0 {
-            continue; // behind the camera
-        }
-        let ndc = clip.truncate() / clip.w;
-        let d2 = (ndc.x - click_x).powi(2) + (ndc.y - click_y).powi(2);
-        if d2 > TOL2 {
+        if clip.w.abs() < 1e-6 {
             continue;
         }
-        if best.is_none_or(|(_, bd)| ndc.z < bd) {
-            best = Some((i, ndc.z));
+        let ndc = clip.truncate() / clip.w;
+        if !(0.0..=1.0).contains(&ndc.z) {
+            continue; // behind the camera / outside the depth frustum
+        }
+        let d2 = (ndc.x - click_x).powi(2) + (ndc.y - click_y).powi(2);
+        if best.is_none_or(|(_, bd)| d2 < bd) {
+            best = Some((i, d2));
         }
     }
     best.map(|(i, _)| i)
