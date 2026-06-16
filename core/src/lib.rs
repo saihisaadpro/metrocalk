@@ -19,6 +19,7 @@ pub mod merge;
 pub mod pipeline;
 pub mod producer;
 pub mod registry;
+pub mod resolve;
 pub mod stdlib;
 pub mod undo;
 
@@ -27,6 +28,7 @@ pub use merge::MergeReport;
 pub use pipeline::{Engine, FieldValue, Op, PipelineError};
 pub use producer::ProducerHook;
 pub use registry::{Builder, ComponentMeta, FieldSpec, FieldType, Registry, RegistryError};
+pub use resolve::{resolve_local, Match, NextTier, Resolution};
 
 /// Engine identifier — one constant shared by downstream crates, logs, and file headers.
 pub const ENGINE_NAME: &str = "metrocalk";
