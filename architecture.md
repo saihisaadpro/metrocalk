@@ -86,6 +86,12 @@ The `World` trait is the backend-agnostic relational-query surface (pair-match /
 preset through the wrapper — north-star test #1; ~776× runner headroom; calibration in
 `tools/query-gate/README.md`).
 
+**Real-`.exe` E2E** (`editor-shell/e2e/`, WebdriverIO + `tauri-driver`, run locally — not in CI as it
+needs the GUI/WebView2 + a matched `msedgedriver`): drives the packaged app's WebView2 DOM, including
+the transparent viewport `<div>` whose clicks fire the native pick, so **north-star test #1's full live
+round-trip is machine-verified** (launch→connect→reveal→bind→undo→viewport-pick→edit; 7/7). Setup +
+the run-via-`node` gotcha (the repo path's ` & ` breaks npm's shim) in `editor-shell/e2e/README.md`.
+
 ## Open questions (gated, not debated)
 
 Resolved at the M0 gate review (2026-06-13) — kept here struck-through for traceability:
