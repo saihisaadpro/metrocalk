@@ -32,7 +32,9 @@
 3. It arrives **pre-componentized** (`Equippable` + `Pickupable` + `DamageSource`); the engine offers to attach it to the character's hand socket. One click.
 4. Press Play → it's pick-up-able / in hand.
 
-**Pass:** ☐ description → working pick-up-able object in minutes ☐ local/marketplace instant & offline; generation only as last resort ☐ arrives as a working object, not dead geometry ☐ one undoable transaction ☐ survives reload.
+**Pass:** ◐ description → working *object* (pick-up-able = runtime-gated) ☑ local instant & offline; generation only as last resort (seamed) ☑ arrives as a working object, not dead geometry ☑ one undoable transaction ☑ survives reload.
+
+> **Status (M3.2, 2026-06-16).** *The local describe-to-create loop is real + machine-verified.* `core/src/resolve.rs` (ADR-012) resolves a description over the curated stdlib **offline** (p50 ~35 µs / p99 ~85 µs, ≥2 release runs) → `editor-shell` instantiates a **pre-componentized working object** (real capability pairs, not dead geometry) through the commit pipeline as **one undoable transaction** → the M3.1 reveal offers a **one-click attach** (≤2 interactions) → it **survives reload** (replay-log, ADR-013). **Proven headless** (`editor-shell/tests/north_star_2.rs`) and **live in the .exe** (E2E 9/9: describe→create+attach; no-match→marketplace seam). Marketplace + generate are **documented seams, never on the happy path** (an honest no-match beats a wrong match). **Gated (flagged, not faked):** "pick-up-able / Press Play" (no runtime/Play mode yet) and "real mesh streams in" (no asset/text-to-3D tier) — the asset + runtime tiers these seams were built for. `wasm` parity: the resolver is pure metadata (no Flecs/Loro) so it's wasm-portable by design, but lives in native-only `/core` today — full browser run awaits the Phase-2 browser backend (ADR-006).
 
 ---
 
