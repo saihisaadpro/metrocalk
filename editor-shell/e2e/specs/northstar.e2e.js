@@ -62,12 +62,7 @@ describe("Metrocalk editor — north-star #1 live", () => {
       timeoutMsg: "no 'picked' status after a viewport click (pick not serviced?)",
     });
     const status = await $("#status").getText();
-    // Pull the native pick diagnostics so a miss tells us WHY (instances / in-front / distances).
-    const dbg = await browser.executeAsync((done) =>
-      window.__TAURI__.core.invoke("pick_debug").then(done),
-    );
     const inspector = await $("#inspector").getText();
-    console.log("PICK DEBUG →", dbg, "| status:", status, "| inspector:", JSON.stringify(inspector));
     expect(status).toContain("picked"); // a click in the cube cloud must select something
     expect(status).not.toContain("nothing here");
     expect(inspector).toContain("Transform");

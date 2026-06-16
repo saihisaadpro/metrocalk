@@ -23,7 +23,7 @@ use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_ecs::{Entity, FlecsWorld};
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
 use metrocalk_editor_shell::{
-    apply_edit, capscene, project_full, CapScene, EditTx, Log, ProjectionDelta, Record,
+    apply_edit, capscene, project_full, CapScene, EditIntent, EditTx, Log, ProjectionDelta, Record,
 };
 use render::{Instance, SceneState, Shared};
 use serde::Serialize;
@@ -134,6 +134,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
     let mut positions: HashMap<Entity, [f32; 3]> = HashMap::new();
     rebuild(&engine, &shared, &mut positions);
     let mut channel: Option<Channel<ProjectionDelta>> = None;
+    // Last-touched sequence per entity (higher = more recent) — the reveal's recency ranking signal,
+    // bumped on every committed edit/bind so it's live, not inert.
+    let mut recency: HashMap<Entity, u64> = HashMap::new();
+    let mut touch: u64 = 0;
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -148,6 +152,14 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                     let _ = ch.send(delta);
                 }
                 if ok {
+                    // bump recency for the edited entity (SetField.id / Bind.from)
+                    let (EditIntent::SetField { id, .. } | EditIntent::Bind { from: id, .. }) =
+                        &tx.intent;
+                    if let Some(e) = EntityId::from_loro_key(id).and_then(|x| engine.ecs_entity(x))
+                    {
+                        touch += 1;
+                        recency.insert(e, touch);
+                    }
                     log.append(&Record::Edit(tx)); // persist the committed edit
                 }
                 rebuild(&engine, &shared, &mut positions);
@@ -163,7 +175,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
             }
             EngineCmd::Reveal { id, reply } => {
                 let resp = EntityId::from_loro_key(&id)
-                    .map(|eid| compute_reveal(&engine, &scene, &positions, eid))
+                    .map(|eid| compute_reveal(&engine, &scene, &positions, &recency, eid))
                     .unwrap_or_default();
                 let _ = reply.send(resp);
             }
@@ -172,6 +184,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                     (EntityId::from_loro_key(&from), EntityId::from_loro_key(&to))
                 {
                     if capscene::bind(&mut engine, &scene, f, t).is_ok() {
+                        // bump recency for both endpoints of the bind
+                        for id in [f, t] {
+                            if let Some(e) = engine.ecs_entity(id) {
+                                touch += 1;
+                                recency.insert(e, touch);
+                            }
+                        }
                         log.append(&Record::Bind {
                             from: from.clone(),
                             to: to.clone(),
@@ -204,16 +223,16 @@ fn compute_reveal(
     engine: &Engine<FlecsWorld>,
     scene: &CapScene,
     positions: &HashMap<Entity, [f32; 3]>,
+    recency: &HashMap<Entity, u64>,
     eid: EntityId,
 ) -> RevealResponse {
     let Some(sel_ecs) = engine.ecs_entity(eid) else {
         return RevealResponse::default();
     };
-    let recency = HashMap::new();
     let ctx = Context {
         cap_name: &scene.cap_name,
         position: positions,
-        recency: &recency,
+        recency,
     };
     let r = reveal(engine.world(), sel_ecs, scene.rels, &ctx);
 
@@ -437,13 +456,6 @@ fn zoom(state: State<AppState>, delta: f32) {
     state.shared.lock().unwrap().zoom_delta += delta;
 }
 
-/// Diagnostics for the last serviced viewport pick (instance count, in-front count, nearest screen
-/// distances). Used by the E2E to see *why* a pick hit or missed.
-#[tauri::command]
-fn pick_debug(state: State<AppState>) -> String {
-    state.shared.lock().unwrap().pick_dbg.clone()
-}
-
 /// Pick in the viewport (Rust — invariant 4). `x`/`y` are a normalized [0,1] window fraction
 /// (DPI/offset-free), not pixels. Computed **synchronously** here — a pure projection over the current
 /// instances + camera — so it never races the render loop's frame cadence (the bug a hidden/throttled
@@ -466,8 +478,7 @@ fn viewport_pick(
         st.elevation = 0.4;
     }
     let cam = render::camera_matrix(st.orbit, st.elevation, st.distance, aspect);
-    let (hit, dbg) = render::pick_nearest(&st.instances, (x, y), &cam);
-    st.pick_dbg = dbg;
+    let hit = render::pick_nearest(&st.instances, (x, y), &cam);
     // update the highlight
     if let Some(p) = st.selected {
         if p < st.instances.len() {
@@ -512,7 +523,6 @@ fn main() {
             drag_start,
             drag_end,
             zoom,
-            pick_debug,
             viewport_pick
         ])
         .run(tauri::generate_context!())

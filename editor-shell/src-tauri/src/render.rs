@@ -51,11 +51,6 @@ pub struct SceneState {
     pub drag_last: Option<(f64, f64)>,
     /// Pending wheel-zoom to fold into `distance` (one command per wheel tick, not per frame).
     pub zoom_delta: f32,
-    /// Diagnostic string for the last pick (instance count, in-front count, nearest dist) — read by
-    /// the `pick_debug` command / E2E. Picking itself is done synchronously in the `viewport_pick`
-    /// command (pure function over these instances + the camera), NOT serviced by the render loop, so
-    /// it never races the frame cadence.
-    pub pick_dbg: String,
 }
 
 pub type Shared = Arc<Mutex<SceneState>>;
@@ -423,24 +418,17 @@ pub fn camera_matrix(orbit: f32, elevation: f32, distance: f32, aspect: f32) -> 
 }
 
 /// Pick the instance nearest the click in screen space — a pure function over the instance list +
-/// camera, so the `viewport_pick` command can run it synchronously (no render-loop round-trip, no
-/// frame-cadence race). `cursor` is a normalized [0,1] window fraction (DPI/offset-free). Returns the
-/// hit index (or `None` only if there are no instances) + a diagnostic string.
+/// camera, so the `viewport_pick` command runs it synchronously (no render-loop round-trip, no
+/// frame-cadence race — the bug a hidden/throttled window exposed). `cursor` is a normalized [0,1]
+/// window fraction (DPI/offset-free). No tolerance, so a click always selects the closest cube
+/// (immune to the ray-vs-sphere gap problem AND to clicking a big cube's face far from its centre).
+/// `best` prefers cubes in front (ndc.z ∈ [0,1], wgpu depth); `best_nc` is the fallback so a depth/`w`
+/// sign convention can never make picking return `None`. `None` only when there are no instances.
 #[must_use]
-pub fn pick_nearest(
-    instances: &[Instance],
-    cursor: (f32, f32),
-    view_proj: &Mat4,
-) -> (Option<usize>, String) {
+pub fn pick_nearest(instances: &[Instance], cursor: (f32, f32), view_proj: &Mat4) -> Option<usize> {
     let (nx, ny) = cursor;
     let click_x = nx * 2.0 - 1.0;
     let click_y = 1.0 - ny * 2.0;
-    // Screen-space pick: project each instance centre to NDC and select the one NEAREST the click — no
-    // tolerance, so a click always selects the closest cube (immune to the ray-vs-sphere gap problem
-    // AND to clicking a big cube's face far from its centre). `best` requires ndc.z ∈ [0,1] (in front);
-    // `best_nc` ignores that (fallback) so a wrong depth convention can never make picking return None.
-    let n = instances.len();
-    let (mut in_front, mut nan) = (0u32, 0u32);
     let mut best: Option<(usize, f32)> = None; // in-front nearest
     let mut best_nc: Option<(usize, f32)> = None; // nearest ignoring the depth cull
     for (i, inst) in instances.iter().enumerate() {
@@ -450,27 +438,17 @@ pub fn pick_nearest(
         }
         let ndc = clip.truncate() / clip.w;
         if ndc.x.is_nan() || ndc.y.is_nan() {
-            nan += 1;
             continue;
         }
         let d2 = (ndc.x - click_x).powi(2) + (ndc.y - click_y).powi(2);
         if best_nc.is_none_or(|(_, bd)| d2 < bd) {
             best_nc = Some((i, d2));
         }
-        if (0.0..=1.0).contains(&ndc.z) {
-            in_front += 1;
-            if best.is_none_or(|(_, bd)| d2 < bd) {
-                best = Some((i, d2));
-            }
+        if (0.0..=1.0).contains(&ndc.z) && best.is_none_or(|(_, bd)| d2 < bd) {
+            best = Some((i, d2));
         }
     }
-    let pick = best.or(best_nc); // prefer in-front; fall back so the cull can never zero out picking
-    let dbg = format!(
-        "n={n} infront={in_front} nan={nan} click=({click_x:.3},{click_y:.3}) culled={:?} nocull={:?}",
-        best.map(|(_, d)| d),
-        best_nc.map(|(_, d)| d)
-    );
-    (pick.map(|(i, _)| i), dbg)
+    best.or(best_nc).map(|(i, _)| i)
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
