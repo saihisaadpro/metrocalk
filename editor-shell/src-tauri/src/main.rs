@@ -27,7 +27,7 @@ use metrocalk_editor_shell::{
     ProjectionDelta, Record,
 };
 use render::{Instance, SceneState, Shared};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{Manager, State};
 
@@ -110,11 +110,100 @@ struct AppState {
 /// The persistence log path — next to the executable, so it's stable across launches of the same
 /// build (close→reopen restores). Falls back to the working dir if the exe path is unavailable.
 fn log_path() -> std::path::PathBuf {
+    sidecar("metrocalk-scene.jsonl")
+}
+
+/// A sidecar file next to the executable (stable across launches of the same build), falling back to
+/// the working dir if the exe path is unavailable. Both the scene log and the window state live here.
+fn sidecar(name: &str) -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("metrocalk-scene.jsonl")
+        .join(name)
+}
+
+/// Persisted window geometry, so the editor reopens where it was left ("open where the last instance
+/// was"). Saved by a write-on-change poll (see `setup`) — robust to a hard terminal kill, which fires
+/// no close event, and needs no prior move to establish a baseline.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+struct WinGeom {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    /// Whether the window was maximized — restored by `maximize()`, not by positioning (which would
+    /// de-maximize and clip the frame off the top-left). `#[serde(default)]` so older files still parse.
+    #[serde(default)]
+    maximized: bool,
+}
+
+fn window_state_path() -> std::path::PathBuf {
+    sidecar("metrocalk-window.json")
+}
+
+/// The window's current outer position + inner size (+ maximized flag), or `None` if unavailable or
+/// minimized (zero size) — so we never persist an invisible 0×0 to restore into.
+fn current_geom(window: &tauri::WebviewWindow) -> Option<WinGeom> {
+    let (Ok(pos), Ok(size)) = (window.outer_position(), window.inner_size()) else {
+        return None;
+    };
+    if size.width == 0 || size.height == 0 {
+        return None;
+    }
+    Some(WinGeom {
+        x: pos.x,
+        y: pos.y,
+        w: size.width,
+        h: size.height,
+        maximized: window.is_maximized().unwrap_or(false),
+    })
+}
+
+/// Write geometry to the sidecar. Best-effort.
+fn save_geom(g: &WinGeom) {
+    if let Ok(s) = serde_json::to_string(g) {
+        let _ = std::fs::write(window_state_path(), s);
+    }
+}
+
+/// Is a grab-able point on the window's title bar (just inside the saved top-left) on a currently
+/// connected monitor? Guards against restoring onto a since-disconnected / rearranged monitor
+/// (dock→undock), which would otherwise strand the only window off-screen with no reachable title bar.
+/// Fails open (returns `true`) if monitors can't be enumerated.
+fn position_on_a_monitor(window: &tauri::WebviewWindow, x: i32, y: i32) -> bool {
+    let Ok(monitors) = window.available_monitors() else {
+        return true;
+    };
+    let (px, py) = (x + 16, y + 16);
+    monitors.iter().any(|m| {
+        let p = m.position();
+        let s = m.size();
+        let mw = i32::try_from(s.width).unwrap_or(i32::MAX);
+        let mh = i32::try_from(s.height).unwrap_or(i32::MAX);
+        px >= p.x && py >= p.y && px < p.x + mw && py < p.y + mh
+    })
+}
+
+/// Restore the saved window geometry, if any. Best-effort: a missing/corrupt file leaves the configured
+/// (centered) default. A maximized window is re-maximized rather than positioned; otherwise the saved
+/// position is applied only when its title bar would land on a connected monitor (so the window can
+/// never open stranded off-screen after a monitor change).
+fn restore_window_geom(window: &tauri::WebviewWindow) {
+    let Ok(s) = std::fs::read_to_string(window_state_path()) else {
+        return;
+    };
+    let Ok(g) = serde_json::from_str::<WinGeom>(&s) else {
+        return;
+    };
+    if g.maximized {
+        let _ = window.maximize();
+        return;
+    }
+    let _ = window.set_size(tauri::PhysicalSize::new(g.w, g.h));
+    if position_on_a_monitor(window, g.x, g.y) {
+        let _ = window.set_position(tauri::PhysicalPosition::new(g.x, g.y));
+    }
 }
 
 fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
@@ -406,10 +495,23 @@ fn rebuild(
         });
         ids.push(key);
     }
+    // Tracking lines: one segment per binding, between the bound entities' centres — what makes a
+    // *restored* bind visible on reload (the engine has the binding, the viewport now draws it) with no
+    // click. Built by the pure, unit-tested `capscene::tracking_segments`; `vs_line` reads only `center`.
+    let line_points: Vec<Instance> = capscene::tracking_segments(engine)
+        .into_iter()
+        .map(|center| Instance {
+            center,
+            scale: 0.0,
+            color: TRACK_LINE_COLOR,
+            selected: 0.0,
+        })
+        .collect();
     let mut st = shared.lock().unwrap();
     let prev_sel = st.selected;
     st.instances = instances;
     st.ids = ids;
+    st.line_points = line_points;
     if let Some(i) = prev_sel {
         if i < st.instances.len() {
             st.instances[i].selected = 1.0;
@@ -419,6 +521,10 @@ fn rebuild(
     }
     st.revision = st.revision.wrapping_add(1);
 }
+
+/// The tracking-line colour (matches the panel's `#9fe` "tracking" accent). Only carried for parity;
+/// `vs_line` uses its own constant colour.
+const TRACK_LINE_COLOR: [f32; 3] = [0.60, 1.0, 0.93];
 
 #[allow(clippy::cast_precision_loss)] // hashing a key to a display color — precision is irrelevant
 fn color_for(key: &str) -> [f32; 3] {
@@ -570,6 +676,26 @@ fn main() {
         .manage(app_state)
         .setup(move |app| {
             let win = app.get_webview_window("main").expect("main window");
+            // Reopen where the editor was left, then persist the geometry on a light write-on-change
+            // poll so a hard terminal kill (no close event) still preserves it — and so there's always
+            // a baseline even if the window is never moved. ~1s granularity, a tiny sidecar write only
+            // when the window actually moved/resized.
+            restore_window_geom(&win);
+            {
+                let w = win.clone();
+                std::thread::spawn(move || {
+                    let mut last: Option<WinGeom> = None;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                        if let Some(g) = current_geom(&w) {
+                            if last != Some(g) {
+                                save_geom(&g);
+                                last = Some(g);
+                            }
+                        }
+                    }
+                });
+            }
             render::start(win, shared.clone());
             Ok(())
         })

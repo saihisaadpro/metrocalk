@@ -4,7 +4,8 @@
   "type": "module",
   "description": "Real-.exe E2E for the Metrocalk editor shell via WebdriverIO + tauri-driver (drives the WebView2 DOM, incl. the transparent viewport div → native pick round-trip).",
   "scripts": {
-    "test": "wdio run wdio.conf.js"
+    "test": "wdio run wdio.conf.js",
+    "test:reload": "wdio run wdio.reload.conf.js"
   },
   "devDependencies": {
     "@wdio/cli": "^9.0.0",

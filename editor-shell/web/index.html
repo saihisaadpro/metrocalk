@@ -72,6 +72,12 @@
             const e = store.get(op.id) || { name: op.id, parentId: null, components: {} };
             if (op.name != null) e.name = op.name;
             if (op.parentId !== undefined) e.parentId = op.parentId;
+            // A re-projection of an entity is authoritative for its edges: clear them so the addEdge ops
+            // in THIS delta re-establish the live set. project_full (sent on connect AND on every undo)
+            // emits all upserts before its edges, so without this the surviving edges re-append (badge
+            // says "tracking 4" for 2) and an undone edge never drops. Incremental bind echoes carry an
+            // addEdge with no upsert, so they still accumulate correctly.
+            e.edges = [];
             store.set(op.id, e);
           } else if (op.op === "remove") {
             store.delete(op.id);
@@ -85,7 +91,24 @@
         }
         for (const c of d.confirms || []) pending.delete(c);
         for (const r of d.rejects || []) { pending.delete(r.clientOpId); showReject(r.reason); }
-        renderList(); renderInspector();
+        renderList(); renderInspector(); maybeRestoreFocus();
+      }
+
+      // On the first projection that carries bindings — the connect-time project_full after a reload —
+      // auto-select the requirer tracking the most, so the user immediately sees their restored work
+      // ("tracking ✓ …") instead of an empty panel they'd have to re-find the entity to populate. Runs
+      // once, and never overrides a selection the user has already made.
+      let didRestoreFocus = false;
+      function maybeRestoreFocus() {
+        if (didRestoreFocus || selected) return;
+        const tracking = [...store.entries()]
+          .filter(([, e]) => e.components && e.components.HealthBar && (e.edges || []).length);
+        if (!tracking.length) return;
+        didRestoreFocus = true;
+        tracking.sort((a, b) => b[1].edges.length - a[1].edges.length);
+        const [id, e] = tracking[0];
+        select(id);
+        status("restored — " + id + " tracking " + e.edges.length);
       }
 
       function renderList() {
@@ -101,9 +124,18 @@
       // points for test #1. They're rare in the scene, so surface them directly: one click reveals
       // their compatible targets. Identified from the projection (entities carrying a HealthBar component).
       function renderRequirers() {
-        const reqs = [...store.entries()].filter(([, e]) => e.components && e.components.HealthBar).slice(0, 40);
+        const all = [...store.entries()].filter(([, e]) => e.components && e.components.HealthBar);
+        // Tracking requirers first, each with a "tracking N" badge — so a restored bind is always
+        // visible regardless of entity-id order (the bound HealthBar may be a high id, past the cap).
+        const trackCount = (e) => (e.edges || []).length;
+        all.sort((a, b) => trackCount(b[1]) - trackCount(a[1]));
+        const reqs = all.slice(0, 60);
         $("requirers").innerHTML = reqs.length
-          ? reqs.map(([id]) => `<div class="cand ${id===selected?'sel':''}" data-id="${id}">HealthBar · ${id}</div>`).join("")
+          ? reqs.map(([id, e]) => {
+              const n = trackCount(e);
+              const badge = n ? ` · <span style="color:#9fe">tracking ${n}</span>` : "";
+              return `<div class="cand ${id===selected?'sel':''}" data-id="${id}">HealthBar · ${id}${badge}</div>`;
+            }).join("")
           : "none found";
         for (const el of $("requirers").querySelectorAll(".cand")) el.onclick = () => select(el.dataset.id);
       }

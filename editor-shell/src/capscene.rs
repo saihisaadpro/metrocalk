@@ -282,6 +282,37 @@ pub fn positions(engine: &Engine<FlecsWorld>) -> HashMap<Entity, [f32; 3]> {
     out
 }
 
+/// The tracking-line segments for the live bindings: a flat list where each consecutive **pair** of
+/// points is one segment, between the two bound entities' `Transform` centres. This is what makes a
+/// *restored* bind visible in the viewport on reload — the shell's `rebuild` maps each point to a render
+/// instance and `vs_line` draws the segments (no click required). Kept pure over the engine so the
+/// restored-bind visualization is unit-testable without a live GPU. A binding to a non-live entity is
+/// skipped; a live entity missing a `Transform` field contributes `0.0` there (the viewport default).
+#[must_use]
+pub fn tracking_segments(engine: &Engine<FlecsWorld>) -> Vec<[f32; 3]> {
+    let pos_of = |id: EntityId| -> Option<[f32; 3]> {
+        engine.ecs_entity(id)?; // skip a binding referencing a non-live entity
+        let comps = engine.components_of(id);
+        let t = comps.get("Transform");
+        let g = |f: &str| -> f32 {
+            t.and_then(|m| m.get(f)).map_or(0.0, |v| match v {
+                FieldValue::Number(n) => *n as f32,
+                FieldValue::Integer(i) => *i as f32,
+                _ => 0.0,
+            })
+        };
+        Some([g("x"), g("y"), g("z")])
+    };
+    let mut out = Vec::new();
+    for (from, _kind, to) in engine.bindings() {
+        if let (Some(a), Some(b)) = (pos_of(from), pos_of(to)) {
+            out.push(a);
+            out.push(b);
+        }
+    }
+    out
+}
+
 /// Instantiate a resolved component KIND as a new pre-componentized scene entity — a `Transform` (so it
 /// renders) + the kind's own component (default fields) + its capability pairs (provides/requires) —
 /// all through the commit pipeline as ONE undoable transaction. This is the "working object, not dead

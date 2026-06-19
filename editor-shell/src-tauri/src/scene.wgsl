@@ -60,6 +60,18 @@ fn vs_grid(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+// Tracking lines (binding-by-intent edges, drawn between bound entity centres). Reuses the `instances`
+// storage buffer purely as a 16-byte-aligned point carrier — the line pipeline binds a *different*
+// buffer (the app's line-point list) to the same slot, and we only read `.center`. One LineList vertex
+// per array element, so consecutive pairs form one segment. A fixed tracking colour (the panel's `#9fe`).
+@vertex
+fn vs_line(@builtin(vertex_index) vi: u32) -> VsOut {
+    var out: VsOut;
+    out.pos = cam.view_proj * vec4<f32>(instances[vi].center, 1.0);
+    out.color = vec3<f32>(0.60, 1.0, 0.93);
+    return out;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color, 1.0);

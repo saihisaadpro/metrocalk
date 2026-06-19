@@ -36,6 +36,11 @@ pub struct SceneState {
     pub instances: Vec<Instance>,
     /// Entity id (Loro key) parallel to `instances` — maps a picked index back to an entity.
     pub ids: Vec<String>,
+    /// Tracking-line endpoints: each consecutive pair is one `LineList` segment drawn between two
+    /// bound entities (binding-by-intent). Reuses [`Instance`] purely as a point carrier — only
+    /// `center` is read (by `vs_line`); the other fields are ignored. Rebuilt with `instances`, so a
+    /// `revision` bump re-uploads both. Empty when nothing is bound (the line pass is skipped).
+    pub line_points: Vec<Instance>,
     /// Currently-selected instance index (drives the highlight).
     pub selected: Option<usize>,
     /// Bump when `instances` changes so the loop re-uploads the buffer.
@@ -243,6 +248,37 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         None,
         "grid",
     );
+    // Tracking lines: same layout as the cubes (cam + a storage buffer of points), LineList topology,
+    // reading `vs_line`. A separate buffer holds the line endpoints (filled from the bindings). They
+    // draw with an always-pass, no-write depth state so a binding reads as an overlay the user can
+    // actually see — never buried inside or behind the dense cube field (the centres they connect).
+    let line_depth_state = wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Always),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    };
+    let line_pipeline = make_pipeline(
+        &device,
+        &shader,
+        &cube_layout,
+        format,
+        &line_depth_state,
+        "vs_line",
+        wgpu::PrimitiveTopology::LineList,
+        None,
+        "line",
+    );
+    let mut line_cap: u64 = 256;
+    let mut line_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lines"),
+        size: line_cap * std::mem::size_of::<Instance>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut line_bg = make_inst_bg(&device, &inst_bgl, &line_buf);
+    let mut n_line: u32 = 0;
 
     eprintln!("[viewport] render loop started");
     let mut cur_rev = u64::MAX;
@@ -310,6 +346,22 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 if !st.instances.is_empty() {
                     queue.write_buffer(&instance_buf, 0, bytemuck::cast_slice(&st.instances));
                 }
+                // tracking-line endpoints (rebuilt in lock-step with instances)
+                n_line = st.line_points.len() as u32;
+                let needed_l = st.line_points.len() as u64;
+                if needed_l > line_cap {
+                    line_cap = needed_l.next_power_of_two();
+                    line_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("lines"),
+                        size: line_cap * std::mem::size_of::<Instance>() as u64,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    line_bg = make_inst_bg(&device, &inst_bgl, &line_buf);
+                }
+                if !st.line_points.is_empty() {
+                    queue.write_buffer(&line_buf, 0, bytemuck::cast_slice(&st.line_points));
+                }
             }
             let aspect = w as f32 / h.max(1) as f32;
             camera_matrix(st.orbit, st.elevation, st.distance, aspect)
@@ -376,6 +428,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.set_bind_group(1, &inst_bg, &[]);
                 rp.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint16);
                 rp.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..n_inst);
+            }
+            if n_line > 0 {
+                rp.set_pipeline(&line_pipeline);
+                rp.set_bind_group(1, &line_bg, &[]);
+                rp.draw(0..n_line, 0..1);
             }
         }
         queue.submit([enc.finish()]);
@@ -516,6 +573,9 @@ fn bgl_entry(
     }
 }
 
+// A thin builder over the wgpu pipeline descriptor — each parameter is one descriptor field, so the
+// arity is inherent (not a sign it should be split).
+#[allow(clippy::too_many_arguments)]
 fn make_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,

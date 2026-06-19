@@ -5,6 +5,19 @@ now (the deferred M2 persistence ADR) · **Builds on:** [ADR-002](002-loro-over-
 the durable mirror), the commit pipeline + `Engine::clear_history`, the M1.6 merge-drops-capabilities
 carry-forward.
 
+> **Status update (2026-06-19) — live-verified; the gap was *surfacing*, not this strategy.** A user
+> report ("binds don't survive close→reopen") was diagnosed by **measurement**, not assumption: the live
+> release shell prints `restored 14 edits (0 skipped)` and `project_full` carries the restored binding
+> edges on connect — i.e. this replay-log restores correctly through the real exe at `SCENE_N=5000`. The
+> real defect was downstream: the UI didn't **surface** the restored state on reload (no auto-selection,
+> the bound HealthBar's high id fell past the requirers cap, and the viewport drew no binding lines). The
+> persistence design here is **unchanged**; the fix was UI surfacing (panel tracking badge + auto-focus,
+> 3D viewport tracking lines) + window-position restore. The previously-noted test gap (the headless
+> `persistence.rs` exercised the `Log` only at n=500 against a temp file) is **closed**:
+> `editor-shell/tests/reload_surfacing.rs` now drives the live record stream (`Bind`/`Edit`/`Describe`/
+> `Undo`) through a real on-disk log at the shell's real `SCENE_N`, asserts the net state **and** that
+> `project_full` carries the surviving edge (the data→UI seam); a live reload E2E covers the surfacing.
+
 ## Context
 
 The live `/editor-shell` needs the scene to **survive close→reopen** (north-star test #1, box 5). The
