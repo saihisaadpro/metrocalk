@@ -19,12 +19,13 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
+use metrocalk_assets::{AssetStore, GltfImporter, MeshGpu};
 use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_ecs::{Entity, FlecsWorld};
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
 use metrocalk_editor_shell::{
     apply_edit, capscene, project_entity, project_full, CapScene, EditIntent, EditTx, Log,
-    ProjectionDelta, Record,
+    MeshCatalog, ProjectionDelta, Record,
 };
 use render::{Instance, SceneState, Shared};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,70 @@ use tauri::ipc::Channel;
 use tauri::{Manager, State};
 
 const SCENE_N: usize = 5000; // the real M1.4 stress scene (the M2 gate target)
+
+/// The checked-in demo assets — **embedded** so the packaged app has no runtime file dependency, while
+/// the importer still runs on real glTF bytes (provenance: `assets/examples/gen_fixtures.rs`).
+const HEALTHBAR_GLB: &[u8] = include_bytes!("../../assets/healthbar.glb");
+const PROP_GLB: &[u8] = include_bytes!("../../assets/prop.glb");
+
+/// The runtime asset state the engine thread owns — the import store's results turned into render data,
+/// loaded once at startup. `catalog` maps a resolved component kind → its asset handle (describe-to-
+/// create); `handle_to_slot` + `scales` turn an entity's `MeshRenderer.mesh` handle into a viewport
+/// render slot + a normalized scale; `meshes` is the slot-indexed packed geometry handed to the
+/// viewport. The asset *store* itself is dropped after packing — nothing here borrows from it.
+struct AssetsRuntime {
+    catalog: MeshCatalog,
+    handle_to_slot: HashMap<String, usize>,
+    scales: Vec<f32>,
+    meshes: Vec<MeshGpu>,
+}
+
+/// Import the embedded fixtures into a content-addressed store, build the kind→handle catalog, and pack
+/// each asset to GPU-ready geometry + a normalized render scale. Import is the one-shot heavy op
+/// (measured here, never frame-budget-gated). Slot order is per-run (the handle in the doc is the
+/// stable id; the slot is a transient render index), so a reload re-resolves handles correctly.
+fn load_assets() -> AssetsRuntime {
+    let importer = GltfImporter::new();
+    let mut store = AssetStore::new();
+    let t0 = std::time::Instant::now();
+    let healthbar = store
+        .import(&importer, HEALTHBAR_GLB)
+        .expect("import healthbar.glb");
+    let prop = store.import(&importer, PROP_GLB).expect("import prop.glb");
+    let import_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // kind → asset handle: a resolved HealthBar renders as the bar mesh; a resolved MeshRenderer as the
+    // prop. A kind absent here has no mesh → the honest placeholder-cube fallback.
+    let catalog: MeshCatalog = [
+        ("HealthBar", healthbar.as_str()),
+        ("MeshRenderer", prop.as_str()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+
+    let mut meshes = Vec::new();
+    let mut handle_to_slot = HashMap::new();
+    let mut scales = Vec::new();
+    for (id, asset) in store.iter() {
+        let slot = meshes.len();
+        meshes.push(MeshGpu::from_asset(asset));
+        let ext = asset.bounds().max_extent();
+        scales.push(if ext > 0.0 { 0.9 / ext } else { 1.0 });
+        handle_to_slot.insert(id.as_str().to_string(), slot);
+    }
+    eprintln!(
+        "[shell] imported {} mesh assets ({} verts total) in {import_ms:.3} ms (one-shot)",
+        meshes.len(),
+        meshes.iter().map(MeshGpu::vertex_count).sum::<usize>()
+    );
+    AssetsRuntime {
+        catalog,
+        handle_to_slot,
+        scales,
+        meshes,
+    }
+}
 
 /// A ranked compatible target the selection can bind to (north-star test #1).
 #[derive(Serialize, Clone)]
@@ -207,6 +272,15 @@ fn restore_window_geom(window: &tauri::WebviewWindow) {
 }
 
 fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
+    // Import the demo mesh assets once (one-shot heavy op) before seeding, so the catalog is ready for
+    // describe-to-create + replay and the viewport's geometry is published.
+    let assets = load_assets();
+    {
+        let mut st = shared.lock().unwrap();
+        st.meshes = assets.meshes.clone();
+        st.meshes_revision = st.meshes_revision.wrapping_add(1);
+    }
+
     let mut world = FlecsWorld::new();
     // Intern the capability relationships BEFORE the engine takes the world (they are metadata, like
     // the registry's own interned rels — not scene entities).
@@ -219,9 +293,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
 
     // Live persistence: re-seeding is deterministic (same SEED → identical ids), so replay the
     // append-only edit log on top to restore the user's prior binds/edits. clear_history again so the
-    // restored scene is non-undoable too (same Ctrl-Z guard as the seed).
+    // restored scene is non-undoable too (same Ctrl-Z guard as the seed). The catalog re-derives any
+    // described kind's mesh handle so a *visible* described object survives reload too.
     let log = Log::open(log_path(), capscene::fingerprint(SCENE_N));
-    let (restored, skipped) = log.replay(&mut engine, &scene);
+    let (restored, skipped) = log.replay(&mut engine, &scene, &assets.catalog);
     engine.clear_history();
     eprintln!(
         "[shell] seeded {} entities — {} HealthBars, {} unbound Health providers; restored {restored} edits ({skipped} skipped)",
@@ -237,7 +312,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
     }
 
     let mut positions: HashMap<Entity, [f32; 3]> = HashMap::new();
-    rebuild(&engine, &shared, &mut positions);
+    rebuild(&engine, &shared, &mut positions, &assets);
     let mut channel: Option<Channel<ProjectionDelta>> = None;
     // Last-touched sequence per entity (higher = more recent) — the reveal's recency ranking signal,
     // bumped on every committed edit/bind so it's live, not inert.
@@ -267,7 +342,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                     }
                     log.append(&Record::Edit(tx)); // persist the committed edit
                 }
-                rebuild(&engine, &shared, &mut positions);
+                rebuild(&engine, &shared, &mut positions, &assets);
             }
             EngineCmd::Undo => {
                 if engine.undo() {
@@ -275,7 +350,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                     if let Some(ch) = &channel {
                         let _ = ch.send(project_full(&engine)); // simplest correct post-undo sync
                     }
-                    rebuild(&engine, &shared, &mut positions);
+                    rebuild(&engine, &shared, &mut positions, &assets);
                 }
             }
             EngineCmd::Reveal { id, reply } => {
@@ -312,14 +387,20 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                                 rejects: vec![],
                             });
                         }
-                        rebuild(&engine, &shared, &mut positions);
+                        rebuild(&engine, &shared, &mut positions, &assets);
                     }
                 }
             }
             EngineCmd::Describe { query, reply } => {
                 // resolve + instantiate the top local match (one undoable transaction); honest
                 // no-match → the marketplace seam (never on the happy path).
-                let resp = match capscene::describe_create(&mut engine, &scene, &query, [0.0; 3]) {
+                let resp = match capscene::describe_create(
+                    &mut engine,
+                    &scene,
+                    &query,
+                    [0.0; 3],
+                    &assets.catalog,
+                ) {
                     Some((id, kind)) => {
                         log.append(&Record::Describe {
                             query: query.clone(),
@@ -332,7 +413,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                         if let Some(ch) = &channel {
                             let _ = ch.send(project_entity(&engine, id)); // targeted echo (inv. 2)
                         }
-                        rebuild(&engine, &shared, &mut positions);
+                        rebuild(&engine, &shared, &mut positions, &assets);
                         DescribeResponse {
                             created: Some(id.to_loro_key()),
                             kind: Some(kind),
@@ -467,10 +548,14 @@ fn rebuild(
     engine: &Engine<FlecsWorld>,
     shared: &Shared,
     positions: &mut HashMap<Entity, [f32; 3]>,
+    assets: &AssetsRuntime,
 ) {
     positions.clear();
     let mut instances = Vec::new();
     let mut ids = Vec::new();
+    // Per-instance render routing: -1 ⇒ cube placeholder, else the imported-mesh slot (parallel to
+    // `instances`). An entity with a `MeshRenderer.mesh` handle the store knows renders as that mesh.
+    let mut mesh_slots: Vec<i32> = Vec::new();
     for id in engine.entity_ids() {
         let comps = engine.components_of(id);
         let t = comps.get("Transform");
@@ -486,13 +571,23 @@ fn rebuild(
             positions.insert(e, p);
         }
         let key = id.to_loro_key();
+        // Resolve the entity's mesh handle (if any) to a render slot + normalized scale.
+        let slot = comps
+            .get("MeshRenderer")
+            .and_then(|m| m.get(capscene::MESH_FIELD))
+            .and_then(|v| match v {
+                FieldValue::Str(h) => assets.handle_to_slot.get(h).copied(),
+                _ => None,
+            });
+        let scale = slot.map_or(0.45, |s| assets.scales.get(s).copied().unwrap_or(0.45));
         let c = color_for(&key);
         instances.push(Instance {
             center: p,
-            scale: 0.45,
+            scale,
             color: c,
             selected: 0.0,
         });
+        mesh_slots.push(slot.map_or(-1, |s| i32::try_from(s).unwrap_or(-1)));
         ids.push(key);
     }
     // Tracking lines: one segment per binding, between the bound entities' centres — what makes a
@@ -511,6 +606,7 @@ fn rebuild(
     let prev_sel = st.selected;
     st.instances = instances;
     st.ids = ids;
+    st.mesh_slots = mesh_slots;
     st.line_points = line_points;
     if let Some(i) = prev_sel {
         if i < st.instances.len() {

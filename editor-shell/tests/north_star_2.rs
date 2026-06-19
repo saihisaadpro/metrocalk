@@ -22,7 +22,7 @@ use metrocalk_ecs::{Entity, FlecsWorld};
 use metrocalk_editor_shell::capscene::{self, CapScene};
 use metrocalk_editor_shell::persist::{Log, Record};
 use metrocalk_editor_shell::reveal::{reveal, Context};
-use metrocalk_editor_shell::TRACKS;
+use metrocalk_editor_shell::{MeshCatalog, TRACKS};
 
 const N: usize = 200;
 
@@ -64,8 +64,14 @@ fn describe_componentize_attach_undo() {
     let (mut e, scene) = seeded();
 
     // DESCRIBE → componentize: "health bar" resolves + instantiates a HealthBar.
-    let (bar, kind) =
-        capscene::describe_create(&mut e, &scene, "health bar", [0.0, 0.0, 0.0]).expect("resolves");
+    let (bar, kind) = capscene::describe_create(
+        &mut e,
+        &scene,
+        "health bar",
+        [0.0, 0.0, 0.0],
+        &MeshCatalog::new(),
+    )
+    .expect("resolves");
     assert_eq!(kind, "HealthBar");
 
     // A WORKING object, not dead geometry: it carries the HealthBar component AND requires Health.
@@ -104,8 +110,14 @@ fn described_creation_and_attach_survive_reload_via_replay_log() {
 
     // run A: describe + attach, each persisted to the replay-log.
     let (mut a, scene_a) = seeded();
-    let (bar, _) =
-        capscene::describe_create(&mut a, &scene_a, "health bar", [1.0, 0.0, 0.0]).unwrap();
+    let (bar, _) = capscene::describe_create(
+        &mut a,
+        &scene_a,
+        "health bar",
+        [1.0, 0.0, 0.0],
+        &MeshCatalog::new(),
+    )
+    .unwrap();
     log.append(&Record::Describe {
         query: "health bar".into(),
         pos: [1.0, 0.0, 0.0],
@@ -132,7 +144,7 @@ fn described_creation_and_attach_survive_reload_via_replay_log() {
     let mut b = Engine::new(world, 1);
     capscene::seed(&mut b, &scene, N).unwrap();
     b.clear_history();
-    let (applied, skipped) = log.replay(&mut b, &scene);
+    let (applied, skipped) = log.replay(&mut b, &scene, &MeshCatalog::new());
     b.clear_history();
 
     assert_eq!((applied, skipped), (2, 0), "describe + bind both replayed");

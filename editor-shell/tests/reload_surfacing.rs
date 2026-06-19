@@ -22,7 +22,9 @@ use metrocalk_ecs::FlecsWorld;
 use metrocalk_editor_shell::capscene::{self, CapScene};
 use metrocalk_editor_shell::persist::{Log, Record};
 use metrocalk_editor_shell::reveal::{reveal, Context};
-use metrocalk_editor_shell::{apply_edit, project_full, EditIntent, EditTx, ProjectionOp, TRACKS};
+use metrocalk_editor_shell::{
+    apply_edit, project_full, EditIntent, EditTx, MeshCatalog, ProjectionOp, TRACKS,
+};
 
 const SCENE_N: usize = 5000; // the shell's real scene size — the untested delta the n=500 test missed
 
@@ -65,7 +67,7 @@ fn relaunch(log: &Log) -> (Engine<FlecsWorld>, usize, usize) {
     let mut engine = Engine::new(world, 1);
     capscene::seed(&mut engine, &scene, SCENE_N).expect("re-seed");
     engine.clear_history(); // seed not undoable
-    let (applied, skipped) = log.replay(&mut engine, &scene);
+    let (applied, skipped) = log.replay(&mut engine, &scene, &MeshCatalog::new());
     engine.clear_history(); // restored scene not undoable
     (engine, applied, skipped)
 }
@@ -104,8 +106,14 @@ fn live_shape_reload_restores_and_surfaces() {
     );
     log.append(&Record::Edit(edit));
 
-    let (created, _kind) = capscene::describe_create(&mut a, &scene_a, "health bar", [0.0; 3])
-        .expect("describe-create");
+    let (created, _kind) = capscene::describe_create(
+        &mut a,
+        &scene_a,
+        "health bar",
+        [0.0; 3],
+        &MeshCatalog::new(),
+    )
+    .expect("describe-create");
     log.append(&Record::Describe {
         query: "health bar".into(),
         pos: [0.0; 3],

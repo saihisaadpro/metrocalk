@@ -72,6 +72,31 @@ fn vs_line(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+// Imported meshes (M4 asset pipeline). A real vertex stream (position/normal/baked material color)
+// drawn instanced — `instances[ii]` carries the entity's centre, render scale, and selection flag
+// (same Instance storage layout as the cubes; the cube `color` field is ignored here, the mesh uses
+// its own baked vertex color). Non-bindless: one vertex/index buffer bound per asset (ADR-003).
+struct MeshIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
+};
+
+@vertex
+fn vs_mesh(v: MeshIn, @builtin(instance_index) ii: u32) -> VsOut {
+    let inst = instances[ii];
+    let world = inst.center + v.position * inst.scale;
+    var out: VsOut;
+    out.pos = cam.view_proj * vec4<f32>(world, 1.0);
+    let shade = 0.55 + 0.45 * clamp(dot(normalize(v.normal), normalize(vec3<f32>(0.4, 0.8, 0.3))), 0.0, 1.0);
+    var col = v.color * shade;
+    if (inst.selected > 0.5) {
+        col = mix(col, vec3<f32>(1.0, 0.85, 0.2), 0.7); // selection highlight
+    }
+    out.color = col;
+    return out;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color, 1.0);

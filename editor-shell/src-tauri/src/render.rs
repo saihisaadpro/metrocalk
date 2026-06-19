@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use glam::{Mat4, Vec3};
+use metrocalk_assets::{MeshGpu, MeshVertex};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 /// Total UI→core IPC calls (every `#[tauri::command]` bumps this). The render loop reports it next to
@@ -41,6 +42,18 @@ pub struct SceneState {
     /// `center` is read (by `vs_line`); the other fields are ignored. Rebuilt with `instances`, so a
     /// `revision` bump re-uploads both. Empty when nothing is bound (the line pass is skipped).
     pub line_points: Vec<Instance>,
+    /// Per-instance mesh-asset slot, parallel to `instances`: `-1` ⇒ render the M2.2 placeholder cube
+    /// (the honest fallback for an entity with no mesh handle); `>= 0` ⇒ an index into [`Self::meshes`]
+    /// (render that imported mesh instead). The render loop partitions `instances` by this into the
+    /// cube pass + per-asset instanced mesh draws. The entity stays in `instances`/`ids` regardless, so
+    /// picking (centre-based) is uniform across cubes and meshes.
+    pub mesh_slots: Vec<i32>,
+    /// The distinct imported meshes, slot-indexed (referenced by [`Self::mesh_slots`]). Packed,
+    /// `wasm32`-portable geometry from the asset store; uploaded once per `meshes_revision`.
+    pub meshes: Vec<MeshGpu>,
+    /// Bump when `meshes` changes so the loop re-uploads the per-asset vertex/index buffers (rare —
+    /// the asset set is loaded once at startup).
+    pub meshes_revision: u64,
     /// Currently-selected instance index (drives the highlight).
     pub selected: Option<usize>,
     /// Bump when `instances` changes so the loop re-uploads the buffer.
@@ -59,6 +72,60 @@ pub struct SceneState {
 }
 
 pub type Shared = Arc<Mutex<SceneState>>;
+
+/// One uploaded mesh asset's GPU geometry (per-asset vertex + index buffers — the non-bindless path:
+/// one bound vertex/index buffer per asset, drawn instanced across the entities that use it).
+struct GpuMesh {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    n_idx: u32,
+}
+
+/// A growable storage buffer of [`Instance`]s + its bind group — the per-asset instance list for one
+/// mesh slot (the transforms of every entity rendering as that mesh). Grows by powers of two.
+struct InstanceBuf {
+    buf: wgpu::Buffer,
+    bg: wgpu::BindGroup,
+    cap: u64,
+    n: u32,
+}
+
+impl InstanceBuf {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cap: u64) -> Self {
+        let buf = new_instance_storage(device, cap);
+        let bg = make_inst_bg(device, layout, &buf);
+        Self { buf, bg, cap, n: 0 }
+    }
+
+    /// Upload `data`, growing (and rebinding) the buffer if needed. Sets `n` to the count drawn.
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        data: &[Instance],
+    ) {
+        let needed = data.len() as u64;
+        if needed > self.cap {
+            self.cap = needed.next_power_of_two();
+            self.buf = new_instance_storage(device, self.cap);
+            self.bg = make_inst_bg(device, layout, &self.buf);
+        }
+        if !data.is_empty() {
+            queue.write_buffer(&self.buf, 0, bytemuck::cast_slice(data));
+        }
+        self.n = data.len() as u32;
+    }
+}
+
+fn new_instance_storage(device: &wgpu::Device, cap: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("instances"),
+        size: cap * std::mem::size_of::<Instance>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
 
 const SHADER: &str = include_str!("scene.wgsl");
 const CUBE_INDICES: [u16; 36] = [
@@ -167,15 +234,6 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    // Instance storage buffer — grown as the scene grows.
-    let mut inst_cap: u64 = 1024;
-    let mut instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("instances"),
-        size: inst_cap * std::mem::size_of::<Instance>() as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
     let cam_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("cam-bgl"),
         entries: &[bgl_entry(
@@ -200,7 +258,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             resource: camera_buf.as_entire_binding(),
         }],
     });
-    let mut inst_bg = make_inst_bg(&device, &inst_bgl, &instance_buf);
+    // Cube instances (the M2.2 placeholder/fallback path + the perf baseline) — the subset of entities
+    // with NO mesh asset. Grows with the scene.
+    let mut cube = InstanceBuf::new(&device, &inst_bgl, 1024);
 
     let index_buf = create_init_buffer(
         &device,
@@ -270,19 +330,68 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         None,
         "line",
     );
-    let mut line_cap: u64 = 256;
-    let mut line_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("lines"),
-        size: line_cap * std::mem::size_of::<Instance>() as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
+    let mut lines = InstanceBuf::new(&device, &inst_bgl, 256);
+
+    // Imported-mesh path (invariant 4: built/uploaded on the render thread; the hot path never crosses
+    // JS). A real vertex buffer (pos/normal/baked-color) + the same cam(0)+instance-storage(1) bind
+    // groups as the cube path — non-bindless (ADR-003, web-required): one vertex/index buffer bound per
+    // asset, drawn instanced across the entities using it. cull=None tolerates arbitrary import winding.
+    let mesh_vbl = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<MeshVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 24,
+                shader_location: 2,
+            },
+        ],
+    };
+    let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mesh"),
+        layout: Some(&cube_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_mesh"),
+            buffers: &[mesh_vbl],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(format.into())],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_state.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
     });
-    let mut line_bg = make_inst_bg(&device, &inst_bgl, &line_buf);
-    let mut n_line: u32 = 0;
+    // Per-asset GPU geometry (slot-indexed, uploaded once per meshes_revision) + per-asset instance
+    // lists (rebuilt per scene revision). `cube_scratch`/`mesh_scratch` are reused partition buffers.
+    let mut gpu_meshes: Vec<Option<GpuMesh>> = Vec::new();
+    let mut mesh_inst: Vec<InstanceBuf> = Vec::new();
+    let mut cur_mesh_rev = u64::MAX;
+    let mut cube_scratch: Vec<Instance> = Vec::new();
+    let mut mesh_scratch: Vec<Vec<Instance>> = Vec::new();
 
     eprintln!("[viewport] render loop started");
     let mut cur_rev = u64::MAX;
-    let mut n_inst: u32 = 0;
     // frame-budget instrumentation (CPU submit time = encode+submit; the integrated viewport's cost)
     let mut acc_ms = 0.0f64;
     let mut acc_n = 0u32;
@@ -329,39 +438,63 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             } else {
                 st.drag_last = None;
             }
+            // Upload per-asset mesh GEOMETRY once when the asset set changes (rare — loaded at startup).
+            if st.meshes_revision != cur_mesh_rev {
+                cur_mesh_rev = st.meshes_revision;
+                gpu_meshes.clear();
+                for m in &st.meshes {
+                    if m.vertices.is_empty() || m.indices.is_empty() {
+                        gpu_meshes.push(None);
+                        continue;
+                    }
+                    let vbuf = create_init_buffer(
+                        &device,
+                        "mesh-v",
+                        bytemuck::cast_slice(&m.vertices),
+                        wgpu::BufferUsages::VERTEX,
+                    );
+                    let ibuf = create_init_buffer(
+                        &device,
+                        "mesh-i",
+                        bytemuck::cast_slice(&m.indices),
+                        wgpu::BufferUsages::INDEX,
+                    );
+                    gpu_meshes.push(Some(GpuMesh {
+                        vbuf,
+                        ibuf,
+                        n_idx: m.indices.len() as u32,
+                    }));
+                }
+                while mesh_inst.len() < gpu_meshes.len() {
+                    mesh_inst.push(InstanceBuf::new(&device, &inst_bgl, 64));
+                }
+                while mesh_scratch.len() < gpu_meshes.len() {
+                    mesh_scratch.push(Vec::new());
+                }
+            }
             if st.revision != cur_rev {
                 cur_rev = st.revision;
-                n_inst = st.instances.len() as u32;
-                let needed = st.instances.len() as u64;
-                if needed > inst_cap {
-                    inst_cap = needed.next_power_of_two();
-                    instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("instances"),
-                        size: inst_cap * std::mem::size_of::<Instance>() as u64,
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                    inst_bg = make_inst_bg(&device, &inst_bgl, &instance_buf);
+                // Partition entities by mesh slot: cubes (no/unknown mesh) vs each asset's instances.
+                // The entity stays in `instances`/`ids` for picking; only the *render* routing splits.
+                cube_scratch.clear();
+                for g in &mut mesh_scratch {
+                    g.clear();
                 }
-                if !st.instances.is_empty() {
-                    queue.write_buffer(&instance_buf, 0, bytemuck::cast_slice(&st.instances));
+                for (i, inst) in st.instances.iter().enumerate() {
+                    let slot = st.mesh_slots.get(i).copied().unwrap_or(-1);
+                    match usize::try_from(slot).ok() {
+                        Some(s) if s < gpu_meshes.len() && gpu_meshes[s].is_some() => {
+                            mesh_scratch[s].push(*inst);
+                        }
+                        _ => cube_scratch.push(*inst),
+                    }
+                }
+                cube.upload(&device, &queue, &inst_bgl, &cube_scratch);
+                for (slot, group) in mesh_scratch.iter().enumerate() {
+                    mesh_inst[slot].upload(&device, &queue, &inst_bgl, group);
                 }
                 // tracking-line endpoints (rebuilt in lock-step with instances)
-                n_line = st.line_points.len() as u32;
-                let needed_l = st.line_points.len() as u64;
-                if needed_l > line_cap {
-                    line_cap = needed_l.next_power_of_two();
-                    line_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("lines"),
-                        size: line_cap * std::mem::size_of::<Instance>() as u64,
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                    line_bg = make_inst_bg(&device, &inst_bgl, &line_buf);
-                }
-                if !st.line_points.is_empty() {
-                    queue.write_buffer(&line_buf, 0, bytemuck::cast_slice(&st.line_points));
-                }
+                lines.upload(&device, &queue, &inst_bgl, &st.line_points);
             }
             let aspect = w as f32 / h.max(1) as f32;
             camera_matrix(st.orbit, st.elevation, st.distance, aspect)
@@ -423,16 +556,33 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             rp.set_bind_group(0, &cam_bg, &[]);
             rp.set_pipeline(&grid_pipeline);
             rp.draw(0..GRID_VERTS, 0..1);
-            if n_inst > 0 {
+            // Cube pass: the placeholder/fallback (entities with no mesh asset) + the M2.2 perf baseline.
+            if cube.n > 0 {
                 rp.set_pipeline(&cube_pipeline);
-                rp.set_bind_group(1, &inst_bg, &[]);
+                rp.set_bind_group(1, &cube.bg, &[]);
                 rp.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint16);
-                rp.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..n_inst);
+                rp.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..cube.n);
             }
-            if n_line > 0 {
+            // Mesh pass: each imported asset drawn once, instanced across the entities using it
+            // (non-bindless — one vertex/index buffer bound per asset).
+            rp.set_pipeline(&mesh_pipeline);
+            for (slot, mesh) in gpu_meshes.iter().enumerate() {
+                let (Some(mesh), Some(inst)) = (mesh.as_ref(), mesh_inst.get(slot)) else {
+                    continue;
+                };
+                if inst.n == 0 {
+                    continue;
+                }
+                rp.set_bind_group(1, &inst.bg, &[]);
+                rp.set_vertex_buffer(0, mesh.vbuf.slice(..));
+                rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..mesh.n_idx, 0, 0..inst.n);
+            }
+            // Tracking lines (binding-by-intent overlay) last, with the always-pass depth state.
+            if lines.n > 0 {
                 rp.set_pipeline(&line_pipeline);
-                rp.set_bind_group(1, &line_bg, &[]);
-                rp.draw(0..n_line, 0..1);
+                rp.set_bind_group(1, &lines.bg, &[]);
+                rp.draw(0..lines.n, 0..1);
             }
         }
         queue.submit([enc.finish()]);
@@ -450,8 +600,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             let ipc_window = ipc_now - last_ipc;
             last_ipc = ipc_now;
             let ipc_per_frame = ipc_window as f64 / f64::from(acc_n.max(1));
+            let n_mesh: u32 = mesh_inst.iter().map(|m| m.n).sum();
             eprintln!(
-                "[viewport] n={n_inst} frames={acc_n} cpu-submit p50={p50:.3}ms p99={p99:.3}ms avg={:.3}ms | ipc={ipc_window} ({ipc_per_frame:.3}/frame)",
+                "[viewport] cubes={} meshes={n_mesh} frames={acc_n} cpu-submit p50={p50:.3}ms p99={p99:.3}ms avg={:.3}ms | ipc={ipc_window} ({ipc_per_frame:.3}/frame)",
+                cube.n,
                 acc_ms / f64::from(acc_n.max(1))
             );
             acc_ms = 0.0;

@@ -21,7 +21,7 @@ use metrocalk_ecs::FlecsWorld;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{apply_edit, EditTx};
-use crate::capscene::{self, CapScene};
+use crate::capscene::{self, CapScene, MeshCatalog};
 
 /// One persisted user action, replayed in order to reconstruct the scene after a deterministic seed.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -33,7 +33,13 @@ pub enum Record {
     Bind { from: String, to: String },
     /// A describe-to-create (M3.2): a free-text query resolved + instantiated at a position. Replayed
     /// deterministically (same resolve + same id allocation) so the described entity is recreated.
+    /// With the asset tier (M4) the resolved kind may also carry a mesh handle — re-derived from the
+    /// same catalog on replay, so a *visible* described object survives reload too.
     Describe { query: String, pos: [f32; 3] },
+    /// A direct mesh placement (M4): an imported asset placed by **handle** at a position. Replayed by
+    /// re-placing the same handle; the handle re-resolves against the reloaded (content-addressed)
+    /// store, so the placed mesh survives close→reopen (ADR-013 id determinism).
+    PlaceMesh { asset: String, pos: [f32; 3] },
     /// A single-step undo of the most recent action.
     Undo,
 }
@@ -83,7 +89,12 @@ impl Log {
     /// that cannot apply — a malformed line, a rejected edit, or a bind referencing an id absent from
     /// the fresh seed (the **divergence** case) — is counted as skipped and never panics. The caller
     /// should `clear_history()` **after** replay so the restored scene is non-undoable.
-    pub fn replay(&self, engine: &mut Engine<FlecsWorld>, scene: &CapScene) -> (usize, usize) {
+    pub fn replay(
+        &self,
+        engine: &mut Engine<FlecsWorld>,
+        scene: &CapScene,
+        catalog: &MeshCatalog,
+    ) -> (usize, usize) {
         let Ok(file) = File::open(&self.path) else {
             return (0, 0); // no log yet → nothing to restore
         };
@@ -111,7 +122,10 @@ impl Log {
                 Record::Edit(tx) => apply_edit(engine, &tx).rejects.is_empty(),
                 Record::Bind { from, to } => replay_bind(engine, scene, &from, &to),
                 Record::Describe { query, pos } => {
-                    capscene::describe_create(engine, scene, &query, pos).is_some()
+                    capscene::describe_create(engine, scene, &query, pos, catalog).is_some()
+                }
+                Record::PlaceMesh { asset, pos } => {
+                    capscene::place_mesh(engine, scene, &asset, pos).is_ok()
                 }
                 Record::Undo => engine.undo(),
             };

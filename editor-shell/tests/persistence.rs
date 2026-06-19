@@ -14,7 +14,7 @@ use metrocalk_ecs::FlecsWorld;
 use metrocalk_editor_shell::capscene::{self, CapScene};
 use metrocalk_editor_shell::persist::{Log, Record};
 use metrocalk_editor_shell::reveal::{reveal, Context};
-use metrocalk_editor_shell::TRACKS;
+use metrocalk_editor_shell::{MeshCatalog, TRACKS};
 
 fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("metrocalk-{name}.jsonl"))
@@ -59,7 +59,7 @@ fn relaunch(log: &Log) -> (Engine<FlecsWorld>, usize, usize) {
     let mut engine = Engine::new(world, 1);
     capscene::seed(&mut engine, &scene, 500).expect("re-seed");
     engine.clear_history(); // seed not undoable
-    let (applied, skipped) = log.replay(&mut engine, &scene);
+    let (applied, skipped) = log.replay(&mut engine, &scene, &MeshCatalog::new());
     engine.clear_history(); // restored scene not undoable
     (engine, applied, skipped)
 }
@@ -173,7 +173,7 @@ fn an_incompatible_fingerprint_log_is_discarded() {
     let mut e = Engine::new(world, 1);
     capscene::seed(&mut e, &scene, 500).unwrap();
     e.clear_history();
-    let (applied, skipped) = log_b.replay(&mut e, &scene);
+    let (applied, skipped) = log_b.replay(&mut e, &scene, &MeshCatalog::new());
     assert_eq!(
         (applied, skipped),
         (0, 0),

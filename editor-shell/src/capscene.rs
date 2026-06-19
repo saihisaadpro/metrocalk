@@ -39,6 +39,18 @@ const SEED: u64 = 0x4D45_5452_4F43_4131;
 /// `kind` string.
 pub const TRACKS: &str = "tracks";
 
+/// The `MeshRenderer` component field that carries the **asset handle** — the lightweight string
+/// (a `metrocalk_assets::AssetId`) that references geometry held in the asset store *beside* the doc.
+/// The handle is all that enters the ECS / Loro (invariant 2); the renderer resolves it to a mesh.
+pub const MESH_FIELD: &str = "mesh";
+
+/// Maps a resolved component **kind** name (e.g. `"HealthBar"`) to the asset **handle** an instance of
+/// that kind should render as. Owned by the shell (built at startup from the loaded [`AssetStore`]);
+/// describe-to-create consults it so a resolved kind with an associated mesh instantiates *looking*
+/// like itself, and a kind with no entry honestly falls back to the placeholder cube. A plain string
+/// map (no `metrocalk_assets` dependency leaks into the bridge lib — the handles are opaque here).
+pub type MeshCatalog = HashMap<String, String>;
+
 /// The interned capability graph for a seeded scene: the relationships + capability handles and their
 /// names — everything the reveal needs beyond the world itself.
 pub struct CapScene {
@@ -325,6 +337,7 @@ pub fn instantiate(
     scene: &CapScene,
     meta: &ComponentMeta,
     pos: [f32; 3],
+    mesh: Option<&str>,
 ) -> Result<EntityId, PipelineError> {
     let id = engine.alloc_entity_id();
     let mut ops = vec![Op::CreateEntity { id, parent: None }];
@@ -364,7 +377,58 @@ pub fn instantiate(
             });
         }
     }
+    // If the kind has an associated mesh asset, carry its **handle** (only the handle — geometry stays
+    // in the store beside the doc, invariant 2) so the entity renders as that mesh, not a cube.
+    if let Some(handle) = mesh {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "MeshRenderer".into(),
+            field: MESH_FIELD.into(),
+            value: FieldValue::Str(handle.to_string()),
+        });
+    }
     engine.commit("describe-create", ops)?;
+    Ok(id)
+}
+
+/// Place an imported mesh as a new entity — a `Transform` + a `MeshRenderer` carrying the asset
+/// **handle** + the `Renderable` capability pair — as ONE undoable transaction. The direct
+/// import→place path (the headless asset test; a future UI "drop this model"); describe-to-create
+/// reuses [`instantiate`]'s mesh arm instead. The handle is opaque here; the renderer resolves it
+/// against the store, and a reload re-resolves it (content-addressed id determinism, ADR-013).
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the create transaction fails (it shouldn't — ops are consistent).
+pub fn place_mesh(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    handle: &str,
+    pos: [f32; 3],
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    for (f, v) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        });
+    }
+    ops.push(Op::SetField {
+        entity: id,
+        component: "MeshRenderer".into(),
+        field: MESH_FIELD.into(),
+        value: FieldValue::Str(handle.to_string()),
+    });
+    if let Some(&c) = scene.caps.get("Renderable") {
+        ops.push(Op::AddPair {
+            entity: id,
+            rel: scene.rels.provides,
+            target: c,
+        });
+    }
+    engine.commit("place-mesh", ops)?;
     Ok(id)
 }
 
@@ -376,6 +440,7 @@ pub fn describe_create(
     scene: &CapScene,
     query: &str,
     pos: [f32; 3],
+    catalog: &MeshCatalog,
 ) -> Option<(EntityId, String)> {
     let lib = metrocalk_core::stdlib::standard_components();
     let top = metrocalk_core::resolve::resolve_local(&lib, query)
@@ -383,7 +448,10 @@ pub fn describe_create(
         .into_iter()
         .next()?;
     let meta = lib.iter().find(|m| m.name == top.kind)?;
-    let id = instantiate(engine, scene, meta, pos).ok()?;
+    // A resolved kind WITH an asset in the catalog instantiates *looking* like itself; without one it
+    // falls back to the placeholder cube — honest, not hidden (the cube fallback is the renderer's).
+    let handle = catalog.get(&top.kind).cloned();
+    let id = instantiate(engine, scene, meta, pos, handle.as_deref()).ok()?;
     Some((id, top.kind))
 }
 

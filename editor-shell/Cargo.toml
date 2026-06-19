@@ -18,5 +18,11 @@ metrocalk-ecs = { path = "../ecs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[dev-dependencies]
+# The asset/import substrate — used by the headless mesh test (import a checked-in glTF → place an
+# entity carrying its handle → undo → replay). Not a runtime dep of the bridge lib (handles are opaque
+# strings here); only the binary (src-tauri) imports + renders meshes.
+metrocalk-assets = { path = "../assets" }
+
 [lints]
 workspace = true

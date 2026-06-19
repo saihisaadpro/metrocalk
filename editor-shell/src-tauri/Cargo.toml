@@ -25,6 +25,8 @@ serde_json = "1"
 metrocalk-core = { path = "../../core" }
 metrocalk-ecs = { path = "../../ecs" }
 metrocalk-editor-shell = { path = ".." }
+# The local asset/import substrate (M4): glTF import + content-addressed store + GPU mesh packing.
+metrocalk-assets = { path = "../../assets" }
 
 # Native wgpu viewport (M2.2 instanced render path). DX12 disabled — wgpu-hal 29's DX12 fights the
 # `windows` crate version Tauri/webview2-com pins (the diamond M2.1/M2.3 documented); Vulkan is the
