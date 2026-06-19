@@ -2657,6 +2657,7 @@ dependencies = [
  "metrocalk-core",
  "metrocalk-ecs",
  "metrocalk-editor-shell",
+ "png 0.18.1",
  "pollster",
  "raw-window-handle",
  "serde",

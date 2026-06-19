@@ -37,5 +37,9 @@ raw-window-handle = "0.6.2"
 bytemuck = { version = "1.19", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck"] }
 
+[dev-dependencies]
+# PNG encode for the offscreen render-evidence bench (examples/mesh_frame_bench.rs). Pure Rust.
+png = "0.18"
+
 [profile.dev]
 opt-level = 1
