@@ -19,3 +19,4 @@ updates recording a gate result are allowed).
 | [011](011-intent-ranking.md) | Intent ranking for binding-by-intent (proximity · affinity · recency) | Accepted |
 | [012](012-describe-to-create-resolver.md) | Describe-to-create resolver: tiered local→marketplace→generate; token-overlap local match | Accepted — M3.2 local tier |
 | [013](013-live-persistence-replay-log.md) | Live editor persistence = deterministic-seed + replay-log (not Loro-merge-on-start) | Accepted — shipped M2 |
+| [014](014-asset-model-and-import-pipeline.md) | Asset model + import pipeline: asset-by-handle · trait-wrapped glTF importer · content-addressed store-beside-doc · non-bindless instanced mesh render · wasm32-portable | Accepted — M4 local tier |
