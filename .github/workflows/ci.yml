@@ -48,5 +48,15 @@ jobs:
           fi
           echo "no loro outside core/ — pipeline boundary intact"
 
+      - name: No foreign decoder types leak past the asset-importer wrapper (invariant 5)
+        run: |
+          # gltf:: / image:: must live ONLY behind the MeshSource trait, in assets/src/gltf_import.rs
+          # (the same discipline as flecs_ecs-in-/ecs). Comment lines (prose mentioning the types) skipped.
+          if grep -rn "gltf::\|image::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::gltf::/image:: leaked outside assets/src/gltf_import.rs — foreign decoder types must stay behind the MeshSource trait (invariant 5; mirrors ADR-001/006)"
+            exit 1
+          fi
+          echo "no gltf::/image:: outside the importer wrapper — boundary intact"
+
       - name: test
         run: cargo test --workspace

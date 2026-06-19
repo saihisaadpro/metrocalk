@@ -3,8 +3,9 @@ name: wasm-tripwire
 # Web-compatibility tripwire (ADR-003): the crates that cross to the browser must keep compiling to
 # wasm32 so web-incompatible changes are caught the week they land, not at Phase 2. Fails loudly.
 # Per ADR-006 this builds only the crates that actually cross (today: spikes/wasm = wgpu; loro also
-# proven). It must NEVER build flecs_ecs / metrocalk-core (native-only) for wasm32 — as the real
-# crossable crates appear in M1.2+, add them here, not the Flecs-backed core.
+# proven; metrocalk-assets = glTF import + mesh-data prep, M4). It must NEVER build flecs_ecs /
+# metrocalk-core (native-only) for wasm32 — `-p metrocalk-assets` pulls neither (it depends on
+# neither). As the real crossable crates appear, add them here, not the Flecs-backed core.
 on:
   push:
   pull_request:
@@ -43,3 +44,28 @@ jobs:
           test -f target/wasm32-unknown-unknown/release/metrocalk_wasm_spike.wasm \
             && echo "artifact present" \
             || (echo "::error::no wasm32 cdylib produced — web target is broken" && exit 1)
+
+  wasm32-assets:
+    name: build wasm32 (metrocalk-assets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The local asset substrate (M4, ADR-006 deliverable 6): glTF/glb import → internal mesh →
+      # content-addressed store → GPU vertex packing must reach the browser. `-p metrocalk-assets` builds
+      # ONLY that crate + its (pure-Rust) deps — gltf/image/png/bytemuck — never core/ecs/Flecs.
+      # KTX2/basis-universal (C++ FFI) is deliberately NOT a dependency (it's native-only — see the asset
+      # ADR); that is the documented native/browser divergence.
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-assets --release --target wasm32-unknown-unknown
+          echo "metrocalk-assets wasm32 build OK"

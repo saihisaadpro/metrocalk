@@ -362,16 +362,16 @@ pub fn textured_quad_glb() -> Vec<u8> {
     build_glb("textured", &[prim], &[checker_png()])
 }
 
-/// A tiny 2×2 RGBA PNG (a checker), encoded with our pinned pure-Rust `image`.
+/// A tiny 2×2 RGBA checker PNG (red/green/blue/yellow). Hardcoded so the demo generator pulls in **no**
+/// `image::`/decoder type — keeping foreign decoder types confined to the importer wrapper
+/// (`gltf_import.rs`), the boundary the CI grep-gate enforces. (Provenance: `examples/dump_png.rs`,
+/// our pure-Rust `image` PNG encoder — removed after generating these bytes.)
 fn checker_png() -> Vec<u8> {
-    let mut img = image::RgbaImage::new(2, 2);
-    img.put_pixel(0, 0, image::Rgba([220, 40, 40, 255]));
-    img.put_pixel(1, 0, image::Rgba([40, 220, 40, 255]));
-    img.put_pixel(0, 1, image::Rgba([40, 40, 220, 255]));
-    img.put_pixel(1, 1, image::Rgba([220, 220, 40, 255]));
-    let mut out = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut out, image::ImageFormat::Png)
-        .expect("encode demo png");
-    out.into_inner()
+    const CHECKER_PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6,
+        0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 29, 73, 68, 65, 84, 120, 1, 1, 18, 0, 237, 255, 0, 220,
+        40, 40, 255, 40, 220, 40, 255, 0, 40, 40, 220, 255, 220, 220, 40, 255, 77, 76, 9, 97, 40,
+        218, 95, 228, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    CHECKER_PNG.to_vec()
 }
