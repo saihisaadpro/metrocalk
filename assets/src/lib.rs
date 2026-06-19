@@ -1,0 +1,163 @@
+//! `metrocalk-assets` — the local asset + import substrate (M4 / Phase-2 asset gate).
+//!
+//! The describe-to-create promise is a working, **visible** object. Until now every entity rendered
+//! as an M2.2 placeholder cube; this crate is the substrate that lets a described (and later,
+//! marketplace) object look like *itself*: import a real glTF/glb → the project's internal
+//! [`mesh::MeshAsset`] (trait-wrapped, [`source::MeshSource`]) → a content-addressed
+//! [`store::AssetStore`] beside the scene document → GPU-ready [`gpu::MeshGpu`] the native renderer
+//! draws. An entity references an asset only by lightweight handle ([`store::AssetId`]); geometry
+//! never enters the ECS or the Loro doc (invariants 1 & 2).
+//!
+//! **No foreign decoder type crosses the public surface** (invariant 5): `gltf::` / `image::` live
+//! only in [`gltf_import`], exactly as `flecs_ecs` lives only in `/ecs` (CI grep-gated). And the whole
+//! crate is `wasm32-unknown-unknown`-clean — no `/core` (Flecs), no Loro, no C FFI — so import +
+//! mesh-data prep reach the browser (ADR-006). KTX2/basis-universal GPU-texture compression is a
+//! native-only normalization step (basis-universal is C++ FFI) — documented in the asset ADR, not
+//! built here.
+
+pub mod demo;
+pub mod gltf_import;
+pub mod gpu;
+pub mod mesh;
+pub mod source;
+pub mod store;
+
+pub use gltf_import::GltfImporter;
+pub use gpu::{MeshGpu, MeshVertex};
+pub use mesh::{Bounds, Material, MeshAsset, Primitive, Texture};
+pub use source::{ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES};
+pub use store::{AssetId, AssetStore};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imports_healthbar_geometry_and_materials() {
+        let bytes = demo::healthbar_glb();
+        let asset = GltfImporter::new()
+            .import(&bytes)
+            .expect("import healthbar");
+        // Two boxes → two primitives, two materials.
+        assert_eq!(asset.primitives.len(), 2, "frame + fill primitives");
+        assert_eq!(asset.materials.len(), 2);
+        // Each box is 24 verts / 36 indices.
+        assert_eq!(asset.vertex_count(), 48);
+        assert_eq!(asset.index_count(), 72);
+        assert_eq!(asset.triangle_count(), 24);
+        // Bar bounds: wide (≈2.1) and short (≈0.56) — clearly not a unit cube.
+        let b = asset.bounds();
+        assert!((b.max[0] - b.min[0]) > 2.0, "bar is wide");
+        assert!((b.max[1] - b.min[1]) < 0.6, "bar is short");
+        // The fill material is reddish.
+        assert!(asset
+            .materials
+            .iter()
+            .any(|m| m.base_color[0] > 0.8 && m.base_color[1] < 0.3));
+    }
+
+    #[test]
+    fn imports_prop_and_derives_normals_when_absent() {
+        let bytes = demo::prop_glb();
+        let asset = GltfImporter::new().import(&bytes).expect("import prop");
+        assert_eq!(asset.primitives.len(), 1);
+        assert_eq!(asset.vertex_count(), 6, "octahedron has 6 verts");
+        assert_eq!(asset.triangle_count(), 8, "octahedron has 8 faces");
+        assert!(
+            asset.primitives[0].normals.is_empty(),
+            "authored without normals"
+        );
+        // The packer derives them.
+        let gpu = MeshGpu::from_asset(&asset);
+        assert_eq!(gpu.vertex_count(), 6);
+        assert_eq!(gpu.index_count(), 24);
+        for v in &gpu.vertices {
+            let len = (v.normal[0].powi(2) + v.normal[1].powi(2) + v.normal[2].powi(2)).sqrt();
+            assert!((len - 1.0).abs() < 1e-3, "derived normal is unit-length");
+        }
+    }
+
+    #[test]
+    fn imports_embedded_png_texture() {
+        let bytes = demo::textured_quad_glb();
+        let asset = GltfImporter::new().import(&bytes).expect("import textured");
+        assert_eq!(
+            asset.textures.len(),
+            1,
+            "the embedded base-color png decodes"
+        );
+        assert_eq!((asset.textures[0].width, asset.textures[0].height), (2, 2));
+        assert_eq!(asset.textures[0].rgba8.len(), 2 * 2 * 4);
+        assert_eq!(asset.materials[0].base_color_texture, Some(0));
+    }
+
+    #[test]
+    fn rejects_oversize_input() {
+        let big = vec![0u8; MAX_IMPORT_BYTES + 1];
+        let err = GltfImporter::new().import(&big).unwrap_err();
+        assert!(matches!(err, ImportError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn rejects_malformed_bytes() {
+        let err = GltfImporter::new()
+            .import(b"not a gltf at all")
+            .unwrap_err();
+        assert!(matches!(err, ImportError::Malformed(_)));
+    }
+
+    #[test]
+    fn content_address_is_stable_and_distinct() {
+        let a = AssetId::of_bytes(&demo::healthbar_glb());
+        let a2 = AssetId::of_bytes(&demo::healthbar_glb());
+        let p = AssetId::of_bytes(&demo::prop_glb());
+        assert_eq!(
+            a, a2,
+            "same bytes → same handle (deterministic across reloads)"
+        );
+        assert_ne!(a, p, "different assets → different handles");
+        assert!(a.as_str().starts_with("mtkasset:"));
+    }
+
+    #[test]
+    fn store_imports_idempotently_and_resolves_by_handle() {
+        let importer = GltfImporter::new();
+        let mut store = AssetStore::new();
+        let bytes = demo::healthbar_glb();
+        let id1 = store.import(&importer, &bytes).expect("import");
+        let id2 = store.import(&importer, &bytes).expect("re-import");
+        assert_eq!(id1, id2);
+        assert_eq!(
+            store.len(),
+            1,
+            "re-importing identical bytes does not duplicate"
+        );
+        assert!(store.contains(id1.as_str()));
+        assert!(store.get_str(id1.as_str()).is_some());
+        assert!(store.get_str("mtkasset:deadbeef").is_none());
+    }
+
+    #[test]
+    fn gpu_pack_merges_primitives_and_bakes_color() {
+        let asset = GltfImporter::new()
+            .import(&demo::healthbar_glb())
+            .expect("import");
+        let gpu = MeshGpu::from_asset(&asset);
+        assert_eq!(gpu.vertex_count(), 48);
+        assert_eq!(gpu.index_count(), 72);
+        // Indices stay in range after re-basing into the merged buffer.
+        assert!(gpu
+            .indices
+            .iter()
+            .all(|&i| (i as usize) < gpu.vertices.len()));
+        // Both materials' colors appear baked into vertices.
+        assert!(
+            gpu.vertices.iter().any(|v| v.color[0] > 0.8),
+            "red fill baked"
+        );
+        assert!(
+            gpu.vertices.iter().any(|v| v.color[0] < 0.2),
+            "dark frame baked"
+        );
+    }
+}

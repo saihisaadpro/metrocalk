@@ -1,0 +1,32 @@
+# metrocalk-assets (M4 / Phase-2 asset gate) — the local asset + import substrate.
+#
+# This crate is the project's INTERNAL, trait-wrapped asset representation + glTF/glb importer +
+# content-addressed store + GPU-ready vertex packing. It is deliberately decoupled from `/core`
+# (Flecs, native-only) and `/transport` (Loro) so it can cross to `wasm32-unknown-unknown` (ADR-006,
+# deliverable 6) — exactly the fence that keeps Flecs out of the browser build. It owns NO scene
+# truth: entities reference an asset by lightweight handle (invariant 2); the ECS stays authoritative
+# over which asset an entity uses (invariant 1). Foreign decoder types (`gltf::`, `image::`) stay
+# behind the importer module (invariant 5; CI grep gate), like `flecs_ecs` behind `/ecs`.
+[package]
+name = "metrocalk-assets"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# glTF/glb parser — pure Rust, wasm32-clean. `default-features = false` drops the `import` feature
+# (which pulls `image` + `base64` + a transitively-rayon'd decoder path that breaks wasm) and the fs
+# entry point; we read self-contained `.glb` blobs via `Gltf::from_slice` and decode textures with
+# our own pinned `image`. `utils` = the `read_*` reader helpers; `names` = `.name()` accessors.
+gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
+# PNG decode only, pure Rust, wasm32-clean (no rayon / no C codecs — `default-features = false`).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Makes the packed vertex `Pod` so the native renderer can `cast_slice` it into a GPU buffer. Pure
+# Rust, wasm32-clean.
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Round-trip the demo glb generators back through the importer in tests.
+
+[lints]
+workspace = true
