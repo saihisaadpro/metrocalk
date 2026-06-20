@@ -21,8 +21,9 @@ use metrocalk_core::{Engine, EntityId};
 use metrocalk_ecs::FlecsWorld;
 use serde::{Deserialize, Serialize};
 
+use crate::ai::{AiPatch, PatchOp};
 use crate::bridge::{apply_edit, EditTx};
-use crate::capscene::{self, CapScene, MeshCatalog};
+use crate::capscene::{self, CapScene, MeshCatalog, MESH_FIELD};
 
 /// One persisted user action, replayed in order to reconstruct the scene after a deterministic seed.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -56,6 +57,16 @@ pub enum Record {
     /// A viewport **Duplicate** (M3.3): clone an entity by source id. Replayed deterministically (same
     /// alloc sequence + fixed offset → the clone lands byte-identical), so it survives reload.
     Duplicate { source: String },
+    /// A generation (M6): a grey placeholder + the streamed-in generated mesh **handle**. Replayed by
+    /// re-placing the placeholder + re-applying the stored handle as a validated AI patch (the generated
+    /// asset is content-addressed — for the deterministic fake it re-resolves; a novel real-provider
+    /// asset persisting its bytes is a documented follow-up). `mesh = None` ⇒ generation hadn't completed.
+    Generate {
+        prompt: String,
+        pos: [f32; 3],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mesh: Option<String>,
+    },
     /// A single-step undo of the most recent action.
     Undo,
 }
@@ -163,6 +174,11 @@ impl Log {
                     .is_some_and(|e| capscene::remove_entity(engine, scene, e).is_ok()),
                 Record::Duplicate { source } => EntityId::from_loro_key(&source)
                     .is_some_and(|s| capscene::duplicate_entity(engine, scene, s).is_ok()),
+                Record::Generate {
+                    prompt: _,
+                    pos,
+                    mesh,
+                } => replay_generate(engine, scene, pos, mesh),
                 Record::Undo => engine.undo(),
             };
             if ok {
@@ -185,4 +201,38 @@ fn replay_bind(engine: &mut Engine<FlecsWorld>, scene: &CapScene, from: &str, to
         return false;
     };
     capscene::bind(engine, scene, f, t).is_ok()
+}
+
+/// Replay a generation: re-place the grey placeholder, then (if generation had completed) re-apply the
+/// streamed-in mesh **handle** as a validated AI patch — exactly the live path, so the generated object
+/// is reconstructed in its final state. The placeholder lands at the same deterministic id.
+fn replay_generate(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    pos: [f32; 3],
+    mesh: Option<String>,
+) -> bool {
+    let Ok(id) = capscene::place_generation_placeholder(engine, scene, pos) else {
+        return false;
+    };
+    let Some(handle) = mesh else {
+        return true; // placeholder-only (generation hadn't completed before the export)
+    };
+    let patch = AiPatch {
+        client_op_id: "replay-generate".to_string(),
+        ops: vec![PatchOp::SetField {
+            id: id.to_loro_key(),
+            component: "MeshRenderer".to_string(),
+            field: MESH_FIELD.to_string(),
+            value: serde_json::Value::String(handle),
+        }],
+    };
+    crate::ai::apply_ai_patch(
+        engine,
+        &metrocalk_core::stdlib::standard_components(),
+        "replay-generate-swap",
+        &patch,
+    )
+    .rejects
+    .is_empty()
 }

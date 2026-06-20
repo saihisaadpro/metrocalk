@@ -562,6 +562,55 @@ pub fn apply_marketplace_entry(
     Ok(id)
 }
 
+/// Place a **grey placeholder** for a generation in flight (M6) — a working object as ONE undoable
+/// transaction: a `Transform` + a `MeshRenderer` with an **empty** mesh handle (so it renders as the
+/// M2.2 cube placeholder until the real mesh streams in) + `provides Renderable` + `requires Spatial`,
+/// so it's **bindable at once**. The generated mesh later streams in as a validated AI patch
+/// (`SetField MeshRenderer.mesh = handle`); undo peels the swap, then the placeholder. The grey cube
+/// is real + usable regardless of whether generation ever returns (the adversarial guard).
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the create transaction fails (it shouldn't — ops are consistent).
+pub fn place_generation_placeholder(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    pos: [f32; 3],
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    for (f, v) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        });
+    }
+    // empty handle → the cube placeholder; the stream-in swaps in the generated mesh handle.
+    ops.push(Op::SetField {
+        entity: id,
+        component: "MeshRenderer".into(),
+        field: MESH_FIELD.into(),
+        value: FieldValue::Str(String::new()),
+    });
+    if let Some(&c) = scene.caps.get(&canonical("Renderable")) {
+        ops.push(Op::AddPair {
+            entity: id,
+            rel: scene.rels.provides,
+            target: c,
+        });
+    }
+    if let Some(&c) = scene.caps.get(&canonical("Spatial")) {
+        ops.push(Op::AddPair {
+            entity: id,
+            rel: scene.rels.requires,
+            target: c,
+        });
+    }
+    engine.commit("generate-placeholder", ops)?;
+    Ok(id)
+}
+
 /// The deterministic offset a [`duplicate_entity`] clone is placed at, beside its source (so it's
 /// visible, not hidden inside the original). Fixed → replay reproduces the clone's position exactly.
 const DUPLICATE_OFFSET_X: f32 = 1.5;
