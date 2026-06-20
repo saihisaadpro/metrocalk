@@ -215,18 +215,33 @@ impl Ledger {
     /// The total still OPEN holds for `acct` (a hold with no matching Settle/Release).
     #[must_use]
     pub fn held(&self, acct: &AccountId) -> Mtk {
+        // One pass to collect closed hold ids, then sum the still-open holds for `acct` — O(n), not the
+        // O(holds·n) of a per-hold `is_hold_open` scan (which every interactive reserve would pay as the
+        // ledger grows).
+        let closed = self.closed_holds();
         let mut total: u64 = 0;
         for e in &self.entries {
             if let Event::Hold {
                 account, amount, ..
             } = &e.event
             {
-                if account == acct && self.is_hold_open(HoldId(e.seq.0)) {
+                if account == acct && !closed.contains(&e.seq.0) {
                     total += amount.get();
                 }
             }
         }
         Mtk(total)
+    }
+
+    /// The ids of holds that have been settled or released (closed) — one pass.
+    fn closed_holds(&self) -> std::collections::HashSet<u64> {
+        self.entries
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::Settle { hold, .. } | Event::Release { hold, .. } => Some(hold.0),
+                _ => None,
+            })
+            .collect()
     }
 
     /// What `acct` can actually spend right now: `balance − held` (open reservations are fenced off —
@@ -397,11 +412,12 @@ impl Ledger {
     /// Release every still-open hold — the startup/replay sweep, so a generation in-flight when the app
     /// was killed is refunded (never silently kept). Returns the swept hold ids.
     pub fn sweep_open_holds(&mut self) -> Vec<HoldId> {
+        let closed = self.closed_holds();
         let open: Vec<HoldId> = self
             .entries
             .iter()
             .filter_map(|e| match &e.event {
-                Event::Hold { .. } if self.is_hold_open(HoldId(e.seq.0)) => Some(HoldId(e.seq.0)),
+                Event::Hold { .. } if !closed.contains(&e.seq.0) => Some(HoldId(e.seq.0)),
                 _ => None,
             })
             .collect();
