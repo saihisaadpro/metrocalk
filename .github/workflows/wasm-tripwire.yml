@@ -69,3 +69,27 @@ jobs:
         run: |
           cargo build -p metrocalk-assets --release --target wasm32-unknown-unknown
           echo "metrocalk-assets wasm32 build OK"
+
+  wasm32-economy:
+    name: build wasm32 (metrocalk-economy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The token economy (M7, ADR-004/006): the ledger + cost model + payout + payment seam must reach
+      # the browser editor (the zero-install funnel meters the same paid tiers). `-p metrocalk-economy`
+      # builds ONLY that pure crate + serde/thiserror — never core/ecs/Flecs (it depends on neither;
+      # that absence is also the free-path tripwire in ci.yml).
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-economy --release --target wasm32-unknown-unknown
+          echo "metrocalk-economy wasm32 build OK"

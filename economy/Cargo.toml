@@ -1,0 +1,25 @@
+# metrocalk-economy (M7 / Phase-2 token economy) — the deterministic token ledger + metering + payout
+# accounting + the payment-provider seam (ADR-004 the spec, ADR-005 ops).
+#
+# A PURE crate, deliberately decoupled from `/core` (Flecs, native-only) and `/transport` (Loro) so it
+# crosses to `wasm32-unknown-unknown` (ADR-006) like `metrocalk-assets`. It owns NO scene truth and reads
+# NO clock/RNG — a balance is a deterministic fold over an append-only log, so it replays byte-identically
+# (the audit + determinism guarantee — invariant 3 for money). The FREE ENGINE (`core`, `ecs`) must NEVER
+# depend on this crate: that crate-graph edge is the compile-time proof the free/offline path cannot touch
+# the meter (CI tripwire). Only `editor-shell` links it, at the three paid sinks. The real payment
+# provider is a documented go-live seam — NO MONEY MOVES here (sandbox only).
+[package]
+name = "metrocalk-economy"
+description = "Deterministic token ledger + metering + creator-payout accounting + the payment-provider seam (ADR-004)."
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[lints]
+workspace = true

@@ -48,6 +48,19 @@ jobs:
           fi
           echo "no loro outside core/ — pipeline boundary intact"
 
+      - name: The free engine never depends on the token economy (M7 free-path proof, ADR-004)
+        run: |
+          # core/ecs (the FREE ENGINE) must NEVER link metrocalk-economy — that crate-graph edge is the
+          # compile-time proof the free/offline path can't touch the meter. Only editor-shell links it
+          # (at the three paid sinks). If the meter ever creeps into the engine, fail loudly.
+          for crate in metrocalk-core metrocalk-ecs; do
+            if cargo tree -p "$crate" -e normal | grep -q "metrocalk-economy"; then
+              echo "::error::$crate links metrocalk-economy — the free engine must not depend on the meter (ADR-004 free-path proof)"
+              exit 1
+            fi
+          done
+          echo "the free engine (core/ecs) does not link the economy — free-path boundary intact"
+
       - name: No foreign decoder types leak past the asset-importer wrapper (invariant 5)
         run: |
           # gltf:: / image:: must live ONLY behind the MeshSource trait, in assets/src/gltf_import.rs
