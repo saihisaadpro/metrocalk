@@ -609,15 +609,19 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         let _ = ch.send(project_full(&engine)); // simplest correct post-undo sync
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
-                    // M8.2: ECS is the single authority over which bodies EXIST — undo of a spawn removed
-                    // the entity, so despawn its sim body (body_of follows the ECS, never the reverse).
+                    // The ECS is the single authority over which bodies EXIST — re-evaluate every sim body
+                    // against the post-undo ECS and despawn any that no longer qualify. This covers BOTH
+                    // undo of a spawn (the entity is gone) AND undo of make-dynamic (the entity REMAINS but
+                    // lost its RigidBody/Collider components). body_of follows the ECS, never the reverse.
                     body_of.retain(|eid, h| {
-                        if engine.entity_exists(*eid) {
-                            true
-                        } else {
+                        let keep = engine.entity_exists(*eid) && {
+                            let comps = engine.components_of(*eid);
+                            comps.contains_key("RigidBody") && comps.contains_key("Collider")
+                        };
+                        if !keep {
                             sim.remove_body(*h);
-                            false
                         }
+                        keep
                     });
                     if body_of.is_empty() {
                         sim_running = false;
