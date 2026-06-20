@@ -562,6 +562,116 @@ pub fn apply_marketplace_entry(
     Ok(id)
 }
 
+/// The deterministic offset a [`duplicate_entity`] clone is placed at, beside its source (so it's
+/// visible, not hidden inside the original). Fixed → replay reproduces the clone's position exactly.
+const DUPLICATE_OFFSET_X: f32 = 1.5;
+
+/// **Remove** an entity as ONE undoable transaction (invariant 3): delete it *and* clean up every
+/// binding it participates in — so a dependent that was tracking a removed provider is **freed** (its
+/// requirement re-opens, the reveal re-offers), and no dangling edge survives. For a binding `from
+/// --tracks--> to` involving `id`: the edge is removed, and when `id` is the **requirer** (`from`) the
+/// provider's consumed-marker `(BindsTo, id)` pair is removed too (so the freed provider re-enters the
+/// candidate set); when `id` is the **provider** (`to`) its own pairs go with the delete. Undo
+/// restores the entity (M1.6 entity-resurrection) **and** the edges + pairs, atomically.
+///
+/// # Errors
+/// [`PipelineError`] if the transaction fails (e.g. the entity is already gone).
+pub fn remove_entity(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    id: EntityId,
+) -> Result<(), PipelineError> {
+    let id_ecs = engine.ecs_entity(id);
+    let mut ops = Vec::new();
+    for (from, kind, to) in engine.bindings() {
+        if from != id && to != id {
+            continue;
+        }
+        ops.push(Op::RemoveBinding { from, kind, to });
+        // `id` is the requirer of this binding → free the provider `to`'s consumed-marker
+        // `(BindsTo, id)` pair (the pair lives on the provider; capscene::bind added it there).
+        if from == id {
+            if let Some(id_ecs) = id_ecs {
+                ops.push(Op::RemovePair {
+                    entity: to,
+                    rel: scene.rels.binds_to,
+                    target: id_ecs,
+                });
+            }
+        }
+    }
+    ops.push(Op::DeleteEntity { id });
+    engine.commit("remove-entity", ops)
+}
+
+/// **Duplicate** an entity as ONE undoable transaction (invariant 3): clone its components (fields) +
+/// its `Provides`/`Requires` capability pairs under a **fresh deterministic id** ([`Engine::alloc_entity_id`]),
+/// placed beside the source. The clone is **independently bindable**: its `BindsTo`/binding edges are
+/// **not** cloned (a fresh copy is unbound), so it re-enters the reveal as its own requirer/provider.
+/// Deterministic id + offset → a replayed duplicate lands byte-identical (ADR-013). Undo removes it.
+///
+/// # Errors
+/// [`PipelineError`] if the source isn't a live entity, or the create transaction fails.
+pub fn duplicate_entity(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    src: EntityId,
+) -> Result<EntityId, PipelineError> {
+    let src_ecs = engine
+        .ecs_entity(src)
+        .ok_or(PipelineError::UnknownEntity(src))?;
+    let new_id = engine.alloc_entity_id();
+    let parent = engine.parent_of(src);
+    let mut ops = vec![Op::CreateEntity { id: new_id, parent }];
+
+    // Clone every component field. Then offset the Transform x so the clone sits beside the source
+    // (the later SetField wins). Read the source x first.
+    let comps = engine.components_of(src);
+    let src_x = comps
+        .get("Transform")
+        .and_then(|t| t.get("x"))
+        .map_or(0.0, |v| match v {
+            FieldValue::Number(n) => *n as f32,
+            FieldValue::Integer(i) => *i as f32,
+            _ => 0.0,
+        });
+    for (component, fields) in comps {
+        for (field, value) in fields {
+            ops.push(Op::SetField {
+                entity: new_id,
+                component: component.clone(),
+                field,
+                value,
+            });
+        }
+    }
+    ops.push(Op::SetField {
+        entity: new_id,
+        component: "Transform".into(),
+        field: "x".into(),
+        value: FieldValue::Number(f64::from(src_x + DUPLICATE_OFFSET_X)),
+    });
+
+    // Clone the capability pairs (provides/requires) — NOT BindsTo, so the clone is fresh + unbound.
+    for cap in engine.world().targets(src_ecs, scene.rels.provides) {
+        ops.push(Op::AddPair {
+            entity: new_id,
+            rel: scene.rels.provides,
+            target: cap,
+        });
+    }
+    for cap in engine.world().targets(src_ecs, scene.rels.requires) {
+        ops.push(Op::AddPair {
+            entity: new_id,
+            rel: scene.rels.requires,
+            target: cap,
+        });
+    }
+
+    engine.commit("duplicate-entity", ops)?;
+    Ok(new_id)
+}
+
 /// Describe-to-create, end to end (local tier): resolve `query` over the stdlib and, on a confident
 /// match, [`instantiate`] it pre-componentized at `pos` (one undoable transaction). Returns the new
 /// entity + the resolved kind name, or `None` for an honest no-match (→ the marketplace seam).

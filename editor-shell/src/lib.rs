@@ -10,17 +10,19 @@
 //! shell wiring (viewport, composite, picking, the residual measurements, the M2 gate) is the
 //! remaining convergence work — see `progress/M2.md`.
 
+pub mod actions;
 pub mod bridge;
 pub mod capscene;
 pub mod persist;
 pub mod reveal;
 
+pub use actions::{actions_for, Action, ActionItem};
 pub use bridge::{
     apply_edit, project_entity, project_full, EditIntent, EditTx, ProjectionDelta, ProjectionOp,
 };
 pub use capscene::{
-    apply_marketplace_entry, bind, describe_create, instantiate, place_mesh, positions, seed,
-    CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
+    apply_marketplace_entry, bind, describe_create, duplicate_entity, instantiate, place_mesh,
+    positions, remove_entity, seed, CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
 };
 pub use persist::{Log, Record};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};

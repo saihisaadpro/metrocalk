@@ -50,6 +50,12 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mesh: Option<String>,
     },
+    /// A viewport **Remove** (M3.3): delete an entity + its edges (binding edges freed, dependents
+    /// re-opened). Replayed by id so the removal survives reload.
+    Remove { id: String },
+    /// A viewport **Duplicate** (M3.3): clone an entity by source id. Replayed deterministically (same
+    /// alloc sequence + fixed offset → the clone lands byte-identical), so it survives reload.
+    Duplicate { source: String },
     /// A single-step undo of the most recent action.
     Undo,
 }
@@ -153,6 +159,10 @@ impl Log {
                         )
                         .is_ok()
                     }),
+                Record::Remove { id } => EntityId::from_loro_key(&id)
+                    .is_some_and(|e| capscene::remove_entity(engine, scene, e).is_ok()),
+                Record::Duplicate { source } => EntityId::from_loro_key(&source)
+                    .is_some_and(|s| capscene::duplicate_entity(engine, scene, s).is_ok()),
                 Record::Undo => engine.undo(),
             };
             if ok {
