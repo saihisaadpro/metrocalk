@@ -31,6 +31,9 @@ pub enum Action {
     Focus,
     /// Select the entity + open its inspector — no mutation.
     Inspect,
+    /// M8.3: turn a dead mesh model into a correct dynamic body (RigidBody + Collider auto-derived) — one
+    /// undoable transaction. Offered only for a mesh that isn't already a physics body.
+    MakeDynamic,
 }
 
 impl Action {
@@ -43,13 +46,17 @@ impl Action {
             Action::Duplicate => "Duplicate",
             Action::Focus => "Focus",
             Action::Inspect => "Inspect",
+            Action::MakeDynamic => "Make dynamic",
         }
     }
 
     /// Whether the action mutates the scene (→ goes through the commit pipeline, is undoable).
     #[must_use]
     pub fn mutates(self) -> bool {
-        matches!(self, Action::Remove | Action::Duplicate)
+        matches!(
+            self,
+            Action::Remove | Action::Duplicate | Action::MakeDynamic
+        )
     }
 }
 
@@ -93,6 +100,7 @@ pub fn actions_for(engine: &Engine<FlecsWorld>, scene: &CapScene, id: EntityId) 
             Action::Duplicate,
             Action::Focus,
             Action::Inspect,
+            Action::MakeDynamic,
         ]
         .into_iter()
         .map(|a| ActionItem::make(a, false, Some("entity no longer exists".to_string())))
@@ -130,11 +138,25 @@ pub fn actions_for(engine: &Engine<FlecsWorld>, scene: &CapScene, id: EntityId) 
         (true, None)
     };
 
+    // Make dynamic (M8.3): offered iff the entity is a dead mesh (renders a mesh, no RigidBody yet);
+    // greyed-with-reason otherwise (the explain-every-"no" discipline).
+    let (md_ok, md_reason) = if crate::physics_intent::looks_dynamic(engine, id) {
+        (true, None)
+    } else if engine.components_of(id).contains_key("RigidBody") {
+        (false, Some("already a physics body".to_string()))
+    } else {
+        (
+            false,
+            Some("only a mesh model can be made dynamic".to_string()),
+        )
+    };
+
     vec![
         ActionItem::make(Action::Bind, bind_ok, bind_reason),
         ActionItem::make(Action::Remove, true, None),
         ActionItem::make(Action::Duplicate, true, None),
         ActionItem::make(Action::Focus, true, None),
         ActionItem::make(Action::Inspect, true, None),
+        ActionItem::make(Action::MakeDynamic, md_ok, md_reason),
     ]
 }

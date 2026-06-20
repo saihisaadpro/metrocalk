@@ -278,4 +278,44 @@ describe("Metrocalk editor — north-star #1 live", () => {
     });
     expect((await physDbg())[0]).toBe(had - 1);
   });
+
+  // ── M8.3 intent-first authoring (test #3 boxes 1–2): a dead mesh → a correct dynamic body via the
+  // "Make dynamic" intent (one undoable tx), and the collider-intelligence check surfaces live. ──────────
+  const invokeT = async (cmd, args) =>
+    browser.execute(async (c, a) => await window.__TAURI__.core.invoke(c, a), cmd, args || {});
+
+  it("M8.3: a described mesh is made a dynamic body (≤2 clicks) → it enters the sim", async () => {
+    // Create a mesh entity (a described HealthBar carries a mesh handle).
+    await $("#describe").setValue("health bar");
+    await $("#describeBtn").click();
+    await browser.waitUntil(async () => /created/.test(await $("#status").getText()), {
+      timeout: 10000,
+      timeoutMsg: "no 'created' status after describe",
+    });
+    const m = (await $("#status").getText()).match(/·\s*(\S+)/);
+    expect(m).not.toBeNull();
+    const id = m[1];
+
+    const before = (await physDbg())[0];
+    // The exact call the "Make dynamic" context action dispatches.
+    const ok = await invokeT("make_dynamic", { id });
+    expect(ok).toBe(true);
+    // It is now a SIMULATED body (correct by construction: RigidBody + an auto-derived collider).
+    await browser.waitUntil(async () => (await physDbg())[0] > before, {
+      timeout: 10000,
+      timeoutMsg: "make_dynamic did not add a simulated body",
+    });
+
+    // The collider-intelligence check is live (returns the warnings array — each explained + a fix id).
+    const warns = await invokeT("physics_check", { id });
+    expect(Array.isArray(warns)).toBe(true);
+
+    // One undoable transaction — Ctrl-Z peels the whole make-dynamic back + despawns the sim body.
+    const had = (await physDbg())[0];
+    await browser.keys(["Control", "z"]);
+    await browser.waitUntil(async () => (await physDbg())[0] < had, {
+      timeout: 10000,
+      timeoutMsg: "undo did not reverse make-dynamic",
+    });
+  });
 });

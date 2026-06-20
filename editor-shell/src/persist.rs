@@ -52,6 +52,13 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mesh: Option<String>,
     },
+    /// M8.3 make-dynamic: a dead mesh entity turned into a dynamic body (RigidBody + Collider added).
+    /// Replayed by re-running it on the same id (deterministic); the engine thread re-hydrates the sim
+    /// body from the restored components.
+    MakeDynamic { id: String },
+    /// M8.3 one-click physics fix (`add-collider`/`use-hull`/`fix-mass`/`fix-scale`) on an entity.
+    /// Replayed by re-applying the same fix so the corrected setup survives reload.
+    PhysicsFix { id: String, action: String },
     /// A marketplace-tier apply (M5): a chosen pre-componentized entry, replayed deterministically by
     /// re-fetching it from the (checked-in) catalog by id + re-applying its namespaced caps + mesh
     /// handle, so a *marketplace*-sourced object survives reload exactly like a local one.
@@ -174,6 +181,18 @@ impl Log {
                 }
                 Record::SpawnBody { pos, mesh } => {
                     capscene::spawn_physics_body(engine, scene, mesh.as_deref(), pos, 0.45).is_ok()
+                }
+                Record::MakeDynamic { id } => EntityId::from_loro_key(&id)
+                    .is_some_and(|e| crate::physics_intent::make_dynamic(engine, scene, e, 1.0).is_ok()),
+                Record::PhysicsFix { id, action } => {
+                    EntityId::from_loro_key(&id).is_some_and(|e| match action.as_str() {
+                        "add-collider" => {
+                            crate::physics_intent::add_collider(engine, scene, e, true).is_ok()
+                        }
+                        "use-hull" => crate::physics_intent::use_convex_hull(engine, e).is_ok(),
+                        "fix-mass" => crate::physics_intent::fix_mass(engine, e, 1.0).is_ok(),
+                        _ => true, // fix-scale: a flagged suggestion, no state change
+                    })
                 }
                 Record::ApplyMarketplace {
                     entry_id,

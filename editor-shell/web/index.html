@@ -502,8 +502,44 @@
         } else if (action === "duplicate") {
           const nid = await invoke("duplicate_entity", { id });
           if (nid) { setTimeout(() => select(nid), 60); status("duplicated → " + nid); }
+        } else if (action === "makedynamic") {
+          // M8.3: dead model → correct dynamic body in ≤2 clicks (one undoable tx). Then surface the
+          // collider-intelligence warnings (each explained + a one-click fix), caught at author time.
+          const ok = await invoke("make_dynamic", { id });
+          if (ok) { select(id); status("made " + id + " dynamic — it falls (Ctrl-Z to undo)"); showPhysWarnings(id); }
+          else status("could not make " + id + " dynamic");
         }
       }
+
+      // ── M8.3 collider intelligence: surface check_physics warnings for an entity, each with a one-click
+      // fix. Caught at AUTHOR time, never as a runtime glitch; the fix re-runs the check (it must clear). ──
+      const physWarn = document.createElement("div");
+      physWarn.id = "physWarn";
+      physWarn.style.cssText = "position:fixed;z-index:62;display:none;right:12px;bottom:12px;max-width:340px;background:#2a1f1b;border:1px solid #c08040;border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.4;box-shadow:0 6px 22px rgba(0,0,0,.55)";
+      document.body.appendChild(physWarn);
+      async function showPhysWarnings(id) {
+        const warns = await invoke("physics_check", { id });
+        if (!warns || !warns.length) { physWarn.style.display = "none"; return; }
+        physWarn.innerHTML = `<div style="font-weight:700;margin-bottom:4px;color:#ffcf9a">⚠ ${warns.length} physics issue${warns.length>1?"s":""} (caught before runtime)</div>`;
+        for (const w of warns) {
+          const row = document.createElement("div");
+          row.style.cssText = "margin:6px 0;padding-bottom:6px;border-bottom:1px solid #4a3a2a";
+          row.innerHTML = `<div style="opacity:.9">${w.message}</div>`;
+          const btn = document.createElement("button");
+          btn.textContent = w.fixLabel;
+          btn.style.cssText = "margin-top:4px;padding:2px 8px;font-size:11px;background:#5a4030";
+          btn.onclick = async () => {
+            const ok = await invoke("physics_fix", { id, action: w.fixAction });
+            status(ok ? ("fixed: " + w.issue) : ("could not fix " + w.issue));
+            showPhysWarnings(id); // re-run the check — the fixed issue must clear
+          };
+          row.appendChild(btn);
+          physWarn.appendChild(row);
+        }
+        physWarn.style.display = "block";
+      }
+      // Close the warnings panel on Escape (alongside the focus/menu Escape handlers).
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape") physWarn.style.display = "none"; });
 
       // Hover details: debounced peek-on-settle; the entity_details fetch crosses JS only when the
       // hovered entity CHANGES — never per frame (invariant 4: the render hot path stays 0 IPC/frame).

@@ -26,6 +26,7 @@ use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_economy::{HoldId, SandboxProvider, GENERATE_TOKENS};
 use metrocalk_ecs::{Entity, FlecsWorld, World};
 use metrocalk_editor_shell::generate::{GenRequest, MeshGenerator};
+use metrocalk_editor_shell::physics_intent::{self, MeshMetrics, PhysicsWarning};
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
 use metrocalk_editor_shell::{
     actions_for, ai_edit_rustier, apply_ai_patch, apply_edit, buy_marketplace, capscene,
@@ -278,6 +279,24 @@ enum EngineCmd {
     /// the read-only diagnostic seam; lets the E2E confirm a dropped ball actually fell + landed.
     PhysicsDebug {
         reply: Sender<(usize, f64, usize)>,
+    },
+    /// M8.3 — make a dead mesh entity a correct dynamic body (one undoable commit + mirror into the sim);
+    /// replies whether it applied.
+    MakeDynamic {
+        id: String,
+        reply: Sender<bool>,
+    },
+    /// M8.3 — run the collider-intelligence catalogue for an entity (a read); replies the warnings.
+    PhysicsCheck {
+        id: String,
+        reply: Sender<Vec<PhysicsWarning>>,
+    },
+    /// M8.3 — apply a one-click physics fix (`add-collider`/`use-hull`/`fix-mass`/`fix-scale`) as one
+    /// undoable commit + re-mirror; replies whether it applied.
+    PhysicsFix {
+        id: String,
+        action: String,
+        reply: Sender<bool>,
     },
     /// Play/pause the deterministic sim (M8.2) — setup stays editable while paused.
     SetSimRunning(bool),
@@ -540,15 +559,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // Re-hydrate the sim from any RESTORED physics entities (replay re-creates the ECS entity but not the
     // sim body — see persist::Record::SpawnBody). Walk the restored RigidBody-carrying entities once.
     for id in engine.entity_ids() {
-        if engine.components_of(id).contains_key("RigidBody") {
-            let p = body_spawn_pos(&engine, id);
-            let h = sim.add_body(&BodyDesc::new(BodyKind::Dynamic, p));
-            let _ = sim.add_collider(
-                h,
-                &ColliderDesc::new(ColliderShape::Ball {
-                    radius: f64::from(BALL_RADIUS),
-                }),
-            );
+        if let Some(h) = mirror_body(&mut sim, &assets, &engine, id) {
             body_of.insert(id, h);
         }
     }
@@ -1224,17 +1235,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     BALL_RADIUS,
                 ) {
                     Ok(id) => {
-                        let h = sim.add_body(&BodyDesc::new(
-                            BodyKind::Dynamic,
-                            [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
-                        ));
-                        let _ = sim.add_collider(
-                            h,
-                            &ColliderDesc::new(ColliderShape::Ball {
-                                radius: f64::from(BALL_RADIUS),
-                            }),
-                        );
-                        body_of.insert(id, h);
+                        if let Some(h) = mirror_body(&mut sim, &assets, &engine, id) {
+                            body_of.insert(id, h);
+                        }
                         log.append(&Record::SpawnBody {
                             pos,
                             mesh: Some(assets.sphere.clone()),
@@ -1276,6 +1279,89 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let contacts = sim.diagnostics().contact_count;
                 let _ = reply.send((body_of.len(), min_y, contacts));
             }
+            EngineCmd::MakeDynamic { id, reply } => {
+                // M8.3 ≤2-click: dead mesh → correct dynamic body (one undoable commit) → mirror into the
+                // sim (a hull collider derived from the mesh) → it falls.
+                let ok = if let Some(eid) = EntityId::from_loro_key(&id) {
+                    match physics_intent::make_dynamic(&mut engine, &scene, eid, 1.0) {
+                        Ok(()) => {
+                            if let Some(h) = mirror_body(&mut sim, &assets, &engine, eid) {
+                                body_of.insert(eid, h);
+                                sim_running = true;
+                            }
+                            log.append(&Record::MakeDynamic { id: id.clone() });
+                            echo_created(
+                                &mut engine,
+                                &shared,
+                                &mut positions,
+                                &assets,
+                                &channel,
+                                &mut recency,
+                                &mut touch,
+                                eid,
+                            );
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                } else {
+                    false
+                };
+                let _ = reply.send(ok);
+            }
+            EngineCmd::PhysicsCheck { id, reply } => {
+                let warns = EntityId::from_loro_key(&id)
+                    .map(|eid| {
+                        physics_intent::check_physics(
+                            &engine,
+                            eid,
+                            mesh_metrics(&assets, &engine, eid),
+                        )
+                    })
+                    .unwrap_or_default();
+                let _ = reply.send(warns);
+            }
+            EngineCmd::PhysicsFix { id, action, reply } => {
+                // M8.3 one-click fix → one undoable commit → re-mirror the (now valid / reshaped) body.
+                let ok = if let Some(eid) = EntityId::from_loro_key(&id) {
+                    let r = match action.as_str() {
+                        "add-collider" => {
+                            physics_intent::add_collider(&mut engine, &scene, eid, true)
+                        }
+                        "use-hull" => physics_intent::use_convex_hull(&mut engine, eid),
+                        "fix-mass" => physics_intent::fix_mass(&mut engine, eid, 1.0),
+                        // fix-scale: a flagged suggestion; real unit reconciliation is M8.5 — acked, no-op.
+                        _ => Ok(()),
+                    };
+                    if r.is_ok() {
+                        if let Some(h) = body_of.remove(&eid) {
+                            sim.remove_body(h);
+                        }
+                        if let Some(h) = mirror_body(&mut sim, &assets, &engine, eid) {
+                            body_of.insert(eid, h);
+                            sim_running = true;
+                        }
+                        log.append(&Record::PhysicsFix {
+                            id: id.clone(),
+                            action: action.clone(),
+                        });
+                        echo_created(
+                            &mut engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &channel,
+                            &mut recency,
+                            &mut touch,
+                            eid,
+                        );
+                    }
+                    r.is_ok()
+                } else {
+                    false
+                };
+                let _ = reply.send(ok);
+            }
         }
     }
 }
@@ -1293,6 +1379,121 @@ fn body_spawn_pos(engine: &Engine<FlecsWorld>, id: EntityId) -> [f64; 3] {
         })
     };
     [get("x"), get("y"), get("z")]
+}
+
+/// The entity's mesh geometry (positions as f64 + indices) from its `MeshRenderer.mesh` slot — for M8.3
+/// collider derivation. `None` if the entity references no resolvable mesh.
+fn mesh_geometry(
+    assets: &AssetsRuntime,
+    engine: &Engine<FlecsWorld>,
+    id: EntityId,
+) -> Option<(Vec<[f64; 3]>, Vec<u32>)> {
+    let comps = engine.components_of(id);
+    let FieldValue::Str(handle) = comps
+        .get("MeshRenderer")
+        .and_then(|m| m.get(capscene::MESH_FIELD))?
+    else {
+        return None;
+    };
+    let slot = *assets.handle_to_slot.get(handle)?;
+    let gpu = assets.meshes.get(slot)?;
+    let verts = gpu
+        .vertices
+        .iter()
+        .map(|v| {
+            [
+                f64::from(v.position[0]),
+                f64::from(v.position[1]),
+                f64::from(v.position[2]),
+            ]
+        })
+        .collect();
+    Some((verts, gpu.indices.clone()))
+}
+
+/// The M8.3 collider-intelligence metrics for an entity's mesh (bounds extent + hull fit/concavity). The
+/// app-side derivation `physics_intent` (which stays `/physics`-free) consumes.
+fn mesh_metrics(
+    assets: &AssetsRuntime,
+    engine: &Engine<FlecsWorld>,
+    id: EntityId,
+) -> Option<MeshMetrics> {
+    let (verts, idx) = mesh_geometry(assets, engine, id)?;
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in &verts {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let max_extent = (0..3).map(|k| hi[k] - lo[k]).fold(0.0_f64, f64::max) as f32;
+    let (fit_error, concave) = metrocalk_physics::derive_collider(&verts, &idx)
+        .map_or((0.0, false), |d| (d.fit_error, d.concave));
+    Some(MeshMetrics {
+        max_extent,
+        fit_error,
+        concave,
+    })
+}
+
+/// The collider shape to mirror for an entity, from its `Collider.shape` field: `convexHull` ⇒ a hull
+/// derived from the mesh; otherwise a ball of `Collider.radius` (the spawn-ball default).
+fn collider_shape_for(
+    assets: &AssetsRuntime,
+    engine: &Engine<FlecsWorld>,
+    id: EntityId,
+) -> ColliderShape {
+    let comps = engine.components_of(id);
+    let col = comps.get("Collider");
+    let shape = col.and_then(|m| m.get("shape")).and_then(|v| match v {
+        FieldValue::Str(s) => Some(s.as_str()),
+        _ => None,
+    });
+    if shape == Some("convexHull") {
+        if let Some((verts, idx)) = mesh_geometry(assets, engine, id) {
+            if let Ok(d) = metrocalk_physics::derive_collider(&verts, &idx) {
+                return d.shape;
+            }
+        }
+    }
+    let r = col
+        .and_then(|m| m.get("radius"))
+        .and_then(|v| match v {
+            FieldValue::Number(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(f64::from(BALL_RADIUS));
+    ColliderShape::Ball { radius: r }
+}
+
+/// Mirror an ECS physics entity into the sim (M8.3): a body of its `RigidBody.kind` at its Transform,
+/// with a collider from its `Collider.shape`. `None` unless it has BOTH a RigidBody and a Collider (the
+/// ECS is authoritative — an incomplete body isn't simulated). Used by spawn, make-dynamic, fixes, and
+/// post-reload re-hydration, so every body mirrors identically.
+fn mirror_body(
+    sim: &mut RapierPhysics,
+    assets: &AssetsRuntime,
+    engine: &Engine<FlecsWorld>,
+    id: EntityId,
+) -> Option<BodyHandle> {
+    let comps = engine.components_of(id);
+    if !comps.contains_key("RigidBody") || !comps.contains_key("Collider") {
+        return None;
+    }
+    let kind = match comps.get("RigidBody").and_then(|m| m.get("kind")) {
+        Some(FieldValue::Str(k)) if k == "fixed" => BodyKind::Fixed,
+        Some(FieldValue::Str(k)) if k == "kinematicPosition" => BodyKind::KinematicPosition,
+        Some(FieldValue::Str(k)) if k == "kinematicVelocity" => BodyKind::KinematicVelocity,
+        _ => BodyKind::Dynamic,
+    };
+    let h = sim.add_body(&BodyDesc::new(kind, body_spawn_pos(engine, id)));
+    let _ = sim.add_collider(
+        h,
+        &ColliderDesc::new(collider_shape_for(assets, engine, id)),
+    );
+    Some(h)
 }
 
 /// M8.2 STEP 4 — the per-tick transform DELTA sync (hot path off JS). Writes each moved body's world
@@ -1839,6 +2040,48 @@ fn physics_debug(state: State<AppState>) -> (usize, f64, usize) {
     rx.recv().unwrap_or((0, 0.0, 0))
 }
 
+/// M8.3 — make a dead mesh entity a correct dynamic body (the ≤2-click intent). Returns whether it applied.
+#[tauri::command]
+fn make_dynamic(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::MakeDynamic { id, reply }).is_err() {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
+/// M8.3 — the collider-intelligence warnings for an entity (each explained + a one-click fix id). A read.
+#[tauri::command]
+fn physics_check(state: State<AppState>, id: String) -> Vec<PhysicsWarning> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PhysicsCheck { id, reply })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// M8.3 — apply a one-click physics fix (`add-collider`/`use-hull`/`fix-mass`/`fix-scale`). Returns whether
+/// it applied (the check then re-passes).
+#[tauri::command]
+fn physics_fix(state: State<AppState>, id: String, action: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PhysicsFix { id, action, reply })
+        .is_err()
+    {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
 /// Hover-tooltip details for an entity (M3.3) — fetched on hovered-entity change, not per frame.
 #[tauri::command]
 fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
@@ -2009,7 +2252,10 @@ fn main() {
             add_item,
             spawn_body,
             set_sim_running,
-            physics_debug
+            physics_debug,
+            make_dynamic,
+            physics_check,
+            physics_fix
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");
