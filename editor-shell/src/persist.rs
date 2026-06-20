@@ -71,6 +71,10 @@ pub enum Record {
     /// re-applying the patch (scene only — the wallet is a separate persisted ledger, so replay never
     /// re-charges tokens), so a rusty edit survives close→reopen.
     AiEdit { id: String },
+    /// An "+ Add" palette pick of a stdlib kind (M3.4) — replayed by re-instantiating the kind named
+    /// `name` (the same path as `describe`), so a browsed-in object survives reload. (`name`, not `kind`:
+    /// the enum's serde tag is already `kind`.)
+    AddKind { name: String, pos: [f32; 3] },
     /// A single-step undo of the most recent action.
     Undo,
 }
@@ -193,6 +197,9 @@ impl Log {
                     .rejects
                     .is_empty()
                 }),
+                Record::AddKind { name, pos } => {
+                    capscene::add_kind(engine, scene, &name, pos, catalog).is_some()
+                }
                 Record::Undo => engine.undo(),
             };
             if ok {

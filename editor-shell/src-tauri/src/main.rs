@@ -15,11 +15,12 @@
 
 mod render;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
 use metrocalk_assets::{AssetId, AssetStore, GltfImporter, MeshGpu, MeshSource};
+use metrocalk_core::catalog::{CatalogItem, CatalogSearch};
 use metrocalk_core::marketplace::{LocalCatalog, MarketplaceIndex};
 use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_economy::{HoldId, SandboxProvider, GENERATE_TOKENS};
@@ -238,6 +239,32 @@ enum EngineCmd {
     WalletInfo {
         reply: Sender<EconResponse>,
     },
+    /// The browsable "+ Add" catalog (M3.4), grouped by category bucket — a read.
+    Catalog {
+        reply: Sender<BTreeMap<String, Vec<CatalogItem>>>,
+    },
+    /// A catalog search (M3.4) — reuses the tiered resolver; a read.
+    CatalogSearch {
+        query: String,
+        reply: Sender<CatalogSearch>,
+    },
+    /// Add a chosen catalog item (M3.4) — a free local instantiate or a metered marketplace buy; the
+    /// **same** instantiate path as describe-to-create.
+    Add {
+        id: String,
+        source: String,
+        reply: Sender<AddResponse>,
+    },
+}
+
+/// The "+ Add" result (M3.4) — the created entity (+ balance after a marketplace buy), or a seam
+/// (insufficient balance / unknown item).
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct AddResponse {
+    created: Option<String>,
+    balance: Option<u32>,
+    seam: Option<String>,
 }
 
 /// The generation result (M6): the grey placeholder that dropped in instantly + the inert token cost,
@@ -984,6 +1011,102 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     ..Default::default()
                 });
             }
+            EngineCmd::Catalog { reply } => {
+                // The browse view (M3.4): ONE catalog query over the registry + the marketplace index,
+                // grouped by category bucket. Pure metadata.
+                let lib = metrocalk_core::stdlib::standard_components();
+                let _ = reply.send(metrocalk_core::catalog::grouped(&lib, &market));
+            }
+            EngineCmd::CatalogSearch { query, reply } => {
+                // Search (M3.4) REUSES the tiered resolver — one source, no parallel search path.
+                let lib = metrocalk_core::stdlib::standard_components();
+                let _ = reply.send(metrocalk_core::catalog::search(&lib, &market, &query));
+            }
+            EngineCmd::Add { id, source, reply } => {
+                // Add = instantiate through the one pipeline (M3.4) — converges with describe: a LOCAL
+                // kind is a free instantiate (`add_kind`, the same path describe uses); a MARKETPLACE
+                // entry is a metered buy (`buy_marketplace`, the M7 path the marketplace describe tier uses).
+                let pos = [0.0; 3];
+                let resp = if source == "marketplace" {
+                    match market.get(&id) {
+                        Some(entry) => {
+                            let mesh = entry
+                                .asset
+                                .as_deref()
+                                .and_then(|name| assets.asset_by_name.get(name).cloned());
+                            let ref_id = format!("add-buy:{}:{}", entry.id, wallet.ledger().len());
+                            let (created, outcome) = buy_marketplace(
+                                &mut engine,
+                                &scene,
+                                &mut wallet,
+                                &entry,
+                                mesh.as_deref(),
+                                pos,
+                                &ref_id,
+                            );
+                            match (created, outcome) {
+                                (Some(eid), Outcome::Charged { balance_tokens, .. }) => {
+                                    log.append(&Record::ApplyMarketplace {
+                                        entry_id: entry.id.clone(),
+                                        pos,
+                                        mesh,
+                                    });
+                                    echo_created(
+                                        &mut engine,
+                                        &shared,
+                                        &mut positions,
+                                        &assets,
+                                        &channel,
+                                        &mut recency,
+                                        &mut touch,
+                                        eid,
+                                    );
+                                    AddResponse {
+                                        created: Some(eid.to_loro_key()),
+                                        balance: Some(balance_tokens),
+                                        seam: None,
+                                    }
+                                }
+                                (_, Outcome::Refused { needed, have }) => AddResponse {
+                                    seam: Some(format!(
+                                        "insufficient balance: this asset costs {needed} tokens, you have {have} — top up?"
+                                    )),
+                                    balance: Some(have),
+                                    ..Default::default()
+                                },
+                                _ => AddResponse::default(),
+                            }
+                        }
+                        None => AddResponse::default(),
+                    }
+                } else {
+                    match capscene::add_kind(&mut engine, &scene, &id, pos, &assets.catalog) {
+                        Some(eid) => {
+                            log.append(&Record::AddKind {
+                                name: id.clone(),
+                                pos,
+                            });
+                            echo_created(
+                                &mut engine,
+                                &shared,
+                                &mut positions,
+                                &assets,
+                                &channel,
+                                &mut recency,
+                                &mut touch,
+                                eid,
+                            );
+                            AddResponse {
+                                created: Some(eid.to_loro_key()),
+                                balance: Some(wallet.balance_tokens()),
+                                seam: None,
+                            }
+                        }
+                        None => AddResponse::default(),
+                    }
+                };
+                let _ = reply.send(resp);
+            }
         }
     }
 }
@@ -1506,6 +1629,49 @@ fn wallet_info(state: State<AppState>) -> EconResponse {
     rx.recv().unwrap_or_default()
 }
 
+/// The browsable "+ Add" catalog (M3.4), grouped by category bucket.
+#[tauri::command]
+fn catalog(state: State<AppState>) -> BTreeMap<String, Vec<CatalogItem>> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Catalog { reply }).is_err() {
+        return BTreeMap::new();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Search the "+ Add" catalog (M3.4) — reuses the tiered resolver (local → marketplace → generate seam).
+#[tauri::command]
+fn catalog_search(state: State<AppState>, query: String) -> CatalogSearch {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CatalogSearch { query, reply })
+        .is_err()
+    {
+        return CatalogSearch {
+            items: Vec::new(),
+            seam: None,
+        };
+    }
+    rx.recv().unwrap_or(CatalogSearch {
+        items: Vec::new(),
+        seam: None,
+    })
+}
+
+/// Add a chosen catalog item (M3.4) — `source` is `"local"` (free instantiate) or `"marketplace"` (buy).
+#[tauri::command]
+fn add_item(state: State<AppState>, id: String, source: String) -> AddResponse {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Add { id, source, reply }).is_err() {
+        return AddResponse::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 fn main() {
     let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
     let (tx, rx) = mpsc::channel::<EngineCmd>();
@@ -1566,7 +1732,10 @@ fn main() {
             generate,
             ai_edit,
             top_up,
-            wallet_info
+            wallet_info,
+            catalog,
+            catalog_search,
+            add_item
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");

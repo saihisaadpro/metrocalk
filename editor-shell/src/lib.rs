@@ -26,7 +26,7 @@ pub use bridge::{
     apply_edit, project_entity, project_full, EditIntent, EditTx, ProjectionDelta, ProjectionOp,
 };
 pub use capscene::{
-    apply_marketplace_entry, bind, describe_create, duplicate_entity, instantiate,
+    add_kind, apply_marketplace_entry, bind, describe_create, duplicate_entity, instantiate,
     place_generation_placeholder, place_mesh, positions, remove_entity, seed, CapScene,
     MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
 };

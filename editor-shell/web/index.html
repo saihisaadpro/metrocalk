@@ -42,9 +42,12 @@
           <button id="topup" style="margin:0 0 0 6px;padding:2px 8px;font-size:11px;background:#4a3a1f">Top up +100</button>
         </div>
         <button id="undo">⟲ Undo (Ctrl-Z)</button>
-        <h3>Describe to create</h3>
+        <h3>Create</h3>
+        <!-- Two doors over ONE catalog + one instantiate (M3.4): BROWSE ("+ Add" palette, categories +
+             search) and DESCRIBE (type it). Both reach the same pre-componentized, undoable instantiate. -->
         <div style="padding:0 12px 6px;display:flex;gap:6px">
-          <input id="describe" placeholder="e.g. health bar" style="flex:1" />
+          <button id="addBtn" style="margin:0;padding:3px 10px;background:#2f4a3a">+ Add (browse)</button>
+          <input id="describe" placeholder="or describe: e.g. health bar" style="flex:1" />
           <button id="describeBtn" style="margin:0;padding:3px 10px">Create</button>
           <button id="genBtn" style="margin:0;padding:3px 10px;display:none;background:#3a2f4a">Generate?</button>
         </div>
@@ -61,6 +64,19 @@
     </div>
     <div id="status">booting</div>
     <div id="reject"></div>
+
+    <!-- The "+ Add" command palette (M3.4): a search bar on top (live filter via the catalog query,
+         which reuses the resolver) + the catalog browsed by category. Each item previews its caps/price.
+         A no-hit search falls through to the generate seam. One catalog, one instantiate. -->
+    <div id="palette" style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;z-index:50">
+      <div style="position:absolute;top:8%;left:50%;transform:translateX(-50%);width:min(560px,92vw);max-height:80vh;display:flex;flex-direction:column;background:rgba(20,22,28,.98);border:1px solid #2a4365;border-radius:8px;overflow:hidden">
+        <div style="display:flex;gap:6px;padding:10px;border-bottom:1px solid #2a2d35">
+          <input id="palSearch" placeholder="Search the catalog (or type to describe) …" style="flex:1;font-size:14px;padding:5px 8px" autocomplete="off" />
+          <button id="palClose" style="margin:0;padding:3px 10px;background:#3a3a3a">esc</button>
+        </div>
+        <div id="palBody" style="overflow-y:auto;padding:4px 0 10px"></div>
+      </div>
+    </div>
 
     <script>
       const { invoke, Channel } = window.__TAURI__.core;
@@ -282,6 +298,67 @@
       $("genBtn").onclick = doGenerate;
       $("describeBtn").onclick = doDescribe;
       $("describe").addEventListener("keydown", (e) => { if (e.key === "Enter") doDescribe(); });
+
+      // ── "+ Add" command palette (M3.4): BROWSE the catalog by category + a SEARCH bar (reuses the
+      // resolver via catalog_search). Picking an item = the same undoable instantiate as describe; a
+      // no-hit search falls through to the generate seam. One catalog, one instantiate path.
+      const palette = $("palette"), palBody = $("palBody"), palSearch = $("palSearch");
+      function openPalette() { palette.style.display = "block"; palSearch.value = ""; palSearch.focus(); renderBrowse(); }
+      function closePalette() { palette.style.display = "none"; }
+      $("addBtn").onclick = openPalette;
+      $("palClose").onclick = closePalette;
+      palette.onclick = (e) => { if (e.target === palette) closePalette(); };
+      window.addEventListener("keydown", (e) => { if (e.key === "Escape" && palette.style.display === "block") closePalette(); });
+
+      function itemRow(it) {
+        // The pre-componentized PREVIEW: what the working object brings (caps), its mesh, its price.
+        const caps = (it.provides || []).map((c) => "+" + c).concat((it.requires || []).map((c) => "needs " + c)).join(" · ");
+        const price = it.price != null ? " · ⊞" + it.price : (it.source === "local" ? " · free" : "");
+        const mesh = it.asset ? " · ▣ " + it.asset : "";
+        const color = it.source === "marketplace" ? "#fbbf24" : "#34d399";
+        return `<div class="cand" data-id="${it.id}" data-src="${it.source}" style="border-left-color:${color}">
+          <b>${it.label}</b>${price}<div class="meta">${caps}${mesh}</div></div>`;
+      }
+      function wireItems() { for (const el of palBody.querySelectorAll(".cand")) el.onclick = () => doAddItem(el.dataset.id, el.dataset.src); }
+      async function renderBrowse() {
+        const grouped = await invoke("catalog");
+        let html = "";
+        for (const [bucket, items] of Object.entries(grouped)) {
+          html += `<div class="sectlabel">${bucket.replace(/^std:/, "")}</div>` + items.map(itemRow).join("");
+        }
+        palBody.innerHTML = html || `<div class="grey">catalog empty</div>`;
+        wireItems();
+      }
+      async function renderSearch(q) {
+        const r = await invoke("catalog_search", { query: q });
+        let html = r.items.map(itemRow).join("");
+        if (!r.items.length) {
+          html = r.seam === "generate"
+            ? `<div class="grey">no catalog match — <span id="palGen" style="color:#c9a7ff;cursor:pointer">Generate "${q}"? (≈10 tokens)</span></div>`
+            : `<div class="grey">no match</div>`;
+        }
+        palBody.innerHTML = html;
+        wireItems();
+        const pg = $("palGen");
+        if (pg) pg.onclick = () => { closePalette(); pendingGen = q; doGenerate(); };
+      }
+      let palTimer = null;
+      palSearch.oninput = () => {
+        clearTimeout(palTimer);
+        const q = palSearch.value.trim();
+        palTimer = setTimeout(() => (q ? renderSearch(q) : renderBrowse()), 120);
+      };
+      async function doAddItem(id, source) {
+        const r = await invoke("add_item", { id, source });
+        setWallet(r.balance);
+        if (r.created) {
+          closePalette();
+          setTimeout(() => select(r.created), 60);
+          status((source === "marketplace" ? "bought " : "added ") + id + (r.balance != null ? " · ⊞ " + r.balance + " left" : ""));
+        } else {
+          status(r.seam || ("could not add " + id));
+        }
+      }
 
       // Viewport input (invariant 4: the hot path stays in Rust).
       //  • LEFT click → native ray-pick. Send a NORMALIZED [0,1] window fraction (not pixels), so

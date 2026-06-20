@@ -744,6 +744,23 @@ pub fn describe_create(
     Some((id, top.kind))
 }
 
+/// Add a stdlib component **kind** directly (the "+ Add" palette, M3.4) — look up the kind's metadata
+/// and instantiate it through the **same** [`instantiate`] path as [`describe_create`], so Add and
+/// describe-to-create converge on one pre-componentized instantiate (not two code paths). A kind WITH a
+/// catalog asset carries its mesh handle (renders as that mesh); else the honest cube. `None` if unknown.
+pub fn add_kind(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    kind: &str,
+    pos: [f32; 3],
+    catalog: &MeshCatalog,
+) -> Option<EntityId> {
+    let lib = metrocalk_core::stdlib::standard_components();
+    let meta = lib.iter().find(|m| m.name == kind)?;
+    let handle = catalog.get(kind).cloned();
+    instantiate(engine, scene, meta, pos, handle.as_deref()).ok()
+}
+
 fn default_value(ty: FieldType) -> FieldValue {
     match ty {
         FieldType::Integer => FieldValue::Integer(0),
