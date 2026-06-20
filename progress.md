@@ -16,19 +16,37 @@
   (handle re-resolves, content-addressed). **`wasm32`-portable** import (CI tripwire green). **Measured
   (release, RTX 4060):** import one-shot ~21 µs / ~10 µs; 5k-cube + 200-instanced-mesh scene CPU+GPU p99
   ~0.4 ms ≪ 16 ms. Evidence: `editor-shell/evidence/m4-mesh-scene.png`. ADR-014.
-- **Handed off (human/hardware/Phase-2 — instrumented, not fabricated):** the **dogfood verdict** (does it *feel* like the win — both loops); drag-feel; DPI · ≥60 s flicker · min-spec · Firefox WebGPU · Channel-e2e re-confirm · real-browser store-apply; test #2's "pick-up-able / Press Play" (gated on the runtime tier). **M4 deferred (named, not stubbed):** KTX2/basis transcode (C++ FFI → native-only), in-shader texture sampling, collider/LOD/rig generation, base64/external-buffer `.gltf`, a UI import affordance, and the live in-window mesh screenshot. *(Live close→reopen: machine-verified.)* See `progress/M4.md` · `progress/M3.md`.
+- **M5 — describe-to-create resolves local → marketplace for real; the capability web is open-ecosystem-safe.**
+  A no-local-match resolves a **marketplace index** (`MarketplaceIndex` trait + checked-in `LocalCatalog`;
+  a remote impl slots in unchanged) → a **pre-componentized** entry (namespaced caps + a prompt-23 mesh
+  handle) applies **already wired** as one undoable, replay-persisted tx with the M3.1 attach. The
+  resolver is now tiered for real — **local short-circuits offline** (a spy index proves it never touches
+  the marketplace), marketplace is the 2nd tier, generate the seam. **Capability identity is namespaced**
+  (ADR-015): bare stdlib = the `std:` standard vocab, author caps namespaced + opt into the web via a
+  one-directional `(AliasOf, std:*)` — two authors' same-name caps **never collide**, yet both bind a
+  `std:` requirer. **Measured (release):** local resolve p99 ~42 µs (unchanged), marketplace query p99
+  ~34 µs. **Economy + generation seamed** — price surfaced as an inert "≈ N tokens / creator keeps ~70%"
+  UI seam, no money moves; text-to-3D not built. ADR-015. See `progress/M5.md`.
+- **Handed off (human/hardware/Phase-2 — instrumented, not fabricated):** the **dogfood verdict** (does it *feel* like the win — all three loops); drag-feel; DPI · ≥60 s flicker · min-spec · Firefox WebGPU · Channel-e2e re-confirm · real-browser store-apply; test #2's "pick-up-able / Press Play" (gated on the runtime tier). **M4/M5 deferred (named, not stubbed):** KTX2/basis transcode (C++ FFI → native-only), in-shader texture sampling, collider/LOD/rig generation, base64/external-buffer `.gltf`, a UI import affordance; the **token economy / payout, remote hosting, text-to-3D generation** (the seams prompts 23+24 left clean); and the live in-window mesh + marketplace screenshots. *(Live close→reopen: machine-verified.)* See `progress/M5.md` · `progress/M4.md`.
 
-## Next (Phase-2 gate)
-- **Marketplace tier + capability namespacing (prompt 24):** the **local import + render pipeline is done
-  (M4, ADR-014)** — next is the **marketplace index** (pre-componentized assets from an index, reusing the
-  same handle/store path), then **text-to-3D generation** + the **token economy**. Resolves the
-  **capability-namespacing** open question (architecture.md) at the same gate; replaces the resolver's
-  token-overlap with a learned/embedding index behind the same `resolve_local` signature.
+## Next (Phase-2 infra)
+- **The seams prompts 23+24 left clean:** **text-to-3D generation**, the **token economy + creator
+  payout**, and **remote hosting** (a remote `MarketplaceIndex` impl drops in unchanged over the trait).
+  The marketplace **index + resolution + pre-componentized apply** and **capability namespacing** are now
+  done (M5, ADR-015); at real catalog scale, replace the resolver/marketplace token-overlap with a
+  learned/embedding index behind the same trait signatures.
 - **Follow-ups (non-blocking):** incremental undo delta (replace `project_full`-on-undo, the ~70 ms hitch at 5k); the capability-rebuild carry-forward (so a future Loro merge/reload keeps capabilities); log compaction (the append-only replay-log grows with session lifetime). *(Recency ranking is now live — done.)*
 - **Carry-forward (later):** getrandom `js` for Loro-in-browser + the Phase-2 pure-Rust query backend (ADR-006).
 - **Carry-forward (Phase 2, with collab):** `merge()` rebuilds entities from Loro but **not their ECS tags/pairs** — capabilities are ECS-only, so the **compatibility query is empty after a merge**. Fix wires the registry into `rebuild_ecs_from_loro`; schedule with collab. (M1.6 audit; see `progress/M1.md`.)
 
 ## Done (milestone-level)
+- **M5 marketplace gate (2026-06-20, ADR-015, `core/src/{caps,marketplace,resolve}.rs` + `editor-shell`):**
+  capability identity = `std:` standard vocab + author-namespaced caps + opt-in `(AliasOf, std:*)` (cross-author
+  collision impossible; reveal/bind works across namespaces); `MarketplaceIndex` trait + checked-in
+  `LocalCatalog`; resolver `local→marketplace→generate` real (local short-circuits offline); a marketplace
+  entry applies pre-componentized (namespaced caps + mesh) as one undoable tx that survives reload + offers
+  the M3.1 attach. Economy/generation seamed (price as inert UI seam, no money moves). local resolve p99
+  ~42 µs (unchanged) · marketplace query p99 ~34 µs. core 21 + editor-shell 31 green; namespacing + e2e tests.
 - **M4 local asset tier (2026-06-19, ADR-014, `/assets` + `editor-shell`):** trait-wrapped glTF/glb
   import → internal mesh → content-addressed store-beside-doc → asset **handle** in the ECS (inv. 1/2);
   the live viewport renders imported **meshes** per-asset instanced, non-bindless, hot path off JS; cube
@@ -52,7 +70,8 @@ Detailed dated entries are sharded by milestone under `progress/` (keeps this da
 Append to the **current milestone's** file, newest first, one entry per session, with measured
 numbers + ADR links. Live state stays here in Now/Next above.
 
-- [progress/M4.md](progress/M4.md) — **current milestone** (Phase-2 asset gate: local import + render)
+- [progress/M5.md](progress/M5.md) — **current milestone** (marketplace gate: capability namespacing + index tier)
+- [progress/M4.md](progress/M4.md) — Phase-2 asset gate (local import + render)
 - [progress/M3.md](progress/M3.md) — binding UX / north-star loops (M3.1 bind-by-intent · M3.2 describe-to-create)
 - [progress/M2.md](progress/M2.md) — desktop shell convergence (M2 build)
 - [progress/M1.md](progress/M1.md) — foundation build (M1.1–M1.6)
