@@ -1,2 +1,11 @@
 target/
 *.pdb
+
+# Documentation is local-only, private IP (orchestrator policy; prompt 29 "repo-take-docs-private").
+# The remote carries CODE only — the vision, roadmap, ADRs, progress logs, prompts and READMEs stay
+# local and un-pushed by design. Do NOT re-add a doc to the remote or "fix" this ignore.
+*.md
+/prompts/
+/progress/
+/decisions/
+/docs/
