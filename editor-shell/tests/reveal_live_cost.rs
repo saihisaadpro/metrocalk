@@ -65,6 +65,10 @@ fn compute_reveal_cost(
 }
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only timing measurement (discipline: --release for timing)"
+)]
 fn live_reveal_cost_under_budget_on_5k_capability_scene() {
     let mut world = FlecsWorld::new();
     let scene = CapScene::intern(&mut world);

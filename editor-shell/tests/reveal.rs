@@ -140,6 +140,10 @@ fn reveal_is_deterministic() {
 }
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only timing measurement (discipline: --release for timing)"
+)]
 fn reveal_latency_under_budget_on_5k_capability_scene() {
     // 5k entities carrying Provides(Health|Mana) + a fraction already bound; one selection requires Health.
     let mut world = FlecsWorld::new();

@@ -17,6 +17,10 @@ fn pct(mut v: Vec<f64>) -> (f64, f64) {
 }
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only timing measurement (discipline: --release for timing)"
+)]
 fn m2_end_to_end_budget_on_5k() {
     let mut world = FlecsWorld::new();
     let scene = CapScene::intern(&mut world);

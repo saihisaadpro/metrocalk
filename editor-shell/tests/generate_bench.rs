@@ -15,6 +15,10 @@ use metrocalk_editor_shell::capscene::{self, CapScene};
 const N: usize = 5000;
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only timing measurement (discipline: --release for timing)"
+)]
 fn placeholder_commit_is_instant() {
     let mut world = FlecsWorld::new();
     let scene = CapScene::intern(&mut world);
