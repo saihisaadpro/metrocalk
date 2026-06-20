@@ -22,11 +22,11 @@ use std::sync::{Arc, Mutex};
 use metrocalk_assets::{AssetStore, GltfImporter, MeshGpu};
 use metrocalk_core::marketplace::{LocalCatalog, MarketplaceIndex};
 use metrocalk_core::{Engine, EntityId, FieldValue};
-use metrocalk_ecs::{Entity, FlecsWorld};
+use metrocalk_ecs::{Entity, FlecsWorld, World};
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
 use metrocalk_editor_shell::{
-    apply_edit, capscene, project_entity, project_full, CapScene, EditIntent, EditTx, Log,
-    MeshCatalog, ProjectionDelta, Record,
+    actions_for, apply_edit, capscene, project_entity, project_full, ActionItem, CapScene,
+    EditIntent, EditTx, Log, MeshCatalog, ProjectionDelta, ProjectionOp, Record,
 };
 use render::{Instance, SceneState, Shared};
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,38 @@ enum EngineCmd {
         query: String,
         reply: Sender<DescribeResponse>,
     },
+    /// The action model for an entity (M3.3) — valid actions + every-"no"-explained (a read).
+    Actions {
+        id: String,
+        reply: Sender<Vec<ActionItem>>,
+    },
+    /// Remove an entity + its edges (M3.3) — one undoable transaction.
+    Remove {
+        id: String,
+    },
+    /// Duplicate an entity (M3.3) — one undoable transaction; replies the new id.
+    Duplicate {
+        id: String,
+        reply: Sender<Option<String>>,
+    },
+    /// Entity details for the hover tooltip (M3.3) — a read.
+    Details {
+        id: String,
+        reply: Sender<Option<EntityDetails>>,
+    },
+}
+
+/// Hover-tooltip details for an entity (M3.3) — name · key components · provided/required caps · the
+/// entities it's bound to. Read-only projection; fetched on hovered-entity change (not per frame).
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct EntityDetails {
+    id: String,
+    name: String,
+    components: Vec<String>,
+    provides: Vec<String>,
+    requires: Vec<String>,
+    bound_to: Vec<String>,
 }
 
 struct AppState {
@@ -491,8 +523,101 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                 };
                 let _ = reply.send(resp);
             }
+            EngineCmd::Actions { id, reply } => {
+                let items = EntityId::from_loro_key(&id)
+                    .map(|e| actions_for(&engine, &scene, e))
+                    .unwrap_or_default();
+                let _ = reply.send(items);
+            }
+            EngineCmd::Remove { id } => {
+                if let Some(e) = EntityId::from_loro_key(&id) {
+                    // Capture the edges this entity participates in BEFORE removing, for the targeted
+                    // re-projection (inv. 2: Remove(id) + RemoveEdge per freed binding — not a full reload).
+                    let removed_edges: Vec<(String, String, String)> = engine
+                        .bindings()
+                        .into_iter()
+                        .filter(|(from, _, to)| *from == e || *to == e)
+                        .map(|(from, kind, to)| (from.to_loro_key(), kind, to.to_loro_key()))
+                        .collect();
+                    if capscene::remove_entity(&mut engine, &scene, e).is_ok() {
+                        log.append(&Record::Remove { id: id.clone() });
+                        if let Some(ch) = &channel {
+                            let mut ops = vec![ProjectionOp::Remove { id: id.clone() }];
+                            for (from, rel, to) in removed_edges {
+                                ops.push(ProjectionOp::RemoveEdge { from, rel, to });
+                            }
+                            let _ = ch.send(ProjectionDelta {
+                                ops,
+                                confirms: vec![],
+                                rejects: vec![],
+                            });
+                        }
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                    }
+                }
+            }
+            EngineCmd::Duplicate { id, reply } => {
+                let new = EntityId::from_loro_key(&id)
+                    .and_then(|e| capscene::duplicate_entity(&mut engine, &scene, e).ok());
+                if let Some(new_id) = new {
+                    log.append(&Record::Duplicate { source: id.clone() });
+                    echo_created(
+                        &mut engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &channel,
+                        &mut recency,
+                        &mut touch,
+                        new_id,
+                    );
+                }
+                let _ = reply.send(new.map(|n| n.to_loro_key()));
+            }
+            EngineCmd::Details { id, reply } => {
+                let details = EntityId::from_loro_key(&id)
+                    .and_then(|e| build_entity_details(&engine, &scene, e));
+                let _ = reply.send(details);
+            }
         }
     }
+}
+
+/// Build the hover-tooltip [`EntityDetails`] for `id` (name · components · provided/required caps via
+/// their display names · the entities it's bound to). `None` if the id isn't a live entity.
+fn build_entity_details(
+    engine: &Engine<FlecsWorld>,
+    scene: &CapScene,
+    id: EntityId,
+) -> Option<EntityDetails> {
+    let ecs = engine.ecs_entity(id)?;
+    let mut components: Vec<String> = engine.components_of(id).into_keys().collect();
+    components.sort();
+    let caps = |rel: Entity| -> Vec<String> {
+        let mut v: Vec<String> = engine
+            .world()
+            .targets(ecs, rel)
+            .iter()
+            .filter_map(|c| scene.cap_name.get(c).cloned())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let bound_to: Vec<String> = engine
+        .bindings()
+        .into_iter()
+        .filter(|(from, _, _)| *from == id)
+        .map(|(_, _, to)| label_of(engine, to))
+        .collect();
+    Some(EntityDetails {
+        id: id.to_loro_key(),
+        name: label_of(engine, id),
+        components,
+        provides: caps(scene.rels.provides),
+        requires: caps(scene.rels.requires),
+        bound_to,
+    })
 }
 
 /// Compute the reveal for `eid`: the required capabilities, the ranked compatible targets, a bounded
@@ -824,7 +949,13 @@ fn viewport_pick(
         st.distance = 60.0;
         st.elevation = 0.4;
     }
-    let cam = render::camera_matrix(st.orbit, st.elevation, st.distance, aspect);
+    let cam = render::camera_matrix(
+        st.orbit,
+        st.elevation,
+        st.distance,
+        aspect,
+        st.cam_target.into(),
+    );
     let hit = render::pick_nearest(&st.instances, (x, y), &cam);
     // update the highlight
     if let Some(p) = st.selected {
@@ -840,6 +971,86 @@ fn viewport_pick(
     }
     st.revision = st.revision.wrapping_add(1);
     hit.and_then(|i| st.ids.get(i).cloned())
+}
+
+/// Non-mutating pick (M3.3 hover) — identifies the entity under the cursor **without** changing the
+/// selection or bumping the revision, so a hover sweep never disturbs the scene. The JS calls this
+/// debounced (on hover-settle) and only re-fetches details when the returned id changes — so the
+/// boundary is crossed on hovered-entity change, never per frame (invariant 4). Returns the id or
+/// `None` (cursor over empty space).
+#[tauri::command]
+fn viewport_peek(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    x: f32,
+    y: f32,
+) -> Option<String> {
+    ipc();
+    let aspect = window.inner_size().map_or(16.0 / 9.0, |s| {
+        s.width.max(1) as f32 / s.height.max(1) as f32
+    });
+    let st = state.shared.lock().unwrap();
+    let (dist, elev) = if st.distance == 0.0 {
+        (60.0, 0.4) // mirror the render loop's lazy camera init without mutating shared state
+    } else {
+        (st.distance, st.elevation)
+    };
+    let cam = render::camera_matrix(st.orbit, elev, dist, aspect, st.cam_target.into());
+    let hit = render::pick_nearest(&st.instances, (x, y), &cam);
+    hit.and_then(|i| st.ids.get(i).cloned())
+}
+
+/// Frame the camera on an entity (M3.3 Focus) — a pure camera op (no scene mutation, not undoable,
+/// invariant 4): set the orbit target to the entity's position so orbit/zoom now revolve around it.
+#[tauri::command]
+fn focus_entity(state: State<AppState>, id: String) {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    if let Some(i) = st.ids.iter().position(|k| *k == id) {
+        st.cam_target = st.instances[i].center;
+        st.revision = st.revision.wrapping_add(1);
+    }
+}
+
+/// The action model for an entity (M3.3) — valid actions + every-"no"-explained. A read; blocks
+/// briefly on the engine thread.
+#[tauri::command]
+fn entity_actions(state: State<AppState>, id: String) -> Vec<ActionItem> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Actions { id, reply }).is_err() {
+        return Vec::new();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Remove an entity + its edges (M3.3) — one undoable transaction (Ctrl-Z restores).
+#[tauri::command]
+fn remove_entity(state: State<AppState>, id: String) {
+    ipc();
+    let _ = state.tx.send(EngineCmd::Remove { id });
+}
+
+/// Duplicate an entity (M3.3) — one undoable transaction; returns the clone's id.
+#[tauri::command]
+fn duplicate_entity(state: State<AppState>, id: String) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Duplicate { id, reply }).is_err() {
+        return None;
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Hover-tooltip details for an entity (M3.3) — fetched on hovered-entity change, not per frame.
+#[tauri::command]
+fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Details { id, reply }).is_err() {
+        return None;
+    }
+    rx.recv().unwrap_or_default()
 }
 
 fn main() {
@@ -891,7 +1102,13 @@ fn main() {
             drag_start,
             drag_end,
             zoom,
-            viewport_pick
+            viewport_pick,
+            viewport_peek,
+            focus_entity,
+            entity_actions,
+            remove_entity,
+            duplicate_entity,
+            entity_details
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");

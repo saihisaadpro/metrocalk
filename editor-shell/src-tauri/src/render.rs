@@ -69,6 +69,9 @@ pub struct SceneState {
     pub drag_last: Option<(f64, f64)>,
     /// Pending wheel-zoom to fold into `distance` (one command per wheel tick, not per frame).
     pub zoom_delta: f32,
+    /// The camera look-at target (orbit centre). Default origin; `focus_entity` sets it to an entity's
+    /// position so the camera frames it. Orbit/zoom stay relative to this target.
+    pub cam_target: [f32; 3],
 }
 
 pub type Shared = Arc<Mutex<SceneState>>;
@@ -497,7 +500,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 lines.upload(&device, &queue, &inst_bgl, &st.line_points);
             }
             let aspect = w as f32 / h.max(1) as f32;
-            camera_matrix(st.orbit, st.elevation, st.distance, aspect)
+            camera_matrix(
+                st.orbit,
+                st.elevation,
+                st.distance,
+                aspect,
+                st.cam_target.into(),
+            )
         };
         queue.write_buffer(
             &camera_buf,
@@ -616,14 +625,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
 }
 
 #[must_use]
-pub fn camera_matrix(orbit: f32, elevation: f32, distance: f32, aspect: f32) -> Mat4 {
-    let eye = Vec3::new(
+pub fn camera_matrix(orbit: f32, elevation: f32, distance: f32, aspect: f32, target: Vec3) -> Mat4 {
+    let offset = Vec3::new(
         orbit.cos() * distance * elevation.cos(),
         distance * elevation.sin(),
         orbit.sin() * distance * elevation.cos(),
     );
+    let eye = target + offset;
     let proj = Mat4::perspective_rh(55f32.to_radians(), aspect, 0.1, distance * 8.0 + 100.0);
-    proj * Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y)
+    proj * Mat4::look_at_rh(eye, target, Vec3::Y)
 }
 
 /// Pick the instance nearest the click in screen space — a pure function over the instance list +
