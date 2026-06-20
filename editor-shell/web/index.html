@@ -40,6 +40,7 @@
         <div style="padding:0 12px 6px;display:flex;gap:6px">
           <input id="describe" placeholder="e.g. health bar" style="flex:1" />
           <button id="describeBtn" style="margin:0;padding:3px 10px">Create</button>
+          <button id="genBtn" style="margin:0;padding:3px 10px;display:none;background:#3a2f4a">Generate?</button>
         </div>
         <h3>Requirers — click one to bind</h3>
         <div id="requirers" style="padding:0 12px 6px;opacity:.6">scanning…</div>
@@ -237,11 +238,31 @@
           }
           setTimeout(() => select(r.created), 60); // let the echoed delta land in the store, then focus it
         } else if (r.seam === "generate") {
-          status('no local or marketplace match for "' + q + '" — would generate (text-to-3D, not enabled)');
+          // Tier 3, OPT-IN: nothing local or on the marketplace — offer Generate (the metered last resort).
+          pendingGen = q;
+          $("genBtn").style.display = "inline-block";
+          status('no local or marketplace match for "' + q + '" — Generate? (≈10 tokens, last resort)');
         } else {
           status('no match for "' + q + '"');
         }
       }
+      // M6 generation (opt-in): a grey placeholder drops in instantly; the real mesh streams in async
+      // over the projection Channel (applyDelta swaps MeshRenderer.mesh) — same entity, undoable.
+      let pendingGen = null;
+      async function doGenerate() {
+        const q = pendingGen;
+        if (!q) return;
+        $("genBtn").style.display = "none";
+        pendingGen = null;
+        const g = await invoke("generate", { query: q });
+        if (g.available && g.created) {
+          setTimeout(() => select(g.created), 60);
+          status("generating '" + q + "' — grey placeholder dropped (≈" + (g.cost || 10) + " tokens, meter seam); streaming the mesh in…");
+        } else {
+          status("generation " + (g.seam || "unavailable") + " — the local + marketplace paths are unaffected");
+        }
+      }
+      $("genBtn").onclick = doGenerate;
       $("describeBtn").onclick = doDescribe;
       $("describe").addEventListener("keydown", (e) => { if (e.key === "Enter") doDescribe(); });
 

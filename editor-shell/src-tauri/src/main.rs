@@ -19,14 +19,16 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
-use metrocalk_assets::{AssetStore, GltfImporter, MeshGpu};
+use metrocalk_assets::{AssetId, AssetStore, GltfImporter, MeshGpu, MeshSource};
 use metrocalk_core::marketplace::{LocalCatalog, MarketplaceIndex};
 use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_ecs::{Entity, FlecsWorld, World};
+use metrocalk_editor_shell::generate::{GenRequest, MeshGenerator, MeterAction, TokenMeter};
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
 use metrocalk_editor_shell::{
-    actions_for, apply_edit, capscene, project_entity, project_full, ActionItem, CapScene,
-    EditIntent, EditTx, Log, MeshCatalog, ProjectionDelta, ProjectionOp, Record,
+    actions_for, apply_ai_patch, apply_edit, capscene, project_entity, project_full, ActionItem,
+    AiPatch, CapScene, EditIntent, EditTx, Log, MeshCatalog, PatchOp, ProjectionDelta,
+    ProjectionOp, Record,
 };
 use render::{Instance, SceneState, Shared};
 use serde::{Deserialize, Serialize};
@@ -200,6 +202,30 @@ enum EngineCmd {
         id: String,
         reply: Sender<Option<EntityDetails>>,
     },
+    /// Generation (M6, tier 3): drop a grey placeholder + kick off async text-to-3D; reply the placeholder.
+    Generate {
+        query: String,
+        reply: Sender<GenerateResponse>,
+    },
+    /// A generation worker finished — import the bytes + stream the real mesh into the placeholder, on
+    /// the engine thread (the !Send engine owns the world + the asset store).
+    GenerateComplete {
+        placeholder: String,
+        prompt: String,
+        bytes: Vec<u8>,
+    },
+}
+
+/// The generation result (M6): the grey placeholder that dropped in instantly + the inert token cost,
+/// or — when the provider is off/offline — the honest degradation (`available = false`). The real mesh
+/// arrives later over the projection Channel (a targeted stream-in delta), not in this reply.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct GenerateResponse {
+    created: Option<String>,
+    cost: Option<u32>,
+    available: bool,
+    seam: Option<String>,
 }
 
 /// Hover-tooltip details for an entity (M3.3) — name · key components · provided/required caps · the
@@ -321,13 +347,23 @@ fn restore_window_geom(window: &tauri::WebviewWindow) {
     }
 }
 
-fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
+fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<EngineCmd>) {
     // Import the demo mesh assets once (one-shot heavy op) before seeding, so the catalog is ready for
-    // describe-to-create + replay and the viewport's geometry is published.
-    let assets = load_assets();
+    // describe-to-create + replay and the viewport's geometry is published. `mut` so a *generated* asset
+    // can be added to the render store at runtime (M6 stream-in).
+    let mut assets = load_assets();
     // The marketplace index (M5) — a local checked-in catalog behind the trait; describe-to-create's
     // second tier (queried only on a no-local-match). A remote index slots in here unchanged.
     let market = LocalCatalog::builtin();
+    // The generation tier (M6) — tier 3, opt-in. The deterministic FAKE provider returns the prop mesh
+    // after a simulated round-trip so the placeholder→stream-in loop is visible offline; the REAL
+    // provider is a documented seam (RemoteGenerator). The token meter is the ADR-004 stub (no money).
+    let generator = metrocalk_editor_shell::generate::FakeGenerator::new(
+        PROP_GLB.to_vec(),
+        std::time::Duration::from_millis(700),
+        true,
+    );
+    let meter = metrocalk_editor_shell::generate::StubMeter;
     {
         let mut st = shared.lock().unwrap();
         st.meshes = assets.meshes.clone();
@@ -578,6 +614,112 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                 let details = EntityId::from_loro_key(&id)
                     .and_then(|e| build_entity_details(&engine, &scene, e));
                 let _ = reply.send(details);
+            }
+            EngineCmd::Generate { query, reply } => {
+                // Tier 3, opt-in. Offline/unconfigured → an honest seam, never a fake asset.
+                if !generator.available() {
+                    let _ = reply.send(GenerateResponse {
+                        available: false,
+                        seam: Some("generation unavailable offline".into()),
+                        ..Default::default()
+                    });
+                } else {
+                    let cost = meter
+                        .charge(MeterAction::Generate, &format!("generate '{query}'"))
+                        .ok();
+                    // Placeholder drops in instantly (one undoable tx); the real mesh streams in async.
+                    let resp =
+                        match capscene::place_generation_placeholder(&mut engine, &scene, [0.0; 3])
+                        {
+                            Ok(ph) => {
+                                echo_created(
+                                    &mut engine,
+                                    &shared,
+                                    &mut positions,
+                                    &assets,
+                                    &channel,
+                                    &mut recency,
+                                    &mut touch,
+                                    ph,
+                                );
+                                // Kick the provider off the hot path; it sends GenerateComplete back when done.
+                                let g = generator.clone();
+                                let back = self_tx.clone();
+                                let ph_key = ph.to_loro_key();
+                                let q = query.clone();
+                                std::thread::spawn(move || {
+                                    if let Ok(bytes) = g.generate(&GenRequest::new(q.clone())) {
+                                        let _ = back.send(EngineCmd::GenerateComplete {
+                                            placeholder: ph_key,
+                                            prompt: q,
+                                            bytes,
+                                        });
+                                    }
+                                });
+                                GenerateResponse {
+                                    created: Some(ph.to_loro_key()),
+                                    cost,
+                                    available: true,
+                                    seam: None,
+                                }
+                            }
+                            Err(_) => GenerateResponse::default(),
+                        };
+                    let _ = reply.send(resp);
+                }
+            }
+            EngineCmd::GenerateComplete {
+                placeholder,
+                prompt,
+                bytes,
+            } => {
+                if let Some(ph) = EntityId::from_loro_key(&placeholder) {
+                    if engine.entity_exists(ph) {
+                        // Import the generated mesh (prompt-23 pipeline) + add it to the render store if
+                        // it's new (the fake's prop is already loaded → idempotent, content-addressed).
+                        let handle = AssetId::of_bytes(&bytes).as_str().to_string();
+                        if !assets.handle_to_slot.contains_key(&handle) {
+                            if let Ok(asset) = GltfImporter::new().import(&bytes) {
+                                let gpu = MeshGpu::from_asset(&asset);
+                                let ext = asset.bounds().max_extent();
+                                let slot = assets.meshes.len();
+                                assets.meshes.push(gpu.clone());
+                                assets.scales.push(if ext > 0.0 { 0.9 / ext } else { 1.0 });
+                                assets.handle_to_slot.insert(handle.clone(), slot);
+                                let mut st = shared.lock().unwrap();
+                                st.meshes.push(gpu);
+                                st.meshes_revision = st.meshes_revision.wrapping_add(1);
+                            }
+                        }
+                        // Stream the mesh in as a VALIDATED AI patch (inv. 3) — same entity, swapped handle.
+                        let patch = AiPatch {
+                            client_op_id: "generate-stream-in".into(),
+                            ops: vec![PatchOp::SetField {
+                                id: placeholder.clone(),
+                                component: "MeshRenderer".into(),
+                                field: capscene::MESH_FIELD.into(),
+                                value: serde_json::Value::String(handle.clone()),
+                            }],
+                        };
+                        let delta = apply_ai_patch(
+                            &mut engine,
+                            &metrocalk_core::stdlib::standard_components(),
+                            "generate-stream-in",
+                            &patch,
+                        );
+                        if delta.rejects.is_empty() {
+                            log.append(&Record::Generate {
+                                prompt,
+                                pos: [0.0; 3],
+                                mesh: Some(handle),
+                            });
+                            if let Some(ch) = &channel {
+                                let _ = ch.send(delta); // targeted stream-in delta (inv. 2)
+                            }
+                            rebuild(&engine, &shared, &mut positions, &assets);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1053,12 +1195,26 @@ fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
     rx.recv().unwrap_or_default()
 }
 
+/// Generate (M6, tier 3) — opt-in last resort. Drops a grey placeholder instantly + kicks off async
+/// text-to-3D; the real mesh streams in later over the projection Channel. Returns the placeholder + the
+/// inert token cost, or the offline seam.
+#[tauri::command]
+fn generate(state: State<AppState>, query: String) -> GenerateResponse {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Generate { query, reply }).is_err() {
+        return GenerateResponse::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 fn main() {
     let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
     let (tx, rx) = mpsc::channel::<EngineCmd>();
     {
         let shared = shared.clone();
-        std::thread::spawn(move || engine_thread(rx, shared));
+        let self_tx = tx.clone(); // so the engine thread can hand workers (generation) a way back
+        std::thread::spawn(move || engine_thread(rx, shared, self_tx));
     }
     let app_state = AppState {
         tx,
@@ -1108,7 +1264,8 @@ fn main() {
             entity_actions,
             remove_entity,
             duplicate_entity,
-            entity_details
+            entity_details,
+            generate
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");

@@ -68,6 +68,7 @@ pub trait MeshGenerator {
 /// transactional apply, and offline-degradation are CI-testable without a network/provider. Because the
 /// bytes are a fixed checked-in mesh, the generated asset's content-address is **stable**, so a replayed
 /// generation lands the same asset (ADR-013).
+#[derive(Clone)]
 pub struct FakeGenerator {
     mesh_bytes: Vec<u8>,
     latency: Duration,
