@@ -14,6 +14,7 @@ pub mod actions;
 pub mod ai;
 pub mod bridge;
 pub mod capscene;
+pub mod generate;
 pub mod persist;
 pub mod reveal;
 
@@ -25,6 +26,10 @@ pub use bridge::{
 pub use capscene::{
     apply_marketplace_entry, bind, describe_create, duplicate_entity, instantiate, place_mesh,
     positions, remove_entity, seed, CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
+};
+pub use generate::{
+    FakeGenerator, GenError, GenRequest, MeshGenerator, MeterAction, RemoteGenerator, StubMeter,
+    TokenMeter,
 };
 pub use persist::{Log, Record};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
