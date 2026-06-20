@@ -32,6 +32,9 @@ use metrocalk_editor_shell::{
     project_entity, project_full, ActionItem, AiPatch, CapScene, EditIntent, EditTx, Log,
     MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp, Record, Wallet,
 };
+use metrocalk_physics::{
+    BodyDesc, BodyHandle, BodyKind, ColliderDesc, ColliderShape, Fidelity, Physics, RapierPhysics,
+};
 use render::{Instance, SceneState, Shared};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -43,6 +46,10 @@ const SCENE_N: usize = 5000; // the real M1.4 stress scene (the M2 gate target)
 /// the importer still runs on real glTF bytes (provenance: `assets/examples/gen_fixtures.rs`).
 const HEALTHBAR_GLB: &[u8] = include_bytes!("../../assets/healthbar.glb");
 const PROP_GLB: &[u8] = include_bytes!("../../assets/prop.glb");
+/// The M8.2 physics test mesh — a ball; a spawned RigidBody renders as this (see `spawn_physics_body`).
+const SPHERE_GLB: &[u8] = include_bytes!("../../assets/sphere.glb");
+/// The spawned ball's collider radius (world meters). The render mesh is normalized separately.
+const BALL_RADIUS: f32 = 0.45;
 
 /// The runtime asset state the engine thread owns — the import store's results turned into render data,
 /// loaded once at startup. `catalog` maps a resolved component kind → its asset handle (describe-to-
@@ -57,6 +64,8 @@ struct AssetsRuntime {
     handle_to_slot: HashMap<String, usize>,
     scales: Vec<f32>,
     meshes: Vec<MeshGpu>,
+    /// The ball mesh handle (M8.2) — a spawned physics body renders as this.
+    sphere: String,
 }
 
 /// Import the embedded fixtures into a content-addressed store, build the kind→handle catalog, and pack
@@ -71,6 +80,9 @@ fn load_assets() -> AssetsRuntime {
         .import(&importer, HEALTHBAR_GLB)
         .expect("import healthbar.glb");
     let prop = store.import(&importer, PROP_GLB).expect("import prop.glb");
+    let sphere = store
+        .import(&importer, SPHERE_GLB)
+        .expect("import sphere.glb");
     let import_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // kind → asset handle: a resolved HealthBar renders as the bar mesh; a resolved MeshRenderer as the
@@ -111,6 +123,7 @@ fn load_assets() -> AssetsRuntime {
         handle_to_slot,
         scales,
         meshes,
+        sphere: sphere.as_str().to_string(),
     }
 }
 
@@ -255,6 +268,22 @@ enum EngineCmd {
         source: String,
         reply: Sender<AddResponse>,
     },
+    /// Spawn a physics body (M8.2) — one undoable ECS setup commit, mirrored into the sim, rendered as
+    /// the ball; replies its id. Starts the sim running.
+    SpawnBody {
+        pos: [f32; 3],
+        reply: Sender<Option<String>>,
+    },
+    /// Physics introspection (M8.2) — `(body count, lowest body y, contact count)`. A read of the sim +
+    /// the read-only diagnostic seam; lets the E2E confirm a dropped ball actually fell + landed.
+    PhysicsDebug {
+        reply: Sender<(usize, f64, usize)>,
+    },
+    /// Play/pause the deterministic sim (M8.2) — setup stays editable while paused.
+    SetSimRunning(bool),
+    /// Internal fixed-timestep heartbeat (M8.2): a self-sent tick that advances the sim one step + syncs
+    /// transforms to the viewport. NOT a JS command — it never crosses the WebView boundary (invariant 4).
+    Tick,
 }
 
 /// The "+ Add" result (M3.4) — the created entity (+ balance after a marketplace buy), or a seam
@@ -489,6 +518,54 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // only, so reserve→settle/release is atomic (no race).
     let mut pending_gen: HashMap<String, HoldId> = HashMap::new();
 
+    // ── M8.2 physics: the deterministic sim (f64 + enhanced-determinism, gameplay fidelity) the engine
+    // thread owns. `body_of` maps each physics ECS entity → its sim body (the ECS is the single authority
+    // over which bodies EXIST; the sim holds only running state). Setup is undoable commits; the per-tick
+    // transform stream is a projection to the render `SceneState`, NEVER a commit (ADR-021: sim-replay is
+    // a distinct channel from Loro time-travel — the undo stack stays authoring-only).
+    let mut sim = RapierPhysics::new(Fidelity::Gameplay.resolve().config);
+    // A fixed ground plane at y=0 (matching the viewport grid) so dropped bodies fall + REST rather than
+    // forever. Sim-only world geometry — NOT an editable ECS entity (its top surface is at y=0.5), so it's
+    // never synced to `body_of`; the grid is its visual.
+    {
+        let ground = sim.add_body(&BodyDesc::new(BodyKind::Fixed, [0.0, 0.0, 0.0]));
+        let _ = sim.add_collider(
+            ground,
+            &ColliderDesc::new(ColliderShape::Cuboid {
+                half_extents: [60.0, 0.5, 60.0],
+            }),
+        );
+    }
+    let mut body_of: HashMap<EntityId, BodyHandle> = HashMap::new();
+    // Re-hydrate the sim from any RESTORED physics entities (replay re-creates the ECS entity but not the
+    // sim body — see persist::Record::SpawnBody). Walk the restored RigidBody-carrying entities once.
+    for id in engine.entity_ids() {
+        if engine.components_of(id).contains_key("RigidBody") {
+            let p = body_spawn_pos(&engine, id);
+            let h = sim.add_body(&BodyDesc::new(BodyKind::Dynamic, p));
+            let _ = sim.add_collider(
+                h,
+                &ColliderDesc::new(ColliderShape::Ball {
+                    radius: f64::from(BALL_RADIUS),
+                }),
+            );
+            body_of.insert(id, h);
+        }
+    }
+    let mut sim_running = !body_of.is_empty();
+    // A fixed-cadence heartbeat (~60/s) on its own thread enqueues `Tick` via the engine's own sender, so
+    // the sim advances ON the engine thread (off the JS hot path, invariant 4) without blocking the
+    // command loop. A `Tick` is a no-op until the sim is running with at least one body.
+    {
+        let ticker = self_tx.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            if ticker.send(EngineCmd::Tick).is_err() {
+                break; // engine thread gone
+            }
+        });
+    }
+
     while let Ok(cmd) = rx.recv() {
         match cmd {
             EngineCmd::Connect(ch) => {
@@ -521,6 +598,19 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         let _ = ch.send(project_full(&engine)); // simplest correct post-undo sync
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
+                    // M8.2: ECS is the single authority over which bodies EXIST — undo of a spawn removed
+                    // the entity, so despawn its sim body (body_of follows the ECS, never the reverse).
+                    body_of.retain(|eid, h| {
+                        if engine.entity_exists(*eid) {
+                            true
+                        } else {
+                            sim.remove_body(*h);
+                            false
+                        }
+                    });
+                    if body_of.is_empty() {
+                        sim_running = false;
+                    }
                 }
             }
             EngineCmd::Reveal { id, reply } => {
@@ -1122,7 +1212,110 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 let _ = reply.send(resp);
             }
+            EngineCmd::SpawnBody { pos, reply } => {
+                // ECS-authoritative SETUP: one undoable commit creates the body entity (rendered as the
+                // ball via its MeshRenderer handle). Then MIRROR it into the sim (a dynamic ball body at
+                // the same position) and start the sim. The per-tick motion is synced separately (Tick).
+                match capscene::spawn_physics_body(
+                    &mut engine,
+                    &scene,
+                    Some(&assets.sphere),
+                    pos,
+                    BALL_RADIUS,
+                ) {
+                    Ok(id) => {
+                        let h = sim.add_body(&BodyDesc::new(
+                            BodyKind::Dynamic,
+                            [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
+                        ));
+                        let _ = sim.add_collider(
+                            h,
+                            &ColliderDesc::new(ColliderShape::Ball {
+                                radius: f64::from(BALL_RADIUS),
+                            }),
+                        );
+                        body_of.insert(id, h);
+                        log.append(&Record::SpawnBody {
+                            pos,
+                            mesh: Some(assets.sphere.clone()),
+                        });
+                        echo_created(
+                            &mut engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &channel,
+                            &mut recency,
+                            &mut touch,
+                            id,
+                        );
+                        sim_running = true;
+                        let _ = reply.send(Some(id.to_loro_key()));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(None);
+                    }
+                }
+            }
+            EngineCmd::SetSimRunning(run) => {
+                sim_running = run;
+            }
+            EngineCmd::Tick => {
+                // One fixed-`dt` step + a delta sync of the moved bodies' transforms to the viewport. A
+                // no-op until a body exists + the sim runs. NEVER a commit/Loro write (ADR-021).
+                if sim_running && !body_of.is_empty() {
+                    sim.step();
+                    sync_out(&sim, &body_of, &shared);
+                }
+            }
+            EngineCmd::PhysicsDebug { reply } => {
+                let min_y = body_of
+                    .values()
+                    .filter_map(|h| sim.transform(*h).map(|(t, _)| t[1]))
+                    .fold(f64::INFINITY, f64::min);
+                let contacts = sim.diagnostics().contact_count;
+                let _ = reply.send((body_of.len(), min_y, contacts));
+            }
         }
+    }
+}
+
+/// Read an entity's `Transform` x/y/z as a sim spawn position (`f64`, origin if absent) — used to
+/// re-hydrate the sim from restored physics entities after replay.
+fn body_spawn_pos(engine: &Engine<FlecsWorld>, id: EntityId) -> [f64; 3] {
+    let comps = engine.components_of(id);
+    let t = comps.get("Transform");
+    let get = |f: &str| -> f64 {
+        t.and_then(|m| m.get(f)).map_or(0.0, |v| match v {
+            FieldValue::Number(n) => *n,
+            FieldValue::Integer(i) => *i as f64,
+            _ => 0.0,
+        })
+    };
+    [get("x"), get("y"), get("z")]
+}
+
+/// M8.2 STEP 4 — the per-tick transform DELTA sync (hot path off JS). Writes each moved body's world
+/// position straight into the shared render [`SceneState`] (the projection the render loop reads every
+/// vsync) and bumps `revision` so the loop re-uploads — in place, no full rebuild, no `engine.commit`,
+/// no `Channel` send (invariants 2 + 4). Rotation is dropped (the cube/mesh shaders only translate +
+/// uniform-scale today — a rotation `Instance` field is a deferred render extension).
+fn sync_out(sim: &RapierPhysics, body_of: &HashMap<EntityId, BodyHandle>, shared: &Shared) {
+    let mut st = shared.lock().unwrap();
+    let mut moved = false;
+    for (eid, h) in body_of {
+        if let Some((t, _q)) = sim.transform(*h) {
+            let key = eid.to_loro_key();
+            if let Some(i) = st.ids.iter().position(|k| *k == key) {
+                if i < st.instances.len() {
+                    st.instances[i].center = [t[0] as f32, t[1] as f32, t[2] as f32];
+                    moved = true;
+                }
+            }
+        }
+    }
+    if moved {
+        st.revision = st.revision.wrapping_add(1);
     }
 }
 
@@ -1608,6 +1801,44 @@ fn duplicate_entity(state: State<AppState>, id: String) -> Option<String> {
     rx.recv().unwrap_or_default()
 }
 
+/// Spawn a physics body (M8.2) — one undoable ECS setup commit, mirrored into the deterministic sim and
+/// rendered as the ball; returns the new entity's id. Starts the sim running so it falls under gravity.
+#[tauri::command]
+fn spawn_body(state: State<AppState>, x: f32, y: f32, z: f32) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SpawnBody {
+            pos: [x, y, z],
+            reply,
+        })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Play/pause the deterministic physics sim (M8.2) — setup stays editable while paused.
+#[tauri::command]
+fn set_sim_running(state: State<AppState>, run: bool) {
+    ipc();
+    let _ = state.tx.send(EngineCmd::SetSimRunning(run));
+}
+
+/// Physics introspection (M8.2) — `[body_count, lowest_y, contacts]`. Lets the E2E confirm a dropped ball
+/// fell (lowest_y < spawn) and landed (contacts > 0). A read; the diagnostic seam is non-mutating.
+#[tauri::command]
+fn physics_debug(state: State<AppState>) -> (usize, f64, usize) {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PhysicsDebug { reply }).is_err() {
+        return (0, 0.0, 0);
+    }
+    rx.recv().unwrap_or((0, 0.0, 0))
+}
+
 /// Hover-tooltip details for an entity (M3.3) — fetched on hovered-entity change, not per frame.
 #[tauri::command]
 fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
@@ -1775,7 +2006,10 @@ fn main() {
             wallet_info,
             catalog,
             catalog_search,
-            add_item
+            add_item,
+            spawn_body,
+            set_sim_running,
+            physics_debug
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");

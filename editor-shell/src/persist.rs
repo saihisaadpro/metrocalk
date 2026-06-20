@@ -42,6 +42,16 @@ pub enum Record {
     /// re-placing the same handle; the handle re-resolves against the reloaded (content-addressed)
     /// store, so the placed mesh survives close→reopen (ADR-013 id determinism).
     PlaceMesh { asset: String, pos: [f32; 3] },
+    /// A physics-body spawn (M8.2): a dynamic RigidBody + ball Collider + its ball mesh handle, at a
+    /// position. Replayed by re-spawning deterministically (same id alloc); the sim body itself is
+    /// RE-HYDRATED from the restored RigidBody entity by the engine thread after replay. Loro stores the
+    /// SETUP intent, never the trajectory — ADR-021: sim-replay is a distinct channel from Loro
+    /// time-travel (the sim regenerates the path from initial-state + ordered input + fixed dt).
+    SpawnBody {
+        pos: [f32; 3],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mesh: Option<String>,
+    },
     /// A marketplace-tier apply (M5): a chosen pre-componentized entry, replayed deterministically by
     /// re-fetching it from the (checked-in) catalog by id + re-applying its namespaced caps + mesh
     /// handle, so a *marketplace*-sourced object survives reload exactly like a local one.
@@ -161,6 +171,9 @@ impl Log {
                 }
                 Record::PlaceMesh { asset, pos } => {
                     capscene::place_mesh(engine, scene, &asset, pos).is_ok()
+                }
+                Record::SpawnBody { pos, mesh } => {
+                    capscene::spawn_physics_body(engine, scene, mesh.as_deref(), pos, 0.45).is_ok()
                 }
                 Record::ApplyMarketplace {
                     entry_id,

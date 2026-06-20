@@ -560,4 +560,52 @@ mod tests {
         );
         assert_eq!(prov.final_world_hash, p.world_hash());
     }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only timing measurement (run --release)")]
+    fn step_fits_the_frame_budget_at_scale() {
+        // Min-spec budget (product principle 3): a fixed-`dt` step at a representative body count must fit
+        // one 60 Hz frame (<16 ms). Measured in release (debug timing is meaningless). 100 dynamic balls
+        // on a ground — the M8.2 demo scale. An absolute, order-of-magnitude gate (jitter-proof on a
+        // shared runner, same rationale as perf-gate); the determinism config (single-thread libm) is the
+        // worst case for speed, so this is the honest authoritative-path cost.
+        let mut p = RapierPhysics::new(PhysicsConfig::default());
+        let ground = p.add_body(&BodyDesc::new(BodyKind::Fixed, [0.0, 0.0, 0.0]));
+        p.add_collider(
+            ground,
+            &ColliderDesc::new(ColliderShape::Cuboid {
+                half_extents: [30.0, 0.5, 30.0],
+            }),
+        )
+        .unwrap();
+        for i in 0..100u32 {
+            let b = p.add_body(&BodyDesc::new(
+                BodyKind::Dynamic,
+                [
+                    f64::from(i % 10) * 1.1 - 5.0,
+                    3.0 + f64::from(i / 10) * 1.1,
+                    0.0,
+                ],
+            ));
+            p.add_collider(b, &ColliderDesc::new(ColliderShape::Ball { radius: 0.5 }))
+                .unwrap();
+        }
+        for _ in 0..30 {
+            p.step(); // warm
+        }
+        let mut times = Vec::with_capacity(300);
+        for _ in 0..300 {
+            let t0 = std::time::Instant::now();
+            p.step();
+            times.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = times[times.len() / 2];
+        let p99 = times[times.len() * 99 / 100];
+        eprintln!("[M8.2] physics step @100 dynamic bodies: p50={p50:.3}ms p99={p99:.3}ms");
+        assert!(
+            p99 < 16.0,
+            "a physics step (p99={p99:.3}ms) must fit one 60 Hz frame at 100 bodies"
+        );
+    }
 }

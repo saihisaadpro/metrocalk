@@ -240,4 +240,42 @@ describe("Metrocalk editor — north-star #1 live", () => {
       timeoutMsg: "a plain click did not exit focus mode",
     });
   });
+
+  // ── M8.2 physics: drop a deterministic dynamic ball → it falls under gravity (sim on the native engine
+  // thread, off the JS hot path) and rests on the ground; one undoable spawn. The test reads the physics
+  // state on demand via physics_debug = [bodyCount, lowestY, contacts] — the app itself never polls it. ──
+  const physDbg = async () =>
+    browser.execute(() => window.__TAURI__.core.invoke("physics_debug"));
+
+  it("M8.2: a dropped ball falls under gravity and lands on the ground", async () => {
+    await $("#dropBall").click();
+    await browser.waitUntil(async () => (await $("#status").getText()).includes("dropped a ball"), {
+      timeout: 10000,
+      timeoutMsg: "no 'dropped a ball' status after clicking Drop a ball",
+    });
+    // The sim advances natively — poll until the ball has fallen well below its y=8 spawn AND made a
+    // ground contact (rest height ≈ 0.95). This proves the deterministic fixed-step loop + the delta
+    // transform sync to the viewport are live.
+    let dbg;
+    await browser.waitUntil(
+      async () => {
+        dbg = await physDbg(); // [count, lowestY, contacts]
+        return dbg[0] >= 1 && dbg[1] < 2.0 && dbg[2] >= 1;
+      },
+      { timeout: 15000, timeoutMsg: "ball never fell + landed; last physics_debug = " + JSON.stringify(dbg) }
+    );
+    expect(dbg[0]).toBeGreaterThanOrEqual(1); // at least one simulated body
+    expect(dbg[1]).toBeLessThan(2.0); // fell from y=8 toward the ground
+  });
+
+  it("M8.2: Ctrl-Z removes the ball (setup is one undoable transaction; the sim body despawns too)", async () => {
+    const had = (await physDbg())[0];
+    expect(had).toBeGreaterThanOrEqual(1);
+    await browser.keys(["Control", "z"]);
+    await browser.waitUntil(async () => (await physDbg())[0] < had, {
+      timeout: 10000,
+      timeoutMsg: "undo did not despawn the ball (body_of must follow the ECS)",
+    });
+    expect((await physDbg())[0]).toBe(had - 1);
+  });
 });

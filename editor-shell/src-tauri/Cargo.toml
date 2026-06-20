@@ -29,6 +29,9 @@ metrocalk-editor-shell = { path = ".." }
 metrocalk-assets = { path = "../../assets" }
 # The token economy (M7): the wallet/ledger types the three paid sinks meter against.
 metrocalk-economy = { path = "../../economy" }
+# The physics subsystem (M8.2): the project-owned `Physics` trait (Rapier wrapped). Only the binary
+# links it — `capscene` (the bridge lib) stays physics-free. No rapier/parry type leaks across (CI-gated).
+metrocalk-physics = { path = "../../physics" }
 
 # Native wgpu viewport (M2.2 instanced render path). DX12 disabled — wgpu-hal 29's DX12 fights the
 # `windows` crate version Tauri/webview2-com pins (the diamond M2.1/M2.3 documented); Vulkan is the

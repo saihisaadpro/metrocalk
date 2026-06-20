@@ -42,6 +42,12 @@
           <button id="topup" style="margin:0 0 0 6px;padding:2px 8px;font-size:11px;background:#4a3a1f">Top up +100</button>
         </div>
         <button id="undo">⟲ Undo (Ctrl-Z)</button>
+        <!-- M8.2 physics: drop a deterministic dynamic ball (one undoable spawn → falls under gravity,
+             simulated natively on the engine thread; pause keeps setup editable). -->
+        <div style="padding:0 12px 6px;display:flex;gap:6px;align-items:center">
+          <button id="dropBall" style="margin:0;padding:3px 10px;background:#4a3f2f">🏀 Drop a ball</button>
+          <button id="simToggle" style="margin:0;padding:3px 10px;background:#2f3a4a">⏸ Pause sim</button>
+        </div>
         <h3>Create</h3>
         <!-- Two doors over ONE catalog + one instantiate (M3.4): BROWSE ("+ Add" palette, categories +
              search) and DESCRIBE (type it). Both reach the same pre-componentized, undoable instantiate. -->
@@ -298,6 +304,23 @@
       $("genBtn").onclick = doGenerate;
       $("describeBtn").onclick = doDescribe;
       $("describe").addEventListener("keydown", (e) => { if (e.key === "Enter") doDescribe(); });
+
+      // ── M8.2 physics: drop a deterministic dynamic ball + play/pause the sim. The spawn is ONE undoable
+      // commit (Ctrl-Z removes the ball); a small x/z spread is recorded in the log so replay reproduces
+      // it. The sim runs natively on the engine thread (no per-frame IPC) — the viewport just shows it move.
+      let simRunning = true;
+      $("dropBall").onclick = async () => {
+        const x = (Math.random() - 0.5) * 2, z = (Math.random() - 0.5) * 2;
+        const id = await invoke("spawn_body", { x, y: 8.0, z });
+        if (id) { simRunning = true; $("simToggle").textContent = "⏸ Pause sim"; status("dropped a ball · " + id + " (falling)"); }
+        else status("could not spawn a body");
+      };
+      $("simToggle").onclick = () => {
+        simRunning = !simRunning;
+        invoke("set_sim_running", { run: simRunning });
+        $("simToggle").textContent = simRunning ? "⏸ Pause sim" : "▶ Resume sim";
+        status(simRunning ? "sim running" : "sim paused");
+      };
 
       // ── "+ Add" command palette (M3.4): BROWSE the catalog by category + a SEARCH bar (reuses the
       // resolver via catalog_search). Picking an item = the same undoable instantiate as describe; a
