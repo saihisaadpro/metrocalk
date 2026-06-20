@@ -562,7 +562,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only timing measurement (run --release)")]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only timing measurement (run --release)"
+    )]
     fn step_fits_the_frame_budget_at_scale() {
         // Min-spec budget (product principle 3): a fixed-`dt` step at a representative body count must fit
         // one 60 Hz frame (<16 ms). Measured in release (debug timing is meaningless). 100 dynamic balls
