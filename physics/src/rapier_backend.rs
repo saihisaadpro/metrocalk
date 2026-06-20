@@ -13,8 +13,8 @@ use rapier3d_f64 as rapier;
 
 use crate::{
     BodyDesc, BodyHandle, BodyKind, BroadPhase, ColliderDesc, ColliderHandle, ColliderShape,
-    Contact, Diagnostics, FrameHash, JointDesc, JointHandle, Physics, PhysicsConfig, PhysicsError,
-    Provenance, Quat, Vec3,
+    Contact, DerivedCollider, Diagnostics, FrameHash, JointDesc, JointHandle, Physics,
+    PhysicsConfig, PhysicsError, Provenance, Quat, Vec3,
 };
 
 /// blake3 hex of bytes — the deterministic hash primitive (matches the M8.1 spike).
@@ -457,6 +457,60 @@ impl Physics for RapierPhysics {
     }
 }
 
+/// M8.3 collision-shape generation (the M4/ADR-014-deferred piece): derive a dynamic-body collider from a
+/// mesh — a convex hull of the vertices + the **fit error** vs the mesh's own volume, so the authoring
+/// layer can report "convex hull, fit error N %" on a concave mesh rather than silently approximating.
+/// Pure geometry (Parry's hull + the divergence-theorem mesh volume); the boundary types are ours.
+///
+/// # Errors
+/// [`PhysicsError::UnsupportedShape`] if the mesh has < 4 vertices or its points are degenerate (a hull
+/// can't be built) — surfaced, never a silent empty collider.
+pub fn derive_collider(
+    vertices: &[Vec3],
+    indices: &[u32],
+) -> Result<DerivedCollider, PhysicsError> {
+    if vertices.len() < 4 {
+        return Err(PhysicsError::UnsupportedShape(
+            "mesh has too few vertices (< 4) to derive a collider".into(),
+        ));
+    }
+    let pts: Vec<Vector> = vertices.iter().map(|v| vec(*v)).collect();
+    let hull = SharedShape::convex_hull(&pts).ok_or_else(|| {
+        PhysicsError::UnsupportedShape("degenerate hull (collinear/coincident points)".into())
+    })?;
+    // density 1 ⇒ mass == volume; compare the hull's volume to the mesh's own enclosed volume.
+    let hull_vol = hull.mass_properties(1.0).mass().max(1e-9);
+    let mesh_vol = mesh_volume(vertices, indices).abs();
+    #[allow(clippy::cast_possible_truncation)]
+    let fit_error = (((hull_vol - mesh_vol) / hull_vol).clamp(0.0, 1.0)) as f32;
+    Ok(DerivedCollider {
+        shape: ColliderShape::ConvexHull {
+            points: vertices.to_vec(),
+        },
+        fit_error,
+        concave: fit_error > 0.1,
+        vertex_count: vertices.len(),
+    })
+}
+
+/// Signed volume enclosed by a triangle mesh (divergence theorem: Σ of the origin tetrahedra over the
+/// triangles). `abs()` at the call site handles winding. A non-multiple-of-3 index tail is ignored.
+fn mesh_volume(vertices: &[Vec3], indices: &[u32]) -> f64 {
+    let mut v = 0.0f64;
+    for tri in indices.chunks_exact(3) {
+        let a = vertices[tri[0] as usize];
+        let b = vertices[tri[1] as usize];
+        let c = vertices[tri[2] as usize];
+        let cross = [
+            b[1] * c[2] - b[2] * c[1],
+            b[2] * c[0] - b[0] * c[2],
+            b[0] * c[1] - b[1] * c[0],
+        ];
+        v += (a[0] * cross[0] + a[1] * cross[1] + a[2] * cross[2]) / 6.0;
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,5 +664,46 @@ mod tests {
             p99 < 16.0,
             "a physics step (p99={p99:.3}ms) must fit one 60 Hz frame at 100 bodies"
         );
+    }
+
+    #[test]
+    fn derive_collider_reports_fit_and_concavity() {
+        // A unit cube — convex, so its hull fits perfectly (fit_error ≈ 0, not concave).
+        let cube = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ];
+        let cube_idx: [u32; 36] = [
+            0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 5, 1, 0, 4, 5, 3, 2, 6, 3, 6, 7, 0, 3, 7, 0, 7,
+            4, 1, 5, 6, 1, 6, 2,
+        ];
+        let d = derive_collider(&cube, &cube_idx).unwrap();
+        assert!(matches!(d.shape, ColliderShape::ConvexHull { .. }));
+        assert_eq!(d.vertex_count, 8);
+        assert!(
+            d.fit_error < 0.05,
+            "a convex cube fits its hull (got {})",
+            d.fit_error
+        );
+        assert!(!d.concave);
+
+        // The SAME 8 corner points but only a flat slab of triangles → the mesh encloses ~no volume while
+        // the hull is the full cube → a high fit error → flagged concave ("this needs a hull/voxels").
+        let d2 = derive_collider(&cube, &[0u32, 1, 2, 0, 2, 3]).unwrap();
+        assert!(
+            d2.fit_error > 0.5,
+            "near-empty mesh in a full hull is concave (got {})",
+            d2.fit_error
+        );
+        assert!(d2.concave);
+
+        // Too few vertices → an explained error, never a silent empty collider.
+        assert!(derive_collider(&cube[..3], &[0u32, 1, 2]).is_err());
     }
 }

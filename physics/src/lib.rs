@@ -23,7 +23,7 @@
 
 mod rapier_backend;
 
-pub use rapier_backend::RapierPhysics;
+pub use rapier_backend::{derive_collider, RapierPhysics};
 
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +115,23 @@ impl ColliderDesc {
             restitution: 0.0,
         }
     }
+}
+
+/// A collider derived from a mesh — the M8.3 collision-shape generation (the piece M4/ADR-014 deferred).
+/// Geometry only; no rapier/parry type crosses this. Carries the FIT metrics so the authoring layer can
+/// explain a concave-dynamic choice ("convex hull, fit error N %") instead of silently approximating.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct DerivedCollider {
+    /// The generated shape — a [`ColliderShape::ConvexHull`] of the mesh vertices (Parry hulls them at
+    /// collider build). A dynamic body needs a convex shape; this is the honest default.
+    pub shape: ColliderShape,
+    /// Fraction of the convex hull's volume NOT filled by the mesh (`0.0` = a perfect convex fit; higher
+    /// = more concave). The "report the error" the concave-dynamic warning surfaces.
+    pub fit_error: f32,
+    /// `true` when `fit_error` exceeds the concavity threshold (10 %) — the mesh is concave, so a dynamic
+    /// body should use this hull (or voxels, or stay static), never the raw concave mesh.
+    pub concave: bool,
+    pub vertex_count: usize,
 }
 
 /// A body to add to the world.
