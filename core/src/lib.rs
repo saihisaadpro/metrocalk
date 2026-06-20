@@ -14,7 +14,9 @@
 //! Native-only — it depends on Flecs through the wrapper; the browser uses the pure-Rust query
 //! backend over the Loro projection (ADR-006).
 
+pub mod caps;
 pub mod entity_id;
+pub mod marketplace;
 pub mod merge;
 pub mod pipeline;
 pub mod producer;
@@ -24,11 +26,14 @@ pub mod stdlib;
 pub mod undo;
 
 pub use entity_id::{EntityId, IdGenerator};
+pub use marketplace::{
+    CapDecl, LocalCatalog, MarketplaceEntry, MarketplaceIndex, MarketplaceMatch,
+};
 pub use merge::MergeReport;
 pub use pipeline::{Engine, FieldValue, Op, PipelineError};
 pub use producer::ProducerHook;
 pub use registry::{Builder, ComponentMeta, FieldSpec, FieldType, Registry, RegistryError};
-pub use resolve::{resolve_local, Match, NextTier, Resolution};
+pub use resolve::{resolve, resolve_local, Match, NextTier, Resolution, Resolved};
 
 /// Engine identifier — one constant shared by downstream crates, logs, and file headers.
 pub const ENGINE_NAME: &str = "metrocalk";
