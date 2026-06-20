@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use metrocalk_core::caps::{canonical, display_name};
+use metrocalk_core::caps::{canonical, display_name, is_standard};
 use metrocalk_core::marketplace::MarketplaceEntry;
 use metrocalk_core::{ComponentMeta, Engine, EntityId, FieldType, FieldValue, Op, PipelineError};
 use metrocalk_ecs::rng::Rng;
@@ -116,12 +116,19 @@ impl CapScene {
         //    applied provider also provides the standard cap (reveal/bind works across authors).
         for entry in metrocalk_core::marketplace::builtin_catalog() {
             for cap in entry.provides.iter().chain(entry.requires.iter()) {
-                let c = intern_cap(world, &mut caps, &mut cap_name, &cap.canonical_name());
+                let cap_canon = cap.canonical_name();
+                let c = intern_cap(world, &mut caps, &mut cap_name, &cap_canon);
                 if let Some(std_name) = cap.canonical_alias() {
-                    let s = intern_cap(world, &mut caps, &mut cap_name, &std_name);
-                    if c != s {
-                        world.add_pair(c, alias_of, s); // the relational `(AliasOf, std)` pair
-                        alias.insert(c, s);
+                    // **One-directional, toward the standard vocab (the adversarial guard, ADR-015):**
+                    // only a CUSTOM cap may alias a STANDARD cap. A `std:* AliasOf author:*` (an author
+                    // trying to re-point / hijack a standard cap) is ignored — the std cap entity is
+                    // never made to alias an author's cap, so no cap can redefine `std:Health`.
+                    if !is_standard(&cap_canon) && is_standard(&std_name) {
+                        let s = intern_cap(world, &mut caps, &mut cap_name, &std_name);
+                        if c != s {
+                            world.add_pair(c, alias_of, s); // the relational `(AliasOf, std)` pair
+                            alias.insert(c, s);
+                        }
                     }
                 }
             }
