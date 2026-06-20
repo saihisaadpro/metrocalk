@@ -344,11 +344,14 @@
         const cx = ev.clientX, cy = ev.clientY;
         hoverTimer = setTimeout(async () => {
           const id = await invoke("viewport_peek", { x: cx / window.innerWidth, y: cy / window.innerHeight });
+          // A menu opened or a drag began while this peek was in flight → abort: don't fetch details and
+          // don't paint a stale tooltip over the menu (the await points aren't covered by the guard above).
+          if (ctxmenu.style.display === "block" || rcStart) return;
           if (id === lastHover) return; // same entity → no boundary crossing for details
           lastHover = id;
           if (!id) { hideTip(); return; }
           const d = await invoke("entity_details", { id });
-          if (d && lastHover === id) showTooltip(d, cx, cy);
+          if (d && lastHover === id && ctxmenu.style.display !== "block") showTooltip(d, cx, cy);
         }, 130);
       });
       vp.addEventListener("mouseleave", hideTip);

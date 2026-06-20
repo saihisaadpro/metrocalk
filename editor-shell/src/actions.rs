@@ -8,8 +8,10 @@
 //! pipeline (`capscene::{remove_entity, duplicate_entity}` + the M3.1 `bind`); `Focus`/`Inspect` are
 //! viewport/UI ops with no mutation.
 
+use std::collections::HashSet;
+
 use metrocalk_core::{Engine, EntityId};
-use metrocalk_ecs::FlecsWorld;
+use metrocalk_ecs::{Entity, FlecsWorld, World};
 use serde::Serialize;
 
 use crate::capscene::CapScene;
@@ -97,17 +99,33 @@ pub fn actions_for(engine: &Engine<FlecsWorld>, scene: &CapScene, id: EntityId) 
         .collect();
     };
 
-    // Bind…: reuse the reveal's required-caps read. Available iff the entity requires something and
-    // hasn't already taken an outgoing binding to satisfy it.
+    // Bind…: reuse the reveal's required-caps read. Available iff the entity has a required capability
+    // NOT yet satisfied by an existing binding. A multi-capability requirer bound for one cap can still
+    // bind the others — so correlate each outgoing binding to the caps its bound provider actually
+    // provides, rather than treating "has any binding" as "fully satisfied".
     let requires = required_caps(engine.world(), ecs, scene.rels);
-    let already_bound = engine.bindings().iter().any(|(from, _, _)| *from == id);
+    let mut satisfied: HashSet<Entity> = HashSet::new();
+    for (from, _, to) in engine.bindings() {
+        if from != id {
+            continue;
+        }
+        if let Some(to_ecs) = engine.ecs_entity(to) {
+            for cap in engine.world().targets(to_ecs, scene.rels.provides) {
+                satisfied.insert(cap);
+            }
+        }
+    }
+    let has_unmet = requires.iter().any(|c| !satisfied.contains(c));
     let (bind_ok, bind_reason) = if requires.is_empty() {
         (
             false,
             Some("requires no capabilities — nothing to bind".to_string()),
         )
-    } else if already_bound {
-        (false, Some("already bound to a provider".to_string()))
+    } else if !has_unmet {
+        (
+            false,
+            Some("all required capabilities are already bound".to_string()),
+        )
     } else {
         (true, None)
     };

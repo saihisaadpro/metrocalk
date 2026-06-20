@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use metrocalk_core::{Engine, EntityId};
+use metrocalk_core::{Engine, EntityId, FieldValue, Op};
 use metrocalk_ecs::{Entity, FlecsWorld};
 
 use metrocalk_editor_shell::actions::{actions_for, Action};
@@ -111,6 +111,53 @@ fn action_model_offers_valid_actions_and_explains_every_no() {
     assert!(actions_for(&engine, &scene, ghost)
         .iter()
         .all(|i| !i.available));
+}
+
+#[test]
+fn bind_stays_available_for_a_multi_cap_requirer_bound_for_only_one() {
+    // A requirer of TWO caps, bound for one, must still offer Bind for the other (the adversarial-review
+    // finding: "has any binding" must not be read as "fully satisfied").
+    let (mut engine, scene, index) = seeded();
+    let r = engine.alloc_entity_id();
+    engine
+        .commit(
+            "multi-req",
+            vec![
+                Op::CreateEntity {
+                    id: r,
+                    parent: None,
+                },
+                Op::SetField {
+                    entity: r,
+                    component: "Transform".into(),
+                    field: "x".into(),
+                    value: FieldValue::Number(0.0),
+                },
+                Op::AddPair {
+                    entity: r,
+                    rel: scene.rels.requires,
+                    target: scene.cap("Health"),
+                },
+                Op::AddPair {
+                    entity: r,
+                    rel: scene.rels.requires,
+                    target: scene.cap("Spatial"),
+                },
+            ],
+        )
+        .unwrap();
+    assert!(
+        action(&engine, &scene, r, Action::Bind).0,
+        "two unmet caps → Bind available"
+    );
+
+    // Bind it to a Health provider → Health satisfied, Spatial still unmet.
+    let provider = nearest_provider(&engine, &scene, index.health_bars[0]);
+    capscene::bind(&mut engine, &scene, r, provider).unwrap();
+    assert!(
+        action(&engine, &scene, r, Action::Bind).0,
+        "multi-cap requirer can still bind its remaining (Spatial) cap"
+    );
 }
 
 #[test]
