@@ -375,6 +375,7 @@
       vp.addEventListener("mousedown", async (ev) => {
         if (ev.button === 2) { rcStart = { x: ev.clientX, y: ev.clientY }; invoke("drag_start"); return; } // right = orbit-or-menu
         if (ev.button !== 0) return;
+        if (focusMode) doUnfocus(); // a plain click returns to the normal overview before re-picking
         const x = ev.clientX / window.innerWidth;
         const y = ev.clientY / window.innerHeight;
         const id = await invoke("viewport_pick", { x, y });
@@ -400,10 +401,41 @@
       tooltip.id = "tooltip";
       tooltip.style.cssText = "position:fixed;z-index:50;display:none;pointer-events:none;max-width:280px;background:#10141f;border:1px solid #2a3550;border-radius:6px;padding:6px 9px;font-size:12px;line-height:1.4;box-shadow:0 4px 16px rgba(0,0,0,.5)";
       document.body.appendChild(tooltip);
+
+      // ── M3.3 Focus mode banner ─────────────────────────────────────────────────────────────────
+      // While an entity is focused the viewport grays out the rest + zooms in; this banner is the
+      // visible affordance to return to normal (click it, or press Esc). `focusMode` mirrors the Rust
+      // state so the E2E/WebView test (and the Escape handler) can assert + toggle it deterministically.
+      let focusMode = false;
+      const focusBanner = document.createElement("div");
+      focusBanner.id = "focusbanner";
+      focusBanner.style.cssText = "position:fixed;z-index:65;display:none;top:12px;left:50%;transform:translateX(-50%);background:#1b2230;border:1px solid #ffd24a;color:#ffe7a3;border-radius:16px;padding:5px 14px;font-size:12px;cursor:pointer;box-shadow:0 4px 18px rgba(0,0,0,.5)";
+      document.body.appendChild(focusBanner);
+      async function enterFocus(id) {
+        focusMode = true;
+        focusBanner.textContent = "🔍 Focused: " + id + "  ·  click or press Esc to exit";
+        focusBanner.style.display = "block";
+        // Surface the Rust camera state into the DOM so the E2E can assert "got nearby" (distance) and
+        // the dim flag without reading the under-WebView GPU surface (ADR-008).
+        try {
+          const [dist, focused] = await invoke("focus_debug");
+          focusBanner.dataset.dist = dist;
+          focusBanner.dataset.focused = focused;
+        } catch (e) {}
+      }
+      function doUnfocus() {
+        if (!focusMode) return;
+        focusMode = false;
+        focusBanner.style.display = "none";
+        invoke("unfocus");
+        status("focus cleared");
+      }
+      focusBanner.addEventListener("click", doUnfocus);
+
       const hideMenu = () => { ctxmenu.style.display = "none"; };
       const hideTip = () => { tooltip.style.display = "none"; lastHover = null; };
       document.addEventListener("click", hideMenu);
-      document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideMenu(); });
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape") { hideMenu(); doUnfocus(); } });
 
       async function openContextMenu(cx, cy) {
         if (hoverTimer) clearTimeout(hoverTimer);
@@ -439,7 +471,7 @@
       async function runAction(action, id) {
         if (action === "bind") { select(id); status("bind: pick a target in the panel"); }
         else if (action === "inspect") { select(id); status("inspect " + id); }
-        else if (action === "focus") { invoke("focus_entity", { id }); status("focused " + id); }
+        else if (action === "focus") { select(id); await invoke("focus_entity", { id }); await enterFocus(id); status("focused " + id); }
         else if (action === "remove") {
           invoke("remove_entity", { id });
           if (selected === id) { selected = null; renderInspector(); revealFor(null); }

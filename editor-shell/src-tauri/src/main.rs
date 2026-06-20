@@ -1543,16 +1543,39 @@ fn viewport_peek(
     hit.and_then(|i| st.ids.get(i).cloned())
 }
 
-/// Frame the camera on an entity (M3.3 Focus) — a pure camera op (no scene mutation, not undoable,
-/// invariant 4): set the orbit target to the entity's position so orbit/zoom now revolve around it.
+/// Frame the camera on an entity (M3.3 Focus) — a pure camera/render-state op (no scene mutation, not
+/// undoable, invariant 4). Three effects, all reversible by [`unfocus`]:
+///   1. **Center** — set the orbit target to the entity's position so the camera looks straight at it
+///      (it sits in the middle of the viewport).
+///   2. **Get nearby** — zoom in to frame the entity by its size (saving the prior `distance` once, so
+///      the first unfocus restores the original framing even after focusing several entities in turn).
+///   3. **Gray the rest** — select the entity and raise the focus flag; the shader then dims every
+///      *other* instance toward the background (the `focus_active` uniform), so only this one stays lit.
 #[tauri::command]
 fn focus_entity(state: State<AppState>, id: String) {
     ipc();
     let mut st = state.shared.lock().unwrap();
     if let Some(i) = st.ids.iter().position(|k| *k == id) {
-        st.cam_target = st.instances[i].center;
-        st.revision = st.revision.wrapping_add(1);
+        st.focus_on(i); // center + zoom-to-frame + select + raise the dim flag (see SceneState::focus_on)
     }
+}
+
+/// Exit M3.3 Focus mode ("everything comes back to normal"): un-dim the other entities and restore the
+/// orbit `distance` saved when focus was entered (see [`render::SceneState::clear_focus`]). Idempotent —
+/// a no-op when nothing is focused, so a stray Escape never disturbs the scene.
+#[tauri::command]
+fn unfocus(state: State<AppState>) {
+    ipc();
+    state.shared.lock().unwrap().clear_focus();
+}
+
+/// Introspect the Focus/camera state for the E2E (the viewport renders to a wgpu surface *under* the
+/// transparent WebView, so WebdriverIO can't read its pixels — this exposes the observable state the
+/// focus workflow test asserts). Returns `(orbit distance, focus-active flag)`.
+#[tauri::command]
+fn focus_debug(state: State<AppState>) -> (f32, bool) {
+    let st = state.shared.lock().unwrap();
+    (st.distance, st.focused.is_some())
 }
 
 /// The action model for an entity (M3.3) — valid actions + every-"no"-explained. A read; blocks
@@ -1740,6 +1763,8 @@ fn main() {
             viewport_pick,
             viewport_peek,
             focus_entity,
+            unfocus,
+            focus_debug,
             entity_actions,
             remove_entity,
             duplicate_entity,

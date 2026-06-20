@@ -186,4 +186,55 @@ describe("Metrocalk editor — north-star #1 live", () => {
     await browser.pause(300);
     expect(await ctxVisible()).toBe(false);
   });
+
+  // ── Focus mode: center + zoom-to-frame the entity ("get nearby") and gray out the rest; Escape (or
+  // a click) brings everything back to normal. The 3D dim happens in the wgpu surface UNDER the
+  // transparent WebView (ADR-008) so WebdriverIO can't read its pixels — we assert the observable
+  // state instead: the banner (DOM) + the Rust camera state surfaced into the banner's dataset. ──────
+  const banner = async () => $("#focusbanner");
+  const bannerVisible = async () => (await (await banner()).getCSSProperty("display")).value !== "none";
+
+  it("Focus from the menu centers, zooms 'nearby', and raises the dim flag", async () => {
+    await browser.keys(["Escape"]); // clean slate: no prior focus, no open menu
+    const vp = await $("#viewport");
+    // Open the context menu on the centre entity, then click Focus.
+    await browser.action("pointer", { parameters: { pointerType: "mouse" } })
+      .move({ origin: vp }).down({ button: 2 }).up({ button: 2 }).perform();
+    await browser.waitUntil(ctxVisible, { timeout: 10000, timeoutMsg: "menu never opened for Focus" });
+    await $('#ctxmenu .ctxitem[data-action="focus"]').click();
+    // The banner is the visible "you are focused" affordance.
+    await browser.waitUntil(bannerVisible, { timeout: 10000, timeoutMsg: "focus banner never appeared" });
+    expect(await (await banner()).getText()).toContain("Focused");
+    // The Rust camera state (surfaced into the dataset) confirms focus active + zoomed into the framing
+    // range — "get nearby" puts the orbit distance at ≤ 40 (the focus-distance clamp), well in from the
+    // ~60 default overview.
+    const b = await banner();
+    expect(await b.getAttribute("data-focused")).toBe("true");
+    expect(Number(await b.getAttribute("data-dist"))).toBeLessThanOrEqual(40);
+  });
+
+  it("Escape unfocuses → banner clears and the dim flag drops (everything back to normal)", async () => {
+    expect(await bannerVisible()).toBe(true); // still focused from the previous step
+    await browser.keys(["Escape"]);
+    await browser.waitUntil(async () => !(await bannerVisible()), {
+      timeout: 10000,
+      timeoutMsg: "focus banner never cleared on Escape",
+    });
+    expect(await $("#status").getText()).toContain("focus cleared");
+  });
+
+  it("Focus again, then a plain viewport click returns to the normal overview", async () => {
+    const vp = await $("#viewport");
+    await browser.action("pointer", { parameters: { pointerType: "mouse" } })
+      .move({ origin: vp }).down({ button: 2 }).up({ button: 2 }).perform();
+    await browser.waitUntil(ctxVisible, { timeout: 10000, timeoutMsg: "menu never reopened for Focus" });
+    await $('#ctxmenu .ctxitem[data-action="focus"]').click();
+    await browser.waitUntil(bannerVisible, { timeout: 10000, timeoutMsg: "focus banner never reappeared" });
+    // A plain left-click anywhere exits focus mode (click-away returns to normal).
+    await vp.click();
+    await browser.waitUntil(async () => !(await bannerVisible()), {
+      timeout: 10000,
+      timeoutMsg: "a plain click did not exit focus mode",
+    });
+  });
 });

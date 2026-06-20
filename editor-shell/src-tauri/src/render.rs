@@ -72,9 +72,70 @@ pub struct SceneState {
     /// The camera look-at target (orbit centre). Default origin; `focus_entity` sets it to an entity's
     /// position so the camera frames it. Orbit/zoom stay relative to this target.
     pub cam_target: [f32; 3],
+    /// M3.3 Focus mode: the focused instance index (`Some` ⇒ focus active). Drives the shader dim
+    /// (`focus_active` uniform) so every *other* entity grays out, and is the camera-frame target.
+    /// Cleared by `unfocus` ("everything comes back to normal"). The focused entity is also the
+    /// selected one, so the shader keeps it lit via the existing per-instance `selected` flag.
+    pub focused: Option<usize>,
+    /// The orbit `distance` saved when focus mode was *entered* (`get nearby` zooms in; unfocus
+    /// restores this). `None` ⇒ not focused / nothing to restore. Saved once on enter so focusing a
+    /// second entity without un-focusing first doesn't lose the original framing.
+    pub pre_focus_distance: Option<f32>,
 }
 
 pub type Shared = Arc<Mutex<SceneState>>;
+
+impl SceneState {
+    /// Enter Focus mode on instance `i` (M3.3) — the pure state transition the `focus_entity` command
+    /// applies: select it, center the camera on it, zoom in to frame it by size ("get nearby"), and
+    /// raise the focus flag so the shader dims the rest. Saves the pre-focus `distance` once, so the
+    /// first [`Self::clear_focus`] restores the original framing even after focusing several entities
+    /// in a row. Bumps `revision` so the new `selected` flag re-uploads. No-op if `i` is out of range.
+    pub fn focus_on(&mut self, i: usize) {
+        if i >= self.instances.len() {
+            return;
+        }
+        // The focused entity is also the selected one (the shader keeps the selected instance lit while
+        // focus dims the rest) — clear any prior highlight first.
+        if let Some(p) = self.selected {
+            if p < self.instances.len() {
+                self.instances[p].selected = 0.0;
+            }
+        }
+        self.selected = Some(i);
+        self.instances[i].selected = 1.0;
+        // Center: look straight at the entity.
+        self.cam_target = self.instances[i].center;
+        // Get nearby: save the framing once, then zoom to ~4× the entity's half-extent, clamped to the
+        // orbit range so a huge or tiny entity still lands at a sensible, in-bounds distance.
+        if self.pre_focus_distance.is_none() {
+            self.pre_focus_distance = Some(if self.distance == 0.0 {
+                60.0
+            } else {
+                self.distance
+            });
+        }
+        let half_extent = self.instances[i].scale.max(0.5);
+        self.distance = (half_extent * 4.0).clamp(6.0, 40.0);
+        self.focused = Some(i);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Exit Focus mode ("everything comes back to normal"): clear the focus flag (the shader un-dims
+    /// every entity) and restore the orbit `distance` saved when focus was entered. Idempotent — a
+    /// no-op (no `revision` bump) when nothing is focused, so a stray Escape never disturbs the scene.
+    /// Selection is intentionally left as-is (only the dim + zoom revert).
+    pub fn clear_focus(&mut self) {
+        if self.focused.is_none() {
+            return;
+        }
+        self.focused = None;
+        if let Some(d) = self.pre_focus_distance.take() {
+            self.distance = d;
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
 
 /// One uploaded mesh asset's GPU geometry (per-asset vertex + index buffers — the non-bindless path:
 /// one bound vertex/index buffer per asset, drawn instanced across the entities that use it).
@@ -141,6 +202,12 @@ const GRID_VERTS: u32 = (2 * (40 + 1) * 2) as u32;
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Camera {
     view_proj: [[f32; 4]; 4],
+    /// Focus-mode flag, packed in `focus[0]`: `1.0` while an entity is focused, `0.0` otherwise. The
+    /// shaders dim every instance whose `selected < 0.5` when this is set, so only the focused (=
+    /// selected) entity stays lit — "gray out the rest." A `vec4` (not a bare `f32` + pad) so the WGSL
+    /// uniform layout matches byte-for-byte: a `vec3` tail would round the std140 struct to 96 bytes
+    /// while this struct is 80, and wgpu would reject the undersized buffer at draw. `[1..4]` unused.
+    focus: [f32; 4],
 }
 
 /// Window handle wrapper so wgpu can make a surface from the Tauri window on a render thread.
@@ -417,7 +484,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
 
         // read shared state; re-upload instances on revision change (picking is NOT serviced here —
         // it's done synchronously in the viewport_pick command, decoupled from the frame cadence)
-        let cam = {
+        let (cam, focus_active) = {
             let mut st = shared.lock().unwrap();
             if st.distance == 0.0 {
                 st.distance = 60.0;
@@ -500,19 +567,22 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 lines.upload(&device, &queue, &inst_bgl, &st.line_points);
             }
             let aspect = w as f32 / h.max(1) as f32;
-            camera_matrix(
+            let cam = camera_matrix(
                 st.orbit,
                 st.elevation,
                 st.distance,
                 aspect,
                 st.cam_target.into(),
-            )
+            );
+            // Focus dim flag (read under the same lock as the camera, so it can't lag the frame).
+            (cam, if st.focused.is_some() { 1.0f32 } else { 0.0 })
         };
         queue.write_buffer(
             &camera_buf,
             0,
             bytemuck::bytes_of(&Camera {
                 view_proj: cam.to_cols_array_2d(),
+                focus: [focus_active, 0.0, 0.0, 0.0],
             }),
         );
 
@@ -774,4 +844,89 @@ fn make_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare scene of `n` unit-scale cubes on a line — enough to exercise the focus state transition
+    /// (no GPU; `focus_on`/`clear_focus` touch only plain fields).
+    fn scene(n: usize) -> SceneState {
+        let mut st = SceneState {
+            distance: 60.0,
+            ..Default::default()
+        };
+        for i in 0..n {
+            st.instances.push(Instance {
+                center: [i as f32 * 2.0, 1.0, 0.0],
+                scale: 1.0,
+                color: [0.5, 0.5, 0.5],
+                selected: 0.0,
+            });
+            st.ids.push(format!("e{i}"));
+        }
+        st
+    }
+
+    #[test]
+    fn focus_centers_zooms_selects_and_flags() {
+        let mut st = scene(4);
+        let rev0 = st.revision;
+        st.focus_on(2);
+        // Center: the orbit target is the focused entity's position.
+        assert_eq!(st.cam_target, [4.0, 1.0, 0.0]);
+        // Get nearby: zoomed in from 60 → scale(1.0)*4 clamped to [6,40] = 6.
+        assert_eq!(st.distance, 6.0);
+        assert!(st.distance < 60.0, "focus must zoom IN (get nearby)");
+        // Selected + focused are the same entity; the shader keeps it lit while dimming the rest.
+        assert_eq!(st.selected, Some(2));
+        assert_eq!(st.focused, Some(2));
+        assert_eq!(st.instances[2].selected, 1.0);
+        // The framing was saved for restore, and the revision bumped so the new flags upload.
+        assert_eq!(st.pre_focus_distance, Some(60.0));
+        assert_ne!(st.revision, rev0);
+    }
+
+    #[test]
+    fn unfocus_restores_everything_to_normal() {
+        let mut st = scene(4);
+        st.focus_on(1);
+        assert!(st.focused.is_some() && st.distance < 60.0);
+        st.clear_focus();
+        // "Everything comes back to normal": dim flag cleared + the saved distance restored.
+        assert_eq!(st.focused, None);
+        assert_eq!(st.distance, 60.0);
+        assert_eq!(st.pre_focus_distance, None);
+        // Selection is intentionally retained (only the dim + zoom revert).
+        assert_eq!(st.selected, Some(1));
+    }
+
+    #[test]
+    fn refocusing_keeps_the_original_framing_then_restores_it() {
+        let mut st = scene(4);
+        st.focus_on(0); // saves 60.0
+        st.focus_on(3); // must NOT overwrite the saved framing with the zoomed-in 6.0
+        assert_eq!(st.pre_focus_distance, Some(60.0));
+        assert_eq!(st.cam_target, [6.0, 1.0, 0.0]); // re-centered on the new entity
+        st.clear_focus();
+        assert_eq!(st.distance, 60.0); // back to the true original, not the intermediate focus distance
+    }
+
+    #[test]
+    fn clear_focus_is_a_noop_when_not_focused() {
+        let mut st = scene(2);
+        let rev0 = st.revision;
+        st.clear_focus(); // a stray Escape with nothing focused
+        assert_eq!(st.focused, None);
+        assert_eq!(st.revision, rev0, "no revision bump when nothing changed");
+    }
+
+    #[test]
+    fn focus_on_out_of_range_is_ignored() {
+        let mut st = scene(2);
+        st.focus_on(9);
+        assert_eq!(st.focused, None);
+        assert_eq!(st.selected, None);
+    }
 }

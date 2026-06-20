@@ -1,8 +1,19 @@
 // Editor viewport shader: instanced entity cubes (from the storage buffer the app fills from /core
 // Transforms) + a ground grid. Selected entity highlights. Matches render.rs's Instance/Camera.
 
-struct Camera { view_proj: mat4x4<f32> };
+struct Camera { view_proj: mat4x4<f32>, focus: vec4<f32> };
 @group(0) @binding(0) var<uniform> cam: Camera;
+
+// Focus mode (M3.3): when `cam.focus_active > 0.5`, every entity that isn't the focused/selected one
+// is grayed toward the background so it reads as faded/transparent (depth-correct, no alpha blend).
+// `is_focused` ⇒ the lit one; everything else dims. Returns the de-emphasized colour.
+const DIM_TARGET = vec3<f32>(0.06, 0.07, 0.10); // the viewport clear colour — fade toward "gone"
+fn apply_focus_dim(col: vec3<f32>, is_focused: bool) -> vec3<f32> {
+    if (cam.focus.x > 0.5 && !is_focused) {
+        return mix(col, DIM_TARGET, 0.86);
+    }
+    return col;
+}
 
 struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, selected: f32 };
 @group(1) @binding(0) var<storage, read> instances: array<Instance>;
@@ -29,7 +40,7 @@ fn vs_cube(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     if (inst.selected > 0.5) {
         col = mix(col, vec3<f32>(1.0, 0.85, 0.2), 0.7); // selection highlight
     }
-    out.color = col;
+    out.color = apply_focus_dim(col, inst.selected > 0.5);
     return out;
 }
 
@@ -68,7 +79,8 @@ fn vs_grid(@builtin(vertex_index) vi: u32) -> VsOut {
 fn vs_line(@builtin(vertex_index) vi: u32) -> VsOut {
     var out: VsOut;
     out.pos = cam.view_proj * vec4<f32>(instances[vi].center, 1.0);
-    out.color = vec3<f32>(0.60, 1.0, 0.93);
+    // Tracking lines are "the rest of the elements" too — fade them in focus mode (never the focused one).
+    out.color = apply_focus_dim(vec3<f32>(0.60, 1.0, 0.93), false);
     return out;
 }
 
@@ -93,7 +105,7 @@ fn vs_mesh(v: MeshIn, @builtin(instance_index) ii: u32) -> VsOut {
     if (inst.selected > 0.5) {
         col = mix(col, vec3<f32>(1.0, 0.85, 0.2), 0.7); // selection highlight
     }
-    out.color = col;
+    out.color = apply_focus_dim(col, inst.selected > 0.5);
     return out;
 }
 
