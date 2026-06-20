@@ -1,0 +1,55 @@
+name: editor-shell-app
+
+# The Tauri APP crate (editor-shell/src-tauri) declares its OWN [workspace] (own Cargo.lock), so the root
+# `cargo test --workspace` in ci.yml never sees it — its unit tests (the Focus-mode SceneState
+# transitions: focus_on / clear_focus), fmt, and clippy would otherwise be completely dark in CI, and a
+# regression in the focus camera/selection/restore logic would ship undetected. This job gates it.
+#
+# windows-latest matches the desktop target (WebView2 + the MSVC/Windows SDK are preinstalled), so the
+# Tauri + wgpu + webview2-com build resolves without extra system packages. Path-filtered so it runs only
+# when the app or its embedded frontend changes (the build is heavy — Tauri + wgpu from source).
+#
+# NOTE: the real-.exe E2E (editor-shell/e2e — WebdriverIO + tauri-driver driving the WebView2 DOM) needs a
+# WebView2-matched msedgedriver + a display, which is fragile to pin in hosted CI; it is a LOCAL/manual
+# gate (run: `cd editor-shell/e2e && node node_modules/@wdio/cli/bin/wdio.js run wdio.conf.js` against a
+# fresh `cargo build --release`). It is intentionally NOT run here — documented so the gap is not silent.
+on:
+  push:
+    paths:
+      - "editor-shell/src-tauri/**"
+      - "editor-shell/web/**"
+      - ".github/workflows/editor-shell-app.yml"
+  pull_request:
+    paths:
+      - "editor-shell/src-tauri/**"
+      - "editor-shell/web/**"
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    name: fmt + clippy + test (Tauri app, windows)
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable) + rustfmt + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: editor-shell/src-tauri
+
+      - name: rustfmt
+        run: cargo fmt --manifest-path editor-shell/src-tauri/Cargo.toml --all --check
+
+      - name: clippy (deny warnings)
+        run: cargo clippy --manifest-path editor-shell/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: test (Focus-mode SceneState transitions + any app unit tests)
+        run: cargo test --manifest-path editor-shell/src-tauri/Cargo.toml

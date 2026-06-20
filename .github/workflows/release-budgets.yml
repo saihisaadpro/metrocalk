@@ -1,0 +1,33 @@
+name: release-budgets
+
+# The per-path latency BUDGET tests (catalog/search, ledger charge + reserve/settle, action-model,
+# generation placeholder, M2 commit/project_full, live reveal) are `#[cfg_attr(debug_assertions, ignore)]`
+# — so ci.yml's DEBUG `cargo test --workspace` skips them, and perf-gate.yml only runs the standalone
+# query-gate binary. In a RELEASE build `debug_assertions` is off, so the attribute does NOT apply and the
+# tests run as normal tests. This job runs them, so a perf regression in those paths can't ship silently.
+# (NOTE: the correct invocation is plain `cargo test --release` — NOT `-- --ignored`, which would match
+# nothing since the tests are un-ignored in release.) The budgets are absolute, order-of-magnitude gates
+# (same jitter-proof rationale as perf-gate.yml — they catch 10×+ regressions, not shared-runner noise).
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  budgets:
+    name: release timing budgets (cargo test --release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the release-only budget tests (un-ignored in release)
+        run: cargo test --workspace --release

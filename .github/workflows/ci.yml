@@ -73,3 +73,36 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+
+      # The opt-in `ws` transport impl (transport/src/impls/ws.rs — the one REAL transport, behind the
+      # non-default `ws` feature) is invisible to the default workspace build/lint/test above. Build,
+      # lint, and test it explicitly so the live WebSocket round-trip can't regress undetected.
+      - name: ws transport impl — clippy + test (the real transport, dark on the default path)
+        run: |
+          cargo clippy -p metrocalk-transport --all-targets --features ws -- -D warnings
+          cargo test -p metrocalk-transport --features ws
+
+  editor-vitest:
+    # The React editor projection (editor/, ADR-010) has a real vitest suite (transport-frame decode,
+    # optimistic-reconcile, 5k selective-subscription projection, end-to-end wiring) that no Rust CI job
+    # touches — it would regress invisibly. This runs it. (editor/ uses pnpm — pnpm-lock.yaml is tracked.)
+    name: vitest (editor TS projection)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Enable pnpm (corepack)
+        run: corepack enable
+
+      - name: Install (frozen lockfile)
+        working-directory: editor
+        run: pnpm install --frozen-lockfile
+
+      - name: vitest
+        working-directory: editor
+        run: pnpm test
