@@ -27,14 +27,30 @@
   `std:` requirer. **Measured (release):** local resolve p99 ~42 µs (unchanged), marketplace query p99
   ~34 µs. **Economy + generation seamed** — price surfaced as an inert "≈ N tokens / creator keeps ~70%"
   UI seam, no money moves; text-to-3D not built. ADR-015. See `progress/M5.md`.
-- **Handed off (human/hardware/Phase-2 — instrumented, not fabricated):** the **dogfood verdict** (does it *feel* like the win — all three loops); drag-feel; DPI · ≥60 s flicker · min-spec · Firefox WebGPU · Channel-e2e re-confirm · real-browser store-apply; test #2's "pick-up-able / Press Play" (gated on the runtime tier). **M4/M5 deferred (named, not stubbed):** KTX2/basis transcode (C++ FFI → native-only), in-shader texture sampling, collider/LOD/rig generation, base64/external-buffer `.gltf`, a UI import affordance; the **token economy / payout, remote hosting, text-to-3D generation** (the seams prompts 23+24 left clean); and the live in-window mesh + marketplace screenshots. *(Live close→reopen: machine-verified.)* See `progress/M5.md` · `progress/M4.md`.
+- **M3.3 — the binding UX is directly manipulable in the viewport (the "context reveal").**
+  Right-**click** any entity → a context menu of exactly the actions valid for it (Bind… / Remove /
+  Duplicate / Focus / Inspect), every unavailable one greyed + **explained** (the M3.1 discipline); each
+  mutating action is **one undoable pipeline transaction** that survives reload (replay-log). **Remove**
+  frees a dependent that was tracking a removed provider (edge cleaned, consumed-marker pair cleared) and
+  undo restores the entity (M1.6 resurrection) + its edges atomically; **Duplicate** clones caps under a
+  fresh deterministic id, independently bindable. Right-**drag** still orbits (movement-threshold
+  disambiguation, zero-per-frame-IPC unchanged); **hover** shows entity details (name · components · caps ·
+  bind state) via a **non-mutating** peek fetched on hovered-entity change only (inv. 4 — 0 per-frame IPC).
+  The action model is registry-driven + UI-agnostic (it survives the React `/editor` port). **Measured
+  (release):** `actions_for` p99 ~3 µs @5k. Headless 5/5; live e2e + the React `/editor` menu/tooltip are
+  the named follow-ups. ADR-016. See `progress/M3.md`.
+- **Handed off (human/hardware/Phase-2 — instrumented, not fabricated):** the **dogfood verdict** (does it *feel* like the win — all loops, incl. the M3.3 context reveal); drag-feel; DPI · ≥60 s flicker · min-spec · Firefox WebGPU · Channel-e2e re-confirm · real-browser store-apply; test #2's "pick-up-able / Press Play" (gated on the runtime tier). **M4/M5 deferred (named, not stubbed):** KTX2/basis transcode (C++ FFI → native-only), in-shader texture sampling, collider/LOD/rig generation, base64/external-buffer `.gltf`, a UI import affordance; the **token economy / payout, remote hosting, text-to-3D generation** (the seams prompts 23+24 left clean); and the live in-window mesh + marketplace screenshots. *(Live close→reopen: machine-verified.)* See `progress/M5.md` · `progress/M4.md`.
 
-## Next (Phase-2 infra)
+## Next
 - **The seams prompts 23+24 left clean:** **text-to-3D generation**, the **token economy + creator
   payout**, and **remote hosting** (a remote `MarketplaceIndex` impl drops in unchanged over the trait).
   The marketplace **index + resolution + pre-componentized apply** and **capability namespacing** are now
   done (M5, ADR-015); at real catalog scale, replace the resolver/marketplace token-overlap with a
-  learned/embedding index behind the same trait signatures.
+  learned/embedding index behind the same trait signatures. **Now authored as runnable prompts:** `25-m6` (generation) · `26-m7` (token economy + creator payout + remote-hosting seam).
+- **M3.3 shipped (the "context reveal," off the economy thread, ADR-016):** the durable core (action
+  model + Remove/Duplicate transactions + persistence) + the live shell surface (right-click menu, hover
+  tooltip, Focus). **Named follow-up:** the production **React `/editor` port** of the menu/tooltip
+  (replacing the scaffold probe over the same `actions_for` + commands) + a local live-e2e run.
 - **Follow-ups (non-blocking):** incremental undo delta (replace `project_full`-on-undo, the ~70 ms hitch at 5k); the capability-rebuild carry-forward (so a future Loro merge/reload keeps capabilities); log compaction (the append-only replay-log grows with session lifetime). *(Recency ranking is now live — done.)*
 - **Carry-forward (later):** getrandom `js` for Loro-in-browser + the Phase-2 pure-Rust query backend (ADR-006).
 - **Carry-forward (Phase 2, with collab):** `merge()` rebuilds entities from Loro but **not their ECS tags/pairs** — capabilities are ECS-only, so the **compatibility query is empty after a merge**. Fix wires the registry into `rebuild_ecs_from_loro`; schedule with collab. (M1.6 audit; see `progress/M1.md`.)
