@@ -17,6 +17,7 @@ pub mod capscene;
 pub mod generate;
 pub mod metering;
 pub mod persist;
+pub mod physics_intent;
 pub mod reveal;
 pub mod wallet;
 
