@@ -103,6 +103,57 @@ fn place_mesh_is_one_undoable_transaction_carrying_only_the_handle() {
 }
 
 #[test]
+fn spawn_physics_body_is_one_undoable_transaction_with_rigidbody_and_collider() {
+    // M8.2 STEP 2: ECS-authoritative physics SETUP — one undoable commit creating a body that carries a
+    // dynamic RigidBody + a ball Collider + (optionally) a mesh handle. Undo removes the whole body.
+    let (mut engine, scene) = seeded();
+    let mut store = AssetStore::new();
+    let handle = store
+        .import(&GltfImporter::new(), HEALTHBAR_GLB)
+        .expect("store import");
+    let before = engine.entity_count();
+
+    let id = capscene::spawn_physics_body(
+        &mut engine,
+        &scene,
+        Some(handle.as_str()),
+        [0.0, 5.0, 0.0],
+        0.45,
+    )
+    .expect("spawn commits");
+    assert_eq!(engine.entity_count(), before + 1, "one entity created");
+
+    // The body carries the simulatable component records (the setup the engine mirrors into the sim).
+    let comps = engine.components_of(id);
+    assert!(comps.contains_key("RigidBody"), "has a RigidBody");
+    assert!(comps.contains_key("Collider"), "has a Collider");
+    assert!(comps.contains_key("Transform"), "has a Transform");
+    // Fields are explicit (NOT the empty default_value) — so the sync seam can map them.
+    assert_eq!(
+        comps["RigidBody"].get("kind"),
+        Some(&FieldValue::Str("dynamic".into()))
+    );
+    assert_eq!(
+        comps["Collider"].get("shape"),
+        Some(&FieldValue::Str("ball".into()))
+    );
+    match comps["Collider"].get("radius") {
+        Some(FieldValue::Number(r)) => assert!((r - f64::from(0.45f32)).abs() < 1e-9),
+        other => panic!("radius missing/wrong: {other:?}"),
+    }
+    // It renders as the given mesh (only the handle in the doc — invariant 2).
+    assert_eq!(mesh_handle(&engine, id).as_deref(), Some(handle.as_str()));
+
+    // ONE undoable transaction: a single Ctrl-Z removes the whole body (setup is undoable; inv. 3).
+    assert!(engine.undo());
+    assert!(
+        !engine.entity_exists(id),
+        "undo reverses the spawn atomically"
+    );
+    assert_eq!(engine.entity_count(), before);
+}
+
+#[test]
 fn placed_mesh_survives_export_then_replay() {
     let log = Log::open(tmp("mesh-assets"), capscene::fingerprint(N));
     log.clear();

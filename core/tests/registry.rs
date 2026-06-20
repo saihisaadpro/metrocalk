@@ -17,7 +17,7 @@ fn registry_with_stdlib() -> Registry<FlecsWorld> {
 #[test]
 fn capability_queries_through_wrapper() {
     let reg = registry_with_stdlib();
-    assert_eq!(reg.len(), 12);
+    assert_eq!(reg.len(), 13); // 12 + the M8.2 Joint kind
 
     // "what provides Health?" — single provider.
     assert_eq!(reg.providers_of("Health"), vec!["Health"]);
@@ -33,6 +33,13 @@ fn capability_queries_through_wrapper() {
     assert!(reg.providers_of("Nonexistent").is_empty());
     // Many kinds require Spatial.
     assert!(reg.requirers_of("Spatial").len() >= 6);
+
+    // M8.2 physics intent wiring: RigidBody provides "Physics"; Collider + Joint REQUIRE it, so a
+    // Collider rides the M3.1 reveal as a one-click attach onto a RigidBody (the "this body needs a
+    // collider" intent) — exactly like HealthBar↔Health.
+    assert_eq!(reg.providers_of("Physics"), vec!["RigidBody"]);
+    assert_eq!(reg.requirers_of("Physics"), vec!["Collider", "Joint"]);
+    assert_eq!(reg.providers_of("Collision"), vec!["Collider"]);
 }
 
 #[test]

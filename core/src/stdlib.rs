@@ -72,26 +72,61 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("3d")
             .tag("render")
             .build(),
+        // Physics (M8.2, ADR-021): metadata for the registry/intent system; the live simulation behind
+        // these rides the project-owned `Physics` trait (`/physics`). `kind`/`shape` are String fields
+        // (FieldType is scalar-only) carrying a closed vocab via the ui_hint — the sync seam maps them to
+        // `physics::BodyKind` / `ColliderShape`. Collider `requires("Physics")` so it rides the M3.1
+        // reveal as a one-click attach onto a RigidBody (which provides "Physics") — "this body needs a
+        // collider, add one?".
         ComponentMeta::builder("RigidBody")
             .category("Gameplay")
-            .field("mass", Number, true)
-            .field("kinematic", Boolean, false)
-            .field("drag", Number, false)
+            .field("kind", Str, true)
+            .field("mass", Number, false)
+            .field("linearDamping", Number, false)
+            .field("angularDamping", Number, false)
+            .field("gravityScale", Number, false)
             .requires("Spatial")
             .provides("Physics")
             .tag("physics")
             .alias("Rigidbody")
+            .ui_hint(
+                "kind",
+                "enum: dynamic|fixed|kinematicPosition|kinematicVelocity",
+            )
             .build(),
         ComponentMeta::builder("Collider")
             .category("Gameplay")
             .field("shape", Str, true)
             .field("isTrigger", Boolean, false)
+            .field("density", Number, false)
             .field("friction", Number, false)
+            .field("restitution", Number, false)
+            // Flat scalar shape params (no Vec3 FieldType) — read per `shape` at the sync seam.
+            .field("radius", Number, false)
+            .field("halfX", Number, false)
+            .field("halfY", Number, false)
+            .field("halfZ", Number, false)
+            .field("halfHeight", Number, false)
             .requires("Spatial")
-            .observes("Physics")
+            .requires("Physics")
             .provides("Collision")
             .tag("physics")
             .tag("collision")
+            .ui_hint(
+                "shape",
+                "enum: ball|cuboid|capsule|convexHull|triMesh|convexDecomposition|voxels|sdf",
+            )
+            .build(),
+        ComponentMeta::builder("Joint")
+            .category("Gameplay")
+            .field("kind", Str, true)
+            .field_fmt("bodyA", Str, true, Some("entity-ref"))
+            .field_fmt("bodyB", Str, true, Some("entity-ref"))
+            .requires("Physics")
+            .provides("Joint")
+            .tag("physics")
+            .tag("joint")
+            .ui_hint("kind", "enum: revolute|fixed|spherical")
             .build(),
         ComponentMeta::builder("AudioSource")
             .category("Audio")

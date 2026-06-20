@@ -490,6 +490,76 @@ pub fn place_mesh(
     Ok(id)
 }
 
+/// Spawn a complete, simulatable physics body as ONE undoable transaction (M8.2): a `Transform` + a
+/// dynamic `RigidBody` + a ball `Collider` + (optionally) a `MeshRenderer` handle so it renders as a real
+/// mesh, plus the physics capability pairs the reveal/attach use. This is ECS-authoritative **setup** —
+/// the live simulation is mirrored into the project-owned `Physics` trait by the engine thread *after*
+/// this commits, and undo removes the whole body in one step. Field values are written **explicitly**
+/// (`kind="dynamic"`, `shape="ball"`, an explicit `radius`) so the body is valid without relying on the
+/// generic [`default_value`] (which would leave `kind`/`shape` empty). The per-tick transform stream is a
+/// separate projection, never a commit — so this never floods the undo stack (ADR-021: sim-replay is a
+/// distinct channel from Loro time-travel).
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the create transaction fails (it shouldn't — ops are consistent).
+pub fn spawn_physics_body(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    handle: Option<&str>,
+    pos: [f32; 3],
+    radius: f32,
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    for (f, v) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        });
+    }
+    // A dynamic RigidBody + a ball Collider, fields explicit (no reliance on default_value).
+    for (component, field, value) in [
+        ("RigidBody", "kind", FieldValue::Str("dynamic".into())),
+        ("RigidBody", "mass", FieldValue::Number(1.0)),
+        ("Collider", "shape", FieldValue::Str("ball".into())),
+        ("Collider", "radius", FieldValue::Number(f64::from(radius))),
+    ] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: component.into(),
+            field: field.into(),
+            value,
+        });
+    }
+    // Capability pairs for the intent system (the body is queryable as a Physics + Collision provider,
+    // and — like every spatial thing — a Spatial requirer). Canonicalized; skipped if not interned.
+    for (rel, cap) in [
+        (scene.rels.provides, "Physics"),
+        (scene.rels.provides, "Collision"),
+        (scene.rels.requires, "Spatial"),
+    ] {
+        if let Some(&c) = scene.caps.get(&canonical(cap)) {
+            ops.push(Op::AddPair {
+                entity: id,
+                rel,
+                target: c,
+            });
+        }
+    }
+    if let Some(h) = handle {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "MeshRenderer".into(),
+            field: MESH_FIELD.into(),
+            value: FieldValue::Str(h.to_string()),
+        });
+    }
+    engine.commit("spawn-physics-body", ops)?;
+    Ok(id)
+}
+
 /// Apply a **marketplace entry** as a new pre-componentized scene entity — its component (display
 /// marker) + its **namespaced** capability pairs (provides/requires, with an aliased custom cap also
 /// providing its standard cap) + its mesh **handle** — all as ONE undoable transaction (invariant 3).
