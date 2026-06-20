@@ -253,8 +253,12 @@
       //  • WHEEL → zoom (one call per tick, not per frame).
       const vp = $("viewport");
       vp.addEventListener("contextmenu", (ev) => ev.preventDefault());
+      // M3.3: track the right-mousedown so a sub-threshold mouseup reads as a CLICK (→ context menu),
+      // while a right-DRAG still orbits natively (zero-per-frame-IPC, unchanged).
+      let rcStart = null;
+      const MOVE_THRESHOLD = 6; // px; below this a right-press is a click, not an orbit
       vp.addEventListener("mousedown", async (ev) => {
-        if (ev.button === 2) { invoke("drag_start"); return; }   // right-drag = native orbit
+        if (ev.button === 2) { rcStart = { x: ev.clientX, y: ev.clientY }; invoke("drag_start"); return; } // right = orbit-or-menu
         if (ev.button !== 0) return;
         const x = ev.clientX / window.innerWidth;
         const y = ev.clientY / window.innerHeight;
@@ -262,8 +266,106 @@
         if (id) { select(id); status("picked " + id); }
         else { selected = null; renderList(); renderInspector(); revealFor(null); status("picked nothing here"); }
       });
-      window.addEventListener("mouseup", () => invoke("drag_end")); // end any orbit on release
+      window.addEventListener("mouseup", async (ev) => {
+        invoke("drag_end"); // end any orbit on release
+        if (ev.button === 2 && rcStart) {
+          const moved = Math.hypot(ev.clientX - rcStart.x, ev.clientY - rcStart.y);
+          rcStart = null;
+          if (moved < MOVE_THRESHOLD) await openContextMenu(ev.clientX, ev.clientY); // a click → menu
+        }
+      });
       vp.addEventListener("wheel", (ev) => { ev.preventDefault(); invoke("zoom", { delta: ev.deltaY * 0.04 }); }, { passive: false });
+
+      // ── M3.3: viewport context menu (right-click) + hover details — the "context reveal" ──────────
+      const ctxmenu = document.createElement("div");
+      ctxmenu.id = "ctxmenu";
+      ctxmenu.style.cssText = "position:fixed;z-index:60;display:none;min-width:160px;background:#1b2230;border:1px solid #38415a;border-radius:6px;box-shadow:0 6px 22px rgba(0,0,0,.5);font-size:13px;overflow:hidden";
+      document.body.appendChild(ctxmenu);
+      const tooltip = document.createElement("div");
+      tooltip.id = "tooltip";
+      tooltip.style.cssText = "position:fixed;z-index:50;display:none;pointer-events:none;max-width:280px;background:#10141f;border:1px solid #2a3550;border-radius:6px;padding:6px 9px;font-size:12px;line-height:1.4;box-shadow:0 4px 16px rgba(0,0,0,.5)";
+      document.body.appendChild(tooltip);
+      const hideMenu = () => { ctxmenu.style.display = "none"; };
+      const hideTip = () => { tooltip.style.display = "none"; lastHover = null; };
+      document.addEventListener("click", hideMenu);
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideMenu(); });
+
+      async function openContextMenu(cx, cy) {
+        if (hoverTimer) clearTimeout(hoverTimer);
+        hideTip();
+        const id = await invoke("viewport_peek", { x: cx / window.innerWidth, y: cy / window.innerHeight });
+        if (!id) { hideMenu(); status("nothing under the cursor"); return; }
+        const actions = await invoke("entity_actions", { id });
+        ctxmenu.innerHTML = "";
+        const head = document.createElement("div");
+        head.textContent = id;
+        head.style.cssText = "padding:4px 12px;opacity:.55;font-size:11px;border-bottom:1px solid #2a3142";
+        ctxmenu.appendChild(head);
+        for (const a of actions) {
+          const item = document.createElement("div");
+          item.className = "ctxitem" + (a.available ? "" : " disabled");
+          item.dataset.action = a.action;
+          item.textContent = a.available ? a.label : a.label + "  —  " + (a.reason || "unavailable");
+          item.style.cssText = "padding:5px 12px;white-space:nowrap;cursor:" + (a.available ? "pointer" : "default") + ";opacity:" + (a.available ? "1" : ".4");
+          if (a.available) {
+            item.onmouseenter = () => (item.style.background = "#2a3550");
+            item.onmouseleave = () => (item.style.background = "");
+            item.onclick = (e) => { e.stopPropagation(); hideMenu(); runAction(a.action, id); };
+          } else if (a.reason) { item.title = a.reason; }
+          ctxmenu.appendChild(item);
+        }
+        // keep the menu on-screen
+        ctxmenu.style.display = "block";
+        const mw = ctxmenu.offsetWidth, mh = ctxmenu.offsetHeight;
+        ctxmenu.style.left = Math.min(cx, window.innerWidth - mw - 4) + "px";
+        ctxmenu.style.top = Math.min(cy, window.innerHeight - mh - 4) + "px";
+      }
+
+      async function runAction(action, id) {
+        if (action === "bind") { select(id); status("bind: pick a target in the panel"); }
+        else if (action === "inspect") { select(id); status("inspect " + id); }
+        else if (action === "focus") { invoke("focus_entity", { id }); status("focused " + id); }
+        else if (action === "remove") {
+          invoke("remove_entity", { id });
+          if (selected === id) { selected = null; renderInspector(); revealFor(null); }
+          status("removed " + id + " (Ctrl-Z to undo)");
+        } else if (action === "duplicate") {
+          const nid = await invoke("duplicate_entity", { id });
+          if (nid) { setTimeout(() => select(nid), 60); status("duplicated → " + nid); }
+        }
+      }
+
+      // Hover details: debounced peek-on-settle; the entity_details fetch crosses JS only when the
+      // hovered entity CHANGES — never per frame (invariant 4: the render hot path stays 0 IPC/frame).
+      let lastHover = null, hoverTimer = null;
+      vp.addEventListener("mousemove", (ev) => {
+        if (hoverTimer) clearTimeout(hoverTimer);
+        if (ctxmenu.style.display === "block" || rcStart) return; // no tooltip while a menu is open / orbiting
+        const cx = ev.clientX, cy = ev.clientY;
+        hoverTimer = setTimeout(async () => {
+          const id = await invoke("viewport_peek", { x: cx / window.innerWidth, y: cy / window.innerHeight });
+          if (id === lastHover) return; // same entity → no boundary crossing for details
+          lastHover = id;
+          if (!id) { hideTip(); return; }
+          const d = await invoke("entity_details", { id });
+          if (d && lastHover === id) showTooltip(d, cx, cy);
+        }, 130);
+      });
+      vp.addEventListener("mouseleave", hideTip);
+
+      function showTooltip(d, cx, cy) {
+        const caps = [];
+        if (d.provides?.length) caps.push("provides " + d.provides.join(", "));
+        if (d.requires?.length) caps.push("requires " + d.requires.join(", "));
+        tooltip.innerHTML =
+          "<b>" + (d.name || d.id) + "</b>" +
+          (d.components?.length ? "<br>" + d.components.join(", ") : "") +
+          (caps.length ? "<br><span style='opacity:.65'>" + caps.join(" · ") + "</span>" : "") +
+          (d.boundTo?.length ? "<br><span style='color:#9fe'>tracking " + d.boundTo.length + "</span>" : "");
+        tooltip.style.left = Math.min(cx + 14, window.innerWidth - 290) + "px";
+        tooltip.style.top = (cy + 14) + "px";
+        tooltip.style.display = "block";
+      }
 
       function doUndo() { invoke("undo"); status("undo"); if (selected) setTimeout(() => revealFor(selected), 40); }
       $("undo").onclick = doUndo;

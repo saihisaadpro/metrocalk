@@ -97,13 +97,93 @@ describe("Metrocalk editor — north-star #1 live", () => {
     expect(await $("#reveal").getText()).toContain("Health");
   });
 
-  it("a no-local-match describe falls through to the marketplace seam (never fakes it)", async () => {
+  it("a no-local-match describe resolves the MARKETPLACE tier — pre-componentized, not faked (M5)", async () => {
     await $("#describe").setValue("rusty medieval sword");
     await $("#describeBtn").click();
     await browser.waitUntil(async () => (await $("#status").getText()).includes("marketplace"), {
       timeout: 10000,
-      timeoutMsg: "no marketplace seam on a no-local-match describe",
+      timeoutMsg: "no marketplace resolution on a no-local-match describe",
     });
-    expect(await $("#status").getText()).toContain("no local match");
+    // M5: the marketplace tier is real — the entry applies pre-componentized (the Weapon component) with
+    // its inert token-price seam, rather than the old M3.2 "would query marketplace" stub.
+    const status = await $("#status").getText();
+    expect(status).toContain("marketplace:");
+    expect(status).toContain("tokens");
+  });
+
+  // ── M3.3: viewport context actions + hover details (the "context reveal") ─────────────────────────
+  const ctxVisible = async () => (await $("#ctxmenu").getCSSProperty("display")).value !== "none";
+
+  it("right-clicks a viewport entity → a context menu of its valid actions appears", async () => {
+    const vp = await $("#viewport");
+    // A right-button press+release with no movement (a click, not an orbit) at the viewport centre.
+    await browser.action("pointer", { parameters: { pointerType: "mouse" } })
+      .move({ origin: vp })
+      .down({ button: 2 })
+      .up({ button: 2 })
+      .perform();
+    await browser.waitUntil(ctxVisible, { timeout: 10000, timeoutMsg: "context menu never opened on right-click" });
+    const items = await $$("#ctxmenu .ctxitem");
+    expect(items.length).toBeGreaterThanOrEqual(5); // Bind / Remove / Duplicate / Focus / Inspect
+    // every unavailable action carries a reason (the explain-every-"no" discipline)
+    for (const it of items) {
+      if ((await it.getAttribute("class")).includes("disabled")) {
+        expect(await it.getText()).toContain("—"); // "Action  —  reason"
+      }
+    }
+  });
+
+  it("Remove from the menu deletes the entity → status says removed (Ctrl-Z to undo)", async () => {
+    // Click the Remove item.
+    const remove = await $('#ctxmenu .ctxitem[data-action="remove"]');
+    await remove.click();
+    await browser.waitUntil(async () => (await $("#status").getText()).includes("removed"), {
+      timeout: 10000,
+      timeoutMsg: "no 'removed' status after clicking Remove",
+    });
+    expect(await $("#status").getText()).toContain("Ctrl-Z");
+    // and the menu closed.
+    expect(await ctxVisible()).toBe(false);
+  });
+
+  it("Ctrl-Z restores the removed entity (one undoable transaction)", async () => {
+    await browser.keys(["Control", "z"]);
+    await browser.waitUntil(async () => (await $("#status").getText()).includes("undo"), {
+      timeout: 10000,
+      timeoutMsg: "no 'undo' status after Ctrl-Z",
+    });
+    expect(await $("#status").getText()).toContain("undo");
+  });
+
+  it("hovering an entity shows a details tooltip without selecting it", async () => {
+    const vp = await $("#viewport");
+    const before = await $("#status").getText();
+    // Settle the cursor over the viewport centre (the debounced peek fires, then entity_details).
+    await browser.action("pointer", { parameters: { pointerType: "mouse" } })
+      .move({ origin: vp, x: 5, y: 5 })
+      .move({ origin: vp })
+      .perform();
+    await browser.waitUntil(
+      async () => (await $("#tooltip").getCSSProperty("display")).value !== "none",
+      { timeout: 10000, timeoutMsg: "hover tooltip never appeared" }
+    );
+    expect(await $("#tooltip").getText()).toMatch(/Transform|Health|Renderable/);
+    // hover did NOT change the selection (status unchanged — no "picked" fired by hovering).
+    expect(await $("#status").getText()).toBe(before);
+  });
+
+  it("right-DRAG still orbits and does NOT open the menu (disambiguation)", async () => {
+    await $("#ctxmenu") && (await browser.keys(["Escape"])); // ensure menu closed
+    const vp = await $("#viewport");
+    await browser.action("pointer", { parameters: { pointerType: "mouse" } })
+      .move({ origin: vp })
+      .down({ button: 2 })
+      .move({ origin: vp, x: 60, y: 30 }) // drag well past the movement threshold
+      .move({ origin: vp, x: 90, y: 50 })
+      .up({ button: 2 })
+      .perform();
+    // a drag past the threshold is an orbit, not a click → the menu must stay closed.
+    await browser.pause(300);
+    expect(await ctxVisible()).toBe(false);
   });
 });
