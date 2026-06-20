@@ -35,9 +35,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust (stable) + rustfmt + clippy
-        uses: dtolnay/rust-toolchain@stable
+      # Pinned to 1.92.0 (the toolchain the app is formatted with) so `cargo fmt --check` matches exactly —
+      # a newer @stable rustfmt can reformat differently and red the gate on already-canonical code.
+      - name: Install Rust 1.92.0 + rustfmt + clippy
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.92.0
           components: rustfmt, clippy
 
       - name: Cache cargo + target

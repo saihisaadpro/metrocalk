@@ -245,7 +245,7 @@ describe("Metrocalk editor — north-star #1 live", () => {
   // thread, off the JS hot path) and rests on the ground; one undoable spawn. The test reads the physics
   // state on demand via physics_debug = [bodyCount, lowestY, contacts] — the app itself never polls it. ──
   const physDbg = async () =>
-    browser.execute(() => window.__TAURI__.core.invoke("physics_debug"));
+    browser.execute(async () => await window.__TAURI__.core.invoke("physics_debug"));
 
   it("M8.2: a dropped ball falls under gravity and lands on the ground", async () => {
     await $("#dropBall").click();
