@@ -157,8 +157,9 @@ struct DescribeResponse {
     kind: Option<String>,
     /// `"local"` or `"marketplace"` — which tier resolved it (the happy-path source).
     source: Option<String>,
-    /// Token price of a marketplace entry — surfaced as an **inert** economy seam (no money moves;
-    /// ADR-004). The UI shows "buy ≈ N tokens / creator keeps ~70%" framing; nothing settles.
+    /// Token price of a marketplace entry — **actively charged** to the user's wallet when the entry is
+    /// bought in the describe flow (M7: debit + ~70% accrued to the creator). No real money moves
+    /// (ADR-004/018); shown so the UI reports the cost + the remaining balance.
     price: Option<u32>,
     /// The seam tier when nothing matched anywhere (`"generate"`) — a documented stub.
     seam: Option<String>,
@@ -618,6 +619,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             balance: Some(have),
                             ..Default::default()
                         },
+                        (_, Outcome::Rejected(why)) => DescribeResponse {
+                            seam: Some(why),
+                            balance: Some(wallet.balance_tokens()),
+                            ..Default::default()
+                        },
                         _ => DescribeResponse::default(),
                     }
                 } else {
@@ -814,8 +820,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             usable = true;
                         }
                     }
-                    let streamed = usable && {
-                        // Stream the mesh in as a VALIDATED AI patch (inv. 3) — same entity, swapped handle.
+                    // Stream the mesh in as a VALIDATED AI patch (inv. 3) — same entity, swapped handle.
+                    // ECHO it to the viewport but do NOT persist the scene yet (that waits on the charge).
+                    let applied = usable && {
                         let patch = AiPatch {
                             client_op_id: "generate-stream-in".into(),
                             ops: vec![PatchOp::SetField {
@@ -833,11 +840,6 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         );
                         let ok = delta.rejects.is_empty();
                         if ok {
-                            log.append(&Record::Generate {
-                                prompt: prompt.clone(),
-                                pos: [0.0; 3],
-                                mesh: Some(handle),
-                            });
                             if let Some(ch) = &channel {
                                 let _ = ch.send(delta); // targeted stream-in delta (inv. 2)
                             }
@@ -845,14 +847,33 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         }
                         ok
                     };
-                    if streamed {
-                        // SUCCESS — settle the reservation (charge ≈10, platform revenue).
-                        if let Some(h) = hold {
-                            wallet.settle(h, &gen_ref);
+                    if applied {
+                        // SUCCESS. Persist the WALLET first (settle = charge ≈10, platform revenue), then
+                        // the SCENE — and persist the scene ONLY if the charge stuck. So a crash or a
+                        // wallet-write failure never leaves a generated asset persisted without its charge
+                        // (no free paid tier); the worst case is an over-charge with the asset un-persisted
+                        // (refundable). The two-log seam errs toward the user/platform, never a free tier.
+                        let charged = hold.is_some_and(|h| wallet.settle(h, &gen_ref));
+                        if charged {
+                            log.append(&Record::Generate {
+                                prompt,
+                                pos: [0.0; 3],
+                                mesh: Some(handle),
+                            });
+                        } else {
+                            // Couldn't settle (hold lost / write failed) → refund any hold and do NOT
+                            // persist a free generation (it showed this session; won't survive reload).
+                            if let Some(h) = hold {
+                                wallet.release(h, &gen_ref);
+                            }
+                            eprintln!(
+                                "[generate] could not settle the reservation — generation not persisted (refunded)"
+                            );
                         }
                     } else {
                         // The importer (or the stream-in patch) rejected the result — RELEASE the hold
-                        // (never charged) and keep the honest grey placeholder, persisted as `mesh: None`.
+                        // (refund, persisted) THEN keep the honest grey placeholder as `mesh: None`
+                        // (wallet before scene).
                         if let Some(h) = hold {
                             wallet.release(h, &gen_ref);
                         }

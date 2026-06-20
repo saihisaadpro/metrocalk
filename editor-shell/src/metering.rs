@@ -72,17 +72,23 @@ pub fn buy_marketplace(
         );
     }
     match capscene::apply_marketplace_entry(engine, scene, entry, pos, mesh) {
-        Ok(id) => {
-            // Pre-checked affordable + single-threaded ⇒ the charge cannot now refuse.
-            let cost = wallet.charge(&action, ref_id).unwrap_or(0);
-            (
+        // Pre-checked affordable + single-threaded ⇒ a Refusal here is unreachable; and we treat any
+        // non-persisted charge as a FAILED buy (not recorded) so a wallet-write failure can never leave
+        // a scene buy without its charge (no free paid tier). The caller persists the scene only on
+        // Outcome::Charged, which requires `wallet.last_write_ok()`.
+        Ok(id) => match wallet.charge(&action, ref_id) {
+            Ok(cost) if wallet.last_write_ok() => (
                 Some(id),
                 Outcome::Charged {
                     cost_tokens: cost,
                     balance_tokens: wallet.balance_tokens(),
                 },
-            )
-        }
+            ),
+            _ => (
+                None,
+                Outcome::Rejected("wallet write failed — buy not recorded".to_string()),
+            ),
+        },
         Err(e) => (None, Outcome::Rejected(e.to_string())),
     }
 }
@@ -122,14 +128,21 @@ pub fn ai_edit_rustier(
         &patch,
     );
     if delta.rejects.is_empty() {
-        let cost = wallet.charge(&Action::Edit, ref_id).unwrap_or(0);
-        (
-            Some(delta),
-            Outcome::Charged {
-                cost_tokens: cost,
-                balance_tokens: wallet.balance_tokens(),
-            },
-        )
+        // The patch was accepted (the edit "succeeded") → charge; a non-persisted charge is a failed
+        // edit (not recorded), so a wallet-write failure can't leave a scene edit without its charge.
+        match wallet.charge(&Action::Edit, ref_id) {
+            Ok(cost) if wallet.last_write_ok() => (
+                Some(delta),
+                Outcome::Charged {
+                    cost_tokens: cost,
+                    balance_tokens: wallet.balance_tokens(),
+                },
+            ),
+            _ => (
+                None,
+                Outcome::Rejected("wallet write failed — edit not recorded".to_string()),
+            ),
+        }
     } else {
         let reason = delta
             .rejects
