@@ -1,0 +1,46 @@
+# M8.1 physics determinism + f64 spike (P1 ≡ NET-4) — a THROWAWAY spike (excluded from the workspace,
+# its own lockfile), not production code. Settles ADR-019/020 (physics precision + determinism).
+#
+# Precision is a CARGO FEATURE so ONE harness builds in both precisions:
+#   f64 (the driver, default): cargo run --release
+#   f32 (the baseline):        cargo run --release --no-default-features --features f32
+# `enhanced-determinism` forces simba/libm_force + parry3d/enhanced-determinism (bit-identical across
+# IEEE-754 targets) and is MUTUALLY EXCLUSIVE with simd/parallel — that exclusion IS the dual-config.
+# A build-time guard (src/lib.rs) fails the build if a simd/parallel feature ever slips in.
+[package]
+name = "metrocalk-physics-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"] # cdylib so the same harness runs on wasm32
+
+[[bin]]
+name = "physics-spike"
+path = "src/main.rs"
+
+[dependencies]
+rapier3d-f64 = { version = "0.33", optional = true, features = [
+    "enhanced-determinism",
+    "serde-serialize",
+] }
+rapier3d = { version = "0.33", optional = true, features = [
+    "enhanced-determinism",
+    "serde-serialize",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1" # deterministic content hash of the serialized world
+
+[features]
+default = ["f64"]
+f64 = ["dep:rapier3d-f64"]
+f32 = ["dep:rapier3d"]
+
+# Deterministic authoritative config: max optimization, but NO simd/parallel (incompatible with
+# enhanced-determinism). lto on; single codegen unit for reproducible codegen.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
