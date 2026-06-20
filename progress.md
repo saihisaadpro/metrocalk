@@ -39,7 +39,19 @@
   The action model is registry-driven + UI-agnostic (it survives the React `/editor` port). **Measured
   (release):** `actions_for` p99 ~3 µs @5k. Headless 5/5; live e2e + the React `/editor` menu/tooltip are
   the named follow-ups. ADR-016. See `progress/M3.md`.
-- **Handed off (human/hardware/Phase-2 — instrumented, not fabricated):** the **dogfood verdict** (does it *feel* like the win — all loops, incl. the M3.3 context reveal); drag-feel; DPI · ≥60 s flicker · min-spec · Firefox WebGPU · Channel-e2e re-confirm · real-browser store-apply; test #2's "pick-up-able / Press Play" (gated on the runtime tier). **M4/M5 deferred (named, not stubbed):** KTX2/basis transcode (C++ FFI → native-only), in-shader texture sampling, collider/LOD/rig generation, base64/external-buffer `.gltf`, a UI import affordance; the **token economy / payout, remote hosting, text-to-3D generation** (the seams prompts 23+24 left clean); and the live in-window mesh + marketplace screenshots. *(Live close→reopen: machine-verified.)* See `progress/M5.md` · `progress/M4.md`.
+- **M6 — describe-to-create is complete: `local → marketplace → generate`, with AI a guest.**
+  The third + final tier: a description matching **nothing** local or on the marketplace offers an
+  **opt-in** "Generate?" (tier 3, never on the offline path) → a **grey placeholder** drops in instantly
+  (one undoable tx, bindable) → text-to-3D runs behind the `MeshGenerator` trait (deterministic **fake**;
+  real provider = a documented seam) on a **worker thread** (off the hot path) → the real mesh **streams
+  in** through the prompt-23 importer as a **validated AI patch** (same id, targeted delta, undoable +
+  replay-persisted). Every AI/generation scene mutation enters through ONE seam — `apply_ai_patch`
+  (schema-validated against the registry + engine state, all-or-nothing, rejection-as-UX); **no raw LLM
+  mutation path**. Generation is **metered** (`TokenMeter` seam — ≈10 tokens, logged, **no money**) and
+  **offline-safe** (provider off → honest seam; local + marketplace unaffected; the grey placeholder
+  stands alone). **Measured (release):** placeholder commit p99 ~1 ms @5k; the round-trip is
+  provider-latency-bound (not faked). Headless 14/14 + the live opt-in flow. ADR-017. See `progress/M6.md`.
+- **Handed off (human/hardware/Phase-2 — instrumented, not fabricated):** the **dogfood verdict** (does it *feel* like the win — all loops, incl. the M3.3 context reveal + M6 generate); drag-feel; DPI · ≥60 s flicker · min-spec · Firefox WebGPU · Channel-e2e re-confirm · real-browser store-apply; test #2's "pick-up-able / Press Play" (gated on the runtime tier). **M4/M5 deferred (named, not stubbed):** KTX2/basis transcode (C++ FFI → native-only), in-shader texture sampling, collider/LOD/rig generation, base64/external-buffer `.gltf`, a UI import affordance; the **token economy / payout, remote hosting, text-to-3D generation** (the seams prompts 23+24 left clean); and the live in-window mesh + marketplace screenshots. *(Live close→reopen: machine-verified.)* See `progress/M5.md` · `progress/M4.md`.
 
 ## Next
 - **The seams prompts 23+24 left clean:** **text-to-3D generation**, the **token economy + creator
@@ -51,6 +63,12 @@
   model + Remove/Duplicate transactions + persistence) + the live shell surface (right-click menu, hover
   tooltip, Focus). **Named follow-up:** the production **React `/editor` port** of the menu/tooltip
   (replacing the scaffold probe over the same `actions_for` + commands) + a local live-e2e run.
+- **Queued — M3.4 Add palette / catalog browser (`28-m3.4`, creation-UX, off the economy thread):** an
+  "+ Add" palette that browses the catalog by **category** with a **search bar** — the *browse* door to
+  creation (describe-to-create is the *search* door). A surface over the existing registry +
+  `MarketplaceIndex` (M5) + instantiate pipeline (no duplicate logic): search reuses `resolve_local`, a
+  no-hit falls through to marketplace → generate; needs a curated **category standard-vocab** (ADR-015
+  pattern). Depends on M3.2 + M5 (shipped); the generate fall-through lights up with M6.
 - **Follow-ups (non-blocking):** incremental undo delta (replace `project_full`-on-undo, the ~70 ms hitch at 5k); the capability-rebuild carry-forward (so a future Loro merge/reload keeps capabilities); log compaction (the append-only replay-log grows with session lifetime). *(Recency ranking is now live — done.)*
 - **Carry-forward (later):** getrandom `js` for Loro-in-browser + the Phase-2 pure-Rust query backend (ADR-006).
 - **Carry-forward (Phase 2, with collab):** `merge()` rebuilds entities from Loro but **not their ECS tags/pairs** — capabilities are ECS-only, so the **compatibility query is empty after a merge**. Fix wires the registry into `rebuild_ecs_from_loro`; schedule with collab. (M1.6 audit; see `progress/M1.md`.)
@@ -86,7 +104,8 @@ Detailed dated entries are sharded by milestone under `progress/` (keeps this da
 Append to the **current milestone's** file, newest first, one entry per session, with measured
 numbers + ADR links. Live state stays here in Now/Next above.
 
-- [progress/M5.md](progress/M5.md) — **current milestone** (marketplace gate: capability namespacing + index tier)
+- [progress/M6.md](progress/M6.md) — **current milestone** (generation tier + the AI-patch contract)
+- [progress/M5.md](progress/M5.md) — marketplace gate (capability namespacing + index tier)
 - [progress/M4.md](progress/M4.md) — Phase-2 asset gate (local import + render)
 - [progress/M3.md](progress/M3.md) — binding UX / north-star loops (M3.1 bind-by-intent · M3.2 describe-to-create)
 - [progress/M2.md](progress/M2.md) — desktop shell convergence (M2 build)
