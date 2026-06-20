@@ -227,10 +227,19 @@
         if (!q) return;
         const r = await invoke("describe", { query: q });
         if (r.created) {
-          status("created " + r.kind + " · " + r.created);
+          if (r.source === "marketplace") {
+            // Marketplace tier: arrived pre-componentized. Economy is an INERT seam (ADR-004) — show
+            // the token price + "creator keeps ~70%" framing; nothing is purchased, no money moves.
+            const econ = r.price != null ? " · ⊞ " + r.price + " tokens (creator keeps ~70%, buying not enabled)" : "";
+            status("marketplace: " + r.kind + " · " + r.created + econ);
+          } else {
+            status("created " + r.kind + " · " + r.created);
+          }
           setTimeout(() => select(r.created), 60); // let the echoed delta land in the store, then focus it
+        } else if (r.seam === "generate") {
+          status('no local or marketplace match for "' + q + '" — would generate (text-to-3D, not enabled)');
         } else {
-          status('no local match for "' + q + '" — would query ' + (r.seam || "marketplace"));
+          status('no match for "' + q + '"');
         }
       }
       $("describeBtn").onclick = doDescribe;

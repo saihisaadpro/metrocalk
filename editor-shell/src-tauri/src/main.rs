@@ -20,6 +20,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
 use metrocalk_assets::{AssetStore, GltfImporter, MeshGpu};
+use metrocalk_core::marketplace::{LocalCatalog, MarketplaceIndex};
 use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_ecs::{Entity, FlecsWorld};
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
@@ -46,6 +47,9 @@ const PROP_GLB: &[u8] = include_bytes!("../../assets/prop.glb");
 /// viewport. The asset *store* itself is dropped after packing — nothing here borrows from it.
 struct AssetsRuntime {
     catalog: MeshCatalog,
+    /// Logical asset name (a marketplace entry's `asset` field, e.g. `"prop"`) → content-addressed
+    /// handle — how a marketplace entry's mesh is resolved at apply time.
+    asset_by_name: HashMap<String, String>,
     handle_to_slot: HashMap<String, usize>,
     scales: Vec<f32>,
     meshes: Vec<MeshGpu>,
@@ -75,6 +79,13 @@ fn load_assets() -> AssetsRuntime {
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
 
+    // Logical asset name → handle, for marketplace entries (their `asset` field is a logical name).
+    let asset_by_name: HashMap<String, String> =
+        [("healthbar", healthbar.as_str()), ("prop", prop.as_str())]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
     let mut meshes = Vec::new();
     let mut handle_to_slot = HashMap::new();
     let mut scales = Vec::new();
@@ -92,6 +103,7 @@ fn load_assets() -> AssetsRuntime {
     );
     AssetsRuntime {
         catalog,
+        asset_by_name,
         handle_to_slot,
         scales,
         meshes,
@@ -133,13 +145,19 @@ struct RevealResponse {
     bound: Vec<Bound>,
 }
 
-/// The describe-to-create result (M3.2): the created entity + kind on a local match, or the seam tier
-/// ("marketplace") on an honest no-match.
+/// The describe-to-create result: the created entity + kind, which tier it came from, and — for a
+/// marketplace hit — the inert economy seam (token price). On no match anywhere, the generate `seam`.
 #[derive(Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct DescribeResponse {
     created: Option<String>,
     kind: Option<String>,
+    /// `"local"` or `"marketplace"` — which tier resolved it (the happy-path source).
+    source: Option<String>,
+    /// Token price of a marketplace entry — surfaced as an **inert** economy seam (no money moves;
+    /// ADR-004). The UI shows "buy ≈ N tokens / creator keeps ~70%" framing; nothing settles.
+    price: Option<u32>,
+    /// The seam tier when nothing matched anywhere (`"generate"`) — a documented stub.
     seam: Option<String>,
 }
 
@@ -275,6 +293,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
     // Import the demo mesh assets once (one-shot heavy op) before seeding, so the catalog is ready for
     // describe-to-create + replay and the viewport's geometry is published.
     let assets = load_assets();
+    // The marketplace index (M5) — a local checked-in catalog behind the trait; describe-to-create's
+    // second tier (queried only on a no-local-match). A remote index slots in here unchanged.
+    let market = LocalCatalog::builtin();
     {
         let mut st = shared.lock().unwrap();
         st.meshes = assets.meshes.clone();
@@ -392,39 +413,81 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared) {
                 }
             }
             EngineCmd::Describe { query, reply } => {
-                // resolve + instantiate the top local match (one undoable transaction); honest
-                // no-match → the marketplace seam (never on the happy path).
-                let resp = match capscene::describe_create(
-                    &mut engine,
-                    &scene,
-                    &query,
-                    [0.0; 3],
-                    &assets.catalog,
-                ) {
-                    Some((id, kind)) => {
-                        log.append(&Record::Describe {
-                            query: query.clone(),
-                            pos: [0.0; 3],
-                        });
-                        if let Some(e) = engine.ecs_entity(id) {
-                            touch += 1;
-                            recency.insert(e, touch);
-                        }
-                        if let Some(ch) = &channel {
-                            let _ = ch.send(project_entity(&engine, id)); // targeted echo (inv. 2)
-                        }
-                        rebuild(&engine, &shared, &mut positions, &assets);
-                        DescribeResponse {
-                            created: Some(id.to_loro_key()),
-                            kind: Some(kind),
-                            seam: None,
-                        }
+                // Tiered resolve: local (offline) first; only on a no-local-match query the marketplace
+                // index; nothing anywhere → the generate seam (unbuilt stub). Each tier instantiates a
+                // pre-componentized working object as one undoable, replay-persisted transaction.
+                let pos = [0.0; 3];
+                let resp = if let Some((id, kind)) =
+                    capscene::describe_create(&mut engine, &scene, &query, pos, &assets.catalog)
+                {
+                    log.append(&Record::Describe {
+                        query: query.clone(),
+                        pos,
+                    });
+                    echo_created(
+                        &mut engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &channel,
+                        &mut recency,
+                        &mut touch,
+                        id,
+                    );
+                    DescribeResponse {
+                        created: Some(id.to_loro_key()),
+                        kind: Some(kind),
+                        source: Some("local".into()),
+                        price: None,
+                        seam: None,
                     }
-                    None => DescribeResponse {
-                        created: None,
-                        kind: None,
-                        seam: Some("marketplace".into()),
-                    },
+                } else if let Some(m) = market.query(&query).into_iter().next() {
+                    // Marketplace tier: a pre-componentized entry, applied already wired (namespaced
+                    // caps + its mesh handle). The price is surfaced as an inert economy seam (ADR-004).
+                    let entry = m.entry;
+                    let mesh = entry
+                        .asset
+                        .as_deref()
+                        .and_then(|name| assets.asset_by_name.get(name).cloned());
+                    match capscene::apply_marketplace_entry(
+                        &mut engine,
+                        &scene,
+                        &entry,
+                        pos,
+                        mesh.as_deref(),
+                    ) {
+                        Ok(id) => {
+                            log.append(&Record::ApplyMarketplace {
+                                entry_id: entry.id.clone(),
+                                pos,
+                                mesh,
+                            });
+                            echo_created(
+                                &mut engine,
+                                &shared,
+                                &mut positions,
+                                &assets,
+                                &channel,
+                                &mut recency,
+                                &mut touch,
+                                id,
+                            );
+                            DescribeResponse {
+                                created: Some(id.to_loro_key()),
+                                kind: Some(entry.component.clone()),
+                                source: Some("marketplace".into()),
+                                price: entry.price,
+                                seam: None,
+                            }
+                        }
+                        Err(_) => DescribeResponse::default(),
+                    }
+                } else {
+                    // No match anywhere — the generate seam (Phase-2 text-to-3D; unbuilt).
+                    DescribeResponse {
+                        seam: Some("generate".into()),
+                        ..Default::default()
+                    }
                 };
                 let _ = reply.send(resp);
             }
@@ -539,6 +602,29 @@ fn label_of(engine: &Engine<FlecsWorld>, id: EntityId) -> String {
 fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     let (dx, dy, dz) = (a[0] - b[0], a[1] - b[1], a[2] - b[2]);
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// Post-create echo for a freshly-instantiated entity (local describe OR marketplace apply): bump its
+/// recency, send the targeted `project_entity` delta (deltas only, inv. 2), and rebuild the viewport.
+#[allow(clippy::too_many_arguments)]
+fn echo_created(
+    engine: &mut Engine<FlecsWorld>,
+    shared: &Shared,
+    positions: &mut HashMap<Entity, [f32; 3]>,
+    assets: &AssetsRuntime,
+    channel: &Option<Channel<ProjectionDelta>>,
+    recency: &mut HashMap<Entity, u64>,
+    touch: &mut u64,
+    id: EntityId,
+) {
+    if let Some(e) = engine.ecs_entity(id) {
+        *touch += 1;
+        recency.insert(e, *touch);
+    }
+    if let Some(ch) = channel {
+        let _ = ch.send(project_entity(engine, id));
+    }
+    rebuild(engine, shared, positions, assets);
 }
 
 /// Rebuild the viewport instance list AND the cached `positions` map from the engine's `Transform`
