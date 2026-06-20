@@ -27,6 +27,8 @@ metrocalk-ecs = { path = "../../ecs" }
 metrocalk-editor-shell = { path = ".." }
 # The local asset/import substrate (M4): glTF import + content-addressed store + GPU mesh packing.
 metrocalk-assets = { path = "../../assets" }
+# The token economy (M7): the wallet/ledger types the three paid sinks meter against.
+metrocalk-economy = { path = "../../economy" }
 
 # Native wgpu viewport (M2.2 instanced render path). DX12 disabled — wgpu-hal 29's DX12 fights the
 # `windows` crate version Tauri/webview2-com pins (the diamond M2.1/M2.3 documented); Vulkan is the

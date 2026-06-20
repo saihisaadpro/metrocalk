@@ -22,13 +22,14 @@ use std::sync::{Arc, Mutex};
 use metrocalk_assets::{AssetId, AssetStore, GltfImporter, MeshGpu, MeshSource};
 use metrocalk_core::marketplace::{LocalCatalog, MarketplaceIndex};
 use metrocalk_core::{Engine, EntityId, FieldValue};
+use metrocalk_economy::{HoldId, SandboxProvider, GENERATE_TOKENS};
 use metrocalk_ecs::{Entity, FlecsWorld, World};
-use metrocalk_editor_shell::generate::{GenRequest, MeshGenerator, MeterAction, TokenMeter};
+use metrocalk_editor_shell::generate::{GenRequest, MeshGenerator};
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
 use metrocalk_editor_shell::{
-    actions_for, apply_ai_patch, apply_edit, capscene, project_entity, project_full, ActionItem,
-    AiPatch, CapScene, EditIntent, EditTx, Log, MeshCatalog, PatchOp, ProjectionDelta,
-    ProjectionOp, Record,
+    actions_for, ai_edit_rustier, apply_ai_patch, apply_edit, buy_marketplace, capscene,
+    project_entity, project_full, ActionItem, AiPatch, CapScene, EditIntent, EditTx, Log,
+    MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp, Record, Wallet,
 };
 use render::{Instance, SceneState, Shared};
 use serde::{Deserialize, Serialize};
@@ -161,6 +162,8 @@ struct DescribeResponse {
     price: Option<u32>,
     /// The seam tier when nothing matched anywhere (`"generate"`) — a documented stub.
     seam: Option<String>,
+    /// The user's token balance after a marketplace buy (M7), for the wallet UI.
+    balance: Option<u32>,
 }
 
 /// Commands to the engine thread (which owns the `!Send` Engine).
@@ -214,6 +217,26 @@ enum EngineCmd {
         prompt: String,
         bytes: Vec<u8>,
     },
+    /// A generation worker failed (provider error / panic) — release the reservation (refund) and keep
+    /// the honest grey placeholder (M7); never charged for a failure.
+    GenerateFailed {
+        placeholder: String,
+        reason: String,
+    },
+    /// A live AI-edit (M7) — "make it rustier": a schema-validated patch metered at the edit rate
+    /// (debit-on-success). Replies the economy outcome.
+    AiEdit {
+        id: String,
+        reply: Sender<EconResponse>,
+    },
+    /// A sandbox token top-up (M7) — $10 ≈ 100 tokens via the payment seam (no real money).
+    TopUp {
+        reply: Sender<EconResponse>,
+    },
+    /// The user's token balance (M7) — a read for the wallet UI.
+    WalletInfo {
+        reply: Sender<EconResponse>,
+    },
 }
 
 /// The generation result (M6): the grey placeholder that dropped in instantly + the inert token cost,
@@ -226,6 +249,22 @@ struct GenerateResponse {
     cost: Option<u32>,
     available: bool,
     seam: Option<String>,
+    /// The user's token balance after reserving the generation (M7), for the wallet UI.
+    balance: Option<u32>,
+}
+
+/// A token-economy reply (M7) — for the AI-edit, the sandbox top-up, and the wallet-balance read.
+/// `ok` = the action applied/charged; `message` carries a refusal/rejection/seam reason.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct EconResponse {
+    ok: bool,
+    /// The user's token balance after, in whole tokens.
+    balance: u32,
+    /// Tokens charged (an edit) or granted (a top-up), if any.
+    cost: Option<u32>,
+    /// A refusal/rejection/seam reason, when not `ok`.
+    message: Option<String>,
 }
 
 /// Hover-tooltip details for an entity (M3.3) — name · key components · provided/required caps · the
@@ -252,6 +291,12 @@ struct AppState {
 /// build (close→reopen restores). Falls back to the working dir if the exe path is unavailable.
 fn log_path() -> std::path::PathBuf {
     sidecar("metrocalk-scene.jsonl")
+}
+
+/// The token wallet's persisted ledger (M7) — a sidecar beside the scene log + window state, so the
+/// balance survives close→reopen (and the free grant can't be farmed by relaunching).
+fn wallet_path() -> std::path::PathBuf {
+    sidecar("metrocalk-wallet.json")
 }
 
 /// A sidecar file next to the executable (stable across launches of the same build), falling back to
@@ -363,7 +408,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
         std::time::Duration::from_millis(700),
         true,
     );
-    let meter = metrocalk_editor_shell::generate::StubMeter;
+    // The token wallet (M7) — the file-backed ledger the paid sinks meter against (free-tier seeded,
+    // orphan holds released on load). The sandbox payment provider tops it up (no real money; the real
+    // provider is a go-live seam). Separate from the scene log: replay never re-charges.
+    let mut wallet = Wallet::open(wallet_path());
+    let payments = SandboxProvider;
     {
         let mut st = shared.lock().unwrap();
         st.meshes = assets.meshes.clone();
@@ -407,6 +456,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // bumped on every committed edit/bind so it's live, not inert.
     let mut recency: HashMap<Entity, u64> = HashMap::new();
     let mut touch: u64 = 0;
+    // In-flight generation reservations (M7): placeholder loro-key → the token Hold, so the async
+    // completion settles (success) or releases (failure) exactly the right hold. Lives on this thread
+    // only, so reserve→settle/release is atomic (no race).
+    let mut pending_gen: HashMap<String, HoldId> = HashMap::new();
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -508,23 +561,29 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         source: Some("local".into()),
                         price: None,
                         seam: None,
+                        balance: Some(wallet.balance_tokens()),
                     }
                 } else if let Some(m) = market.query(&query).into_iter().next() {
-                    // Marketplace tier: a pre-componentized entry, applied already wired (namespaced
-                    // caps + its mesh handle). The price is surfaced as an inert economy seam (ADR-004).
+                    // Marketplace tier (M7): a pre-componentized entry, BOUGHT — debit the price (2–4) +
+                    // accrue ~70% to the creator (its id namespace) on success, or refuse gracefully when
+                    // broke (an honest "top up?", no scene change). The mesh handle resolves first.
                     let entry = m.entry;
                     let mesh = entry
                         .asset
                         .as_deref()
                         .and_then(|name| assets.asset_by_name.get(name).cloned());
-                    match capscene::apply_marketplace_entry(
+                    let ref_id = format!("buy:{}:{}", entry.id, wallet.ledger().len());
+                    let (created, outcome) = buy_marketplace(
                         &mut engine,
                         &scene,
+                        &mut wallet,
                         &entry,
-                        pos,
                         mesh.as_deref(),
-                    ) {
-                        Ok(id) => {
+                        pos,
+                        &ref_id,
+                    );
+                    match (created, outcome) {
+                        (Some(id), Outcome::Charged { balance_tokens, .. }) => {
                             log.append(&Record::ApplyMarketplace {
                                 entry_id: entry.id.clone(),
                                 pos,
@@ -546,14 +605,26 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 source: Some("marketplace".into()),
                                 price: entry.price,
                                 seam: None,
+                                balance: Some(balance_tokens),
                             }
                         }
-                        Err(_) => DescribeResponse::default(),
+                        (_, Outcome::Refused { needed, have }) => DescribeResponse {
+                            kind: Some(entry.component.clone()),
+                            source: Some("marketplace".into()),
+                            price: entry.price,
+                            seam: Some(format!(
+                                "insufficient balance: this asset costs {needed} tokens, you have {have} — top up?"
+                            )),
+                            balance: Some(have),
+                            ..Default::default()
+                        },
+                        _ => DescribeResponse::default(),
                     }
                 } else {
-                    // No match anywhere — the generate seam (Phase-2 text-to-3D; unbuilt).
+                    // No match anywhere — the generate seam (the opt-in tier-3 metered last resort).
                     DescribeResponse {
                         seam: Some("generate".into()),
+                        balance: Some(wallet.balance_tokens()),
                         ..Default::default()
                     }
                 };
@@ -625,24 +696,28 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         ..Default::default()
                     });
                 } else {
-                    // Meter the action FIRST (ADR-004, rejection-as-UX): an insufficient balance refuses
-                    // BEFORE any placeholder drops. `StubMeter` never errors today — this gate is what a
-                    // real ledger (prompt 26) plugs into; the placeholder is never charged-then-skipped.
-                    let resp =
-                        match meter.charge(MeterAction::Generate, &format!("generate '{query}'")) {
-                            Err(reason) => GenerateResponse {
-                                available: true,
-                                seam: Some(reason),
-                                ..Default::default()
-                            },
-                            // Charged → the placeholder drops in instantly (one undoable tx); the real mesh
-                            // streams in async on a worker thread.
-                            Ok(cost) => match capscene::place_generation_placeholder(
-                                &mut engine,
-                                &scene,
-                                [0.0; 3],
-                            ) {
+                    // Tier 3, opt-in. RESERVE the cost up front (M7) — fences the tokens the instant the
+                    // request is accepted (defeats free-tier-via-race), refuses gracefully when broke
+                    // BEFORE any placeholder drops, and is only SETTLED on a successful stream-in (a
+                    // failed generation RELEASES the hold — never charged for a failure).
+                    let ref_id = format!("gen:{}:{}", query, wallet.ledger().len());
+                    let resp = match wallet.reserve_generate(&ref_id) {
+                        Err(refusal) => GenerateResponse {
+                            available: true,
+                            seam: Some(format!(
+                                "insufficient balance: a generation costs {} tokens, you have {} — top up?",
+                                refusal.needed.whole_tokens(),
+                                refusal.available.whole_tokens()
+                            )),
+                            balance: Some(wallet.balance_tokens()),
+                            ..Default::default()
+                        },
+                        Ok(hold) => {
+                            match capscene::place_generation_placeholder(&mut engine, &scene, [0.0; 3])
+                            {
                                 Ok(ph) => {
+                                    let ph_key = ph.to_loro_key();
+                                    pending_gen.insert(ph_key.clone(), hold);
                                     echo_created(
                                         &mut engine,
                                         &shared,
@@ -653,30 +728,52 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                         &mut touch,
                                         ph,
                                     );
-                                    // Kick the provider off the hot path; it sends GenerateComplete back when done.
+                                    // Kick the provider off the hot path. It ALWAYS sends back exactly one
+                                    // terminal message — GenerateComplete on success, GenerateFailed on a
+                                    // provider Err OR a panic (caught) — so the reservation never leaks.
                                     let g = generator.clone();
                                     let back = self_tx.clone();
-                                    let ph_key = ph.to_loro_key();
                                     let q = query.clone();
+                                    let pk = ph_key.clone();
                                     std::thread::spawn(move || {
-                                        if let Ok(bytes) = g.generate(&GenRequest::new(q.clone())) {
-                                            let _ = back.send(EngineCmd::GenerateComplete {
-                                                placeholder: ph_key,
+                                        let produced = std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| {
+                                                g.generate(&GenRequest::new(q.clone()))
+                                            }),
+                                        );
+                                        let msg = match produced {
+                                            Ok(Ok(bytes)) => EngineCmd::GenerateComplete {
+                                                placeholder: pk,
                                                 prompt: q,
                                                 bytes,
-                                            });
-                                        }
+                                            },
+                                            Ok(Err(e)) => EngineCmd::GenerateFailed {
+                                                placeholder: pk,
+                                                reason: e.to_string(),
+                                            },
+                                            Err(_) => EngineCmd::GenerateFailed {
+                                                placeholder: pk,
+                                                reason: "generation worker panicked".to_string(),
+                                            },
+                                        };
+                                        let _ = back.send(msg);
                                     });
                                     GenerateResponse {
-                                        created: Some(ph.to_loro_key()),
-                                        cost: Some(cost),
+                                        created: Some(ph_key),
+                                        cost: Some(GENERATE_TOKENS),
                                         available: true,
                                         seam: None,
+                                        balance: Some(wallet.balance_tokens()),
                                     }
                                 }
-                                Err(_) => GenerateResponse::default(),
-                            },
-                        };
+                                // Couldn't place the placeholder → release the reservation (no charge).
+                                Err(_) => {
+                                    wallet.release(hold, &ref_id);
+                                    GenerateResponse::default()
+                                }
+                            }
+                        }
+                    };
                     let _ = reply.send(resp);
                 }
             }
@@ -685,72 +782,186 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 prompt,
                 bytes,
             } => {
-                if let Some(ph) = EntityId::from_loro_key(&placeholder) {
-                    if engine.entity_exists(ph) {
-                        // Import the generated mesh through the prompt-23 pipeline + add it to the render
-                        // store if it's new (the fake's prop is already loaded → idempotent,
-                        // content-addressed). A handle is only USABLE once it resolves to imported
-                        // geometry: a malformed/oversized generated mesh is REJECTED here, so we never
-                        // stream in (or persist) a dangling handle — an honest grey cube beats a fake asset.
-                        let handle = AssetId::of_bytes(&bytes).as_str().to_string();
-                        let mut usable = assets.handle_to_slot.contains_key(&handle);
-                        if !usable {
-                            if let Ok(asset) = GltfImporter::new().import(&bytes) {
-                                let gpu = MeshGpu::from_asset(&asset);
-                                let ext = asset.bounds().max_extent();
-                                let slot = assets.meshes.len();
-                                assets.meshes.push(gpu.clone());
-                                assets.scales.push(if ext > 0.0 { 0.9 / ext } else { 1.0 });
-                                assets.handle_to_slot.insert(handle.clone(), slot);
-                                let mut st = shared.lock().unwrap();
-                                st.meshes.push(gpu);
-                                st.meshes_revision = st.meshes_revision.wrapping_add(1);
-                                usable = true;
-                            }
-                        }
-                        if usable {
-                            // Stream the mesh in as a VALIDATED AI patch (inv. 3) — same entity, swapped handle.
-                            let patch = AiPatch {
-                                client_op_id: "generate-stream-in".into(),
-                                ops: vec![PatchOp::SetField {
-                                    id: placeholder.clone(),
-                                    component: "MeshRenderer".into(),
-                                    field: capscene::MESH_FIELD.into(),
-                                    value: serde_json::Value::String(handle.clone()),
-                                }],
-                            };
-                            let delta = apply_ai_patch(
-                                &mut engine,
-                                &metrocalk_core::stdlib::standard_components(),
-                                "generate-stream-in",
-                                &patch,
-                            );
-                            if delta.rejects.is_empty() {
-                                log.append(&Record::Generate {
-                                    prompt,
-                                    pos: [0.0; 3],
-                                    mesh: Some(handle),
-                                });
-                                if let Some(ch) = &channel {
-                                    let _ = ch.send(delta); // targeted stream-in delta (inv. 2)
-                                }
-                                rebuild(&engine, &shared, &mut positions, &assets);
-                            }
-                        } else {
-                            // The importer rejected the generated bytes — keep the honest grey placeholder
-                            // (never a dangling handle) and persist it as `mesh: None`, so it survives
-                            // reload as a grey working object instead of vanishing.
-                            eprintln!(
-                                "[generate] import rejected the generated mesh — keeping the grey placeholder"
-                            );
-                            log.append(&Record::Generate {
-                                prompt,
-                                pos: [0.0; 3],
-                                mesh: None,
-                            });
+                // The reservation for this placeholder (None if it was already made terminal).
+                let hold = pending_gen.remove(&placeholder);
+                let gen_ref = format!("gen-done:{placeholder}");
+                let placeholder_live =
+                    EntityId::from_loro_key(&placeholder).is_some_and(|e| engine.entity_exists(e));
+                if !placeholder_live {
+                    // The placeholder was undone/removed while generating → refund the hold, drop the
+                    // result (never charge for an asset the user already discarded).
+                    if let Some(h) = hold {
+                        wallet.release(h, &gen_ref);
+                    }
+                } else {
+                    // Import the generated mesh through the prompt-23 pipeline + add it to the render
+                    // store if it's new (content-addressed; the fake's prop is idempotent). A handle is
+                    // only USABLE once it resolves to imported geometry — a malformed/oversized mesh is
+                    // REJECTED, so we never stream in (or persist) a dangling handle.
+                    let handle = AssetId::of_bytes(&bytes).as_str().to_string();
+                    let mut usable = assets.handle_to_slot.contains_key(&handle);
+                    if !usable {
+                        if let Ok(asset) = GltfImporter::new().import(&bytes) {
+                            let gpu = MeshGpu::from_asset(&asset);
+                            let ext = asset.bounds().max_extent();
+                            let slot = assets.meshes.len();
+                            assets.meshes.push(gpu.clone());
+                            assets.scales.push(if ext > 0.0 { 0.9 / ext } else { 1.0 });
+                            assets.handle_to_slot.insert(handle.clone(), slot);
+                            let mut st = shared.lock().unwrap();
+                            st.meshes.push(gpu);
+                            st.meshes_revision = st.meshes_revision.wrapping_add(1);
+                            usable = true;
                         }
                     }
+                    let streamed = usable && {
+                        // Stream the mesh in as a VALIDATED AI patch (inv. 3) — same entity, swapped handle.
+                        let patch = AiPatch {
+                            client_op_id: "generate-stream-in".into(),
+                            ops: vec![PatchOp::SetField {
+                                id: placeholder.clone(),
+                                component: "MeshRenderer".into(),
+                                field: capscene::MESH_FIELD.into(),
+                                value: serde_json::Value::String(handle.clone()),
+                            }],
+                        };
+                        let delta = apply_ai_patch(
+                            &mut engine,
+                            &metrocalk_core::stdlib::standard_components(),
+                            "generate-stream-in",
+                            &patch,
+                        );
+                        let ok = delta.rejects.is_empty();
+                        if ok {
+                            log.append(&Record::Generate {
+                                prompt: prompt.clone(),
+                                pos: [0.0; 3],
+                                mesh: Some(handle),
+                            });
+                            if let Some(ch) = &channel {
+                                let _ = ch.send(delta); // targeted stream-in delta (inv. 2)
+                            }
+                            rebuild(&engine, &shared, &mut positions, &assets);
+                        }
+                        ok
+                    };
+                    if streamed {
+                        // SUCCESS — settle the reservation (charge ≈10, platform revenue).
+                        if let Some(h) = hold {
+                            wallet.settle(h, &gen_ref);
+                        }
+                    } else {
+                        // The importer (or the stream-in patch) rejected the result — RELEASE the hold
+                        // (never charged) and keep the honest grey placeholder, persisted as `mesh: None`.
+                        if let Some(h) = hold {
+                            wallet.release(h, &gen_ref);
+                        }
+                        eprintln!(
+                            "[generate] import rejected the generated mesh — keeping the grey placeholder (refunded)"
+                        );
+                        log.append(&Record::Generate {
+                            prompt,
+                            pos: [0.0; 3],
+                            mesh: None,
+                        });
+                    }
                 }
+            }
+            EngineCmd::GenerateFailed {
+                placeholder,
+                reason,
+            } => {
+                // The provider errored or the worker panicked — RELEASE the reservation (refund) and keep
+                // the honest grey placeholder; never charged for a failure.
+                if let Some(h) = pending_gen.remove(&placeholder) {
+                    wallet.release(h, &format!("gen-fail:{placeholder}"));
+                }
+                eprintln!(
+                    "[generate] provider failed ({reason}) — placeholder kept, reservation refunded"
+                );
+                if EntityId::from_loro_key(&placeholder).is_some_and(|e| engine.entity_exists(e)) {
+                    log.append(&Record::Generate {
+                        prompt: String::new(),
+                        pos: [0.0; 3],
+                        mesh: None,
+                    });
+                }
+            }
+            EngineCmd::AiEdit { id, reply } => {
+                // The live "make it rustier" AI-edit (M7): a schema-validated patch metered at the edit
+                // rate (debit-on-success; a rejected patch or insufficient balance never charges).
+                let resp = if let Some(eid) = EntityId::from_loro_key(&id) {
+                    let ref_id = format!("edit:{id}:{}", wallet.ledger().len());
+                    let (delta, outcome) = ai_edit_rustier(&mut engine, &mut wallet, eid, &ref_id);
+                    match outcome {
+                        Outcome::Charged {
+                            cost_tokens,
+                            balance_tokens,
+                        } => {
+                            if let (Some(d), Some(ch)) = (delta, &channel) {
+                                let _ = ch.send(d); // echo the material edit to the inspector
+                            }
+                            log.append(&Record::AiEdit { id: id.clone() });
+                            rebuild(&engine, &shared, &mut positions, &assets);
+                            EconResponse {
+                                ok: true,
+                                balance: balance_tokens,
+                                cost: Some(cost_tokens),
+                                message: Some("made it rustier".to_string()),
+                            }
+                        }
+                        Outcome::Refused { needed, have } => EconResponse {
+                            ok: false,
+                            balance: have,
+                            cost: Some(needed),
+                            message: Some(format!(
+                                "insufficient balance: an edit costs {needed} tokens, you have {have} — top up?"
+                            )),
+                        },
+                        Outcome::Rejected(why) => EconResponse {
+                            ok: false,
+                            balance: wallet.balance_tokens(),
+                            message: Some(format!("edit rejected: {why}")),
+                            ..Default::default()
+                        },
+                    }
+                } else {
+                    EconResponse {
+                        ok: false,
+                        balance: wallet.balance_tokens(),
+                        message: Some("no such entity".to_string()),
+                        ..Default::default()
+                    }
+                };
+                let _ = reply.send(resp);
+            }
+            EngineCmd::TopUp { reply } => {
+                // Sandbox top-up (M7): $10 ≈ 100 tokens via the payment seam — NO real money moves.
+                let ref_id = format!("topup:{}", wallet.ledger().len());
+                let resp = match wallet.top_up(&payments, 1000, &ref_id) {
+                    Ok(granted) => EconResponse {
+                        ok: true,
+                        balance: wallet.balance_tokens(),
+                        cost: Some(granted),
+                        message: Some(format!(
+                            "topped up {granted} tokens (sandbox — no real charge)"
+                        )),
+                    },
+                    Err(e) => EconResponse {
+                        ok: false,
+                        balance: wallet.balance_tokens(),
+                        message: Some(e.to_string()),
+                        ..Default::default()
+                    },
+                };
+                let _ = reply.send(resp);
+            }
+            EngineCmd::WalletInfo { reply } => {
+                let _ = reply.send(EconResponse {
+                    ok: true,
+                    balance: wallet.balance_tokens(),
+                    ..Default::default()
+                });
             }
         }
     }
@@ -1239,6 +1450,41 @@ fn generate(state: State<AppState>, query: String) -> GenerateResponse {
     rx.recv().unwrap_or_default()
 }
 
+/// AI-edit (M7) — "make it rustier" on an entity: a schema-validated patch metered at the edit rate
+/// (debit-on-success). Blocks briefly on the engine thread's reply.
+#[tauri::command]
+fn ai_edit(state: State<AppState>, id: String) -> EconResponse {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::AiEdit { id, reply }).is_err() {
+        return EconResponse::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Sandbox token top-up (M7) — $10 ≈ 100 tokens via the payment seam. **No real money moves** (the real
+/// provider is a go-live seam).
+#[tauri::command]
+fn top_up(state: State<AppState>) -> EconResponse {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::TopUp { reply }).is_err() {
+        return EconResponse::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// The user's token balance (M7) — a read for the wallet UI.
+#[tauri::command]
+fn wallet_info(state: State<AppState>) -> EconResponse {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::WalletInfo { reply }).is_err() {
+        return EconResponse::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 fn main() {
     let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
     let (tx, rx) = mpsc::channel::<EngineCmd>();
@@ -1296,7 +1542,10 @@ fn main() {
             remove_entity,
             duplicate_entity,
             entity_details,
-            generate
+            generate,
+            ai_edit,
+            top_up,
+            wallet_info
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");

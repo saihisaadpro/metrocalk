@@ -1061,6 +1061,7 @@ version = "0.1.0"
 dependencies = [
  "metrocalk-assets",
  "metrocalk-core",
+ "metrocalk-economy",
  "metrocalk-ecs",
  "serde",
  "serde_json",

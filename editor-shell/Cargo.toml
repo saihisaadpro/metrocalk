@@ -15,6 +15,8 @@ path = "src/lib.rs"
 [dependencies]
 metrocalk-core = { path = "../core" }
 metrocalk-ecs = { path = "../ecs" }
+# The token economy (M7) — the wallet/metering seam wraps the pure ledger + cost model + payment seam.
+metrocalk-economy = { path = "../economy" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

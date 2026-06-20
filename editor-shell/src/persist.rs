@@ -67,6 +67,10 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mesh: Option<String>,
     },
+    /// A live AI-edit (M7): the schema-validated "make it rustier" patch on an entity. Replayed by
+    /// re-applying the patch (scene only — the wallet is a separate persisted ledger, so replay never
+    /// re-charges tokens), so a rusty edit survives close→reopen.
+    AiEdit { id: String },
     /// A single-step undo of the most recent action.
     Undo,
 }
@@ -179,6 +183,16 @@ impl Log {
                     pos,
                     mesh,
                 } => replay_generate(engine, scene, pos, mesh),
+                Record::AiEdit { id } => EntityId::from_loro_key(&id).is_some_and(|e| {
+                    crate::ai::apply_ai_patch(
+                        engine,
+                        &metrocalk_core::stdlib::standard_components(),
+                        "replay-ai-edit",
+                        &crate::metering::rustier_patch(e),
+                    )
+                    .rejects
+                    .is_empty()
+                }),
                 Record::Undo => engine.undo(),
             };
             if ok {

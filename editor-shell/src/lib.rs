@@ -15,8 +15,10 @@ pub mod ai;
 pub mod bridge;
 pub mod capscene;
 pub mod generate;
+pub mod metering;
 pub mod persist;
 pub mod reveal;
+pub mod wallet;
 
 pub use actions::{actions_for, Action, ActionItem};
 pub use ai::{apply_ai_patch, AiPatch, PatchOp};
@@ -32,5 +34,7 @@ pub use generate::{
     FakeGenerator, GenError, GenRequest, MeshGenerator, MeterAction, RemoteGenerator, StubMeter,
     TokenMeter,
 };
+pub use metering::{ai_edit_rustier, buy_marketplace, rustier_patch, Outcome};
 pub use persist::{Log, Record};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
+pub use wallet::Wallet;

@@ -2631,6 +2631,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrocalk-economy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "metrocalk-ecs"
 version = "0.1.0"
 dependencies = [
@@ -2642,6 +2651,7 @@ name = "metrocalk-editor-shell"
 version = "0.1.0"
 dependencies = [
  "metrocalk-core",
+ "metrocalk-economy",
  "metrocalk-ecs",
  "serde",
  "serde_json",
@@ -2655,6 +2665,7 @@ dependencies = [
  "glam",
  "metrocalk-assets",
  "metrocalk-core",
+ "metrocalk-economy",
  "metrocalk-ecs",
  "metrocalk-editor-shell",
  "png 0.18.1",

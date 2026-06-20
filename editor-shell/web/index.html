@@ -35,6 +35,12 @@
       <div class="panel">
         <h3>metrocalk · editor (M2.6)</h3>
         <div style="padding:0 12px 6px;opacity:.6" id="count">connecting…</div>
+        <!-- Wallet (M7): the token balance the paid tiers (generate/buy/edit) meter against. The engine
+             is FREE forever — local build/bind/describe-local never touch this. Top-up is a SANDBOX
+             ($10 ≈ 100 tokens) — no real money moves. -->
+        <div style="padding:0 12px 6px;color:#fbbf24" id="wallet">⊞ <span id="walletBal">…</span> tokens
+          <button id="topup" style="margin:0 0 0 6px;padding:2px 8px;font-size:11px;background:#4a3a1f">Top up +100</button>
+        </div>
         <button id="undo">⟲ Undo (Ctrl-Z)</button>
         <h3>Describe to create</h3>
         <div style="padding:0 12px 6px;display:flex;gap:6px">
@@ -151,10 +157,16 @@
             html += `<div class="field"><span>${f}</span><input data-c="${comp}" data-f="${f}" value="${v}"/></div>`;
           }
         }
+        // The live AI-edit (M7) — "make it rustier" rides the schema-validated patch path, metered at
+        // the edit rate (≈2 tokens, debit-on-success). The real LLM is a seam; this is the deterministic
+        // offline stand-in (sets MeshRenderer.material).
+        html += `<button id="rustier" style="margin:8px 12px;background:#5a2f1f">✦ Make it rustier (≈2 tokens)</button>`;
         $("inspector").innerHTML = html;
         for (const inp of $("inspector").querySelectorAll("input")) {
           inp.onchange = () => editField(selected, inp.dataset.c, inp.dataset.f, parseMaybeNumber(inp.value));
         }
+        const rb = $("rustier");
+        if (rb) rb.onclick = () => doAiEdit(selected);
       }
       const parseMaybeNumber = (s) => { const n = Number(s); return s.trim() !== "" && !isNaN(n) ? n : s; };
 
@@ -227,16 +239,20 @@
         const q = $("describe").value.trim();
         if (!q) return;
         const r = await invoke("describe", { query: q });
+        setWallet(r.balance); // M7: any tier may have moved the balance
         if (r.created) {
           if (r.source === "marketplace") {
-            // Marketplace tier: arrived pre-componentized. Economy is an INERT seam (ADR-004) — show
-            // the token price + "creator keeps ~70%" framing; nothing is purchased, no money moves.
-            const econ = r.price != null ? " · ⊞ " + r.price + " tokens (creator keeps ~70%, buying not enabled)" : "";
-            status("marketplace: " + r.kind + " · " + r.created + econ);
+            // Marketplace tier (M7): BOUGHT — the price was debited, ~70% accrued to the creator (no
+            // real money). Show the cost + the new balance.
+            const econ = r.price != null ? " · −" + r.price + " tokens (creator keeps ~70%)" : "";
+            status("bought " + r.kind + " · " + r.created + econ + " · ⊞ " + r.balance + " left");
           } else {
-            status("created " + r.kind + " · " + r.created);
+            status("created " + r.kind + " · " + r.created + " (free, local)");
           }
           setTimeout(() => select(r.created), 60); // let the echoed delta land in the store, then focus it
+        } else if (r.seam && r.seam.startsWith("insufficient")) {
+          // Marketplace buy refused (broke) — the honest "top up?" UX (no scene change).
+          status(r.seam);
         } else if (r.seam === "generate") {
           // Tier 3, OPT-IN: nothing local or on the marketplace — offer Generate (the metered last resort).
           pendingGen = q;
@@ -255,9 +271,10 @@
         $("genBtn").style.display = "none";
         pendingGen = null;
         const g = await invoke("generate", { query: q });
+        setWallet(g.balance);
         if (g.available && g.created) {
           setTimeout(() => select(g.created), 60);
-          status("generating '" + q + "' — grey placeholder dropped (≈" + (g.cost || 10) + " tokens, meter seam); streaming the mesh in…");
+          status("generating '" + q + "' — grey placeholder dropped (≈" + (g.cost || 10) + " tokens reserved; charged only on success); streaming the mesh in…");
         } else {
           status("generation " + (g.seam || "unavailable") + " — the local + marketplace paths are unaffected");
         }
@@ -395,10 +412,30 @@
       $("undo").onclick = doUndo;
       window.addEventListener("keydown", (e) => { if ((e.ctrlKey||e.metaKey) && e.key === "z") doUndo(); });
 
+      // ── wallet / token economy (M7) ────────────────────────────────────────────
+      // The balance the paid tiers meter against. The engine is free forever; only generate/buy/edit
+      // touch this. Top-up is a sandbox ($10 ≈ 100 tokens) — NO real money. Updated from every paid op.
+      function setWallet(bal) { if (bal != null) $("walletBal").textContent = bal; }
+      async function refreshWallet() { try { const w = await invoke("wallet_info"); setWallet(w.balance); } catch (e) {} }
+      $("topup").onclick = async () => {
+        const r = await invoke("top_up");
+        setWallet(r.balance);
+        status(r.message || ("balance: " + r.balance + " tokens"));
+      };
+      async function doAiEdit(id) {
+        if (!id) return;
+        const r = await invoke("ai_edit", { id });
+        setWallet(r.balance);
+        status(r.message || (r.ok ? "edited" : "edit refused"));
+        if (r.ok) setTimeout(() => { if (selected === id) renderInspector(); }, 60);
+      }
+
       // connect: the core pushes ProjectionDeltas over the Channel (desktop binding of the M2.4 wire)
       const channel = new Channel();
       channel.onmessage = (delta) => applyDelta(delta);
-      invoke("connect", { channel }).then(() => status("connected to /core")).catch((e) => status("connect failed: " + e));
+      invoke("connect", { channel })
+        .then(() => { status("connected to /core"); refreshWallet(); })
+        .catch((e) => status("connect failed: " + e));
     </script>
   </body>
 </html>
