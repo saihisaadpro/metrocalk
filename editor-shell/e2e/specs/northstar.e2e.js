@@ -70,7 +70,10 @@ describe("Metrocalk editor — north-star #1 live", () => {
 
   it("edits a field through the pipeline (round-trip)", async () => {
     const input = await $("#inspector input");
-    if (!(await input.isExisting())) return; // no field to edit (defensive)
+    // The pick test above asserted the inspector shows "Transform", so a picked entity MUST expose an
+    // editable field. Assert it exists rather than silently early-returning — a no-field inspector is a
+    // real regression to surface, not a reason to vacuously pass.
+    expect(await input.isExisting()).toBe(true);
     await input.setValue("12.5");
     await browser.keys(["Enter"]);
     await browser.waitUntil(async () => (await $("#status").getText()).includes("edit"), {
@@ -97,18 +100,18 @@ describe("Metrocalk editor — north-star #1 live", () => {
     expect(await $("#reveal").getText()).toContain("Health");
   });
 
-  it("a no-local-match describe resolves the MARKETPLACE tier — pre-componentized, not faked (M5)", async () => {
+  it("a no-local-match describe BUYS from the MARKETPLACE tier — pre-componentized, not faked (M5/M7)", async () => {
     await $("#describe").setValue("rusty medieval sword");
     await $("#describeBtn").click();
-    await browser.waitUntil(async () => (await $("#status").getText()).includes("marketplace"), {
+    // M7: the marketplace tier is a real BUY (debit-on-success), so the status reads
+    // "bought … from marketplace: …" — distinct from the generate seam's "no local or marketplace match".
+    await browser.waitUntil(async () => (await $("#status").getText()).includes("bought"), {
       timeout: 10000,
-      timeoutMsg: "no marketplace resolution on a no-local-match describe",
+      timeoutMsg: "no marketplace BUY on a no-local-match describe (rusty medieval sword)",
     });
-    // M5: the marketplace tier is real — the entry applies pre-componentized (the Weapon component) with
-    // its inert token-price seam, rather than the old M3.2 "would query marketplace" stub.
     const status = await $("#status").getText();
-    expect(status).toContain("marketplace:");
-    expect(status).toContain("tokens");
+    expect(status).toContain("marketplace:"); // resolved through the marketplace tier (not local, not generate)
+    expect(status).toContain("tokens");        // it was metered (M7 real buy — the price, ~70% to the creator)
   });
 
   // ── M3.3: viewport context actions + hover details (the "context reveal") ─────────────────────────

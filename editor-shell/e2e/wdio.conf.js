@@ -14,6 +14,10 @@ const application = path.resolve(dir, "../src-tauri/target/release/metrocalk-edi
 // The shell writes its persistence log next to the exe; delete it so each E2E run starts on a clean,
 // freshly-seeded scene (persistence-across-launch is covered by the headless tests).
 const sceneLog = path.resolve(dir, "../src-tauri/target/release/metrocalk-scene.jsonl");
+// The token wallet persists beside the exe and the marketplace-buy test DEBITS it (M7 real buy). Reset
+// it too, so every run starts on the full free grant — otherwise the buy test slowly drains the wallet
+// across runs and eventually flakes ("insufficient balance" instead of "bought").
+const walletFile = path.resolve(dir, "../src-tauri/target/release/metrocalk-wallet.json");
 const nativeDriver = path.resolve(dir, ".driver/msedgedriver.exe");
 const tauriDriverBin = path.resolve(process.env.USERPROFILE, ".cargo/bin/tauri-driver.exe");
 
@@ -46,10 +50,13 @@ export const config = {
   connectionRetryCount: 3,
 
   onPrepare: () => {
+    // Clean slate: a freshly-seeded scene + the full free token grant (the marketplace-buy test debits
+    // the wallet, so it must not carry over between runs).
     try {
       rmSync(sceneLog, { force: true });
+      rmSync(walletFile, { force: true });
     } catch {
-      /* no log yet — fine */
+      /* no log/wallet yet — fine */
     }
   },
 

@@ -261,9 +261,9 @@
             // Marketplace tier (M7): BOUGHT — the price was debited, ~70% accrued to the creator (no
             // real money). Show the cost + the new balance.
             const econ = r.price != null ? " · −" + r.price + " tokens (creator keeps ~70%)" : "";
-            status("bought " + r.kind + " · " + r.created + econ + " · ⊞ " + r.balance + " left");
+            status("marketplace: bought " + r.kind + " · " + r.created + econ + " · ⊞ " + r.balance + " left");
           } else {
-            status("created " + r.kind + " · " + r.created + " (free, local)");
+            status("local: created " + r.kind + " · " + r.created + " (free)");
           }
           setTimeout(() => select(r.created), 60); // let the echoed delta land in the store, then focus it
         } else if (r.seam && r.seam.startsWith("insufficient")) {
