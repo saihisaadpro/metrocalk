@@ -22,6 +22,7 @@ fn main() {
     for (name, bytes) in [
         ("healthbar.glb", metrocalk_assets::demo::healthbar_glb()),
         ("prop.glb", metrocalk_assets::demo::prop_glb()),
+        ("sphere.glb", metrocalk_assets::demo::sphere_glb()),
     ] {
         let path = out.join(name);
         std::fs::write(&path, &bytes).expect("write fixture");

@@ -10,8 +10,10 @@
 //! art library.
 
 // Demo geometry: literal coordinates + index lists, and f32→LE byte casts for the buffer. Truncation
-// of small counts to u16 indices is intentional and bounded by the hand-authored geometry.
-#![allow(clippy::cast_possible_truncation)]
+// of small counts to u16 indices is intentional and bounded by the hand-authored geometry; likewise the
+// sphere's `usize`→`f32` segment ratios are over tiny constant counts (≤16), so the precision loss is
+// nil in practice.
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::fmt::Write as _;
 
@@ -339,6 +341,47 @@ pub fn prop_glb() -> Vec<u8> {
         texture: None,
     };
     build_glb("prop", &[prim], &[])
+}
+
+/// A smooth UV sphere (radius 0.5) — the canonical **physics** test mesh (M8.2): unmistakably not a
+/// cube, it pairs with a ball collider and visibly falls, rolls, and rests under gravity. Smooth
+/// per-vertex normals (a unit sphere's outward normal is its position direction). Own geometry — no
+/// third-party asset, deterministic bytes, wasm-safe. ~221 verts / 1152 indices (u16-safe).
+#[must_use]
+pub fn sphere_glb() -> Vec<u8> {
+    const R: f32 = 0.5;
+    const STACKS: usize = 12; // latitude bands (north pole → south)
+    const SLICES: usize = 16; // longitude segments
+    let mut positions = Vec::with_capacity((STACKS + 1) * (SLICES + 1));
+    let mut normals = Vec::with_capacity((STACKS + 1) * (SLICES + 1));
+    for i in 0..=STACKS {
+        let lat = (i as f32 / STACKS as f32) * std::f32::consts::PI; // 0..π
+        let (sin_lat, cos_lat) = lat.sin_cos();
+        for j in 0..=SLICES {
+            let lon = (j as f32 / SLICES as f32) * std::f32::consts::TAU; // 0..2π
+            let (sin_lon, cos_lon) = lon.sin_cos();
+            let n = [sin_lat * cos_lon, cos_lat, sin_lat * sin_lon];
+            positions.push([R * n[0], R * n[1], R * n[2]]);
+            normals.push(n); // already unit-length
+        }
+    }
+    let mut indices = Vec::with_capacity(STACKS * SLICES * 6);
+    let row = (SLICES + 1) as u16;
+    for i in 0..STACKS as u16 {
+        for j in 0..SLICES as u16 {
+            let a = i * row + j;
+            let b = a + row;
+            indices.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+        }
+    }
+    let prim = PrimSpec {
+        positions,
+        normals: Some(normals),
+        indices,
+        base_color: [0.95, 0.55, 0.20, 1.0], // amber — distinct from the scene cubes/props
+        texture: None,
+    };
+    build_glb("sphere", &[prim], &[])
 }
 
 /// A unit quad carrying an embedded PNG base-color texture — for the importer's texture-decode test.

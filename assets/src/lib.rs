@@ -78,6 +78,38 @@ mod tests {
     }
 
     #[test]
+    fn imports_sphere_ball_test_mesh() {
+        // The M8.2 physics test mesh: a smooth UV sphere (radius 0.5), authored with normals.
+        let bytes = demo::sphere_glb();
+        let asset = GltfImporter::new().import(&bytes).expect("import sphere");
+        assert_eq!(asset.primitives.len(), 1);
+        assert_eq!(asset.vertex_count(), 13 * 17, "13 stacks × 17 slices grid");
+        assert_eq!(
+            asset.triangle_count(),
+            12 * 16 * 2,
+            "two tris per stack×slice quad"
+        );
+        // Roughly a unit-diameter ball: ~1.0 extent on every axis, centred at the origin.
+        let b = asset.bounds();
+        for axis in 0..3 {
+            assert!(
+                (b.max[axis] - b.min[axis] - 1.0).abs() < 0.05,
+                "axis {axis} spans ~1.0 (diameter)"
+            );
+            assert!(
+                (b.max[axis] + b.min[axis]).abs() < 0.05,
+                "centred on origin"
+            );
+        }
+        // Authored normals survive packing and are unit-length (smooth shading).
+        let gpu = MeshGpu::from_asset(&asset);
+        for v in &gpu.vertices {
+            let len = (v.normal[0].powi(2) + v.normal[1].powi(2) + v.normal[2].powi(2)).sqrt();
+            assert!((len - 1.0).abs() < 1e-3, "sphere normal is unit-length");
+        }
+    }
+
+    #[test]
     fn imports_embedded_png_texture() {
         let bytes = demo::textured_quad_glb();
         let asset = GltfImporter::new().import(&bytes).expect("import textured");
