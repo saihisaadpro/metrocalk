@@ -15,6 +15,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
 
     vec![
         ComponentMeta::builder("Transform")
+            .category("Props")
             .field("px", Number, true)
             .field("py", Number, true)
             .field("pz", Number, true)
@@ -29,6 +30,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("transform")
             .build(),
         ComponentMeta::builder("Health")
+            .category("Gameplay")
             .field("hp", Integer, true)
             .field("maxHp", Integer, true)
             .field("regen", Number, false)
@@ -40,6 +42,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .ui_hint("hp", "slider 0..maxHp")
             .build(),
         ComponentMeta::builder("HealthBar")
+            .category("UI")
             .field("width", Number, false)
             .field("anchor", Str, false)
             .requires("Health")
@@ -50,6 +53,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .alias("HP bar")
             .build(),
         ComponentMeta::builder("Sprite")
+            .category("Props")
             .field_fmt("texture", Str, true, asset)
             .field("layer", Integer, false)
             .field("flipX", Boolean, false)
@@ -59,6 +63,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("render")
             .build(),
         ComponentMeta::builder("MeshRenderer")
+            .category("Props")
             .field_fmt("mesh", Str, true, asset)
             .field_fmt("material", Str, false, asset)
             .field("castShadows", Boolean, false)
@@ -68,6 +73,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("render")
             .build(),
         ComponentMeta::builder("RigidBody")
+            .category("Gameplay")
             .field("mass", Number, true)
             .field("kinematic", Boolean, false)
             .field("drag", Number, false)
@@ -77,6 +83,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .alias("Rigidbody")
             .build(),
         ComponentMeta::builder("Collider")
+            .category("Gameplay")
             .field("shape", Str, true)
             .field("isTrigger", Boolean, false)
             .field("friction", Number, false)
@@ -87,6 +94,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("collision")
             .build(),
         ComponentMeta::builder("AudioSource")
+            .category("Audio")
             .field_fmt("clip", Str, true, asset)
             .field("volume", Number, false)
             .field("looping", Boolean, false)
@@ -96,6 +104,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .alias("Sound")
             .build(),
         ComponentMeta::builder("Light")
+            .category("Props")
             .field("intensity", Number, true)
             .field_fmt("color", Str, false, Some("color"))
             .field("range", Number, false)
@@ -105,6 +114,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("light")
             .build(),
         ComponentMeta::builder("Camera")
+            .category("Props")
             .field("fov", Number, false)
             .field("near", Number, false)
             .field("far", Number, false)
@@ -114,6 +124,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("camera")
             .build(),
         ComponentMeta::builder("Animator")
+            .category("Gameplay")
             .field_fmt("controller", Str, true, asset)
             .field("speed", Number, false)
             .requires("Spatial")
@@ -122,6 +133,7 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("animation")
             .build(),
         ComponentMeta::builder("Script")
+            .category("Logic")
             .field_fmt("source", Str, true, asset)
             .field("enabled", Boolean, false)
             .provides("Behavior")

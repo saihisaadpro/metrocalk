@@ -12,6 +12,7 @@
 
 use crate::caps::canonical;
 use crate::resolve::{normalize, split_name};
+use crate::taxonomy::Category;
 
 /// A capability an entry provides or requires — **namespaced**, with an optional **one-directional**
 /// alias to a standard cap. `acme:Health` aliased to `std:Health` means "my Health IS-A std Health":
@@ -85,8 +86,11 @@ pub struct MarketplaceEntry {
     pub requires: Vec<CapDecl>,
     /// Logical asset name (resolved to a content-addressed prompt-23 handle by the shell), if any.
     pub asset: Option<String>,
-    /// Token price for the future economy — **inert** (no ledger, no settlement; ADR-004).
+    /// Token price (ADR-004; charged via the M7 wallet on buy).
     pub price: Option<u32>,
+    /// The catalog category this entry browses under (M3.4) — namespaced + optionally aliased to a
+    /// standard bucket so two authors' custom categories never fragment the taxonomy (ADR-015 pattern).
+    pub category: Category,
 }
 
 /// One ranked marketplace hit.
@@ -106,6 +110,10 @@ pub trait MarketplaceIndex {
 
     /// Fetch an entry by id — the deterministic replay path (re-apply a chosen entry after reload).
     fn get(&self, id: &str) -> Option<MarketplaceEntry>;
+
+    /// All browsable entries (the "+ Add" catalog, M3.4). A remote impl returns its curated/paged
+    /// browse set; the local catalog returns its whole dataset.
+    fn all(&self) -> Vec<MarketplaceEntry>;
 }
 
 /// Same confidence gate as the resolver (ADR-012): a weak match is an honest no-match, not a wrong one.
@@ -178,6 +186,10 @@ impl MarketplaceIndex for LocalCatalog {
     fn get(&self, id: &str) -> Option<MarketplaceEntry> {
         self.entries.iter().find(|e| e.id == id).cloned()
     }
+
+    fn all(&self) -> Vec<MarketplaceEntry> {
+        self.entries.clone()
+    }
 }
 
 /// Weighted token-overlap (same shape as the resolver's `score_meta`): the entry's display name +
@@ -239,6 +251,7 @@ pub fn builtin_catalog() -> Vec<MarketplaceEntry> {
             requires: vec![CapDecl::std("Spatial")],
             asset: Some("prop".to_string()),
             price: Some(4),
+            category: Category::std("Props"),
         },
         MarketplaceEntry {
             id: "acme:companion-drone".to_string(),
@@ -254,6 +267,8 @@ pub fn builtin_catalog() -> Vec<MarketplaceEntry> {
             requires: vec![CapDecl::std("Spatial")],
             asset: Some("prop".to_string()),
             price: Some(3),
+            // A custom category that opts into the standard "Characters" bucket (ADR-015 pattern).
+            category: Category::aliased("acme:Companions", "Characters"),
         },
         MarketplaceEntry {
             id: "brandx:spirit-familiar".to_string(),
@@ -269,6 +284,9 @@ pub fn builtin_catalog() -> Vec<MarketplaceEntry> {
             requires: vec![CapDecl::std("Spatial")],
             asset: Some("prop".to_string()),
             price: Some(2),
+            // A DIFFERENT author's custom category, also aliasing "Characters" — they browse together,
+            // never collide (the open-marketplace taxonomy guard).
+            category: Category::aliased("brandx:Familiars", "Characters"),
         },
     ]
 }

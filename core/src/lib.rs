@@ -15,6 +15,7 @@
 //! backend over the Loro projection (ADR-006).
 
 pub mod caps;
+pub mod catalog;
 pub mod entity_id;
 pub mod marketplace;
 pub mod merge;
@@ -23,8 +24,10 @@ pub mod producer;
 pub mod registry;
 pub mod resolve;
 pub mod stdlib;
+pub mod taxonomy;
 pub mod undo;
 
+pub use catalog::{CatalogItem, CatalogSearch, SearchSeam, Source};
 pub use entity_id::{EntityId, IdGenerator};
 pub use marketplace::{
     CapDecl, LocalCatalog, MarketplaceEntry, MarketplaceIndex, MarketplaceMatch,
@@ -34,6 +37,7 @@ pub use pipeline::{Engine, FieldValue, Op, PipelineError};
 pub use producer::ProducerHook;
 pub use registry::{Builder, ComponentMeta, FieldSpec, FieldType, Registry, RegistryError};
 pub use resolve::{resolve, resolve_local, Match, NextTier, Resolution, Resolved};
+pub use taxonomy::{bucket_of, is_standard_category, Category, STD_CATEGORIES};
 
 /// Engine identifier — one constant shared by downstream crates, logs, and file headers.
 pub const ENGINE_NAME: &str = "metrocalk";

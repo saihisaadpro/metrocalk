@@ -76,6 +76,10 @@ pub struct ComponentMeta {
     /// Optional per-field UI/semantic hints (field name → hint), kept sorted for stable round-trips.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ui_hints: BTreeMap<String, String>,
+    /// The catalog category this kind browses under (M3.4, "+ Add" palette) — **canonical** (`std:UI`);
+    /// `None` = uncategorized (groups under `std:Other`). See [`crate::taxonomy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 impl ComponentMeta {
@@ -185,6 +189,11 @@ impl Builder {
     /// Add a search alias.
     pub fn alias(mut self, alias: impl Into<String>) -> Self {
         self.meta.aliases.push(alias.into());
+        self
+    }
+    /// Set the catalog category (M3.4) — canonicalized (`UI` → `std:UI`).
+    pub fn category(mut self, category: impl Into<String>) -> Self {
+        self.meta.category = Some(crate::caps::canonical(&category.into()));
         self
     }
     /// Add/override a UI hint for a field.

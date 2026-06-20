@@ -227,6 +227,9 @@ mod tier_tests {
         fn get(&self, id: &str) -> Option<MarketplaceEntry> {
             self.inner.get(id)
         }
+        fn all(&self) -> Vec<MarketplaceEntry> {
+            self.inner.all()
+        }
     }
     fn spy() -> SpyIndex {
         SpyIndex {
