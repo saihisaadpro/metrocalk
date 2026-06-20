@@ -11,12 +11,14 @@
 //! remaining convergence work — see `progress/M2.md`.
 
 pub mod actions;
+pub mod ai;
 pub mod bridge;
 pub mod capscene;
 pub mod persist;
 pub mod reveal;
 
 pub use actions::{actions_for, Action, ActionItem};
+pub use ai::{apply_ai_patch, AiPatch, PatchOp};
 pub use bridge::{
     apply_edit, project_entity, project_full, EditIntent, EditTx, ProjectionDelta, ProjectionOp,
 };
