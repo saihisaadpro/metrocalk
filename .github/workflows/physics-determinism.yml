@@ -1,0 +1,104 @@
+name: physics-determinism
+
+# M8.1 P1 gate (≡ NET-4): is rapier3d-f64 0.33 + enhanced-determinism BIT-IDENTICAL across platforms
+# and ISAs? Runs the throwaway /spikes/physics harness (seeded 498-body + 16-joint scene, 10k fixed-dt
+# steps, blake3 of the serialized world) on x86_64 (Linux + Windows) AND arm64 (macOS Apple Silicon) —
+# the true cross-ISA test — plus wasm32. Each job prints its FINAL_WORLD_HASH as a ::notice:: so the
+# hashes can be compared from the check-runs annotations without auth (logs are 403 for me). The
+# toolchain is PINNED to 1.92.0 so every platform builds identical codegen — an apples-to-apples hash.
+#
+# This builds ONLY spikes/physics (its own lockfile; excluded from the workspace) — never the Flecs core.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "spikes/physics/**"
+      - ".github/workflows/physics-determinism.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: hash ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest] # macos-latest = Apple Silicon (arm64)
+    defaults:
+      run:
+        shell: bash # Git Bash on windows-latest → grep/awk work uniformly
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.92.0 (pinned — identical codegen across platforms)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes/physics
+
+      - name: Report arch
+        run: |
+          echo "OS=$RUNNER_OS ARCH=$RUNNER_ARCH"
+          rustc -vV
+
+      - name: f64 hash (default = f64 + enhanced-determinism)
+        working-directory: spikes/physics
+        run: |
+          out=$(cargo run --release)
+          echo "$out"
+          hash=$(echo "$out" | grep -oE 'FINAL_WORLD_HASH\[f64\] = [0-9a-f]+' | awk '{print $NF}')
+          probe=$(echo "$out" | grep -oE 'PRECISION_PROBE\[f64\]:[^"]*' | head -1)
+          repl=$(echo "$out" | grep -oE 'REPLAY\[f64\]:[^"]*' | head -1)
+          echo "::notice title=physics f64 ${{ matrix.os }} ($RUNNER_ARCH)::$hash"
+          echo "::notice title=probe f64 ${{ matrix.os }}::$probe"
+          echo "::notice title=replay f64 ${{ matrix.os }}::$repl"
+          test -n "$hash" || { echo "::error::no f64 hash produced on ${{ matrix.os }}"; exit 1; }
+
+      - name: f32 hash (--no-default-features --features f32)
+        working-directory: spikes/physics
+        run: |
+          out=$(cargo run --release --no-default-features --features f32)
+          echo "$out"
+          hash=$(echo "$out" | grep -oE 'FINAL_WORLD_HASH\[f32\] = [0-9a-f]+' | awk '{print $NF}')
+          echo "::notice title=physics f32 ${{ matrix.os }} ($RUNNER_ARCH)::$hash"
+          test -n "$hash" || { echo "::error::no f32 hash produced on ${{ matrix.os }}"; exit 1; }
+
+  wasm:
+    name: hash wasm32-wasip1 (wasmtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.92.0 + wasm32-wasip1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+          targets: wasm32-wasip1
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes/physics
+
+      - name: Install wasmtime
+        run: |
+          curl -sSf https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: f64 hash on wasm32 (cross-ISA via V8-class IEEE-754 runtime)
+        working-directory: spikes/physics
+        run: |
+          cargo build --release --target wasm32-wasip1
+          out=$(wasmtime run target/wasm32-wasip1/release/physics-spike.wasm)
+          echo "$out"
+          hash=$(echo "$out" | grep -oE 'FINAL_WORLD_HASH\[f64\] = [0-9a-f]+' | awk '{print $NF}')
+          echo "::notice title=physics f64 wasm32-wasip1::$hash"
+          test -n "$hash" || { echo "::error::no f64 hash produced on wasm32"; exit 1; }
