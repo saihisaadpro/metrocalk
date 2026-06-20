@@ -616,7 +616,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let _ = reply.send(details);
             }
             EngineCmd::Generate { query, reply } => {
-                // Tier 3, opt-in. Offline/unconfigured → an honest seam, never a fake asset.
+                // Tier 3, opt-in. Offline/unconfigured → an honest seam, no placeholder, never a fake
+                // asset (contrast the available path below: meter, then drop the placeholder).
                 if !generator.available() {
                     let _ = reply.send(GenerateResponse {
                         available: false,
@@ -624,46 +625,57 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         ..Default::default()
                     });
                 } else {
-                    let cost = meter
-                        .charge(MeterAction::Generate, &format!("generate '{query}'"))
-                        .ok();
-                    // Placeholder drops in instantly (one undoable tx); the real mesh streams in async.
+                    // Meter the action FIRST (ADR-004, rejection-as-UX): an insufficient balance refuses
+                    // BEFORE any placeholder drops. `StubMeter` never errors today — this gate is what a
+                    // real ledger (prompt 26) plugs into; the placeholder is never charged-then-skipped.
                     let resp =
-                        match capscene::place_generation_placeholder(&mut engine, &scene, [0.0; 3])
-                        {
-                            Ok(ph) => {
-                                echo_created(
-                                    &mut engine,
-                                    &shared,
-                                    &mut positions,
-                                    &assets,
-                                    &channel,
-                                    &mut recency,
-                                    &mut touch,
-                                    ph,
-                                );
-                                // Kick the provider off the hot path; it sends GenerateComplete back when done.
-                                let g = generator.clone();
-                                let back = self_tx.clone();
-                                let ph_key = ph.to_loro_key();
-                                let q = query.clone();
-                                std::thread::spawn(move || {
-                                    if let Ok(bytes) = g.generate(&GenRequest::new(q.clone())) {
-                                        let _ = back.send(EngineCmd::GenerateComplete {
-                                            placeholder: ph_key,
-                                            prompt: q,
-                                            bytes,
-                                        });
+                        match meter.charge(MeterAction::Generate, &format!("generate '{query}'")) {
+                            Err(reason) => GenerateResponse {
+                                available: true,
+                                seam: Some(reason),
+                                ..Default::default()
+                            },
+                            // Charged → the placeholder drops in instantly (one undoable tx); the real mesh
+                            // streams in async on a worker thread.
+                            Ok(cost) => match capscene::place_generation_placeholder(
+                                &mut engine,
+                                &scene,
+                                [0.0; 3],
+                            ) {
+                                Ok(ph) => {
+                                    echo_created(
+                                        &mut engine,
+                                        &shared,
+                                        &mut positions,
+                                        &assets,
+                                        &channel,
+                                        &mut recency,
+                                        &mut touch,
+                                        ph,
+                                    );
+                                    // Kick the provider off the hot path; it sends GenerateComplete back when done.
+                                    let g = generator.clone();
+                                    let back = self_tx.clone();
+                                    let ph_key = ph.to_loro_key();
+                                    let q = query.clone();
+                                    std::thread::spawn(move || {
+                                        if let Ok(bytes) = g.generate(&GenRequest::new(q.clone())) {
+                                            let _ = back.send(EngineCmd::GenerateComplete {
+                                                placeholder: ph_key,
+                                                prompt: q,
+                                                bytes,
+                                            });
+                                        }
+                                    });
+                                    GenerateResponse {
+                                        created: Some(ph.to_loro_key()),
+                                        cost: Some(cost),
+                                        available: true,
+                                        seam: None,
                                     }
-                                });
-                                GenerateResponse {
-                                    created: Some(ph.to_loro_key()),
-                                    cost,
-                                    available: true,
-                                    seam: None,
                                 }
-                            }
-                            Err(_) => GenerateResponse::default(),
+                                Err(_) => GenerateResponse::default(),
+                            },
                         };
                     let _ = reply.send(resp);
                 }
@@ -675,10 +687,14 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             } => {
                 if let Some(ph) = EntityId::from_loro_key(&placeholder) {
                     if engine.entity_exists(ph) {
-                        // Import the generated mesh (prompt-23 pipeline) + add it to the render store if
-                        // it's new (the fake's prop is already loaded → idempotent, content-addressed).
+                        // Import the generated mesh through the prompt-23 pipeline + add it to the render
+                        // store if it's new (the fake's prop is already loaded → idempotent,
+                        // content-addressed). A handle is only USABLE once it resolves to imported
+                        // geometry: a malformed/oversized generated mesh is REJECTED here, so we never
+                        // stream in (or persist) a dangling handle — an honest grey cube beats a fake asset.
                         let handle = AssetId::of_bytes(&bytes).as_str().to_string();
-                        if !assets.handle_to_slot.contains_key(&handle) {
+                        let mut usable = assets.handle_to_slot.contains_key(&handle);
+                        if !usable {
                             if let Ok(asset) = GltfImporter::new().import(&bytes) {
                                 let gpu = MeshGpu::from_asset(&asset);
                                 let ext = asset.bounds().max_extent();
@@ -689,34 +705,49 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 let mut st = shared.lock().unwrap();
                                 st.meshes.push(gpu);
                                 st.meshes_revision = st.meshes_revision.wrapping_add(1);
+                                usable = true;
                             }
                         }
-                        // Stream the mesh in as a VALIDATED AI patch (inv. 3) — same entity, swapped handle.
-                        let patch = AiPatch {
-                            client_op_id: "generate-stream-in".into(),
-                            ops: vec![PatchOp::SetField {
-                                id: placeholder.clone(),
-                                component: "MeshRenderer".into(),
-                                field: capscene::MESH_FIELD.into(),
-                                value: serde_json::Value::String(handle.clone()),
-                            }],
-                        };
-                        let delta = apply_ai_patch(
-                            &mut engine,
-                            &metrocalk_core::stdlib::standard_components(),
-                            "generate-stream-in",
-                            &patch,
-                        );
-                        if delta.rejects.is_empty() {
+                        if usable {
+                            // Stream the mesh in as a VALIDATED AI patch (inv. 3) — same entity, swapped handle.
+                            let patch = AiPatch {
+                                client_op_id: "generate-stream-in".into(),
+                                ops: vec![PatchOp::SetField {
+                                    id: placeholder.clone(),
+                                    component: "MeshRenderer".into(),
+                                    field: capscene::MESH_FIELD.into(),
+                                    value: serde_json::Value::String(handle.clone()),
+                                }],
+                            };
+                            let delta = apply_ai_patch(
+                                &mut engine,
+                                &metrocalk_core::stdlib::standard_components(),
+                                "generate-stream-in",
+                                &patch,
+                            );
+                            if delta.rejects.is_empty() {
+                                log.append(&Record::Generate {
+                                    prompt,
+                                    pos: [0.0; 3],
+                                    mesh: Some(handle),
+                                });
+                                if let Some(ch) = &channel {
+                                    let _ = ch.send(delta); // targeted stream-in delta (inv. 2)
+                                }
+                                rebuild(&engine, &shared, &mut positions, &assets);
+                            }
+                        } else {
+                            // The importer rejected the generated bytes — keep the honest grey placeholder
+                            // (never a dangling handle) and persist it as `mesh: None`, so it survives
+                            // reload as a grey working object instead of vanishing.
+                            eprintln!(
+                                "[generate] import rejected the generated mesh — keeping the grey placeholder"
+                            );
                             log.append(&Record::Generate {
                                 prompt,
                                 pos: [0.0; 3],
-                                mesh: Some(handle),
+                                mesh: None,
                             });
-                            if let Some(ch) = &channel {
-                                let _ = ch.send(delta); // targeted stream-in delta (inv. 2)
-                            }
-                            rebuild(&engine, &shared, &mut positions, &assets);
                         }
                     }
                 }

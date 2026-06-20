@@ -167,6 +167,69 @@ fn placeholder_first_stream_in_reveal_undo() {
 }
 
 #[test]
+fn rejected_generated_mesh_keeps_the_grey_placeholder_no_dangling_handle() {
+    // A provider can return confident GARBAGE. The live `GenerateComplete` guard streams in a handle
+    // ONLY once it resolves to imported geometry — so a mesh the prompt-23 importer rejects leaves the
+    // honest grey placeholder (and persists as `mesh: None`), never a dangling handle that would
+    // render-fall-back to a cube while the persist log points at a non-existent asset.
+    let (mut engine, scene) = seeded();
+
+    // The fake "generates" non-glb bytes; the placeholder is already a real grey working object.
+    let gen = FakeGenerator::new(
+        vec![0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4],
+        Duration::ZERO,
+        true,
+    );
+    let bytes = gen
+        .generate(&GenRequest::new("quux blorbo"))
+        .expect("fake returns bytes");
+    let ph =
+        capscene::place_generation_placeholder(&mut engine, &scene, [0.0; 3]).expect("placeholder");
+
+    // The prompt-23 importer REJECTS the garbage — the precondition the guard relies on (`usable=false`).
+    let mut store = AssetStore::new();
+    assert!(
+        store.import(&GltfImporter::new(), &bytes).is_err(),
+        "non-glb bytes are rejected by the prompt-23 import validation"
+    );
+
+    // Guard outcome: import failed ⇒ no stream-in ⇒ the placeholder keeps its EMPTY (grey) handle.
+    assert_eq!(
+        mesh_handle(&engine, ph),
+        Some(FieldValue::Str(String::new())),
+        "a rejected generation leaves the honest grey placeholder, not a dangling handle"
+    );
+
+    // And the honest reload state is `mesh: None` (a grey cube), which replays back to a clean
+    // placeholder — no dangling handle is ever persisted.
+    let log = Log::open(tmp("generate-rejected"), capscene::fingerprint(N));
+    log.clear();
+    log.append(&Record::Generate {
+        prompt: "quux blorbo".into(),
+        pos: [0.0; 3],
+        mesh: None,
+    });
+    let mut world = FlecsWorld::new();
+    let scene_b = CapScene::intern(&mut world);
+    let mut b = Engine::new(world, 1);
+    capscene::seed(&mut b, &scene_b, N).expect("re-seed");
+    b.clear_history();
+    let (applied, skipped) = log.replay(&mut b, &scene_b, &HashMap::new());
+    b.clear_history();
+    assert_eq!(
+        (applied, skipped),
+        (1, 0),
+        "the None-mesh generation replays as a clean placeholder"
+    );
+    assert_eq!(
+        mesh_handle(&b, ph),
+        Some(FieldValue::Str(String::new())),
+        "the reloaded object is the honest grey placeholder, no dangling handle"
+    );
+    log.clear();
+}
+
+#[test]
 fn generation_survives_export_then_replay() {
     let log = Log::open(tmp("generate"), capscene::fingerprint(N));
     log.clear();

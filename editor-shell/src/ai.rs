@@ -3,8 +3,11 @@
 //! "AI is a guest, never the foundation": every AI / generation output that mutates the scene enters
 //! here as a **constrained, schema-validated patch** and is applied through the **one commit pipeline**
 //! — validated against the registry schema + engine state, rejected-as-UX on failure, undoable on
-//! success. There is **no raw/unvalidated LLM mutation path**. This is the MCP-surface contract (the
-//! generation stream-in + the AI-edit sibling both ride it); the MCP *server* itself stays a seam.
+//! success. There is **no raw/unvalidated LLM mutation path**. This is the MCP-surface contract: the
+//! generation stream-in rides it **live**, and the AI-**edit** sibling ("make it rustier") is the *same*
+//! generic `apply_ai_patch` — built + unit-tested at the function level, with its live editor command/UI
+//! the **next increment** of this seam (`MeterAction::Edit` is not yet exercised by a live path). The
+//! MCP *server* itself likewise stays a seam.
 //!
 //! The patch is **not** arbitrary RFC-6902 (which could touch anything): it's a small allow-listed set
 //! of ops, each checked — the entity must exist, the component must be a known kind, the field must be

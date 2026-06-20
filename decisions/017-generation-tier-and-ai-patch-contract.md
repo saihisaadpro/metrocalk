@@ -26,9 +26,13 @@ RFC-6902) and is applied through the **one commit pipeline**: each op is checked
 schema + engine state (entity exists, component is a known kind, field is in its schema, value's JSON
 type **strictly** matches), then committed as a single undoable transaction. Any invalid op rejects the
 **whole** patch (all-or-nothing, rejection-as-UX with the specific reason); nothing is applied. There is
-no raw/unvalidated LLM mutation path. This is the MCP-surface contract (the **AI-edit** sibling — "make
-it rustier" = a `SetField` patch metered at the edit rate — rides the same path); the MCP *server* stays
-a seam.
+no raw/unvalidated LLM mutation path. This is the MCP-surface contract: `apply_ai_patch` is generic, so
+the **AI-edit** sibling ("make it rustier" = a `SetField` patch metered at the edit rate,
+`MeterAction::Edit`) is the *same* validated path — built and unit-tested at the function level, but its
+**live editor command + UI are the next increment of this seam** (not yet wired; today only the
+generation stream-in drives `apply_ai_patch` live, charged at the *generate* rate, so `MeterAction::Edit`
+is not yet exercised by a live path — prompt 25 permitted this as "built or documented as the next
+increment"). The MCP *server* likewise stays a seam.
 
 **2. Provider trait (invariant 5).** A project-owned `generate::MeshGenerator` returns glb **bytes**
 (the caller imports them via the prompt-23 pipeline — generation is a *source* of assets, not a second
@@ -44,7 +48,12 @@ provider runs on a **worker thread** (off the hot path); when it returns, the en
 bytes and **streams the real mesh in** as a validated AI patch (`SetField MeshRenderer.mesh = handle`) —
 same entity, same id, a **targeted delta** (inv. 2). Undo peels the stream-in (→ grey placeholder), then
 the placeholder (→ gone). Persisted as `Record::Generate { prompt, pos, mesh }`; a completed generation
-survives reload (the asset is content-addressed; the deterministic fake re-resolves).
+survives reload (the asset is content-addressed; the deterministic fake re-resolves). If the generated
+bytes **fail** the prompt-23 import (malformed/oversized), the stream-in is skipped — the entity keeps
+its honest grey placeholder and persists as `mesh: None` (a grey cube on reload, **never a dangling
+handle**). An **in-flight** generation (the app closed before the worker returns) is *not* yet restored —
+the record is written only once the mesh arrives (or is rejected); persisting in-flight placeholders is a
+follow-up.
 
 **4. Metered last resort (ADR-004 — seam).** Each generation/edit records a token cost + checks a balance
 through the `TokenMeter` seam (`StubMeter`: Generate ≈ 10, Edit ≈ 2; always allows + logs). The cost is
