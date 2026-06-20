@@ -106,6 +106,15 @@ impl MeshSource for GltfImporter {
                 };
                 guard_count(positions.len())?;
                 guard_count(indices.len())?;
+                // Triangle lists only (mode is already constrained to Triangles): a count not divisible
+                // by 3 is a malformed primitive — reject it fail-fast rather than let the downstream
+                // `chunks_exact(3)` silently drop the trailing partial triangle.
+                if !indices.len().is_multiple_of(3) {
+                    return Err(ImportError::Malformed(format!(
+                        "triangle-list index count {} is not a multiple of 3",
+                        indices.len()
+                    )));
+                }
 
                 let material = prim.material().index().unwrap_or_else(|| {
                     used_default = true;

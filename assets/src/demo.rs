@@ -362,6 +362,26 @@ pub fn textured_quad_glb() -> Vec<u8> {
     build_glb("textured", &[prim], &[checker_png()])
 }
 
+/// A quad whose triangle-list index count is **not** a multiple of 3 (5 indices) — a deliberately
+/// malformed primitive, for the importer's fail-fast strictness guard test.
+#[must_use]
+pub fn malformed_indices_glb() -> Vec<u8> {
+    let positions = vec![
+        [-0.5, -0.5, 0.0],
+        [0.5, -0.5, 0.0],
+        [0.5, 0.5, 0.0],
+        [-0.5, 0.5, 0.0],
+    ];
+    let prim = PrimSpec {
+        positions,
+        normals: None,
+        indices: vec![0, 1, 2, 0, 3], // 5 — not a multiple of 3
+        base_color: [0.5, 0.5, 0.5, 1.0],
+        texture: None,
+    };
+    build_glb("malformed", &[prim], &[])
+}
+
 /// A tiny 2×2 RGBA checker PNG (red/green/blue/yellow). Hardcoded so the demo generator pulls in **no**
 /// `image::`/decoder type — keeping foreign decoder types confined to the importer wrapper
 /// (`gltf_import.rs`), the boundary the CI grep-gate enforces. (Provenance: `examples/dump_png.rs`,

@@ -107,6 +107,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_triangle_index_count() {
+        // A triangle-list primitive with a 5-index buffer is malformed — the importer must reject it
+        // fail-fast, never silently drop the trailing partial triangle (adversarial-review finding).
+        let err = GltfImporter::new()
+            .import(&demo::malformed_indices_glb())
+            .unwrap_err();
+        assert!(matches!(err, ImportError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
     fn content_address_is_stable_and_distinct() {
         let a = AssetId::of_bytes(&demo::healthbar_glb());
         let a2 = AssetId::of_bytes(&demo::healthbar_glb());
