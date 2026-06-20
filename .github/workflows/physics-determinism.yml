@@ -74,6 +74,11 @@ jobs:
     name: hash wasm32-wasip1 (wasmtime)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Non-blocking: the P1 verdict is settled by the NATIVE matrix above (the cross-ISA test). The
+    # authoritative wasm number (`aaf1a431…`, which DIVERGES from native — see ADR-020) comes from a
+    # reproducible local wasmtime run (documented in spikes/physics/RESULTS.md); this CI job is a
+    # convenience re-run and must not red the workflow if the runner's wasmtime/build setup hiccups.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
