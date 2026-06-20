@@ -16,6 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
+use metrocalk_core::marketplace::MarketplaceIndex;
 use metrocalk_core::{Engine, EntityId};
 use metrocalk_ecs::FlecsWorld;
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,15 @@ pub enum Record {
     /// re-placing the same handle; the handle re-resolves against the reloaded (content-addressed)
     /// store, so the placed mesh survives close→reopen (ADR-013 id determinism).
     PlaceMesh { asset: String, pos: [f32; 3] },
+    /// A marketplace-tier apply (M5): a chosen pre-componentized entry, replayed deterministically by
+    /// re-fetching it from the (checked-in) catalog by id + re-applying its namespaced caps + mesh
+    /// handle, so a *marketplace*-sourced object survives reload exactly like a local one.
+    ApplyMarketplace {
+        entry_id: String,
+        pos: [f32; 3],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mesh: Option<String>,
+    },
     /// A single-step undo of the most recent action.
     Undo,
 }
@@ -127,6 +137,22 @@ impl Log {
                 Record::PlaceMesh { asset, pos } => {
                     capscene::place_mesh(engine, scene, &asset, pos).is_ok()
                 }
+                Record::ApplyMarketplace {
+                    entry_id,
+                    pos,
+                    mesh,
+                } => metrocalk_core::marketplace::LocalCatalog::builtin()
+                    .get(&entry_id)
+                    .is_some_and(|entry| {
+                        capscene::apply_marketplace_entry(
+                            engine,
+                            scene,
+                            &entry,
+                            pos,
+                            mesh.as_deref(),
+                        )
+                        .is_ok()
+                    }),
                 Record::Undo => engine.undo(),
             };
             if ok {

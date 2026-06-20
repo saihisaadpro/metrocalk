@@ -26,6 +26,8 @@
 
 use std::collections::HashMap;
 
+use metrocalk_core::caps::{canonical, display_name};
+use metrocalk_core::marketplace::MarketplaceEntry;
 use metrocalk_core::{ComponentMeta, Engine, EntityId, FieldType, FieldValue, Op, PipelineError};
 use metrocalk_ecs::rng::Rng;
 use metrocalk_ecs::{Entity, FlecsWorld, World};
@@ -52,14 +54,23 @@ pub const MESH_FIELD: &str = "mesh";
 pub type MeshCatalog = HashMap<String, String>;
 
 /// The interned capability graph for a seeded scene: the relationships + capability handles and their
-/// names — everything the reveal needs beyond the world itself.
+/// names — everything the reveal needs beyond the world itself. Capabilities are interned by their
+/// **canonical namespaced name** (ADR-015): the curated stdlib is the `std:` standard vocabulary, and
+/// a marketplace entry's custom caps (`acme:Health`) are distinct entities that opt into the standard
+/// relational web via an `(AliasOf, std:Cap)` pair — so two authors' same-local-name caps never collide
+/// yet still bind a `std:` requirer.
 pub struct CapScene {
     /// `Provides` / `Requires` / `BindsTo` relationship handles.
     pub rels: Rels,
-    /// capability name → interned handle (e.g. `"Health"`).
+    /// **canonical** capability name (`std:Health`, `acme:Health`) → interned handle.
     pub caps: HashMap<String, Entity>,
-    /// the inverse — handle → name, for the reveal's "doesn't provide X" reason.
+    /// handle → **display** name (`Health`, `Health (acme)`) — the reveal's "doesn't provide X" reason.
     pub cap_name: HashMap<Entity, String>,
+    /// The `AliasOf` relationship handle: a custom cap `--AliasOf--> std cap` pair records the opt-in.
+    pub alias_of: Entity,
+    /// custom cap handle → the standard cap it aliases. Resolved into an extra `Provides` pair at apply,
+    /// so a `std:X` requirer binds an `author:X (AliasOf std:X)` provider — across authors.
+    pub alias: HashMap<Entity, Entity>,
 }
 
 /// What a seed produced, so the live shell (and tests) can find the clickable requirers without
@@ -82,34 +93,73 @@ impl CapScene {
             requires: world.create_entity(),
             binds_to: world.create_entity(),
         };
+        let alias_of = world.create_entity();
         let mut caps = HashMap::new();
         let mut cap_name = HashMap::new();
-        // Intern EVERY capability the stdlib uses (provides + requires), deterministically (sorted), so
-        // any resolved kind (M3.2 describe-to-create) can be instantiated with its real capability
-        // pairs — not just the handful the seed scene needs.
+        let mut alias = HashMap::new();
+
+        // 1. The standard vocabulary: every capability the stdlib uses (provides + requires), interned
+        //    by canonical `std:` key, deterministically (sorted). The world is owned by the engine after
+        //    this, so every cap an applied entity could need must be interned up front.
         let mut names: Vec<String> = metrocalk_core::stdlib::standard_components()
             .iter()
             .flat_map(|m| m.provides.iter().chain(m.requires.iter()).cloned())
             .collect();
         names.sort();
         names.dedup();
-        for name in names {
-            let e = world.create_entity();
-            caps.insert(name.clone(), e);
-            cap_name.insert(e, name);
+        for name in &names {
+            intern_cap(world, &mut caps, &mut cap_name, name);
         }
+
+        // 2. The marketplace catalog's caps + their `(AliasOf, std:*)` opt-ins. A custom cap
+        //    (`acme:Health`) is its own entity; aliasing records the pair + the resolution map so an
+        //    applied provider also provides the standard cap (reveal/bind works across authors).
+        for entry in metrocalk_core::marketplace::builtin_catalog() {
+            for cap in entry.provides.iter().chain(entry.requires.iter()) {
+                let c = intern_cap(world, &mut caps, &mut cap_name, &cap.canonical_name());
+                if let Some(std_name) = cap.canonical_alias() {
+                    let s = intern_cap(world, &mut caps, &mut cap_name, &std_name);
+                    if c != s {
+                        world.add_pair(c, alias_of, s); // the relational `(AliasOf, std)` pair
+                        alias.insert(c, s);
+                    }
+                }
+            }
+        }
+
         Self {
             rels,
             caps,
             cap_name,
+            alias_of,
+            alias,
         }
     }
 
-    /// A capability handle by name (panics on an unseeded name — the seed only uses interned ones).
+    /// A capability handle by name (canonicalized — `Health` and `std:Health` resolve to the same
+    /// entity). Panics on an un-interned name (the seed + catalog intern everything used).
     #[must_use]
     pub fn cap(&self, name: &str) -> Entity {
-        self.caps[name]
+        self.caps[&canonical(name)]
     }
+}
+
+/// Intern a capability by its canonical name (dedup), recording its display name. A free fn (not a
+/// closure) so it can borrow `world` + the maps disjointly.
+fn intern_cap(
+    world: &mut FlecsWorld,
+    caps: &mut HashMap<String, Entity>,
+    cap_name: &mut HashMap<Entity, String>,
+    name: &str,
+) -> Entity {
+    let key = canonical(name);
+    if let Some(&e) = caps.get(&key) {
+        return e;
+    }
+    let e = world.create_entity();
+    caps.insert(key.clone(), e);
+    cap_name.insert(e, display_name(&key));
+    e
 }
 
 /// A fingerprint of the deterministic scene this build produces, persisted as the replay log's header.
@@ -358,9 +408,10 @@ pub fn instantiate(
             value: default_value(field.ty),
         });
     }
-    // the working capabilities: provides/requires as ECS pairs the reveal + attach use
+    // the working capabilities: provides/requires as ECS pairs the reveal + attach use (canonicalized —
+    // a stdlib kind's bare `"Health"` interns at `std:Health`).
     for cap in &meta.provides {
-        if let Some(&c) = scene.caps.get(cap) {
+        if let Some(&c) = scene.caps.get(&canonical(cap)) {
             ops.push(Op::AddPair {
                 entity: id,
                 rel: scene.rels.provides,
@@ -369,7 +420,7 @@ pub fn instantiate(
         }
     }
     for cap in &meta.requires {
-        if let Some(&c) = scene.caps.get(cap) {
+        if let Some(&c) = scene.caps.get(&canonical(cap)) {
             ops.push(Op::AddPair {
                 entity: id,
                 rel: scene.rels.requires,
@@ -421,7 +472,7 @@ pub fn place_mesh(
         field: MESH_FIELD.into(),
         value: FieldValue::Str(handle.to_string()),
     });
-    if let Some(&c) = scene.caps.get("Renderable") {
+    if let Some(&c) = scene.caps.get(&canonical("Renderable")) {
         ops.push(Op::AddPair {
             entity: id,
             rel: scene.rels.provides,
@@ -429,6 +480,78 @@ pub fn place_mesh(
         });
     }
     engine.commit("place-mesh", ops)?;
+    Ok(id)
+}
+
+/// Apply a **marketplace entry** as a new pre-componentized scene entity — its component (display
+/// marker) + its **namespaced** capability pairs (provides/requires, with an aliased custom cap also
+/// providing its standard cap) + its mesh **handle** — all as ONE undoable transaction (invariant 3).
+/// This is the marketplace tier's "arrives already wired, not a dead file": identical UX to a local
+/// describe-create, only the *source* differs. The caps must be interned (the catalog's are, up front
+/// in [`CapScene::intern`]); an un-interned cap is skipped. `mesh` is the asset handle the shell
+/// resolved from the entry's logical asset name (or `None` → the honest cube fallback).
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the create transaction fails (it shouldn't — ops are consistent).
+pub fn apply_marketplace_entry(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    entry: &MarketplaceEntry,
+    pos: [f32; 3],
+    mesh: Option<&str>,
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    for (f, v) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        });
+    }
+    // The entry's component as an inspectable record (named for the inspector), carrying its source id.
+    ops.push(Op::SetField {
+        entity: id,
+        component: entry.component.clone(),
+        field: "source".into(),
+        value: FieldValue::Str(entry.id.clone()),
+    });
+    if let Some(handle) = mesh {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "MeshRenderer".into(),
+            field: MESH_FIELD.into(),
+            value: FieldValue::Str(handle.to_string()),
+        });
+    }
+    // provides: the namespaced cap, plus its standard cap when aliased (so a `std:X` requirer binds it).
+    for cap in &entry.provides {
+        if let Some(&c) = scene.caps.get(&cap.canonical_name()) {
+            ops.push(Op::AddPair {
+                entity: id,
+                rel: scene.rels.provides,
+                target: c,
+            });
+            if let Some(&std_cap) = scene.alias.get(&c) {
+                ops.push(Op::AddPair {
+                    entity: id,
+                    rel: scene.rels.provides,
+                    target: std_cap,
+                });
+            }
+        }
+    }
+    for cap in &entry.requires {
+        if let Some(&c) = scene.caps.get(&cap.canonical_name()) {
+            ops.push(Op::AddPair {
+                entity: id,
+                rel: scene.rels.requires,
+                target: c,
+            });
+        }
+    }
+    engine.commit("apply-marketplace", ops)?;
     Ok(id)
 }
 
