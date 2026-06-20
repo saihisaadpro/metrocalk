@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use metrocalk_core::marketplace::{LocalCatalog, MarketplaceIndex};
 use metrocalk_core::{Engine, FieldValue};
-use metrocalk_ecs::FlecsWorld;
 use metrocalk_economy::{AccountId, Action, Mtk};
+use metrocalk_ecs::FlecsWorld;
 
 use metrocalk_editor_shell::capscene::{self, CapScene};
 use metrocalk_editor_shell::{ai_edit_rustier, buy_marketplace, Outcome, Wallet};
@@ -45,7 +45,9 @@ fn a_marketplace_buy_debits_the_price_and_pays_the_creator_seventy_percent() {
     assert!(matches!(outcome, Outcome::Charged { cost_tokens: 4, .. }));
     assert_eq!(wallet.balance_tokens(), 26, "user paid 4");
     assert_eq!(
-        wallet.ledger().balance(&AccountId::Creator("forge".to_string())),
+        wallet
+            .ledger()
+            .balance(&AccountId::Creator("forge".to_string())),
         Mtk(2800),
         "creator accrues exactly 70% (2.8 tokens)"
     );
