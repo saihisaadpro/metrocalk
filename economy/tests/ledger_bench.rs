@@ -29,7 +29,12 @@ fn percentiles(mut us: Vec<f64>) -> (f64, f64) {
     (us[us.len() / 2], us[us.len() * 99 / 100])
 }
 
+// Timing gates are a **release** measurement (benchmark discipline: always `--release` for timing). CI
+// runs `cargo test --workspace` in DEBUG, where an unoptimized fold over a 10k-entry ledger on a shared
+// runner can exceed the 16ms budget — a false failure. So these are ignored in debug and run in release
+// (`cargo test -p metrocalk-economy --release --test ledger_bench`).
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release-only timing measurement")]
 fn charge_latency_on_a_realistic_ledger() {
     let mut l = realistic_ledger(5_000); // ~10k entries (debit + accrue each)
     let start_len = l.len();
@@ -57,6 +62,7 @@ fn charge_latency_on_a_realistic_ledger() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release-only timing measurement")]
 fn reserve_then_settle_latency_on_a_realistic_ledger() {
     let mut l = realistic_ledger(5_000);
     let start_len = l.len();
