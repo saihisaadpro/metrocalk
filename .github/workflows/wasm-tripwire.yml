@@ -93,3 +93,27 @@ jobs:
         run: |
           cargo build -p metrocalk-economy --release --target wasm32-unknown-unknown
           echo "metrocalk-economy wasm32 build OK"
+
+  wasm32-physics:
+    name: build wasm32 (metrocalk-physics)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The physics subsystem (M8.2, ADR-021) must cross to the browser (P5, ADR-006): Rapier 0.33 +
+      # Parry 0.28 are pure Rust. The DEFAULT `deterministic` config (f64 + enhanced-determinism, no
+      # rayon) is the wasm-safe authoritative build — the `fast` config's rayon is native-only and is
+      # not built here. `-p metrocalk-physics` pulls rapier/parry/serde/blake3 — never core/ecs/Flecs.
+      - name: Build wasm32 (release, deterministic config)
+        run: |
+          cargo build -p metrocalk-physics --release --target wasm32-unknown-unknown
+          echo "metrocalk-physics wasm32 build OK"

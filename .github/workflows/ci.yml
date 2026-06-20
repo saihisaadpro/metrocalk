@@ -71,6 +71,18 @@ jobs:
           fi
           echo "no gltf::/image:: outside the importer wrapper — boundary intact"
 
+      - name: No rapier/parry types leak outside the /physics crate (invariant 5, M8.2/ADR-021)
+        run: |
+          # rapier::/parry:: (+ the crate names) must live ONLY behind the Physics trait, in /physics —
+          # the same discipline as flecs_ecs-in-/ecs, loro-in-/core, gltf::-in-the-importer. Every other
+          # crate drives physics through the project-owned Physics trait + boundary types ([f64;3]/[f64;4]),
+          # never a rapier/parry type. Prose comments mentioning "rapier" are fine (no `::`/crate-name).
+          if grep -rn "rapier3d\|rapier::\|parry3d\|parry::" core ecs transport plugins assets economy editor-shell tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::rapier/parry leaked outside /physics — physics types must stay behind the Physics trait (invariant 5; mirrors ADR-001)"
+            exit 1
+          fi
+          echo "no rapier/parry outside /physics — Physics-trait boundary intact"
+
       - name: test
         run: cargo test --workspace
 

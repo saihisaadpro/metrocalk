@@ -1,0 +1,36 @@
+[package]
+name = "metrocalk-physics"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# The project-owned physics subsystem (M8.2): Rapier wrapped behind our `Physics` trait so no rapier::/
+# parry:: type crosses the public surface (invariant 5, CI grep-gated). Precision + determinism follow
+# the M8.1 verdict (ADR-020): f64 + enhanced-determinism is the AUTHORITATIVE config (bit-identical
+# across native ISAs). The boundary math type is deliberately our own — plain [f64;3]/[f64;4] arrays —
+# so the trait is a clean seam (the renderer/ECS convert to glam f32 on their side); no glam/rapier type
+# leaks across it.
+[dependencies]
+# Rapier 0.33's public math API is glam (DVec3/DQuat), re-exported as the `Vector`/`Rotation` aliases —
+# so we bridge our boundary `[f64;3]`/`[f64;4]` arrays via those aliases and need no direct glam dep.
+rapier3d-f64 = { version = "0.33", features = ["serde-serialize"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+
+[features]
+# The M8.1 DUAL-CONFIG, as compile-time features (enhanced-determinism is mutually exclusive with simd/
+# parallel — rapier refuses to build them together, so this is a build decision, not a runtime switch):
+#   default = deterministic  → the AUTHORITATIVE core (replay, rollback, sim) — libm, single-thread, no SIMD.
+#   fast                     → SIMD/parallel, NO determinism guarantee — only for throwaway, non-networked
+#                              single-player. Build with `--no-default-features --features fast`.
+default = ["deterministic"]
+deterministic = ["rapier3d-f64/enhanced-determinism"]
+# NOTE: rapier3d-f64 0.33 has NO SIMD feature ("SoA SIMD not supported yet on f64" — it's commented out
+# in rapier's own manifest), so the f64 fast config is `parallel` (rayon) only — still mutually exclusive
+# with enhanced-determinism (which forces single-threaded libm). The authoritative core is the default.
+fast = ["rapier3d-f64/parallel"]
