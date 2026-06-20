@@ -67,8 +67,16 @@ impl Category {
     /// standard bucket.
     #[must_use]
     pub fn bucket(&self) -> String {
+        // Honor an alias ONLY when it points to a STANDARD bucket — a malformed/reverse alias to a
+        // non-standard category falls to `Other`, so a bad entry can never fragment a standard bucket
+        // (the taxonomy invariant holds even for an untrusted marketplace provider's metadata).
         if let Some(a) = &self.alias_of {
-            return canonical(a);
+            let c = canonical(a);
+            return if is_standard_category(&c) {
+                c
+            } else {
+                OTHER.to_string()
+            };
         }
         let c = canonical(&self.name);
         if is_standard_category(&c) {
@@ -130,6 +138,20 @@ mod tests {
             "no bare-string fragmenting of a std bucket"
         );
         assert_eq!(c.display(), "Vehicles (acme)");
+    }
+
+    #[test]
+    fn a_malformed_alias_to_a_non_standard_bucket_falls_to_other_never_fragments() {
+        // An untrusted entry whose alias points to a NON-standard category must not create a parallel
+        // bucket — it falls to Other (the invariant holds against bad provider metadata).
+        assert_eq!(
+            Category::aliased("acme:X", "acme:NotAStandardBucket").bucket(),
+            OTHER
+        );
+        assert_eq!(
+            Category::aliased("std:Props", "brandx:Junk").bucket(),
+            OTHER
+        );
     }
 
     #[test]

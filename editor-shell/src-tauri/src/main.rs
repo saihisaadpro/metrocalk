@@ -1074,10 +1074,20 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                     balance: Some(have),
                                     ..Default::default()
                                 },
+                                (_, Outcome::Rejected(why)) => AddResponse {
+                                    seam: Some(why),
+                                    balance: Some(wallet.balance_tokens()),
+                                    ..Default::default()
+                                },
                                 _ => AddResponse::default(),
                             }
                         }
-                        None => AddResponse::default(),
+                        // An id the palette offered but the catalog no longer has — honest, not silent.
+                        None => AddResponse {
+                            seam: Some(format!("'{id}' is not in the catalog")),
+                            balance: Some(wallet.balance_tokens()),
+                            ..Default::default()
+                        },
                     }
                 } else {
                     match capscene::add_kind(&mut engine, &scene, &id, pos, &assets.catalog) {
@@ -1102,7 +1112,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 seam: None,
                             }
                         }
-                        None => AddResponse::default(),
+                        // An unknown kind — honest seam, never a silent no-op.
+                        None => AddResponse {
+                            seam: Some(format!("unknown component kind '{id}'")),
+                            balance: Some(wallet.balance_tokens()),
+                            ..Default::default()
+                        },
                     }
                 };
                 let _ = reply.send(resp);
