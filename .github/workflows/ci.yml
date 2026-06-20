@@ -96,8 +96,10 @@ jobs:
         with:
           node-version: 20
 
-      - name: Enable pnpm (corepack)
-        run: corepack enable
+      # Pin pnpm 10 explicitly (the tracked pnpm-lock.yaml is a v10 lockfile). corepack's bundled default
+      # is older and can't read it, so `--frozen-lockfile` fails — install pnpm 10 directly instead.
+      - name: Install pnpm 10
+        run: npm install -g pnpm@10
 
       - name: Install (frozen lockfile)
         working-directory: editor
