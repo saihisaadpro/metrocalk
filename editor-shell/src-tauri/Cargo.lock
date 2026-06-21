@@ -2776,6 +2776,7 @@ dependencies = [
  "bytemuck",
  "gltf",
  "image",
+ "metrocalk-skeleton",
 ]
 
 [[package]]
@@ -2869,6 +2870,14 @@ dependencies = [
  "rapier3d-f64",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "metrocalk-skeleton"
+version = "0.1.0"
+dependencies = [
+ "glam 0.30.10",
+ "metrocalk-gizmo",
 ]
 
 [[package]]
