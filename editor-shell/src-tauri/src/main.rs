@@ -662,18 +662,42 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 if let Some(ch) = &channel {
                     let _ = ch.send(delta);
                 }
+                let mut edited_phys: Option<EntityId> = None;
                 if ok {
                     // bump recency for the edited entity (SetField.id / Bind.from)
                     let (EditIntent::SetField { id, .. } | EditIntent::Bind { from: id, .. }) =
                         &tx.intent;
-                    if let Some(e) = EntityId::from_loro_key(id).and_then(|x| engine.ecs_entity(x))
-                    {
-                        touch += 1;
-                        recency.insert(e, touch);
+                    if let Some(eid) = EntityId::from_loro_key(id) {
+                        if let Some(e) = engine.ecs_entity(eid) {
+                            touch += 1;
+                            recency.insert(e, touch);
+                        }
+                        // M8.4 edit-at-pause: an edit to a physics body (e.g. nudge `Collider.friction`
+                        // mid-scrub) is one undoable commit (this pipeline) AND must re-derive the run so
+                        // a resume re-simulates deterministically from the edited value.
+                        let comps = engine.components_of(eid);
+                        if comps.contains_key("RigidBody") && comps.contains_key("Collider") {
+                            edited_phys = Some(eid);
+                        }
                     }
                     log.append(&Record::Edit(tx)); // persist the committed edit
                 }
                 rebuild(&engine, &shared, &mut positions, &assets);
+                if edited_phys.is_some() {
+                    // Re-derive the run from the edited value, capturing the CURRENT state of every body as
+                    // the new frame-0 (no jump) — so resuming re-simulates deterministically with the new
+                    // friction/mass from here. Stays PAUSED (the user nudged mid-scrub; they resume to see
+                    // the effect). The M8.3 mistake-checks re-run when the UI calls `physics_check` after.
+                    (recording, rec_entities, sim, body_of) =
+                        restart_run(&engine, &assets, &sim, &body_of);
+                    frame = 0;
+                    max_frame = 0;
+                    sim_running = false;
+                    prev_centers = sync_out(&sim, &body_of, &shared);
+                    if overlays_on {
+                        push_overlay(&sim, &body_of, &prev_centers, &shared);
+                    }
+                }
             }
             EngineCmd::Undo => {
                 if engine.undo() {

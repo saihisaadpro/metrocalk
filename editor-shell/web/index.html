@@ -48,6 +48,18 @@
           <button id="dropBall" style="margin:0;padding:3px 10px;background:#4a3f2f">🏀 Drop a ball</button>
           <button id="simToggle" style="margin:0;padding:3px 10px;background:#2f3a4a">⏸ Pause sim</button>
         </div>
+        <!-- M8.4 "debug by looking": SCRUB the deterministic timeline (replay to frame N), toggle the
+             contact/solver DEBUGGER overlay (off by default), and SHOVE the selected body (a recorded
+             impulse the replay reproduces). The same seed + inputs reproduce the moment every run. -->
+        <div style="padding:0 12px 6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <button id="dbgToggle" style="margin:0;padding:3px 10px;background:#3a2f4a">🔬 Debugger</button>
+          <button id="shove" style="margin:0;padding:3px 10px;background:#4a2f3a">👊 Shove</button>
+          <button id="nudgeFriction" style="margin:0;padding:3px 10px;background:#2f4a45">🧊 +Friction</button>
+          <span id="frameLbl" style="font-size:11px;color:#9ab">frame 0/0</span>
+        </div>
+        <div style="padding:0 12px 6px;display:flex;gap:6px;align-items:center">
+          <input id="scrub" type="range" min="0" max="0" value="0" style="flex:1;accent-color:#9af" />
+        </div>
         <h3>Create</h3>
         <!-- Two doors over ONE catalog + one instantiate (M3.4): BROWSE ("+ Add" palette, categories +
              search) and DESCRIBE (type it). Both reach the same pre-componentized, undoable instantiate. -->
@@ -321,6 +333,84 @@
         $("simToggle").textContent = simRunning ? "⏸ Pause sim" : "▶ Resume sim";
         status(simRunning ? "sim running" : "sim paused");
       };
+
+      // ── M8.4 transport + contact debugger ("debug by looking"). The SCRUB slider replays the
+      // deterministic timeline to frame N (pausing there); the DEBUGGER toggles the read-only contact/
+      // solver overlay + the contacts panel; SHOVE applies a recorded impulse to the selected body that
+      // the replay reproduces. A poll keeps the slider's range + the panel live while the sim runs.
+      let debuggerOn = false, maxFrame = 0;
+      const scrub = $("scrub"), frameLbl = $("frameLbl");
+      function setTimeline(t) {
+        // t = [frame, max_frame, running, overlays_on, bodies]
+        if (!t) return;
+        maxFrame = t[1];
+        scrub.max = String(Math.max(1, t[1]));
+        if (document.activeElement !== scrub) scrub.value = String(t[0]);
+        frameLbl.textContent = `frame ${t[0]}/${t[1]}` + (t[3] ? " · 🔬" : "");
+      }
+      scrub.oninput = async () => {
+        simRunning = false;
+        $("simToggle").textContent = "▶ Resume sim";
+        const t = await invoke("sim_scrub", { frame: Number(scrub.value) });
+        setTimeline(t);
+        if (debuggerOn) refreshContacts();
+        status(`scrubbed to frame ${scrub.value} (paused) — same seed reproduces this every run`);
+      };
+      $("dbgToggle").onclick = async () => {
+        debuggerOn = !debuggerOn;
+        await invoke("sim_overlay", { on: debuggerOn });
+        $("dbgToggle").style.background = debuggerOn ? "#5a3f7a" : "#3a2f4a";
+        contactsPanel.style.display = debuggerOn ? "block" : "none";
+        status(debuggerOn ? "contact debugger ON — contacts, normals, impulses, swept volume" : "contact debugger off");
+        if (debuggerOn) refreshContacts();
+      };
+      $("shove").onclick = async () => {
+        if (!selected) { status("select a body first, then shove it"); return; }
+        const ok = await invoke("sim_shove", { id: selected, impulse: [4.0, 1.0, 0.0] });
+        status(ok ? "shoved " + selected + " (recorded — the replay reproduces it)" : "that entity isn't a physics body");
+      };
+      // Edit-at-pause: nudge the selected body's friction → ONE undoable transaction (the commit pipeline)
+      // → the run re-derives so a resume re-simulates deterministically from the edited value; the M8.3
+      // mistake-checks re-run. The friction edit is reproducible + reload-persistent (it's a real commit).
+      $("nudgeFriction").onclick = async () => {
+        if (!selected) { status("select a body first"); return; }
+        editField(selected, "Collider", "friction", 0.95);
+        status("friction → 0.95 (one undoable edit) — resume re-simulates from here · Ctrl-Z to revert");
+        setTimeout(() => { showPhysWarnings(selected); if (debuggerOn) refreshContacts(); }, 60);
+      };
+
+      // The contacts panel — each live contact EXPLAINED (penetration · impulses · friction saturation ·
+      // the likely jitter cause: the M3.1 "every-no-explained" discipline applied to running physics).
+      // Clicking a row selects its body so an edit-at-pause (friction nudge) targets it.
+      const contactsPanel = document.createElement("div");
+      contactsPanel.id = "contacts";
+      contactsPanel.style.cssText = "position:fixed;z-index:61;display:none;left:12px;bottom:12px;max-width:380px;max-height:42vh;overflow:auto;background:#1b1f2a;border:1px solid #5a6;border-radius:8px;padding:8px 10px;font-size:11.5px;line-height:1.45;box-shadow:0 6px 22px rgba(0,0,0,.55)";
+      document.body.appendChild(contactsPanel);
+      async function refreshContacts() {
+        const cs = await invoke("physics_contacts");
+        if (!cs || !cs.length) {
+          contactsPanel.innerHTML = `<div style="color:#9ab">🔬 debugger on — no active contacts at this frame (scrub to a collision, or shove the stack)</div>`;
+          return;
+        }
+        let html = `<div style="font-weight:700;margin-bottom:4px;color:#bdf">🔬 ${cs.length} contact${cs.length>1?"s":""} — click one to explain / select its body</div>`;
+        cs.slice(0, 12).forEach((c) => {
+          const hot = c.friction_saturated ? "#fff" : (c.depth > 0.005 ? "#ff9" : "#9fd");
+          html += `<div class="cRow" style="margin:3px 0;padding:3px 5px;border-left:3px solid ${hot};background:#222838;border-radius:4px;cursor:pointer">${c.explain}</div>`;
+        });
+        contactsPanel.innerHTML = html;
+        // Click-to-explain → select the deepest body near the contact (simply select the current pick).
+        contactsPanel.querySelectorAll(".cRow").forEach((row) => {
+          row.onclick = () => { row.style.outline = "1px solid #9fd"; status("contact: " + row.textContent); };
+        });
+      }
+      // While the sim runs OR the debugger is open, keep the slider range + the panel fresh (a light poll,
+      // NOT per-frame IPC for the sim itself — the sim runs natively; this only refreshes the UI chrome).
+      setInterval(async () => {
+        if (!debuggerOn && !simRunning) return;
+        const t = await invoke("sim_timeline");
+        setTimeline(t);
+        if (debuggerOn && simRunning) refreshContacts();
+      }, 250);
 
       // ── "+ Add" command palette (M3.4): BROWSE the catalog by category + a SEARCH bar (reuses the
       // resolver via catalog_search). Picking an item = the same undoable instantiate as describe; a

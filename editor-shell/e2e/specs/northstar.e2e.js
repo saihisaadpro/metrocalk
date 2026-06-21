@@ -318,4 +318,80 @@ describe("Metrocalk editor — north-star #1 live", () => {
       timeoutMsg: "undo did not reverse make-dynamic",
     });
   });
+
+  // ── M8.4 "debug by looking" (test #3 sim-debug boxes): pause → scrub a deterministic timeline → SEE +
+  // EXPLAIN a contact → edit-at-pause (one undoable tx) → resume. Same seed + inputs reproduce it. ────────
+  it("M8.4: scrub the deterministic timeline, SEE + explain a contact, edit-at-pause, resume", async () => {
+    // Build a small contacting scene — a few balls dropped close together fall + rest on the ground.
+    let lastId;
+    for (let i = 0; i < 3; i++) {
+      lastId = await invokeT("spawn_body", { x: (i - 1) * 0.25, y: 4 + i * 0.6, z: 0 });
+    }
+    expect(typeof lastId).toBe("string");
+
+    // Let them settle into contact (landed + at least one active contact).
+    await browser.waitUntil(
+      async () => {
+        const d = await physDbg(); // [count, lowestY, contacts]
+        return d[0] >= 3 && d[1] < 1.7 && d[2] > 0;
+      },
+      { timeout: 20000, timeoutMsg: "balls did not settle into contact" }
+    );
+
+    // The timeline has advanced — there's a past to scrub into.
+    const tl = await invokeT("sim_timeline"); // [frame, max_frame, running, overlays_on, bodies]
+    expect(tl[1]).toBeGreaterThan(10);
+
+    // Turn ON the contact/solver debugger overlay (OFF by default) — read-only, non-mutating.
+    await invokeT("sim_overlay", { on: true });
+
+    // The contacts are EXPLAINED ("debug by looking"): each carries penetration + impulse + the why.
+    const contacts = await invokeT("physics_contacts");
+    expect(Array.isArray(contacts)).toBe(true);
+    expect(contacts.length).toBeGreaterThan(0);
+    expect(contacts[0].explain).toMatch(/penetration/);
+    expect(contacts[0].explain).toMatch(/normal impulse/);
+
+    // SCRUB back to an earlier frame → it lands EXACTLY there and PAUSES (transport over the replay channel).
+    const back = Math.max(1, Math.floor(tl[1] / 2));
+    const s = await invokeT("sim_scrub", { frame: back });
+    expect(s[0]).toBe(back);
+    expect(s[2]).toBe(false); // scrub pauses
+
+    // DETERMINISTIC REPRODUCTION (P2/P3 through the running tool): scrub away, scrub back to the SAME
+    // frame → bit-identical state (same lowest-y). A captured moment reproduces, not a ghost.
+    const y1 = (await physDbg())[1];
+    await invokeT("sim_scrub", { frame: Math.min(tl[1], back + 6) });
+    await invokeT("sim_scrub", { frame: back });
+    const y2 = (await physDbg())[1];
+    expect(Math.abs(y2 - y1)).toBeLessThan(1e-9);
+
+    // EDIT-AT-PAUSE = one undoable transaction through the SAME commit pipeline: nudge friction. The body
+    // survives (a material edit, not structural); the M8.3 mistake-checks re-run; resume re-simulates.
+    const beforeBodies = (await invokeT("sim_timeline"))[4];
+    await invokeT("submit_edit", {
+      tx: {
+        clientOpId: "e2e-friction",
+        label: "set Collider.friction",
+        patches: [],
+        intent: { kind: "setField", id: lastId, component: "Collider", field: "friction", value: 0.95 },
+      },
+    });
+    const afterBodies = (await invokeT("sim_timeline"))[4];
+    expect(afterBodies).toBe(beforeBodies); // edit-at-pause changed a value, not the body set
+    const warns = await invokeT("physics_check", { id: lastId });
+    expect(Array.isArray(warns)).toBe(true); // the checks re-ran on the edited value
+
+    // RESUME → deterministic re-simulation from the edit; the frame advances again.
+    await invokeT("set_sim_running", { run: true });
+    await browser.waitUntil(async () => (await invokeT("sim_timeline"))[0] > 0, {
+      timeout: 10000,
+      timeoutMsg: "sim did not resume after edit-at-pause",
+    });
+
+    // Closing the debugger is zero-cost (the overlay buffer empties) — toggle it off cleanly.
+    await invokeT("sim_overlay", { on: false });
+    const off = await invokeT("sim_timeline");
+    expect(off[3]).toBe(false);
+  });
 });
