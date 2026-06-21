@@ -31,6 +31,9 @@ use metrocalk_core::marketplace::MarketplaceEntry;
 use metrocalk_core::{ComponentMeta, Engine, EntityId, FieldType, FieldValue, Op, PipelineError};
 use metrocalk_ecs::rng::Rng;
 use metrocalk_ecs::{Entity, FlecsWorld, World};
+// M9.5 / G5 deform: a handle deform is saved as a G2 override; `reconstruct_part_deform` reads it back
+// + runs the deterministic ARAP deformer (no foreign math type leaks — plain f64 arrays).
+use metrocalk_deform::{ArapConfig, ArapDeformer, DeformMesh, Deformer, Region};
 // M9.2 part editing reuses G1's math (no new gizmo math) — the plain-array `Transform` + the
 // parent-space write-back; glam stays behind the `Gizmo` trait (the public types are arrays).
 use metrocalk_gizmo::{mat_mul, to_local, Transform as GizmoTransform};
@@ -953,6 +956,95 @@ pub fn set_part_active(
         "set-part-active",
         vec![Op::SetActive { entity: id, active }],
     )
+}
+
+/// **Save a fidelity deformation as a G2 override** (M9.5 / G5, ADR-029): an ARAP/cage handle edit is
+/// stored as the **sparse set of moved handle targets** — NOT the baked vertices (geometry never enters
+/// the doc — invariant 2; the surface is *reproduced* deterministically from these targets, exactly as a
+/// pose stores joint TRS deltas, not baked verts). Each handle is three per-field override ops
+/// (`Deform / {idx}:{x,y,z}`) in ONE undoable transaction (ADR-026 per-field LWW: two handles never
+/// clobber, and the deform overlays the base by structure). So a deform is automatically **undoable +
+/// reload-persistent + merge-aware** — it rides the same override pipeline as a part transform.
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the override transaction fails.
+pub fn set_part_deform(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+    handles: &[(usize, [f32; 3])],
+) -> Result<(), PipelineError> {
+    let mut ops = Vec::with_capacity(handles.len() * 3);
+    for &(idx, t) in handles {
+        for (axis, v) in [("x", t[0]), ("y", t[1]), ("z", t[2])] {
+            ops.push(Op::SetOverride {
+                entity: id,
+                component: "Deform".into(),
+                field: format!("{idx}:{axis}"),
+                value: FieldValue::Number(f64::from(v)),
+            });
+        }
+    }
+    engine.commit("deform-part", ops)
+}
+
+/// Read back a part's stored deform — the `(handle_index, target)` pairs saved by [`set_part_deform`],
+/// sorted by handle index. Empty ⇒ the part carries no deformation (its surface is the rest mesh).
+#[must_use]
+pub fn part_deform_handles(engine: &Engine<FlecsWorld>, id: EntityId) -> Vec<(usize, [f32; 3])> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<usize, [f32; 3]> = BTreeMap::new();
+    for (key, value) in engine.overrides_of(id) {
+        let Some((comp, field)) = key.split_once('\u{1f}') else {
+            continue;
+        };
+        if comp != "Deform" {
+            continue;
+        }
+        let (Some((idx_s, axis)), FieldValue::Number(n)) = (field.split_once(':'), value) else {
+            continue;
+        };
+        let Ok(idx) = idx_s.parse::<usize>() else {
+            continue;
+        };
+        let slot = map.entry(idx).or_insert([0.0; 3]);
+        #[allow(clippy::cast_possible_truncation)]
+        // override stores f64; the deform surface is f32-ish
+        let n32 = n as f32;
+        match axis {
+            "x" => slot[0] = n32,
+            "y" => slot[1] = n32,
+            "z" => slot[2] = n32,
+            _ => {}
+        }
+    }
+    map.into_iter().collect()
+}
+
+/// **Reproduce a part's deformed surface** from its stored G2 deform override (M9.5 / G5): read the saved
+/// handle targets, place them onto `region`'s handles (un-moved handles stay at rest), and run the
+/// deterministic ARAP deformer over `mesh`. Returns the deformed `f64` vertex positions, or `None` if the
+/// region's solve is degenerate. Deterministic — the override is the *only* persisted state; the surface
+/// is recomputed (so it's reload-stable and never stored as full geometry).
+#[must_use]
+pub fn reconstruct_part_deform(
+    mesh: &DeformMesh,
+    region: &Region,
+    engine: &Engine<FlecsWorld>,
+    id: EntityId,
+) -> Option<Vec<[f64; 3]>> {
+    // Targets default to each handle's rest position; the stored overrides move the edited ones.
+    let mut targets: Vec<[f64; 3]> = region
+        .handles
+        .iter()
+        .map(|&h| mesh.positions[h as usize])
+        .collect();
+    for (idx, t) in part_deform_handles(engine, id) {
+        if let Some(slot) = targets.get_mut(idx) {
+            *slot = [f64::from(t[0]), f64::from(t[1]), f64::from(t[2])];
+        }
+    }
+    let arap = ArapDeformer::prepare(mesh, region, ArapConfig::default())?;
+    Some(arap.deform(&targets))
 }
 
 /// Seed a small **composed character** for rigid part editing (M9.2 / G2): a root "body" with two child

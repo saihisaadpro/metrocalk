@@ -1332,6 +1332,7 @@ version = "0.1.0"
 dependencies = [
  "metrocalk-assets",
  "metrocalk-core",
+ "metrocalk-deform",
  "metrocalk-economy",
  "metrocalk-ecs",
  "metrocalk-gizmo",

@@ -117,6 +117,14 @@ pub enum Record {
     /// M9.2 deactivate-not-delete (G2): a part's `active` flag (USD deactivate ≡ reversible hide).
     /// Replayed by id so a removed part stays hidden (recoverable) after reload.
     SetPartActive { id: String, active: bool },
+    /// M9.5 fidelity deformation (G5, ADR-029): a part's saved handle deform — the moved handle targets,
+    /// stored as a G2 override (NOT baked geometry — the surface is reproduced deterministically from
+    /// these). Replayed by re-emitting the override (`set_part_deform`) so the deformed surface survives
+    /// close→reopen, exactly like a part transform.
+    Deform {
+        id: String,
+        handles: Vec<(usize, [f32; 3])>,
+    },
     /// A marketplace-tier apply (M5): a chosen pre-componentized entry, replayed deterministically by
     /// re-fetching it from the (checked-in) catalog by id + re-applying its namespaced caps + mesh
     /// handle, so a *marketplace*-sourced object survives reload exactly like a local one.
@@ -313,6 +321,8 @@ impl Log {
                 }),
                 Record::SetPartActive { id, active } => EntityId::from_loro_key(&id)
                     .is_some_and(|e| capscene::set_part_active(engine, e, active).is_ok()),
+                Record::Deform { id, handles } => EntityId::from_loro_key(&id)
+                    .is_some_and(|e| capscene::set_part_deform(engine, e, &handles).is_ok()),
                 Record::ApplyMarketplace {
                     entry_id,
                     pos,
