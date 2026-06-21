@@ -34,7 +34,8 @@ use metrocalk_editor_shell::{
     MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp, Record, Wallet,
 };
 use metrocalk_physics::{
-    BodyDesc, BodyHandle, BodyKind, ColliderDesc, ColliderShape, Fidelity, Physics, RapierPhysics,
+    explain_contact, BodyDesc, BodyHandle, BodyKind, ColliderDesc, ColliderShape, Contact,
+    Fidelity, Physics, RapierPhysics, Recording, Replay,
 };
 use render::{Instance, SceneState, Shared};
 use serde::{Deserialize, Serialize};
@@ -300,9 +301,79 @@ enum EngineCmd {
     },
     /// Play/pause the deterministic sim (M8.2) — setup stays editable while paused.
     SetSimRunning(bool),
+    /// M8.4 — scrub the sim timeline to `frame` over the **sim-replay channel** (deterministic replay of
+    /// the recorded setup + inputs; a rewind rebuilds the world, sidestepping #910). Pauses + projects the
+    /// scrubbed frame. Replies the timeline state so the slider stays in sync.
+    SimScrub {
+        frame: u64,
+        reply: Sender<TimelineInfo>,
+    },
+    /// M8.4 — the timeline state for the transport UI (current frame, the max scrubbable frame, running).
+    SimTimeline {
+        reply: Sender<TimelineInfo>,
+    },
+    /// M8.4 — toggle the contact/solver debugger overlay (off by default; zero per-frame cost when off —
+    /// diagnostics aren't even queried). Non-mutating: reading the seam never perturbs the sim.
+    SimOverlay {
+        on: bool,
+    },
+    /// M8.4 — apply + RECORD a one-shot impulse ("shove") on a body at the current frame, so the replay
+    /// reproduces it. Replies whether it applied.
+    SimShove {
+        id: String,
+        impulse: [f64; 3],
+        reply: Sender<bool>,
+    },
+    /// M8.4 — the live contacts at the current (paused or running) frame, each with its measured fields +
+    /// a plain-language `explain` (the M3.1/ADR-016 "debug by looking" read). Non-mutating.
+    PhysicsContacts {
+        reply: Sender<Vec<ContactInfo>>,
+    },
     /// Internal fixed-timestep heartbeat (M8.2): a self-sent tick that advances the sim one step + syncs
     /// transforms to the viewport. NOT a JS command — it never crosses the WebView boundary (invariant 4).
     Tick,
+}
+
+/// The sim timeline state for the M8.4 transport UI. `frame` is the cursor; `max_frame` is the furthest
+/// simulated frame (you can't scrub past what's been simulated — the slider's right edge).
+#[derive(Serialize, Clone, Copy, Default)]
+struct TimelineInfo {
+    frame: u64,
+    max_frame: u64,
+    running: bool,
+    overlays_on: bool,
+    bodies: usize,
+}
+
+/// One contact exposed to the UI (M8.4 click-to-explain + the overlay) — the measured fields plus the
+/// plain-language `explain`. A flat DTO so the WebView reads it without knowing the physics boundary types.
+#[derive(Serialize, Clone)]
+struct ContactInfo {
+    point: [f32; 3],
+    normal: [f32; 3],
+    depth: f64,
+    normal_impulse: f64,
+    tangent_impulse: f64,
+    friction: f64,
+    restitution: f64,
+    friction_saturated: bool,
+    explain: String,
+}
+
+impl ContactInfo {
+    fn from_contact(c: &Contact) -> Self {
+        Self {
+            point: [c.point[0] as f32, c.point[1] as f32, c.point[2] as f32],
+            normal: [c.normal[0] as f32, c.normal[1] as f32, c.normal[2] as f32],
+            depth: c.depth,
+            normal_impulse: c.normal_impulse,
+            tangent_impulse: c.tangent_impulse,
+            friction: c.friction,
+            restitution: c.restitution,
+            friction_saturated: c.friction_saturated,
+            explain: explain_contact(c),
+        }
+    }
 }
 
 /// The "+ Add" result (M3.4) — the created entity (+ balance after a marketplace buy), or a seam
@@ -537,32 +608,34 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // only, so reserve→settle/release is atomic (no race).
     let mut pending_gen: HashMap<String, HoldId> = HashMap::new();
 
-    // ── M8.2 physics: the deterministic sim (f64 + enhanced-determinism, gameplay fidelity) the engine
-    // thread owns. `body_of` maps each physics ECS entity → its sim body (the ECS is the single authority
-    // over which bodies EXIST; the sim holds only running state). Setup is undoable commits; the per-tick
-    // transform stream is a projection to the render `SceneState`, NEVER a commit (ADR-021: sim-replay is
-    // a distinct channel from Loro time-travel — the undo stack stays authoring-only).
-    let mut sim = RapierPhysics::new(Fidelity::Gameplay.resolve().config);
-    // A fixed ground plane at y=0 (matching the viewport grid) so dropped bodies fall + REST rather than
-    // forever. Sim-only world geometry — NOT an editable ECS entity (its top surface is at y=0.5), so it's
-    // never synced to `body_of`; the grid is its visual.
-    {
-        let ground = sim.add_body(&BodyDesc::new(BodyKind::Fixed, [0.0, 0.0, 0.0]));
-        let _ = sim.add_collider(
-            ground,
-            &ColliderDesc::new(ColliderShape::Cuboid {
-                half_extents: [60.0, 0.5, 60.0],
-            }),
-        );
-    }
-    let mut body_of: HashMap<EntityId, BodyHandle> = HashMap::new();
-    // Re-hydrate the sim from any RESTORED physics entities (replay re-creates the ECS entity but not the
-    // sim body — see persist::Record::SpawnBody). Walk the restored RigidBody-carrying entities once.
-    for id in engine.entity_ids() {
-        if let Some(h) = mirror_body(&mut sim, &assets, &engine, id) {
-            body_of.insert(id, h);
-        }
-    }
+    // ── M8.2/M8.4 physics: the deterministic sim (f64 + enhanced-determinism, gameplay fidelity) the
+    // engine thread owns, driven over the **sim-replay channel** (ADR-021/023 — distinct from Loro
+    // time-travel). The ECS is the single authority over which bodies EXIST; setup is undoable commits;
+    // the per-tick transform stream is a projection to the render `SceneState`, NEVER a commit.
+    //
+    // The current RUN is described by a `Recording` (a fixed ground body 0 + every ECS physics body + the
+    // recorded shove inputs) and a `frame` counter. `sim` is `recording.build()` stepped `frame` times —
+    // so a SCRUB re-derives `sim` deterministically by rebuilding from the recording (M8.4 P2/P3), and a
+    // body-set change starts a fresh run capturing the current state (no visual jump). `body_of` maps each
+    // ECS physics entity → its sim body (rebuilt each run); `rec_entities` is the recording-body-index →
+    // entity map (index 0 = the ground = `None`). A run's shove inputs live in `recording.inputs` (by body
+    // index), so a SCRUB replays them; a new run rebuilds the recording fresh (past shoves are already
+    // baked into the captured current state).
+    let (mut recording, mut rec_entities, mut sim, mut body_of) = restart_run(
+        &engine,
+        &assets,
+        &RapierPhysics::new(Fidelity::Gameplay.resolve().config),
+        &HashMap::new(),
+    );
+    let mut frame: u64 = 0;
+    // The furthest frame simulated this run — the scrub slider's right edge (you can't scrub into a future
+    // that hasn't been simulated). Advances with `frame` during play; held across a scrub.
+    let mut max_frame: u64 = 0;
+    // The contact/solver debugger overlay — OFF by default (zero per-frame cost: diagnostics aren't even
+    // queried when off). Non-mutating when on.
+    let mut overlays_on = false;
+    // Previous frame's body centres, for the swept-volume (trajectory) overlay segments.
+    let mut prev_centers: HashMap<EntityId, [f32; 3]> = HashMap::new();
     let mut sim_running = !body_of.is_empty();
     // A fixed-cadence heartbeat (~60/s) on its own thread enqueues `Tick` via the engine's own sender, so
     // the sim advances ON the engine thread (off the JS hot path, invariant 4) without blocking the
@@ -609,20 +682,15 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         let _ = ch.send(project_full(&engine)); // simplest correct post-undo sync
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
-                    // The ECS is the single authority over which bodies EXIST — re-evaluate every sim body
-                    // against the post-undo ECS and despawn any that no longer qualify. This covers BOTH
-                    // undo of a spawn (the entity is gone) AND undo of make-dynamic (the entity REMAINS but
-                    // lost its RigidBody/Collider components). body_of follows the ECS, never the reverse.
-                    body_of.retain(|eid, h| {
-                        let keep = engine.entity_exists(*eid) && {
-                            let comps = engine.components_of(*eid);
-                            comps.contains_key("RigidBody") && comps.contains_key("Collider")
-                        };
-                        if !keep {
-                            sim.remove_body(*h);
-                        }
-                        keep
-                    });
+                    // The ECS is the single authority over which bodies EXIST — restart the run from the
+                    // post-undo ECS. This covers BOTH undo of a spawn (the entity is gone → its body
+                    // drops out) AND undo of make-dynamic (the entity REMAINS but lost its RigidBody/
+                    // Collider → it's no longer a body). Surviving bodies keep their current simulated
+                    // state (restart_run captures it), so undo doesn't snap the rest of the scene back.
+                    (recording, rec_entities, sim, body_of) =
+                        restart_run(&engine, &assets, &sim, &body_of);
+                    frame = 0;
+                    max_frame = 0;
                     if body_of.is_empty() {
                         sim_running = false;
                     }
@@ -1239,9 +1307,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     BALL_RADIUS,
                 ) {
                     Ok(id) => {
-                        if let Some(h) = mirror_body(&mut sim, &assets, &engine, id) {
-                            body_of.insert(id, h);
-                        }
+                        // A new body starts a fresh deterministic RUN (capturing the current state of any
+                        // existing bodies, so they don't snap back to spawn) — the scrub timeline spans the
+                        // run from here.
+                        (recording, rec_entities, sim, body_of) =
+                            restart_run(&engine, &assets, &sim, &body_of);
+                        frame = 0;
+                        max_frame = 0;
                         log.append(&Record::SpawnBody {
                             pos,
                             mesh: Some(assets.sphere.clone()),
@@ -1268,12 +1340,91 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 sim_running = run;
             }
             EngineCmd::Tick => {
-                // One fixed-`dt` step + a delta sync of the moved bodies' transforms to the viewport. A
-                // no-op until a body exists + the sim runs. NEVER a commit/Loro write (ADR-021).
+                // One fixed-`dt` step + a delta sync of the moved bodies' transforms to the viewport, and
+                // (only if the debugger is open) a refresh of the read-only overlay. A no-op until a body
+                // exists + the sim runs. NEVER a commit/Loro write (ADR-021). Off the JS hot path (inv. 4).
                 if sim_running && !body_of.is_empty() {
+                    let centers = sync_out(&sim, &body_of, &shared);
                     sim.step();
-                    sync_out(&sim, &body_of, &shared);
+                    frame += 1;
+                    max_frame = max_frame.max(frame);
+                    if overlays_on {
+                        push_overlay(&sim, &body_of, &prev_centers, &shared);
+                    }
+                    prev_centers = centers;
                 }
+            }
+            EngineCmd::SimScrub {
+                frame: target,
+                reply,
+            } => {
+                // Scrub over the sim-replay channel: deterministically re-derive the world at `target` by
+                // replaying the recording (a rewind rebuilds the world — fresh broad-phase, no #910), then
+                // PAUSE there. `sim` becomes the replayed world so a later resume continues bit-identically.
+                let target = target.min(max_frame);
+                let mut replay = Replay::new(recording.clone());
+                replay.seek(target);
+                (sim, body_of) = install_replay(replay, &rec_entities);
+                frame = target;
+                sim_running = false;
+                prev_centers = sync_out(&sim, &body_of, &shared);
+                if overlays_on {
+                    // overlay at the scrubbed frame (prev == current, so no trajectory streak on a still)
+                    push_overlay(&sim, &body_of, &prev_centers, &shared);
+                }
+                let _ = reply.send(TimelineInfo {
+                    frame,
+                    max_frame,
+                    running: sim_running,
+                    overlays_on,
+                    bodies: body_of.len(),
+                });
+            }
+            EngineCmd::SimTimeline { reply } => {
+                let _ = reply.send(TimelineInfo {
+                    frame,
+                    max_frame,
+                    running: sim_running,
+                    overlays_on,
+                    bodies: body_of.len(),
+                });
+            }
+            EngineCmd::SimOverlay { on } => {
+                overlays_on = on;
+                if on {
+                    push_overlay(&sim, &body_of, &prev_centers, &shared);
+                } else {
+                    clear_overlay(&shared); // zero cost when closed
+                }
+            }
+            EngineCmd::SimShove { id, impulse, reply } => {
+                // Apply the impulse live AND record it (by body index) at the current frame, so a scrub
+                // replays it — the sim-replay input channel (M8.1 P2). The recorded artifact reproduces it.
+                let ok = EntityId::from_loro_key(&id)
+                    .and_then(|eid| {
+                        body_of
+                            .get(&eid)
+                            .copied()
+                            .zip(rec_index_of(&rec_entities, eid))
+                    })
+                    .map(|(h, idx)| {
+                        sim.apply_impulse(h, impulse);
+                        recording.add_input(frame, idx, impulse);
+                        sync_out(&sim, &body_of, &shared);
+                    })
+                    .is_some();
+                let _ = reply.send(ok);
+            }
+            EngineCmd::PhysicsContacts { reply } => {
+                // The live contacts at the current frame, each explained — the click-to-explain read.
+                // Non-mutating (the diagnostic seam is read-only).
+                let contacts = sim
+                    .diagnostics()
+                    .contacts
+                    .iter()
+                    .map(ContactInfo::from_contact)
+                    .collect();
+                let _ = reply.send(contacts);
             }
             EngineCmd::PhysicsDebug { reply } => {
                 let min_y = body_of
@@ -1289,10 +1440,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let ok = if let Some(eid) = EntityId::from_loro_key(&id) {
                     match physics_intent::make_dynamic(&mut engine, &scene, eid, 1.0) {
                         Ok(()) => {
-                            if let Some(h) = mirror_body(&mut sim, &assets, &engine, eid) {
-                                body_of.insert(eid, h);
-                                sim_running = true;
-                            }
+                            (recording, rec_entities, sim, body_of) =
+                                restart_run(&engine, &assets, &sim, &body_of);
+                            frame = 0;
+                            max_frame = 0;
+                            sim_running = true;
                             log.append(&Record::MakeDynamic { id: id.clone() });
                             echo_created(
                                 &mut engine,
@@ -1338,13 +1490,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         _ => Ok(()),
                     };
                     if r.is_ok() {
-                        if let Some(h) = body_of.remove(&eid) {
-                            sim.remove_body(h);
-                        }
-                        if let Some(h) = mirror_body(&mut sim, &assets, &engine, eid) {
-                            body_of.insert(eid, h);
-                            sim_running = true;
-                        }
+                        (recording, rec_entities, sim, body_of) =
+                            restart_run(&engine, &assets, &sim, &body_of);
+                        frame = 0;
+                        max_frame = 0;
+                        sim_running = true;
                         log.append(&Record::PhysicsFix {
                             id: id.clone(),
                             action: action.clone(),
@@ -1472,16 +1622,43 @@ fn collider_shape_for(
     ColliderShape::Ball { radius: r }
 }
 
-/// Mirror an ECS physics entity into the sim (M8.3): a body of its `RigidBody.kind` at its Transform,
-/// with a collider from its `Collider.shape`. `None` unless it has BOTH a RigidBody and a Collider (the
-/// ECS is authoritative — an incomplete body isn't simulated). Used by spawn, make-dynamic, fixes, and
-/// post-reload re-hydration, so every body mirrors identically.
-fn mirror_body(
-    sim: &mut RapierPhysics,
+/// The full collider for an entity — its [`collider_shape_for`] shape plus the material coefficients from
+/// the `Collider` component (`density`/`friction`/`restitution`, sane defaults). So an **edit-at-pause**
+/// to `Collider.friction` lands in the very next recorded run (M8.4 deliverable 4).
+fn collider_desc_for(
     assets: &AssetsRuntime,
     engine: &Engine<FlecsWorld>,
     id: EntityId,
-) -> Option<BodyHandle> {
+) -> ColliderDesc {
+    let comps = engine.components_of(id);
+    let col = comps.get("Collider");
+    let num = |field: &str, default: f64| -> f64 {
+        col.and_then(|m| m.get(field)).map_or(default, |v| match v {
+            FieldValue::Number(n) => *n,
+            FieldValue::Integer(i) => *i as f64,
+            _ => default,
+        })
+    };
+    ColliderDesc {
+        shape: collider_shape_for(assets, engine, id),
+        density: num("density", 1.0),
+        friction: num("friction", 0.5),
+        restitution: num("restitution", 0.0),
+    }
+}
+
+/// Capture an ECS physics entity as a recorded body. `None` unless it has BOTH a RigidBody and a Collider
+/// (the ECS is authoritative — an incomplete body isn't simulated). If the entity is ALREADY live in
+/// `old_body_of`, its **current** simulated transform + velocity become the recorded initial state — so
+/// restarting a run mid-motion (e.g. dropping a second ball) doesn't snap the rest of the scene back to
+/// spawn. Otherwise (a fresh body) it starts at rest at its ECS `Transform`.
+fn record_body(
+    engine: &Engine<FlecsWorld>,
+    assets: &AssetsRuntime,
+    old_sim: &RapierPhysics,
+    old_body_of: &HashMap<EntityId, BodyHandle>,
+    id: EntityId,
+) -> Option<(BodyDesc, ColliderDesc)> {
     let comps = engine.components_of(id);
     if !comps.contains_key("RigidBody") || !comps.contains_key("Collider") {
         return None;
@@ -1492,28 +1669,207 @@ fn mirror_body(
         Some(FieldValue::Str(k)) if k == "kinematicVelocity" => BodyKind::KinematicVelocity,
         _ => BodyKind::Dynamic,
     };
-    let h = sim.add_body(&BodyDesc::new(kind, body_spawn_pos(engine, id)));
-    let _ = sim.add_collider(
-        h,
-        &ColliderDesc::new(collider_shape_for(assets, engine, id)),
+    let (translation, rotation, linvel, angvel) = match old_body_of.get(&id) {
+        Some(h) => {
+            let (t, q) = old_sim
+                .transform(*h)
+                .unwrap_or((body_spawn_pos(engine, id), [0.0, 0.0, 0.0, 1.0]));
+            let (lv, av) = old_sim.velocity(*h).unwrap_or(([0.0; 3], [0.0; 3]));
+            (t, q, lv, av)
+        }
+        None => (
+            body_spawn_pos(engine, id),
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0; 3],
+            [0.0; 3],
+        ),
+    };
+    let body = BodyDesc {
+        kind,
+        translation,
+        rotation,
+        linvel,
+        angvel,
+    };
+    Some((body, collider_desc_for(assets, engine, id)))
+}
+
+/// Start a fresh deterministic RUN from the current ECS: a [`Recording`] of a fixed ground (body 0) +
+/// every ECS physics body (captured at its current simulated state via [`record_body`], so the scene
+/// doesn't jump) + EMPTY inputs (past shoves are baked into the captured state). Returns the recording,
+/// the body-index → entity map (index 0 = the ground = `None`), the freshly-built `sim`, and the rebuilt
+/// `body_of`. The caller resets `frame`/`max_frame` to 0. This is the M8.4 timeline's "scene changed →
+/// new run" reset, and the M8.2/M8.3 mirror-into-the-sim path unified.
+fn restart_run(
+    engine: &Engine<FlecsWorld>,
+    assets: &AssetsRuntime,
+    old_sim: &RapierPhysics,
+    old_body_of: &HashMap<EntityId, BodyHandle>,
+) -> (
+    Recording,
+    Vec<Option<EntityId>>,
+    RapierPhysics,
+    HashMap<EntityId, BodyHandle>,
+) {
+    let mut recording = Recording::new(Fidelity::Gameplay.resolve().config);
+    let mut entities: Vec<Option<EntityId>> = Vec::new();
+    // Body 0 — a fixed ground plane at y=0 (top surface y=0.5, matching the viewport grid) so dropped
+    // bodies fall + REST. Sim-only world geometry, never an ECS entity.
+    recording.add_body(
+        BodyDesc::new(BodyKind::Fixed, [0.0, 0.0, 0.0]),
+        ColliderDesc::new(ColliderShape::Cuboid {
+            half_extents: [60.0, 0.5, 60.0],
+        }),
     );
-    Some(h)
+    entities.push(None);
+    for id in engine.entity_ids() {
+        if let Some((body, collider)) = record_body(engine, assets, old_sim, old_body_of, id) {
+            recording.add_body(body, collider);
+            entities.push(Some(id));
+        }
+    }
+    let (sim, handles) = recording.build();
+    let mut body_of = HashMap::new();
+    for (i, ent) in entities.iter().enumerate() {
+        if let (Some(eid), Some(h)) = (ent, handles.get(i)) {
+            body_of.insert(*eid, *h);
+        }
+    }
+    (recording, entities, sim, body_of)
+}
+
+/// The recording-body index for an entity (the inverse of `rec_entities`) — so a shove records its input
+/// against the right body. `None` if the entity isn't a recorded body.
+fn rec_index_of(rec_entities: &[Option<EntityId>], id: EntityId) -> Option<usize> {
+    rec_entities.iter().position(|e| *e == Some(id))
+}
+
+/// Install a scrubbed [`Replay`] as the live `sim`: take its world + rebuild `body_of` from the
+/// recording-index → entity map. The replay world IS `recording`-built + stepped to the target frame, so
+/// a resume continues bit-identically to a never-paused run (M8.4 P2/P3 — proven headless in `/physics`).
+fn install_replay(
+    replay: Replay,
+    rec_entities: &[Option<EntityId>],
+) -> (RapierPhysics, HashMap<EntityId, BodyHandle>) {
+    let (world, handles) = replay.into_parts();
+    let mut body_of = HashMap::new();
+    for (i, ent) in rec_entities.iter().enumerate() {
+        if let (Some(eid), Some(h)) = (ent, handles.get(i)) {
+            body_of.insert(*eid, *h);
+        }
+    }
+    (world, body_of)
+}
+
+// M8.4 contact-debugger overlay colours. Contacts are hot (load); a saturated-friction contact flips to
+// white-hot (the jitter flag); the swept trajectory is cool.
+const OVERLAY_CONTACT_COLOR: [f32; 3] = [1.0, 0.35, 0.2];
+const OVERLAY_NORMAL_COLOR: [f32; 3] = [1.0, 0.85, 0.2];
+const OVERLAY_SWEEP_COLOR: [f32; 3] = [0.3, 0.7, 1.0];
+
+/// Build + publish the contact/solver debugger overlay (M8.4 deliverable 2) into the shared render state:
+/// a small cross at each contact point, a segment along each contact normal (white-hot when friction is
+/// saturated — the jitter flag), and the per-body **swept volume** as the prev→current trajectory segment
+/// (the report's "4D spacetime collision" rendered as a *visualization*, not a 4D authoring system — the
+/// honest scope). READ-ONLY: built from the diagnostic seam, it never perturbs the sim. Drawn by the
+/// always-pass line pass so it reads as an overlay over the scene.
+fn push_overlay(
+    sim: &RapierPhysics,
+    body_of: &HashMap<EntityId, BodyHandle>,
+    prev_centers: &HashMap<EntityId, [f32; 3]>,
+    shared: &Shared,
+) {
+    let mut seg: Vec<Instance> = Vec::new();
+    let mut push = |a: [f32; 3], b: [f32; 3], color: [f32; 3]| {
+        seg.push(Instance {
+            center: a,
+            scale: 0.0,
+            color,
+            selected: 0.0,
+        });
+        seg.push(Instance {
+            center: b,
+            scale: 0.0,
+            color,
+            selected: 0.0,
+        });
+    };
+    for c in &sim.diagnostics().contacts {
+        let p = [c.point[0] as f32, c.point[1] as f32, c.point[2] as f32];
+        let n = [c.normal[0] as f32, c.normal[1] as f32, c.normal[2] as f32];
+        let s = 0.08_f32;
+        push(
+            [p[0] - s, p[1], p[2]],
+            [p[0] + s, p[1], p[2]],
+            OVERLAY_CONTACT_COLOR,
+        );
+        push(
+            [p[0], p[1] - s, p[2]],
+            [p[0], p[1] + s, p[2]],
+            OVERLAY_CONTACT_COLOR,
+        );
+        push(
+            [p[0], p[1], p[2] - s],
+            [p[0], p[1], p[2] + s],
+            OVERLAY_CONTACT_COLOR,
+        );
+        let nl = 0.4_f32;
+        let color = if c.friction_saturated {
+            [1.0, 1.0, 1.0]
+        } else {
+            OVERLAY_NORMAL_COLOR
+        };
+        push(
+            p,
+            [p[0] + n[0] * nl, p[1] + n[1] * nl, p[2] + n[2] * nl],
+            color,
+        );
+    }
+    for (eid, h) in body_of {
+        if let (Some((t, _)), Some(prev)) = (sim.transform(*h), prev_centers.get(eid)) {
+            let cur = [t[0] as f32, t[1] as f32, t[2] as f32];
+            if (prev[0] - cur[0]).abs() + (prev[1] - cur[1]).abs() + (prev[2] - cur[2]).abs() > 1e-4
+            {
+                push(*prev, cur, OVERLAY_SWEEP_COLOR);
+            }
+        }
+    }
+    let mut st = shared.lock().unwrap();
+    st.overlay_lines = seg;
+    st.overlay_revision = st.overlay_revision.wrapping_add(1);
+}
+
+/// Clear the debugger overlay (when it closes) — zero per-frame cost while off.
+fn clear_overlay(shared: &Shared) {
+    let mut st = shared.lock().unwrap();
+    if !st.overlay_lines.is_empty() {
+        st.overlay_lines.clear();
+        st.overlay_revision = st.overlay_revision.wrapping_add(1);
+    }
 }
 
 /// M8.2 STEP 4 — the per-tick transform DELTA sync (hot path off JS). Writes each moved body's world
 /// position straight into the shared render [`SceneState`] (the projection the render loop reads every
 /// vsync) and bumps `revision` so the loop re-uploads — in place, no full rebuild, no `engine.commit`,
 /// no `Channel` send (invariants 2 + 4). Rotation is dropped (the cube/mesh shaders only translate +
-/// uniform-scale today — a rotation `Instance` field is a deferred render extension).
-fn sync_out(sim: &RapierPhysics, body_of: &HashMap<EntityId, BodyHandle>, shared: &Shared) {
+/// uniform-scale today — a rotation `Instance` field is a deferred render extension). Returns the centres
+/// it wrote (entity → world centre) so the caller can feed the swept-volume overlay the previous frame.
+fn sync_out(
+    sim: &RapierPhysics,
+    body_of: &HashMap<EntityId, BodyHandle>,
+    shared: &Shared,
+) -> HashMap<EntityId, [f32; 3]> {
+    let mut centers = HashMap::with_capacity(body_of.len());
     let mut st = shared.lock().unwrap();
     let mut moved = false;
     for (eid, h) in body_of {
         if let Some((t, _q)) = sim.transform(*h) {
+            let c = [t[0] as f32, t[1] as f32, t[2] as f32];
+            centers.insert(*eid, c);
             let key = eid.to_loro_key();
             if let Some(i) = st.ids.iter().position(|k| *k == key) {
                 if i < st.instances.len() {
-                    st.instances[i].center = [t[0] as f32, t[1] as f32, t[2] as f32];
+                    st.instances[i].center = c;
                     moved = true;
                 }
             }
@@ -1522,6 +1878,7 @@ fn sync_out(sim: &RapierPhysics, body_of: &HashMap<EntityId, BodyHandle>, shared
     if moved {
         st.revision = st.revision.wrapping_add(1);
     }
+    centers
 }
 
 /// Build the hover-tooltip [`EntityDetails`] for `id` (name · components · provided/required caps via
@@ -2086,6 +2443,68 @@ fn physics_fix(state: State<AppState>, id: String, action: String) -> bool {
     rx.recv().unwrap_or(false)
 }
 
+/// M8.4 — scrub the sim timeline to `frame` (deterministic replay over the sim-replay channel; pauses
+/// there). Returns the timeline state `[frame, max_frame, running, overlays_on, bodies]` for the slider.
+#[tauri::command]
+fn sim_scrub(state: State<AppState>, frame: u64) -> (u64, u64, bool, bool, usize) {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::SimScrub { frame, reply }).is_err() {
+        return (0, 0, false, false, 0);
+    }
+    rx.recv()
+        .map(|t| (t.frame, t.max_frame, t.running, t.overlays_on, t.bodies))
+        .unwrap_or((0, 0, false, false, 0))
+}
+
+/// M8.4 — the current sim timeline state `[frame, max_frame, running, overlays_on, bodies]` (a read).
+#[tauri::command]
+fn sim_timeline(state: State<AppState>) -> (u64, u64, bool, bool, usize) {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::SimTimeline { reply }).is_err() {
+        return (0, 0, false, false, 0);
+    }
+    rx.recv()
+        .map(|t| (t.frame, t.max_frame, t.running, t.overlays_on, t.bodies))
+        .unwrap_or((0, 0, false, false, 0))
+}
+
+/// M8.4 — toggle the contact/solver debugger overlay (off by default; zero per-frame cost when off).
+#[tauri::command]
+fn sim_overlay(state: State<AppState>, on: bool) {
+    ipc();
+    let _ = state.tx.send(EngineCmd::SimOverlay { on });
+}
+
+/// M8.4 — apply + record a one-shot "shove" impulse on a body (the sim-replay input channel). Returns
+/// whether it applied.
+#[tauri::command]
+fn sim_shove(state: State<AppState>, id: String, impulse: [f64; 3]) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SimShove { id, impulse, reply })
+        .is_err()
+    {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
+/// M8.4 — the live contacts at the current frame, each with its measured fields + a plain-language
+/// `explain` (the click-to-explain read). Non-mutating.
+#[tauri::command]
+fn physics_contacts(state: State<AppState>) -> Vec<ContactInfo> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PhysicsContacts { reply }).is_err() {
+        return Vec::new();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 /// Hover-tooltip details for an entity (M3.3) — fetched on hovered-entity change, not per frame.
 #[tauri::command]
 fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
@@ -2259,7 +2678,12 @@ fn main() {
             physics_debug,
             make_dynamic,
             physics_check,
-            physics_fix
+            physics_fix,
+            sim_scrub,
+            sim_timeline,
+            sim_overlay,
+            sim_shove,
+            physics_contacts
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");

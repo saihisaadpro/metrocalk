@@ -138,6 +138,14 @@ impl Replay {
         &self.world
     }
 
+    /// Consume the cursor, yielding its world + body handles (index-parallel to [`Recording::bodies`]) —
+    /// so a scrubbed frame can be **installed as the live sim** (the world is already the recording built +
+    /// stepped to the current frame, so resuming from it is bit-identical to a never-paused run).
+    #[must_use]
+    pub fn into_parts(self) -> (RapierPhysics, Vec<BodyHandle>) {
+        (self.world, self.handles)
+    }
+
     /// One deterministic step: apply this frame's recorded inputs, advance one fixed `dt`, bump the
     /// cursor. Identical given an identical recording — the P2 guarantee.
     pub fn advance(&mut self) {

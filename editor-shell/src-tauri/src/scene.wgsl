@@ -84,6 +84,18 @@ fn vs_line(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+// M8.4 contact-debugger overlay lines — same LineList point carrier as `vs_line`, but each segment
+// carries its OWN colour (contact crosses hot, normals amber, saturated-friction white, swept trajectory
+// cool — so the overlay colour-codes load/jitter). NOT focus-dimmed: the debugger must stay fully legible.
+// Off by default (empty buffer → the pass is skipped → zero per-frame cost).
+@vertex
+fn vs_overlay(@builtin(vertex_index) vi: u32) -> VsOut {
+    var out: VsOut;
+    out.pos = cam.view_proj * vec4<f32>(instances[vi].center, 1.0);
+    out.color = instances[vi].color;
+    return out;
+}
+
 // Imported meshes (M4 asset pipeline). A real vertex stream (position/normal/baked material color)
 // drawn instanced — `instances[ii]` carries the entity's centre, render scale, and selection flag
 // (same Instance storage layout as the cubes; the cube `color` field is ignored here, the mesh uses

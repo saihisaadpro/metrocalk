@@ -42,6 +42,13 @@ pub struct SceneState {
     /// `center` is read (by `vs_line`); the other fields are ignored. Rebuilt with `instances`, so a
     /// `revision` bump re-uploads both. Empty when nothing is bound (the line pass is skipped).
     pub line_points: Vec<Instance>,
+    /// M8.4 contact-debugger overlay endpoints — same `LineList` carrier as [`Self::line_points`], drawn by
+    /// the same always-pass line pass (each consecutive pair is one segment). **Empty by default** (the
+    /// debugger is off → the overlay pass is skipped → zero per-frame cost). Updated independently from
+    /// `instances`, on its own [`Self::overlay_revision`].
+    pub overlay_lines: Vec<Instance>,
+    /// Bump when `overlay_lines` changes so the loop re-uploads them (decoupled from `revision`).
+    pub overlay_revision: u64,
     /// Per-instance mesh-asset slot, parallel to `instances`: `-1` ⇒ render the M2.2 placeholder cube
     /// (the honest fallback for an entity with no mesh handle); `>= 0` ⇒ an index into [`Self::meshes`]
     /// (render that imported mesh instead). The render loop partitions `instances` by this into the
@@ -401,6 +408,22 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         "line",
     );
     let mut lines = InstanceBuf::new(&device, &inst_bgl, 256);
+    // M8.4 contact-debugger overlay: its own pipeline (`vs_overlay` reads each segment's per-instance
+    // colour) + buffer, sharing the always-pass line depth state so contacts/normals/swept-volume read as
+    // an overlay over the scene. Off by default (the buffer stays empty → the draw is skipped).
+    let overlay_pipeline = make_pipeline(
+        &device,
+        &shader,
+        &cube_layout,
+        format,
+        &line_depth_state,
+        "vs_overlay",
+        wgpu::PrimitiveTopology::LineList,
+        None,
+        "overlay",
+    );
+    let mut overlay = InstanceBuf::new(&device, &inst_bgl, 256);
+    let mut cur_overlay_rev = u64::MAX;
 
     // Imported-mesh path (invariant 4: built/uploaded on the render thread; the hot path never crosses
     // JS). A real vertex buffer (pos/normal/baked-color) + the same cam(0)+instance-storage(1) bind
@@ -566,6 +589,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 // tracking-line endpoints (rebuilt in lock-step with instances)
                 lines.upload(&device, &queue, &inst_bgl, &st.line_points);
             }
+            // M8.4 contact-debugger overlay — uploaded on its OWN revision (the debugger updates
+            // independently of scene edits; while off, the buffer is empty so there's nothing to upload).
+            if st.overlay_revision != cur_overlay_rev {
+                cur_overlay_rev = st.overlay_revision;
+                overlay.upload(&device, &queue, &inst_bgl, &st.overlay_lines);
+            }
             let aspect = w as f32 / h.max(1) as f32;
             let cam = camera_matrix(
                 st.orbit,
@@ -662,6 +691,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.set_pipeline(&line_pipeline);
                 rp.set_bind_group(1, &lines.bg, &[]);
                 rp.draw(0..lines.n, 0..1);
+            }
+            // M8.4 contact-debugger overlay, drawn over everything (per-segment colour, always-pass depth).
+            // Skipped entirely when the debugger is off (`overlay.n == 0`) — zero per-frame cost.
+            if overlay.n > 0 {
+                rp.set_pipeline(&overlay_pipeline);
+                rp.set_bind_group(1, &overlay.bg, &[]);
+                rp.draw(0..overlay.n, 0..1);
             }
         }
         queue.submit([enc.finish()]);
