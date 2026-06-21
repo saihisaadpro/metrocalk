@@ -13,7 +13,11 @@
 // of small counts to u16 indices is intentional and bounded by the hand-authored geometry; likewise the
 // sphere's `usize`→`f32` segment ratios are over tiny constant counts (≤16), so the precision loss is
 // nil in practice.
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 
 use std::fmt::Write as _;
 
@@ -514,6 +518,101 @@ pub fn skinned_quad_glb() -> Vec<u8> {
     json.push_str(",\"scenes\":[{\"nodes\":[0,1]}],\"scene\":0}");
 
     assemble_glb(&json, &b.bin)
+}
+
+/// A minimal **neural-auto-rig** fixture in the `MTKRIG` blob format (M9.5 / G5) — the structured output
+/// a neural auto-rigger (UniRig / RigAnything / Make-It-Animatable) emits, ingested by the offline-bake
+/// importer ([`crate::autorig::NeuralRigImporter`]). Deliberately exercises every bake fix-up: the
+/// 5-joint chain is given in **reversed** order (each parent index > self → the bake must topo-sort),
+/// the weights are **un-normalized** (weight 2.0 → renormalized to 1), and vertex 0 carries **5
+/// influences** (> 4 → the bake keeps the top 4). A short 2-column bar so a posed bone visibly bends it.
+/// NOT a real network — the deterministic structured prediction, authored by hand.
+#[must_use]
+pub fn neural_rigged_blob() -> Vec<u8> {
+    // 5-joint chain along +Y at y = 0, 1.5, 3, 4.5, 6, given REVERSED (input[0] = the tip). Each entry:
+    // (parent input index, or -1 for the root; local-bind translation 1.5 above its parent).
+    // input order: 0 = L4 (tip), 1 = L3, 2 = L2, 3 = L1, 4 = L0 (root).
+    let joints: [(i32, [f32; 3]); 5] = [
+        (1, [0.0, 1.5, 0.0]),  // L4, parent L3 (input 1)
+        (2, [0.0, 1.5, 0.0]),  // L3, parent L2 (input 2)
+        (3, [0.0, 1.5, 0.0]),  // L2, parent L1 (input 3)
+        (4, [0.0, 1.5, 0.0]),  // L1, parent L0 (input 4)
+        (-1, [0.0, 0.0, 0.0]), // L0, root
+    ];
+    // Bar mesh: 2 columns (x = ±0.4) × 7 rows (y = 0..6) → 14 verts; index = row*2 + col.
+    let cols = [-0.4f32, 0.4];
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    for r in 0..7 {
+        for &x in &cols {
+            positions.push([x, r as f32, 0.0]);
+        }
+    }
+    let mut tris: Vec<[u32; 3]> = Vec::new();
+    for r in 0..6u32 {
+        let (bl, br, tl, tr) = (r * 2, r * 2 + 1, (r + 1) * 2, (r + 1) * 2 + 1);
+        tris.push([bl, br, tr]);
+        tris.push([bl, tr, tl]);
+    }
+    // Influences (un-normalized): each vertex → its nearest logical joint by height (weight 2.0), except
+    // vertex 0, which gets all 5 (weights 1..5) to exercise the > 4 → top-4 reduction. logical→input map.
+    let logical_to_input = [4u32, 3, 2, 1, 0]; // L0..L4 → their input slots
+    let mut infl: Vec<Vec<(u32, f32)>> = Vec::new();
+    for (vi, p) in positions.iter().enumerate() {
+        if vi == 0 {
+            infl.push((0u32..5).map(|j| (j, (j + 1) as f32)).collect());
+        } else {
+            let li = ((p[1] / 1.5).round() as i32).clamp(0, 4) as usize;
+            infl.push(vec![(logical_to_input[li], 2.0)]);
+        }
+    }
+    encode_mtkrig(&positions, &tris, &joints, &infl)
+}
+
+/// Encode the `MTKRIG` blob (little-endian) the [`neural_rigged_blob`] fixture + the offline-bake importer
+/// share. Layout: magic, nverts + positions, ntris + indices, njoints + (parent i32, TRS 10×f32), nverts
+/// + per-vertex (ninf u16, (joint u32, weight f32)×).
+fn encode_mtkrig(
+    positions: &[[f32; 3]],
+    tris: &[[u32; 3]],
+    joints: &[(i32, [f32; 3])],
+    infl: &[Vec<(u32, f32)>],
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"MTKRIG01");
+    b.extend_from_slice(&(positions.len() as u32).to_le_bytes());
+    for p in positions {
+        for &c in p {
+            b.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+    b.extend_from_slice(&(tris.len() as u32).to_le_bytes());
+    for t in tris {
+        for &i in t {
+            b.extend_from_slice(&i.to_le_bytes());
+        }
+    }
+    b.extend_from_slice(&(joints.len() as u32).to_le_bytes());
+    for &(parent, t) in joints {
+        b.extend_from_slice(&parent.to_le_bytes());
+        for &c in &t {
+            b.extend_from_slice(&c.to_le_bytes());
+        }
+        for &c in &[0.0f32, 0.0, 0.0, 1.0] {
+            b.extend_from_slice(&c.to_le_bytes()); // rotation identity (xyzw)
+        }
+        for &c in &[1.0f32, 1.0, 1.0] {
+            b.extend_from_slice(&c.to_le_bytes()); // scale
+        }
+    }
+    b.extend_from_slice(&(positions.len() as u32).to_le_bytes());
+    for list in infl {
+        b.extend_from_slice(&(list.len() as u16).to_le_bytes());
+        for &(j, w) in list {
+            b.extend_from_slice(&j.to_le_bytes());
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    b
 }
 
 /// A tiny 2×2 RGBA checker PNG (red/green/blue/yellow). Hardcoded so the demo generator pulls in **no**

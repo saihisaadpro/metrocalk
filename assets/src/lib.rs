@@ -15,6 +15,7 @@
 //! native-only normalization step (basis-universal is C++ FFI) — documented in the asset ADR, not
 //! built here.
 
+pub mod autorig;
 pub mod demo;
 pub mod gltf_import;
 pub mod gpu;
@@ -22,6 +23,7 @@ pub mod mesh;
 pub mod source;
 pub mod store;
 
+pub use autorig::{bake_standard_lbs, AutoRig, AutoRigJoint, NeuralRigImporter};
 pub use gltf_import::GltfImporter;
 pub use gpu::{MeshGpu, MeshVertex};
 pub use mesh::{Bounds, Material, MeshAsset, Primitive, Texture};
@@ -267,5 +269,113 @@ mod tests {
             .primitives
             .iter()
             .all(|p| p.joints.is_empty() && p.weights.is_empty()));
+    }
+
+    // ── M9.5 / G5: neural auto-rig as OFFLINE asset-prep → baked standard LBS (never runtime NN) ─────
+
+    #[test]
+    fn neural_autorig_bakes_a_topo_sorted_standard_lbs_rig() {
+        // A neural rigger's (reversed-order, un-normalized) prediction imports through the M4 trait and
+        // BAKES a standard rig: joints topologically sorted (parent < child), skinning matrices identity
+        // at bind, every vertex normalized to a partition of unity with ≤ 4 influences.
+        let asset = NeuralRigImporter::new()
+            .import(&demo::neural_rigged_blob())
+            .expect("bake neural rig");
+        let skel = asset.skeleton.as_ref().expect("the bake emits a skeleton");
+        assert_eq!(skel.joints.len(), 5, "5-joint chain");
+        for (i, j) in skel.joints.iter().enumerate() {
+            if let Some(p) = j.parent {
+                assert!(p < i, "topologically sorted (parent {p} < child {i})");
+            }
+        }
+        // Identity skinning matrices at bind (a bound vertex is unmoved in the rest pose).
+        for m in skel.skinning_matrices(&metrocalk_skeleton::Pose::new()) {
+            for (c, col) in m.iter().enumerate() {
+                for (r, &val) in col.iter().enumerate() {
+                    let id = if c == r { 1.0 } else { 0.0 };
+                    assert!((val - id).abs() < 1e-4, "skinning matrix identity at bind");
+                }
+            }
+        }
+        let prim = &asset.primitives[0];
+        assert_eq!(prim.joints.len(), prim.positions.len());
+        for w in &prim.weights {
+            let sum: f32 = w.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "weights normalized to a partition of unity"
+            );
+        }
+    }
+
+    #[test]
+    fn neural_autorig_reduces_over_four_influences_to_top_four() {
+        // Vertex 0 was predicted with 5 influences (weights 1..5). The bake keeps the top 4 (drops the
+        // weight-1 influence → input joint "L4") and renormalizes. So vertex 0 has exactly 4 non-zero
+        // weights summing to 1, and the dropped joint is absent.
+        let asset = NeuralRigImporter::new()
+            .import(&demo::neural_rigged_blob())
+            .expect("bake");
+        let prim = &asset.primitives[0];
+        let w0 = prim.weights[0];
+        let nonzero = w0.iter().filter(|&&x| x > 0.0).count();
+        assert_eq!(nonzero, 4, "5 influences reduced to the top 4");
+        assert!((w0.iter().sum::<f32>() - 1.0).abs() < 1e-5, "renormalized");
+        // The strongest predicted influence (weight 5 → logical root L0, baked to joint 0) survives.
+        assert!(
+            prim.joints[0]
+                .iter()
+                .zip(w0)
+                .any(|(&j, x)| j == 0 && x > 0.0),
+            "the strongest influence (the root) is kept"
+        );
+    }
+
+    #[test]
+    fn a_neural_rigged_character_poses_via_g3_lbs() {
+        // The success criterion: a neural-rigged import poses via G3's deterministic LBS — bend an upper
+        // joint, a top vertex (bound high on the chain) swings; the bottom (root-bound) holds.
+        use metrocalk_skeleton::{skin_position, Pose};
+        let asset = NeuralRigImporter::new()
+            .import(&demo::neural_rigged_blob())
+            .expect("bake");
+        let skel = asset.skeleton.as_ref().unwrap();
+        let prim = &asset.primitives[0];
+
+        let mut pose = Pose::new();
+        let mut bent = skel.joints[1].local_bind; // bend joint 1 (low on the chain) about +Z
+        bent.rotation = [0.0, 0.0, (0.7f32).sin(), (0.7f32).cos()];
+        pose.set(1, bent);
+        let skin = skel.skinning_matrices(&pose);
+        let moved = |v: usize| {
+            let p = prim.positions[v];
+            let d = skin_position(p, prim.joints[v], prim.weights[v], &skin);
+            ((d[0] - p[0]).powi(2) + (d[1] - p[1]).powi(2) + (d[2] - p[2]).powi(2)).sqrt()
+        };
+        // Vertex index = row*2 + col; the top row (y=6) is verts 12,13, the bottom (y=0) is 0,1.
+        // (Vertex 0 has the synthetic 5-influence weights, so use vertex 1 for the "bottom holds" check.)
+        let bottom = moved(1);
+        let top = moved(12);
+        assert!(bottom < 0.05, "the root-bound bottom holds: {bottom}");
+        assert!(
+            top > 1.0,
+            "the chain-bound top swings under the bend: {top}"
+        );
+    }
+
+    #[test]
+    fn neural_autorig_rejects_a_malformed_blob() {
+        let imp = NeuralRigImporter::new();
+        assert!(matches!(
+            imp.import(b"not an mtkrig blob").unwrap_err(),
+            ImportError::Malformed(_)
+        ));
+        // A truncated-but-correct-magic blob is also rejected (the bounds-checked reader, no panic).
+        let mut good = demo::neural_rigged_blob();
+        good.truncate(20);
+        assert!(matches!(
+            imp.import(&good).unwrap_err(),
+            ImportError::Malformed(_)
+        ));
     }
 }
