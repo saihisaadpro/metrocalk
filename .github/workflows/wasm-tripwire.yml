@@ -165,3 +165,27 @@ jobs:
         run: |
           cargo build -p metrocalk-gizmo --release --target wasm32-unknown-unknown
           echo "metrocalk-gizmo wasm32 build OK"
+
+  wasm32-skeleton:
+    name: build wasm32 (metrocalk-skeleton)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The skeletal-posing runtime (M9.3 / G3, ADR-027): FK + 2-bone IK + LBS(+DQS) on glam behind our own
+      # Skeleton/Pose types (deliverable 8 — load + FK + IK + LBS reach the browser, ADR-006). Pure Rust
+      # (glam + the gizmo crate's plain-array types), so it crosses to wasm. `-p metrocalk-skeleton` pulls
+      # glam/metrocalk-gizmo — never core/ecs/Flecs/rapier.
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-skeleton --release --target wasm32-unknown-unknown
+          echo "metrocalk-skeleton wasm32 build OK"

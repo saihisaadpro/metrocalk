@@ -1365,6 +1365,14 @@ name = "metrocalk-plugins"
 version = "0.1.0"
 
 [[package]]
+name = "metrocalk-skeleton"
+version = "0.1.0"
+dependencies = [
+ "glam 0.30.10",
+ "metrocalk-gizmo",
+]
+
+[[package]]
 name = "metrocalk-transport"
 version = "0.1.0"
 dependencies = [

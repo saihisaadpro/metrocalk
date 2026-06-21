@@ -1,0 +1,24 @@
+[package]
+name = "metrocalk-skeleton"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# The skeletal-posing subsystem (M9.3 / G3): FK + 2-bone analytic IK + LBS(+DQS) behind our own
+# `Skeleton`/`Pose` types (invariant 5 — we write our own on `glam`, not the nightly-only single-maintainer
+# `ozz-animation-rs`; it stays the studied fallback). The PUBLIC surface uses our plain-array math types
+# (reusing the gizmo crate's `Transform`/`Mat4`/`Vec3`/`Quat` so a bone's gizmo edit flows straight in) —
+# glam stays an internal math detail (the /gizmo + /physics boundary discipline). Pure Rust → wasm-clean
+# (ADR-006, wasm-tripwire-gated): load + FK + IK + LBS reach the browser; gameplay-affecting solves stay
+# on this deterministic CPU path (the M8.1 caveat — GPU skinning is render-only/visual).
+[dependencies]
+# glam = the internal math (mat4 compose/inverse/inverse-transpose, quats, dual-quats); never crosses the
+# public surface (the plain-array types do). Same version the gizmo + wgpu viewport use.
+glam = "0.30"
+# The shared plain-array math types (Transform/Mat4/Vec3/Quat + mat_mul) — a bone's local TRS IS a gizmo
+# Transform, so a posed bone (G1 gizmo) and a pose bundle (G2 override) reuse one type, no conversion.
+metrocalk-gizmo = { path = "../gizmo" }
