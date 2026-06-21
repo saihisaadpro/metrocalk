@@ -340,17 +340,20 @@ enum EngineCmd {
         source: String,
         reply: Sender<ImportResult>,
     },
-    /// M9.1 — commit a gizmo transform: the entity's new world position as Transform x/y/z, one undoable
-    /// transaction (3 SetField ops in one commit). A physics body re-simulates from the new pose.
+    /// M9.1 — commit a gizmo transform: the entity's new world TRS (position + rotation quat + uniform
+    /// display scale) as Transform fields, ONE undoable transaction. A physics body re-simulates from the
+    /// new pose.
     GizmoCommit {
         id: String,
         pos: [f32; 3],
+        rot: [f32; 4],
+        scale: f32,
     },
     /// M9.1 — read an entity's committed Transform x/y/z (a read; lets the gizmo + E2E confirm the move
     /// landed in the core, not just the render projection).
     ReadTransform {
         id: String,
-        reply: Sender<(f64, f64, f64)>,
+        reply: Sender<[f64; 8]>,
     },
     /// Internal fixed-timestep heartbeat (M8.2): a self-sent tick that advances the sim one step + syncs
     /// transforms to the viewport. NOT a JS command — it never crosses the WebView boundary (invariant 4).
@@ -1556,16 +1559,26 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 let _ = reply.send(result);
             }
-            EngineCmd::GizmoCommit { id, pos } => {
+            EngineCmd::GizmoCommit {
+                id,
+                pos,
+                rot,
+                scale,
+            } => {
                 // M9.1: the gizmo drag's coalesced delta lands as ONE undoable transaction (Transform
-                // x/y/z in one commit). A physics body re-simulates from the new pose (restart the run).
+                // position + rotation + scale in one commit). A physics body re-simulates from the new pose.
                 if let Some(eid) = EntityId::from_loro_key(&id) {
-                    if capscene::set_transform(&mut engine, eid, pos).is_ok() {
+                    if capscene::set_transform(&mut engine, eid, pos, rot, scale).is_ok() {
                         log.append(&Record::Transform {
                             id: id.clone(),
                             x: f64::from(pos[0]),
                             y: f64::from(pos[1]),
                             z: f64::from(pos[2]),
+                            qx: f64::from(rot[0]),
+                            qy: f64::from(rot[1]),
+                            qz: f64::from(rot[2]),
+                            qw: f64::from(rot[3]),
+                            scale: f64::from(scale),
                         });
                         let comps = engine.components_of(eid);
                         if comps.contains_key("RigidBody") && comps.contains_key("Collider") {
@@ -1596,19 +1609,29 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let t = EntityId::from_loro_key(&id)
                     .map(|eid| {
                         let comps = engine.components_of(eid);
-                        let get = |f: &str| -> f64 {
+                        let get = |f: &str, default: f64| -> f64 {
                             comps
                                 .get("Transform")
                                 .and_then(|m| m.get(f))
-                                .map_or(0.0, |v| match v {
+                                .map_or(default, |v| match v {
                                     FieldValue::Number(n) => *n,
                                     FieldValue::Integer(i) => *i as f64,
-                                    _ => 0.0,
+                                    _ => default,
                                 })
                         };
-                        (get("x"), get("y"), get("z"))
+                        // [x, y, z, qx, qy, qz, qw, scale] — quat identity / unit scale when unauthored.
+                        [
+                            get("x", 0.0),
+                            get("y", 0.0),
+                            get("z", 0.0),
+                            get("qx", 0.0),
+                            get("qy", 0.0),
+                            get("qz", 0.0),
+                            get("qw", 1.0),
+                            get("scale", 1.0),
+                        ]
                     })
-                    .unwrap_or((0.0, 0.0, 0.0));
+                    .unwrap_or([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]);
                 let _ = reply.send(t);
             }
             EngineCmd::PhysicsDebug { reply } => {
@@ -1987,12 +2010,14 @@ fn push_overlay(
             scale: 0.0,
             color,
             selected: 0.0,
+            rotation: render::IDENTITY_QUAT,
         });
         seg.push(Instance {
             center: b,
             scale: 0.0,
             color,
             selected: 0.0,
+            rotation: render::IDENTITY_QUAT,
         });
     };
     for c in &sim.diagnostics().contacts {
@@ -2064,13 +2089,17 @@ fn sync_out(
     let mut st = shared.lock().unwrap();
     let mut moved = false;
     for (eid, h) in body_of {
-        if let Some((t, _q)) = sim.transform(*h) {
+        if let Some((t, q)) = sim.transform(*h) {
             let c = [t[0] as f32, t[1] as f32, t[2] as f32];
+            // The body's orientation (quat xyzw) — so a tumbling body actually LOOKS like it's tumbling,
+            // not sliding (the renderer-rotation path; M8.2 dropped this). The render shaders apply it.
+            let rot = [q[0] as f32, q[1] as f32, q[2] as f32, q[3] as f32];
             centers.insert(*eid, c);
             let key = eid.to_loro_key();
             if let Some(i) = st.ids.iter().position(|k| *k == key) {
                 if i < st.instances.len() {
                     st.instances[i].center = c;
+                    st.instances[i].rotation = rot;
                     moved = true;
                 }
             }
@@ -2277,6 +2306,16 @@ fn rebuild(
             })
         };
         let p = [get("x"), get("y"), get("z")];
+        // Authored rotation (M9.1+ renderer-rotation path): the Transform's quaternion fields qx/qy/qz/qw,
+        // identity when unauthored. A physics body's per-tick rotation overrides this live via sync_out.
+        let rot = {
+            let q = [get("qx"), get("qy"), get("qz"), get("qw")];
+            if q == [0.0; 4] {
+                render::IDENTITY_QUAT
+            } else {
+                q
+            }
+        };
         if let Some(e) = engine.ecs_entity(id) {
             positions.insert(e, p);
         }
@@ -2289,13 +2328,20 @@ fn rebuild(
                 FieldValue::Str(h) => assets.handle_to_slot.get(h).copied(),
                 _ => None,
             });
-        let scale = slot.map_or(0.45, |s| assets.scales.get(s).copied().unwrap_or(0.45));
+        let asset_scale = slot.map_or(0.45, |s| assets.scales.get(s).copied().unwrap_or(0.45));
+        // An authored display scale (a gizmo scale-edit, field `scale`) overrides the asset-normalized
+        // base; absent ⇒ the base. So a scaled entity reloads at its edited size.
+        let scale = match t.and_then(|m| m.get("scale")) {
+            Some(FieldValue::Number(s)) if *s > 0.0 => *s as f32,
+            _ => asset_scale,
+        };
         let c = color_for(&key);
         instances.push(Instance {
             center: p,
             scale,
             color: c,
             selected: 0.0,
+            rotation: rot,
         });
         mesh_slots.push(slot.map_or(-1, |s| i32::try_from(s).unwrap_or(-1)));
         ids.push(key);
@@ -2310,6 +2356,7 @@ fn rebuild(
             scale: 0.0,
             color: TRACK_LINE_COLOR,
             selected: 0.0,
+            rotation: render::IDENTITY_QUAT,
         })
         .collect();
     let mut st = shared.lock().unwrap();
@@ -2846,13 +2893,17 @@ fn gizmo_pick_drag(
     let Some(handle) = st.gizmo.pick(ray, origin, basis, scale) else {
         return false;
     };
+    // Carry the entity's CURRENT rotation so a rotate accumulates (and a translate preserves it); the
+    // scale multiplier starts at [1,1,1] with the absolute held in `gizmo_start_scale`.
     let current = GizmoTransform {
         translation: origin,
-        rotation: basis,
+        rotation: st.instances[sel].rotation,
         scale: [1.0; 3],
     };
+    let scale0 = st.instances[sel].scale;
     st.gizmo
         .drag_start(handle, ray, origin, basis, scale, current);
+    st.gizmo_start_scale = scale0;
     st.gizmo_dragging = true;
     st.gizmo_sel = Some(sel);
     st.gizmo_snap = ctrl;
@@ -2870,6 +2921,8 @@ fn gizmo_grab(window: tauri::WebviewWindow, state: State<AppState>, axis: String
         return false;
     };
     let origin = st.instances[sel].center;
+    let rot0 = st.instances[sel].rotation;
+    let scale0 = st.instances[sel].scale;
     let eye = render::camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
     let scale = metrocalk_gizmo::pixel_scale(eye, origin, GIZMO_FOV.to_radians(), GIZMO_K);
     let dir = [origin[0] - eye[0], origin[1] - eye[1], origin[2] - eye[2]];
@@ -2880,9 +2933,11 @@ fn gizmo_grab(window: tauri::WebviewWindow, state: State<AppState>, axis: String
         "z" => Handle::AxisZ,
         _ => Handle::AxisX,
     };
+    // `current` carries the entity's CURRENT rotation so a rotate accumulates from it (and a translate
+    // preserves it); scale starts at the multiplier base [1,1,1] and `gizmo_start_scale` holds the absolute.
     let current = GizmoTransform {
         translation: origin,
-        rotation: basis,
+        rotation: rot0,
         scale: [1.0; 3],
     };
     st.gizmo
@@ -2890,6 +2945,7 @@ fn gizmo_grab(window: tauri::WebviewWindow, state: State<AppState>, axis: String
     st.gizmo_dragging = true;
     st.gizmo_sel = Some(sel);
     st.gizmo_snap = false;
+    st.gizmo_start_scale = scale0;
     st.gizmo_test_cursor = render::project_to_screen(
         origin,
         st.orbit,
@@ -3007,19 +3063,27 @@ fn gizmo_drag_end(window: tauri::WebviewWindow, state: State<AppState>) {
             st.gizmo.drag_end();
             st.gizmo_test_cursor = None;
             st.gizmo_sel.and_then(|sel| {
-                (sel < st.instances.len() && sel < st.ids.len())
-                    .then(|| (st.ids[sel].clone(), st.instances[sel].center))
+                (sel < st.instances.len() && sel < st.ids.len()).then(|| {
+                    let inst = st.instances[sel];
+                    (st.ids[sel].clone(), inst.center, inst.rotation, inst.scale)
+                })
             })
         }
     };
-    if let Some((id, pos)) = commit {
-        let _ = state.tx.send(EngineCmd::GizmoCommit { id, pos });
+    if let Some((id, pos, rot, scale)) = commit {
+        let _ = state.tx.send(EngineCmd::GizmoCommit {
+            id,
+            pos,
+            rot,
+            scale,
+        });
     }
 }
 
-/// M9.1 — read an entity's committed Transform x/y/z (the gizmo HUD + E2E confirm the move landed in core).
+/// M9.1 — read an entity's committed Transform `[x,y,z,qx,qy,qz,qw,scale]` (the gizmo HUD + E2E confirm the
+/// move/rotate/scale landed in core, not just the render projection).
 #[tauri::command]
-fn read_transform(state: State<AppState>, id: String) -> (f64, f64, f64) {
+fn read_transform(state: State<AppState>, id: String) -> [f64; 8] {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state
@@ -3027,9 +3091,10 @@ fn read_transform(state: State<AppState>, id: String) -> (f64, f64, f64) {
         .send(EngineCmd::ReadTransform { id, reply })
         .is_err()
     {
-        return (0.0, 0.0, 0.0);
+        return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0];
     }
-    rx.recv().unwrap_or((0.0, 0.0, 0.0))
+    rx.recv()
+        .unwrap_or([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0])
 }
 
 /// M9.1 — the gizmo state for the HUD/E2E: `(mode, has_selection, dragging, space, pivot)`.

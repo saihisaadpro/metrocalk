@@ -25,6 +25,12 @@ use crate::ai::{AiPatch, PatchOp};
 use crate::bridge::{apply_edit, EditTx};
 use crate::capscene::{self, CapScene, MeshCatalog, MESH_FIELD};
 
+/// serde default for the `Record::Transform` `qw` / `scale` fields (an old log without them ⇒ identity
+/// rotation / unit scale).
+fn one() -> f64 {
+    1.0
+}
+
 /// One persisted user action, replayed in order to reconstruct the scene after a deterministic seed.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -62,9 +68,52 @@ pub enum Record {
     /// M8.5 interchange import (`format` = "urdf" | "usd"): the source text is kept so replay re-imports
     /// it through the same `Interchange` trait → identical registry components survive reload.
     Import { format: String, source: String },
-    /// M9.1 transform-gizmo move: the entity's net world position (Transform x/y/z), replayed as one
-    /// `set_transform` commit so a dragged entity reloads at its moved position.
-    Transform { id: String, x: f64, y: f64, z: f64 },
+    /// M9.1 transform-gizmo move: the entity's net world TRS — position (x/y/z), rotation quat
+    /// (qx/qy/qz/qw), uniform scale — replayed as one `set_transform` commit so a moved/rotated/scaled
+    /// entity reloads in its edited pose. The rotation/scale fields default (identity / 1.0) for old logs.
+    Transform {
+        id: String,
+        x: f64,
+        y: f64,
+        z: f64,
+        #[serde(default)]
+        qx: f64,
+        #[serde(default)]
+        qy: f64,
+        #[serde(default)]
+        qz: f64,
+        #[serde(default = "one")]
+        qw: f64,
+        #[serde(default = "one")]
+        scale: f64,
+    },
+    /// M9.2 rigid part edit (G2): a part's net **LOCAL** TRS, stored as a sparse per-field **override**
+    /// (ADR-026). Replayed by re-emitting the override (`set_part_local`) so the edited part reloads in
+    /// its pose, overlaying the source/base by structure. The local is stored (not world) so replay is
+    /// parent-independent + deterministic. Rotation/scale default to identity / 1.0 for old logs.
+    EditPart {
+        id: String,
+        x: f64,
+        y: f64,
+        z: f64,
+        #[serde(default)]
+        qx: f64,
+        #[serde(default)]
+        qy: f64,
+        #[serde(default)]
+        qz: f64,
+        #[serde(default = "one")]
+        qw: f64,
+        #[serde(default = "one")]
+        scale: f64,
+    },
+    /// M9.2 reparent (G2 "drag in hierarchy"): move a part under a new parent (or to root when `parent`
+    /// is `None`) — one `node.move` op. Replayed by id so the new hierarchy survives reload.
+    Reparent {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
+    },
     /// A marketplace-tier apply (M5): a chosen pre-componentized entry, replayed deterministically by
     /// re-fetching it from the (checked-in) catalog by id + re-applying its namespaced caps + mesh
     /// handle, so a *marketplace*-sourced object survives reload exactly like a local one.
@@ -214,11 +263,51 @@ impl Log {
                         .is_some()
                 }
                 #[allow(clippy::cast_possible_truncation)]
-                Record::Transform { id, x, y, z } => {
-                    EntityId::from_loro_key(&id).is_some_and(|e| {
-                        capscene::set_transform(engine, e, [x as f32, y as f32, z as f32]).is_ok()
-                    })
-                }
+                Record::Transform {
+                    id,
+                    x,
+                    y,
+                    z,
+                    qx,
+                    qy,
+                    qz,
+                    qw,
+                    scale,
+                } => EntityId::from_loro_key(&id).is_some_and(|e| {
+                    capscene::set_transform(
+                        engine,
+                        e,
+                        [x as f32, y as f32, z as f32],
+                        [qx as f32, qy as f32, qz as f32, qw as f32],
+                        scale as f32,
+                    )
+                    .is_ok()
+                }),
+                #[allow(clippy::cast_possible_truncation)]
+                Record::EditPart {
+                    id,
+                    x,
+                    y,
+                    z,
+                    qx,
+                    qy,
+                    qz,
+                    qw,
+                    scale,
+                } => EntityId::from_loro_key(&id).is_some_and(|e| {
+                    capscene::set_part_local(
+                        engine,
+                        e,
+                        [x as f32, y as f32, z as f32],
+                        [qx as f32, qy as f32, qz as f32, qw as f32],
+                        scale as f32,
+                    )
+                    .is_ok()
+                }),
+                Record::Reparent { id, parent } => EntityId::from_loro_key(&id).is_some_and(|e| {
+                    let p = parent.as_deref().and_then(EntityId::from_loro_key);
+                    capscene::reparent(engine, e, p).is_ok()
+                }),
                 Record::ApplyMarketplace {
                     entry_id,
                     pos,

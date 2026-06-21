@@ -22,7 +22,10 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 /// (invariant 4) — orbit/zoom update natively in the loop; only the start/end of a gesture are IPC.
 pub static IPC_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// One renderable entity instance. 32 bytes, std430-clean (matches the WGSL `Instance`).
+/// One renderable entity instance. 48 bytes, std430-clean (matches the WGSL `Instance`). `rotation` is a
+/// unit quaternion (xyzw; identity `[0,0,0,1]`) applied per-instance by the shader — so a tumbling physics
+/// body / a rotated authored Transform / a posed part actually *looks* rotated (the shared renderer-
+/// rotation path). The line/overlay/gizmo passes reuse `Instance` purely as a point carrier and ignore it.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Instance {
@@ -30,7 +33,11 @@ pub struct Instance {
     pub scale: f32,
     pub color: [f32; 3],
     pub selected: f32,
+    pub rotation: [f32; 4],
 }
+
+/// The identity quaternion (no rotation) — the default for `Instance::rotation`.
+pub const IDENTITY_QUAT: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 /// Scene state shared between the app (writer, from core deltas + input) and the render loop (reader).
 #[derive(Default)]
@@ -99,6 +106,8 @@ pub struct SceneState {
     pub gizmo_sel: Option<usize>,
     /// Ctrl-hold snapping for the active drag.
     pub gizmo_snap: bool,
+    /// The dragged instance's display scale at drag start (so a scale-drag multiplies from it).
+    pub gizmo_start_scale: f32,
     /// A test-injected normalized cursor: when `Some`, the render loop drives the drag from it instead of
     /// the OS cursor (so an E2E can drive the SAME render-loop drag path deterministically). `None` ⇒ the
     /// live OS cursor drives (the production path).
@@ -579,13 +588,22 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         snap,
                     );
                     if let Some(sel) = st.gizmo_sel {
-                        if sel < st.instances.len()
-                            && st.instances[sel].center != world_new.translation
-                        {
-                            // only re-upload when the position actually changed (a static/frozen drag
-                            // costs nothing — and never per-frame IPC, the per-frame work is all native)
-                            st.instances[sel].center = world_new.translation;
-                            st.revision = st.revision.wrapping_add(1);
+                        if sel < st.instances.len() {
+                            // Apply the full TRS live: translate→center, rotate→rotation (so a tumble/pose
+                            // is VISIBLE via the shader), scale→display scale (multiplied from the start
+                            // scale). Re-upload only on actual change (a frozen drag costs nothing, and the
+                            // per-frame work is all native — 0 per-frame IPC).
+                            let new_scale = st.gizmo_start_scale * world_new.scale[0];
+                            let inst = &mut st.instances[sel];
+                            if inst.center != world_new.translation
+                                || inst.rotation != world_new.rotation
+                                || inst.scale != new_scale
+                            {
+                                inst.center = world_new.translation;
+                                inst.rotation = world_new.rotation;
+                                inst.scale = new_scale;
+                                st.revision = st.revision.wrapping_add(1);
+                            }
                         }
                     }
                 }
@@ -678,6 +696,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                             scale: 0.0,
                             color: gv.color,
                             selected: 0.0,
+                            rotation: IDENTITY_QUAT,
                         })
                         .collect()
                 }
@@ -1047,6 +1066,7 @@ mod tests {
                 scale: 1.0,
                 color: [0.5, 0.5, 0.5],
                 selected: 0.0,
+                rotation: IDENTITY_QUAT,
             });
             st.ids.push(format!("e{i}"));
         }

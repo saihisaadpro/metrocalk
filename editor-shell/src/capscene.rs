@@ -31,6 +31,9 @@ use metrocalk_core::marketplace::MarketplaceEntry;
 use metrocalk_core::{ComponentMeta, Engine, EntityId, FieldType, FieldValue, Op, PipelineError};
 use metrocalk_ecs::rng::Rng;
 use metrocalk_ecs::{Entity, FlecsWorld, World};
+// M9.2 part editing reuses G1's math (no new gizmo math) — the plain-array `Transform` + the
+// parent-space write-back; glam stays behind the `Gizmo` trait (the public types are arrays).
+use metrocalk_gizmo::{mat_mul, to_local, Transform as GizmoTransform};
 
 use crate::reveal::Rels;
 
@@ -776,9 +779,11 @@ pub fn import_scene(
     Ok(body_ids)
 }
 
-/// Commit an entity's `Transform` x/y/z as **ONE undoable transaction** (M9.1 — the coalesced gizmo-drag
-/// result, or a replayed transform edit). Three `SetField` ops in a single `engine.commit`, so Ctrl-Z
-/// reverses the whole move atomically (invariant 3). Used by the gizmo commit + its replay.
+/// Commit an entity's `Transform` — position (x/y/z) + rotation quaternion (qx/qy/qz/qw) + uniform display
+/// scale — as **ONE undoable transaction** (M9.1 — the coalesced gizmo-drag result, or a replayed transform
+/// edit). All `SetField` ops in a single `engine.commit`, so Ctrl-Z reverses the whole move atomically
+/// (invariant 3). The shell's `Transform` uses its own `x/y/z` + `qx/qy/qz/qw` + `scale` field convention
+/// (the same minimal-placeholder convention as `x/y/z`); the renderer reads them back.
 ///
 /// # Errors
 /// Propagates a [`PipelineError`] if the transaction fails (the ops are registry-consistent by construction).
@@ -786,28 +791,149 @@ pub fn set_transform(
     engine: &mut Engine<FlecsWorld>,
     id: EntityId,
     pos: [f32; 3],
+    rot: [f32; 4],
+    scale: f32,
 ) -> Result<(), PipelineError> {
+    let field = |f: &str, v: f32| Op::SetField {
+        entity: id,
+        component: "Transform".into(),
+        field: f.into(),
+        value: FieldValue::Number(f64::from(v)),
+    };
     let ops = vec![
-        Op::SetField {
-            entity: id,
-            component: "Transform".into(),
-            field: "x".into(),
-            value: FieldValue::Number(f64::from(pos[0])),
-        },
-        Op::SetField {
-            entity: id,
-            component: "Transform".into(),
-            field: "y".into(),
-            value: FieldValue::Number(f64::from(pos[1])),
-        },
-        Op::SetField {
-            entity: id,
-            component: "Transform".into(),
-            field: "z".into(),
-            value: FieldValue::Number(f64::from(pos[2])),
-        },
+        field("x", pos[0]),
+        field("y", pos[1]),
+        field("z", pos[2]),
+        field("qx", rot[0]),
+        field("qy", rot[1]),
+        field("qz", rot[2]),
+        field("qw", rot[3]),
+        field("scale", scale),
     ];
     engine.commit("gizmo-transform", ops)
+}
+
+// ── M9.2 (G2): rigid part editing — G1's gizmo applied to a CHILD node (ADR-026) ───────────────────
+
+/// Read a part's **effective LOCAL** transform — the Transform component RESOLVED through the override
+/// layer (base ⊕ override, override-wins; [`Engine::resolved_components`]) into a gizmo [`GizmoTransform`].
+/// So a part's per-field override drives its local TRS, and missing fields default to identity
+/// (translation 0, quat identity, scale 1 — the renderer/`ReadTransform` convention).
+#[must_use]
+pub fn local_transform(engine: &Engine<FlecsWorld>, id: EntityId) -> GizmoTransform {
+    let comps = engine.resolved_components(id);
+    let t = comps.get("Transform");
+    let g = |f: &str, default: f32| -> f32 {
+        t.and_then(|m| m.get(f)).map_or(default, |v| match v {
+            FieldValue::Number(n) => *n as f32,
+            FieldValue::Integer(i) => *i as f32,
+            _ => default,
+        })
+    };
+    let s = g("scale", 1.0);
+    GizmoTransform {
+        translation: [g("x", 0.0), g("y", 0.0), g("z", 0.0)],
+        rotation: [g("qx", 0.0), g("qy", 0.0), g("qz", 0.0), g("qw", 1.0)],
+        scale: [s, s, s],
+    }
+}
+
+/// A part's **GLOBAL (world)** transform = `parent_global · local`, walking the Movable-Tree hierarchy
+/// (`global(child) = global(parent) · local(child)`). This is why **descendants follow** a parent edit:
+/// a parent's new local recomputes every descendant's global. Reuses G1's matrix math (no new gizmo math).
+#[must_use]
+pub fn global_transform(engine: &Engine<FlecsWorld>, id: EntityId) -> GizmoTransform {
+    let local = local_transform(engine, id);
+    match engine.parent_of(id) {
+        Some(parent) => GizmoTransform::from_matrix(mat_mul(
+            global_transform(engine, parent).to_matrix(),
+            local.to_matrix(),
+        )),
+        None => local,
+    }
+}
+
+/// Write a part's **LOCAL** TRS as a sparse **per-field override** (8 `SetOverride` ops in ONE undoable
+/// transaction, ADR-026): "rotate the leg" and "scale the leg" are separate keys that never clobber, and
+/// they overlay the part's base by structure (override-wins) — never a whole-object rewrite. This is the
+/// M9.2 part edit + the replay primitive. Uniform display scale (rigid-part scope; non-uniform = G5).
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the override transaction fails.
+pub fn set_part_local(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+    pos: [f32; 3],
+    rot: [f32; 4],
+    scale: f32,
+) -> Result<(), PipelineError> {
+    let ov = |f: &str, v: f32| Op::SetOverride {
+        entity: id,
+        component: "Transform".into(),
+        field: f.into(),
+        value: FieldValue::Number(f64::from(v)),
+    };
+    engine.commit(
+        "edit-part",
+        vec![
+            ov("x", pos[0]),
+            ov("y", pos[1]),
+            ov("z", pos[2]),
+            ov("qx", rot[0]),
+            ov("qy", rot[1]),
+            ov("qz", rot[2]),
+            ov("qw", rot[3]),
+            ov("scale", scale),
+        ],
+    )
+}
+
+/// **Parent-space write-back for a part** (G1 on a child, ADR-025 deliverable 4 applied to G2): the
+/// gizmo acts in WORLD space, but a child stores its LOCAL transform, so `local = inverse(parent_global)
+/// · world` ([`to_local`]). Stores the result as a per-field override ([`set_part_local`]); returns the
+/// LOCAL TRS written (the caller persists the local, so replay is parent-independent + deterministic).
+/// For a root part the parent is identity ⇒ `local == world` (the M9.1 flat-entity behavior preserved).
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the override transaction fails.
+pub fn edit_part_transform(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+    world: GizmoTransform,
+) -> Result<GizmoTransform, PipelineError> {
+    let parent_world = match engine.parent_of(id) {
+        Some(parent) => global_transform(engine, parent).to_matrix(),
+        None => GizmoTransform::IDENTITY.to_matrix(),
+    };
+    let local = to_local(&world, parent_world);
+    set_part_local(
+        engine,
+        id,
+        local.translation,
+        local.rotation,
+        local.scale[0],
+    )?;
+    Ok(local)
+}
+
+/// **Reparent a part** ("drag in hierarchy") — one `node.move` op in ONE undoable transaction (the Loro
+/// Movable-Tree move: fractional index + PeerID tiebreak). `new_parent = None` moves it to the root.
+/// Undo restores the prior parent (the pipeline captures it as the inverse).
+///
+/// # Errors
+/// [`PipelineError::UnknownEntity`] if the part or the new parent isn't a live entity.
+pub fn reparent(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+    new_parent: Option<EntityId>,
+) -> Result<(), PipelineError> {
+    engine.commit(
+        "reparent-part",
+        vec![Op::Reparent {
+            entity: id,
+            new_parent,
+        }],
+    )
 }
 
 /// Apply a **marketplace entry** as a new pre-componentized scene entity — its component (display

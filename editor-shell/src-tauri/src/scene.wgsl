@@ -15,10 +15,19 @@ fn apply_focus_dim(col: vec3<f32>, is_focused: bool) -> vec3<f32> {
     return col;
 }
 
-struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, selected: f32 };
+// `rotation` is a unit quaternion (x,y,z,w); identity = (0,0,0,1). Applied per-instance so a tumbling
+// physics body / a rotated authored Transform / a posed part actually *looks* rotated (M9.1+ — the shared
+// renderer-rotation path). Matches render.rs's Instance (48 bytes, std430-clean).
+struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, selected: f32, rotation: vec4<f32> };
 @group(1) @binding(0) var<storage, read> instances: array<Instance>;
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
+
+// Rotate vector `v` by unit quaternion `q` (x,y,z,w): v + 2·q.w·(qv×v) + 2·qv×(qv×v).
+fn quat_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+    let t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
 
 fn corner(id: u32) -> vec3<f32> {
     return vec3<f32>(
@@ -32,10 +41,11 @@ fn corner(id: u32) -> vec3<f32> {
 fn vs_cube(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
     let inst = instances[ii];
     let local = corner(vi);
-    let world = inst.center + local * inst.scale;
+    let world = inst.center + quat_rotate(inst.rotation, local * inst.scale);
     var out: VsOut;
     out.pos = cam.view_proj * vec4<f32>(world, 1.0);
-    let shade = 0.55 + 0.45 * clamp(dot(normalize(local), normalize(vec3<f32>(0.4, 0.8, 0.3))), 0.0, 1.0);
+    let nrm = quat_rotate(inst.rotation, normalize(local)); // rotate the face normal so lighting follows
+    let shade = 0.55 + 0.45 * clamp(dot(nrm, normalize(vec3<f32>(0.4, 0.8, 0.3))), 0.0, 1.0);
     var col = inst.color * shade;
     if (inst.selected > 0.5) {
         col = mix(col, vec3<f32>(1.0, 0.85, 0.2), 0.7); // selection highlight
@@ -109,10 +119,11 @@ struct MeshIn {
 @vertex
 fn vs_mesh(v: MeshIn, @builtin(instance_index) ii: u32) -> VsOut {
     let inst = instances[ii];
-    let world = inst.center + v.position * inst.scale;
+    let world = inst.center + quat_rotate(inst.rotation, v.position * inst.scale);
     var out: VsOut;
     out.pos = cam.view_proj * vec4<f32>(world, 1.0);
-    let shade = 0.55 + 0.45 * clamp(dot(normalize(v.normal), normalize(vec3<f32>(0.4, 0.8, 0.3))), 0.0, 1.0);
+    let nrm = quat_rotate(inst.rotation, normalize(v.normal));
+    let shade = 0.55 + 0.45 * clamp(dot(nrm, normalize(vec3<f32>(0.4, 0.8, 0.3))), 0.0, 1.0);
     var col = v.color * shade;
     if (inst.selected > 0.5) {
         col = mix(col, vec3<f32>(1.0, 0.85, 0.2), 0.7); // selection highlight

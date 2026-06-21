@@ -1326,6 +1326,7 @@ dependencies = [
  "metrocalk-core",
  "metrocalk-economy",
  "metrocalk-ecs",
+ "metrocalk-gizmo",
  "metrocalk-interchange",
  "serde",
  "serde_json",

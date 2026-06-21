@@ -21,6 +21,9 @@ metrocalk-economy = { path = "../economy" }
 # components by `capscene::import_scene`. Brings the neutral SceneImport + the re-exported /physics
 # boundary enums (BodyKind/ColliderShape/JointDesc); no urdf_rs/openusd type crosses (grep-gated).
 metrocalk-interchange = { path = "../interchange" }
+# The gizmo (M9.1) — M9.2 part editing reuses G1's plain-array `Transform` + the parent-space
+# write-back (`to_local`/`mat_mul`) for child-node transforms. glam stays behind the trait (grep-gated).
+metrocalk-gizmo = { path = "../gizmo" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
