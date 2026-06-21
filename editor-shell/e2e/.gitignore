@@ -1,3 +1,9 @@
 node_modules/
 .driver/
 package-lock.json
+# Build-acceptance artifacts + measured-number docs are LOCAL-ONLY (orchestrator: docs stay un-pushed;
+# the remote carries code only). The specs/bootstrap/report-generator/page-objects ARE code → tracked.
+baseline.json
+acceptance-report.json
+COVERAGE.md
+evidence/
