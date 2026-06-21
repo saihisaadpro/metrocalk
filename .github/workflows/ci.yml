@@ -95,6 +95,22 @@ jobs:
           fi
           echo "no urdf/openusd outside /interchange — Interchange-trait boundary intact"
 
+      - name: No egui-ecosystem / transform-gizmo / glam types leak past the Gizmo trait (invariant 5, M9.1/ADR-025)
+        run: |
+          # The gizmo's PUBLIC surface is our own plain arrays — glam is an internal math detail of /gizmo
+          # (like rapier in /physics), and the egui ecosystem + transform-gizmo are NOT adopted at all (the
+          # reference/fallback only). So: no glam outside the crates that legitimately use it (the wgpu
+          # viewport src-tauri + /gizmo internals — both excluded here), and no egui/transform-gizmo anywhere.
+          if grep -rn "transform_gizmo\|epaint::\|ecolor::\|emath::\|egui::" core ecs transport plugins assets economy physics interchange editor-shell tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::egui-ecosystem / transform-gizmo type leaked — the gizmo is our own behind the Gizmo trait (invariant 5)"
+            exit 1
+          fi
+          if grep -rn "\bglam::" core ecs transport plugins assets economy interchange editor-shell/src tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::glam leaked past the Gizmo trait — gizmo math must stay behind plain-array boundary types (invariant 5)"
+            exit 1
+          fi
+          echo "no egui/transform-gizmo/glam leak past the Gizmo trait — boundary intact"
+
       - name: test
         run: cargo test --workspace
 

@@ -1332,6 +1332,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrocalk-gizmo"
+version = "0.1.0"
+dependencies = [
+ "glam 0.30.10",
+ "serde",
+]
+
+[[package]]
 name = "metrocalk-interchange"
 version = "0.1.0"
 dependencies = [

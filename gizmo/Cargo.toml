@@ -1,0 +1,22 @@
+[package]
+name = "metrocalk-gizmo"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# The transform-gizmo subsystem (M9.1 / G1): the universal translate/rotate/scale manipulator behind our
+# own `Gizmo` trait (invariant 5). Built from scratch — `transform-gizmo` 0.9 unconditionally pulls the
+# egui ecosystem (epaint/ecolor/emath) + a pinned glam + mint and only hands back viewport vertices you
+# rasterize yourself anyway, so we implement the (small, documented) interaction math in our own wgpu
+# pipeline and keep `transform-gizmo` as the reference/fallback, never a default dep. The PUBLIC surface
+# uses our own plain-array types ([f32;3]/[f32;4]/[[f32;4];4]) — glam stays an internal math detail (the
+# /physics boundary discipline), so no foreign math type leaks past the trait (CI grep-gated).
+[dependencies]
+# glam is the internal math (mat4 compose/decompose/inverse, quats, rays); it never crosses the trait's
+# public surface (plain arrays do). Same version the wgpu viewport uses, so conversions are trivial.
+glam = "0.30"
+serde = { version = "1", features = ["derive"] }
