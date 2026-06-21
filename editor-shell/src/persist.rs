@@ -62,6 +62,9 @@ pub enum Record {
     /// M8.5 interchange import (`format` = "urdf" | "usd"): the source text is kept so replay re-imports
     /// it through the same `Interchange` trait → identical registry components survive reload.
     Import { format: String, source: String },
+    /// M9.1 transform-gizmo move: the entity's net world position (Transform x/y/z), replayed as one
+    /// `set_transform` commit so a dragged entity reloads at its moved position.
+    Transform { id: String, x: f64, y: f64, z: f64 },
     /// A marketplace-tier apply (M5): a chosen pre-componentized entry, replayed deterministically by
     /// re-fetching it from the (checked-in) catalog by id + re-applying its namespaced caps + mesh
     /// handle, so a *marketplace*-sourced object survives reload exactly like a local one.
@@ -209,6 +212,12 @@ impl Log {
                         .ok()
                         .and_then(|imp| capscene::import_scene(engine, scene, &imp).ok())
                         .is_some()
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                Record::Transform { id, x, y, z } => {
+                    EntityId::from_loro_key(&id).is_some_and(|e| {
+                        capscene::set_transform(engine, e, [x as f32, y as f32, z as f32]).is_ok()
+                    })
                 }
                 Record::ApplyMarketplace {
                     entry_id,

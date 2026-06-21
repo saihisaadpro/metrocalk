@@ -33,6 +33,9 @@ use metrocalk_editor_shell::{
     project_entity, project_full, ActionItem, AiPatch, CapScene, EditIntent, EditTx, Log,
     MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp, Record, Wallet,
 };
+use metrocalk_gizmo::{
+    Gizmo, GizmoMode, GizmoPivot, GizmoSpace, Handle, Ray, Transform as GizmoTransform,
+};
 use metrocalk_interchange::{Interchange, UrdfInterchange, UsdInterchange};
 use metrocalk_physics::{
     explain_contact, BodyDesc, BodyHandle, BodyKind, ColliderDesc, ColliderShape, Contact,
@@ -336,6 +339,18 @@ enum EngineCmd {
         format: String,
         source: String,
         reply: Sender<ImportResult>,
+    },
+    /// M9.1 — commit a gizmo transform: the entity's new world position as Transform x/y/z, one undoable
+    /// transaction (3 SetField ops in one commit). A physics body re-simulates from the new pose.
+    GizmoCommit {
+        id: String,
+        pos: [f32; 3],
+    },
+    /// M9.1 — read an entity's committed Transform x/y/z (a read; lets the gizmo + E2E confirm the move
+    /// landed in the core, not just the render projection).
+    ReadTransform {
+        id: String,
+        reply: Sender<(f64, f64, f64)>,
     },
     /// Internal fixed-timestep heartbeat (M8.2): a self-sent tick that advances the sim one step + syncs
     /// transforms to the viewport. NOT a JS command — it never crosses the WebView boundary (invariant 4).
@@ -1541,6 +1556,56 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 let _ = reply.send(result);
             }
+            EngineCmd::GizmoCommit { id, pos } => {
+                // M9.1: the gizmo drag's coalesced delta lands as ONE undoable transaction (Transform
+                // x/y/z in one commit). A physics body re-simulates from the new pose (restart the run).
+                if let Some(eid) = EntityId::from_loro_key(&id) {
+                    if capscene::set_transform(&mut engine, eid, pos).is_ok() {
+                        log.append(&Record::Transform {
+                            id: id.clone(),
+                            x: f64::from(pos[0]),
+                            y: f64::from(pos[1]),
+                            z: f64::from(pos[2]),
+                        });
+                        let comps = engine.components_of(eid);
+                        if comps.contains_key("RigidBody") && comps.contains_key("Collider") {
+                            (recording, rec_entities, sim, body_of) =
+                                restart_run(&engine, &assets, &sim, &body_of);
+                            frame = 0;
+                            max_frame = 0;
+                        }
+                        echo_created(
+                            &mut engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &channel,
+                            &mut recency,
+                            &mut touch,
+                            eid,
+                        );
+                    }
+                }
+            }
+            EngineCmd::ReadTransform { id, reply } => {
+                let t = EntityId::from_loro_key(&id)
+                    .map(|eid| {
+                        let comps = engine.components_of(eid);
+                        let get = |f: &str| -> f64 {
+                            comps
+                                .get("Transform")
+                                .and_then(|m| m.get(f))
+                                .map_or(0.0, |v| match v {
+                                    FieldValue::Number(n) => *n,
+                                    FieldValue::Integer(i) => *i as f64,
+                                    _ => 0.0,
+                                })
+                        };
+                        (get("x"), get("y"), get("z"))
+                    })
+                    .unwrap_or((0.0, 0.0, 0.0));
+                let _ = reply.send(t);
+            }
             EngineCmd::PhysicsDebug { reply } => {
                 let min_y = body_of
                     .values()
@@ -2656,6 +2721,304 @@ fn import_interchange(state: State<AppState>, format: String, source: String) ->
     rx.recv().unwrap_or_default()
 }
 
+// ── M9.1 transform gizmo ────────────────────────────────────────────────────────────────────────────
+//
+// The per-frame drag runs NATIVELY in the render loop (0 per-frame IPC, like the orbit) — these commands
+// only START a drag, set the mode/toggles, and COMMIT on release (2-ish IPC per gesture). A test-cursor
+// override lets an E2E drive the SAME render-loop drag deterministically by supplying a world target.
+
+const GIZMO_FOV: f32 = 55.0;
+const GIZMO_K: f32 = 0.14;
+
+/// `(aspect, selected_index)` for the gizmo, or `None` if nothing is selected / out of range.
+fn gizmo_ctx(window: &tauri::WebviewWindow, st: &render::SceneState) -> Option<(f32, usize)> {
+    let aspect = window.inner_size().map_or(16.0 / 9.0, |s| {
+        s.width.max(1) as f32 / s.height.max(1) as f32
+    });
+    let sel = st.selected?;
+    (sel < st.instances.len()).then_some((aspect, sel))
+}
+
+/// M9.1 — switch the persistent gizmo mode (W/E/R → translate/rotate/scale).
+#[tauri::command]
+fn gizmo_mode(state: State<AppState>, mode: String) {
+    ipc();
+    let m = match mode.as_str() {
+        "rotate" => GizmoMode::Rotate,
+        "scale" => GizmoMode::Scale,
+        _ => GizmoMode::Translate,
+    };
+    state.shared.lock().unwrap().gizmo.set_mode(m);
+}
+
+/// M9.1 — toggle world/local axes; returns the new space ("world"|"local").
+#[tauri::command]
+fn gizmo_space_toggle(state: State<AppState>) -> String {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.gizmo.toggle_space();
+    match st.gizmo.space() {
+        GizmoSpace::World => "world",
+        GizmoSpace::Local => "local",
+    }
+    .into()
+}
+
+/// M9.1 — toggle pivot/center; returns the new pivot ("origin"|"center").
+#[tauri::command]
+fn gizmo_pivot_toggle(state: State<AppState>) -> String {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.gizmo.toggle_pivot();
+    match st.gizmo.pivot() {
+        GizmoPivot::Origin => "origin",
+        GizmoPivot::Center => "center",
+    }
+    .into()
+}
+
+/// M9.1 — select an entity by its loro-key (so the gizmo shows on it). Returns whether it was found.
+#[tauri::command]
+fn gizmo_select(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    let Some(i) = st.ids.iter().position(|k| *k == id) else {
+        return false;
+    };
+    if let Some(p) = st.selected {
+        if p < st.instances.len() {
+            st.instances[p].selected = 0.0;
+        }
+    }
+    st.selected = Some(i);
+    if i < st.instances.len() {
+        st.instances[i].selected = 1.0;
+    }
+    st.revision = st.revision.wrapping_add(1);
+    true
+}
+
+/// M9.1 (LIVE path) — pick a gizmo handle under the normalized `(x,y)` cursor + start a drag. The render
+/// loop then drives the per-frame move from the OS cursor (0 IPC). Returns whether a handle was hit (so
+/// JS knows to NOT fall through to select/orbit).
+#[tauri::command]
+fn gizmo_pick_drag(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    x: f32,
+    y: f32,
+    ctrl: bool,
+) -> bool {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    let Some((aspect, sel)) = gizmo_ctx(&window, &st) else {
+        return false;
+    };
+    let origin = st.instances[sel].center;
+    let eye = render::camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+    let scale = metrocalk_gizmo::pixel_scale(eye, origin, GIZMO_FOV.to_radians(), GIZMO_K);
+    let (ro, rd) = render::cursor_ray(
+        (x, y),
+        st.orbit,
+        st.elevation,
+        st.distance,
+        aspect,
+        st.cam_target,
+    );
+    let ray = Ray {
+        origin: ro,
+        dir: rd,
+    };
+    let basis = [0.0, 0.0, 0.0, 1.0];
+    let Some(handle) = st.gizmo.pick(ray, origin, basis, scale) else {
+        return false;
+    };
+    let current = GizmoTransform {
+        translation: origin,
+        rotation: basis,
+        scale: [1.0; 3],
+    };
+    st.gizmo
+        .drag_start(handle, ray, origin, basis, scale, current);
+    st.gizmo_dragging = true;
+    st.gizmo_sel = Some(sel);
+    st.gizmo_snap = ctrl;
+    st.gizmo_test_cursor = None; // the live OS cursor drives the drag
+    true
+}
+
+/// M9.1 (TEST path) — start a drag on a named axis ("x"|"y"|"z") with a deterministic ray, freezing at the
+/// entity origin (so the render loop holds steady — no jump, no IPC — until [`gizmo_set_target`] moves it).
+#[tauri::command]
+fn gizmo_grab(window: tauri::WebviewWindow, state: State<AppState>, axis: String) -> bool {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    let Some((aspect, sel)) = gizmo_ctx(&window, &st) else {
+        return false;
+    };
+    let origin = st.instances[sel].center;
+    let eye = render::camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+    let scale = metrocalk_gizmo::pixel_scale(eye, origin, GIZMO_FOV.to_radians(), GIZMO_K);
+    let dir = [origin[0] - eye[0], origin[1] - eye[1], origin[2] - eye[2]];
+    let ray = Ray { origin: eye, dir };
+    let basis = [0.0, 0.0, 0.0, 1.0];
+    let handle = match axis.as_str() {
+        "y" => Handle::AxisY,
+        "z" => Handle::AxisZ,
+        _ => Handle::AxisX,
+    };
+    let current = GizmoTransform {
+        translation: origin,
+        rotation: basis,
+        scale: [1.0; 3],
+    };
+    st.gizmo
+        .drag_start(handle, ray, origin, basis, scale, current);
+    st.gizmo_dragging = true;
+    st.gizmo_sel = Some(sel);
+    st.gizmo_snap = false;
+    st.gizmo_test_cursor = render::project_to_screen(
+        origin,
+        st.orbit,
+        st.elevation,
+        st.distance,
+        aspect,
+        st.cam_target,
+    );
+    true
+}
+
+/// M9.1 (TEST path) — set the drag's target to a WORLD point (projected to a cursor the render loop then
+/// drags the selection toward). Deterministic driving of the same render-loop drag.
+#[tauri::command]
+fn gizmo_set_target(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    tx: f32,
+    ty: f32,
+    tz: f32,
+) {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    let aspect = window.inner_size().map_or(16.0 / 9.0, |s| {
+        s.width.max(1) as f32 / s.height.max(1) as f32
+    });
+    st.gizmo_test_cursor = render::project_to_screen(
+        [tx, ty, tz],
+        st.orbit,
+        st.elevation,
+        st.distance,
+        aspect,
+        st.cam_target,
+    );
+}
+
+/// M9.1 — the normalized screen position of a handle's grab point (for the live JS pick + the E2E).
+#[tauri::command]
+fn gizmo_handle_screen(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    axis: String,
+) -> Option<(f32, f32)> {
+    ipc();
+    let st = state.shared.lock().unwrap();
+    let (aspect, sel) = gizmo_ctx(&window, &st)?;
+    let origin = st.instances[sel].center;
+    let eye = render::camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+    let scale = metrocalk_gizmo::pixel_scale(eye, origin, GIZMO_FOV.to_radians(), GIZMO_K);
+    let a = match axis.as_str() {
+        "y" => [0.0, 1.0, 0.0],
+        "z" => [0.0, 0.0, 1.0],
+        _ => [1.0, 0.0, 0.0],
+    };
+    let tip = [
+        origin[0] + a[0] * scale * 0.6,
+        origin[1] + a[1] * scale * 0.6,
+        origin[2] + a[2] * scale * 0.6,
+    ];
+    render::project_to_screen(
+        tip,
+        st.orbit,
+        st.elevation,
+        st.distance,
+        aspect,
+        st.cam_target,
+    )
+}
+
+/// M9.1 — end the gizmo drag and COMMIT the coalesced move as ONE undoable transaction.
+#[tauri::command]
+fn gizmo_drag_end(state: State<AppState>) {
+    ipc();
+    let commit = {
+        let mut st = state.shared.lock().unwrap();
+        if !st.gizmo_dragging {
+            None
+        } else {
+            st.gizmo_dragging = false;
+            st.gizmo.drag_end();
+            st.gizmo_test_cursor = None;
+            st.gizmo_sel.and_then(|sel| {
+                (sel < st.instances.len() && sel < st.ids.len())
+                    .then(|| (st.ids[sel].clone(), st.instances[sel].center))
+            })
+        }
+    };
+    if let Some((id, pos)) = commit {
+        let _ = state.tx.send(EngineCmd::GizmoCommit { id, pos });
+    }
+}
+
+/// M9.1 — read an entity's committed Transform x/y/z (the gizmo HUD + E2E confirm the move landed in core).
+#[tauri::command]
+fn read_transform(state: State<AppState>, id: String) -> (f64, f64, f64) {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ReadTransform { id, reply })
+        .is_err()
+    {
+        return (0.0, 0.0, 0.0);
+    }
+    rx.recv().unwrap_or((0.0, 0.0, 0.0))
+}
+
+/// M9.1 — the gizmo state for the HUD/E2E: `(mode, has_selection, dragging, space, pivot)`.
+#[tauri::command]
+fn gizmo_debug(state: State<AppState>) -> (String, bool, bool, String, String) {
+    ipc();
+    let st = state.shared.lock().unwrap();
+    let mode = match st.gizmo.mode() {
+        GizmoMode::Translate => "translate",
+        GizmoMode::Rotate => "rotate",
+        GizmoMode::Scale => "scale",
+    };
+    let space = match st.gizmo.space() {
+        GizmoSpace::World => "world",
+        GizmoSpace::Local => "local",
+    };
+    let pivot = match st.gizmo.pivot() {
+        GizmoPivot::Origin => "origin",
+        GizmoPivot::Center => "center",
+    };
+    (
+        mode.into(),
+        st.selected.is_some(),
+        st.gizmo_dragging,
+        space.into(),
+        pivot.into(),
+    )
+}
+
+/// Total UI→core IPC calls so far — lets the E2E prove a gizmo drag is **0 per-frame IPC** (the count
+/// stays flat across many render frames during an active drag; only the gesture's start/end cross JS).
+#[tauri::command]
+fn ipc_count() -> u64 {
+    ipc();
+    render::IPC_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Hover-tooltip details for an entity (M3.3) — fetched on hovered-entity change, not per frame.
 #[tauri::command]
 fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
@@ -2835,7 +3198,19 @@ fn main() {
             sim_overlay,
             sim_shove,
             physics_contacts,
-            import_interchange
+            import_interchange,
+            gizmo_mode,
+            gizmo_space_toggle,
+            gizmo_pivot_toggle,
+            gizmo_select,
+            gizmo_pick_drag,
+            gizmo_grab,
+            gizmo_set_target,
+            gizmo_handle_screen,
+            gizmo_drag_end,
+            read_transform,
+            gizmo_debug,
+            ipc_count
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");

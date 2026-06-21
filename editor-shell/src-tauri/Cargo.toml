@@ -35,6 +35,9 @@ metrocalk-physics = { path = "../../physics" }
 # The interchange tier (M8.5) — URDF/USD import behind the Interchange trait. No urdf_rs/openusd type
 # leaks across (CI grep-gated, like rapier in /physics).
 metrocalk-interchange = { path = "../../interchange" }
+# The transform gizmo (M9.1 / G1) — translate/rotate/scale behind the Gizmo trait. Its public surface is
+# plain arrays (glam internal only); render.rs converts to/from its glam viewport types at the boundary.
+metrocalk-gizmo = { path = "../../gizmo" }
 
 # Native wgpu viewport (M2.2 instanced render path). DX12 disabled — wgpu-hal 29's DX12 fights the
 # `windows` crate version Tauri/webview2-com pins (the diamond M2.1/M2.3 documented); Vulkan is the

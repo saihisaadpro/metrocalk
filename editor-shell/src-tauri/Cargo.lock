@@ -2829,6 +2829,7 @@ dependencies = [
  "metrocalk-economy",
  "metrocalk-ecs",
  "metrocalk-editor-shell",
+ "metrocalk-gizmo",
  "metrocalk-interchange",
  "metrocalk-physics",
  "png 0.18.1",
@@ -2839,6 +2840,14 @@ dependencies = [
  "tauri",
  "tauri-build",
  "wgpu",
+]
+
+[[package]]
+name = "metrocalk-gizmo"
+version = "0.1.0"
+dependencies = [
+ "glam 0.30.10",
+ "serde",
 ]
 
 [[package]]

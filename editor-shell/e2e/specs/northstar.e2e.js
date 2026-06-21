@@ -440,4 +440,46 @@ describe("Metrocalk editor — north-star #1 live", () => {
       timeoutMsg: "undo did not reverse the URDF import",
     });
   });
+
+  // ── M9.1 (G1): the transform gizmo drags a selected entity — native (0 per-frame IPC), one undoable
+  // transaction, hierarchy-correct (parent-space write-back proven headless in /gizmo). ──────────────────
+  it("M9.1: the transform gizmo drags a selected entity (0 per-frame IPC, one undoable tx)", async () => {
+    // A deterministic target: a PAUSED physics body at a known position (so the gizmo move is the only motion).
+    const id = await invokeT("spawn_body", { x: 0, y: 6, z: 0 });
+    expect(typeof id).toBe("string");
+    await invokeT("set_sim_running", { run: false });
+    expect(await invokeT("gizmo_select", { id })).toBe(true);
+    await invokeT("gizmo_mode", { mode: "translate" });
+
+    const g = await invokeT("gizmo_debug"); // [mode, hasSelection, dragging, space, pivot]
+    expect(g[0]).toBe("translate");
+    expect(g[1]).toBe(true);
+    const t0 = await invokeT("read_transform", { id });
+
+    // Start a drag on the Y handle (vertical → always well-presented, never edge-on to the camera), then
+    // prove 0-PER-FRAME-IPC: across ~27 render frames (450 ms) with an ACTIVE drag and no commands, the
+    // IPC counter does NOT grow per frame — the per-frame work is native in the render loop (only the
+    // gesture's start/end cross JS, invariant 4).
+    expect(await invokeT("gizmo_grab", { axis: "y" })).toBe(true);
+    const ipcA = await invokeT("ipc_count");
+    await browser.pause(450);
+    const ipcB = await invokeT("ipc_count");
+    expect(ipcB - ipcA).toBeLessThan(10); // ≈ the handful of reads, NOT ~27 (1/frame) → 0 per-frame IPC
+
+    // Drag up +Y (the render loop moves the instance natively), release → ONE undoable commit.
+    await invokeT("gizmo_set_target", { tx: 0.0, ty: t0[1] + 5.0, tz: 0.0 });
+    await browser.pause(150); // let the native render-loop drag apply
+    await invokeT("gizmo_drag_end");
+    await browser.waitUntil(async () => (await invokeT("read_transform", { id }))[1] > t0[1] + 1.0, {
+      timeout: 10000,
+      timeoutMsg: "the gizmo drag did not move the entity along +Y",
+    });
+
+    // ONE undoable transaction — Ctrl-Z reverts the whole move atomically.
+    await browser.keys(["Control", "z"]);
+    await browser.waitUntil(
+      async () => Math.abs((await invokeT("read_transform", { id }))[1] - t0[1]) < 0.2,
+      { timeout: 10000, timeoutMsg: "Ctrl-Z did not revert the gizmo move" }
+    );
+  });
 });

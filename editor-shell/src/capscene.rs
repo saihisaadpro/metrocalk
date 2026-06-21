@@ -776,6 +776,40 @@ pub fn import_scene(
     Ok(body_ids)
 }
 
+/// Commit an entity's `Transform` x/y/z as **ONE undoable transaction** (M9.1 — the coalesced gizmo-drag
+/// result, or a replayed transform edit). Three `SetField` ops in a single `engine.commit`, so Ctrl-Z
+/// reverses the whole move atomically (invariant 3). Used by the gizmo commit + its replay.
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the transaction fails (the ops are registry-consistent by construction).
+pub fn set_transform(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+    pos: [f32; 3],
+) -> Result<(), PipelineError> {
+    let ops = vec![
+        Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: "x".into(),
+            value: FieldValue::Number(f64::from(pos[0])),
+        },
+        Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: "y".into(),
+            value: FieldValue::Number(f64::from(pos[1])),
+        },
+        Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: "z".into(),
+            value: FieldValue::Number(f64::from(pos[2])),
+        },
+    ];
+    engine.commit("gizmo-transform", ops)
+}
+
 /// Apply a **marketplace entry** as a new pre-componentized scene entity — its component (display
 /// marker) + its **namespaced** capability pairs (provides/requires, with an aliased custom cap also
 /// providing its standard cap) + its mesh **handle** — all as ONE undoable transaction (invariant 3).

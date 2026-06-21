@@ -12,8 +12,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 use metrocalk_assets::{MeshGpu, MeshVertex};
+use metrocalk_gizmo::{Gizmo, TransformGizmo};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 /// Total UI→core IPC calls (every `#[tauri::command]` bumps this). The render loop reports it next to
@@ -88,6 +89,20 @@ pub struct SceneState {
     /// restores this). `None` ⇒ not focused / nothing to restore. Saved once on enter so focusing a
     /// second entity without un-focusing first doesn't lose the original framing.
     pub pre_focus_distance: Option<f32>,
+    /// M9.1 transform gizmo — its mode (W/E/R) + in-flight drag live here so the render loop can run the
+    /// per-frame drag natively (0 per-frame IPC, like the orbit). The drawn geometry is regenerated each
+    /// frame at the selected entity (constant pixel size); the gizmo shows whenever `selected` is `Some`.
+    pub gizmo: TransformGizmo,
+    /// A gizmo drag is active (the render loop polls the cursor + moves the dragged instance).
+    pub gizmo_dragging: bool,
+    /// The instance index being dragged (frozen at drag start).
+    pub gizmo_sel: Option<usize>,
+    /// Ctrl-hold snapping for the active drag.
+    pub gizmo_snap: bool,
+    /// A test-injected normalized cursor: when `Some`, the render loop drives the drag from it instead of
+    /// the OS cursor (so an E2E can drive the SAME render-loop drag path deterministically). `None` ⇒ the
+    /// live OS cursor drives (the production path).
+    pub gizmo_test_cursor: Option<(f32, f32)>,
 }
 
 pub type Shared = Arc<Mutex<SceneState>>;
@@ -424,6 +439,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     );
     let mut overlay = InstanceBuf::new(&device, &inst_bgl, 256);
     let mut cur_overlay_rev = u64::MAX;
+    // M9.1 transform gizmo: its own buffer, drawn with the SAME `overlay_pipeline` (vs_overlay reads the
+    // per-segment colour) + always-pass depth, so the X/Y/Z handles read as an overlay over the scene.
+    // Regenerated + uploaded each frame at the selected entity (constant pixel size); empty ⇒ pass skipped.
+    let mut gizmo_buf = InstanceBuf::new(&device, &inst_bgl, 256);
 
     // Imported-mesh path (invariant 4: built/uploaded on the render thread; the hot path never crosses
     // JS). A real vertex buffer (pos/normal/baked-color) + the same cam(0)+instance-storage(1) bind
@@ -507,7 +526,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
 
         // read shared state; re-upload instances on revision change (picking is NOT serviced here —
         // it's done synchronously in the viewport_pick command, decoupled from the frame cadence)
-        let (cam, focus_active) = {
+        let (cam, focus_active, gizmo_verts) = {
             let mut st = shared.lock().unwrap();
             if st.distance == 0.0 {
                 st.distance = 60.0;
@@ -530,6 +549,46 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 }
             } else {
                 st.drag_last = None;
+            }
+            // M9.1 gizmo drag — parallel to the orbit, also fully native (0 per-frame IPC): poll the cursor
+            // (the OS cursor, or a test-injected one) + run the gizmo's drag_update, moving the dragged
+            // instance live. Only gizmo_pick_drag/gizmo_drag_end cross JS (2 per gesture), never per frame.
+            if st.gizmo_dragging {
+                let cursor = st.gizmo_test_cursor.or_else(|| {
+                    window
+                        .cursor_position()
+                        .ok()
+                        .map(|p| (p.x as f32 / w.max(1) as f32, p.y as f32 / h.max(1) as f32))
+                });
+                if let Some(cur) = cursor {
+                    let aspect = w as f32 / h.max(1) as f32;
+                    let (ro, rd) = cursor_ray(
+                        cur,
+                        st.orbit,
+                        st.elevation,
+                        st.distance,
+                        aspect,
+                        st.cam_target,
+                    );
+                    let snap = st.gizmo_snap;
+                    let world_new = st.gizmo.drag_update(
+                        metrocalk_gizmo::Ray {
+                            origin: ro,
+                            dir: rd,
+                        },
+                        snap,
+                    );
+                    if let Some(sel) = st.gizmo_sel {
+                        if sel < st.instances.len()
+                            && st.instances[sel].center != world_new.translation
+                        {
+                            // only re-upload when the position actually changed (a static/frozen drag
+                            // costs nothing — and never per-frame IPC, the per-frame work is all native)
+                            st.instances[sel].center = world_new.translation;
+                            st.revision = st.revision.wrapping_add(1);
+                        }
+                    }
+                }
             }
             // Upload per-asset mesh GEOMETRY once when the asset set changes (rare — loaded at startup).
             if st.meshes_revision != cur_mesh_rev {
@@ -603,8 +662,33 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 aspect,
                 st.cam_target.into(),
             );
+            // M9.1: regenerate the gizmo geometry at the selected entity each frame — constant pixel size,
+            // and it follows the entity through a drag. Empty when nothing is selected → the pass is
+            // skipped (zero cost). World-space basis (the cube/mesh shaders don't show rotation).
+            let gizmo_verts: Vec<Instance> = match st.selected {
+                Some(sel) if sel < st.instances.len() => {
+                    let origin = st.instances[sel].center;
+                    let eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+                    let scale = metrocalk_gizmo::pixel_scale(eye, origin, 55f32.to_radians(), 0.14);
+                    st.gizmo
+                        .geometry(origin, [0.0, 0.0, 0.0, 1.0], scale)
+                        .into_iter()
+                        .map(|gv| Instance {
+                            center: gv.pos,
+                            scale: 0.0,
+                            color: gv.color,
+                            selected: 0.0,
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
             // Focus dim flag (read under the same lock as the camera, so it can't lag the frame).
-            (cam, if st.focused.is_some() { 1.0f32 } else { 0.0 })
+            (
+                cam,
+                if st.focused.is_some() { 1.0f32 } else { 0.0 },
+                gizmo_verts,
+            )
         };
         queue.write_buffer(
             &camera_buf,
@@ -614,6 +698,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 focus: [focus_active, 0.0, 0.0, 0.0],
             }),
         );
+        // M9.1: upload the gizmo handle geometry (tiny — regenerated each frame at the selection).
+        gizmo_buf.upload(&device, &queue, &inst_bgl, &gizmo_verts);
 
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -699,6 +785,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.set_bind_group(1, &overlay.bg, &[]);
                 rp.draw(0..overlay.n, 0..1);
             }
+            // M9.1 transform gizmo, drawn LAST (over everything), per-segment X/Y/Z colour, always-pass
+            // depth. Skipped when nothing is selected (`gizmo_buf.n == 0`) — zero per-frame cost.
+            if gizmo_buf.n > 0 {
+                rp.set_pipeline(&overlay_pipeline);
+                rp.set_bind_group(1, &gizmo_buf.bg, &[]);
+                rp.draw(0..gizmo_buf.n, 0..1);
+            }
         }
         queue.submit([enc.finish()]);
         frame.present();
@@ -774,6 +867,61 @@ pub fn pick_nearest(instances: &[Instance], cursor: (f32, f32), view_proj: &Mat4
         }
     }
     best.or(best_nc).map(|(i, _)| i)
+}
+
+/// The camera eye (world position) for the orbit camera — the cursor ray origin + the pixel-scale
+/// reference. Returns a plain array so it feeds the gizmo's boundary types directly.
+#[must_use]
+pub fn camera_eye(orbit: f32, elevation: f32, distance: f32, target: [f32; 3]) -> [f32; 3] {
+    let offset = Vec3::new(
+        orbit.cos() * distance * elevation.cos(),
+        distance * elevation.sin(),
+        orbit.sin() * distance * elevation.cos(),
+    );
+    (Vec3::from(target) + offset).to_array()
+}
+
+/// Unproject a normalized `[0,1]` cursor into a world-space ray `(origin, direction)` under the orbit
+/// camera — the gizmo's pick + drag input. Origin is the near-plane hit; direction is normalized. Plain
+/// arrays in/out (glam stays internal). wgpu NDC depth is `[0,1]`, so the near plane is `z=0`.
+#[must_use]
+pub fn cursor_ray(
+    cursor: (f32, f32),
+    orbit: f32,
+    elevation: f32,
+    distance: f32,
+    aspect: f32,
+    target: [f32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    let inv = camera_matrix(orbit, elevation, distance, aspect, target.into()).inverse();
+    let ndc_x = cursor.0 * 2.0 - 1.0;
+    let ndc_y = 1.0 - cursor.1 * 2.0;
+    let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+    let far = inv * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+    let np = near.truncate() / near.w;
+    let fp = far.truncate() / far.w;
+    (np.to_array(), (fp - np).normalize_or_zero().to_array())
+}
+
+/// Project a world point to a normalized `[0,1]` cursor (the inverse of [`cursor_ray`]) — lets a test
+/// drive a deterministic gizmo drag by supplying a world TARGET (projected to a cursor the render loop
+/// then drags toward). `None` if the point is behind the camera.
+#[must_use]
+pub fn project_to_screen(
+    world: [f32; 3],
+    orbit: f32,
+    elevation: f32,
+    distance: f32,
+    aspect: f32,
+    target: [f32; 3],
+) -> Option<(f32, f32)> {
+    let clip = camera_matrix(orbit, elevation, distance, aspect, target.into())
+        * Vec3::from(world).extend(1.0);
+    if clip.w <= 1e-6 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    Some(((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5))
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {

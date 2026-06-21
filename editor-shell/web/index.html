@@ -106,6 +106,7 @@
       // projection store: id -> { name, parentId, components }
       const store = new Map();
       let selected = null;
+      let gizmoDragging = false; // M9.1: a left-drag on a gizmo handle is in progress (render loop moves it)
       let opSeq = 0;
       const pending = new Map(); // clientOpId -> intent (for optimistic display, dropped on confirm)
 
@@ -209,7 +210,7 @@
       }
       const parseMaybeNumber = (s) => { const n = Number(s); return s.trim() !== "" && !isNaN(n) ? n : s; };
 
-      function select(id) { selected = id; renderList(); renderInspector(); revealFor(id); }
+      function select(id) { selected = id; renderList(); renderInspector(); revealFor(id); invoke("gizmo_select", { id }); updateGizmoHud(); }
 
       // ── binding by intent (north-star test #1) ─────────────────────────────────
       // On select, ask the core what this entity can connect to: ranked compatible targets, every
@@ -548,15 +549,27 @@
       vp.addEventListener("mousedown", async (ev) => {
         if (ev.button === 2) { rcStart = { x: ev.clientX, y: ev.clientY }; invoke("drag_start"); return; } // right = orbit-or-menu
         if (ev.button !== 0) return;
-        if (focusMode) doUnfocus(); // a plain click returns to the normal overview before re-picking
         const x = ev.clientX / window.innerWidth;
         const y = ev.clientY / window.innerHeight;
+        // M9.1: with an entity selected, a left-press ON A GIZMO HANDLE starts a drag (native per-frame,
+        // 0 IPC) — not a re-select/orbit. Ctrl = snap. Otherwise fall through to pick/select.
+        if (selected) {
+          const hit = await invoke("gizmo_pick_drag", { x, y, ctrl: ev.ctrlKey || ev.metaKey });
+          if (hit) { gizmoDragging = true; status("gizmo drag" + (ev.ctrlKey ? " · snapping" : "")); return; }
+        }
+        if (focusMode) doUnfocus(); // a plain click returns to the normal overview before re-picking
         const id = await invoke("viewport_pick", { x, y });
         if (id) { select(id); status("picked " + id); }
-        else { selected = null; renderList(); renderInspector(); revealFor(null); status("picked nothing here"); }
+        else { selected = null; renderList(); renderInspector(); revealFor(null); updateGizmoHud(); status("picked nothing here"); }
       });
       window.addEventListener("mouseup", async (ev) => {
         invoke("drag_end"); // end any orbit on release
+        if (gizmoDragging) {
+          gizmoDragging = false;
+          await invoke("gizmo_drag_end"); // commit the coalesced move as ONE undoable transaction
+          status("moved " + (selected || "") + " (one undoable edit — Ctrl-Z)");
+          setTimeout(updateGizmoHud, 40);
+        }
         if (ev.button === 2 && rcStart) {
           const moved = Math.hypot(ev.clientX - rcStart.x, ev.clientY - rcStart.y);
           rcStart = null;
@@ -696,7 +709,7 @@
       let lastHover = null, hoverTimer = null;
       vp.addEventListener("mousemove", (ev) => {
         if (hoverTimer) clearTimeout(hoverTimer);
-        if (ctxmenu.style.display === "block" || rcStart) return; // no tooltip while a menu is open / orbiting
+        if (ctxmenu.style.display === "block" || rcStart || gizmoDragging) return; // no tooltip while a menu is open / orbiting / gizmo-dragging
         const cx = ev.clientX, cy = ev.clientY;
         hoverTimer = setTimeout(async () => {
           const id = await invoke("viewport_peek", { x: cx / window.innerWidth, y: cy / window.innerHeight });
@@ -726,9 +739,48 @@
         tooltip.style.display = "block";
       }
 
-      function doUndo() { invoke("undo"); status("undo"); if (selected) setTimeout(() => revealFor(selected), 40); }
+      function doUndo() { invoke("undo"); status("undo"); if (selected) setTimeout(() => { revealFor(selected); updateGizmoHud(); }, 40); }
       $("undo").onclick = doUndo;
       window.addEventListener("keydown", (e) => { if ((e.ctrlKey||e.metaKey) && e.key === "z") doUndo(); });
+
+      // ── M9.1 transform gizmo: W/E/R switch the persistent gizmo (translate/rotate/scale) — the universal
+      // game-editor shortcut. Guarded so they don't fire while typing in a field. ──────────────────────────
+      window.addEventListener("keydown", async (e) => {
+        const tag = e.target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || e.ctrlKey || e.metaKey || e.altKey) return;
+        const k = e.key.toLowerCase();
+        if (k === "w") { await invoke("gizmo_mode", { mode: "translate" }); status("gizmo: move (W)"); updateGizmoHud(); }
+        else if (k === "e") { await invoke("gizmo_mode", { mode: "rotate" }); status("gizmo: rotate (E)"); updateGizmoHud(); }
+        else if (k === "r") { await invoke("gizmo_mode", { mode: "scale" }); status("gizmo: scale (R)"); updateGizmoHud(); }
+      });
+
+      // ── M9.1 precision HUD (themes 1+4): the gizmo's mode + the selected entity's live world coordinates +
+      // world/local & pivot/center toggles + the Ctrl=snap hint. Shown whenever an entity is selected. ──────
+      const gizmoHud = document.createElement("div");
+      gizmoHud.id = "gizmoHud";
+      gizmoHud.style.cssText = "position:fixed;z-index:60;display:none;right:12px;top:64px;min-width:200px;background:#161c28;border:1px solid #3a4a6a;border-radius:8px;padding:7px 10px;font-size:11.5px;line-height:1.55;box-shadow:0 4px 18px rgba(0,0,0,.5)";
+      document.body.appendChild(gizmoHud);
+      async function updateGizmoHud() {
+        const g = await invoke("gizmo_debug"); // [mode, hasSel, dragging, space, pivot]
+        if (!g[1]) { gizmoHud.style.display = "none"; return; }
+        let t = [0, 0, 0];
+        if (selected) { try { t = await invoke("read_transform", { id: selected }); } catch (e) {} }
+        const modeName = { translate: "⬌ Move (W)", rotate: "⟳ Rotate (E)", scale: "⤢ Scale (R)" }[g[0]] || g[0];
+        const risk = (Math.abs(t[0]) > 500 || Math.abs(t[1]) > 500 || Math.abs(t[2]) > 500)
+          ? `<div style="color:#fd6;font-size:10px">⚠ far from origin — check scale/units</div>` : "";
+        gizmoHud.innerHTML =
+          `<div style="font-weight:700;color:#bcd">${modeName}</div>` +
+          `<div style="color:#9ab;font-family:monospace">world  ${t[0].toFixed(2)}, ${t[1].toFixed(2)}, ${t[2].toFixed(2)}</div>` +
+          risk +
+          `<div style="display:flex;gap:6px;margin-top:4px;align-items:center">` +
+            `<button id="gzSpace" style="padding:1px 7px;font-size:10px;background:#26324a">${g[3]}</button>` +
+            `<button id="gzPivot" style="padding:1px 7px;font-size:10px;background:#26324a">${g[4]}</button>` +
+            `<span style="color:#789;font-size:10px">Ctrl = snap</span>` +
+          `</div>`;
+        $("gzSpace").onclick = async () => { const s = await invoke("gizmo_space_toggle"); status("axes: " + s); updateGizmoHud(); };
+        $("gzPivot").onclick = async () => { const p = await invoke("gizmo_pivot_toggle"); status("pivot: " + p); updateGizmoHud(); };
+        gizmoHud.style.display = "block";
+      }
 
       // ── wallet / token economy (M7) ────────────────────────────────────────────
       // The balance the paid tiers meter against. The engine is free forever; only generate/buy/edit
