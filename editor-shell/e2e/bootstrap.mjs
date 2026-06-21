@@ -30,9 +30,15 @@ const fail = (m) => {
 
 // WebView2 Evergreen runtime version from the registry (the client GUID is Microsoft's fixed Edge WebView2).
 function webview2Version() {
-  const ps = `(Get-ItemProperty "HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}").pv`;
+  // -ErrorAction SilentlyContinue → a missing key/property yields empty output (clean null + our own
+  // message), not a raw PowerShell error dump. Try the per-user path too (some installs register there).
+  const key = "Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+  const ps =
+    `$p=(Get-ItemProperty "HKLM:\\SOFTWARE\\WOW6432Node\\${key}" -ErrorAction SilentlyContinue).pv;` +
+    `if(-not $p){$p=(Get-ItemProperty "HKCU:\\SOFTWARE\\${key}" -ErrorAction SilentlyContinue).pv};` +
+    `if($p){$p}`;
   try {
-    const out = execSync(`powershell -NoProfile -Command "${ps}"`, { encoding: "utf8" }).trim();
+    const out = execSync(`powershell -NoProfile -Command "${ps}"`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
     return out || null;
   } catch {
     return null;
