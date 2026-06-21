@@ -2859,6 +2859,9 @@ fn rebuild(
     // Per-instance render routing: -1 ⇒ cube placeholder, else the imported-mesh slot (parallel to
     // `instances`). An entity with a `MeshRenderer.mesh` handle the store knows renders as that mesh.
     let mut mesh_slots: Vec<i32> = Vec::new();
+    // M9.4 — per-instance snap affinity (parallel to `instances`): a parent (a pivot) outranks a bare
+    // origin in the snap ranker. Built here so the render-thread snap (`nearest_snap`) stays 0-IPC.
+    let mut snap_affinity: Vec<u32> = Vec::new();
     for id in engine.entity_ids() {
         // M9.2 deactivate-not-delete: a deactivated PART is hidden from the viewport (the entity + its
         // data survive; undo re-activates it → it reappears on the next rebuild). Only children can be
@@ -2938,6 +2941,9 @@ fn rebuild(
             rotation: rot,
         });
         mesh_slots.push(slot.map_or(-1, |s| i32::try_from(s).unwrap_or(-1)));
+        // A parent (has children) is a stronger spatial snap target (a pivot) than a bare origin
+        // (`SnapKind::Pivot`=6 vs `Origin`=0 in the shared ranker's affinity).
+        snap_affinity.push(if engine.children_of(id).is_empty() { 0 } else { 6 });
         ids.push(key);
     }
     // Tracking lines: one segment per binding, between the bound entities' centres — what makes a
@@ -2962,6 +2968,7 @@ fn rebuild(
     st.instances = instances;
     st.ids = ids;
     st.mesh_slots = mesh_slots;
+    st.snap_affinity = snap_affinity;
     st.line_points = line_points;
     st.selected = prev_sel_id.and_then(|id| st.ids.iter().position(|k| *k == id));
     if let Some(i) = st.selected {
@@ -3650,12 +3657,27 @@ fn gizmo_drag_end(window: tauri::WebviewWindow, state: State<AppState>) {
                         },
                         snap,
                     );
-                    st.instances[sel].center = world_final.translation;
+                    // M9.4: apply the SAME magnetic snap as the live render-loop drag, so the COMMITTED
+                    // pose lands exactly on the ghost (not the un-snapped release point).
+                    let mut t = world_final.translation;
+                    if !st.snap_disabled {
+                        if let Some(i) = render::nearest_snap(
+                            &st.instances,
+                            &st.snap_affinity,
+                            sel,
+                            t,
+                            render::SNAP_RADIUS,
+                        ) {
+                            t = st.instances[i].center;
+                        }
+                    }
+                    st.instances[sel].center = t;
                 }
             }
             st.gizmo_dragging = false;
             st.gizmo.drag_end();
             st.gizmo_test_cursor = None;
+            st.snap_ghost = None;
             st.gizmo_sel.and_then(|sel| {
                 (sel < st.instances.len() && sel < st.ids.len()).then(|| {
                     let inst = st.instances[sel];
@@ -3836,6 +3858,22 @@ fn placement_sentence(state: State<AppState>, id: String, text: String) -> Solve
         return SolveResult::default();
     }
     rx.recv().unwrap_or_default()
+}
+
+/// M9.4 — toggle magnetic snapping (the live render-loop drag pulls the dragged entity onto the nearest
+/// meaningful target). Default ON; touches only the shared `SceneState` (no engine round-trip).
+#[tauri::command]
+fn set_snap(state: State<AppState>, on: bool) {
+    ipc();
+    state.shared.lock().unwrap().snap_disabled = !on;
+}
+
+/// M9.4 — the current snap **ghost** position during a drag (the nearest target the dragged entity will
+/// snap to), or `None` (no candidate in range / not dragging). The HUD + E2E read it.
+#[tauri::command]
+fn snap_ghost(state: State<AppState>) -> Option<[f32; 3]> {
+    ipc();
+    state.shared.lock().unwrap().snap_ghost
 }
 
 /// M9.1 — the gizmo state for the HUD/E2E: `(mode, has_selection, dragging, space, pivot)`.
@@ -4073,6 +4111,8 @@ fn main() {
             snap_query,
             apply_constraint,
             placement_sentence,
+            set_snap,
+            snap_ghost,
             gizmo_debug,
             ipc_count
         ])

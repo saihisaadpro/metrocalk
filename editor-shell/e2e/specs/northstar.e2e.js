@@ -587,5 +587,29 @@ describe("Metrocalk editor — north-star #1 live", () => {
     const body = await invokeT("spawn_body", { x: 0, y: 5, z: 0 });
     const warnings = await invokeT("physics_check", { id: body });
     expect(Array.isArray(warnings)).toBe(true);
+
+    // LIVE magnetic snapping: a drag that comes within range of a target shows the snap GHOST, and the
+    // released pose snaps onto it (the render-thread snap, 0-IPC, reusing the shared ADR-011 ranker).
+    await invokeT("set_snap", { on: true });
+    const p = await invokeT("part_debug", { id: part }); // [x, y, z, ...] the part's world position
+    const dragee = await invokeT("spawn_body", { x: p[0] + 0.3, y: p[1] - 3.0, z: p[2] });
+    await invokeT("set_sim_running", { run: false });
+    expect(await invokeT("gizmo_select", { id: dragee })).toBe(true);
+    await invokeT("gizmo_mode", { mode: "translate" });
+    expect(await invokeT("gizmo_grab", { axis: "y" })).toBe(true);
+    // Drive the drag up to the part's height → at (p.x+0.3, p.y, p.z) it's 0.3 m from the part (< the 1.5 m
+    // snap radius) → the render loop magnetically snaps onto it + shows the ghost.
+    await invokeT("gizmo_set_target", { tx: p[0] + 0.3, ty: p[1], tz: p[2] });
+    await browser.pause(200); // let the native render-loop drag + snap apply
+    const ghost = await invokeT("snap_ghost");
+    expect(ghost).not.toBe(null); // a snap candidate is in range → the ghost is shown
+    await invokeT("gizmo_drag_end"); // commit — the released pose is the snapped one
+    await browser.waitUntil(
+      async () => {
+        const t = await invokeT("read_transform", { id: dragee }); // [x, y, z, ...]
+        return Math.abs(t[0] - p[0]) < 0.25 && Math.abs(t[1] - p[1]) < 0.25 && Math.abs(t[2] - p[2]) < 0.25;
+      },
+      { timeout: 10000, timeoutMsg: "the drag did not magnetically snap onto the nearby target" }
+    );
   });
 });

@@ -107,6 +107,7 @@
       const store = new Map();
       let selected = null;
       let lastComp = null; // M9.2: the id of the last character saved with "Save character" (for "Drop instance")
+      let snapOn = true; // M9.4: magnetic snapping (the live drag pulls onto the nearest target)
       let gizmoDragging = false; // M9.1: a left-drag on a gizmo handle is in progress (render loop moves it)
       let opSeq = 0;
       const pending = new Map(); // clientOpId -> intent (for optimistic display, dropped on confirm)
@@ -216,6 +217,7 @@
         // ── M9.4 transform solver: snap to the nearest meaningful target (ADR-011-ranked), or place by a
         // natural-language sentence (compiled to editable constraints → a schema-validated patch).
         html += `<div style="opacity:.7;margin-top:10px;border-top:1px solid #333;padding-top:6px">transform solver (M9.4)</div>`;
+        html += `<button id="snapToggle" style="margin:4px 12px;background:#2a3a3a">🧲 Magnetic snap: ${snapOn ? "ON" : "OFF"}</button>`;
         html += `<button id="snapNearest" style="margin:4px 12px;background:#1f4a3a">🧲 Snap to nearest</button>`;
         html += `<div class="field"><span>place by sentence</span><input id="placeSentence" placeholder="e.g. upright, 10 cm from the edge"/></div>`;
         html += `<button id="placeBtn" style="margin:4px 12px;background:#2f3a5a">✦ Apply placement</button>`;
@@ -247,6 +249,13 @@
           const to = $("reparentTo").value.trim();
           invoke("reparent_part", { id: selected, parent: to === "" ? null : to });
           status("reparented" + (to ? " under " + to : " to root") + " (Ctrl-Z to undo)");
+        };
+        const stg = $("snapToggle");
+        if (stg) stg.onclick = async () => {
+          snapOn = !snapOn;
+          await invoke("set_snap", { on: snapOn });
+          status("magnetic snap " + (snapOn ? "ON" : "OFF"));
+          renderInspector();
         };
         const sn = $("snapNearest");
         if (sn) sn.onclick = async () => {

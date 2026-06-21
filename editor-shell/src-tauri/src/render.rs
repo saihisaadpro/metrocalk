@@ -14,8 +14,13 @@ use std::sync::{Arc, Mutex};
 
 use glam::{Mat4, Vec3, Vec4};
 use metrocalk_assets::{MeshGpu, MeshVertex};
+use metrocalk_editor_shell::reveal::intent_order;
 use metrocalk_gizmo::{Gizmo, TransformGizmo};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+
+/// M9.4 — the magnetic-snap radius (world units): during a gizmo drag the dragged instance snaps onto the
+/// nearest meaningful target within this range (the live "magnetic intent snapping").
+pub const SNAP_RADIUS: f32 = 1.5;
 
 /// Total UI→core IPC calls (every `#[tauri::command]` bumps this). The render loop reports it next to
 /// the frame count so a sustained drag can be shown to cross the JS boundary **zero times per frame**
@@ -112,6 +117,16 @@ pub struct SceneState {
     /// the OS cursor (so an E2E can drive the SAME render-loop drag path deterministically). `None` ⇒ the
     /// live OS cursor drives (the production path).
     pub gizmo_test_cursor: Option<(f32, f32)>,
+    /// M9.4 — per-instance snap **affinity** (parallel to `instances`): a pivot (a parent) is a stronger
+    /// spatial intent than a bare origin, so it wins the affinity tiebreak in the shared ADR-011 ranker
+    /// ([`nearest_snap`]). Built on rebuild from the engine's hierarchy.
+    pub snap_affinity: Vec<u32>,
+    /// M9.4 — magnetic snapping disabled (default `false` ⇒ snapping ON). The render-loop drag pulls the
+    /// dragged instance onto the nearest snap target when enabled; toggled by the `set_snap` command.
+    pub snap_disabled: bool,
+    /// M9.4 — the current snap **ghost** (the nearest target's world position during a drag), drawn as an
+    /// overlay marker + read by `snap_ghost` (the HUD/E2E). `None` ⇒ no candidate in range / not dragging.
+    pub snap_ghost: Option<[f32; 3]>,
 }
 
 pub type Shared = Arc<Mutex<SceneState>>;
@@ -580,7 +595,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         st.cam_target,
                     );
                     let snap = st.gizmo_snap;
-                    let world_new = st.gizmo.drag_update(
+                    let mut world_new = st.gizmo.drag_update(
                         metrocalk_gizmo::Ray {
                             origin: ro,
                             dir: rd,
@@ -589,6 +604,24 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     );
                     if let Some(sel) = st.gizmo_sel {
                         if sel < st.instances.len() {
+                            // M9.4 magnetic intent snapping (0 per-frame IPC, all native): find the nearest
+                            // meaningful target (the SHARED ADR-011 ranker) to the dragged position; show its
+                            // ghost, and — unless snapping is disabled — pull the drag onto it. The drag_end
+                            // command re-applies the same snap so the committed pose matches the ghost.
+                            let ghost = nearest_snap(
+                                &st.instances,
+                                &st.snap_affinity,
+                                sel,
+                                world_new.translation,
+                                SNAP_RADIUS,
+                            )
+                            .map(|i| st.instances[i].center);
+                            st.snap_ghost = ghost;
+                            if !st.snap_disabled {
+                                if let Some(g) = ghost {
+                                    world_new.translation = g;
+                                }
+                            }
                             // Apply the full TRS live: translate→center, rotate→rotation (so a tumble/pose
                             // is VISIBLE via the shader), scale→display scale (multiplied from the start
                             // scale). Re-upload only on actual change (a frozen drag costs nothing, and the
@@ -607,6 +640,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         }
                     }
                 }
+            } else if st.snap_ghost.is_some() {
+                st.snap_ghost = None; // clear the snap ghost when not dragging
             }
             // Upload per-asset mesh GEOMETRY once when the asset set changes (rare — loaded at startup).
             if st.meshes_revision != cur_mesh_rev {
@@ -683,7 +718,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // M9.1: regenerate the gizmo geometry at the selected entity each frame — constant pixel size,
             // and it follows the entity through a drag. Empty when nothing is selected → the pass is
             // skipped (zero cost). World-space basis (the cube/mesh shaders don't show rotation).
-            let gizmo_verts: Vec<Instance> = match st.selected {
+            let mut gizmo_verts: Vec<Instance> = match st.selected {
                 Some(sel) if sel < st.instances.len() => {
                     let origin = st.instances[sel].center;
                     let eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
@@ -702,6 +737,24 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 }
                 _ => Vec::new(),
             };
+            // M9.4: the snap **ghost** — a small cyan 3-axis cross at the nearest target during a drag
+            // (constant pixel size), drawn through the same overlay pass. Empty unless snapping is live.
+            if let Some(g) = st.snap_ghost {
+                let eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+                let s = metrocalk_gizmo::pixel_scale(eye, g, 55f32.to_radians(), 0.05);
+                const GHOST: [f32; 3] = [0.2, 0.9, 0.9];
+                for ax in [[s, 0.0, 0.0], [0.0, s, 0.0], [0.0, 0.0, s]] {
+                    let mark = |o: f32| Instance {
+                        center: [g[0] + ax[0] * o, g[1] + ax[1] * o, g[2] + ax[2] * o],
+                        scale: 0.0,
+                        color: GHOST,
+                        selected: 0.0,
+                        rotation: IDENTITY_QUAT,
+                    };
+                    gizmo_verts.push(mark(-1.0));
+                    gizmo_verts.push(mark(1.0));
+                }
+            }
             // Focus dim flag (read under the same lock as the camera, so it can't lag the frame).
             (
                 cam,
@@ -886,6 +939,41 @@ pub fn pick_nearest(instances: &[Instance], cursor: (f32, f32), view_proj: &Mat4
         }
     }
     best.or(best_nc).map(|(i, _)| i)
+}
+
+/// M9.4 — the index of the nearest snap target to `from` (excluding `sel`) within `radius`, ranked by the
+/// **shared ADR-011 `intent_order`** (proximity primary, then affinity — the *same* ranker the bind reveal
+/// and the snap-graph use, NOT a parallel heuristic; the adversarial guard). `None` if nothing is in range.
+/// Runs on the render thread during a drag (0 per-frame IPC). The recency tiebreak is omitted on this hot
+/// path — distance and affinity dominate, and exact ties are negligible for continuous float positions.
+#[must_use]
+pub fn nearest_snap(
+    instances: &[Instance],
+    affinity: &[u32],
+    sel: usize,
+    from: [f32; 3],
+    radius: f32,
+) -> Option<usize> {
+    let mut best: Option<(usize, (f32, u32, u64, u64))> = None;
+    for (i, inst) in instances.iter().enumerate() {
+        if i == sel {
+            continue;
+        }
+        let (dx, dy, dz) = (
+            from[0] - inst.center[0],
+            from[1] - inst.center[1],
+            from[2] - inst.center[2],
+        );
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist > radius {
+            continue;
+        }
+        let key = (dist, affinity.get(i).copied().unwrap_or(0), 0u64, i as u64);
+        if best.is_none_or(|(_, bk)| intent_order(key, bk) == std::cmp::Ordering::Less) {
+            best = Some((i, key));
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 /// The camera eye (world position) for the orbit camera — the cursor ray origin + the pixel-scale
