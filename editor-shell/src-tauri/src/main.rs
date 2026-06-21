@@ -1569,6 +1569,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         });
                         let comps = engine.components_of(eid);
                         if comps.contains_key("RigidBody") && comps.contains_key("Collider") {
+                            // The gizmo MOVED this body — restart it from the new ECS Transform, not its
+                            // stale sim position. Dropping it from `body_of` makes restart_run's
+                            // record_body read the just-committed Transform for it (zeroing velocity from
+                            // the gizmo placement); the OTHER bodies keep their current simulated state.
+                            body_of.remove(&eid);
                             (recording, rec_entities, sim, body_of) =
                                 restart_run(&engine, &assets, &sim, &body_of);
                             frame = 0;
@@ -2308,17 +2313,25 @@ fn rebuild(
         })
         .collect();
     let mut st = shared.lock().unwrap();
-    let prev_sel = st.selected;
+    // Preserve selection by entity ID, NOT index: the instance index is invalidated whenever entities are
+    // added/removed, so restoring `selected`/`gizmo_sel` by index would silently retarget a DIFFERENT
+    // entity (e.g. deleting an entity before the selected one). Capture the ids before `ids` is replaced.
+    let prev_sel_id = st.selected.and_then(|i| st.ids.get(i).cloned());
+    let prev_gizmo_id = st.gizmo_sel.and_then(|i| st.ids.get(i).cloned());
     st.instances = instances;
     st.ids = ids;
     st.mesh_slots = mesh_slots;
     st.line_points = line_points;
-    if let Some(i) = prev_sel {
-        if i < st.instances.len() {
-            st.instances[i].selected = 1.0;
-        } else {
-            st.selected = None;
-        }
+    st.selected = prev_sel_id.and_then(|id| st.ids.iter().position(|k| *k == id));
+    if let Some(i) = st.selected {
+        st.instances[i].selected = 1.0;
+    }
+    // Keep an active gizmo drag pinned to its entity by ID; if the dragged entity is gone (deleted
+    // elsewhere), end the drag cleanly rather than freezing it on a stale index.
+    st.gizmo_sel = prev_gizmo_id.and_then(|id| st.ids.iter().position(|k| *k == id));
+    if st.gizmo_dragging && st.gizmo_sel.is_none() {
+        st.gizmo_dragging = false;
+        st.gizmo.drag_end();
     }
     st.revision = st.revision.wrapping_add(1);
 }
@@ -2948,13 +2961,48 @@ fn gizmo_handle_screen(
 
 /// M9.1 — end the gizmo drag and COMMIT the coalesced move as ONE undoable transaction.
 #[tauri::command]
-fn gizmo_drag_end(state: State<AppState>) {
+fn gizmo_drag_end(window: tauri::WebviewWindow, state: State<AppState>) {
     ipc();
     let commit = {
         let mut st = state.shared.lock().unwrap();
         if !st.gizmo_dragging {
             None
         } else {
+            // Run ONE final drag_update with the current cursor so the committed position is the EXACT
+            // release point — not the (up to one frame stale) last render-loop result (the race the review
+            // flagged). drag_update is a pure function of the cursor, so re-running it is idempotent.
+            let aspect = window.inner_size().map_or(16.0 / 9.0, |s| {
+                s.width.max(1) as f32 / s.height.max(1) as f32
+            });
+            let cursor = st.gizmo_test_cursor.or_else(|| {
+                let p = window.cursor_position().ok()?;
+                let s = window.inner_size().ok()?;
+                Some((
+                    p.x as f32 / s.width.max(1) as f32,
+                    p.y as f32 / s.height.max(1) as f32,
+                ))
+            });
+            if let (Some(cur), Some(sel)) = (cursor, st.gizmo_sel) {
+                if sel < st.instances.len() {
+                    let (ro, rd) = render::cursor_ray(
+                        cur,
+                        st.orbit,
+                        st.elevation,
+                        st.distance,
+                        aspect,
+                        st.cam_target,
+                    );
+                    let snap = st.gizmo_snap;
+                    let world_final = st.gizmo.drag_update(
+                        Ray {
+                            origin: ro,
+                            dir: rd,
+                        },
+                        snap,
+                    );
+                    st.instances[sel].center = world_final.translation;
+                }
+            }
             st.gizmo_dragging = false;
             st.gizmo.drag_end();
             st.gizmo_test_cursor = None;
