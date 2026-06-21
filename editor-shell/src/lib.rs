@@ -19,6 +19,7 @@ pub mod metering;
 pub mod persist;
 pub mod physics_intent;
 pub mod reveal;
+pub mod transform_solver;
 pub mod wallet;
 
 pub use actions::{actions_for, Action, ActionItem};

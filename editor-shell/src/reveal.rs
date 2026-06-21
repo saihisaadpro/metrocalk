@@ -127,25 +127,34 @@ pub fn reveal<W: World>(world: &W, selected: Entity, rels: Rels, ctx: &Context<'
         })
         .collect();
 
-    // Deterministic intent ranking: nearer first, then better capability fit, then more-recently
-    // touched, then a stable entity-id tiebreak (so the same scene always yields the same order).
+    // Deterministic intent ranking via the SHARED ordering (the same one the M9.4 snap-graph reuses).
     compatible.sort_by(|a, b| {
-        a.distance
-            .partial_cmp(&b.distance)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.affinity.cmp(&a.affinity))
-            .then_with(|| {
-                let ra = ctx.recency.get(&a.entity).copied().unwrap_or(0);
-                let rb = ctx.recency.get(&b.entity).copied().unwrap_or(0);
-                rb.cmp(&ra)
-            })
-            .then(a.entity.0.cmp(&b.entity.0))
+        let ra = ctx.recency.get(&a.entity).copied().unwrap_or(0);
+        let rb = ctx.recency.get(&b.entity).copied().unwrap_or(0);
+        intent_order(
+            (a.distance, a.affinity, ra, a.entity.0),
+            (b.distance, b.affinity, rb, b.entity.0),
+        )
     });
 
     Reveal {
         required: required_names,
         compatible,
     }
+}
+
+/// The deterministic **ADR-011 intent ordering** — the ONE ranker, shared by the bind reveal *and* the
+/// M9.4 transform **snap-graph** (so snapping never grows a parallel heuristic — the adversarial guard):
+/// **nearer first** (distance asc), then **better fit** (affinity desc), then **more-recently-touched**
+/// (recency desc), then a **stable id tiebreak** (asc) so the same scene always yields the same order.
+/// Each item is `(distance, affinity, recency, stable_id)`.
+#[must_use]
+pub fn intent_order(a: (f32, u32, u64, u64), b: (f32, u32, u64, u64)) -> std::cmp::Ordering {
+    a.0.partial_cmp(&b.0)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then(b.1.cmp(&a.1))
+        .then(b.2.cmp(&a.2))
+        .then(a.3.cmp(&b.3))
 }
 
 /// Explain why `candidate` can't be bound to `selected`, or `None` if it actually IS compatible.
