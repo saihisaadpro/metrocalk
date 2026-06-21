@@ -540,4 +540,52 @@ describe("Metrocalk editor — north-star #1 live", () => {
       timeoutMsg: "Ctrl-Z did not restore the deactivated part (deactivate-not-delete)",
     });
   });
+
+  // ── M9.4 (G4): the intent-powered transform solver — snap-graph (ADR-011 reuse) + declared constraints
+  // (every "no" explained) + a natural-language placement sentence (schema-validated patch). ─────────────
+  it("M9.4: the snap-graph ranks targets, a declared constraint solves or explains, a placement sentence compiles", async () => {
+    const demo = await invokeT("demo_character"); // [root, [parts]]
+    const [root, parts] = demo;
+    const part = parts[0];
+
+    // The snap-graph: ranked candidates within radius, each with an explained "why this" (the reveal/rank/
+    // explain pattern applied to space — the SAME ADR-011 ranker, reused).
+    const hits = await invokeT("snap_query", { id: part, radius: 100.0 });
+    expect(Array.isArray(hits) && hits.length > 0).toBe(true);
+    expect(typeof hits[0].why).toBe("string");
+    expect(hits[0].why.toLowerCase()).toContain("snap to");
+    // Ranked nearest-first (proximity primary, ADR-011).
+    expect(hits[0].distance).toBeLessThanOrEqual(hits[hits.length - 1].distance + 1e-3);
+
+    // Declare a "snap" constraint → the part moves to the target's world position (solve + commit, undoable).
+    const rootDbg = await invokeT("part_debug", { id: root }); // [x, y, z, active, nOverrides]
+    const res = await invokeT("apply_constraint", { id: part, kind: "snap", target: root, value: 0.0 });
+    expect(res.ok).toBe(true);
+    await browser.waitUntil(
+      async () => {
+        const d = await invokeT("part_debug", { id: part });
+        return Math.abs(d[0] - rootDbg[0]) < 0.1 && Math.abs(d[1] - rootDbg[1]) < 0.1 && Math.abs(d[2] - rootDbg[2]) < 0.1;
+      },
+      { timeout: 10000, timeoutMsg: "the snap constraint did not move the part to the target" }
+    );
+
+    // A constraint with no target is REFUSED, with an explanation (every "no" explained, ADR-016).
+    const blocked = await invokeT("apply_constraint", { id: part, kind: "coaxial", target: null, value: 0.0 });
+    expect(blocked.ok).toBe(false);
+    expect(typeof blocked.reason).toBe("string");
+    expect(blocked.reason.length).toBeGreaterThan(0);
+
+    // A natural-language placement sentence compiles to editable intents (the AI-as-constraint-compiler).
+    const placed = await invokeT("placement_sentence", {
+      id: root,
+      text: "put it upright, 10 cm from the edge",
+    });
+    expect(Array.isArray(placed.intents) && placed.intents.length > 0).toBe(true);
+
+    // Physics-aware placement feedback reuses the M8.3 collider-intelligence check (a body placed without a
+    // collider is flagged + explained, never a silent runtime glitch).
+    const body = await invokeT("spawn_body", { x: 0, y: 5, z: 0 });
+    const warnings = await invokeT("physics_check", { id: body });
+    expect(Array.isArray(warnings)).toBe(true);
+  });
 });

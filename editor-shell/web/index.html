@@ -213,6 +213,12 @@
         html += `<button id="deactPart" style="margin:4px 12px;background:#5a1f2f">🗑 Deactivate part (Ctrl-Z restores)</button>`;
         html += `<div class="field"><span>reparent under</span><input id="reparentTo" placeholder="paste an entity id — empty = root"/></div>`;
         html += `<button id="reparentBtn" style="margin:4px 12px;background:#3a3a1f">↳ Reparent (node.move)</button>`;
+        // ── M9.4 transform solver: snap to the nearest meaningful target (ADR-011-ranked), or place by a
+        // natural-language sentence (compiled to editable constraints → a schema-validated patch).
+        html += `<div style="opacity:.7;margin-top:10px;border-top:1px solid #333;padding-top:6px">transform solver (M9.4)</div>`;
+        html += `<button id="snapNearest" style="margin:4px 12px;background:#1f4a3a">🧲 Snap to nearest</button>`;
+        html += `<div class="field"><span>place by sentence</span><input id="placeSentence" placeholder="e.g. upright, 10 cm from the edge"/></div>`;
+        html += `<button id="placeBtn" style="margin:4px 12px;background:#2f3a5a">✦ Apply placement</button>`;
         $("inspector").innerHTML = html;
         for (const inp of $("inspector").querySelectorAll("input")) {
           inp.onchange = () => editField(selected, inp.dataset.c, inp.dataset.f, parseMaybeNumber(inp.value));
@@ -241,6 +247,23 @@
           const to = $("reparentTo").value.trim();
           invoke("reparent_part", { id: selected, parent: to === "" ? null : to });
           status("reparented" + (to ? " under " + to : " to root") + " (Ctrl-Z to undo)");
+        };
+        const sn = $("snapNearest");
+        if (sn) sn.onclick = async () => {
+          const hits = await invoke("snap_query", { id: selected, radius: 1000.0 });
+          if (!hits || !hits.length) { status("no snap targets nearby"); return; }
+          const top = hits[0];
+          const res = await invoke("apply_constraint", { id: selected, kind: "snap", target: top.id, value: 0.0 });
+          status(res.ok ? "snapped — " + top.why : "snap blocked: " + (res.reason || ""));
+        };
+        const pb = $("placeBtn");
+        if (pb) pb.onclick = async () => {
+          const text = $("placeSentence").value.trim();
+          if (!text) { status("type a placement sentence"); return; }
+          const res = await invoke("placement_sentence", { id: selected, text });
+          if (res.ok) status("placed: " + (res.intents || []).join(", "));
+          else status("couldn't place: " + (res.reason || "no constraints recognized") +
+            (res.intents && res.intents.length ? " (intents: " + res.intents.join(", ") + ")" : ""));
         };
       }
       const parseMaybeNumber = (s) => { const n = Number(s); return s.trim() !== "" && !isNaN(n) ? n : s; };
