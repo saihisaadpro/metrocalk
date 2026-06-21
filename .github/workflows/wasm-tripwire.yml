@@ -189,3 +189,28 @@ jobs:
         run: |
           cargo build -p metrocalk-skeleton --release --target wasm32-unknown-unknown
           echo "metrocalk-skeleton wasm32 build OK"
+
+  wasm32-deform:
+    name: build wasm32 (metrocalk-deform)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The high-fidelity deformation tier (M9.5 / G5, ADR-029): the ARAP handle-deformer + auto-skin-weights
+      # reimplemented on our OWN deterministic primitives (a fixed-sweep Jacobi SVD + a sequential dense
+      # Cholesky — NO rayon, the audited-out determinism hazard), f64 throughout. Pure Rust (no foreign math
+      # type leaks), so the deform path reaches the browser (ADR-006). `-p metrocalk-deform` pulls only
+      # metrocalk-skeleton (glam + the gizmo plain arrays) — never core/ecs/Flecs/rapier.
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-deform --release --target wasm32-unknown-unknown
+          echo "metrocalk-deform wasm32 build OK"

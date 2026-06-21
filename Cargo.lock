@@ -1304,6 +1304,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrocalk-deform"
+version = "0.1.0"
+dependencies = [
+ "metrocalk-skeleton",
+]
+
+[[package]]
 name = "metrocalk-economy"
 version = "0.1.0"
 dependencies = [

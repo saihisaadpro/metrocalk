@@ -1,0 +1,23 @@
+# metrocalk-deform (M9.5 / G5, ADR-029) — the high-fidelity mesh-deformation tier.
+#
+# The fidelity rung above rigid part editing (G2) and bone-LBS (G3): drag a handle, the surface FLOWS
+# (As-Rigid-As-Possible). We REIMPLEMENT the ARAP local/global loop ourselves (not `baby_shark`) so the
+# determinism is ours by construction — pinned iteration count, a deterministic Jacobi SVD with a fixed
+# sign convention, and a sequential dense Cholesky (NO rayon, whose reduction order is the determinism
+# hazard the ADR audits). f64 throughout (the M8.1 / ADR-020 cross-ISA-deterministic path), region-of-
+# interest restricted (the cost knob). Pure Rust (glam's f64 types behind a plain-array boundary, no
+# foreign type leaks — invariant 5), so the deform path crosses to `wasm32-unknown-unknown` (ADR-006).
+[package]
+name = "metrocalk-deform"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The skeletal runtime (G3): the auto-skin-weights path produces per-vertex JOINTS_0/WEIGHTS_0 that
+# `skeleton::skin_position` (LBS) consumes — bone-driven smooth deform = our weights → G3's LBS. Pure
+# Rust (glam + the gizmo crate's plain arrays), wasm32-clean.
+metrocalk-skeleton = { path = "../skeleton" }
+
+[lints]
+workspace = true
