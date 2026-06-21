@@ -744,6 +744,62 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only timing measurement (run --release)"
+    )]
+    fn overlay_query_fits_the_frame_budget_at_scale() {
+        // M8.4 deliverable 6 — the OVERLAY-ON per-frame cost: a step PLUS a full diagnostics() query (the
+        // contact debugger's per-frame read) must still fit one 60 Hz frame on min-spec. Overlay-OFF is the
+        // step-only cost (the test above) — diagnostics aren't queried, so the overlay adds ZERO when
+        // closed. This proves the "no per-frame cost when closed, holds the budget when open" claim with a
+        // measurement, not an assertion. Same 100-body scale + absolute gate as the step bench.
+        let mut p = RapierPhysics::new(PhysicsConfig::default());
+        let ground = p.add_body(&BodyDesc::new(BodyKind::Fixed, [0.0, 0.0, 0.0]));
+        p.add_collider(
+            ground,
+            &ColliderDesc::new(ColliderShape::Cuboid {
+                half_extents: [30.0, 0.5, 30.0],
+            }),
+        )
+        .unwrap();
+        for i in 0..100u32 {
+            let b = p.add_body(&BodyDesc::new(
+                BodyKind::Dynamic,
+                [
+                    f64::from(i % 10) * 1.1 - 5.0,
+                    3.0 + f64::from(i / 10) * 1.1,
+                    0.0,
+                ],
+            ));
+            p.add_collider(b, &ColliderDesc::new(ColliderShape::Ball { radius: 0.5 }))
+                .unwrap();
+        }
+        for _ in 0..60 {
+            p.step(); // warm + settle so contacts exist (the overlay's worst case = many live contacts)
+        }
+        let mut times = Vec::with_capacity(300);
+        for _ in 0..300 {
+            let t0 = std::time::Instant::now();
+            p.step();
+            let d = p.diagnostics(); // the overlay's per-frame read
+            std::hint::black_box(&d);
+            times.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = times[times.len() / 2];
+        let p99 = times[times.len() * 99 / 100];
+        let contacts = p.diagnostics().contact_count;
+        eprintln!(
+            "[M8.4] step + overlay diagnostics @100 bodies ({contacts} contacts): p50={p50:.3}ms p99={p99:.3}ms"
+        );
+        assert!(
+            p99 < 16.0,
+            "overlay-on per-frame work (p99={p99:.3}ms) must fit one 60 Hz frame at 100 bodies"
+        );
+    }
+
+    #[test]
     fn derive_collider_reports_fit_and_concavity() {
         // A unit cube — convex, so its hull fits perfectly (fit_error ≈ 0, not concave).
         let cube = [
