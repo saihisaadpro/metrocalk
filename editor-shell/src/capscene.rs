@@ -175,10 +175,12 @@ fn intern_cap(
 /// A fingerprint of the deterministic scene this build produces, persisted as the replay log's header.
 /// Replay refuses (and discards) a log written by an incompatible build — different seed, scene size,
 /// or `seed()` algorithm — rather than replaying saved ids against a divergent id space (which would
-/// silently bind the wrong entities). **Bump `mtkscene1` whenever [`seed`]'s draw sequence changes.**
+/// silently bind the wrong entities). **Bump the `mtksceneN` tag whenever [`seed`]'s — or the
+/// post-seed deterministic construction's — draw sequence changes** (M9.2 added a composed character
+/// right after the seed, shifting the post-seed alloc sequence → `mtkscene2`).
 #[must_use]
 pub fn fingerprint(n: usize) -> String {
-    format!("mtkscene1 seed={SEED:#x} n={n}")
+    format!("mtkscene2 seed={SEED:#x} n={n}")
 }
 
 /// Seed `n` entities through the commit pipeline: each gets a `Transform` (spread in a volume, the
@@ -934,6 +936,96 @@ pub fn reparent(
             new_parent,
         }],
     )
+}
+
+/// **Deactivate-not-delete** a part (or reactivate it) — one undoable `SetActive` (ADR-026). The entity,
+/// its data, and a concurrent editor's edits are all preserved; the renderer hides a deactivated child,
+/// and undo re-activates it (the part reappears).
+///
+/// # Errors
+/// [`PipelineError::UnknownEntity`] if `id` isn't a live entity.
+pub fn set_part_active(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+    active: bool,
+) -> Result<(), PipelineError> {
+    engine.commit(
+        "set-part-active",
+        vec![Op::SetActive { entity: id, active }],
+    )
+}
+
+/// Seed a small **composed character** for rigid part editing (M9.2 / G2): a root "body" with two child
+/// parts, each a child Movable-Tree node with its own LOCAL `Transform` (+ a `MeshRenderer` handle so it
+/// renders, + a `Part` marker so the inspector names it) — ONE undoable transaction. Returns `(root,
+/// [part0, part1])`. The parts are selected + gizmo-edited like any entity; editing a child writes a
+/// per-field override ([`edit_part_transform`]), reparenting is [`reparent`], and the whole character is
+/// saved for reuse via `Engine::save_composition`. Deterministic ids (seeded as scene construction) so
+/// the override-edit persistence (`Record::EditPart`) re-binds across launches.
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the create transaction fails (it shouldn't — ops are consistent).
+pub fn compose_character(
+    engine: &mut Engine<FlecsWorld>,
+    pos: [f32; 3],
+    mesh: Option<&str>,
+) -> Result<(EntityId, Vec<EntityId>), PipelineError> {
+    let root = engine.alloc_entity_id();
+    let parts = [engine.alloc_entity_id(), engine.alloc_entity_id()];
+    let tf = |entity, f: &str, v: f32| Op::SetField {
+        entity,
+        component: "Transform".into(),
+        field: f.into(),
+        value: FieldValue::Number(f64::from(v)),
+    };
+    let mesh_op = |entity| {
+        mesh.map(|h| Op::SetField {
+            entity,
+            component: "MeshRenderer".into(),
+            field: MESH_FIELD.into(),
+            value: FieldValue::Str(h.to_string()),
+        })
+    };
+    let mut ops = vec![
+        Op::CreateEntity {
+            id: root,
+            parent: None,
+        },
+        tf(root, "x", pos[0]),
+        tf(root, "y", pos[1]),
+        tf(root, "z", pos[2]),
+    ];
+    ops.extend(mesh_op(root));
+    // Two rigid child parts at local offsets either side of the body (local-space, so a body move/rotate
+    // carries them — the "descendants follow" demo).
+    for (part, dx) in [(parts[0], 1.2_f32), (parts[1], -1.2_f32)] {
+        ops.push(Op::CreateEntity {
+            id: part,
+            parent: Some(root),
+        });
+        ops.push(tf(part, "x", dx));
+        ops.push(tf(part, "y", 0.8));
+        ops.extend(mesh_op(part));
+        ops.push(Op::SetField {
+            entity: part,
+            component: "Part".into(),
+            field: "kind".into(),
+            value: FieldValue::Str("rigid".into()),
+        });
+    }
+    engine.commit("compose-character", ops)?;
+    Ok((root, parts.to_vec()))
+}
+
+/// The root of the Movable-Tree subtree `id` belongs to (walk parents to the top) — so the **whole
+/// character** can be saved from any selected part (`Engine::save_composition` takes the root).
+#[must_use]
+pub fn root_of(engine: &Engine<FlecsWorld>, id: EntityId) -> EntityId {
+    let mut cur = id;
+    while let Some(p) = engine.parent_of(cur) {
+        cur = p;
+    }
+    cur
 }
 
 /// Apply a **marketplace entry** as a new pre-componentized scene entity — its component (display

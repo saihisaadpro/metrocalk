@@ -355,6 +355,34 @@ enum EngineCmd {
         id: String,
         reply: Sender<[f64; 8]>,
     },
+    /// M9.2 — reparent a part ("drag in hierarchy") = one `node.move` (parent `None` → root). Undoable.
+    ReparentPart {
+        id: String,
+        parent: Option<String>,
+    },
+    /// M9.2 — deactivate-not-delete a part (or reactivate it); one undoable tx. Replies whether applied.
+    SetPartActive {
+        id: String,
+        active: bool,
+        reply: Sender<bool>,
+    },
+    /// M9.2 — save the selected part's whole character (its root subtree) as a reusable `Composition`,
+    /// kept in an in-memory registry; replies the new composition id.
+    SaveCharacter {
+        id: String,
+        reply: Sender<Option<String>>,
+    },
+    /// M9.2 — drop a fresh instance of a saved `Composition` (by id); replies the new instance root id.
+    InstantiateCharacter {
+        comp_id: String,
+        reply: Sender<Option<String>>,
+    },
+    /// M9.2 — a part's resolved world position + active flag + override-key count, for the E2E to confirm
+    /// the override landed / a deactivate hid it / the source link survives. `(x, y, z, active, n_over)`.
+    PartDebug {
+        id: String,
+        reply: Sender<(f64, f64, f64, bool, usize)>,
+    },
     /// Internal fixed-timestep heartbeat (M8.2): a self-sent tick that advances the sim one step + syncs
     /// transforms to the viewport. NOT a JS command — it never crosses the WebView boundary (invariant 4).
     Tick,
@@ -613,8 +641,25 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     let scene = CapScene::intern(&mut world);
     let mut engine = Engine::new(world, 1);
     let index = capscene::seed(&mut engine, &scene, SCENE_N).expect("seed capability scene");
-    // The seed is scene construction, not a user edit — drop it from the undo stack so Ctrl-Z can
-    // never undo past the user's binds and delete the whole world (the bug a live Ctrl-Z surfaced).
+    // M9.2: a small **composed character** (a body root + two rigid child parts) for part editing —
+    // seeded as deterministic scene construction right after the seed (its ids are stable across launches
+    // so the override-edit persistence re-binds; the `mtkscene2` fingerprint reflects this added draw).
+    // The parts render as the prop mesh; click one → gizmo-edit it (a per-field override).
+    let demo_char = capscene::compose_character(
+        &mut engine,
+        [0.0, 1.0, 6.0],
+        assets.catalog.get("MeshRenderer").map(String::as_str),
+    )
+    .ok();
+    if let Some((root, parts)) = &demo_char {
+        eprintln!(
+            "[shell] composed a demo character: body {} with {} rigid parts (click a part to edit it)",
+            root.to_loro_key(),
+            parts.len()
+        );
+    }
+    // The seed + the composed character are scene construction, not user edits — drop them from the undo
+    // stack so Ctrl-Z can never undo past the user's binds and delete the whole world.
     engine.clear_history();
 
     // Live persistence: re-seeding is deterministic (same SEED → identical ids), so replay the
@@ -648,6 +693,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // completion settles (success) or releases (failure) exactly the right hold. Lives on this thread
     // only, so reserve→settle/release is atomic (no race).
     let mut pending_gen: HashMap<String, HoldId> = HashMap::new();
+    // M9.2: saved characters — `save_composition` results kept in-memory by id, so a later "drop instance"
+    // re-instantiates them (the marketplace index would carry these — the same serializable Composition).
+    // A counter makes each saved id unique within the session. (Session-scoped; persisting saved
+    // compositions + their instantiations across reload is a named follow-up — the override EDITS persist.)
+    let mut compositions: HashMap<String, metrocalk_core::Composition> = HashMap::new();
+    let mut comp_seq: u32 = 0;
 
     // ── M8.2/M8.4 physics: the deterministic sim (f64 + enhanced-determinism, gameplay fidelity) the
     // engine thread owns, driven over the **sim-replay channel** (ADR-021/023 — distinct from Loro
@@ -1565,10 +1616,39 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 rot,
                 scale,
             } => {
-                // M9.1: the gizmo drag's coalesced delta lands as ONE undoable transaction (Transform
-                // position + rotation + scale in one commit). A physics body re-simulates from the new pose.
+                // M9.1/M9.2: the gizmo drag's coalesced delta lands as ONE undoable transaction. A CHILD
+                // PART (M9.2 / ADR-026) gets **parent-space write-back → a per-field OVERRIDE** (non-
+                // destructive, override-wins by structure); a flat root keeps the M9.1 base `set_transform`.
+                // Both persist + a physics body re-simulates from the new pose.
                 if let Some(eid) = EntityId::from_loro_key(&id) {
-                    if capscene::set_transform(&mut engine, eid, pos, rot, scale).is_ok() {
+                    let applied = if engine.parent_of(eid).is_some() {
+                        match capscene::edit_part_transform(
+                            &mut engine,
+                            eid,
+                            GizmoTransform {
+                                translation: pos,
+                                rotation: rot,
+                                scale: [scale, scale, scale],
+                            },
+                        ) {
+                            // Persist the LOCAL (parent-independent ⇒ deterministic replay).
+                            Ok(local) => {
+                                log.append(&Record::EditPart {
+                                    id: id.clone(),
+                                    x: f64::from(local.translation[0]),
+                                    y: f64::from(local.translation[1]),
+                                    z: f64::from(local.translation[2]),
+                                    qx: f64::from(local.rotation[0]),
+                                    qy: f64::from(local.rotation[1]),
+                                    qz: f64::from(local.rotation[2]),
+                                    qw: f64::from(local.rotation[3]),
+                                    scale: f64::from(local.scale[0]),
+                                });
+                                true
+                            }
+                            Err(_) => false,
+                        }
+                    } else if capscene::set_transform(&mut engine, eid, pos, rot, scale).is_ok() {
                         log.append(&Record::Transform {
                             id: id.clone(),
                             x: f64::from(pos[0]),
@@ -1580,6 +1660,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             qw: f64::from(rot[3]),
                             scale: f64::from(scale),
                         });
+                        true
+                    } else {
+                        false
+                    };
+                    if applied {
                         let comps = engine.components_of(eid);
                         if comps.contains_key("RigidBody") && comps.contains_key("Collider") {
                             // The gizmo MOVED this body — restart it from the new ECS Transform, not its
@@ -1633,6 +1718,86 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     })
                     .unwrap_or([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]);
                 let _ = reply.send(t);
+            }
+            EngineCmd::ReparentPart { id, parent } => {
+                // M9.2 "drag in hierarchy": one node.move, undoable + persisted; re-sync the projection.
+                if let Some(eid) = EntityId::from_loro_key(&id) {
+                    let p = parent.as_deref().and_then(EntityId::from_loro_key);
+                    if capscene::reparent(&mut engine, eid, p).is_ok() {
+                        log.append(&Record::Reparent {
+                            id: id.clone(),
+                            parent: parent.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            let _ = ch.send(project_full(&engine));
+                        }
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                    }
+                }
+            }
+            EngineCmd::SetPartActive { id, active, reply } => {
+                // M9.2 deactivate-not-delete (or reactivate): one undoable tx + persist; rebuild hides /
+                // re-shows the part. Undo restores it (the e2e: deactivate → Ctrl-Z brings it back).
+                let ok = EntityId::from_loro_key(&id).is_some_and(|eid| {
+                    capscene::set_part_active(&mut engine, eid, active).is_ok()
+                });
+                if ok {
+                    log.append(&Record::SetPartActive {
+                        id: id.clone(),
+                        active,
+                    });
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::SaveCharacter { id, reply } => {
+                // M9.2 save-for-reuse: snapshot the selected part's WHOLE character (its root subtree) into
+                // a reusable Composition (the edited state baked in), kept in the session registry.
+                let comp_id = EntityId::from_loro_key(&id).map(|eid| {
+                    let root = capscene::root_of(&engine, eid);
+                    let cid = format!("char:{}:{comp_seq}", root.to_loro_key());
+                    comp_seq += 1;
+                    let comp = engine.save_composition(root, &cid);
+                    compositions.insert(cid.clone(), comp);
+                    cid
+                });
+                let _ = reply.send(comp_id);
+            }
+            EngineCmd::InstantiateCharacter { comp_id, reply } => {
+                // M9.2 "drop a fresh instance": re-instantiate a saved Composition — independently-id'd,
+                // pre-componentized, the edit present (override-wins), linked back to the source.
+                let new_root = compositions.get(&comp_id).and_then(|comp| {
+                    engine
+                        .instantiate_composition(comp)
+                        .ok()
+                        .map(|root| (root, root.to_loro_key()))
+                });
+                if let Some((root, _)) = &new_root {
+                    echo_created(
+                        &mut engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &channel,
+                        &mut recency,
+                        &mut touch,
+                        *root,
+                    );
+                }
+                let _ = reply.send(new_root.map(|(_, key)| key));
+            }
+            EngineCmd::PartDebug { id, reply } => {
+                let info = EntityId::from_loro_key(&id).map_or((0.0, 0.0, 0.0, false, 0), |eid| {
+                    let g = capscene::global_transform(&engine, eid);
+                    (
+                        f64::from(g.translation[0]),
+                        f64::from(g.translation[1]),
+                        f64::from(g.translation[2]),
+                        engine.is_active(eid),
+                        engine.overrides_of(eid).len(),
+                    )
+                });
+                let _ = reply.send(info);
             }
             EngineCmd::PhysicsDebug { reply } => {
                 let min_y = body_of
@@ -2280,6 +2445,19 @@ fn echo_created(
     rebuild(engine, shared, positions, assets);
 }
 
+/// The product of a part's ancestors' local display scales (each `Transform.scale` field, default 1) —
+/// so a child renders enlarged/shrunk with a scaled parent (M9.2 hierarchy scale propagation). `1.0`
+/// for a root (empty chain) ⇒ flat entities are unaffected.
+fn ancestor_scale_product(engine: &Engine<FlecsWorld>, id: EntityId) -> f32 {
+    let mut s = 1.0;
+    let mut cur = engine.parent_of(id);
+    while let Some(p) = cur {
+        s *= capscene::local_transform(engine, p).scale[0];
+        cur = engine.parent_of(p);
+    }
+    s
+}
+
 /// Rebuild the viewport instance list AND the cached `positions` map from the engine's `Transform`
 /// components in one pass (scene truth → viewport + reveal input). The only place scene geometry flows
 /// core → viewport.
@@ -2296,6 +2474,13 @@ fn rebuild(
     // `instances`). An entity with a `MeshRenderer.mesh` handle the store knows renders as that mesh.
     let mut mesh_slots: Vec<i32> = Vec::new();
     for id in engine.entity_ids() {
+        // M9.2 deactivate-not-delete: a deactivated PART is hidden from the viewport (the entity + its
+        // data survive; undo re-activates it → it reappears on the next rebuild). Only children can be
+        // deactivated, so flat entities skip the (override-map) `is_active` read entirely.
+        let is_child = engine.parent_of(id).is_some();
+        if is_child && !engine.is_active(id) {
+            continue;
+        }
         let comps = engine.components_of(id);
         let t = comps.get("Transform");
         let get = |f: &str| -> f32 {
@@ -2305,21 +2490,6 @@ fn rebuild(
                 _ => 0.0,
             })
         };
-        let p = [get("x"), get("y"), get("z")];
-        // Authored rotation (M9.1+ renderer-rotation path): the Transform's quaternion fields qx/qy/qz/qw,
-        // identity when unauthored. A physics body's per-tick rotation overrides this live via sync_out.
-        let rot = {
-            let q = [get("qx"), get("qy"), get("qz"), get("qw")];
-            if q == [0.0; 4] {
-                render::IDENTITY_QUAT
-            } else {
-                q
-            }
-        };
-        if let Some(e) = engine.ecs_entity(id) {
-            positions.insert(e, p);
-        }
-        let key = id.to_loro_key();
         // Resolve the entity's mesh handle (if any) to a render slot + normalized scale.
         let slot = comps
             .get("MeshRenderer")
@@ -2329,12 +2499,50 @@ fn rebuild(
                 _ => None,
             });
         let asset_scale = slot.map_or(0.45, |s| assets.scales.get(s).copied().unwrap_or(0.45));
-        // An authored display scale (a gizmo scale-edit, field `scale`) overrides the asset-normalized
-        // base; absent ⇒ the base. So a scaled entity reloads at its edited size.
-        let scale = match t.and_then(|m| m.get("scale")) {
-            Some(FieldValue::Number(s)) if *s > 0.0 => *s as f32,
-            _ => asset_scale,
+        // M9.2: a CHILD part renders at its **global** transform (`parent·local`, override-resolved) so
+        // descendants follow a parent edit; a FLAT entity (root / instance root / physics body) keeps the
+        // exact M9.1 base read — zero behavior change + zero override-resolution cost for the 5k scene.
+        let (p, rot, scale) = if is_child {
+            let g = capscene::global_transform(engine, id);
+            let resolved_scale = engine
+                .resolved_components(id)
+                .get("Transform")
+                .and_then(|m| m.get("scale"))
+                .and_then(|v| match v {
+                    FieldValue::Number(s) if *s > 0.0 => Some(*s as f32),
+                    _ => None,
+                });
+            let own = resolved_scale.unwrap_or(asset_scale);
+            let rot = if g.rotation == render::IDENTITY_QUAT {
+                render::IDENTITY_QUAT
+            } else {
+                g.rotation
+            };
+            (g.translation, rot, own * ancestor_scale_product(engine, id))
+        } else {
+            let p = [get("x"), get("y"), get("z")];
+            // Authored rotation (M9.1+ renderer-rotation path): qx/qy/qz/qw, identity when unauthored. A
+            // physics body's per-tick rotation overrides this live via sync_out.
+            let rot = {
+                let q = [get("qx"), get("qy"), get("qz"), get("qw")];
+                if q == [0.0; 4] {
+                    render::IDENTITY_QUAT
+                } else {
+                    q
+                }
+            };
+            // An authored display scale (a gizmo scale-edit, field `scale`) overrides the asset-normalized
+            // base; absent ⇒ the base. So a scaled entity reloads at its edited size.
+            let scale = match t.and_then(|m| m.get("scale")) {
+                Some(FieldValue::Number(s)) if *s > 0.0 => *s as f32,
+                _ => asset_scale,
+            };
+            (p, rot, scale)
         };
+        if let Some(e) = engine.ecs_entity(id) {
+            positions.insert(e, p);
+        }
+        let key = id.to_loro_key();
         let c = color_for(&key);
         instances.push(Instance {
             center: p,
@@ -3097,6 +3305,69 @@ fn read_transform(state: State<AppState>, id: String) -> [f64; 8] {
         .unwrap_or([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0])
 }
 
+/// M9.2 — reparent a part ("drag in hierarchy"); `parent` `None` → root. Fire-and-forget (undoable).
+#[tauri::command]
+fn reparent_part(state: State<AppState>, id: String, parent: Option<String>) {
+    ipc();
+    let _ = state.tx.send(EngineCmd::ReparentPart { id, parent });
+}
+
+/// M9.2 — deactivate-not-delete a part (or reactivate); replies whether it applied.
+#[tauri::command]
+fn set_part_active(state: State<AppState>, id: String, active: bool) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SetPartActive { id, active, reply })
+        .is_err()
+    {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
+/// M9.2 — save the selected part's whole character for reuse; replies the composition id.
+#[tauri::command]
+fn save_character(state: State<AppState>, id: String) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SaveCharacter { id, reply })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().ok().flatten()
+}
+
+/// M9.2 — drop a fresh instance of a saved character; replies the new instance root id.
+#[tauri::command]
+fn instantiate_character(state: State<AppState>, comp: String) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::InstantiateCharacter { comp_id: comp, reply })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().ok().flatten()
+}
+
+/// M9.2 — a part's resolved world position + active flag + override-key count (the E2E read).
+#[tauri::command]
+fn part_debug(state: State<AppState>, id: String) -> (f64, f64, f64, bool, usize) {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PartDebug { id, reply }).is_err() {
+        return (0.0, 0.0, 0.0, false, 0);
+    }
+    rx.recv().unwrap_or((0.0, 0.0, 0.0, false, 0))
+}
+
 /// M9.1 — the gizmo state for the HUD/E2E: `(mode, has_selection, dragging, space, pivot)`.
 #[tauri::command]
 fn gizmo_debug(state: State<AppState>) -> (String, bool, bool, String, String) {
@@ -3322,6 +3593,11 @@ fn main() {
             gizmo_handle_screen,
             gizmo_drag_end,
             read_transform,
+            reparent_part,
+            set_part_active,
+            save_character,
+            instantiate_character,
+            part_debug,
             gizmo_debug,
             ipc_count
         ])
