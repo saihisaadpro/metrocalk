@@ -21,9 +21,11 @@
 //! ordered input + fixed `dt` regenerates the trajectory; Loro stores the initial state + input log as a
 //! document and never re-runs the sim. This crate owns the former; it shares only the initial snapshot.
 
+pub mod accuracy;
 mod rapier_backend;
 pub mod replay;
 
+pub use accuracy::{run_suite as accuracy_suite, AccuracyCase};
 pub use rapier_backend::{derive_collider, explain_contact, RapierPhysics};
 pub use replay::{InputEvent, RecordedBody, Recording, Replay};
 
@@ -144,6 +146,17 @@ pub struct BodyDesc {
     pub rotation: Quat,
     pub linvel: Vec3,
     pub angvel: Vec3,
+    /// Whether the solver may put this body to sleep when it moves slowly (rapier's island sleeping — a
+    /// performance win for resting scenes). Default `true`. Set `false` for a low-energy oscillator that
+    /// must keep moving (a small-amplitude pendulum, a long validation run) — otherwise it sleeps + freezes
+    /// and the trajectory is wrong. `#[serde(default)]` keeps old recordings deserializing (→ awake-able).
+    #[serde(default = "yes")]
+    pub can_sleep: bool,
+}
+
+/// serde default for [`BodyDesc::can_sleep`] (a missing field in an old recording ⇒ the default, sleep-able).
+fn yes() -> bool {
+    true
 }
 
 impl BodyDesc {
@@ -156,7 +169,14 @@ impl BodyDesc {
             rotation: [0.0, 0.0, 0.0, 1.0],
             linvel: [0.0; 3],
             angvel: [0.0; 3],
+            can_sleep: true,
         }
+    }
+    /// This body, but the solver may never sleep it (for low-energy oscillators / long validation runs).
+    #[must_use]
+    pub fn never_sleeping(mut self) -> Self {
+        self.can_sleep = false;
+        self
     }
 }
 
@@ -265,12 +285,30 @@ impl Fidelity {
                 explanation:
                     "gameplay = the deterministic f64 + enhanced-determinism config (M8.1).".into(),
             },
+            // M8.5: the VALIDATION rung is now REAL — not a different solver, but the deterministic f64
+            // config whose accuracy is MEASURED against closed-form references (`accuracy::run_suite`) with
+            // stated error bounds + reproducible provenance (M8.1) + energy/residual reporting (M8.4). The
+            // reality of "validation" is the validated bounds, not a fancier integrator.
+            Self::Validation => FidelityResolution {
+                requested: self,
+                resolved: Self::Validation,
+                is_exact: true,
+                config: gameplay,
+                explanation:
+                    "validation = the deterministic f64 config with MEASURED accuracy bounds (free-fall, \
+                     projectile, pendulum, restitution, 10k-step constraint drift, multibody energy — \
+                     each vs its closed-form reference) + energy/residual diagnostics (M8.4)."
+                        .into(),
+            },
             higher => {
                 let what_lands = match higher {
                     Self::Cinematic => "higher sub-step counts + softer contact materials for film-grade settling",
-                    Self::Validation => "energy/penetration error bounds + a validated solver for engineering accuracy",
-                    Self::Robust => "more solver iterations + CCD for tall stacks and stiff joints",
-                    Self::Inference => "a differentiable/interop path (ADR-020 keeps this interop-only)",
+                    // ROBUST = IPC barrier-energy contact: offline-only, C++, no Rust path (M8.5 — a
+                    // declared, explained seam, never faked).
+                    Self::Robust => "robust (IPC barrier) contact for stiff stacks — offline-only / no Rust path yet; use validation",
+                    // INFERENCE = differentiable / fit-from-reference (Brax/MJX/Newton/Genesis): interop
+                    // only — Metrocalk FEEDS them via interchange, never an in-engine solver (ADR-020/024).
+                    Self::Inference => "a differentiable/interop path — interop-only (we feed MJX/Newton via interchange, never reimplement)",
                     _ => "the requested rung",
                 };
                 FidelityResolution {

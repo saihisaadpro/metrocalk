@@ -1714,6 +1714,7 @@ fn record_body(
         rotation,
         linvel,
         angvel,
+        can_sleep: true,
     };
     Some((body, collider_desc_for(assets, engine, id)))
 }

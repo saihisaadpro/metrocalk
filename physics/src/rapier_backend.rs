@@ -205,6 +205,7 @@ impl Physics for RapierPhysics {
             .translation(vec(desc.translation))
             .linvel(vec(desc.linvel))
             .angvel(vec(desc.angvel))
+            .can_sleep(desc.can_sleep)
             .build();
         let h = self.bodies.insert(rb);
         // Apply the spawn rotation separately (glam-rapier exposes no `Isometry` ctor in the prelude);
