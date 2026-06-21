@@ -30,9 +30,10 @@ use metrocalk_editor_shell::physics_intent::{self, MeshMetrics, PhysicsWarning};
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
 use metrocalk_editor_shell::{
     actions_for, ai_edit_rustier, apply_ai_patch, apply_edit, buy_marketplace, capscene,
-    project_entity, project_full, ActionItem, AiPatch, CapScene, EditIntent, EditTx, Log,
-    MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp, Record, Wallet,
+    project_entity, project_full, transform_solver, ActionItem, AiPatch, CapScene, EditIntent,
+    EditTx, Log, MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp, Record, Wallet,
 };
+use metrocalk_editor_shell::transform_solver::{Constraint, ConstraintIntent, SnapKind, SnapTarget};
 use metrocalk_gizmo::{
     Gizmo, GizmoMode, GizmoPivot, GizmoSpace, Handle, Ray, Transform as GizmoTransform,
 };
@@ -185,6 +186,30 @@ struct DescribeResponse {
     seam: Option<String>,
     /// The user's token balance after a marketplace buy (M7), for the wallet UI.
     balance: Option<u32>,
+}
+
+/// M9.4 — one ranked snap candidate for the UI/E2E: the snap-graph node + the explained "why this"
+/// (the reveal/rank/explain pattern applied to space, ranked by the shared ADR-011 `intent_order`).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SnapHit {
+    id: String,
+    kind: String,
+    x: f32,
+    y: f32,
+    z: f32,
+    distance: f32,
+    why: String,
+}
+
+/// M9.4 — the outcome of applying a constraint / placement sentence: `ok` + an explained `reason` (every
+/// "no" explained, ADR-016) + the compiled `intents` (the editable-before-commit list, for a sentence).
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SolveResult {
+    ok: bool,
+    reason: Option<String>,
+    intents: Vec<String>,
 }
 
 /// Commands to the engine thread (which owns the `!Send` Engine).
@@ -393,6 +418,32 @@ enum EngineCmd {
         root: String,
         path: String,
         reply: Sender<Option<String>>,
+    },
+    /// M9.4 — the snap-graph for `id`: ranked candidate targets within `radius` (the shared ADR-011 ranker)
+    /// each with an explained "why this" — the magnetic-intent surface (a read).
+    SnapQuery {
+        id: String,
+        radius: f32,
+        reply: Sender<Vec<SnapHit>>,
+    },
+    /// M9.4 — declare + apply a spatial **constraint** to `id` (solve + commit through the one pipeline,
+    /// undoable), or reply the explained block. `kind` = snap/align-surface/coplanar/coaxial/clearance/
+    /// symmetry; `target` = a snap-target entity id (its position drives the constraint); `value` = the
+    /// clearance distance.
+    ApplyConstraint {
+        id: String,
+        kind: String,
+        target: Option<String>,
+        value: f32,
+        reply: Sender<SolveResult>,
+    },
+    /// M9.4 — a natural-language **placement sentence**: compile → resolve the intents against the
+    /// snap-graph → apply as a schema-validated patch (`apply_transform_constraint`, ADR-017). Replies the
+    /// editable intents + the outcome.
+    PlacementSentence {
+        id: String,
+        text: String,
+        reply: Sender<SolveResult>,
     },
     /// Internal fixed-timestep heartbeat (M8.2): a self-sent tick that advances the sim one step + syncs
     /// transforms to the viewport. NOT a JS command — it never crosses the WebView boundary (invariant 4).
@@ -1825,6 +1876,216 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .map(|e| e.to_loro_key());
                 let _ = reply.send(part);
             }
+            EngineCmd::SnapQuery { id, radius, reply } => {
+                let hits = EntityId::from_loro_key(&id)
+                    .map(|eid| snap_hits(&engine, &positions, &recency, eid, radius))
+                    .unwrap_or_default();
+                let _ = reply.send(hits);
+            }
+            EngineCmd::ApplyConstraint {
+                id,
+                kind,
+                target,
+                value,
+                reply,
+            } => {
+                // Resolve `kind` + the target's position into a deterministic constraint, solve it, and
+                // commit through the one pipeline (M9.4) — or reply the explained block (every "no").
+                let mut applied = None;
+                let result = match EntityId::from_loro_key(&id) {
+                    None => SolveResult {
+                        ok: false,
+                        reason: Some("invalid entity id".into()),
+                        ..Default::default()
+                    },
+                    Some(eid) => {
+                        let tpos = target
+                            .as_deref()
+                            .and_then(EntityId::from_loro_key)
+                            .and_then(|te| engine.ecs_entity(te))
+                            .and_then(|ecs| positions.get(&ecs).copied());
+                        let constraint = match (kind.as_str(), tpos) {
+                            ("snap", Some(t)) => Some(Constraint::SnapToPoint { target: t }),
+                            ("align-surface", Some(t)) => Some(Constraint::AlignToSurface {
+                                point: t,
+                                normal: [0.0, 1.0, 0.0],
+                            }),
+                            ("coplanar", Some(t)) => Some(Constraint::Coplanar {
+                                point: t,
+                                normal: [0.0, 1.0, 0.0],
+                            }),
+                            ("coaxial", Some(t)) => Some(Constraint::Coaxial {
+                                point: t,
+                                dir: [0.0, 1.0, 0.0],
+                            }),
+                            ("clearance", Some(t)) => Some(Constraint::Clearance {
+                                from: t,
+                                distance: value,
+                            }),
+                            ("symmetry", Some(t)) => Some(Constraint::Symmetry {
+                                point: t,
+                                normal: [1.0, 0.0, 0.0],
+                            }),
+                            _ => None,
+                        };
+                        match constraint {
+                            None => SolveResult {
+                                ok: false,
+                                reason: Some(format!(
+                                    "'{kind}' needs a valid snap target — pick one first"
+                                )),
+                                ..Default::default()
+                            },
+                            Some(c) => {
+                                let current = capscene::global_transform(&engine, eid);
+                                match transform_solver::solve(&c, &current) {
+                                    Err(b) => SolveResult {
+                                        ok: false,
+                                        reason: Some(b.reason),
+                                        ..Default::default()
+                                    },
+                                    Ok(world) => {
+                                        let ok =
+                                            commit_world_transform(&mut engine, &log, eid, world);
+                                        if ok {
+                                            applied = Some(eid);
+                                        }
+                                        SolveResult {
+                                            ok,
+                                            reason: (!ok).then(|| "commit failed".into()),
+                                            ..Default::default()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                if let Some(eid) = applied {
+                    echo_created(
+                        &mut engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &channel,
+                        &mut recency,
+                        &mut touch,
+                        eid,
+                    );
+                }
+                let _ = reply.send(result);
+            }
+            EngineCmd::PlacementSentence { id, text, reply } => {
+                // Compile the sentence → editable intents → resolve each against the snap-graph (the
+                // nearest target/surface) → chain the solves → apply as a SCHEMA-VALIDATED patch
+                // (apply_transform_constraint / apply_ai_patch, ADR-017 — never a raw mutation).
+                let intents = transform_solver::compile(&text);
+                let labels: Vec<String> = intents.iter().map(|i| format!("{i:?}")).collect();
+                let mut applied = None;
+                let result = match EntityId::from_loro_key(&id) {
+                    None => SolveResult {
+                        ok: false,
+                        reason: Some("invalid entity id".into()),
+                        intents: labels,
+                    },
+                    Some(_) if intents.is_empty() => SolveResult {
+                        ok: false,
+                        reason: Some("couldn't interpret the placement".into()),
+                        intents: labels,
+                    },
+                    Some(eid) => {
+                        let nearest = snap_hits(&engine, &positions, &recency, eid, 1.0e6)
+                            .into_iter()
+                            .next();
+                        let pt = nearest.as_ref().map(|h| [h.x, h.y, h.z]);
+                        let mut world = capscene::global_transform(&engine, eid);
+                        let mut err = None;
+                        for intent in &intents {
+                            let c = match intent {
+                                ConstraintIntent::Upright => Constraint::AlignToSurface {
+                                    point: pt.unwrap_or(world.translation),
+                                    normal: [0.0, 1.0, 0.0],
+                                },
+                                ConstraintIntent::SnapToNearest => match pt {
+                                    Some(t) => Constraint::SnapToPoint { target: t },
+                                    None => continue,
+                                },
+                                ConstraintIntent::Clearance(d) => match pt {
+                                    Some(t) => Constraint::Clearance {
+                                        from: t,
+                                        distance: *d,
+                                    },
+                                    None => continue,
+                                },
+                                ConstraintIntent::Coaxial => match pt {
+                                    Some(t) => Constraint::Coaxial {
+                                        point: t,
+                                        dir: [0.0, 1.0, 0.0],
+                                    },
+                                    None => continue,
+                                },
+                            };
+                            match transform_solver::solve(&c, &world) {
+                                Ok(w) => world = w,
+                                Err(b) => {
+                                    err = Some(b.reason);
+                                    break;
+                                }
+                            }
+                        }
+                        match err {
+                            Some(reason) => SolveResult {
+                                ok: false,
+                                reason: Some(reason),
+                                intents: labels,
+                            },
+                            None => {
+                                let delta = transform_solver::apply_transform_constraint(
+                                    &mut engine,
+                                    eid,
+                                    &world,
+                                    "placement-sentence",
+                                );
+                                let ok = delta.rejects.is_empty();
+                                if ok {
+                                    applied = Some(eid);
+                                    // Persist the placed pose for reload (the AI patch committed it; record
+                                    // the net world transform so replay reproduces it).
+                                    log.append(&Record::Transform {
+                                        id: eid.to_loro_key(),
+                                        x: f64::from(world.translation[0]),
+                                        y: f64::from(world.translation[1]),
+                                        z: f64::from(world.translation[2]),
+                                        qx: f64::from(world.rotation[0]),
+                                        qy: f64::from(world.rotation[1]),
+                                        qz: f64::from(world.rotation[2]),
+                                        qw: f64::from(world.rotation[3]),
+                                        scale: f64::from(world.scale[0]),
+                                    });
+                                }
+                                SolveResult {
+                                    ok,
+                                    reason: (!ok).then(|| "the constraint patch was rejected".into()),
+                                    intents: labels,
+                                }
+                            }
+                        }
+                    }
+                };
+                if let Some(eid) = applied {
+                    echo_created(
+                        &mut engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &channel,
+                        &mut recency,
+                        &mut touch,
+                        eid,
+                    );
+                }
+                let _ = reply.send(result);
+            }
             EngineCmd::PhysicsDebug { reply } => {
                 let min_y = body_of
                     .values()
@@ -2469,6 +2730,105 @@ fn echo_created(
         let _ = ch.send(project_entity(engine, id));
     }
     rebuild(engine, shared, positions, assets);
+}
+
+/// M9.4 — build the snap-graph hits for `dragged`: every OTHER entity's origin (or pivot, if it has
+/// children) within `radius`, ranked by the **shared ADR-011 `intent_order`** (reused via
+/// `transform_solver::snap_candidates` — not a parallel heuristic), each with an explained "why this".
+fn snap_hits(
+    engine: &Engine<FlecsWorld>,
+    positions: &HashMap<Entity, [f32; 3]>,
+    recency: &HashMap<Entity, u64>,
+    dragged: EntityId,
+    radius: f32,
+) -> Vec<SnapHit> {
+    let Some(dragged_ecs) = engine.ecs_entity(dragged) else {
+        return Vec::new();
+    };
+    let from = positions.get(&dragged_ecs).copied().unwrap_or([0.0; 3]);
+    let targets: Vec<SnapTarget> = positions
+        .iter()
+        .filter(|(e, _)| **e != dragged_ecs)
+        .map(|(&e, &position)| {
+            // A parent (has children) is a stronger spatial intent (a pivot) than a bare origin.
+            let kind = engine
+                .entity_id_of(e)
+                .filter(|eid| !engine.children_of(*eid).is_empty())
+                .map_or(SnapKind::Origin, |_| SnapKind::Pivot);
+            SnapTarget {
+                entity: e,
+                kind,
+                position,
+            }
+        })
+        .collect();
+    transform_solver::snap_candidates(&targets, from, radius, recency)
+        .into_iter()
+        .filter_map(|c| {
+            let eid = engine.entity_id_of(c.entity)?;
+            Some(SnapHit {
+                id: eid.to_loro_key(),
+                kind: c.kind.label().to_string(),
+                x: c.position[0],
+                y: c.position[1],
+                z: c.position[2],
+                distance: c.distance,
+                why: format!(
+                    "snap to the {} of {} — {:.2} m",
+                    c.kind.label(),
+                    eid.to_loro_key(),
+                    c.distance
+                ),
+            })
+        })
+        .collect()
+}
+
+/// Commit a constraint-solved **world** transform to `eid` through the one pipeline (M9.1/M9.2 routing,
+/// undoable): a CHILD part gets the parent-space-write-back **override** (+ `Record::EditPart`); a root
+/// gets `set_transform` (+ `Record::Transform`). Returns whether it applied.
+fn commit_world_transform(
+    engine: &mut Engine<FlecsWorld>,
+    log: &Log,
+    eid: EntityId,
+    world: GizmoTransform,
+) -> bool {
+    if engine.parent_of(eid).is_some() {
+        match capscene::edit_part_transform(engine, eid, world) {
+            Ok(local) => {
+                log.append(&Record::EditPart {
+                    id: eid.to_loro_key(),
+                    x: f64::from(local.translation[0]),
+                    y: f64::from(local.translation[1]),
+                    z: f64::from(local.translation[2]),
+                    qx: f64::from(local.rotation[0]),
+                    qy: f64::from(local.rotation[1]),
+                    qz: f64::from(local.rotation[2]),
+                    qw: f64::from(local.rotation[3]),
+                    scale: f64::from(local.scale[0]),
+                });
+                true
+            }
+            Err(_) => false,
+        }
+    } else if capscene::set_transform(engine, eid, world.translation, world.rotation, world.scale[0])
+        .is_ok()
+    {
+        log.append(&Record::Transform {
+            id: eid.to_loro_key(),
+            x: f64::from(world.translation[0]),
+            y: f64::from(world.translation[1]),
+            z: f64::from(world.translation[2]),
+            qx: f64::from(world.rotation[0]),
+            qy: f64::from(world.rotation[1]),
+            qz: f64::from(world.rotation[2]),
+            qw: f64::from(world.rotation[3]),
+            scale: f64::from(world.scale[0]),
+        });
+        true
+    } else {
+        false
+    }
 }
 
 /// The product of a part's ancestors' local display scales (each `Transform.scale` field, default 1) —
@@ -3420,6 +3780,64 @@ fn part_at_path(state: State<AppState>, root: String, path: String) -> Option<St
     rx.recv().ok().flatten()
 }
 
+/// M9.4 — the snap-graph for `id`: ranked candidate targets (the shared ADR-011 ranker) + each one's
+/// explained "why this", within `radius`.
+#[tauri::command]
+fn snap_query(state: State<AppState>, id: String, radius: f32) -> Vec<SnapHit> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SnapQuery { id, radius, reply })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// M9.4 — declare + apply a spatial constraint (solve + commit, undoable), or get the explained block.
+#[tauri::command]
+fn apply_constraint(
+    state: State<AppState>,
+    id: String,
+    kind: String,
+    target: Option<String>,
+    value: f32,
+) -> SolveResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ApplyConstraint {
+            id,
+            kind,
+            target,
+            value,
+            reply,
+        })
+        .is_err()
+    {
+        return SolveResult::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// M9.4 — a natural-language placement sentence → editable intents → a schema-validated patch (ADR-017).
+#[tauri::command]
+fn placement_sentence(state: State<AppState>, id: String, text: String) -> SolveResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PlacementSentence { id, text, reply })
+        .is_err()
+    {
+        return SolveResult::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 /// M9.1 — the gizmo state for the HUD/E2E: `(mode, has_selection, dragging, space, pivot)`.
 #[tauri::command]
 fn gizmo_debug(state: State<AppState>) -> (String, bool, bool, String, String) {
@@ -3652,6 +4070,9 @@ fn main() {
             part_debug,
             demo_character,
             part_at_path,
+            snap_query,
+            apply_constraint,
+            placement_sentence,
             gizmo_debug,
             ipc_count
         ])
