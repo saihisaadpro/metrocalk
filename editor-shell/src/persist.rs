@@ -182,8 +182,9 @@ impl Log {
                 Record::SpawnBody { pos, mesh } => {
                     capscene::spawn_physics_body(engine, scene, mesh.as_deref(), pos, 0.45).is_ok()
                 }
-                Record::MakeDynamic { id } => EntityId::from_loro_key(&id)
-                    .is_some_and(|e| crate::physics_intent::make_dynamic(engine, scene, e, 1.0).is_ok()),
+                Record::MakeDynamic { id } => EntityId::from_loro_key(&id).is_some_and(|e| {
+                    crate::physics_intent::make_dynamic(engine, scene, e, 1.0).is_ok()
+                }),
                 Record::PhysicsFix { id, action } => {
                     EntityId::from_loro_key(&id).is_some_and(|e| match action.as_str() {
                         "add-collider" => {
