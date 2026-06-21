@@ -441,6 +441,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only timing measurement (run --release)"
+    )]
+    fn per_frame_gizmo_work_fits_the_frame_budget() {
+        // The per-frame gizmo work (pick + drag_update + geometry generation) is the smoothness-critical
+        // interaction (principle 2) — it must be trivially under one 60 Hz frame on min-spec. Measured in
+        // release (debug timing is meaningless). Pure CPU math, so the number is host-stable + tiny.
+        let mut g = TransformGizmo::new();
+        let cam = [10.0, 8.0, 10.0];
+        let origin = [0.0; 3];
+        let basis = [0.0, 0.0, 0.0, 1.0];
+        let scale = 1.5;
+        g.drag_start(
+            Handle::AxisX,
+            ray_to(cam, origin),
+            origin,
+            basis,
+            scale,
+            Transform::IDENTITY,
+        );
+        let n = 100_000u32;
+        let t0 = std::time::Instant::now();
+        for i in 0..n {
+            let ray = ray_to(cam, [f32::from((i % 1000) as u16) * 0.001, 0.0, 0.0]);
+            let _ = std::hint::black_box(g.pick(ray, origin, basis, scale));
+            let _ = std::hint::black_box(g.drag_update(ray, false));
+            let _ = std::hint::black_box(g.geometry(origin, basis, scale));
+        }
+        let per_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+        eprintln!("[M9.1] gizmo pick+drag+geometry: {per_ms:.6} ms/frame");
+        assert!(
+            per_ms < 1.0,
+            "the per-frame gizmo work (got {per_ms} ms) must fit one 60 Hz frame"
+        );
+    }
+
+    #[test]
     fn drag_is_coalesced_not_per_frame() {
         // The gizmo holds the START transform across many updates — a 100-step drag yields ONE delta from
         // the original, never accumulating frame-over-frame (the undo-storm guard).
