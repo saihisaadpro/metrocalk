@@ -83,6 +83,20 @@ pub enum InverseOp {
         kind: String,
         to: EntityId,
     },
+
+    /// Inverse of SetOverride/RemoveOverride — restore the field's prior override value, or remove
+    /// it if it didn't exist (`old_value: None` → a precise single-field `RemoveOverride`).
+    SetOverride {
+        entity: EntityId,
+        component: String,
+        field: String,
+        old_value: Option<FieldValue>,
+    },
+    /// Inverse of SetActive — restore the part's prior effective active state.
+    SetActive {
+        entity: EntityId,
+        active: bool,
+    },
 }
 
 impl InverseOp {
@@ -166,6 +180,30 @@ impl InverseOp {
                 from: *from,
                 kind: kind.clone(),
                 to: *to,
+            },
+
+            Self::SetOverride {
+                entity,
+                component,
+                field,
+                old_value,
+            } => match old_value {
+                Some(v) => Op::SetOverride {
+                    entity: *entity,
+                    component: component.clone(),
+                    field: field.clone(),
+                    value: v.clone(),
+                },
+                // Precise inverse of an additive override: remove ONLY this override field.
+                None => Op::RemoveOverride {
+                    entity: *entity,
+                    component: component.clone(),
+                    field: field.clone(),
+                },
+            },
+            Self::SetActive { entity, active } => Op::SetActive {
+                entity: *entity,
+                active: *active,
             },
         }
     }

@@ -26,6 +26,7 @@ pub mod resolve;
 pub mod stdlib;
 pub mod taxonomy;
 pub mod undo;
+pub mod variant;
 
 pub use catalog::{CatalogItem, CatalogSearch, SearchSeam, Source};
 pub use entity_id::{EntityId, IdGenerator};
@@ -38,6 +39,7 @@ pub use producer::ProducerHook;
 pub use registry::{Builder, ComponentMeta, FieldSpec, FieldType, Registry, RegistryError};
 pub use resolve::{resolve, resolve_local, Match, NextTier, Resolution, Resolved};
 pub use taxonomy::{bucket_of, is_standard_category, Category, STD_CATEGORIES};
+pub use variant::{Composition, CompositionNode, ResolvedNode, Variant, VariantOp};
 
 /// Engine identifier — one constant shared by downstream crates, logs, and file headers.
 pub const ENGINE_NAME: &str = "metrocalk";

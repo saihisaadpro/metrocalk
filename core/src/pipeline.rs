@@ -12,16 +12,21 @@ use crate::entity_id::{EntityId, IdGenerator};
 use crate::merge::{self, MergeReport};
 use crate::undo::{InverseOp, InverseTransaction};
 use loro::{
-    Container, ExportMode, LoroDoc, LoroMap, LoroValue, TreeID, TreeParentId, ValueOrContainer,
+    Container, ContainerTrait, ContainerType, ExportMode, LoroDoc, LoroMap, LoroValue, TreeID,
+    TreeParentId, ValueOrContainer,
 };
 use metrocalk_ecs::{Entity, World};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 // ── public value type (no Loro leak) ───────────────────────────────────────
 
 /// A component field value. Maps 1:1 to JSON-Schema scalar types and to Loro value variants.
-#[derive(Clone, Debug, PartialEq)]
+/// `serde`-derived so the override/variant bundles ([`crate::variant`]) that carry these values are
+/// a persistable, marketplace-able asset (ADR-026) — the derive stays on our own plain type, no Loro
+/// leak.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FieldValue {
     Integer(i64),
     Number(f64),
@@ -112,6 +117,47 @@ pub enum Op {
         kind: String,
         to: EntityId,
     },
+
+    // ── override / variant model (M9.2 / ADR-026) ──────────────────────────
+    /// Set a sparse **per-field override** on a part (ADR-026): a single `(component, field)` delta
+    /// stored on the part's own **mergeable** override slot — the structurally-stronger read layer
+    /// over the part's base component value (USD `over`, Unity `m_Modification`, but merge-aware).
+    /// Never a whole-object write (so a concurrent sibling-field edit is never clobbered), and the
+    /// slot is a Loro Mergeable Container so two peers concurrently *first-creating* it converge
+    /// (no silent data loss). Resolution always checks the override before the base — override-wins
+    /// **by structure**, never by timestamp ([`Engine::resolved_components`]).
+    SetOverride {
+        entity: EntityId,
+        component: String,
+        field: String,
+        value: FieldValue,
+    },
+    /// Clear a single field override — revert that field to the source/base value. Leaves sibling
+    /// overrides on the same part intact (the precise inverse of an additive [`Op::SetOverride`]).
+    RemoveOverride {
+        entity: EntityId,
+        component: String,
+        field: String,
+    },
+    /// **Deactivate-not-delete** (ADR-026): set a part's `active` flag (USD `deactivate` ≡ a
+    /// reversible hide / Loro TRASH), stored as a structured entry in the same mergeable override
+    /// slot. A removed part is therefore recoverable (undo restores it) and a concurrent editor's
+    /// field edits on the same part are never lost to a destructive delete.
+    SetActive { entity: EntityId, active: bool },
+}
+
+/// The top-level Loro map holding every instance's sparse override layer (ADR-026), a sibling of
+/// `components`/`bindings`/`hierarchy`. Each part's slot under it is a **mergeable** child map.
+pub(crate) const OVERRIDES: &str = "overrides";
+
+/// The reserved key (a leading unit-separator, so it can never collide with a real
+/// `"{component}\u{1f}{field}"` override key — a component name is non-empty before the separator)
+/// under which a part's `active` flag lives in its override slot.
+const OVERRIDE_ACTIVE_KEY: &str = "\u{1f}active";
+
+/// The key for one field override inside a part's slot: `"{component}\u{1f}{field}"`.
+fn override_field_key(component: &str, field: &str) -> String {
+    format!("{component}\u{1f}{field}")
 }
 
 // ── errors ─────────────────────────────────────────────────────────────────
@@ -156,10 +202,11 @@ impl<W: World> Engine<W> {
     pub fn new(world: W, peer_id: u64) -> Self {
         let doc = LoroDoc::new();
         doc.set_peer_id(peer_id).unwrap();
-        // Touch the three top-level containers so they exist before any commit.
+        // Touch the top-level containers so they exist before any commit.
         let _ = doc.get_tree("hierarchy");
         let _ = doc.get_map("components");
         let _ = doc.get_map("bindings");
+        let _ = doc.get_map(OVERRIDES); // the override/variant layer (ADR-026)
 
         Self {
             world,
@@ -455,7 +502,10 @@ impl<W: World> Engine<W> {
                 | Op::AddTag { entity, .. }
                 | Op::RemoveTag { entity, .. }
                 | Op::AddPair { entity, .. }
-                | Op::RemovePair { entity, .. } => {
+                | Op::RemovePair { entity, .. }
+                | Op::SetOverride { entity, .. }
+                | Op::RemoveOverride { entity, .. }
+                | Op::SetActive { entity, .. } => {
                     if !alive.contains(entity) {
                         return Err(PipelineError::UnknownEntity(*entity));
                     }
@@ -570,6 +620,18 @@ impl<W: World> Engine<W> {
             Op::Reparent { entity, new_parent } => self.apply_reparent(*entity, *new_parent),
             Op::AddBinding { from, kind, to } => self.apply_add_binding(*from, kind, *to),
             Op::RemoveBinding { from, kind, to } => self.apply_remove_binding(*from, kind, *to),
+            Op::SetOverride {
+                entity,
+                component,
+                field,
+                value,
+            } => self.apply_set_override(*entity, component, field, value),
+            Op::RemoveOverride {
+                entity,
+                component,
+                field,
+            } => self.apply_remove_override(*entity, component, field),
+            Op::SetActive { entity, active } => self.apply_set_active(*entity, *active),
         }
     }
 
@@ -859,6 +921,180 @@ impl<W: World> Engine<W> {
         Ok(())
     }
 
+    // ── override / variant apply (M9.2 / ADR-026) ──────────────────────
+
+    /// Get-or-create a part's **mergeable** override slot. `ensure_mergeable_map` is the F1-critical
+    /// call: two peers concurrently first-creating the same `(overrides, entity_key, Map)` slot get
+    /// the **same deterministic container id**, so their edits merge in one child rather than one
+    /// silently clobbering the other (the #1 silent-data-loss trap; ADR-002 F1 re-verified under our
+    /// engine-side undo stack in `core/tests/override_model.rs`).
+    fn override_slot(&self, entity: EntityId) -> Result<LoroMap, PipelineError> {
+        self.doc
+            .get_map(OVERRIDES)
+            .ensure_mergeable_map(&entity.to_loro_key())
+            .map_err(loro_err)
+    }
+
+    /// Whether a part's override slot already has a (mergeable) container — checked via its
+    /// deterministic id so a *read*/remove never creates an empty slot as a side effect.
+    fn override_slot_exists(&self, entity: EntityId) -> bool {
+        let parent = self.doc.get_map(OVERRIDES).id();
+        let cid =
+            loro::ContainerID::new_mergeable(&parent, &entity.to_loro_key(), ContainerType::Map);
+        self.doc.has_container(&cid)
+    }
+
+    fn apply_set_override(
+        &mut self,
+        entity: EntityId,
+        component: &str,
+        field: &str,
+        value: &FieldValue,
+    ) -> Result<(), PipelineError> {
+        if !self.eid_to_ecs.contains_key(&entity) {
+            return Err(PipelineError::UnknownEntity(entity));
+        }
+        let slot = self.override_slot(entity)?;
+        slot.insert(&override_field_key(component, field), value.to_loro())
+            .map_err(loro_err)?;
+        Ok(())
+    }
+
+    fn apply_remove_override(
+        &mut self,
+        entity: EntityId,
+        component: &str,
+        field: &str,
+    ) -> Result<(), PipelineError> {
+        if !self.eid_to_ecs.contains_key(&entity) {
+            return Err(PipelineError::UnknownEntity(entity));
+        }
+        // Only touch the slot if it already exists (don't create an empty slot on a no-op remove).
+        if self.override_slot_exists(entity) {
+            let slot = self.override_slot(entity)?;
+            let key = override_field_key(component, field);
+            if slot.get(&key).is_some() {
+                slot.delete(&key).map_err(loro_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_set_active(&mut self, entity: EntityId, active: bool) -> Result<(), PipelineError> {
+        if !self.eid_to_ecs.contains_key(&entity) {
+            return Err(PipelineError::UnknownEntity(entity));
+        }
+        let slot = self.override_slot(entity)?;
+        slot.insert(OVERRIDE_ACTIVE_KEY, active).map_err(loro_err)?;
+        Ok(())
+    }
+
+    // ── override / variant reads (the stronger read layer) ─────────────
+
+    /// The raw deep value of a part's override slot (a `LoroValue::Map` of `key → value`), or `None`
+    /// if the part has no overrides. Pure read (`get_deep_value` never mutates, and the mergeable
+    /// child surfaces transparently with its binary marker hidden) — so it never creates a slot.
+    fn override_slot_value(&self, entity: EntityId) -> Option<LoroValue> {
+        if let LoroValue::Map(m) = self.doc.get_map(OVERRIDES).get_deep_value() {
+            return m.get(&entity.to_loro_key()).cloned();
+        }
+        None
+    }
+
+    /// The value of one field override on a part, or `None` if that field is not overridden.
+    #[must_use]
+    pub fn get_override(
+        &self,
+        entity: EntityId,
+        component: &str,
+        field: &str,
+    ) -> Option<FieldValue> {
+        let LoroValue::Map(slot) = self.override_slot_value(entity)? else {
+            return None;
+        };
+        let key = override_field_key(component, field);
+        slot.iter()
+            .find(|(k, _)| k.as_str() == key)
+            .and_then(|(_, v)| FieldValue::from_loro(v))
+    }
+
+    /// Every field override on a part as `"{component}\u{1f}{field}" → value` (the `active` flag
+    /// excluded). The headline **sparsity** read: a part edit writes ONLY the changed keys here, never
+    /// a whole-object copy of the base.
+    #[must_use]
+    pub fn overrides_of(&self, entity: EntityId) -> HashMap<String, FieldValue> {
+        let mut out = HashMap::new();
+        if let Some(LoroValue::Map(slot)) = self.override_slot_value(entity) {
+            for (k, v) in slot.iter() {
+                if k.as_str() == OVERRIDE_ACTIVE_KEY {
+                    continue;
+                }
+                if let Some(fv) = FieldValue::from_loro(v) {
+                    out.insert(k.clone(), fv);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a part is active (deactivate-not-delete). Absent flag ⇒ active (the default), so a
+    /// part is only hidden once it has been explicitly deactivated.
+    #[must_use]
+    pub fn is_active(&self, entity: EntityId) -> bool {
+        if let Some(LoroValue::Map(slot)) = self.override_slot_value(entity) {
+            for (k, v) in slot.iter() {
+                if k.as_str() == OVERRIDE_ACTIVE_KEY {
+                    if let LoroValue::Bool(b) = v {
+                        return *b;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// A part's **resolved** components — the base component record overlaid with its override layer,
+    /// **override-wins-by-structure** (the override is checked/applied after the base, so a stale
+    /// base-restore can never beat a live override; the USD LIVRPS caveat made concrete). This is what
+    /// the renderer/inspector/projection should read for an instance part.
+    #[must_use]
+    pub fn resolved_components(
+        &self,
+        entity: EntityId,
+    ) -> HashMap<String, HashMap<String, FieldValue>> {
+        let mut base = self.capture_components(entity);
+        if let Some(LoroValue::Map(slot)) = self.override_slot_value(entity) {
+            for (k, v) in slot.iter() {
+                if k.as_str() == OVERRIDE_ACTIVE_KEY {
+                    continue;
+                }
+                if let (Some((comp, field)), Some(fv)) =
+                    (k.split_once('\u{1f}'), FieldValue::from_loro(v))
+                {
+                    base.entry(comp.to_string())
+                        .or_default()
+                        .insert(field.to_string(), fv);
+                }
+            }
+        }
+        base
+    }
+
+    /// The ordered child entities of `id` in the scene hierarchy (fractional-index order — the stable
+    /// sibling order the override/variant rel-paths key off). Empty for a leaf or unknown id.
+    #[must_use]
+    pub fn children_of(&self, id: EntityId) -> Vec<EntityId> {
+        let Some(&tid) = self.eid_to_tid.get(&id) else {
+            return Vec::new();
+        };
+        let tree = self.doc.get_tree("hierarchy");
+        tree.children(TreeParentId::Node(tid))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|ctid| self.tid_to_eid(ctid))
+            .collect()
+    }
+
     // ── inverse computation (reads current state) ──────────────────────
 
     #[allow(clippy::too_many_lines)] // one match arm per Op variant; splitting would fragment the inverse logic
@@ -1020,6 +1256,38 @@ impl<W: World> Engine<W> {
                 from: *from,
                 kind: kind.clone(),
                 to: *to,
+            }),
+
+            // Setting and removing an override share one inverse: restore the field's prior override
+            // value (`old_value: Some`), or — if it had none — `old_value: None`, whose forward form
+            // is a precise single-field `RemoveOverride` (the same precise-inverse discipline as
+            // SetField/RemoveField — never clobber a sibling override).
+            Op::SetOverride {
+                entity,
+                component,
+                field,
+                ..
+            }
+            | Op::RemoveOverride {
+                entity,
+                component,
+                field,
+            } => {
+                let old = self.get_override(*entity, component, field);
+                Ok(InverseOp::SetOverride {
+                    entity: *entity,
+                    component: component.clone(),
+                    field: field.clone(),
+                    old_value: old,
+                })
+            }
+
+            // The inverse of a (de)activation restores the EFFECTIVE prior active state. An absent
+            // flag reads as active, so the inverse of deactivating a never-flagged part is
+            // `SetActive(true)` — observationally identical to absent, and fully reversible.
+            Op::SetActive { entity, .. } => Ok(InverseOp::SetActive {
+                entity: *entity,
+                active: self.is_active(*entity),
             }),
         }
     }
