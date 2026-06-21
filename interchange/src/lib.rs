@@ -14,13 +14,17 @@
 //! USD-Physics (the pre-1.0 `openusd` crate) follows behind the same trait; MJCF is a *probe + seam* (no
 //! mature Rust parser), not a committed round-trip.
 
-use metrocalk_physics::{BodyKind, ColliderDesc, JointDesc, Quat, Vec3};
+use metrocalk_physics::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 mod urdf;
 mod usd;
 pub use urdf::UrdfInterchange;
 pub use usd::UsdInterchange;
+
+// Re-export the /physics boundary types a SceneImport carries, so a consumer (the editor) maps an import
+// to registry components depending only on `metrocalk-interchange` — no separate /physics dep needed.
+pub use metrocalk_physics::{BodyKind, ColliderDesc, ColliderShape, JointDesc};
 
 /// The stage units a format declares — the M8.5 deliverable-2 ground truth feeding M8.3's scale check.
 /// URDF is SI (1 m / 1 kg per unit); USD declares `metersPerUnit` / `kilogramsPerUnit` (often cm / g).

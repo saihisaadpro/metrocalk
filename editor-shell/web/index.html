@@ -60,6 +60,11 @@
         <div style="padding:0 12px 6px;display:flex;gap:6px;align-items:center">
           <input id="scrub" type="range" min="0" max="0" value="0" style="flex:1;accent-color:#9af" />
         </div>
+        <!-- M8.5 interchange: import a URDF robot / USD-Physics scene → registry components, units
+             reconciled, every unsupported feature explained. -->
+        <div style="padding:0 12px 6px;display:flex;gap:6px;align-items:center">
+          <button id="importRobot" style="margin:0;padding:3px 10px;background:#2f4a4a">🤖 Import URDF/USD</button>
+        </div>
         <h3>Create</h3>
         <!-- Two doors over ONE catalog + one instantiate (M3.4): BROWSE ("+ Add" palette, categories +
              search) and DESCRIBE (type it). Both reach the same pre-componentized, undoable instantiate. -->
@@ -377,6 +382,61 @@
         editField(selected, "Collider", "friction", 0.95);
         status("friction → 0.95 (one undoable edit) — resume re-simulates from here · Ctrl-Z to revert");
         setTimeout(() => { showPhysWarnings(selected); if (debuggerOn) refreshContacts(); }, 60);
+      };
+
+      // ── M8.5 interchange import: paste a URDF / USD-Physics scene → registry components (one undoable
+      // tx), units reconciled, every unsupported feature explained ("debug by looking" for imports too).
+      const importPanel = document.createElement("div");
+      importPanel.id = "importPanel";
+      importPanel.style.cssText = "position:fixed;z-index:70;display:none;left:50%;top:50%;transform:translate(-50%,-50%);width:560px;max-width:92vw;background:#1b2230;border:1px solid #2f6;border-radius:10px;padding:14px 16px;font-size:13px;box-shadow:0 10px 40px rgba(0,0,0,.6)";
+      importPanel.innerHTML = `
+        <div style="font-weight:700;margin-bottom:6px;color:#bfe">🤖 Import a robot / physics scene</div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+          <label><input type="radio" name="impFmt" value="urdf" checked> URDF</label>
+          <label><input type="radio" name="impFmt" value="usd"> USD-Physics (.usda)</label>
+          <button id="impSample" style="margin-left:auto;padding:2px 8px;font-size:11px;background:#33415a">Paste sample arm</button>
+        </div>
+        <textarea id="impText" rows="8" style="width:100%;box-sizing:border-box;background:#0e131c;color:#cde;border:1px solid #2a3550;border-radius:6px;font-family:monospace;font-size:11px" placeholder="paste URDF (.urdf XML) or USD-Physics (.usda)…"></textarea>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button id="impGo" style="padding:4px 14px;background:#2f6a4a">Import</button>
+          <button id="impClose" style="padding:4px 14px;background:#444">Close</button>
+        </div>
+        <div id="impResult" style="margin-top:8px;max-height:30vh;overflow:auto;font-size:11.5px;line-height:1.45"></div>`;
+      document.body.appendChild(importPanel);
+      const SAMPLE_ARM = `<?xml version="1.0"?>
+<robot name="arm">
+  <link name="base">
+    <inertial><mass value="5.0"/><inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/></inertial>
+    <collision><geometry><box size="0.6 0.3 0.6"/></geometry></collision>
+  </link>
+  <link name="upper">
+    <inertial><mass value="2.0"/><inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/></inertial>
+    <collision><geometry><cylinder radius="0.12" length="1.0"/></geometry></collision>
+  </link>
+  <joint name="shoulder" type="revolute">
+    <parent link="base"/><child link="upper"/>
+    <origin xyz="0 1.0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-1.57" upper="1.57" effort="100" velocity="1"/>
+  </joint>
+</robot>`;
+      $("importRobot").onclick = () => { importPanel.style.display = "block"; $("impText").focus(); };
+      $("impClose").onclick = () => { importPanel.style.display = "none"; };
+      $("impSample").onclick = () => { $("impText").value = SAMPLE_ARM; document.querySelector('input[name=impFmt][value=urdf]').checked = true; };
+      $("impGo").onclick = async () => {
+        const format = document.querySelector("input[name=impFmt]:checked").value;
+        const source = $("impText").value;
+        if (!source.trim()) { $("impResult").innerHTML = `<span style="color:#f99">paste a URDF/USD scene first</span>`; return; }
+        const r = await invoke("import_interchange", { format, source });
+        if (!r.ok) { $("impResult").innerHTML = `<span style="color:#f99">✕ ${r.error || "import failed"}</span>`; return; }
+        let html = `<div style="color:#9f9">✓ imported ${r.bodies} bodies, ${r.joints} joints as registry components (Ctrl-Z to undo)</div>`;
+        const unit = r.reconciled ? `<div style="color:#fd6">⚖ units reconciled: metersPerUnit=${r.meters_per_unit} → scene metres (M8.3 scale check)</div>` : `<div style="color:#9ab">units: SI (metres/kg)</div>`;
+        html += unit;
+        if (r.notes && r.notes.length) {
+          html += `<div style="margin-top:4px;color:#bcd">${r.notes.length} explained note${r.notes.length>1?"s":""}:</div>`;
+          r.notes.forEach((n) => { html += `<div style="margin:2px 0;padding:2px 6px;border-left:2px solid #57a;background:#222a3a;border-radius:3px">${n}</div>`; });
+        }
+        $("impResult").innerHTML = html;
+        status(`imported ${r.bodies} bodies from ${r.format}`);
       };
 
       // The contacts panel — each live contact EXPLAINED (penetration · impulses · friction saturation ·

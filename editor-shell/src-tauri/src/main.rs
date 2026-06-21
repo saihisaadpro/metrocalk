@@ -33,6 +33,7 @@ use metrocalk_editor_shell::{
     project_entity, project_full, ActionItem, AiPatch, CapScene, EditIntent, EditTx, Log,
     MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp, Record, Wallet,
 };
+use metrocalk_interchange::{Interchange, UrdfInterchange, UsdInterchange};
 use metrocalk_physics::{
     explain_contact, BodyDesc, BodyHandle, BodyKind, ColliderDesc, ColliderShape, Contact,
     Fidelity, Physics, RapierPhysics, Recording, Replay,
@@ -329,9 +330,31 @@ enum EngineCmd {
     PhysicsContacts {
         reply: Sender<Vec<ContactInfo>>,
     },
+    /// M8.5 — import a URDF / USD-Physics scene (`format` = "urdf" | "usd") into registry components (one
+    /// undoable tx), units reconciled; replies the summary (bodies/joints/units/notes).
+    ImportInterchange {
+        format: String,
+        source: String,
+        reply: Sender<ImportResult>,
+    },
     /// Internal fixed-timestep heartbeat (M8.2): a self-sent tick that advances the sim one step + syncs
     /// transforms to the viewport. NOT a JS command — it never crosses the WebView boundary (invariant 4).
     Tick,
+}
+
+/// The result of an M8.5 interchange import, surfaced to the UI: how much imported, the declared units +
+/// whether they were reconciled (the M8.3 scale check), and every explained "no".
+#[derive(Serialize, Clone, Default)]
+struct ImportResult {
+    ok: bool,
+    format: String,
+    bodies: usize,
+    joints: usize,
+    meters_per_unit: f64,
+    kilograms_per_unit: f64,
+    reconciled: bool,
+    notes: Vec<String>,
+    error: Option<String>,
 }
 
 /// The sim timeline state for the M8.4 transport UI. `frame` is the cursor; `max_frame` is the furthest
@@ -1450,6 +1473,74 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .collect();
                 let _ = reply.send(contacts);
             }
+            EngineCmd::ImportInterchange {
+                format,
+                source,
+                reply,
+            } => {
+                // M8.5: parse a URDF / USD-Physics scene behind the Interchange trait → instantiate it as
+                // registry components in ONE undoable tx (units reconciled) → restart the run so the bodies
+                // simulate. Every unsupported feature is an explained note; a parse error is surfaced.
+                let parsed = match format.as_str() {
+                    "usd" => UsdInterchange.import(source.as_bytes()),
+                    _ => UrdfInterchange.import(source.as_bytes()),
+                };
+                let result = match parsed {
+                    Ok(scene_import) => {
+                        match capscene::import_scene(&mut engine, &scene, &scene_import) {
+                            Ok(ids) => {
+                                (recording, rec_entities, sim, body_of) =
+                                    restart_run(&engine, &assets, &sim, &body_of);
+                                frame = 0;
+                                max_frame = 0;
+                                sim_running = true;
+                                log.append(&Record::Import {
+                                    format: format.clone(),
+                                    source: source.clone(),
+                                });
+                                for id in &ids {
+                                    echo_created(
+                                        &mut engine,
+                                        &shared,
+                                        &mut positions,
+                                        &assets,
+                                        &channel,
+                                        &mut recency,
+                                        &mut touch,
+                                        *id,
+                                    );
+                                }
+                                ImportResult {
+                                    ok: true,
+                                    format: scene_import.format.clone(),
+                                    bodies: scene_import.bodies.len(),
+                                    joints: scene_import.joints.len(),
+                                    meters_per_unit: scene_import.units.meters_per_unit,
+                                    kilograms_per_unit: scene_import.units.kilograms_per_unit,
+                                    reconciled: scene_import.units.needs_reconciliation(),
+                                    notes: scene_import
+                                        .notes
+                                        .iter()
+                                        .map(|n| format!("{} — {}", n.feature, n.detail))
+                                        .collect(),
+                                    error: None,
+                                }
+                            }
+                            Err(e) => ImportResult {
+                                ok: false,
+                                error: Some(format!("instantiate failed: {e}")),
+                                ..Default::default()
+                            },
+                        }
+                    }
+                    Err(e) => ImportResult {
+                        ok: false,
+                        error: Some(format!("{e}")),
+                        ..Default::default()
+                    },
+                };
+                let _ = reply.send(result);
+            }
             EngineCmd::PhysicsDebug { reply } => {
                 let min_y = body_of
                     .values()
@@ -1629,21 +1720,36 @@ fn collider_shape_for(
         FieldValue::Str(s) => Some(s.as_str()),
         _ => None,
     });
-    if shape == Some("convexHull") {
-        if let Some((verts, idx)) = mesh_geometry(assets, engine, id) {
-            if let Ok(d) = metrocalk_physics::derive_collider(&verts, &idx) {
-                return d.shape;
+    let num = |field: &str, default: f64| -> f64 {
+        col.and_then(|m| m.get(field)).map_or(default, |v| match v {
+            FieldValue::Number(n) => *n,
+            FieldValue::Integer(i) => *i as f64,
+            _ => default,
+        })
+    };
+    match shape {
+        Some("convexHull") => {
+            if let Some((verts, idx)) = mesh_geometry(assets, engine, id) {
+                if let Ok(d) = metrocalk_physics::derive_collider(&verts, &idx) {
+                    return d.shape;
+                }
+            }
+            ColliderShape::Ball {
+                radius: num("radius", f64::from(BALL_RADIUS)),
             }
         }
+        // M8.5: imported (URDF/USD) bodies carry real primitive shapes — mirror them faithfully.
+        Some("cuboid") => ColliderShape::Cuboid {
+            half_extents: [num("halfX", 0.5), num("halfY", 0.5), num("halfZ", 0.5)],
+        },
+        Some("capsule") => ColliderShape::Capsule {
+            half_height: num("halfHeight", 0.5),
+            radius: num("radius", 0.25),
+        },
+        _ => ColliderShape::Ball {
+            radius: num("radius", f64::from(BALL_RADIUS)),
+        },
     }
-    let r = col
-        .and_then(|m| m.get("radius"))
-        .and_then(|v| match v {
-            FieldValue::Number(n) => Some(*n),
-            _ => None,
-        })
-        .unwrap_or(f64::from(BALL_RADIUS));
-    ColliderShape::Ball { radius: r }
 }
 
 /// The full collider for an entity — its [`collider_shape_for`] shape plus the material coefficients from
@@ -2530,6 +2636,26 @@ fn physics_contacts(state: State<AppState>) -> Vec<ContactInfo> {
     rx.recv().unwrap_or_default()
 }
 
+/// M8.5 — import a URDF / USD-Physics scene (`format` = "urdf" | "usd") as registry components (one
+/// undoable tx, units reconciled). Returns the summary (bodies/joints/units/notes) for the UI.
+#[tauri::command]
+fn import_interchange(state: State<AppState>, format: String, source: String) -> ImportResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ImportInterchange {
+            format,
+            source,
+            reply,
+        })
+        .is_err()
+    {
+        return ImportResult::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 /// Hover-tooltip details for an entity (M3.3) — fetched on hovered-entity change, not per frame.
 #[tauri::command]
 fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
@@ -2708,7 +2834,8 @@ fn main() {
             sim_timeline,
             sim_overlay,
             sim_shove,
-            physics_contacts
+            physics_contacts,
+            import_interchange
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");

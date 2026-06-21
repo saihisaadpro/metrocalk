@@ -394,4 +394,50 @@ describe("Metrocalk editor — north-star #1 live", () => {
     const off = await invokeT("sim_timeline");
     expect(off[3]).toBe(false);
   });
+
+  // ── M8.5 interchange: import a URDF arm → registry-component entities, units validated, every
+  // unsupported feature explained, undoable. (USD is exercised headlessly in /interchange.) ──────────────
+  it("M8.5: imports a URDF arm into the sim as registry components, with explained notes", async () => {
+    const URDF = `<?xml version="1.0"?>
+<robot name="arm">
+  <link name="base">
+    <inertial><mass value="5.0"/><inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/></inertial>
+    <collision><geometry><box size="0.6 0.3 0.6"/></geometry></collision>
+  </link>
+  <link name="upper">
+    <inertial><mass value="2.0"/><inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/></inertial>
+    <collision><geometry><cylinder radius="0.12" length="1.0"/></geometry></collision>
+  </link>
+  <joint name="shoulder" type="revolute">
+    <parent link="base"/><child link="upper"/>
+    <origin xyz="0 1.0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-1.57" upper="1.57" effort="100" velocity="1"/>
+  </joint>
+</robot>`;
+
+    const before = (await physDbg())[0];
+    const r = await invokeT("import_interchange", { format: "urdf", source: URDF });
+    expect(r.ok).toBe(true);
+    expect(r.bodies).toBe(2); // two links → two bodies
+    expect(r.joints).toBe(1); // one revolute
+    expect(r.format).toMatch(/URDF/);
+    // Every approximation is EXPLAINED, not silently dropped (the accuracy discipline).
+    expect(Array.isArray(r.notes)).toBe(true);
+    expect(r.notes.some((n) => /cylinder/i.test(n))).toBe(true); // cylinder → capsule, noted
+    expect(r.notes.some((n) => /limit/i.test(n))).toBe(true); // unenforced joint limit, noted
+
+    // The imported bodies entered the sim (registry components → mirrored bodies).
+    await browser.waitUntil(async () => (await physDbg())[0] > before, {
+      timeout: 10000,
+      timeoutMsg: "the imported URDF bodies did not enter the sim",
+    });
+
+    // ONE undoable transaction — Ctrl-Z peels the whole import back.
+    const had = (await physDbg())[0];
+    await browser.keys(["Control", "z"]);
+    await browser.waitUntil(async () => (await physDbg())[0] < had, {
+      timeout: 10000,
+      timeoutMsg: "undo did not reverse the URDF import",
+    });
+  });
 });

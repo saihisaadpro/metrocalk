@@ -560,6 +560,222 @@ pub fn spawn_physics_body(
     Ok(id)
 }
 
+/// Instantiate a parsed [`SceneImport`](metrocalk_interchange::SceneImport) (URDF / USD-Physics, M8.5) as
+/// registry-component entities in **ONE undoable transaction** (invariant 3): each imported body → a
+/// `Transform` + `RigidBody` + `Collider` (+ the Physics/Collision/Spatial caps so it rides the intent
+/// system), each imported joint → a `Joint` component referencing its two body entities. Returns the body
+/// entity ids (parallel to `import.bodies`). The import is intent-wired + inspectable + undoable like any
+/// scene edit — the foreign format becomes ordinary entities, no privileged objects.
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the transaction fails (the ops are registry-consistent by construction).
+#[allow(clippy::too_many_lines)] // a flat body+joint→ops mapping; splitting it would obscure, not clarify
+pub fn import_scene(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    import: &metrocalk_interchange::SceneImport,
+) -> Result<Vec<EntityId>, PipelineError> {
+    use metrocalk_interchange::{BodyKind, ColliderShape, JointDesc};
+
+    let body_ids: Vec<EntityId> = import
+        .bodies
+        .iter()
+        .map(|_| engine.alloc_entity_id())
+        .collect();
+    let mut ops = Vec::new();
+    let set = |ops: &mut Vec<Op>, id, comp: &str, field: &str, value| {
+        ops.push(Op::SetField {
+            entity: id,
+            component: comp.into(),
+            field: field.into(),
+            value,
+        });
+    };
+
+    for (body, &id) in import.bodies.iter().zip(&body_ids) {
+        ops.push(Op::CreateEntity { id, parent: None });
+        for (f, v) in [
+            ("x", body.translation[0]),
+            ("y", body.translation[1]),
+            ("z", body.translation[2]),
+        ] {
+            set(&mut ops, id, "Transform", f, FieldValue::Number(v));
+        }
+        let kind = match body.kind {
+            BodyKind::Fixed => "fixed",
+            BodyKind::KinematicPosition => "kinematicPosition",
+            BodyKind::KinematicVelocity => "kinematicVelocity",
+            BodyKind::Dynamic => "dynamic",
+        };
+        set(
+            &mut ops,
+            id,
+            "RigidBody",
+            "kind",
+            FieldValue::Str(kind.into()),
+        );
+        if let Some(m) = body.mass {
+            set(&mut ops, id, "RigidBody", "mass", FieldValue::Number(m));
+        }
+        if let Some(col) = &body.collider {
+            set(
+                &mut ops,
+                id,
+                "Collider",
+                "density",
+                FieldValue::Number(col.density),
+            );
+            set(
+                &mut ops,
+                id,
+                "Collider",
+                "friction",
+                FieldValue::Number(col.friction),
+            );
+            set(
+                &mut ops,
+                id,
+                "Collider",
+                "restitution",
+                FieldValue::Number(col.restitution),
+            );
+            match &col.shape {
+                ColliderShape::Ball { radius } => {
+                    set(
+                        &mut ops,
+                        id,
+                        "Collider",
+                        "shape",
+                        FieldValue::Str("ball".into()),
+                    );
+                    set(
+                        &mut ops,
+                        id,
+                        "Collider",
+                        "radius",
+                        FieldValue::Number(*radius),
+                    );
+                }
+                ColliderShape::Cuboid { half_extents } => {
+                    set(
+                        &mut ops,
+                        id,
+                        "Collider",
+                        "shape",
+                        FieldValue::Str("cuboid".into()),
+                    );
+                    set(
+                        &mut ops,
+                        id,
+                        "Collider",
+                        "halfX",
+                        FieldValue::Number(half_extents[0]),
+                    );
+                    set(
+                        &mut ops,
+                        id,
+                        "Collider",
+                        "halfY",
+                        FieldValue::Number(half_extents[1]),
+                    );
+                    set(
+                        &mut ops,
+                        id,
+                        "Collider",
+                        "halfZ",
+                        FieldValue::Number(half_extents[2]),
+                    );
+                }
+                ColliderShape::Capsule {
+                    half_height,
+                    radius,
+                } => {
+                    set(
+                        &mut ops,
+                        id,
+                        "Collider",
+                        "shape",
+                        FieldValue::Str("capsule".into()),
+                    );
+                    set(
+                        &mut ops,
+                        id,
+                        "Collider",
+                        "halfHeight",
+                        FieldValue::Number(*half_height),
+                    );
+                    set(
+                        &mut ops,
+                        id,
+                        "Collider",
+                        "radius",
+                        FieldValue::Number(*radius),
+                    );
+                }
+                // Hull/tri-mesh/seam shapes (e.g. a URDF mesh collider) carry no primitive params — a
+                // ball stand-in keeps the body simulable; the import note explains the real story.
+                _ => {
+                    set(
+                        &mut ops,
+                        id,
+                        "Collider",
+                        "shape",
+                        FieldValue::Str("ball".into()),
+                    );
+                    set(&mut ops, id, "Collider", "radius", FieldValue::Number(0.25));
+                }
+            }
+        }
+        for (rel, cap) in [
+            (scene.rels.provides, "Physics"),
+            (scene.rels.provides, "Collision"),
+            (scene.rels.requires, "Spatial"),
+        ] {
+            if let Some(&c) = scene.caps.get(&canonical(cap)) {
+                ops.push(Op::AddPair {
+                    entity: id,
+                    rel,
+                    target: c,
+                });
+            }
+        }
+    }
+
+    // Joints → a `Joint` component referencing the two body entities (inspectable; the editor's live
+    // joint-constrained sim is a named follow-up — the mapping itself is proven in /interchange).
+    for joint in &import.joints {
+        let (Some(&a), Some(&b)) = (body_ids.get(joint.parent), body_ids.get(joint.child)) else {
+            continue;
+        };
+        let id = engine.alloc_entity_id();
+        ops.push(Op::CreateEntity { id, parent: None });
+        let kind = match joint.joint {
+            JointDesc::Revolute { .. } => "revolute",
+            JointDesc::Spherical { .. } => "spherical",
+            // Fixed + any future variant → the rigid-weld default.
+            _ => "fixed",
+        };
+        set(&mut ops, id, "Joint", "kind", FieldValue::Str(kind.into()));
+        set(
+            &mut ops,
+            id,
+            "Joint",
+            "bodyA",
+            FieldValue::Str(a.to_loro_key()),
+        );
+        set(
+            &mut ops,
+            id,
+            "Joint",
+            "bodyB",
+            FieldValue::Str(b.to_loro_key()),
+        );
+    }
+
+    engine.commit("import-interchange", ops)?;
+    Ok(body_ids)
+}
+
 /// Apply a **marketplace entry** as a new pre-componentized scene entity — its component (display
 /// marker) + its **namespaced** capability pairs (provides/requires, with an aliased custom cap also
 /// providing its standard cap) + its mesh **handle** — all as ONE undoable transaction (invariant 3).

@@ -17,6 +17,10 @@ metrocalk-core = { path = "../core" }
 metrocalk-ecs = { path = "../ecs" }
 # The token economy (M7) — the wallet/metering seam wraps the pure ledger + cost model + payment seam.
 metrocalk-economy = { path = "../economy" }
+# The interchange tier (M8.5) — URDF/USD import behind the `Interchange` trait, mapped to registry
+# components by `capscene::import_scene`. Brings the neutral SceneImport + the re-exported /physics
+# boundary enums (BodyKind/ColliderShape/JointDesc); no urdf_rs/openusd type crosses (grep-gated).
+metrocalk-interchange = { path = "../interchange" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

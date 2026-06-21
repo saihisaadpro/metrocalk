@@ -59,6 +59,9 @@ pub enum Record {
     /// M8.3 one-click physics fix (`add-collider`/`use-hull`/`fix-mass`/`fix-scale`) on an entity.
     /// Replayed by re-applying the same fix so the corrected setup survives reload.
     PhysicsFix { id: String, action: String },
+    /// M8.5 interchange import (`format` = "urdf" | "usd"): the source text is kept so replay re-imports
+    /// it through the same `Interchange` trait → identical registry components survive reload.
+    Import { format: String, source: String },
     /// A marketplace-tier apply (M5): a chosen pre-componentized entry, replayed deterministically by
     /// re-fetching it from the (checked-in) catalog by id + re-applying its namespaced caps + mesh
     /// handle, so a *marketplace*-sourced object survives reload exactly like a local one.
@@ -141,6 +144,7 @@ impl Log {
     /// that cannot apply — a malformed line, a rejected edit, or a bind referencing an id absent from
     /// the fresh seed (the **divergence** case) — is counted as skipped and never panics. The caller
     /// should `clear_history()` **after** replay so the restored scene is non-undoable.
+    #[allow(clippy::too_many_lines)] // one match arm per Record kind; splitting the dispatch hurts clarity
     pub fn replay(
         &self,
         engine: &mut Engine<FlecsWorld>,
@@ -194,6 +198,17 @@ impl Log {
                         "fix-mass" => crate::physics_intent::fix_mass(engine, e, 1.0).is_ok(),
                         _ => true, // fix-scale: a flagged suggestion, no state change
                     })
+                }
+                Record::Import { format, source } => {
+                    use metrocalk_interchange::{Interchange, UrdfInterchange, UsdInterchange};
+                    let parsed = match format.as_str() {
+                        "usd" => UsdInterchange.import(source.as_bytes()),
+                        _ => UrdfInterchange.import(source.as_bytes()),
+                    };
+                    parsed
+                        .ok()
+                        .and_then(|imp| capscene::import_scene(engine, scene, &imp).ok())
+                        .is_some()
                 }
                 Record::ApplyMarketplace {
                     entry_id,
