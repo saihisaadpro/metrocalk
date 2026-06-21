@@ -117,3 +117,28 @@ jobs:
         run: |
           cargo build -p metrocalk-physics --release --target wasm32-unknown-unknown
           echo "metrocalk-physics wasm32 build OK"
+
+  wasm32-interchange:
+    name: build wasm32 (metrocalk-interchange)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The interchange tier (M8.5, ADR-024): URDF (urdf-rs/yaserde) + USD (openusd) behind the
+      # Interchange trait, mapping to our neutral types + the /physics boundary. All pure Rust, so the
+      # crate crosses to wasm — the URDF path is fully wasm-portable; USD's openusd `Stage::open` is
+      # file-based, so USD IMPORT is a native action at runtime (the ADR-006 boundary), but the crate still
+      # BUILDS for wasm. `-p metrocalk-interchange` pulls urdf-rs/openusd/physics — never core/ecs/Flecs.
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-interchange --release --target wasm32-unknown-unknown
+          echo "metrocalk-interchange wasm32 build OK"
