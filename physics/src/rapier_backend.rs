@@ -369,27 +369,28 @@ impl Physics for RapierPhysics {
             if !pair.has_any_active_contact() {
                 continue;
             }
-            // The two bodies the contacting colliders belong to (+ their world positions, for a
-            // representative contact point — the seam reports the pair + normal + depth; the exact
-            // manifold point is refined when M8.4 needs it).
-            let body_of = |ch| -> Option<(BodyHandle, Vec3)> {
+            let body_of = |ch| -> Option<BodyHandle> {
                 let h = self.colliders.get(ch)?.parent()?;
                 let (i, g) = h.into_raw_parts();
-                let pos = self
-                    .bodies
-                    .get(h)
-                    .map_or([0.0; 3], |b| unvec(b.translation()));
-                Some((BodyHandle(pack(i, g)), pos))
+                Some(BodyHandle(pack(i, g)))
             };
-            let (Some((a, pa)), Some((b, pb))) = (body_of(pair.collider1), body_of(pair.collider2))
-            else {
+            let (Some(a), Some(b)) = (body_of(pair.collider1), body_of(pair.collider2)) else {
                 continue;
             };
-            let midpoint = [
-                (pa[0] + pb[0]) * 0.5,
-                (pa[1] + pb[1]) * 0.5,
-                (pa[2] + pb[2]) * 0.5,
-            ];
+            // Material coefficients are properties of the two colliders; report the effective (averaged)
+            // value the contact behaves with — the friction cone the debugger draws. (Rapier's default
+            // combine rule is the average; labelled as effective so it's honest, not a fabricated number.)
+            let col1 = self.colliders.get(pair.collider1);
+            let col2 = self.colliders.get(pair.collider2);
+            let friction = col1
+                .zip(col2)
+                .map_or(0.0, |(c1, c2)| (c1.friction() + c2.friction()) * 0.5);
+            let restitution = col1
+                .zip(col2)
+                .map_or(0.0, |(c1, c2)| (c1.restitution() + c2.restitution()) * 0.5);
+            // Collider 1's world placement transforms each manifold point (stored in its local frame) to
+            // world space — the exact contact point the overlay marks + the click-to-explain target.
+            let pos1 = col1.map(rapier::geometry::Collider::position).copied();
             for m in &pair.manifolds {
                 let normal = unvec(m.data.normal);
                 for pt in &m.points {
@@ -397,12 +398,28 @@ impl Physics for RapierPhysics {
                     if depth > max_penetration {
                         max_penetration = depth;
                     }
+                    let point =
+                        pos1.map_or_else(|| [0.0; 3], |p| unvec(p.transform_point(pt.local_p1)));
+                    let normal_impulse = pt.data.impulse;
+                    // Friction impulse is a 2-vector in the contact tangent plane; report its magnitude.
+                    let tangent_impulse = {
+                        let t = pt.data.tangent_impulse;
+                        (t[0] * t[0] + t[1] * t[1]).sqrt()
+                    };
+                    let friction_saturated = normal_impulse > 1e-9
+                        && tangent_impulse >= friction * normal_impulse * (1.0 - 1e-3);
                     contacts.push(Contact {
                         body_a: a,
                         body_b: b,
-                        point: midpoint,
+                        point,
                         normal,
                         depth,
+                        normal_impulse,
+                        tangent_impulse,
+                        friction,
+                        restitution,
+                        friction_saturated,
+                        manifold_id: pt.fid1.0 ^ (pt.fid2.0.rotate_left(16)),
                     });
                 }
             }
@@ -493,6 +510,39 @@ pub fn derive_collider(
     })
 }
 
+/// Plain-language "why" for a contact — the M3.1 / ADR-016 explain discipline applied to *running*
+/// physics ("debug by looking"). It narrates the **measured** contact (penetration, post-solve impulses,
+/// friction saturation) and names the likely cause of a jitter — the physics analog of "why is this greyed
+/// out?" / "✅ state = FacingBoss, ❌ KillCounter 3/4". Pure formatting over a [`Contact`]; it never
+/// invents a quantity that wasn't measured (the per-island solver residual rapier 0.33 doesn't expose is
+/// named as the geometric penetration residual, not faked).
+#[must_use]
+pub fn explain_contact(c: &Contact) -> String {
+    let mut s = format!(
+        "penetration {:.2} mm · normal impulse {:.2} N·s · friction impulse {:.2} N·s (μ≈{:.2}, restitution≈{:.2})",
+        c.depth * 1000.0,
+        c.normal_impulse,
+        c.tangent_impulse,
+        c.friction,
+        c.restitution,
+    );
+    if c.friction_saturated {
+        s.push_str(
+            " · friction SATURATED (the surfaces are slipping) — a classic jitter source: raise friction, \
+             lower the timestep, or add rolling resistance",
+        );
+    }
+    if c.depth > 0.005 {
+        s.push_str(
+            " · deep penetration (position residual > 5 mm) — soft contact / too few solver iterations; \
+             this is why it sinks and jitters",
+        );
+    } else if !c.friction_saturated {
+        s.push_str(" · resting cleanly (shallow penetration, friction within the cone)");
+    }
+    s
+}
+
 /// Signed volume enclosed by a triangle mesh (divergence theorem: Σ of the origin tetrahedra over the
 /// triangles). `abs()` at the call site handles winding. A non-multiple-of-3 index tail is ignored.
 fn mesh_volume(vertices: &[Vec3], indices: &[u32]) -> f64 {
@@ -571,6 +621,33 @@ mod tests {
         assert!(
             d.contact_count > 0,
             "settled balls rest on the ground → contacts exist"
+        );
+    }
+
+    #[test]
+    fn contacts_carry_solved_impulses_and_explain_themselves() {
+        // A settled stack produces resting contacts; each must carry the post-solve normal impulse (a
+        // resting box pushes back against gravity) + a world point + a material μ — the data the M8.4
+        // overlay color-codes and `explain_contact` narrates. None of it is fabricated: a frictionless
+        // float would show zero impulse, so a positive impulse here is the solver's real output.
+        let mut p = scene();
+        for _ in 0..400 {
+            p.step();
+        }
+        let d = p.diagnostics();
+        assert!(d.contact_count > 0, "settled balls rest → contacts exist");
+        let resting =
+            d.contacts.iter().find(|c| c.normal_impulse > 0.0).expect(
+                "a resting contact carries a positive normal impulse (supports the weight)",
+            );
+        assert!(
+            resting.point[1].abs() < 50.0 && resting.friction >= 0.0,
+            "the contact has a finite world point + a material friction coefficient"
+        );
+        let why = explain_contact(resting);
+        assert!(
+            why.contains("penetration") && why.contains("normal impulse"),
+            "explain narrates the measured contact ({why})"
         );
     }
 

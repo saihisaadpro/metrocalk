@@ -22,8 +22,10 @@
 //! document and never re-runs the sim. This crate owns the former; it shares only the initial snapshot.
 
 mod rapier_backend;
+pub mod replay;
 
-pub use rapier_backend::{derive_collider, RapierPhysics};
+pub use rapier_backend::{derive_collider, explain_contact, RapierPhysics};
+pub use replay::{InputEvent, RecordedBody, Recording, Replay};
 
 use serde::{Deserialize, Serialize};
 
@@ -285,16 +287,37 @@ impl Fidelity {
     }
 }
 
-/// One active contact, exposed read-only for the M8.4 contact debugger (the M8.1 diagnostics, live).
+/// One active contact, exposed read-only for the M8.4 contact debugger (the M8.1 diagnostics, live). The
+/// post-solve impulses + friction state are what the overlay color-codes and [`explain_contact`] narrates
+/// — the physics analog of "✅/❌ why this is greyed out" (the M3.1/ADR-016 discipline). Every field is
+/// **measured from the solved manifold**, never estimated; the seams (per-island solver residual,
+/// time-of-impact) are named honestly where rapier 0.33 doesn't expose them, not faked.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Contact {
     pub body_a: BodyHandle,
     pub body_b: BodyHandle,
-    /// A representative contact point (world space).
+    /// The deepest manifold point in **world space** (the contact the overlay draws + the click target).
     pub point: Vec3,
+    /// Contact normal (unit, pointing from A toward B).
     pub normal: Vec3,
-    /// Penetration depth (positive = overlapping).
+    /// Penetration depth (positive = overlapping). The position residual the solver couldn't fully
+    /// resolve this frame — the honest "residual" proxy (rapier 0.33 exposes no per-island solver
+    /// residual; this is the geometric one, labelled as such).
     pub depth: f64,
+    /// Normal impulse applied by the solver this step (N·s) — how hard the contact pushed.
+    pub normal_impulse: f64,
+    /// Tangential (friction) impulse magnitude this step (N·s).
+    pub tangent_impulse: f64,
+    /// Combined friction coefficient at this contact (the friction cone's slope).
+    pub friction: f64,
+    /// Combined restitution (bounciness) at this contact.
+    pub restitution: f64,
+    /// `true` when the friction impulse is at the cone limit (`|tangent| ≈ μ·normal`) — the contact is
+    /// **slipping**, a classic jitter source the debugger flags.
+    pub friction_saturated: bool,
+    /// Persistent feature id of the deepest point — stable while the same surface features touch. A value
+    /// that **flickers** frame-to-frame is the signature of jitter (the overlay/`explain` surfaces it).
+    pub manifold_id: u32,
 }
 
 /// Read-only solver/contact diagnostics — the seam M8.4's debugger consumes. Producing it MUST NOT
