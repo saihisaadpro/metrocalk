@@ -18,6 +18,10 @@ workspace = true
 # urdf-rs (OpenRR) — the standard Rust URDF parser (XML → a typed robot model). Pure Rust (yaserde), so it
 # crosses to wasm. Wrapped here; its types never leak past `Interchange`.
 urdf-rs = "0.9"
+# openusd — a pure-Rust OpenUSD reader (.usda text + a UsdPhysics schema reader). Pre-1.0, so wrapped
+# behind the `Interchange` trait (invariant 5). Pure Rust (logos/half/strum — no C++ FFI), but Stage::open
+# is file-based, so USD import is a native action (the ADR-006 wasm boundary; URDF carries the wasm path).
+openusd = "0.5"
 # Our physics boundary types (BodyDesc/ColliderDesc/JointDesc/ColliderShape) — the neutral import target.
 metrocalk-physics = { path = "../physics" }
 serde = { version = "1", features = ["derive"] }

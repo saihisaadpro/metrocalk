@@ -18,7 +18,9 @@ use metrocalk_physics::{BodyKind, ColliderDesc, JointDesc, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 mod urdf;
+mod usd;
 pub use urdf::UrdfInterchange;
+pub use usd::UsdInterchange;
 
 /// The stage units a format declares — the M8.5 deliverable-2 ground truth feeding M8.3's scale check.
 /// URDF is SI (1 m / 1 kg per unit); USD declares `metersPerUnit` / `kilogramsPerUnit` (often cm / g).
