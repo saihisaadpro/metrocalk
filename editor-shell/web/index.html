@@ -106,6 +106,7 @@
       // projection store: id -> { name, parentId, components }
       const store = new Map();
       let selected = null;
+      let lastComp = null; // M9.2: the id of the last character saved with "Save character" (for "Drop instance")
       let gizmoDragging = false; // M9.1: a left-drag on a gizmo handle is in progress (render loop moves it)
       let opSeq = 0;
       const pending = new Map(); // clientOpId -> intent (for optimistic display, dropped on confirm)
@@ -201,12 +202,46 @@
         // the edit rate (≈2 tokens, debit-on-success). The real LLM is a seam; this is the deterministic
         // offline stand-in (sets MeshRenderer.material).
         html += `<button id="rustier" style="margin:8px 12px;background:#5a2f1f">✦ Make it rustier (≈2 tokens)</button>`;
+        // ── M9.2 part editing (G2): a part is a child node; drag it with the gizmo (the move commits as a
+        // per-field OVERRIDE, ADR-026). Save the whole character for reuse, drop a fresh instance, hide a
+        // part (deactivate-not-delete, Ctrl-Z restores), and reparent it ("drag in hierarchy" = node.move).
+        const parentId = e.parentId;
+        html += `<div style="opacity:.7;margin-top:10px;border-top:1px solid #333;padding-top:6px">part editing (M9.2)</div>`;
+        html += `<div style="opacity:.6;font-size:11px;margin:0 12px">${parentId ? "child of " + parentId : "root (top-level)"}</div>`;
+        html += `<button id="saveChar" style="margin:4px 12px;background:#1f3a5a">💾 Save character for reuse</button>`;
+        html += `<button id="dropInst" style="margin:4px 12px;background:#1f3a5a"${lastComp ? "" : " disabled"}>📋 Drop a fresh instance</button>`;
+        html += `<button id="deactPart" style="margin:4px 12px;background:#5a1f2f">🗑 Deactivate part (Ctrl-Z restores)</button>`;
+        html += `<div class="field"><span>reparent under</span><input id="reparentTo" placeholder="paste an entity id — empty = root"/></div>`;
+        html += `<button id="reparentBtn" style="margin:4px 12px;background:#3a3a1f">↳ Reparent (node.move)</button>`;
         $("inspector").innerHTML = html;
         for (const inp of $("inspector").querySelectorAll("input")) {
           inp.onchange = () => editField(selected, inp.dataset.c, inp.dataset.f, parseMaybeNumber(inp.value));
         }
         const rb = $("rustier");
         if (rb) rb.onclick = () => doAiEdit(selected);
+        const sc = $("saveChar");
+        if (sc) sc.onclick = async () => {
+          const c = await invoke("save_character", { id: selected });
+          if (c) { lastComp = c; status("saved character " + c + " — Drop a fresh instance to reuse it"); renderInspector(); }
+          else status("save character failed");
+        };
+        const di = $("dropInst");
+        if (di) di.onclick = async () => {
+          if (!lastComp) { status("save a character first"); return; }
+          const r = await invoke("instantiate_character", { comp: lastComp });
+          status(r ? "dropped a fresh instance: " + r + " (the saved edit overrides the source)" : "drop instance failed");
+        };
+        const dp = $("deactPart");
+        if (dp) dp.onclick = async () => {
+          const ok = await invoke("set_part_active", { id: selected, active: false });
+          status(ok ? "part deactivated (data preserved — Ctrl-Z restores it)" : "deactivate failed (root parts can't be hidden)");
+        };
+        const rpb = $("reparentBtn");
+        if (rpb) rpb.onclick = () => {
+          const to = $("reparentTo").value.trim();
+          invoke("reparent_part", { id: selected, parent: to === "" ? null : to });
+          status("reparented" + (to ? " under " + to : " to root") + " (Ctrl-Z to undo)");
+        };
       }
       const parseMaybeNumber = (s) => { const n = Number(s); return s.trim() !== "" && !isNaN(n) ? n : s; };
 

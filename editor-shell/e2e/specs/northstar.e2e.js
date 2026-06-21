@@ -482,4 +482,62 @@ describe("Metrocalk editor — north-star #1 live", () => {
       { timeout: 10000, timeoutMsg: "Ctrl-Z did not revert the gizmo move" }
     );
   });
+
+  // ── M9.2 (G2): rigid part editing — the G1 gizmo on a CHILD node, stored as a per-field OVERRIDE
+  // (ADR-026), save-the-character-for-reuse, and deactivate-not-delete. ─────────────────────────────────
+  it("M9.2: edit a child PART (override) → save the character → a fresh instance carries the edit; deactivate a part → Ctrl-Z restores it", async () => {
+    // The seeded demo character: a body root + rigid child parts (a part is a child Movable-Tree node).
+    const demo = await invokeT("demo_character"); // [root, [parts]]
+    expect(demo).not.toBe(null);
+    const [, parts] = demo;
+    expect(parts.length).toBeGreaterThanOrEqual(2);
+    const part = parts[0];
+
+    // The part starts ACTIVE. (Override count is NOT asserted as 0 — a prior run's persisted edit may
+    // have replayed; the test keys off the DELTA the edit produces, which is robust either way.)
+    const before = await invokeT("part_debug", { id: part }); // [x, y, z, active, nOverrides]
+    expect(before[3]).toBe(true);
+
+    // Edit the part with the gizmo: select → translate → grab Y → move up → release. The commit routes
+    // through edit_part_transform (parent-space write-back → a sparse per-field OVERRIDE), NOT a base
+    // rewrite — so the source stays intact and the override wins by structure.
+    expect(await invokeT("gizmo_select", { id: part })).toBe(true);
+    await invokeT("gizmo_mode", { mode: "translate" });
+    expect(await invokeT("gizmo_grab", { axis: "y" })).toBe(true);
+    await invokeT("gizmo_set_target", { tx: before[0], ty: before[1] + 3.0, tz: before[2] });
+    await browser.pause(150);
+    await invokeT("gizmo_drag_end");
+    await browser.waitUntil(
+      async () => {
+        const d = await invokeT("part_debug", { id: part });
+        return d[4] > 0 && d[1] > before[1] + 1.0; // overrides present AND the part moved up in world
+      },
+      { timeout: 10000, timeoutMsg: "the part edit did not land as a per-field override + move" }
+    );
+    const after = await invokeT("part_debug", { id: part });
+    expect(after[4]).toBeGreaterThan(0); // sparse per-field override keys (not a whole-object copy)
+
+    // Save the edited character for reuse → drop a fresh instance → its matching part carries the edit
+    // (override baked into the reusable asset; override wins over the un-edited source by structure).
+    const comp = await invokeT("save_character", { id: part });
+    expect(typeof comp).toBe("string");
+    const inst = await invokeT("instantiate_character", { comp });
+    expect(typeof inst).toBe("string");
+    const instPart = await invokeT("part_at_path", { root: inst, path: "0" });
+    expect(typeof instPart).toBe("string");
+    const instDbg = await invokeT("part_debug", { id: instPart });
+    expect(instDbg[1]).toBeGreaterThan(before[1] + 1.0); // the saved edit is present on the fresh instance
+
+    // Deactivate-not-delete: a removed part is hidden + recoverable. Ensure a known ACTIVE baseline first
+    // (robust to a prior run), deactivate, then Ctrl-Z restores it.
+    const part2 = parts[1];
+    await invokeT("set_part_active", { id: part2, active: true });
+    expect(await invokeT("set_part_active", { id: part2, active: false })).toBe(true);
+    expect((await invokeT("part_debug", { id: part2 }))[3]).toBe(false); // hidden, but data preserved
+    await browser.keys(["Control", "z"]);
+    await browser.waitUntil(async () => (await invokeT("part_debug", { id: part2 }))[3] === true, {
+      timeout: 10000,
+      timeoutMsg: "Ctrl-Z did not restore the deactivated part (deactivate-not-delete)",
+    });
+  });
 });
