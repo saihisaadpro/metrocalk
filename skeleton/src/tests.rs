@@ -308,3 +308,59 @@ fn a_pose_applies_to_a_selection_of_bones_only() {
         "the selected bend carried the end, got {end:?}"
     );
 }
+
+// ── benchmark discipline: FK + IK + LBS cost for a representative character ────
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only timing measurement (run --release)"
+)]
+fn fk_ik_lbs_cost_for_a_representative_character() {
+    // A representative rig (a 20-joint chain) skinning a 5k-vertex mesh: measure one full pose evaluation
+    // — FK globals + skinning matrices + a 2-bone IK solve + LBS (position + inverse-transpose normal) over
+    // every vertex. Pure CPU math → host-stable + tiny, and IDENTICAL on min-spec (this is the
+    // deterministic CPU path; the GPU LBS variant is render-only). Release-gated (debug timing is noise).
+    const JOINTS: usize = 20;
+    const VERTS: usize = 5000;
+    let mut specs: Vec<(Option<usize>, Transform)> = vec![(None, tf([0.0, 0.0, 0.0]))];
+    for i in 1..JOINTS {
+        specs.push((Some(i - 1), tf([0.0, 0.5, 0.0]))); // a chain up +Y
+    }
+    let skel = skeleton(&specs);
+    // A synthetic skinned mesh: each vertex bound to two adjacent joints (≤4-influence LBS).
+    let verts: Vec<([f32; 3], [u16; 4], [f32; 4])> = (0..VERTS)
+        .map(|v| {
+            let j = u16::try_from(v % (JOINTS - 1)).unwrap_or(0);
+            (
+                [0.3, (v as f32) * 0.001, 0.0],
+                [j, j + 1, 0, 0],
+                [0.6, 0.4, 0.0, 0.0],
+            )
+        })
+        .collect();
+
+    let n = 200u32;
+    let t0 = std::time::Instant::now();
+    let mut acc = 0.0f32;
+    for i in 0..n {
+        // The per-edit work: bend a joint + a 2-bone IK solve, then deform every vertex.
+        let mut pose = Pose::new();
+        let mut b = skel.joints[3].local_bind;
+        b.rotation = axis_angle([1.0, 0.0, 0.0], 0.3 + 0.001 * i as f32);
+        pose.set(3, b);
+        let posed = ik::apply_two_bone_ik(&skel, &pose, 0, 1, 2, [0.4, 0.6, 0.2], [0.0, 0.0, 1.0]);
+        let skin = skel.skinning_matrices(&posed);
+        for (p, j, w) in &verts {
+            acc += skin_position(*p, *j, *w, &skin)[1];
+            acc += skin_normal([0.0, 1.0, 0.0], *j, *w, &skin)[1];
+        }
+    }
+    let per_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+    std::hint::black_box(acc);
+    eprintln!("[M9.3] FK+IK+LBS, {JOINTS} joints × {VERTS} verts: {per_ms:.4} ms/pose-eval");
+    assert!(
+        per_ms < 16.0,
+        "a full pose-eval (got {per_ms} ms) must fit one 60 Hz frame"
+    );
+}
