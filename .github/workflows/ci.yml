@@ -83,6 +83,18 @@ jobs:
           fi
           echo "no rapier/parry outside /physics — Physics-trait boundary intact"
 
+      - name: No urdf/openusd types leak outside the /interchange crate (invariant 5, M8.5/ADR-024)
+        run: |
+          # The robotics/VFX import crates (urdf_rs, openusd) must live ONLY behind the Interchange trait,
+          # in /interchange — exactly as rapier lives in /physics + gltf in the importer. Every other crate
+          # consumes an import through the project-owned Interchange trait + our neutral types (SceneImport
+          # carrying the /physics boundary types), never a urdf_rs/openusd type. Prose comments are fine.
+          if grep -rn "urdf_rs\|openusd" core ecs transport plugins assets economy physics editor-shell tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::urdf/openusd leaked outside /interchange — import types must stay behind the Interchange trait (invariant 5; mirrors ADR-001/014)"
+            exit 1
+          fi
+          echo "no urdf/openusd outside /interchange — Interchange-trait boundary intact"
+
       - name: test
         run: cargo test --workspace
 

@@ -1,0 +1,23 @@
+[package]
+name = "metrocalk-interchange"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# The project-owned INTERCHANGE subsystem (M8.5): the robotics/VFX import formats (URDF now;
+# USD-Physics next) wrapped behind our own `Interchange` trait so NO `urdf_rs`/`openusd` type crosses the
+# public surface (invariant 5, CI grep-gated — the same discipline as rapier-in-/physics and gltf-in-
+# /assets). It maps each format onto our OWN neutral types, which carry the /physics boundary types
+# (BodyDesc/ColliderDesc/JointDesc — themselves rapier-free), so an import becomes registry components with
+# no foreign coupling. Every unsupported feature is an explained note, never a silent drop (ADR-016).
+[dependencies]
+# urdf-rs (OpenRR) — the standard Rust URDF parser (XML → a typed robot model). Pure Rust (yaserde), so it
+# crosses to wasm. Wrapped here; its types never leak past `Interchange`.
+urdf-rs = "0.9"
+# Our physics boundary types (BodyDesc/ColliderDesc/JointDesc/ColliderShape) — the neutral import target.
+metrocalk-physics = { path = "../physics" }
+serde = { version = "1", features = ["derive"] }
