@@ -383,6 +383,17 @@ enum EngineCmd {
         id: String,
         reply: Sender<(f64, f64, f64, bool, usize)>,
     },
+    /// M9.2 — the seeded demo character's `(root, [parts])` ids (so the UI/E2E can select a part to edit).
+    DemoCharacter {
+        reply: Sender<Option<(String, Vec<String>)>>,
+    },
+    /// M9.2 — the entity at a structural rel-path within an instance root (e.g. `"0"` = first child), so
+    /// the E2E can address a fresh instance's matching part after `instantiate_character`.
+    PartAtPath {
+        root: String,
+        path: String,
+        reply: Sender<Option<String>>,
+    },
     /// Internal fixed-timestep heartbeat (M8.2): a self-sent tick that advances the sim one step + syncs
     /// transforms to the viewport. NOT a JS command — it never crosses the WebView boundary (invariant 4).
     Tick,
@@ -1798,6 +1809,21 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     )
                 });
                 let _ = reply.send(info);
+            }
+            EngineCmd::DemoCharacter { reply } => {
+                let ids = demo_char.as_ref().map(|(root, parts)| {
+                    (
+                        root.to_loro_key(),
+                        parts.iter().map(EntityId::to_loro_key).collect(),
+                    )
+                });
+                let _ = reply.send(ids);
+            }
+            EngineCmd::PartAtPath { root, path, reply } => {
+                let part = EntityId::from_loro_key(&root)
+                    .and_then(|rt| engine.entity_at_path(rt, &path))
+                    .map(|e| e.to_loro_key());
+                let _ = reply.send(part);
             }
             EngineCmd::PhysicsDebug { reply } => {
                 let min_y = body_of
@@ -3368,6 +3394,32 @@ fn part_debug(state: State<AppState>, id: String) -> (f64, f64, f64, bool, usize
     rx.recv().unwrap_or((0.0, 0.0, 0.0, false, 0))
 }
 
+/// M9.2 — the seeded demo character's `(root, [parts])` ids (click a part to edit it).
+#[tauri::command]
+fn demo_character(state: State<AppState>) -> Option<(String, Vec<String>)> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::DemoCharacter { reply }).is_err() {
+        return None;
+    }
+    rx.recv().ok().flatten()
+}
+
+/// M9.2 — the entity at a structural rel-path within an instance root (e.g. `"0"` = first child).
+#[tauri::command]
+fn part_at_path(state: State<AppState>, root: String, path: String) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PartAtPath { root, path, reply })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().ok().flatten()
+}
+
 /// M9.1 — the gizmo state for the HUD/E2E: `(mode, has_selection, dragging, space, pivot)`.
 #[tauri::command]
 fn gizmo_debug(state: State<AppState>) -> (String, bool, bool, String, String) {
@@ -3598,6 +3650,8 @@ fn main() {
             save_character,
             instantiate_character,
             part_debug,
+            demo_character,
+            part_at_path,
             gizmo_debug,
             ipc_count
         ])
