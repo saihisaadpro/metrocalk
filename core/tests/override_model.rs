@@ -505,3 +505,126 @@ fn f1_mergeable_override_slot_survives_engine_side_undo_redo_then_still_merges()
     assert_eq!(num(b2.get_override(part2, "Transform", "x")), Some(1.0));
     assert_eq!(num(b2.get_override(part2, "Transform", "y")), Some(2.0));
 }
+
+// ── multiplayer-undo invariant (deliverable 5) ───────────────────────────────
+
+#[test]
+fn multiplayer_undo_reverts_only_my_edit_not_a_concurrent_peers() {
+    // Figma's multiplayer-undo invariant, the implementable core: an undo reverses MY action as a new
+    // forward commit (operational undo, ADR-002 F2) — it never rewinds shared history, so a concurrent
+    // peer's edit to a DIFFERENT field of the same part survives my undo + the subsequent merge.
+    let (mut a, mut b, part) = two_peers_sharing_a_part();
+
+    a.commit(
+        "A-edits-x",
+        vec![Op::SetOverride {
+            entity: part,
+            component: "Transform".into(),
+            field: "x".into(),
+            value: FieldValue::Number(1.0),
+        }],
+    )
+    .unwrap();
+    b.commit(
+        "B-edits-y",
+        vec![Op::SetOverride {
+            entity: part,
+            component: "Transform".into(),
+            field: "y".into(),
+            value: FieldValue::Number(2.0),
+        }],
+    )
+    .unwrap();
+
+    // A undoes ITS OWN edit (operationally — a new inverse commit), before seeing B.
+    assert!(a.undo(), "A undoes its own override");
+    assert_eq!(
+        a.get_override(part, "Transform", "x"),
+        None,
+        "A's x reverted"
+    );
+
+    // Now merge. A's net contribution is "x set then x removed"; B's is "y set".
+    let ua = a.export_updates();
+    let ub = b.export_updates();
+    a.merge(&ub).unwrap();
+    b.merge(&ua).unwrap();
+
+    // The shared doc converges: A's undone edit is gone, B's concurrent edit SURVIVES on both peers —
+    // A's undo touched only A's action, never corrupting B's.
+    for (name, e) in [("A", &a), ("B", &b)] {
+        assert_eq!(
+            e.get_override(part, "Transform", "x"),
+            None,
+            "{name}: A's undone x stays gone"
+        );
+        assert_eq!(
+            num(e.get_override(part, "Transform", "y")),
+            Some(2.0),
+            "{name}: B's concurrent edit survived A's undo (multiplayer-undo invariant)"
+        );
+    }
+}
+
+// ── marketplace-representable edited variant (deliverable 4; money seamed) ────
+
+#[test]
+fn an_edited_composition_is_a_serializable_pre_componentized_marketplace_asset() {
+    // An edited variant is a first-class pre-componentized asset the marketplace index (ADR-015, behind
+    // a trait) can carry: the Composition serializes losslessly + carries the mesh handle (a component
+    // field) + the baked edit. NO economy code here — money/provider stays seamed (M5/M7 discipline);
+    // this only proves the asset is transportable + re-instantiable.
+    let mut e = engine(1);
+    let (root, [part, _]) = compose_character(&mut e);
+    // Give the part a renderable mesh handle (a normal component field) + edit it.
+    e.commit(
+        "mesh+edit",
+        vec![
+            Op::SetField {
+                entity: part,
+                component: "MeshRenderer".into(),
+                field: "mesh".into(),
+                value: FieldValue::Str("assets/pauldron.glb".into()),
+            },
+            Op::SetOverride {
+                entity: part,
+                component: "Transform".into(),
+                field: "x".into(),
+                value: FieldValue::Number(4.0),
+            },
+        ],
+    )
+    .unwrap();
+
+    let comp: Composition = e.save_composition(root, "market:hero-edited-v1");
+
+    // Serialize → deserialize losslessly (the marketplace index carries exactly this payload).
+    let json = serde_json::to_string(&comp).unwrap();
+    let back: Composition = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        back, comp,
+        "the edited-variant asset round-trips through serde"
+    );
+
+    // It carries the mesh handle + the baked edit in its pre-componentized nodes.
+    let saved_part = back.nodes.iter().find(|n| n.path == "0").unwrap();
+    assert_eq!(
+        saved_part.components["MeshRenderer"].get("mesh"),
+        Some(&FieldValue::Str("assets/pauldron.glb".into())),
+        "the mesh handle is carried in the asset"
+    );
+    assert_eq!(
+        saved_part.components["Transform"].get("x"),
+        Some(&FieldValue::Number(4.0)),
+        "the baked edit is carried in the asset"
+    );
+
+    // And it re-instantiates into a working, independently-id'd entity tree (buy + edit < regenerate).
+    let inst = e.instantiate_composition(&back).unwrap();
+    let inst_part = e.entity_at_path(inst, "0").unwrap();
+    assert_eq!(
+        e.get_field(inst_part, "MeshRenderer", "mesh"),
+        Some(FieldValue::Str("assets/pauldron.glb".into())),
+        "the re-instantiated asset renders as its mesh"
+    );
+}
