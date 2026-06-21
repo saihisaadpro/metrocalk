@@ -227,7 +227,11 @@ impl Deformer for ArapDeformer {
 /// dense Cholesky. Accumulation is in fixed triangle order and each adjacency list is sorted →
 /// deterministic.
 #[must_use]
-fn cotangent_adjacency(pos: &[Vec3], tris: &[[u32; 3]], n: usize) -> Vec<Vec<(usize, f64)>> {
+pub(crate) fn cotangent_adjacency(
+    pos: &[Vec3],
+    tris: &[[u32; 3]],
+    n: usize,
+) -> Vec<Vec<(usize, f64)>> {
     fn accum(w: &mut HashMap<(usize, usize), f64>, i: usize, j: usize, c: f64) {
         let key = if i < j { (i, j) } else { (j, i) };
         *w.entry(key).or_insert(0.0) += c;

@@ -15,6 +15,7 @@ use crate::linalg::{
     best_rotation, cholesky, cholesky_solve, jacobi_eigen_sym, mat_mul, mat_vec, sub, transpose,
     Mat3, Vec3,
 };
+use crate::skin_weights::{auto_skin_weights, SkinWeightConfig};
 
 fn dist(a: Vec3, b: Vec3) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
@@ -367,5 +368,144 @@ fn arap_precompute_and_per_frame_cost_across_region_sizes() {
     assert!(
         localized_per_ms < 8.0,
         "a localized region's per-frame deform (got {localized_per_ms} ms) must hold the frame budget with min-spec headroom"
+    );
+}
+
+// ── auto skin weights (deliverable 2): biharmonic-inpainted weights → drive G3 LBS ────────────────
+
+/// A vertical ribbon (3 × 11 grid, x∈{0,1,2}, y∈{0..10}) with a 2-bone chain through its center column:
+/// joint 0 (root) at the bottom (1,0,0), joint 1 at the middle (1,5,0). Bone 0 covers the lower half,
+/// bone 1 the upper half — so the upper vertices weight to joint 1, the lower to joint 0.
+fn ribbon_and_skeleton() -> (DeformMesh, metrocalk_skeleton::Skeleton, [(Vec3, Vec3); 2]) {
+    use metrocalk_skeleton::{Joint, Skeleton, Transform};
+    let (mesh, _b, _c) = grid(3, 11);
+    let tf = |t: [f32; 3]| Transform {
+        translation: t,
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        scale: [1.0, 1.0, 1.0],
+    };
+    let mut skel = Skeleton {
+        joints: vec![
+            Joint {
+                parent: None,
+                local_bind: tf([1.0, 0.0, 0.0]), // root at the bottom-center
+                inverse_bind: [[0.0; 4]; 4],
+            },
+            Joint {
+                parent: Some(0),
+                local_bind: tf([0.0, 5.0, 0.0]), // child 5 up → global (1,5,0)
+                inverse_bind: [[0.0; 4]; 4],
+            },
+        ],
+    };
+    skel.recompute_inverse_binds();
+    // Bone segments (seeding hints), parallel to the joints: lower half → joint 0, upper half → joint 1.
+    let bones = [
+        ([1.0, 0.0, 0.0], [1.0, 5.0, 0.0]),
+        ([1.0, 5.0, 0.0], [1.0, 10.0, 0.0]),
+    ];
+    (mesh, skel, bones)
+}
+
+#[test]
+fn auto_skin_weights_are_a_partition_of_unity_and_localized() {
+    let (mesh, _skel, bones) = ribbon_and_skeleton();
+    let bind = auto_skin_weights(&mesh, &bones, SkinWeightConfig::default()).expect("weights");
+    assert_eq!(bind.weights.len(), mesh.positions.len());
+
+    for (v, w) in bind.weights.iter().enumerate() {
+        let sum: f32 = w.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "vertex {v} weights sum to 1 (partition of unity)"
+        );
+        assert!(
+            w.iter().all(|&x| (-1e-6..=1.000_001).contains(&x)),
+            "weights bounded [0,1]"
+        );
+    }
+
+    // Weight of joint `j` at a vertex, summed over its slots.
+    let wj = |v: usize, j: u16| -> f32 {
+        bind.joints[v]
+            .iter()
+            .zip(bind.weights[v])
+            .filter(|&(&jj, _)| jj == j)
+            .map(|(_, x)| x)
+            .sum()
+    };
+    let idx = |i: usize, j: usize| j * 3 + i;
+    // Bottom-center vertex → mostly joint 0; top-center → mostly joint 1; middle → blended (both > 0.15).
+    assert!(wj(idx(1, 0), 0) > 0.8, "bottom is owned by the root bone");
+    assert!(wj(idx(1, 10), 1) > 0.8, "top is owned by the child bone");
+    let mid = idx(1, 5);
+    assert!(
+        wj(mid, 0) > 0.15 && wj(mid, 1) > 0.15,
+        "the middle blends both bones (smooth): j0={}, j1={}",
+        wj(mid, 0),
+        wj(mid, 1)
+    );
+}
+
+#[test]
+fn a_posed_bone_deforms_the_surface_smoothly_via_g3_lbs() {
+    // The end-to-end success criterion: auto-weights → G3 LBS. Bend joint 1 (about +Z at its origin
+    // y=5) → the upper vertices (weighted to joint 1) swing in +X, the bottom (weighted to the unposed
+    // root) barely moves, and the middle moves partially — a smooth bone-driven deformation.
+    use metrocalk_skeleton::{skin_position, Pose};
+    let (mesh, skel, bones) = ribbon_and_skeleton();
+    let bind = auto_skin_weights(&mesh, &bones, SkinWeightConfig::default()).expect("weights");
+
+    let mut pose = Pose::new();
+    let mut bent = skel.joints[1].local_bind;
+    bent.rotation = [0.0, 0.0, (0.6f32).sin(), (0.6f32).cos()]; // ~69° about +Z
+    pose.set(1, bent);
+    let skin = skel.skinning_matrices(&pose);
+
+    let idx = |i: usize, j: usize| j * 3 + i;
+    let deformed = |v: usize| {
+        let p32 = [
+            mesh.positions[v][0] as f32,
+            mesh.positions[v][1] as f32,
+            mesh.positions[v][2] as f32,
+        ];
+        skin_position(p32, bind.joints[v], bind.weights[v], &skin)
+    };
+    let rest = |v: usize| {
+        [
+            mesh.positions[v][0] as f32,
+            mesh.positions[v][1] as f32,
+            mesh.positions[v][2] as f32,
+        ]
+    };
+    let moved = |v: usize| {
+        let d = deformed(v);
+        let r = rest(v);
+        ((d[0] - r[0]).powi(2) + (d[1] - r[1]).powi(2) + (d[2] - r[2]).powi(2)).sqrt()
+    };
+
+    // Sample up the bar: the lower half (joint 0, unposed) holds; above the pivot the displacement grows
+    // smoothly with height (longer rotation arm) — the surface flows, no rigid jump. (The vertex exactly
+    // at the pivot can't move — it IS the rotation center — so we sample y=6,8,10.)
+    let bottom = moved(idx(1, 0));
+    let up6 = moved(idx(1, 6));
+    let up8 = moved(idx(1, 8));
+    let top = moved(idx(1, 10));
+    assert!(
+        bottom < 0.05,
+        "the bottom (root-weighted) barely moves: {bottom}"
+    );
+    assert!(
+        top > 1.0,
+        "the top (child-weighted) swings substantially: {top}"
+    );
+    assert!(
+        bottom < up6 && up6 < up8 && up8 < top,
+        "smooth monotone falloff up the bar: bottom {bottom} < y6 {up6} < y8 {up8} < top {top}"
+    );
+    // A +Z rotation of a point above the pivot swings it toward −X (x' = −r·sinθ).
+    assert!(
+        deformed(idx(1, 10))[0] < rest(idx(1, 10))[0] - 0.5,
+        "top swung −X under the +Z bend"
     );
 }

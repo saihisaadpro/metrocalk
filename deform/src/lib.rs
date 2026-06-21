@@ -1,7 +1,6 @@
 //! `metrocalk-deform` — the high-fidelity mesh-deformation tier (M9.5 / G5, ADR-029): the rung above
 //! rigid part editing (G2) and bone-LBS (G3). **Drag a handle, the surface flows** — As-Rigid-As-Possible
-//! deformation, plus an optional **auto-skin-weights** path (`skin_weights`, added next) that drives
-//! G3's LBS.
+//! deformation, plus an optional **auto-skin-weights** path ([`skin_weights`]) that drives G3's LBS.
 //!
 //! **Why we reimplement rather than depend on `baby_shark`** (the ADR-029 determinism audit): a
 //! deformation that feeds gameplay must be deterministic and cross-platform bit-identical (the M8.1 /
@@ -34,9 +33,11 @@
 
 pub mod arap;
 pub mod linalg;
+pub mod skin_weights;
 
 pub use arap::{ArapConfig, ArapDeformer, DeformMesh, Deformer, Region};
 pub use linalg::Vec3;
+pub use skin_weights::{auto_skin_weights, SkinBinding, SkinWeightConfig};
 
 #[cfg(test)]
 mod tests;
