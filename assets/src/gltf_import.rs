@@ -12,8 +12,11 @@
 // glTF positions/uvs are f32 already; index casts are bounded by MAX_ELEMENTS (checked before read).
 #![allow(clippy::cast_possible_truncation)]
 
+use std::collections::HashMap;
+
 use gltf::image::Source as ImageSource;
 use gltf::Gltf;
+use metrocalk_skeleton::{Joint, Skeleton, Transform};
 
 use crate::mesh::{Material, MeshAsset, Primitive, Texture};
 use crate::source::{ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES};
@@ -36,6 +39,9 @@ impl MeshSource for GltfImporter {
         "gltf/glb"
     }
 
+    // One linear import flow (parse → materials → primitives → skin → textures); splitting it would
+    // scatter the shared `doc`/`blob`/`primitives` state. M9.3's skin parsing pushed it past 100 lines.
+    #[allow(clippy::too_many_lines)]
     fn import(&self, bytes: &[u8]) -> Result<MeshAsset, ImportError> {
         if bytes.len() > MAX_IMPORT_BYTES {
             return Err(ImportError::TooLarge {
@@ -121,12 +127,26 @@ impl MeshSource for GltfImporter {
                     default_material_index
                 });
 
+                // M9.3 skin attributes: JOINTS_0 (≤4 influences/vertex) + WEIGHTS_0, normalized to
+                // u16/f32. Empty ⇒ a static primitive. The joint indices reference the skin's joint list;
+                // they are remapped to the skeleton's topological order after the rig is built (below).
+                let joints: Vec<[u16; 4]> = reader
+                    .read_joints(0)
+                    .map(|j| j.into_u16().collect())
+                    .unwrap_or_default();
+                let weights: Vec<[f32; 4]> = reader
+                    .read_weights(0)
+                    .map(|w| w.into_f32().collect())
+                    .unwrap_or_default();
+
                 primitives.push(Primitive {
                     positions,
                     normals,
                     uvs,
                     indices,
                     material,
+                    joints,
+                    weights,
                 });
             }
         }
@@ -137,6 +157,31 @@ impl MeshSource for GltfImporter {
         if used_default {
             materials.push(Material::default());
         }
+
+        // M9.3 / G3: build the rig from the skin on the first node that pairs a mesh + a skin (the
+        // single-skin tier — a multi-skin asset is a documented limitation), then **remap every
+        // primitive's JOINTS_0** from skin-list order into the skeleton's topological order. Mapping the
+        // foreign `gltf::Skin` onto OUR `skeleton::Skeleton` happens here, inside the wrapper — no
+        // `gltf::` type crosses out (the grep-gate boundary).
+        let skin = doc
+            .nodes()
+            .find(|n| n.skin().is_some() && n.mesh().is_some())
+            .and_then(|n| n.skin())
+            .or_else(|| doc.skins().next());
+        let skeleton = skin.map(|skin| {
+            let (skel, remap) = build_skeleton(&doc, &skin, blob);
+            let max = remap.len();
+            for prim in &mut primitives {
+                for j in &mut prim.joints {
+                    for slot in j.iter_mut() {
+                        let old = *slot as usize;
+                        // A zero-weight influence may carry a junk index; clamp out-of-range to 0.
+                        *slot = if old < max { remap[old] as u16 } else { 0 };
+                    }
+                }
+            }
+            skel
+        });
 
         // Decode the base-color textures actually referenced by a material (RGBA8, from their
         // bufferView bytes). A texture we can't resolve/decode is dropped to `None` on the material —
@@ -154,9 +199,111 @@ impl MeshSource for GltfImporter {
             primitives,
             materials,
             textures,
+            skeleton,
         })
     }
 }
+
+/// Map a glTF `skin` onto our [`Skeleton`] (M9.3 / G3): collect the skin's joint nodes (their bind-pose
+/// local TRS + `inverseBindMatrices`), derive each joint's parent within the skin set (its node's parent
+/// if that parent is also a joint, else a skeleton root), **topologically sort** so a parent precedes its
+/// children (FK is a single forward pass), and return the skeleton + the `old-skin-slot → new-topo-index`
+/// remap (applied to the primitives' `JOINTS_0`). Standard glТF rigs have a contiguous joint hierarchy;
+/// an intermediate non-joint node between two joints is a documented limitation (its transform isn't
+/// folded into the child's local).
+fn build_skeleton(doc: &Gltf, skin: &gltf::Skin, blob: &[u8]) -> (Skeleton, Vec<usize>) {
+    let joint_nodes: Vec<gltf::Node> = skin.joints().collect();
+    let n = joint_nodes.len();
+    let node_index_of: Vec<usize> = joint_nodes.iter().map(gltf::Node::index).collect();
+    let slot_of_node: HashMap<usize, usize> = node_index_of
+        .iter()
+        .enumerate()
+        .map(|(slot, &ni)| (ni, slot))
+        .collect();
+
+    // node → parent node (glTF stores children, not parents — scan once).
+    let mut parent_node: HashMap<usize, usize> = HashMap::new();
+    for nd in doc.nodes() {
+        for child in nd.children() {
+            parent_node.insert(child.index(), nd.index());
+        }
+    }
+    // Each joint's parent SLOT: its node's parent, if that parent is also a skin joint; else a root.
+    let parent_slot: Vec<Option<usize>> = (0..n)
+        .map(|slot| {
+            parent_node
+                .get(&node_index_of[slot])
+                .and_then(|pni| slot_of_node.get(pni).copied())
+        })
+        .collect();
+
+    // inverseBindMatrices (column-major 4×4, parallel to the joint list); absent ⇒ identity per spec.
+    let ibms: Vec<[[f32; 4]; 4]> = skin
+        .reader(|buffer| match buffer.source() {
+            gltf::buffer::Source::Bin => Some(blob),
+            gltf::buffer::Source::Uri(_) => None,
+        })
+        .read_inverse_bind_matrices()
+        .map_or_else(|| vec![IDENTITY4; n], Iterator::collect);
+
+    // Bind-pose local TRS of each joint node (decomposed: translation, rotation xyzw, scale).
+    let locals: Vec<Transform> = joint_nodes
+        .iter()
+        .map(|nd| {
+            let (translation, rotation, scale) = nd.transform().decomposed();
+            Transform {
+                translation,
+                rotation,
+                scale,
+            }
+        })
+        .collect();
+
+    // Topological pre-order (DFS from roots) → parent always precedes its children.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut stack: Vec<usize> = Vec::new();
+    for (slot, parent) in parent_slot.iter().enumerate() {
+        match parent {
+            Some(p) => children[*p].push(slot),
+            None => stack.push(slot),
+        }
+    }
+    stack.reverse();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    while let Some(slot) = stack.pop() {
+        order.push(slot);
+        for &c in children[slot].iter().rev() {
+            stack.push(c);
+        }
+    }
+    // A malformed (cyclic) skin could leave joints unvisited — append them so indices stay valid.
+    if order.len() < n {
+        let seen: std::collections::HashSet<usize> = order.iter().copied().collect();
+        order.extend((0..n).filter(|s| !seen.contains(s)));
+    }
+
+    let mut remap = vec![0usize; n];
+    for (new_idx, &old) in order.iter().enumerate() {
+        remap[old] = new_idx;
+    }
+    let joints: Vec<Joint> = order
+        .iter()
+        .map(|&old| Joint {
+            parent: parent_slot[old].map(|p| remap[p]),
+            local_bind: locals[old],
+            inverse_bind: ibms[old],
+        })
+        .collect();
+    (Skeleton { joints }, remap)
+}
+
+/// A column-major 4×4 identity (the default `inverseBindMatrix` when a skin omits the accessor).
+const IDENTITY4: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
 
 /// Reject a count over [`MAX_ELEMENTS`] before it can allocate.
 fn guard_count(count: usize) -> Result<(), ImportError> {

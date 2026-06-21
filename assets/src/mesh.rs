@@ -107,6 +107,12 @@ pub struct Primitive {
     pub indices: Vec<u32>,
     /// Index into [`MeshAsset::materials`].
     pub material: usize,
+    /// Per-vertex skin **joints** (glTF `JOINTS_0`, ≤4 influences) — indices into
+    /// [`MeshAsset::skeleton`]'s joints, **already remapped to the skeleton's topological order** by the
+    /// importer (M9.3 / G3). Empty ⇒ the primitive is not skinned (a static mesh).
+    pub joints: Vec<[u16; 4]>,
+    /// Per-vertex skin **weights** (glTF `WEIGHTS_0`, parallel to [`Self::joints`]). Empty ⇒ not skinned.
+    pub weights: Vec<[f32; 4]>,
 }
 
 /// A fully-imported asset — the working, internal object an entity references by handle. Geometry +
@@ -121,6 +127,11 @@ pub struct MeshAsset {
     pub materials: Vec<Material>,
     /// Decoded textures, indexed by [`Material::base_color_texture`].
     pub textures: Vec<Texture>,
+    /// The rig (M9.3 / G3): a [`metrocalk_skeleton::Skeleton`] mapped from the glTF `skin` — joints
+    /// (topologically ordered), their bind-pose local TRS, and `inverseBindMatrices`. `None` ⇒ a static
+    /// (un-rigged) mesh. The per-vertex `JOINTS_0`/`WEIGHTS_0` on each [`Primitive`] index into it. The
+    /// foreign `gltf::` types stay behind the importer wrapper — this is our own type (invariant 5).
+    pub skeleton: Option<metrocalk_skeleton::Skeleton>,
 }
 
 impl MeshAsset {

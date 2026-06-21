@@ -202,4 +202,70 @@ mod tests {
             "dark frame baked"
         );
     }
+
+    #[test]
+    fn imports_a_skinned_rig_with_a_topo_sorted_skeleton() {
+        // M9.3 / G3: a glTF `skin` loads through the importer as our `skeleton::Skeleton` (no `gltf::`
+        // leak — the mapping lives in the wrapper), and each vertex carries `JOINTS_0`/`WEIGHTS_0`
+        // remapped to the skeleton's topological order.
+        use metrocalk_skeleton::{skin_position, Pose};
+        let asset = GltfImporter::new()
+            .import(&demo::skinned_quad_glb())
+            .expect("import skinned");
+        let skel = asset.skeleton.as_ref().expect("a glTF skin → a skeleton");
+        assert_eq!(skel.joints.len(), 2, "root + child");
+        assert_eq!(skel.joints[0].parent, None, "root joint");
+        assert_eq!(
+            skel.joints[1].parent,
+            Some(0),
+            "child parented to root (parent < child — topological order)"
+        );
+        // Bind: the child joint sits at y=1, and the skinning matrices are identity (a bound vertex is
+        // unmoved in the rest pose).
+        assert!(
+            (skel.joint_position(&Pose::new(), 1)[1] - 1.0).abs() < 1e-4,
+            "child joint at y=1 in bind"
+        );
+        for m in skel.skinning_matrices(&Pose::new()) {
+            for (c, col) in m.iter().enumerate() {
+                for (r, &val) in col.iter().enumerate() {
+                    let id = if c == r { 1.0 } else { 0.0 };
+                    assert!((val - id).abs() < 1e-4, "skinning matrix identity at bind");
+                }
+            }
+        }
+        // The primitive carries per-vertex JOINTS_0/WEIGHTS_0 (remapped to topo order — identity here).
+        let p = &asset.primitives[0];
+        assert_eq!((p.joints.len(), p.weights.len()), (4, 4));
+        assert_eq!(p.joints[0], [0, 0, 0, 0], "bottom vertex → root joint");
+        assert_eq!(p.joints[2], [1, 0, 0, 0], "top vertex → child joint");
+        assert!((p.weights[0][0] - 1.0).abs() < 1e-6, "fully weighted");
+        // FK pose: bend the child 90° about Z → a top vertex (bound to the child) swings toward -X.
+        let mut pose = Pose::new();
+        let mut bent = skel.joints[1].local_bind;
+        bent.rotation = [0.0, 0.0, 0.707_106_77, 0.707_106_77]; // 90° about +Z
+        pose.set(1, bent);
+        let skin = skel.skinning_matrices(&pose);
+        let out = skin_position([0.2, 2.0, 0.0], [1, 0, 0, 0], [1.0, 0.0, 0.0, 0.0], &skin);
+        assert!(
+            out[0] < -0.5,
+            "the child bend swung the top vertex toward -X (FK over the loaded rig), got {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_static_mesh_carries_no_skeleton_or_skin_attrs() {
+        // The existing un-rigged fixtures must stay skeleton-free (additive skin fields don't disturb them).
+        let asset = GltfImporter::new()
+            .import(&demo::prop_glb())
+            .expect("import prop");
+        assert!(
+            asset.skeleton.is_none(),
+            "an un-rigged mesh carries no skeleton"
+        );
+        assert!(asset
+            .primitives
+            .iter()
+            .all(|p| p.joints.is_empty() && p.weights.is_empty()));
+    }
 }

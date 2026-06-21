@@ -1288,6 +1288,7 @@ dependencies = [
  "bytemuck",
  "gltf",
  "image",
+ "metrocalk-skeleton",
 ]
 
 [[package]]

@@ -24,6 +24,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Makes the packed vertex `Pod` so the native renderer can `cast_slice` it into a GPU buffer. Pure
 # Rust, wasm32-clean.
 bytemuck = { version = "1", features = ["derive"] }
+# The skeletal runtime (M9.3 / G3) — the importer maps a glTF `skin` (joints + inverseBindMatrices +
+# JOINTS_0/WEIGHTS_0) onto a `skeleton::Skeleton` INSIDE the wrapper (gltf_import.rs), so the loaded rig
+# crosses out as OUR type, no `gltf::` leak. Pure Rust (glam + the gizmo crate's plain arrays), wasm32-clean.
+metrocalk-skeleton = { path = "../skeleton" }
 
 [dev-dependencies]
 # Round-trip the demo glb generators back through the importer in tests.

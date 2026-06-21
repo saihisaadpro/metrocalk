@@ -425,6 +425,97 @@ pub fn malformed_indices_glb() -> Vec<u8> {
     build_glb("malformed", &[prim], &[])
 }
 
+/// A minimal **skinned** mesh (M9.3 / G3): a tall quad bound to a 2-joint chain — a **root** joint at the
+/// origin and a **child** joint 1 unit up (parented to the root). The bottom edge (y=0) binds fully to the
+/// root, the top edge (y=2) to the child, so an FK pose of the child bends the top. The
+/// `inverseBindMatrices` are the inverse of each joint's bind global (root → identity; child → translate
+/// (0,-1,0)), so the skinning matrices are **identity at bind** (a bound vertex is unmoved in the rest
+/// pose). Own geometry, deterministic bytes, wasm-safe — the provenance for the importer's skin-load test.
+#[must_use]
+pub fn skinned_quad_glb() -> Vec<u8> {
+    const MAT4: &str = "MAT4";
+    const VEC4: &str = "VEC4";
+    let mut b = GlbBuilder::default();
+
+    // Geometry: a tall quad in XY. Bottom edge y=0 (→ root joint 0), top edge y=2 (→ child joint 1).
+    let positions = [
+        [-0.2f32, 0.0, 0.0],
+        [0.2, 0.0, 0.0],
+        [0.2, 2.0, 0.0],
+        [-0.2, 2.0, 0.0],
+    ];
+    let pos_view = b.add_view(
+        &f32_le(positions.iter().flat_map(|p| p.iter().copied())),
+        Some(ARRAY_BUFFER),
+    );
+    let pos_acc = b.add_accessor(pos_view, FLOAT, 4, "VEC3", Some(vec3_minmax(&positions)));
+
+    // JOINTS_0 (VEC4 u16): bottom verts → root (0); top verts → child (1).
+    let joints: [[u16; 4]; 4] = [[0, 0, 0, 0], [0, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0]];
+    let mut joint_bytes = Vec::new();
+    for j in joints {
+        for v in j {
+            joint_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let j_view = b.add_view(&joint_bytes, Some(ARRAY_BUFFER));
+    let j_acc = b.add_accessor(j_view, UNSIGNED_SHORT, 4, VEC4, None);
+
+    // WEIGHTS_0 (VEC4 f32): fully weighted to the first influence.
+    let weights = [[1.0f32, 0.0, 0.0, 0.0]; 4];
+    let w_view = b.add_view(
+        &f32_le(weights.iter().flat_map(|w| w.iter().copied())),
+        Some(ARRAY_BUFFER),
+    );
+    let w_acc = b.add_accessor(w_view, FLOAT, 4, VEC4, None);
+
+    // Indices.
+    let mut idx_bytes = Vec::new();
+    for i in [0u16, 1, 2, 0, 2, 3] {
+        idx_bytes.extend_from_slice(&i.to_le_bytes());
+    }
+    let idx_view = b.add_view(&idx_bytes, Some(ELEMENT_ARRAY_BUFFER));
+    let idx_acc = b.add_accessor(idx_view, UNSIGNED_SHORT, 6, "SCALAR", None);
+
+    // inverseBindMatrices (MAT4 f32, column-major, 2 joints): root = identity; child = translate (0,-1,0).
+    let ibm: [f32; 32] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+        1.0, // joint 0
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0,
+        1.0, // joint 1
+    ];
+    let ibm_view = b.add_view(&f32_le(ibm), None); // non-vertex data → no bufferView target
+    let ibm_acc = b.add_accessor(ibm_view, FLOAT, 2, MAT4, None);
+
+    b.align4();
+    let buffer_len = b.bin.len();
+
+    let mut json = String::from("{\"asset\":{\"version\":\"2.0\"}");
+    let _ = write!(json, ",\"buffers\":[{{\"byteLength\":{buffer_len}}}]");
+    let _ = write!(json, ",\"bufferViews\":[{}]", b.views.join(","));
+    let _ = write!(json, ",\"accessors\":[{}]", b.accessors.join(","));
+    let _ = write!(
+        json,
+        ",\"materials\":[{{\"pbrMetallicRoughness\":{{\"baseColorFactor\":[0.7,0.6,0.3,1.0]}}}}]"
+    );
+    let _ = write!(
+        json,
+        ",\"meshes\":[{{\"name\":\"skinned\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{pos_acc},\"JOINTS_0\":{j_acc},\"WEIGHTS_0\":{w_acc}}},\"indices\":{idx_acc},\"material\":0,\"mode\":4}}]}}]"
+    );
+    // nodes: 0 = the skinned mesh instance; 1 = root joint (child 2); 2 = child joint at +Y 1.
+    let _ = write!(
+        json,
+        ",\"nodes\":[{{\"mesh\":0,\"skin\":0}},{{\"name\":\"root\",\"translation\":[0,0,0],\"children\":[2]}},{{\"name\":\"child\",\"translation\":[0,1,0]}}]"
+    );
+    let _ = write!(
+        json,
+        ",\"skins\":[{{\"joints\":[1,2],\"inverseBindMatrices\":{ibm_acc},\"skeleton\":1}}]"
+    );
+    json.push_str(",\"scenes\":[{\"nodes\":[0,1]}],\"scene\":0}");
+
+    assemble_glb(&json, &b.bin)
+}
+
 /// A tiny 2×2 RGBA checker PNG (red/green/blue/yellow). Hardcoded so the demo generator pulls in **no**
 /// `image::`/decoder type — keeping foreign decoder types confined to the importer wrapper
 /// (`gltf_import.rs`), the boundary the CI grep-gate enforces. (Provenance: `examples/dump_png.rs`,
