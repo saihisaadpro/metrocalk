@@ -552,8 +552,14 @@ pub fn apply_transform_constraint<W: World>(
 #[cfg(test)]
 mod tests {
     // The asserts compare values a constraint COPIES verbatim (SnapToPoint→target, Free→drag,
-    // orbit-keeps-rotation) — exact float equality is correct there (no arithmetic to drift).
-    #![allow(clippy::float_cmp)]
+    // orbit-keeps-rotation) — exact float equality is correct there (no arithmetic to drift). The bench
+    // builds a synthetic scene with index→coordinate casts (bounded, precision-irrelevant).
+    #![allow(
+        clippy::float_cmp,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     use super::*;
     use metrocalk_gizmo::quat_basis;
 
@@ -915,6 +921,57 @@ mod tests {
         assert!(
             !rej.rejects.is_empty(),
             "a malformed AI value is rejected, not coerced"
+        );
+    }
+
+    // ── benchmark discipline: snap-graph query + constraint solve at scene scale ──
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only timing measurement (run --release)"
+    )]
+    fn snap_and_solve_cost_at_scene_scale() {
+        // The snap-graph query + a constraint solve at the M1.4 stress-scene scale (5000 targets) — the
+        // interaction-budget check (principles 2/3). Pure CPU + deterministic → host-stable and IDENTICAL
+        // on min-spec (it's the deterministic CPU path). Release-gated (debug timing is noise).
+        const N: usize = 5000;
+        let recency = HashMap::new();
+        let targets: Vec<SnapTarget> = (0..N)
+            .map(|i| SnapTarget {
+                entity: Entity(i as u64),
+                kind: if i % 7 == 0 {
+                    SnapKind::Pivot
+                } else {
+                    SnapKind::Origin
+                },
+                position: [
+                    (i % 50) as f32 * 0.4 - 10.0,
+                    ((i / 50) % 50) as f32 * 0.4,
+                    i as f32 * 0.001,
+                ],
+            })
+            .collect();
+        let n = 200u32;
+        let t0 = std::time::Instant::now();
+        let mut acc = 0usize;
+        for i in 0..n {
+            let from = [(i % 20) as f32 * 0.1, 0.0, 0.0];
+            let hits = snap_candidates(&targets, from, 5.0, &recency);
+            acc += hits.len();
+            if let Some(h) = hits.first() {
+                let _ = std::hint::black_box(solve(
+                    &Constraint::SnapToPoint { target: h.position },
+                    &Transform::IDENTITY,
+                ));
+            }
+        }
+        let per_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+        std::hint::black_box(acc);
+        eprintln!("[M9.4] snap-graph ({N} targets) + solve: {per_ms:.4} ms/query");
+        assert!(
+            per_ms < 16.0,
+            "snap+solve (got {per_ms} ms) must fit one 60 Hz frame"
         );
     }
 }
