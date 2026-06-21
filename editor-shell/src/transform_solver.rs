@@ -25,9 +25,13 @@
 
 use std::collections::HashMap;
 
-use metrocalk_ecs::Entity;
+use metrocalk_core::{ComponentMeta, Engine, EntityId, FieldSpec, FieldType};
+use metrocalk_ecs::{Entity, World};
 use metrocalk_gizmo::{axis_angle, Quat, Transform, Vec3};
+use serde_json::json;
 
+use crate::ai::{apply_ai_patch, AiPatch, PatchOp};
+use crate::bridge::ProjectionDelta;
 use crate::reveal::intent_order;
 
 // ── tiny plain-array vector math (glam stays behind the gizmo trait; editor-shell/src is glam-free) ────
@@ -402,6 +406,149 @@ fn rotation_to_up(n: Vec3) -> Quat {
     axis_angle(axis, d.acos())
 }
 
+// ── AI-as-constraint-compiler (deliverable 5 — NL → schema-validated patch, ADR-017) ──────────────────
+
+/// A transform-constraint INTENT parsed from natural language — the **editable-before-commit**
+/// representation (the deterministic offline stand-in for the LLM; "AI is a guest, never the foundation").
+/// Geometry (which surface / target / axis) resolves against the snap-graph + selection at apply time, and
+/// every applied result still lands as a SCHEMA-VALIDATED patch ([`apply_transform_constraint`], ADR-017)
+/// — never a raw mutation.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ConstraintIntent {
+    /// "upright" / "on top" / "on the surface/table/floor" / "stand" → align-to-surface (nearest surface).
+    Upright,
+    /// "snap" / "to the socket/pivot" → snap-to-point (nearest snap-graph target).
+    SnapToNearest,
+    /// "N cm/mm/m from the edge" / "clearance" / "away" → hold a fixed clearance (metres).
+    Clearance(f32),
+    /// "coaxial" / "concentric" / "aligned with" / "along the axis" → coaxial with the nearest axis.
+    Coaxial,
+}
+
+/// Deterministically compile a placement sentence into **editable constraint intents** (offline; an LLM
+/// would produce richer ones, but each still becomes a validated patch — the "AI a guest" contract). Empty
+/// ⇒ nothing recognized (the honest no-match the UI shows as "couldn't interpret"). Canonical order.
+#[must_use]
+pub fn compile(nl: &str) -> Vec<ConstraintIntent> {
+    let s = nl.to_lowercase();
+    let mut out = Vec::new();
+    if [
+        "upright",
+        "on top",
+        "on the surface",
+        "on the table",
+        "on the floor",
+        "stand",
+    ]
+    .iter()
+    .any(|k| s.contains(k))
+    {
+        out.push(ConstraintIntent::Upright);
+    }
+    if ["coaxial", "concentric", "aligned with", "along the axis"]
+        .iter()
+        .any(|k| s.contains(k))
+    {
+        out.push(ConstraintIntent::Coaxial);
+    }
+    if let Some(d) = parse_clearance(&s) {
+        out.push(ConstraintIntent::Clearance(d));
+    }
+    if ["snap", "to the socket", "to the pivot"]
+        .iter()
+        .any(|k| s.contains(k))
+    {
+        out.push(ConstraintIntent::SnapToNearest);
+    }
+    out
+}
+
+/// Parse a "N cm/mm/m" clearance distance (→ metres) from a sentence about clearance/edge/away/from.
+fn parse_clearance(s: &str) -> Option<f32> {
+    if !["from", "clearance", "away", "edge"]
+        .iter()
+        .any(|k| s.contains(k))
+    {
+        return None;
+    }
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    for w in toks.windows(2) {
+        let num: String = w[0]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let Ok(n) = num.parse::<f32>() else { continue };
+        let unit = w[1];
+        if unit.starts_with("cm") {
+            return Some(n / 100.0);
+        }
+        if unit.starts_with("mm") {
+            return Some(n / 1000.0);
+        }
+        if unit.starts_with('m') {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// The shell's Transform component schema (x/y/z/qx/qy/qz/qw/scale, all Number) — the constraint patch
+/// validates against THIS, so a solved transform lands as a schema-validated [`apply_ai_patch`] (ADR-017),
+/// never a raw mutation, and a malformed value is rejected-as-UX.
+#[must_use]
+pub fn transform_schema() -> ComponentMeta {
+    let field = |name: &str| FieldSpec {
+        name: name.to_string(),
+        ty: FieldType::Number,
+        required: false,
+        format: None,
+    };
+    ComponentMeta {
+        name: "Transform".to_string(),
+        fields: ["x", "y", "z", "qx", "qy", "qz", "qw", "scale"]
+            .iter()
+            .map(|n| field(n))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// Apply a constraint-**solved** transform to `entity` as a **schema-validated, undoable** AI patch — the
+/// constraint-compiler sink (deliverable 5). The solved TRS becomes `SetField` ops on the Transform
+/// component, validated against [`transform_schema`] through [`apply_ai_patch`] (ADR-017): on the one
+/// pipeline, undoable, **never a raw mutation** — a malformed value is rejected-as-UX. The NL → intents →
+/// (snap-graph-resolved) Constraint → `solve` → this is the describe-to-create loop applied to space.
+pub fn apply_transform_constraint<W: World>(
+    engine: &mut Engine<W>,
+    entity: EntityId,
+    solved: &Transform,
+    client_op_id: &str,
+) -> ProjectionDelta {
+    let id = entity.to_loro_key();
+    let f = |field: &str, v: f32| PatchOp::SetField {
+        id: id.clone(),
+        component: "Transform".to_string(),
+        field: field.to_string(),
+        value: json!(v),
+    };
+    let [tx, ty, tz] = solved.translation;
+    let [qx, qy, qz, qw] = solved.rotation;
+    let patch = AiPatch {
+        client_op_id: client_op_id.to_string(),
+        ops: vec![
+            f("x", tx),
+            f("y", ty),
+            f("z", tz),
+            f("qx", qx),
+            f("qy", qy),
+            f("qz", qz),
+            f("qw", qw),
+            f("scale", solved.scale[0]),
+        ],
+    };
+    apply_ai_patch(engine, &[transform_schema()], "ai-constraint", &patch)
+}
+
 #[cfg(test)]
 mod tests {
     // The asserts compare values a constraint COPIES verbatim (SnapToPoint→target, Free→drag,
@@ -689,6 +836,85 @@ mod tests {
         assert_eq!(
             degen.translation, dragged.translation,
             "a degenerate axis falls back to free"
+        );
+    }
+
+    // ── AI-as-constraint-compiler (NL → editable intents → schema-validated patch, never raw) ─────────
+
+    #[test]
+    fn compiles_a_placement_sentence_into_editable_intents() {
+        let intents = compile("put the lamp on the table, upright, 10 cm from the edge");
+        assert!(
+            intents.contains(&ConstraintIntent::Upright),
+            "got {intents:?}"
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|i| matches!(i, ConstraintIntent::Clearance(d) if (d - 0.1).abs() < 1e-4)),
+            "10 cm → 0.1 m clearance; got {intents:?}"
+        );
+    }
+
+    #[test]
+    fn compile_no_match_is_empty() {
+        assert!(
+            compile("the quick brown fox jumps").is_empty(),
+            "honest no-match"
+        );
+    }
+
+    #[test]
+    fn an_ai_constraint_lands_as_a_validated_undoable_patch_never_raw() {
+        use metrocalk_core::{FieldValue, Op};
+        use metrocalk_ecs::FlecsWorld;
+        let mut e = Engine::new(FlecsWorld::new(), 1);
+        let id = e.alloc_entity_id();
+        e.commit(
+            "create",
+            vec![
+                Op::CreateEntity { id, parent: None },
+                Op::SetField {
+                    entity: id,
+                    component: "Transform".into(),
+                    field: "x".into(),
+                    value: FieldValue::Number(0.0),
+                },
+            ],
+        )
+        .unwrap();
+        // A constraint-solved transform lands as a SCHEMA-VALIDATED, undoable patch (ADR-017).
+        let mut solved = Transform::IDENTITY;
+        solved.translation = [5.0, 0.0, 0.0];
+        let delta = apply_transform_constraint(&mut e, id, &solved, "op1");
+        assert!(
+            delta.rejects.is_empty(),
+            "the constraint patch applied (validated): {delta:?}"
+        );
+        assert_eq!(
+            e.get_field(id, "Transform", "x"),
+            Some(FieldValue::Number(5.0))
+        );
+        assert!(e.undo(), "the constraint commit is undoable");
+        assert_ne!(
+            e.get_field(id, "Transform", "x"),
+            Some(FieldValue::Number(5.0)),
+            "undo reverted it"
+        );
+        // A MALFORMED AI value (a string into a Number field) is REJECTED-as-UX — never a raw mutation.
+        let bad = AiPatch {
+            client_op_id: "bad".into(),
+            ops: vec![PatchOp::SetField {
+                id: id.to_loro_key(),
+                component: "Transform".into(),
+                field: "x".into(),
+                value: serde_json::Value::String("nope".into()),
+            }],
+        };
+        let rej = apply_ai_patch(&mut e, &[transform_schema()], "ai-bad", &bad);
+        assert!(
+            !rej.rejects.is_empty(),
+            "a malformed AI value is rejected, not coerced"
         );
     }
 }
