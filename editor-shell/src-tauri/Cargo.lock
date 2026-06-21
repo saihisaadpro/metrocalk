@@ -2792,6 +2792,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrocalk-deform"
+version = "0.1.0"
+
+[[package]]
 name = "metrocalk-economy"
 version = "0.1.0"
 dependencies = [
@@ -2812,6 +2816,7 @@ name = "metrocalk-editor-shell"
 version = "0.1.0"
 dependencies = [
  "metrocalk-core",
+ "metrocalk-deform",
  "metrocalk-economy",
  "metrocalk-ecs",
  "metrocalk-gizmo",
