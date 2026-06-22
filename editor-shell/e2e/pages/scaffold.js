@@ -166,6 +166,86 @@ export const scaffold = {
   focusBannerVisible: () => visible("#focusbanner"),
   focusBanner: () => css("#focusbanner"),
 
+  // ── add-palette pick / generate stream-in ─────────────────────────────────────────────────────
+  async pickPaletteItem(i = 0) {
+    const items = await this.paletteItems();
+    await items[i].click();
+  },
+  async clickPaletteGenerate() {
+    await (await this.paletteGenerateOffer()).click();
+  },
+
+  // ── M8 physics controls (now in the shipping DOM) ─────────────────────────────────────────────
+  async dropBall() {
+    await (await css("#dropBall")).click();
+  },
+  async toggleSim() {
+    await (await css("#simToggle")).click();
+  },
+  async toggleDebugger() {
+    await (await css("#dbgToggle")).click();
+  },
+  async shove() {
+    await (await css("#shove")).click();
+  },
+  async nudgeFriction() {
+    await (await css("#nudgeFriction")).click();
+  },
+  scrubInput: () => css("#scrub"),
+  frameLabel: () => css("#frameLbl").then((e) => e.getText()),
+  async openImport() {
+    await (await css("#importRobot")).click();
+  },
+  async pasteSampleArm() {
+    await (await css("#impSample")).click();
+  },
+  async importText(text) {
+    await (await css("#impText")).setValue(text);
+  },
+  async runImport() {
+    await (await css("#impGo")).click();
+  },
+  importResult: () => css("#impResult").then((e) => e.getText()),
+  async closeImport() {
+    await (await css("#impClose")).click();
+  },
+  // physics instrumentation the transparent viewport can't show (the app itself never polls these).
+  physDebug: () => invoke("physics_debug"), // [count, lowestY, contacts]
+  simTimeline: () => invoke("sim_timeline"), // [frame, max, running, overlays, bodies]
+  physicsCheck: (id) => invoke("physics_check", { id }),
+
+  // ── M9 transform / gizmo / part / solver controls (inspector buttons appear on selection) ──────
+  async gizmoMode(mode) {
+    const k = mode === "translate" ? "w" : mode === "rotate" ? "e" : "r";
+    await browser.keys([k]); // the W/E/R DOM keybindings the user presses
+  },
+  gizmoDebug: () => invoke("gizmo_debug"), // [mode, hasSel, dragging, space, pivot]
+  readTransform: (id) => invoke("read_transform", { id }),
+  saveCharButton: () => css("#saveChar"),
+  async saveChar() {
+    await (await css("#saveChar")).click();
+  },
+  async dropInstance() {
+    await (await css("#dropInst")).click();
+  },
+  async deactivatePart() {
+    await (await css("#deactPart")).click();
+  },
+  async reparentTo(idOrEmpty) {
+    await (await css("#reparentTo")).setValue(idOrEmpty);
+    await (await css("#reparentBtn")).click();
+  },
+  async toggleSnap() {
+    await (await css("#snapToggle")).click();
+  },
+  async snapToNearest() {
+    await (await css("#snapNearest")).click();
+  },
+  async placeBySentence(text) {
+    await (await css("#placeSentence")).setValue(text);
+    await (await css("#placeBtn")).click();
+  },
+
   // ── the live control inventory (derived from the shipping DOM) ────────────────────────────────
   // Each entry: the control, the command(s) it drives, the workflow that exercises it. The coverage
   // matrix reconciles `command` coverage against this list so a new button can't slip in unexercised.

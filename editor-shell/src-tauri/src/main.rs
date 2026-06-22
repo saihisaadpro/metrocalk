@@ -419,6 +419,13 @@ enum EngineCmd {
         path: String,
         reply: Sender<Option<String>>,
     },
+    /// M9.2 — a part's current parent entity id (the `node.move` edge), or `None` for a root. Lets the
+    /// build-acceptance gate read back a reparent (`reparent_part`) off a stable structural signal +
+    /// confirm Ctrl-Z restored the original parent.
+    PartParent {
+        id: String,
+        reply: Sender<Option<String>>,
+    },
     /// M9.4 — the snap-graph for `id`: ranked candidate targets within `radius` (the shared ADR-011 ranker)
     /// each with an explained "why this" — the magnetic-intent surface (a read).
     SnapQuery {
@@ -1875,6 +1882,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .and_then(|rt| engine.entity_at_path(rt, &path))
                     .map(|e| e.to_loro_key());
                 let _ = reply.send(part);
+            }
+            EngineCmd::PartParent { id, reply } => {
+                let parent = EntityId::from_loro_key(&id)
+                    .and_then(|eid| engine.parent_of(eid))
+                    .map(|p| p.to_loro_key());
+                let _ = reply.send(parent);
             }
             EngineCmd::SnapQuery { id, radius, reply } => {
                 let hits = EntityId::from_loro_key(&id)
@@ -3802,6 +3815,18 @@ fn part_at_path(state: State<AppState>, root: String, path: String) -> Option<St
     rx.recv().ok().flatten()
 }
 
+/// M9.2 — a part's current parent entity id (the `node.move` edge), `None` for a root. The stable
+/// structural read-back the acceptance gate keys a reparant + its Ctrl-Z restore off.
+#[tauri::command]
+fn part_parent(state: State<AppState>, id: String) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PartParent { id, reply }).is_err() {
+        return None;
+    }
+    rx.recv().ok().flatten()
+}
+
 /// M9.4 — the snap-graph for `id`: ranked candidate targets (the shared ADR-011 ranker) + each one's
 /// explained "why this", within `radius`.
 #[tauri::command]
@@ -4108,6 +4133,7 @@ fn main() {
             part_debug,
             demo_character,
             part_at_path,
+            part_parent,
             snap_query,
             apply_constraint,
             placement_sentence,
