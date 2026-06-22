@@ -9,6 +9,7 @@
 import { projectionStore } from "../store/projection";
 import type {
   DescribeResponse,
+  EconResponse,
   EditIntent,
   EditTx,
   EntityProjection,
@@ -33,6 +34,12 @@ export interface EditorClient {
   revealTargets(id: string): Promise<RevealResponse>;
   /** Describe-to-create: resolve a free-text query (local → marketplace → generate seam). */
   describe(query: string): Promise<DescribeResponse>;
+  /** The user's token balance (M7). */
+  walletInfo(): Promise<EconResponse>;
+  /** Sandbox top-up (M7 — no real money, ADR-004/018). */
+  topUp(): Promise<EconResponse>;
+  /** AI-edit "make it rustier" on an entity (M7 — schema-validated patch, debit-on-success). */
+  aiEdit(id: string): Promise<EconResponse>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -104,6 +111,18 @@ class TauriClient implements EditorClient {
   describe(query: string): Promise<DescribeResponse> {
     return this.core.invoke<DescribeResponse>("describe", { query });
   }
+
+  walletInfo(): Promise<EconResponse> {
+    return this.core.invoke<EconResponse>("wallet_info");
+  }
+
+  topUp(): Promise<EconResponse> {
+    return this.core.invoke<EconResponse>("top_up");
+  }
+
+  aiEdit(id: string): Promise<EconResponse> {
+    return this.core.invoke<EconResponse>("ai_edit", { id });
+  }
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
@@ -131,6 +150,7 @@ function buildWorld(n: number): EntityProjection[] {
  *  `npm run dev` still renders the reveal/describe surfaces without a live core. (Vitest tests inject
  *  their own stubbed `EditorClient`; the real reveal/describe come from the shell commands under Tauri.) */
 class MockClient implements EditorClient {
+  private balance = 100;
   constructor(private readonly inner: DeltaClient) {}
   setField(id: string, component: string, field: string, value: Json): string {
     return this.inner.setField(id, component, field, value);
@@ -160,6 +180,20 @@ class MockClient implements EditorClient {
   }
   describe(_query: string): Promise<DescribeResponse> {
     return Promise.resolve({ created: null, kind: null, source: null, price: null, seam: "generate", balance: null });
+  }
+  walletInfo(): Promise<EconResponse> {
+    return Promise.resolve({ ok: true, balance: this.balance, cost: null, message: null });
+  }
+  topUp(): Promise<EconResponse> {
+    this.balance += 100;
+    return Promise.resolve({ ok: true, balance: this.balance, cost: 100, message: null });
+  }
+  aiEdit(_id: string): Promise<EconResponse> {
+    if (this.balance < 2) {
+      return Promise.resolve({ ok: false, balance: this.balance, cost: null, message: "insufficient balance" });
+    }
+    this.balance -= 2;
+    return Promise.resolve({ ok: true, balance: this.balance, cost: 2, message: null });
   }
 }
 

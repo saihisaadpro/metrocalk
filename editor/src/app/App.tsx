@@ -9,6 +9,10 @@ import { shouldDeferToNative, type Rect } from "../input/ownership";
 import { Hierarchy } from "../panels/Hierarchy";
 import { Rejections } from "../panels/Rejections";
 import { Reveal } from "../panels/Reveal";
+import { DescribeBar } from "../panels/DescribeBar";
+import { Wallet } from "../panels/Wallet";
+import { Requirers } from "../panels/Requirers";
+import { StatusBar } from "../panels/StatusBar";
 import { Inspector } from "../inspector/Inspector";
 import { BindingGraph } from "../graph/BindingGraph";
 
@@ -30,11 +34,22 @@ export function App() {
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: "#0a0a0f", color: "#e8e8e8" }}>
       <div style={{ height: 40, display: "flex", alignItems: "center", gap: 12, padding: "0 12px", background: "#14161c", borderBottom: "1px solid #2a2d35", font: "13px ui-monospace, monospace" }}>
-        <strong>metrocalk</strong> <span style={{ opacity: 0.6 }}>editor — projection of the core (M2.5)</span>
+        <strong>metrocalk</strong> <span style={{ opacity: 0.6 }}>editor — projection of the core (M10.1)</span>
+        <div style={{ marginLeft: "auto" }}>
+          <Wallet client={client} />
+        </div>
+      </div>
+      <div style={{ borderBottom: "1px solid #2a2d35", background: "#101218" }}>
+        <DescribeBar client={client} />
       </div>
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: "260px 1fr 320px", minHeight: 0 }}>
-        <div style={{ borderRight: "1px solid #2a2d35", overflow: "hidden" }}>
-          <Hierarchy />
+        <div style={{ borderRight: "1px solid #2a2d35", overflow: "hidden", display: "flex", flexDirection: "column" }}>
+          <div style={{ borderBottom: "1px solid #2a2d35", maxHeight: 160, overflowY: "auto" }}>
+            <Requirers />
+          </div>
+          <div style={{ flex: 1, overflow: "hidden", minHeight: 0 }}>
+            <Hierarchy />
+          </div>
         </div>
         {/* viewport: native-owned. React must NOT handle hot input here (invariant 4). */}
         <div
@@ -58,6 +73,7 @@ export function App() {
           </div>
         </div>
       </div>
+      <StatusBar />
       <Rejections />
     </div>
   );

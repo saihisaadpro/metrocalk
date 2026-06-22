@@ -102,6 +102,15 @@ export interface DescribeResponse {
   balance: number | null;
 }
 
+/** `wallet_info` / `top_up` / `ai_edit` — the token-economy result (M7): the balance after, the
+ *  charge/grant if any, and a refusal/seam `message` when `!ok` (refuse-when-broke, explained). */
+export interface EconResponse {
+  ok: boolean;
+  balance: number;
+  cost: number | null;
+  message: string | null;
+}
+
 const te = new TextEncoder();
 const td = new TextDecoder();
 export const encodeJson = (v: unknown): Uint8Array => te.encode(JSON.stringify(v));
