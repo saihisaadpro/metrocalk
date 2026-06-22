@@ -20,7 +20,20 @@ export function Reveal({ client }: { client: EditorClient }) {
   // Re-query the reveal when this entity's OUTGOING edges change — so a bind/undo immediately moves the
   // target into/out of "tracking" (the command recomputes bound + drops the consumed provider from
   // compatible). Without this the reveal only refreshed on (re)selection and a fresh bind never surfaced.
-  const edgeSig = id ? Object.keys(edges).filter((k) => edges[k].from === id).sort().join(",") : "";
+  //
+  // The signature includes each edge's STATUS, not just its key: an optimistic bind adds the edge as
+  // `pending` (one fetch — which may race the engine commit and still read the target as "compatible"),
+  // then the authoritative `addEdge` flips the SAME key to `confirmed`. Keying on the key alone, that
+  // confirm would not change the signature → no re-fetch → the bound row would only appear on a manual
+  // re-select (a real intermittent "I clicked but nothing moved to tracking" bug). Including the status
+  // makes the confirm a distinct signature → the authoritative re-fetch always lands.
+  const edgeSig = id
+    ? Object.values(edges)
+        .filter((e) => e.from === id)
+        .map((e) => `${e.id}:${e.status}`)
+        .sort()
+        .join(",")
+    : "";
 
   const [reveal, setReveal] = useState<RevealResponse>(EMPTY);
 

@@ -342,6 +342,27 @@ const reactDeltas = {
     const items = await all('[data-testid="asset-item"]');
     await items[i].click();
   },
+
+  // ── M10.3 File menu (React-only chrome) — the first-session journey (M10.5). `New` is a pure command
+  // (empty scene, no dialog); `Save`/`Open` open the OWED native dialogs, so the journey drives persistence
+  // via `save_project`/`open_project({path})` invokes (the command layer the dialogs would call). ──
+  async newProject() {
+    await (await css("#fileMenu")).click(); // open the File menu
+    await (await css("#fileNew")).click(); // New project → new_project (a fresh empty scene)
+    const discard = await css("#guardDiscard"); // if a dirty-guard appeared, discard + proceed
+    if (await discard.isExisting()) await discard.click();
+  },
+  projectDirty: () => visible("#projectDirty"),
+
+  // ── M10.4 Play / Stop (React PlayControls) — the test-it leg of the journey ──
+  async play() {
+    await (await css('[data-testid="play"]')).click();
+  },
+  async stopPlay() {
+    await (await css('[data-testid="stop"]')).click();
+  },
+  playing: () => visible('[data-testid="playIndicator"]'),
+  playIndicatorText: () => css('[data-testid="playIndicator"]').then((e) => e.getText()),
 };
 
 export function page() {

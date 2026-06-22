@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "dev.metrocalk.editor",
   "build": {
-    "frontendDist": "../web"
+    "frontendDist": "../../editor/dist"
   },
   "app": {
     "withGlobalTauri": true,

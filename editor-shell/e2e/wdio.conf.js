@@ -9,15 +9,37 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
-// Built release binary (rebuild with: cargo build --release --manifest-path ../src-tauri/Cargo.toml).
-const application = path.resolve(dir, "../src-tauri/target/release/metrocalk-editor-shell.exe");
-// The shell writes its persistence log next to the exe; delete it so each E2E run starts on a clean,
-// freshly-seeded scene (persistence-across-launch is covered by the headless tests).
-const sceneLog = path.resolve(dir, "../src-tauri/target/release/metrocalk-scene.jsonl");
-// The token wallet persists beside the exe and the marketplace-buy test DEBITS it (M7 real buy). Reset
-// it too, so every run starts on the full free grant — otherwise the buy test slowly drains the wallet
-// across runs and eventually flakes ("insufficient balance" instead of "bought").
-const walletFile = path.resolve(dir, "../src-tauri/target/release/metrocalk-wallet.json");
+// Built binary. Release by default (the canonical gate target; rebuild with:
+// cargo build --release --manifest-path ../src-tauri/Cargo.toml). MTK_EXE overrides the path so the
+// journey can iterate against a faster debug build, then run the standing gate against release.
+const application =
+  process.env.MTK_EXE ||
+  path.resolve(dir, "../src-tauri/target/release/metrocalk-editor-shell.exe");
+// The shell writes its persistence log + wallet next to the exe; delete them so each E2E run starts on a
+// clean, freshly-seeded scene + the full free token grant (persistence-across-launch is covered by the
+// headless tests; the marketplace-buy test DEBITS the wallet, so it must not carry over between runs and
+// eventually flake "insufficient balance"). Derived from the ACTUAL exe path so an MTK_EXE override (debug)
+// cleans beside the debug binary, not the release one.
+const exeDir = path.dirname(application);
+const sceneLog = path.join(exeDir, "metrocalk-scene.jsonl");
+const walletFile = path.join(exeDir, "metrocalk-wallet.json");
+// The recents list (ADR-033 startup = open-last-else-seeded-sample). The first-session journey SAVES a
+// `.mtk`, which pushes that path into recents — so without clearing it, every LATER spec boots the
+// journey's sample instead of the freshly-seeded scene (and its bind/edit/requirer assertions fail on the
+// wrong scene). Clear it so each run starts from the known-good seeded scene.
+const recentsFile = path.join(exeDir, "metrocalk-recents.json");
+
+// A clean slate beside the exe: a freshly-seeded scene, the full free token grant (the marketplace-buy
+// test debits the wallet), and NO recents (so startup boots the seeded scene, not a journey-saved sample).
+function cleanSlate() {
+  for (const f of [sceneLog, walletFile, recentsFile]) {
+    try {
+      rmSync(f, { force: true });
+    } catch {
+      /* not present yet — fine */
+    }
+  }
+}
 const nativeDriver = path.resolve(dir, ".driver/msedgedriver.exe");
 const tauriDriverBin = path.resolve(process.env.USERPROFILE, ".cargo/bin/tauri-driver.exe");
 
@@ -49,25 +71,32 @@ export const config = {
   connectionRetryTimeout: 120000,
   connectionRetryCount: 3,
 
-  onPrepare: () => {
-    // Clean slate: a freshly-seeded scene + the full free token grant (the marketplace-buy test debits
-    // the wallet, so it must not carry over between runs).
-    try {
-      rmSync(sceneLog, { force: true });
-      rmSync(walletFile, { force: true });
-    } catch {
-      /* no log/wallet yet — fine */
-    }
-  },
+  onPrepare: () => cleanSlate(),
 
   beforeSession: () =>
     new Promise((resolve) => {
+      // Each spec FILE relaunches the exe, so re-clean before every session — otherwise the first-session
+      // journey's saved `.mtk` (pushed into recents mid-run) makes a later spec boot the sample via
+      // open-last instead of the seeded scene, and its scene/wallet mutations leak forward too.
+      cleanSlate();
       tauriDriver = spawn(tauriDriverBin, ["--native-driver", nativeDriver], {
         stdio: [null, process.stdout, process.stderr],
       });
       tauriDriver.on("error", (e) => console.error("tauri-driver failed to start:", e));
       setTimeout(resolve, 2000); // give tauri-driver + msedgedriver a moment to bind their ports
     }),
+
+  // Dismiss the first-run onboarding card before every test so it never overlaps an acceptance interaction
+  // (the onboarding spec re-summons it explicitly inside its own test, after this hook has run). A no-op
+  // when the card isn't present (already dismissed / not the React build).
+  beforeTest: async () => {
+    try {
+      const skip = await browser.$("#onboardSkip");
+      if (await skip.isExisting()) await skip.click();
+    } catch {
+      /* card absent — fine */
+    }
+  },
 
   afterSession: () => {
     tauriDriver?.kill();

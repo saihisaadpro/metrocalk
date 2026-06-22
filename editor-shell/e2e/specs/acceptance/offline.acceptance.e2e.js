@@ -137,7 +137,7 @@ describe("acceptance / offline — local paths work network-free; paid tiers deg
       }
       if (localItem) break;
     }
-    expect(localItem, "the installed catalog exposes at least one local item").not.toBeNull();
+    expect(localItem).not.toBeNull(); // the installed catalog exposes at least one local item
 
     const balBefore = await ui.walletBalance();
     const r = await invoke("add_item", { id: localItem.id, source: "local" });
@@ -285,17 +285,15 @@ describe("acceptance / offline — local paths work network-free; paid tiers deg
     // drops a grey placeholder + streams in, or it returns an explained "unavailable" seam). Either branch
     // is an honest, non-crashing seam — what matters is the status NAMES generate + leaves local paths intact.
     await ui.clickGenerate();
-    await browser.waitUntil(
-      async () => {
-        const s = await ui.status();
-        return s.includes("generating") || s.includes("generation");
-      },
-      { timeout: 10000, timeoutMsg: "clicking Generate did not surface an honest generate-seam status" }
-    );
-    const genStatus = await ui.status();
-    const generateHonest =
-      genStatus.includes("generating") || // grey placeholder dropped + streaming (the in-proc fake)
-      genStatus.includes("generation"); // OR an explained "generation <seam> — local + marketplace unaffected"
+    // The in-proc generate is FAST: the status passes through "generating …" (progress) and lands on
+    // "generated · <id>" (the placeholder dropped + streamed in) — or, if unavailable, "generation
+    // <seam>". All three are the honest seam; match the shared "generat" stem so the assertion doesn't
+    // race the brief progress window (catching only "generating" was the flake).
+    await browser.waitUntil(async () => /generat/i.test(await ui.status()), {
+      timeout: 10000,
+      timeoutMsg: "clicking Generate did not surface an honest generate-seam status",
+    });
+    const generateHonest = /generat/i.test(await ui.status()); // generating | generated | generation <seam>
     expect(generateHonest).toBe(true);
 
     // top_up is a WALLET SEAM (sandbox, no real money) — exercise it as a seam: it raises the balance with

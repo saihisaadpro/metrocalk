@@ -16,6 +16,7 @@ import { setStatus } from "../store/ui";
 import { panelLayout } from "./layout";
 import { Hierarchy } from "../panels/Hierarchy";
 import { Rejections } from "../panels/Rejections";
+import { Onboarding } from "../panels/Onboarding";
 import { Reveal } from "../panels/Reveal";
 import { DescribeBar } from "../panels/DescribeBar";
 import { Wallet } from "../panels/Wallet";
@@ -334,6 +335,7 @@ export function App() {
       )}
       <StatusBar />
       <Rejections />
+      <Onboarding />
     </div>
   );
 }
