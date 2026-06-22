@@ -27,13 +27,16 @@ use metrocalk_economy::{HoldId, SandboxProvider, GENERATE_TOKENS};
 use metrocalk_ecs::{Entity, FlecsWorld, World};
 use metrocalk_editor_shell::generate::{GenRequest, MeshGenerator};
 use metrocalk_editor_shell::physics_intent::{self, MeshMetrics, PhysicsWarning};
+use metrocalk_editor_shell::project as mtk_project;
 use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
+use metrocalk_editor_shell::transform_solver::{
+    Constraint, ConstraintIntent, SnapKind, SnapTarget,
+};
 use metrocalk_editor_shell::{
     actions_for, ai_edit_rustier, apply_ai_patch, apply_edit, buy_marketplace, capscene,
     project_entity, project_full, transform_solver, ActionItem, AiPatch, CapScene, EditIntent,
     EditTx, Log, MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp, Record, Wallet,
 };
-use metrocalk_editor_shell::transform_solver::{Constraint, ConstraintIntent, SnapKind, SnapTarget};
 use metrocalk_gizmo::{
     Gizmo, GizmoMode, GizmoPivot, GizmoSpace, Handle, Ray, Transform as GizmoTransform,
 };
@@ -210,6 +213,19 @@ struct SolveResult {
     ok: bool,
     reason: Option<String>,
     intents: Vec<String>,
+}
+
+/// M10.3 (ADR-033) — the project document state the File menu reads: the current `.mtk` path (or `null`
+/// for an untitled project), whether there are **unsaved changes** (the guard's signal), the recent
+/// projects, and an explained `error` from the last file op (open/save) — never a crash. Mirrors the
+/// React `ProjectInfo`.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ProjectInfoResp {
+    path: Option<String>,
+    dirty: bool,
+    recents: Vec<String>,
+    error: Option<String>,
 }
 
 /// Commands to the engine thread (which owns the `!Send` Engine).
@@ -451,6 +467,27 @@ enum EngineCmd {
         id: String,
         text: String,
         reply: Sender<SolveResult>,
+    },
+    /// M10.3 (ADR-033) — the current project state (path · unsaved-changes · recents) for the File menu.
+    ProjectState {
+        reply: Sender<ProjectInfoResp>,
+    },
+    /// M10.3 — save the project to `path` (or the current path when `None`) as a `.mtk` (atomic). No
+    /// path + an untitled project ⇒ an explained "use Save As" (the native dialog is the local-GUI step).
+    SaveProject {
+        path: Option<String>,
+        reply: Sender<ProjectInfoResp>,
+    },
+    /// M10.3 — open a `.mtk` project from `path` (swapping in a fresh engine/scene + re-projecting). A
+    /// corrupt/newer/missing file replies an explained error and leaves the current project intact.
+    /// `None` path ⇒ the native Open dialog (the local-GUI step). **Live engine-swap accepted on a GUI run.**
+    OpenProject {
+        path: Option<String>,
+        reply: Sender<ProjectInfoResp>,
+    },
+    /// M10.3 — new empty project (a fresh engine/scene, the session log reset). **Accepted on a GUI run.**
+    NewProject {
+        reply: Sender<ProjectInfoResp>,
     },
     /// Internal fixed-timestep heartbeat (M8.2): a self-sent tick that advances the sim one step + syncs
     /// transforms to the viewport. NOT a JS command — it never crosses the WebView boundary (invariant 4).
@@ -707,7 +744,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     let mut world = FlecsWorld::new();
     // Intern the capability relationships BEFORE the engine takes the world (they are metadata, like
     // the registry's own interned rels — not scene entities).
-    let scene = CapScene::intern(&mut world);
+    // `mut` so a project Open/New (M10.3) can swap in a fresh capability scene alongside the engine.
+    let mut scene = CapScene::intern(&mut world);
     let mut engine = Engine::new(world, 1);
     // Mirror capability pairs into the durable Loro document so a load/merge re-derives them (ADR-032,
     // the M1.6 capability-rebuild fix). Set BEFORE seeding so every seeded `(Provides/Requires, cap)`
@@ -758,6 +796,14 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
 
     let mut positions: HashMap<Entity, [f32; 3]> = HashMap::new();
     rebuild(&engine, &shared, &mut positions, &assets);
+    // M10.3 (ADR-033) — the open `.mtk` project: its path (`None` = untitled; startup is still
+    // seed+replay, so a fresh boot is untitled — the open-last startup flip is owed) and the Loro
+    // version vector at the last save/open/new, so `dirty = current vv != saved_vv` needs no per-command
+    // instrumentation. `saved_vv` is captured AFTER the boot seed+replay, so a freshly-restored session
+    // starts "clean" and the guard tracks edits made since.
+    let recents_path = sidecar("metrocalk-recents.json");
+    let mut current_path: Option<std::path::PathBuf> = None;
+    let mut saved_vv: Vec<u8> = engine.version_vector();
     let mut channel: Option<Channel<ProjectionDelta>> = None;
     // Last-touched sequence per entity (higher = more recent) — the reveal's recency ranking signal,
     // bumped on every committed edit/bind so it's live, not inert.
@@ -1526,6 +1572,139 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     }
                 }
             }
+            EngineCmd::ProjectState { reply } => {
+                let _ = reply.send(project_info(
+                    current_path.as_deref(),
+                    engine.version_vector() != saved_vv,
+                    &recents_path,
+                    None,
+                ));
+            }
+            EngineCmd::SaveProject { path, reply } => {
+                // Target = the explicit path, else the current project's. Untitled + no path ⇒ Save As
+                // (the native dialog is the local-GUI step) — an explained reply, never a crash.
+                let target = path
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| current_path.clone());
+                let resp = match target {
+                    None => project_info(
+                        current_path.as_deref(),
+                        engine.version_vector() != saved_vv,
+                        &recents_path,
+                        Some(
+                            "untitled project — choose a location (Save As); the native file dialog is the local-GUI step"
+                                .into(),
+                        ),
+                    ),
+                    Some(p) => match mtk_project::save(&engine, &p) {
+                        Ok(()) => {
+                            current_path = Some(p.clone());
+                            saved_vv = engine.version_vector(); // now "clean" w.r.t. disk
+                            mtk_project::push_recent(
+                                &recents_path,
+                                &p.display().to_string(),
+                                mtk_project::RECENTS_CAP,
+                            );
+                            project_info(Some(&p), false, &recents_path, None)
+                        }
+                        Err(e) => project_info(
+                            current_path.as_deref(),
+                            engine.version_vector() != saved_vv,
+                            &recents_path,
+                            Some(format!("save failed: {e}")),
+                        ),
+                    },
+                };
+                let _ = reply.send(resp);
+            }
+            EngineCmd::NewProject { reply } => {
+                // A fresh empty project: a new world + scene + engine (resolver set), the session log
+                // reset, re-projected, the sim restarted empty. Render-coupled — ACCEPTED on a GUI run.
+                let mut w = FlecsWorld::new();
+                let s = CapScene::intern(&mut w);
+                let mut e = Engine::new(w, 1);
+                e.set_capability_resolver(Box::new(capscene::CapResolver::from_scene(&s)));
+                engine = e;
+                scene = s;
+                current_path = None;
+                saved_vv = engine.version_vector();
+                log.clear(); // the session replay log resets for the new project
+                recency.clear();
+                touch = 0;
+                rebuild(&engine, &shared, &mut positions, &assets);
+                if let Some(ch) = &channel {
+                    let _ = ch.send(project_full(&engine));
+                }
+                (recording, rec_entities, sim, body_of) = restart_run(
+                    &engine,
+                    &assets,
+                    &RapierPhysics::new(Fidelity::Gameplay.resolve().config),
+                    &HashMap::new(),
+                );
+                frame = 0;
+                max_frame = 0;
+                sim_running = false;
+                let _ = reply.send(project_info(None, false, &recents_path, None));
+            }
+            EngineCmd::OpenProject { path, reply } => {
+                let Some(p) = path.map(std::path::PathBuf::from) else {
+                    // No path ⇒ the native Open dialog (the local-GUI step) — explained reply.
+                    let _ = reply.send(project_info(
+                        current_path.as_deref(),
+                        engine.version_vector() != saved_vv,
+                        &recents_path,
+                        Some(
+                            "choose a file to open — the native file dialog is the local-GUI step"
+                                .into(),
+                        ),
+                    ));
+                    continue;
+                };
+                // Build a FRESH engine + scene + resolver and OPEN the .mtk into it; swap in ONLY on
+                // success (a corrupt/newer/missing file leaves the current project intact — explained,
+                // never a crash). Render-coupled swap — ACCEPTED on a GUI run.
+                let mut w = FlecsWorld::new();
+                let s = CapScene::intern(&mut w);
+                let mut e = Engine::new(w, 1);
+                e.set_capability_resolver(Box::new(capscene::CapResolver::from_scene(&s)));
+                let resp = match mtk_project::open_into(&mut e, &p) {
+                    Ok(_report) => {
+                        engine = e;
+                        scene = s;
+                        current_path = Some(p.clone());
+                        saved_vv = engine.version_vector();
+                        log.clear(); // the opened document IS the state; reset the session log
+                        recency.clear();
+                        touch = 0;
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                        if let Some(ch) = &channel {
+                            let _ = ch.send(project_full(&engine));
+                        }
+                        (recording, rec_entities, sim, body_of) = restart_run(
+                            &engine,
+                            &assets,
+                            &RapierPhysics::new(Fidelity::Gameplay.resolve().config),
+                            &HashMap::new(),
+                        );
+                        frame = 0;
+                        max_frame = 0;
+                        sim_running = !body_of.is_empty();
+                        mtk_project::push_recent(
+                            &recents_path,
+                            &p.display().to_string(),
+                            mtk_project::RECENTS_CAP,
+                        );
+                        project_info(Some(&p), false, &recents_path, None)
+                    }
+                    Err(err) => project_info(
+                        current_path.as_deref(),
+                        engine.version_vector() != saved_vv,
+                        &recents_path,
+                        Some(err.to_string()),
+                    ),
+                };
+                let _ = reply.send(resp);
+            }
             EngineCmd::SetSimRunning(run) => {
                 sim_running = run;
             }
@@ -1812,9 +1991,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             EngineCmd::SetPartActive { id, active, reply } => {
                 // M9.2 deactivate-not-delete (or reactivate): one undoable tx + persist; rebuild hides /
                 // re-shows the part. Undo restores it (the e2e: deactivate → Ctrl-Z brings it back).
-                let ok = EntityId::from_loro_key(&id).is_some_and(|eid| {
-                    capscene::set_part_active(&mut engine, eid, active).is_ok()
-                });
+                let ok = EntityId::from_loro_key(&id)
+                    .is_some_and(|eid| capscene::set_part_active(&mut engine, eid, active).is_ok());
                 if ok {
                     log.append(&Record::SetPartActive {
                         id: id.clone(),
@@ -2083,7 +2261,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 }
                                 SolveResult {
                                     ok,
-                                    reason: (!ok).then(|| "the constraint patch was rejected".into()),
+                                    reason: (!ok)
+                                        .then(|| "the constraint patch was rejected".into()),
                                     intents: labels,
                                 }
                             }
@@ -2829,8 +3008,14 @@ fn commit_world_transform(
             }
             Err(_) => false,
         }
-    } else if capscene::set_transform(engine, eid, world.translation, world.rotation, world.scale[0])
-        .is_ok()
+    } else if capscene::set_transform(
+        engine,
+        eid,
+        world.translation,
+        world.rotation,
+        world.scale[0],
+    )
+    .is_ok()
     {
         log.append(&Record::Transform {
             id: eid.to_loro_key(),
@@ -2865,6 +3050,22 @@ fn ancestor_scale_product(engine: &Engine<FlecsWorld>, id: EntityId) -> f32 {
 /// Rebuild the viewport instance list AND the cached `positions` map from the engine's `Transform`
 /// components in one pass (scene truth → viewport + reveal input). The only place scene geometry flows
 /// core → viewport.
+/// Build a [`ProjectInfoResp`] for the File menu (M10.3) — the path, the dirty flag, the (freshly-read)
+/// recents, and an optional explained error. Keeps the four project-command arms terse.
+fn project_info(
+    path: Option<&std::path::Path>,
+    dirty: bool,
+    recents_path: &std::path::Path,
+    error: Option<String>,
+) -> ProjectInfoResp {
+    ProjectInfoResp {
+        path: path.map(|p| p.display().to_string()),
+        dirty,
+        recents: mtk_project::load_recents(recents_path),
+        error,
+    }
+}
+
 fn rebuild(
     engine: &Engine<FlecsWorld>,
     shared: &Shared,
@@ -2961,7 +3162,11 @@ fn rebuild(
         mesh_slots.push(slot.map_or(-1, |s| i32::try_from(s).unwrap_or(-1)));
         // A parent (has children) is a stronger spatial snap target (a pivot) than a bare origin
         // (`SnapKind::Pivot`=6 vs `Origin`=0 in the shared ranker's affinity).
-        snap_affinity.push(if engine.children_of(id).is_empty() { 0 } else { 6 });
+        snap_affinity.push(if engine.children_of(id).is_empty() {
+            0
+        } else {
+            6
+        });
         ids.push(key);
     }
     // Tracking lines: one segment per binding, between the bound entities' centres — what makes a
@@ -3775,7 +3980,10 @@ fn instantiate_character(state: State<AppState>, comp: String) -> Option<String>
     let (reply, rx) = mpsc::channel();
     if state
         .tx
-        .send(EngineCmd::InstantiateCharacter { comp_id: comp, reply })
+        .send(EngineCmd::InstantiateCharacter {
+            comp_id: comp,
+            reply,
+        })
         .is_err()
     {
         return None;
@@ -4043,6 +4251,63 @@ fn add_item(state: State<AppState>, id: String, source: String) -> AddResponse {
     rx.recv().unwrap_or_default()
 }
 
+// ── M10.3 (ADR-033): project lifecycle — New / Open / Save / Save As over the `.mtk` document ──────
+
+/// The current project state (path · unsaved-changes · recents) for the File menu (ADR-033).
+#[tauri::command]
+fn project_state(state: State<AppState>) -> ProjectInfoResp {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::ProjectState { reply }).is_err() {
+        return ProjectInfoResp::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Save the project as a `.mtk` (atomic). `path` `None` ⇒ the current path, or an explained Save-As
+/// prompt when untitled (the native dialog is the local-GUI step).
+#[tauri::command]
+fn save_project(state: State<AppState>, path: Option<String>) -> ProjectInfoResp {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SaveProject { path, reply })
+        .is_err()
+    {
+        return ProjectInfoResp::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Open a `.mtk` project (swap in a fresh engine/scene, re-derive caps — ADR-032). A corrupt/newer/
+/// missing file replies an explained error and leaves the current project intact. `path` `None` ⇒ the
+/// native Open dialog (the local-GUI step). The live engine-swap is accepted on a GUI run.
+#[tauri::command]
+fn open_project(state: State<AppState>, path: Option<String>) -> ProjectInfoResp {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::OpenProject { path, reply })
+        .is_err()
+    {
+        return ProjectInfoResp::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// New empty project (a fresh engine/scene, the session log reset). Accepted on a GUI run.
+#[tauri::command]
+fn new_project(state: State<AppState>) -> ProjectInfoResp {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::NewProject { reply }).is_err() {
+        return ProjectInfoResp::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 fn main() {
     let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
     let (tx, rx) = mpsc::channel::<EngineCmd>();
@@ -4145,6 +4410,10 @@ fn main() {
             set_snap,
             snap_ghost,
             gizmo_debug,
+            project_state,
+            save_project,
+            open_project,
+            new_project,
             ipc_count
         ])
         .run(tauri::generate_context!())

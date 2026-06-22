@@ -25,6 +25,11 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     catalog: () => Promise.resolve({}),
     catalogSearch: () => Promise.resolve({ items: [] }),
     addItem: vi.fn(() => Promise.resolve({ created: "e-new", balance: null, seam: null })),
+    projectState: () => Promise.resolve({ path: null, dirty: false, recents: [], error: null }),
+    newProject: vi.fn(() => Promise.resolve({ path: null, dirty: false, recents: [], error: null })),
+    openProject: vi.fn(() => Promise.resolve({ path: "p.mtk", dirty: false, recents: ["p.mtk"], error: null })),
+    saveProject: vi.fn(() => Promise.resolve({ path: "p.mtk", dirty: false, recents: ["p.mtk"], error: null })),
+    saveProjectAs: vi.fn(() => Promise.resolve({ path: "p.mtk", dirty: false, recents: ["p.mtk"], error: null })),
     ...over,
   };
 }

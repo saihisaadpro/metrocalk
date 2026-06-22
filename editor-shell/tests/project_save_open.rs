@@ -198,6 +198,32 @@ fn a_corrupt_file_is_refused_not_a_crash() {
 }
 
 #[test]
+fn recents_move_to_front_dedup_and_cap() {
+    let path = std::env::temp_dir().join(format!("metrocalk-recents-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(project::push_recent(&path, "a.mtk", 3), vec!["a.mtk"]);
+    project::push_recent(&path, "b.mtk", 3); // [b, a]
+    let r = project::push_recent(&path, "a.mtk", 3); // re-touch a → [a, b]
+    assert_eq!(r, vec!["a.mtk".to_string(), "b.mtk".to_string()]);
+    project::push_recent(&path, "c.mtk", 3); // [c, a, b]
+    let r = project::push_recent(&path, "d.mtk", 3); // cap 3 → [d, c, a], oldest (b) dropped
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0], "d.mtk");
+    assert!(
+        !r.contains(&"b.mtk".to_string()),
+        "the capped-out oldest entry is dropped"
+    );
+    assert_eq!(
+        project::load_recents(&path),
+        r,
+        "the list is persisted to disk"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn a_nonexistent_path_is_an_io_error_not_a_crash() {
     let path = temp_mtk("does-not-exist");
     let _ = std::fs::remove_file(&path);

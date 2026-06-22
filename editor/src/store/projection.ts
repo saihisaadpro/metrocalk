@@ -14,6 +14,7 @@
 
 import { createStore } from "zustand/vanilla";
 import { useStore } from "zustand";
+import { projectStore } from "./project";
 import type {
   EditIntent,
   EntityProjection,
@@ -100,6 +101,9 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
   },
 
   optimisticEdit(op) {
+    // An edit means unsaved changes — light the File menu's "•" instantly (ADR-033). Authoritative
+    // dirtiness is the shell's (refreshed on menu open); this is the optimistic indicator.
+    projectStore.getState().markDirty();
     const s = get();
     const pending = { ...s.pending, [op.clientOpId]: op };
     if (op.intent.kind === "setField") {

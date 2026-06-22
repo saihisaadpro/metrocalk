@@ -7,6 +7,7 @@
 //! ADR-010). The native viewport hot path never crosses this layer (invariant 4).
 
 import { projectionStore } from "../store/projection";
+import type { ProjectInfo } from "../store/project";
 import type {
   ActionItem,
   AddResponse,
@@ -66,6 +67,21 @@ export interface EditorClient {
   catalogSearch(query: string): Promise<CatalogSearch>;
   /** Instantiate a catalog item into the scene (place-into-scene) — one undoable, persisted entity. */
   addItem(id: string, source: string): Promise<AddResponse>;
+
+  // ── project lifecycle (M10.3 / ADR-033): New / Open / Save / Save As over the `.mtk` document ──────
+  /** The current project state — path, unsaved-changes flag, recent projects. The File menu refreshes
+   *  this on open so the unsaved-changes guard reads the authoritative (shell-side) dirty flag. */
+  projectState(): Promise<ProjectInfo>;
+  /** New empty project (discarding the current scene — the menu guards on `dirty` first). */
+  newProject(): Promise<ProjectInfo>;
+  /** Open a `.mtk` project. With a `path` (a recent), opens it directly; without one, the shell shows a
+   *  native Open dialog (the live half — owed). A corrupt/newer/missing file resolves with `error` set. */
+  openProject(path?: string): Promise<ProjectInfo>;
+  /** Save to the current path (atomic, ADR-033); if the project is untitled, the shell shows a Save
+   *  dialog (the live half — owed). */
+  saveProject(): Promise<ProjectInfo>;
+  /** Save As — always picks a new path via the shell's native dialog (the live half — owed). */
+  saveProjectAs(): Promise<ProjectInfo>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -182,6 +198,22 @@ class TauriClient implements EditorClient {
   addItem(id: string, source: string): Promise<AddResponse> {
     return this.core.invoke<AddResponse>("add_item", { id, source });
   }
+
+  projectState(): Promise<ProjectInfo> {
+    return this.core.invoke<ProjectInfo>("project_state");
+  }
+  newProject(): Promise<ProjectInfo> {
+    return this.core.invoke<ProjectInfo>("new_project");
+  }
+  openProject(path?: string): Promise<ProjectInfo> {
+    return this.core.invoke<ProjectInfo>("open_project", { path: path ?? null });
+  }
+  saveProject(): Promise<ProjectInfo> {
+    return this.core.invoke<ProjectInfo>("save_project", { path: null });
+  }
+  saveProjectAs(): Promise<ProjectInfo> {
+    return this.core.invoke<ProjectInfo>("save_project", { path: null, saveAs: true });
+  }
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
@@ -210,6 +242,7 @@ function buildWorld(n: number): EntityProjection[] {
  *  their own stubbed `EditorClient`; the real reveal/describe come from the shell commands under Tauri.) */
 class MockClient implements EditorClient {
   private balance = 100;
+  private project: ProjectInfo = { path: null, dirty: false, recents: [], error: null };
   constructor(private readonly inner: DeltaClient) {}
   setField(id: string, component: string, field: string, value: Json): string {
     return this.inner.setField(id, component, field, value);
@@ -307,6 +340,38 @@ class MockClient implements EditorClient {
   }
   addItem(_id: string, _source: string): Promise<AddResponse> {
     return Promise.resolve({ created: "e-new", balance: null, seam: null });
+  }
+
+  // The dev MockCore has no real document; track a plausible in-memory project so the File menu renders.
+  projectState(): Promise<ProjectInfo> {
+    return Promise.resolve({ ...this.project });
+  }
+  newProject(): Promise<ProjectInfo> {
+    this.project = { path: null, dirty: false, recents: this.project.recents, error: null };
+    return Promise.resolve({ ...this.project });
+  }
+  openProject(path?: string): Promise<ProjectInfo> {
+    const p = path ?? "untitled.mtk";
+    this.project = {
+      path: p,
+      dirty: false,
+      recents: [p, ...this.project.recents.filter((r) => r !== p)].slice(0, 8),
+      error: null,
+    };
+    return Promise.resolve({ ...this.project });
+  }
+  saveProject(): Promise<ProjectInfo> {
+    const p = this.project.path ?? "untitled.mtk";
+    this.project = {
+      path: p,
+      dirty: false,
+      recents: [p, ...this.project.recents.filter((r) => r !== p)].slice(0, 8),
+      error: null,
+    };
+    return Promise.resolve({ ...this.project });
+  }
+  saveProjectAs(): Promise<ProjectInfo> {
+    return this.saveProject();
   }
 }
 

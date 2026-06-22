@@ -80,6 +80,33 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The default cap on the recent-projects list (most-recent first).
+pub const RECENTS_CAP: usize = 8;
+
+/// Load the recent-projects list (most-recent first) from `path`. A missing/corrupt file is an empty
+/// list — never an error (the File menu's "Recent" is best-effort chrome).
+#[must_use]
+pub fn load_recents(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Record `project` as the most-recently-used path: move it to the front (deduped), cap the list at
+/// [`RECENTS_CAP`], persist to `path`, and return the new list. Best-effort write (a failure still
+/// returns the in-memory list).
+pub fn push_recent(path: &Path, project: &str, cap: usize) -> Vec<String> {
+    let mut list = load_recents(path);
+    list.retain(|p| p != project);
+    list.insert(0, project.to_string());
+    list.truncate(cap.max(1));
+    if let Ok(s) = serde_json::to_string(&list) {
+        let _ = std::fs::write(path, s);
+    }
+    list
+}
+
 /// Open a `.mtk` project **into** `engine` — which must already have its capability resolver set (so
 /// caps restore, ADR-032). Reads the file, parses + **migrates** the envelope forward (or refuses a
 /// newer/corrupt one with an explained error), and `merge`s the Loro snapshot, which rebuilds the ECS
