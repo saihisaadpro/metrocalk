@@ -18,6 +18,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# Native Open/Save file dialogs for the M10.3 File menu (project New/Open/Save/Save As).
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

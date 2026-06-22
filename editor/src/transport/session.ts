@@ -212,7 +212,7 @@ class TauriClient implements EditorClient {
     return this.core.invoke<ProjectInfo>("save_project", { path: null });
   }
   saveProjectAs(): Promise<ProjectInfo> {
-    return this.core.invoke<ProjectInfo>("save_project", { path: null, saveAs: true });
+    return this.core.invoke<ProjectInfo>("save_project_as");
   }
 }
 

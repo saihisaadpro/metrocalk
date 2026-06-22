@@ -49,6 +49,7 @@ use render::{Instance, SceneState, Shared};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 const SCENE_N: usize = 5000; // the real M1.4 stress scene (the M2 gate target)
 
@@ -794,16 +795,38 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
         );
     }
 
-    let mut positions: HashMap<Entity, [f32; 3]> = HashMap::new();
-    rebuild(&engine, &shared, &mut positions, &assets);
-    // M10.3 (ADR-033) — the open `.mtk` project: its path (`None` = untitled; startup is still
-    // seed+replay, so a fresh boot is untitled — the open-last startup flip is owed) and the Loro
-    // version vector at the last save/open/new, so `dirty = current vv != saved_vv` needs no per-command
-    // instrumentation. `saved_vv` is captured AFTER the boot seed+replay, so a freshly-restored session
-    // starts "clean" and the guard tracks edits made since.
+    // M10.3 (ADR-033) deliverable 4 — startup = **open-last-else-the-seeded-sample**. The seed+replay
+    // above is the known-good default (the "new"/sample scene); if the user's last project opens cleanly,
+    // swap it in BEFORE the first projection. **FAIL-SAFE:** any open failure (missing/corrupt/newer)
+    // keeps the sample, so a bad last-project can never break launch. (The seed work is "wasted" when a
+    // project opens — a small one-shot boot cost that keeps this an additive, low-risk flip.)
     let recents_path = sidecar("metrocalk-recents.json");
     let mut current_path: Option<std::path::PathBuf> = None;
+    if let Some(last) = mtk_project::load_recents(&recents_path).into_iter().next() {
+        let p = std::path::PathBuf::from(&last);
+        if p.exists() {
+            let mut w = FlecsWorld::new();
+            let s = CapScene::intern(&mut w);
+            let mut e = Engine::new(w, 1);
+            e.set_capability_resolver(Box::new(capscene::CapResolver::from_scene(&s)));
+            if mtk_project::open_into(&mut e, &p).is_ok() {
+                engine = e;
+                scene = s;
+                current_path = Some(p);
+                eprintln!("[shell] opened last project: {last}");
+            } else {
+                eprintln!(
+                    "[shell] last project didn't open cleanly — starting from the sample scene"
+                );
+            }
+        }
+    }
+    // The Loro version vector at the last save/open/new (captured AFTER any open/seed, so a fresh session
+    // starts "clean"): `dirty = current vv != saved_vv` needs no per-command instrumentation.
     let mut saved_vv: Vec<u8> = engine.version_vector();
+
+    let mut positions: HashMap<Entity, [f32; 3]> = HashMap::new();
+    rebuild(&engine, &shared, &mut positions, &assets);
     let mut channel: Option<Channel<ProjectionDelta>> = None;
     // Last-touched sequence per entity (higher = more recent) — the reveal's recency ranking signal,
     // bumped on every committed edit/bind so it's live, not inert.
@@ -4253,10 +4276,9 @@ fn add_item(state: State<AppState>, id: String, source: String) -> AddResponse {
 
 // ── M10.3 (ADR-033): project lifecycle — New / Open / Save / Save As over the `.mtk` document ──────
 
-/// The current project state (path · unsaved-changes · recents) for the File menu (ADR-033).
-#[tauri::command]
-fn project_state(state: State<AppState>) -> ProjectInfoResp {
-    ipc();
+/// Query the engine thread for the current project state (a read) — also the no-op reply when a file
+/// dialog is cancelled.
+fn query_project_state(state: &State<AppState>) -> ProjectInfoResp {
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::ProjectState { reply }).is_err() {
         return ProjectInfoResp::default();
@@ -4264,48 +4286,108 @@ fn project_state(state: State<AppState>) -> ProjectInfoResp {
     rx.recv().unwrap_or_default()
 }
 
-/// Save the project as a `.mtk` (atomic). `path` `None` ⇒ the current path, or an explained Save-As
-/// prompt when untitled (the native dialog is the local-GUI step).
-#[tauri::command]
-fn save_project(state: State<AppState>, path: Option<String>) -> ProjectInfoResp {
-    ipc();
+/// Show a native Open dialog filtered to `.mtk`; the chosen path string, or `None` if cancelled.
+fn pick_open_path(app: &tauri::AppHandle) -> Option<String> {
+    app.dialog()
+        .file()
+        .add_filter("Metrocalk project", &["mtk"])
+        .blocking_pick_file()
+        .and_then(|f| f.into_path().ok())
+        .map(|p| p.display().to_string())
+}
+
+/// Show a native Save dialog defaulting to a `.mtk`; the chosen path string, or `None` if cancelled.
+fn pick_save_path(app: &tauri::AppHandle) -> Option<String> {
+    app.dialog()
+        .file()
+        .add_filter("Metrocalk project", &["mtk"])
+        .set_file_name("untitled.mtk")
+        .blocking_save_file()
+        .and_then(|f| f.into_path().ok())
+        .map(|p| p.display().to_string())
+}
+
+/// Enqueue a save/open/new command (built from the reply sender) and await the reply.
+fn run_project_cmd(
+    state: &State<AppState>,
+    cmd: impl FnOnce(Sender<ProjectInfoResp>) -> EngineCmd,
+) -> ProjectInfoResp {
     let (reply, rx) = mpsc::channel();
-    if state
-        .tx
-        .send(EngineCmd::SaveProject { path, reply })
-        .is_err()
-    {
+    if state.tx.send(cmd(reply)).is_err() {
         return ProjectInfoResp::default();
     }
     rx.recv().unwrap_or_default()
 }
 
-/// Open a `.mtk` project (swap in a fresh engine/scene, re-derive caps — ADR-032). A corrupt/newer/
-/// missing file replies an explained error and leaves the current project intact. `path` `None` ⇒ the
-/// native Open dialog (the local-GUI step). The live engine-swap is accepted on a GUI run.
+/// The current project state (path · unsaved-changes · recents) for the File menu (ADR-033).
 #[tauri::command]
-fn open_project(state: State<AppState>, path: Option<String>) -> ProjectInfoResp {
+fn project_state(state: State<AppState>) -> ProjectInfoResp {
     ipc();
-    let (reply, rx) = mpsc::channel();
-    if state
-        .tx
-        .send(EngineCmd::OpenProject { path, reply })
-        .is_err()
-    {
-        return ProjectInfoResp::default();
-    }
-    rx.recv().unwrap_or_default()
+    query_project_state(&state)
+}
+
+/// Save the project as a `.mtk` (atomic). Explicit `path` wins; else save to the current path; else
+/// (untitled) a native Save dialog. A cancelled dialog is a no-op.
+#[tauri::command]
+fn save_project(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    path: Option<String>,
+) -> ProjectInfoResp {
+    ipc();
+    let target = match path {
+        Some(p) => Some(p),
+        None => query_project_state(&state)
+            .path
+            .or_else(|| pick_save_path(&app)),
+    };
+    let Some(target) = target else {
+        return query_project_state(&state); // cancelled / no target — no-op
+    };
+    run_project_cmd(&state, |reply| EngineCmd::SaveProject {
+        path: Some(target),
+        reply,
+    })
+}
+
+/// Save As — always a native Save dialog to a new path. A cancelled dialog is a no-op.
+#[tauri::command]
+fn save_project_as(app: tauri::AppHandle, state: State<AppState>) -> ProjectInfoResp {
+    ipc();
+    let Some(target) = pick_save_path(&app) else {
+        return query_project_state(&state); // cancelled — no-op
+    };
+    run_project_cmd(&state, |reply| EngineCmd::SaveProject {
+        path: Some(target),
+        reply,
+    })
+}
+
+/// Open a `.mtk` project (swap in a fresh engine/scene, re-derive caps — ADR-032). Explicit `path` (a
+/// recent) wins; else a native Open dialog. A corrupt/newer/missing file replies an explained error and
+/// leaves the current project intact; a cancelled dialog is a no-op. The live engine-swap is accepted on
+/// a GUI run.
+#[tauri::command]
+fn open_project(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    path: Option<String>,
+) -> ProjectInfoResp {
+    ipc();
+    let Some(target) = path.or_else(|| pick_open_path(&app)) else {
+        return query_project_state(&state); // cancelled — no-op
+    };
+    run_project_cmd(&state, |reply| EngineCmd::OpenProject {
+        path: Some(target),
+        reply,
+    })
 }
 
 /// New empty project (a fresh engine/scene, the session log reset). Accepted on a GUI run.
 #[tauri::command]
 fn new_project(state: State<AppState>) -> ProjectInfoResp {
     ipc();
-    let (reply, rx) = mpsc::channel();
-    if state.tx.send(EngineCmd::NewProject { reply }).is_err() {
-        return ProjectInfoResp::default();
-    }
-    rx.recv().unwrap_or_default()
+    run_project_cmd(&state, |reply| EngineCmd::NewProject { reply })
 }
 
 fn main() {
@@ -4322,6 +4404,7 @@ fn main() {
     };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init()) // native Open/Save file dialogs (M10.3 File menu)
         .manage(app_state)
         .setup(move |app| {
             let win = app.get_webview_window("main").expect("main window");
@@ -4412,6 +4495,7 @@ fn main() {
             gizmo_debug,
             project_state,
             save_project,
+            save_project_as,
             open_project,
             new_project,
             ipc_count
