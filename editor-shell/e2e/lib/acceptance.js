@@ -9,6 +9,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { invoke } from "../pages/scaffold.js";
+// Re-export the page-object's `invoke` so specs can import the whole acceptance toolkit (report · budgets ·
+// console guard · `invoke` read-back) from one module — the shape every acceptance spec was authored to.
+export { invoke };
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const E2E = path.resolve(dir, "..");

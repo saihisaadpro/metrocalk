@@ -47,7 +47,11 @@ export function Hierarchy() {
   return (
     <div>
       <div style={{ padding: "8px", fontWeight: 700, color: "#e8e8e8" }}>
-        hierarchy <span style={{ opacity: 0.6, fontWeight: 400 }}>({order.length})</span>
+        hierarchy{" "}
+        {/* `#count` — the scaffold's stable connect signal ("N entities") the prompt-40 harness reads. */}
+        <span id="count" style={{ opacity: 0.6, fontWeight: 400 }}>
+          {order.length} entities
+        </span>
       </div>
       <div
         onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}

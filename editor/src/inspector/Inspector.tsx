@@ -38,14 +38,18 @@ export function Inspector({ client }: { client: EditorClient }) {
   const id = useSelectedId();
   const entity = useDisplayedEntity(id ?? "");
   if (!id || !entity) {
-    return <div style={{ padding: 12, color: "#888" }}>Select an entity to inspect.</div>;
+    return (
+      <div id="inspector" style={{ padding: 12, color: "#888" }}>
+        Select an entity to inspect.
+      </div>
+    );
   }
   const schema = buildEntitySchema(entity.components);
   // A real empty-state (C6) — never a blank pane: when the entity carries no *editable* (schema-backed)
   // properties, say so + name the next step, rather than rendering nothing beside the header.
   const hasFields = !!schema.properties && Object.keys(schema.properties).length > 0;
   return (
-    <div style={{ padding: 12 }}>
+    <div id="inspector" style={{ padding: 12 }}>
       <div style={{ fontWeight: 700, marginBottom: 8 }}>{entity.name}</div>
       {hasFields ? (
         <JsonForms
