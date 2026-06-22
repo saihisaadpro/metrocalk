@@ -546,6 +546,14 @@ impl<W: World> Engine<W> {
         self.doc.export(ExportMode::Snapshot).unwrap()
     }
 
+    /// Export the project as a Loro **snapshot** (ADR-002: snapshot + oplog — the snapshot carries
+    /// history). This is the durable document the `.mtk` project format wraps and writes; opening one
+    /// `merge`s it back, restoring entities, edges, and — via the mirrored `caps` layer (ADR-032) —
+    /// every entity's capability pairs, so the reveal/bind query works after a load.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.doc.export(ExportMode::Snapshot).unwrap()
+    }
+
     // ── internals ──────────────────────────────────────────────────────
 
     /// Pre-validate the whole batch against a running "alive" set (existing entities + in-batch

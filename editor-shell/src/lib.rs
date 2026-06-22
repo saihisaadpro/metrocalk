@@ -18,6 +18,7 @@ pub mod generate;
 pub mod metering;
 pub mod persist;
 pub mod physics_intent;
+pub mod project;
 pub mod reveal;
 pub mod transform_solver;
 pub mod wallet;
@@ -38,5 +39,6 @@ pub use generate::{
 };
 pub use metering::{ai_edit_rustier, buy_marketplace, rustier_patch, Outcome};
 pub use persist::{Log, Record};
+pub use project::{atomic_write, open_into, save, OpenError};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
 pub use wallet::Wallet;
