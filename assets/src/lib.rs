@@ -15,6 +15,7 @@
 //! native-only normalization step (basis-universal is C++ FFI) — documented in the asset ADR, not
 //! built here.
 
+pub mod audio;
 pub mod autorig;
 pub mod demo;
 pub mod gltf_import;
@@ -23,6 +24,7 @@ pub mod mesh;
 pub mod source;
 pub mod store;
 
+pub use audio::{AudioAsset, AudioFormat, AudioImporter, AudioSource, AudioStore};
 pub use autorig::{bake_standard_lbs, AutoRig, AutoRigJoint, NeuralRigImporter};
 pub use gltf_import::GltfImporter;
 pub use gpu::{MeshGpu, MeshVertex};
