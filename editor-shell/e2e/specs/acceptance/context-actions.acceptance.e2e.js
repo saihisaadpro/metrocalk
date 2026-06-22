@@ -290,7 +290,7 @@ describe("acceptance / M3.3 — context reveal + every action, the full conjunct
         recapture: () => captureBudget(s.label, s.label, { id }, { n: 30, warmup: 5 }),
       });
       report.budget(scored);
-      expect(scored.verdict, `${s.label}: ${scored.note}`).toBe("pass");
+      expect(scored.verdict).toBe("pass");
     }
   });
 });

@@ -43,6 +43,10 @@ export interface ProjectionDelta {
   ops: ProjectionOp[];
   confirms?: string[];
   rejects?: RejectInfo[];
+  /** `true` only for a server-initiated **full re-projection** (`project_full`: connect/undo/sim-restart/
+   *  open). The store REPLACES (drops stale entities/edges) instead of merging — so an undone bind's edge,
+   *  or a deleted entity, can't linger. Default/absent = an incremental delta (merged). */
+  full?: boolean;
 }
 
 /** RFC-6902 subset — the edit language shared with the AI layer. */

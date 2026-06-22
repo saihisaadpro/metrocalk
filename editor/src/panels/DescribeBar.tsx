@@ -34,29 +34,35 @@ export function DescribeBar({ client }: { client: EditorClient }) {
     const q = query.trim();
     if (!q) return; // empty guard (Create is also disabled) — never a silent inert CTA (C5)
     setPanel(null);
-    const r = await client.describe(q);
-    if (r.balance != null) setBalance(r.balance);
+    try {
+      const r = await client.describe(q);
+      if (r.balance != null) setBalance(r.balance);
 
-    // MATCH → place + select the result, right where the action started (the loop closes here).
-    if (r.created) {
-      const cost = r.source === "marketplace" && r.price != null ? ` · −${r.price} tokens` : "";
-      projectionStore.getState().select(r.created);
-      setQuery("");
-      pushToast(`Created ${r.kind ?? "object"} · ${r.source ?? "local"}${cost}`, "success");
-      setStatus(`created ${r.kind ?? "entity"} · ${r.created} · ${r.source ?? "local"}`);
-      return;
+      // MATCH → place + select the result, right where the action started (the loop closes here).
+      if (r.created) {
+        const cost = r.source === "marketplace" && r.price != null ? ` · −${r.price} tokens` : "";
+        projectionStore.getState().select(r.created);
+        setQuery("");
+        pushToast(`Created ${r.kind ?? "object"} · ${r.source ?? "local"}${cost}`, "success");
+        setStatus(`created ${r.kind ?? "entity"} · ${r.created} · ${r.source ?? "local"}`);
+        return;
+      }
+
+      // A marketplace buy refused (broke) → the explained seam (verbatim), no scene change.
+      if (r.seam && r.seam.startsWith("insufficient")) {
+        setPanel({ kind: "refusal", message: r.seam });
+        setStatus(r.seam);
+        return;
+      }
+
+      // NO MATCH anywhere → the explicit, actionable generate offer (C1) — NOT a passive footer line.
+      setPanel({ kind: "offer", query: q });
+      setStatus(`no local or marketplace match for "${q}" — Generate with AI? (~${GENERATE_COST} tokens)`);
+    } catch (e) {
+      console.error("describe failed", e);
+      pushToast("create failed — please try again", "error");
+      setStatus("create failed");
     }
-
-    // A marketplace buy refused (broke) → the explained seam (verbatim), no scene change.
-    if (r.seam && r.seam.startsWith("insufficient")) {
-      setPanel({ kind: "refusal", message: r.seam });
-      setStatus(r.seam);
-      return;
-    }
-
-    // NO MATCH anywhere → the explicit, actionable generate offer (C1) — NOT a passive footer line.
-    setPanel({ kind: "offer", query: q });
-    setStatus(`no local or marketplace match for "${q}" — Generate with AI? (~${GENERATE_COST} tokens)`);
   }
 
   /** The opt-in, METERED tier-3 generate (M6/ADR-017): a deliberate, priced click → a progress state →
@@ -65,7 +71,17 @@ export function DescribeBar({ client }: { client: EditorClient }) {
     setPanel({ kind: "generating", query: q });
     setStatus(`generating "${q}" … (~${GENERATE_COST} tokens)`);
     pushToast(`Generating "${q}" … ~${GENERATE_COST} tokens`, "cost");
-    const r = await client.generate(q);
+    let r: Awaited<ReturnType<typeof client.generate>>;
+    try {
+      r = await client.generate(q);
+    } catch (e) {
+      // A failed generation must clear the progress state + explain — never strand "Generating…".
+      console.error("generate failed", e);
+      setPanel({ kind: "refusal", message: "generation failed — please try again" });
+      pushToast("generation failed", "error");
+      setStatus("generation failed");
+      return;
+    }
     if (r.balance != null) setBalance(r.balance);
     if (r.created) {
       projectionStore.getState().select(r.created);

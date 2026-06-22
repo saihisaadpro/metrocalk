@@ -69,9 +69,10 @@ export interface EditorClient {
   makeDynamic(id: string): Promise<boolean>;
 
   // ── native viewport input (Tauri-only; the dev MockCore has no viewport) — the M10.1 composite closeout ─
-  /** Left-click pick over the native wgpu region → the picked entity id (or null). Computed synchronously
-   *  in the command (no per-frame race). */
-  viewportPick(): Promise<string | null>;
+  /** Pick over the native wgpu region at NORMALIZED viewport coords (x,y ∈ [0,1]) → the picked entity id
+   *  (or null). Computed synchronously in the command from the camera ray (no per-frame race, no OS-cursor
+   *  dependency — so a synthetic click works too). */
+  viewportPick(x: number, y: number): Promise<string | null>;
   /** Begin a right-drag orbit — the native render loop then polls the OS cursor and orbits with **0 IPC per
    *  frame** (invariant 4); only this call + `dragEnd` cross the boundary, once per gesture. */
   dragStart(): void;
@@ -222,8 +223,8 @@ class TauriClient implements EditorClient {
     return this.core.invoke<boolean>("make_dynamic", { id });
   }
 
-  viewportPick(): Promise<string | null> {
-    return this.core.invoke<string | null>("viewport_pick");
+  viewportPick(x: number, y: number): Promise<string | null> {
+    return this.core.invoke<string | null>("viewport_pick", { x, y });
   }
   dragStart(): void {
     void this.core.invoke("drag_start").catch((e: unknown) => console.error("drag_start failed", e));
@@ -472,7 +473,7 @@ class MockClient implements EditorClient {
     return Promise.resolve(true);
   }
   // The dev MockCore has no native viewport — these are inert (the real wgpu input is Tauri-only).
-  viewportPick(): Promise<string | null> {
+  viewportPick(_x: number, _y: number): Promise<string | null> {
     return Promise.resolve(null);
   }
   dragStart(): void {}

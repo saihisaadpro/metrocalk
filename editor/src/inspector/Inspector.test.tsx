@@ -22,6 +22,8 @@ test("an entity with editable components renders editable property INPUTS (data-
   expect(screen.queryByTestId("inspectorEmpty")).toBeNull(); // a form, not the empty-state
   // the data-driven schema produces EDITABLE inputs for the real fields (x/y/z/width) — the C6 fix
   expect(container.querySelectorAll("input").length).toBeGreaterThan(0);
+  // the component NAME is visible (the Group label) — the prompt-40 north-star-1 keys on "Transform"
+  expect(container.textContent).toContain("Transform");
 });
 
 test("an entity with NO editable properties shows a real empty-state, not a blank pane (C6)", () => {

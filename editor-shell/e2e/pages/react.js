@@ -17,7 +17,7 @@
 // Selection: the acceptance run picks this object when `MTK_UI=react` (else the scaffold). The new
 // observables/overrides are exercised live on the local `.exe` run (the caveated convergence gate).
 
-import { $ } from "@wdio/globals";
+import { $, browser } from "@wdio/globals";
 import { scaffold } from "./scaffold.js";
 
 const visible = async (sel) => {
@@ -29,6 +29,12 @@ const visible = async (sel) => {
 export const react = {
   ...scaffold,
   name: "react (/editor)",
+
+  // ── undo: the React editor has no `#undo` button — undo is Ctrl-Z (a global keydown). Override the
+  // scaffold's button verb to the keyboard so the shared specs re-green by page-object swap, not a rewrite.
+  async undoButton() {
+    await browser.keys(["Control", "z"]);
+  },
 
   // ── AI-edit: now a deliberate two-step spend (open confirm → apply) — M10.10 / C3 ──────────────────
   async clickRustier() {

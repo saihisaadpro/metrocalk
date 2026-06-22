@@ -64,6 +64,17 @@ pub struct ProjectionDelta {
     pub confirms: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rejects: Vec<RejectInfo>,
+    /// `true` only for a server-initiated **full re-projection** (`project_full` — sent on connect, undo,
+    /// sim-restart, project open/new). The UI projection store treats it as a REPLACE (drop stale
+    /// entities/edges), not an incremental merge — so e.g. an undone bind's edge can't linger. Default
+    /// `false` (an incremental/echo delta); skipped on the wire when false to keep deltas lean.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub full: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -143,6 +154,7 @@ pub fn apply_edit<W: World>(engine: &mut Engine<W>, tx: &EditTx) -> ProjectionDe
                     }],
                     confirms: vec![tx.client_op_id.clone()],
                     rejects: vec![],
+                    full: false,
                 },
                 Err(e) => reject(&tx.client_op_id, e.to_string()),
             }
@@ -169,6 +181,7 @@ pub fn apply_edit<W: World>(engine: &mut Engine<W>, tx: &EditTx) -> ProjectionDe
                     }],
                     confirms: vec![tx.client_op_id.clone()],
                     rejects: vec![],
+                    full: false,
                 },
                 Err(e) => reject(&tx.client_op_id, e.to_string()),
             }
@@ -214,6 +227,7 @@ pub fn project_full<W: World>(engine: &Engine<W>) -> ProjectionDelta {
         ops,
         confirms: vec![],
         rejects: vec![],
+        full: true, // a FULL re-projection → the UI store REPLACES (drops stale entities/edges, e.g. on undo)
     }
 }
 
@@ -242,6 +256,7 @@ pub fn project_entity<W: World>(engine: &Engine<W>, id: EntityId) -> ProjectionD
         ops,
         confirms: vec![],
         rejects: vec![],
+        full: false, // an incremental single-entity echo — merged, not a replace
     }
 }
 
@@ -262,6 +277,7 @@ fn reject(client_op_id: &str, reason: String) -> ProjectionDelta {
             client_op_id: client_op_id.to_string(),
             reason,
         }],
+        full: false,
     }
 }
 

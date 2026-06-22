@@ -7,7 +7,7 @@
 //! `#rustier` id (prompt-40) on the trigger; `#rustierApply` on the confirm.
 
 import { useState } from "react";
-import { useSelectedId } from "../store/projection";
+import { useSelectedId, projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { setBalance } from "../store/wallet";
 import { pushToast } from "../store/toasts";
@@ -25,21 +25,31 @@ export function AiEditPanel({ client }: { client: EditorClient }) {
 
   async function apply() {
     if (!selectedId || busy) return;
+    const target = selectedId; // capture: the selection may change during the await (don't mis-attribute)
     setBusy(true);
-    const r = await client.aiEdit(selectedId);
-    setBusy(false);
-    setConfirming(false);
-    if (r.ok) {
-      // Debit-on-success: the new balance is authoritative; surface the charge AND the result.
-      setBalance(r.balance);
-      const cost = r.cost ?? AI_EDIT_COST;
-      pushToast(`Weathered-metal look applied · −${cost} tokens · ${r.balance} left`, "success");
-      setStatus(`weathered-metal look · −${cost} tokens`);
-    } else {
-      // Refuse-when-broke, EXPLAINED: surface the reason, leave the balance untouched (no charge).
-      const msg = r.message ?? "refused";
-      pushToast(msg, "error");
-      setStatus(msg);
+    try {
+      const r = await client.aiEdit(target);
+      if (r.ok) {
+        // Debit-on-success: the new balance is authoritative; surface the charge AND the result. Only claim
+        // the visible per-entity result when the selection hasn't moved (the balance update is global).
+        setBalance(r.balance);
+        const cost = r.cost ?? AI_EDIT_COST;
+        const onTarget = projectionStore.getState().selectedId === target;
+        pushToast(`Weathered-metal look applied · −${cost} tokens · ${r.balance} left`, "success");
+        setStatus(onTarget ? `weathered-metal look · −${cost} tokens` : `applied · −${cost} tokens`);
+      } else {
+        // Refuse-when-broke, EXPLAINED: surface the reason, leave the balance untouched (no charge).
+        const msg = r.message ?? "refused";
+        pushToast(msg, "error");
+        setStatus(msg);
+      }
+    } catch (e) {
+      // A failed AI-edit must not strand the panel or leak an unhandled rejection (the clean-console gate).
+      console.error("ai_edit failed", e);
+      pushToast("AI-edit failed — please try again", "error");
+    } finally {
+      setBusy(false);
+      setConfirming(false);
     }
   }
 

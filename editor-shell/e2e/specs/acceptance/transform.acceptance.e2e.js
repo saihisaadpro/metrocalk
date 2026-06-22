@@ -352,7 +352,7 @@ describe("acceptance / M9 transform — gizmo (G1) · part edit (G2) · solver (
           ),
       });
       report.budget(scored);
-      expect(scored.verdict, `${s.label}: ${scored.note}`).toBe("pass");
+      expect(scored.verdict).toBe("pass");
     }
   });
 });

@@ -297,10 +297,26 @@ export const scaffold = {
   },
 };
 
+// The React `/editor` DELTAS over the scaffold verbs (M10.1 swap): the React UI keeps the scaffold's stable
+// ids, so almost every selector is identical — only the verbs whose *interaction shape* genuinely differs
+// are overridden here (undo is Ctrl-Z, not a `#undo` button; AI-edit is a two-step confirm). The specs +
+// acceptance dimensions never change — that's the swappable-layer point (prompt-40 d9 / M10.1 d7).
+const reactDeltas = {
+  name: "react (/editor)",
+  // React undo = a global Ctrl-Z keydown (no `#undo` button in the React chrome).
+  async undoButton() {
+    await browser.keys(["Control", "z"]);
+  },
+  // AI-edit ("rustier") is now a deliberate two-step spend: open the confirm, then Apply (M10.10 / C3).
+  async clickRustier() {
+    await (await css("#rustier")).click();
+    const apply = await css("#rustierApply");
+    if (await apply.isExisting()) await apply.click();
+  },
+};
+
 export function page() {
-  // The active page-object — the React `/editor` (M10.1) when MTK_UI=react, else the vanilla scaffold. The
-  // React parity components keep the scaffold's stable ids, so the swap is selector-identical today (any
-  // deltas the local React run surfaces live in pages/react.js); the specs + acceptance dimensions never
-  // change — that's the swappable-layer point (prompt-40 deliverable 9 / M10.1 deliverable 7).
-  return process.env.MTK_UI === "react" ? { ...scaffold, name: "react (/editor)" } : scaffold;
+  // The active page-object — the React `/editor` (M10.1) when MTK_UI=react (scaffold verbs + the React
+  // deltas above), else the vanilla scaffold.
+  return process.env.MTK_UI === "react" ? { ...scaffold, ...reactDeltas } : scaffold;
 }

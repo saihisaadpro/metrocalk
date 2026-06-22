@@ -77,4 +77,36 @@ describe("optimistic echo + reconciliation", () => {
     expect(s.edges["p|BindsTo|d"]?.status).toBe("confirmed");
     expect(s.rejections).toHaveLength(0);
   });
+
+  // A `project_full` (server-initiated full re-projection — connect/undo/sim-restart/open) REPLACES the
+  // scene; an incremental delta MERGES. This is the fix for the live "undo doesn't drop the bound edge"
+  // desync: undo emits project_full (no removeEdge), so a merge would leave the stale edge.
+  it("a FULL re-projection REPLACES the scene — stale entities + edges are dropped (the undo sync)", () => {
+    const store = projectionStore.getState();
+    store.applyDelta({
+      ops: [
+        { op: "upsert", id: "a", name: "A", parentId: null },
+        { op: "upsert", id: "b", name: "B", parentId: null },
+        { op: "addEdge", from: "a", rel: "tracks", to: "b" },
+      ],
+    });
+    let s = projectionStore.getState();
+    expect(s.order).toEqual(["a", "b"]);
+    expect(s.edges["a|tracks|b"]).toBeTruthy();
+
+    // a full re-projection carrying ONLY "a" (b removed + the bind undone) drops the rest
+    store.applyDelta({ ops: [{ op: "upsert", id: "a", name: "A", parentId: null }], full: true });
+    s = projectionStore.getState();
+    expect(s.order).toEqual(["a"]); // b dropped
+    expect(s.base["b"]).toBeUndefined();
+    expect(s.displayed["b"]).toBeUndefined();
+    expect(s.edges["a|tracks|b"]).toBeUndefined(); // the stale edge is gone — the undo-tracking fix
+  });
+
+  it("an INCREMENTAL delta MERGES — it never drops existing entities", () => {
+    const store = projectionStore.getState();
+    store.applyDelta({ ops: [{ op: "upsert", id: "a", name: "A", parentId: null }] });
+    store.applyDelta({ ops: [{ op: "upsert", id: "c", name: "C", parentId: null }] }); // no `full`
+    expect(projectionStore.getState().order).toEqual(["a", "c"]);
+  });
 });

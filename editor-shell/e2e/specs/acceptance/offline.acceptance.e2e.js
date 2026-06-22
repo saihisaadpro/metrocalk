@@ -374,7 +374,7 @@ describe("acceptance / offline — local paths work network-free; paid tiers deg
           ),
       });
       report.budget(scored);
-      expect(scored.verdict, `${s.label}: ${scored.note}`).toBe("pass");
+      expect(scored.verdict).toBe("pass");
     }
 
     // Record the run-wide OFFLINE verdict + the honest manual-mode boundary into the report singleton, so the

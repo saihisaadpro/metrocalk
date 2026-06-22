@@ -8,7 +8,7 @@
 //! signals, so the prompt-40 acceptance page-object re-greens by selector-swap, not a spec rewrite.
 
 import { useEffect, useState } from "react";
-import { useSelectedId } from "../store/projection";
+import { useSelectedId, useEdges } from "../store/projection";
 import type { EditorClient } from "../transport/session";
 import type { RevealResponse } from "../transport/protocol";
 
@@ -16,6 +16,12 @@ const EMPTY: RevealResponse = { required: [], compatible: [], greyed: [], bound:
 
 export function Reveal({ client }: { client: EditorClient }) {
   const id = useSelectedId();
+  const edges = useEdges();
+  // Re-query the reveal when this entity's OUTGOING edges change — so a bind/undo immediately moves the
+  // target into/out of "tracking" (the command recomputes bound + drops the consumed provider from
+  // compatible). Without this the reveal only refreshed on (re)selection and a fresh bind never surfaced.
+  const edgeSig = id ? Object.keys(edges).filter((k) => edges[k].from === id).sort().join(",") : "";
+
   const [reveal, setReveal] = useState<RevealResponse>(EMPTY);
 
   useEffect(() => {
@@ -35,7 +41,9 @@ export function Reveal({ client }: { client: EditorClient }) {
     return () => {
       live = false;
     };
-  }, [id, client]);
+    // edgeSig in deps → re-fetch on a bind/undo touching this entity's edges
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, client, edgeSig]);
 
   if (!id) {
     return <div style={{ padding: 12, color: "#888" }}>Select an entity to see compatible bind targets.</div>;

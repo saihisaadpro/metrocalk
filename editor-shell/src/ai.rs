@@ -69,6 +69,7 @@ pub fn apply_ai_patch<W: World>(
             ops: proj,
             confirms: vec![patch.client_op_id.clone()],
             rejects: vec![],
+            full: false,
         },
         Err(e) => reject(&patch.client_op_id, e.to_string()),
     }
@@ -141,5 +142,6 @@ fn reject(client_op_id: &str, reason: String) -> ProjectionDelta {
             client_op_id: client_op_id.to_string(),
             reason,
         }],
+        full: false,
     }
 }

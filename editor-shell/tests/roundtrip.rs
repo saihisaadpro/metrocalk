@@ -193,6 +193,7 @@ fn wire_json_matches_the_editor_camelcase_shape() {
         }],
         confirms: vec!["x".into()],
         rejects: vec![],
+        full: false,
     };
     let s = serde_json::to_string(&d).unwrap();
     assert!(s.contains(r#""op":"addEdge""#), "{s}");

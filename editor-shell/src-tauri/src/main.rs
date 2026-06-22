@@ -1030,6 +1030,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 }],
                                 confirms: vec![],
                                 rejects: vec![],
+                                full: false,
                             });
                         }
                         rebuild(&engine, &shared, &mut positions, &assets);
@@ -1165,6 +1166,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 ops,
                                 confirms: vec![],
                                 rejects: vec![],
+                                full: false,
                             });
                         }
                         rebuild(&engine, &shared, &mut positions, &assets);

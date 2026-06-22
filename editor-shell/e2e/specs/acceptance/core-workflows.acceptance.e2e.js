@@ -140,7 +140,7 @@ describe("acceptance / core workflows — describe · palette · generate · wal
     for (const s of ops) {
       const scored = await scoreBudget(s, baseline, { perFrame: true, recapture: () => captureBudget(s.label, s.label, { query: "health bar" }, { n: 20, warmup: 4 }) });
       report.budget(scored);
-      expect(scored.verdict, `${s.label}: ${scored.note}`).toBe("pass");
+      expect(scored.verdict).toBe("pass");
     }
   });
 });

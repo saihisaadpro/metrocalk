@@ -448,7 +448,7 @@ describe("acceptance / M8 physics — drop · transport · debugger · determini
         recapture: () => captureBudget(s.label, s.label, {}, { n: 30, warmup: 5 }),
       });
       report.budget(scored);
-      expect(scored.verdict, `${s.label}: ${scored.note}`).toBe("pass");
+      expect(scored.verdict).toBe("pass");
     }
   });
 });

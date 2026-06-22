@@ -25,6 +25,20 @@ export function FileMenu({ client }: { client: EditorClient }) {
   // A guarded action awaiting "discard unsaved changes?" confirmation, or `null` when none is pending.
   const [pending, setPending] = useState<{ run: () => Promise<ProjectInfo>; label: string } | null>(null);
 
+  // Escape closes the unsaved-guard (cancel) first, else the open dropdown. Capture-phase + stopPropagation
+  // so it runs BEFORE App's window Esc handler — pressing Esc to dismiss a menu must not also Stop Play.
+  useEffect(() => {
+    if (!open && !pending) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      if (pending) setPending(null);
+      else setOpen(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, pending]);
+
   // Refresh the authoritative project state (path · dirty · recents) whenever the menu opens, so the
   // guard reads the shell's truth, not just the optimistic indicator.
   useEffect(() => {
@@ -144,9 +158,13 @@ export function FileMenu({ client }: { client: EditorClient }) {
         <div
           id="unsavedGuard"
           data-testid="unsavedGuard"
+          onClick={() => setPending(null)}
           style={{ position: "fixed", inset: 0, zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", background: "#0008" }}
         >
-          <div style={{ background: "#14161c", border: "1px solid #3a3d45", borderRadius: 8, padding: 18, maxWidth: 340 }}>
+          <div
+            onClick={(e) => e.stopPropagation()} // clicks inside the dialog must not cancel
+            style={{ background: "#14161c", border: "1px solid #3a3d45", borderRadius: 8, padding: 18, maxWidth: 340 }}
+          >
             <div style={{ marginBottom: 12 }}>
               Discard unsaved changes to <strong>{projectName(path)}</strong>?
             </div>

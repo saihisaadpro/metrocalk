@@ -8,6 +8,7 @@
 import { JsonForms } from "@jsonforms/react";
 import { vanillaCells, vanillaRenderers } from "@jsonforms/vanilla-renderers";
 import { useSelectedId, useDisplayedEntity } from "../store/projection";
+import { setStatus } from "../store/ui";
 import type { EditorClient } from "../transport/session";
 import type { Json } from "../transport/protocol";
 import { buildEntitySchema, buildEntityUiSchema } from "../schema/registry";
@@ -29,6 +30,8 @@ function emitChanges(client: EditorClient, id: string, before: Components, after
     for (const [field, value] of Object.entries(fields)) {
       if (before[component]?.[field] !== value) {
         client.setField(id, component, field, value as Json);
+        // a stable "edit <component>.<field>" token the prompt-40 E2E keys on (intentional, not cosmetic)
+        setStatus(`edit ${component}.${field}`);
       }
     }
   }

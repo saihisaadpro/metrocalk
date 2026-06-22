@@ -265,7 +265,8 @@ describe("acceptance / add-palette + generate — the create-from-catalog + last
           }),
       });
       report.budget(scored);
-      expect(scored.verdict, `${s.label}: ${scored.note}`).toBe("pass");
+      if (scored.verdict !== "pass") console.error(`BUDGET ${s.label}: ${scored.note}`); // WDIO expect takes no message arg
+      expect(scored.verdict).toBe("pass");
     }
   });
 });

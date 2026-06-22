@@ -38,13 +38,18 @@ export function Wallet({ client }: { client: EditorClient }) {
   }, []);
 
   async function onTopUp() {
-    const r = await client.topUp();
-    setBalance(r.balance);
-    setFlash(true);
-    flashTimer.current = setTimeout(() => setFlash(false), 600);
-    // HONEST: a sandbox dev grant, not a purchase; the change is loud (toast + status), never silent.
-    pushToast(`+100 dev tokens (sandbox grant — no purchase) · ${r.balance} total`, "cost");
-    setStatus(`+100 dev tokens · ${r.balance} total`);
+    try {
+      const r = await client.topUp();
+      setBalance(r.balance);
+      setFlash(true);
+      flashTimer.current = setTimeout(() => setFlash(false), 600);
+      // HONEST: a sandbox dev grant, not a purchase; the change is loud (toast + status), never silent.
+      pushToast(`+100 dev tokens (sandbox grant — no purchase) · ${r.balance} total`, "cost");
+      setStatus(`+100 dev tokens · ${r.balance} total`);
+    } catch (e) {
+      console.error("top_up failed", e);
+      pushToast("top up failed — please try again", "error");
+    }
   }
 
   return (

@@ -60,7 +60,7 @@ export function ContextMenu({
         feedback("removed " + id + " · Ctrl-Z to undo", "info");
         break;
       case "duplicate":
-        client.duplicateEntity(id);
+        void client.duplicateEntity(id).catch((e) => console.error("duplicate failed", e));
         feedback("duplicated " + id, "success");
         break;
       case "focus":
@@ -76,7 +76,7 @@ export function ContextMenu({
         feedback("binding " + id, "info");
         break;
       case "makedynamic":
-        client.makeDynamic(id);
+        void client.makeDynamic(id).catch((e) => console.error("make_dynamic failed", e));
         feedback("made " + id + " dynamic", "success");
         break;
       default:

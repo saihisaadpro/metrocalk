@@ -122,14 +122,17 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
 
   applyDelta(delta) {
     const s = get();
-    // Copy each map ONCE per delta, then mutate the copies in place — O(n + ops), not O(n × ops). A
-    // bulk initial-load delta of 5k entities through per-op spreads would be O(n²). Per-entity refs
-    // still change only for touched entities (new entity objects), so selective subscription holds.
-    const base = { ...s.base };
-    const summaries = { ...s.summaries };
-    const edges = { ...s.edges };
-    let order = s.order;
-    let orderCopied = false;
+    // A server-initiated FULL re-projection (`project_full`: connect/undo/sim-restart/open) REPLACES the
+    // scene — start from EMPTY so stale entities/edges (e.g. an undone bind's edge, or an undone-create's
+    // entity) can't linger (invariant 1: the store mirrors the authoritative scene). An incremental delta
+    // MERGES onto the current maps. Either way each map is copied ONCE per delta, then mutated in place —
+    // O(n + ops), not O(n × ops); per-entity refs change only for touched entities (selective subscription).
+    const full = delta.full === true;
+    const base = full ? {} : { ...s.base };
+    const summaries = full ? {} : { ...s.summaries };
+    const edges = full ? {} : { ...s.edges };
+    let order = full ? [] : s.order;
+    let orderCopied = full;
     const orderMut = (): string[] => {
       if (!orderCopied) {
         order = [...order];
@@ -198,8 +201,9 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
       }
     }
 
-    // Drop confirmed optimistic ops (their authoritative form is now in `base`/`edges`).
-    const pending = { ...s.pending };
+    // Drop confirmed optimistic ops (their authoritative form is now in `base`/`edges`). A full
+    // re-projection supersedes ALL pending optimistic ops (the authoritative scene is now complete).
+    const pending = full ? {} : { ...s.pending };
     if (delta.confirms?.length) {
       for (const cid of delta.confirms) delete pending[cid];
     }
@@ -218,8 +222,9 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
       rejections = [...delta.rejects, ...rejections].slice(0, 50);
     }
 
-    // Recompute `displayed` only for entities whose base or pending changed.
-    let displayed = s.displayed;
+    // Recompute `displayed` only for entities whose base or pending changed (on a full re-projection,
+    // start from empty so dropped entities don't survive in the overlay).
+    let displayed = full ? {} : s.displayed;
     if (touched.size) {
       displayed = { ...displayed };
       for (const id of touched) {

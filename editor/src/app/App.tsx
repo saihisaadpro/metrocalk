@@ -110,6 +110,16 @@ export function App() {
   const order = useEntityOrder();
   const sceneEmpty = order.length === 0;
 
+  // Emit a stable "connected · N entities" status the FIRST time the projection streams in (the scaffold's
+  // connect signal the prompt-40 black-box E2E keys on — an intentional, stable token, not cosmetic copy).
+  const connectedRef = useRef(false);
+  useEffect(() => {
+    if (!connectedRef.current && order.length > 0) {
+      connectedRef.current = true;
+      setStatus(`connected · ${order.length} entities`);
+    }
+  }, [order.length]);
+
   // Responsive layout — the stage is layout-priority; panels collapse to rails below a breakpoint (C8).
   const [vw, setVw] = useState(() => (typeof window !== "undefined" ? window.innerWidth : 1440));
   useEffect(() => {
@@ -129,6 +139,10 @@ export function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        // Don't hijack TEXT undo while the user is typing in a field — only undo the SCENE otherwise.
+        const el = document.activeElement as HTMLElement | null;
+        const editing = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+        if (editing) return;
         e.preventDefault();
         client.undo();
         setStatus("undo");
@@ -221,11 +235,26 @@ export function App() {
             if (e.button === 2) {
               rightDrag.current = { x: e.clientX, y: e.clientY, moved: false };
               client.dragStart(); // native orbit begins; the render loop polls the cursor (0 IPC/frame)
-            } else if (e.button === 0) {
-              void client.viewportPick().then((picked) => {
-                if (picked) projectionStore.getState().select(picked);
-              });
             }
+          }}
+          onClick={(e) => {
+            // Left-click pick on the click event (fires reliably under WebDriver `element.click()`, unlike a
+            // synthesized pointerdown). Pick at the click's NORMALIZED viewport coords (the command rays the
+            // camera — no OS-cursor dependency) → select + a stable "picked"/"nothing here" status.
+            const r = e.currentTarget.getBoundingClientRect();
+            const nx = (e.clientX - r.left) / Math.max(1, r.width);
+            const ny = (e.clientY - r.top) / Math.max(1, r.height);
+            void client
+              .viewportPick(nx, ny)
+              .then((picked) => {
+                if (picked) {
+                  projectionStore.getState().select(picked);
+                  setStatus(`picked ${picked}`);
+                } else {
+                  setStatus("nothing here");
+                }
+              })
+              .catch((err) => console.error("viewport_pick failed", err));
           }}
           onPointerMove={(e) => {
             const rd = rightDrag.current;
