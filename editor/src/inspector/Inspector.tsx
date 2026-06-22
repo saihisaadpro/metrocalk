@@ -8,7 +8,7 @@
 import { JsonForms } from "@jsonforms/react";
 import { vanillaCells, vanillaRenderers } from "@jsonforms/vanilla-renderers";
 import { useSelectedId, useDisplayedEntity } from "../store/projection";
-import type { DeltaClient } from "../transport/client";
+import type { EditorClient } from "../transport/session";
 import type { Json } from "../transport/protocol";
 import { buildEntitySchema } from "../schema/registry";
 import { ColorControl, colorTester, EntityRefControl, entityRefTester } from "./renderers";
@@ -24,7 +24,7 @@ type Components = Record<string, Record<string, Json>>;
 /** Diff the JSON Forms data against the projected components and emit one `setField` per changed
  *  field. Diffing against the projection means the mount-time onChange (data === projection) is a
  *  no-op, so we never echo our own state back as an edit. */
-function emitChanges(client: DeltaClient, id: string, before: Components, after: Components) {
+function emitChanges(client: EditorClient, id: string, before: Components, after: Components) {
   for (const [component, fields] of Object.entries(after)) {
     for (const [field, value] of Object.entries(fields)) {
       if (before[component]?.[field] !== value) {
@@ -34,7 +34,7 @@ function emitChanges(client: DeltaClient, id: string, before: Components, after:
   }
 }
 
-export function Inspector({ client }: { client: DeltaClient }) {
+export function Inspector({ client }: { client: EditorClient }) {
   const id = useSelectedId();
   const entity = useDisplayedEntity(id ?? "");
   if (!id || !entity) {

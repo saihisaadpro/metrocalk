@@ -4,45 +4,19 @@
 //! real in M2.6. Everything else here is UI chrome owned by React.
 
 import { useMemo, useRef } from "react";
-import { DeltaClient } from "../transport/client";
-import { MockCore } from "../transport/mock-core";
-import type { EntityProjection } from "../transport/protocol";
-import { inProcessPair } from "../transport/transport";
+import { createSession, type EditorClient } from "../transport/session";
 import { shouldDeferToNative, type Rect } from "../input/ownership";
 import { Hierarchy } from "../panels/Hierarchy";
 import { Rejections } from "../panels/Rejections";
 import { Inspector } from "../inspector/Inspector";
 import { BindingGraph } from "../graph/BindingGraph";
 
-const CAPS = ["Health", "Shield", "Click", "Damage", "Light"];
-
-/** A seeded 5k scene for the core (authoritative). Deterministic so the dev view is reproducible. */
-function buildWorld(n: number): EntityProjection[] {
-  const out: EntityProjection[] = [];
-  let seed = 0x9e3779b9;
-  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 0xffffffff);
-  for (let i = 0; i < n; i++) {
-    const components: EntityProjection["components"] = {
-      Transform: { x: Math.round(rnd() * 100), y: Math.round(rnd() * 100), z: 0 },
-    };
-    if (i % 7 === 0) components.Material = { color: "#88ccff", metalness: 0.2 };
-    if (i % 5 === 0) components.Provides = { capability: CAPS[i % CAPS.length] };
-    if (i % 11 === 0) components.Socket = { accepts: CAPS[(i + 1) % CAPS.length] };
-    if (i % 13 === 0) components.Targeting = { target: "" };
-    out.push({ id: `e${i}`, name: `Entity ${i}`, parentId: i === 0 ? null : "e0", components });
-  }
-  return out;
-}
-
-function useEditorSession(): DeltaClient {
-  const ref = useRef<DeltaClient | null>(null);
+/** Build the editor session once: the REAL Tauri shell transport inside the packaged `.exe` (the live
+ *  `/core` over the `connect` Channel), else the in-process MockCore for `npm run dev` / tests. */
+function useEditorSession(): EditorClient {
+  const ref = useRef<EditorClient | null>(null);
   if (!ref.current) {
-    const [uiT, coreT] = inProcessPair();
-    const world = buildWorld(5000);
-    const core = new MockCore(coreT, world);
-    const client = new DeltaClient(uiT);
-    core.emitScene(); // initial committed delta → the UI projects it
-    ref.current = client;
+    ref.current = createSession();
   }
   return ref.current;
 }
