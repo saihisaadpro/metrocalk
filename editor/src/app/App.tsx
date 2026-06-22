@@ -8,13 +8,12 @@
 //! coloured border + an overlaid "● PLAYING — Esc / ⏹ to stop" badge + de-emphasised edit chrome (C2);
 //! feedback lands as **toasts over the stage** (C11); a fresh scene shows a real **empty state** (C10).
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { createSession, type EditorClient } from "../transport/session";
+import { useEffect, useRef, useState } from "react";
+import { createSession, isTauri, type EditorClient } from "../transport/session";
 import { projectionStore, useEntityOrder } from "../store/projection";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
 import { panelLayout } from "./layout";
-import { shouldDeferToNative, type Rect } from "../input/ownership";
 import { Hierarchy } from "../panels/Hierarchy";
 import { Rejections } from "../panels/Rejections";
 import { Reveal } from "../panels/Reveal";
@@ -100,10 +99,11 @@ function Rail({ side, label, onOpen }: { side: "left" | "right"; label: string; 
 
 export function App() {
   const client = useEditorSession();
-  // Placeholder viewport rect; M2.6 supplies the real wgpu region.
-  const viewport: Rect = useMemo(() => ({ x: 280, y: 56, w: 600, h: 620 }), []);
+  const native = isTauri(); // inside the packaged .exe the viewport is the real wgpu region (composite)
   // The M3.3 right-click context menu, opened for an entity at a cursor position.
   const [ctx, setCtx] = useState<{ id: string; x: number; y: number } | null>(null);
+  // Tracks a right-press for the orbit-vs-context-menu movement threshold (the scaffold's disambiguation).
+  const rightDrag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
 
   const playing = usePlaying();
   const paused = usePaused();
@@ -210,24 +210,43 @@ export function App() {
           <div style={{ borderRight: "1px solid #2a2d35", overflow: "hidden", ...chromeDim }}>{leftPanel}</div>
         )}
 
-        {/* viewport: native-owned. React must NOT handle hot input here (invariant 4). Right-click opens
-            the M3.3 context menu for the current selection (the real viewport-pick-under-cursor is the
-            local closeout). When playing, a coloured border + on-stage badge make the mode unmistakable. */}
+        {/* viewport: native-owned (invariant 4). Inside the `.exe` it is **transparent** so the native wgpu
+            scene composites through (ADR-008); the per-frame orbit/zoom runs in the native render loop (the
+            JS only fires drag_start/drag_end/zoom/pick — never per frame). Left-click → native pick → select;
+            right-DRAG → orbit (suppress the menu); right-CLICK → the M3.3 context menu. */}
         <div
+          id="viewport"
+          data-testid="viewport"
           onPointerDown={(e) => {
-            if (shouldDeferToNative(e.clientX, e.clientY, viewport)) {
-              // left for the native wgpu picker — wired in M2.6. Do nothing in JS.
-              return;
+            if (e.button === 2) {
+              rightDrag.current = { x: e.clientX, y: e.clientY, moved: false };
+              client.dragStart(); // native orbit begins; the render loop polls the cursor (0 IPC/frame)
+            } else if (e.button === 0) {
+              void client.viewportPick().then((picked) => {
+                if (picked) projectionStore.getState().select(picked);
+              });
             }
           }}
+          onPointerMove={(e) => {
+            const rd = rightDrag.current;
+            if (rd && (Math.abs(e.clientX - rd.x) > 6 || Math.abs(e.clientY - rd.y) > 6)) rd.moved = true;
+          }}
+          onPointerUp={(e) => {
+            if (e.button === 2 && rightDrag.current) client.dragEnd();
+          }}
+          onWheel={(e) => client.zoom(e.deltaY * 0.04)}
           onContextMenu={(e) => {
             e.preventDefault();
+            // a right-DRAG was an orbit, not a menu request — suppress the menu (movement threshold)
+            const orbited = rightDrag.current?.moved;
+            rightDrag.current = null;
+            if (orbited) return;
             const sel = projectionStore.getState().selectedId;
             if (sel) setCtx({ id: sel, x: e.clientX, y: e.clientY });
           }}
           style={{
             position: "relative",
-            background: "#0d0f15",
+            background: native ? "transparent" : "#0d0f15", // transparent → wgpu composites through (.exe)
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -239,7 +258,7 @@ export function App() {
             transition: "outline-color .2s, box-shadow .2s",
           }}
         >
-          native wgpu viewport (M2.6) — hot input owned by Rust, not JS
+          {!native && "native wgpu viewport — drag to orbit · scroll to zoom · click to select (live in the .exe)"}
           {playing && <PlayBadge paused={paused} onStop={stopPlay} />}
           {sceneEmpty && !playing && <EmptyState />}
           <ToastHost top={playing ? 52 : 14} />

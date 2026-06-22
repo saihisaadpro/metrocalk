@@ -12,9 +12,10 @@ afterEach(() => projectionStore.getState().reset());
 
 test("only Socket-bearing requirers list, and clicking one selects it (→ Reveal populates)", () => {
   projectionStore.getState().bulkLoad([
-    // a requirer: carries a Socket that accepts "Health" (a HealthBar "requires Health")
-    { id: "hb1", name: "HealthBar", parentId: null, components: { Socket: { accepts: "Health" } } },
-    // a plain entity: no Socket → NOT a requirer, must be filtered out
+    // a requirer: carries the real `/core` requirer MARKER component `HealthBar` (it requires Health — a
+    // cap, an ECS pair, not a projected field)
+    { id: "hb1", name: "HealthBar", parentId: null, components: { HealthBar: { width: 1 } } },
+    // a plain entity: no HealthBar → NOT a requirer, must be filtered out
     { id: "p1", name: "Lamp", parentId: null, components: { Transform: { x: 0, y: 0, z: 0 } } },
   ]);
 

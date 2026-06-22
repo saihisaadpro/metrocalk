@@ -67,6 +67,18 @@ export interface EditorClient {
   focusEntity(id: string): void;
   /** M8.3: turn a dead mesh into a correct dynamic body — one undoable transaction. */
   makeDynamic(id: string): Promise<boolean>;
+
+  // ── native viewport input (Tauri-only; the dev MockCore has no viewport) — the M10.1 composite closeout ─
+  /** Left-click pick over the native wgpu region → the picked entity id (or null). Computed synchronously
+   *  in the command (no per-frame race). */
+  viewportPick(): Promise<string | null>;
+  /** Begin a right-drag orbit — the native render loop then polls the OS cursor and orbits with **0 IPC per
+   *  frame** (invariant 4); only this call + `dragEnd` cross the boundary, once per gesture. */
+  dragStart(): void;
+  /** End the orbit drag. */
+  dragEnd(): void;
+  /** Wheel zoom — folded into the camera distance natively next frame (one call per wheel tick). */
+  zoom(delta: number): void;
   /** The browse catalog (M3.4 / ADR-019) — the ONE catalog (registry + marketplace + imported), grouped
    *  by category. The asset browser reuses this; it never forks the search/category logic. */
   catalog(): Promise<Record<string, CatalogItem[]>>;
@@ -210,6 +222,19 @@ class TauriClient implements EditorClient {
     return this.core.invoke<boolean>("make_dynamic", { id });
   }
 
+  viewportPick(): Promise<string | null> {
+    return this.core.invoke<string | null>("viewport_pick");
+  }
+  dragStart(): void {
+    void this.core.invoke("drag_start").catch((e: unknown) => console.error("drag_start failed", e));
+  }
+  dragEnd(): void {
+    void this.core.invoke("drag_end").catch((e: unknown) => console.error("drag_end failed", e));
+  }
+  zoom(delta: number): void {
+    void this.core.invoke("zoom", { delta }).catch((e: unknown) => console.error("zoom failed", e));
+  }
+
   catalog(): Promise<Record<string, CatalogItem[]>> {
     return this.core.invoke<Record<string, CatalogItem[]>>("catalog");
   }
@@ -259,12 +284,16 @@ const CAPS = ["Health", "Shield", "Click", "Damage", "Light"];
  *  (north-star #1) is demonstrable. The `buildWorld` 5k fixture below is for the perf / selective-re-render
  *  tests ONLY — a fresh project must never open onto 5,000 anonymous "Entity N" rows. */
 function sampleScene(): EntityProjection[] {
+  // The REAL `/core` vocabulary (M10.10 closeout): a requirer carries a `HealthBar` marker (it *requires*
+  // Health — a cap, not a projected field); a provider carries `Health{hp,maxHp}`; everything has
+  // `Transform{x,y,z}`; renderable things carry `MeshRenderer{mesh}`. So the React panels are written once,
+  // against this vocabulary, and are correct on both the dev MockCore and the live `/core`.
   return [
-    { id: "player", name: "Player", parentId: null, components: { Transform: { x: 0, y: 0, z: 0 }, Provides: { capability: "Health" } } },
-    { id: "health-bar", name: "Health Bar", parentId: null, components: { Transform: { x: 0, y: 2, z: 0 }, Socket: { accepts: "Health" } } },
-    { id: "ground", name: "Ground", parentId: null, components: { Transform: { x: 0, y: -1, z: 0 }, Material: { color: "#3a4250", metalness: 0.1 } } },
-    { id: "key-light", name: "Key Light", parentId: null, components: { Transform: { x: 3, y: 4, z: 2 }, Provides: { capability: "Light" } } },
-    { id: "spawn", name: "Spawn Point", parentId: null, components: { Transform: { x: -2, y: 0, z: 1 } } },
+    { id: "health-bar", name: "Health Bar", parentId: null, components: { Transform: { x: 0, y: 2, z: 0 }, HealthBar: { width: 1 } } },
+    { id: "player", name: "Player", parentId: null, components: { Transform: { x: 0, y: 0, z: 0 }, Health: { hp: 100, maxHp: 100 }, MeshRenderer: { mesh: "player" } } },
+    { id: "medkit", name: "Medkit", parentId: null, components: { Transform: { x: 2, y: 0, z: 1 }, Health: { hp: 50, maxHp: 50 }, MeshRenderer: { mesh: "medkit" } } },
+    { id: "ground", name: "Ground", parentId: null, components: { Transform: { x: 0, y: -1, z: 0 }, MeshRenderer: { mesh: "ground" } } },
+    { id: "camera", name: "Camera", parentId: null, components: { Transform: { x: -2, y: 0, z: 4 } } },
   ];
 }
 
@@ -338,21 +367,19 @@ class MockClient implements EditorClient {
     return this.inner.onEphemeral(cb);
   }
   revealTargets(id: string): Promise<RevealResponse> {
+    // Dev stand-in for the live compat query (the real reveal is a command): a requirer (a `HealthBar`,
+    // which requires Health) reveals the Health providers (entities carrying a `Health` component) as
+    // ranked compatible targets. Real vocabulary, so the panel behaves the same on the live `/core`.
     const s = projectionStore.getState();
     const sel = s.displayed[id];
-    const need = (sel?.components.Socket?.accepts as string | undefined) ?? null;
+    const isRequirer = !!sel && "HealthBar" in sel.components;
     const providers = s.order
       .map((eid) => s.displayed[eid])
-      .filter((e): e is EntityProjection => !!e && e.id !== id && "Provides" in e.components);
-    const compatible = providers
-      .filter((e) => !need || e.components.Provides.capability === need)
-      .slice(0, 8)
-      .map((e, i) => ({ id: e.id, name: e.name, distance: i, affinity: 100 - i }));
-    const greyed = providers
-      .filter((e) => need && e.components.Provides.capability !== need)
-      .slice(0, 3)
-      .map((e) => ({ id: e.id, name: e.name, reason: `doesn't provide ${need}` }));
-    return Promise.resolve({ required: need ? [need] : [], compatible, greyed, bound: [] });
+      .filter((e): e is EntityProjection => !!e && e.id !== id && "Health" in e.components);
+    const compatible = isRequirer
+      ? providers.slice(0, 8).map((e, i) => ({ id: e.id, name: e.name, distance: i, affinity: 100 - i * 5 }))
+      : [];
+    return Promise.resolve({ required: isRequirer ? ["Health"] : [], compatible, greyed: [], bound: [] });
   }
   describe(query: string): Promise<DescribeResponse> {
     // The dev stand-in for the tiered resolver (ADR-012): a query that names a catalog kind resolves
@@ -361,7 +388,12 @@ class MockClient implements EditorClient {
     // what lets the Playwright/Vitest review re-drive C1 end-to-end (the bar then selects the created id).
     const kind = matchCatalogKind(query);
     if (kind) {
-      const id = this.place(kind, { Transform: { x: 0, y: 0, z: 0 }, Material: { color: "#88ccff", metalness: 0.3 } });
+      // A HealthBar resolves as a real requirer (HealthBar marker); other kinds as a renderable.
+      const comps: Record<string, Record<string, Json>> =
+        kind === "HealthBar"
+          ? { Transform: { x: 0, y: 0, z: 0 }, HealthBar: { width: 1 } }
+          : { Transform: { x: 0, y: 0, z: 0 }, MeshRenderer: { mesh: kind } };
+      const id = this.place(kind, comps);
       return Promise.resolve({ created: id, kind, source: "local", price: null, seam: null, balance: this.balance });
     }
     return Promise.resolve({ created: null, kind: null, source: null, price: null, seam: "generate", balance: this.balance });
@@ -378,12 +410,9 @@ class MockClient implements EditorClient {
       return Promise.resolve({ ok: false, balance: this.balance, cost: null, message: "insufficient balance" });
     }
     this.balance -= 2;
-    // Apply a VISIBLE result (C3 — "always show what changed"): a weathered-metal material lands on the
-    // entity (the dev stand-in for the AI patch the real shell streams back), so the inspector reflects it.
-    this.core.push([
-      { op: "setField", id, component: "Material", field: "color", value: "#6b5b4a" },
-      { op: "setField", id, component: "Material", field: "metalness", value: 0.8 },
-    ]);
+    // Apply a VISIBLE result (C3 — "always show what changed"): the real AI-edit patches
+    // `MeshRenderer.material` (ADR-017); the dev stand-in mirrors that, so the inspector reflects it.
+    this.core.push([{ op: "setField", id, component: "MeshRenderer", field: "material", value: "weathered-metal" }]);
     return Promise.resolve({ ok: true, balance: this.balance, cost: 2, message: null });
   }
   generate(query: string): Promise<GenerateResponse> {
@@ -403,8 +432,7 @@ class MockClient implements EditorClient {
     const name = query.trim() ? query.trim().slice(0, 40) : "Generated object";
     const id = this.place(name, {
       Transform: { x: 0, y: 0, z: 0 },
-      Material: { color: "#9a8cff", metalness: 0.5 },
-      MeshRenderer: { mesh: "gen:mock" },
+      MeshRenderer: { mesh: "gen:mock", material: "default" },
     });
     return Promise.resolve({ created: id, cost: GENERATE_COST, available: true, seam: null, balance: this.balance });
   }
@@ -413,7 +441,7 @@ class MockClient implements EditorClient {
   }
   entityActions(id: string): Promise<ActionItem[]> {
     const e = projectionStore.getState().displayed[id];
-    const canBind = !!e?.components.Socket;
+    const canBind = !!e?.components.HealthBar; // a requirer (HealthBar) has an unmet requirement to bind
     return Promise.resolve([
       { action: "bind", label: "Bind…", available: canBind, reason: canBind ? undefined : "no unmet requirement to bind", mutates: false },
       { action: "remove", label: "Remove", available: true, mutates: true },
@@ -430,8 +458,8 @@ class MockClient implements EditorClient {
       id,
       name: e.name,
       components: Object.keys(c),
-      provides: c.Provides?.capability != null ? [String(c.Provides.capability)] : [],
-      requires: c.Socket?.accepts != null ? [String(c.Socket.accepts)] : [],
+      provides: "Health" in c ? ["Health"] : [],
+      requires: "HealthBar" in c ? ["Health"] : [],
       boundTo: [],
     });
   }
@@ -443,6 +471,13 @@ class MockClient implements EditorClient {
   makeDynamic(_id: string): Promise<boolean> {
     return Promise.resolve(true);
   }
+  // The dev MockCore has no native viewport — these are inert (the real wgpu input is Tauri-only).
+  viewportPick(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  dragStart(): void {}
+  dragEnd(): void {}
+  zoom(_delta: number): void {}
   catalog(): Promise<Record<string, CatalogItem[]>> {
     const item = (id: string, label: string, category: string, source: string): CatalogItem => ({
       id, label, bucket: category, category, source, provides: [], requires: [],
@@ -463,7 +498,7 @@ class MockClient implements EditorClient {
     // Place-into-scene (the dev stand-in): instantiate the catalog item as a real entity (so the asset
     // browser's place ACTUALLY places + the caller selects it — the closed loop). A marketplace source
     // debits; local is free.
-    const created = this.place(id, { Transform: { x: 0, y: 0, z: 0 }, Material: { color: "#88ccff", metalness: 0.2 } });
+    const created = this.place(id, { Transform: { x: 0, y: 0, z: 0 }, MeshRenderer: { mesh: id } });
     let balance: number | null = null;
     if (source === "marketplace") {
       this.balance = Math.max(0, this.balance - 2);

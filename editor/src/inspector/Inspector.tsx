@@ -10,7 +10,7 @@ import { vanillaCells, vanillaRenderers } from "@jsonforms/vanilla-renderers";
 import { useSelectedId, useDisplayedEntity } from "../store/projection";
 import type { EditorClient } from "../transport/session";
 import type { Json } from "../transport/protocol";
-import { buildEntitySchema } from "../schema/registry";
+import { buildEntitySchema, buildEntityUiSchema } from "../schema/registry";
 import { ColorControl, colorTester, EntityRefControl, entityRefTester } from "./renderers";
 
 const renderers = [
@@ -54,6 +54,7 @@ export function Inspector({ client }: { client: EditorClient }) {
       {hasFields ? (
         <JsonForms
           schema={schema}
+          uischema={buildEntityUiSchema(entity.components)}
           data={entity.components}
           renderers={renderers}
           cells={vanillaCells}
