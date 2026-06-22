@@ -20,6 +20,7 @@ pub mod autorig;
 pub mod demo;
 pub mod gltf_import;
 pub mod gpu;
+pub mod image_import;
 pub mod mesh;
 pub mod source;
 pub mod store;
@@ -28,6 +29,7 @@ pub use audio::{AudioAsset, AudioFormat, AudioImporter, AudioSource, AudioStore}
 pub use autorig::{bake_standard_lbs, AutoRig, AutoRigJoint, NeuralRigImporter};
 pub use gltf_import::GltfImporter;
 pub use gpu::{MeshGpu, MeshVertex};
+pub use image_import::{ImageImporter, MAX_TEXELS};
 pub use mesh::{Bounds, Material, MeshAsset, Primitive, Texture};
 pub use source::{ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES};
 pub use store::{AssetId, AssetStore};

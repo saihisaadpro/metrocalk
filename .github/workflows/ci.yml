@@ -61,15 +61,16 @@ jobs:
           done
           echo "the free engine (core/ecs) does not link the economy — free-path boundary intact"
 
-      - name: No foreign decoder types leak past the asset-importer wrapper (invariant 5)
+      - name: No foreign decoder types leak past the asset-importer wrappers (invariant 5)
         run: |
-          # gltf:: / image:: must live ONLY behind the MeshSource trait, in assets/src/gltf_import.rs
-          # (the same discipline as flecs_ecs-in-/ecs). Comment lines (prose mentioning the types) skipped.
-          if grep -rn "gltf::\|image::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
-            echo "::error::gltf::/image:: leaked outside assets/src/gltf_import.rs — foreign decoder types must stay behind the MeshSource trait (invariant 5; mirrors ADR-001/006)"
+          # gltf:: / image:: must live ONLY behind the MeshSource trait, in the importer wrappers
+          # (gltf_import.rs for glTF + its embedded textures; image_import.rs for standalone PNG/JPG, M10.2)
+          # — the same discipline as flecs_ecs-in-/ecs. Comment lines (prose mentioning the types) skipped.
+          if grep -rn "gltf::\|image::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'image_import.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::gltf::/image:: leaked outside the importer wrappers — foreign decoder types must stay behind the MeshSource trait (invariant 5; mirrors ADR-001/006)"
             exit 1
           fi
-          echo "no gltf::/image:: outside the importer wrapper — boundary intact"
+          echo "no gltf::/image:: outside the importer wrappers — boundary intact"
 
       - name: No rapier/parry types leak outside the /physics crate (invariant 5, M8.2/ADR-021)
         run: |

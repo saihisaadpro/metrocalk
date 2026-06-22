@@ -19,8 +19,9 @@ publish = false
 # entry point; we read self-contained `.glb` blobs via `Gltf::from_slice` and decode textures with
 # our own pinned `image`. `utils` = the `read_*` reader helpers; `names` = `.name()` accessors.
 gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
-# PNG decode only, pure Rust, wasm32-clean (no rayon / no C codecs — `default-features = false`).
-image = { version = "0.25", default-features = false, features = ["png"] }
+# PNG + JPEG decode (standalone user-image import, M10.2), pure Rust, wasm32-clean (no rayon / no C codecs
+# — `default-features = false`; `jpeg-decoder`'s rayon is an opt-in feature we do NOT enable).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Makes the packed vertex `Pod` so the native renderer can `cast_slice` it into a GPU buffer. Pure
 # Rust, wasm32-clean.
 bytemuck = { version = "1", features = ["derive"] }

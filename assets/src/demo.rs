@@ -619,7 +619,7 @@ fn encode_mtkrig(
 /// `image::`/decoder type — keeping foreign decoder types confined to the importer wrapper
 /// (`gltf_import.rs`), the boundary the CI grep-gate enforces. (Provenance: `examples/dump_png.rs`,
 /// our pure-Rust `image` PNG encoder — removed after generating these bytes.)
-fn checker_png() -> Vec<u8> {
+pub fn checker_png() -> Vec<u8> {
     const CHECKER_PNG: &[u8] = &[
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6,
         0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 29, 73, 68, 65, 84, 120, 1, 1, 18, 0, 237, 255, 0, 220,
