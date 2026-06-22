@@ -133,6 +133,35 @@ export interface EntityDetails {
   boundTo: string[];
 }
 
+/** A catalog entry (M3.4 / ADR-019) — the ONE catalog surface the asset browser reuses (registry +
+ *  marketplace + imported), mirroring `metrocalk_core::catalog::CatalogItem`. */
+export interface CatalogItem {
+  id: string;
+  label: string;
+  bucket: string;
+  category: string;
+  source: string; // "local" | "marketplace" | …
+  provides: string[];
+  requires: string[];
+  asset?: string;
+  price?: number;
+  score?: number;
+}
+
+/** `catalog_search(query)` — ranked matches over the one catalog + the no-match seam. */
+export interface CatalogSearch {
+  items: CatalogItem[];
+  seam?: string;
+}
+
+/** `add_item(id, source)` — instantiate a catalog item into the scene (place-into-scene): the created
+ *  entity id, the balance after (marketplace buy), or the seam. */
+export interface AddResponse {
+  created: string | null;
+  balance: number | null;
+  seam: string | null;
+}
+
 const te = new TextEncoder();
 const td = new TextDecoder();
 export const encodeJson = (v: unknown): Uint8Array => te.encode(JSON.stringify(v));

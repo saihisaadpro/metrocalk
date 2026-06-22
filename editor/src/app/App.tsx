@@ -16,6 +16,7 @@ import { Wallet } from "../panels/Wallet";
 import { Requirers } from "../panels/Requirers";
 import { StatusBar } from "../panels/StatusBar";
 import { ContextMenu } from "../panels/ContextMenu";
+import { AssetBrowser } from "../panels/AssetBrowser";
 import { Inspector } from "../inspector/Inspector";
 import { BindingGraph } from "../graph/BindingGraph";
 
@@ -65,7 +66,10 @@ export function App() {
       </div>
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: "260px 1fr 320px", minHeight: 0 }}>
         <div style={{ borderRight: "1px solid #2a2d35", overflow: "hidden", display: "flex", flexDirection: "column" }}>
-          <div style={{ borderBottom: "1px solid #2a2d35", maxHeight: 160, overflowY: "auto" }}>
+          <div style={{ borderBottom: "1px solid #2a2d35", maxHeight: 200, overflowY: "auto" }}>
+            <AssetBrowser client={client} />
+          </div>
+          <div style={{ borderBottom: "1px solid #2a2d35", maxHeight: 140, overflowY: "auto" }}>
             <Requirers />
           </div>
           <div style={{ flex: 1, overflow: "hidden", minHeight: 0 }}>

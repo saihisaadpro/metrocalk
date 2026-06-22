@@ -22,6 +22,9 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     duplicateEntity: () => Promise.resolve(null),
     focusEntity: vi.fn(),
     makeDynamic: () => Promise.resolve(true),
+    catalog: () => Promise.resolve({}),
+    catalogSearch: () => Promise.resolve({ items: [] }),
+    addItem: vi.fn(() => Promise.resolve({ created: "e-new", balance: null, seam: null })),
     ...over,
   };
 }

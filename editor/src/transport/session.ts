@@ -9,6 +9,9 @@
 import { projectionStore } from "../store/projection";
 import type {
   ActionItem,
+  AddResponse,
+  CatalogItem,
+  CatalogSearch,
   DescribeResponse,
   EconResponse,
   EditIntent,
@@ -56,6 +59,13 @@ export interface EditorClient {
   focusEntity(id: string): void;
   /** M8.3: turn a dead mesh into a correct dynamic body — one undoable transaction. */
   makeDynamic(id: string): Promise<boolean>;
+  /** The browse catalog (M3.4 / ADR-019) — the ONE catalog (registry + marketplace + imported), grouped
+   *  by category. The asset browser reuses this; it never forks the search/category logic. */
+  catalog(): Promise<Record<string, CatalogItem[]>>;
+  /** Search the one catalog (reuses the tiered resolver) — ranked matches + a no-match seam. */
+  catalogSearch(query: string): Promise<CatalogSearch>;
+  /** Instantiate a catalog item into the scene (place-into-scene) — one undoable, persisted entity. */
+  addItem(id: string, source: string): Promise<AddResponse>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -161,6 +171,16 @@ class TauriClient implements EditorClient {
   }
   makeDynamic(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("make_dynamic", { id });
+  }
+
+  catalog(): Promise<Record<string, CatalogItem[]>> {
+    return this.core.invoke<Record<string, CatalogItem[]>>("catalog");
+  }
+  catalogSearch(query: string): Promise<CatalogSearch> {
+    return this.core.invoke<CatalogSearch>("catalog_search", { query });
+  }
+  addItem(id: string, source: string): Promise<AddResponse> {
+    return this.core.invoke<AddResponse>("add_item", { id, source });
   }
 }
 
@@ -268,6 +288,25 @@ class MockClient implements EditorClient {
   focusEntity(_id: string): void {}
   makeDynamic(_id: string): Promise<boolean> {
     return Promise.resolve(true);
+  }
+  catalog(): Promise<Record<string, CatalogItem[]>> {
+    const item = (id: string, label: string, category: string, source: string): CatalogItem => ({
+      id, label, bucket: category, category, source, provides: [], requires: [],
+    });
+    return Promise.resolve({
+      Health: [item("HealthBar", "HealthBar", "Health", "local")],
+      UI: [item("Button", "Button", "UI", "local")],
+    });
+  }
+  catalogSearch(query: string): Promise<CatalogSearch> {
+    return this.catalog().then((groups) => {
+      const all = Object.values(groups).flat();
+      const items = all.filter((i) => i.label.toLowerCase().includes(query.toLowerCase()));
+      return { items, seam: items.length === 0 ? "generate" : undefined };
+    });
+  }
+  addItem(_id: string, _source: string): Promise<AddResponse> {
+    return Promise.resolve({ created: "e-new", balance: null, seam: null });
   }
 }
 
