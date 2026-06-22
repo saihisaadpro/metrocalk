@@ -3,8 +3,9 @@
 //! contract**: pointer events over it are deferred to the native wgpu layer (invariant 4), wired for
 //! real in M2.6. Everything else here is UI chrome owned by React.
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createSession, type EditorClient } from "../transport/session";
+import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { shouldDeferToNative, type Rect } from "../input/ownership";
 import { Hierarchy } from "../panels/Hierarchy";
@@ -14,6 +15,7 @@ import { DescribeBar } from "../panels/DescribeBar";
 import { Wallet } from "../panels/Wallet";
 import { Requirers } from "../panels/Requirers";
 import { StatusBar } from "../panels/StatusBar";
+import { ContextMenu } from "../panels/ContextMenu";
 import { Inspector } from "../inspector/Inspector";
 import { BindingGraph } from "../graph/BindingGraph";
 
@@ -31,9 +33,12 @@ export function App() {
   const client = useEditorSession();
   // Placeholder viewport rect; M2.6 supplies the real wgpu region.
   const viewport: Rect = useMemo(() => ({ x: 280, y: 56, w: 600, h: 620 }), []);
+  // The M3.3 right-click context menu, opened for an entity at a cursor position.
+  const [ctx, setCtx] = useState<{ id: string; x: number; y: number } | null>(null);
 
   // Ctrl-Z / ⌘-Z → undo (the reverting delta streams back over the Channel; the keyboard flow the
-  // scaffold preserved). A discrete event — never the per-frame hot path (invariant 4).
+  // scaffold preserved). A discrete event — never the per-frame hot path (invariant 4). Escape closes
+  // the context menu.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
@@ -41,6 +46,7 @@ export function App() {
         client.undo();
         setStatus("undo");
       }
+      if (e.key === "Escape") setCtx(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -66,13 +72,20 @@ export function App() {
             <Hierarchy />
           </div>
         </div>
-        {/* viewport: native-owned. React must NOT handle hot input here (invariant 4). */}
+        {/* viewport: native-owned. React must NOT handle hot input here (invariant 4). Right-click opens
+            the M3.3 context menu for the current selection (the real viewport-pick-under-cursor is the
+            local closeout). */}
         <div
           onPointerDown={(e) => {
             if (shouldDeferToNative(e.clientX, e.clientY, viewport)) {
               // left for the native wgpu picker — wired in M2.6. Do nothing in JS.
               return;
             }
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            const sel = projectionStore.getState().selectedId;
+            if (sel) setCtx({ id: sel, x: e.clientX, y: e.clientY });
           }}
           style={{ position: "relative", background: "#0d0f15", display: "flex", alignItems: "center", justifyContent: "center", color: "#444", font: "12px ui-monospace, monospace" }}
         >
@@ -88,6 +101,14 @@ export function App() {
           </div>
         </div>
       </div>
+      {ctx && (
+        <>
+          <div onClick={() => setCtx(null)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />
+          <div style={{ position: "fixed", left: ctx.x, top: ctx.y, zIndex: 100 }}>
+            <ContextMenu client={client} id={ctx.id} onClose={() => setCtx(null)} />
+          </div>
+        </>
+      )}
       <StatusBar />
       <Rejections />
     </div>

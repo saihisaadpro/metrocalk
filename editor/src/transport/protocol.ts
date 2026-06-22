@@ -111,6 +111,28 @@ export interface EconResponse {
   message: string | null;
 }
 
+/** `entity_actions(id)` — one context-menu action's availability (M3.3). `action` is the lowercase tag
+ *  ("bind"|"remove"|"duplicate"|"focus"|"inspect"|"makedynamic"); when `!available`, `reason` explains why
+ *  (every "no" explained, ADR-016); `mutates` ⇒ it's an undoable transaction. */
+export interface ActionItem {
+  action: string;
+  label: string;
+  available: boolean;
+  reason?: string;
+  mutates: boolean;
+}
+
+/** `entity_details(id)` — the hover tooltip read (M3.3): name + component names + provided/required caps
+ *  + the entities it's bound to. */
+export interface EntityDetails {
+  id: string;
+  name: string;
+  components: string[];
+  provides: string[];
+  requires: string[];
+  boundTo: string[];
+}
+
 const te = new TextEncoder();
 const td = new TextDecoder();
 export const encodeJson = (v: unknown): Uint8Array => te.encode(JSON.stringify(v));

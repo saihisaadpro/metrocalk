@@ -8,10 +8,12 @@
 
 import { projectionStore } from "../store/projection";
 import type {
+  ActionItem,
   DescribeResponse,
   EconResponse,
   EditIntent,
   EditTx,
+  EntityDetails,
   EntityProjection,
   Json,
   JsonPatch,
@@ -42,6 +44,18 @@ export interface EditorClient {
   aiEdit(id: string): Promise<EconResponse>;
   /** Undo the last committed transaction (Ctrl-Z); the reverting delta streams back over the Channel. */
   undo(): void;
+  /** The context-menu actions for an entity (M3.3) — each available-or-explained. */
+  entityActions(id: string): Promise<ActionItem[]>;
+  /** The hover-tooltip details for an entity (M3.3) — name + components + caps + bound. */
+  entityDetails(id: string): Promise<EntityDetails | null>;
+  /** Remove an entity + its edges (M3.3) — one undoable transaction (the delta streams back). */
+  removeEntity(id: string): void;
+  /** Duplicate an entity (M3.3) — one undoable transaction; resolves to the clone's id. */
+  duplicateEntity(id: string): Promise<string | null>;
+  /** Frame the camera on an entity (M3.3) — no mutation. */
+  focusEntity(id: string): void;
+  /** M8.3: turn a dead mesh into a correct dynamic body — one undoable transaction. */
+  makeDynamic(id: string): Promise<boolean>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -129,6 +143,25 @@ class TauriClient implements EditorClient {
   undo(): void {
     void this.core.invoke("undo").catch((e: unknown) => console.error("undo failed", e));
   }
+
+  entityActions(id: string): Promise<ActionItem[]> {
+    return this.core.invoke<ActionItem[]>("entity_actions", { id });
+  }
+  entityDetails(id: string): Promise<EntityDetails | null> {
+    return this.core.invoke<EntityDetails | null>("entity_details", { id });
+  }
+  removeEntity(id: string): void {
+    void this.core.invoke("remove_entity", { id }).catch((e: unknown) => console.error("remove_entity failed", e));
+  }
+  duplicateEntity(id: string): Promise<string | null> {
+    return this.core.invoke<string | null>("duplicate_entity", { id });
+  }
+  focusEntity(id: string): void {
+    void this.core.invoke("focus_entity", { id }).catch((e: unknown) => console.error("focus_entity failed", e));
+  }
+  makeDynamic(id: string): Promise<boolean> {
+    return this.core.invoke<boolean>("make_dynamic", { id });
+  }
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
@@ -203,6 +236,38 @@ class MockClient implements EditorClient {
   }
   undo(): void {
     /* the dev MockCore has no undo stack — a no-op (the real shell undoes over the Channel) */
+  }
+  entityActions(id: string): Promise<ActionItem[]> {
+    const e = projectionStore.getState().displayed[id];
+    const canBind = !!e?.components.Socket;
+    return Promise.resolve([
+      { action: "bind", label: "Bind…", available: canBind, reason: canBind ? undefined : "no unmet requirement to bind", mutates: false },
+      { action: "remove", label: "Remove", available: true, mutates: true },
+      { action: "duplicate", label: "Duplicate", available: true, mutates: true },
+      { action: "focus", label: "Focus", available: true, mutates: false },
+      { action: "inspect", label: "Inspect", available: true, mutates: false },
+    ]);
+  }
+  entityDetails(id: string): Promise<EntityDetails | null> {
+    const e = projectionStore.getState().displayed[id];
+    if (!e) return Promise.resolve(null);
+    const c = e.components;
+    return Promise.resolve({
+      id,
+      name: e.name,
+      components: Object.keys(c),
+      provides: c.Provides?.capability != null ? [String(c.Provides.capability)] : [],
+      requires: c.Socket?.accepts != null ? [String(c.Socket.accepts)] : [],
+      boundTo: [],
+    });
+  }
+  removeEntity(_id: string): void {}
+  duplicateEntity(_id: string): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  focusEntity(_id: string): void {}
+  makeDynamic(_id: string): Promise<boolean> {
+    return Promise.resolve(true);
   }
 }
 

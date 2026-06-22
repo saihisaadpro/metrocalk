@@ -12,6 +12,7 @@ import { projectionStore } from "../store/projection";
 import { uiStore } from "../store/ui";
 import type { EditorClient } from "../transport/session";
 import type { DescribeResponse } from "../transport/protocol";
+import { fakeClient } from "../transport/test-client";
 
 afterEach(() => {
   projectionStore.getState().reset();
@@ -21,20 +22,12 @@ afterEach(() => {
 /** Stub the contract surface; `describe` resolves to the canned tiered result, and we capture the
  *  query it was called with so the test can assert the real call (not just a render). */
 function stubClient(result: DescribeResponse, describe = vi.fn()): EditorClient {
-  return {
-    setField: vi.fn(() => "op"),
-    bind: vi.fn(() => "op"),
-    onEphemeral: () => () => {},
-    revealTargets: () => Promise.resolve({ required: [], compatible: [], greyed: [], bound: [] }),
+  return fakeClient({
     describe: (query: string) => {
       describe(query);
       return Promise.resolve(result);
     },
-    walletInfo: () => Promise.resolve({ ok: true, balance: 100, cost: null, message: null }),
-    topUp: () => Promise.resolve({ ok: true, balance: 200, cost: 100, message: null }),
-    aiEdit: () => Promise.resolve({ ok: true, balance: 98, cost: 2, message: null }),
-    undo: () => {},
-  };
+  });
 }
 
 const LOCAL_HIT: DescribeResponse = {

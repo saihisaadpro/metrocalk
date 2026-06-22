@@ -11,6 +11,7 @@ import { projectionStore } from "../store/projection";
 import { uiStore } from "../store/ui";
 import type { EditorClient } from "../transport/session";
 import type { EconResponse } from "../transport/protocol";
+import { fakeClient } from "../transport/test-client";
 
 afterEach(() => {
   projectionStore.getState().reset();
@@ -20,18 +21,7 @@ afterEach(() => {
 /** A full `EditorClient` stub — only the econ verbs are exercised; the rest are inert vi.fn()s so the
  *  object satisfies the contract surface the Wallet imports. */
 function stubClient(over: Partial<EditorClient> = {}): EditorClient {
-  return {
-    setField: vi.fn(() => "op"),
-    bind: vi.fn(() => "op"),
-    onEphemeral: vi.fn(() => () => {}),
-    revealTargets: vi.fn(() => Promise.resolve({ required: [], compatible: [], greyed: [], bound: [] })),
-    describe: vi.fn(() => Promise.resolve({ created: null, kind: null, source: null, price: null, seam: null, balance: null })),
-    walletInfo: vi.fn(() => Promise.resolve<EconResponse>({ ok: true, balance: 100, cost: null, message: null })),
-    topUp: vi.fn(() => Promise.resolve<EconResponse>({ ok: true, balance: 200, cost: 100, message: null })),
-    aiEdit: vi.fn(() => Promise.resolve<EconResponse>({ ok: true, balance: 198, cost: 2, message: null })),
-    undo: vi.fn(),
-    ...over,
-  };
+  return fakeClient(over);
 }
 
 function selectAnEntity() {

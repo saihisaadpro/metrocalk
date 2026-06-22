@@ -9,24 +9,18 @@ import { Reveal } from "./Reveal";
 import { projectionStore } from "../store/projection";
 import type { EditorClient } from "../transport/session";
 import type { RevealResponse } from "../transport/protocol";
+import { fakeClient } from "../transport/test-client";
 
 afterEach(() => projectionStore.getState().reset());
 
 function stubClient(reveal: RevealResponse, bind = vi.fn()): EditorClient {
-  return {
-    setField: vi.fn(() => "op"),
+  return fakeClient({
     bind: (from: string, rel: string, to: string) => {
       bind(from, rel, to);
       return "op";
     },
-    onEphemeral: () => () => {},
     revealTargets: () => Promise.resolve(reveal),
-    describe: () => Promise.resolve({ created: null, kind: null, source: null, price: null, seam: "generate", balance: null }),
-    walletInfo: () => Promise.resolve({ ok: true, balance: 100, cost: null, message: null }),
-    topUp: () => Promise.resolve({ ok: true, balance: 200, cost: 100, message: null }),
-    aiEdit: () => Promise.resolve({ ok: true, balance: 98, cost: 2, message: null }),
-    undo: () => {},
-  };
+  });
 }
 
 const REVEAL: RevealResponse = {
