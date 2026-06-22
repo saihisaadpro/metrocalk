@@ -30,6 +30,10 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     openProject: vi.fn(() => Promise.resolve({ path: "p.mtk", dirty: false, recents: ["p.mtk"], error: null })),
     saveProject: vi.fn(() => Promise.resolve({ path: "p.mtk", dirty: false, recents: ["p.mtk"], error: null })),
     saveProjectAs: vi.fn(() => Promise.resolve({ path: "p.mtk", dirty: false, recents: ["p.mtk"], error: null })),
+    play: vi.fn(() => Promise.resolve({ playing: true, paused: false })),
+    stop: vi.fn(() => Promise.resolve({ playing: false, paused: false })),
+    pause: vi.fn(() => Promise.resolve({ playing: true, paused: true })),
+    playState: () => Promise.resolve({ playing: false, paused: false }),
     ...over,
   };
 }

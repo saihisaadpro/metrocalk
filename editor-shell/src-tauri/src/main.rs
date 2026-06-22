@@ -229,6 +229,16 @@ struct ProjectInfoResp {
     error: Option<String>,
 }
 
+/// M10.4 (ADR-034) — Play-mode state for the editor's runtime controls: `playing` = the scene is
+/// running (Play entered, not yet Stopped); `paused` = running but the sim is frozen. Both false ⇒
+/// Stopped (authoring). Mirrors the React `PlayInfo`.
+#[derive(Serialize, Clone, Copy, Default)]
+#[serde(rename_all = "camelCase")]
+struct PlayInfo {
+    playing: bool,
+    paused: bool,
+}
+
 /// Commands to the engine thread (which owns the `!Send` Engine).
 enum EngineCmd {
     Connect(Channel<ProjectionDelta>),
@@ -489,6 +499,24 @@ enum EngineCmd {
     /// M10.3 — new empty project (a fresh engine/scene, the session log reset). **Accepted on a GUI run.**
     NewProject {
         reply: Sender<ProjectInfoResp>,
+    },
+    /// M10.4 (ADR-034) — **Play**: snapshot the edit state, then run the deterministic sim on the current
+    /// scene (enter play mode). Non-destructive — the sim projects to the render only (ADR-021).
+    Play {
+        reply: Sender<PlayInfo>,
+    },
+    /// M10.4 — **Stop**: restore the pre-Play edit state **bit-exactly** from the snapshot + re-project +
+    /// reset the sim (exit play mode). Reuses the project-open swap from the in-memory snapshot.
+    Stop {
+        reply: Sender<PlayInfo>,
+    },
+    /// M10.4 — **Pause / Resume**: freeze (or unfreeze) the running sim while staying in play mode.
+    Pause {
+        reply: Sender<PlayInfo>,
+    },
+    /// M10.4 — the current Play-mode state for the runtime controls (a read).
+    PlayStateQuery {
+        reply: Sender<PlayInfo>,
     },
     /// Internal fixed-timestep heartbeat (M8.2): a self-sent tick that advances the sim one step + syncs
     /// transforms to the viewport. NOT a JS command — it never crosses the WebView boundary (invariant 4).
@@ -872,6 +900,14 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // Previous frame's body centres, for the swept-volume (trajectory) overlay segments.
     let mut prev_centers: HashMap<EntityId, [f32; 3]> = HashMap::new();
     let mut sim_running = !body_of.is_empty();
+    // M10.4 (ADR-034) — Play mode. `play_mode` = the editor is RUNNING the scene (vs authoring); the
+    // deterministic sim already projects per-tick transforms to the render only (ADR-021 — never the
+    // ECS/Loro), so a running scene never mutates the authored document. `play_snapshot` captures the
+    // edit-state Loro doc on Play; **Stop restores from it bit-exactly** (a fresh engine + merge — so
+    // even an edit that leaked in Play is wiped; non-destructive by construction). `paused` = play mode
+    // with the sim frozen (`sim_running == false` while `play_mode`).
+    let mut play_mode = false;
+    let mut play_snapshot: Option<Vec<u8>> = None;
     // A fixed-cadence heartbeat (~60/s) on its own thread enqueues `Tick` via the engine's own sender, so
     // the sim advances ON the engine thread (off the JS hot path, invariant 4) without blocking the
     // command loop. A `Tick` is a no-op until the sim is running with at least one body.
@@ -892,6 +928,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 channel = Some(ch);
             }
             EngineCmd::Edit(tx) => {
+                // M10.4 (ADR-034): edits are DISABLED during Play — the authored scene must not change
+                // while running (deliverable 4; the React UI also disables the edit affordances, and
+                // Stop restores from the snapshot regardless, but this is the authoritative backstop on
+                // the primary edit path).
+                if play_mode {
+                    continue;
+                }
                 let delta = apply_edit(&mut engine, &tx);
                 let ok = delta.rejects.is_empty();
                 if let Some(ch) = &channel {
@@ -1730,6 +1773,78 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             }
             EngineCmd::SetSimRunning(run) => {
                 sim_running = run;
+            }
+            EngineCmd::Play { reply } => {
+                // Enter play mode: snapshot the edit state (so Stop restores it bit-exactly), then run
+                // the deterministic sim from the current scene. The sim projects per-tick transforms to
+                // the render only (ADR-021), so the authored ECS/Loro is never mutated by running.
+                if !play_mode {
+                    play_snapshot = Some(engine.snapshot());
+                    play_mode = true;
+                    (recording, rec_entities, sim, body_of) =
+                        restart_run(&engine, &assets, &sim, &body_of);
+                    frame = 0;
+                    max_frame = 0;
+                    sim_running = true;
+                }
+                let _ = reply.send(PlayInfo {
+                    playing: play_mode,
+                    paused: play_mode && !sim_running,
+                });
+            }
+            EngineCmd::Pause { reply } => {
+                // Freeze / unfreeze the running sim while staying in play mode (no effect when Stopped).
+                if play_mode {
+                    sim_running = !sim_running;
+                }
+                let _ = reply.send(PlayInfo {
+                    playing: play_mode,
+                    paused: play_mode && !sim_running,
+                });
+            }
+            EngineCmd::Stop { reply } => {
+                // **Non-destructive Stop:** restore the pre-Play edit state bit-exactly from the snapshot
+                // (a fresh engine + scene + resolver + merge — the same swap as project-open, but from the
+                // in-memory snapshot), so even an edit that leaked during Play is wiped. The sim then
+                // re-derives from the authored scene (bodies snap back to their edit positions).
+                if play_mode {
+                    if let Some(snap) = play_snapshot.take() {
+                        let mut w = FlecsWorld::new();
+                        let s = CapScene::intern(&mut w);
+                        let mut e = Engine::new(w, 1);
+                        e.set_capability_resolver(Box::new(capscene::CapResolver::from_scene(&s)));
+                        if e.merge(&snap).is_ok() {
+                            engine = e;
+                            scene = s;
+                        }
+                    }
+                    play_mode = false;
+                    sim_running = false;
+                    recency.clear(); // ECS handles changed on the restore swap — drop stale ranking state
+                    touch = 0;
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                    if let Some(ch) = &channel {
+                        let _ = ch.send(project_full(&engine));
+                    }
+                    (recording, rec_entities, sim, body_of) = restart_run(
+                        &engine,
+                        &assets,
+                        &RapierPhysics::new(Fidelity::Gameplay.resolve().config),
+                        &HashMap::new(),
+                    );
+                    frame = 0;
+                    max_frame = 0;
+                }
+                let _ = reply.send(PlayInfo {
+                    playing: false,
+                    paused: false,
+                });
+            }
+            EngineCmd::PlayStateQuery { reply } => {
+                let _ = reply.send(PlayInfo {
+                    playing: play_mode,
+                    paused: play_mode && !sim_running,
+                });
             }
             EngineCmd::Tick => {
                 // One fixed-`dt` step + a delta sync of the moved bodies' transforms to the viewport, and
@@ -4390,6 +4505,52 @@ fn new_project(state: State<AppState>) -> ProjectInfoResp {
     run_project_cmd(&state, |reply| EngineCmd::NewProject { reply })
 }
 
+// ── M10.4 (ADR-034): Play mode — run the scene non-destructively ───────────────────────────────────
+
+/// Enter Play — run the deterministic sim on the current scene (snapshots the edit state for Stop).
+#[tauri::command]
+fn play(state: State<AppState>) -> PlayInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Play { reply }).is_err() {
+        return PlayInfo::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Stop — restore the exact pre-Play edit state (non-destructive) and exit play mode.
+#[tauri::command]
+fn stop(state: State<AppState>) -> PlayInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Stop { reply }).is_err() {
+        return PlayInfo::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Pause / resume the running sim (stays in play mode).
+#[tauri::command]
+fn pause(state: State<AppState>) -> PlayInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Pause { reply }).is_err() {
+        return PlayInfo::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// The current Play-mode state for the runtime controls (a read).
+#[tauri::command]
+fn play_state(state: State<AppState>) -> PlayInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PlayStateQuery { reply }).is_err() {
+        return PlayInfo::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 fn main() {
     let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
     let (tx, rx) = mpsc::channel::<EngineCmd>();
@@ -4498,6 +4659,10 @@ fn main() {
             save_project_as,
             open_project,
             new_project,
+            play,
+            stop,
+            pause,
+            play_state,
             ipc_count
         ])
         .run(tauri::generate_context!())

@@ -8,6 +8,7 @@
 
 import { projectionStore } from "../store/projection";
 import type { ProjectInfo } from "../store/project";
+import type { PlayInfo } from "../store/play";
 import type {
   ActionItem,
   AddResponse,
@@ -82,6 +83,16 @@ export interface EditorClient {
   saveProject(): Promise<ProjectInfo>;
   /** Save As — always picks a new path via the shell's native dialog (the live half — owed). */
   saveProjectAs(): Promise<ProjectInfo>;
+
+  // ── Play mode (M10.4 / ADR-034): run the scene non-destructively ────────────────────────────────
+  /** Enter Play — run the deterministic sim on the current scene (snapshots the edit state for Stop). */
+  play(): Promise<PlayInfo>;
+  /** Stop — restore the exact pre-Play edit state (non-destructive) and exit play mode. */
+  stop(): Promise<PlayInfo>;
+  /** Pause / resume the running sim (stays in play mode). */
+  pause(): Promise<PlayInfo>;
+  /** The current Play-mode state (a read) — the controls refresh from this. */
+  playState(): Promise<PlayInfo>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -214,6 +225,19 @@ class TauriClient implements EditorClient {
   saveProjectAs(): Promise<ProjectInfo> {
     return this.core.invoke<ProjectInfo>("save_project_as");
   }
+
+  play(): Promise<PlayInfo> {
+    return this.core.invoke<PlayInfo>("play");
+  }
+  stop(): Promise<PlayInfo> {
+    return this.core.invoke<PlayInfo>("stop");
+  }
+  pause(): Promise<PlayInfo> {
+    return this.core.invoke<PlayInfo>("pause");
+  }
+  playState(): Promise<PlayInfo> {
+    return this.core.invoke<PlayInfo>("play_state");
+  }
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
@@ -243,6 +267,7 @@ function buildWorld(n: number): EntityProjection[] {
 class MockClient implements EditorClient {
   private balance = 100;
   private project: ProjectInfo = { path: null, dirty: false, recents: [], error: null };
+  private playInfo: PlayInfo = { playing: false, paused: false };
   constructor(private readonly inner: DeltaClient) {}
   setField(id: string, component: string, field: string, value: Json): string {
     return this.inner.setField(id, component, field, value);
@@ -372,6 +397,22 @@ class MockClient implements EditorClient {
   }
   saveProjectAs(): Promise<ProjectInfo> {
     return this.saveProject();
+  }
+
+  play(): Promise<PlayInfo> {
+    this.playInfo = { playing: true, paused: false };
+    return Promise.resolve({ ...this.playInfo });
+  }
+  stop(): Promise<PlayInfo> {
+    this.playInfo = { playing: false, paused: false };
+    return Promise.resolve({ ...this.playInfo });
+  }
+  pause(): Promise<PlayInfo> {
+    if (this.playInfo.playing) this.playInfo = { playing: true, paused: !this.playInfo.paused };
+    return Promise.resolve({ ...this.playInfo });
+  }
+  playState(): Promise<PlayInfo> {
+    return Promise.resolve({ ...this.playInfo });
   }
 }
 

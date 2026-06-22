@@ -18,6 +18,7 @@ import { StatusBar } from "../panels/StatusBar";
 import { ContextMenu } from "../panels/ContextMenu";
 import { AssetBrowser } from "../panels/AssetBrowser";
 import { FileMenu } from "../panels/FileMenu";
+import { PlayControls } from "../panels/PlayControls";
 import { Inspector } from "../inspector/Inspector";
 import { BindingGraph } from "../graph/BindingGraph";
 
@@ -59,6 +60,7 @@ export function App() {
       <div style={{ height: 40, display: "flex", alignItems: "center", gap: 12, padding: "0 12px", background: "#14161c", borderBottom: "1px solid #2a2d35", font: "13px ui-monospace, monospace" }}>
         <strong>metrocalk</strong>
         <FileMenu client={client} />
+        <PlayControls client={client} />
         <div style={{ marginLeft: "auto" }}>
           <Wallet client={client} />
         </div>
