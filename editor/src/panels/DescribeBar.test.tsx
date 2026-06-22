@@ -33,6 +33,7 @@ function stubClient(result: DescribeResponse, describe = vi.fn()): EditorClient 
     walletInfo: () => Promise.resolve({ ok: true, balance: 100, cost: null, message: null }),
     topUp: () => Promise.resolve({ ok: true, balance: 200, cost: 100, message: null }),
     aiEdit: () => Promise.resolve({ ok: true, balance: 98, cost: 2, message: null }),
+    undo: () => {},
   };
 }
 

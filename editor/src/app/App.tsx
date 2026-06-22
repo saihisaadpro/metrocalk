@@ -3,8 +3,9 @@
 //! contract**: pointer events over it are deferred to the native wgpu layer (invariant 4), wired for
 //! real in M2.6. Everything else here is UI chrome owned by React.
 
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { createSession, type EditorClient } from "../transport/session";
+import { setStatus } from "../store/ui";
 import { shouldDeferToNative, type Rect } from "../input/ownership";
 import { Hierarchy } from "../panels/Hierarchy";
 import { Rejections } from "../panels/Rejections";
@@ -30,6 +31,20 @@ export function App() {
   const client = useEditorSession();
   // Placeholder viewport rect; M2.6 supplies the real wgpu region.
   const viewport: Rect = useMemo(() => ({ x: 280, y: 56, w: 600, h: 620 }), []);
+
+  // Ctrl-Z / ⌘-Z → undo (the reverting delta streams back over the Channel; the keyboard flow the
+  // scaffold preserved). A discrete event — never the per-frame hot path (invariant 4).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        client.undo();
+        setStatus("undo");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [client]);
 
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: "#0a0a0f", color: "#e8e8e8" }}>

@@ -40,6 +40,8 @@ export interface EditorClient {
   topUp(): Promise<EconResponse>;
   /** AI-edit "make it rustier" on an entity (M7 — schema-validated patch, debit-on-success). */
   aiEdit(id: string): Promise<EconResponse>;
+  /** Undo the last committed transaction (Ctrl-Z); the reverting delta streams back over the Channel. */
+  undo(): void;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -123,6 +125,10 @@ class TauriClient implements EditorClient {
   aiEdit(id: string): Promise<EconResponse> {
     return this.core.invoke<EconResponse>("ai_edit", { id });
   }
+
+  undo(): void {
+    void this.core.invoke("undo").catch((e: unknown) => console.error("undo failed", e));
+  }
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
@@ -194,6 +200,9 @@ class MockClient implements EditorClient {
     }
     this.balance -= 2;
     return Promise.resolve({ ok: true, balance: this.balance, cost: 2, message: null });
+  }
+  undo(): void {
+    /* the dev MockCore has no undo stack — a no-op (the real shell undoes over the Channel) */
   }
 }
 

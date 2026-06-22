@@ -29,6 +29,7 @@ function stubClient(over: Partial<EditorClient> = {}): EditorClient {
     walletInfo: vi.fn(() => Promise.resolve<EconResponse>({ ok: true, balance: 100, cost: null, message: null })),
     topUp: vi.fn(() => Promise.resolve<EconResponse>({ ok: true, balance: 200, cost: 100, message: null })),
     aiEdit: vi.fn(() => Promise.resolve<EconResponse>({ ok: true, balance: 198, cost: 2, message: null })),
+    undo: vi.fn(),
     ...over,
   };
 }
