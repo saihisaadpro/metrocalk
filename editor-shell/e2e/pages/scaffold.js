@@ -298,6 +298,9 @@ export const scaffold = {
 };
 
 export function page() {
-  // The active page-object. M10.1 adds `react.js` and switches here (env-gated), nothing else changes.
-  return scaffold;
+  // The active page-object — the React `/editor` (M10.1) when MTK_UI=react, else the vanilla scaffold. The
+  // React parity components keep the scaffold's stable ids, so the swap is selector-identical today (any
+  // deltas the local React run surfaces live in pages/react.js); the specs + acceptance dimensions never
+  // change — that's the swappable-layer point (prompt-40 deliverable 9 / M10.1 deliverable 7).
+  return process.env.MTK_UI === "react" ? { ...scaffold, name: "react (/editor)" } : scaffold;
 }
