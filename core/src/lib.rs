@@ -34,7 +34,7 @@ pub use marketplace::{
     CapDecl, LocalCatalog, MarketplaceEntry, MarketplaceIndex, MarketplaceMatch,
 };
 pub use merge::MergeReport;
-pub use pipeline::{Engine, FieldValue, Op, PipelineError};
+pub use pipeline::{CapRole, CapabilityResolver, Engine, FieldValue, Op, PipelineError};
 pub use producer::ProducerHook;
 pub use registry::{Builder, ComponentMeta, FieldSpec, FieldType, Registry, RegistryError};
 pub use resolve::{resolve, resolve_local, Match, NextTier, Resolution, Resolved};

@@ -29,8 +29,8 @@ pub use bridge::{
 };
 pub use capscene::{
     add_kind, apply_marketplace_entry, bind, describe_create, duplicate_entity, instantiate,
-    place_generation_placeholder, place_mesh, positions, remove_entity, seed, CapScene,
-    MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
+    place_generation_placeholder, place_mesh, positions, remove_entity, seed, CapResolver,
+    CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
 };
 pub use generate::{
     FakeGenerator, GenError, GenRequest, MeshGenerator, MeterAction, RemoteGenerator, StubMeter,

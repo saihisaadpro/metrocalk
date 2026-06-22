@@ -709,6 +709,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // the registry's own interned rels — not scene entities).
     let scene = CapScene::intern(&mut world);
     let mut engine = Engine::new(world, 1);
+    // Mirror capability pairs into the durable Loro document so a load/merge re-derives them (ADR-032,
+    // the M1.6 capability-rebuild fix). Set BEFORE seeding so every seeded `(Provides/Requires, cap)`
+    // pair is mirrored — this is what makes the future `.mtk` Loro-document load path keep reveal/bind
+    // working (the replay-log path doesn't need it, but the project format does).
+    engine.set_capability_resolver(Box::new(capscene::CapResolver::from_scene(&scene)));
     let index = capscene::seed(&mut engine, &scene, SCENE_N).expect("seed capability scene");
     // M9.2: a small **composed character** (a body root + two rigid child parts) for part editing —
     // seeded as deterministic scene construction right after the seed (its ids are stable across launches

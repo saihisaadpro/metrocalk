@@ -4,11 +4,14 @@
 //! byte-identical `EntityId`s, so a binding saved as `("1_5","1_a")` refers to the same entities next
 //! launch — then (2) replaying an append-only log of the user's committed mutations on top.
 //!
-//! This deliberately avoids Loro export/`merge`-on-start: `merge` rebuilds the ECS from Loro but does
-//! **not** restore the ECS capability pairs the reveal's `without(BindsTo,*)` exclusion needs (the
-//! documented merge-drops-capabilities limitation — see `capscene::bind`). The edit log is the
-//! `EditTx`/bind stream the editor already produces (the right shape), and replay goes back through
-//! the **same commit pipeline** (invariant 3). After replay the caller calls
+//! This historically avoided Loro export/`merge`-on-start because `merge` rebuilt the ECS from Loro
+//! but **not** the capability pairs the reveal's `without(BindsTo,*)` exclusion needs (the
+//! merge-drops-capabilities limitation). That limitation is **now resolved** (ADR-032): a load/merge
+//! re-derives caps from the durable document via the engine's `CapabilityResolver`, so a Loro-document
+//! load is a viable load path — the M10.3 `.mtk` project format builds on it. This replay-log remains
+//! the editor-**session** restore (deterministic seed + the `EditTx`/bind stream through the **same
+//! commit pipeline**, invariant 3); the real-project save/open is the Loro document. After replay the
+//! caller calls
 //! [`Engine::clear_history`](metrocalk_core::Engine::clear_history) so the restored scene is
 //! non-undoable (Ctrl-Z can't delete a restored world — the same guard as the seed).
 

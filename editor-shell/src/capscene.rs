@@ -28,7 +28,10 @@ use std::collections::HashMap;
 
 use metrocalk_core::caps::{canonical, display_name, is_standard};
 use metrocalk_core::marketplace::MarketplaceEntry;
-use metrocalk_core::{ComponentMeta, Engine, EntityId, FieldType, FieldValue, Op, PipelineError};
+use metrocalk_core::{
+    CapRole, CapabilityResolver, ComponentMeta, Engine, EntityId, FieldType, FieldValue, Op,
+    PipelineError,
+};
 use metrocalk_ecs::rng::Rng;
 use metrocalk_ecs::{Entity, FlecsWorld, World};
 // M9.5 / G5 deform: a handle deform is saved as a G2 override; `reconstruct_part_deform` reads it back
@@ -154,6 +157,67 @@ impl CapScene {
     #[must_use]
     pub fn cap(&self, name: &str) -> Entity {
         self.caps[&canonical(name)]
+    }
+}
+
+/// A standalone [`CapabilityResolver`] (ADR-032) built from a [`CapScene`] — set on the [`Engine`]
+/// (`Engine::set_capability_resolver`) so the commit pipeline mirrors capability pairs into the durable
+/// Loro document by canonical name, and a load/merge re-derives them (the capability-rebuild fix for
+/// the M1.6 carry-forward). It **clones** the scene's relationship handles + the cap name↔handle maps
+/// (handles are `Copy`), so the engine can own the resolver while the rest of the shell keeps borrowing
+/// the `CapScene`. Resolution is by **canonical name**, so it is correct even though a fresh launch's
+/// interned cap handles differ run-to-run — the persisted name re-interns to this world's handle.
+pub struct CapResolver {
+    rels: Rels,
+    /// canonical name (`std:Health`) → interned handle (resolve a persisted pair back on load).
+    handle_of: HashMap<String, Entity>,
+    /// interned handle → canonical name (persist a pair by stable name at commit).
+    name_of: HashMap<Entity, String>,
+}
+
+impl CapResolver {
+    /// Build a resolver mirroring `scene`'s interned capability vocabulary.
+    #[must_use]
+    pub fn from_scene(scene: &CapScene) -> Self {
+        let mut name_of = HashMap::with_capacity(scene.caps.len());
+        for (canon, &handle) in &scene.caps {
+            name_of.insert(handle, canon.clone());
+        }
+        Self {
+            rels: scene.rels,
+            handle_of: scene.caps.clone(),
+            name_of,
+        }
+    }
+}
+
+impl CapabilityResolver for CapResolver {
+    fn classify_pair(&self, rel: Entity, target: Entity) -> Option<(CapRole, String)> {
+        // Only the two cap relationships the scene uses are mirrored; BindsTo (and any other rel) is
+        // reconstructed from the bindings map, so it returns `None` and is not persisted here.
+        let role = if rel == self.rels.provides {
+            CapRole::Provides
+        } else if rel == self.rels.requires {
+            CapRole::Requires
+        } else {
+            return None;
+        };
+        Some((role, self.name_of.get(&target)?.clone()))
+    }
+
+    fn resolve_pair(&self, role: CapRole, canonical_name: &str) -> Option<(Entity, Entity)> {
+        let rel = match role {
+            CapRole::Provides => self.rels.provides,
+            CapRole::Requires => self.rels.requires,
+            // The shell scene interns no Observes relationship (no scene entity uses one), so a
+            // persisted Observes pair — there are none today — is skipped rather than mis-bound.
+            CapRole::Observes => return None,
+        };
+        Some((rel, *self.handle_of.get(canonical_name)?))
+    }
+
+    fn binds_to_rel(&self) -> Entity {
+        self.rels.binds_to
     }
 }
 
@@ -299,13 +363,12 @@ pub fn seed(
 /// consumed — it leaves the compatible set, and a re-reveal greys it "already bound". Undo reverses
 /// both atomically.
 ///
-/// **Reload constraint (carry-forward):** the reveal's exclusion depends on the ECS `BindsTo` pair,
-/// which `Engine::merge` does NOT rebuild (it restores entities from Loro but not their ECS
-/// tags/pairs). So a binding's exclusion survives undo and full re-projection, but a *merge*/reload
-/// would drop it (the Loro edge persists, the ECS pair does not), and the reveal would re-offer the
-/// bound provider. The live shell never merges (single peer; undo re-projects), so this is latent
-/// today; the fix is to re-derive `(BindsTo, *)` from the Loro `bindings` map in
-/// `rebuild_ecs_from_loro` (scheduled with collab).
+/// **Reload (RESOLVED, ADR-032):** the reveal's exclusion depends on the ECS `BindsTo` pair, which
+/// is ECS-only (not in Loro). Earlier `Engine::merge` rebuilt entities but not their pairs, so a
+/// merge/load dropped the exclusion and re-offered the bound provider (the M1.6 carry-forward). Now
+/// `rebuild_ecs_from_loro` re-derives `(BindsTo, requirer)` for each persisted binding edge (and the
+/// provides/requires pairs from the durable `caps` mirror), so a binding's exclusion survives a load
+/// exactly as it survives undo — via the [`CapResolver`] set on the engine.
 ///
 /// # Errors
 /// [`PipelineError::UnknownEntity`] if either endpoint isn't a live scene entity, propagated from the

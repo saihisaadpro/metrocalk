@@ -160,6 +160,75 @@ fn override_field_key(component: &str, field: &str) -> String {
     format!("{component}\u{1f}{field}")
 }
 
+/// The top-level Loro map mirroring each entity's **capability pairs** by canonical name (ADR-032) — a
+/// sibling of `components`/`bindings`/`overrides`. Capabilities are interned ECS metadata handles (the
+/// shell interns them; ADR-015 namespacing), **not** scene entities, so they are not stable across runs
+/// and cannot be persisted as raw handles. The durable document therefore mirrors them by **stable
+/// canonical name**, and [`Engine::rebuild_ecs_from_loro`] re-derives the ECS pairs on load/merge — the
+/// fix for the M1.6 carry-forward (merge rebuilt entities but not their capability pairs, so the reveal/
+/// bind compat query was empty after a load). Each entity's slot is a child map of
+/// `"{role}\u{1f}{canonical}" → true`. The **BindsTo** consumed-marker is NOT mirrored here — it is
+/// reconstructed from the `bindings` map (one provider-marker per persisted edge), so it can never drift
+/// from the durable edges.
+pub(crate) const CAPS: &str = "caps";
+
+/// The role of a capability relationship, used to mirror a `(rel, cap)` pair to / from the durable
+/// document by name (ADR-032). The reveal/bind query keys off **Provides**/**Requires**; **Observes** is
+/// supported for completeness (a kind may observe a capability for live updates).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapRole {
+    Provides,
+    Requires,
+    Observes,
+}
+
+impl CapRole {
+    /// A stable one-char tag for the persisted key (`P`/`R`/`O`) — never user-facing, so it stays terse.
+    fn tag(self) -> char {
+        match self {
+            CapRole::Provides => 'P',
+            CapRole::Requires => 'R',
+            CapRole::Observes => 'O',
+        }
+    }
+
+    fn from_tag(c: char) -> Option<Self> {
+        match c {
+            'P' => Some(CapRole::Provides),
+            'R' => Some(CapRole::Requires),
+            'O' => Some(CapRole::Observes),
+            _ => None,
+        }
+    }
+}
+
+/// The persisted key for one capability pair in an entity's [`CAPS`] slot: `"{role}\u{1f}{canonical}"`.
+fn cap_key(role: CapRole, canonical_name: &str) -> String {
+    format!("{}\u{1f}{canonical_name}", role.tag())
+}
+
+/// Bridges the engine's interned capability **handles** to stable **canonical names**, so the commit
+/// pipeline can mirror capability pairs into the durable Loro document ([`CAPS`]) and a load/merge can
+/// re-derive the ECS pairs the reveal/bind compatibility query needs (the capability-rebuild fix,
+/// ADR-032). Capabilities are interned ECS metadata (created by the shell — ADR-015 namespacing), not
+/// scene entities, so they are persisted by name. The **BindsTo** consumed-marker is reconstructed from
+/// the `bindings` map instead of being mirrored, so it isn't covered here.
+///
+/// Set on the engine with [`Engine::set_capability_resolver`]; without one, mirroring + restore are
+/// no-ops (the engine behaves exactly as before — caps stay ECS-only) so `/core`'s own tests, which
+/// don't intern a capability vocabulary, are unaffected.
+pub trait CapabilityResolver {
+    /// If `rel` is a capability relationship, the `(role, canonical name of target)` to persist; `None`
+    /// for a non-capability pair (e.g. the BindsTo marker, or an unknown rel) — those are not mirrored.
+    fn classify_pair(&self, rel: Entity, target: Entity) -> Option<(CapRole, String)>;
+    /// Resolve a persisted `(role, canonical name)` back to the ECS `(rel, target)` handles to re-add on
+    /// rebuild; `None` if the name isn't interned in this engine's world (a stale/foreign cap — skipped).
+    fn resolve_pair(&self, role: CapRole, canonical_name: &str) -> Option<(Entity, Entity)>;
+    /// The BindsTo relationship handle, so a persisted binding edge re-marks its provider consumed (the
+    /// reveal's `without(BindsTo, *)` exclusion survives load).
+    fn binds_to_rel(&self) -> Entity;
+}
+
 // ── errors ─────────────────────────────────────────────────────────────────
 
 #[derive(Error, Debug)]
@@ -195,6 +264,11 @@ pub struct Engine<W: World> {
     // undo / redo
     undo_stack: Vec<InverseTransaction>,
     redo_stack: Vec<InverseTransaction>,
+
+    // capability mirroring (ADR-032): bridges interned cap handles ↔ canonical names so the commit
+    // pipeline mirrors cap pairs into the durable doc and a load/merge re-derives them. `None` ⇒
+    // caps stay ECS-only (the pre-ADR-032 behaviour — `/core`'s own tests don't set one).
+    cap_resolver: Option<Box<dyn CapabilityResolver>>,
 }
 
 impl<W: World> Engine<W> {
@@ -207,6 +281,7 @@ impl<W: World> Engine<W> {
         let _ = doc.get_map("components");
         let _ = doc.get_map("bindings");
         let _ = doc.get_map(OVERRIDES); // the override/variant layer (ADR-026)
+        let _ = doc.get_map(CAPS); // the capability-pair mirror (ADR-032)
 
         Self {
             world,
@@ -220,7 +295,16 @@ impl<W: World> Engine<W> {
             entity_pairs: HashMap::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            cap_resolver: None,
         }
+    }
+
+    /// Install the [`CapabilityResolver`] that mirrors capability pairs into the durable document and
+    /// re-derives them on load/merge (ADR-032). Call once, **before** the first cap-bearing commit
+    /// (e.g. right after `Engine::new`, before seeding), so every committed `(Provides/Requires, cap)`
+    /// pair is mirrored. Without it, capabilities stay ECS-only (the pre-ADR-032 behaviour).
+    pub fn set_capability_resolver(&mut self, resolver: Box<dyn CapabilityResolver>) {
+        self.cap_resolver = Some(resolver);
     }
 
     // ── public reads ───────────────────────────────────────────────────
@@ -697,14 +781,21 @@ impl<W: World> Engine<W> {
         let tree = self.doc.get_tree("hierarchy");
         tree.delete(tid).map_err(loro_err)?;
 
-        // Loro: clean up component records + bindings for all subtree entities
+        // Loro: clean up component records + capability mirrors + bindings for all subtree entities
         let components = self.doc.get_map("components");
+        let caps = self.doc.get_map(CAPS);
         let bindings = self.doc.get_map("bindings");
         let subtree_keys: HashSet<String> = subtree.iter().map(EntityId::to_loro_key).collect();
         for eid in &subtree {
             let key = eid.to_loro_key();
             if components.get(&key).is_some() {
                 components.delete(&key).map_err(loro_err)?;
+            }
+            // The capability mirror (ADR-032) goes with the entity — an EntityId is never reused
+            // (monotonic), so a left-behind slot couldn't be mis-read, but we keep the doc tidy and
+            // the oplog from growing with dead-entity caps.
+            if caps.get(&key).is_some() {
+                caps.delete(&key).map_err(loro_err)?;
             }
         }
         // Remove bindings that reference any entity in the subtree
@@ -838,6 +929,7 @@ impl<W: World> Engine<W> {
             .entry(entity)
             .or_default()
             .insert((rel, target));
+        self.mirror_cap_add(entity, rel, target)?;
         Ok(())
     }
 
@@ -856,6 +948,50 @@ impl<W: World> Engine<W> {
             .entry(entity)
             .or_default()
             .remove(&(rel, target));
+        self.mirror_cap_remove(entity, rel, target)?;
+        Ok(())
+    }
+
+    /// Mirror a `(rel, target)` capability pair into the durable [`CAPS`] document layer by canonical
+    /// name (ADR-032), so a load/merge can re-derive it. A no-op without a [`CapabilityResolver`], or
+    /// for a non-capability pair (e.g. the BindsTo marker, reconstructed from `bindings` instead).
+    fn mirror_cap_add(
+        &self,
+        entity: EntityId,
+        rel: Entity,
+        target: Entity,
+    ) -> Result<(), PipelineError> {
+        let Some(resolver) = &self.cap_resolver else {
+            return Ok(());
+        };
+        let Some((role, name)) = resolver.classify_pair(rel, target) else {
+            return Ok(());
+        };
+        let slot = try_child_map(&self.doc.get_map(CAPS), &entity.to_loro_key())?;
+        slot.insert(&cap_key(role, &name), true).map_err(loro_err)?;
+        Ok(())
+    }
+
+    /// Remove a capability pair's mirror from the [`CAPS`] layer — the inverse of [`mirror_cap_add`]
+    /// (so undo, which replays a `RemovePair`, keeps the durable mirror consistent).
+    fn mirror_cap_remove(
+        &self,
+        entity: EntityId,
+        rel: Entity,
+        target: Entity,
+    ) -> Result<(), PipelineError> {
+        let Some(resolver) = &self.cap_resolver else {
+            return Ok(());
+        };
+        let Some((role, name)) = resolver.classify_pair(rel, target) else {
+            return Ok(());
+        };
+        if let Some(slot) = get_child_map(&self.doc.get_map(CAPS), &entity.to_loro_key()) {
+            let key = cap_key(role, &name);
+            if slot.get(&key).is_some() {
+                slot.delete(&key).map_err(loro_err)?;
+            }
+        }
         Ok(())
     }
 
@@ -1406,6 +1542,12 @@ impl<W: World> Engine<W> {
             self.entity_pairs.insert(eid, HashSet::new());
         }
 
+        // Re-derive every entity's ECS capability pairs from the durable document (ADR-032) — the fix
+        // for the M1.6 carry-forward. Without this the entities above carry empty tag/pair sets, so the
+        // reveal/bind compatibility query (`with(Provides,C)` + `without(BindsTo,*)`) is empty after a
+        // load/merge — binding-by-intent silently breaks on the first reload.
+        self.rebuild_caps_from_loro();
+
         // Update id generator to avoid future collisions
         let max_counter = self
             .eid_to_ecs
@@ -1416,6 +1558,67 @@ impl<W: World> Engine<W> {
         if let Some(mc) = max_counter {
             while self.id_gen.next_id().counter <= mc {}
         }
+    }
+
+    /// Re-derive every alive entity's ECS capability pairs from the durable document (ADR-032), called
+    /// by [`rebuild_ecs_from_loro`](Self::rebuild_ecs_from_loro) after the entities are recreated. Two
+    /// sources, both in the document, so the rebuild is faithful (idempotent across save→load):
+    /// 1. **Provides/Requires/Observes** — read back from the [`CAPS`] mirror by canonical name and
+    ///    re-interned to this world's handles via the [`CapabilityResolver`].
+    /// 2. **BindsTo** — reconstructed from the `bindings` map: a persisted edge `from --kind--> to` marks
+    ///    its provider `to` consumed by `from`'s (fresh) ECS handle, exactly as [`capscene::bind`] did,
+    ///    so the reveal's `without(BindsTo, *)` exclusion survives the load.
+    ///
+    /// A no-op without a resolver (capabilities stay ECS-only — the pre-ADR-032 behaviour for `/core`'s
+    /// own merge tests). An un-interned (stale/foreign) cap name is skipped, never fatal.
+    fn rebuild_caps_from_loro(&mut self) {
+        // Take the resolver out so we can mutate `self.world`/`self.entity_pairs` while using it (its
+        // methods don't touch `self`); restored before return.
+        let Some(resolver) = self.cap_resolver.take() else {
+            return;
+        };
+
+        // 1. Provides/Requires/Observes from the CAPS mirror.
+        let caps = self.doc.get_map(CAPS);
+        let entities: Vec<(EntityId, Entity)> =
+            self.eid_to_ecs.iter().map(|(k, v)| (*k, *v)).collect();
+        for (eid, ecs) in entities {
+            let Some(slot) = get_child_map(&caps, &eid.to_loro_key()) else {
+                continue;
+            };
+            for key in slot.keys() {
+                let Some((tag, name)) = key.split_once('\u{1f}') else {
+                    continue;
+                };
+                let Some(role) = tag.chars().next().and_then(CapRole::from_tag) else {
+                    continue;
+                };
+                if let Some((rel, target)) = resolver.resolve_pair(role, name) {
+                    self.world.add_pair(ecs, rel, target);
+                    self.entity_pairs
+                        .entry(eid)
+                        .or_default()
+                        .insert((rel, target));
+                }
+            }
+        }
+
+        // 2. BindsTo reconstructed from the durable binding edges.
+        let binds_to = resolver.binds_to_rel();
+        for (from, _kind, to) in self.bindings() {
+            let (Some(&from_ecs), Some(&to_ecs)) =
+                (self.eid_to_ecs.get(&from), self.eid_to_ecs.get(&to))
+            else {
+                continue;
+            };
+            self.world.add_pair(to_ecs, binds_to, from_ecs);
+            self.entity_pairs
+                .entry(to)
+                .or_default()
+                .insert((binds_to, from_ecs));
+        }
+
+        self.cap_resolver = Some(resolver);
     }
 }
 
