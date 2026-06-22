@@ -111,6 +111,22 @@ export interface EconResponse {
   message: string | null;
 }
 
+/** `generate(query)` — the tier-3, opt-in generation result (M6 / ADR-017): the grey placeholder that
+ *  dropped in instantly (`created`) + the metered `cost`, or — when generation is unavailable or the
+ *  wallet refuses — `available: false` / a `seam`. The real mesh streams in later over the projection
+ *  Channel (the ADR-017 patch). `balance` is the wallet after reserving the generation, for the wallet UI. */
+export interface GenerateResponse {
+  created: string | null;
+  cost: number | null;
+  available: boolean;
+  seam: string | null;
+  balance: number | null;
+}
+
+/** The opt-in generation cost shown in the UI (mirrors the shell's `GENERATE_TOKENS`). The real debit is
+ *  authoritative on the shell; this is only the legible estimate the Generate button shows up-front. */
+export const GENERATE_COST = 10;
+
 /** `entity_actions(id)` — one context-menu action's availability (M3.3). `action` is the lowercase tag
  *  ("bind"|"remove"|"duplicate"|"focus"|"inspect"|"makedynamic"); when `!available`, `reason` explains why
  *  (every "no" explained, ADR-016); `mutates` ⇒ it's an undoable transaction. */

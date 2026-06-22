@@ -1,83 +1,50 @@
-//! Wallet + AI-edit (M7) — verified headless in jsdom: the mounted balance reads from `wallet_info`,
-//! "Top up" grants the sandbox stipend and re-shows the new balance + status, and "Make it rustier"
-//! debits-on-success (new balance + the charge in status) BUT — the load-bearing refuse-when-broke
-//! case — when `ai_edit` refuses (`!ok`), the surfaced reason lands in the status line and the
-//! balance is LEFT UNCHANGED (the charge never happened; every "no" explained, ADR-016).
+//! Wallet (M10.10 / C4·C7) — verified headless in jsdom: the balance reads from `wallet_info` into the
+//! centralized wallet store and renders, and "Top up" is an HONEST sandbox **dev grant** — the new
+//! balance shows AND the change is loud (an honest "+100 dev tokens" status, never "topped up" implying a
+//! purchase, never a silent mutation). The AI-edit "rustier" action has MOVED out of the wallet (C4) to
+//! `AiEditPanel` — so it must NOT appear here (the collision-with-the-balance fix).
 
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, expect, test } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { Wallet } from "./Wallet";
-import { projectionStore } from "../store/projection";
+import { walletStore } from "../store/wallet";
 import { uiStore } from "../store/ui";
-import type { EditorClient } from "../transport/session";
-import type { EconResponse } from "../transport/protocol";
+import { toastStore } from "../store/toasts";
 import { fakeClient } from "../transport/test-client";
 
 afterEach(() => {
-  projectionStore.getState().reset();
-  uiStore.getState().setStatus(""); // hygiene: status is global; don't let it leak across tests
+  walletStore.getState().reset();
+  uiStore.getState().setStatus("");
+  toastStore.getState().reset();
 });
 
-/** A full `EditorClient` stub — only the econ verbs are exercised; the rest are inert vi.fn()s so the
- *  object satisfies the contract surface the Wallet imports. */
-function stubClient(over: Partial<EditorClient> = {}): EditorClient {
-  return fakeClient(over);
-}
-
-function selectAnEntity() {
-  projectionStore.getState().bulkLoad([{ id: "e1", name: "Rover", parentId: null, components: {} }]);
-  projectionStore.getState().select("e1");
-}
-
-test("mount reads wallet_info and shows the balance", async () => {
-  render(<Wallet client={stubClient()} />);
+test("mount reads wallet_info into the store and shows the balance", async () => {
+  render(<Wallet client={fakeClient()} />);
   const bal = await screen.findByTestId("balance");
   await waitFor(() => expect(bal.textContent).toBe("100"));
 });
 
-test("Top up grants the stipend → new balance shown + status set", async () => {
-  render(<Wallet client={stubClient()} />);
+test("Top up is an HONEST dev grant: new balance shown + an honest (non-purchase) status, no silent mutation", async () => {
+  render(<Wallet client={fakeClient()} />);
   const bal = await screen.findByTestId("balance");
   await waitFor(() => expect(bal.textContent).toBe("100"));
 
   fireEvent.click(screen.getByTestId("topup"));
 
+  // the balance updates …
   await waitFor(() => expect(bal.textContent).toBe("200"));
-  expect(uiStore.getState().status).toBe("topped up · 200 tokens");
+  // … and the change is VISIBLE + HONEST: "dev tokens", not "topped up" (a purchase implication) — C7
+  expect(uiStore.getState().status).toContain("dev tokens");
+  expect(uiStore.getState().status).not.toMatch(/purchase|bought/i);
+  expect(toastStore.getState().toasts.some((t) => /dev tokens/.test(t.text))).toBe(true);
 });
 
-test("AI-edit button only appears with a selection, and debits-on-success (balance + charge in status)", async () => {
-  // No selection → no rustier button.
-  const { rerender } = render(<Wallet client={stubClient()} />);
+test("the button is labelled as a dev grant, not 'Top up +100' (C7 honesty)", async () => {
+  render(<Wallet client={fakeClient()} />);
+  expect(screen.getByTestId("topup").textContent).toContain("dev tokens");
+});
+
+test("the AI-edit 'rustier' action is NOT in the wallet (moved off it — C4 collision fix)", () => {
+  render(<Wallet client={fakeClient()} />);
   expect(screen.queryByTestId("rustier")).toBeNull();
-
-  // Select an entity → the button appears.
-  selectAnEntity();
-  rerender(<Wallet client={stubClient()} />);
-  const bal = await screen.findByTestId("balance");
-  await waitFor(() => expect(bal.textContent).toBe("100"));
-
-  fireEvent.click(screen.getByTestId("rustier"));
-
-  await waitFor(() => expect(bal.textContent).toBe("198"));
-  expect(uiStore.getState().status).toBe("rustier · −2");
-});
-
-test("refuse-when-broke is EXPLAINED: !ok surfaces the message and the balance is UNCHANGED", async () => {
-  selectAnEntity();
-  const refuse = vi.fn(() =>
-    Promise.resolve<EconResponse>({ ok: false, balance: 0, cost: null, message: "insufficient balance" }),
-  );
-  render(<Wallet client={stubClient({ aiEdit: refuse })} />);
-  const bal = await screen.findByTestId("balance");
-  await waitFor(() => expect(bal.textContent).toBe("100"));
-
-  fireEvent.click(screen.getByTestId("rustier"));
-
-  // The refusal is surfaced verbatim …
-  await waitFor(() => expect(uiStore.getState().status).toBe("insufficient balance"));
-  // … the AI-edit was attempted on the selected entity …
-  expect(refuse).toHaveBeenCalledTimes(1);
-  // … and NO charge landed: the displayed balance is left exactly as it was.
-  expect(bal.textContent).toBe("100");
 });

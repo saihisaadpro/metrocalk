@@ -20,11 +20,14 @@ import type {
   EditTx,
   EntityDetails,
   EntityProjection,
+  GenerateResponse,
   Json,
   JsonPatch,
   ProjectionDelta,
+  ProjectionOp,
   RevealResponse,
 } from "./protocol";
+import { GENERATE_COST } from "./protocol";
 import { DeltaClient } from "./client";
 import { MockCore } from "./mock-core";
 import { inProcessPair } from "./transport";
@@ -47,6 +50,9 @@ export interface EditorClient {
   topUp(): Promise<EconResponse>;
   /** AI-edit "make it rustier" on an entity (M7 — schema-validated patch, debit-on-success). */
   aiEdit(id: string): Promise<EconResponse>;
+  /** Generate (tier 3, opt-in — M6 / ADR-017): a placeholder drops in + the cost is metered; the real
+   *  mesh streams in later over the projection Channel. The opt-in tier-3 generate, not the default path. */
+  generate(query: string): Promise<GenerateResponse>;
   /** Undo the last committed transaction (Ctrl-Z); the reverting delta streams back over the Channel. */
   undo(): void;
   /** The context-menu actions for an entity (M3.3) — each available-or-explained. */
@@ -177,6 +183,10 @@ class TauriClient implements EditorClient {
     return this.core.invoke<EconResponse>("ai_edit", { id });
   }
 
+  generate(query: string): Promise<GenerateResponse> {
+    return this.core.invoke<GenerateResponse>("generate", { query });
+  }
+
   undo(): void {
     void this.core.invoke("undo").catch((e: unknown) => console.error("undo failed", e));
   }
@@ -243,8 +253,34 @@ class TauriClient implements EditorClient {
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
 const CAPS = ["Health", "Shield", "Click", "Damage", "Light"];
 
-/** A seeded 5k scene for the MockCore (deterministic so the dev view is reproducible). */
-function buildWorld(n: number): EntityProjection[] {
+/** The dev/test **first-run** scene (M10.10 / C10) — a small, *named*, meaningful starter scene (NOT the
+ *  5k perf fixture): a real project the dev view + the Playwright/Vitest review drive, with one requirer
+ *  (the Health Bar's `Socket`) and a matching provider (the Player's `Provides`) so bind-by-intent
+ *  (north-star #1) is demonstrable. The `buildWorld` 5k fixture below is for the perf / selective-re-render
+ *  tests ONLY — a fresh project must never open onto 5,000 anonymous "Entity N" rows. */
+function sampleScene(): EntityProjection[] {
+  return [
+    { id: "player", name: "Player", parentId: null, components: { Transform: { x: 0, y: 0, z: 0 }, Provides: { capability: "Health" } } },
+    { id: "health-bar", name: "Health Bar", parentId: null, components: { Transform: { x: 0, y: 2, z: 0 }, Socket: { accepts: "Health" } } },
+    { id: "ground", name: "Ground", parentId: null, components: { Transform: { x: 0, y: -1, z: 0 }, Material: { color: "#3a4250", metalness: 0.1 } } },
+    { id: "key-light", name: "Key Light", parentId: null, components: { Transform: { x: 3, y: 4, z: 2 }, Provides: { capability: "Light" } } },
+    { id: "spawn", name: "Spawn Point", parentId: null, components: { Transform: { x: -2, y: 0, z: 1 } } },
+  ];
+}
+
+/** Dev-only catalog kinds the MockClient's describe resolves LOCALLY (the match→place path); anything
+ *  else falls through to the opt-in generate seam. The real tiered resolver runs under Tauri. */
+const MOCK_KINDS = ["HealthBar", "Button"];
+function matchCatalogKind(query: string): string | null {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const q = norm(query);
+  if (!q) return null;
+  return MOCK_KINDS.find((k) => q.includes(norm(k))) ?? null;
+}
+
+/** The PERF fixture (deterministic 5k scene) — used by the selective-re-render / scale tests ONLY, never
+ *  as the first-run project (C10). Exported so a perf test can seed it explicitly. */
+export function buildWorld(n: number): EntityProjection[] {
   const out: EntityProjection[] = [];
   let seed = 0x9e3779b9;
   const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 0xffffffff);
@@ -268,7 +304,30 @@ class MockClient implements EditorClient {
   private balance = 100;
   private project: ProjectInfo = { path: null, dirty: false, recents: [], error: null };
   private playInfo: PlayInfo = { playing: false, paused: false };
-  constructor(private readonly inner: DeltaClient) {}
+  private placeSeq = 0;
+  private saveSeq = 0;
+  constructor(
+    private readonly inner: DeltaClient,
+    private readonly core: MockCore,
+  ) {}
+
+  /** Place a pre-componentized entity into the scene through the SAME delta path the real core uses
+   *  (`MockCore.push` → committed `ProjectionDelta` → the projection store), so describe/generate/place
+   *  actually CLOSE THE LOOP in the dev view (C1): the entity exists in the authoritative mock base (a
+   *  later edit won't reject) AND streams into the store. Returns the created id so the caller selects it. */
+  private place(name: string, components: Record<string, Record<string, Json>>): string {
+    this.placeSeq += 1;
+    const id = `new-${this.placeSeq}`;
+    const ops: ProjectionOp[] = [{ op: "upsert", id, name, parentId: null }];
+    for (const [c, fields] of Object.entries(components)) {
+      for (const [f, v] of Object.entries(fields)) {
+        ops.push({ op: "setField", id, component: c, field: f, value: v });
+      }
+    }
+    this.core.push(ops);
+    return id;
+  }
+
   setField(id: string, component: string, field: string, value: Json): string {
     return this.inner.setField(id, component, field, value);
   }
@@ -295,8 +354,17 @@ class MockClient implements EditorClient {
       .map((e) => ({ id: e.id, name: e.name, reason: `doesn't provide ${need}` }));
     return Promise.resolve({ required: need ? [need] : [], compatible, greyed, bound: [] });
   }
-  describe(_query: string): Promise<DescribeResponse> {
-    return Promise.resolve({ created: null, kind: null, source: null, price: null, seam: "generate", balance: null });
+  describe(query: string): Promise<DescribeResponse> {
+    // The dev stand-in for the tiered resolver (ADR-012): a query that names a catalog kind resolves
+    // LOCALLY and is PLACED + returned (match → place + select); anything else returns the opt-in generate
+    // seam (no placeholder — the real backend's tiers run under Tauri). Closing the loop in the dev view is
+    // what lets the Playwright/Vitest review re-drive C1 end-to-end (the bar then selects the created id).
+    const kind = matchCatalogKind(query);
+    if (kind) {
+      const id = this.place(kind, { Transform: { x: 0, y: 0, z: 0 }, Material: { color: "#88ccff", metalness: 0.3 } });
+      return Promise.resolve({ created: id, kind, source: "local", price: null, seam: null, balance: this.balance });
+    }
+    return Promise.resolve({ created: null, kind: null, source: null, price: null, seam: "generate", balance: this.balance });
   }
   walletInfo(): Promise<EconResponse> {
     return Promise.resolve({ ok: true, balance: this.balance, cost: null, message: null });
@@ -305,12 +373,40 @@ class MockClient implements EditorClient {
     this.balance += 100;
     return Promise.resolve({ ok: true, balance: this.balance, cost: 100, message: null });
   }
-  aiEdit(_id: string): Promise<EconResponse> {
+  aiEdit(id: string): Promise<EconResponse> {
     if (this.balance < 2) {
       return Promise.resolve({ ok: false, balance: this.balance, cost: null, message: "insufficient balance" });
     }
     this.balance -= 2;
+    // Apply a VISIBLE result (C3 — "always show what changed"): a weathered-metal material lands on the
+    // entity (the dev stand-in for the AI patch the real shell streams back), so the inspector reflects it.
+    this.core.push([
+      { op: "setField", id, component: "Material", field: "color", value: "#6b5b4a" },
+      { op: "setField", id, component: "Material", field: "metalness", value: 0.8 },
+    ]);
     return Promise.resolve({ ok: true, balance: this.balance, cost: 2, message: null });
+  }
+  generate(query: string): Promise<GenerateResponse> {
+    // Tier 3, opt-in. Reserve the cost; if broke, refuse-explained (no placeholder, no debit). Else place
+    // the generated object (the dev stand-in for the placeholder-first stream-in) + debit, returning the
+    // created id so the bar places + selects it — the closed loop the real backend streams in over Channel.
+    if (this.balance < GENERATE_COST) {
+      return Promise.resolve({
+        created: null,
+        cost: null,
+        available: true,
+        seam: `insufficient balance: a generation costs ${GENERATE_COST} tokens, you have ${this.balance} — top up?`,
+        balance: this.balance,
+      });
+    }
+    this.balance -= GENERATE_COST;
+    const name = query.trim() ? query.trim().slice(0, 40) : "Generated object";
+    const id = this.place(name, {
+      Transform: { x: 0, y: 0, z: 0 },
+      Material: { color: "#9a8cff", metalness: 0.5 },
+      MeshRenderer: { mesh: "gen:mock" },
+    });
+    return Promise.resolve({ created: id, cost: GENERATE_COST, available: true, seam: null, balance: this.balance });
   }
   undo(): void {
     /* the dev MockCore has no undo stack — a no-op (the real shell undoes over the Channel) */
@@ -363,8 +459,17 @@ class MockClient implements EditorClient {
       return { items, seam: items.length === 0 ? "generate" : undefined };
     });
   }
-  addItem(_id: string, _source: string): Promise<AddResponse> {
-    return Promise.resolve({ created: "e-new", balance: null, seam: null });
+  addItem(id: string, source: string): Promise<AddResponse> {
+    // Place-into-scene (the dev stand-in): instantiate the catalog item as a real entity (so the asset
+    // browser's place ACTUALLY places + the caller selects it — the closed loop). A marketplace source
+    // debits; local is free.
+    const created = this.place(id, { Transform: { x: 0, y: 0, z: 0 }, Material: { color: "#88ccff", metalness: 0.2 } });
+    let balance: number | null = null;
+    if (source === "marketplace") {
+      this.balance = Math.max(0, this.balance - 2);
+      balance = this.balance;
+    }
+    return Promise.resolve({ created, balance, seam: null });
   }
 
   // The dev MockCore has no real document; track a plausible in-memory project so the File menu renders.
@@ -386,7 +491,17 @@ class MockClient implements EditorClient {
     return Promise.resolve({ ...this.project });
   }
   saveProject(): Promise<ProjectInfo> {
-    const p = this.project.path ?? "untitled.mtk";
+    // Honest save (C9): an UNTITLED project has no path — the FileMenu routes its Save → Save As, but guard
+    // here too (never report "saved" on an unnamed doc by inventing "untitled.mtk"). A titled doc re-saves.
+    if (!this.project.path) return this.saveProjectAs();
+    this.project = { ...this.project, dirty: false, error: null };
+    return Promise.resolve({ ...this.project });
+  }
+  saveProjectAs(): Promise<ProjectInfo> {
+    // Save As always assigns a NEW name (the shell's native Save dialog on the `.exe`; a deterministic
+    // stand-in here) — so the title can reflect the real filename afterward.
+    this.saveSeq += 1;
+    const p = this.saveSeq === 1 ? "my-project.mtk" : `my-project-${this.saveSeq}.mtk`;
     this.project = {
       path: p,
       dirty: false,
@@ -394,9 +509,6 @@ class MockClient implements EditorClient {
       error: null,
     };
     return Promise.resolve({ ...this.project });
-  }
-  saveProjectAs(): Promise<ProjectInfo> {
-    return this.saveProject();
   }
 
   play(): Promise<PlayInfo> {
@@ -418,10 +530,12 @@ class MockClient implements EditorClient {
 
 function mockSession(): EditorClient {
   const [uiT, coreT] = inProcessPair();
-  const core = new MockCore(coreT, buildWorld(5000));
+  // The dev/test first-run = the small NAMED sample scene (C10), not the 5k perf fixture. `buildWorld`
+  // stays exported for the perf / selective-re-render tests that seed it explicitly.
+  const core = new MockCore(coreT, sampleScene());
   const client = new DeltaClient(uiT);
   core.emitScene();
-  return new MockClient(client);
+  return new MockClient(client, core);
 }
 
 /** Build the editor session: the real Tauri shell transport inside the WebView, else the dev MockCore. */

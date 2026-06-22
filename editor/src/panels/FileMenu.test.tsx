@@ -12,6 +12,7 @@ import { FileMenu } from "./FileMenu";
 import { projectStore } from "../store/project";
 import { projectionStore } from "../store/projection";
 import { uiStore } from "../store/ui";
+import { toastStore } from "../store/toasts";
 import { fakeClient } from "../transport/test-client";
 import type { ProjectInfo } from "../store/project";
 
@@ -19,6 +20,7 @@ afterEach(() => {
   projectStore.getState().reset();
   projectionStore.getState().reset();
   uiStore.getState().setStatus("");
+  toastStore.getState().reset();
 });
 
 const info = (over: Partial<ProjectInfo> = {}): ProjectInfo => ({
@@ -79,9 +81,9 @@ test("New on a DIRTY project guards: Cancel aborts, Discard proceeds", async () 
   await waitFor(() => expect(newProject).toHaveBeenCalledTimes(1));
 });
 
-test("Save is never guarded (no data loss), and dispatches save_project", async () => {
+test("Save on a TITLED project is never guarded (no data loss) and dispatches save_project", async () => {
   const saveProject = vi.fn(() => Promise.resolve(info({ path: "a.mtk" })));
-  render(<FileMenu client={fakeClient({ projectState: () => Promise.resolve(info({ dirty: true })), saveProject })} />);
+  render(<FileMenu client={fakeClient({ projectState: () => Promise.resolve(info({ path: "a.mtk", dirty: true })), saveProject })} />);
 
   fireEvent.click(screen.getByTestId("fileMenu"));
   await waitFor(() => expect(projectStore.getState().dirty).toBe(true));
@@ -90,6 +92,28 @@ test("Save is never guarded (no data loss), and dispatches save_project", async 
   await waitFor(() => expect(saveProject).toHaveBeenCalledTimes(1));
   expect(screen.queryByTestId("unsavedGuard")).toBeNull(); // never guards a save
   await waitFor(() => expect(projectStore.getState().dirty).toBe(false)); // save cleared dirty
+  expect(uiStore.getState().status).toContain("a.mtk"); // status names the file, not a bare "saved"
+});
+
+test("Save on an UNTITLED project routes to Save As (no 'saved' on an unnamed doc — C9); the title reflects the filename", async () => {
+  const saveProject = vi.fn();
+  const saveProjectAs = vi.fn(() => Promise.resolve(info({ path: "proj/my-project.mtk" })));
+  render(
+    <FileMenu
+      client={fakeClient({ projectState: () => Promise.resolve(info({ path: null, dirty: true })), saveProject, saveProjectAs })}
+    />,
+  );
+
+  fireEvent.click(screen.getByTestId("fileMenu"));
+  await waitFor(() => expect(projectStore.getState().dirty).toBe(true));
+  fireEvent.click(screen.getByTestId("fileSave"));
+
+  // untitled Save → Save As (the dialog assigns a name); plain Save is NOT used on an unnamed doc
+  await waitFor(() => expect(saveProjectAs).toHaveBeenCalledTimes(1));
+  expect(saveProject).not.toHaveBeenCalled();
+  // the title now reflects the real filename, and the status names the file (never "saved" on "untitled")
+  await waitFor(() => expect(projectStore.getState().path).toBe("proj/my-project.mtk"));
+  expect(uiStore.getState().status).toContain("my-project.mtk");
 });
 
 test("Save As dispatches the always-dialog save", async () => {

@@ -15,6 +15,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     walletInfo: () => Promise.resolve({ ok: true, balance: 100, cost: null, message: null }),
     topUp: () => Promise.resolve({ ok: true, balance: 200, cost: 100, message: null }),
     aiEdit: () => Promise.resolve({ ok: true, balance: 198, cost: 2, message: null }),
+    generate: () => Promise.resolve({ created: "gen-1", cost: 10, available: true, seam: null, balance: 90 }),
     undo: vi.fn(),
     entityActions: () => Promise.resolve([]),
     entityDetails: () => Promise.resolve(null),

@@ -7,8 +7,18 @@
 import { useEffect, useState } from "react";
 import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
+import { pushToast, type ToastKind } from "../store/toasts";
 import type { EditorClient } from "../transport/session";
 import type { ActionItem } from "../transport/protocol";
+
+/** Soften the engine-internal phrasings of an "every-no-explained" reason into plain user words (C11).
+ *  Unknown reasons pass through unchanged (the backend already explains them as a sentence). */
+function plainReason(reason: string): string {
+  if (/no unmet requirement to bind/i.test(reason)) {
+    return "nothing to bind yet — this object already has what it needs";
+  }
+  return reason;
+}
 
 export function ContextMenu({
   client,
@@ -36,32 +46,38 @@ export function ContextMenu({
     };
   }, [id, client]);
 
+  // Feedback at the gesture (C11): a transient toast next to the action AND the footer status line.
+  function feedback(msg: string, kind: ToastKind = "info") {
+    setStatus(msg);
+    pushToast(msg, kind);
+  }
+
   function dispatch(a: ActionItem) {
     if (!a.available) return; // a disabled row does NOTHING — no dispatch, no close
     switch (a.action) {
       case "remove":
         client.removeEntity(id);
-        setStatus("removed " + id + " · Ctrl-Z to undo");
+        feedback("removed " + id + " · Ctrl-Z to undo", "info");
         break;
       case "duplicate":
         client.duplicateEntity(id);
-        setStatus("duplicated " + id);
+        feedback("duplicated " + id, "success");
         break;
       case "focus":
         client.focusEntity(id);
-        setStatus("focused " + id);
+        feedback("focused " + id, "info");
         break;
       case "inspect":
         projectionStore.getState().select(id);
-        setStatus("inspecting " + id);
+        feedback("inspecting " + id, "info");
         break;
       case "bind":
         projectionStore.getState().select(id); // opens the reveal
-        setStatus("binding " + id);
+        feedback("binding " + id, "info");
         break;
       case "makedynamic":
         client.makeDynamic(id);
-        setStatus("made " + id + " dynamic");
+        feedback("made " + id + " dynamic", "success");
         break;
       default:
         return; // unknown verb → don't close
@@ -79,6 +95,7 @@ export function ContextMenu({
           data-testid="ctxitem"
           aria-disabled={!a.available}
           onClick={() => dispatch(a)}
+          title={a.available || !a.reason ? undefined : plainReason(a.reason)}
           style={{
             padding: "5px 8px",
             borderRadius: 4,
@@ -86,7 +103,7 @@ export function ContextMenu({
             color: a.available ? "#cde" : "#667",
           }}
         >
-          {a.available || !a.reason ? a.label : a.label + " — " + a.reason}
+          {a.available || !a.reason ? a.label : a.label + " — " + plainReason(a.reason)}
         </div>
       ))}
     </div>

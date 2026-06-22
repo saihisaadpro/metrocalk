@@ -10,13 +10,18 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { DescribeBar } from "./DescribeBar";
 import { projectionStore } from "../store/projection";
 import { uiStore } from "../store/ui";
+import { walletStore } from "../store/wallet";
+import { toastStore } from "../store/toasts";
 import type { EditorClient } from "../transport/session";
-import type { DescribeResponse } from "../transport/protocol";
+import { GENERATE_COST } from "../transport/protocol";
+import type { DescribeResponse, GenerateResponse } from "../transport/protocol";
 import { fakeClient } from "../transport/test-client";
 
 afterEach(() => {
   projectionStore.getState().reset();
   uiStore.getState().setStatus("");
+  walletStore.getState().reset();
+  toastStore.getState().reset();
 });
 
 /** Stub the contract surface; `describe` resolves to the canned tiered result, and we capture the
@@ -109,4 +114,51 @@ test("an empty query is a no-op — no describe call, no status churn", () => {
 
   expect(describe).not.toHaveBeenCalled();
   expect(uiStore.getState().status).toBe("");
+});
+
+// ── C1: the headline fix — no-match dead-ends in an EXPLICIT, actionable Generate button, not a footer ──
+test("no-match → an explicit Generate button (#genBtn) appears, and clicking it generates → places + selects", async () => {
+  const generate = vi.fn(
+    (): Promise<GenerateResponse> => Promise.resolve({ created: "gen-9", cost: 10, available: true, seam: null, balance: 90 }),
+  );
+  const client = fakeClient({ describe: () => Promise.resolve(NO_MATCH), generate });
+  render(<DescribeBar client={client} />);
+
+  fireEvent.change(screen.getByTestId("describe"), { target: { value: "a flying dragon" } });
+  fireEvent.click(screen.getByTestId("describeBtn"));
+
+  // an EXPLICIT, actionable Generate button appears IN THE BAR (not a passive footer line) — the C1 fix
+  const gen = await screen.findByTestId("genBtn");
+  expect(gen.textContent).toMatch(/generate with ai/i);
+  expect(gen.textContent).toContain(`~${GENERATE_COST} tokens`); // cost is legible UP-FRONT (C3)
+
+  // clicking it generates with the typed query → places + SELECTS the result (the loop closes)
+  fireEvent.click(gen);
+  await waitFor(() => expect(generate).toHaveBeenCalledWith("a flying dragon"));
+  await waitFor(() => expect(projectionStore.getState().selectedId).toBe("gen-9"));
+  // the spend is loud: the balance updated + a toast confirms what was bought (C7/C11)
+  expect(walletStore.getState().balance).toBe(90);
+  expect(toastStore.getState().toasts.some((t) => /generated/i.test(t.text))).toBe(true);
+});
+
+test("the generate offer carries NO 'last resort' in-joke jargon (C1 copy)", async () => {
+  render(<DescribeBar client={fakeClient({ describe: () => Promise.resolve(NO_MATCH) })} />);
+  fireEvent.change(screen.getByTestId("describe"), { target: { value: "zzz" } });
+  fireEvent.click(screen.getByTestId("describeBtn"));
+  const panel = await screen.findByTestId("describePanel");
+  expect(panel.textContent).not.toMatch(/last resort/i);
+  // status carries the offer (contains "Generate"), but the actionable control is the button, not the footer
+  expect(uiStore.getState().status).toMatch(/generate/i);
+});
+
+test("Create is DISABLED while the field is empty (no enabled-inert CTA — C5)", () => {
+  const describe = vi.fn();
+  render(<DescribeBar client={stubClient(NO_MATCH, describe)} />);
+  const btn = screen.getByTestId("describeBtn") as HTMLButtonElement;
+  expect(btn.disabled).toBe(true);
+  fireEvent.click(btn);
+  expect(describe).not.toHaveBeenCalled();
+  // typing enables it
+  fireEvent.change(screen.getByTestId("describe"), { target: { value: "x" } });
+  expect((screen.getByTestId("describeBtn") as HTMLButtonElement).disabled).toBe(false);
 });

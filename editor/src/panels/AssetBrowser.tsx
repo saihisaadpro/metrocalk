@@ -8,7 +8,10 @@
 //! list is keyed for virtualization on the min-spec profile.
 
 import { useEffect, useState } from "react";
+import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
+import { walletStore, setBalance } from "../store/wallet";
+import { pushToast } from "../store/toasts";
 import type { EditorClient } from "../transport/session";
 import type { CatalogItem } from "../transport/protocol";
 
@@ -47,10 +50,20 @@ export function AssetBrowser({ client }: { client: EditorClient }) {
   }
 
   async function place(item: CatalogItem) {
+    const before = walletStore.getState().balance;
     const r = await client.addItem(item.id, item.source);
+    if (r.balance != null) setBalance(r.balance); // a marketplace buy debits — keep the wallet legible
     if (r.created) {
-      setStatus(`added ${item.label} · ${item.source}${item.price != null ? ` · −${item.price} tokens` : ""}`);
+      // place + SELECT the result so it's visible/inspectable (C11 — feedback at the gesture, no silent
+      // "added X" with nothing to show). The cost shown is the ACTUAL debit (balance delta), never a
+      // catalog-price guess that could disagree with the real charge.
+      projectionStore.getState().select(r.created);
+      const spent = before != null && r.balance != null ? before - r.balance : null;
+      const cost = spent && spent > 0 ? ` · −${spent} tokens` : "";
+      pushToast(`Added ${item.label} · ${item.source}${cost}`, "success");
+      setStatus(`added ${item.label} · ${item.source}`);
     } else if (r.seam) {
+      pushToast(`${item.label}: ${r.seam}`, "error");
       setStatus(`${item.label}: ${r.seam}`);
     }
   }

@@ -13,7 +13,11 @@ import { useEffect, useState } from "react";
 import { projectStore, projectName, useProjectInfo, type ProjectInfo } from "../store/project";
 import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
+import { pushToast } from "../store/toasts";
 import type { EditorClient } from "../transport/session";
+
+/** The file's display name *with* its extension (so a save names the real file, not a stem). */
+const fileName = (path: string | null): string | null => (path ? (path.split(/[\\/]/).pop() ?? path) : null);
 
 export function FileMenu({ client }: { client: EditorClient }) {
   const { path, dirty, recents } = useProjectInfo();
@@ -60,6 +64,27 @@ export function FileMenu({ client }: { client: EditorClient }) {
     }
   }
 
+  /** Honest Save (C9): an UNTITLED project has no name, so Save → **Save As** (the dialog assigns one);
+   *  afterward the menu title reflects the real filename and the status/toast names the file —
+   *  never "saved" on an unnamed doc. `forceDialog` is the explicit Save As… item. */
+  async function save(forceDialog: boolean) {
+    const info = await (forceDialog || !path ? client.saveProjectAs() : client.saveProject());
+    projectStore.getState().refresh(info);
+    const name = fileName(info.path);
+    if (info.error) {
+      setStatus(info.error);
+      pushToast(info.error, "error");
+    } else if (!name) {
+      // a CANCELLED Save-As dialog returns the unchanged (still-unnamed) state — an honest no-op, never
+      // "saved" on an unnamed doc (C9). (The native dialog is the `.exe` path; the mock always names it.)
+      setStatus("save cancelled");
+    } else {
+      setStatus(`Saved to ${name}`);
+      pushToast(`Saved to ${name}`, "success");
+    }
+    setOpen(false);
+  }
+
   return (
     <div id="fileMenuRoot" style={{ position: "relative", font: "12px ui-monospace, monospace" }}>
       <button
@@ -89,8 +114,8 @@ export function FileMenu({ client }: { client: EditorClient }) {
             <MenuItem id="fileNew" label="New project" onClick={() => guarded(() => client.newProject(), "New", "new project")} />
             <MenuItem id="fileOpen" label="Open…" onClick={() => guarded(() => client.openProject(), "Open", "opened")} />
             <Divider />
-            <MenuItem id="fileSave" label="Save" onClick={() => void run(() => client.saveProject(), "saved")} />
-            <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void run(() => client.saveProjectAs(), "saved")} />
+            <MenuItem id="fileSave" label="Save" onClick={() => void save(false)} />
+            <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void save(true)} />
             <Divider />
             <div style={{ padding: "4px 8px 2px", opacity: 0.5, fontSize: 11 }}>Recent</div>
             <div id="fileRecent" data-testid="fileRecent">

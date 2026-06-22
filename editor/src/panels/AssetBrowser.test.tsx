@@ -50,6 +50,8 @@ test("browses the one catalog grouped by category, and places an item via add_it
   fireEvent.click(items[1]);
   expect(addItem).toHaveBeenCalledWith("acme:Knight", "marketplace");
   await vi.waitFor(() => expect(uiStore.getState().status).toContain("Knight"));
+  // place + SELECT (C11): the placed entity becomes the selection so it's visible/inspectable
+  expect(projectionStore.getState().selectedId).toBe("e42");
 });
 
 test("search reuses the resolver (ranked items), and a no-match surfaces the generate seam", async () => {

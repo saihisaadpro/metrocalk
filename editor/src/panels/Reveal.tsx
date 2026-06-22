@@ -46,7 +46,12 @@ export function Reveal({ client }: { client: EditorClient }) {
   return (
     <div id="reveal" data-testid="reveal" style={{ padding: 12, fontSize: 13 }}>
       {reveal.required.length > 0 && (
-        <div style={{ opacity: 0.7, marginBottom: 6 }}>requires {reveal.required.join(", ")}</div>
+        <div
+          style={{ opacity: 0.7, marginBottom: 6 }}
+          title={`This object needs a source of ${reveal.required.join(", ")} — bind it to one of the matches below.`}
+        >
+          Needs {reveal.required.join(", ")} — pick a match to bind
+        </div>
       )}
       {reveal.bound.length > 0 && (
         <div style={{ marginBottom: 8 }}>
@@ -65,9 +70,13 @@ export function Reveal({ client }: { client: EditorClient }) {
           data-testid="candidate"
           data-id={c.id}
           onClick={() => client.bind(id, "tracks", c.id)}
+          title={`Click to bind — this object will track ${c.name} (match ${c.affinity} of 100)`}
           style={{ display: "block", width: "100%", textAlign: "left", margin: "2px 0", padding: "4px 6px", background: "#1c2030", color: "#cde", border: "1px solid #2a3550", borderRadius: 4, cursor: "pointer" }}
         >
-          {c.name} <span style={{ opacity: 0.5 }}>· affinity {c.affinity}</span>
+          {c.name}{" "}
+          <span style={{ opacity: 0.5 }} title="How well this target fits (higher = better match)">
+            · match {c.affinity}
+          </span>
         </button>
       ))}
       {reveal.greyed.map((g) => (

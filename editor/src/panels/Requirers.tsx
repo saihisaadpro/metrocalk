@@ -46,7 +46,13 @@ export function Requirers() {
             >
               {e.name}
               {accepts != null && (
-                <span style={{ opacity: 0.55, fontSize: 11 }}> · requires {String(accepts)}</span>
+                <span
+                  style={{ opacity: 0.55, fontSize: 11 }}
+                  title={`Needs a source of ${String(accepts)} — click to see compatible targets to bind.`}
+                >
+                  {" "}
+                  · needs {String(accepts)}
+                </span>
               )}
             </div>
           );
