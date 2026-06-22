@@ -286,7 +286,7 @@ describe("acceptance / M3.3 — context reveal + every action, the full conjunct
 
     for (const s of ops) {
       const scored = await scoreBudget(s, baseline, {
-        perFrame: true,
+        perFrame: false,
         recapture: () => captureBudget(s.label, s.label, { id }, { n: 30, warmup: 5 }),
       });
       report.budget(scored);

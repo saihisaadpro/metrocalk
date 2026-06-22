@@ -80,6 +80,12 @@ export const scaffold = {
     if (!(await input.isExisting())) return false;
     await input.setValue(String(value));
     await browser.keys(["Enter"]);
+    // Blur the field after committing so a follow-on Ctrl-Z undoes the SCENE, not the input's text (the
+    // React editor deliberately bails Ctrl-Z while a text field is focused — don't hijack text undo).
+    await browser.execute(() => {
+      const el = document.activeElement;
+      if (el && typeof el.blur === "function") el.blur();
+    });
     return true;
   },
 
@@ -312,6 +318,29 @@ const reactDeltas = {
     await (await css("#rustier")).click();
     const apply = await css("#rustierApply");
     if (await apply.isExisting()) await apply.click();
+  },
+
+  // ── add-palette → the React AssetBrowser (M10.2): the React UI has no separate `#palette` modal — the
+  // browse/search/place/generate-fallthrough catalog surface IS the always-visible AssetBrowser
+  // (`#assetbrowser` · `#assetSearch` · `[data-testid=asset-item]` · `[data-testid=asset-seam]`). Map the
+  // scaffold palette verbs onto it so the add-palette spec re-greens by page-object swap, not a rewrite. ──
+  async openPalette() {
+    // always visible — focus the search so a follow-on type lands there (no modal to open)
+    const s = await css("#assetSearch");
+    if (await s.isExisting()) await s.click();
+  },
+  paletteVisible: () => visible("#assetbrowser"),
+  paletteItems: () => all('[data-testid="asset-item"]'),
+  async searchPalette(q) {
+    await (await css("#assetSearch")).setValue(q);
+  },
+  paletteGenerateOffer: () => css('[data-testid="asset-seam"]'),
+  async closePalette() {
+    /* nothing to close — the browser is a persistent panel */
+  },
+  async pickPaletteItem(i = 0) {
+    const items = await all('[data-testid="asset-item"]');
+    await items[i].click();
   },
 };
 

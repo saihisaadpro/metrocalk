@@ -54,7 +54,7 @@ describe("acceptance / offline — local paths work network-free; paid tiers deg
     expect(functional).toBe(true);
 
     // The attach panel populates → the created entity is a real, bindable HealthBar (read back, not the click).
-    await browser.waitUntil(async () => (await ui.revealText()).includes("requires"), {
+    await browser.waitUntil(async () => (await ui.revealCandidates()).length > 0, {
       timeout: 10000,
       timeoutMsg: "the locally-described entity's attach panel never populated",
     });
@@ -82,7 +82,7 @@ describe("acceptance / offline — local paths work network-free; paid tiers deg
   it("bind-by-intent works offline and is undoable (read back from the projection)", async () => {
     await clearConsole();
     await ui.selectRequirer(0);
-    await browser.waitUntil(async () => (await ui.revealText()).includes("requires"), {
+    await browser.waitUntil(async () => (await ui.revealCandidates()).length > 0, {
       timeout: 10000,
       timeoutMsg: "reveal never populated (offline bind setup)",
     });
@@ -364,7 +364,7 @@ describe("acceptance / offline — local paths work network-free; paid tiers deg
 
     for (const s of ops) {
       const scored = await scoreBudget(s, baseline, {
-        perFrame: true,
+        perFrame: false,
         recapture: () =>
           captureBudget(
             s.label,

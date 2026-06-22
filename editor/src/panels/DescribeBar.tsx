@@ -38,13 +38,22 @@ export function DescribeBar({ client }: { client: EditorClient }) {
       const r = await client.describe(q);
       if (r.balance != null) setBalance(r.balance);
 
-      // MATCH → place + select the result, right where the action started (the loop closes here).
+      // MATCH → place + select the result, right where the action started (the loop closes here). The
+      // status carries the stable TIER tag the prompt-40 E2E keys on (`local:` / `marketplace:` · `bought` ·
+      // `tokens`); the toast is the friendly UX (M10.10) — both, not footer-only.
       if (r.created) {
-        const cost = r.source === "marketplace" && r.price != null ? ` · −${r.price} tokens` : "";
         projectionStore.getState().select(r.created);
         setQuery("");
-        pushToast(`Created ${r.kind ?? "object"} · ${r.source ?? "local"}${cost}`, "success");
-        setStatus(`created ${r.kind ?? "entity"} · ${r.created} · ${r.source ?? "local"}`);
+        const kind = r.kind ?? "entity";
+        if (r.source === "marketplace") {
+          const cost = r.price != null ? ` · −${r.price} tokens` : "";
+          const left = r.balance != null ? ` · ${r.balance} left` : "";
+          setStatus(`marketplace: bought ${kind} · ${r.created}${cost}${left}`);
+          pushToast(`Bought ${r.kind ?? "object"} · marketplace${cost}`, "success");
+        } else {
+          setStatus(`local: created ${kind} · ${r.created} (free)`);
+          pushToast(`Created ${r.kind ?? "object"} · local`, "success");
+        }
         return;
       }
 

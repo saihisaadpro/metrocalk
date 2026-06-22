@@ -139,6 +139,20 @@ describe("acceptance / north-star #1 — bind-by-intent, the full conjunction", 
 
     const ops = [];
     if (rid) ops.push(await captureBudget("reveal_targets", "reveal_targets", { id: rid }, { n: 30, warmup: 8 }));
+    // commit (submit_edit) — the UI-side edit-submit cost (IPC + enqueue); a real setField on the requirer's
+    // Transform.x, a fresh clientOpId per sample so the optimistic-echo path is exercised, not deduped.
+    if (rid) {
+      let bench = 0;
+      const commitArgs = () => ({
+        tx: {
+          clientOpId: `bench-${bench++}`,
+          label: "bench-set",
+          patches: [{ op: "replace", path: `/entities/${rid}/components/Transform/x`, value: 1.0 }],
+          intent: { kind: "setField", id: rid, component: "Transform", field: "x", value: 1.0 },
+        },
+      });
+      ops.push(await captureBudget("submit_edit", "submit_edit", commitArgs, { n: 30, warmup: 8 }));
+    }
     ops.push(await captureBudget("viewport_pick", "viewport_pick", { x: 0.5, y: 0.5 }, { n: 30, warmup: 8 }));
     ops.push(await captureBudget("wallet_info", "wallet_info", {}, { n: 30, warmup: 8 }));
 

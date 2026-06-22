@@ -8,7 +8,8 @@ export function Rejections() {
   const rejections = useRejections();
   if (rejections.length === 0) return null;
   return (
-    <div style={{ position: "fixed", right: 12, bottom: 12, maxWidth: 360, zIndex: 20 }}>
+    // Stable `#reject` id — the "every 'no' explained" surface the prompt-40 E2E reads (ADR-010).
+    <div id="reject" data-testid="reject" style={{ position: "fixed", right: 12, bottom: 12, maxWidth: 360, zIndex: 20 }}>
       {rejections.map((r) => (
         <div
           key={r.clientOpId}
@@ -22,7 +23,8 @@ export function Rejections() {
             font: "12px ui-monospace, monospace",
           }}
         >
-          <strong>bind rejected</strong> — {r.reason}
+          {/* generic — the surface handles bind AND field-edit rejections (the reason explains which) */}
+          <strong>rejected</strong> — {r.reason}
           <button
             onClick={() => projectionStore.getState().dismissRejection(r.clientOpId)}
             style={{ marginLeft: 8, background: "transparent", color: "#ffd", border: "none", cursor: "pointer" }}

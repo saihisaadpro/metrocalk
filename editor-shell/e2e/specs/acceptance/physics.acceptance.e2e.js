@@ -444,7 +444,7 @@ describe("acceptance / M8 physics — drop · transport · debugger · determini
 
     for (const s of ops) {
       const scored = await scoreBudget(s, baseline, {
-        perFrame: true,
+        perFrame: false,
         recapture: () => captureBudget(s.label, s.label, {}, { n: 30, warmup: 5 }),
       });
       report.budget(scored);

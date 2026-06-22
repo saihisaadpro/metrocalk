@@ -209,7 +209,7 @@ describe("acceptance / negative + edge — rejection-as-UX, refuse-when-broke, i
 
     // Pick a requirer (a HealthBar) and reveal its ranked compatible targets through the command.
     await ui.selectRequirer(0);
-    await browser.waitUntil(async () => (await ui.revealText()).includes("requires"), {
+    await browser.waitUntil(async () => (await ui.revealCandidates()).length > 0, {
       timeout: 10000,
       timeoutMsg: "the requirer's reveal never populated",
     });

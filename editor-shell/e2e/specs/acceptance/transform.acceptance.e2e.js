@@ -342,7 +342,7 @@ describe("acceptance / M9 transform — gizmo (G1) · part edit (G2) · solver (
 
     for (const s of ops) {
       const scored = await scoreBudget(s, baseline, {
-        perFrame: true,
+        perFrame: false,
         recapture: () =>
           captureBudget(
             s.label,
