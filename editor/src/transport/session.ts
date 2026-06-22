@@ -8,12 +8,14 @@
 
 import { projectionStore } from "../store/projection";
 import type {
+  DescribeResponse,
   EditIntent,
   EditTx,
   EntityProjection,
   Json,
   JsonPatch,
   ProjectionDelta,
+  RevealResponse,
 } from "./protocol";
 import { DeltaClient } from "./client";
 import { MockCore } from "./mock-core";
@@ -27,6 +29,10 @@ export interface EditorClient {
   bind(from: string, rel: string, to: string): string;
   /** Subscribe to ephemeral (preview/presence) frames — a no-op on the desktop shell for now. */
   onEphemeral(cb: (data: Json) => void): () => void;
+  /** Reveal the ranked compatible bind targets (+ greyed-with-reason, + bound) for an entity (north-star #1). */
+  revealTargets(id: string): Promise<RevealResponse>;
+  /** Describe-to-create: resolve a free-text query (local → marketplace → generate seam). */
+  describe(query: string): Promise<DescribeResponse>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -90,6 +96,14 @@ class TauriClient implements EditorClient {
   onEphemeral(): () => void {
     return () => {};
   }
+
+  revealTargets(id: string): Promise<RevealResponse> {
+    return this.core.invoke<RevealResponse>("reveal_targets", { id });
+  }
+
+  describe(query: string): Promise<DescribeResponse> {
+    return this.core.invoke<DescribeResponse>("describe", { query });
+  }
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
@@ -113,12 +127,48 @@ function buildWorld(n: number): EntityProjection[] {
   return out;
 }
 
+/** The dev/test client: a framed `DeltaClient` for edits + minimal store-derived query mocks so
+ *  `npm run dev` still renders the reveal/describe surfaces without a live core. (Vitest tests inject
+ *  their own stubbed `EditorClient`; the real reveal/describe come from the shell commands under Tauri.) */
+class MockClient implements EditorClient {
+  constructor(private readonly inner: DeltaClient) {}
+  setField(id: string, component: string, field: string, value: Json): string {
+    return this.inner.setField(id, component, field, value);
+  }
+  bind(from: string, rel: string, to: string): string {
+    return this.inner.bind(from, rel, to);
+  }
+  onEphemeral(cb: (data: Json) => void): () => void {
+    return this.inner.onEphemeral(cb);
+  }
+  revealTargets(id: string): Promise<RevealResponse> {
+    const s = projectionStore.getState();
+    const sel = s.displayed[id];
+    const need = (sel?.components.Socket?.accepts as string | undefined) ?? null;
+    const providers = s.order
+      .map((eid) => s.displayed[eid])
+      .filter((e): e is EntityProjection => !!e && e.id !== id && "Provides" in e.components);
+    const compatible = providers
+      .filter((e) => !need || e.components.Provides.capability === need)
+      .slice(0, 8)
+      .map((e, i) => ({ id: e.id, name: e.name, distance: i, affinity: 100 - i }));
+    const greyed = providers
+      .filter((e) => need && e.components.Provides.capability !== need)
+      .slice(0, 3)
+      .map((e) => ({ id: e.id, name: e.name, reason: `doesn't provide ${need}` }));
+    return Promise.resolve({ required: need ? [need] : [], compatible, greyed, bound: [] });
+  }
+  describe(_query: string): Promise<DescribeResponse> {
+    return Promise.resolve({ created: null, kind: null, source: null, price: null, seam: "generate", balance: null });
+  }
+}
+
 function mockSession(): EditorClient {
   const [uiT, coreT] = inProcessPair();
   const core = new MockCore(coreT, buildWorld(5000));
   const client = new DeltaClient(uiT);
   core.emitScene();
-  return client;
+  return new MockClient(client);
 }
 
 /** Build the editor session: the real Tauri shell transport inside the WebView, else the dev MockCore. */

@@ -8,6 +8,7 @@ import { createSession, type EditorClient } from "../transport/session";
 import { shouldDeferToNative, type Rect } from "../input/ownership";
 import { Hierarchy } from "../panels/Hierarchy";
 import { Rejections } from "../panels/Rejections";
+import { Reveal } from "../panels/Reveal";
 import { Inspector } from "../inspector/Inspector";
 import { BindingGraph } from "../graph/BindingGraph";
 
@@ -49,7 +50,10 @@ export function App() {
         </div>
         <div style={{ borderLeft: "1px solid #2a2d35", overflowY: "auto", display: "flex", flexDirection: "column" }}>
           <Inspector client={client} />
-          <div style={{ borderTop: "1px solid #2a2d35", flex: 1, minHeight: 260 }}>
+          <div style={{ borderTop: "1px solid #2a2d35" }}>
+            <Reveal client={client} />
+          </div>
+          <div style={{ borderTop: "1px solid #2a2d35", flex: 1, minHeight: 220 }}>
             <BindingGraph />
           </div>
         </div>

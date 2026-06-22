@@ -64,6 +64,44 @@ export interface EditTx {
   intent: EditIntent;
 }
 
+// ── shell query-command results (M10.1) — mirror the Rust serde shapes in editor-shell/src-tauri ───────
+
+/** A ranked compatible target the selection can bind to (north-star #1). */
+export interface Candidate {
+  id: string;
+  name: string;
+  distance: number;
+  affinity: number;
+}
+/** An incompatible target, greyed WITH the registry-derived reason ("every 'no' explained"). */
+export interface Greyed {
+  id: string;
+  name: string;
+  reason: string;
+}
+/** An existing outgoing binding of the selection ("tracking …" after a bind / reload). */
+export interface Bound {
+  id: string;
+  name: string;
+  kind: string;
+}
+/** `reveal_targets(id)` — the ranked reveal for a selected entity. */
+export interface RevealResponse {
+  required: string[];
+  compatible: Candidate[];
+  greyed: Greyed[];
+  bound: Bound[];
+}
+/** `describe(query)` — the tiered describe-to-create result (local → marketplace → generate seam). */
+export interface DescribeResponse {
+  created: string | null;
+  kind: string | null;
+  source: string | null;
+  price: number | null;
+  seam: string | null;
+  balance: number | null;
+}
+
 const te = new TextEncoder();
 const td = new TextDecoder();
 export const encodeJson = (v: unknown): Uint8Array => te.encode(JSON.stringify(v));
