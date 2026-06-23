@@ -7,7 +7,14 @@ import { browser, $, $$, expect } from "@wdio/globals";
 
 const boundCount = async () => (await $$("#reveal .boundrow")).length;
 
-describe("Metrocalk editor — north-star #1 live", () => {
+// LEGACY scaffold smoke (raw scaffold selectors — `#undo` button, modal `#palette`, `#focusbanner`, the
+// M8/M9 scaffold ids — NOT the swappable page-object). It is fully SUPERSEDED by the `specs/acceptance/*`
+// page-object specs, which run on BOTH UIs. The packaged `.exe` now serves React (`frontendDist`→React), so
+// this can only pass against a scaffold build — skip it on the React gate (the acceptance specs are the
+// UI-correct successor: north-star-1 · core-workflows · context-actions · physics · transform).
+const d = process.env.MTK_UI === "react" ? describe.skip : describe;
+
+d("Metrocalk editor — north-star #1 live", () => {
   it("launches, composites, and connects to /core (5000 entities)", async () => {
     await browser.waitUntil(async () => /\d+ entities/.test(await $("#count").getText()), {
       timeout: 60000,

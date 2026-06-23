@@ -182,6 +182,63 @@ export interface AddResponse {
   seam: string | null;
 }
 
+// ── M8 physics surface (the React PhysicsPanel; mirrors the Rust serde shapes in editor-shell) ──────────
+
+/** `sim_timeline` / `sim_scrub` — returned to JS as a POSITIONAL 5-tuple, not an object:
+ *  `[frame, maxFrame, running, overlaysOn, bodies]`. */
+export type TimelineTuple = [number, number, boolean, boolean, number];
+
+/** `import_interchange(format, source)` — the URDF/USD import outcome (snake_case serde). */
+export interface ImportResult {
+  ok: boolean;
+  format: string;
+  bodies: number;
+  joints: number;
+  meters_per_unit: number;
+  kilograms_per_unit: number;
+  reconciled: boolean;
+  notes: string[];
+  error: string | null;
+}
+
+/** `physics_contacts()` — one EXPLAINED contact row ("debug by looking"): `explain` names the penetration
+ *  + normal impulse; `depth`/`friction_saturated` are the structured fields (snake_case serde). */
+export interface ContactInfo {
+  explain: string;
+  depth: number;
+  friction_saturated: boolean;
+}
+
+/** `physics_check(id)` — a collider-intelligence warning (camelCase serde): each is EXPLAINED (`message`)
+ *  and carries a one-click fix (`fixLabel` + `fixAction` the shell maps back through `physics_fix`). */
+export interface PhysicsWarning {
+  issue: "no-collider" | "concave-dynamic" | "bad-scale" | "bad-mass";
+  message: string;
+  fixLabel: string;
+  fixAction: string;
+}
+
+// ── M9 transform surface (the React TransformPanel) ─────────────────────────────────────────────────────
+
+/** `snap_query(id, radius)` — a ranked snap candidate, each with an explained `why` (camelCase serde). */
+export interface SnapHit {
+  id: string;
+  kind: string;
+  x: number;
+  y: number;
+  z: number;
+  distance: number;
+  why: string;
+}
+
+/** `apply_constraint` / `placement_sentence` — solve-or-explain: `ok` + the compiled `intents`, or a
+ *  `reason` when refused (every "no" explained, camelCase serde). */
+export interface SolveResult {
+  ok: boolean;
+  reason: string | null;
+  intents: string[];
+}
+
 const te = new TextEncoder();
 const td = new TextDecoder();
 export const encodeJson = (v: unknown): Uint8Array => te.encode(JSON.stringify(v));

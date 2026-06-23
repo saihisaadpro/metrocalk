@@ -309,6 +309,10 @@ export const scaffold = {
 // acceptance dimensions never change — that's the swappable-layer point (prompt-40 d9 / M10.1 d7).
 const reactDeltas = {
   name: "react (/editor)",
+  // The React catalog is the always-visible AssetBrowser — a PERSISTENT panel, not a closeable modal like
+  // the scaffold's `#palette`. Specs that assert "the palette closes on esc" guard on this flag (a
+  // behavioral difference no page-object selector swap can paper over — the panel is meant to stay open).
+  persistentCatalog: true,
   // React undo = a global Ctrl-Z keydown (no `#undo` button in the React chrome).
   async undoButton() {
     await browser.keys(["Control", "z"]);

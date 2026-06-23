@@ -94,6 +94,29 @@ export function DescribeBar({ client }: { client: EditorClient }) {
     if (r.balance != null) setBalance(r.balance);
     if (r.created) {
       projectionStore.getState().select(r.created);
+      void client.gizmoSelect(r.created).catch(() => {}); // set the ENGINE selection too (gizmo/inspector track it)
+      // The generate RESERVES a hold up front, then SETTLES the real charge asynchronously when the generation
+      // completes (the engine-thread `GenerateComplete` → `settle`). `wallet_info`'s `balance` is holds-blind,
+      // so the up-front response (and the first poll) still report the PRE-charge balance; the balance only
+      // drops once the settle lands. Briefly poll until it does so the wallet reflects the real charge (M7 /
+      // the legible-cost contract), stopping the moment it changes (so it can't contend with the next
+      // interaction's budget). It only writes the wallet when the authoritative balance drops BELOW the
+      // reserved (response) balance — i.e. an actual settle — so it never overwrites the response's value with
+      // an unrelated read. NOTE (owed): the right fix is a server→client balance signal ON settle (the mesh
+      // already streams in over the same Channel) — this poll is a localized band-aid for its absence.
+      const reserved = r.balance;
+      if (reserved != null) {
+        void (async () => {
+          for (let i = 0; i < 8; i++) {
+            await new Promise((res) => setTimeout(res, 300));
+            const w = await client.walletInfo().catch(() => null);
+            if (w && w.balance < reserved) {
+              setBalance(w.balance); // the metered charge settled
+              break;
+            }
+          }
+        })();
+      }
       setQuery("");
       setPanel(null);
       const cost = r.cost != null ? ` · −${r.cost} tokens` : "";

@@ -24,10 +24,13 @@ export function ContextMenu({
   client,
   id,
   onClose,
+  onFocus,
 }: {
   client: EditorClient;
   id: string;
   onClose: () => void;
+  /** M3.3 focus: after framing the entity, hand the framed camera distance up so App raises the banner. */
+  onFocus?: (id: string, dist: number) => void;
 }) {
   const [actions, setActions] = useState<ActionItem[]>([]);
 
@@ -65,14 +68,21 @@ export function ContextMenu({
         break;
       case "focus":
         client.focusEntity(id);
+        // Read the framed camera distance back from the live engine → App shows the banner with data-dist.
+        void client
+          .focusDebug()
+          .then(([dist]) => onFocus?.(id, dist))
+          .catch(() => onFocus?.(id, 0));
         feedback("focused " + id, "info");
         break;
       case "inspect":
         projectionStore.getState().select(id);
+        void client.gizmoSelect(id).catch(() => {}); // keep the ENGINE selection in sync (TransformPanel reads it)
         feedback("inspecting " + id, "info");
         break;
       case "bind":
         projectionStore.getState().select(id); // opens the reveal
+        void client.gizmoSelect(id).catch(() => {}); // keep the ENGINE selection in sync
         feedback("binding " + id, "info");
         break;
       case "makedynamic":

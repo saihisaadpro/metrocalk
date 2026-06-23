@@ -31,6 +31,9 @@ import { EmptyState } from "../panels/EmptyState";
 import { AiEditPanel } from "../panels/AiEditPanel";
 import { Inspector } from "../inspector/Inspector";
 import { BindingGraph } from "../graph/BindingGraph";
+import { PhysicsPanel } from "../panels/PhysicsPanel";
+import { TransformPanel } from "../panels/TransformPanel";
+import { FocusBanner } from "../panels/FocusBanner";
 
 /** Build the editor session once: the REAL Tauri shell transport inside the packaged `.exe` (the live
  *  `/core` over the `connect` Channel), else the in-process MockCore for `npm run dev` / tests. */
@@ -103,8 +106,13 @@ export function App() {
   const native = isTauri(); // inside the packaged .exe the viewport is the real wgpu region (composite)
   // The M3.3 right-click context menu, opened for an entity at a cursor position.
   const [ctx, setCtx] = useState<{ id: string; x: number; y: number } | null>(null);
+  // M3.3 focus mode — the framed entity + its camera distance (read from `focus_debug`); drives the banner.
+  const [focused, setFocused] = useState<{ id: string; dist: number } | null>(null);
   // Tracks a right-press for the orbit-vs-context-menu movement threshold (the scaffold's disambiguation).
   const rightDrag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
+  // M9 gizmo handle-drag: set by a left-press that HIT a gizmo handle (so the click doesn't re-pick + the
+  // release commits). A ref (not state) so the click/up guards read it synchronously off the hot path.
+  const gizmoHit = useRef(false);
 
   const playing = usePlaying();
   const paused = usePaused();
@@ -139,18 +147,32 @@ export function App() {
   // "Esc … to stop"). A discrete event — never the per-frame hot path (invariant 4).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const el = document.activeElement as HTMLElement | null;
+      const editing = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
         // Don't hijack TEXT undo while the user is typing in a field — only undo the SCENE otherwise.
-        const el = document.activeElement as HTMLElement | null;
-        const editing = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
         if (editing) return;
         e.preventDefault();
         client.undo();
         setStatus("undo");
       }
+      // M9 gizmo mode — the universal W/E/R game-editor shortcut (sticky tool state; guarded off text fields
+      // + modifier chords so it never fires while editing or during Ctrl-Z). A discrete command, not per-frame.
+      const k = e.key.toLowerCase();
+      if ((k === "w" || k === "e" || k === "r") && !e.ctrlKey && !e.metaKey && !e.altKey && !editing) {
+        client.gizmoMode(k === "w" ? "translate" : k === "e" ? "rotate" : "scale");
+        setStatus(k === "w" ? "move (W)" : k === "e" ? "rotate (E)" : "scale (R)");
+      }
       if (e.key === "Escape") {
         if (ctx) {
           setCtx(null);
+          return;
+        }
+        if (focused) {
+          // Exit focus mode: restore the camera + drop the dim flag, clear the banner, emit the stable status.
+          client.unfocus();
+          setFocused(null);
+          setStatus("focus cleared");
           return;
         }
         if (drawer) {
@@ -163,13 +185,16 @@ export function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, ctx, drawer, playing]);
+  }, [client, ctx, drawer, playing, focused]);
 
   function stopPlay() {
-    void client.stop().then((info) => {
-      playStore.getState().refresh(info);
-      setStatus("⏹ stopped");
-    });
+    void client
+      .stop()
+      .then((info) => {
+        playStore.getState().refresh(info);
+        setStatus("⏹ stopped");
+      })
+      .catch((e) => console.error("stop failed", e));
   }
 
   // Edit chrome is de-emphasised while playing (the mode switch is felt in peripheral vision; edits are
@@ -198,6 +223,8 @@ export function App() {
       <div style={{ borderTop: "1px solid #2a2d35" }}>
         <Reveal client={client} />
       </div>
+      <TransformPanel client={client} />
+      <PhysicsPanel client={client} />
       <div style={{ borderTop: "1px solid #2a2d35", flex: 1, minHeight: 220 }}>
         <BindingGraph />
       </div>
@@ -236,9 +263,31 @@ export function App() {
             if (e.button === 2) {
               rightDrag.current = { x: e.clientX, y: e.clientY, moved: false };
               client.dragStart(); // native orbit begins; the render loop polls the cursor (0 IPC/frame)
+              return;
+            }
+            if (e.button === 0) {
+              // M9 gizmo handle-grab: only when an entity is selected; if a handle is HIT the render loop
+              // drags it natively (0 IPC/frame, like orbit) and the release commits. A miss falls through to
+              // the normal pick. The hit flag resolves async, so a WebDriver synthetic click (which fires
+              // immediately) still picks normally — the suppression is for real human-timed drags.
+              gizmoHit.current = false;
+              if (projectionStore.getState().selectedId) {
+                const r = e.currentTarget.getBoundingClientRect();
+                const nx = (e.clientX - r.left) / Math.max(1, r.width);
+                const ny = (e.clientY - r.top) / Math.max(1, r.height);
+                void client
+                  .gizmoPickDrag(nx, ny, e.ctrlKey || e.metaKey)
+                  .then((hit) => (gizmoHit.current = hit))
+                  .catch(() => {});
+              }
             }
           }}
           onClick={(e) => {
+            // A left-press that grabbed a gizmo handle is a DRAG, not a pick — don't re-select.
+            if (gizmoHit.current) {
+              gizmoHit.current = false;
+              return;
+            }
             // Left-click pick on the click event (fires reliably under WebDriver `element.click()`, unlike a
             // synthesized pointerdown). Pick at the click's NORMALIZED viewport coords (the command rays the
             // camera — no OS-cursor dependency) → select + a stable "picked"/"nothing here" status.
@@ -263,10 +312,18 @@ export function App() {
           }}
           onPointerUp={(e) => {
             if (e.button === 2 && rightDrag.current) client.dragEnd();
+            if (e.button === 0 && gizmoHit.current) client.gizmoDragEnd(); // commit the gizmo move (one tx)
           }}
           onWheel={(e) => client.zoom(e.deltaY * 0.04)}
           onContextMenu={(e) => {
             e.preventDefault();
+            // No context actions while Playing — editing is gated off in Play (and it would let a user open
+            // Focus mid-Play, where Esc would then clear focus instead of stopping Play, contradicting the
+            // on-stage badge's "Esc to stop"). The badge's promise stays honest.
+            if (playing) {
+              rightDrag.current = null;
+              return;
+            }
             // a right-DRAG was an orbit, not a menu request — suppress the menu (movement threshold)
             const orbited = rightDrag.current?.moved;
             rightDrag.current = null;
@@ -329,9 +386,25 @@ export function App() {
         <>
           <div onClick={() => setCtx(null)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />
           <div style={{ position: "fixed", left: ctx.x, top: ctx.y, zIndex: 100 }}>
-            <ContextMenu client={client} id={ctx.id} onClose={() => setCtx(null)} />
+            <ContextMenu
+              client={client}
+              id={ctx.id}
+              onClose={() => setCtx(null)}
+              onFocus={(id, dist) => setFocused({ id, dist })}
+            />
           </div>
         </>
+      )}
+      {focused && (
+        <FocusBanner
+          id={focused.id}
+          dist={focused.dist}
+          onClear={() => {
+            client.unfocus();
+            setFocused(null);
+            setStatus("focus cleared");
+          }}
+        />
       )}
       <StatusBar />
       <Rejections />

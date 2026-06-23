@@ -3822,6 +3822,18 @@ fn gizmo_select(state: State<AppState>, id: String) -> bool {
     true
 }
 
+/// M9 (React port) — the currently gizmo-selected entity's loro-key, so a React inspector button can act on
+/// the SAME selection the live engine holds (exactly as the scaffold's module-level `selected` JS var did:
+/// the scaffold set both together in `select()`, but the React panel learns the selection from the engine —
+/// robust whether selection was set by a viewport pick or, in the acceptance harness, a direct
+/// `gizmo_select`). `None` when nothing is selected.
+#[tauri::command]
+fn gizmo_selected(state: State<AppState>) -> Option<String> {
+    ipc();
+    let st = state.shared.lock().unwrap();
+    st.selected.and_then(|i| st.ids.get(i).cloned())
+}
+
 /// M9.1 (LIVE path) — pick a gizmo handle under the normalized `(x,y)` cursor + start a drag. The render
 /// loop then drives the per-frame move from the OS cursor (0 IPC). Returns whether a handle was hit (so
 /// JS knows to NOT fall through to select/orbit).
@@ -4636,6 +4648,7 @@ fn main() {
             gizmo_space_toggle,
             gizmo_pivot_toggle,
             gizmo_select,
+            gizmo_selected,
             gizmo_pick_drag,
             gizmo_grab,
             gizmo_set_target,

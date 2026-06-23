@@ -14,6 +14,7 @@ import type {
   AddResponse,
   CatalogItem,
   CatalogSearch,
+  ContactInfo,
   DescribeResponse,
   EconResponse,
   EditIntent,
@@ -21,11 +22,16 @@ import type {
   EntityDetails,
   EntityProjection,
   GenerateResponse,
+  ImportResult,
   Json,
   JsonPatch,
+  PhysicsWarning,
   ProjectionDelta,
   ProjectionOp,
   RevealResponse,
+  SnapHit,
+  SolveResult,
+  TimelineTuple,
 } from "./protocol";
 import { GENERATE_COST } from "./protocol";
 import { DeltaClient } from "./client";
@@ -67,6 +73,70 @@ export interface EditorClient {
   focusEntity(id: string): void;
   /** M8.3: turn a dead mesh into a correct dynamic body — one undoable transaction. */
   makeDynamic(id: string): Promise<boolean>;
+
+  // ── M8 physics (the React PhysicsPanel; the sim runs natively off the JS hot path — invariant 4) ─────
+  /** Drop / spawn a dynamic body at a world position → the new body's id (or null). */
+  spawnBody(x: number, y: number, z: number): Promise<string | null>;
+  /** Pause / resume the deterministic sim (the M8 run flag). */
+  setSimRunning(run: boolean): void;
+  /** The "debug by looking" contact-overlay flag. */
+  simOverlay(on: boolean): void;
+  /** The sim timeline `[frame, maxFrame, running, overlaysOn, bodies]` — drives the transport chrome. */
+  simTimeline(): Promise<TimelineTuple>;
+  /** Scrub the deterministic replay to a frame (lands EXACTLY there + pauses). */
+  simScrub(frame: number): Promise<TimelineTuple>;
+  /** Shove the selected body with an impulse → applied (false if it isn't a body). */
+  simShove(id: string, impulse: [number, number, number]): Promise<boolean>;
+  /** The explained contact rows (the debugger overlay's "why"). */
+  physicsContacts(): Promise<ContactInfo[]>;
+  /** The collider-intelligence warnings for a body — each explained + a one-click fix. */
+  physicsCheck(id: string): Promise<PhysicsWarning[]>;
+  /** Apply a one-click physics fix (the `fixAction` from a warning). */
+  physicsFix(id: string, action: string): Promise<boolean>;
+  /** Import a URDF/USD interchange document → bodies + explained reconciliation notes. */
+  importInterchange(format: string, source: string): Promise<ImportResult>;
+
+  // ── M9 transform / gizmo / part / snap (the React TransformPanel) ───────────────────────────────────
+  /** Set the gizmo mode (the W/E/R shortcut) — sticky tool state on the shared gizmo. */
+  gizmoMode(mode: "translate" | "rotate" | "scale"): void;
+  /** Select an entity for the gizmo (so an inspector button can act on it) → found. */
+  gizmoSelect(id: string): Promise<boolean>;
+  /** The currently gizmo-selected entity's id (so a button acts on the LIVE engine selection) — or null. */
+  gizmoSelected(): Promise<string | null>;
+  /** The gizmo HUD read `[mode, hasSel, dragging, space, pivot]`. */
+  gizmoDebug(): Promise<[string, boolean, boolean, string, string]>;
+  /** Toggle world/local space → the new label. */
+  gizmoSpaceToggle(): Promise<string>;
+  /** Toggle origin/center pivot → the new label. */
+  gizmoPivotToggle(): Promise<string>;
+  /** Begin a gizmo handle drag at normalized cursor coords → hit (so JS knows not to fall through). */
+  gizmoPickDrag(x: number, y: number, ctrl: boolean): Promise<boolean>;
+  /** End the gizmo drag — commits ONE undoable transform transaction. */
+  gizmoDragEnd(): void;
+  /** Read an entity's world transform `[x,y,z,qx,qy,qz,qw,scale]`. */
+  readTransform(id: string): Promise<number[]>;
+  /** Save the selected character (with its part overrides) for reuse → the comp id. */
+  saveCharacter(id: string): Promise<string | null>;
+  /** Drop a fresh instance of a saved character → the new root id. */
+  instantiateCharacter(comp: string): Promise<string | null>;
+  /** Deactivate-not-delete (or restore) a rigid part — recoverable, undoable. */
+  setPartActive(id: string, active: boolean): Promise<boolean>;
+  /** Reparent a part under a new parent (node.move) — undoable. */
+  reparentPart(id: string, parent: string | null): void;
+  /** Magnetic-snap toggle (M9.4). */
+  setSnap(on: boolean): void;
+  /** The ranked snap candidates within a radius, each with an explained `why`. */
+  snapQuery(id: string, radius: number): Promise<SnapHit[]>;
+  /** Apply a declared transform constraint → solve+commit, or refuse-with-reason (every "no" explained). */
+  applyConstraint(id: string, kind: string, target: string | null, value: number): Promise<SolveResult>;
+  /** Compile a natural-language placement sentence to ≥1 editable intent. */
+  placementSentence(id: string, text: string): Promise<SolveResult>;
+
+  // ── M3.3 focus mode (the FocusBanner) ───────────────────────────────────────────────────────────────
+  /** Exit focus mode — restore the saved camera distance + drop the dim flag. */
+  unfocus(): void;
+  /** The focus read `[framedDistance, focusActive]` (the banner shows the distance). */
+  focusDebug(): Promise<[number, boolean]>;
 
   // ── native viewport input (Tauri-only; the dev MockCore has no viewport) — the M10.1 composite closeout ─
   /** Pick over the native wgpu region at NORMALIZED viewport coords (x,y ∈ [0,1]) → the picked entity id
@@ -221,6 +291,99 @@ class TauriClient implements EditorClient {
   }
   makeDynamic(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("make_dynamic", { id });
+  }
+
+  // ── M8 physics ──
+  spawnBody(x: number, y: number, z: number): Promise<string | null> {
+    return this.core.invoke<string | null>("spawn_body", { x, y, z });
+  }
+  setSimRunning(run: boolean): void {
+    void this.core.invoke("set_sim_running", { run }).catch((e: unknown) => console.error("set_sim_running failed", e));
+  }
+  simOverlay(on: boolean): void {
+    void this.core.invoke("sim_overlay", { on }).catch((e: unknown) => console.error("sim_overlay failed", e));
+  }
+  simTimeline(): Promise<TimelineTuple> {
+    return this.core.invoke<TimelineTuple>("sim_timeline");
+  }
+  simScrub(frame: number): Promise<TimelineTuple> {
+    return this.core.invoke<TimelineTuple>("sim_scrub", { frame });
+  }
+  simShove(id: string, impulse: [number, number, number]): Promise<boolean> {
+    return this.core.invoke<boolean>("sim_shove", { id, impulse });
+  }
+  physicsContacts(): Promise<ContactInfo[]> {
+    return this.core.invoke<ContactInfo[]>("physics_contacts");
+  }
+  physicsCheck(id: string): Promise<PhysicsWarning[]> {
+    return this.core.invoke<PhysicsWarning[]>("physics_check", { id });
+  }
+  physicsFix(id: string, action: string): Promise<boolean> {
+    return this.core.invoke<boolean>("physics_fix", { id, action });
+  }
+  importInterchange(format: string, source: string): Promise<ImportResult> {
+    return this.core.invoke<ImportResult>("import_interchange", { format, source });
+  }
+
+  // ── M9 transform / gizmo / part / snap ──
+  gizmoMode(mode: "translate" | "rotate" | "scale"): void {
+    void this.core.invoke("gizmo_mode", { mode }).catch((e: unknown) => console.error("gizmo_mode failed", e));
+  }
+  gizmoSelect(id: string): Promise<boolean> {
+    return this.core.invoke<boolean>("gizmo_select", { id });
+  }
+  gizmoSelected(): Promise<string | null> {
+    return this.core.invoke<string | null>("gizmo_selected");
+  }
+  gizmoDebug(): Promise<[string, boolean, boolean, string, string]> {
+    return this.core.invoke<[string, boolean, boolean, string, string]>("gizmo_debug");
+  }
+  gizmoSpaceToggle(): Promise<string> {
+    return this.core.invoke<string>("gizmo_space_toggle");
+  }
+  gizmoPivotToggle(): Promise<string> {
+    return this.core.invoke<string>("gizmo_pivot_toggle");
+  }
+  gizmoPickDrag(x: number, y: number, ctrl: boolean): Promise<boolean> {
+    return this.core.invoke<boolean>("gizmo_pick_drag", { x, y, ctrl });
+  }
+  gizmoDragEnd(): void {
+    void this.core.invoke("gizmo_drag_end").catch((e: unknown) => console.error("gizmo_drag_end failed", e));
+  }
+  readTransform(id: string): Promise<number[]> {
+    return this.core.invoke<number[]>("read_transform", { id });
+  }
+  saveCharacter(id: string): Promise<string | null> {
+    return this.core.invoke<string | null>("save_character", { id });
+  }
+  instantiateCharacter(comp: string): Promise<string | null> {
+    return this.core.invoke<string | null>("instantiate_character", { comp });
+  }
+  setPartActive(id: string, active: boolean): Promise<boolean> {
+    return this.core.invoke<boolean>("set_part_active", { id, active });
+  }
+  reparentPart(id: string, parent: string | null): void {
+    void this.core.invoke("reparent_part", { id, parent }).catch((e: unknown) => console.error("reparent_part failed", e));
+  }
+  setSnap(on: boolean): void {
+    void this.core.invoke("set_snap", { on }).catch((e: unknown) => console.error("set_snap failed", e));
+  }
+  snapQuery(id: string, radius: number): Promise<SnapHit[]> {
+    return this.core.invoke<SnapHit[]>("snap_query", { id, radius });
+  }
+  applyConstraint(id: string, kind: string, target: string | null, value: number): Promise<SolveResult> {
+    return this.core.invoke<SolveResult>("apply_constraint", { id, kind, target, value });
+  }
+  placementSentence(id: string, text: string): Promise<SolveResult> {
+    return this.core.invoke<SolveResult>("placement_sentence", { id, text });
+  }
+
+  // ── M3.3 focus ──
+  unfocus(): void {
+    void this.core.invoke("unfocus").catch((e: unknown) => console.error("unfocus failed", e));
+  }
+  focusDebug(): Promise<[number, boolean]> {
+    return this.core.invoke<[number, boolean]>("focus_debug");
   }
 
   viewportPick(x: number, y: number): Promise<string | null> {
@@ -471,6 +634,82 @@ class MockClient implements EditorClient {
   focusEntity(_id: string): void {}
   makeDynamic(_id: string): Promise<boolean> {
     return Promise.resolve(true);
+  }
+  // M8 physics / M9 transform / M3.3 focus are Tauri-only (the dev MockCore has no sim/gizmo/native camera)
+  // — inert, deterministic stubs so the panels render + the dev view never throws. The live behavior is
+  // proven by the real-`.exe` acceptance gate (physics/transform/context-actions specs).
+  spawnBody(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  setSimRunning(): void {}
+  simOverlay(): void {}
+  simTimeline(): Promise<TimelineTuple> {
+    return Promise.resolve([0, 0, false, false, 0]);
+  }
+  simScrub(): Promise<TimelineTuple> {
+    return Promise.resolve([0, 0, false, false, 0]);
+  }
+  simShove(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+  physicsContacts(): Promise<ContactInfo[]> {
+    return Promise.resolve([]);
+  }
+  physicsCheck(): Promise<PhysicsWarning[]> {
+    return Promise.resolve([]);
+  }
+  physicsFix(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+  importInterchange(): Promise<ImportResult> {
+    return Promise.resolve({ ok: false, format: "", bodies: 0, joints: 0, meters_per_unit: 1, kilograms_per_unit: 1, reconciled: false, notes: [], error: "import is live-only (the .exe)" });
+  }
+  gizmoMode(): void {}
+  gizmoSelect(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+  gizmoSelected(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  gizmoDebug(): Promise<[string, boolean, boolean, string, string]> {
+    return Promise.resolve(["translate", false, false, "world", "origin"]);
+  }
+  gizmoSpaceToggle(): Promise<string> {
+    return Promise.resolve("world");
+  }
+  gizmoPivotToggle(): Promise<string> {
+    return Promise.resolve("origin");
+  }
+  gizmoPickDrag(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+  gizmoDragEnd(): void {}
+  readTransform(): Promise<number[]> {
+    return Promise.resolve([0, 0, 0, 0, 0, 0, 1, 1]);
+  }
+  saveCharacter(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  instantiateCharacter(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  setPartActive(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  reparentPart(): void {}
+  setSnap(): void {}
+  snapQuery(): Promise<SnapHit[]> {
+    return Promise.resolve([]);
+  }
+  applyConstraint(): Promise<SolveResult> {
+    return Promise.resolve({ ok: false, reason: "constraints are live-only (the .exe)", intents: [] });
+  }
+  placementSentence(): Promise<SolveResult> {
+    return Promise.resolve({ ok: false, reason: "placement is live-only (the .exe)", intents: [] });
+  }
+  unfocus(): void {}
+  focusDebug(): Promise<[number, boolean]> {
+    return Promise.resolve([20, true]); // ≤40 so the dev view's focus read is consistent
   }
   // The dev MockCore has no native viewport — these are inert (the real wgpu input is Tauri-only).
   viewportPick(_x: number, _y: number): Promise<string | null> {
