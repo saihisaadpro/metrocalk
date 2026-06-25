@@ -137,22 +137,23 @@ describe("acceptance / north-star #1 — bind-by-intent, the full conjunction", 
     const ridAttr = await reqs[0].getAttribute("data-id");
     const rid = ridAttr || null;
 
+    // The submit_edit args-builder (a fresh clientOpId per sample so the optimistic-echo path is exercised,
+    // not deduped). HOISTED so the budget recapture (the flake-quarantine re-measure) can reuse it — passing
+    // the tx, not `{}` (the latent bug that surfaced "submit_edit missing required key tx" on a regression).
+    let bench = 0;
+    const commitArgs = () => ({
+      tx: {
+        clientOpId: `bench-${bench++}`,
+        label: "bench-set",
+        patches: [{ op: "replace", path: `/entities/${rid}/components/Transform/x`, value: 1.0 }],
+        intent: { kind: "setField", id: rid, component: "Transform", field: "x", value: 1.0 },
+      },
+    });
+
     const ops = [];
     if (rid) ops.push(await captureBudget("reveal_targets", "reveal_targets", { id: rid }, { n: 30, warmup: 8 }));
-    // commit (submit_edit) — the UI-side edit-submit cost (IPC + enqueue); a real setField on the requirer's
-    // Transform.x, a fresh clientOpId per sample so the optimistic-echo path is exercised, not deduped.
-    if (rid) {
-      let bench = 0;
-      const commitArgs = () => ({
-        tx: {
-          clientOpId: `bench-${bench++}`,
-          label: "bench-set",
-          patches: [{ op: "replace", path: `/entities/${rid}/components/Transform/x`, value: 1.0 }],
-          intent: { kind: "setField", id: rid, component: "Transform", field: "x", value: 1.0 },
-        },
-      });
-      ops.push(await captureBudget("submit_edit", "submit_edit", commitArgs, { n: 30, warmup: 8 }));
-    }
+    // commit (submit_edit) — the UI-side edit-submit cost (IPC + enqueue); a real setField on the requirer's Transform.x.
+    if (rid) ops.push(await captureBudget("submit_edit", "submit_edit", commitArgs, { n: 30, warmup: 8 }));
     ops.push(await captureBudget("viewport_pick", "viewport_pick", { x: 0.5, y: 0.5 }, { n: 30, warmup: 8 }));
     ops.push(await captureBudget("wallet_info", "wallet_info", {}, { n: 30, warmup: 8 }));
 
@@ -160,7 +161,19 @@ describe("acceptance / north-star #1 — bind-by-intent, the full conjunction", 
       console.log(`BUDGET ${s.label}: p50=${s.p50.toFixed(2)}ms p99=${s.p99.toFixed(2)}ms max=${s.max.toFixed(2)}ms`);
       const scored = await scoreBudget(s, baseline, {
         perFrame: false, // discrete interactions — record + regression-gate, not the per-frame 16ms gate
-        recapture: () => captureBudget(s.label, s.label, s.label === "reveal_targets" ? { id: rid } : s.label === "viewport_pick" ? { x: 0.5, y: 0.5 } : {}, { n: 30, warmup: 8 }),
+        recapture: () =>
+          captureBudget(
+            s.label,
+            s.label,
+            s.label === "reveal_targets"
+              ? { id: rid }
+              : s.label === "viewport_pick"
+                ? { x: 0.5, y: 0.5 }
+                : s.label === "submit_edit"
+                  ? commitArgs
+                  : {},
+            { n: 30, warmup: 8 }
+          ),
       });
       report.budget(scored);
       if (scored.verdict !== "pass") console.error(`BUDGET FAIL ${s.label}: ${scored.note}`);

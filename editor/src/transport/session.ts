@@ -74,6 +74,27 @@ export interface EditorClient {
   /** M8.3: turn a dead mesh into a correct dynamic body — one undoable transaction. */
   makeDynamic(id: string): Promise<boolean>;
 
+  // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable transaction over the Movable Tree +
+  // override pipeline. reparent reuses `reparentPart`; delete=deactivate is distinct from `removeEntity`. ──
+  /** Create an empty named entity at a position → its id (the caller selects it). */
+  createEntity(x: number, y: number, z: number, name: string): Promise<string | null>;
+  /** Rename an entity (`__meta__.name`) → applied; the projection re-reads it (inv. 1). */
+  renameEntity(id: string, name: string): Promise<boolean>;
+  /** Group a selection under a new parent node → the group id. */
+  groupEntities(ids: string[], name: string): Promise<string | null>;
+  /** Ungroup — dissolve a group (children to its parent, delete the group) → applied. */
+  ungroupEntity(id: string): Promise<boolean>;
+  /** Multi-edit — set one numeric field on N entities as ONE batched, atomic, undoable tx → applied. */
+  multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean>;
+  /** Delete = deactivate (non-destructive; frees dependents) — undo restores → applied. */
+  deleteDeactivate(id: string): Promise<boolean>;
+  /** Copy a sub-tree to the clipboard (cross-project = the serde Composition). */
+  copySubtree(id: string): void;
+  /** Cut = copy + delete(deactivate) → applied. */
+  cutSubtree(id: string): Promise<boolean>;
+  /** Paste the clipboard under fresh deterministic ids → the new root id. */
+  pasteClipboard(): Promise<string | null>;
+
   // ── M8 physics (the React PhysicsPanel; the sim runs natively off the JS hot path — invariant 4) ─────
   /** Drop / spawn a dynamic body at a world position → the new body's id (or null). */
   spawnBody(x: number, y: number, z: number): Promise<string | null>;
@@ -291,6 +312,35 @@ class TauriClient implements EditorClient {
   }
   makeDynamic(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("make_dynamic", { id });
+  }
+
+  // ── M10.6 scene-authoring verbs ──
+  createEntity(x: number, y: number, z: number, name: string): Promise<string | null> {
+    return this.core.invoke<string | null>("create_entity", { x, y, z, name });
+  }
+  renameEntity(id: string, name: string): Promise<boolean> {
+    return this.core.invoke<boolean>("rename_entity", { id, name });
+  }
+  groupEntities(ids: string[], name: string): Promise<string | null> {
+    return this.core.invoke<string | null>("group_entities", { ids, name });
+  }
+  ungroupEntity(id: string): Promise<boolean> {
+    return this.core.invoke<boolean>("ungroup_entity", { id });
+  }
+  multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean> {
+    return this.core.invoke<boolean>("multi_edit", { ids, component, field, value });
+  }
+  deleteDeactivate(id: string): Promise<boolean> {
+    return this.core.invoke<boolean>("delete_deactivate", { id });
+  }
+  copySubtree(id: string): void {
+    void this.core.invoke("copy_subtree", { id }).catch((e: unknown) => console.error("copy_subtree failed", e));
+  }
+  cutSubtree(id: string): Promise<boolean> {
+    return this.core.invoke<boolean>("cut_subtree", { id });
+  }
+  pasteClipboard(): Promise<string | null> {
+    return this.core.invoke<string | null>("paste_clipboard");
   }
 
   // ── M8 physics ──
@@ -634,6 +684,33 @@ class MockClient implements EditorClient {
   focusEntity(_id: string): void {}
   makeDynamic(_id: string): Promise<boolean> {
     return Promise.resolve(true);
+  }
+  // ── M10.6 scene-authoring verbs — the real undoable commits run under Tauri (proven by the .exe gate);
+  // the dev MockCore stubs are inert+deterministic so the menu/hierarchy render without a live core. ──
+  createEntity(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  renameEntity(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  groupEntities(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  ungroupEntity(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  multiEdit(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  deleteDeactivate(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  copySubtree(): void {}
+  cutSubtree(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  pasteClipboard(): Promise<string | null> {
+    return Promise.resolve(null);
   }
   // M8 physics / M9 transform / M3.3 focus are Tauri-only (the dev MockCore has no sim/gizmo/native camera)
   // — inert, deterministic stubs so the panels render + the dev view never throws. The live behavior is

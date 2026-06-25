@@ -46,10 +46,17 @@ export interface ProjectionState {
   pending: Record<string, PendingOp>;
   rejections: RejectInfo[];
   selectedId: string | null;
+  /** M10.6 multi-selection (always includes `selectedId` as the primary/anchor). Verbs that act on a
+   *  selection (group, multi-edit, multi-delete) read this; the inspector/reveal read `selectedId`. */
+  multiSelect: string[];
 
   applyDelta(delta: ProjectionDelta): void;
   optimisticEdit(op: PendingOp): void;
   select(id: string | null): void;
+  /** Ctrl/Cmd-click — toggle `id` in/out of the multi-selection (the primary becomes `id`). */
+  toggleSelect(id: string): void;
+  /** Shift-click — extend the selection from the current primary to `id` over the visible `order`. */
+  selectRange(id: string): void;
   dismissRejection(clientOpId: string): void;
   bulkLoad(entities: EntityProjection[]): void;
   reset(): void;
@@ -87,6 +94,7 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
   pending: {},
   rejections: [],
   selectedId: null,
+  multiSelect: [],
 
   bulkLoad(entities) {
     const base: Record<string, EntityProjection> = {};
@@ -238,7 +246,28 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
   },
 
   select(id) {
-    set({ selectedId: id });
+    set({ selectedId: id, multiSelect: id ? [id] : [] });
+  },
+
+  toggleSelect(id) {
+    const s = get();
+    const has = s.multiSelect.includes(id);
+    const multiSelect = has ? s.multiSelect.filter((x) => x !== id) : [...s.multiSelect, id];
+    // The primary follows: `id` when adding, else the last remaining (or null when the set empties).
+    set({ multiSelect, selectedId: has ? (multiSelect[multiSelect.length - 1] ?? null) : id });
+  },
+
+  selectRange(id) {
+    const s = get();
+    const anchor = s.selectedId;
+    const ai = anchor ? s.order.indexOf(anchor) : -1;
+    const bi = s.order.indexOf(id);
+    if (ai < 0 || bi < 0) {
+      set({ selectedId: id, multiSelect: [id] });
+      return;
+    }
+    const [lo, hi] = ai <= bi ? [ai, bi] : [bi, ai];
+    set({ multiSelect: s.order.slice(lo, hi + 1), selectedId: id });
   },
 
   dismissRejection(clientOpId) {
@@ -246,7 +275,7 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
   },
 
   reset() {
-    set({ base: {}, displayed: {}, summaries: {}, order: [], edges: {}, pending: {}, rejections: [], selectedId: null });
+    set({ base: {}, displayed: {}, summaries: {}, order: [], edges: {}, pending: {}, rejections: [], selectedId: null, multiSelect: [] });
   },
 }));
 
@@ -261,6 +290,13 @@ export const useSummary = (id: string): EntitySummary | undefined =>
 export const useEntityOrder = (): string[] => useStore(projectionStore, (s) => s.order);
 
 export const useSelectedId = (): string | null => useStore(projectionStore, (s) => s.selectedId);
+
+export const useMultiSelect = (): string[] => useStore(projectionStore, (s) => s.multiSelect);
+
+/** Per-row membership selector (a boolean) — so a hierarchy row re-renders only when ITS selection
+ *  membership changes, not on every selection change (selective re-render at 5k, principle 3). */
+export const useIsMultiSelected = (id: string): boolean =>
+  useStore(projectionStore, (s) => s.multiSelect.includes(id));
 
 export const useRejections = (): RejectInfo[] => useStore(projectionStore, (s) => s.rejections);
 

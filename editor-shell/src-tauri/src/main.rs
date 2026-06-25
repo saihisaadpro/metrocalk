@@ -303,6 +303,59 @@ enum EngineCmd {
         id: String,
         reply: Sender<Option<EntityDetails>>,
     },
+    // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable transaction over the Movable Tree +
+    // override pipeline. reparent reuses `ReparentPart`; delete=deactivate is distinct from `Remove`. ──
+    /// Create an empty named entity at a position → reply its id (selected by the caller).
+    CreateEntity {
+        x: f32,
+        y: f32,
+        z: f32,
+        name: String,
+        reply: Sender<Option<String>>,
+    },
+    /// Rename an entity (`__meta__.name`) → reply applied.
+    RenameEntity {
+        id: String,
+        name: String,
+        reply: Sender<bool>,
+    },
+    /// Group a selection under a new parent node → reply the group id.
+    GroupEntities {
+        ids: Vec<String>,
+        name: String,
+        reply: Sender<Option<String>>,
+    },
+    /// Ungroup — dissolve a group (children to its parent, delete the group) → reply applied.
+    UngroupEntity {
+        id: String,
+        reply: Sender<bool>,
+    },
+    /// Multi-edit — set one numeric field on N entities as ONE batched, atomic, undoable tx → reply applied.
+    MultiEdit {
+        ids: Vec<String>,
+        component: String,
+        field: String,
+        value: f64,
+        reply: Sender<bool>,
+    },
+    /// Delete = deactivate (M10.6, non-destructive; frees dependents) → reply applied.
+    DeleteDeactivate {
+        id: String,
+        reply: Sender<bool>,
+    },
+    /// Copy a sub-tree to the clipboard (a read → fills the thread clipboard).
+    CopySubtree {
+        id: String,
+    },
+    /// Cut = copy + delete(deactivate) → reply applied.
+    CutSubtree {
+        id: String,
+        reply: Sender<bool>,
+    },
+    /// Paste the clipboard under fresh ids → reply the new root id.
+    PasteClipboard {
+        reply: Sender<Option<String>>,
+    },
     /// Generation (M6, tier 3): drop a grey placeholder + kick off async text-to-3D; reply the placeholder.
     Generate {
         query: String,
@@ -893,6 +946,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // bumped on every committed edit/bind so it's live, not inert.
     let mut recency: HashMap<Entity, u64> = HashMap::new();
     let mut touch: u64 = 0;
+    // M10.6 — the scene-authoring clipboard: a copied/cut sub-tree's resolved `Composition` (serde), held
+    // on this thread between copy/cut and paste. Cross-project paste (a project clipboard) is M10.3's seam.
+    let mut clipboard: Option<metrocalk_core::Composition> = None;
     // In-flight generation reservations (M7): placeholder loro-key → the token Hold, so the async
     // completion settles (success) or releases (failure) exactly the right hold. Lives on this thread
     // only, so reserve→settle/release is atomic (no race).
@@ -1221,6 +1277,139 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         &mut touch,
                         new_id,
                     );
+                }
+                let _ = reply.send(new.map(|n| n.to_loro_key()));
+            }
+            // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable commit → re-project the scene.
+            // (Verbs persist via the M10.3 `.mtk` save/open — the Loro doc; the in-session replay-log
+            // Records for these are a tracked follow-up.) ──
+            EngineCmd::CreateEntity {
+                x,
+                y,
+                z,
+                name,
+                reply,
+            } => {
+                let new = capscene::create_entity(&mut engine, [x, y, z], &name).ok();
+                if new.is_some() {
+                    if let Some(ch) = &channel {
+                        let _ = ch.send(project_full(&engine));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(new.map(|n| n.to_loro_key()));
+            }
+            EngineCmd::RenameEntity { id, name, reply } => {
+                let ok = EntityId::from_loro_key(&id)
+                    .is_some_and(|e| capscene::rename(&mut engine, e, &name).is_ok());
+                if ok {
+                    if let Some(ch) = &channel {
+                        let _ = ch.send(project_full(&engine));
+                    }
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::GroupEntities { ids, name, reply } => {
+                let members: Vec<EntityId> = ids
+                    .iter()
+                    .filter_map(|s| EntityId::from_loro_key(s))
+                    .collect();
+                let g = if members.is_empty() {
+                    None
+                } else {
+                    capscene::group(&mut engine, &members, &name).ok()
+                };
+                if g.is_some() {
+                    if let Some(ch) = &channel {
+                        let _ = ch.send(project_full(&engine));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(g.map(|n| n.to_loro_key()));
+            }
+            EngineCmd::UngroupEntity { id, reply } => {
+                let ok = EntityId::from_loro_key(&id)
+                    .is_some_and(|e| capscene::ungroup(&mut engine, e).is_ok());
+                if ok {
+                    if let Some(ch) = &channel {
+                        let _ = ch.send(project_full(&engine));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::MultiEdit {
+                ids,
+                component,
+                field,
+                value,
+                reply,
+            } => {
+                let targets: Vec<EntityId> = ids
+                    .iter()
+                    .filter_map(|s| EntityId::from_loro_key(s))
+                    .collect();
+                let ok = !targets.is_empty()
+                    && capscene::multi_edit(
+                        &mut engine,
+                        &targets,
+                        &component,
+                        &field,
+                        &FieldValue::Number(value),
+                    )
+                    .is_ok();
+                if ok {
+                    if let Some(ch) = &channel {
+                        let _ = ch.send(project_full(&engine));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::DeleteDeactivate { id, reply } => {
+                let ok = EntityId::from_loro_key(&id)
+                    .is_some_and(|e| capscene::delete_deactivate(&mut engine, &scene, e).is_ok());
+                if ok {
+                    if let Some(ch) = &channel {
+                        let _ = ch.send(project_full(&engine));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::CopySubtree { id } => {
+                clipboard = EntityId::from_loro_key(&id)
+                    .map(|e| capscene::copy_subtree(&engine, e, "clipboard"));
+            }
+            EngineCmd::CutSubtree { id, reply } => {
+                let ok = if let Some(e) = EntityId::from_loro_key(&id) {
+                    match capscene::cut_subtree(&mut engine, &scene, e, "clipboard") {
+                        Ok(c) => {
+                            clipboard = Some(c);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                } else {
+                    false
+                };
+                if ok {
+                    if let Some(ch) = &channel {
+                        let _ = ch.send(project_full(&engine));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::PasteClipboard { reply } => {
+                let new = clipboard
+                    .as_ref()
+                    .and_then(|c| capscene::paste_composition(&mut engine, c).ok());
+                if new.is_some() {
+                    if let Some(ch) = &channel {
+                        let _ = ch.send(project_full(&engine));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
                 }
                 let _ = reply.send(new.map(|n| n.to_loro_key()));
             }
@@ -4162,6 +4351,145 @@ fn reparent_part(state: State<AppState>, id: String, parent: Option<String>) {
     let _ = state.tx.send(EngineCmd::ReparentPart { id, parent });
 }
 
+// ── M10.6 scene-authoring verbs (ADR-036) ────────────────────────────────────────────────────────────
+
+/// M10.6 — create an empty named entity at a position; reply its id (the UI selects it).
+#[tauri::command]
+fn create_entity(state: State<AppState>, x: f32, y: f32, z: f32, name: String) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CreateEntity {
+            x,
+            y,
+            z,
+            name,
+            reply,
+        })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().unwrap_or(None)
+}
+
+/// M10.6 — rename an entity (`__meta__.name`), one undoable tx; reply applied.
+#[tauri::command]
+fn rename_entity(state: State<AppState>, id: String, name: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::RenameEntity { id, name, reply })
+        .is_err()
+    {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
+/// M10.6 — group a selection under a new parent node; reply the group id.
+#[tauri::command]
+fn group_entities(state: State<AppState>, ids: Vec<String>, name: String) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::GroupEntities { ids, name, reply })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().unwrap_or(None)
+}
+
+/// M10.6 — ungroup (dissolve a group); reply applied.
+#[tauri::command]
+fn ungroup_entity(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::UngroupEntity { id, reply })
+        .is_err()
+    {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
+/// M10.6 — multi-edit: set one numeric field on N entities as ONE batched, atomic, undoable tx.
+#[tauri::command]
+fn multi_edit(
+    state: State<AppState>,
+    ids: Vec<String>,
+    component: String,
+    field: String,
+    value: f64,
+) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::MultiEdit {
+            ids,
+            component,
+            field,
+            value,
+            reply,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
+/// M10.6 — delete = deactivate (non-destructive; frees dependents); reply applied.
+#[tauri::command]
+fn delete_deactivate(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::DeleteDeactivate { id, reply })
+        .is_err()
+    {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
+/// M10.6 — copy a sub-tree to the clipboard (a read → fills the thread clipboard).
+#[tauri::command]
+fn copy_subtree(state: State<AppState>, id: String) {
+    ipc();
+    let _ = state.tx.send(EngineCmd::CopySubtree { id });
+}
+
+/// M10.6 — cut = copy + delete(deactivate); reply applied.
+#[tauri::command]
+fn cut_subtree(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::CutSubtree { id, reply }).is_err() {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
+/// M10.6 — paste the clipboard under fresh ids; reply the new root id.
+#[tauri::command]
+fn paste_clipboard(state: State<AppState>) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PasteClipboard { reply }).is_err() {
+        return None;
+    }
+    rx.recv().unwrap_or(None)
+}
+
 /// M9.2 — deactivate-not-delete a part (or reactivate); replies whether it applied.
 #[tauri::command]
 fn set_part_active(state: State<AppState>, id: String, active: bool) -> bool {
@@ -4724,6 +5052,15 @@ fn main() {
             gizmo_drag_end,
             read_transform,
             reparent_part,
+            create_entity,
+            rename_entity,
+            group_entities,
+            ungroup_entity,
+            multi_edit,
+            delete_deactivate,
+            copy_subtree,
+            cut_subtree,
+            paste_clipboard,
             set_part_active,
             save_character,
             instantiate_character,

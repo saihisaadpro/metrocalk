@@ -200,12 +200,13 @@ pub fn project_full<W: World>(engine: &Engine<W>) -> ProjectionDelta {
     for id in engine.entity_ids() {
         let key = id.to_loro_key();
         let parent = engine.parent_of(id).map(|p| p.to_loro_key());
+        let comps = engine.components_of(id);
         ops.push(ProjectionOp::Upsert {
             id: key.clone(),
-            name: Some(key.clone()),
+            name: Some(entity_label(&comps, &key)),
             parent_id: Some(parent),
         });
-        for (component, fields) in engine.components_of(id) {
+        for (component, fields) in comps {
             for (field, value) in fields {
                 ops.push(ProjectionOp::SetField {
                     id: key.clone(),
@@ -237,12 +238,13 @@ pub fn project_full<W: World>(engine: &Engine<W>) -> ProjectionDelta {
 pub fn project_entity<W: World>(engine: &Engine<W>, id: EntityId) -> ProjectionDelta {
     let key = id.to_loro_key();
     let parent = engine.parent_of(id).map(|p| p.to_loro_key());
+    let comps = engine.components_of(id);
     let mut ops = vec![ProjectionOp::Upsert {
         id: key.clone(),
-        name: Some(key.clone()),
+        name: Some(entity_label(&comps, &key)),
         parent_id: Some(parent),
     }];
-    for (component, fields) in engine.components_of(id) {
+    for (component, fields) in comps {
         for (field, value) in fields {
             ops.push(ProjectionOp::SetField {
                 id: key.clone(),
@@ -258,6 +260,23 @@ pub fn project_entity<W: World>(engine: &Engine<W>, id: EntityId) -> ProjectionD
         rejects: vec![],
         full: false, // an incremental single-entity echo — merged, not a replace
     }
+}
+
+/// The entity's display name for the projection — the user-set `__meta__.name` (M10.6 rename) if present,
+/// else the loro key. Takes the ALREADY-fetched components (project_full/project_entity fetch them once per
+/// entity) so it adds **no extra `components_of` call** — the projection stays single-fetch per entity at 5k.
+fn entity_label(
+    comps: &std::collections::HashMap<String, std::collections::HashMap<String, FieldValue>>,
+    key: &str,
+) -> String {
+    comps
+        .get("__meta__")
+        .and_then(|m| m.get("name"))
+        .and_then(|v| match v {
+            FieldValue::Str(s) => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| key.to_string())
 }
 
 fn field_to_json(v: &FieldValue) -> Json {

@@ -15,6 +15,7 @@ import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
 import { panelLayout } from "./layout";
 import { Hierarchy } from "../panels/Hierarchy";
+import { AuthoringToolbar } from "../panels/AuthoringToolbar";
 import { Rejections } from "../panels/Rejections";
 import { Onboarding } from "../panels/Onboarding";
 import { Reveal } from "../panels/Reveal";
@@ -211,8 +212,9 @@ export function App() {
       <div style={{ borderBottom: "1px solid #2a2d35", maxHeight: 140, overflowY: "auto" }}>
         <Requirers />
       </div>
+      <AuthoringToolbar client={client} />
       <div style={{ flex: 1, overflow: "hidden", minHeight: 0 }}>
-        <Hierarchy />
+        <Hierarchy client={client} />
       </div>
     </div>
   );

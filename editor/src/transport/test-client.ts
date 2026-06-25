@@ -23,6 +23,16 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     duplicateEntity: () => Promise.resolve(null),
     focusEntity: vi.fn(),
     makeDynamic: () => Promise.resolve(true),
+    // M10.6 scene-authoring verbs (a test overrides what it exercises).
+    createEntity: () => Promise.resolve("e-created"),
+    renameEntity: () => Promise.resolve(true),
+    groupEntities: () => Promise.resolve("group-1"),
+    ungroupEntity: () => Promise.resolve(true),
+    multiEdit: vi.fn(() => Promise.resolve(true)),
+    deleteDeactivate: vi.fn(() => Promise.resolve(true)),
+    copySubtree: vi.fn(),
+    cutSubtree: () => Promise.resolve(true),
+    pasteClipboard: () => Promise.resolve("paste-1"),
     // M8 physics / M9 transform / focus (Tauri-only; inert defaults — a test overrides what it exercises).
     spawnBody: () => Promise.resolve("body-1"),
     setSimRunning: vi.fn(),
