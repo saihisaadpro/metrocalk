@@ -3792,6 +3792,30 @@ fn focus_debug(state: State<AppState>) -> (f32, bool) {
     (st.distance, st.focused.is_some())
 }
 
+// ── M10.7 camera & framing ergonomics (ADR-037) — pure camera/render-state ops (invariant 4) ───────────
+
+/// M10.7 — **frame the whole scene** (the React toolbar's "Frame all"). A pure camera op (not undoable).
+#[tauri::command]
+fn frame_all(state: State<AppState>) {
+    ipc();
+    state.shared.lock().unwrap().frame_all();
+}
+
+/// M10.7 — snap the camera to a canonical view (`top`/`front`/`side`/`persp`) — the orientation cube /
+/// view-preset buttons. A pure camera op.
+#[tauri::command]
+fn view_preset(state: State<AppState>, preset: String) {
+    ipc();
+    state.shared.lock().unwrap().set_view_preset(&preset);
+}
+
+/// M10.7 — the camera state `[orbit, elevation, distance, tx, ty, tz]` for the orientation cube + the E2E
+/// (the wgpu viewport's pixels aren't WebDriver-readable; this exposes the observable camera state).
+#[tauri::command]
+fn camera_debug(state: State<AppState>) -> [f32; 6] {
+    state.shared.lock().unwrap().camera_state()
+}
+
 /// The action model for an entity (M3.3) — valid actions + every-"no"-explained. A read; blocks
 /// briefly on the engine thread.
 #[tauri::command]
@@ -5016,6 +5040,9 @@ fn main() {
             focus_entity,
             unfocus,
             focus_debug,
+            frame_all,
+            view_preset,
+            camera_debug,
             entity_actions,
             remove_entity,
             duplicate_entity,

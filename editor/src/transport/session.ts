@@ -159,6 +159,14 @@ export interface EditorClient {
   /** The focus read `[framedDistance, focusActive]` (the banner shows the distance). */
   focusDebug(): Promise<[number, boolean]>;
 
+  // ── M10.7 camera & framing ergonomics (ADR-037) — pure camera ops, native (invariant 4) ──────────────
+  /** Frame the whole scene (center + fit the bounds). */
+  frameAll(): void;
+  /** Snap the camera to a canonical view: `top` / `front` / `side` / `persp`. */
+  viewPreset(preset: string): void;
+  /** The camera state `[orbit, elevation, distance, tx, ty, tz]` (the orientation cube + the e2e). */
+  cameraDebug(): Promise<number[]>;
+
   // ── native viewport input (Tauri-only; the dev MockCore has no viewport) — the M10.1 composite closeout ─
   /** Pick over the native wgpu region at NORMALIZED viewport coords (x,y ∈ [0,1]) → the picked entity id
    *  (or null). Computed synchronously in the command from the camera ray (no per-frame race, no OS-cursor
@@ -434,6 +442,16 @@ class TauriClient implements EditorClient {
   }
   focusDebug(): Promise<[number, boolean]> {
     return this.core.invoke<[number, boolean]>("focus_debug");
+  }
+
+  frameAll(): void {
+    void this.core.invoke("frame_all").catch((e: unknown) => console.error("frame_all failed", e));
+  }
+  viewPreset(preset: string): void {
+    void this.core.invoke("view_preset", { preset }).catch((e: unknown) => console.error("view_preset failed", e));
+  }
+  cameraDebug(): Promise<number[]> {
+    return this.core.invoke<number[]>("camera_debug");
   }
 
   viewportPick(x: number, y: number): Promise<string | null> {
@@ -787,6 +805,11 @@ class MockClient implements EditorClient {
   unfocus(): void {}
   focusDebug(): Promise<[number, boolean]> {
     return Promise.resolve([20, true]); // ≤40 so the dev view's focus read is consistent
+  }
+  frameAll(): void {}
+  viewPreset(): void {}
+  cameraDebug(): Promise<number[]> {
+    return Promise.resolve([0.785, 0.5, 60, 0, 0, 0]);
   }
   // The dev MockCore has no native viewport — these are inert (the real wgpu input is Tauri-only).
   viewportPick(_x: number, _y: number): Promise<string | null> {

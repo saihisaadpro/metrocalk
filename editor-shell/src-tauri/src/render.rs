@@ -132,6 +132,65 @@ pub struct SceneState {
 pub type Shared = Arc<Mutex<SceneState>>;
 
 impl SceneState {
+    /// M10.7 — **frame the whole scene**: center the orbit target on the scene's bounds and set a distance
+    /// that fits them in view. A pure camera op (invariant 4 — render-state only, not undoable). No-op on an
+    /// empty scene. Exits focus dim (framing-all looks at everything).
+    pub fn frame_all(&mut self) {
+        if self.instances.is_empty() {
+            return;
+        }
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for inst in &self.instances {
+            let r = inst.scale.max(0.5);
+            for k in 0..3 {
+                lo[k] = lo[k].min(inst.center[k] - r);
+                hi[k] = hi[k].max(inst.center[k] + r);
+            }
+        }
+        self.cam_target = [
+            (lo[0] + hi[0]) * 0.5,
+            (lo[1] + hi[1]) * 0.5,
+            (lo[2] + hi[2]) * 0.5,
+        ];
+        let radius = (0..3)
+            .map(|k| (hi[k] - lo[k]) * 0.5)
+            .fold(0.0_f32, f32::max)
+            .max(1.0);
+        self.distance = (radius * 2.4).clamp(6.0, 400.0);
+        self.clear_focus();
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// M10.7 — snap the camera to a **canonical view** (top/front/side/persp), keeping the orbit target +
+    /// distance. A pure camera op (invariant 4). `orbit` = azimuth, `elevation` = pitch (see `camera_eye`).
+    pub fn set_view_preset(&mut self, preset: &str) {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+        let (orbit, elevation) = match preset {
+            "top" => (-FRAC_PI_2, 1.4), // near-straight-down (clamped below the look_at degeneracy)
+            "front" => (FRAC_PI_2, 0.0), // eye on +Z, looking horizontally
+            "side" => (0.0, 0.0),       // eye on +X
+            _ => (FRAC_PI_4, 0.5),      // perspective 3/4 (the default-ish view)
+        };
+        self.orbit = orbit;
+        self.elevation = elevation;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// M10.7 — the camera state `[orbit, elevation, distance, target_x, target_y, target_z]` for the
+    /// orientation cube + the E2E (the viewport is a native wgpu surface WebDriver can't read pixels from).
+    #[must_use]
+    pub fn camera_state(&self) -> [f32; 6] {
+        [
+            self.orbit,
+            self.elevation,
+            self.distance,
+            self.cam_target[0],
+            self.cam_target[1],
+            self.cam_target[2],
+        ]
+    }
+
     /// Enter Focus mode on instance `i` (M3.3) — the pure state transition the `focus_entity` command
     /// applies: select it, center the camera on it, zoom in to frame it by size ("get nearby"), and
     /// raise the focus flag so the shader dims the rest. Saves the pre-focus `distance` once, so the

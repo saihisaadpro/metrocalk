@@ -16,6 +16,7 @@ import { setStatus } from "../store/ui";
 import { panelLayout } from "./layout";
 import { Hierarchy } from "../panels/Hierarchy";
 import { AuthoringToolbar } from "../panels/AuthoringToolbar";
+import { ViewportToolbar } from "../panels/ViewportToolbar";
 import { Rejections } from "../panels/Rejections";
 import { Onboarding } from "../panels/Onboarding";
 import { Reveal } from "../panels/Reveal";
@@ -348,6 +349,7 @@ export function App() {
           }}
         >
           {!native && "native wgpu viewport — drag to orbit · scroll to zoom · click to select (live in the .exe)"}
+          {!playing && <ViewportToolbar client={client} />}
           {playing && <PlayBadge paused={paused} onStop={stopPlay} />}
           {sceneEmpty && !playing && <EmptyState />}
           <ToastHost top={playing ? 52 : 14} />
