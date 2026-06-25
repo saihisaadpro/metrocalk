@@ -28,14 +28,12 @@ metrocalk-gizmo = { path = "../gizmo" }
 # targets are per-field override ops); `reconstruct_part_deform` reads them back + runs the deterministic
 # ARAP deformer to reproduce the surface. Pure f64 math, no foreign type leaks.
 metrocalk-deform = { path = "../deform" }
+# The asset/import substrate (M4/M10.2/M11.1). Used by `blobstore` (M11.1) to persist generated/imported
+# asset bytes by content address (`AssetId`) so a generated mesh survives reload — the M6 residual. Pure
+# Rust + wasm32-clean, so it doesn't compromise the lib's portability.
+metrocalk-assets = { path = "../assets" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
-# The asset/import substrate — used by the headless mesh test (import a checked-in glTF → place an
-# entity carrying its handle → undo → replay). Not a runtime dep of the bridge lib (handles are opaque
-# strings here); only the binary (src-tauri) imports + renders meshes.
-metrocalk-assets = { path = "../assets" }
 
 [lints]
 workspace = true

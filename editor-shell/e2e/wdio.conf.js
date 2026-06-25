@@ -28,6 +28,10 @@ const walletFile = path.join(exeDir, "metrocalk-wallet.json");
 // journey's sample instead of the freshly-seeded scene (and its bind/edit/requirer assertions fail on the
 // wrong scene). Clear it so each run starts from the known-good seeded scene.
 const recentsFile = path.join(exeDir, "metrocalk-recents.json");
+// The M11.1 content-addressed asset-blob dir (persisted generated/imported bytes). A generate test writes
+// a blob here; without clearing it, a LATER spec's boot would re-import that stale asset into its store
+// (an orphan — harmless, but a clean slate must be deterministic).
+const blobDir = path.join(exeDir, "metrocalk-assets");
 
 // A clean slate beside the exe: a freshly-seeded scene, the full free token grant (the marketplace-buy
 // test debits the wallet), and NO recents (so startup boots the seeded scene, not a journey-saved sample).
@@ -38,6 +42,11 @@ function cleanSlate() {
     } catch {
       /* not present yet — fine */
     }
+  }
+  try {
+    rmSync(blobDir, { recursive: true, force: true });
+  } catch {
+    /* not present yet — fine */
   }
 }
 const nativeDriver = path.resolve(dir, ".driver/msedgedriver.exe");

@@ -1,0 +1,192 @@
+//! Content-addressed asset-bytes persistence (M11.1 — closes the **M6 residual**).
+//!
+//! The in-memory [`AssetStore`](metrocalk_assets::AssetStore) is rebuilt at launch by re-importing source
+//! bytes. For **checked-in** fixtures that's free (the bytes are embedded). For a **generated** mesh (M6)
+//! or a **user-imported** file (M11.1) the bytes exist only at create time — so without persisting them the
+//! handle in the saved `.mtk` doc would **dangle** on reload (the entity references an asset the store can
+//! no longer produce). This module persists those bytes to a **content-addressed sidecar directory** beside
+//! the document: each blob is named by its own content hash (the [`AssetId`]), so writes dedup for free and
+//! a reload re-imports exactly the same handles (invariant 2 — the doc carries the handle, never the bytes).
+//!
+//! Native-only (it owns the filesystem) — so it lives here, not in `metrocalk-assets`, which stays
+//! `wasm32`-clean. The browser funnel persists asset bytes server-side (the named wasm seam).
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use metrocalk_assets::AssetId;
+
+/// The filename for a blob: the content hash (the `AssetId`'s hex, without the `mtkasset:` scheme) + a
+/// `.blob` extension. Self-describing and collision-free (it *is* the content address).
+fn blob_name(id: &AssetId) -> String {
+    let hex = id.as_str().strip_prefix("mtkasset:").unwrap_or(id.as_str());
+    format!("{hex}.blob")
+}
+
+/// The on-disk path for a blob in `dir`.
+#[must_use]
+pub fn blob_path(dir: &Path, id: &AssetId) -> PathBuf {
+    dir.join(blob_name(id))
+}
+
+/// Persist `bytes` to `dir` under their content address; return the handle. Idempotent — identical bytes
+/// produce the same path and are not rewritten. Crash-safe (write-temp → rename), so a torn write never
+/// leaves a half-blob that would fail the load-time hash check below.
+///
+/// # Errors
+/// Propagates a filesystem error (the directory couldn't be created, or the write/rename failed).
+pub fn put(dir: &Path, bytes: &[u8]) -> io::Result<AssetId> {
+    let id = AssetId::of_bytes(bytes);
+    let path = blob_path(dir, &id);
+    if path.exists() {
+        return Ok(id); // content-addressed → already persisted, byte-identical
+    }
+    fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("blob.tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &path)?;
+    Ok(id)
+}
+
+/// Load every persisted blob from `dir`, returning `(handle, bytes)` pairs. A blob whose content does not
+/// hash to its filename (a corrupt or tampered file) is **skipped, not trusted** — the persisted-asset
+/// safety gate (never a panic, never a wrong-handle resolve). A missing directory yields an empty list.
+#[must_use]
+pub fn load_all(dir: &Path) -> Vec<(AssetId, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out; // no sidecar dir yet — nothing persisted
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("blob") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else { continue };
+        // Verify the content matches the name — a blob is only trusted if it hashes to its own address.
+        let id = AssetId::of_bytes(&bytes);
+        let name_matches = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == blob_name(&id));
+        if name_matches {
+            out.push((id, bytes));
+        }
+    }
+    // Deterministic order (read_dir order is OS-dependent) so a reload is reproducible.
+    out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    out
+}
+
+/// Drop every persisted blob whose handle is not in the live set (the GC seam, mirroring
+/// [`AssetStore::gc`](metrocalk_assets::AssetStore) on disk). Returns how many were removed.
+pub fn gc<S: std::hash::BuildHasher>(
+    dir: &Path,
+    live: &std::collections::HashSet<AssetId, S>,
+) -> usize {
+    let mut removed = 0;
+    for (id, _) in load_all(dir) {
+        if !live.contains(&id) && fs::remove_file(blob_path(dir, &id)).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrocalk_assets::{AssetStore, GltfImporter};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mtk_blobstore_{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A small valid glb the importer accepts (the healthbar fixture), used as "generated mesh bytes".
+    fn gen_bytes() -> Vec<u8> {
+        metrocalk_assets::demo::healthbar_glb()
+    }
+
+    #[test]
+    fn generated_bytes_survive_reload() {
+        let dir = scratch("survive_reload");
+        let bytes = gen_bytes();
+
+        // At generation time: persist the bytes; the handle is content-addressed.
+        let id = put(&dir, &bytes).expect("persist generated bytes");
+        assert_eq!(
+            id,
+            AssetId::of_bytes(&bytes),
+            "handle is the content address"
+        );
+
+        // A fresh launch: a brand-new (empty) store re-populates from the sidecar dir and the SAME handle
+        // re-resolves to imported geometry — the dangling-handle bug is gone.
+        let mut store = AssetStore::new();
+        let importer = GltfImporter::new();
+        let mut resolved = false;
+        for (loaded_id, loaded_bytes) in load_all(&dir) {
+            let reimported = store
+                .import(&importer, &loaded_bytes)
+                .expect("re-import blob");
+            assert_eq!(
+                reimported, loaded_id,
+                "re-import reproduces the same handle"
+            );
+            if reimported == id {
+                resolved = true;
+            }
+        }
+        assert!(resolved, "the persisted handle re-resolves after reload");
+        assert!(
+            store.get_str(id.as_str()).is_some(),
+            "store now has the asset"
+        );
+    }
+
+    #[test]
+    fn put_is_idempotent() {
+        let dir = scratch("idempotent");
+        let bytes = gen_bytes();
+        let a = put(&dir, &bytes).unwrap();
+        let b = put(&dir, &bytes).unwrap();
+        assert_eq!(a, b);
+        // One blob on disk, not two.
+        let count = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("blob"))
+            .count();
+        assert_eq!(count, 1, "identical bytes persist once");
+    }
+
+    #[test]
+    fn a_corrupt_blob_is_skipped_not_trusted() {
+        let dir = scratch("corrupt");
+        let bytes = gen_bytes();
+        let id = put(&dir, &bytes).unwrap();
+        // Tamper: overwrite the blob's contents (its name no longer matches its hash).
+        fs::write(blob_path(&dir, &id), b"tampered bytes").unwrap();
+        let loaded = load_all(&dir);
+        assert!(
+            loaded.is_empty(),
+            "a content/name mismatch is skipped, never trusted"
+        );
+    }
+
+    #[test]
+    fn gc_drops_unreferenced_blobs() {
+        let dir = scratch("gc");
+        let keep = put(&dir, &gen_bytes()).unwrap();
+        let drop = put(&dir, &metrocalk_assets::demo::prop_glb()).unwrap();
+        let mut live = std::collections::HashSet::new();
+        live.insert(keep.clone());
+        assert_eq!(gc(&dir, &live), 1, "the unreferenced blob is collected");
+        let remaining: Vec<_> = load_all(&dir).into_iter().map(|(i, _)| i).collect();
+        assert_eq!(remaining, vec![keep]);
+        assert!(!remaining.contains(&drop));
+    }
+}

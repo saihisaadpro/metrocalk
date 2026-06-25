@@ -22,7 +22,9 @@ pub mod gltf_import;
 pub mod gpu;
 pub mod image_import;
 pub mod import;
+pub mod lod;
 pub mod mesh;
+pub mod obj_import;
 pub mod source;
 pub mod store;
 
@@ -32,7 +34,9 @@ pub use gltf_import::GltfImporter;
 pub use gpu::{MeshGpu, MeshVertex};
 pub use image_import::{ImageImporter, MAX_TEXELS};
 pub use import::{detect, import_any, Detected, ImportedAsset};
+pub use lod::{GridClusterLod, LodConfig, LodGenerator, MeshLod};
 pub use mesh::{Bounds, Material, MeshAsset, Primitive, Texture};
+pub use obj_import::ObjImporter;
 pub use source::{ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES};
 pub use store::{AssetId, AssetStore};
 

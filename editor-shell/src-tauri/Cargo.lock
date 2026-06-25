@@ -2779,6 +2779,7 @@ dependencies = [
  "gltf",
  "image",
  "metrocalk-skeleton",
+ "tobj",
 ]
 
 [[package]]
@@ -2817,6 +2818,7 @@ dependencies = [
 name = "metrocalk-editor-shell"
 version = "0.1.0"
 dependencies = [
+ "metrocalk-assets",
  "metrocalk-core",
  "metrocalk-deform",
  "metrocalk-economy",
@@ -5221,6 +5223,12 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "tobj"
+version = "4.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da83817ac7401436633efc35c19edae9f326fa741fae775a1caa406de9db07c"
 
 [[package]]
 name = "tokio"

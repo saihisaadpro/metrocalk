@@ -22,6 +22,10 @@ gltf = { version = "1.4", default-features = false, features = ["utils", "names"
 # PNG + JPEG decode (standalone user-image import, M10.2), pure Rust, wasm32-clean (no rayon / no C codecs
 # — `default-features = false`; `jpeg-decoder`'s rayon is an opt-in feature we do NOT enable).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Wavefront OBJ decode (M11.1) — pure Rust, wasm32-clean. `default-features = false` drops `ahash`
+# (whose runtime-rng pulls getrandom, which breaks wasm32-unknown-unknown); std hashing is plenty for a
+# one-shot import. `tobj::` stays behind `obj_import.rs` (the importer-wrapper boundary, like `gltf::`).
+tobj = { version = "4.0", default-features = false }
 # Makes the packed vertex `Pod` so the native renderer can `cast_slice` it into a GPU buffer. Pure
 # Rust, wasm32-clean.
 bytemuck = { version = "1", features = ["derive"] }

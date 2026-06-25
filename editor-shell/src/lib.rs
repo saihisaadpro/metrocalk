@@ -12,6 +12,7 @@
 
 pub mod actions;
 pub mod ai;
+pub mod blobstore;
 pub mod bridge;
 pub mod capscene;
 pub mod generate;
