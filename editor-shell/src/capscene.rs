@@ -28,9 +28,10 @@ use std::collections::HashMap;
 
 use metrocalk_core::caps::{canonical, display_name, is_standard};
 use metrocalk_core::marketplace::MarketplaceEntry;
+use metrocalk_core::variant::INSTANCE_META;
 use metrocalk_core::{
-    CapRole, CapabilityResolver, ComponentMeta, Engine, EntityId, FieldType, FieldValue, Op,
-    PipelineError,
+    CapRole, CapabilityResolver, ComponentMeta, Composition, Engine, EntityId, FieldType,
+    FieldValue, Op, PipelineError,
 };
 use metrocalk_ecs::rng::Rng;
 use metrocalk_ecs::{Entity, FlecsWorld, World};
@@ -1412,6 +1413,348 @@ pub fn duplicate_entity(
 
     engine.commit("duplicate-entity", ops)?;
     Ok(new_id)
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+// M10.6 — SCENE-AUTHORING VERBS (ADR-036). The editor's compose-a-scene verbs — create · rename · reparent ·
+// group/ungroup · multi-edit · copy/cut/paste · delete — each ONE undoable pipeline transaction (inv. 3)
+// riding the **Loro Movable Tree** (reparent = `node.move`, cycle-safe) + the **override model** (delete =
+// deactivate-not-destroy, M9.2). They EXTEND M3.3's surface (Remove/Duplicate/Focus/Inspect), reusing the
+// shipped primitives: reparent reuses M9.2's `node.move`, delete reuses M9.2's `SetActive`, copy/paste
+// reuses the variant `Composition` machinery — no new model, no fork. Verbs are commits → they mutate the
+// Loro document, so they **survive reload** via the M10.3 `.mtk` save/open (snapshot+oplog) by construction.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The `__meta__` field carrying an entity's user-facing **name** (M10.6 rename) — distinct from the
+/// `composition` provenance field (variant.rs). Stored in the durable doc, so a name survives reload.
+pub const NAME_FIELD: &str = "name";
+/// The `__meta__` field tagging a created **primitive** kind (`cube`/`plane`/`empty`) for the renderer.
+pub const PRIMITIVE_FIELD: &str = "primitive";
+
+/// Read an entity's user-facing name (set by [`rename`]), or `None` if it was never named.
+#[must_use]
+pub fn entity_name(engine: &Engine<FlecsWorld>, id: EntityId) -> Option<String> {
+    engine
+        .components_of(id)
+        .get(INSTANCE_META)
+        .and_then(|m| m.get(NAME_FIELD))
+        .and_then(|v| match v {
+            FieldValue::Str(s) => Some(s.clone()),
+            _ => None,
+        })
+}
+
+/// Build the three `Transform` x/y/z `SetField` ops for `pos`.
+fn transform_ops(id: EntityId, pos: [f32; 3]) -> Vec<Op> {
+    ["x", "y", "z"]
+        .into_iter()
+        .zip(pos)
+        .map(|(f, v)| Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        })
+        .collect()
+}
+
+/// **CREATE** an empty named entity at `pos` — ONE undoable transaction; the caller selects it. A
+/// transform-only node (no mesh); a visible primitive is [`create_primitive`]. Undo removes it.
+///
+/// # Errors
+/// [`PipelineError`] if the create transaction fails.
+pub fn create_entity(
+    engine: &mut Engine<FlecsWorld>,
+    pos: [f32; 3],
+    name: &str,
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    ops.extend(transform_ops(id, pos));
+    ops.push(Op::SetField {
+        entity: id,
+        component: INSTANCE_META.into(),
+        field: NAME_FIELD.into(),
+        value: FieldValue::Str(name.into()),
+    });
+    engine.commit("create-entity", ops)?;
+    Ok(id)
+}
+
+/// **CREATE a primitive** (cube/plane/…) at `pos` — an entity carrying a `Transform`, a name, a primitive-
+/// kind tag, and the `Renderable` capability so it shows; ONE undoable transaction. The renderer draws the
+/// primitive/placeholder mesh for the kind (a dedicated primitive mesh asset is a render concern).
+///
+/// # Errors
+/// [`PipelineError`] if the create transaction fails.
+pub fn create_primitive(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    kind: &str,
+    pos: [f32; 3],
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    ops.extend(transform_ops(id, pos));
+    ops.push(Op::SetField {
+        entity: id,
+        component: INSTANCE_META.into(),
+        field: NAME_FIELD.into(),
+        value: FieldValue::Str(kind.into()),
+    });
+    ops.push(Op::SetField {
+        entity: id,
+        component: INSTANCE_META.into(),
+        field: PRIMITIVE_FIELD.into(),
+        value: FieldValue::Str(kind.into()),
+    });
+    if let Some(&c) = scene.caps.get(&canonical("Renderable")) {
+        ops.push(Op::AddPair {
+            entity: id,
+            rel: scene.rels.provides,
+            target: c,
+        });
+    }
+    engine.commit("create-primitive", ops)?;
+    Ok(id)
+}
+
+/// **RENAME** an entity — ONE undoable transaction (a single `SetField` on `__meta__.name`); the
+/// projection re-reads it (inv. 1). Undo restores the prior name. Reload-persistent (it's in the doc).
+///
+/// # Errors
+/// [`PipelineError::UnknownEntity`] if `id` isn't a live entity, or the commit fails.
+pub fn rename(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+    name: &str,
+) -> Result<(), PipelineError> {
+    if engine.ecs_entity(id).is_none() {
+        return Err(PipelineError::UnknownEntity(id));
+    }
+    engine.commit(
+        "rename",
+        vec![Op::SetField {
+            entity: id,
+            component: INSTANCE_META.into(),
+            field: NAME_FIELD.into(),
+            value: FieldValue::Str(name.into()),
+        }],
+    )
+}
+
+/// Whether `maybe_descendant` is `ancestor` itself or anywhere below it in the Movable Tree — the cycle
+/// test for a reparent (moving `ancestor` under one of its own descendants would orphan a cycle).
+fn is_descendant(
+    engine: &Engine<FlecsWorld>,
+    ancestor: EntityId,
+    maybe_descendant: EntityId,
+) -> bool {
+    if ancestor == maybe_descendant {
+        return true;
+    }
+    let mut stack = engine.children_of(ancestor);
+    while let Some(c) = stack.pop() {
+        if c == maybe_descendant {
+            return true;
+        }
+        stack.extend(engine.children_of(c));
+    }
+    false
+}
+
+/// **REPARENT** `id` under `new_parent` via the Movable Tree (`node.move`) — ONE undoable transaction;
+/// `new_parent = None` moves it to the root. **Cycle-safe:** a move that would make `id` its own ancestor
+/// is **rejected** before the commit (and Loro's `MovableTree` rejects it too — `CyclicMoveError`). Undo
+/// restores the prior parent (the pipeline captures it as the inverse). Child world-transform is preserved
+/// for the flat/identity-parent case; a moved parent re-localizes per the gizmo rule (ADR-025).
+///
+/// # Errors
+/// [`PipelineError`] on a cycle (`Loro`), an unknown entity, or a failed commit.
+pub fn reparent_entity(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+    new_parent: Option<EntityId>,
+) -> Result<(), PipelineError> {
+    if let Some(p) = new_parent {
+        if is_descendant(engine, id, p) {
+            return Err(PipelineError::Loro(format!(
+                "reparent rejected — would create a cycle ({p} is {id} or its descendant)"
+            )));
+        }
+    }
+    engine.commit(
+        "reparent",
+        vec![Op::Reparent {
+            entity: id,
+            new_parent,
+        }],
+    )
+}
+
+/// **GROUP** a selection under a NEW parent node — ONE undoable transaction. The group node is created at
+/// the origin (identity), so each member's **world transform is preserved** (`global = identity · local =
+/// world` for the flat members; a later group move re-localizes per ADR-025). Reparenting every member in
+/// the SAME commit means one undo dissolves the group + restores every prior parent atomically. Returns
+/// the group id (the caller selects it).
+///
+/// # Errors
+/// [`PipelineError`] if any member isn't live, or the commit fails.
+pub fn group(
+    engine: &mut Engine<FlecsWorld>,
+    members: &[EntityId],
+    name: &str,
+) -> Result<EntityId, PipelineError> {
+    let group_id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity {
+        id: group_id,
+        parent: None,
+    }];
+    ops.extend(transform_ops(group_id, [0.0, 0.0, 0.0]));
+    ops.push(Op::SetField {
+        entity: group_id,
+        component: INSTANCE_META.into(),
+        field: NAME_FIELD.into(),
+        value: FieldValue::Str(name.into()),
+    });
+    for &m in members {
+        ops.push(Op::Reparent {
+            entity: m,
+            new_parent: Some(group_id),
+        });
+    }
+    engine.commit("group", ops)?;
+    Ok(group_id)
+}
+
+/// **UNGROUP** — dissolve a group: reparent every child to the group's parent (its grandparent), then
+/// delete the now-empty group node; ONE undoable transaction. World transforms are preserved for an
+/// identity group. Undo reverses it atomically (the group resurrects + the children move back). Returns
+/// the freed children.
+///
+/// # Errors
+/// [`PipelineError`] if the commit fails.
+pub fn ungroup(
+    engine: &mut Engine<FlecsWorld>,
+    group_id: EntityId,
+) -> Result<Vec<EntityId>, PipelineError> {
+    let children = engine.children_of(group_id);
+    let grandparent = engine.parent_of(group_id);
+    let mut ops = Vec::with_capacity(children.len() + 1);
+    for &c in &children {
+        ops.push(Op::Reparent {
+            entity: c,
+            new_parent: grandparent,
+        });
+    }
+    // Children are reparented OUT first (ops apply in order), so the group is empty when it's deleted —
+    // the cascade catches nothing extra. Undo resurrects the empty group, then moves the children back.
+    ops.push(Op::DeleteEntity { id: group_id });
+    engine.commit("ungroup", ops)?;
+    Ok(children)
+}
+
+/// **MULTI-EDIT** — apply one field edit to N entities as ONE **batched, atomic, undoable** transaction
+/// (NOT N silent ops). A single undo restores **all N** at once (inv. 3). Unknown ids in the batch fail the
+/// whole transaction (all-or-nothing), so a multi-selection is never half-edited.
+///
+/// # Errors
+/// [`PipelineError`] if any entity is unknown, or the commit fails.
+pub fn multi_edit(
+    engine: &mut Engine<FlecsWorld>,
+    ids: &[EntityId],
+    component: &str,
+    field: &str,
+    value: &FieldValue,
+) -> Result<(), PipelineError> {
+    let ops = ids
+        .iter()
+        .map(|&id| Op::SetField {
+            entity: id,
+            component: component.into(),
+            field: field.into(),
+            value: value.clone(),
+        })
+        .collect();
+    engine.commit("multi-edit", ops)
+}
+
+/// **DELETE** (M10.6) — **deactivate, not destroy** (ADR-026): set `id` inactive (so undo restores it and a
+/// concurrent editor's field edits are never lost to a destructive delete) AND **free any dependents**
+/// tracking it (the M3.3 Remove rule — the requirement re-opens), ONE undoable transaction. Distinct from
+/// M3.3 [`remove_entity`] (a destructive `DeleteEntity`); this is the non-destructive scene-authoring
+/// delete the compose-a-scene loop uses.
+///
+/// # Errors
+/// [`PipelineError`] if the commit fails.
+pub fn delete_deactivate(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    id: EntityId,
+) -> Result<(), PipelineError> {
+    let id_ecs = engine.ecs_entity(id);
+    let mut ops = vec![Op::SetActive {
+        entity: id,
+        active: false,
+    }];
+    // Free dependents (the M3.3 rule): drop every binding `id` participates in, and — when `id` is the
+    // requirer — the provider's consumed-marker `(BindsTo, id)` pair, so the freed provider re-enters the
+    // reveal. Undo restores them with the re-activation.
+    for (from, kind, to) in engine.bindings() {
+        if from != id && to != id {
+            continue;
+        }
+        ops.push(Op::RemoveBinding { from, kind, to });
+        if from == id {
+            if let Some(e) = id_ecs {
+                ops.push(Op::RemovePair {
+                    entity: to,
+                    rel: scene.rels.binds_to,
+                    target: e,
+                });
+            }
+        }
+    }
+    engine.commit("delete-deactivate", ops)
+}
+
+/// **COPY** — snapshot a sub-tree's **resolved** state (components + overrides + active flags) to a
+/// portable clipboard value, reusing the variant [`Composition`] machinery (no new model — pure read).
+/// The [`Composition`] is `serde`, so a clipboard captured in one project pastes into another
+/// (**cross-project**), same-process or serialized.
+#[must_use]
+pub fn copy_subtree(engine: &Engine<FlecsWorld>, root: EntityId, clip_id: &str) -> Composition {
+    engine.save_composition(root, clip_id)
+}
+
+/// **PASTE** a copied [`Composition`] under **fresh deterministic ids** ([`Engine::alloc_entity_id`]) — ONE
+/// undoable transaction (undo removes the whole pasted sub-tree). Deterministic ids ⇒ a replayed paste
+/// lands byte-identical (ADR-013). Works across projects (the [`Composition`] is the only thing that
+/// crosses — never a stale id). Returns the new root.
+///
+/// # Errors
+/// [`PipelineError`] if the instantiate transaction fails.
+pub fn paste_composition(
+    engine: &mut Engine<FlecsWorld>,
+    comp: &Composition,
+) -> Result<EntityId, PipelineError> {
+    engine.instantiate_composition(comp)
+}
+
+/// **CUT** — copy a sub-tree to the clipboard, then **delete (deactivate)** the source (non-destructive, so
+/// the data is preserved on the clipboard AND recoverable via undo). Returns the clipboard [`Composition`].
+///
+/// # Errors
+/// [`PipelineError`] if the delete transaction fails.
+pub fn cut_subtree(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    root: EntityId,
+    clip_id: &str,
+) -> Result<Composition, PipelineError> {
+    let clip = engine.save_composition(root, clip_id);
+    delete_deactivate(engine, scene, root)?;
+    Ok(clip)
 }
 
 /// Describe-to-create, end to end (local tier): resolve `query` over the stdlib and, on a confident
