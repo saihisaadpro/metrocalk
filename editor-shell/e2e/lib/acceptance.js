@@ -70,9 +70,21 @@ export async function captureBudget(label, cmd, argsFn, { n = 30, warmup = 5 } =
       args
     );
   };
-  for (let i = 0; i < warmup; i++) await sample(); // warm up — not scored
+  // A small node-side yield between samples so the back-to-back WebDriver round-trips don't saturate the
+  // WebView2 DevTools channel under the heavier React renderer. A tight uninterrupted burst of ~35
+  // `execute/sync` invokes intermittently stalled the renderer (a 30s "Timed out receiving message from
+  // renderer" → the 120s mocha timeout); spacing the round-trips lets the renderer message pump breathe.
+  // It does NOT affect what is measured: each sample independently times its own invoke round-trip.
+  const breathe = () => new Promise((r) => setTimeout(r, 5));
+  for (let i = 0; i < warmup; i++) {
+    await sample(); // warm up — not scored
+    await breathe();
+  }
   const xs = [];
-  for (let i = 0; i < n; i++) xs.push(await sample());
+  for (let i = 0; i < n; i++) {
+    xs.push(await sample());
+    await breathe();
+  }
   xs.sort((x, y) => x - y);
   const q = (p) => xs[Math.min(xs.length - 1, Math.floor(p * xs.length))];
   return { label, n, p50: q(0.5), p99: q(0.99), max: xs[xs.length - 1] };

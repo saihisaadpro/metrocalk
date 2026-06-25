@@ -26,8 +26,9 @@ const countEntities = async () => {
   return m ? Number(m[1]) : NaN;
 };
 
-// React-only surface (#genBtn / #playStageBadge / #count) — skip when the run targets the vanilla scaffold.
-const reactOnly = process.env.MTK_UI === "react" ? describe : describe.skip;
+// React is the production UI now (the vanilla scaffold is retired), so this always runs. Kept as a named
+// alias for clarity (the surface it asserts — #genBtn / #playStageBadge / #count — is React-only).
+const reactOnly = describe;
 
 reactOnly("acceptance / M10.10 editor UX hardening + viewport closeout (live, React UI on the .exe)", () => {
   before(async () => {

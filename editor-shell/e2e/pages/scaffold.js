@@ -370,7 +370,10 @@ const reactDeltas = {
 };
 
 export function page() {
-  // The active page-object — the React `/editor` (M10.1) when MTK_UI=react (scaffold verbs + the React
-  // deltas above), else the vanilla scaffold.
-  return process.env.MTK_UI === "react" ? { ...scaffold, ...reactDeltas } : scaffold;
+  // The React `/editor` is the PRODUCTION UI (`frontendDist`→React, M10.1; the vanilla scaffold
+  // `web/index.html` is retired). The `scaffold` object above is now the BASE selector/verb layer — the
+  // stable ids the React UI keeps — that the React deltas extend. There is no separate scaffold UI to
+  // target anymore, so the page-object is unconditionally React. (`MTK_UI` is kept honored as a legacy
+  // no-op for any external runner that still sets it.)
+  return { ...scaffold, ...reactDeltas };
 }

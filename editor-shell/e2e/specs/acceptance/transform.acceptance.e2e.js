@@ -53,6 +53,15 @@ describe("acceptance / M9 transform — gizmo (G1) · part edit (G2) · solver (
     const id = await invoke("spawn_body", { x: 0, y: 6, z: 0 });
     expect(typeof id).toBe("string");
     await invoke("set_sim_running", { run: false });
+    // Disable magnetic snap for this RAW-translate test: the body spawns inside the dense seeded scene (5003
+    // entities), so with snap ON the commit would snap the move onto a neighbour within SNAP_RADIUS instead of
+    // landing at the target. Magnetic snap is exercised separately in G4; here we assert the precise translate.
+    await invoke("set_snap", { on: false });
+    // FRAME the body: the deterministic gizmo test-drag projects world→screen→world (gizmo_set_target), so the
+    // subject must be ON-SCREEN. A freshly-spawned body sits off-screen for the boot camera (its gizmo handle
+    // doesn't project) — focus centers the camera on it so the projection (and the drag) are valid.
+    await invoke("focus_entity", { id });
+    await browser.pause(150);
 
     // Select it + enter translate via the W key → gizmo_debug confirms the mode + a live selection.
     expect(await invoke("gizmo_select", { id })).toBe(true);
@@ -120,6 +129,12 @@ describe("acceptance / M9 transform — gizmo (G1) · part edit (G2) · solver (
     // replayed; the test keys off the DELTA the edit produces, robust either way.)
     const before = await invoke("part_debug", { id: part }); // [x, y, z, active, nOverrides]
     expect(before[3]).toBe(true);
+
+    // FRAME the part: the deterministic gizmo test-drag projects world→screen→world, so the subject must be
+    // on-screen. G1 (running before this) leaves the camera on its body, and the demo character may sit
+    // off-screen for the boot camera too — focus centers on the part so the projection (and the drag) are valid.
+    await invoke("focus_entity", { id: part });
+    await browser.pause(150);
 
     // Edit the part with the gizmo: select → translate (W) → grab Y → move up → release. The commit routes
     // through edit_part_transform (parent-space write-back → a SPARSE per-field OVERRIDE), NOT a base

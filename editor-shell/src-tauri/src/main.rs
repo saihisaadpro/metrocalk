@@ -337,6 +337,14 @@ enum EngineCmd {
     PhysicsDebug {
         reply: Sender<(usize, f64, usize)>,
     },
+    /// A single body's CURRENT SIM position `[x,y,z]` — the render-side transform the sim integrates. The
+    /// sim is render-only (ADR-021), so a body's motion (a shove/impulse) NEVER reaches the authored
+    /// `Transform` that `read_transform` reads; this reads the sim source `physics_debug` aggregates, so a
+    /// test can verify a body actually MOVED. `[0,0,0]` if the id isn't a live sim body.
+    BodySimPosition {
+        id: String,
+        reply: Sender<[f64; 3]>,
+    },
     /// M8.3 — make a dead mesh entity a correct dynamic body (one undoable commit + mirror into the sim);
     /// replies whether it applied.
     MakeDynamic {
@@ -1273,7 +1281,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                         cost: Some(GENERATE_TOKENS),
                                         available: true,
                                         seam: None,
-                                        balance: Some(wallet.balance_tokens()),
+                                        // AVAILABLE (settled − the open hold), not the holds-blind balance: the
+                                        // reserve fences the cost up front, so the spendable balance the user
+                                        // sees must reflect the charge AT THE GESTURE (the legible-cost
+                                        // contract, M7/M10.10) — not jump only when the async settle lands.
+                                        balance: Some(wallet.available_tokens()),
                                     }
                                 }
                                 // Couldn't place the placeholder → release the reservation (no charge).
@@ -2430,6 +2442,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .fold(f64::INFINITY, f64::min);
                 let contacts = sim.diagnostics().contact_count;
                 let _ = reply.send((body_of.len(), min_y, contacts));
+            }
+            EngineCmd::BodySimPosition { id, reply } => {
+                let pos = EntityId::from_loro_key(&id)
+                    .and_then(|eid| body_of.get(&eid))
+                    .and_then(|h| sim.transform(*h))
+                    .map_or([0.0, 0.0, 0.0], |(t, _)| t);
+                let _ = reply.send(pos);
             }
             EngineCmd::MakeDynamic { id, reply } => {
                 // M8.3 ≤2-click: dead mesh → correct dynamic body (one undoable commit) → mirror into the
@@ -3621,6 +3640,23 @@ fn physics_debug(state: State<AppState>) -> (usize, f64, usize) {
     rx.recv().unwrap_or((0, 0.0, 0))
 }
 
+/// M8 — a single body's CURRENT sim position `[x,y,z]` (the render-side transform the sim integrates). The
+/// sim is render-only (ADR-021), so a shove/impulse moves the body in the sim, NOT the authored `Transform`
+/// — so a test confirms motion against THIS, not `read_transform`. `[0,0,0]` if `id` isn't a live sim body.
+#[tauri::command]
+fn body_sim_position(state: State<AppState>, id: String) -> [f64; 3] {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::BodySimPosition { id, reply })
+        .is_err()
+    {
+        return [0.0, 0.0, 0.0];
+    }
+    rx.recv().unwrap_or([0.0, 0.0, 0.0])
+}
+
 /// M8.3 — make a dead mesh entity a correct dynamic body (the ≤2-click intent). Returns whether it applied.
 #[tauri::command]
 fn make_dynamic(state: State<AppState>, id: String) -> bool {
@@ -4635,6 +4671,7 @@ fn main() {
             spawn_body,
             set_sim_running,
             physics_debug,
+            body_sim_position,
             make_dynamic,
             physics_check,
             physics_fix,

@@ -238,22 +238,25 @@ describe("acceptance / M8 physics — drop · transport · debugger · determini
 
     // The UI's shove requires a selection (it reads `selected`); select the body the same way the UI does.
     expect(await invoke("gizmo_select", { id })).toBe(true);
-    const t0 = await invoke("read_transform", { id }); // [x, y, z, ...]
+    // Read the body's SIM position (not read_transform): the sim is render-only (ADR-021), so a shove moves
+    // the body in the sim/render, NEVER the authored Transform — verifying motion against read_transform would
+    // be checking the wrong source. `body_sim_position` reads the same sim transform physics_debug aggregates.
+    const p0 = await invoke("body_sim_position", { id }); // [x, y, z]
 
     // Shove via the same command the #shove button dispatches (impulse +X). Resume so the impulse integrates.
     const shoved = await invoke("sim_shove", { id, impulse: [6.0, 1.0, 0.0] });
     expect(shoved).toBe(true);
     await invoke("set_sim_running", { run: true });
 
-    // The body moved off its spawn X (the recorded impulse pushed it along +X).
+    // The body moved off its spawn X (the recorded impulse pushed it along +X) — read back from the SIM.
     await browser.waitUntil(
       async () => {
-        const t = await invoke("read_transform", { id });
-        return Math.abs(t[0] - t0[0]) > 0.2;
+        const p = await invoke("body_sim_position", { id });
+        return Math.abs(p[0] - p0[0]) > 0.2;
       },
       { timeout: 10000, timeoutMsg: "the shoved body never moved along the impulse axis" }
     );
-    const moved = Math.abs((await invoke("read_transform", { id }))[0] - t0[0]) > 0.2;
+    const moved = Math.abs((await invoke("body_sim_position", { id }))[0] - p0[0]) > 0.2;
 
     const errs = await consoleErrors();
     const clean = errs.length === 0;
@@ -262,7 +265,7 @@ describe("acceptance / M8 physics — drop · transport · debugger · determini
     report.workflow(
       "physics/shove",
       { functional: moved, inv1: true, inv3: null, clean, offline: true },
-      { commands: ["sim_shove", "spawn_body", "read_transform"] }
+      { commands: ["sim_shove", "spawn_body", "body_sim_position"] }
     );
 
     expect(moved).toBe(true);
@@ -282,13 +285,19 @@ describe("acceptance / M8 physics — drop · transport · debugger · determini
     await browser.waitUntil(
       async () => {
         const d = await ui.physDebug();
-        return d[0] >= 3 && d[1] < 1.8 && d[2] > 0;
+        const t = await invoke("sim_timeline"); // [frame, max, running, overlays, bodies]
+        // A genuinely settled scene WITH a real recorded timeline (> 12 frames). The timeline length is
+        // checked DIRECTLY here, not inferred from body-settle: a leftover resting body from a prior test
+        // (the shove body) can satisfy the body-settle proxy (lowestY < 1.8, a contact) on the first poll —
+        // before the recording has accumulated frames — so the old proxy-only wait could return with an
+        // empty timeline. Full-suite ordering exposed that race; requiring t[1] > 12 makes it robust.
+        return d[0] >= 3 && d[1] < 1.8 && d[2] > 0 && t[1] > 12;
       },
-      { timeout: 20000, timeoutMsg: "the scene never settled before scrubbing" }
+      { timeout: 20000, timeoutMsg: "the scene never settled into a real timeline before scrubbing" }
     );
 
     const tl = await invoke("sim_timeline"); // [frame, max, running, overlays, bodies]
-    expect(tl[1]).toBeGreaterThan(10); // a real timeline exists
+    expect(tl[1]).toBeGreaterThan(10); // a real timeline exists (guaranteed by the wait above)
 
     // Scrub to a target frame (lands EXACTLY there and PAUSES — transport over the deterministic replay channel).
     const back = Math.max(1, Math.floor(tl[1] / 2));
