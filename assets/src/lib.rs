@@ -26,6 +26,10 @@ pub mod gltf_import;
 pub mod gpu;
 pub mod image_import;
 pub mod import;
+/// KTX2/basis texture transcode (M11.1, ADR-040) — native-only (`basis-universal` C++ FFI), behind the
+/// `ktx2` feature so the default crate stays wasm32-clean. The browser funnel transcodes server-side.
+#[cfg(feature = "ktx2")]
+pub mod ktx2_import;
 pub mod lod;
 pub mod mesh;
 pub mod obj_import;
@@ -40,6 +44,8 @@ pub use gltf_import::GltfImporter;
 pub use gpu::{MeshGpu, MeshVertex};
 pub use image_import::{ImageImporter, MAX_TEXELS};
 pub use import::{detect, import_any, Detected, ImportedAsset};
+#[cfg(feature = "ktx2")]
+pub use ktx2_import::{transcode_to_rgba8, KtxImporter};
 pub use lod::{GridClusterLod, LodConfig, LodGenerator, MeshLod};
 pub use mesh::{Bounds, Material, MeshAsset, Primitive, Texture};
 pub use obj_import::ObjImporter;

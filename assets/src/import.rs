@@ -135,6 +135,22 @@ fn fbx_route(_bytes: &[u8]) -> Result<ImportedAsset, ImportError> {
     ))
 }
 
+/// KTX2/basis route — the native transcoder (feature `ktx2`), else an explained native-seam error.
+#[cfg(feature = "ktx2")]
+fn ktx2_route(bytes: &[u8]) -> Result<ImportedAsset, ImportError> {
+    crate::ktx2_import::KtxImporter::new()
+        .import(bytes)
+        .map(ImportedAsset::Mesh)
+}
+#[cfg(not(feature = "ktx2"))]
+fn ktx2_route(_bytes: &[u8]) -> Result<ImportedAsset, ImportError> {
+    Err(ImportError::Malformed(
+        "KTX2 recognized — its basis transcode is the native C++ FFI path (build with the `ktx2` feature). \
+         Use PNG/JPG, or pre-transcode to RGBA8."
+            .into(),
+    ))
+}
+
 /// Import a user file through the right backend, chosen by [`detect`].
 ///
 /// # Errors
@@ -149,11 +165,7 @@ pub fn import_any(bytes: &[u8]) -> Result<ImportedAsset, ImportError> {
         // FBX → the native `ufbx` importer when the `fbx` feature is built (ADR-040); otherwise recognized
         // + explained (never a silent "unrecognized" / panic — the browser funnel converts server-side).
         Some(Detected::Fbx) => fbx_route(bytes),
-        Some(Detected::Ktx2) => Err(ImportError::Malformed(
-            "KTX2 recognized — its basis transcode is the native C++ FFI path (not built in this slice). \
-             Use PNG/JPG, or pre-transcode to RGBA8."
-                .into(),
-        )),
+        Some(Detected::Ktx2) => ktx2_route(bytes),
         None => Err(ImportError::Malformed(
             "unrecognized file — supported: glTF/glb, OBJ, PNG/JPG, WAV/OGG (FBX/KTX2 recognized, native seam)".into(),
         )),

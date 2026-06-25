@@ -28,9 +28,10 @@ metrocalk-core = { path = "../../core" }
 metrocalk-ecs = { path = "../../ecs" }
 metrocalk-editor-shell = { path = ".." }
 # The local asset/import substrate (M4): glTF import + content-addressed store + GPU mesh packing.
-# `fbx` enables the native ufbx FFI importer (M11.1, ADR-040) — the .exe imports FBX. The wasm funnel never
-# builds this crate with `fbx` (the browser converts FBX server-side — the explicit seam).
-metrocalk-assets = { path = "../../assets", features = ["fbx"] }
+# `fbx`+`ktx2` enable the native FFI importers (M11.1, ADR-040) — the .exe imports FBX (ufbx) and KTX2/basis
+# (basis-universal). The wasm funnel never builds this crate with them (the browser converts/transcodes
+# server-side — the explicit seam).
+metrocalk-assets = { path = "../../assets", features = ["fbx", "ktx2"] }
 # The token economy (M7): the wallet/ledger types the three paid sinks meter against.
 metrocalk-economy = { path = "../../economy" }
 # The physics subsystem (M8.2): the project-owned `Physics` trait (Rapier wrapped). Only the binary
