@@ -18,6 +18,10 @@
 pub mod audio;
 pub mod autorig;
 pub mod demo;
+/// FBX import (M11.1, ADR-040) — native-only (`ufbx` C-FFI), behind the `fbx` feature so the default crate
+/// stays wasm32-clean. The browser funnel converts FBX server-side (the explicit wasm seam).
+#[cfg(feature = "fbx")]
+pub mod fbx_import;
 pub mod gltf_import;
 pub mod gpu;
 pub mod image_import;
@@ -30,6 +34,8 @@ pub mod store;
 
 pub use audio::{AudioAsset, AudioFormat, AudioImporter, AudioSource, AudioStore};
 pub use autorig::{bake_standard_lbs, AutoRig, AutoRigJoint, NeuralRigImporter};
+#[cfg(feature = "fbx")]
+pub use fbx_import::FbxImporter;
 pub use gltf_import::GltfImporter;
 pub use gpu::{MeshGpu, MeshVertex};
 pub use image_import::{ImageImporter, MAX_TEXELS};

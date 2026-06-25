@@ -356,6 +356,13 @@ enum EngineCmd {
     PasteClipboard {
         reply: Sender<Option<String>>,
     },
+    /// M11.1 (ADR-040) — import a user asset file from disk (FBX/glTF/OBJ/PNG/… via the MAGIC router):
+    /// register its GPU mesh, place an entity carrying the handle, persist the bytes (survives reload) →
+    /// reply the new entity id (or `None` on an unsupported/malformed file).
+    ImportAsset {
+        path: String,
+        reply: Sender<Option<String>>,
+    },
     /// Generation (M6, tier 3): drop a grey placeholder + kick off async text-to-3D; reply the placeholder.
     Generate {
         query: String,
@@ -1412,6 +1419,55 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
                 let _ = reply.send(new.map(|n| n.to_loro_key()));
+            }
+            EngineCmd::ImportAsset { path, reply } => {
+                // M11.1 — drop any file → a working asset. Read the file, route by MAGIC (glTF/OBJ/FBX/
+                // PNG/…), register its GPU mesh if new, persist the bytes by content address (survives
+                // reload — the M6/M11.1 residual), place an entity carrying the handle, and reply its id.
+                // An unsupported/malformed file → `None` (the React surface explains it).
+                let mut result = None;
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Ok(metrocalk_assets::ImportedAsset::Mesh(asset)) =
+                        metrocalk_assets::import_any(&bytes)
+                    {
+                        let handle = AssetId::of_bytes(&bytes).as_str().to_string();
+                        if !assets.handle_to_slot.contains_key(&handle) {
+                            let gpu = MeshGpu::from_asset(&asset);
+                            let ext = asset.bounds().max_extent();
+                            let slot = assets.meshes.len();
+                            assets.meshes.push(gpu.clone());
+                            assets.scales.push(if ext > 0.0 { 0.9 / ext } else { 1.0 });
+                            assets.handle_to_slot.insert(handle.clone(), slot);
+                            let mut st = shared.lock().unwrap();
+                            st.meshes.push(gpu);
+                            st.meshes_revision = st.meshes_revision.wrapping_add(1);
+                        }
+                        let _ = metrocalk_editor_shell::blobstore::put(
+                            &sidecar("metrocalk-assets"),
+                            &bytes,
+                        );
+                        if let Ok(id) =
+                            capscene::place_mesh(&mut engine, &scene, &handle, [0.0, 1.0, 0.0])
+                        {
+                            log.append(&Record::PlaceMesh {
+                                asset: handle.clone(),
+                                pos: [0.0, 1.0, 0.0],
+                            });
+                            echo_created(
+                                &mut engine,
+                                &shared,
+                                &mut positions,
+                                &assets,
+                                &channel,
+                                &mut recency,
+                                &mut touch,
+                                id,
+                            );
+                            result = Some(id.to_loro_key());
+                        }
+                    }
+                }
+                let _ = reply.send(result);
             }
             EngineCmd::Details { id, reply } => {
                 let details = EntityId::from_loro_key(&id)
@@ -4514,6 +4570,48 @@ fn paste_clipboard(state: State<AppState>) -> Option<String> {
     rx.recv().unwrap_or(None)
 }
 
+/// M11.1 (ADR-040) — import an asset file from a known path (the e2e drives this); reply the new entity id.
+#[tauri::command]
+fn import_asset(state: State<AppState>, path: String) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ImportAsset { path, reply })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().unwrap_or(None)
+}
+
+/// M11.1 — **File → Import**: open a native file dialog filtered to 3D/asset formats, then import the
+/// chosen file (the human path; the native dialog is the local-GUI step). Reply the new entity id, or
+/// `None` if cancelled / unsupported.
+#[tauri::command]
+fn import_asset_dialog(app: tauri::AppHandle, state: State<AppState>) -> Option<String> {
+    ipc();
+    let path = app
+        .dialog()
+        .file()
+        .add_filter(
+            "3D models & assets",
+            &["fbx", "glb", "gltf", "obj", "png", "jpg", "jpeg"],
+        )
+        .blocking_pick_file()
+        .and_then(|f| f.into_path().ok())
+        .map(|p| p.display().to_string())?;
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ImportAsset { path, reply })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().unwrap_or(None)
+}
+
 /// M9.2 — deactivate-not-delete a part (or reactivate); replies whether it applied.
 #[tauri::command]
 fn set_part_active(state: State<AppState>, id: String, active: bool) -> bool {
@@ -5088,6 +5186,8 @@ fn main() {
             copy_subtree,
             cut_subtree,
             paste_clipboard,
+            import_asset,
+            import_asset_dialog,
             set_part_active,
             save_character,
             instantiate_character,

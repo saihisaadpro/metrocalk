@@ -119,6 +119,22 @@ pub fn detect(bytes: &[u8]) -> Option<Detected> {
     None
 }
 
+/// FBX route — the native `ufbx` importer (feature `fbx`), else an explained native-seam error.
+#[cfg(feature = "fbx")]
+fn fbx_route(bytes: &[u8]) -> Result<ImportedAsset, ImportError> {
+    crate::fbx_import::FbxImporter::new()
+        .import(bytes)
+        .map(ImportedAsset::Mesh)
+}
+#[cfg(not(feature = "fbx"))]
+fn fbx_route(_bytes: &[u8]) -> Result<ImportedAsset, ImportError> {
+    Err(ImportError::Malformed(
+        "FBX recognized — its importer is the native `ufbx` path (build with the `fbx` feature). \
+         Export to glTF/glb or OBJ for now."
+            .into(),
+    ))
+}
+
 /// Import a user file through the right backend, chosen by [`detect`].
 ///
 /// # Errors
@@ -130,12 +146,9 @@ pub fn import_any(bytes: &[u8]) -> Result<ImportedAsset, ImportError> {
         Some(Detected::Image) => ImageImporter::new().import(bytes).map(ImportedAsset::Mesh),
         Some(Detected::Obj) => ObjImporter::new().import(bytes).map(ImportedAsset::Mesh),
         Some(Detected::Audio) => AudioImporter::new().import(bytes).map(ImportedAsset::Audio),
-        // Recognized but native-FFI-owed (ADR-040): explained, never a silent "unrecognized" or a panic.
-        Some(Detected::Fbx) => Err(ImportError::Malformed(
-            "FBX recognized — its importer is the native `ufbx` path (not built in this slice). \
-             Export to glTF/glb or OBJ for now."
-                .into(),
-        )),
+        // FBX → the native `ufbx` importer when the `fbx` feature is built (ADR-040); otherwise recognized
+        // + explained (never a silent "unrecognized" / panic — the browser funnel converts server-side).
+        Some(Detected::Fbx) => fbx_route(bytes),
         Some(Detected::Ktx2) => Err(ImportError::Malformed(
             "KTX2 recognized — its basis transcode is the native C++ FFI path (not built in this slice). \
              Use PNG/JPG, or pre-transcode to RGBA8."

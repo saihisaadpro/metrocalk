@@ -33,9 +33,23 @@ bytemuck = { version = "1", features = ["derive"] }
 # JOINTS_0/WEIGHTS_0) onto a `skeleton::Skeleton` INSIDE the wrapper (gltf_import.rs), so the loaded rig
 # crosses out as OUR type, no `gltf::` leak. Pure Rust (glam + the gizmo crate's plain arrays), wasm32-clean.
 metrocalk-skeleton = { path = "../skeleton" }
+# FBX import (M11.1, ADR-040) — the `ufbx` C library wrapped via FFI (`cc`). Robust ASCII+binary+skinning,
+# but **native-only** → OFF by default behind the `fbx` feature so the crate stays wasm32-clean (the
+# wasm-tripwire builds the default). `ufbx::` stays behind `fbx_import.rs` (grep-gated, like `gltf::`).
+ufbx = { version = "0.10", optional = true }
+
+[features]
+default = []
+# M11.1 native-only FFI formats (ADR-040): the editor app enables this; the wasm/browser funnel never does
+# (the FBX/KTX2 conversions are a server-side seam there — the explicit wasm boundary).
+native-formats = ["fbx"]
+fbx = ["dep:ufbx"]
 
 [dev-dependencies]
 # Round-trip the demo glb generators back through the importer in tests.
+# Bake-off comparison ONLY (M11.1 crate eval, ADR-040): the pure-Rust FBX DOM parser — experimental,
+# binary-only — measured head-to-head with `ufbx` on the SAME fixture, then NOT used in production.
+fbxcel-dom = "0.0.10"
 
 [lints]
 workspace = true

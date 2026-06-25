@@ -187,6 +187,12 @@ export interface EditorClient {
   /** Instantiate a catalog item into the scene (place-into-scene) — one undoable, persisted entity. */
   addItem(id: string, source: string): Promise<AddResponse>;
 
+  // ── M11.1 File→Import (ADR-040): drop any file → a working asset (FBX/glTF/OBJ/PNG via the MAGIC router) ─
+  /** Import an asset file from a known path → the new entity id (the e2e path). */
+  importAsset(path: string): Promise<string | null>;
+  /** File→Import: open the native file dialog + import the chosen file → the new entity id. */
+  importAssetDialog(): Promise<string | null>;
+
   // ── project lifecycle (M10.3 / ADR-033): New / Open / Save / Save As over the `.mtk` document ──────
   /** The current project state — path, unsaved-changes flag, recent projects. The File menu refreshes
    *  this on open so the unsaved-changes guard reads the authoritative (shell-side) dirty flag. */
@@ -475,6 +481,12 @@ class TauriClient implements EditorClient {
   }
   addItem(id: string, source: string): Promise<AddResponse> {
     return this.core.invoke<AddResponse>("add_item", { id, source });
+  }
+  importAsset(path: string): Promise<string | null> {
+    return this.core.invoke<string | null>("import_asset", { path });
+  }
+  importAssetDialog(): Promise<string | null> {
+    return this.core.invoke<string | null>("import_asset_dialog");
   }
 
   projectState(): Promise<ProjectInfo> {
@@ -845,6 +857,13 @@ class MockClient implements EditorClient {
       balance = this.balance;
     }
     return Promise.resolve({ created, balance, seam: null });
+  }
+  // Import is live-only (the native MAGIC router + ufbx FFI + the file dialog) — inert in the dev MockCore.
+  importAsset(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  importAssetDialog(): Promise<string | null> {
+    return Promise.resolve(null);
   }
 
   // The dev MockCore has no real document; track a plausible in-memory project so the File menu renders.

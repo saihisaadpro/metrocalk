@@ -63,14 +63,14 @@ jobs:
 
       - name: No foreign decoder types leak past the asset-importer wrappers (invariant 5)
         run: |
-          # gltf:: / image:: must live ONLY behind the MeshSource trait, in the importer wrappers
-          # (gltf_import.rs for glTF + its embedded textures; image_import.rs for standalone PNG/JPG, M10.2)
+          # gltf:: / image:: / tobj:: / ufbx:: must live ONLY behind the MeshSource trait, in the importer
+          # wrappers (gltf_import.rs · image_import.rs · obj_import.rs [M11.1] · fbx_import.rs [M11.1, native])
           # — the same discipline as flecs_ecs-in-/ecs. Comment lines (prose mentioning the types) skipped.
-          if grep -rn "gltf::\|image::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'image_import.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
-            echo "::error::gltf::/image:: leaked outside the importer wrappers — foreign decoder types must stay behind the MeshSource trait (invariant 5; mirrors ADR-001/006)"
+          if grep -rn "gltf::\|image::\|tobj::\|ufbx::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'image_import.rs' | grep -v 'obj_import.rs' | grep -v 'fbx_import.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::a foreign decoder type (gltf::/image::/tobj::/ufbx::) leaked outside the importer wrappers — they must stay behind the MeshSource trait (invariant 5; mirrors ADR-001/006/040)"
             exit 1
           fi
-          echo "no gltf::/image:: outside the importer wrappers — boundary intact"
+          echo "no gltf::/image::/tobj::/ufbx:: outside the importer wrappers — boundary intact"
 
       - name: No rapier/parry types leak outside the /physics crate (invariant 5, M8.2/ADR-021)
         run: |
@@ -122,6 +122,15 @@ jobs:
         run: |
           cargo clippy -p metrocalk-transport --all-targets --features ws -- -D warnings
           cargo test -p metrocalk-transport --features ws
+
+      # The native FBX importer (M11.1/ADR-040) lives behind the non-default `fbx` feature (the `ufbx` C
+      # library via FFI) so the wasm-tripwire's default build stays wasm32-clean. Build, lint, and test it
+      # explicitly so the importer AND the **measured** crate bake-off (tests/fbx_bakeoff.rs, ufbx vs
+      # fbxcel-dom) are not dark. The runner has a C toolchain (`cc` builds ufbx).
+      - name: assets FBX importer — clippy + test the native ufbx path + the bake-off (dark on default)
+        run: |
+          cargo clippy -p metrocalk-assets --all-targets --features fbx -- -D warnings
+          cargo test -p metrocalk-assets --features fbx
 
   editor-vitest:
     # The React editor projection (editor/, ADR-010) has a real vitest suite (transport-frame decode,

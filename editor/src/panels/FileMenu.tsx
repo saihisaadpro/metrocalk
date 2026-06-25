@@ -99,6 +99,21 @@ export function FileMenu({ client }: { client: EditorClient }) {
     setOpen(false);
   }
 
+  /** M11.1 (ADR-040) — File→Import: open the native file dialog, import the chosen file through the MAGIC
+   *  router (FBX/glTF/OBJ/PNG), select the placed entity. "Drop any file → a working asset." */
+  async function importFile() {
+    setOpen(false);
+    const id = await client.importAssetDialog();
+    if (id) {
+      projectionStore.getState().select(id);
+      projectStore.getState().markDirty();
+      setStatus(`imported · ${id}`);
+      pushToast("imported an asset", "success");
+    } else {
+      setStatus("import cancelled or unsupported");
+    }
+  }
+
   return (
     <div id="fileMenuRoot" style={{ position: "relative", font: "12px ui-monospace, monospace" }}>
       <button
@@ -127,6 +142,7 @@ export function FileMenu({ client }: { client: EditorClient }) {
           >
             <MenuItem id="fileNew" label="New project" onClick={() => guarded(() => client.newProject(), "New", "new project")} />
             <MenuItem id="fileOpen" label="Open…" onClick={() => guarded(() => client.openProject(), "Open", "opened")} />
+            <MenuItem id="fileImport" label="Import asset…" onClick={() => void importFile()} />
             <Divider />
             <MenuItem id="fileSave" label="Save" onClick={() => void save(false)} />
             <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void save(true)} />
