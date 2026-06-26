@@ -38,7 +38,7 @@ pub use generate::{
     FakeGenerator, GenError, GenRequest, MeshGenerator, MeterAction, RemoteGenerator, StubMeter,
     TokenMeter,
 };
-pub use metering::{ai_edit_rustier, buy_marketplace, rustier_patch, Outcome};
+pub use metering::{ai_edit_material, buy_marketplace, material_patch, Outcome};
 pub use persist::{Log, Record};
 pub use project::{atomic_write, open_into, save, OpenError};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};

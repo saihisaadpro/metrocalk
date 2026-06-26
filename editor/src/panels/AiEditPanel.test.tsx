@@ -56,10 +56,25 @@ test("legible + deliberate spend: click → confirm (price + before/after) → A
 
   // Apply → the charge lands (debit-on-success): the store balance + the toast/status name the cost
   fireEvent.click(screen.getByTestId("rustierApply"));
-  await waitFor(() => expect(aiEdit).toHaveBeenCalledWith("e1"));
+  // M11.2: the weathered-metal suggestion now names its preset explicitly ("rusty").
+  await waitFor(() => expect(aiEdit).toHaveBeenCalledWith("e1", "rusty"));
   await waitFor(() => expect(walletStore.getState().balance).toBe(98));
   expect(uiStore.getState().status).toContain("−2");
   expect(toastStore.getState().toasts.some((t) => /applied/i.test(t.text))).toBe(true);
+});
+
+test("M11.2 material palette: a chip assigns the chosen PBR preset through the metered AI-edit", async () => {
+  selectAnEntity();
+  setBalance(100);
+  const aiEdit = vi.fn(() => Promise.resolve<EconResponse>({ ok: true, balance: 98, cost: 2, message: null }));
+  render(<AiEditPanel client={fakeClient({ aiEdit })} />);
+
+  // The palette states the cost up-front; a labelled chip is a deliberate pick → applies that preset.
+  expect(screen.getByTestId("materialPalette").textContent).toMatch(/~2 tokens/);
+  fireEvent.click(screen.getByTestId("material-chrome"));
+  await waitFor(() => expect(aiEdit).toHaveBeenCalledWith("e1", "chrome"));
+  await waitFor(() => expect(walletStore.getState().balance).toBe(98));
+  expect(toastStore.getState().toasts.some((t) => /chrome/i.test(t.text))).toBe(true);
 });
 
 test("Cancel aborts the confirm — no spend", () => {

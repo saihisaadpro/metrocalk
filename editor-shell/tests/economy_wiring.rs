@@ -11,7 +11,7 @@ use metrocalk_economy::{AccountId, Action, Mtk};
 use metrocalk_ecs::FlecsWorld;
 
 use metrocalk_editor_shell::capscene::{self, CapScene};
-use metrocalk_editor_shell::{ai_edit_rustier, buy_marketplace, Outcome, Wallet};
+use metrocalk_editor_shell::{ai_edit_material, buy_marketplace, Outcome, Wallet};
 
 const N: usize = 200;
 
@@ -95,7 +95,7 @@ fn an_ai_edit_debits_two_tokens_and_sets_the_material_rusty() {
     let mut wallet = Wallet::in_memory();
     let ph = capscene::place_generation_placeholder(&mut engine, &scene, [0.0; 3]).unwrap();
 
-    let (delta, outcome) = ai_edit_rustier(&mut engine, &mut wallet, ph, "edit-1");
+    let (delta, outcome) = ai_edit_material(&mut engine, &mut wallet, ph, "edit-1", "rusty");
     assert!(matches!(outcome, Outcome::Charged { cost_tokens: 2, .. }));
     assert_eq!(wallet.balance_tokens(), 28);
     assert!(delta.is_some(), "the material edit echoes a delta");
@@ -117,7 +117,7 @@ fn an_ai_edit_on_a_nonexistent_entity_is_rejected_and_never_charged() {
     let bogus = engine.alloc_entity_id(); // allocated, but no entity created
     let before = wallet.balance_tokens();
 
-    let (delta, outcome) = ai_edit_rustier(&mut engine, &mut wallet, bogus, "edit-bogus");
+    let (delta, outcome) = ai_edit_material(&mut engine, &mut wallet, bogus, "edit-bogus", "rusty");
     assert!(matches!(outcome, Outcome::Rejected(_)));
     assert!(delta.is_none());
     assert_eq!(
@@ -136,7 +136,7 @@ fn an_ai_edit_is_refused_gracefully_when_broke() {
     }
     assert_eq!(wallet.balance_tokens(), 0);
     let ph = capscene::place_generation_placeholder(&mut engine, &scene, [0.0; 3]).unwrap();
-    let (delta, outcome) = ai_edit_rustier(&mut engine, &mut wallet, ph, "edit-broke");
+    let (delta, outcome) = ai_edit_material(&mut engine, &mut wallet, ph, "edit-broke", "rusty");
     assert!(matches!(outcome, Outcome::Refused { needed: 2, have: 0 }));
     assert!(delta.is_none(), "nothing applied when broke");
 }

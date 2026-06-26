@@ -153,8 +153,8 @@ const PI = 3.14159265359;
 // + 0.45·NdotL); a physically-correct single light through the `/PI` diffuse term is otherwise too dark for
 // an editor viewport. (Exposure tuned analytically — pixel-verification is owed on a non-occluded GUI run.)
 const LIGHT_DIR = vec3<f32>(0.4, 0.8, 0.3);
-const LIGHT_COLOR = vec3<f32>(2.6, 2.6, 2.6);
-const AMBIENT = 0.18; // hemispheric fill so unlit faces aren't near-black (no IBL until M11.3)
+const LIGHT_COLOR = vec3<f32>(2.4, 2.4, 2.4);
+const AMBIENT = 0.35; // fill so an UNLIT matte face isn't ~3x dimmer than the prior Lambert (review fix)
 
 // GGX/Trowbridge-Reitz normal distribution.
 fn distribution_ggx(n_dot_h: f32, rough: f32) -> f32 {

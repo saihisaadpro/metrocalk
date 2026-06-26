@@ -36,7 +36,7 @@ use metrocalk_editor_shell::transform_solver::{
     Constraint, ConstraintIntent, SnapKind, SnapTarget,
 };
 use metrocalk_editor_shell::{
-    actions_for, ai_edit_rustier, apply_ai_patch, apply_edit, buy_marketplace, capscene,
+    actions_for, ai_edit_material, apply_ai_patch, apply_edit, buy_marketplace, capscene,
     project_entity, project_full, transform_solver, ActionItem, AiPatch, CapScene, EditIntent,
     EditTx, Log, MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp, Record, Wallet,
 };
@@ -393,10 +393,11 @@ enum EngineCmd {
         placeholder: String,
         reason: String,
     },
-    /// A live AI-edit (M7) — "make it rustier": a schema-validated patch metered at the edit rate
-    /// (debit-on-success). Replies the economy outcome.
+    /// A live AI-edit (M7 + M11.2) — assign a named PBR `material` preset: a schema-validated patch metered
+    /// at the edit rate (debit-on-success). Replies the economy outcome.
     AiEdit {
         id: String,
+        material: String,
         reply: Sender<EconResponse>,
     },
     /// A sandbox token top-up (M7) — $10 ≈ 100 tokens via the payment seam (no real money).
@@ -1755,12 +1756,18 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     });
                 }
             }
-            EngineCmd::AiEdit { id, reply } => {
-                // The live "make it rustier" AI-edit (M7): a schema-validated patch metered at the edit
-                // rate (debit-on-success; a rejected patch or insufficient balance never charges).
+            EngineCmd::AiEdit {
+                id,
+                material,
+                reply,
+            } => {
+                // The live material AI-edit (M7 + M11.2): assign a named PBR material preset via a
+                // schema-validated patch, metered at the edit rate (debit-on-success; a rejected patch or
+                // insufficient balance never charges). `material` is the chosen preset (UI palette).
                 let resp = if let Some(eid) = EntityId::from_loro_key(&id) {
                     let ref_id = format!("edit:{id}:{}", wallet.ledger().len());
-                    let (delta, outcome) = ai_edit_rustier(&mut engine, &mut wallet, eid, &ref_id);
+                    let (delta, outcome) =
+                        ai_edit_material(&mut engine, &mut wallet, eid, &ref_id, &material);
                     match outcome {
                         Outcome::Charged {
                             cost_tokens,
@@ -1769,13 +1776,16 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             if let (Some(d), Some(ch)) = (delta, &channel) {
                                 send_proj!(ch, d); // echo the material edit to the inspector
                             }
-                            log.append(&Record::AiEdit { id: id.clone() });
+                            log.append(&Record::AiEdit {
+                                id: id.clone(),
+                                material: material.clone(),
+                            });
                             rebuild(&engine, &shared, &mut positions, &assets);
                             EconResponse {
                                 ok: true,
                                 balance: balance_tokens,
                                 cost: Some(cost_tokens),
-                                message: Some("made it rustier".to_string()),
+                                message: Some(format!("applied {material} material")),
                             }
                         }
                         Outcome::Refused { needed, have } => EconResponse {
@@ -4945,13 +4955,22 @@ fn generate(state: State<AppState>, query: String) -> GenerateResponse {
     rx.recv().unwrap_or_default()
 }
 
-/// AI-edit (M7) — "make it rustier" on an entity: a schema-validated patch metered at the edit rate
-/// (debit-on-success). Blocks briefly on the engine thread's reply.
+/// AI-edit (M7 + M11.2) — assign a named PBR `material` preset (rusty/metal/chrome/gold/…) to an entity: a
+/// schema-validated patch metered at the edit rate (debit-on-success). Blocks briefly on the engine reply.
 #[tauri::command]
-fn ai_edit(state: State<AppState>, id: String) -> EconResponse {
+fn ai_edit(state: State<AppState>, id: String, material: Option<String>) -> EconResponse {
     ipc();
+    let material = material.unwrap_or_else(|| "rusty".to_string()); // back-compat: the original rustier edit
     let (reply, rx) = mpsc::channel();
-    if state.tx.send(EngineCmd::AiEdit { id, reply }).is_err() {
+    if state
+        .tx
+        .send(EngineCmd::AiEdit {
+            id,
+            material,
+            reply,
+        })
+        .is_err()
+    {
         return EconResponse::default();
     }
     rx.recv().unwrap_or_default()

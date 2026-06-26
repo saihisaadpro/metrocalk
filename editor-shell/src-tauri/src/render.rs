@@ -27,7 +27,7 @@ pub const SNAP_RADIUS: f32 = 1.5;
 /// (invariant 4) — orbit/zoom update natively in the loop; only the start/end of a gesture are IPC.
 pub static IPC_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// One renderable entity instance. 48 bytes, std430-clean (matches the WGSL `Instance`). `rotation` is a
+/// One renderable entity instance. 64 bytes, std430-clean (matches the WGSL `Instance`). `rotation` is a
 /// unit quaternion (xyzw; identity `[0,0,0,1]`) applied per-instance by the shader — so a tumbling physics
 /// body / a rotated authored Transform / a posed part actually *looks* rotated (the shared renderer-
 /// rotation path). The line/overlay/gizmo passes reuse `Instance` purely as a point carrier and ignore it.

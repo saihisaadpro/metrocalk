@@ -34,6 +34,11 @@ fn one() -> f64 {
     1.0
 }
 
+/// serde default for `Record::AiEdit::material` — an old log (pre-M11.2) had only the rustier edit.
+fn rusty_material() -> String {
+    crate::metering::RUSTY_MATERIAL_NAME.to_string()
+}
+
 /// One persisted user action, replayed in order to reconstruct the scene after a deterministic seed.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -153,10 +158,15 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mesh: Option<String>,
     },
-    /// A live AI-edit (M7): the schema-validated "make it rustier" patch on an entity. Replayed by
-    /// re-applying the patch (scene only — the wallet is a separate persisted ledger, so replay never
-    /// re-charges tokens), so a rusty edit survives close→reopen.
-    AiEdit { id: String },
+    /// A live AI-edit (M7 + M11.2): the schema-validated material-assign patch on an entity (`material` =
+    /// the named PBR preset, default `"rusty"` for an old log). Replayed by re-applying the patch (scene
+    /// only — the wallet is a separate persisted ledger, so replay never re-charges), so the material
+    /// survives close→reopen.
+    AiEdit {
+        id: String,
+        #[serde(default = "rusty_material")]
+        material: String,
+    },
     /// An "+ Add" palette pick of a stdlib kind (M3.4) — replayed by re-instantiating the kind named
     /// `name` (the same path as `describe`), so a browsed-in object survives reload. (`name`, not `kind`:
     /// the enum's serde tag is already `kind`.)
@@ -369,12 +379,12 @@ impl Log {
                     pos,
                     mesh,
                 } => replay_generate(engine, scene, pos, mesh),
-                Record::AiEdit { id } => EntityId::from_loro_key(&id).is_some_and(|e| {
+                Record::AiEdit { id, material } => EntityId::from_loro_key(&id).is_some_and(|e| {
                     crate::ai::apply_ai_patch(
                         engine,
                         &metrocalk_core::stdlib::standard_components(),
                         "replay-ai-edit",
-                        &crate::metering::rustier_patch(e),
+                        &crate::metering::material_patch(e, &material),
                     )
                     .rejects
                     .is_empty()

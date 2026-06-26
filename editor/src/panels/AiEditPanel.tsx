@@ -15,6 +15,17 @@ import type { EditorClient } from "../transport/session";
 
 const AI_EDIT_COST = 2;
 
+// The M11.2 (ADR-041) PBR material presets — a small palette of named looks, each assigned through the same
+// metered, schema-validated AI-edit (apply_ai_patch → MeshRenderer.material → a per-entity render override).
+const MATERIALS: { preset: string; label: string }[] = [
+  { preset: "metal", label: "Metal" },
+  { preset: "chrome", label: "Chrome" },
+  { preset: "gold", label: "Gold" },
+  { preset: "copper", label: "Copper" },
+  { preset: "rusty", label: "Rust" },
+  { preset: "plastic", label: "Plastic" },
+];
+
 export function AiEditPanel({ client }: { client: EditorClient }) {
   const selectedId = useSelectedId();
   const [confirming, setConfirming] = useState(false);
@@ -23,20 +34,20 @@ export function AiEditPanel({ client }: { client: EditorClient }) {
   // Nothing selected → nothing to edit (the AI-edit only makes sense on an entity).
   if (!selectedId) return null;
 
-  async function apply() {
+  async function apply(material = "rusty", label = "Weathered-metal look") {
     if (!selectedId || busy) return;
     const target = selectedId; // capture: the selection may change during the await (don't mis-attribute)
     setBusy(true);
     try {
-      const r = await client.aiEdit(target);
+      const r = await client.aiEdit(target, material);
       if (r.ok) {
         // Debit-on-success: the new balance is authoritative; surface the charge AND the result. Only claim
         // the visible per-entity result when the selection hasn't moved (the balance update is global).
         setBalance(r.balance);
         const cost = r.cost ?? AI_EDIT_COST;
         const onTarget = projectionStore.getState().selectedId === target;
-        pushToast(`Weathered-metal look applied · −${cost} tokens · ${r.balance} left`, "success");
-        setStatus(onTarget ? `weathered-metal look · −${cost} tokens` : `applied · −${cost} tokens`);
+        pushToast(`${label} applied · −${cost} tokens · ${r.balance} left`, "success");
+        setStatus(onTarget ? `${label.toLowerCase()} · −${cost} tokens` : `applied · −${cost} tokens`);
       } else {
         // Refuse-when-broke, EXPLAINED: surface the reason, leave the balance untouched (no charge).
         const msg = r.message ?? "refused";
@@ -94,6 +105,25 @@ export function AiEditPanel({ client }: { client: EditorClient }) {
           </div>
         </div>
       )}
+      {/* M11.2 material palette — a deliberate, labelled pick (the cost is stated); each applies the same
+          metered AI-edit with the chosen PBR preset. */}
+      <div id="materialPalette" data-testid="materialPalette" style={{ marginTop: 10 }}>
+        <div style={{ opacity: 0.6, fontSize: 11, marginBottom: 4 }}>Materials · ~{AI_EDIT_COST} tokens each</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {MATERIALS.map((m) => (
+            <button
+              key={m.preset}
+              data-testid={`material-${m.preset}`}
+              disabled={busy}
+              onClick={() => void apply(m.preset, `${m.label} material`)}
+              title={`Give this object a ${m.label.toLowerCase()} PBR finish — about ${AI_EDIT_COST} tokens`}
+              style={{ padding: "3px 9px", background: "#1b2233", color: "#cfe", border: "1px solid #2a3550", borderRadius: 4, cursor: busy ? "default" : "pointer", fontSize: 12 }}
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

@@ -54,8 +54,9 @@ export interface EditorClient {
   walletInfo(): Promise<EconResponse>;
   /** Sandbox top-up (M7 — no real money, ADR-004/018). */
   topUp(): Promise<EconResponse>;
-  /** AI-edit "make it rustier" on an entity (M7 — schema-validated patch, debit-on-success). */
-  aiEdit(id: string): Promise<EconResponse>;
+  /** AI-edit: assign a named PBR material preset to an entity (M7 + M11.2 — schema-validated patch,
+   *  debit-on-success). `material` defaults to "rusty" (the original weathered-metal look). */
+  aiEdit(id: string, material?: string): Promise<EconResponse>;
   /** Generate (tier 3, opt-in — M6 / ADR-017): a placeholder drops in + the cost is metered; the real
    *  mesh streams in later over the projection Channel. The opt-in tier-3 generate, not the default path. */
   generate(query: string): Promise<GenerateResponse>;
@@ -297,8 +298,8 @@ class TauriClient implements EditorClient {
     return this.core.invoke<EconResponse>("top_up").catch((e: unknown) => { console.error("top_up failed", e); throw e; });
   }
 
-  aiEdit(id: string): Promise<EconResponse> {
-    return this.core.invoke<EconResponse>("ai_edit", { id }).catch((e: unknown) => { console.error("ai_edit failed", e); throw e; });
+  aiEdit(id: string, material?: string): Promise<EconResponse> {
+    return this.core.invoke<EconResponse>("ai_edit", { id, material: material ?? null }).catch((e: unknown) => { console.error("ai_edit failed", e); throw e; });
   }
 
   generate(query: string): Promise<GenerateResponse> {
@@ -649,14 +650,14 @@ class MockClient implements EditorClient {
     this.balance += 100;
     return Promise.resolve({ ok: true, balance: this.balance, cost: 100, message: null });
   }
-  aiEdit(id: string): Promise<EconResponse> {
+  aiEdit(id: string, material?: string): Promise<EconResponse> {
     if (this.balance < 2) {
       return Promise.resolve({ ok: false, balance: this.balance, cost: null, message: "insufficient balance" });
     }
     this.balance -= 2;
     // Apply a VISIBLE result (C3 — "always show what changed"): the real AI-edit patches
-    // `MeshRenderer.material` (ADR-017); the dev stand-in mirrors that, so the inspector reflects it.
-    this.core.push([{ op: "setField", id, component: "MeshRenderer", field: "material", value: "weathered-metal" }]);
+    // `MeshRenderer.material` (ADR-017/041); the dev stand-in mirrors that, so the inspector reflects it.
+    this.core.push([{ op: "setField", id, component: "MeshRenderer", field: "material", value: material ?? "rusty" }]);
     return Promise.resolve({ ok: true, balance: this.balance, cost: 2, message: null });
   }
   generate(query: string): Promise<GenerateResponse> {

@@ -97,11 +97,12 @@ pub fn buy_marketplace(
 /// patch (`MeshRenderer.material = "rusty"`) through the one pipeline (undoable), and on success debit
 /// the edit rate. A rejected patch (e.g. a non-existent entity) is never charged. Returns the
 /// projection delta to echo (when applied) + the outcome.
-pub fn ai_edit_rustier(
+pub fn ai_edit_material(
     engine: &mut Engine<FlecsWorld>,
     wallet: &mut Wallet,
     id: EntityId,
     ref_id: &str,
+    material: &str,
 ) -> (Option<ProjectionDelta>, Outcome) {
     if !wallet.can_afford(&Action::Edit) {
         return (
@@ -112,13 +113,16 @@ pub fn ai_edit_rustier(
             },
         );
     }
+    // M11.2 (ADR-041): the AI-edit assigns a named PBR material preset (the render maps it to a per-entity
+    // metallic-roughness override). `material` is the chosen preset (the UI palette / suggestion), defaulting
+    // to "rusty" (the original "weathered-metal look"). Always through the one schema-validated patch.
     let patch = AiPatch {
         client_op_id: "ai-edit".to_string(),
         ops: vec![PatchOp::SetField {
             id: id.to_loro_key(),
             component: "MeshRenderer".to_string(),
             field: "material".to_string(),
-            value: Json::String(RUSTY_MATERIAL.to_string()),
+            value: Json::String(material.to_string()),
         }],
     };
     let delta = apply_ai_patch(
@@ -156,14 +160,17 @@ pub fn ai_edit_rustier(
 /// re-apply on reload so a rusty edit survives close→reopen (the wallet is persisted separately, so
 /// replay never re-charges).
 #[must_use]
-pub fn rustier_patch(id: EntityId) -> AiPatch {
+pub fn material_patch(id: EntityId, material: &str) -> AiPatch {
     AiPatch {
         client_op_id: "replay-ai-edit".to_string(),
         ops: vec![PatchOp::SetField {
             id: id.to_loro_key(),
             component: "MeshRenderer".to_string(),
             field: "material".to_string(),
-            value: Json::String(RUSTY_MATERIAL.to_string()),
+            value: Json::String(material.to_string()),
         }],
     }
 }
+
+/// The default AI-edit material when none is named (the original "weathered-metal look").
+pub const RUSTY_MATERIAL_NAME: &str = RUSTY_MATERIAL;
