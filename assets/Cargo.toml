@@ -19,9 +19,10 @@ publish = false
 # entry point; we read self-contained `.glb` blobs via `Gltf::from_slice` and decode textures with
 # our own pinned `image`. `utils` = the `read_*` reader helpers; `names` = `.name()` accessors.
 gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
-# PNG + JPEG decode (standalone user-image import, M10.2), pure Rust, wasm32-clean (no rayon / no C codecs
-# — `default-features = false`; `jpeg-decoder`'s rayon is an opt-in feature we do NOT enable).
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# PNG + JPEG decode (standalone user-image import, M10.2) + Radiance HDR decode (M11.3 inc.2 IBL env maps),
+# pure Rust, wasm32-clean (no rayon / no C codecs — `default-features = false`; `jpeg-decoder`'s rayon is an
+# opt-in feature we do NOT enable).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr"] }
 # Wavefront OBJ decode (M11.1) — pure Rust, wasm32-clean. `default-features = false` drops `ahash`
 # (whose runtime-rng pulls getrandom, which breaks wasm32-unknown-unknown); std hashing is plenty for a
 # one-shot import. `tobj::` stays behind `obj_import.rs` (the importer-wrapper boundary, like `gltf::`).

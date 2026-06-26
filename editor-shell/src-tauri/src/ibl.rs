@@ -68,9 +68,8 @@ fn sky_radiance(d: Vec3) -> Vec3 {
     base + Vec3::new(1.0, 0.93, 0.78) * sun
 }
 
-/// The equirect sky + its box-mip chain, each level as packed `rgba16f` texels (row-major).
-fn build_env_mips() -> Vec<(usize, usize, Vec<u16>)> {
-    // Level 0 in f32 (kept for clean downsampling; converted to halves at upload).
+/// The procedural sky as a level-0 equirect (`ENV_W × ENV_H` linear-RGB texels).
+fn procedural_level0() -> (usize, usize, Vec<[f32; 3]>) {
     let mut level0 = vec![[0.0f32; 3]; ENV_W * ENV_H];
     for y in 0..ENV_H {
         for x in 0..ENV_W {
@@ -78,7 +77,38 @@ fn build_env_mips() -> Vec<(usize, usize, Vec<u16>)> {
             level0[y * ENV_W + x] = [c.x, c.y, c.z];
         }
     }
-    let mut f32_levels: Vec<(usize, usize, Vec<[f32; 3]>)> = vec![(ENV_W, ENV_H, level0)];
+    (ENV_W, ENV_H, level0)
+}
+
+/// Level 0 for the env: a real `.hdr` panorama if `MTK_ENV_HDR` points to a readable Radiance file
+/// (M11.3 inc.2 — the image-crate HDR path; the bytes could equally come from a store handle), else the
+/// procedural sky. A load failure logs and falls back, so a bad path never breaks the viewport.
+fn env_level0() -> (usize, usize, Vec<[f32; 3]>) {
+    let Ok(path) = std::env::var("MTK_ENV_HDR") else {
+        return procedural_level0();
+    };
+    match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| {
+        metrocalk_assets::env_import::load_hdr_equirect(&b).map_err(|e| e.to_string())
+    }) {
+        Ok(env) => {
+            eprintln!(
+                "[ibl] loaded HDR env '{path}' ({}x{})",
+                env.width, env.height
+            );
+            (env.width as usize, env.height as usize, env.pixels)
+        }
+        Err(e) => {
+            eprintln!("[ibl] HDR env '{path}' failed ({e}); using procedural sky");
+            procedural_level0()
+        }
+    }
+}
+
+/// The equirect env + its box-mip chain, each level as packed `rgba16f` texels (row-major).
+fn build_env_mips() -> Vec<(usize, usize, Vec<u16>)> {
+    // Level 0 in f32 (kept for clean downsampling; converted to halves at upload).
+    let (w0, h0, level0) = env_level0();
+    let mut f32_levels: Vec<(usize, usize, Vec<[f32; 3]>)> = vec![(w0, h0, level0)];
     loop {
         let (pw, ph) = {
             let last = f32_levels.last().unwrap();
@@ -219,11 +249,12 @@ pub fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 pub fn create(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) -> Ibl {
     let mips = build_env_mips();
     let mip_count = mips.len() as u32;
+    let (base_w, base_h, _) = &mips[0];
     let env = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("env-equirect"),
         size: wgpu::Extent3d {
-            width: ENV_W as u32,
-            height: ENV_H as u32,
+            width: *base_w as u32,
+            height: *base_h as u32,
             depth_or_array_layers: 1,
         },
         mip_level_count: mip_count,

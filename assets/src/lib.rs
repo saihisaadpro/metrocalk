@@ -18,6 +18,7 @@
 pub mod audio;
 pub mod autorig;
 pub mod demo;
+pub mod env_import;
 /// FBX import (M11.1, ADR-040) — native-only (`ufbx` C-FFI), behind the `fbx` feature so the default crate
 /// stays wasm32-clean. The browser funnel converts FBX server-side (the explicit wasm seam).
 #[cfg(feature = "fbx")]
