@@ -28,7 +28,7 @@ fn seeded() -> (Engine<FlecsWorld>, CapScene) {
     (engine, scene)
 }
 
-fn light_field<'a>(engine: &'a Engine<FlecsWorld>, id: EntityId, f: &str) -> Option<FieldValue> {
+fn light_field(engine: &Engine<FlecsWorld>, id: EntityId, f: &str) -> Option<FieldValue> {
     engine
         .components_of(id)
         .get("Light")

@@ -87,9 +87,11 @@ fn env_level0() -> (usize, usize, Vec<[f32; 3]>) {
     let Ok(path) = std::env::var("MTK_ENV_HDR") else {
         return procedural_level0();
     };
-    match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| {
-        metrocalk_assets::env_import::load_hdr_equirect(&b).map_err(|e| e.to_string())
-    }) {
+    match std::fs::read(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|b| {
+            metrocalk_assets::env_import::load_hdr_equirect(&b).map_err(|e| e.to_string())
+        }) {
         Ok(env) => {
             eprintln!(
                 "[ibl] loaded HDR env '{path}' ({}x{})",

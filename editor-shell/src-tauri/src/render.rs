@@ -350,11 +350,27 @@ impl LightBuf {
         if needed > self.cap {
             self.cap = needed.next_power_of_two();
             self.buf = new_light_storage(device, self.cap);
-            self.bg = make_inst_bg(device, layout, &self.buf);
         }
         if !data.is_empty() {
             queue.write_buffer(&self.buf, 0, bytemuck::cast_slice(data));
         }
+        // Bind ONLY the populated range, not the whole (next-power-of-two over-allocated) buffer: the shader
+        // loops `arrayLength(&lights)`, which is binding_size / stride — binding the full buffer would make
+        // it iterate trailing zero lights (a zero directional is `normalize(vec3(0))` = NaN). Rebound here
+        // (on each light revision, not per frame) so the count always matches.
+        let stride = std::mem::size_of::<LightGpu>() as u64;
+        self.bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lights-bg"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &self.buf,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(needed * stride),
+                }),
+            }],
+        });
     }
 }
 

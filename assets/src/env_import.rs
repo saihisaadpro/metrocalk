@@ -43,6 +43,7 @@ mod tests {
     /// Encode a tiny HDR gradient (with an above-1.0 "sun" texel) to `.hdr`, decode it back, and check the
     /// dimensions + that the HDR highlight survived (Radiance RGBE is lossy, so values are approximate).
     #[test]
+    #[allow(clippy::cast_precision_loss)] // tiny fixed-size test buffer; the index casts are exact
     fn hdr_round_trips_dimensions_and_keeps_an_hdr_highlight() {
         let (w, h) = (4u32, 2u32);
         let mut buf = ImageBuffer::<Rgb<f32>, Vec<f32>>::new(w, h);
@@ -57,7 +58,7 @@ mod tests {
 
         let env = load_hdr_equirect(&bytes).expect("decode hdr");
         assert_eq!((env.width, env.height), (w, h));
-        assert_eq!(env.pixels.len() as u32, w * h);
+        assert_eq!(env.pixels.len(), (w * h) as usize);
         assert!(env.pixels[0][0] > 4.0, "the HDR sun survived (>1.0)");
     }
 
