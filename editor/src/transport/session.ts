@@ -79,6 +79,9 @@ export interface EditorClient {
   // override pipeline. reparent reuses `reparentPart`; delete=deactivate is distinct from `removeEntity`. ──
   /** Create an empty named entity at a position → its id (the caller selects it). */
   createEntity(x: number, y: number, z: number, name: string): Promise<string | null>;
+  /** M11.3 — author a Light entity (kind = directional|point|spot) at a position with a linear RGB colour +
+   *  intensity → its id. One undoable commit; the lit result is a render projection (not in the doc). */
+  addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null>;
   /** Rename an entity (`__meta__.name`) → applied; the projection re-reads it (inv. 1). */
   renameEntity(id: string, name: string): Promise<boolean>;
   /** Group a selection under a new parent node → the group id. */
@@ -332,6 +335,9 @@ class TauriClient implements EditorClient {
   // ── M10.6 scene-authoring verbs ──
   createEntity(x: number, y: number, z: number, name: string): Promise<string | null> {
     return this.core.invoke<string | null>("create_entity", { x, y, z, name }).catch((e: unknown) => { console.error("create_entity failed", e); throw e; });
+  }
+  addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null> {
+    return this.core.invoke<string | null>("add_light", { kind, x, y, z, r, g, b, intensity }).catch((e: unknown) => { console.error("add_light failed", e); throw e; });
   }
   renameEntity(id: string, name: string): Promise<boolean> {
     return this.core.invoke<boolean>("rename_entity", { id, name }).catch((e: unknown) => { console.error("rename_entity failed", e); throw e; });
@@ -719,6 +725,9 @@ class MockClient implements EditorClient {
   // ── M10.6 scene-authoring verbs — the real undoable commits run under Tauri (proven by the .exe gate);
   // the dev MockCore stubs are inert+deterministic so the menu/hierarchy render without a live core. ──
   createEntity(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  addLight(): Promise<string | null> {
     return Promise.resolve(null);
   }
   renameEntity(): Promise<boolean> {

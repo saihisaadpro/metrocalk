@@ -56,6 +56,16 @@ pub enum Record {
     /// re-placing the same handle; the handle re-resolves against the reloaded (content-addressed)
     /// store, so the placed mesh survives close→reopen (ADR-013 id determinism).
     PlaceMesh { asset: String, pos: [f32; 3] },
+    /// M11.3 (ADR-042) — an authored Light entity (kind = directional|point|spot, linear colour, intensity).
+    /// Replayed deterministically (same id alloc) so the light survives close→reopen. Only the light ENTITY
+    /// is persisted (Loro doc state); the per-frame lit result is a render projection, never logged.
+    AddLight {
+        // `light_kind` (not `kind`): the enum's serde tag is already `kind`.
+        light_kind: String,
+        pos: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+    },
     /// A physics-body spawn (M8.2): a dynamic RigidBody + ball Collider + its ball mesh handle, at a
     /// position. Replayed by re-spawning deterministically (same id alloc); the sim body itself is
     /// RE-HYDRATED from the restored RigidBody entity by the engine thread after replay. Loro stores the
@@ -277,6 +287,12 @@ impl Log {
                 Record::PlaceMesh { asset, pos } => {
                     capscene::place_mesh(engine, scene, &asset, pos).is_ok()
                 }
+                Record::AddLight {
+                    light_kind,
+                    pos,
+                    color,
+                    intensity,
+                } => capscene::add_light(engine, scene, &light_kind, pos, color, intensity).is_ok(),
                 Record::SpawnBody { pos, mesh } => {
                     capscene::spawn_physics_body(engine, scene, mesh.as_deref(), pos, 0.45).is_ok()
                 }

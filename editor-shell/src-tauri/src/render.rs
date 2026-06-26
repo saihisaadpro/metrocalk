@@ -46,6 +46,22 @@ pub struct Instance {
     pub material: [f32; 4],
 }
 
+/// One light for the fragment shader's multi-light loop (M11.3, ADR-042). 48 bytes, std430-clean (matches
+/// the WGSL `Light`). `kind` packs in `pos.w` (0=directional, 1=point, 2=spot); for point/spot `pos.xyz` is
+/// the world position, for directional `dir.xyz` is the direction. `color` is linear RGB, `range` the
+/// point/spot falloff radius. Built each rebuild from the scene's authored `Light` entities (a render
+/// projection — never Loro; the light ENTITY is the undoable doc state, this is its per-frame upload).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LightGpu {
+    /// `xyz` = world position (point/spot); `w` = kind (0 dir, 1 point, 2 spot).
+    pub pos_kind: [f32; 4],
+    /// `xyz` = linear RGB colour; `w` = intensity.
+    pub color_intensity: [f32; 4],
+    /// `xyz` = direction (directional/spot); `w` = range (point/spot falloff, 0 = infinite).
+    pub dir_range: [f32; 4],
+}
+
 /// The identity quaternion (no rotation) — the default for `Instance::rotation`.
 pub const IDENTITY_QUAT: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
@@ -67,6 +83,13 @@ pub struct SceneState {
     pub overlay_lines: Vec<Instance>,
     /// Bump when `overlay_lines` changes so the loop re-uploads them (decoupled from `revision`).
     pub overlay_revision: u64,
+    /// M11.3 (ADR-042) — the scene's lights, built each rebuild from the authored `Light` entities (a
+    /// render projection: the light ENTITIES are the undoable Loro doc state, this is their per-frame GPU
+    /// upload). Never empty when uploaded — `rebuild` falls back to a single default key light so an
+    /// unlit scene isn't black (the prior hard-coded directional, now a real entry in the list).
+    pub lights: Vec<LightGpu>,
+    /// Bump when `lights` changes so the loop re-uploads them (decoupled from `revision`).
+    pub lights_revision: u64,
     /// Per-instance mesh-asset slot, parallel to `instances`: `-1` ⇒ render the M2.2 placeholder cube
     /// (the honest fallback for an entity with no mesh handle); `>= 0` ⇒ an index into [`Self::meshes`]
     /// (render that imported mesh instead). The render loop partitions `instances` by this into the
@@ -301,6 +324,49 @@ fn new_instance_storage(device: &wgpu::Device, cap: u64) -> wgpu::Buffer {
     })
 }
 
+/// M11.3 — the scene's lights as a growable FRAGMENT-visible storage buffer (the shader reads the count via
+/// `arrayLength`, so the upload is always ≥1 element — `rebuild` guarantees a default key light). Mirrors
+/// [`InstanceBuf`] for the lights bind group (group 2 on the mesh pipeline).
+struct LightBuf {
+    buf: wgpu::Buffer,
+    bg: wgpu::BindGroup,
+    cap: u64,
+}
+
+impl LightBuf {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cap: u64) -> Self {
+        let buf = new_light_storage(device, cap);
+        let bg = make_inst_bg(device, layout, &buf);
+        Self { buf, bg, cap }
+    }
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        data: &[LightGpu],
+    ) {
+        let needed = data.len().max(1) as u64;
+        if needed > self.cap {
+            self.cap = needed.next_power_of_two();
+            self.buf = new_light_storage(device, self.cap);
+            self.bg = make_inst_bg(device, layout, &self.buf);
+        }
+        if !data.is_empty() {
+            queue.write_buffer(&self.buf, 0, bytemuck::cast_slice(data));
+        }
+    }
+}
+
+fn new_light_storage(device: &wgpu::Device, cap: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lights"),
+        size: cap.max(1) * std::mem::size_of::<LightGpu>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
 const SHADER: &str = include_str!("scene.wgsl");
 const CUBE_INDICES: [u16; 36] = [
     0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6, 0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4, 2, 6,
@@ -432,6 +498,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             wgpu::BufferBindingType::Storage { read_only: true },
         )],
     });
+    // M11.3 — the scene's lights, a FRAGMENT-visible read-only storage buffer (fs_mesh loops over them).
+    let lights_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("lights-bgl"),
+        entries: &[bgl_entry(
+            0,
+            wgpu::ShaderStages::FRAGMENT,
+            wgpu::BufferBindingType::Storage { read_only: true },
+        )],
+    });
     let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("cam-bg"),
         layout: &cam_bgl,
@@ -443,6 +518,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // Cube instances (the M2.2 placeholder/fallback path + the perf baseline) — the subset of entities
     // with NO mesh asset. Grows with the scene.
     let mut cube = InstanceBuf::new(&device, &inst_bgl, 1024);
+    // M11.3 — the scene's lights (group 2 on the mesh pipeline). Starts with room for a handful; grows.
+    let mut lights_buf = LightBuf::new(&device, &lights_bgl, 8);
 
     let index_buf = create_init_buffer(
         &device,
@@ -461,6 +538,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let cube_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("cube-layout"),
         bind_group_layouts: &[Some(&cam_bgl), Some(&inst_bgl)],
+        immediate_size: 0,
+    });
+    // M11.3 — the mesh pipeline adds group 2 (lights) for the multi-light PBR fragment shader.
+    let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("mesh-layout"),
+        bind_group_layouts: &[Some(&cam_bgl), Some(&inst_bgl), Some(&lights_bgl)],
         immediate_size: 0,
     });
     let cube_pipeline = make_pipeline(
@@ -529,6 +612,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     );
     let mut overlay = InstanceBuf::new(&device, &inst_bgl, 256);
     let mut cur_overlay_rev = u64::MAX;
+    let mut cur_lights_rev = u64::MAX;
     // M9.1 transform gizmo: its own buffer, drawn with the SAME `overlay_pipeline` (vs_overlay reads the
     // per-segment colour) + always-pass depth, so the X/Y/Z handles read as an overlay over the scene.
     // Regenerated + uploaded each frame at the selected entity (constant pixel size); empty ⇒ pass skipped.
@@ -572,7 +656,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     };
     let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("mesh"),
-        layout: Some(&cube_layout),
+        layout: Some(&mesh_layout), // M11.3: cam(0) + instances(1) + lights(2)
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_mesh"),
@@ -784,6 +868,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 cur_overlay_rev = st.overlay_revision;
                 overlay.upload(&device, &queue, &inst_bgl, &st.overlay_lines);
             }
+            // M11.3 — upload the scene's lights on their own revision (decoupled from entity edits).
+            if st.lights_revision != cur_lights_rev {
+                cur_lights_rev = st.lights_revision;
+                lights_buf.upload(&device, &queue, &lights_bgl, &st.lights);
+            }
             let aspect = w as f32 / h.max(1) as f32;
             let cam = camera_matrix(
                 st.orbit,
@@ -915,6 +1004,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // Mesh pass: each imported asset drawn once, instanced across the entities using it
             // (non-bindless — one vertex/index buffer bound per asset).
             rp.set_pipeline(&mesh_pipeline);
+            rp.set_bind_group(2, &lights_buf.bg, &[]); // M11.3 — the scene lights, shared across mesh draws
             for (slot, mesh) in gpu_meshes.iter().enumerate() {
                 let (Some(mesh), Some(inst)) = (mesh.as_ref(), mesh_inst.get(slot)) else {
                     continue;

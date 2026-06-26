@@ -325,6 +325,14 @@ enum EngineCmd {
         name: String,
         reply: Sender<Option<String>>,
     },
+    /// M11.3 — author a Light entity (Directional/Point/Spot), one undoable commit. Replies its id.
+    AddLight {
+        kind: String,
+        pos: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        reply: Sender<Option<String>>,
+    },
     /// Rename an entity (`__meta__.name`) → reply applied.
     RenameEntity {
         id: String,
@@ -1332,6 +1340,31 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             } => {
                 let new = capscene::create_entity(&mut engine, [x, y, z], &name).ok();
                 if new.is_some() {
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, project_full(&engine));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(new.map(|n| n.to_loro_key()));
+            }
+            EngineCmd::AddLight {
+                kind,
+                pos,
+                color,
+                intensity,
+                reply,
+            } => {
+                // M11.3 — author a Light entity (one undoable commit, persisted). rebuild() re-collects the
+                // scene lights so the new light affects shading immediately (a render projection).
+                let new =
+                    capscene::add_light(&mut engine, &scene, &kind, pos, color, intensity).ok();
+                if new.is_some() {
+                    log.append(&Record::AddLight {
+                        light_kind: kind.clone(),
+                        pos,
+                        color,
+                        intensity,
+                    });
                     if let Some(ch) = &channel {
                         send_proj!(ch, project_full(&engine));
                     }
@@ -3576,6 +3609,65 @@ fn project_info(
     }
 }
 
+/// M11.3 (ADR-042) — gather the scene's authored `Light` entities into GPU lights (a render projection: the
+/// light ENTITY is the undoable Loro doc state; this is its per-frame upload, never written back to Loro).
+/// `dir` is the direction a directional/spot light SHINES (so the shader's L = -dir); point/spot use the
+/// entity Transform position + `range`. Falls back to a single default key light (the prior hard-coded
+/// directional, now a real list entry) so a scene with no light entities still renders lit, not black.
+fn collect_lights(engine: &Engine<FlecsWorld>) -> Vec<render::LightGpu> {
+    let read = |m: &HashMap<String, FieldValue>, f: &str, d: f32| -> f32 {
+        m.get(f).map_or(d, |v| match v {
+            FieldValue::Number(n) => *n as f32,
+            FieldValue::Integer(i) => *i as f32,
+            _ => d,
+        })
+    };
+    let mut lights: Vec<render::LightGpu> = Vec::new();
+    for id in engine.entity_ids() {
+        let comps = engine.components_of(id);
+        let Some(light) = comps.get("Light") else {
+            continue;
+        };
+        let t = comps.get("Transform");
+        let pos = t.map_or([0.0, 0.0, 0.0], |tm| {
+            [read(tm, "x", 0.0), read(tm, "y", 0.0), read(tm, "z", 0.0)]
+        });
+        let kind = match light.get("kind") {
+            Some(FieldValue::Str(s)) => match s.as_str() {
+                "point" => 1.0,
+                "spot" => 2.0,
+                _ => 0.0,
+            },
+            _ => 0.0, // default: directional
+        };
+        lights.push(render::LightGpu {
+            pos_kind: [pos[0], pos[1], pos[2], kind],
+            color_intensity: [
+                read(light, "r", 1.0),
+                read(light, "g", 1.0),
+                read(light, "b", 1.0),
+                read(light, "intensity", 1.0),
+            ],
+            dir_range: [
+                read(light, "dirX", 0.0),
+                read(light, "dirY", -1.0),
+                read(light, "dirZ", 0.0),
+                read(light, "range", 0.0),
+            ],
+        });
+    }
+    if lights.is_empty() {
+        // The default key light — the prior hard-coded directional (M11.2's LIGHT_DIR was the dir TO the
+        // light, so the SHINE direction is its negation), intensity 2.4. Keeps unlit scenes readable.
+        lights.push(render::LightGpu {
+            pos_kind: [0.0, 0.0, 0.0, 0.0],
+            color_intensity: [1.0, 1.0, 1.0, 2.4],
+            dir_range: [-0.4, -0.8, -0.3, 0.0],
+        });
+    }
+    lights
+}
+
 fn rebuild(
     engine: &Engine<FlecsWorld>,
     shared: &Shared,
@@ -3713,6 +3805,8 @@ fn rebuild(
             material: [0.0; 4],
         })
         .collect();
+    // M11.3 — the scene's lights (a render projection from the authored Light entities).
+    let lights = collect_lights(engine);
     let mut st = shared.lock().unwrap();
     // Preserve selection by entity ID, NOT index: the instance index is invalidated whenever entities are
     // added/removed, so restoring `selected`/`gizmo_sel` by index would silently retarget a DIFFERENT
@@ -3724,6 +3818,8 @@ fn rebuild(
     st.mesh_slots = mesh_slots;
     st.snap_affinity = snap_affinity;
     st.line_points = line_points;
+    st.lights = lights;
+    st.lights_revision = st.lights_revision.wrapping_add(1);
     st.selected = prev_sel_id.and_then(|id| st.ids.iter().position(|k| *k == id));
     if let Some(i) = st.selected {
         st.instances[i].selected = 1.0;
@@ -4567,6 +4663,43 @@ fn create_entity(state: State<AppState>, x: f32, y: f32, z: f32, name: String) -
     rx.recv().unwrap_or(None)
 }
 
+/// M11.3 (ADR-042) — author a Light entity (kind = directional|point|spot) at a position with a linear RGB
+/// colour + intensity; one undoable commit, persists. Reply its id (the UI selects it). Lighting is a render
+/// projection — only the light ENTITY enters Loro/undo, never the per-frame lit result.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+// Tauri commands bind args positionally from the JS invoke; a colour/pos struct would need a matching JS
+// shape, so the flat parameter list is the idiomatic command signature here.
+#[allow(clippy::too_many_arguments)]
+fn add_light(
+    state: State<AppState>,
+    kind: String,
+    x: f32,
+    y: f32,
+    z: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    intensity: f32,
+) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AddLight {
+            kind,
+            pos: [x, y, z],
+            color: [r, g, b],
+            intensity,
+            reply,
+        })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().unwrap_or(None)
+}
+
 /// M10.6 — rename an entity (`__meta__.name`), one undoable tx; reply applied.
 #[tauri::command]
 fn rename_entity(state: State<AppState>, id: String, name: String) -> bool {
@@ -5310,6 +5443,7 @@ fn main() {
             read_transform,
             reparent_part,
             create_entity,
+            add_light,
             rename_entity,
             group_entities,
             ungroup_entity,

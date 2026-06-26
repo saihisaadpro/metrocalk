@@ -138,15 +138,28 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("audio")
             .alias("Sound")
             .build(),
+        // M11.3 (ADR-042): a real, authored light. `kind` picks Directional/Point/Spot; `r/g/b` is the linear
+        // colour, `intensity` the strength; point/spot use the entity Transform's position + `range` falloff;
+        // directional/spot aim along `dir*` (default straight down). `castShadows` (consumed by the shadow
+        // pass) defaults off. Authoring a light is one undoable component commit (it rides the registry like
+        // any other component); the per-frame LIT RESULT is a render projection (never Loro), per ADR-021.
         ComponentMeta::builder("Light")
             .category("Props")
+            .field("kind", Str, false)
             .field("intensity", Number, true)
-            .field_fmt("color", Str, false, Some("color"))
+            .field("r", Number, false)
+            .field("g", Number, false)
+            .field("b", Number, false)
             .field("range", Number, false)
+            .field("dirX", Number, false)
+            .field("dirY", Number, false)
+            .field("dirZ", Number, false)
+            .field("castShadows", Boolean, false)
             .requires("Spatial")
             .provides("Lighting")
             .tag("3d")
             .tag("light")
+            .ui_hint("kind", "enum: directional|point|spot")
             .build(),
         ComponentMeta::builder("Camera")
             .category("Props")

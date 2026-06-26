@@ -148,13 +148,17 @@ fn vs_mesh(v: MeshIn, @builtin(instance_index) ii: u32) -> MeshVsOut {
 }
 
 const PI = 3.14159265359;
-// The editor key light — a fixed directional light (the prior baseline's hardcoded direction). Intensity
-// 2.6 (not 1.0) so a matte surface reads about as bright as the prior flat Lambert (which had a 0.55 ambient
-// + 0.45·NdotL); a physically-correct single light through the `/PI` diffuse term is otherwise too dark for
-// an editor viewport. (Exposure tuned analytically — pixel-verification is owed on a non-occluded GUI run.)
-const LIGHT_DIR = vec3<f32>(0.4, 0.8, 0.3);
-const LIGHT_COLOR = vec3<f32>(2.4, 2.4, 2.4);
-const AMBIENT = 0.35; // fill so an UNLIT matte face isn't ~3x dimmer than the prior Lambert (review fix)
+const AMBIENT = 0.35; // fill so an UNLIT matte face isn't ~3x dimmer than the prior Lambert (M11.2 review fix)
+
+// M11.3 (ADR-042) — the scene's authored lights (group 2), looped per fragment. Matches render.rs's
+// `LightGpu`. `pos_kind.w`: 0=directional, 1=point, 2=spot. Directional/spot SHINE along `dir_range.xyz`;
+// point/spot sit at `pos_kind.xyz` with `dir_range.w` = range falloff. `color_intensity` = linear RGB·intensity.
+struct Light {
+    pos_kind: vec4<f32>,
+    color_intensity: vec4<f32>,
+    dir_range: vec4<f32>,
+};
+@group(2) @binding(0) var<storage, read> lights: array<Light>;
 
 // GGX/Trowbridge-Reitz normal distribution.
 fn distribution_ggx(n_dot_h: f32, rough: f32) -> f32 {
@@ -178,6 +182,26 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+// One light's Cook-Torrance contribution. `l` = unit direction TO the light; `radiance` = colour·intensity
+// (already attenuated). Energy-conserving Lambert diffuse + GGX/Smith/Fresnel specular; metals have no diffuse.
+fn light_contrib(
+    n: vec3<f32>, v: vec3<f32>, base: vec3<f32>, metallic: f32, roughness: f32, f0: vec3<f32>,
+    l: vec3<f32>, radiance: vec3<f32>,
+) -> vec3<f32> {
+    let h = normalize(v + l);
+    let n_dot_l = max(dot(n, l), 0.0);
+    let n_dot_v = max(dot(n, v), 1e-4);
+    let n_dot_h = max(dot(n, h), 0.0);
+    let v_dot_h = max(dot(v, h), 0.0);
+    let f = fresnel_schlick(v_dot_h, f0);
+    let ndf = distribution_ggx(n_dot_h, roughness);
+    let g = geometry_smith(n_dot_v, n_dot_l, roughness);
+    let specular = (ndf * g * f) / max(4.0 * n_dot_v * n_dot_l, 1e-4);
+    let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
+    let diffuse = kd * base / PI;
+    return (diffuse + specular) * radiance * n_dot_l;
+}
+
 @fragment
 fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
     let base = in.base_color;
@@ -187,29 +211,42 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.world_normal);
     let cam_eye = cam.focus.yzw; // packed in the Camera uniform's spare slot
     let v = normalize(cam_eye - in.world_pos);
-    let l = normalize(LIGHT_DIR);
-    let h = normalize(v + l);
-
-    let n_dot_l = max(dot(n, l), 0.0);
-    let n_dot_v = max(dot(n, v), 1e-4);
-    let n_dot_h = max(dot(n, h), 0.0);
-    let v_dot_h = max(dot(v, h), 0.0);
-
     // F0: dielectric 0.04, lerped toward the base color as the surface becomes metallic.
     let f0 = mix(vec3<f32>(0.04), base, metallic);
-    let f = fresnel_schlick(v_dot_h, f0);
-    let ndf = distribution_ggx(n_dot_h, roughness);
-    let g = geometry_smith(n_dot_v, n_dot_l, roughness);
-    let specular = (ndf * g * f) / max(4.0 * n_dot_v * n_dot_l, 1e-4);
 
-    // Energy conservation: diffuse is what's not reflected, and metals have no diffuse.
-    let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
-    let diffuse = kd * base / PI;
+    // M11.3 — accumulate every authored light (directional/point/spot). The list is never empty (render.rs
+    // falls back to a default key light), so an unlit scene still renders.
+    var lo = vec3<f32>(0.0);
+    let count = arrayLength(&lights);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let lt = lights[i];
+        let kind = lt.pos_kind.w;
+        var l: vec3<f32>;
+        var atten = 1.0;
+        if (kind < 0.5) {
+            l = normalize(-lt.dir_range.xyz); // directional: toward the light = -shine direction
+        } else {
+            let to_light = lt.pos_kind.xyz - in.world_pos;
+            let dist = max(length(to_light), 1e-4);
+            l = to_light / dist;
+            atten = 1.0 / (dist * dist); // physical inverse-square
+            let range = lt.dir_range.w;
+            if (range > 0.0) {
+                let win = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
+                atten = atten * win * win; // smooth range cutoff
+            }
+            if (kind > 1.5) { // spot cone: narrow by the angle to the shine axis
+                let cd = dot(normalize(lt.dir_range.xyz), -l);
+                atten = atten * clamp((cd - 0.8) / 0.12, 0.0, 1.0);
+            }
+        }
+        let radiance = lt.color_intensity.xyz * lt.color_intensity.w * atten;
+        lo = lo + light_contrib(n, v, base, metallic, roughness, f0, l, radiance);
+    }
 
-    let direct = (diffuse + specular) * LIGHT_COLOR * n_dot_l;
-    // Ambient fill (metals get less, having no diffuse) so unlit faces aren't near-black (no IBL yet, M11.3).
+    // Ambient fill (metals get less, having no diffuse) so unlit faces aren't near-black (no IBL yet, M11.3 inc.2).
     let ambient = base * (1.0 - metallic * 0.6) * AMBIENT;
-    var col = ambient + direct;
+    var col = ambient + lo;
 
     // Editor overlays applied AFTER shading: selection highlight + focus-dim.
     if (in.selected > 0.5) {

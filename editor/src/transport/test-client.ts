@@ -25,6 +25,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     makeDynamic: () => Promise.resolve(true),
     // M10.6 scene-authoring verbs (a test overrides what it exercises).
     createEntity: () => Promise.resolve("e-created"),
+    addLight: () => Promise.resolve("light-created"),
     renameEntity: () => Promise.resolve(true),
     groupEntities: () => Promise.resolve("group-1"),
     ungroupEntity: () => Promise.resolve(true),

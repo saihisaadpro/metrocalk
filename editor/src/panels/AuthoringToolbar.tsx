@@ -62,6 +62,13 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
         setStatus("created an entity · Ctrl-Z to undo");
         pushToast("created an entity", "success");
       })}
+      {/* M11.3 — author a Light entity (a point light above the origin, warm-white). One undoable commit. */}
+      {btn("authLight", "+ Light", async () => {
+        const id = await client.addLight("point", 0, 4, 0, 1, 0.96, 0.9, 60);
+        select(id);
+        setStatus("added a light · Ctrl-Z to undo");
+        pushToast("added a point light", "success");
+      })}
       {btn(
         "authGroup",
         "Group",

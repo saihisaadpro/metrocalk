@@ -562,6 +562,59 @@ pub fn place_mesh(
     Ok(id)
 }
 
+/// M11.3 (ADR-042) — author a `Light` entity as ONE undoable transaction: a `Transform` (so it has a
+/// position + rides the gizmo/inspector like any entity) + a `Light` component (`kind`/colour/intensity/
+/// range) + the `Provides(Lighting)` capability pair. Replayed by id so the light survives close→reopen.
+/// `kind` ∈ {"directional","point","spot"}. The per-frame LIT RESULT is a render projection (never Loro).
+pub fn add_light(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    kind: &str,
+    pos: [f32; 3],
+    color: [f32; 3],
+    intensity: f32,
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    for (f, v) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        });
+    }
+    ops.push(Op::SetField {
+        entity: id,
+        component: "Light".into(),
+        field: "kind".into(),
+        value: FieldValue::Str(kind.to_string()),
+    });
+    ops.push(Op::SetField {
+        entity: id,
+        component: "Light".into(),
+        field: "intensity".into(),
+        value: FieldValue::Number(f64::from(intensity)),
+    });
+    for (f, v) in [("r", color[0]), ("g", color[1]), ("b", color[2])] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Light".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        });
+    }
+    if let Some(&c) = scene.caps.get(&canonical("Lighting")) {
+        ops.push(Op::AddPair {
+            entity: id,
+            rel: scene.rels.provides,
+            target: c,
+        });
+    }
+    engine.commit("add-light", ops)?;
+    Ok(id)
+}
+
 /// Spawn a complete, simulatable physics body as ONE undoable transaction (M8.2): a `Transform` + a
 /// dynamic `RigidBody` + a ball `Collider` + (optionally) a `MeshRenderer` handle so it renders as a real
 /// mesh, plus the physics capability pairs the reveal/attach use. This is ECS-authoritative **setup** —
