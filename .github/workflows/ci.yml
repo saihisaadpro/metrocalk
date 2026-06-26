@@ -65,9 +65,9 @@ jobs:
         run: |
           # gltf:: / image:: / tobj:: / ufbx:: / basis_universal:: must live ONLY behind the MeshSource trait,
           # in the importer wrappers (gltf_import.rs · image_import.rs · obj_import.rs [M11.1] · fbx_import.rs
-          # [M11.1, native] · ktx2_import.rs [M11.1, native]) — the same discipline as flecs_ecs-in-/ecs.
-          # Comment lines (prose mentioning the types) skipped.
-          if grep -rn "gltf::\|image::\|tobj::\|ufbx::\|basis_universal::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'image_import.rs' | grep -v 'obj_import.rs' | grep -v 'fbx_import.rs' | grep -v 'ktx2_import.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+          # [M11.1, native] · ktx2_import.rs [M11.1, native] · env_import.rs [M11.3, HDR env maps]) — the same
+          # discipline as flecs_ecs-in-/ecs. Comment lines (prose mentioning the types) skipped.
+          if grep -rn "gltf::\|image::\|tobj::\|ufbx::\|basis_universal::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'image_import.rs' | grep -v 'obj_import.rs' | grep -v 'fbx_import.rs' | grep -v 'ktx2_import.rs' | grep -v 'env_import.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
             echo "::error::a foreign decoder type (gltf::/image::/tobj::/ufbx::/basis_universal::) leaked outside the importer wrappers — they must stay behind the MeshSource trait (invariant 5; mirrors ADR-001/006/040)"
             exit 1
           fi
