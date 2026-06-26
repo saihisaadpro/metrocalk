@@ -1,7 +1,9 @@
 // Editor viewport shader: instanced entity cubes (from the storage buffer the app fills from /core
 // Transforms) + a ground grid. Selected entity highlights. Matches render.rs's Instance/Camera.
 
-struct Camera { view_proj: mat4x4<f32>, focus: vec4<f32> };
+// `inv_view_proj` (M11.3 inc.2) lets the skybox turn a screen pixel into a world ray; the cube/grid/line
+// shaders ignore it. Field order matches render.rs's `Camera` (view_proj · inv_view_proj · focus).
+struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, focus: vec4<f32> };
 @group(0) @binding(0) var<uniform> cam: Camera;
 
 // Focus mode (M3.3): when `cam.focus_active > 0.5`, every entity that isn't the focused/selected one
@@ -148,7 +150,6 @@ fn vs_mesh(v: MeshIn, @builtin(instance_index) ii: u32) -> MeshVsOut {
 }
 
 const PI = 3.14159265359;
-const AMBIENT = 0.35; // fill so an UNLIT matte face isn't ~3x dimmer than the prior Lambert (M11.2 review fix)
 
 // M11.3 (ADR-042) — the scene's authored lights (group 2), looped per fragment. Matches render.rs's
 // `LightGpu`. `pos_kind.w`: 0=directional, 1=point, 2=spot. Directional/spot SHINE along `dir_range.xyz`;
@@ -159,6 +160,42 @@ struct Light {
     dir_range: vec4<f32>,
 };
 @group(2) @binding(0) var<storage, read> lights: array<Light>;
+
+// M11.3 inc.2 (ADR-042) — image-based lighting (group 3). `env` is a procedural HDR sky (equirectangular,
+// box-mip chain): mip 0 is the skybox, higher mips approximate roughness blur for specular IBL, and the top
+// mip is a cheap diffuse irradiance. `brdf_lut` holds the split-sum (scale, bias) over (NdotV, roughness).
+@group(3) @binding(0) var env: texture_2d<f32>;
+@group(3) @binding(1) var env_samp: sampler;
+@group(3) @binding(2) var brdf_lut: texture_2d<f32>;
+@group(3) @binding(3) var lut_samp: sampler;
+
+// Unit direction → equirect UV. MUST stay the inverse of ibl.rs's `texel_dir`.
+fn dir_to_equirect(d: vec3<f32>) -> vec2<f32> {
+    let u = atan2(d.z, d.x) / (2.0 * PI) + 0.5;
+    let v = acos(clamp(d.y, -1.0, 1.0)) / PI;
+    return vec2<f32>(u, v);
+}
+
+// Fresnel-Schlick with a roughness-aware ceiling (Sébastien Lagarde) — the ambient/IBL Fresnel, which
+// (unlike the per-light term) has no single half-vector, so it uses NdotV and rolls off with roughness.
+fn fresnel_schlick_roughness(cos_theta: f32, f0: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let inv_rough = vec3<f32>(1.0 - roughness);
+    return f0 + (max(inv_rough, f0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// M11.3 inc.2 — the lit/IBL paths work in LINEAR HDR (the sun + bright reflections exceed 1.0), but the
+// swapchain is a NON-sRGB (linear-store) format, so the shader must both compress the highlights and
+// encode to sRGB itself. ACES filmic (Narkowicz fit) + a 2.2 gamma — applied to the mesh + sky outputs.
+fn tonemap_aces(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+fn to_srgb(x: vec3<f32>) -> vec3<f32> {
+    return pow(x, vec3<f32>(1.0 / 2.2));
+}
+fn display_encode(hdr: vec3<f32>) -> vec3<f32> {
+    return to_srgb(tonemap_aces(hdr));
+}
 
 // GGX/Trowbridge-Reitz normal distribution.
 fn distribution_ggx(n_dot_h: f32, rough: f32) -> f32 {
@@ -244,11 +281,23 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
         lo = lo + light_contrib(n, v, base, metallic, roughness, f0, l, radiance);
     }
 
-    // Ambient fill (metals get less, having no diffuse) so unlit faces aren't near-black (no IBL yet, M11.3 inc.2).
-    let ambient = base * (1.0 - metallic * 0.6) * AMBIENT;
-    var col = ambient + lo;
+    // M11.3 inc.2 — image-based ambient (replaces the flat fill): diffuse from a blurred env mip (a cheap
+    // irradiance) + specular from the roughness-matched env mip × the split-sum BRDF LUT. THIS is what
+    // gives a metal something to reflect, so chrome/gold are no longer near-black (the M11.2 dark-metal).
+    let n_dot_v_amb = max(dot(n, v), 1e-4);
+    let max_mip = f32(textureNumLevels(env) - 1);
+    let f_amb = fresnel_schlick_roughness(n_dot_v_amb, f0, roughness);
+    let kd_amb = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);
+    let irradiance = textureSampleLevel(env, env_samp, dir_to_equirect(n), max(max_mip - 2.0, 0.0)).rgb;
+    let diffuse_ibl = kd_amb * irradiance * base;
+    let refl = reflect(-v, n);
+    let prefiltered = textureSampleLevel(env, env_samp, dir_to_equirect(refl), roughness * max_mip).rgb;
+    let brdf = textureSampleLevel(brdf_lut, lut_samp, vec2<f32>(n_dot_v_amb, roughness), 0.0).rg;
+    let specular_ibl = prefiltered * (f_amb * brdf.x + brdf.y);
+    // Linear HDR → tonemapped, sRGB-encoded display colour (the swapchain is linear-store).
+    var col = display_encode(diffuse_ibl + specular_ibl + lo);
 
-    // Editor overlays applied AFTER shading: selection highlight + focus-dim.
+    // Editor overlays applied AFTER shading, in display space: selection highlight + focus-dim.
     if (in.selected > 0.5) {
         col = mix(col, vec3<f32>(1.0, 0.85, 0.2), 0.55);
     }
@@ -259,4 +308,31 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color, 1.0);
+}
+
+// M11.3 inc.2 — skybox. One oversized triangle covers the screen; the fragment reconstructs the world-space
+// view ray from the inverse view-proj and samples the env (mip 0). Drawn first, depth-write off, so the
+// grid + meshes draw in front. The env backdrop is also exactly what the meshes' specular IBL reflects.
+struct SkyOut { @builtin(position) pos: vec4<f32>, @location(0) ndc: vec2<f32> };
+
+@vertex
+fn vs_sky(@builtin(vertex_index) vi: u32) -> SkyOut {
+    var corners = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0),
+    );
+    let xy = corners[vi];
+    var out: SkyOut;
+    out.pos = vec4<f32>(xy, 1.0, 1.0); // z = w ⇒ depth 1.0 (far plane)
+    out.ndc = xy;
+    return out;
+}
+
+@fragment
+fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
+    // Unproject two points along the pixel's ray (wgpu NDC z ∈ [0,1]); their difference is the view dir.
+    let near = cam.inv_view_proj * vec4<f32>(in.ndc, 0.0, 1.0);
+    let far = cam.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+    let dir = normalize(far.xyz / far.w - near.xyz / near.w);
+    let hdr = textureSampleLevel(env, env_samp, dir_to_equirect(dir), 0.0).rgb;
+    return vec4<f32>(display_encode(hdr), 1.0);
 }

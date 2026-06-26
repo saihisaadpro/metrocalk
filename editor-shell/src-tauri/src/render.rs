@@ -378,6 +378,9 @@ const GRID_VERTS: u32 = (2 * (40 + 1) * 2) as u32;
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Camera {
     view_proj: [[f32; 4]; 4],
+    /// M11.3 inc.2 — inverse view-proj, so the skybox can turn a screen pixel back into a world ray to
+    /// sample the equirect env. Unused by the cube/grid/line shaders (they ignore the trailing field).
+    inv_view_proj: [[f32; 4]; 4],
     /// Focus-mode flag, packed in `focus[0]`: `1.0` while an entity is focused, `0.0` otherwise. The
     /// shaders dim every instance whose `selected < 0.5` when this is set, so only the focused (=
     /// selected) entity stays lit — "gray out the rest." A `vec4` (not a bare `f32` + pad) so the WGSL
@@ -520,6 +523,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let mut cube = InstanceBuf::new(&device, &inst_bgl, 1024);
     // M11.3 — the scene's lights (group 2 on the mesh pipeline). Starts with room for a handful; grows.
     let mut lights_buf = LightBuf::new(&device, &lights_bgl, 8);
+    // M11.3 inc.2 — image-based lighting (group 3): a procedural HDR sky + split-sum BRDF LUT. Gives metals
+    // an environment to reflect (closes the M11.2 dark-metal) and backs the viewport as a skybox.
+    let ibl_bgl = crate::ibl::bind_group_layout(&device);
+    let ibl = crate::ibl::create(&device, &queue, &ibl_bgl);
 
     let index_buf = create_init_buffer(
         &device,
@@ -540,10 +547,37 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         bind_group_layouts: &[Some(&cam_bgl), Some(&inst_bgl)],
         immediate_size: 0,
     });
-    // M11.3 — the mesh pipeline adds group 2 (lights) for the multi-light PBR fragment shader.
+    // M11.3 — the mesh pipeline adds group 2 (lights) for the multi-light PBR fragment shader, and
+    // group 3 (IBL: env + BRDF LUT) for image-based ambient/specular (inc.2).
     let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("mesh-layout"),
-        bind_group_layouts: &[Some(&cam_bgl), Some(&inst_bgl), Some(&lights_bgl)],
+        bind_group_layouts: &[
+            Some(&cam_bgl),
+            Some(&inst_bgl),
+            Some(&lights_bgl),
+            Some(&ibl_bgl),
+        ],
+        immediate_size: 0,
+    });
+    // M11.3 inc.2 — the skybox uses only groups 0 (camera) + 3 (env), but wgpu requires every layout slot
+    // bound at draw, so 1/2 are explicit EMPTY layouts (clearer than binding unrelated buffers there).
+    let empty_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("empty-bgl"),
+        entries: &[],
+    });
+    let empty_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("empty-bg"),
+        layout: &empty_bgl,
+        entries: &[],
+    });
+    let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sky-layout"),
+        bind_group_layouts: &[
+            Some(&cam_bgl),
+            Some(&empty_bgl),
+            Some(&empty_bgl),
+            Some(&ibl_bgl),
+        ],
         immediate_size: 0,
     });
     let cube_pipeline = make_pipeline(
@@ -675,6 +709,40 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             ..Default::default()
         },
         depth_stencil: Some(depth_state.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    // M11.3 inc.2 — skybox: a fullscreen triangle (no vertex buffer) drawn FIRST at the far plane. Depth
+    // write OFF + LessEqual so it fills the background but every mesh/grid line draws in front of it.
+    let sky_depth = wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    };
+    let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sky"),
+        layout: Some(&sky_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_sky"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_sky"),
+            targets: &[Some(format.into())],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(sky_depth),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -939,6 +1007,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             0,
             bytemuck::bytes_of(&Camera {
                 view_proj: cam.to_cols_array_2d(),
+                inv_view_proj: cam.inverse().to_cols_array_2d(),
                 focus: [focus_active, cam_eye[0], cam_eye[1], cam_eye[2]],
             }),
         );
@@ -992,6 +1061,14 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 multiview_mask: None,
             });
             rp.set_bind_group(0, &cam_bg, &[]);
+            // M11.3 inc.2 — skybox first: a fullscreen triangle sampling the env (group 3). Depth-write off,
+            // so the grid + meshes below draw in front of it. Gives the viewport an HDR backdrop and the
+            // environment the metals reflect.
+            rp.set_pipeline(&sky_pipeline);
+            rp.set_bind_group(1, &empty_bg, &[]);
+            rp.set_bind_group(2, &empty_bg, &[]);
+            rp.set_bind_group(3, &ibl.bind_group, &[]);
+            rp.draw(0..3, 0..1);
             rp.set_pipeline(&grid_pipeline);
             rp.draw(0..GRID_VERTS, 0..1);
             // Cube pass: the placeholder/fallback (entities with no mesh asset) + the M2.2 perf baseline.
@@ -1005,6 +1082,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // (non-bindless — one vertex/index buffer bound per asset).
             rp.set_pipeline(&mesh_pipeline);
             rp.set_bind_group(2, &lights_buf.bg, &[]); // M11.3 — the scene lights, shared across mesh draws
+            rp.set_bind_group(3, &ibl.bind_group, &[]); // M11.3 inc.2 — env + BRDF LUT for image-based lighting
             for (slot, mesh) in gpu_meshes.iter().enumerate() {
                 let (Some(mesh), Some(inst)) = (mesh.as_ref(), mesh_inst.get(slot)) else {
                     continue;

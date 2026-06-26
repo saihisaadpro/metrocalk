@@ -13,6 +13,7 @@
 //! returns ranked compatible targets + every "no" explained; a candidate click binds in one undoable
 //! transaction (north-star test #1).
 
+mod ibl;
 mod render;
 
 use std::collections::{BTreeMap, HashMap};
