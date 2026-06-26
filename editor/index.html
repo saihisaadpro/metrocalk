@@ -5,7 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Metrocalk editor</title>
   </head>
-  <body style="margin: 0; background: #0a0a0f">
+  <!-- body is TRANSPARENT so the native wgpu viewport composites up through the transparent React root in
+       the .exe (ADR-008). In `npm run dev` the React root is opaque (#0a0a0f) and covers this, so the page
+       still looks right; only inside the packaged transparent WebView2 does the chain stay see-through. -->
+  <body style="margin: 0; background: transparent">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

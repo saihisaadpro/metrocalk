@@ -874,7 +874,15 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // pair is mirrored — this is what makes the future `.mtk` Loro-document load path keep reveal/bind
     // working (the replay-log path doesn't need it, but the project format does).
     engine.set_capability_resolver(Box::new(capscene::CapResolver::from_scene(&scene)));
-    let index = capscene::seed(&mut engine, &scene, SCENE_N).expect("seed capability scene");
+    // The seed count defaults to the M2 stress target (`SCENE_N`), but `MTK_SCENE_N` overrides it — a
+    // clean low-/zero-entity scene for visually inspecting a single imported asset (e.g. an FBX) without
+    // 5000 cubes burying it. The fingerprint folds the count in, so a non-default seed just gets its own
+    // replay log namespace (it never corrupts the default project's log).
+    let scene_n: usize = std::env::var("MTK_SCENE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SCENE_N);
+    let index = capscene::seed(&mut engine, &scene, scene_n).expect("seed capability scene");
     // M9.2: a small **composed character** (a body root + two rigid child parts) for part editing —
     // seeded as deterministic scene construction right after the seed (its ids are stable across launches
     // so the override-edit persistence re-binds; the `mtkscene2` fingerprint reflects this added draw).
@@ -900,7 +908,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // append-only edit log on top to restore the user's prior binds/edits. clear_history again so the
     // restored scene is non-undoable too (same Ctrl-Z guard as the seed). The catalog re-derives any
     // described kind's mesh handle so a *visible* described object survives reload too.
-    let log = Log::open(log_path(), capscene::fingerprint(SCENE_N));
+    let log = Log::open(log_path(), capscene::fingerprint(scene_n));
     let (restored, skipped) = log.replay(&mut engine, &scene, &assets.catalog);
     engine.clear_history();
     eprintln!(

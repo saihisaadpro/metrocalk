@@ -90,7 +90,7 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
 function Rail({ side, label, onOpen }: { side: "left" | "right"; label: string; onOpen: () => void }) {
   const border = side === "left" ? { borderRight: "1px solid #2a2d35" } : { borderLeft: "1px solid #2a2d35" };
   return (
-    <div style={{ ...border, display: "flex", alignItems: "center", justifyContent: "center", height: "100%" }}>
+    <div style={{ ...border, display: "flex", alignItems: "center", justifyContent: "center", height: "100%", background: "#0a0a0f" }}>
       <button
         data-testid={`rail-${side}`}
         onClick={onOpen}
@@ -235,7 +235,11 @@ export function App() {
   );
 
   return (
-    <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: "#0a0a0f", color: "#e8e8e8" }}>
+    // Root is the chrome backdrop. In the .exe (`native`) it is **transparent** so the native wgpu scene
+    // composites up through the transparent viewport hole (ADR-008) — the panels below paint their OWN
+    // opaque background so only the viewport stays a hole. (A `#0a0a0f` root here would occlude the wgpu
+    // layer even behind the transparent viewport div — the bug that left the .exe viewport black.)
+    <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: native ? "transparent" : "#0a0a0f", color: "#e8e8e8" }}>
       <div style={{ height: 40, display: "flex", alignItems: "center", gap: 12, padding: "0 12px", background: "#14161c", borderBottom: "1px solid #2a2d35", font: "13px ui-monospace, monospace", overflow: "hidden", minWidth: 0 }}>
         <strong>metrocalk</strong>
         <FileMenu client={client} />
@@ -252,7 +256,7 @@ export function App() {
         {layout.collapsed ? (
           <Rail side="left" label="Scene" onOpen={() => setDrawer("left")} />
         ) : (
-          <div style={{ borderRight: "1px solid #2a2d35", overflow: "hidden", ...chromeDim }}>{leftPanel}</div>
+          <div style={{ borderRight: "1px solid #2a2d35", overflow: "hidden", background: "#0a0a0f", ...chromeDim }}>{leftPanel}</div>
         )}
 
         {/* viewport: native-owned (invariant 4). Inside the `.exe` it is **transparent** so the native wgpu
@@ -359,7 +363,7 @@ export function App() {
         {layout.collapsed ? (
           <Rail side="right" label="Inspector" onOpen={() => setDrawer("right")} />
         ) : (
-          <div style={{ borderLeft: "1px solid #2a2d35", overflow: "hidden", ...chromeDim }}>{rightPanel}</div>
+          <div style={{ borderLeft: "1px solid #2a2d35", overflow: "hidden", background: "#0a0a0f", ...chromeDim }}>{rightPanel}</div>
         )}
       </div>
 

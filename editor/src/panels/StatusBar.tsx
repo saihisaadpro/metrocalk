@@ -24,6 +24,7 @@ export function StatusBar() {
         fontSize: 12,
         fontFamily: "monospace",
         color: idle ? "#667" : "#cde",
+        background: "#0a0a0f", // opaque chrome — the .exe root is transparent (wgpu composite), so the footer paints its own bg
         borderTop: "1px solid #222",
         whiteSpace: "nowrap",
         overflow: "hidden",
