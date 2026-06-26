@@ -13,9 +13,11 @@
 //   • C1        — describe→Create→Generate drives the real `generate`: a placeholder is PLACED on /core.
 //   • C2        — Play is unmistakable ON THE STAGE: the on-stage badge + a reachable Stop appear live.
 //
-// Still owed (NOT asserted — see progress/M10.md): the generate's metered stream-in (render-coupled) + the
-// live Stop-restores-scene (M10.4); C9 the native Save dialog (human); C10 the real first-run seed (backend);
-// budgets/min-spec; the full scaffold-page-object remap + the frontendDist switch + scaffold deletion.
+// CONVERGED since (2026-06-26, post-viewport-composite-fix): `composite` (above) now renders the wgpu scene
+// through the transparent webview live; the live Play-runs-sim + Stop-restores-scene (M10.4) is asserted by
+// first-session (THE JOURNEY); the real first-run empty-state (C10) is asserted by first-session (New →
+// #emptyState). Still owed: C9 the NATIVE Save *dialog* (the OS file picker is human-only — the save_project_as
+// flow + title-reflects-name IS covered by first-session); budgets/min-spec on a true low-core rig.
 
 import { browser, $, $$, expect } from "@wdio/globals";
 import { invoke, consoleErrors, clearConsole, ipcPerFrame } from "../../lib/acceptance.js";

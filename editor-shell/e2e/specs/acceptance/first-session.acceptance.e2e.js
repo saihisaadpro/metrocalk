@@ -59,7 +59,18 @@ describe("acceptance / M10.5 — first-creative-session journey (open → New �
       timeout: 10000,
       timeoutMsg: "New project did not yield an empty scene",
     });
-    report.workflow("journey/new-project", { functional: true, clean: true }, { commands: ["new_project"] });
+    // C10 (M10.10) — a real first-run shows the EMPTY-STATE overlay with one next step, NOT a blank stage
+    // and NOT the 5k perf fixture. Now verifiable on the .exe (the viewport composite renders, ADR-008).
+    await browser.waitUntil(async () => $("#emptyState").isExisting(), {
+      timeout: 5000,
+      timeoutMsg: "an empty scene did not show the first-run empty-state overlay (#emptyState)",
+    });
+    expect(await $("#emptyState").then((e) => e.getText())).toMatch(/empty/i);
+    report.workflow(
+      "journey/new-project",
+      { functional: true, clean: true },
+      { commands: ["new_project"], controls: ["#emptyState"] }
+    );
 
     // ── place a checked-in asset (the AssetBrowser catalog place — M10.2's import engine; the new-user
     //    file-import UI is owed, so the checked-in catalog asset IS the honest "import an asset" here) ──
