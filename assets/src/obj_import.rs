@@ -37,6 +37,7 @@ fn default_obj_material() -> Material {
     Material {
         base_color: [0.8, 0.8, 0.8, 1.0],
         base_color_texture: None,
+        ..Default::default() // matte-dielectric metallic/roughness (.mtl PBR is a named seam)
     }
 }
 

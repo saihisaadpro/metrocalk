@@ -39,6 +39,11 @@ pub struct Instance {
     pub color: [f32; 3],
     pub selected: f32,
     pub rotation: [f32; 4],
+    /// M11.2 per-entity PBR material override `[metallic, roughness, has_override, _pad]`. When
+    /// `has_override > 0.5` the mesh shader uses these (with `color` as the override base color) instead of
+    /// the asset's baked vertex material — this is how a "make it metal/rusty/gold" intent recolors ONE
+    /// entity without touching the shared geometry. `[0; 4]` (the default) = use the baked material.
+    pub material: [f32; 4],
 }
 
 /// The identity quaternion (no rotation) — the default for `Instance::rotation`.
@@ -411,9 +416,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     });
     let cam_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("cam-bgl"),
+        // VERTEX_FRAGMENT: the PBR fs_mesh (M11.2) reads the camera eye (packed in `cam.focus.yzw`) for the
+        // view direction, so the camera uniform must be visible to the fragment stage too.
         entries: &[bgl_entry(
             0,
-            wgpu::ShaderStages::VERTEX,
+            wgpu::ShaderStages::VERTEX_FRAGMENT,
             wgpu::BufferBindingType::Uniform,
         )],
     });
@@ -550,6 +557,17 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 offset: 24,
                 shader_location: 2,
             },
+            // M11.2 (ADR-041): baked metallic-roughness PBR factors (the Cook-Torrance inputs in fs_main).
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 36,
+                shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 40,
+                shader_location: 4,
+            },
         ],
     };
     let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -563,7 +581,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some("fs_mesh"), // M11.2: per-fragment metallic-roughness PBR (Cook-Torrance)
             targets: &[Some(format.into())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }),
@@ -609,7 +627,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
 
         // read shared state; re-upload instances on revision change (picking is NOT serviced here —
         // it's done synchronously in the viewport_pick command, decoupled from the frame cadence)
-        let (cam, focus_active, gizmo_verts) = {
+        let (cam, cam_eye, focus_active, gizmo_verts) = {
             let mut st = shared.lock().unwrap();
             if st.distance == 0.0 {
                 st.distance = 60.0;
@@ -774,6 +792,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 aspect,
                 st.cam_target.into(),
             );
+            // The camera eye (world) — the PBR view direction in fs_mesh (M11.2). Carried in the Camera
+            // uniform's spare `focus.yzw` (focus.x stays the focus-dim flag).
+            let cam_eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
             // M9.1: regenerate the gizmo geometry at the selected entity each frame — constant pixel size,
             // and it follows the entity through a drag. Empty when nothing is selected → the pass is
             // skipped (zero cost). World-space basis (the cube/mesh shaders don't show rotation).
@@ -791,6 +812,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                             color: gv.color,
                             selected: 0.0,
                             rotation: IDENTITY_QUAT,
+                            material: [0.0; 4],
                         })
                         .collect()
                 }
@@ -809,6 +831,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         color: GHOST,
                         selected: 0.0,
                         rotation: IDENTITY_QUAT,
+                        material: [0.0; 4],
                     };
                     gizmo_verts.push(mark(-1.0));
                     gizmo_verts.push(mark(1.0));
@@ -817,6 +840,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // Focus dim flag (read under the same lock as the camera, so it can't lag the frame).
             (
                 cam,
+                cam_eye,
                 if st.focused.is_some() { 1.0f32 } else { 0.0 },
                 gizmo_verts,
             )
@@ -826,7 +850,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             0,
             bytemuck::bytes_of(&Camera {
                 view_proj: cam.to_cols_array_2d(),
-                focus: [focus_active, 0.0, 0.0, 0.0],
+                focus: [focus_active, cam_eye[0], cam_eye[1], cam_eye[2]],
             }),
         );
         // M9.1: upload the gizmo handle geometry (tiny — regenerated each frame at the selection).
@@ -1214,6 +1238,7 @@ mod tests {
                 color: [0.5, 0.5, 0.5],
                 selected: 0.0,
                 rotation: IDENTITY_QUAT,
+                material: [0.0; 4],
             });
             st.ids.push(format!("e{i}"));
         }

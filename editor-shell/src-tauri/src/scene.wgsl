@@ -18,7 +18,9 @@ fn apply_focus_dim(col: vec3<f32>, is_focused: bool) -> vec3<f32> {
 // `rotation` is a unit quaternion (x,y,z,w); identity = (0,0,0,1). Applied per-instance so a tumbling
 // physics body / a rotated authored Transform / a posed part actually *looks* rotated (M9.1+ — the shared
 // renderer-rotation path). Matches render.rs's Instance (48 bytes, std430-clean).
-struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, selected: f32, rotation: vec4<f32> };
+// `material` (M11.2) = per-entity PBR override [metallic, roughness, has_override, _]; when has_override>0.5
+// the mesh path uses it (+ `color` as the override base color) instead of the asset's baked vertex material.
+struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, selected: f32, rotation: vec4<f32>, material: vec4<f32> };
 @group(1) @binding(0) var<storage, read> instances: array<Instance>;
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
@@ -106,30 +108,115 @@ fn vs_overlay(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
-// Imported meshes (M4 asset pipeline). A real vertex stream (position/normal/baked material color)
-// drawn instanced — `instances[ii]` carries the entity's centre, render scale, and selection flag
-// (same Instance storage layout as the cubes; the cube `color` field is ignored here, the mesh uses
-// its own baked vertex color). Non-bindless: one vertex/index buffer bound per asset (ADR-003).
+// Imported meshes (M4 asset pipeline) with metallic-roughness PBR (M11.2, ADR-041). The vertex stream
+// carries position/normal/baked-base-color + the baked metallic+roughness factors; `vs_mesh` interpolates
+// world position + normal + material across the triangle and `fs_mesh` evaluates a Cook-Torrance BRDF
+// PER FRAGMENT over one directional light (the editor key light) + a small ambient. Non-bindless: one
+// vertex/index buffer per asset (ADR-003). The cube `color` field of `instances[ii]` is unused here.
 struct MeshIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
+    @location(3) metallic: f32,
+    @location(4) roughness: f32,
+};
+
+struct MeshVsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) base_color: vec3<f32>,
+    @location(1) world_pos: vec3<f32>,
+    @location(2) world_normal: vec3<f32>,
+    @location(3) mr: vec2<f32>,       // metallic, roughness
+    @location(4) selected: f32,
 };
 
 @vertex
-fn vs_mesh(v: MeshIn, @builtin(instance_index) ii: u32) -> VsOut {
+fn vs_mesh(v: MeshIn, @builtin(instance_index) ii: u32) -> MeshVsOut {
     let inst = instances[ii];
     let world = inst.center + quat_rotate(inst.rotation, v.position * inst.scale);
-    var out: VsOut;
+    var out: MeshVsOut;
     out.pos = cam.view_proj * vec4<f32>(world, 1.0);
-    let nrm = quat_rotate(inst.rotation, normalize(v.normal));
-    let shade = 0.55 + 0.45 * clamp(dot(nrm, normalize(vec3<f32>(0.4, 0.8, 0.3))), 0.0, 1.0);
-    var col = v.color * shade;
-    if (inst.selected > 0.5) {
-        col = mix(col, vec3<f32>(1.0, 0.85, 0.2), 0.7); // selection highlight
-    }
-    out.color = apply_focus_dim(col, inst.selected > 0.5);
+    out.world_pos = world;
+    out.world_normal = quat_rotate(inst.rotation, normalize(v.normal));
+    out.selected = inst.selected;
+    // Per-entity material override (M11.2): a "make it metal/rusty/gold" intent recolors ONLY this entity;
+    // absent → the asset's baked vertex material.
+    let has_override = inst.material.z > 0.5;
+    out.base_color = select(v.color, inst.color, has_override);
+    out.mr = select(vec2<f32>(v.metallic, v.roughness), inst.material.xy, has_override);
     return out;
+}
+
+const PI = 3.14159265359;
+// The editor key light — a fixed directional light (the prior baseline's hardcoded direction). Intensity
+// 2.6 (not 1.0) so a matte surface reads about as bright as the prior flat Lambert (which had a 0.55 ambient
+// + 0.45·NdotL); a physically-correct single light through the `/PI` diffuse term is otherwise too dark for
+// an editor viewport. (Exposure tuned analytically — pixel-verification is owed on a non-occluded GUI run.)
+const LIGHT_DIR = vec3<f32>(0.4, 0.8, 0.3);
+const LIGHT_COLOR = vec3<f32>(2.6, 2.6, 2.6);
+const AMBIENT = 0.18; // hemispheric fill so unlit faces aren't near-black (no IBL until M11.3)
+
+// GGX/Trowbridge-Reitz normal distribution.
+fn distribution_ggx(n_dot_h: f32, rough: f32) -> f32 {
+    let a = rough * rough;
+    let a2 = a * a;
+    let d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-7);
+}
+
+// Schlick-GGX geometry term (direct lighting k), Smith-combined for view + light.
+fn geometry_smith(n_dot_v: f32, n_dot_l: f32, rough: f32) -> f32 {
+    let r = rough + 1.0;
+    let k = (r * r) / 8.0;
+    let gv = n_dot_v / (n_dot_v * (1.0 - k) + k);
+    let gl = n_dot_l / (n_dot_l * (1.0 - k) + k);
+    return gv * gl;
+}
+
+// Fresnel-Schlick.
+fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
+    return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+@fragment
+fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
+    let base = in.base_color;
+    let metallic = clamp(in.mr.x, 0.0, 1.0);
+    let roughness = clamp(in.mr.y, 0.04, 1.0); // floor avoids a singular mirror highlight
+
+    let n = normalize(in.world_normal);
+    let cam_eye = cam.focus.yzw; // packed in the Camera uniform's spare slot
+    let v = normalize(cam_eye - in.world_pos);
+    let l = normalize(LIGHT_DIR);
+    let h = normalize(v + l);
+
+    let n_dot_l = max(dot(n, l), 0.0);
+    let n_dot_v = max(dot(n, v), 1e-4);
+    let n_dot_h = max(dot(n, h), 0.0);
+    let v_dot_h = max(dot(v, h), 0.0);
+
+    // F0: dielectric 0.04, lerped toward the base color as the surface becomes metallic.
+    let f0 = mix(vec3<f32>(0.04), base, metallic);
+    let f = fresnel_schlick(v_dot_h, f0);
+    let ndf = distribution_ggx(n_dot_h, roughness);
+    let g = geometry_smith(n_dot_v, n_dot_l, roughness);
+    let specular = (ndf * g * f) / max(4.0 * n_dot_v * n_dot_l, 1e-4);
+
+    // Energy conservation: diffuse is what's not reflected, and metals have no diffuse.
+    let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
+    let diffuse = kd * base / PI;
+
+    let direct = (diffuse + specular) * LIGHT_COLOR * n_dot_l;
+    // Ambient fill (metals get less, having no diffuse) so unlit faces aren't near-black (no IBL yet, M11.3).
+    let ambient = base * (1.0 - metallic * 0.6) * AMBIENT;
+    var col = ambient + direct;
+
+    // Editor overlays applied AFTER shading: selection highlight + focus-dim.
+    if (in.selected > 0.5) {
+        col = mix(col, vec3<f32>(1.0, 0.85, 0.2), 0.55);
+    }
+    col = apply_focus_dim(col, in.selected > 0.5);
+    return vec4<f32>(col, 1.0);
 }
 
 @fragment

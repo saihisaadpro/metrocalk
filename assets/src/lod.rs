@@ -221,6 +221,7 @@ mod tests {
             materials: vec![Material {
                 base_color: [1.0; 4],
                 base_color_texture: None,
+                ..Default::default()
             }],
             textures: Vec::new(),
             skeleton: None,

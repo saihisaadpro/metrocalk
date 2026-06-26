@@ -61,6 +61,10 @@ impl MeshSource for GltfImporter {
                 let pbr = m.pbr_metallic_roughness();
                 Material {
                     base_color: pbr.base_color_factor(),
+                    // M11.2 (ADR-041): the glTF metallic-roughness factors were parsed-but-dropped — keep
+                    // them now so an authored PBR asset renders metal/rough as designed.
+                    metallic: pbr.metallic_factor(),
+                    roughness: pbr.roughness_factor(),
                     base_color_texture: pbr
                         .base_color_texture()
                         .map(|t| t.texture().source().index()),

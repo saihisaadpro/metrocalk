@@ -33,6 +33,7 @@ fn default_fbx_material() -> Material {
     Material {
         base_color: [0.8, 0.8, 0.8, 1.0],
         base_color_texture: None,
+        ..Default::default() // matte-dielectric metallic/roughness (FBX PBR extraction is a follow-up)
     }
 }
 

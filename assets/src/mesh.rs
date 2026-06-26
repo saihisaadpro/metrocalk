@@ -58,13 +58,19 @@ impl Bounds {
     }
 }
 
-/// One material's base appearance — PBR base-color factor + an optional base-color texture (an index
-/// into [`MeshAsset::textures`]). The render path bakes `base_color` per-primitive today; texture
-/// sampling is the next render increment (the texture is decoded + carried so the data path is real).
+/// One material's appearance — a metallic-roughness PBR factor set (M11.2, ADR-041) + an optional
+/// base-color texture (an index into [`MeshAsset::textures`]). The render bakes these per-vertex and the
+/// shader evaluates a Cook-Torrance BRDF over the scene's directional light. `metallic`/`roughness` are
+/// the glTF 2.0 metallic-roughness model; importers without PBR data (FBX/OBJ) use the matte-dielectric
+/// default so they look like the prior flat shading, while a glTF carries its authored values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Material {
     /// Linear RGBA base color factor `[0,1]`.
     pub base_color: [f32; 4],
+    /// Metalness `[0,1]` — 0 = dielectric (plastic/wood), 1 = metal (the base color becomes the F0 tint).
+    pub metallic: f32,
+    /// Perceptual roughness `[0,1]` — 0 = mirror-smooth, 1 = fully rough/matte.
+    pub roughness: f32,
     /// Index into [`MeshAsset::textures`] of the base-color texture, if any.
     pub base_color_texture: Option<usize>,
 }
@@ -73,6 +79,10 @@ impl Default for Material {
     fn default() -> Self {
         Self {
             base_color: [0.8, 0.8, 0.8, 1.0],
+            // Matte dielectric: a non-metal, fairly rough surface so a PBR-data-less import (FBX/OBJ) reads
+            // like the prior Lambert shading rather than a default-glTF shiny metal.
+            metallic: 0.0,
+            roughness: 0.7,
             base_color_texture: None,
         }
     }

@@ -3158,6 +3158,7 @@ fn push_overlay(
             color,
             selected: 0.0,
             rotation: render::IDENTITY_QUAT,
+            material: [0.0; 4],
         });
         seg.push(Instance {
             center: b,
@@ -3165,6 +3166,7 @@ fn push_overlay(
             color,
             selected: 0.0,
             rotation: render::IDENTITY_QUAT,
+            material: [0.0; 4],
         });
     };
     for c in &sim.diagnostics().contacts {
@@ -3656,13 +3658,26 @@ fn rebuild(
             positions.insert(e, p);
         }
         let key = id.to_loro_key();
-        let c = color_for(&key);
+        // M11.2: a per-entity PBR material override from MeshRenderer.material (intent/AI-edit). When a
+        // recognised preset is set, the shader uses its metallic/roughness + base color for THIS entity.
+        let (mat_override, override_color) = comps
+            .get("MeshRenderer")
+            .and_then(|m| m.get("material"))
+            .and_then(|v| match v {
+                FieldValue::Str(s) => material_preset(s),
+                _ => None,
+            })
+            .map_or(([0.0; 4], None), |(color, metallic, roughness)| {
+                ([metallic, roughness, 1.0, 0.0], Some(color))
+            });
+        let c = override_color.unwrap_or_else(|| color_for(&key));
         instances.push(Instance {
             center: p,
             scale,
             color: c,
             selected: 0.0,
             rotation: rot,
+            material: mat_override,
         });
         mesh_slots.push(slot.map_or(-1, |s| i32::try_from(s).unwrap_or(-1)));
         // A parent (has children) is a stronger spatial snap target (a pivot) than a bare origin
@@ -3685,6 +3700,7 @@ fn rebuild(
             color: TRACK_LINE_COLOR,
             selected: 0.0,
             rotation: render::IDENTITY_QUAT,
+            material: [0.0; 4],
         })
         .collect();
     let mut st = shared.lock().unwrap();
@@ -3727,6 +3743,23 @@ fn color_for(key: &str) -> [f32; 3] {
         0.4 + ((h >> 8) & 0xff) as f32 / 425.0,
         0.4 + ((h >> 16) & 0xff) as f32 / 425.0,
     ]
+}
+
+/// M11.2 (ADR-041) — a named PBR material preset → `(base_color, metallic, roughness)`. Assigned per-entity
+/// via the `MeshRenderer.material` field (the intent-assign / AI-edit path that reuses `apply_ai_patch`,
+/// e.g. the "weathered-metal look" edit sets `"rusty"`); the render applies it as a per-instance override of
+/// the asset's BAKED material, so one entity is "made metal/rusty/gold" without touching shared geometry.
+/// Unknown / absent names → `None` (the baked asset material renders unchanged).
+fn material_preset(name: &str) -> Option<([f32; 3], f32, f32)> {
+    Some(match name {
+        "rusty" | "rust" | "weathered" => ([0.42, 0.22, 0.12], 0.55, 0.65),
+        "metal" | "metallic" | "steel" | "iron" => ([0.56, 0.57, 0.58], 1.0, 0.35),
+        "chrome" | "mirror" | "polished" => ([0.55, 0.56, 0.58], 1.0, 0.06),
+        "gold" => ([1.0, 0.78, 0.34], 1.0, 0.22),
+        "copper" | "bronze" => ([0.95, 0.60, 0.40], 1.0, 0.30),
+        "plastic" | "matte" => ([0.80, 0.80, 0.82], 0.0, 0.55),
+        _ => return None,
+    })
 }
 
 // ── tauri commands (UI → core) ─────────────────────────────────────────────────
@@ -5294,4 +5327,38 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");
+}
+
+#[cfg(test)]
+mod material_tests {
+    use super::material_preset;
+
+    #[test]
+    fn known_presets_map_to_plausible_pbr_and_metal_is_metallic() {
+        // A metal preset is fully metallic + fairly smooth; rust is semi-metallic + rough; all valid [0,1].
+        let (_c, m_metal, r_metal) = material_preset("metal").expect("metal preset");
+        assert!((m_metal - 1.0).abs() < 1e-6 && r_metal < 0.5);
+        let (_c, m_rust, r_rust) = material_preset("rusty").expect("rusty preset");
+        assert!(m_rust > 0.0 && m_rust < 1.0 && r_rust > 0.5);
+        for name in ["rusty", "metal", "chrome", "gold", "copper", "plastic"] {
+            let (color, metal, rough) = material_preset(name).expect(name);
+            assert!(
+                color.iter().all(|c| (0.0..=1.0).contains(c)),
+                "{name} color in [0,1]"
+            );
+            assert!(
+                (0.0..=1.0).contains(&metal) && (0.0..=1.0).contains(&rough),
+                "{name} m/r in [0,1]"
+            );
+        }
+        // chrome is near-mirror (very low roughness); gold is warm + metallic.
+        assert!(material_preset("chrome").unwrap().2 < 0.1);
+        assert!((material_preset("gold").unwrap().1 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unknown_material_is_no_override() {
+        assert!(material_preset("banana").is_none());
+        assert!(material_preset("").is_none());
+    }
 }

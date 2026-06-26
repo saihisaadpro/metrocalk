@@ -21,8 +21,9 @@
 
 use crate::mesh::MeshAsset;
 
-/// One packed vertex — position, normal (for lighting), and a baked RGB color (the source material's
-/// base-color factor). 36 bytes, `std430`/vertex-attribute clean. Matches the renderer's WGSL.
+/// One packed vertex — position, normal (for lighting), a baked RGB base color, and the baked
+/// metallic-roughness PBR factors (M11.2, ADR-041). 44 bytes, `std430`/vertex-attribute clean. Matches the
+/// renderer's WGSL (`vs_mesh` reads all five attributes; `fs_main` evaluates a Cook-Torrance BRDF).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshVertex {
@@ -32,6 +33,10 @@ pub struct MeshVertex {
     pub normal: [f32; 3],
     /// Baked base color (linear RGB).
     pub color: [f32; 3],
+    /// Baked metalness `[0,1]` (from the primitive's [`crate::mesh::Material`]).
+    pub metallic: f32,
+    /// Baked perceptual roughness `[0,1]`.
+    pub roughness: f32,
 }
 
 /// A mesh ready to upload: one interleaved vertex buffer + one `u32` index buffer.
@@ -53,12 +58,15 @@ impl MeshGpu {
 
         for prim in &asset.primitives {
             let base = vertices.len() as u32;
-            let color = asset
-                .materials
-                .get(prim.material)
-                .map_or([0.8, 0.8, 0.8], |m| {
-                    [m.base_color[0], m.base_color[1], m.base_color[2]]
-                });
+            let mat = asset.materials.get(prim.material);
+            let color = mat.map_or([0.8, 0.8, 0.8], |m| {
+                [m.base_color[0], m.base_color[1], m.base_color[2]]
+            });
+            // Bake the primitive's PBR factors per-vertex (matte-dielectric default when material-less),
+            // clamped to the valid [0,1] range the BRDF assumes.
+            let (metallic, roughness) = mat.map_or((0.0, 0.7), |m| {
+                (m.metallic.clamp(0.0, 1.0), m.roughness.clamp(0.0, 1.0))
+            });
 
             let normals = if prim.normals.len() == prim.positions.len() {
                 prim.normals.clone()
@@ -71,6 +79,8 @@ impl MeshGpu {
                     position,
                     normal: normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
                     color,
+                    metallic,
+                    roughness,
                 });
             }
             // Re-base this primitive's indices into the merged vertex buffer; drop any out-of-range
@@ -190,6 +200,8 @@ mod tests {
             position: p,
             normal: [0.0, 1.0, 0.0],
             color: [0.8, 0.8, 0.8],
+            metallic: 0.0,
+            roughness: 0.7,
         }
     }
 
@@ -229,5 +241,62 @@ mod tests {
         };
         point.normalize_to_unit(); // zero extent → unchanged (no divide-by-zero)
         assert_eq!(point.vertices[0].position, [3.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn from_asset_bakes_metallic_roughness_per_vertex() {
+        use crate::mesh::{Material, MeshAsset, Primitive};
+        let tri = Primitive {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            indices: vec![0, 1, 2],
+            material: 0,
+            joints: Vec::new(),
+            weights: Vec::new(),
+        };
+        // A polished metal (the glTF PBR factors the importer now keeps) bakes onto every vertex.
+        let asset = MeshAsset {
+            name: "metal".into(),
+            primitives: vec![tri],
+            materials: vec![Material {
+                base_color: [0.9, 0.8, 0.2, 1.0],
+                metallic: 0.95,
+                roughness: 0.15,
+                base_color_texture: None,
+            }],
+            textures: Vec::new(),
+            skeleton: None,
+        };
+        let gpu = MeshGpu::from_asset(&asset);
+        assert!(!gpu.vertices.is_empty());
+        assert!(gpu
+            .vertices
+            .iter()
+            .all(|v| (v.metallic - 0.95).abs() < 1e-6 && (v.roughness - 0.15).abs() < 1e-6));
+    }
+
+    #[test]
+    fn from_asset_material_less_primitive_is_matte_dielectric() {
+        use crate::mesh::{MeshAsset, Primitive};
+        // No materials → the matte default (non-metal, fairly rough) so it reads like the prior shading.
+        let asset = MeshAsset {
+            name: "bare".into(),
+            primitives: vec![Primitive {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: Vec::new(),
+                uvs: Vec::new(),
+                indices: vec![0, 1, 2],
+                material: 0,
+                joints: Vec::new(),
+                weights: Vec::new(),
+            }],
+            materials: Vec::new(),
+            textures: Vec::new(),
+            skeleton: None,
+        };
+        let v = MeshGpu::from_asset(&asset).vertices[0];
+        assert_eq!(v.metallic, 0.0);
+        assert!((v.roughness - 0.7).abs() < 1e-6);
     }
 }

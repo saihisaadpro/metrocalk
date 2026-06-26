@@ -95,6 +95,7 @@ impl MeshSource for ImageImporter {
             materials: vec![Material {
                 base_color: [1.0, 1.0, 1.0, 1.0],
                 base_color_texture: Some(0),
+                ..Default::default()
             }],
             textures: vec![texture],
             skeleton: None,
