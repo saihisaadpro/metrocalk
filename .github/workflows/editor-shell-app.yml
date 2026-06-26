@@ -35,6 +35,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # `tauri::generate_context!()` embeds `frontendDist` (tauri.conf.json → ../../editor/dist) at compile
+      # time, so the dir must EXIST or the macro panics. `editor/dist` is a gitignored Vite BUILD ARTIFACT
+      # (not in the checkout). This job tests the RUST app (fmt/clippy + the SceneState unit tests), NOT the
+      # embedded UI (that's covered by editor-vitest + the local .exe E2E), so a tiny STUB dist is enough to
+      # let the macro succeed — no Node/pnpm build needed here.
+      - name: Stub frontendDist (so tauri::generate_context! compiles without a real Vite build)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force editor/dist | Out-Null
+          Set-Content -Path editor/dist/index.html -Value '<!doctype html><meta charset="utf-8"><title>ci-stub</title>'
+
       # Pinned to 1.92.0 (the toolchain the app is formatted with) so `cargo fmt --check` matches exactly —
       # a newer @stable rustfmt can reformat differently and red the gate on already-canonical code.
       - name: Install Rust 1.92.0 + rustfmt + clippy
