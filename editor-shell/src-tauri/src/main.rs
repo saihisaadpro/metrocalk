@@ -56,6 +56,18 @@ use tauri_plugin_dialog::DialogExt;
 
 const SCENE_N: usize = 5000; // the real M1.4 stress scene (the M2 gate target)
 
+/// Send a projection delta to the WebView, LOGGING a send failure instead of swallowing it (audit F1).
+/// A dead channel (webview closed mid-op) used to drop every confirm/undo/create/bind delta silently →
+/// the UI desynced from the engine (stuck-pending edits, dead-looking undo, ghost entities) with zero
+/// trace. `$ch` is the bound `&Channel` from `if let Some(ch) = &channel`.
+macro_rules! send_proj {
+    ($ch:expr, $d:expr) => {
+        if let Err(e) = $ch.send($d) {
+            eprintln!("[shell] projection channel send failed (UI may be out of sync): {e}");
+        }
+    };
+}
+
 /// The checked-in demo assets — **embedded** so the packaged app has no runtime file dependency, while
 /// the importer still runs on real glTF bytes (provenance: `assets/examples/gen_fixtures.rs`).
 const HEALTHBAR_GLB: &[u8] = include_bytes!("../../assets/healthbar.glb");
@@ -1020,7 +1032,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(16));
             if ticker.send(EngineCmd::Tick).is_err() {
-                break; // engine thread gone
+                // The engine thread is gone (exited or panicked) — say so once (audit F6) instead of the
+                // ticker just silently stopping while the viewport appears frozen.
+                eprintln!("[shell] engine thread is gone — the physics ticker has stopped");
+                break;
             }
         });
     }
@@ -1028,7 +1043,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     while let Ok(cmd) = rx.recv() {
         match cmd {
             EngineCmd::Connect(ch) => {
-                let _ = ch.send(project_full(&engine)); // initial full-scene load
+                send_proj!(ch, project_full(&engine)); // initial full-scene load
                 channel = Some(ch);
             }
             EngineCmd::Edit(tx) => {
@@ -1042,7 +1057,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let delta = apply_edit(&mut engine, &tx);
                 let ok = delta.rejects.is_empty();
                 if let Some(ch) = &channel {
-                    let _ = ch.send(delta);
+                    send_proj!(ch, delta);
                 }
                 let mut edited_phys: Option<EntityId> = None;
                 if ok {
@@ -1085,7 +1100,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 if engine.undo() {
                     log.append(&Record::Undo); // persist the undo so replay reproduces the net state
                     if let Some(ch) = &channel {
-                        let _ = ch.send(project_full(&engine)); // simplest correct post-undo sync
+                        send_proj!(ch, project_full(&engine)); // simplest correct post-undo sync
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                     // The ECS is the single authority over which bodies EXIST — restart the run from the
@@ -1126,16 +1141,19 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         }); // persist the bind
                         if let Some(ch) = &channel {
                             // echo the new edge so the projection (and a reload) carries it
-                            let _ = ch.send(ProjectionDelta {
-                                ops: vec![metrocalk_editor_shell::ProjectionOp::AddEdge {
-                                    from: from.clone(),
-                                    rel: capscene::TRACKS.to_string(),
-                                    to: to.clone(),
-                                }],
-                                confirms: vec![],
-                                rejects: vec![],
-                                full: false,
-                            });
+                            send_proj!(
+                                ch,
+                                ProjectionDelta {
+                                    ops: vec![metrocalk_editor_shell::ProjectionOp::AddEdge {
+                                        from: from.clone(),
+                                        rel: capscene::TRACKS.to_string(),
+                                        to: to.clone(),
+                                    }],
+                                    confirms: vec![],
+                                    rejects: vec![],
+                                    full: false,
+                                }
+                            );
                         }
                         rebuild(&engine, &shared, &mut positions, &assets);
                     }
@@ -1260,18 +1278,24 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         .map(|(from, kind, to)| (from.to_loro_key(), kind, to.to_loro_key()))
                         .collect();
                     if capscene::remove_entity(&mut engine, &scene, e).is_ok() {
+                        // Drop any physics body tracked for this entity (audit, medium): a stale `body_of`
+                        // entry would keep simulating an invisible body + skew the body count after delete.
+                        body_of.remove(&e);
                         log.append(&Record::Remove { id: id.clone() });
                         if let Some(ch) = &channel {
                             let mut ops = vec![ProjectionOp::Remove { id: id.clone() }];
                             for (from, rel, to) in removed_edges {
                                 ops.push(ProjectionOp::RemoveEdge { from, rel, to });
                             }
-                            let _ = ch.send(ProjectionDelta {
-                                ops,
-                                confirms: vec![],
-                                rejects: vec![],
-                                full: false,
-                            });
+                            send_proj!(
+                                ch,
+                                ProjectionDelta {
+                                    ops,
+                                    confirms: vec![],
+                                    rejects: vec![],
+                                    full: false,
+                                }
+                            );
                         }
                         rebuild(&engine, &shared, &mut positions, &assets);
                     }
@@ -1308,7 +1332,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let new = capscene::create_entity(&mut engine, [x, y, z], &name).ok();
                 if new.is_some() {
                     if let Some(ch) = &channel {
-                        let _ = ch.send(project_full(&engine));
+                        send_proj!(ch, project_full(&engine));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1319,7 +1343,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .is_some_and(|e| capscene::rename(&mut engine, e, &name).is_ok());
                 if ok {
                     if let Some(ch) = &channel {
-                        let _ = ch.send(project_full(&engine));
+                        send_proj!(ch, project_full(&engine));
                     }
                 }
                 let _ = reply.send(ok);
@@ -1336,7 +1360,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 if g.is_some() {
                     if let Some(ch) = &channel {
-                        let _ = ch.send(project_full(&engine));
+                        send_proj!(ch, project_full(&engine));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1347,7 +1371,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .is_some_and(|e| capscene::ungroup(&mut engine, e).is_ok());
                 if ok {
                     if let Some(ch) = &channel {
-                        let _ = ch.send(project_full(&engine));
+                        send_proj!(ch, project_full(&engine));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1375,7 +1399,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .is_ok();
                 if ok {
                     if let Some(ch) = &channel {
-                        let _ = ch.send(project_full(&engine));
+                        send_proj!(ch, project_full(&engine));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1386,7 +1410,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .is_some_and(|e| capscene::delete_deactivate(&mut engine, &scene, e).is_ok());
                 if ok {
                     if let Some(ch) = &channel {
-                        let _ = ch.send(project_full(&engine));
+                        send_proj!(ch, project_full(&engine));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1410,7 +1434,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 if ok {
                     if let Some(ch) = &channel {
-                        let _ = ch.send(project_full(&engine));
+                        send_proj!(ch, project_full(&engine));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1422,7 +1446,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .and_then(|c| capscene::paste_composition(&mut engine, c).ok());
                 if new.is_some() {
                     if let Some(ch) = &channel {
-                        let _ = ch.send(project_full(&engine));
+                        send_proj!(ch, project_full(&engine));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1440,20 +1464,32 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     {
                         let handle = AssetId::of_bytes(&bytes).as_str().to_string();
                         if !assets.handle_to_slot.contains_key(&handle) {
-                            let gpu = MeshGpu::from_asset(&asset);
-                            let ext = asset.bounds().max_extent();
+                            // Normalise the imported geometry to ~1 unit, centred (FBX/glTF are often authored
+                            // in cm, hundreds of units across). The renderer applies `Transform.scale`
+                            // directly to these verts, so this makes `scale` an intuitive world-size
+                            // multiplier (1.0 ≈ one unit) instead of `0.9/extent`-tiny; the collider reads
+                            // the SAME verts (`mesh_geometry`) so it stays matched + centred on the entity.
+                            let mut gpu = MeshGpu::from_asset(&asset);
+                            gpu.normalize_to_unit();
                             let slot = assets.meshes.len();
                             assets.meshes.push(gpu.clone());
-                            assets.scales.push(if ext > 0.0 { 0.9 / ext } else { 1.0 });
+                            assets.scales.push(1.0);
                             assets.handle_to_slot.insert(handle.clone(), slot);
                             let mut st = shared.lock().unwrap();
                             st.meshes.push(gpu);
                             st.meshes_revision = st.meshes_revision.wrapping_add(1);
                         }
-                        let _ = metrocalk_editor_shell::blobstore::put(
+                        // Persist the bytes content-addressed so the handle re-resolves on reload (audit F3):
+                        // log a write failure rather than swallow it — else the imported mesh silently
+                        // vanishes after restart (the saved handle dangles).
+                        if let Err(e) = metrocalk_editor_shell::blobstore::put(
                             &sidecar("metrocalk-assets"),
                             &bytes,
-                        );
+                        ) {
+                            eprintln!(
+                                "[shell] import: failed to persist asset bytes — it may not survive reload: {e}"
+                            );
+                        }
                         if let Ok(id) =
                             capscene::place_mesh(&mut engine, &scene, &handle, [0.0, 1.0, 0.0])
                         {
@@ -1603,21 +1639,32 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     if !usable {
                         if let Ok(asset) = GltfImporter::new().import(&bytes) {
                             // M11.1 — persist the generated bytes by content address so this handle
-                            // re-resolves after reload (the M6 residual: a generated mesh survives reopen).
-                            let _ = metrocalk_editor_shell::blobstore::put(
+                            // re-resolves after reload (the M6 residual). Persistence is a PREREQUISITE
+                            // (audit F3): if the write fails the handle would dangle on reload, so we do NOT
+                            // register / stream it in (and the charge below never settles) — the generation
+                            // fails cleanly + visibly instead of charging for an asset that vanishes.
+                            match metrocalk_editor_shell::blobstore::put(
                                 &sidecar("metrocalk-assets"),
                                 &bytes,
-                            );
-                            let gpu = MeshGpu::from_asset(&asset);
-                            let ext = asset.bounds().max_extent();
-                            let slot = assets.meshes.len();
-                            assets.meshes.push(gpu.clone());
-                            assets.scales.push(if ext > 0.0 { 0.9 / ext } else { 1.0 });
-                            assets.handle_to_slot.insert(handle.clone(), slot);
-                            let mut st = shared.lock().unwrap();
-                            st.meshes.push(gpu);
-                            st.meshes_revision = st.meshes_revision.wrapping_add(1);
-                            usable = true;
+                            ) {
+                                Ok(_) => {
+                                    // Normalise to ~1 unit, centred (see the import path) so the generated
+                                    // mesh's `scale` is an intuitive world-size multiplier + collider matched.
+                                    let mut gpu = MeshGpu::from_asset(&asset);
+                                    gpu.normalize_to_unit();
+                                    let slot = assets.meshes.len();
+                                    assets.meshes.push(gpu.clone());
+                                    assets.scales.push(1.0);
+                                    assets.handle_to_slot.insert(handle.clone(), slot);
+                                    let mut st = shared.lock().unwrap();
+                                    st.meshes.push(gpu);
+                                    st.meshes_revision = st.meshes_revision.wrapping_add(1);
+                                    usable = true;
+                                }
+                                Err(e) => eprintln!(
+                                    "[generate] failed to persist generated mesh — not streaming it in: {e}"
+                                ),
+                            }
                         }
                     }
                     // Stream the mesh in as a VALIDATED AI patch (inv. 3) — same entity, swapped handle.
@@ -1641,7 +1688,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         let ok = delta.rejects.is_empty();
                         if ok {
                             if let Some(ch) = &channel {
-                                let _ = ch.send(delta); // targeted stream-in delta (inv. 2)
+                                send_proj!(ch, delta); // targeted stream-in delta (inv. 2)
                             }
                             rebuild(&engine, &shared, &mut positions, &assets);
                         }
@@ -1720,7 +1767,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             balance_tokens,
                         } => {
                             if let (Some(d), Some(ch)) = (delta, &channel) {
-                                let _ = ch.send(d); // echo the material edit to the inspector
+                                send_proj!(ch, d); // echo the material edit to the inspector
                             }
                             log.append(&Record::AiEdit { id: id.clone() });
                             rebuild(&engine, &shared, &mut positions, &assets);
@@ -1997,7 +2044,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 touch = 0;
                 rebuild(&engine, &shared, &mut positions, &assets);
                 if let Some(ch) = &channel {
-                    let _ = ch.send(project_full(&engine));
+                    send_proj!(ch, project_full(&engine));
                 }
                 (recording, rec_entities, sim, body_of) = restart_run(
                     &engine,
@@ -2042,7 +2089,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         touch = 0;
                         rebuild(&engine, &shared, &mut positions, &assets);
                         if let Some(ch) = &channel {
-                            let _ = ch.send(project_full(&engine));
+                            send_proj!(ch, project_full(&engine));
                         }
                         (recording, rec_entities, sim, body_of) = restart_run(
                             &engine,
@@ -2111,9 +2158,17 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         let s = CapScene::intern(&mut w);
                         let mut e = Engine::new(w, 1);
                         e.set_capability_resolver(Box::new(capscene::CapResolver::from_scene(&s)));
-                        if e.merge(&snap).is_ok() {
-                            engine = e;
-                            scene = s;
+                        // Restore the pre-Play edit state. If the snapshot merge fails we must NOT leave the
+                        // play-mutated engine in place silently (audit F4) — log it loudly; the user sees the
+                        // (uncorrupted) prior engine continue rather than silent scene corruption.
+                        match e.merge(&snap) {
+                            Ok(_) => {
+                                engine = e;
+                                scene = s;
+                            }
+                            Err(err) => eprintln!(
+                                "[shell] Stop: snapshot merge FAILED — pre-Play scene NOT restored: {err}"
+                            ),
                         }
                     }
                     play_mode = false;
@@ -2122,7 +2177,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     touch = 0;
                     rebuild(&engine, &shared, &mut positions, &assets);
                     if let Some(ch) = &channel {
-                        let _ = ch.send(project_full(&engine));
+                        send_proj!(ch, project_full(&engine));
                     }
                     (recording, rec_entities, sim, body_of) = restart_run(
                         &engine,
@@ -2418,7 +2473,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             parent: parent.clone(),
                         });
                         if let Some(ch) = &channel {
-                            let _ = ch.send(project_full(&engine));
+                            send_proj!(ch, project_full(&engine));
                         }
                         rebuild(&engine, &shared, &mut positions, &assets);
                     }
@@ -3367,7 +3422,7 @@ fn echo_created(
         recency.insert(e, *touch);
     }
     if let Some(ch) = channel {
-        let _ = ch.send(project_entity(engine, id));
+        send_proj!(ch, project_entity(engine, id));
     }
     rebuild(engine, shared, positions, assets);
 }
@@ -3560,7 +3615,10 @@ fn rebuild(
                 .get("Transform")
                 .and_then(|m| m.get("scale"))
                 .and_then(|v| match v {
+                    // A whole-number scale (e.g. `2.0`) round-trips JSON as an Integer (json_to_field), so
+                    // accept BOTH — else an integer scale silently falls through to the asset base.
                     FieldValue::Number(s) if *s > 0.0 => Some(*s as f32),
+                    FieldValue::Integer(i) if *i > 0 => Some(*i as f32),
                     _ => None,
                 });
             let own = resolved_scale.unwrap_or(asset_scale);
@@ -3586,6 +3644,10 @@ fn rebuild(
             // base; absent ⇒ the base. So a scaled entity reloads at its edited size.
             let scale = match t.and_then(|m| m.get("scale")) {
                 Some(FieldValue::Number(s)) if *s > 0.0 => *s as f32,
+                // A whole-number scale (e.g. `2.0`) arrives as an Integer (json_to_field maps any whole
+                // JSON number to Integer), so accept it too — otherwise an integer scale silently reverts
+                // to the asset base (the bug where `scale=2` rendered identically to the default).
+                Some(FieldValue::Integer(i)) if *i > 0 => *i as f32,
                 _ => asset_scale,
             };
             (p, rot, scale)
@@ -5096,7 +5158,17 @@ fn main() {
     {
         let shared = shared.clone();
         let self_tx = tx.clone(); // so the engine thread can hand workers (generation) a way back
-        std::thread::spawn(move || engine_thread(rx, shared, self_tx));
+                                  // Wrap the engine loop so a panic is LOGGED, not silently swallowed (audit F6). A bare panic here
+                                  // kills the thread invisibly: the viewport freezes, commands return defaults, and nothing says why.
+        std::thread::spawn(move || {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine_thread(rx, shared, self_tx);
+            }))
+            .is_err()
+            {
+                eprintln!("[shell] FATAL: the engine thread panicked — the editor is now unresponsive (the viewport will freeze). Please restart.");
+            }
+        });
     }
     let app_state = AppState {
         tx,

@@ -184,22 +184,40 @@ impl Log {
     }
 
     /// Append one record (one JSON line), writing the `#mtk` header first if the file is new/empty.
-    /// Best-effort: a serialization or IO failure is dropped, never fatal — losing a persisted edit
-    /// must not crash the editor.
+    /// Non-fatal (losing a persisted edit must not crash the editor) but NOT silent (audit F2): an IO
+    /// failure here means the edit won't survive reload, so log it loudly rather than swallow it.
     pub fn append(&self, rec: &Record) {
         let Ok(line) = serde_json::to_string(rec) else {
+            eprintln!("[persist] failed to serialize a record — edit not persisted (won't survive reload)");
             return;
         };
         let is_empty = self.path.metadata().map_or(true, |m| m.len() == 0);
-        if let Ok(mut f) = OpenOptions::new()
+        match OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
         {
-            if is_empty {
-                let _ = writeln!(f, "{HEADER_PREFIX}{}", self.fingerprint);
+            Ok(mut f) => {
+                if is_empty {
+                    if let Err(e) = writeln!(f, "{HEADER_PREFIX}{}", self.fingerprint) {
+                        eprintln!(
+                            "[persist] failed to write log header to {}: {e}",
+                            self.path.display()
+                        );
+                        return; // avoid a headerless log (replay would reject it on the fingerprint guard)
+                    }
+                }
+                if let Err(e) = writeln!(f, "{line}") {
+                    eprintln!(
+                        "[persist] failed to append edit to {}: {e} (won't survive reload)",
+                        self.path.display()
+                    );
+                }
             }
-            let _ = writeln!(f, "{line}");
+            Err(e) => eprintln!(
+                "[persist] failed to open replay log {} — edit not persisted: {e}",
+                self.path.display()
+            ),
         }
     }
 
@@ -375,9 +393,18 @@ impl Log {
         (applied, skipped)
     }
 
-    /// Delete the log (a "new scene" / reset). Best-effort.
+    /// Delete the log (a "new scene" / reset). Non-fatal, but a failure is logged (audit F9): a surviving
+    /// stale log would replay old edits into a fresh scene (or re-trip the fingerprint guard every launch).
+    /// `NotFound` is the normal "already clean" case and is not noise-worthy.
     pub fn clear(&self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "[persist] failed to clear replay log {}: {e}",
+                    self.path.display()
+                );
+            }
+        }
     }
 }
 

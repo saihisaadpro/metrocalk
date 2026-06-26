@@ -94,7 +94,7 @@ export function DescribeBar({ client }: { client: EditorClient }) {
     if (r.balance != null) setBalance(r.balance);
     if (r.created) {
       projectionStore.getState().select(r.created);
-      void client.gizmoSelect(r.created).catch(() => {}); // set the ENGINE selection too (gizmo/inspector track it)
+      void client.gizmoSelect(r.created).catch((e) => console.error("gizmoSelect failed (engine selection may be out of sync)", e)); // set the ENGINE selection too (gizmo/inspector track it)
       // The wallet shows the charge AT THE GESTURE: `generate` reserves a hold up front and returns the
       // AVAILABLE balance (settled − the hold), so `setBalance(r.balance)` above already reflects the −cost.
       // No client poll — the legible-cost contract is met by the response, not a post-hoc read.

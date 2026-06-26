@@ -63,8 +63,14 @@ export function ContextMenu({
         feedback("removed " + id + " · Ctrl-Z to undo", "info");
         break;
       case "duplicate":
-        void client.duplicateEntity(id).catch((e) => console.error("duplicate failed", e));
-        feedback("duplicated " + id, "success");
+        // Report the REAL outcome (audit F11): the toast used to claim success unconditionally.
+        void client
+          .duplicateEntity(id)
+          .then((newId) => feedback(newId ? "duplicated " + id : "couldn't duplicate " + id, newId ? "success" : "error"))
+          .catch((e) => {
+            console.error("duplicate failed", e);
+            feedback("couldn't duplicate " + id, "error");
+          });
         break;
       case "focus":
         client.focusEntity(id);
@@ -77,17 +83,23 @@ export function ContextMenu({
         break;
       case "inspect":
         projectionStore.getState().select(id);
-        void client.gizmoSelect(id).catch(() => {}); // keep the ENGINE selection in sync (TransformPanel reads it)
+        void client.gizmoSelect(id).catch((e) => console.error("gizmoSelect failed (engine selection may be out of sync)", e)); // keep the ENGINE selection in sync (TransformPanel reads it)
         feedback("inspecting " + id, "info");
         break;
       case "bind":
         projectionStore.getState().select(id); // opens the reveal
-        void client.gizmoSelect(id).catch(() => {}); // keep the ENGINE selection in sync
+        void client.gizmoSelect(id).catch((e) => console.error("gizmoSelect failed (engine selection may be out of sync)", e)); // keep the ENGINE selection in sync
         feedback("binding " + id, "info");
         break;
       case "makedynamic":
-        void client.makeDynamic(id).catch((e) => console.error("make_dynamic failed", e));
-        feedback("made " + id + " dynamic", "success");
+        // Report the REAL outcome (audit F11): the engine can refuse (e.g. no derivable collider).
+        void client
+          .makeDynamic(id)
+          .then((ok) => feedback(ok ? "made " + id + " dynamic" : "couldn't make " + id + " dynamic", ok ? "success" : "error"))
+          .catch((e) => {
+            console.error("make_dynamic failed", e);
+            feedback("couldn't make " + id + " dynamic", "error");
+          });
         break;
       default:
         return; // unknown verb → don't close

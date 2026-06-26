@@ -9,8 +9,15 @@
 //! (so the non-bindless path needs no per-material bind group this milestone — texture sampling is the
 //! next render increment), and derives smooth normals when the source ships none.
 
-// Index offsets are bounded by MAX_ELEMENTS; the f32 color baking is a display value.
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+// Index offsets are bounded by MAX_ELEMENTS; the f32 color baking is a display value. The fixed [_;3]
+// component loops read clearest as `0..3` (the iterator rewrite is noisier for a 3-vector), and the tests
+// compare exact, unmodified float coordinates.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::needless_range_loop,
+    clippy::float_cmp
+)]
 
 use crate::mesh::MeshAsset;
 
@@ -92,6 +99,42 @@ impl MeshGpu {
     pub fn index_count(&self) -> usize {
         self.indices.len()
     }
+
+    /// Recenter to the bounding-box centre and scale to **unit max-extent**, in place. An imported asset's
+    /// raw vertices can span hundreds of units (FBX is often authored in cm); the renderer applies the
+    /// entity's `Transform.scale` directly to these positions (`v.position * scale` in the shader), so a
+    /// "normal-looking" scale like `1.0` would blow a 200-unit mesh up to 200 units. Normalising here makes
+    /// the stored geometry ~1 unit so the `scale` field is an intuitive world-size multiplier (`1.0` ≈ one
+    /// unit, `2.0` ≈ double) AND the derived collider — which reads these same vertices — stays centred on
+    /// the entity and matched to the render. No-op for an empty or degenerate (zero-extent) mesh.
+    pub fn normalize_to_unit(&mut self) {
+        if self.vertices.is_empty() {
+            return;
+        }
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for v in &self.vertices {
+            for k in 0..3 {
+                lo[k] = lo[k].min(v.position[k]);
+                hi[k] = hi[k].max(v.position[k]);
+            }
+        }
+        let ext = (0..3).map(|k| hi[k] - lo[k]).fold(0.0_f32, f32::max);
+        // Positive guard (NaN- and zero-extent-safe): only normalize a real, non-degenerate mesh.
+        if ext > 0.0 {
+            let center = [
+                (lo[0] + hi[0]) * 0.5,
+                (lo[1] + hi[1]) * 0.5,
+                (lo[2] + hi[2]) * 0.5,
+            ];
+            let inv = 1.0 / ext;
+            for v in &mut self.vertices {
+                for k in 0..3 {
+                    v.position[k] = (v.position[k] - center[k]) * inv;
+                }
+            }
+        }
+    }
 }
 
 /// Smooth per-vertex normals: accumulate each triangle's face normal onto its vertices, then
@@ -135,5 +178,56 @@ fn normalize(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
         [v[0] / len, v[1] / len, v[2] / len]
     } else {
         fallback
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vtx(p: [f32; 3]) -> MeshVertex {
+        MeshVertex {
+            position: p,
+            normal: [0.0, 1.0, 0.0],
+            color: [0.8, 0.8, 0.8],
+        }
+    }
+
+    #[test]
+    fn normalize_to_unit_recenters_and_unit_scales() {
+        // A big, off-centre box (like an FBX in cm): x spans 200, centred at (100, 50, 10).
+        let mut m = MeshGpu {
+            vertices: vec![vtx([0.0, 0.0, 0.0]), vtx([200.0, 100.0, 20.0])],
+            indices: vec![],
+        };
+        m.normalize_to_unit();
+        // Recentred about the bbox centre, scaled so the max axis (x, span 200) becomes 1.0.
+        let (a, b) = (m.vertices[0].position, m.vertices[1].position);
+        assert!(
+            (a[0] - (-0.5)).abs() < 1e-5 && (b[0] - 0.5).abs() < 1e-5,
+            "x spans [-0.5,0.5]"
+        );
+        // Aspect preserved: y span 100 → 0.5, z span 20 → 0.1 (same divisor as x).
+        assert!((b[1] - a[1] - 0.5).abs() < 1e-5, "y span 0.5");
+        assert!((b[2] - a[2] - 0.1).abs() < 1e-5, "z span 0.1 (aspect kept)");
+        // Centred on the origin.
+        assert!(
+            a.iter().zip(&b).all(|(lo, hi)| (lo + hi).abs() < 1e-5),
+            "centred"
+        );
+    }
+
+    #[test]
+    fn normalize_to_unit_is_a_noop_for_degenerate_or_empty() {
+        let mut empty = MeshGpu::default();
+        empty.normalize_to_unit(); // no panic
+        assert!(empty.vertices.is_empty());
+
+        let mut point = MeshGpu {
+            vertices: vec![vtx([3.0, 3.0, 3.0]), vtx([3.0, 3.0, 3.0])],
+            indices: vec![],
+        };
+        point.normalize_to_unit(); // zero extent → unchanged (no divide-by-zero)
+        assert_eq!(point.vertices[0].position, [3.0, 3.0, 3.0]);
     }
 }

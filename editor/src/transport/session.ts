@@ -282,27 +282,27 @@ class TauriClient implements EditorClient {
   }
 
   revealTargets(id: string): Promise<RevealResponse> {
-    return this.core.invoke<RevealResponse>("reveal_targets", { id });
+    return this.core.invoke<RevealResponse>("reveal_targets", { id }).catch((e: unknown) => { console.error("reveal_targets failed", e); throw e; });
   }
 
   describe(query: string): Promise<DescribeResponse> {
-    return this.core.invoke<DescribeResponse>("describe", { query });
+    return this.core.invoke<DescribeResponse>("describe", { query }).catch((e: unknown) => { console.error("describe failed", e); throw e; });
   }
 
   walletInfo(): Promise<EconResponse> {
-    return this.core.invoke<EconResponse>("wallet_info");
+    return this.core.invoke<EconResponse>("wallet_info").catch((e: unknown) => { console.error("wallet_info failed", e); throw e; });
   }
 
   topUp(): Promise<EconResponse> {
-    return this.core.invoke<EconResponse>("top_up");
+    return this.core.invoke<EconResponse>("top_up").catch((e: unknown) => { console.error("top_up failed", e); throw e; });
   }
 
   aiEdit(id: string): Promise<EconResponse> {
-    return this.core.invoke<EconResponse>("ai_edit", { id });
+    return this.core.invoke<EconResponse>("ai_edit", { id }).catch((e: unknown) => { console.error("ai_edit failed", e); throw e; });
   }
 
   generate(query: string): Promise<GenerateResponse> {
-    return this.core.invoke<GenerateResponse>("generate", { query });
+    return this.core.invoke<GenerateResponse>("generate", { query }).catch((e: unknown) => { console.error("generate failed", e); throw e; });
   }
 
   undo(): void {
@@ -310,56 +310,56 @@ class TauriClient implements EditorClient {
   }
 
   entityActions(id: string): Promise<ActionItem[]> {
-    return this.core.invoke<ActionItem[]>("entity_actions", { id });
+    return this.core.invoke<ActionItem[]>("entity_actions", { id }).catch((e: unknown) => { console.error("entity_actions failed", e); throw e; });
   }
   entityDetails(id: string): Promise<EntityDetails | null> {
-    return this.core.invoke<EntityDetails | null>("entity_details", { id });
+    return this.core.invoke<EntityDetails | null>("entity_details", { id }).catch((e: unknown) => { console.error("entity_details failed", e); throw e; });
   }
   removeEntity(id: string): void {
     void this.core.invoke("remove_entity", { id }).catch((e: unknown) => console.error("remove_entity failed", e));
   }
   duplicateEntity(id: string): Promise<string | null> {
-    return this.core.invoke<string | null>("duplicate_entity", { id });
+    return this.core.invoke<string | null>("duplicate_entity", { id }).catch((e: unknown) => { console.error("duplicate_entity failed", e); throw e; });
   }
   focusEntity(id: string): void {
     void this.core.invoke("focus_entity", { id }).catch((e: unknown) => console.error("focus_entity failed", e));
   }
   makeDynamic(id: string): Promise<boolean> {
-    return this.core.invoke<boolean>("make_dynamic", { id });
+    return this.core.invoke<boolean>("make_dynamic", { id }).catch((e: unknown) => { console.error("make_dynamic failed", e); throw e; });
   }
 
   // ── M10.6 scene-authoring verbs ──
   createEntity(x: number, y: number, z: number, name: string): Promise<string | null> {
-    return this.core.invoke<string | null>("create_entity", { x, y, z, name });
+    return this.core.invoke<string | null>("create_entity", { x, y, z, name }).catch((e: unknown) => { console.error("create_entity failed", e); throw e; });
   }
   renameEntity(id: string, name: string): Promise<boolean> {
-    return this.core.invoke<boolean>("rename_entity", { id, name });
+    return this.core.invoke<boolean>("rename_entity", { id, name }).catch((e: unknown) => { console.error("rename_entity failed", e); throw e; });
   }
   groupEntities(ids: string[], name: string): Promise<string | null> {
-    return this.core.invoke<string | null>("group_entities", { ids, name });
+    return this.core.invoke<string | null>("group_entities", { ids, name }).catch((e: unknown) => { console.error("group_entities failed", e); throw e; });
   }
   ungroupEntity(id: string): Promise<boolean> {
-    return this.core.invoke<boolean>("ungroup_entity", { id });
+    return this.core.invoke<boolean>("ungroup_entity", { id }).catch((e: unknown) => { console.error("ungroup_entity failed", e); throw e; });
   }
   multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean> {
-    return this.core.invoke<boolean>("multi_edit", { ids, component, field, value });
+    return this.core.invoke<boolean>("multi_edit", { ids, component, field, value }).catch((e: unknown) => { console.error("multi_edit failed", e); throw e; });
   }
   deleteDeactivate(id: string): Promise<boolean> {
-    return this.core.invoke<boolean>("delete_deactivate", { id });
+    return this.core.invoke<boolean>("delete_deactivate", { id }).catch((e: unknown) => { console.error("delete_deactivate failed", e); throw e; });
   }
   copySubtree(id: string): void {
     void this.core.invoke("copy_subtree", { id }).catch((e: unknown) => console.error("copy_subtree failed", e));
   }
   cutSubtree(id: string): Promise<boolean> {
-    return this.core.invoke<boolean>("cut_subtree", { id });
+    return this.core.invoke<boolean>("cut_subtree", { id }).catch((e: unknown) => { console.error("cut_subtree failed", e); throw e; });
   }
   pasteClipboard(): Promise<string | null> {
-    return this.core.invoke<string | null>("paste_clipboard");
+    return this.core.invoke<string | null>("paste_clipboard").catch((e: unknown) => { console.error("paste_clipboard failed", e); throw e; });
   }
 
   // ── M8 physics ──
   spawnBody(x: number, y: number, z: number): Promise<string | null> {
-    return this.core.invoke<string | null>("spawn_body", { x, y, z });
+    return this.core.invoke<string | null>("spawn_body", { x, y, z }).catch((e: unknown) => { console.error("spawn_body failed", e); throw e; });
   }
   setSimRunning(run: boolean): void {
     void this.core.invoke("set_sim_running", { run }).catch((e: unknown) => console.error("set_sim_running failed", e));
@@ -368,25 +368,25 @@ class TauriClient implements EditorClient {
     void this.core.invoke("sim_overlay", { on }).catch((e: unknown) => console.error("sim_overlay failed", e));
   }
   simTimeline(): Promise<TimelineTuple> {
-    return this.core.invoke<TimelineTuple>("sim_timeline");
+    return this.core.invoke<TimelineTuple>("sim_timeline").catch((e: unknown) => { console.error("sim_timeline failed", e); throw e; });
   }
   simScrub(frame: number): Promise<TimelineTuple> {
-    return this.core.invoke<TimelineTuple>("sim_scrub", { frame });
+    return this.core.invoke<TimelineTuple>("sim_scrub", { frame }).catch((e: unknown) => { console.error("sim_scrub failed", e); throw e; });
   }
   simShove(id: string, impulse: [number, number, number]): Promise<boolean> {
-    return this.core.invoke<boolean>("sim_shove", { id, impulse });
+    return this.core.invoke<boolean>("sim_shove", { id, impulse }).catch((e: unknown) => { console.error("sim_shove failed", e); throw e; });
   }
   physicsContacts(): Promise<ContactInfo[]> {
-    return this.core.invoke<ContactInfo[]>("physics_contacts");
+    return this.core.invoke<ContactInfo[]>("physics_contacts").catch((e: unknown) => { console.error("physics_contacts failed", e); throw e; });
   }
   physicsCheck(id: string): Promise<PhysicsWarning[]> {
-    return this.core.invoke<PhysicsWarning[]>("physics_check", { id });
+    return this.core.invoke<PhysicsWarning[]>("physics_check", { id }).catch((e: unknown) => { console.error("physics_check failed", e); throw e; });
   }
   physicsFix(id: string, action: string): Promise<boolean> {
-    return this.core.invoke<boolean>("physics_fix", { id, action });
+    return this.core.invoke<boolean>("physics_fix", { id, action }).catch((e: unknown) => { console.error("physics_fix failed", e); throw e; });
   }
   importInterchange(format: string, source: string): Promise<ImportResult> {
-    return this.core.invoke<ImportResult>("import_interchange", { format, source });
+    return this.core.invoke<ImportResult>("import_interchange", { format, source }).catch((e: unknown) => { console.error("import_interchange failed", e); throw e; });
   }
 
   // ── M9 transform / gizmo / part / snap ──
@@ -394,37 +394,37 @@ class TauriClient implements EditorClient {
     void this.core.invoke("gizmo_mode", { mode }).catch((e: unknown) => console.error("gizmo_mode failed", e));
   }
   gizmoSelect(id: string): Promise<boolean> {
-    return this.core.invoke<boolean>("gizmo_select", { id });
+    return this.core.invoke<boolean>("gizmo_select", { id }).catch((e: unknown) => { console.error("gizmo_select failed", e); throw e; });
   }
   gizmoSelected(): Promise<string | null> {
-    return this.core.invoke<string | null>("gizmo_selected");
+    return this.core.invoke<string | null>("gizmo_selected").catch((e: unknown) => { console.error("gizmo_selected failed", e); throw e; });
   }
   gizmoDebug(): Promise<[string, boolean, boolean, string, string]> {
-    return this.core.invoke<[string, boolean, boolean, string, string]>("gizmo_debug");
+    return this.core.invoke<[string, boolean, boolean, string, string]>("gizmo_debug").catch((e: unknown) => { console.error("gizmo_debug failed", e); throw e; });
   }
   gizmoSpaceToggle(): Promise<string> {
-    return this.core.invoke<string>("gizmo_space_toggle");
+    return this.core.invoke<string>("gizmo_space_toggle").catch((e: unknown) => { console.error("gizmo_space_toggle failed", e); throw e; });
   }
   gizmoPivotToggle(): Promise<string> {
-    return this.core.invoke<string>("gizmo_pivot_toggle");
+    return this.core.invoke<string>("gizmo_pivot_toggle").catch((e: unknown) => { console.error("gizmo_pivot_toggle failed", e); throw e; });
   }
   gizmoPickDrag(x: number, y: number, ctrl: boolean): Promise<boolean> {
-    return this.core.invoke<boolean>("gizmo_pick_drag", { x, y, ctrl });
+    return this.core.invoke<boolean>("gizmo_pick_drag", { x, y, ctrl }).catch((e: unknown) => { console.error("gizmo_pick_drag failed", e); throw e; });
   }
   gizmoDragEnd(): void {
     void this.core.invoke("gizmo_drag_end").catch((e: unknown) => console.error("gizmo_drag_end failed", e));
   }
   readTransform(id: string): Promise<number[]> {
-    return this.core.invoke<number[]>("read_transform", { id });
+    return this.core.invoke<number[]>("read_transform", { id }).catch((e: unknown) => { console.error("read_transform failed", e); throw e; });
   }
   saveCharacter(id: string): Promise<string | null> {
-    return this.core.invoke<string | null>("save_character", { id });
+    return this.core.invoke<string | null>("save_character", { id }).catch((e: unknown) => { console.error("save_character failed", e); throw e; });
   }
   instantiateCharacter(comp: string): Promise<string | null> {
-    return this.core.invoke<string | null>("instantiate_character", { comp });
+    return this.core.invoke<string | null>("instantiate_character", { comp }).catch((e: unknown) => { console.error("instantiate_character failed", e); throw e; });
   }
   setPartActive(id: string, active: boolean): Promise<boolean> {
-    return this.core.invoke<boolean>("set_part_active", { id, active });
+    return this.core.invoke<boolean>("set_part_active", { id, active }).catch((e: unknown) => { console.error("set_part_active failed", e); throw e; });
   }
   reparentPart(id: string, parent: string | null): void {
     void this.core.invoke("reparent_part", { id, parent }).catch((e: unknown) => console.error("reparent_part failed", e));
@@ -433,13 +433,13 @@ class TauriClient implements EditorClient {
     void this.core.invoke("set_snap", { on }).catch((e: unknown) => console.error("set_snap failed", e));
   }
   snapQuery(id: string, radius: number): Promise<SnapHit[]> {
-    return this.core.invoke<SnapHit[]>("snap_query", { id, radius });
+    return this.core.invoke<SnapHit[]>("snap_query", { id, radius }).catch((e: unknown) => { console.error("snap_query failed", e); throw e; });
   }
   applyConstraint(id: string, kind: string, target: string | null, value: number): Promise<SolveResult> {
-    return this.core.invoke<SolveResult>("apply_constraint", { id, kind, target, value });
+    return this.core.invoke<SolveResult>("apply_constraint", { id, kind, target, value }).catch((e: unknown) => { console.error("apply_constraint failed", e); throw e; });
   }
   placementSentence(id: string, text: string): Promise<SolveResult> {
-    return this.core.invoke<SolveResult>("placement_sentence", { id, text });
+    return this.core.invoke<SolveResult>("placement_sentence", { id, text }).catch((e: unknown) => { console.error("placement_sentence failed", e); throw e; });
   }
 
   // ── M3.3 focus ──
@@ -447,7 +447,7 @@ class TauriClient implements EditorClient {
     void this.core.invoke("unfocus").catch((e: unknown) => console.error("unfocus failed", e));
   }
   focusDebug(): Promise<[number, boolean]> {
-    return this.core.invoke<[number, boolean]>("focus_debug");
+    return this.core.invoke<[number, boolean]>("focus_debug").catch((e: unknown) => { console.error("focus_debug failed", e); throw e; });
   }
 
   frameAll(): void {
@@ -457,11 +457,11 @@ class TauriClient implements EditorClient {
     void this.core.invoke("view_preset", { preset }).catch((e: unknown) => console.error("view_preset failed", e));
   }
   cameraDebug(): Promise<number[]> {
-    return this.core.invoke<number[]>("camera_debug");
+    return this.core.invoke<number[]>("camera_debug").catch((e: unknown) => { console.error("camera_debug failed", e); throw e; });
   }
 
   viewportPick(x: number, y: number): Promise<string | null> {
-    return this.core.invoke<string | null>("viewport_pick", { x, y });
+    return this.core.invoke<string | null>("viewport_pick", { x, y }).catch((e: unknown) => { console.error("viewport_pick failed", e); throw e; });
   }
   dragStart(): void {
     void this.core.invoke("drag_start").catch((e: unknown) => console.error("drag_start failed", e));
@@ -477,45 +477,45 @@ class TauriClient implements EditorClient {
     return this.core.invoke<Record<string, CatalogItem[]>>("catalog");
   }
   catalogSearch(query: string): Promise<CatalogSearch> {
-    return this.core.invoke<CatalogSearch>("catalog_search", { query });
+    return this.core.invoke<CatalogSearch>("catalog_search", { query }).catch((e: unknown) => { console.error("catalog_search failed", e); throw e; });
   }
   addItem(id: string, source: string): Promise<AddResponse> {
-    return this.core.invoke<AddResponse>("add_item", { id, source });
+    return this.core.invoke<AddResponse>("add_item", { id, source }).catch((e: unknown) => { console.error("add_item failed", e); throw e; });
   }
   importAsset(path: string): Promise<string | null> {
-    return this.core.invoke<string | null>("import_asset", { path });
+    return this.core.invoke<string | null>("import_asset", { path }).catch((e: unknown) => { console.error("import_asset failed", e); throw e; });
   }
   importAssetDialog(): Promise<string | null> {
-    return this.core.invoke<string | null>("import_asset_dialog");
+    return this.core.invoke<string | null>("import_asset_dialog").catch((e: unknown) => { console.error("import_asset_dialog failed", e); throw e; });
   }
 
   projectState(): Promise<ProjectInfo> {
-    return this.core.invoke<ProjectInfo>("project_state");
+    return this.core.invoke<ProjectInfo>("project_state").catch((e: unknown) => { console.error("project_state failed", e); throw e; });
   }
   newProject(): Promise<ProjectInfo> {
-    return this.core.invoke<ProjectInfo>("new_project");
+    return this.core.invoke<ProjectInfo>("new_project").catch((e: unknown) => { console.error("new_project failed", e); throw e; });
   }
   openProject(path?: string): Promise<ProjectInfo> {
-    return this.core.invoke<ProjectInfo>("open_project", { path: path ?? null });
+    return this.core.invoke<ProjectInfo>("open_project", { path: path ?? null }).catch((e: unknown) => { console.error("open_project failed", e); throw e; });
   }
   saveProject(): Promise<ProjectInfo> {
-    return this.core.invoke<ProjectInfo>("save_project", { path: null });
+    return this.core.invoke<ProjectInfo>("save_project", { path: null }).catch((e: unknown) => { console.error("save_project failed", e); throw e; });
   }
   saveProjectAs(): Promise<ProjectInfo> {
-    return this.core.invoke<ProjectInfo>("save_project_as");
+    return this.core.invoke<ProjectInfo>("save_project_as").catch((e: unknown) => { console.error("save_project_as failed", e); throw e; });
   }
 
   play(): Promise<PlayInfo> {
-    return this.core.invoke<PlayInfo>("play");
+    return this.core.invoke<PlayInfo>("play").catch((e: unknown) => { console.error("play failed", e); throw e; });
   }
   stop(): Promise<PlayInfo> {
-    return this.core.invoke<PlayInfo>("stop");
+    return this.core.invoke<PlayInfo>("stop").catch((e: unknown) => { console.error("stop failed", e); throw e; });
   }
   pause(): Promise<PlayInfo> {
-    return this.core.invoke<PlayInfo>("pause");
+    return this.core.invoke<PlayInfo>("pause").catch((e: unknown) => { console.error("pause failed", e); throw e; });
   }
   playState(): Promise<PlayInfo> {
-    return this.core.invoke<PlayInfo>("play_state");
+    return this.core.invoke<PlayInfo>("play_state").catch((e: unknown) => { console.error("play_state failed", e); throw e; });
   }
 }
 

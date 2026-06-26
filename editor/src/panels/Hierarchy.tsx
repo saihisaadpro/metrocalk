@@ -36,7 +36,7 @@ const Row = memo(function Row({ id, top, client }: { id: string; top: number; cl
     if (e.shiftKey) st.selectRange(id);
     else if (e.ctrlKey || e.metaKey) st.toggleSelect(id);
     else st.select(id);
-    void client.gizmoSelect(id).catch(() => {});
+    void client.gizmoSelect(id).catch((e) => console.error("gizmoSelect failed (engine selection may be out of sync)", e));
   }
 
   return (

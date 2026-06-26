@@ -343,7 +343,12 @@ fn decode_textures(doc: &Gltf, blob: &[u8], materials: &mut [Material]) -> Vec<T
             remap.insert(img_idx, compact);
             mat.base_color_texture = Some(compact);
         } else {
-            mat.base_color_texture = None; // unresolved — fall back to the base-color factor
+            // Unresolved (external URI / non-PNG / corrupt) — fall back to the base-color factor, but say so
+            // (audit F7): an import silently losing a texture looks like a wrong material, not a known limit.
+            eprintln!(
+                "[assets] glTF: base-color texture (image #{img_idx}) couldn't be decoded — using the flat base color instead"
+            );
+            mat.base_color_texture = None;
         }
     }
     out

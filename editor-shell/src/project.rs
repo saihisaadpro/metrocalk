@@ -101,8 +101,18 @@ pub fn push_recent(path: &Path, project: &str, cap: usize) -> Vec<String> {
     list.retain(|p| p != project);
     list.insert(0, project.to_string());
     list.truncate(cap.max(1));
-    if let Ok(s) = serde_json::to_string(&list) {
-        let _ = std::fs::write(path, s);
+    // Non-fatal (recents is MRU history, not project data) but not silent (audit F8): a write failure here
+    // means a saved/opened project won't appear in File>Recent or auto-restore — log it.
+    match serde_json::to_string(&list) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(path, s) {
+                eprintln!(
+                    "[shell] failed to update recent-projects list {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("[shell] failed to serialize recent-projects list: {e}"),
     }
     list
 }

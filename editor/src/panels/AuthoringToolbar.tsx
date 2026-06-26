@@ -19,7 +19,7 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
   const select = (id: string | null) => {
     if (id) {
       projectionStore.getState().select(id);
-      void client.gizmoSelect(id).catch(() => {});
+      void client.gizmoSelect(id).catch((e) => console.error("gizmoSelect failed (engine selection may be out of sync)", e));
     }
   };
 
