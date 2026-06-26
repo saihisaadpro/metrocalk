@@ -223,7 +223,9 @@ fn bake_brdf_lut() -> Vec<u16> {
 
 // ── GPU resources ──────────────────────────────────────────────────────────────────────────────────
 
-/// group 3 layout: env texture + its sampler, BRDF LUT + its sampler (all FRAGMENT-visible).
+/// group 3 layout: env texture + its sampler, BRDF LUT + its sampler, and (M11.3 inc.3) the shadow map +
+/// its comparison sampler — all FRAGMENT-visible. The shadow lives here, not its own group, because the
+/// device caps bind groups at 4 (web-portable).
 pub fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let tex = |binding| wgpu::BindGroupLayoutEntry {
         binding,
@@ -243,12 +245,42 @@ pub fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     };
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("ibl-bgl"),
-        entries: &[tex(0), samp(1), tex(2), samp(3)],
+        entries: &[
+            tex(0),
+            samp(1),
+            tex(2),
+            samp(3),
+            // M11.3 inc.3 — shadow map (depth) + comparison sampler.
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                count: None,
+            },
+        ],
     })
 }
 
-/// Bake the procedural env + BRDF LUT and build the group-3 bind group.
-pub fn create(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) -> Ibl {
+/// Bake the procedural env + BRDF LUT and build the group-3 bind group (which also carries the M11.3 inc.3
+/// shadow map + comparison sampler, supplied by the caller — they share group 3 to stay within the device's
+/// 4-bind-group cap).
+pub fn create(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    shadow_view: &wgpu::TextureView,
+    shadow_sampler: &wgpu::Sampler,
+) -> Ibl {
     let mips = build_env_mips();
     let mip_count = mips.len() as u32;
     let (base_w, base_h, _) = &mips[0];
@@ -366,6 +398,15 @@ pub fn create(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGro
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::Sampler(&lut_sampler),
+            },
+            // M11.3 inc.3 — the shadow map + comparison sampler (owned by render.rs; shared in group 3).
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(shadow_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(shadow_sampler),
             },
         ],
     });

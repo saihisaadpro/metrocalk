@@ -155,6 +155,12 @@ pub struct SceneState {
     /// M9.4 — the current snap **ghost** (the nearest target's world position during a drag), drawn as an
     /// overlay marker + read by `snap_ghost` (the HUD/E2E). `None` ⇒ no candidate in range / not dragging.
     pub snap_ghost: Option<[f32; 3]>,
+    /// M11.3 inc.3 — index (into `lights`) of the scene's shadow-casting directional light (the first
+    /// authored directional with `castShadows`, else the default key light). `None` ⇒ nothing casts → the
+    /// shadow pass is skipped, `light_view_proj` stays identity, and `fs_mesh` shadows nothing. The INDEX
+    /// (not just the direction) so the shader applies the single shadow map to ONLY its caster, not every
+    /// directional light. Rebuilt with `lights` (a render projection).
+    pub shadow_caster: Option<usize>,
 }
 
 pub type Shared = Arc<Mutex<SceneState>>;
@@ -397,12 +403,57 @@ struct Camera {
     /// M11.3 inc.2 — inverse view-proj, so the skybox can turn a screen pixel back into a world ray to
     /// sample the equirect env. Unused by the cube/grid/line shaders (they ignore the trailing field).
     inv_view_proj: [[f32; 4]; 4],
+    /// M11.3 inc.3 — the shadow-casting light's ortho view-proj: the depth pass projects geometry by it,
+    /// and `fs_mesh` reprojects each fragment through it to look up the shadow map. Identity when nothing
+    /// casts (the lookup then falls outside the unit cube → unshadowed).
+    light_view_proj: [[f32; 4]; 4],
     /// Focus-mode flag, packed in `focus[0]`: `1.0` while an entity is focused, `0.0` otherwise. The
     /// shaders dim every instance whose `selected < 0.5` when this is set, so only the focused (=
     /// selected) entity stays lit — "gray out the rest." A `vec4` (not a bare `f32` + pad) so the WGSL
     /// uniform layout matches byte-for-byte: a `vec3` tail would round the std140 struct to 96 bytes
     /// while this struct is 80, and wgpu would reject the undersized buffer at draw. `[1..4]` unused.
     focus: [f32; 4],
+    /// M11.3 inc.3 — `shadow[0]` is the index (into the lights buffer) of the shadow-casting directional
+    /// light, or `-1.0` when nothing casts. `fs_mesh` applies the single shadow map to ONLY that light, so
+    /// other directional lights (which have no map) stay unshadowed. `[1..4]` unused (pad to a vec4).
+    shadow: [f32; 4],
+}
+// The WGSL `Camera` (3×mat4 + 2×vec4) is 224 bytes; keep this struct byte-identical or wgpu rejects the
+// uniform at draw. A compile-time tripwire so a future field can't silently desync the layout.
+const _: () = assert!(std::mem::size_of::<Camera>() == 224);
+
+/// M11.3 inc.3 — shadow-map quality profile, chosen once at startup from `MTK_SHADOW_QUALITY`
+/// (`low`|`medium`|`high`, default medium). Drives the shadow-map resolution; `Low` is the entry-level /
+/// min-spec gate. Higher = sharper shadows at more depth-pass + sampling cost.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShadowQuality {
+    Low,
+    Medium,
+    High,
+}
+
+impl ShadowQuality {
+    fn from_env() -> Self {
+        match std::env::var("MTK_SHADOW_QUALITY").ok().as_deref() {
+            Some("low") => Self::Low,
+            Some("high") => Self::High,
+            _ => Self::Medium,
+        }
+    }
+    fn shadow_size(self) -> u32 {
+        match self {
+            Self::Low => 1024,
+            Self::Medium => 2048,
+            Self::High => 4096,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 /// Window handle wrapper so wgpu can make a surface from the Tauri window on a render thread.
@@ -539,16 +590,94 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let mut cube = InstanceBuf::new(&device, &inst_bgl, 1024);
     // M11.3 — the scene's lights (group 2 on the mesh pipeline). Starts with room for a handful; grows.
     let mut lights_buf = LightBuf::new(&device, &lights_bgl, 8);
-    // M11.3 inc.2 — image-based lighting (group 3): a procedural HDR sky + split-sum BRDF LUT. Gives metals
-    // an environment to reflect (closes the M11.2 dark-metal) and backs the viewport as a skybox.
+    // M11.3 inc.3 — the directional shadow map: a depth texture rendered from the caster's POV each frame,
+    // sampled by fs_mesh with a COMPARISON sampler (hardware PCF). Fixed size per quality profile (it's the
+    // LIGHT's view — independent of the window, never resized). Created BEFORE the IBL group because it
+    // rides group 3 (bindings 4/5) — the device caps bind groups at 4, so the shadow can't have its own.
+    let shadow_quality = ShadowQuality::from_env();
+    let shadow_size = shadow_quality.shadow_size();
+    let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shadow-map"),
+        size: wgpu::Extent3d {
+            width: shadow_size,
+            height: shadow_size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let shadow_view = shadow_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("shadow-cmp"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear, // bilinear PCF on the depth compares
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        compare: Some(wgpu::CompareFunction::LessEqual),
+        ..Default::default()
+    });
+    // M11.3 inc.2/3 — image-based lighting + the shadow map share group 3: a procedural HDR sky + split-sum
+    // BRDF LUT (bindings 0-3) + the shadow map/sampler (4/5). The shadow pass does NOT bind group 3, so the
+    // map can be a render target there and sampled here without conflict.
     let ibl_bgl = crate::ibl::bind_group_layout(&device);
-    let ibl = crate::ibl::create(&device, &queue, &ibl_bgl);
+    let ibl = crate::ibl::create(&device, &queue, &ibl_bgl, &shadow_view, &shadow_sampler);
 
     let index_buf = create_init_buffer(
         &device,
         "cube-idx",
         bytemuck::cast_slice(&CUBE_INDICES),
         wgpu::BufferUsages::INDEX,
+    );
+
+    // M11.3 inc.3 — a matte ground plane (a large quad just below y=0) so the scene's shadows have a
+    // surface to land on: the grid is only lines and cubes use the flat `fs_main`, so without a receiver
+    // shadows would be invisible. Drawn through the mesh pipeline (fs_mesh ⇒ IBL + shadow), and NOT through
+    // the shadow pass (it's a receiver, not a caster — including it would just self-shadow-acne the plane).
+    let ground_vert = |x: f32, z: f32| MeshVertex {
+        position: [x, 0.0, z],
+        normal: [0.0, 1.0, 0.0],
+        color: [0.30, 0.31, 0.34],
+        metallic: 0.0,
+        roughness: 0.95,
+    };
+    let ground_verts = [
+        ground_vert(-1.0, -1.0),
+        ground_vert(1.0, -1.0),
+        ground_vert(1.0, 1.0),
+        ground_vert(-1.0, 1.0),
+    ];
+    let ground_vbuf = create_init_buffer(
+        &device,
+        "ground-vbuf",
+        bytemuck::cast_slice(&ground_verts),
+        wgpu::BufferUsages::VERTEX,
+    );
+    const GROUND_IDX: [u32; 6] = [0, 1, 2, 0, 2, 3];
+    let ground_ibuf = create_init_buffer(
+        &device,
+        "ground-ibuf",
+        bytemuck::cast_slice(&GROUND_IDX),
+        wgpu::BufferUsages::INDEX,
+    );
+    let mut ground_inst = InstanceBuf::new(&device, &inst_bgl, 1);
+    ground_inst.upload(
+        &device,
+        &queue,
+        &inst_bgl,
+        &[Instance {
+            center: [0.0, -0.02, 0.0], // a hair below the grid so the grid lines read on top
+            scale: 60.0,
+            color: [0.30, 0.31, 0.34],
+            selected: 0.0,
+            rotation: IDENTITY_QUAT,
+            material: [0.0; 4], // no override → use the baked matte vertex material
+        }],
     );
 
     let depth_state = wgpu::DepthStencilState {
@@ -563,8 +692,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         bind_group_layouts: &[Some(&cam_bgl), Some(&inst_bgl)],
         immediate_size: 0,
     });
-    // M11.3 — the mesh pipeline adds group 2 (lights) for the multi-light PBR fragment shader, and
-    // group 3 (IBL: env + BRDF LUT) for image-based ambient/specular (inc.2).
+    // M11.3 — the mesh pipeline adds group 2 (lights) for the multi-light PBR fragment shader and group 3
+    // (IBL env + BRDF LUT for image-based ambient/specular [inc.2], plus the shadow map + comparison sampler
+    // for directional shadows [inc.3] — all in group 3 to stay within the 4-bind-group cap).
     let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("mesh-layout"),
         bind_group_layouts: &[
@@ -573,6 +703,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             Some(&lights_bgl),
             Some(&ibl_bgl),
         ],
+        immediate_size: 0,
+    });
+    // M11.3 inc.3 — the depth-only shadow pass needs only the camera (group 0, for light_view_proj) +
+    // the instances (group 1). No lights/IBL/shadow groups.
+    let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("shadow-layout"),
+        bind_group_layouts: &[Some(&cam_bgl), Some(&inst_bgl)],
         immediate_size: 0,
     });
     // M11.3 inc.2 — the skybox uses only groups 0 (camera) + 3 (env), but wgpu requires every layout slot
@@ -710,7 +847,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_mesh"),
-            buffers: &[mesh_vbl],
+            buffers: std::slice::from_ref(&mesh_vbl), // borrowed — also reused by the shadow mesh pipeline
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -763,6 +900,49 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         multiview_mask: None,
         cache: None,
     });
+    // M11.3 inc.3 — depth-only shadow pipelines: render cube + mesh geometry from the light's POV into the
+    // shadow map. No fragment stage (depth only). A constant + slope depth bias on the *pass* side (here
+    // via DepthBiasState) plus the shader-side bias together fight acne; cull_mode None so thin/flat
+    // geometry still occludes. Same `depth_state` format (Depth32Float, Less, write on).
+    let shadow_depth_state = wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::Less),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState {
+            constant: 2,
+            slope_scale: 2.0,
+            clamp: 0.0,
+        },
+    };
+    let make_shadow_pipeline = |label: &str, entry: &str, buffers: &[wgpu::VertexBufferLayout]| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&shadow_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some(entry),
+                buffers,
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(shadow_depth_state.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let shadow_cube_pipeline = make_shadow_pipeline("shadow-cube", "vs_cube_shadow", &[]);
+    let shadow_mesh_pipeline = make_shadow_pipeline(
+        "shadow-mesh",
+        "vs_mesh_shadow",
+        std::slice::from_ref(&mesh_vbl),
+    );
     // Per-asset GPU geometry (slot-indexed, uploaded once per meshes_revision) + per-asset instance
     // lists (rebuilt per scene revision). `cube_scratch`/`mesh_scratch` are reused partition buffers.
     let mut gpu_meshes: Vec<Option<GpuMesh>> = Vec::new();
@@ -795,7 +975,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
 
         // read shared state; re-upload instances on revision change (picking is NOT serviced here —
         // it's done synchronously in the viewport_pick command, decoupled from the frame cadence)
-        let (cam, cam_eye, focus_active, gizmo_verts) = {
+        let (cam, cam_eye, focus_active, gizmo_verts, light_vp, caster_idx) = {
             let mut st = shared.lock().unwrap();
             if st.distance == 0.0 {
                 st.distance = 60.0;
@@ -968,6 +1148,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // The camera eye (world) — the PBR view direction in fs_mesh (M11.2). Carried in the Camera
             // uniform's spare `focus.yzw` (focus.x stays the focus-dim flag).
             let cam_eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+            // M11.3 inc.3 — the shadow-casting light's ortho view-proj, fitted to the live instance bounds.
+            // The caster's shine direction comes from its entry in the lights buffer; `caster_idx` (as f32,
+            // -1 = none) goes to the shader so the map shadows ONLY that light.
+            let shadow_dir = st
+                .shadow_caster
+                .and_then(|i| st.lights.get(i))
+                .map(|l| [l.dir_range[0], l.dir_range[1], l.dir_range[2]]);
+            let light_vp = shadow_view_proj(shadow_dir, &st.instances);
+            let caster_idx = st.shadow_caster.map_or(-1.0, |i| i as f32);
             // M9.1: regenerate the gizmo geometry at the selected entity each frame — constant pixel size,
             // and it follows the entity through a drag. Empty when nothing is selected → the pass is
             // skipped (zero cost). World-space basis (the cube/mesh shaders don't show rotation).
@@ -1016,6 +1205,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 cam_eye,
                 if st.focused.is_some() { 1.0f32 } else { 0.0 },
                 gizmo_verts,
+                light_vp,
+                caster_idx,
             )
         };
         queue.write_buffer(
@@ -1024,7 +1215,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             bytemuck::bytes_of(&Camera {
                 view_proj: cam.to_cols_array_2d(),
                 inv_view_proj: cam.inverse().to_cols_array_2d(),
+                light_view_proj: light_vp.to_cols_array_2d(),
                 focus: [focus_active, cam_eye[0], cam_eye[1], cam_eye[2]],
+                shadow: [caster_idx, 0.0, 0.0, 0.0],
             }),
         );
         // M9.1: upload the gizmo handle geometry (tiny — regenerated each frame at the selection).
@@ -1047,6 +1240,49 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // M11.3 inc.3 — shadow depth pass FIRST (same encoder ⇒ it finishes before the scene pass samples
+        // the map; wgpu inserts the texture barrier). ALWAYS clears the map to 1.0 (far = lit) so a scene
+        // with no caster — or a directional whose castShadows is off — samples "lit", not stale depth; only
+        // the geometry DRAWS are gated on having a caster (identity light_vp ⇒ skip the draws).
+        {
+            let mut sp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &shadow_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if light_vp != Mat4::IDENTITY {
+                sp.set_bind_group(0, &cam_bg, &[]);
+                if cube.n > 0 {
+                    sp.set_pipeline(&shadow_cube_pipeline);
+                    sp.set_bind_group(1, &cube.bg, &[]);
+                    sp.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                    sp.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..cube.n);
+                }
+                sp.set_pipeline(&shadow_mesh_pipeline);
+                for (slot, mesh) in gpu_meshes.iter().enumerate() {
+                    let (Some(mesh), Some(inst)) = (mesh.as_ref(), mesh_inst.get(slot)) else {
+                        continue;
+                    };
+                    if inst.n == 0 {
+                        continue;
+                    }
+                    sp.set_bind_group(1, &inst.bg, &[]);
+                    sp.set_vertex_buffer(0, mesh.vbuf.slice(..));
+                    sp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    sp.draw_indexed(0..mesh.n_idx, 0, 0..inst.n);
+                }
+            }
+        }
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
@@ -1098,7 +1334,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // (non-bindless — one vertex/index buffer bound per asset).
             rp.set_pipeline(&mesh_pipeline);
             rp.set_bind_group(2, &lights_buf.bg, &[]); // M11.3 — the scene lights, shared across mesh draws
-            rp.set_bind_group(3, &ibl.bind_group, &[]); // M11.3 inc.2 — env + BRDF LUT for image-based lighting
+            rp.set_bind_group(3, &ibl.bind_group, &[]); // M11.3 inc.2/3 — env + BRDF LUT + shadow map/sampler
             for (slot, mesh) in gpu_meshes.iter().enumerate() {
                 let (Some(mesh), Some(inst)) = (mesh.as_ref(), mesh_inst.get(slot)) else {
                     continue;
@@ -1111,6 +1347,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..mesh.n_idx, 0, 0..inst.n);
             }
+            // M11.3 inc.3 — the ground plane (matte; receives IBL + the scene's shadows). Same mesh
+            // pipeline, so groups 0/2/3 stay bound; only its instance (group 1) + geometry change.
+            rp.set_bind_group(1, &ground_inst.bg, &[]);
+            rp.set_vertex_buffer(0, ground_vbuf.slice(..));
+            rp.set_index_buffer(ground_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            rp.draw_indexed(0..GROUND_IDX.len() as u32, 0, 0..1);
             // Tracking lines (binding-by-intent overlay) last, with the always-pass depth state.
             if lines.n > 0 {
                 rp.set_pipeline(&line_pipeline);
@@ -1149,8 +1391,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             let ipc_per_frame = ipc_window as f64 / f64::from(acc_n.max(1));
             let n_mesh: u32 = mesh_inst.iter().map(|m| m.n).sum();
             eprintln!(
-                "[viewport] cubes={} meshes={n_mesh} frames={acc_n} cpu-submit p50={p50:.3}ms p99={p99:.3}ms avg={:.3}ms | ipc={ipc_window} ({ipc_per_frame:.3}/frame)",
+                "[viewport] cubes={} meshes={n_mesh} shadow={}@{shadow_size} frames={acc_n} cpu-submit p50={p50:.3}ms p99={p99:.3}ms avg={:.3}ms | ipc={ipc_window} ({ipc_per_frame:.3}/frame)",
                 cube.n,
+                shadow_quality.label(),
                 acc_ms / f64::from(acc_n.max(1))
             );
             acc_ms = 0.0;
@@ -1172,6 +1415,47 @@ pub fn camera_matrix(orbit: f32, elevation: f32, distance: f32, aspect: f32, tar
     let eye = target + offset;
     let proj = Mat4::perspective_rh(55f32.to_radians(), aspect, 0.1, distance * 8.0 + 100.0);
     proj * Mat4::look_at_rh(eye, target, Vec3::Y)
+}
+
+/// M11.3 inc.3 — the shadow-casting light's ortho view-proj, fitted to the scene's instance bounds so the
+/// fixed-resolution shadow map lands its detail on the actual objects (not the whole ±40 grid). `None`
+/// shadow_dir ⇒ identity: `fs_mesh`'s reprojection then falls outside the unit cube, reading as fully lit
+/// (the depth pass is also skipped). wgpu NDC z ∈ [0,1] (`orthographic_rh`, matching `perspective_rh`).
+fn shadow_view_proj(shadow_dir: Option<[f32; 3]>, instances: &[Instance]) -> Mat4 {
+    let Some(dir) = shadow_dir else {
+        return Mat4::IDENTITY;
+    };
+    let dir = Vec3::from(dir).normalize_or_zero();
+    if dir.length_squared() < 1e-6 {
+        return Mat4::IDENTITY;
+    }
+    // Bound the instances (centre + radius); cap the radius so a sprawling scene doesn't make shadows too
+    // coarse, and floor it so a single object still gets a sane frustum. Empty scene ⇒ a small origin box.
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for inst in instances {
+        let r = inst.scale.max(0.5);
+        for k in 0..3 {
+            lo[k] = lo[k].min(inst.center[k] - r);
+            hi[k] = hi[k].max(inst.center[k] + r);
+        }
+    }
+    let (center, radius) = if lo[0].is_finite() {
+        let lo_y = lo[1].min(-0.1); // pull the box down to the ground plane (y≈0) so it receives shadows
+        let c = Vec3::new(
+            (lo[0] + hi[0]) * 0.5,
+            (lo_y + hi[1]) * 0.5,
+            (lo[2] + hi[2]) * 0.5,
+        );
+        let ext = Vec3::new(hi[0] - lo[0], hi[1] - lo_y, hi[2] - lo[2]) * 0.5;
+        (c, ext.length().clamp(2.0, 30.0))
+    } else {
+        (Vec3::ZERO, 8.0)
+    };
+    let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let eye = center - dir * (radius * 2.0);
+    let view = Mat4::look_at_rh(eye, center, up);
+    let proj = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.05, radius * 4.0);
+    proj * view
 }
 
 /// Pick the instance nearest the click in screen space — a pure function over the instance list +

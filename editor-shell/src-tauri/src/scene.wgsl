@@ -1,10 +1,54 @@
 // Editor viewport shader: instanced entity cubes (from the storage buffer the app fills from /core
 // Transforms) + a ground grid. Selected entity highlights. Matches render.rs's Instance/Camera.
 
-// `inv_view_proj` (M11.3 inc.2) lets the skybox turn a screen pixel into a world ray; the cube/grid/line
-// shaders ignore it. Field order matches render.rs's `Camera` (view_proj · inv_view_proj · focus).
-struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, focus: vec4<f32> };
+// `inv_view_proj` (M11.3 inc.2) lets the skybox turn a screen pixel into a world ray; `light_view_proj`
+// (M11.3 inc.3) is the shadow-casting light's ortho view-proj, for both the depth pass and fs_mesh's shadow
+// lookup. The cube/grid/line shaders ignore the trailing fields. Field order matches render.rs's `Camera`
+// (view_proj · inv_view_proj · light_view_proj · focus) — 208 bytes, std140-clean.
+struct Camera {
+    view_proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
+    light_view_proj: mat4x4<f32>,
+    focus: vec4<f32>,
+    // M11.3 inc.3 — `shadow.x` = index of the shadow-casting directional light (-1 = none); the single
+    // shadow map applies to ONLY that light, so other directionals (no map) stay unshadowed.
+    shadow: vec4<f32>,
+};
 @group(0) @binding(0) var<uniform> cam: Camera;
+
+// M11.3 inc.3 (ADR-042) — the directional shadow map: a depth texture rendered from the shadow-casting
+// light's POV, sampled with a comparison sampler (hardware PCF). Filled by the depth-only shadow pass before
+// the main pass each frame; a render projection, never doc state. Shares GROUP 3 with the IBL env/LUT
+// (bindings 4/5) because the device caps bind groups at 4 (web-portable) — and the shadow pass doesn't bind
+// group 3, so there's no render-target-vs-sampled conflict.
+@group(3) @binding(4) var shadow_map: texture_depth_2d;
+@group(3) @binding(5) var shadow_samp: sampler_comparison;
+
+// Fraction of the directional light reaching `world_pos` (1 = fully lit, 0 = fully shadowed). Projects into
+// the light's clip space, does a 3×3 PCF compare with a slope-scaled depth bias. Anything outside the
+// shadow frustum is treated as lit (the map only covers the scene's fitted bounds).
+fn shadow_factor(world_pos: vec3<f32>, n_dot_l: f32) -> f32 {
+    let lc = cam.light_view_proj * vec4<f32>(world_pos, 1.0);
+    let ndc = lc.xyz / lc.w;
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5); // clip → UV (flip Y)
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0 || ndc.z < 0.0) {
+        return 1.0; // outside the shadow frustum → unshadowed
+    }
+    // Slope-scaled bias: steeper grazing angles need more, to avoid shadow acne; clamped so flat faces
+    // don't peter-pan (detach their contact shadow).
+    let bias = clamp(0.0016 * tan(acos(clamp(n_dot_l, 0.0, 1.0))), 0.0006, 0.004);
+    let ref_depth = ndc.z - bias;
+    let dim = vec2<f32>(textureDimensions(shadow_map));
+    let texel = 1.0 / dim;
+    var sum = 0.0;
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let o = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + o, ref_depth);
+        }
+    }
+    return sum / 9.0;
+}
 
 // Focus mode (M3.3): when `cam.focus_active > 0.5`, every entity that isn't the focused/selected one
 // is grayed toward the background so it reads as faded/transparent (depth-correct, no alpha blend).
@@ -277,7 +321,14 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
                 atten = atten * clamp((cd - 0.8) / 0.12, 0.0, 1.0);
             }
         }
-        let radiance = lt.color_intensity.xyz * lt.color_intensity.w * atten;
+        // M11.3 inc.3 — the single shadow map was rendered for ONE caster (cam.shadow.x). Apply it to that
+        // light only, so other directional lights (which have no map) aren't falsely shadowed. Point/spot
+        // are never shadowed (single directional caster).
+        var shadow = 1.0;
+        if (kind < 0.5 && cam.shadow.x >= 0.0 && f32(i) == cam.shadow.x) {
+            shadow = shadow_factor(in.world_pos, dot(n, l));
+        }
+        let radiance = lt.color_intensity.xyz * lt.color_intensity.w * atten * shadow;
         lo = lo + light_contrib(n, v, base, metallic, roughness, f0, l, radiance);
     }
 
@@ -335,4 +386,21 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     let dir = normalize(far.xyz / far.w - near.xyz / near.w);
     let hdr = textureSampleLevel(env, env_samp, dir_to_equirect(dir), 0.0).rgb;
     return vec4<f32>(display_encode(hdr), 1.0);
+}
+
+// M11.3 inc.3 — depth-only shadow pass: render the same cube + mesh geometry from the light's POV into the
+// shadow map. Identical world transform to vs_cube / vs_mesh, but projected by `light_view_proj`. No
+// fragment stage (depth only). Group 0 = camera (for light_view_proj), group 1 = instances.
+@vertex
+fn vs_cube_shadow(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
+    let inst = instances[ii];
+    let world = inst.center + quat_rotate(inst.rotation, corner(vi) * inst.scale);
+    return cam.light_view_proj * vec4<f32>(world, 1.0);
+}
+
+@vertex
+fn vs_mesh_shadow(v: MeshIn, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
+    let inst = instances[ii];
+    let world = inst.center + quat_rotate(inst.rotation, v.position * inst.scale);
+    return cam.light_view_proj * vec4<f32>(world, 1.0);
 }

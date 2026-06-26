@@ -3615,7 +3615,11 @@ fn project_info(
 /// `dir` is the direction a directional/spot light SHINES (so the shader's L = -dir); point/spot use the
 /// entity Transform position + `range`. Falls back to a single default key light (the prior hard-coded
 /// directional, now a real list entry) so a scene with no light entities still renders lit, not black.
-fn collect_lights(engine: &Engine<FlecsWorld>) -> Vec<render::LightGpu> {
+/// Returns the GPU light list AND the INDEX of the scene's shadow-casting light (M11.3 inc.3): the FIRST
+/// directional `Light` whose `castShadows` isn't explicitly false, else the default key light. `None` ⇒
+/// nothing casts (e.g. only point lights authored) → the render skips the shadow pass. The index (not the
+/// direction) so the shader can apply the single shadow map to ONLY that light, not every directional.
+fn collect_lights(engine: &Engine<FlecsWorld>) -> (Vec<render::LightGpu>, Option<usize>) {
     let read = |m: &HashMap<String, FieldValue>, f: &str, d: f32| -> f32 {
         m.get(f).map_or(d, |v| match v {
             FieldValue::Number(n) => *n as f32,
@@ -3624,6 +3628,7 @@ fn collect_lights(engine: &Engine<FlecsWorld>) -> Vec<render::LightGpu> {
         })
     };
     let mut lights: Vec<render::LightGpu> = Vec::new();
+    let mut shadow_caster: Option<usize> = None;
     for id in engine.entity_ids() {
         let comps = engine.components_of(id);
         let Some(light) = comps.get("Light") else {
@@ -3641,6 +3646,19 @@ fn collect_lights(engine: &Engine<FlecsWorld>) -> Vec<render::LightGpu> {
             },
             _ => 0.0, // default: directional
         };
+        let dir = [
+            read(light, "dirX", 0.0),
+            read(light, "dirY", -1.0),
+            read(light, "dirZ", 0.0),
+        ];
+        // M11.3 inc.3 — the first directional light that casts is the shadow caster (a single shadow map).
+        // Record its INDEX (the slot it's about to occupy) so the shader shadows only this one light.
+        if shadow_caster.is_none() && kind == 0.0 {
+            let casts = !matches!(light.get("castShadows"), Some(FieldValue::Bool(false)));
+            if casts {
+                shadow_caster = Some(lights.len());
+            }
+        }
         lights.push(render::LightGpu {
             pos_kind: [pos[0], pos[1], pos[2], kind],
             color_intensity: [
@@ -3649,24 +3667,21 @@ fn collect_lights(engine: &Engine<FlecsWorld>) -> Vec<render::LightGpu> {
                 read(light, "b", 1.0),
                 read(light, "intensity", 1.0),
             ],
-            dir_range: [
-                read(light, "dirX", 0.0),
-                read(light, "dirY", -1.0),
-                read(light, "dirZ", 0.0),
-                read(light, "range", 0.0),
-            ],
+            dir_range: [dir[0], dir[1], dir[2], read(light, "range", 0.0)],
         });
     }
     if lights.is_empty() {
         // The default key light — the prior hard-coded directional (M11.2's LIGHT_DIR was the dir TO the
-        // light, so the SHINE direction is its negation), intensity 2.4. Keeps unlit scenes readable.
+        // light, so the SHINE direction is its negation), intensity 2.4. Keeps unlit scenes readable, and
+        // it casts the default shadow.
         lights.push(render::LightGpu {
             pos_kind: [0.0, 0.0, 0.0, 0.0],
             color_intensity: [1.0, 1.0, 1.0, 2.4],
             dir_range: [-0.4, -0.8, -0.3, 0.0],
         });
+        shadow_caster = Some(0); // the default key light (index 0) casts
     }
-    lights
+    (lights, shadow_caster)
 }
 
 fn rebuild(
@@ -3806,8 +3821,9 @@ fn rebuild(
             material: [0.0; 4],
         })
         .collect();
-    // M11.3 — the scene's lights (a render projection from the authored Light entities).
-    let lights = collect_lights(engine);
+    // M11.3 — the scene's lights + the shadow-caster index (a render projection from the authored Light
+    // entities; inc.3 — castShadows picks the caster).
+    let (lights, shadow_caster) = collect_lights(engine);
     let mut st = shared.lock().unwrap();
     // Preserve selection by entity ID, NOT index: the instance index is invalidated whenever entities are
     // added/removed, so restoring `selected`/`gizmo_sel` by index would silently retarget a DIFFERENT
@@ -3820,6 +3836,7 @@ fn rebuild(
     st.snap_affinity = snap_affinity;
     st.line_points = line_points;
     st.lights = lights;
+    st.shadow_caster = shadow_caster;
     st.lights_revision = st.lights_revision.wrapping_add(1);
     st.selected = prev_sel_id.and_then(|id| st.ids.iter().position(|k| *k == id));
     if let Some(i) = st.selected {
