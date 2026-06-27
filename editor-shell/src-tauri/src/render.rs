@@ -564,10 +564,13 @@ struct Camera {
 const _: () = assert!(std::mem::size_of::<Camera>() == 224);
 
 /// M11.3 inc.3 — shadow-map quality profile, chosen once at startup from `MTK_SHADOW_QUALITY`
-/// (`low`|`medium`|`high`, default medium). Drives the shadow-map resolution; `Low` is the entry-level /
-/// min-spec gate. Higher = sharper shadows at more depth-pass + sampling cost.
+/// (`off`|`low`|`medium`|`high`, default medium). Drives the shadow-map resolution; `Low` is the
+/// entry-level gate and **`Off` is the true min-spec profile** — it skips the depth pass *and* the
+/// per-fragment PCF (the scene renders fully lit, the cheapest path). Higher = sharper shadows at more
+/// depth-pass + sampling cost.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShadowQuality {
+    Off,
     Low,
     Medium,
     High,
@@ -576,6 +579,7 @@ enum ShadowQuality {
 impl ShadowQuality {
     fn from_env() -> Self {
         match std::env::var("MTK_SHADOW_QUALITY").ok().as_deref() {
+            Some("off") => Self::Off,
             Some("low") => Self::Low,
             Some("high") => Self::High,
             _ => Self::Medium,
@@ -583,6 +587,9 @@ impl ShadowQuality {
     }
     fn shadow_size(self) -> u32 {
         match self {
+            // Off still allocates a tiny valid depth map (the bind group + comparison sampler need one),
+            // but nothing draws into it and nothing samples it — a negligible per-frame clear.
+            Self::Off => 256,
             Self::Low => 1024,
             Self::Medium => 2048,
             Self::High => 4096,
@@ -590,6 +597,7 @@ impl ShadowQuality {
     }
     fn label(self) -> &'static str {
         match self {
+            Self::Off => "off",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -1426,13 +1434,21 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             }
             // M11.3 inc.3 — the shadow-casting light's ortho view-proj, fitted to the live instance bounds.
             // The caster's shine direction comes from its entry in the lights buffer; `caster_idx` (as f32,
-            // -1 = none) goes to the shader so the map shadows ONLY that light.
-            let shadow_dir = st
-                .shadow_caster
-                .and_then(|i| st.lights.get(i))
-                .map(|l| [l.dir_range[0], l.dir_range[1], l.dir_range[2]]);
-            let light_vp = shadow_view_proj(shadow_dir, &st.instances);
-            let caster_idx = st.shadow_caster.map_or(-1.0, |i| i as f32);
+            // -1 = none) goes to the shader so the map shadows ONLY that light. The `Off` quality profile
+            // (min-spec) forces no caster + identity VP: the depth pass draws nothing and `fs_mesh` skips the
+            // per-fragment PCF (the scene renders fully lit — the cheapest path).
+            let (light_vp, caster_idx) = if shadow_quality == ShadowQuality::Off {
+                (Mat4::IDENTITY, -1.0)
+            } else {
+                let shadow_dir = st
+                    .shadow_caster
+                    .and_then(|i| st.lights.get(i))
+                    .map(|l| [l.dir_range[0], l.dir_range[1], l.dir_range[2]]);
+                (
+                    shadow_view_proj(shadow_dir, &st.instances),
+                    st.shadow_caster.map_or(-1.0, |i| i as f32),
+                )
+            };
             // M9.1: regenerate the gizmo geometry at the selected entity each frame — constant pixel size,
             // and it follows the entity through a drag. Empty when nothing is selected → the pass is
             // skipped (zero cost). World-space basis (the cube/mesh shaders don't show rotation).
