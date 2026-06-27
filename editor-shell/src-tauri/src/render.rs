@@ -335,22 +335,33 @@ fn new_instance_storage(device: &wgpu::Device, cap: u64) -> wgpu::Buffer {
 // WebGPU 4-group cap. An untextured mesh binds a 1×1 white dummy → `fs_mesh` always samples (white × the
 // baked factor = the factor), so it looks exactly as before.
 
-/// Upload an RGBA8 base-color texture → a sampled view. `Rgba8UnormSrgb` so the sRGB albedo is linearized
-/// on sample (the BRDF works in linear space).
-fn upload_albedo(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> wgpu::TextureView {
+/// Upload an RGBA8 texture → a sampled view. `srgb` picks `Rgba8UnormSrgb` (base-color — linearized on
+/// sample, the BRDF works in linear space) vs `Rgba8Unorm` for **data** textures (metallic-roughness +
+/// normal maps MUST stay linear — sampling a normal map as sRGB would corrupt the decoded vectors).
+fn upload_tex(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &Texture,
+    srgb: bool,
+) -> wgpu::TextureView {
     let (w, h) = (tex.width.max(1), tex.height.max(1));
     let size = wgpu::Extent3d {
         width: w,
         height: h,
         depth_or_array_layers: 1,
     };
+    let format = if srgb {
+        wgpu::TextureFormat::Rgba8UnormSrgb
+    } else {
+        wgpu::TextureFormat::Rgba8Unorm
+    };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("mesh-albedo"),
+        label: Some("mesh-tex"),
         size,
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -372,10 +383,10 @@ fn upload_albedo(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> w
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-/// A 1×1 white texture view — the dummy bound for an untextured mesh (white × the baked factor = the
-/// factor). Created once at setup, cloned per untextured mesh.
-fn white_dummy(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
-    upload_albedo(
+/// A 1×1 white texture view — the dummy bound for a mesh with no base-color/MR texture (white × the baked
+/// factor = the factor). Created once at setup, cloned per untextured mesh.
+fn white_dummy(device: &wgpu::Device, queue: &wgpu::Queue, srgb: bool) -> wgpu::TextureView {
+    upload_tex(
         device,
         queue,
         &Texture {
@@ -383,16 +394,35 @@ fn white_dummy(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView 
             height: 1,
             rgba8: vec![255, 255, 255, 255],
         },
+        srgb,
     )
 }
 
-/// The mesh main-pass group 1: instances (vertex) + base-color texture + sampler (fragment). One per mesh,
-/// rebuilt when the instance buffer is (re)allocated (a power-of-two grow).
+/// A 1×1 flat-normal dummy ([128,128,255] linear → +Z) — bound for a mesh with no normal map, so the
+/// tangent-space perturbation is a no-op (the geometric normal is used).
+fn flat_normal_dummy(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
+    upload_tex(
+        device,
+        queue,
+        &Texture {
+            width: 1,
+            height: 1,
+            rgba8: vec![128, 128, 255, 255],
+        },
+        false,
+    )
+}
+
+/// The mesh main-pass group 1: instances (vertex) + base-color/metallic-roughness/normal textures + a
+/// shared sampler (fragment). One per mesh, rebuilt when the instance buffer is (re)allocated.
+#[allow(clippy::too_many_arguments)]
 fn make_mesh_main_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     inst_buf: &wgpu::Buffer,
-    view: &wgpu::TextureView,
+    base: &wgpu::TextureView,
+    mr: &wgpu::TextureView,
+    normal: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -405,11 +435,19 @@ fn make_mesh_main_bg(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(view),
+                resource: wgpu::BindingResource::TextureView(base),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(mr),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(normal),
             },
         ],
     })
@@ -777,6 +815,26 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3, // M11.2 follow-up — metallic-roughness texture (linear)
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4, // M11.2 follow-up — tangent-space normal map (linear)
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     });
     let albedo_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -789,7 +847,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
     });
-    let dummy_view = white_dummy(&device, &queue);
+    let dummy_view = white_dummy(&device, &queue, true); // base-color (sRGB)
+    let dummy_mr_view = white_dummy(&device, &queue, false); // metallic-roughness (linear; b=g=1 → no change)
+    let dummy_normal_view = flat_normal_dummy(&device, &queue); // flat +Z normal (linear)
 
     let mut ground_inst = InstanceBuf::new(&device, &inst_bgl, 1);
     ground_inst.upload(
@@ -812,6 +872,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         &mesh_inst_bgl,
         &ground_inst.buf,
         &dummy_view,
+        &dummy_mr_view,
+        &dummy_normal_view,
         &albedo_sampler,
     );
 
@@ -1088,10 +1150,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // lists (rebuilt per scene revision). `cube_scratch`/`mesh_scratch` are reused partition buffers.
     let mut gpu_meshes: Vec<Option<GpuMesh>> = Vec::new();
     let mut mesh_inst: Vec<InstanceBuf> = Vec::new();
-    // M11.2 follow-up — per-asset base-color texture view (parallel to `gpu_meshes`; the white dummy when
-    // untextured) + the mesh main-pass group-1 bind group (instances + that texture), rebuilt when an
-    // instance buffer grows.
+    // M11.2 follow-up — per-asset texture views (parallel to `gpu_meshes`; the dummies when untextured):
+    // base-color, metallic-roughness, normal. Plus the mesh main-pass group-1 bind group (instances + the
+    // three textures), rebuilt when an instance buffer grows.
     let mut mesh_tex: Vec<wgpu::TextureView> = Vec::new();
+    let mut mesh_mr_tex: Vec<wgpu::TextureView> = Vec::new();
+    let mut mesh_normal_tex: Vec<wgpu::TextureView> = Vec::new();
     let mut mesh_main_bg: Vec<wgpu::BindGroup> = Vec::new();
     let mut cur_mesh_rev = u64::MAX;
     let mut cube_scratch: Vec<Instance> = Vec::new();
@@ -1218,11 +1282,16 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             if st.meshes_revision != cur_mesh_rev {
                 cur_mesh_rev = st.meshes_revision;
                 gpu_meshes.clear();
-                mesh_tex.clear(); // kept parallel to gpu_meshes (the per-asset base-color view, dummy if none)
+                // kept parallel to gpu_meshes (the per-asset texture views, dummies if none)
+                mesh_tex.clear();
+                mesh_mr_tex.clear();
+                mesh_normal_tex.clear();
                 for m in &st.meshes {
                     if m.vertices.is_empty() || m.indices.is_empty() {
                         gpu_meshes.push(None);
                         mesh_tex.push(dummy_view.clone());
+                        mesh_mr_tex.push(dummy_mr_view.clone());
+                        mesh_normal_tex.push(dummy_normal_view.clone());
                         continue;
                     }
                     let vbuf = create_init_buffer(
@@ -1242,10 +1311,19 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         ibuf,
                         n_idx: m.indices.len() as u32,
                     }));
-                    // M11.2 — upload the asset's base-color texture (or the white dummy) for fs_mesh to sample.
+                    // M11.2 — upload the asset's textures (or the dummies) for fs_mesh to sample. Base-color
+                    // is sRGB; metallic-roughness + normal are LINEAR data (sampling them as sRGB would be wrong).
                     mesh_tex.push(match &m.base_color_texture {
-                        Some(t) => upload_albedo(&device, &queue, t),
+                        Some(t) => upload_tex(&device, &queue, t, true),
                         None => dummy_view.clone(),
+                    });
+                    mesh_mr_tex.push(match &m.metallic_roughness_texture {
+                        Some(t) => upload_tex(&device, &queue, t, false),
+                        None => dummy_mr_view.clone(),
+                    });
+                    mesh_normal_tex.push(match &m.normal_texture {
+                        Some(t) => upload_tex(&device, &queue, t, false),
+                        None => dummy_normal_view.clone(),
                     });
                 }
                 while mesh_inst.len() < gpu_meshes.len() {
@@ -1287,6 +1365,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         &mesh_inst_bgl,
                         &mesh_inst[slot].buf,
                         &mesh_tex[slot],
+                        &mesh_mr_tex[slot],
+                        &mesh_normal_tex[slot],
                         &albedo_sampler,
                     ));
                 }

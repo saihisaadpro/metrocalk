@@ -74,6 +74,10 @@ struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, selected: f32
 // Only `fs_mesh` references these; the cube/grid/line pipelines' group-1 layout omits them (unused = fine).
 @group(1) @binding(1) var base_color_tex: texture_2d<f32>;
 @group(1) @binding(2) var base_color_samp: sampler;
+// M11.2 follow-up — metallic-roughness (glTF: roughness=G, metalness=B) + tangent-space normal map, sharing
+// the sampler. Untextured slots bind dummies (white → factor unchanged; flat-normal [128,128,255] → +Z).
+@group(1) @binding(3) var mr_tex: texture_2d<f32>;
+@group(1) @binding(4) var normal_tex: texture_2d<f32>;
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
 
@@ -292,15 +296,43 @@ fn light_contrib(
     return (diffuse + specular) * radiance * n_dot_l;
 }
 
+// M11.2 follow-up — tangent-space normal mapping WITHOUT precomputed tangents (Schüler's cotangent frame):
+// build the TBN from screen-space derivatives of world position + UV, then rotate the sampled normal into
+// world space. Degenerate UV (untextured meshes have a constant UV → zero gradient) falls back to the
+// geometric normal, avoiding a NaN from inverseSqrt(0).
+fn perturb_normal(n: vec3<f32>, world_pos: vec3<f32>, uv: vec2<f32>, map: vec3<f32>) -> vec3<f32> {
+    let dp1 = dpdx(world_pos);
+    let dp2 = dpdy(world_pos);
+    let duv1 = dpdx(uv);
+    let duv2 = dpdy(uv);
+    let dp2perp = cross(dp2, n);
+    let dp1perp = cross(n, dp1);
+    let t = dp2perp * duv1.x + dp1perp * duv2.x;
+    let b = dp2perp * duv1.y + dp1perp * duv2.y;
+    let m = max(dot(t, t), dot(b, b));
+    if (m < 1e-12) {
+        return n; // no UV gradient → the geometric normal (the flat-normal dummy also lands here harmlessly)
+    }
+    let invmax = inverseSqrt(m);
+    let tbn = mat3x3<f32>(t * invmax, b * invmax, n);
+    return normalize(tbn * map);
+}
+
 @fragment
 fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
     // M11.2 follow-up — albedo = the base-color TEXTURE × the baked/override factor. An untextured mesh
     // binds a 1×1 white dummy, so this is the factor unchanged (identical to the prior flat shading).
     let base = textureSample(base_color_tex, base_color_samp, in.uv).rgb * in.base_color;
-    let metallic = clamp(in.mr.x, 0.0, 1.0);
-    let roughness = clamp(in.mr.y, 0.04, 1.0); // floor avoids a singular mirror highlight
+    // M11.2 follow-up — multiply the baked metallic/roughness factors by the MR map (glTF packing:
+    // roughness=G, metalness=B); an untextured mesh binds a white dummy (×1 → unchanged).
+    let mr_s = textureSample(mr_tex, base_color_samp, in.uv);
+    let metallic = clamp(in.mr.x * mr_s.b, 0.0, 1.0);
+    let roughness = clamp(in.mr.y * mr_s.g, 0.04, 1.0); // floor avoids a singular mirror highlight
 
-    let n = normalize(in.world_normal);
+    // M11.2 follow-up — perturb the geometric normal by the tangent-space normal map (flat dummy → no-op).
+    let geo_n = normalize(in.world_normal);
+    let nmap = textureSample(normal_tex, base_color_samp, in.uv).rgb * 2.0 - 1.0;
+    let n = perturb_normal(geo_n, in.world_pos, in.uv, nmap);
     let cam_eye = cam.focus.yzw; // packed in the Camera uniform's spare slot
     let v = normalize(cam_eye - in.world_pos);
     // F0: dielectric 0.04, lerped toward the base color as the surface becomes metallic.

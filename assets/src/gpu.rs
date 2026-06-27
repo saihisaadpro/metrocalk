@@ -56,6 +56,10 @@ pub struct MeshGpu {
     pub indices: Vec<u32>,
     /// The primary base-color (albedo) texture (RGBA8), if the asset ships one.
     pub base_color_texture: Option<crate::mesh::Texture>,
+    /// The primary metallic-roughness texture (RGBA8; glTF packing roughness=G, metalness=B), if any.
+    pub metallic_roughness_texture: Option<crate::mesh::Texture>,
+    /// The primary tangent-space normal map (RGBA8), if any.
+    pub normal_texture: Option<crate::mesh::Texture>,
 }
 
 impl MeshGpu {
@@ -107,21 +111,25 @@ impl MeshGpu {
             }
         }
 
-        // The primary base-color texture: the first primitive whose material references one (single
-        // texture per mesh — a multi-texture mesh uses the first, a documented limitation). Cloned so the
-        // packed mesh is self-contained for the renderer to upload.
-        let base_color_texture = asset.primitives.iter().find_map(|p| {
-            asset
-                .materials
-                .get(p.material)
-                .and_then(|m| m.base_color_texture)
-                .and_then(|ti| asset.textures.get(ti).cloned())
-        });
+        // The primary textures: the first primitive whose material references each slot (single texture
+        // per mesh — a multi-texture mesh uses the first, a documented limitation). Cloned so the packed
+        // mesh is self-contained for the renderer to upload.
+        let tex_of = |pick: fn(&crate::mesh::Material) -> Option<usize>| {
+            asset.primitives.iter().find_map(|p| {
+                asset
+                    .materials
+                    .get(p.material)
+                    .and_then(pick)
+                    .and_then(|ti| asset.textures.get(ti).cloned())
+            })
+        };
 
         Self {
             vertices,
             indices,
-            base_color_texture,
+            base_color_texture: tex_of(|m| m.base_color_texture),
+            metallic_roughness_texture: tex_of(|m| m.metallic_roughness_texture),
+            normal_texture: tex_of(|m| m.normal_texture),
         }
     }
 
@@ -240,6 +248,8 @@ mod tests {
             vertices: vec![vtx([0.0, 0.0, 0.0]), vtx([200.0, 100.0, 20.0])],
             indices: vec![],
             base_color_texture: None,
+            metallic_roughness_texture: None,
+            normal_texture: None,
         };
         m.normalize_to_unit();
         // Recentred about the bbox centre, scaled so the max axis (x, span 200) becomes 1.0.
@@ -268,6 +278,8 @@ mod tests {
             vertices: vec![vtx([3.0, 3.0, 3.0]), vtx([3.0, 3.0, 3.0])],
             indices: vec![],
             base_color_texture: None,
+            metallic_roughness_texture: None,
+            normal_texture: None,
         };
         point.normalize_to_unit(); // zero extent → unchanged (no divide-by-zero)
         assert_eq!(point.vertices[0].position, [3.0, 3.0, 3.0]);
@@ -294,6 +306,8 @@ mod tests {
                 metallic: 0.95,
                 roughness: 0.15,
                 base_color_texture: None,
+                metallic_roughness_texture: None,
+                normal_texture: None,
             }],
             textures: Vec::new(),
             skeleton: None,
@@ -331,8 +345,13 @@ mod tests {
     }
 
     #[test]
-    fn from_asset_carries_uv_and_the_base_color_texture() {
+    fn from_asset_carries_uv_and_the_base_color_mr_and_normal_textures() {
         use crate::mesh::{Material, MeshAsset, Primitive, Texture};
+        let tex = |w: u32, h: u32| Texture {
+            width: w,
+            height: h,
+            rgba8: vec![255; (w * h * 4) as usize],
+        };
         let asset = MeshAsset {
             name: "tex".into(),
             primitives: vec![Primitive {
@@ -349,22 +368,24 @@ mod tests {
                 metallic: 0.0,
                 roughness: 0.7,
                 base_color_texture: Some(0),
+                metallic_roughness_texture: Some(1),
+                normal_texture: Some(2),
             }],
-            textures: vec![Texture {
-                width: 2,
-                height: 2,
-                rgba8: vec![255; 16],
-            }],
+            // Distinct sizes so we can assert each slot maps to the right texture.
+            textures: vec![tex(2, 2), tex(4, 1), tex(1, 4)],
             skeleton: None,
         };
         let gpu = MeshGpu::from_asset(&asset);
-        // The per-vertex UV flows through (so the fragment shader can sample the texture).
+        // The per-vertex UV flows through (so the fragment shader can sample the textures).
         assert_eq!(gpu.vertices[1].uv, [1.0, 0.0], "the second vertex's UV");
-        // The primary base-color texture is carried for the renderer to upload + sample.
-        let tex = gpu
-            .base_color_texture
-            .expect("the base-color texture is carried");
-        assert_eq!((tex.width, tex.height), (2, 2));
-        assert_eq!(tex.rgba8.len(), 16);
+        // Each slot is carried for the renderer to upload + sample, mapped to the right texture.
+        let b = gpu.base_color_texture.expect("base-color carried");
+        assert_eq!((b.width, b.height), (2, 2));
+        let mr = gpu
+            .metallic_roughness_texture
+            .expect("metallic-roughness carried");
+        assert_eq!((mr.width, mr.height), (4, 1));
+        let nrm = gpu.normal_texture.expect("normal map carried");
+        assert_eq!((nrm.width, nrm.height), (1, 4));
     }
 }

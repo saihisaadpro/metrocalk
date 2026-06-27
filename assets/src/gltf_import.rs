@@ -68,6 +68,12 @@ impl MeshSource for GltfImporter {
                     base_color_texture: pbr
                         .base_color_texture()
                         .map(|t| t.texture().source().index()),
+                    // M11.2 follow-up — the metallic-roughness map (roughness=G, metalness=B, multiplied
+                    // onto the factors) + the tangent-space normal map. Indices remapped by decode_textures.
+                    metallic_roughness_texture: pbr
+                        .metallic_roughness_texture()
+                        .map(|t| t.texture().source().index()),
+                    normal_texture: m.normal_texture().map(|t| t.texture().source().index()),
                 }
             })
             .collect();
@@ -327,35 +333,72 @@ fn guard_count(count: usize) -> Result<(), ImportError> {
 fn decode_textures(doc: &Gltf, blob: &[u8], materials: &mut [Material]) -> Vec<Texture> {
     use std::collections::HashMap;
     let mut out: Vec<Texture> = Vec::new();
-    let mut remap: HashMap<usize, usize> = HashMap::new(); // glTF image index → compact texture index
+    // glTF image index → compact texture index (None = referenced but undecodable; cached so a shared
+    // image decodes once and we warn once).
+    let mut remap: HashMap<usize, Option<usize>> = HashMap::new();
 
     for mat in materials.iter_mut() {
-        let Some(img_idx) = mat.base_color_texture else {
-            continue;
-        };
-        if let Some(&compact) = remap.get(&img_idx) {
-            mat.base_color_texture = Some(compact);
-            continue;
-        }
-        let decoded = doc
-            .images()
-            .nth(img_idx)
-            .and_then(|img| decode_image(&img, blob));
-        if let Some(tex) = decoded {
-            let compact = out.len();
-            out.push(tex);
-            remap.insert(img_idx, compact);
-            mat.base_color_texture = Some(compact);
-        } else {
-            // Unresolved (external URI / non-PNG / corrupt) — fall back to the base-color factor, but say so
-            // (audit F7): an import silently losing a texture looks like a wrong material, not a known limit.
-            eprintln!(
-                "[assets] glTF: base-color texture (image #{img_idx}) couldn't be decoded — using the flat base color instead"
-            );
-            mat.base_color_texture = None;
-        }
+        mat.base_color_texture = resolve_slot(
+            doc,
+            blob,
+            mat.base_color_texture,
+            &mut out,
+            &mut remap,
+            "base-color",
+        );
+        mat.metallic_roughness_texture = resolve_slot(
+            doc,
+            blob,
+            mat.metallic_roughness_texture,
+            &mut out,
+            &mut remap,
+            "metallic-roughness",
+        );
+        mat.normal_texture = resolve_slot(
+            doc,
+            blob,
+            mat.normal_texture,
+            &mut out,
+            &mut remap,
+            "normal",
+        );
     }
     out
+}
+
+/// Decode one material texture SLOT (a glTF image index) into the compact `out` list, caching the
+/// image-index → compact-index mapping so a shared image decodes once. Returns the compact index, or
+/// `None` (no slot, or the image is unresolvable — external URI / non-PNG / corrupt → factor/flat fallback).
+fn resolve_slot(
+    doc: &Gltf,
+    blob: &[u8],
+    slot: Option<usize>,
+    out: &mut Vec<Texture>,
+    remap: &mut std::collections::HashMap<usize, Option<usize>>,
+    label: &str,
+) -> Option<usize> {
+    let img_idx = slot?;
+    if let Some(&cached) = remap.get(&img_idx) {
+        return cached;
+    }
+    let compact = doc
+        .images()
+        .nth(img_idx)
+        .and_then(|img| decode_image(&img, blob))
+        .map(|tex| {
+            let i = out.len();
+            out.push(tex);
+            i
+        });
+    if compact.is_none() {
+        // Unresolved — fall back to the factor / flat normal, but say so (audit F7): an import silently
+        // losing a texture looks like a wrong material, not a known limit.
+        eprintln!(
+            "[assets] glTF: {label} texture (image #{img_idx}) couldn't be decoded — using the factor/flat fallback"
+        );
+    }
+    remap.insert(img_idx, compact);
+    compact
 }
 
 /// Decode one glTF image from its bufferView (PNG only, RGBA8). `None` if the source is external/URI

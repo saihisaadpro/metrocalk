@@ -73,6 +73,11 @@ pub struct Material {
     pub roughness: f32,
     /// Index into [`MeshAsset::textures`] of the base-color texture, if any.
     pub base_color_texture: Option<usize>,
+    /// Index into [`MeshAsset::textures`] of the metallic-roughness texture, if any (glTF packing:
+    /// roughness in the G channel, metalness in B — multiplied onto the `metallic`/`roughness` factors).
+    pub metallic_roughness_texture: Option<usize>,
+    /// Index into [`MeshAsset::textures`] of the tangent-space normal map, if any.
+    pub normal_texture: Option<usize>,
 }
 
 impl Default for Material {
@@ -84,6 +89,8 @@ impl Default for Material {
             metallic: 0.0,
             roughness: 0.7,
             base_color_texture: None,
+            metallic_roughness_texture: None,
+            normal_texture: None,
         }
     }
 }
