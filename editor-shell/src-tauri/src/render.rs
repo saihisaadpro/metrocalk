@@ -209,7 +209,10 @@ impl SceneState {
             .map(|k| (hi[k] - lo[k]) * 0.5)
             .fold(0.0_f32, f32::max)
             .max(1.0);
-        self.distance = (radius * 2.4).clamp(6.0, 400.0);
+        // Floor at 3.0 (not 6.0): a single small object (radius ~1 → 2.4) was being pushed out to 6.0 and
+        // rendered tiny — "create something → see it" (the close-the-loop UX). Multi-object scenes have a
+        // larger radius, so the floor only tightens framing for small/single-object scenes.
+        self.distance = (radius * 2.4).clamp(3.0, 400.0);
         self.clear_focus();
         self.revision = self.revision.wrapping_add(1);
     }
