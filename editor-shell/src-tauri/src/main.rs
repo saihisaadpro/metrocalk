@@ -349,6 +349,12 @@ enum EngineCmd {
         intensity: f32,
         reply: Sender<Option<String>>,
     },
+    /// M11.3 — a NON-MUTATING lighting read for the acceptance gate (a stable signal, like `PartDebug`):
+    /// (count of AUTHORED light entities = doc truth, render light count incl. the synthesized default key
+    /// light when empty, shadow-caster index or -1, caster kind 0=dir/1=point/2=spot or -1).
+    LightingDebug {
+        reply: Sender<(usize, usize, i64, i64)>,
+    },
     /// Rename an entity (`__meta__.name`) → reply applied.
     RenameEntity {
         id: String,
@@ -1387,6 +1393,23 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
                 let _ = reply.send(new.map(|n| n.to_loro_key()));
+            }
+            EngineCmd::LightingDebug { reply } => {
+                // The lighting truth the acceptance gate keys off (stable signal, not pixels): how many
+                // lights are AUTHORED (doc/undo truth), what the render sees (incl. the synthesized default
+                // when empty), and which light casts the shadow (index + kind). Reuses `collect_lights` —
+                // the same projection the shader consumes — so the gate asserts the real render result.
+                let authored = engine
+                    .entity_ids()
+                    .iter()
+                    .filter(|id| engine.components_of(**id).contains_key("Light"))
+                    .count();
+                let (lights, caster) = collect_lights(&engine);
+                let caster_kind = caster
+                    .and_then(|i| lights.get(i))
+                    .map_or(-1, |l| l.pos_kind[3] as i64);
+                let shadow_caster = caster.map_or(-1, |i| i as i64);
+                let _ = reply.send((authored, lights.len(), shadow_caster, caster_kind));
             }
             EngineCmd::RenameEntity { id, name, reply } => {
                 let ok = EntityId::from_loro_key(&id)
@@ -4947,6 +4970,18 @@ fn instantiate_character(state: State<AppState>, comp: String) -> Option<String>
     rx.recv().ok().flatten()
 }
 
+/// M11.3 — a non-mutating lighting read for the acceptance gate: (authored light entities, render light
+/// count incl. the synthesized default key light, shadow-caster index or -1, caster kind 0/1/2 or -1).
+#[tauri::command]
+fn lighting_debug(state: State<AppState>) -> (usize, usize, i64, i64) {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::LightingDebug { reply }).is_err() {
+        return (0, 0, -1, -1);
+    }
+    rx.recv().unwrap_or((0, 0, -1, -1))
+}
+
 /// M9.2 — a part's resolved world position + active flag + override-key count (the E2E read).
 #[tauri::command]
 fn part_debug(state: State<AppState>, id: String) -> (f64, f64, f64, bool, usize) {
@@ -5485,6 +5520,7 @@ fn main() {
             reparent_part,
             create_entity,
             add_light,
+            lighting_debug,
             rename_entity,
             group_entities,
             ungroup_entity,
@@ -5602,5 +5638,67 @@ Objects:  {\n\
             store.contains(&handle),
             "the re-imported FBX resolves under the SAME content-address handle the .mtk saved"
         );
+    }
+}
+
+#[cfg(test)]
+mod lighting_debug_tests {
+    use super::collect_lights;
+    use metrocalk_core::Engine;
+    use metrocalk_ecs::FlecsWorld;
+    use metrocalk_editor_shell::capscene::{self, CapScene};
+
+    fn engine() -> (Engine<FlecsWorld>, CapScene) {
+        let mut world = FlecsWorld::new();
+        let scene = CapScene::intern(&mut world);
+        let mut e = Engine::new(world, 1);
+        capscene::seed(&mut e, &scene, 4).expect("seed");
+        e.clear_history();
+        (e, scene)
+    }
+
+    #[test]
+    fn empty_scene_synthesizes_a_default_casting_key_light() {
+        // The lighting_debug signal the gate reads: with no AUTHORED lights, the render still has the
+        // synthesized default key light (a directional caster) so the scene is never unlit.
+        let (e, _s) = engine();
+        let (lights, caster) = collect_lights(&e);
+        assert_eq!(lights.len(), 1, "one synthesized default key light");
+        assert_eq!(caster, Some(0), "the default directional casts the shadow");
+        assert_eq!(lights[0].pos_kind[3], 0.0, "kind 0 = directional");
+    }
+
+    #[test]
+    fn an_authored_directional_light_casts_and_undo_restores_the_default() {
+        let (mut e, scene) = engine();
+        capscene::add_light(
+            &mut e,
+            &scene,
+            "directional",
+            [0.0, 8.0, 0.0],
+            [1.0, 1.0, 1.0],
+            3.0,
+        )
+        .expect("add a directional light");
+        let (lights, caster) = collect_lights(&e);
+        assert_eq!(
+            lights.len(),
+            1,
+            "the authored light replaces the synthesized default"
+        );
+        assert_eq!(
+            caster,
+            Some(0),
+            "the authored directional is the shadow caster"
+        );
+        // One undoable commit — Ctrl-Z removes the authored light; the render falls back to the default.
+        e.undo();
+        let (lights2, caster2) = collect_lights(&e);
+        assert_eq!(
+            lights2.len(),
+            1,
+            "the synthesized default returns after undo"
+        );
+        assert_eq!(caster2, Some(0));
     }
 }
