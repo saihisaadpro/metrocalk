@@ -68,6 +68,12 @@ fn apply_focus_dim(col: vec3<f32>, is_focused: bool) -> vec3<f32> {
 // the mesh path uses it (+ `color` as the override base color) instead of the asset's baked vertex material.
 struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, selected: f32, rotation: vec4<f32>, material: vec4<f32> };
 @group(1) @binding(0) var<storage, read> instances: array<Instance>;
+// M11.2 follow-up — the per-mesh base-color (albedo) texture rides the already-per-mesh instance group
+// (group 1), staying within the 4-bind-group cap. An untextured mesh binds a 1×1 WHITE dummy, so sampling
+// is always valid (white × the baked factor = the factor → an untextured mesh looks exactly as before).
+// Only `fs_mesh` references these; the cube/grid/line pipelines' group-1 layout omits them (unused = fine).
+@group(1) @binding(1) var base_color_tex: texture_2d<f32>;
+@group(1) @binding(2) var base_color_samp: sampler;
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
 
@@ -165,6 +171,7 @@ struct MeshIn {
     @location(2) color: vec3<f32>,
     @location(3) metallic: f32,
     @location(4) roughness: f32,
+    @location(5) uv: vec2<f32>,
 };
 
 struct MeshVsOut {
@@ -174,6 +181,7 @@ struct MeshVsOut {
     @location(2) world_normal: vec3<f32>,
     @location(3) mr: vec2<f32>,       // metallic, roughness
     @location(4) selected: f32,
+    @location(5) uv: vec2<f32>,
 };
 
 @vertex
@@ -190,6 +198,7 @@ fn vs_mesh(v: MeshIn, @builtin(instance_index) ii: u32) -> MeshVsOut {
     let has_override = inst.material.z > 0.5;
     out.base_color = select(v.color, inst.color, has_override);
     out.mr = select(vec2<f32>(v.metallic, v.roughness), inst.material.xy, has_override);
+    out.uv = v.uv;
     return out;
 }
 
@@ -285,7 +294,9 @@ fn light_contrib(
 
 @fragment
 fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
-    let base = in.base_color;
+    // M11.2 follow-up — albedo = the base-color TEXTURE × the baked/override factor. An untextured mesh
+    // binds a 1×1 white dummy, so this is the factor unchanged (identical to the prior flat shading).
+    let base = textureSample(base_color_tex, base_color_samp, in.uv).rgb * in.base_color;
     let metallic = clamp(in.mr.x, 0.0, 1.0);
     let roughness = clamp(in.mr.y, 0.04, 1.0); // floor avoids a singular mirror highlight
 

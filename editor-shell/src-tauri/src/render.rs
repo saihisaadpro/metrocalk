@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use glam::{Mat4, Vec3, Vec4};
-use metrocalk_assets::{MeshGpu, MeshVertex};
+use metrocalk_assets::{MeshGpu, MeshVertex, Texture};
 use metrocalk_editor_shell::reveal::intent_order;
 use metrocalk_gizmo::{Gizmo, TransformGizmo};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -327,6 +327,91 @@ fn new_instance_storage(device: &wgpu::Device, cap: u64) -> wgpu::Buffer {
         size: cap * std::mem::size_of::<Instance>() as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
+    })
+}
+
+// M11.2 follow-up — base-color texture sampling on the mesh pipeline. Non-bindless (ADR-003): one texture
+// per mesh, bound on the already-per-mesh instance group (group 1) so the bind-group count stays at the
+// WebGPU 4-group cap. An untextured mesh binds a 1×1 white dummy → `fs_mesh` always samples (white × the
+// baked factor = the factor), so it looks exactly as before.
+
+/// Upload an RGBA8 base-color texture → a sampled view. `Rgba8UnormSrgb` so the sRGB albedo is linearized
+/// on sample (the BRDF works in linear space).
+fn upload_albedo(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> wgpu::TextureView {
+    let (w, h) = (tex.width.max(1), tex.height.max(1));
+    let size = wgpu::Extent3d {
+        width: w,
+        height: h,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("mesh-albedo"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &tex.rgba8,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        size,
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// A 1×1 white texture view — the dummy bound for an untextured mesh (white × the baked factor = the
+/// factor). Created once at setup, cloned per untextured mesh.
+fn white_dummy(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
+    upload_albedo(
+        device,
+        queue,
+        &Texture {
+            width: 1,
+            height: 1,
+            rgba8: vec![255, 255, 255, 255],
+        },
+    )
+}
+
+/// The mesh main-pass group 1: instances (vertex) + base-color texture + sampler (fragment). One per mesh,
+/// rebuilt when the instance buffer is (re)allocated (a power-of-two grow).
+fn make_mesh_main_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    inst_buf: &wgpu::Buffer,
+    view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mesh-main-bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: inst_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
     })
 }
 
@@ -645,6 +730,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         color: [0.30, 0.31, 0.34],
         metallic: 0.0,
         roughness: 0.95,
+        uv: [0.0, 0.0], // untextured (binds the white dummy)
     };
     let ground_verts = [
         ground_vert(-1.0, -1.0),
@@ -665,6 +751,46 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         bytemuck::cast_slice(&GROUND_IDX),
         wgpu::BufferUsages::INDEX,
     );
+    // M11.2 follow-up — the mesh main pass's group 1: instances + a base-color texture + sampler. Distinct
+    // from `inst_bgl` (cubes/ground/lines keep that), so adding a texture doesn't ripple to those pipelines.
+    let mesh_inst_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("mesh-inst-bgl"),
+        entries: &[
+            bgl_entry(
+                0,
+                wgpu::ShaderStages::VERTEX,
+                wgpu::BufferBindingType::Storage { read_only: true },
+            ),
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let albedo_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("albedo-samp"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    let dummy_view = white_dummy(&device, &queue);
+
     let mut ground_inst = InstanceBuf::new(&device, &inst_bgl, 1);
     ground_inst.upload(
         &device,
@@ -678,6 +804,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             rotation: IDENTITY_QUAT,
             material: [0.0; 4], // no override → use the baked matte vertex material
         }],
+    );
+    // The ground draws with the MESH pipeline → its group 1 must be a `mesh_inst_bgl` bind group too. It's
+    // untextured (the white dummy), and its single cap-1 instance buffer never grows → built once here.
+    let ground_main_bg = make_mesh_main_bg(
+        &device,
+        &mesh_inst_bgl,
+        &ground_inst.buf,
+        &dummy_view,
+        &albedo_sampler,
     );
 
     let depth_state = wgpu::DepthStencilState {
@@ -699,7 +834,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         label: Some("mesh-layout"),
         bind_group_layouts: &[
             Some(&cam_bgl),
-            Some(&inst_bgl),
+            Some(&mesh_inst_bgl), // M11.2 — group 1 = instances + base-color texture + sampler
             Some(&lights_bgl),
             Some(&ibl_bgl),
         ],
@@ -839,6 +974,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 offset: 40,
                 shader_location: 4,
             },
+            // M11.2 follow-up — the UV for base-color texture sampling in fs_mesh.
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 44,
+                shader_location: 5,
+            },
         ],
     };
     let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -947,6 +1088,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // lists (rebuilt per scene revision). `cube_scratch`/`mesh_scratch` are reused partition buffers.
     let mut gpu_meshes: Vec<Option<GpuMesh>> = Vec::new();
     let mut mesh_inst: Vec<InstanceBuf> = Vec::new();
+    // M11.2 follow-up — per-asset base-color texture view (parallel to `gpu_meshes`; the white dummy when
+    // untextured) + the mesh main-pass group-1 bind group (instances + that texture), rebuilt when an
+    // instance buffer grows.
+    let mut mesh_tex: Vec<wgpu::TextureView> = Vec::new();
+    let mut mesh_main_bg: Vec<wgpu::BindGroup> = Vec::new();
     let mut cur_mesh_rev = u64::MAX;
     let mut cube_scratch: Vec<Instance> = Vec::new();
     let mut mesh_scratch: Vec<Vec<Instance>> = Vec::new();
@@ -1072,9 +1218,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             if st.meshes_revision != cur_mesh_rev {
                 cur_mesh_rev = st.meshes_revision;
                 gpu_meshes.clear();
+                mesh_tex.clear(); // kept parallel to gpu_meshes (the per-asset base-color view, dummy if none)
                 for m in &st.meshes {
                     if m.vertices.is_empty() || m.indices.is_empty() {
                         gpu_meshes.push(None);
+                        mesh_tex.push(dummy_view.clone());
                         continue;
                     }
                     let vbuf = create_init_buffer(
@@ -1094,6 +1242,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         ibuf,
                         n_idx: m.indices.len() as u32,
                     }));
+                    // M11.2 — upload the asset's base-color texture (or the white dummy) for fs_mesh to sample.
+                    mesh_tex.push(match &m.base_color_texture {
+                        Some(t) => upload_albedo(&device, &queue, t),
+                        None => dummy_view.clone(),
+                    });
                 }
                 while mesh_inst.len() < gpu_meshes.len() {
                     mesh_inst.push(InstanceBuf::new(&device, &inst_bgl, 64));
@@ -1122,6 +1275,20 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 cube.upload(&device, &queue, &inst_bgl, &cube_scratch);
                 for (slot, group) in mesh_scratch.iter().enumerate() {
                     mesh_inst[slot].upload(&device, &queue, &inst_bgl, group);
+                }
+                // M11.2 — rebuild each mesh's main-pass group 1 (an instance upload may have grown → a new
+                // buffer) pairing the current instance buffer with the asset's base-color texture. Few meshes,
+                // only on scene-edit revisions (never per frame). mesh_inst.len() ≥ gpu_meshes.len() (the
+                // meshes_revision block grows it first) and mesh_tex.len() == gpu_meshes.len(), so both index.
+                mesh_main_bg.clear();
+                for slot in 0..gpu_meshes.len() {
+                    mesh_main_bg.push(make_mesh_main_bg(
+                        &device,
+                        &mesh_inst_bgl,
+                        &mesh_inst[slot].buf,
+                        &mesh_tex[slot],
+                        &albedo_sampler,
+                    ));
                 }
                 // tracking-line endpoints (rebuilt in lock-step with instances)
                 lines.upload(&device, &queue, &inst_bgl, &st.line_points);
@@ -1336,20 +1503,23 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             rp.set_bind_group(2, &lights_buf.bg, &[]); // M11.3 — the scene lights, shared across mesh draws
             rp.set_bind_group(3, &ibl.bind_group, &[]); // M11.3 inc.2/3 — env + BRDF LUT + shadow map/sampler
             for (slot, mesh) in gpu_meshes.iter().enumerate() {
-                let (Some(mesh), Some(inst)) = (mesh.as_ref(), mesh_inst.get(slot)) else {
+                let (Some(mesh), Some(inst), Some(main_bg)) =
+                    (mesh.as_ref(), mesh_inst.get(slot), mesh_main_bg.get(slot))
+                else {
                     continue;
                 };
                 if inst.n == 0 {
                     continue;
                 }
-                rp.set_bind_group(1, &inst.bg, &[]);
+                rp.set_bind_group(1, main_bg, &[]); // M11.2 — group 1 = instances + base-color texture/sampler
                 rp.set_vertex_buffer(0, mesh.vbuf.slice(..));
                 rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..mesh.n_idx, 0, 0..inst.n);
             }
             // M11.3 inc.3 — the ground plane (matte; receives IBL + the scene's shadows). Same mesh
-            // pipeline, so groups 0/2/3 stay bound; only its instance (group 1) + geometry change.
-            rp.set_bind_group(1, &ground_inst.bg, &[]);
+            // pipeline, so groups 0/2/3 stay bound; only its instance (group 1, the untextured dummy) +
+            // geometry change.
+            rp.set_bind_group(1, &ground_main_bg, &[]);
             rp.set_vertex_buffer(0, ground_vbuf.slice(..));
             rp.set_index_buffer(ground_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rp.draw_indexed(0..GROUND_IDX.len() as u32, 0, 0..1);

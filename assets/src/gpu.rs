@@ -5,9 +5,10 @@
 //! vertex `Pod` so the native renderer can `cast_slice` it straight into a buffer.
 //!
 //! Packing merges an asset's primitives into one interleaved vertex buffer + one index buffer (a mesh
-//! draws as a single indexed call), bakes each primitive's material base-color into the vertex color
-//! (so the non-bindless path needs no per-material bind group this milestone — texture sampling is the
-//! next render increment), and derives smooth normals when the source ships none.
+//! draws as a single indexed call), bakes each primitive's material base-color/metallic-roughness into the
+//! vertex stream, carries the per-vertex UV + the primary base-color texture for the renderer to sample
+//! (M11.2 follow-up — non-bindless: one texture bind group per mesh on the already-per-mesh instance group),
+//! and derives smooth normals when the source ships none.
 
 // Index offsets are bounded by MAX_ELEMENTS; the f32 color baking is a display value. The fixed [_;3]
 // component loops read clearest as `0..3` (the iterator rewrite is noisier for a 3-vector), and the tests
@@ -21,9 +22,10 @@
 
 use crate::mesh::MeshAsset;
 
-/// One packed vertex — position, normal (for lighting), a baked RGB base color, and the baked
-/// metallic-roughness PBR factors (M11.2, ADR-041). 44 bytes, `std430`/vertex-attribute clean. Matches the
-/// renderer's WGSL (`vs_mesh` reads all five attributes; `fs_main` evaluates a Cook-Torrance BRDF).
+/// One packed vertex — position, normal (for lighting), a baked RGB base color, the baked
+/// metallic-roughness PBR factors (M11.2, ADR-041), and the **UV** for base-color texture sampling (M11.2
+/// follow-up). 48 bytes, `std430`/vertex-attribute clean. Matches the renderer's WGSL (`vs_mesh` reads all
+/// six attributes; `fs_mesh` samples the base-color texture × the baked factor + a Cook-Torrance BRDF).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshVertex {
@@ -37,15 +39,23 @@ pub struct MeshVertex {
     pub metallic: f32,
     /// Baked perceptual roughness `[0,1]`.
     pub roughness: f32,
+    /// Texture coordinate (0 when the source ships none → samples the renderer's 1×1 white dummy = the
+    /// baked factor renders unchanged, so an untextured mesh looks exactly as before).
+    pub uv: [f32; 2],
 }
 
-/// A mesh ready to upload: one interleaved vertex buffer + one `u32` index buffer.
+/// A mesh ready to upload: one interleaved vertex buffer + one `u32` index buffer, plus the optional
+/// base-color texture the renderer uploads + samples (M11.2 follow-up — single primary texture per mesh;
+/// multi-texture meshes use the first, a documented limitation). `None` ⇒ the renderer binds a 1×1 white
+/// dummy so `fs_mesh` can always sample (white × the baked factor = the factor — untextured looks as before).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MeshGpu {
     /// Interleaved vertices.
     pub vertices: Vec<MeshVertex>,
     /// Triangle-list indices into `vertices`.
     pub indices: Vec<u32>,
+    /// The primary base-color (albedo) texture (RGBA8), if the asset ships one.
+    pub base_color_texture: Option<crate::mesh::Texture>,
 }
 
 impl MeshGpu {
@@ -81,6 +91,8 @@ impl MeshGpu {
                     color,
                     metallic,
                     roughness,
+                    // UV when the source ships one; 0 otherwise (→ the 1×1 white dummy = factor unchanged).
+                    uv: prim.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                 });
             }
             // Re-base this primitive's indices into the merged vertex buffer; drop any out-of-range
@@ -95,7 +107,22 @@ impl MeshGpu {
             }
         }
 
-        Self { vertices, indices }
+        // The primary base-color texture: the first primitive whose material references one (single
+        // texture per mesh — a multi-texture mesh uses the first, a documented limitation). Cloned so the
+        // packed mesh is self-contained for the renderer to upload.
+        let base_color_texture = asset.primitives.iter().find_map(|p| {
+            asset
+                .materials
+                .get(p.material)
+                .and_then(|m| m.base_color_texture)
+                .and_then(|ti| asset.textures.get(ti).cloned())
+        });
+
+        Self {
+            vertices,
+            indices,
+            base_color_texture,
+        }
     }
 
     /// Vertex count.
@@ -202,6 +229,7 @@ mod tests {
             color: [0.8, 0.8, 0.8],
             metallic: 0.0,
             roughness: 0.7,
+            uv: [0.0, 0.0],
         }
     }
 
@@ -211,6 +239,7 @@ mod tests {
         let mut m = MeshGpu {
             vertices: vec![vtx([0.0, 0.0, 0.0]), vtx([200.0, 100.0, 20.0])],
             indices: vec![],
+            base_color_texture: None,
         };
         m.normalize_to_unit();
         // Recentred about the bbox centre, scaled so the max axis (x, span 200) becomes 1.0.
@@ -238,6 +267,7 @@ mod tests {
         let mut point = MeshGpu {
             vertices: vec![vtx([3.0, 3.0, 3.0]), vtx([3.0, 3.0, 3.0])],
             indices: vec![],
+            base_color_texture: None,
         };
         point.normalize_to_unit(); // zero extent → unchanged (no divide-by-zero)
         assert_eq!(point.vertices[0].position, [3.0, 3.0, 3.0]);
@@ -298,5 +328,43 @@ mod tests {
         let v = MeshGpu::from_asset(&asset).vertices[0];
         assert_eq!(v.metallic, 0.0);
         assert!((v.roughness - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn from_asset_carries_uv_and_the_base_color_texture() {
+        use crate::mesh::{Material, MeshAsset, Primitive, Texture};
+        let asset = MeshAsset {
+            name: "tex".into(),
+            primitives: vec![Primitive {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: Vec::new(),
+                uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                indices: vec![0, 1, 2],
+                material: 0,
+                joints: Vec::new(),
+                weights: Vec::new(),
+            }],
+            materials: vec![Material {
+                base_color: [1.0, 1.0, 1.0, 1.0],
+                metallic: 0.0,
+                roughness: 0.7,
+                base_color_texture: Some(0),
+            }],
+            textures: vec![Texture {
+                width: 2,
+                height: 2,
+                rgba8: vec![255; 16],
+            }],
+            skeleton: None,
+        };
+        let gpu = MeshGpu::from_asset(&asset);
+        // The per-vertex UV flows through (so the fragment shader can sample the texture).
+        assert_eq!(gpu.vertices[1].uv, [1.0, 0.0], "the second vertex's UV");
+        // The primary base-color texture is carried for the renderer to upload + sample.
+        let tex = gpu
+            .base_color_texture
+            .expect("the base-color texture is carried");
+        assert_eq!((tex.width, tex.height), (2, 2));
+        assert_eq!(tex.rgba8.len(), 16);
     }
 }
