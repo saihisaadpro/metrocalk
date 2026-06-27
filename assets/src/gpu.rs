@@ -4,12 +4,12 @@
 //! draw, no bindless). Pure data, no `wgpu` dependency: `bytemuck` (pure Rust, wasm-clean) makes the
 //! vertex `Pod` so the native renderer can `cast_slice` it straight into a buffer.
 //!
-//! Packing merges an asset's primitives into one interleaved vertex buffer + one index buffer, partitioned
-//! into per-primitive [`SubMesh`] index ranges (a multi-material mesh draws one sub-draw per submesh), bakes
-//! each primitive's material base-color/metallic-roughness into the vertex stream, carries the per-vertex UV
-//! + each submesh's own base-color/metallic-roughness/normal textures for the renderer to sample (M11.2
-//! follow-up — non-bindless: one texture bind group per submesh on the already-per-mesh instance group), and
-//! derives smooth normals when the source ships none.
+//! Packing merges an asset's primitives into one interleaved vertex buffer plus one index buffer,
+//! partitioned into per-primitive [`SubMesh`] index ranges (a multi-material mesh draws one sub-draw per
+//! submesh), bakes each primitive's material base-color/metallic-roughness into the vertex stream, carries
+//! the per-vertex UV alongside each submesh's own base-color/metallic-roughness/normal textures for the
+//! renderer to sample (M11.2 follow-up — non-bindless: one texture bind group per submesh on the
+//! already-per-mesh instance group), and derives smooth normals when the source ships none.
 
 // Index offsets are bounded by MAX_ELEMENTS; the f32 color baking is a display value. The fixed [_;3]
 // component loops read clearest as `0..3` (the iterator rewrite is noisier for a 3-vector), and the tests
