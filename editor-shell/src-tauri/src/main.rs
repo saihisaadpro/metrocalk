@@ -21,8 +21,8 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
 use metrocalk_assets::{
-    detect, AssetId, AssetStore, Detected, GltfImporter, ImageImporter, MeshGpu, MeshSource,
-    ObjImporter,
+    detect, AssetId, AssetStore, Detected, FbxImporter, GltfImporter, ImageImporter, KtxImporter,
+    MeshGpu, MeshSource, ObjImporter,
 };
 use metrocalk_core::catalog::{CatalogItem, CatalogSearch};
 use metrocalk_core::marketplace::{LocalCatalog, MarketplaceIndex};
@@ -95,6 +95,27 @@ struct AssetsRuntime {
     sphere: String,
 }
 
+/// Re-import ONE persisted asset blob into the store on boot, routed by MAGIC — mirrors `import_any`'s
+/// routing (ADR-040) so a handle saved in the `.mtk` re-resolves after reload. Returns whether a mesh
+/// asset was registered. **FBX + KTX2 are included** because the binary builds `metrocalk-assets` with the
+/// `fbx`+`ktx2` features (Cargo.toml): omitting them silently dropped a reopened FBX/KTX2 import to the
+/// placeholder — the M11.1 reload hole that contradicted ADR-040's "survives reload". The handle is the
+/// content address of the SOURCE bytes (`AssetStore::import` → `AssetId::of_bytes`), the same value the
+/// live import command saved, so the doc's `MeshRenderer.mesh` re-resolves. Audio/unrecognized blobs are
+/// not mesh assets → `false`. The match is exhaustive (no `_`) so a future `Detected` variant must be
+/// triaged here, not silently dropped again.
+fn reimport_persisted_blob(store: &mut AssetStore, gltf: &GltfImporter, bytes: &[u8]) -> bool {
+    let stored = match detect(bytes) {
+        Some(Detected::Gltf) => store.import(gltf, bytes),
+        Some(Detected::Obj) => store.import(&ObjImporter::new(), bytes),
+        Some(Detected::Image) => store.import(&ImageImporter::new(), bytes),
+        Some(Detected::Fbx) => store.import(&FbxImporter::new(), bytes),
+        Some(Detected::Ktx2) => store.import(&KtxImporter::new(), bytes),
+        Some(Detected::Audio) | None => return false, // not a mesh asset
+    };
+    stored.is_ok()
+}
+
 /// Import the embedded fixtures into a content-addressed store, build the kind→handle catalog, and pack
 /// each asset to GPU-ready geometry + a normalized render scale. Import is the one-shot heavy op
 /// (measured here, never frame-budget-gated). Slot order is per-run (the handle in the doc is the
@@ -119,13 +140,7 @@ fn load_assets() -> AssetsRuntime {
     let blob_dir = sidecar("metrocalk-assets");
     let mut blobs_loaded = 0usize;
     for (_id, bytes) in metrocalk_editor_shell::blobstore::load_all(&blob_dir) {
-        let stored = match detect(&bytes) {
-            Some(Detected::Gltf) => store.import(&importer, &bytes),
-            Some(Detected::Obj) => store.import(&ObjImporter::new(), &bytes),
-            Some(Detected::Image) => store.import(&ImageImporter::new(), &bytes),
-            _ => continue, // audio / unrecognized — not a mesh asset
-        };
-        if stored.is_ok() {
+        if reimport_persisted_blob(&mut store, &importer, &bytes) {
             blobs_loaded += 1;
         }
     }
@@ -1800,8 +1815,16 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // insufficient balance never charges). `material` is the chosen preset (UI palette).
                 let resp = if let Some(eid) = EntityId::from_loro_key(&id) {
                     let ref_id = format!("edit:{id}:{}", wallet.ledger().len());
-                    let (delta, outcome) =
-                        ai_edit_material(&mut engine, &mut wallet, eid, &ref_id, &material);
+                    // Supply the render material vocabulary: an unknown preset is rejected-as-UX BEFORE
+                    // metering (it would otherwise charge then render unchanged — audit P1).
+                    let (delta, outcome) = ai_edit_material(
+                        &mut engine,
+                        &mut wallet,
+                        eid,
+                        &ref_id,
+                        &material,
+                        material_preset(&material).is_some(),
+                    );
                     match outcome {
                         Outcome::Charged {
                             cost_tokens,
@@ -5531,5 +5554,53 @@ mod material_tests {
     fn unknown_material_is_no_override() {
         assert!(material_preset("banana").is_none());
         assert!(material_preset("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::{reimport_persisted_blob, AssetId, AssetStore, GltfImporter};
+
+    /// A minimal valid ASCII FBX 7.4 unit cube (mirrors `assets/tests/fbx_bakeoff.rs`); `ufbx` parses it.
+    fn ascii_cube_fbx() -> &'static [u8] {
+        b"; FBX 7.4.0 project file\n\
+FBXHeaderExtension:  {\n\
+\tFBXHeaderVersion: 1003\n\
+\tFBXVersion: 7400\n\
+}\n\
+Objects:  {\n\
+\tGeometry: 100, \"Geometry::Cube\", \"Mesh\" {\n\
+\t\tVertices: *24 {\n\
+\t\t\ta: -0.5,-0.5,-0.5,0.5,-0.5,-0.5,0.5,0.5,-0.5,-0.5,0.5,-0.5,-0.5,-0.5,0.5,0.5,-0.5,0.5,0.5,0.5,0.5,-0.5,0.5,0.5\n\
+\t\t}\n\
+\t\tPolygonVertexIndex: *24 {\n\
+\t\t\ta: 0,1,2,-4,4,5,6,-8,0,1,5,-5,1,2,6,-6,2,3,7,-7,3,0,4,-8\n\
+\t\t}\n\
+\t}\n\
+}\n"
+    }
+
+    /// Regression for the M11.1 reload hole (audit P1): the boot re-import router dropped `Fbx`/`Ktx2`
+    /// to the placeholder (`_ => continue`), so a reopened FBX import dangled — contradicting ADR-040's
+    /// "a generated/imported mesh survives reload". The `.mtk` saves the handle `AssetId::of_bytes(src)`;
+    /// reload must re-register that EXACT handle so `MeshRenderer.mesh` resolves. (KTX2 rides the same arm.)
+    #[test]
+    fn persisted_fbx_blob_reimports_under_its_content_handle_on_reload() {
+        let fbx = ascii_cube_fbx();
+        let handle = AssetId::of_bytes(fbx).as_str().to_string();
+        let mut store = AssetStore::new();
+        assert!(
+            !store.contains(&handle),
+            "precondition: the FBX handle is absent before the reload re-import"
+        );
+        let registered = reimport_persisted_blob(&mut store, &GltfImporter::new(), fbx);
+        assert!(
+            registered,
+            "an FBX blob must re-import on reload, not fall through to the placeholder (the M11.1 hole)"
+        );
+        assert!(
+            store.contains(&handle),
+            "the re-imported FBX resolves under the SAME content-address handle the .mtk saved"
+        );
     }
 }

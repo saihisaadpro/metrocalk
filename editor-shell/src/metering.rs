@@ -93,17 +93,32 @@ pub fn buy_marketplace(
     }
 }
 
-/// Apply the "make it rustier" **AI-edit** to `id`: check affordability, apply the schema-validated
-/// patch (`MeshRenderer.material = "rusty"`) through the one pipeline (undoable), and on success debit
-/// the edit rate. A rejected patch (e.g. a non-existent entity) is never charged. Returns the
-/// projection delta to echo (when applied) + the outcome.
+/// Apply the "make it rustier" **AI-edit** to `id`: validate the material is a known finish, check
+/// affordability, apply the schema-validated patch (`MeshRenderer.material = "rusty"`) through the one
+/// pipeline (undoable), and on success debit the edit rate. A rejected patch (a non-existent entity, or
+/// an **unknown material** that the renderer has no preset for) is never charged. `known` is supplied by
+/// the caller, which owns the render material vocabulary (`material_preset`). Returns the projection
+/// delta to echo (when applied) + the outcome.
 pub fn ai_edit_material(
     engine: &mut Engine<FlecsWorld>,
     wallet: &mut Wallet,
     id: EntityId,
     ref_id: &str,
     material: &str,
+    known: bool,
 ) -> (Option<ProjectionDelta>, Outcome) {
+    if !known {
+        // M11.2 (audit P1): an unknown material name passes the schema (it is a valid String) but the
+        // renderer has no preset for it → without this guard the patch would apply + CHARGE, then render
+        // unchanged — a silent no-op the user paid for. Reject BEFORE metering: never debit for an edit
+        // that cannot change the picture (cost legible · every "no" explained, ADR-016).
+        return (
+            None,
+            Outcome::Rejected(format!(
+                "unknown material \"{material}\" — choose a known finish (e.g. rusty, metal, chrome, gold, copper, plastic)"
+            )),
+        );
+    }
     if !wallet.can_afford(&Action::Edit) {
         return (
             None,

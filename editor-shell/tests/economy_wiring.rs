@@ -95,7 +95,7 @@ fn an_ai_edit_debits_two_tokens_and_sets_the_material_rusty() {
     let mut wallet = Wallet::in_memory();
     let ph = capscene::place_generation_placeholder(&mut engine, &scene, [0.0; 3]).unwrap();
 
-    let (delta, outcome) = ai_edit_material(&mut engine, &mut wallet, ph, "edit-1", "rusty");
+    let (delta, outcome) = ai_edit_material(&mut engine, &mut wallet, ph, "edit-1", "rusty", true);
     assert!(matches!(outcome, Outcome::Charged { cost_tokens: 2, .. }));
     assert_eq!(wallet.balance_tokens(), 28);
     assert!(delta.is_some(), "the material edit echoes a delta");
@@ -117,13 +117,54 @@ fn an_ai_edit_on_a_nonexistent_entity_is_rejected_and_never_charged() {
     let bogus = engine.alloc_entity_id(); // allocated, but no entity created
     let before = wallet.balance_tokens();
 
-    let (delta, outcome) = ai_edit_material(&mut engine, &mut wallet, bogus, "edit-bogus", "rusty");
+    let (delta, outcome) =
+        ai_edit_material(&mut engine, &mut wallet, bogus, "edit-bogus", "rusty", true);
     assert!(matches!(outcome, Outcome::Rejected(_)));
     assert!(delta.is_none());
     assert_eq!(
         wallet.balance_tokens(),
         before,
         "a rejected edit is never charged"
+    );
+}
+
+#[test]
+fn an_ai_edit_with_an_unknown_material_is_rejected_and_never_charged() {
+    // M11.2 (audit P1): an unknown material name passes the schema (a valid String) but the renderer has
+    // no preset for it → without the `known` guard it would apply + charge, then render unchanged (a
+    // silent no-op the user paid for). It must be rejected-as-UX and never debited.
+    let (mut engine, scene) = seeded();
+    let mut wallet = Wallet::in_memory();
+    let ph = capscene::place_generation_placeholder(&mut engine, &scene, [0.0; 3]).unwrap();
+    let before = wallet.balance_tokens();
+
+    // `known = false` is what the caller supplies for an unrecognized preset (`material_preset` → None).
+    let (delta, outcome) = ai_edit_material(
+        &mut engine,
+        &mut wallet,
+        ph,
+        "edit-unknown",
+        "banana",
+        false,
+    );
+    assert!(
+        matches!(outcome, Outcome::Rejected(ref why) if why.contains("unknown material")),
+        "an unknown material is rejected with an explained reason, got {outcome:?}"
+    );
+    assert!(delta.is_none(), "nothing applied for an unknown material");
+    assert_eq!(
+        wallet.balance_tokens(),
+        before,
+        "an unknown material is NEVER charged (no silent debit for a no-op)"
+    );
+    // And the scene was not mutated: the placeholder carries no material override.
+    let material = engine
+        .components_of(ph)
+        .get("MeshRenderer")
+        .and_then(|m| m.get("material").cloned());
+    assert!(
+        material.is_none(),
+        "a rejected unknown-material edit writes no material field"
     );
 }
 
@@ -136,7 +177,8 @@ fn an_ai_edit_is_refused_gracefully_when_broke() {
     }
     assert_eq!(wallet.balance_tokens(), 0);
     let ph = capscene::place_generation_placeholder(&mut engine, &scene, [0.0; 3]).unwrap();
-    let (delta, outcome) = ai_edit_material(&mut engine, &mut wallet, ph, "edit-broke", "rusty");
+    let (delta, outcome) =
+        ai_edit_material(&mut engine, &mut wallet, ph, "edit-broke", "rusty", true);
     assert!(matches!(outcome, Outcome::Refused { needed: 2, have: 0 }));
     assert!(delta.is_none(), "nothing applied when broke");
 }
