@@ -111,3 +111,35 @@ fn a_light_survives_close_then_reopen_via_replay() {
     );
     log.clear();
 }
+
+#[test]
+fn the_light_component_carries_only_authored_declaration_no_render_projection_leak() {
+    // ADR-021 guard (test-first, the audit's named M11.3 gap): the per-frame LIT RESULT — shadow maps, the
+    // IBL sample, the directional `light_view_proj`, the shadow-caster index — is a render PROJECTION
+    // (SceneState/Camera, regenerated each rebuild), NEVER doc/undo state. The Loro document must carry
+    // ONLY the authored light DECLARATION. If a future change ever persists a computed render field onto
+    // the `Light` component (the ADR-021 violation), this fails loudly instead of bloating the doc + undo.
+    let (mut e, scene) = seeded();
+    let id = capscene::add_light(
+        &mut e,
+        &scene,
+        "directional",
+        [0.0, 10.0, 0.0],
+        [1.0, 1.0, 1.0],
+        3.0,
+    )
+    .expect("add a light");
+
+    let comps = e.components_of(id);
+    let light = comps
+        .get("Light")
+        .expect("the light entity has a Light component");
+    let mut keys: Vec<&str> = light.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["b", "g", "intensity", "kind", "r"],
+        "the doc carries ONLY the authored light declaration — no computed render-projection field \
+         (a shadow matrix / light_view_proj / shadow_caster / baked lit result) leaked into Loro (ADR-021)"
+    );
+}
