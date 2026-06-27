@@ -687,7 +687,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         desired_maximum_frame_latency: 2,
     };
     surface.configure(&device, &config);
-    let mut depth = make_depth(&device, w, h);
+    // M11.4 (ADR-043) — MSAA anti-aliasing. Sample count chosen once from `MTK_MSAA` (`off`/`1`/`2`/`4`/`8`,
+    // default 4), clamped to adapter support; 1 = off (the min-spec path: render straight to the swapchain,
+    // identical to the pre-MSAA frame). The scene depth + every scene-pass pipeline are built at this count;
+    // the depth-only shadow pass stays single-sample.
+    let samples = msaa_sample_count(&adapter, format);
+    eprintln!("[viewport] MSAA samples={samples}");
+    let mut depth = make_depth(&device, w, h, samples);
+    // The multisampled scene COLOR target (resolved to the swapchain at pass end); `None` when off.
+    let mut msaa = make_msaa(&device, format, w, h, samples);
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("scene"),
@@ -965,6 +973,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         "vs_cube",
         wgpu::PrimitiveTopology::TriangleList,
         Some(wgpu::Face::Back),
+        samples,
         "cube",
     );
     let grid_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -981,6 +990,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         "vs_grid",
         wgpu::PrimitiveTopology::LineList,
         None,
+        samples,
         "grid",
     );
     // Tracking lines: same layout as the cubes (cam + a storage buffer of points), LineList topology,
@@ -1003,6 +1013,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         "vs_line",
         wgpu::PrimitiveTopology::LineList,
         None,
+        samples,
         "line",
     );
     let mut lines = InstanceBuf::new(&device, &inst_bgl, 256);
@@ -1018,6 +1029,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         "vs_overlay",
         wgpu::PrimitiveTopology::LineList,
         None,
+        samples,
         "overlay",
     );
     let mut overlay = InstanceBuf::new(&device, &inst_bgl, 256);
@@ -1091,7 +1103,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             ..Default::default()
         },
         depth_stencil: Some(depth_state.clone()),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     });
@@ -1125,7 +1140,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             ..Default::default()
         },
         depth_stencil: Some(sky_depth),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     });
@@ -1205,7 +1223,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 config.width = w;
                 config.height = h;
                 surface.configure(&device, &config);
-                depth = make_depth(&device, w, h);
+                depth = make_depth(&device, w, h, samples);
+                msaa = make_msaa(&device, format, w, h, samples);
             }
         }
 
@@ -1577,11 +1596,17 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             }
         }
         {
+            // M11.4 — with MSAA on, the scene draws into the multisampled target and RESOLVES to the
+            // swapchain at pass end; off, it draws straight to the swapchain (resolve_target None).
+            let (scene_color, scene_resolve) = match msaa.as_ref() {
+                Some(m) => (m, Some(&view)),
+                None => (&view, None),
+            };
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: scene_color,
+                    resolve_target: scene_resolve,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -1878,7 +1903,7 @@ pub fn project_to_screen(
     Some(((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5))
 }
 
-fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
+fn make_depth(device: &wgpu::Device, w: u32, h: u32, samples: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
@@ -1888,7 +1913,7 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1955,6 +1980,7 @@ fn make_pipeline(
     vs: &str,
     topology: wgpu::PrimitiveTopology,
     cull: Option<wgpu::Face>,
+    samples: u32,
     label: &str,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1978,10 +2004,67 @@ fn make_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(depth.clone()),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     })
+}
+
+/// M11.4 (ADR-043) — MSAA sample count from `MTK_MSAA` (`off`/`1`/`2`/`4`/`8`, default 4), clamped to the
+/// highest count ≤ requested that the adapter supports for `format` (so a downlevel GPU still gets some AA,
+/// or falls back to 1 = off). `1` means no multisample target + no resolve — the pre-MSAA path.
+fn msaa_sample_count(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> u32 {
+    let requested = match std::env::var("MTK_MSAA").ok().as_deref() {
+        Some("off" | "1") => 1,
+        Some("2") => 2,
+        Some("8") => 8,
+        _ => 4,
+    };
+    if requested <= 1 {
+        return 1;
+    }
+    let flags = adapter.get_texture_format_features(format).flags;
+    for c in [requested, 4, 2] {
+        if c <= requested && flags.sample_count_supported(c) {
+            return c;
+        }
+    }
+    1
+}
+
+/// M11.4 — the multisampled scene COLOR target (resolved to the swapchain at the scene pass's end).
+/// `None` when `samples <= 1` (MSAA off → the scene pass renders straight to the swapchain view).
+fn make_msaa(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    w: u32,
+    h: u32,
+    samples: u32,
+) -> Option<wgpu::TextureView> {
+    if samples <= 1 {
+        return None;
+    }
+    Some(
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("msaa-color"),
+                size: wgpu::Extent3d {
+                    width: w.max(1),
+                    height: h.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default()),
+    )
 }
 
 #[cfg(test)]
