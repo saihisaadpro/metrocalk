@@ -34,6 +34,8 @@ fn main() {
             "multi_material_quad.glb",
             metrocalk_assets::demo::multi_material_quad_glb(),
         ),
+        // M11.1 static-collider fixture — a plain cube (flat top a dropped ball rests on).
+        ("cube.glb", metrocalk_assets::demo::cube_glb()),
     ] {
         let path = out.join(name);
         std::fs::write(&path, &bytes).expect("write fixture");

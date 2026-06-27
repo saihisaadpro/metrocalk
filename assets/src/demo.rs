@@ -338,6 +338,14 @@ pub fn healthbar_glb() -> Vec<u8> {
     build_glb("healthbar", &[frame, fill], &[])
 }
 
+/// A plain unit cube (one primitive/material) — the M11.1 static-collider fixture: a wide flat top a
+/// dropped ball rests on, whose convex hull is the box itself.
+#[must_use]
+pub fn cube_glb() -> Vec<u8> {
+    let cube = box_prim([-0.5, -0.5, -0.5], [0.5, 0.5, 0.5], [0.55, 0.58, 0.65, 1.0]);
+    build_glb("cube", &[cube], &[])
+}
+
 /// A faceted octahedron prop — distinctly non-cube, and authored with **no** normals so the GPU
 /// packer derives them (smooth-normal derivation path).
 #[must_use]

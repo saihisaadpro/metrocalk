@@ -220,6 +220,39 @@ pub fn make_dynamic(
     engine.commit("make-dynamic", ops)
 }
 
+/// M11.1 (ADR-040) — make an existing (e.g. imported) mesh a **static** physics obstacle: a `fixed`
+/// `RigidBody` + a convex-hull `Collider` derived from the mesh, as ONE undoable transaction (invariant 3).
+/// Unlike [`make_dynamic`] the body never moves, so imported level geometry (a floor, ramp, platform)
+/// becomes collidable scenery that dynamic bodies rest ON without itself falling. The hull is in the mesh's
+/// normalized (unit) space, so it matches the render at `scale == 1` (a non-unit scale is a known limitation,
+/// shared with the URDF/convex-hull path).
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the commit fails.
+pub fn make_static(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    id: EntityId,
+) -> Result<(), PipelineError> {
+    // A fixed RigidBody (no mass — `BodyKind::Fixed` ignores it) + the `provides Physics` pair, then a
+    // convex-hull collider (shared with `collider_ops`).
+    let mut ops = vec![Op::SetField {
+        entity: id,
+        component: "RigidBody".into(),
+        field: "kind".into(),
+        value: FieldValue::Str("fixed".into()),
+    }];
+    if let Some(&c) = scene.caps.get(&canonical("Physics")) {
+        ops.push(Op::AddPair {
+            entity: id,
+            rel: scene.rels.provides,
+            target: c,
+        });
+    }
+    collider_ops(&mut ops, scene, id, true, 0.5);
+    engine.commit("make-static", ops)
+}
+
 /// The `NoCollider` fix: add just a `Collider` (a derived convex hull, or a ball) to a body that lacks
 /// one — one undoable transaction.
 ///
@@ -310,6 +343,36 @@ mod tests {
         assert!(!looks_dynamic(&e, id), "it's no longer a dead model");
 
         // ONE undoable transaction.
+        assert!(e.undo());
+        assert!(!e.components_of(id).contains_key("RigidBody"));
+        assert!(!e.components_of(id).contains_key("Collider"));
+    }
+
+    #[test]
+    fn make_static_gives_a_fixed_collidable_obstacle_undoable() {
+        let (mut e, scene) = engine();
+        let id = dead_mesh(&mut e, &scene);
+
+        make_static(&mut e, &scene, id).expect("make static");
+        let comps = e.components_of(id);
+        // A FIXED RigidBody (it never moves) + a convex-hull Collider (derived from the mesh) — a valid,
+        // collidable static obstacle, not a dynamic body.
+        assert_eq!(
+            comps.get("RigidBody").and_then(|m| m.get("kind")),
+            Some(&FieldValue::Str("fixed".into())),
+            "the obstacle is a FIXED body"
+        );
+        assert_eq!(
+            comps.get("Collider").and_then(|m| m.get("shape")),
+            Some(&FieldValue::Str("convexHull".into())),
+            "a convex hull derived from the mesh"
+        );
+        assert!(
+            check_physics(&e, id, None).is_empty(),
+            "correct by construction"
+        );
+
+        // ONE undoable transaction — Ctrl-Z removes the whole obstacle.
         assert!(e.undo());
         assert!(!e.components_of(id).contains_key("RigidBody"));
         assert!(!e.components_of(id).contains_key("Collider"));

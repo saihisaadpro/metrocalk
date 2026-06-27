@@ -87,6 +87,9 @@ pub enum Record {
     /// Replayed by re-running it on the same id (deterministic); the engine thread re-hydrates the sim
     /// body from the restored components.
     MakeDynamic { id: String },
+    /// M11.1 make-static: an existing (imported) mesh turned into a STATIC physics obstacle (a fixed
+    /// RigidBody + a convex-hull Collider). Replayed by re-running it on the same id (deterministic).
+    MakeStatic { id: String },
     /// M8.3 one-click physics fix (`add-collider`/`use-hull`/`fix-mass`/`fix-scale`) on an entity.
     /// Replayed by re-applying the same fix so the corrected setup survives reload.
     PhysicsFix { id: String, action: String },
@@ -309,6 +312,8 @@ impl Log {
                 Record::MakeDynamic { id } => EntityId::from_loro_key(&id).is_some_and(|e| {
                     crate::physics_intent::make_dynamic(engine, scene, e, 1.0).is_ok()
                 }),
+                Record::MakeStatic { id } => EntityId::from_loro_key(&id)
+                    .is_some_and(|e| crate::physics_intent::make_static(engine, scene, e).is_ok()),
                 Record::PhysicsFix { id, action } => {
                     EntityId::from_loro_key(&id).is_some_and(|e| match action.as_str() {
                         "add-collider" => {

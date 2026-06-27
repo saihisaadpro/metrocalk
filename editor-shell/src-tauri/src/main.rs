@@ -499,6 +499,11 @@ enum EngineCmd {
         id: String,
         reply: Sender<bool>,
     },
+    /// M11.1 — make an existing (imported) mesh a STATIC physics obstacle (fixed body + hull collider).
+    MakeStatic {
+        id: String,
+        reply: Sender<bool>,
+    },
     /// M8.3 — run the collider-intelligence catalogue for an entity (a read); replies the warnings.
     PhysicsCheck {
         id: String,
@@ -3000,6 +3005,37 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 let _ = reply.send(ok);
             }
+            EngineCmd::MakeStatic { id, reply } => {
+                // M11.1 — imported mesh → STATIC collidable obstacle (fixed body + hull collider) in one
+                // undoable commit, mirrored into the sim so dynamic bodies rest ON it. The sim run-state is
+                // left as-is (a static obstacle doesn't animate; a later drop starts it).
+                let ok = if let Some(eid) = EntityId::from_loro_key(&id) {
+                    match physics_intent::make_static(&mut engine, &scene, eid) {
+                        Ok(()) => {
+                            (recording, rec_entities, sim, body_of) =
+                                restart_run(&engine, &assets, &sim, &body_of);
+                            frame = 0;
+                            max_frame = 0;
+                            log.append(&Record::MakeStatic { id: id.clone() });
+                            echo_created(
+                                &mut engine,
+                                &shared,
+                                &mut positions,
+                                &assets,
+                                &channel,
+                                &mut recency,
+                                &mut touch,
+                                eid,
+                            );
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                } else {
+                    false
+                };
+                let _ = reply.send(ok);
+            }
             EngineCmd::PhysicsCheck { id, reply } => {
                 let warns = EntityId::from_loro_key(&id)
                     .map(|eid| {
@@ -4331,6 +4367,18 @@ fn make_dynamic(state: State<AppState>, id: String) -> bool {
     rx.recv().unwrap_or(false)
 }
 
+/// M11.1 — make an imported mesh a STATIC collidable obstacle (a fixed body + a convex-hull collider) so
+/// dynamic bodies rest ON it. One undoable commit; survives reload. Returns whether it applied.
+#[tauri::command]
+fn make_static(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::MakeStatic { id, reply }).is_err() {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
 /// M8.3 — the collider-intelligence warnings for an entity (each explained + a one-click fix id). A read.
 #[tauri::command]
 fn physics_check(state: State<AppState>, id: String) -> Vec<PhysicsWarning> {
@@ -5651,6 +5699,7 @@ fn main() {
             physics_debug,
             body_sim_position,
             make_dynamic,
+            make_static,
             physics_check,
             physics_fix,
             sim_scrub,
