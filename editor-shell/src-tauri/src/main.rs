@@ -1640,12 +1640,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 "[shell] import: failed to persist asset bytes — it may not survive reload: {e}"
                             );
                         }
-                        if let Ok(id) =
-                            capscene::place_mesh(&mut engine, &scene, &handle, [0.0, 1.0, 0.0])
-                        {
+                        // M11.1 — lay successive imports out on a grid so they don't stack on the same spot
+                        // (the persisted record keeps the chosen pos, so reload restores the same layout).
+                        let pos = next_import_pos(&engine);
+                        if let Ok(id) = capscene::place_mesh(&mut engine, &scene, &handle, pos) {
                             log.append(&Record::PlaceMesh {
                                 asset: handle.clone(),
-                                pos: [0.0, 1.0, 0.0],
+                                pos,
                             });
                             echo_created(
                                 &mut engine,
@@ -3104,6 +3105,22 @@ fn body_spawn_pos(engine: &Engine<FlecsWorld>, id: EntityId) -> [f64; 3] {
         })
     };
     [get("x"), get("y"), get("z")]
+}
+
+/// M11.1 — a non-overlapping spawn position for an imported mesh: a 4-wide grid (2.5u spacing, y=1),
+/// indexed by how many mesh entities already exist, so successive imports lay out side by side instead of
+/// stacking on the same spot. Resets naturally with the scene (a cleared scene → index 0 again).
+fn next_import_pos(engine: &Engine<FlecsWorld>) -> [f32; 3] {
+    let n = engine
+        .entity_ids()
+        .iter()
+        .filter(|id| engine.components_of(**id).contains_key("MeshRenderer"))
+        .count();
+    const COLS: usize = 4;
+    const SPACING: f32 = 2.5;
+    let col = (n % COLS) as f32;
+    let row = (n / COLS) as f32;
+    [(col - 1.5) * SPACING, 1.0, row * SPACING]
 }
 
 /// The entity's mesh geometry (positions as f64 + indices) from its `MeshRenderer.mesh` slot — for M8.3
