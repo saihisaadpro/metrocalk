@@ -21,14 +21,19 @@
 
 use std::fmt::Write as _;
 
-/// One primitive to encode: positions, optional normals, triangle indices, a base color, and an
-/// optional base-color texture (index into the builder's textures).
+/// One primitive to encode: positions, optional normals + UVs, triangle indices, a base color, and
+/// optional PBR textures (each an index into the builder's textures). `texture` = base-color,
+/// `mr_texture` = metallic-roughness (G=roughness, B=metallic), `normal_texture` = tangent-space normal.
+#[derive(Default)]
 struct PrimSpec {
     positions: Vec<[f32; 3]>,
     normals: Option<Vec<[f32; 3]>>,
+    uvs: Option<Vec<[f32; 2]>>,
     indices: Vec<u16>,
     base_color: [f32; 4],
     texture: Option<usize>,
+    mr_texture: Option<usize>,
+    normal_texture: Option<usize>,
 }
 
 // glTF component / target / type constants.
@@ -131,6 +136,14 @@ fn build_glb(name: &str, prims: &[PrimSpec], textures: &[Vec<u8>]) -> Vec<u8> {
             let n_acc = b.add_accessor(n_view, FLOAT, normals.len(), "VEC3", None);
             let _ = write!(attrs, ",\"NORMAL\":{n_acc}");
         }
+        // TEXCOORD_0 (optional) — required for textures to sample spatially (without it the importer
+        // reads no UVs and every vertex samples texel 0, i.e. a flat color).
+        if let Some(uvs) = &prim.uvs {
+            let uv_bytes = f32_le(uvs.iter().flat_map(|p| p.iter().copied()));
+            let uv_view = b.add_view(&uv_bytes, Some(ARRAY_BUFFER));
+            let uv_acc = b.add_accessor(uv_view, FLOAT, uvs.len(), "VEC2", None);
+            let _ = write!(attrs, ",\"TEXCOORD_0\":{uv_acc}");
+        }
         // indices (u16)
         let mut idx_bytes = Vec::new();
         for &i in &prim.indices {
@@ -144,12 +157,18 @@ fn build_glb(name: &str, prims: &[PrimSpec], textures: &[Vec<u8>]) -> Vec<u8> {
         ));
 
         let [r, g, bl, a] = prim.base_color;
-        let tex = prim.texture.map_or(String::new(), |t| {
-            format!(",\"baseColorTexture\":{{\"index\":{t}}}")
+        let mut pbr = format!("\"baseColorFactor\":[{r},{g},{bl},{a}]");
+        if let Some(t) = prim.texture {
+            let _ = write!(pbr, ",\"baseColorTexture\":{{\"index\":{t}}}");
+        }
+        if let Some(t) = prim.mr_texture {
+            let _ = write!(pbr, ",\"metallicRoughnessTexture\":{{\"index\":{t}}}");
+        }
+        // `normalTexture` is a material-level sibling of pbrMetallicRoughness (not inside it).
+        let normal = prim.normal_texture.map_or(String::new(), |t| {
+            format!(",\"normalTexture\":{{\"index\":{t}}}")
         });
-        material_json.push(format!(
-            "{{\"pbrMetallicRoughness\":{{\"baseColorFactor\":[{r},{g},{bl},{a}]{tex}}}}}"
-        ));
+        material_json.push(format!("{{\"pbrMetallicRoughness\":{{{pbr}}}{normal}}}"));
     }
 
     // Embedded PNG textures (as bufferView images).
@@ -298,7 +317,7 @@ fn box_prim(min: [f32; 3], max: [f32; 3], color: [f32; 4]) -> PrimSpec {
         normals: Some(normals),
         indices,
         base_color: color,
-        texture: None,
+        ..Default::default()
     }
 }
 
@@ -342,7 +361,7 @@ pub fn prop_glb() -> Vec<u8> {
         normals: None,
         indices,
         base_color: [0.20, 0.70, 0.75, 1.0],
-        texture: None,
+        ..Default::default()
     };
     build_glb("prop", &[prim], &[])
 }
@@ -383,7 +402,7 @@ pub fn sphere_glb() -> Vec<u8> {
         normals: Some(normals),
         indices,
         base_color: [0.95, 0.55, 0.20, 1.0], // amber — distinct from the scene cubes/props
-        texture: None,
+        ..Default::default()
     };
     build_glb("sphere", &[prim], &[])
 }
@@ -405,8 +424,102 @@ pub fn textured_quad_glb() -> Vec<u8> {
         indices,
         base_color: [1.0, 1.0, 1.0, 1.0],
         texture: Some(0),
+        ..Default::default()
     };
     build_glb("textured", &[prim], &[checker_png()])
+}
+
+/// A unit quad (XY plane, +Z normal, UVs spanning [0,1]) carrying a **full PBR texture set**: a solid
+/// light base color, a metallic-roughness map split left|right (smooth metal | rough dielectric), and a
+/// tangent-space **normal map** encoding a sinusoidal ripple relief. This is the M11.2 follow-up fixture
+/// — on a flat quad under a grazing light it shows the normal-mapped relief + the metallic split, the
+/// positive MR/normal *visual*, and it exercises the importer's 3-slot texture-decode path.
+#[must_use]
+pub fn normal_mapped_quad_glb() -> Vec<u8> {
+    let positions = vec![
+        [-0.5, -0.5, 0.0],
+        [0.5, -0.5, 0.0],
+        [0.5, 0.5, 0.0],
+        [-0.5, 0.5, 0.0],
+    ];
+    let normals = vec![[0.0, 0.0, 1.0]; 4];
+    let uvs = vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let indices = vec![0, 1, 2, 0, 2, 3];
+    let prim = PrimSpec {
+        positions,
+        normals: Some(normals),
+        uvs: Some(uvs),
+        indices,
+        base_color: [1.0, 1.0, 1.0, 1.0],
+        texture: Some(0),
+        mr_texture: Some(1),
+        normal_texture: Some(2),
+    };
+    build_glb(
+        "normal_mapped",
+        &[prim],
+        &[gray_base_png(), mr_split_png(), ripple_normal_png()],
+    )
+}
+
+/// Encode an RGBA8 buffer as PNG bytes (via the crate's pinned, wasm-clean `image`).
+fn encode_png_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Vec<u8> {
+    let img = image::RgbaImage::from_raw(width, height, rgba).expect("rgba dims match");
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .expect("encode png");
+    out.into_inner()
+}
+
+/// A solid light-grey base-color PNG (so the normal/MR relief dominates the look, not a busy albedo).
+fn gray_base_png() -> Vec<u8> {
+    const N: u32 = 8;
+    let rgba: Vec<u8> = (0..N * N).flat_map(|_| [200u8, 200, 205, 255]).collect();
+    encode_png_rgba(N, N, rgba)
+}
+
+/// A metallic-roughness PNG split left|right: left half = smooth metal (B=metal high, G=rough low),
+/// right half = rough dielectric (B=0, G high). Sampled in `fs_mesh` as `metallic *= B`, `roughness *= G`.
+fn mr_split_png() -> Vec<u8> {
+    const N: u32 = 16;
+    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
+    for _y in 0..N {
+        for x in 0..N {
+            let metal_half = x < N / 2;
+            let g = if metal_half { 40 } else { 235 }; // roughness (G)
+            let b = if metal_half { 255 } else { 0 }; // metalness (B)
+            rgba.extend_from_slice(&[0, g, b, 255]);
+        }
+    }
+    encode_png_rgba(N, N, rgba)
+}
+
+/// A tangent-space normal map encoding a sinusoidal **ripple** relief: a height field h = sin·sin, its
+/// surface normal = normalize(-∂h/∂u, -∂h/∂v, 1), RGB-encoded (xyz·0.5+0.5, B≈1 at the flats). On a flat
+/// quad this reads as a quilted relief under a grazing light — proof the normal map drives the shading.
+fn ripple_normal_png() -> Vec<u8> {
+    const N: u32 = 64;
+    const F: f32 = 4.0; // ripple cycles across the tile
+    const G: f32 = 0.7; // peak relief gradient (≈ tan of the steepest tilt)
+    let tau_f = std::f32::consts::TAU * F;
+    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
+    for y in 0..N {
+        for x in 0..N {
+            let u = x as f32 / N as f32;
+            let v = y as f32 / N as f32;
+            // ∂h/∂u, ∂h/∂v of the height field h = sin(τF u)·sin(τF v).
+            let grad = [
+                G * (tau_f * u).cos() * (tau_f * v).sin(),
+                G * (tau_f * u).sin() * (tau_f * v).cos(),
+            ];
+            let len = (grad[0] * grad[0] + grad[1] * grad[1] + 1.0).sqrt();
+            let n = [-grad[0] / len, -grad[1] / len, 1.0 / len];
+            let enc = |c: f32| ((c * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+            rgba.extend_from_slice(&[enc(n[0]), enc(n[1]), enc(n[2]), 255]);
+        }
+    }
+    encode_png_rgba(N, N, rgba)
 }
 
 /// A quad whose triangle-list index count is **not** a multiple of 3 (5 indices) — a deliberately
@@ -424,7 +537,7 @@ pub fn malformed_indices_glb() -> Vec<u8> {
         normals: None,
         indices: vec![0, 1, 2, 0, 3], // 5 — not a multiple of 3
         base_color: [0.5, 0.5, 0.5, 1.0],
-        texture: None,
+        ..Default::default()
     };
     build_glb("malformed", &[prim], &[])
 }

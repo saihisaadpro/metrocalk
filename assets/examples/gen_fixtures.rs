@@ -23,6 +23,12 @@ fn main() {
         ("healthbar.glb", metrocalk_assets::demo::healthbar_glb()),
         ("prop.glb", metrocalk_assets::demo::prop_glb()),
         ("sphere.glb", metrocalk_assets::demo::sphere_glb()),
+        // M11.2 follow-up — a full-PBR demo tile (base + metallic-roughness + normal map) for the
+        // positive MR/normal visual check.
+        (
+            "normal_mapped_quad.glb",
+            metrocalk_assets::demo::normal_mapped_quad_glb(),
+        ),
     ] {
         let path = out.join(name);
         std::fs::write(&path, &bytes).expect("write fixture");

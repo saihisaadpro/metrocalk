@@ -200,6 +200,62 @@ mod tests {
     }
 
     #[test]
+    fn gltf_extracts_base_color_metallic_roughness_and_normal_textures() {
+        // M11.2 follow-up: the importer must pull ALL THREE PBR texture slots (base-color, metallic-
+        // roughness, normal) from a glTF material — not just base-color — decode each image once, and
+        // carry UVs so the textures sample across the surface. The render path (gpu.rs / scene.wgsl)
+        // already consumes all three; this guards the extraction half that feeds it.
+        let asset =
+            match import_any(&crate::demo::normal_mapped_quad_glb()).expect("normal-mapped glb") {
+                ImportedAsset::Mesh(m) => m,
+                ImportedAsset::Audio(_) => panic!("a glb must route to a mesh"),
+            };
+        // All three distinct images decoded (the 3-slot decode path), not just the base-color one.
+        assert_eq!(asset.textures.len(), 3, "all three PBR textures decoded");
+
+        let mat = asset.materials.first().expect("one material");
+        assert!(
+            mat.base_color_texture.is_some(),
+            "base-color slot extracted"
+        );
+        assert!(
+            mat.metallic_roughness_texture.is_some(),
+            "metallic-roughness slot extracted (was previously dropped)"
+        );
+        assert!(
+            mat.normal_texture.is_some(),
+            "normal slot extracted (was previously dropped)"
+        );
+
+        // The three slots map to THREE DISTINCT in-range textures (no MR↔normal aliasing / remap bug).
+        let mut idxs = vec![
+            mat.base_color_texture.unwrap(),
+            mat.metallic_roughness_texture.unwrap(),
+            mat.normal_texture.unwrap(),
+        ];
+        assert!(
+            idxs.iter().all(|&i| i < asset.textures.len()),
+            "slot indices in range"
+        );
+        idxs.sort_unstable();
+        idxs.dedup();
+        assert_eq!(idxs.len(), 3, "the three slots are three distinct textures");
+
+        // UVs (TEXCOORD_0) flowed through so the maps sample spatially (without them every vertex
+        // samples texel 0 → a flat color, the silent failure this fixture's UVs guard against).
+        let prim = asset.primitives.first().expect("one primitive");
+        assert_eq!(
+            prim.uvs.len(),
+            prim.positions.len(),
+            "per-vertex UVs present"
+        );
+        assert!(
+            prim.uvs.iter().any(|uv| uv[0] != 0.0 || uv[1] != 0.0),
+            "UVs span the surface (not all zero)"
+        );
+    }
+
+    #[test]
     fn detect_is_extension_independent_and_rejects_unknown() {
         assert_eq!(detect(&crate::demo::checker_png()), Some(Detected::Image));
         assert_eq!(detect(&crate::demo::healthbar_glb()), Some(Detected::Gltf));
