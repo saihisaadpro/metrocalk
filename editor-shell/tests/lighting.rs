@@ -138,8 +138,19 @@ fn the_light_component_carries_only_authored_declaration_no_render_projection_le
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["b", "g", "intensity", "kind", "r"],
-        "the doc carries ONLY the authored light declaration — no computed render-projection field \
-         (a shadow matrix / light_view_proj / shadow_caster / baked lit result) leaked into Loro (ADR-021)"
+        [
+            "b",
+            "castShadows",
+            "dirX",
+            "dirY",
+            "dirZ",
+            "g",
+            "intensity",
+            "kind",
+            "r"
+        ],
+        "the doc carries ONLY the authored light DECLARATION (kind/colour/intensity + the M11.3 authorable \
+         direction + castShadows) — no COMPUTED render-projection field (a shadow matrix / light_view_proj / \
+         shadow_caster index / baked lit result) leaked into Loro (ADR-021)"
     );
 }

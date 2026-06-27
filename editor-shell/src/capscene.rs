@@ -604,6 +604,24 @@ pub fn add_light(
             value: FieldValue::Number(f64::from(v)),
         });
     }
+    // M11.3 — author the shine DIRECTION (a directional light defaults straight down) + whether the light
+    // CASTS the shadow map, as REAL component fields so they EXIST on the entity: the data-driven inspector
+    // can edit/toggle them (one undoable `SetField`), and `collect_lights` reads the authored values instead
+    // of its absent-field fallbacks. (Render-only effect; the lit/shadow RESULT stays a projection — ADR-021.)
+    for (f, v) in [("dirX", 0.0_f32), ("dirY", -1.0), ("dirZ", 0.0)] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Light".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        });
+    }
+    ops.push(Op::SetField {
+        entity: id,
+        component: "Light".into(),
+        field: "castShadows".into(),
+        value: FieldValue::Bool(true),
+    });
     if let Some(&c) = scene.caps.get(&canonical("Lighting")) {
         ops.push(Op::AddPair {
             entity: id,

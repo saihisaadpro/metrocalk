@@ -5644,7 +5644,7 @@ Objects:  {\n\
 #[cfg(test)]
 mod lighting_debug_tests {
     use super::collect_lights;
-    use metrocalk_core::Engine;
+    use metrocalk_core::{Engine, FieldValue, Op};
     use metrocalk_ecs::FlecsWorld;
     use metrocalk_editor_shell::capscene::{self, CapScene};
 
@@ -5700,5 +5700,43 @@ mod lighting_debug_tests {
             "the synthesized default returns after undo"
         );
         assert_eq!(caster2, Some(0));
+    }
+
+    #[test]
+    fn toggling_cast_shadows_off_drops_the_light_as_the_shadow_caster() {
+        // M11.3 authorability: `add_light` now writes a real `castShadows` field, so the inspector can
+        // toggle it (a `SetField` — the exact op `submit_edit` emits). With the only light's shadows off,
+        // nothing casts (collect_lights only promotes a directional whose castShadows isn't Bool(false)).
+        let (mut e, scene) = engine();
+        let id = capscene::add_light(
+            &mut e,
+            &scene,
+            "directional",
+            [0.0, 8.0, 0.0],
+            [1.0, 1.0, 1.0],
+            3.0,
+        )
+        .expect("add a directional light");
+        assert_eq!(
+            collect_lights(&e).1,
+            Some(0),
+            "a fresh directional casts by default"
+        );
+        // The inspector's mechanism: one undoable SetField on the now-EXISTING castShadows field.
+        e.commit(
+            "toggle-shadows",
+            vec![Op::SetField {
+                entity: id,
+                component: "Light".into(),
+                field: "castShadows".into(),
+                value: FieldValue::Bool(false),
+            }],
+        )
+        .expect("toggle castShadows off");
+        assert_eq!(
+            collect_lights(&e).1,
+            None,
+            "with the only light's shadows toggled off, nothing casts (the authorable toggle works)"
+        );
     }
 }
