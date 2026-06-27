@@ -5097,6 +5097,17 @@ fn set_snap(state: State<AppState>, on: bool) {
     state.shared.lock().unwrap().snap_disabled = !on;
 }
 
+/// M11.4 — set the post-processing exposure (a linear multiplier applied before the ACES tonemap in
+/// `display_encode`). Render-only state (no engine round-trip, 0-IPC, never Loro — ADR-021), clamped to a
+/// sane range so the scene can't go fully black or blown out. Returns the applied value.
+#[tauri::command]
+fn set_exposure(state: State<AppState>, exposure: f32) -> f32 {
+    ipc();
+    let e = exposure.clamp(0.05, 8.0);
+    state.shared.lock().unwrap().exposure = e;
+    e
+}
+
 /// M9.4 — the current snap **ghost** position during a drag (the nearest target the dragged entity will
 /// snap to), or `None` (no candidate in range / not dragging). The HUD + E2E read it.
 #[tauri::command]
@@ -5542,6 +5553,7 @@ fn main() {
             apply_constraint,
             placement_sentence,
             set_snap,
+            set_exposure,
             snap_ghost,
             gizmo_debug,
             project_state,

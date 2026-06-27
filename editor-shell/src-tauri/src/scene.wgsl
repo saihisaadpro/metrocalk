@@ -251,7 +251,9 @@ fn to_srgb(x: vec3<f32>) -> vec3<f32> {
     return pow(x, vec3<f32>(1.0 / 2.2));
 }
 fn display_encode(hdr: vec3<f32>) -> vec3<f32> {
-    return to_srgb(tonemap_aces(hdr));
+    // M11.4 — apply post EXPOSURE (cam.shadow.y, a linear multiplier set by `set_exposure`) before the ACES
+    // tonemap, so a too-bright/too-dark HDR scene can be balanced without touching lights.
+    return to_srgb(tonemap_aces(hdr * cam.shadow.y));
 }
 
 // GGX/Trowbridge-Reitz normal distribution.

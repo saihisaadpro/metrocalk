@@ -120,6 +120,10 @@ pub struct SceneState {
     /// The camera look-at target (orbit centre). Default origin; `focus_entity` sets it to an entity's
     /// position so the camera frames it. Orbit/zoom stay relative to this target.
     pub cam_target: [f32; 3],
+    /// M11.4 — post-processing exposure (a linear multiplier applied before the ACES tonemap in
+    /// `display_encode`). Render-only state (a projection, never Loro/undo — like the camera pose), set by
+    /// `set_exposure` (0-IPC). 0 is treated as "uninitialised" → defaults to 1.0.
+    pub exposure: f32,
     /// M3.3 Focus mode: the focused instance index (`Some` ⇒ focus active). Drives the shader dim
     /// (`focus_active` uniform) so every *other* entity grays out, and is the camera-frame target.
     /// Cleared by `unfocus` ("everything comes back to normal"). The focused entity is also the
@@ -1185,11 +1189,14 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
 
         // read shared state; re-upload instances on revision change (picking is NOT serviced here —
         // it's done synchronously in the viewport_pick command, decoupled from the frame cadence)
-        let (cam, cam_eye, focus_active, gizmo_verts, light_vp, caster_idx) = {
+        let (cam, cam_eye, focus_active, gizmo_verts, light_vp, caster_idx, exposure) = {
             let mut st = shared.lock().unwrap();
             if st.distance == 0.0 {
                 st.distance = 60.0;
                 st.elevation = 0.4;
+            }
+            if st.exposure == 0.0 {
+                st.exposure = 1.0; // M11.4 — default exposure (0 = uninitialised)
             }
             // Camera input — entirely native (invariant 4): fold in any wheel zoom, and while a
             // right-drag is active, poll the OS cursor and orbit by its per-frame delta. No `invoke`
@@ -1454,6 +1461,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 gizmo_verts,
                 light_vp,
                 caster_idx,
+                st.exposure,
             )
         };
         queue.write_buffer(
@@ -1464,7 +1472,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 inv_view_proj: cam.inverse().to_cols_array_2d(),
                 light_view_proj: light_vp.to_cols_array_2d(),
                 focus: [focus_active, cam_eye[0], cam_eye[1], cam_eye[2]],
-                shadow: [caster_idx, 0.0, 0.0, 0.0],
+                shadow: [caster_idx, exposure, 0.0, 0.0], // .y = M11.4 post exposure (display_encode)
             }),
         );
         // M9.1: upload the gizmo handle geometry (tiny — regenerated each frame at the selection).
