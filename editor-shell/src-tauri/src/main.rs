@@ -1075,6 +1075,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // with the sim frozen (`sim_running == false` while `play_mode`).
     let mut play_mode = false;
     let mut play_snapshot: Option<Vec<u8>> = None;
+    // M11.4 (ADR-043) — Play renders through the ACTIVE scene camera. On Play we snapshot the active
+    // camera's view into the render override (`cam_override`, a projection — never Loro/undo, ADR-021),
+    // saving whatever the editor view was (fly-cam or a manual look-through); on Stop we restore it.
+    let mut pre_play_cam: Option<render::CamView> = None;
     // A fixed-cadence heartbeat (~60/s) on its own thread enqueues `Tick` via the engine's own sender, so
     // the sim advances ON the engine thread (off the JS hot path, invariant 4) without blocking the
     // command loop. A `Tick` is a no-op until the sim is running with at least one body.
@@ -2284,6 +2288,22 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 if !play_mode {
                     play_snapshot = Some(engine.snapshot());
                     play_mode = true;
+                    // M11.4 (ADR-043) — render through the active scene camera while playing. Save the
+                    // pre-Play editor view so Stop restores it; if no camera is active, keep the current
+                    // view (fly-cam or a manual look-through). Render-only — never touches the doc.
+                    let active = capscene::active_camera(&engine);
+                    {
+                        let mut st = shared.lock().unwrap();
+                        pre_play_cam = st.cam_override;
+                        if let Some((p, fov, near, far)) = active {
+                            st.cam_override = Some(render::CamView {
+                                pos: p,
+                                fov_deg: fov,
+                                near,
+                                far,
+                            });
+                        }
+                    }
                     (recording, rec_entities, sim, body_of) =
                         restart_run(&engine, &assets, &sim, &body_of);
                     frame = 0;
@@ -2331,6 +2351,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     }
                     play_mode = false;
                     sim_running = false;
+                    // M11.4 — leave look-through: restore the pre-Play editor view (fly-cam or manual).
+                    shared.lock().unwrap().cam_override = pre_play_cam.take();
                     recency.clear(); // ECS handles changed on the restore swap — drop stale ranking state
                     touch = 0;
                     rebuild(&engine, &shared, &mut positions, &assets);
