@@ -66,6 +66,13 @@ pub enum Record {
         color: [f32; 3],
         intensity: f32,
     },
+    /// M11.4 (ADR-043) — an authored scene Camera entity (Transform pos + fov + active). Replayed by id
+    /// (same alloc) so it survives close→reopen; the look-through view-proj is a render projection, never logged.
+    AddCamera {
+        pos: [f32; 3],
+        fov: f32,
+        active: bool,
+    },
     /// A physics-body spawn (M8.2): a dynamic RigidBody + ball Collider + its ball mesh handle, at a
     /// position. Replayed by re-spawning deterministically (same id alloc); the sim body itself is
     /// RE-HYDRATED from the restored RigidBody entity by the engine thread after replay. Loro stores the
@@ -293,6 +300,9 @@ impl Log {
                     color,
                     intensity,
                 } => capscene::add_light(engine, scene, &light_kind, pos, color, intensity).is_ok(),
+                Record::AddCamera { pos, fov, active } => {
+                    capscene::add_camera(engine, scene, pos, fov, active).is_ok()
+                }
                 Record::SpawnBody { pos, mesh } => {
                     capscene::spawn_physics_body(engine, scene, mesh.as_deref(), pos, 0.45).is_ok()
                 }

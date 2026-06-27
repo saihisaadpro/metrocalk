@@ -161,11 +161,16 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("light")
             .ui_hint("kind", "enum: directional|point|spot")
             .build(),
+        // M11.4 (ADR-043): a scene camera — the view the *game* renders, distinct from the editor fly-cam.
+        // `fov`/`near`/`far` + position via the entity Transform; `active` picks which one Play / look-through
+        // renders from. Authoring a camera is one undoable component commit (rides the registry); the editor
+        // fly-cam stays render/tool state (never Loro). The look-through view-proj is a render projection.
         ComponentMeta::builder("Camera")
             .category("Props")
             .field("fov", Number, false)
             .field("near", Number, false)
             .field("far", Number, false)
+            .field("active", Boolean, false)
             .requires("Spatial")
             .provides("View")
             .tag("3d")

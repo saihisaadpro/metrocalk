@@ -633,6 +633,85 @@ pub fn add_light(
     Ok(id)
 }
 
+/// M11.4 (ADR-043) — author a scene Camera entity: a `Transform` position + a `Camera` component
+/// (fov/near/far + `active`). ONE undoable commit; replayed by id so it survives close→reopen. The active
+/// scene camera is what look-through / Play renders from; the editor fly-cam stays separate render state.
+pub fn add_camera(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    pos: [f32; 3],
+    fov_deg: f32,
+    active: bool,
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    for (f, v) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        });
+    }
+    for (f, v) in [("fov", fov_deg), ("near", 0.1), ("far", 500.0)] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Camera".into(),
+            field: f.into(),
+            value: FieldValue::Number(f64::from(v)),
+        });
+    }
+    ops.push(Op::SetField {
+        entity: id,
+        component: "Camera".into(),
+        field: "active".into(),
+        value: FieldValue::Bool(active),
+    });
+    if let Some(&c) = scene.caps.get(&canonical("View")) {
+        ops.push(Op::AddPair {
+            entity: id,
+            rel: scene.rels.provides,
+            target: c,
+        });
+    }
+    engine.commit("add-camera", ops)?;
+    Ok(id)
+}
+
+/// M11.4 — the active scene camera's `(position, fov_deg, near, far)` for look-through, or `None` if none
+/// is active. The first entity with a `Camera` component whose `active` isn't explicitly `false`. Read-only
+/// (a render projection: the look-through view-proj is never Loro/undo — ADR-021).
+#[must_use]
+pub fn active_camera(engine: &Engine<FlecsWorld>) -> Option<([f32; 3], f32, f32, f32)> {
+    let num = |m: &std::collections::HashMap<String, FieldValue>, f: &str, d: f32| -> f32 {
+        match m.get(f) {
+            Some(FieldValue::Number(n)) => *n as f32,
+            Some(FieldValue::Integer(i)) => *i as f32,
+            _ => d,
+        }
+    };
+    for id in engine.entity_ids() {
+        let comps = engine.components_of(id);
+        let Some(cam) = comps.get("Camera") else {
+            continue;
+        };
+        if matches!(cam.get("active"), Some(FieldValue::Bool(false))) {
+            continue; // explicitly inactive
+        }
+        let t = comps.get("Transform");
+        let pos = t.map_or([0.0, 0.0, 0.0], |tm| {
+            [num(tm, "x", 0.0), num(tm, "y", 0.0), num(tm, "z", 0.0)]
+        });
+        return Some((
+            pos,
+            num(cam, "fov", 55.0),
+            num(cam, "near", 0.1),
+            num(cam, "far", 500.0),
+        ));
+    }
+    None
+}
+
 /// Spawn a complete, simulatable physics body as ONE undoable transaction (M8.2): a `Transform` + a
 /// dynamic `RigidBody` + a ball `Collider` + (optionally) a `MeshRenderer` handle so it renders as a real
 /// mesh, plus the physics capability pairs the reveal/attach use. This is ECS-authoritative **setup** —

@@ -355,6 +355,26 @@ enum EngineCmd {
     LightingDebug {
         reply: Sender<(usize, usize, i64, i64)>,
     },
+    /// M11.4 — author a scene Camera entity (Transform pos + Camera{fov,near,far,active}), one undoable
+    /// commit. Replies its id.
+    AddCamera {
+        pos: [f32; 3],
+        fov: f32,
+        active: bool,
+        reply: Sender<Option<String>>,
+    },
+    /// M11.4 — LOOK THROUGH the active scene camera (`on`) or back to the editor fly-cam (`!on`): snapshots
+    /// the active Camera entity's view into the render override (a projection, never Loro). Replies whether
+    /// an active camera was found (when `on`).
+    LookThrough {
+        on: bool,
+        reply: Sender<bool>,
+    },
+    /// M11.4 — a non-mutating camera read for the gate: (count of authored Camera entities, an active one
+    /// present, the active fov in degrees or -1).
+    CameraDebug {
+        reply: Sender<(usize, bool, f32)>,
+    },
     /// Rename an entity (`__meta__.name`) → reply applied.
     RenameEntity {
         id: String,
@@ -1410,6 +1430,54 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .map_or(-1, |l| l.pos_kind[3] as i64);
                 let shadow_caster = caster.map_or(-1, |i| i as i64);
                 let _ = reply.send((authored, lights.len(), shadow_caster, caster_kind));
+            }
+            EngineCmd::AddCamera {
+                pos,
+                fov,
+                active,
+                reply,
+            } => {
+                // M11.4 — author a scene Camera entity (one undoable commit, persisted).
+                let new = capscene::add_camera(&mut engine, &scene, pos, fov, active).ok();
+                if new.is_some() {
+                    log.append(&Record::AddCamera { pos, fov, active });
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, project_full(&engine));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(new.map(|n| n.to_loro_key()));
+            }
+            EngineCmd::LookThrough { on, reply } => {
+                // Snapshot the active scene camera's view into the render override (read every frame in the
+                // camera block) — a projection, never Loro/undo (ADR-021). `on=false` → back to the fly-cam.
+                let found = if on {
+                    if let Some((p, fov, near, far)) = capscene::active_camera(&engine) {
+                        shared.lock().unwrap().cam_override = Some(render::CamView {
+                            pos: p,
+                            fov_deg: fov,
+                            near,
+                            far,
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    shared.lock().unwrap().cam_override = None;
+                    true
+                };
+                let _ = reply.send(found);
+            }
+            EngineCmd::CameraDebug { reply } => {
+                let count = engine
+                    .entity_ids()
+                    .iter()
+                    .filter(|id| engine.components_of(**id).contains_key("Camera"))
+                    .count();
+                let active = capscene::active_camera(&engine);
+                let fov = active.map_or(-1.0, |(_, f, _, _)| f);
+                let _ = reply.send((count, active.is_some(), fov));
             }
             EngineCmd::RenameEntity { id, name, reply } => {
                 let ok = EntityId::from_loro_key(&id)
@@ -4982,6 +5050,58 @@ fn lighting_debug(state: State<AppState>) -> (usize, usize, i64, i64) {
     rx.recv().unwrap_or((0, 0, -1, -1))
 }
 
+/// M11.4 — author a scene Camera entity (one undoable commit; survives reload). `pos` world position,
+/// `fov` degrees, `active` whether it's the look-through/Play camera. Replies its id.
+#[tauri::command]
+fn add_camera(
+    state: State<AppState>,
+    x: f32,
+    y: f32,
+    z: f32,
+    fov: f32,
+    active: bool,
+) -> Option<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AddCamera {
+            pos: [x, y, z],
+            fov,
+            active,
+            reply,
+        })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().unwrap_or(None)
+}
+
+/// M11.4 — look through the active scene camera (`on`) or back to the editor fly-cam (`!on`). Render-only
+/// (a projection, 0-IPC, never Loro). Replies whether an active camera was found (when `on`).
+#[tauri::command]
+fn look_through_camera(state: State<AppState>, on: bool) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::LookThrough { on, reply }).is_err() {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
+/// M11.4 — non-mutating SCENE-camera read for the gate: (authored Camera entities, an active one present,
+/// the active fov in degrees or -1). Distinct from `camera_debug`, which reports the editor fly-cam state.
+#[tauri::command]
+fn scene_camera_debug(state: State<AppState>) -> (usize, bool, f32) {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::CameraDebug { reply }).is_err() {
+        return (0, false, -1.0);
+    }
+    rx.recv().unwrap_or((0, false, -1.0))
+}
+
 /// M9.2 — a part's resolved world position + active flag + override-key count (the E2E read).
 #[tauri::command]
 fn part_debug(state: State<AppState>, id: String) -> (f64, f64, f64, bool, usize) {
@@ -5532,6 +5652,9 @@ fn main() {
             create_entity,
             add_light,
             lighting_debug,
+            add_camera,
+            look_through_camera,
+            scene_camera_debug,
             rename_entity,
             group_entities,
             ungroup_entity,

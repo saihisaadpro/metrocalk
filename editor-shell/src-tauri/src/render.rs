@@ -65,6 +65,17 @@ pub struct LightGpu {
 /// The identity quaternion (no rotation) — the default for `Instance::rotation`.
 pub const IDENTITY_QUAT: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
+/// M11.4 (ADR-043) — the active scene camera's look-through view parameters. A render PROJECTION (never
+/// Loro/undo): when `SceneState.cam_override` is `Some`, the frame renders from this scene camera instead
+/// of the editor fly-cam. Set by `look_through_camera` from the authored `Camera` entity.
+#[derive(Clone, Copy)]
+pub struct CamView {
+    pub pos: [f32; 3],
+    pub fov_deg: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
 /// Scene state shared between the app (writer, from core deltas + input) and the render loop (reader).
 #[derive(Default)]
 pub struct SceneState {
@@ -124,6 +135,9 @@ pub struct SceneState {
     /// `display_encode`). Render-only state (a projection, never Loro/undo — like the camera pose), set by
     /// `set_exposure` (0-IPC). 0 is treated as "uninitialised" → defaults to 1.0.
     pub exposure: f32,
+    /// M11.4 — look-through: when `Some`, the frame renders from this scene camera (the editor fly-cam is
+    /// bypassed). Render-only (a projection, never Loro — ADR-021); set by `look_through_camera`.
+    pub cam_override: Option<CamView>,
     /// M3.3 Focus mode: the focused instance index (`Some` ⇒ focus active). Drives the shader dim
     /// (`focus_active` uniform) so every *other* entity grays out, and is the camera-frame target.
     /// Cleared by `unfocus` ("everything comes back to normal"). The focused entity is also the
@@ -1392,7 +1406,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 lights_buf.upload(&device, &queue, &lights_bgl, &st.lights);
             }
             let aspect = w as f32 / h.max(1) as f32;
-            let cam = camera_matrix(
+            let mut cam = camera_matrix(
                 st.orbit,
                 st.elevation,
                 st.distance,
@@ -1401,7 +1415,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             );
             // The camera eye (world) — the PBR view direction in fs_mesh (M11.2). Carried in the Camera
             // uniform's spare `focus.yzw` (focus.x stays the focus-dim flag).
-            let cam_eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+            let mut cam_eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+            // M11.4 — LOOK THROUGH the active scene camera: replace the editor view-proj with the camera's
+            // (its position + fov, looking at the orbit target). A pure render projection (never Loro).
+            if let Some(ov) = st.cam_override {
+                let eye = Vec3::from(ov.pos);
+                let proj = Mat4::perspective_rh(ov.fov_deg.to_radians(), aspect, ov.near, ov.far);
+                cam = proj * Mat4::look_at_rh(eye, st.cam_target.into(), Vec3::Y);
+                cam_eye = ov.pos;
+            }
             // M11.3 inc.3 — the shadow-casting light's ortho view-proj, fitted to the live instance bounds.
             // The caster's shine direction comes from its entry in the lights buffer; `caster_idx` (as f32,
             // -1 = none) goes to the shader so the map shadows ONLY that light.
