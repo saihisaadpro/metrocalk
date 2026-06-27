@@ -4,11 +4,12 @@
 //! draw, no bindless). Pure data, no `wgpu` dependency: `bytemuck` (pure Rust, wasm-clean) makes the
 //! vertex `Pod` so the native renderer can `cast_slice` it straight into a buffer.
 //!
-//! Packing merges an asset's primitives into one interleaved vertex buffer + one index buffer (a mesh
-//! draws as a single indexed call), bakes each primitive's material base-color/metallic-roughness into the
-//! vertex stream, carries the per-vertex UV + the primary base-color texture for the renderer to sample
-//! (M11.2 follow-up — non-bindless: one texture bind group per mesh on the already-per-mesh instance group),
-//! and derives smooth normals when the source ships none.
+//! Packing merges an asset's primitives into one interleaved vertex buffer + one index buffer, partitioned
+//! into per-primitive [`SubMesh`] index ranges (a multi-material mesh draws one sub-draw per submesh), bakes
+//! each primitive's material base-color/metallic-roughness into the vertex stream, carries the per-vertex UV
+//! + each submesh's own base-color/metallic-roughness/normal textures for the renderer to sample (M11.2
+//! follow-up — non-bindless: one texture bind group per submesh on the already-per-mesh instance group), and
+//! derives smooth normals when the source ships none.
 
 // Index offsets are bounded by MAX_ELEMENTS; the f32 color baking is a display value. The fixed [_;3]
 // component loops read clearest as `0..3` (the iterator rewrite is noisier for a 3-vector), and the tests
@@ -44,22 +45,37 @@ pub struct MeshVertex {
     pub uv: [f32; 2],
 }
 
-/// A mesh ready to upload: one interleaved vertex buffer + one `u32` index buffer, plus the optional
-/// base-color texture the renderer uploads + samples (M11.2 follow-up — single primary texture per mesh;
-/// multi-texture meshes use the first, a documented limitation). `None` ⇒ the renderer binds a 1×1 white
-/// dummy so `fs_mesh` can always sample (white × the baked factor = the factor — untextured looks as before).
+/// One drawable **submesh** — a contiguous index range with its own material's textures. M11.2 follow-up:
+/// a multi-material mesh draws **one submesh per source primitive**, each binding its own base-color /
+/// metallic-roughness / normal textures (non-bindless — a separate bind group per submesh), so a model
+/// whose parts use different textures no longer renders with just the first one. `None` in a slot ⇒ the
+/// renderer binds the matching dummy (1×1 white / flat normal), so the baked vertex factor renders unchanged.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SubMesh {
+    /// Offset of this submesh's first index into [`MeshGpu::indices`].
+    pub index_offset: u32,
+    /// Number of indices this submesh draws.
+    pub index_count: u32,
+    /// Base-color (albedo) texture (RGBA8, sampled sRGB), if this submesh's material ships one.
+    pub base_color_texture: Option<crate::mesh::Texture>,
+    /// Metallic-roughness texture (RGBA8 LINEAR; glTF packing roughness=G, metalness=B), if any.
+    pub metallic_roughness_texture: Option<crate::mesh::Texture>,
+    /// Tangent-space normal map (RGBA8 LINEAR), if any.
+    pub normal_texture: Option<crate::mesh::Texture>,
+}
+
+/// A mesh ready to upload: one interleaved vertex buffer + one `u32` index buffer, partitioned into
+/// [`SubMesh`]es (M11.2 follow-up) — one per source primitive, each carrying its own material textures so a
+/// multi-material model renders every part's texture, not just the first. An untextured submesh binds the
+/// renderer's dummies (white × the baked factor = the factor — looks exactly as an untextured mesh did).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MeshGpu {
     /// Interleaved vertices.
     pub vertices: Vec<MeshVertex>,
     /// Triangle-list indices into `vertices`.
     pub indices: Vec<u32>,
-    /// The primary base-color (albedo) texture (RGBA8), if the asset ships one.
-    pub base_color_texture: Option<crate::mesh::Texture>,
-    /// The primary metallic-roughness texture (RGBA8; glTF packing roughness=G, metalness=B), if any.
-    pub metallic_roughness_texture: Option<crate::mesh::Texture>,
-    /// The primary tangent-space normal map (RGBA8), if any.
-    pub normal_texture: Option<crate::mesh::Texture>,
+    /// Drawable submeshes (one per source primitive): an index range + that primitive's material textures.
+    pub submeshes: Vec<SubMesh>,
 }
 
 impl MeshGpu {
@@ -69,9 +85,18 @@ impl MeshGpu {
     pub fn from_asset(asset: &MeshAsset) -> Self {
         let mut vertices = Vec::with_capacity(asset.vertex_count());
         let mut indices = Vec::with_capacity(asset.index_count());
+        let mut submeshes = Vec::with_capacity(asset.primitives.len());
+
+        // The texture a material references in `slot`, cloned (so the packed mesh is self-contained).
+        let tex = |mat: Option<&crate::mesh::Material>,
+                   pick: fn(&crate::mesh::Material) -> Option<usize>| {
+            mat.and_then(pick)
+                .and_then(|ti| asset.textures.get(ti).cloned())
+        };
 
         for prim in &asset.primitives {
             let base = vertices.len() as u32;
+            let index_offset = indices.len() as u32;
             let mat = asset.materials.get(prim.material);
             let color = mat.map_or([0.8, 0.8, 0.8], |m| {
                 [m.base_color[0], m.base_color[1], m.base_color[2]]
@@ -109,27 +134,24 @@ impl MeshGpu {
                     indices.push(base + tri[2]);
                 }
             }
+            // One submesh per primitive: its index range + its own material textures. Skip a primitive that
+            // contributed no valid triangles (nothing to draw).
+            let index_count = indices.len() as u32 - index_offset;
+            if index_count > 0 {
+                submeshes.push(SubMesh {
+                    index_offset,
+                    index_count,
+                    base_color_texture: tex(mat, |m| m.base_color_texture),
+                    metallic_roughness_texture: tex(mat, |m| m.metallic_roughness_texture),
+                    normal_texture: tex(mat, |m| m.normal_texture),
+                });
+            }
         }
-
-        // The primary textures: the first primitive whose material references each slot (single texture
-        // per mesh — a multi-texture mesh uses the first, a documented limitation). Cloned so the packed
-        // mesh is self-contained for the renderer to upload.
-        let tex_of = |pick: fn(&crate::mesh::Material) -> Option<usize>| {
-            asset.primitives.iter().find_map(|p| {
-                asset
-                    .materials
-                    .get(p.material)
-                    .and_then(pick)
-                    .and_then(|ti| asset.textures.get(ti).cloned())
-            })
-        };
 
         Self {
             vertices,
             indices,
-            base_color_texture: tex_of(|m| m.base_color_texture),
-            metallic_roughness_texture: tex_of(|m| m.metallic_roughness_texture),
-            normal_texture: tex_of(|m| m.normal_texture),
+            submeshes,
         }
     }
 
@@ -247,9 +269,7 @@ mod tests {
         let mut m = MeshGpu {
             vertices: vec![vtx([0.0, 0.0, 0.0]), vtx([200.0, 100.0, 20.0])],
             indices: vec![],
-            base_color_texture: None,
-            metallic_roughness_texture: None,
-            normal_texture: None,
+            ..Default::default()
         };
         m.normalize_to_unit();
         // Recentred about the bbox centre, scaled so the max axis (x, span 200) becomes 1.0.
@@ -277,9 +297,7 @@ mod tests {
         let mut point = MeshGpu {
             vertices: vec![vtx([3.0, 3.0, 3.0]), vtx([3.0, 3.0, 3.0])],
             indices: vec![],
-            base_color_texture: None,
-            metallic_roughness_texture: None,
-            normal_texture: None,
+            ..Default::default()
         };
         point.normalize_to_unit(); // zero extent → unchanged (no divide-by-zero)
         assert_eq!(point.vertices[0].position, [3.0, 3.0, 3.0]);
@@ -378,14 +396,73 @@ mod tests {
         let gpu = MeshGpu::from_asset(&asset);
         // The per-vertex UV flows through (so the fragment shader can sample the textures).
         assert_eq!(gpu.vertices[1].uv, [1.0, 0.0], "the second vertex's UV");
-        // Each slot is carried for the renderer to upload + sample, mapped to the right texture.
-        let b = gpu.base_color_texture.expect("base-color carried");
+        // One primitive → one submesh, carrying all three texture slots mapped to the right textures.
+        assert_eq!(gpu.submeshes.len(), 1, "one submesh for the one primitive");
+        let sm = &gpu.submeshes[0];
+        assert_eq!(sm.index_count, 3, "the triangle's three indices");
+        let b = sm.base_color_texture.as_ref().expect("base-color carried");
         assert_eq!((b.width, b.height), (2, 2));
-        let mr = gpu
+        let mr = sm
             .metallic_roughness_texture
+            .as_ref()
             .expect("metallic-roughness carried");
         assert_eq!((mr.width, mr.height), (4, 1));
-        let nrm = gpu.normal_texture.expect("normal map carried");
+        let nrm = sm.normal_texture.as_ref().expect("normal map carried");
         assert_eq!((nrm.width, nrm.height), (1, 4));
+    }
+
+    #[test]
+    fn from_asset_keeps_distinct_textures_per_submesh() {
+        use crate::mesh::{Material, MeshAsset, Primitive, Texture};
+        // M11.2 follow-up — a MULTI-MATERIAL mesh: two primitives, each with its OWN base-color texture.
+        // Each must become its own submesh binding its own texture (the prior code used only the first).
+        let tex = |w: u32, h: u32| Texture {
+            width: w,
+            height: h,
+            rgba8: vec![255; (w * h * 4) as usize],
+        };
+        let prim = |mat: usize| Primitive {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: Vec::new(),
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            indices: vec![0, 1, 2],
+            material: mat,
+            joints: Vec::new(),
+            weights: Vec::new(),
+        };
+        let mat = |slot: usize| Material {
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            metallic: 0.0,
+            roughness: 0.7,
+            base_color_texture: Some(slot),
+            metallic_roughness_texture: None,
+            normal_texture: None,
+        };
+        let asset = MeshAsset {
+            name: "multi".into(),
+            primitives: vec![prim(0), prim(1)],
+            materials: vec![mat(0), mat(1)],
+            // Distinct sizes so we can tell which texture each submesh kept.
+            textures: vec![tex(2, 2), tex(8, 8)],
+            skeleton: None,
+        };
+        let gpu = MeshGpu::from_asset(&asset);
+        assert_eq!(gpu.submeshes.len(), 2, "one submesh per primitive");
+        // Contiguous, non-overlapping index ranges covering the whole buffer.
+        assert_eq!(gpu.submeshes[0].index_offset, 0);
+        assert_eq!(gpu.submeshes[0].index_count, 3);
+        assert_eq!(gpu.submeshes[1].index_offset, 3);
+        assert_eq!(gpu.submeshes[1].index_count, 3);
+        // Each submesh kept ITS OWN base-color texture (2×2 vs 8×8), not just the first.
+        let a = gpu.submeshes[0]
+            .base_color_texture
+            .as_ref()
+            .expect("sm0 tex");
+        let b = gpu.submeshes[1]
+            .base_color_texture
+            .as_ref()
+            .expect("sm1 tex");
+        assert_eq!((a.width, a.height), (2, 2));
+        assert_eq!((b.width, b.height), (8, 8));
     }
 }

@@ -295,11 +295,25 @@ impl SceneState {
 }
 
 /// One uploaded mesh asset's GPU geometry (per-asset vertex + index buffers — the non-bindless path:
-/// one bound vertex/index buffer per asset, drawn instanced across the entities that use it).
+/// one bound vertex/index buffer per asset, drawn instanced across the entities that use it). M11.2
+/// follow-up: partitioned into per-primitive [`GpuSubMesh`]es, each with its own uploaded textures, so a
+/// multi-material mesh draws every part's texture (one sub-draw + bind group per submesh).
 struct GpuMesh {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
+    /// Whole-mesh index count — the depth-only shadow pass draws the full mesh in one call (no textures).
     n_idx: u32,
+    submeshes: Vec<GpuSubMesh>,
+}
+
+/// One submesh's draw range + its uploaded texture views (dummies where its material ships none). The
+/// per-submesh main-pass bind group (instances + these three textures) is rebuilt in the revision block.
+struct GpuSubMesh {
+    index_offset: u32,
+    index_count: u32,
+    base_view: wgpu::TextureView,
+    mr_view: wgpu::TextureView,
+    normal_view: wgpu::TextureView,
 }
 
 /// A growable storage buffer of [`Instance`]s + its bind group — the per-asset instance list for one
@@ -1194,13 +1208,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // lists (rebuilt per scene revision). `cube_scratch`/`mesh_scratch` are reused partition buffers.
     let mut gpu_meshes: Vec<Option<GpuMesh>> = Vec::new();
     let mut mesh_inst: Vec<InstanceBuf> = Vec::new();
-    // M11.2 follow-up — per-asset texture views (parallel to `gpu_meshes`; the dummies when untextured):
-    // base-color, metallic-roughness, normal. Plus the mesh main-pass group-1 bind group (instances + the
-    // three textures), rebuilt when an instance buffer grows.
-    let mut mesh_tex: Vec<wgpu::TextureView> = Vec::new();
-    let mut mesh_mr_tex: Vec<wgpu::TextureView> = Vec::new();
-    let mut mesh_normal_tex: Vec<wgpu::TextureView> = Vec::new();
-    let mut mesh_main_bg: Vec<wgpu::BindGroup> = Vec::new();
+    // M11.2 follow-up — the main-pass group-1 bind groups, **per submesh** (instances + that submesh's three
+    // textures): `mesh_main_bg[slot][submesh]`. Rebuilt when an instance buffer grows (a revision). The
+    // per-submesh texture views live in `gpu_meshes[slot].submeshes` (uploaded once per meshes_revision).
+    let mut mesh_main_bg: Vec<Vec<wgpu::BindGroup>> = Vec::new();
     let mut cur_mesh_rev = u64::MAX;
     let mut cube_scratch: Vec<Instance> = Vec::new();
     let mut mesh_scratch: Vec<Vec<Instance>> = Vec::new();
@@ -1330,16 +1341,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             if st.meshes_revision != cur_mesh_rev {
                 cur_mesh_rev = st.meshes_revision;
                 gpu_meshes.clear();
-                // kept parallel to gpu_meshes (the per-asset texture views, dummies if none)
-                mesh_tex.clear();
-                mesh_mr_tex.clear();
-                mesh_normal_tex.clear();
                 for m in &st.meshes {
                     if m.vertices.is_empty() || m.indices.is_empty() {
                         gpu_meshes.push(None);
-                        mesh_tex.push(dummy_view.clone());
-                        mesh_mr_tex.push(dummy_mr_view.clone());
-                        mesh_normal_tex.push(dummy_normal_view.clone());
                         continue;
                     }
                     let vbuf = create_init_buffer(
@@ -1354,25 +1358,34 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         bytemuck::cast_slice(&m.indices),
                         wgpu::BufferUsages::INDEX,
                     );
+                    // M11.2 follow-up — upload each SUBMESH's own textures (or the dummies). Base-color is
+                    // sRGB; metallic-roughness + normal are LINEAR (sampling them as sRGB would be wrong).
+                    let submeshes = m
+                        .submeshes
+                        .iter()
+                        .map(|sm| GpuSubMesh {
+                            index_offset: sm.index_offset,
+                            index_count: sm.index_count,
+                            base_view: sm.base_color_texture.as_ref().map_or_else(
+                                || dummy_view.clone(),
+                                |t| upload_tex(&device, &queue, t, true),
+                            ),
+                            mr_view: sm.metallic_roughness_texture.as_ref().map_or_else(
+                                || dummy_mr_view.clone(),
+                                |t| upload_tex(&device, &queue, t, false),
+                            ),
+                            normal_view: sm.normal_texture.as_ref().map_or_else(
+                                || dummy_normal_view.clone(),
+                                |t| upload_tex(&device, &queue, t, false),
+                            ),
+                        })
+                        .collect();
                     gpu_meshes.push(Some(GpuMesh {
                         vbuf,
                         ibuf,
                         n_idx: m.indices.len() as u32,
+                        submeshes,
                     }));
-                    // M11.2 — upload the asset's textures (or the dummies) for fs_mesh to sample. Base-color
-                    // is sRGB; metallic-roughness + normal are LINEAR data (sampling them as sRGB would be wrong).
-                    mesh_tex.push(match &m.base_color_texture {
-                        Some(t) => upload_tex(&device, &queue, t, true),
-                        None => dummy_view.clone(),
-                    });
-                    mesh_mr_tex.push(match &m.metallic_roughness_texture {
-                        Some(t) => upload_tex(&device, &queue, t, false),
-                        None => dummy_mr_view.clone(),
-                    });
-                    mesh_normal_tex.push(match &m.normal_texture {
-                        Some(t) => upload_tex(&device, &queue, t, false),
-                        None => dummy_normal_view.clone(),
-                    });
                 }
                 while mesh_inst.len() < gpu_meshes.len() {
                     mesh_inst.push(InstanceBuf::new(&device, &inst_bgl, 64));
@@ -1402,21 +1415,29 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 for (slot, group) in mesh_scratch.iter().enumerate() {
                     mesh_inst[slot].upload(&device, &queue, &inst_bgl, group);
                 }
-                // M11.2 — rebuild each mesh's main-pass group 1 (an instance upload may have grown → a new
-                // buffer) pairing the current instance buffer with the asset's base-color texture. Few meshes,
-                // only on scene-edit revisions (never per frame). mesh_inst.len() ≥ gpu_meshes.len() (the
-                // meshes_revision block grows it first) and mesh_tex.len() == gpu_meshes.len(), so both index.
+                // M11.2 follow-up — rebuild each mesh's main-pass group-1 bind groups, **one per submesh**
+                // (an instance upload may have grown → a new buffer), pairing the current instance buffer with
+                // that submesh's own textures. Few meshes/submeshes, only on scene-edit revisions (never per
+                // frame). `mesh_inst.len() ≥ gpu_meshes.len()` (the meshes_revision block grows it first).
                 mesh_main_bg.clear();
                 for slot in 0..gpu_meshes.len() {
-                    mesh_main_bg.push(make_mesh_main_bg(
-                        &device,
-                        &mesh_inst_bgl,
-                        &mesh_inst[slot].buf,
-                        &mesh_tex[slot],
-                        &mesh_mr_tex[slot],
-                        &mesh_normal_tex[slot],
-                        &albedo_sampler,
-                    ));
+                    let groups = gpu_meshes[slot].as_ref().map_or_else(Vec::new, |mesh| {
+                        mesh.submeshes
+                            .iter()
+                            .map(|sm| {
+                                make_mesh_main_bg(
+                                    &device,
+                                    &mesh_inst_bgl,
+                                    &mesh_inst[slot].buf,
+                                    &sm.base_view,
+                                    &sm.mr_view,
+                                    &sm.normal_view,
+                                    &albedo_sampler,
+                                )
+                            })
+                            .collect()
+                    });
+                    mesh_main_bg.push(groups);
                 }
                 // tracking-line endpoints (rebuilt in lock-step with instances)
                 lines.upload(&device, &queue, &inst_bgl, &st.line_points);
@@ -1654,7 +1675,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             rp.set_bind_group(2, &lights_buf.bg, &[]); // M11.3 — the scene lights, shared across mesh draws
             rp.set_bind_group(3, &ibl.bind_group, &[]); // M11.3 inc.2/3 — env + BRDF LUT + shadow map/sampler
             for (slot, mesh) in gpu_meshes.iter().enumerate() {
-                let (Some(mesh), Some(inst), Some(main_bg)) =
+                let (Some(mesh), Some(inst), Some(bgs)) =
                     (mesh.as_ref(), mesh_inst.get(slot), mesh_main_bg.get(slot))
                 else {
                     continue;
@@ -1662,10 +1683,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 if inst.n == 0 {
                     continue;
                 }
-                rp.set_bind_group(1, main_bg, &[]); // M11.2 — group 1 = instances + base-color texture/sampler
                 rp.set_vertex_buffer(0, mesh.vbuf.slice(..));
                 rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                rp.draw_indexed(0..mesh.n_idx, 0, 0..inst.n);
+                // M11.2 follow-up — one sub-draw per submesh, each with its own group-1 (instances + that
+                // submesh's textures), so a multi-material mesh shows every part's texture.
+                for (sm, main_bg) in mesh.submeshes.iter().zip(bgs) {
+                    rp.set_bind_group(1, main_bg, &[]);
+                    let end = sm.index_offset + sm.index_count;
+                    rp.draw_indexed(sm.index_offset..end, 0, 0..inst.n);
+                }
             }
             // M11.3 inc.3 — the ground plane (matte; receives IBL + the scene's shadows). Same mesh
             // pipeline, so groups 0/2/3 stay bound; only its instance (group 1, the untextured dummy) +

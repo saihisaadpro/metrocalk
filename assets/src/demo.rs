@@ -522,6 +522,39 @@ fn ripple_normal_png() -> Vec<u8> {
     encode_png_rgba(N, N, rgba)
 }
 
+/// Two side-by-side quads as **two primitives / two materials**, each with its OWN base-color texture (a
+/// checker on the left, a solid colour on the right). The M11.2 multi-texture-per-mesh fixture: a correct
+/// renderer shows BOTH textures; the prior single-texture path showed only the first across the whole mesh.
+#[must_use]
+pub fn multi_material_quad_glb() -> Vec<u8> {
+    let quad = |x0: f32, x1: f32, tex: usize| PrimSpec {
+        positions: vec![
+            [x0, -0.5, 0.0],
+            [x1, -0.5, 0.0],
+            [x1, 0.5, 0.0],
+            [x0, 0.5, 0.0],
+        ],
+        normals: Some(vec![[0.0, 0.0, 1.0]; 4]),
+        uvs: Some(vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]),
+        indices: vec![0, 1, 2, 0, 2, 3],
+        base_color: [1.0, 1.0, 1.0, 1.0],
+        texture: Some(tex),
+        ..Default::default()
+    };
+    build_glb(
+        "multi_material",
+        &[quad(-1.0, 0.0, 0), quad(0.0, 1.0, 1)],
+        &[checker_png(), solid_png([40, 220, 90, 255])],
+    )
+}
+
+/// A small solid-colour RGBA PNG (the right tile's base texture — vivid so the per-submesh split is obvious).
+fn solid_png(rgba: [u8; 4]) -> Vec<u8> {
+    const N: u32 = 4;
+    let pixels: Vec<u8> = (0..N * N).flat_map(|_| rgba).collect();
+    encode_png_rgba(N, N, pixels)
+}
+
 /// A quad whose triangle-list index count is **not** a multiple of 3 (5 indices) — a deliberately
 /// malformed primitive, for the importer's fail-fast strictness guard test.
 #[must_use]

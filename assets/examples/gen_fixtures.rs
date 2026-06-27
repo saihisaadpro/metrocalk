@@ -29,6 +29,11 @@ fn main() {
             "normal_mapped_quad.glb",
             metrocalk_assets::demo::normal_mapped_quad_glb(),
         ),
+        // M11.2 multi-texture-per-mesh fixture — two materials, two base textures, side by side.
+        (
+            "multi_material_quad.glb",
+            metrocalk_assets::demo::multi_material_quad_glb(),
+        ),
     ] {
         let path = out.join(name);
         std::fs::write(&path, &bytes).expect("write fixture");
