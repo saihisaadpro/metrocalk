@@ -299,6 +299,8 @@ export const scaffold = {
       { control: "#snapToggle", command: ["set_snap"], workflow: "G4/magnetic snap toggle" },
       { control: "#snapNearest", command: ["snap_query", "apply_constraint"], workflow: "G4/snap-to-nearest" },
       { control: "#placeBtn", command: ["placement_sentence"], workflow: "G4/place-by-sentence" },
+      // M11.3 lighting surface (ADR-042) — authored light entities + the lighting_debug read the gate keys off
+      { control: "lighting (add_light + lighting_debug)", command: ["add_light", "lighting_debug"], workflow: "lighting/author + shadow-caster" },
     ];
   },
 };
