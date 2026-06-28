@@ -71,6 +71,7 @@ fn rule(entity: &str) -> RuleData {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only timing measurement")]
 fn rule_validation_and_authoring_hold_the_budget() {
+    const N: usize = 2000; // rules authored, to measure the cost as the `rules` map grows
     let reg = registry();
     let mut e = Engine::new(FlecsWorld::new(), 1);
     let mut entity = String::new();
@@ -96,7 +97,6 @@ fn rule_validation_and_authoring_hold_the_budget() {
     }
 
     // Authoring cost as the `rules` map grows (each Create is one undoable SetRule commit).
-    const N: usize = 2000;
     let mut auth = Vec::with_capacity(N);
     for _ in 0..N {
         let id = e.alloc_rule_id();
@@ -116,7 +116,9 @@ fn rule_validation_and_authoring_hold_the_budget() {
     let (vp50, vp99) = percentiles(val);
     let (ap50, ap99) = percentiles(auth);
     eprintln!("[M12.1] validate_rule (3-part conditional): p50={vp50:.2}us p99={vp99:.2}us");
-    eprintln!("[M12.1] author rule (SetRule commit, up to {N} rules): p50={ap50:.2}us p99={ap99:.2}us");
+    eprintln!(
+        "[M12.1] author rule (SetRule commit, up to {N} rules): p50={ap50:.2}us p99={ap99:.2}us"
+    );
     assert!(vp99 < 16_000.0, "validate p99={vp99:.1}us must be ≪ 16ms");
     assert!(ap99 < 16_000.0, "author p99={ap99:.1}us must be ≪ 16ms");
 }

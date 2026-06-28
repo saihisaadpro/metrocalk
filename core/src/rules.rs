@@ -176,26 +176,26 @@ impl fmt::Display for RuleError {
             Self::EmptyName => write!(f, "this rule needs a name"),
             Self::NoActions => write!(
                 f,
-                "this rule has no actions — add at least one thing for it to do"
+                "this rule has no actions - add at least one thing for it to do"
             ),
             Self::UnknownEvent(e) => {
                 write!(
                     f,
-                    "“{e}” isn't an event the engine knows — pick one from the list"
+                    "'{e}' isn't an event the engine knows - pick one from the list"
                 )
             }
             Self::UnknownAction(a) => {
                 write!(
                     f,
-                    "“{a}” isn't an action the engine knows — pick one from the list"
+                    "'{a}' isn't an action the engine knows - pick one from the list"
                 )
             }
-            Self::UnknownEntity(e) => write!(f, "the entity “{e}” no longer exists"),
+            Self::UnknownEntity(e) => write!(f, "the entity '{e}' no longer exists"),
             Self::UnknownComponent { component } => {
-                write!(f, "“{component}” isn't a component the engine knows")
+                write!(f, "'{component}' isn't a component the engine knows")
             }
             Self::UnknownField { component, field } => {
-                write!(f, "“{component}” has no field “{field}”")
+                write!(f, "'{component}' has no field '{field}'")
             }
             Self::FieldTypeMismatch {
                 component,
