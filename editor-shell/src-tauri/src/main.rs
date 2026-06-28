@@ -3873,6 +3873,69 @@ fn collect_lights(engine: &Engine<FlecsWorld>) -> (Vec<render::LightGpu>, Option
     (lights, shadow_caster)
 }
 
+/// M11.4 — one line-segment endpoint for a marker icon glyph (only `center`/`color` are read by the overlay
+/// shader; the rest are inert, matching the gizmo/line carriers).
+fn glyph_pt(center: [f32; 3], color: [f32; 3]) -> Instance {
+    Instance {
+        center,
+        scale: 0.0,
+        color,
+        selected: 0.0,
+        rotation: render::IDENTITY_QUAT,
+        material: [0.0; 4],
+    }
+}
+
+/// M11.4 — a light marker glyph: a warm burst of rays from `p` (a recognizable "light", color-coded), as
+/// `LineList` endpoint pairs for the overlay pass.
+fn light_glyph(p: [f32; 3]) -> Vec<Instance> {
+    const C: [f32; 3] = [1.0, 0.82, 0.2]; // warm amber (reads against the grey sky)
+    let r = 0.5_f32;
+    let d = r * 0.6;
+    let rays = [
+        [r, 0.0, 0.0],
+        [-r, 0.0, 0.0],
+        [0.0, r, 0.0],
+        [0.0, -r, 0.0],
+        [0.0, 0.0, r],
+        [0.0, 0.0, -r],
+        [d, d, d],
+        [-d, -d, -d],
+        [d, -d, -d],
+        [-d, d, d],
+    ];
+    let mut out = Vec::with_capacity(rays.len() * 2);
+    for ray in rays {
+        out.push(glyph_pt(p, C));
+        out.push(glyph_pt([p[0] + ray[0], p[1] + ray[1], p[2] + ray[2]], C));
+    }
+    out
+}
+
+/// M11.4 — a camera marker glyph: a small wireframe frustum at `p` opening along -Z (cyan), as `LineList`
+/// endpoint pairs.
+fn camera_glyph(p: [f32; 3]) -> Vec<Instance> {
+    const C: [f32; 3] = [0.35, 0.8, 1.0]; // cyan
+    let s = 0.22_f32;
+    let dz = -0.42_f32;
+    let corners = [
+        [p[0] - s, p[1] - s, p[2] + dz],
+        [p[0] + s, p[1] - s, p[2] + dz],
+        [p[0] + s, p[1] + s, p[2] + dz],
+        [p[0] - s, p[1] + s, p[2] + dz],
+    ];
+    let mut out = Vec::with_capacity(16);
+    for c in corners {
+        out.push(glyph_pt(p, C)); // apex → corner
+        out.push(glyph_pt(c, C));
+    }
+    for i in 0..4 {
+        out.push(glyph_pt(corners[i], C)); // front-rect edge
+        out.push(glyph_pt(corners[(i + 1) % 4], C));
+    }
+    out
+}
+
 fn rebuild(
     engine: &Engine<FlecsWorld>,
     shared: &Shared,
@@ -3888,6 +3951,9 @@ fn rebuild(
     // M9.4 — per-instance snap affinity (parallel to `instances`): a parent (a pivot) outranks a bare
     // origin in the snap ranker. Built here so the render-thread snap (`nearest_snap`) stays 0-IPC.
     let mut snap_affinity: Vec<u32> = Vec::new();
+    // M11.4 — wireframe ICON glyphs for light/camera marker entities (line-segment endpoint pairs). Markers
+    // are drawn as these glyphs, NOT as solid placeholder cubes (see the marker skip below).
+    let mut marker_glyphs: Vec<Instance> = Vec::new();
     for id in engine.entity_ids() {
         // M9.2 deactivate-not-delete: a deactivated PART is hidden from the viewport (the entity + its
         // data survive; undo re-activates it → it reappears on the next rebuild). Only children can be
@@ -3905,6 +3971,21 @@ fn rebuild(
                 _ => 0.0,
             })
         };
+        // M11.4 — a pure light/camera MARKER (a Transform but no MeshRenderer) is not scene geometry: render
+        // it as a wireframe ICON glyph (burst / frustum), never a solid placeholder cube. It stays in the
+        // hierarchy (selectable there) + the inspector (numeric Transform edits); it just isn't an `instances`
+        // entry, so it has no viewport gizmo (the gizmo indexes `instances`) — the documented icon trade.
+        if !comps.contains_key("MeshRenderer")
+            && (comps.contains_key("Light") || comps.contains_key("Camera"))
+        {
+            let p = [get("x"), get("y"), get("z")];
+            marker_glyphs.extend(if comps.contains_key("Camera") {
+                camera_glyph(p)
+            } else {
+                light_glyph(p)
+            });
+            continue;
+        }
         // Resolve the entity's mesh handle (if any) to a render slot + normalized scale.
         let slot = comps
             .get("MeshRenderer")
@@ -4024,6 +4105,7 @@ fn rebuild(
     st.mesh_slots = mesh_slots;
     st.snap_affinity = snap_affinity;
     st.line_points = line_points;
+    st.marker_glyphs = marker_glyphs;
     st.lights = lights;
     st.shadow_caster = shadow_caster;
     st.lights_revision = st.lights_revision.wrapping_add(1);

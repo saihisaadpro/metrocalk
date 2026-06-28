@@ -87,6 +87,11 @@ pub struct SceneState {
     /// `center` is read (by `vs_line`); the other fields are ignored. Rebuilt with `instances`, so a
     /// `revision` bump re-uploads both. Empty when nothing is bound (the line pass is skipped).
     pub line_points: Vec<Instance>,
+    /// M11.4 (ADR-043) — wireframe ICON glyphs for light/camera marker entities (a warm burst for a light,
+    /// a cyan frustum for a camera). Same `LineList` carrier as `line_points` but drawn by the per-segment
+    /// **overlay** pass (so each glyph is colour-coded), always-pass depth so the icon reads as an overlay.
+    /// Built in `rebuild` (markers are NOT rendered as solid cubes); empty ⇒ the marker pass is skipped.
+    pub marker_glyphs: Vec<Instance>,
     /// M8.4 contact-debugger overlay endpoints — same `LineList` carrier as [`Self::line_points`], drawn by
     /// the same always-pass line pass (each consecutive pair is one segment). **Empty by default** (the
     /// debugger is off → the overlay pass is skipped → zero per-frame cost). Updated independently from
@@ -1138,6 +1143,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         "overlay",
     );
     let mut overlay = InstanceBuf::new(&device, &inst_bgl, 256);
+    // M11.4 — light/camera ICON glyphs (wireframe), drawn via the overlay pipeline. Rebuilt with the scene
+    // (uploaded on `revision`, like `lines`); empty ⇒ skipped.
+    let mut markers = InstanceBuf::new(&device, &inst_bgl, 256);
     let mut cur_overlay_rev = u64::MAX;
     let mut cur_lights_rev = u64::MAX;
     // M9.1 transform gizmo: its own buffer, drawn with the SAME `overlay_pipeline` (vs_overlay reads the
@@ -1534,6 +1542,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 }
                 // tracking-line endpoints (rebuilt in lock-step with instances)
                 lines.upload(&device, &queue, &inst_bgl, &st.line_points);
+                // M11.4 — light/camera icon glyphs (rebuilt with the scene).
+                markers.upload(&device, &queue, &inst_bgl, &st.marker_glyphs);
             }
             // M8.4 contact-debugger overlay — uploaded on its OWN revision (the debugger updates
             // independently of scene edits; while off, the buffer is empty so there's nothing to upload).
@@ -1808,6 +1818,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.set_pipeline(&overlay_pipeline);
                 rp.set_bind_group(1, &overlay.bg, &[]);
                 rp.draw(0..overlay.n, 0..1);
+            }
+            // M11.4 — light/camera ICON glyphs (wireframe, per-segment colour, always-pass depth) so a
+            // light/camera reads as an icon, not a solid placeholder cube. Empty ⇒ skipped.
+            if markers.n > 0 {
+                rp.set_pipeline(&overlay_pipeline);
+                rp.set_bind_group(1, &markers.bg, &[]);
+                rp.draw(0..markers.n, 0..1);
             }
             // M9.1 transform gizmo, drawn LAST (over everything), per-segment X/Y/Z colour, always-pass
             // depth. Skipped when nothing is selected (`gizmo_buf.n == 0`) — zero per-frame cost.
