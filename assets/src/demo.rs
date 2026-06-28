@@ -415,6 +415,46 @@ pub fn sphere_glb() -> Vec<u8> {
     build_glb("sphere", &[prim], &[])
 }
 
+/// A DENSE UV sphere (radius 0.5, 48×96) — ~4.7k verts / ~28k indices, fine enough that the renderer's
+/// LOD decimator (M11.1) actually merges vertices, so distance-based LOD is visible (a far sphere shows
+/// coarser facets than near). The provenance for the LOD live check; otherwise like `sphere_glb`.
+#[must_use]
+pub fn dense_sphere_glb() -> Vec<u8> {
+    const R: f32 = 0.5;
+    const STACKS: usize = 48;
+    const SLICES: usize = 96;
+    let mut positions = Vec::with_capacity((STACKS + 1) * (SLICES + 1));
+    let mut normals = Vec::with_capacity((STACKS + 1) * (SLICES + 1));
+    for i in 0..=STACKS {
+        let lat = (i as f32 / STACKS as f32) * std::f32::consts::PI;
+        let (sin_lat, cos_lat) = lat.sin_cos();
+        for j in 0..=SLICES {
+            let lon = (j as f32 / SLICES as f32) * std::f32::consts::TAU;
+            let (sin_lon, cos_lon) = lon.sin_cos();
+            let n = [sin_lat * cos_lon, cos_lat, sin_lat * sin_lon];
+            positions.push([R * n[0], R * n[1], R * n[2]]);
+            normals.push(n);
+        }
+    }
+    let mut indices = Vec::with_capacity(STACKS * SLICES * 6);
+    let row = (SLICES + 1) as u16;
+    for i in 0..STACKS as u16 {
+        for j in 0..SLICES as u16 {
+            let a = i * row + j;
+            let b = a + row;
+            indices.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+        }
+    }
+    let prim = PrimSpec {
+        positions,
+        normals: Some(normals),
+        indices,
+        base_color: [0.95, 0.55, 0.20, 1.0],
+        ..Default::default()
+    };
+    build_glb("dense_sphere", &[prim], &[])
+}
+
 /// A unit quad carrying an embedded PNG base-color texture — for the importer's texture-decode test.
 #[must_use]
 pub fn textured_quad_glb() -> Vec<u8> {

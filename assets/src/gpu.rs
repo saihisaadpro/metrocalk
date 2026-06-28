@@ -202,6 +202,104 @@ impl MeshGpu {
             }
         }
     }
+
+    /// M11.1 (ADR-040) — generate coarser LOD copies of this (already-normalized, ~1-unit) mesh by uniform
+    /// **vertex clustering**: vertices sharing a grid cell merge to their centroid, triangles are remapped,
+    /// and any that collapse to a line/point are dropped. Each LOD is a SINGLE submesh carrying this mesh's
+    /// PRIMARY (first-submesh) textures — texture detail matters little at the distance a LOD kicks in.
+    /// `levels` coarsenings, the cell doubling per level, so triangle counts are monotonically
+    /// non-increasing. A level that fails to reduce (or empties) is dropped. Deterministic.
+    #[must_use]
+    pub fn lods(&self, levels: u8) -> Vec<MeshGpu> {
+        if self.vertices.is_empty() || self.indices.is_empty() || levels == 0 {
+            return Vec::new();
+        }
+        let primary = self.submeshes.first();
+        let base = primary.and_then(|s| s.base_color_texture.clone());
+        let mr = primary.and_then(|s| s.metallic_roughness_texture.clone());
+        let normal = primary.and_then(|s| s.normal_texture.clone());
+        let mut out = Vec::with_capacity(levels as usize);
+        for level in 1..=levels {
+            // The normalized mesh spans ~1 unit; base cell 0.06, doubling per level → coarser + cheaper.
+            let cell = 0.06_f32 * 2.0_f32.powi(i32::from(level) - 1);
+            let g = self.clustered(cell, base.clone(), mr.clone(), normal.clone());
+            if !g.indices.is_empty() && g.vertices.len() < self.vertices.len() {
+                out.push(g);
+            }
+        }
+        out
+    }
+
+    /// One vertex-clustered copy at grid `cell` — a single submesh with the given textures (the LOD helper).
+    fn clustered(
+        &self,
+        cell: f32,
+        base: Option<crate::mesh::Texture>,
+        mr: Option<crate::mesh::Texture>,
+        normal: Option<crate::mesh::Texture>,
+    ) -> MeshGpu {
+        use std::collections::HashMap;
+        let key = |p: [f32; 3]| -> (i32, i32, i32) {
+            (
+                (p[0] / cell).floor() as i32,
+                (p[1] / cell).floor() as i32,
+                (p[2] / cell).floor() as i32,
+            )
+        };
+        let mut cell_to_new: HashMap<(i32, i32, i32), u32> = HashMap::new();
+        let mut verts: Vec<MeshVertex> = Vec::new();
+        let mut counts: Vec<f32> = Vec::new();
+        let mut old_to_new: Vec<u32> = Vec::with_capacity(self.vertices.len());
+        for v in &self.vertices {
+            let ni = *cell_to_new.entry(key(v.position)).or_insert_with(|| {
+                verts.push(*v);
+                counts.push(0.0);
+                (verts.len() - 1) as u32
+            });
+            // Centroid-accumulate position + average the shading attrs (the pushed initial value is folded in
+            // by the n==0 step, so no double-count).
+            let i = ni as usize;
+            let (n, nn) = (counts[i], counts[i] + 1.0);
+            for c in 0..3 {
+                verts[i].position[c] = (verts[i].position[c] * n + v.position[c]) / nn;
+                verts[i].normal[c] = (verts[i].normal[c] * n + v.normal[c]) / nn;
+                verts[i].color[c] = (verts[i].color[c] * n + v.color[c]) / nn;
+            }
+            verts[i].uv[0] = (verts[i].uv[0] * n + v.uv[0]) / nn;
+            verts[i].uv[1] = (verts[i].uv[1] * n + v.uv[1]) / nn;
+            verts[i].metallic = (verts[i].metallic * n + v.metallic) / nn;
+            verts[i].roughness = (verts[i].roughness * n + v.roughness) / nn;
+            counts[i] = nn;
+            old_to_new.push(ni);
+        }
+        let mut indices = Vec::new();
+        for tri in self.indices.chunks_exact(3) {
+            let (a, b, c) = (
+                old_to_new[tri[0] as usize],
+                old_to_new[tri[1] as usize],
+                old_to_new[tri[2] as usize],
+            );
+            if a != b && b != c && a != c {
+                indices.extend_from_slice(&[a, b, c]); // drop triangles that collapsed to a line/point
+            }
+        }
+        let submeshes = if indices.is_empty() {
+            Vec::new()
+        } else {
+            vec![SubMesh {
+                index_offset: 0,
+                index_count: indices.len() as u32,
+                base_color_texture: base,
+                metallic_roughness_texture: mr,
+                normal_texture: normal,
+            }]
+        };
+        MeshGpu {
+            vertices: verts,
+            indices,
+            submeshes,
+        }
+    }
 }
 
 /// Smooth per-vertex normals: accumulate each triangle's face normal onto its vertices, then
@@ -464,5 +562,55 @@ mod tests {
             .expect("sm1 tex");
         assert_eq!((a.width, a.height), (2, 2));
         assert_eq!((b.width, b.height), (8, 8));
+    }
+
+    #[test]
+    fn lods_cluster_decimate_and_reduce_triangles() {
+        // A dense flat grid in [0,1]² (finer than the LOD-1 cell): clustering must merge vertices + reduce
+        // the triangle count, monotonically, and emit a single textured submesh per LOD.
+        const N: usize = 40;
+        let mut m = MeshGpu::default();
+        for j in 0..N {
+            for i in 0..N {
+                m.vertices.push(MeshVertex {
+                    position: [i as f32 / (N - 1) as f32, j as f32 / (N - 1) as f32, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    color: [0.8, 0.8, 0.8],
+                    metallic: 0.0,
+                    roughness: 0.7,
+                    uv: [0.0, 0.0],
+                });
+            }
+        }
+        let idx = |i: usize, j: usize| (j * N + i) as u32;
+        for j in 0..N - 1 {
+            for i in 0..N - 1 {
+                m.indices
+                    .extend_from_slice(&[idx(i, j), idx(i + 1, j), idx(i, j + 1)]);
+                m.indices
+                    .extend_from_slice(&[idx(i + 1, j), idx(i + 1, j + 1), idx(i, j + 1)]);
+            }
+        }
+        m.submeshes.push(SubMesh {
+            index_offset: 0,
+            index_count: m.indices.len() as u32,
+            ..Default::default()
+        });
+        let full_tris = m.indices.len() / 3;
+
+        let lods = m.lods(2);
+        assert_eq!(lods.len(), 2, "two LOD levels generated");
+        assert!(
+            lods[0].vertices.len() < m.vertices.len(),
+            "LOD-1 merged vertices"
+        );
+        let l0 = lods[0].indices.len() / 3;
+        let l1 = lods[1].indices.len() / 3;
+        assert!(
+            l0 < full_tris,
+            "LOD-1 has fewer triangles than the full mesh"
+        );
+        assert!(l1 <= l0, "LOD-2 is no finer than LOD-1 (monotonic)");
+        assert_eq!(lods[0].submeshes.len(), 1, "a LOD is a single submesh");
     }
 }

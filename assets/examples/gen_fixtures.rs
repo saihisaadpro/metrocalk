@@ -36,6 +36,8 @@ fn main() {
         ),
         // M11.1 static-collider fixture — a plain cube (flat top a dropped ball rests on).
         ("cube.glb", metrocalk_assets::demo::cube_glb()),
+        // M11.1 LOD fixture — a dense sphere (fine enough that distance LOD is visible).
+        ("dense_sphere.glb", metrocalk_assets::demo::dense_sphere_glb()),
     ] {
         let path = out.join(name);
         std::fs::write(&path, &bytes).expect("write fixture");

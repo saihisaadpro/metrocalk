@@ -1311,6 +1311,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // textures): `mesh_main_bg[slot][submesh]`. Rebuilt when an instance buffer grows (a revision). The
     // per-submesh texture views live in `gpu_meshes[slot].submeshes` (uploaded once per meshes_revision).
     let mut mesh_main_bg: Vec<Vec<wgpu::BindGroup>> = Vec::new();
+    // M11.1 (ADR-040) — LOD: coarser uploaded copies per asset (`gpu_lods[slot][level]`, level 0 = LOD-1)
+    // + their per-submesh bind groups (`lod_main_bg[slot][level][submesh]`), selected per slot by the camera
+    // distance to that asset's instances (`mesh_centroid[slot]`). LOD-0 (full) stays `gpu_meshes`/`mesh_main_bg`.
+    let mut gpu_lods: Vec<Vec<GpuMesh>> = Vec::new();
+    let mut lod_main_bg: Vec<Vec<Vec<wgpu::BindGroup>>> = Vec::new();
+    let mut mesh_centroid: Vec<[f32; 3]> = Vec::new();
+    let lod_on = !matches!(std::env::var("MTK_LOD").ok().as_deref(), Some("off" | "0"));
     let mut cur_mesh_rev = u64::MAX;
     let mut cube_scratch: Vec<Instance> = Vec::new();
     let mut mesh_scratch: Vec<Vec<Instance>> = Vec::new();
@@ -1442,10 +1449,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             if st.meshes_revision != cur_mesh_rev {
                 cur_mesh_rev = st.meshes_revision;
                 gpu_meshes.clear();
-                for m in &st.meshes {
+                gpu_lods.clear();
+                // Upload one `MeshGpu` (the full mesh OR a LOD) → a `GpuMesh` with per-submesh texture views.
+                // M11.2: base-color is sRGB; metallic-roughness + normal are LINEAR.
+                let upload_mesh = |m: &MeshGpu| -> Option<GpuMesh> {
                     if m.vertices.is_empty() || m.indices.is_empty() {
-                        gpu_meshes.push(None);
-                        continue;
+                        return None;
                     }
                     let vbuf = create_init_buffer(
                         &device,
@@ -1459,8 +1468,6 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         bytemuck::cast_slice(&m.indices),
                         wgpu::BufferUsages::INDEX,
                     );
-                    // M11.2 follow-up — upload each SUBMESH's own textures (or the dummies). Base-color is
-                    // sRGB; metallic-roughness + normal are LINEAR (sampling them as sRGB would be wrong).
                     let submeshes = m
                         .submeshes
                         .iter()
@@ -1481,12 +1488,22 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                             ),
                         })
                         .collect();
-                    gpu_meshes.push(Some(GpuMesh {
+                    Some(GpuMesh {
                         vbuf,
                         ibuf,
                         n_idx: m.indices.len() as u32,
                         submeshes,
-                    }));
+                    })
+                };
+                for m in &st.meshes {
+                    // M11.1 — also build coarser LODs for distance selection (skipped when `MTK_LOD=off`).
+                    let lods: Vec<GpuMesh> = if lod_on {
+                        m.lods(2).iter().filter_map(&upload_mesh).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    gpu_lods.push(lods);
+                    gpu_meshes.push(upload_mesh(m));
                 }
                 while mesh_inst.len() < gpu_meshes.len() {
                     mesh_inst.push(InstanceBuf::new(&device, &inst_bgl, 64));
@@ -1516,6 +1533,22 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 for (slot, group) in mesh_scratch.iter().enumerate() {
                     mesh_inst[slot].upload(&device, &queue, &inst_bgl, group);
                 }
+                // M11.1 — each slot's instance centroid (the camera-distance basis for LOD selection).
+                mesh_centroid.clear();
+                for group in &mesh_scratch {
+                    mesh_centroid.push(if group.is_empty() {
+                        [0.0, 0.0, 0.0]
+                    } else {
+                        let n = group.len() as f32;
+                        let mut s = [0.0f32; 3];
+                        for inst in group {
+                            for (sk, &ck) in s.iter_mut().zip(&inst.center) {
+                                *sk += ck;
+                            }
+                        }
+                        [s[0] / n, s[1] / n, s[2] / n]
+                    });
+                }
                 // M11.2 follow-up — rebuild each mesh's main-pass group-1 bind groups, **one per submesh**
                 // (an instance upload may have grown → a new buffer), pairing the current instance buffer with
                 // that submesh's own textures. Few meshes/submeshes, only on scene-edit revisions (never per
@@ -1539,6 +1572,30 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                             .collect()
                     });
                     mesh_main_bg.push(groups);
+                }
+                // M11.1 — per-LOD bind groups: same (current) instance buffer + that LOD's submesh textures.
+                lod_main_bg.clear();
+                for (slot, lods) in gpu_lods.iter().enumerate() {
+                    let per_lod: Vec<Vec<wgpu::BindGroup>> = lods
+                        .iter()
+                        .map(|lod| {
+                            lod.submeshes
+                                .iter()
+                                .map(|sm| {
+                                    make_mesh_main_bg(
+                                        &device,
+                                        &mesh_inst_bgl,
+                                        &mesh_inst[slot].buf,
+                                        &sm.base_view,
+                                        &sm.mr_view,
+                                        &sm.normal_view,
+                                        &albedo_sampler,
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    lod_main_bg.push(per_lod);
                 }
                 // tracking-line endpoints (rebuilt in lock-step with instances)
                 lines.upload(&device, &queue, &inst_bgl, &st.line_points);
@@ -1789,11 +1846,26 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 if inst.n == 0 {
                     continue;
                 }
-                rp.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                // M11.1 — pick the LOD by the camera distance to this asset's instance centroid; level 0 =
+                // the full mesh, higher = coarser. Falls back to the full mesh if the LOD/bg isn't present.
+                let n_lods = gpu_lods.get(slot).map_or(0, |l| l.len());
+                let level = lod_level(cam_eye, mesh_centroid.get(slot).copied(), n_lods);
+                let (geo, geo_bgs) = if level == 0 {
+                    (mesh, bgs)
+                } else {
+                    match (
+                        gpu_lods.get(slot).and_then(|l| l.get(level - 1)),
+                        lod_main_bg.get(slot).and_then(|l| l.get(level - 1)),
+                    ) {
+                        (Some(g), Some(b)) => (g, b),
+                        _ => (mesh, bgs),
+                    }
+                };
+                rp.set_vertex_buffer(0, geo.vbuf.slice(..));
+                rp.set_index_buffer(geo.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 // M11.2 follow-up — one sub-draw per submesh, each with its own group-1 (instances + that
                 // submesh's textures), so a multi-material mesh shows every part's texture.
-                for (sm, main_bg) in mesh.submeshes.iter().zip(bgs) {
+                for (sm, main_bg) in geo.submeshes.iter().zip(geo_bgs) {
                     rp.set_bind_group(1, main_bg, &[]);
                     let end = sm.index_offset + sm.index_count;
                     rp.draw_indexed(sm.index_offset..end, 0, 0..inst.n);
@@ -2374,9 +2446,50 @@ fn make_bloom_targets(
     }
 }
 
+/// M11.1 (ADR-040) — choose a LOD level from the camera distance to an asset's instance centroid: nearer =
+/// finer. `0` = the full mesh; `1..=n_lods` = progressively coarser (the normalized meshes are ~1 unit, so
+/// the thresholds are world distances). Clamped to the LODs that actually exist; `0` if there are none or no
+/// centroid.
+fn lod_level(cam_eye: [f32; 3], centroid: Option<[f32; 3]>, n_lods: usize) -> usize {
+    if n_lods == 0 {
+        return 0;
+    }
+    let Some(c) = centroid else {
+        return 0;
+    };
+    let d2 = (0..3).map(|k| (cam_eye[k] - c[k]).powi(2)).sum::<f32>();
+    let level = if d2 < 16.0 * 16.0 {
+        0
+    } else if d2 < 34.0 * 34.0 {
+        1
+    } else {
+        2
+    };
+    level.min(n_lods)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lod_level_picks_coarser_with_distance_and_clamps() {
+        let c = Some([0.0, 0.0, 0.0]);
+        assert_eq!(lod_level([0.0, 0.0, 5.0], c, 2), 0, "near → full");
+        assert_eq!(lod_level([0.0, 0.0, 20.0], c, 2), 1, "mid → LOD-1");
+        assert_eq!(lod_level([0.0, 0.0, 50.0], c, 2), 2, "far → LOD-2");
+        assert_eq!(
+            lod_level([0.0, 0.0, 50.0], c, 1),
+            1,
+            "clamped to the available LODs"
+        );
+        assert_eq!(lod_level([0.0, 0.0, 50.0], c, 0), 0, "no LODs → full");
+        assert_eq!(
+            lod_level([0.0, 0.0, 50.0], None, 2),
+            0,
+            "no centroid → full"
+        );
+    }
 
     /// A bare scene of `n` unit-scale cubes on a line — enough to exercise the focus state transition
     /// (no GPU; `focus_on`/`clear_focus` touch only plain fields).
