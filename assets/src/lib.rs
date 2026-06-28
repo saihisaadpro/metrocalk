@@ -34,6 +34,9 @@ pub mod ktx2_import;
 pub mod lod;
 pub mod mesh;
 pub mod obj_import;
+/// M11.5 (ADR-044) — asset identity: a provenance record + perceptual-hash near-dup detection, riding the
+/// content-addressed store. Pure-Rust; the C2PA backing + offline auto-rig are seams behind it.
+pub mod provenance;
 pub mod source;
 pub mod store;
 
@@ -50,6 +53,9 @@ pub use ktx2_import::{transcode_to_rgba8, KtxImporter};
 pub use lod::{GridClusterLod, LodConfig, LodGenerator, MeshLod};
 pub use mesh::{Bounds, Material, MeshAsset, Primitive, Texture};
 pub use obj_import::ObjImporter;
+pub use provenance::{
+    hamming_distance, is_near_duplicate, perceptual_hash, AssetKind, Provenance,
+};
 pub use source::{ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES};
 pub use store::{AssetId, AssetStore};
 
