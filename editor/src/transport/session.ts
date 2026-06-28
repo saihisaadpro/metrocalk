@@ -30,6 +30,10 @@ import type {
   ProjectionDelta,
   ProjectionOp,
   RevealResponse,
+  AuthorRuleResult,
+  RuleData,
+  RuleRegistryInfo,
+  RuleSummary,
   SnapHit,
   SolveResult,
   TimelineTuple,
@@ -222,6 +226,16 @@ export interface EditorClient {
   pause(): Promise<PlayInfo>;
   /** The current Play-mode state (a read) — the controls refresh from this. */
   playState(): Promise<PlayInfo>;
+
+  // ── M12.1 Rules layer (When/If/Then) — the registry-fed builder + Rule list (ADR-045) ───────────────
+  /** The typo-proof builder vocabulary: every event/action/component+field the builder may offer. */
+  ruleRegistry(): Promise<RuleRegistryInfo>;
+  /** All authored rules for the editor Rule list. */
+  listRules(): Promise<RuleSummary[]>;
+  /** Author (or replace, if `id` is given) a rule: the new id + the offered mirror, or a Blocked reason. */
+  authorRule(rule: RuleData, id?: string | null): Promise<AuthorRuleResult>;
+  /** Remove a rule (one undoable transaction). */
+  deleteRule(id: string): Promise<boolean>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -557,6 +571,18 @@ export class TauriClient implements EditorClient {
   }
   playState(): Promise<PlayInfo> {
     return this.core.invoke<PlayInfo>("play_state").catch((e: unknown) => { console.error("play_state failed", e); throw e; });
+  }
+  ruleRegistry(): Promise<RuleRegistryInfo> {
+    return this.core.invoke<RuleRegistryInfo>("rule_registry").catch((e: unknown) => { console.error("rule_registry failed", e); throw e; });
+  }
+  listRules(): Promise<RuleSummary[]> {
+    return this.core.invoke<RuleSummary[]>("list_rules").catch((e: unknown) => { console.error("list_rules failed", e); throw e; });
+  }
+  authorRule(rule: RuleData, id: string | null = null): Promise<AuthorRuleResult> {
+    return this.core.invoke<AuthorRuleResult>("author_rule", { rule, id }).catch((e: unknown) => { console.error("author_rule failed", e); throw e; });
+  }
+  deleteRule(id: string): Promise<boolean> {
+    return this.core.invoke<boolean>("delete_rule", { id }).catch((e: unknown) => { console.error("delete_rule failed", e); throw e; });
   }
 }
 
@@ -963,6 +989,35 @@ class MockClient implements EditorClient {
   }
   playState(): Promise<PlayInfo> {
     return Promise.resolve({ ...this.playInfo });
+  }
+  // M12.1 Rules (dev MockCore): a representative registry-fed vocabulary so the builder renders in `npm run
+  // dev`; authoring is inert here (the real list + validation + mirror are the live `.exe` path).
+  ruleRegistry(): Promise<RuleRegistryInfo> {
+    return Promise.resolve({
+      events: [
+        { name: "EnemyDied", description: "an enemy was defeated" },
+        { name: "StateEntered", description: "a quest/state machine entered a state" },
+        { name: "StateExited", description: "a quest/state machine left a state" },
+      ],
+      actions: [
+        { name: "SetField", description: "set a component field to a value" },
+        { name: "AdjustCounter", description: "add a number to a numeric counter field" },
+      ],
+      components: [
+        { name: "KillCounter", fields: [{ name: "count", ty: "integer" }] },
+        { name: "QuestState", fields: [{ name: "state", ty: "string" }] },
+        { name: "Flammable", fields: [{ name: "lit", ty: "boolean" }] },
+      ],
+    });
+  }
+  listRules(): Promise<RuleSummary[]> {
+    return Promise.resolve([]);
+  }
+  authorRule(): Promise<AuthorRuleResult> {
+    return Promise.resolve({ id: "rule-dev", error: null, mirror: null });
+  }
+  deleteRule(): Promise<boolean> {
+    return Promise.resolve(true);
   }
 }
 

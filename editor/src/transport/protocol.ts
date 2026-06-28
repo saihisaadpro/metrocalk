@@ -239,6 +239,84 @@ export interface SolveResult {
   intents: string[];
 }
 
+// ── M12.1 Rules layer (When/If/Then) — the registry-fed builder + Rule list (ADR-045) ───────────────────
+// These mirror the Rust serde shapes exactly (`metrocalk_core::rules`): `FieldValue` is externally tagged
+// (`{ Integer: 4 }`), `CompareOp` is snake_case, so a `RuleData` round-trips JS → core → JS unchanged.
+
+/** A typed literal in a condition/action — externally tagged to match `metrocalk_core::FieldValue`. */
+export type FieldValue =
+  | { Integer: number }
+  | { Number: number }
+  | { Bool: boolean }
+  | { Str: string };
+
+/** The comparison operator in an If-condition (matches `CompareOp`'s snake_case serde). */
+export type CompareOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
+
+/** One If-condition: `<entity>.<component>.<field> <op> <value>` — every part registry-typed. */
+export interface RuleCondition {
+  entity: string;
+  component: string;
+  field: string;
+  op: CompareOp;
+  value: FieldValue;
+}
+
+/** One Then-action: a registry verb over `<entity>.<component>.<field> = <value>` (closed vocabulary). */
+export interface RuleAction {
+  action: string;
+  entity: string;
+  component: string;
+  field: string;
+  value: FieldValue;
+}
+
+/** A whole rule — the shape `author_rule` takes + the mirror it returns. */
+export interface RuleData {
+  name: string;
+  enabled: boolean;
+  event: string;
+  conditions: RuleCondition[];
+  actions: RuleAction[];
+}
+
+/** A row in the editor Rule list (`list_rules`, camelCase serde). */
+export interface RuleSummary {
+  id: string;
+  name: string;
+  enabled: boolean;
+  event: string;
+  conditionCount: number;
+  actionCount: number;
+}
+
+/** One dropdown entry — a registry event or action verb (name + plain-language description). */
+export interface RuleVocabItem {
+  name: string;
+  description: string;
+}
+
+/** A component the If/Then can target, with its fields' scalar types (so the value input is type-matched). */
+export interface RuleComponentVocab {
+  name: string;
+  fields: { name: string; ty: "integer" | "number" | "boolean" | "string" }[];
+}
+
+/** The whole registry-fed vocabulary (`rule_registry`) the builder's dropdowns are assembled from. */
+export interface RuleRegistryInfo {
+  events: RuleVocabItem[];
+  actions: RuleVocabItem[];
+  components: RuleComponentVocab[];
+}
+
+/** `author_rule` outcome: the new `id`, a plain-language `error` if the registry Blocked it (ADR-016), and
+ *  the proactively-offered `mirror` "cleanup" rule (the missing-"off"-switch guard) — `null` if none. */
+export interface AuthorRuleResult {
+  id: string | null;
+  error: string | null;
+  mirror: RuleData | null;
+}
+
 const te = new TextEncoder();
 const td = new TextDecoder();
 export const encodeJson = (v: unknown): Uint8Array => te.encode(JSON.stringify(v));

@@ -85,6 +85,11 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     stop: vi.fn(() => Promise.resolve({ playing: false, paused: false })),
     pause: vi.fn(() => Promise.resolve({ playing: true, paused: true })),
     playState: () => Promise.resolve({ playing: false, paused: false }),
+    // M12.1 Rules (a test overrides what it exercises).
+    ruleRegistry: () => Promise.resolve({ events: [], actions: [], components: [] }),
+    listRules: vi.fn(() => Promise.resolve([])),
+    authorRule: vi.fn(() => Promise.resolve({ id: "rule-1", error: null, mirror: null })),
+    deleteRule: vi.fn(() => Promise.resolve(true)),
     ...over,
   };
 }
