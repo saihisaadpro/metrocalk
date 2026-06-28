@@ -24,6 +24,7 @@ pub mod producer;
 pub mod project;
 pub mod registry;
 pub mod resolve;
+pub mod rules;
 pub mod stdlib;
 pub mod taxonomy;
 pub mod undo;
@@ -38,8 +39,13 @@ pub use merge::MergeReport;
 pub use pipeline::{CapRole, CapabilityResolver, Engine, FieldValue, Op, PipelineError};
 pub use producer::ProducerHook;
 pub use project::{ProjectError, FORMAT_VERSION};
-pub use registry::{Builder, ComponentMeta, FieldSpec, FieldType, Registry, RegistryError};
+pub use registry::{
+    ActionMeta, Builder, ComponentMeta, EventMeta, FieldSpec, FieldType, Registry, RegistryError,
+};
 pub use resolve::{resolve, resolve_local, Match, NextTier, Resolution, Resolved};
+pub use rules::{
+    propose_mirror, validate_rule, Action, CompareOp, Condition, RuleData, RuleError, RuleId,
+};
 pub use taxonomy::{bucket_of, is_standard_category, Category, STD_CATEGORIES};
 pub use variant::{Composition, CompositionNode, ResolvedNode, Variant, VariantOp};
 

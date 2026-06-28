@@ -5,9 +5,9 @@
 //! Capabilities form the relational web: e.g. `Sprite` and `MeshRenderer` both *provide* `Renderable`
 //! and *require* `Spatial`; `HealthBar` *requires* + *observes* `Health` and *provides* `UIElement`.
 
-use crate::registry::{ComponentMeta, FieldType};
+use crate::registry::{ActionMeta, ComponentMeta, EventMeta, FieldType};
 
-/// The standard component kinds (12). Registering all of them populates the relational catalog.
+/// The standard component kinds. Registering all of them populates the relational catalog.
 #[allow(clippy::too_many_lines)] // a flat data table of component definitions, not branching logic
 pub fn standard_components() -> Vec<ComponentMeta> {
     use FieldType::{Boolean, Integer, Number, String as Str};
@@ -194,5 +194,64 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("code")
             .alias("Behavior")
             .build(),
+        // ── M12.1 (ADR-045) rule-target primitives — the counters / quest-state / effect components a Rule
+        // reads + mutates through the typed vocabulary (the building blocks of the test-5 conditional). ──
+        ComponentMeta::builder("KillCounter")
+            .category("Logic")
+            .field("count", Integer, true)
+            .provides("Counter")
+            .tag("quest")
+            .tag("counter")
+            .ui_hint("count", "enemies defeated so far")
+            .build(),
+        ComponentMeta::builder("QuestState")
+            .category("Logic")
+            .field("state", Str, true)
+            .provides("QuestState")
+            .tag("quest")
+            .ui_hint(
+                "state",
+                "the quest phase, e.g. Hunting|ReadyForBoss|FacingBoss",
+            )
+            .build(),
+        ComponentMeta::builder("Zone")
+            .category("Logic")
+            .field("current", Str, true)
+            .provides("Zone")
+            .tag("quest")
+            .ui_hint("current", "the area the entity is in, e.g. BossArena")
+            .build(),
+        ComponentMeta::builder("Flammable")
+            .category("Gameplay")
+            .field("lit", Boolean, true)
+            .provides("Flammable")
+            .tag("effect")
+            .ui_hint("lit", "whether the object is currently on fire")
+            .build(),
+    ]
+}
+
+/// The standard rule **events** — the "When" vocabulary the Rules builder (M12.1 / ADR-045) offers. The
+/// `*Entered`/`*Exited` pairs are what the mirror-rule proposer ([`crate::rules::propose_mirror`]) inverts.
+#[must_use]
+pub fn standard_events() -> Vec<EventMeta> {
+    vec![
+        EventMeta::new("EnemyDied", "an enemy was defeated"),
+        EventMeta::new("EntitySpawned", "an entity was created in the scene"),
+        EventMeta::new("EntityDestroyed", "an entity was removed from the scene"),
+        EventMeta::new("ZoneEntered", "an entity entered an area / zone"),
+        EventMeta::new("ZoneExited", "an entity left an area / zone"),
+        EventMeta::new("StateEntered", "a quest/state machine entered a state"),
+        EventMeta::new("StateExited", "a quest/state machine left a state"),
+    ]
+}
+
+/// The standard rule **actions** — the CLOSED "Then" vocabulary (the honest ceiling: verbs over component
+/// fields, never free code; genuinely algorithmic behaviour is the M12.3 plugin tier).
+#[must_use]
+pub fn standard_actions() -> Vec<ActionMeta> {
+    vec![
+        ActionMeta::new("SetField", "set a component field to a value"),
+        ActionMeta::new("AdjustCounter", "add a number to a numeric counter field"),
     ]
 }

@@ -9,6 +9,7 @@
 
 use crate::entity_id::EntityId;
 use crate::pipeline::{FieldValue, Op};
+use crate::rules::{RuleData, RuleId};
 use metrocalk_ecs::Entity;
 use std::collections::HashMap;
 
@@ -97,10 +98,18 @@ pub enum InverseOp {
         entity: EntityId,
         active: bool,
     },
+
+    /// Inverse of SetRule/RemoveRule (ADR-045) — restore the rule's prior data, or remove it if it
+    /// didn't exist (`old: None` → a precise `RemoveRule`).
+    SetRule {
+        id: RuleId,
+        old: Option<RuleData>,
+    },
 }
 
 impl InverseOp {
     /// Convert this inverse op back into a forward [`Op`] for application.
+    #[allow(clippy::too_many_lines)] // a flat 1:1 inverse→forward dispatch table, not branching logic
     pub fn to_forward_op(&self) -> Op {
         match self {
             Self::DestroyEntity { id } => Op::DeleteEntity { id: *id },
@@ -204,6 +213,15 @@ impl InverseOp {
             Self::SetActive { entity, active } => Op::SetActive {
                 entity: *entity,
                 active: *active,
+            },
+
+            Self::SetRule { id, old } => match old {
+                Some(rule) => Op::SetRule {
+                    id: id.clone(),
+                    rule: rule.clone(),
+                },
+                // Precise inverse of authoring a brand-new rule: remove it.
+                None => Op::RemoveRule { id: id.clone() },
             },
         }
     }

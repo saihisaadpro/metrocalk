@@ -10,6 +10,7 @@
 
 use crate::entity_id::{EntityId, IdGenerator};
 use crate::merge::{self, MergeReport};
+use crate::rules::{RuleData, RuleId};
 use crate::undo::{InverseOp, InverseTransaction};
 use loro::{
     Container, ContainerTrait, ContainerType, ExportMode, LoroDoc, LoroMap, LoroValue, TreeID,
@@ -144,7 +145,24 @@ pub enum Op {
     /// slot. A removed part is therefore recoverable (undo restores it) and a concurrent editor's
     /// field edits on the same part are never lost to a destructive delete.
     SetActive { entity: EntityId, active: bool },
+
+    // ── Rules layer (M12.1 / ADR-045) ──────────────────────────────────────
+    /// Author (create or replace) a **rule** — When/If/Then registry-fed data — under the document's
+    /// `rules` collection, keyed by [`RuleId`]. The whole rule travels in one op, so authoring an
+    /// N-part conditional is **one undoable transaction** (undo removes/restores it). Registry validity
+    /// (typo-proof: events/components/fields/actions/value-types) is enforced by
+    /// [`crate::rules::validate_rule`] at the authoring layer *before* commit (the engine is registry-
+    /// agnostic, exactly as [`Op::SetField`] is); the pipeline persists it as a **mergeable** child map
+    /// so two peers authoring different rules converge (invariant 1).
+    SetRule { id: RuleId, rule: RuleData },
+    /// Remove a rule from the `rules` collection (undoable — the inverse restores it).
+    RemoveRule { id: RuleId },
 }
+
+/// The top-level Loro map holding the project's **rules** (M12.1 / ADR-045), a sibling of
+/// `components`/`bindings`/`overrides`/`caps`. Each rule's slot under it is a **mergeable** child map
+/// keyed by [`RuleId`] (so concurrent first-creation of distinct rules converges, never clobbers).
+pub(crate) const RULES: &str = "rules";
 
 /// The top-level Loro map holding every instance's sparse override layer (ADR-026), a sibling of
 /// `components`/`bindings`/`hierarchy`. Each part's slot under it is a **mergeable** child map.
@@ -282,6 +300,7 @@ impl<W: World> Engine<W> {
         let _ = doc.get_map("bindings");
         let _ = doc.get_map(OVERRIDES); // the override/variant layer (ADR-026)
         let _ = doc.get_map(CAPS); // the capability-pair mirror (ADR-032)
+        let _ = doc.get_map(RULES); // the Rules layer (ADR-045)
 
         Self {
             world,
@@ -318,6 +337,37 @@ impl<W: World> Engine<W> {
     /// [`Op::CreateEntity`] to actually create it).
     pub fn alloc_entity_id(&mut self) -> EntityId {
         self.id_gen.next_id()
+    }
+
+    /// Allocate a peer-namespaced [`RuleId`] (M12.1 / ADR-045) — does not author the rule (submit an
+    /// [`Op::SetRule`] to do that). Peer-namespaced like an entity id, so two peers authoring rules
+    /// concurrently never collide on the same key.
+    pub fn alloc_rule_id(&mut self) -> RuleId {
+        RuleId::new(format!("rule_{}", self.id_gen.next_id().to_loro_key()))
+    }
+
+    /// Read one rule by id from the document (`None` if absent).
+    #[must_use]
+    pub fn rule(&self, id: &RuleId) -> Option<RuleData> {
+        let rules = self.doc.get_map(RULES);
+        let slot = get_child_map(&rules, id.as_str())?;
+        read_rule_slot(&slot)
+    }
+
+    /// All authored rules as `(id, rule)`, sorted by id (deterministic — the editor's Rule list source).
+    #[must_use]
+    pub fn rules(&self) -> Vec<(RuleId, RuleData)> {
+        let rules = self.doc.get_map(RULES);
+        let mut out = Vec::new();
+        for k in rules.keys() {
+            if let Some(slot) = get_child_map(&rules, &k) {
+                if let Some(rule) = read_rule_slot(&slot) {
+                    out.push((RuleId::new(k.to_string()), rule));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     pub fn entity_exists(&self, id: EntityId) -> bool {
@@ -620,9 +670,13 @@ impl<W: World> Engine<W> {
                         return Err(PipelineError::UnknownEntity(*to));
                     }
                 }
-                // `apply_remove_binding` tolerates a missing edge / endpoints (no-op if absent), so
-                // it can never fail — nothing to pre-validate.
-                Op::RemoveBinding { .. } => {}
+                // Nothing to pre-validate (these can't fail a precondition):
+                // - `apply_remove_binding` tolerates a missing edge / endpoints (no-op if absent).
+                // - Rules (ADR-045) are document-level data, not scene entities; registry validity
+                //   (typo-proof events/fields/actions) is enforced by `rules::validate_rule` at the
+                //   authoring layer before commit — the pipeline is registry-agnostic, exactly as it is
+                //   for a `SetField`'s component/field — and `RemoveRule` is a tolerant no-op if absent.
+                Op::RemoveBinding { .. } | Op::SetRule { .. } | Op::RemoveRule { .. } => {}
             }
         }
         Ok(())
@@ -724,6 +778,8 @@ impl<W: World> Engine<W> {
                 field,
             } => self.apply_remove_override(*entity, component, field),
             Op::SetActive { entity, active } => self.apply_set_active(*entity, *active),
+            Op::SetRule { id, rule } => self.apply_set_rule(id, rule),
+            Op::RemoveRule { id } => self.apply_remove_rule(id),
         }
     }
 
@@ -1133,6 +1189,40 @@ impl<W: World> Engine<W> {
         Ok(())
     }
 
+    // ── Rules layer apply (M12.1 / ADR-045) ────────────────────────────
+
+    /// Write a rule into its **mergeable** slot under `rules` (so two peers authoring distinct rules
+    /// converge — ADR-026 pattern). `name`/`enabled`/`event` are stored as scalar keys (field-level
+    /// merge); the variable-length `conditions`/`actions` lists ride as JSON strings (rule-level merge).
+    fn apply_set_rule(&mut self, id: &RuleId, rule: &RuleData) -> Result<(), PipelineError> {
+        let slot = self
+            .doc
+            .get_map(RULES)
+            .ensure_mergeable_map(id.as_str())
+            .map_err(loro_err)?;
+        slot.insert("name", rule.name.as_str()).map_err(loro_err)?;
+        slot.insert("enabled", rule.enabled).map_err(loro_err)?;
+        slot.insert("event", rule.event.as_str())
+            .map_err(loro_err)?;
+        let conditions = serde_json::to_string(&rule.conditions)
+            .map_err(|e| PipelineError::Loro(e.to_string()))?;
+        slot.insert("conditions", conditions.as_str())
+            .map_err(loro_err)?;
+        let actions =
+            serde_json::to_string(&rule.actions).map_err(|e| PipelineError::Loro(e.to_string()))?;
+        slot.insert("actions", actions.as_str()).map_err(loro_err)?;
+        Ok(())
+    }
+
+    /// Remove a rule's slot from `rules` (a no-op if it isn't present).
+    fn apply_remove_rule(&mut self, id: &RuleId) -> Result<(), PipelineError> {
+        let rules = self.doc.get_map(RULES);
+        if rules.get(id.as_str()).is_some() {
+            rules.delete(id.as_str()).map_err(loro_err)?;
+        }
+        Ok(())
+    }
+
     // ── override / variant reads (the stronger read layer) ─────────────
 
     /// The raw deep value of a part's override slot (a `LoroValue::Map` of `key → value`), or `None`
@@ -1433,6 +1523,15 @@ impl<W: World> Engine<W> {
                 entity: *entity,
                 active: self.is_active(*entity),
             }),
+
+            // Authoring and removing a rule share one inverse: restore the rule's prior data
+            // (`old: Some`), or — if there was none — `old: None`, whose forward form is a precise
+            // `RemoveRule`. So undo of an authored rule removes it, and undo of a removed rule
+            // restores it exactly (ADR-045, the one-undoable-transaction guarantee).
+            Op::SetRule { id, .. } | Op::RemoveRule { id } => Ok(InverseOp::SetRule {
+                id: id.clone(),
+                old: self.rule(id),
+            }),
         }
     }
 
@@ -1660,6 +1759,32 @@ fn get_child_map(parent: &LoroMap, key: &str) -> Option<LoroMap> {
         Some(ValueOrContainer::Container(Container::Map(m))) => Some(m),
         _ => None,
     }
+}
+
+/// Read a [`RuleData`] back from its Loro slot (M12.1 / ADR-045) — the inverse of [`Engine::apply_set_rule`].
+/// `None` if a required scalar key is missing or the JSON lists don't parse (a corrupt/foreign slot is
+/// skipped, never trusted — the same discipline as a corrupt persisted blob).
+fn read_rule_slot(slot: &LoroMap) -> Option<RuleData> {
+    let get_str = |k: &str| match slot.get(k) {
+        Some(ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
+        _ => None,
+    };
+    let name = get_str("name")?;
+    let event = get_str("event")?;
+    let enabled = matches!(
+        slot.get("enabled"),
+        Some(ValueOrContainer::Value(LoroValue::Bool(true)))
+    );
+    let conditions =
+        serde_json::from_str(&get_str("conditions").unwrap_or_else(|| "[]".into())).ok()?;
+    let actions = serde_json::from_str(&get_str("actions").unwrap_or_else(|| "[]".into())).ok()?;
+    Some(RuleData {
+        name,
+        enabled,
+        event,
+        conditions,
+        actions,
+    })
 }
 
 pub(crate) fn binding_key(from: &EntityId, kind: &str, to: &EntityId) -> String {

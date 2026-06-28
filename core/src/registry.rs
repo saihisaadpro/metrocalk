@@ -108,6 +108,48 @@ impl ComponentMeta {
     }
 }
 
+/// A rule **event** the registry knows — the "When" vocabulary the M12.1 Rules builder offers (ADR-045).
+/// A name + a plain-language description (the typo-proof dropdown source + its tooltip). Event *payloads*
+/// (the subject entity a fired event carries) are the M12.5 runtime concern; M12.1 is the authoring model.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub struct EventMeta {
+    /// Unique event name, e.g. `"EnemyDied"`.
+    pub name: String,
+    /// Plain-language description (no jargon — the UX-quality "scent" bar).
+    pub description: String,
+}
+
+impl EventMeta {
+    /// Build an event-meta from a name + description.
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
+
+/// A rule **action** verb the registry knows — the "Then" vocabulary (ADR-045). The action set is
+/// **closed** (the honest ceiling, test #5): verbs over component fields, never free code — genuinely
+/// algorithmic behaviour is the M12.3 WASM-plugin tier.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub struct ActionMeta {
+    /// Unique action name, e.g. `"SetField"`.
+    pub name: String,
+    /// Plain-language description of what the verb does.
+    pub description: String,
+}
+
+impl ActionMeta {
+    /// Build an action-meta from a name + description.
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
+
 /// Ergonomic, explicit builder for a [`ComponentMeta`] (chosen over a derive macro — less magic, and
 /// it works for runtime/plugin/marketplace registration, not only compile-time types).
 #[derive(Debug)]
@@ -358,6 +400,11 @@ pub struct Registry<W: World> {
     capabilities: HashMap<String, Entity>,
     kinds: HashMap<String, Registered>,
     by_entity: HashMap<Entity, String>,
+    // M12.1 (ADR-045) — the Rules-layer vocabulary: the events a rule can trigger on (When) and the action
+    // verbs it can run (Then). `BTreeMap` so enumeration is sorted + deterministic (stable builder dropdowns
+    // + reproducible tests). Components carry their own field schema (above); events/actions are name-keyed.
+    events: BTreeMap<String, EventMeta>,
+    actions: BTreeMap<String, ActionMeta>,
 }
 
 impl<W: World> Registry<W> {
@@ -374,6 +421,8 @@ impl<W: World> Registry<W> {
             capabilities: HashMap::new(),
             kinds: HashMap::new(),
             by_entity: HashMap::new(),
+            events: BTreeMap::new(),
+            actions: BTreeMap::new(),
         }
     }
 
@@ -468,5 +517,39 @@ impl<W: World> Registry<W> {
     /// All registered metadata (unordered).
     pub fn metas(&self) -> impl Iterator<Item = &ComponentMeta> {
         self.kinds.values().map(|r| &r.meta)
+    }
+
+    // ── M12.1 Rules vocabulary (ADR-045) — the "When" events + "Then" actions ──
+
+    /// Register a rule **event** (the "When" vocabulary). Re-registering a name overwrites it.
+    pub fn register_event(&mut self, meta: EventMeta) {
+        self.events.insert(meta.name.clone(), meta);
+    }
+
+    /// Register a rule **action** verb (the closed "Then" vocabulary — the honest ceiling).
+    pub fn register_action(&mut self, meta: ActionMeta) {
+        self.actions.insert(meta.name.clone(), meta);
+    }
+
+    /// Whether `name` is a registered rule event — the typo-proof gate for a rule's `When`.
+    #[must_use]
+    pub fn has_event(&self, name: &str) -> bool {
+        self.events.contains_key(name)
+    }
+
+    /// Whether `name` is a registered rule action verb — the typo-proof gate for a rule's `Then`.
+    #[must_use]
+    pub fn has_action(&self, name: &str) -> bool {
+        self.actions.contains_key(name)
+    }
+
+    /// All registered events, sorted by name (the builder's "When" dropdown source).
+    pub fn events(&self) -> impl Iterator<Item = &EventMeta> {
+        self.events.values()
+    }
+
+    /// All registered action verbs, sorted by name (the builder's "Then" dropdown source).
+    pub fn actions(&self) -> impl Iterator<Item = &ActionMeta> {
+        self.actions.values()
     }
 }
