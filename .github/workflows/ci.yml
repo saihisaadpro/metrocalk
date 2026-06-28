@@ -67,8 +67,10 @@ jobs:
           # in the importer wrappers (gltf_import.rs · image_import.rs · obj_import.rs [M11.1] · fbx_import.rs
           # [M11.1, native] · ktx2_import.rs [M11.1, native] · env_import.rs [M11.3, HDR env maps]); the
           # crypto type ed25519_dalek:: must stay behind signed.rs [M11.5, the signing backing] — the same
-          # discipline as flecs_ecs-in-/ecs. Comment lines (prose mentioning the types) skipped.
-          if grep -rn "gltf::\|image::\|tobj::\|ufbx::\|basis_universal::\|ed25519_dalek::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'image_import.rs' | grep -v 'obj_import.rs' | grep -v 'fbx_import.rs' | grep -v 'ktx2_import.rs' | grep -v 'env_import.rs' | grep -v 'signed.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+          # discipline as flecs_ecs-in-/ecs. Comment lines (prose mentioning the types) skipped. demo.rs is a
+          # test-FIXTURE generator (it ENCODES demo PNGs via `image::write_to` — the inverse of the import/
+          # decode path this gate guards), so it's exempt like the wrappers, not a decode-path leak.
+          if grep -rn "gltf::\|image::\|tobj::\|ufbx::\|basis_universal::\|ed25519_dalek::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'image_import.rs' | grep -v 'obj_import.rs' | grep -v 'fbx_import.rs' | grep -v 'ktx2_import.rs' | grep -v 'env_import.rs' | grep -v 'signed.rs' | grep -v 'demo.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
             echo "::error::a foreign type (gltf::/image::/tobj::/ufbx::/basis_universal::/ed25519_dalek::) leaked outside its wrapper module — it must stay behind the MeshSource/ProvenanceVerifier trait (invariant 5; mirrors ADR-001/006/040/044)"
             exit 1
           fi
