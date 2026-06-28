@@ -41,6 +41,13 @@ ufbx = { version = "0.10", optional = true }
 # KTX2/basis texture transcode (M11.1, ADR-040) — `basis-universal` wraps Binomial's C++ codec via FFI.
 # Native-only (C++ → no wasm) → behind the `ktx2` feature. `basis_universal::` stays behind `ktx2_import.rs`.
 basis-universal = { version = "0.3", optional = true }
+# M11.5 (ADR-044) — the cryptographic provenance signing backing (`SignedProvenanceTrust`): real Ed25519
+# signatures over a canonical assertion set + a hard content-hash binding (the C2PA TRUST MODEL — signed
+# assertions + tamper/forgery rejection + authorship). Pure Rust (no C, no openssl) → unlike the native
+# `c2pa` crate it does NOT break the wasm invariant; behind the `signing` feature so the default crate stays
+# minimal, and `ed25519_dalek::` stays confined to `signed.rs` (grep-gated, invariant 5). The C2PA/JUMBF wire
+# format + the CAI trust-list interop ride on top of this as a named seam.
+ed25519-dalek = { version = "2", optional = true }
 
 [features]
 default = []
@@ -49,6 +56,9 @@ default = []
 native-formats = ["fbx", "ktx2"]
 fbx = ["dep:ufbx"]
 ktx2 = ["dep:basis-universal"]
+# M11.5 (ADR-044): cryptographic provenance signing (Ed25519). Off by default (lean + wasm-tripwire-clean);
+# the editor app + the marketplace path enable it. Pure Rust, so it COULD also verify in the browser.
+signing = ["dep:ed25519-dalek"]
 
 [dev-dependencies]
 # Round-trip the demo glb generators back through the importer in tests.

@@ -47,6 +47,13 @@ pub struct Provenance {
     pub content_hash: String,
     /// A perceptual (dHash) fingerprint of the asset's primary texture, for near-duplicate detection.
     pub perceptual_hash: u64,
+    /// M11.5 (ADR-044) — a cryptographic signature (hex Ed25519, 64 bytes) over this record's canonical
+    /// assertion set, bound to `content_hash` (the C2PA trust model). `None` = unsigned. Written by the
+    /// `signing`-feature [`crate::signed::SignedProvenanceTrust`] backing; verified there + at the marketplace.
+    pub signature: Option<String>,
+    /// The signer's public key (hex Ed25519, 32 bytes) — who vouches for the asset. Checked against a
+    /// trusted-key set on verify (the CAI trust list is the named interop seam). `None` = unsigned.
+    pub signer: Option<String>,
 }
 
 impl Provenance {
@@ -84,7 +91,32 @@ impl Provenance {
             provider: Some(provider),
             content_hash: content_hash.into(),
             perceptual_hash,
+            ..Self::default()
         }
+    }
+
+    /// The **canonical assertion set** that a signature binds (M11.5 / ADR-044) — a deterministic,
+    /// unambiguous serialization of the provenance identity (everything *except* the signature/signer
+    /// themselves), so re-deriving it from the stored record on verify reproduces the exact signed bytes.
+    /// Tampering ANY identity field (or the content hash) changes these bytes → the signature no longer
+    /// verifies. Versioned (`mtk-prov-v1`) so the format can evolve without silently accepting old bytes.
+    #[must_use]
+    pub fn canonical_assertions(&self) -> Vec<u8> {
+        let kind = match self.kind {
+            Some(AssetKind::Imported) => "imported",
+            Some(AssetKind::Generated) => "generated",
+            None => "unknown",
+        };
+        format!(
+            "mtk-prov-v1\nkind={kind}\nsource={}\nai={}\nprompt={}\nprovider={}\nhash={}\nphash={:x}",
+            self.source,
+            u8::from(self.ai_generated),
+            self.prompt.as_deref().unwrap_or(""),
+            self.provider.as_deref().unwrap_or(""),
+            self.content_hash,
+            self.perceptual_hash,
+        )
+        .into_bytes()
     }
 }
 

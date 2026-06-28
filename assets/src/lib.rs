@@ -37,6 +37,10 @@ pub mod obj_import;
 /// M11.5 (ADR-044) — asset identity: a provenance record + perceptual-hash near-dup detection, riding the
 /// content-addressed store. Pure-Rust; the C2PA backing + offline auto-rig are seams behind it.
 pub mod provenance;
+/// M11.5 (ADR-044) — the cryptographic provenance signing backing (Ed25519, the C2PA trust model). Behind
+/// the `signing` feature so the default crate stays minimal + wasm-tripwire-clean.
+#[cfg(feature = "signing")]
+pub mod signed;
 pub mod source;
 pub mod store;
 
@@ -57,6 +61,8 @@ pub use provenance::{
     hamming_distance, is_near_duplicate, perceptual_hash, AssetKind, ContentAddressTrust,
     Provenance, ProvenanceVerifier, TamperError,
 };
+#[cfg(feature = "signing")]
+pub use signed::SignedProvenanceTrust;
 pub use source::{ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES};
 pub use store::{AssetId, AssetStore};
 

@@ -65,13 +65,14 @@ jobs:
         run: |
           # gltf:: / image:: / tobj:: / ufbx:: / basis_universal:: must live ONLY behind the MeshSource trait,
           # in the importer wrappers (gltf_import.rs · image_import.rs · obj_import.rs [M11.1] · fbx_import.rs
-          # [M11.1, native] · ktx2_import.rs [M11.1, native] · env_import.rs [M11.3, HDR env maps]) — the same
+          # [M11.1, native] · ktx2_import.rs [M11.1, native] · env_import.rs [M11.3, HDR env maps]); the
+          # crypto type ed25519_dalek:: must stay behind signed.rs [M11.5, the signing backing] — the same
           # discipline as flecs_ecs-in-/ecs. Comment lines (prose mentioning the types) skipped.
-          if grep -rn "gltf::\|image::\|tobj::\|ufbx::\|basis_universal::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'image_import.rs' | grep -v 'obj_import.rs' | grep -v 'fbx_import.rs' | grep -v 'ktx2_import.rs' | grep -v 'env_import.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
-            echo "::error::a foreign decoder type (gltf::/image::/tobj::/ufbx::/basis_universal::) leaked outside the importer wrappers — they must stay behind the MeshSource trait (invariant 5; mirrors ADR-001/006/040)"
+          if grep -rn "gltf::\|image::\|tobj::\|ufbx::\|basis_universal::\|ed25519_dalek::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'image_import.rs' | grep -v 'obj_import.rs' | grep -v 'fbx_import.rs' | grep -v 'ktx2_import.rs' | grep -v 'env_import.rs' | grep -v 'signed.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::a foreign type (gltf::/image::/tobj::/ufbx::/basis_universal::/ed25519_dalek::) leaked outside its wrapper module — it must stay behind the MeshSource/ProvenanceVerifier trait (invariant 5; mirrors ADR-001/006/040/044)"
             exit 1
           fi
-          echo "no gltf::/image::/tobj::/ufbx::/basis_universal:: outside the importer wrappers — boundary intact"
+          echo "no gltf::/image::/tobj::/ufbx::/basis_universal::/ed25519_dalek:: outside the wrapper modules — boundary intact"
 
       - name: No rapier/parry types leak outside the /physics crate (invariant 5, M8.2/ADR-021)
         run: |
@@ -141,6 +142,15 @@ jobs:
         run: |
           cargo clippy -p metrocalk-assets --all-targets --features "fbx ktx2" -- -D warnings
           cargo test -p metrocalk-assets --features ktx2
+
+      # The cryptographic provenance signing backing (M11.5/ADR-044) lives behind the non-default `signing`
+      # feature (the pure-Rust `ed25519-dalek` — the C2PA trust model: signed assertions + content binding).
+      # The default workspace build never compiles it, so build, lint, and test it explicitly — the
+      # sign/verify/tamper/forgery guards must not be dark.
+      - name: assets provenance signing — clippy + test the Ed25519 backing (dark on default)
+        run: |
+          cargo clippy -p metrocalk-assets --all-targets --features signing -- -D warnings
+          cargo test -p metrocalk-assets --features signing
 
   editor-vitest:
     # The React editor projection (editor/, ADR-010) has a real vitest suite (transport-frame decode,
