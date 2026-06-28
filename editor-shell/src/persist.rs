@@ -91,6 +91,11 @@ pub enum Record {
     },
     /// M12.2 (ADR-046) — a removed state machine; replayed as the same `RemoveStateMachine`.
     RemoveStateMachine { id: String },
+    /// M12.3 (ADR-047) — a sandboxed WASM-plugin run: the plugin name + its JSON input. Replayed by
+    /// **re-running** the (deterministic) plugin and re-applying its effect through the commit pipeline, so
+    /// a plugin-driven scene change survives close→reopen. Replay relies on the plugin being deterministic
+    /// (the registry's `PluginMeta.deterministic` gate) — same input → same effect.
+    RunPlugin { name: String, input: String },
     /// A physics-body spawn (M8.2): a dynamic RigidBody + ball Collider + its ball mesh handle, at a
     /// position. Replayed by re-spawning deterministically (same id alloc); the sim body itself is
     /// RE-HYDRATED from the restored RigidBody entity by the engine thread after replay. Loro stores the
@@ -358,6 +363,13 @@ impl Log {
                         }],
                     )
                     .is_ok(),
+                Record::RunPlugin { name, input } => crate::plugin_host::run_plugin(
+                    engine,
+                    &metrocalk_core::stdlib::standard_components(),
+                    &name,
+                    &input,
+                )
+                .is_ok_and(|d| d.rejects.is_empty()),
                 Record::SpawnBody { pos, mesh } => {
                     capscene::spawn_physics_body(engine, scene, mesh.as_deref(), pos, 0.45).is_ok()
                 }

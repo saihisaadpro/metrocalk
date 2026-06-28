@@ -1,0 +1,27 @@
+# M12.3 (ADR-047) — the example WASM plugin: a genuinely ALGORITHMIC behaviour (a deterministic procedural
+# arrangement) of the kind the no-code Rules layer can't express — the honest-ceiling escape. Built to
+# wasm32 via extism-pdk; NOT a workspace member (excluded in the root Cargo.toml). The built .wasm is
+# checked in at ../tests/fixtures/arrange.wasm. Pure compute: no host functions, no WASI, no random/clock →
+# DETERMINISTIC, so it's eligible for the Play/replay lockstep path.
+[package]
+name = "mtk-arrange-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace root: this crate is `exclude`d from the metrocalk workspace (it's wasm32-only), so it
+# needs its own empty `[workspace]` so cargo doesn't try to attach it to the parent.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

@@ -150,6 +150,38 @@ impl ActionMeta {
     }
 }
 
+/// A **WASM plugin component** the registry knows (M12.3 / ADR-047) — the *honest ceiling*: genuinely
+/// algorithmic behaviour lives in a sandboxed plugin, not in Rules. Registering it makes the plugin
+/// **referenceable + typed** so an M12.1 Rule's `RunPlugin` action can name it (reveal/explain applies) and
+/// the host loads it by name. The `deterministic` flag is the **Play/replay gate** (deliverable 6): a
+/// non-deterministic plugin can't enter the lockstep path. The registry knows the plugin's name + contract;
+/// the sandboxed *running* lives in `/plugins` (invariant 5).
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub struct PluginMeta {
+    /// Unique plugin name, e.g. `"arrange"` (what a `RunPlugin` action references + the host loads by).
+    pub name: String,
+    /// Plain-language description of what the plugin computes (the explain/scent surface).
+    pub description: String,
+    /// Whether the plugin is **deterministic** (same input → same output). Only a deterministic plugin may
+    /// run in the Play/replay lockstep path (M8.1); a non-deterministic one is flagged out of it.
+    pub deterministic: bool,
+}
+
+impl PluginMeta {
+    /// Build a plugin-meta from a name + description + the determinism flag.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        deterministic: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            deterministic,
+        }
+    }
+}
+
 /// Ergonomic, explicit builder for a [`ComponentMeta`] (chosen over a derive macro — less magic, and
 /// it works for runtime/plugin/marketplace registration, not only compile-time types).
 #[derive(Debug)]
@@ -405,6 +437,9 @@ pub struct Registry<W: World> {
     // + reproducible tests). Components carry their own field schema (above); events/actions are name-keyed.
     events: BTreeMap<String, EventMeta>,
     actions: BTreeMap<String, ActionMeta>,
+    // M12.3 (ADR-047) — the WASM-plugin vocabulary (the honest ceiling): the algorithmic components a
+    // `RunPlugin` rule action may invoke. Name-keyed, sorted/deterministic like events/actions.
+    plugins: BTreeMap<String, PluginMeta>,
 }
 
 impl<W: World> Registry<W> {
@@ -423,6 +458,7 @@ impl<W: World> Registry<W> {
             by_entity: HashMap::new(),
             events: BTreeMap::new(),
             actions: BTreeMap::new(),
+            plugins: BTreeMap::new(),
         }
     }
 
@@ -551,5 +587,30 @@ impl<W: World> Registry<W> {
     /// All registered action verbs, sorted by name (the builder's "Then" dropdown source).
     pub fn actions(&self) -> impl Iterator<Item = &ActionMeta> {
         self.actions.values()
+    }
+
+    // ── M12.3 plugin vocabulary (ADR-047) — the honest ceiling ──────────
+
+    /// Register a WASM-plugin component (the algorithmic escape a `RunPlugin` action may invoke).
+    /// Re-registering a name overwrites it.
+    pub fn register_plugin(&mut self, meta: PluginMeta) {
+        self.plugins.insert(meta.name.clone(), meta);
+    }
+
+    /// Whether `name` is a registered plugin — the typo-proof gate for a `RunPlugin` action's target.
+    #[must_use]
+    pub fn has_plugin(&self, name: &str) -> bool {
+        self.plugins.contains_key(name)
+    }
+
+    /// Metadata for a registered plugin (its description + the determinism flag).
+    #[must_use]
+    pub fn plugin(&self, name: &str) -> Option<&PluginMeta> {
+        self.plugins.get(name)
+    }
+
+    /// All registered plugins, sorted by name (the builder's plugin-picker source).
+    pub fn plugins(&self) -> impl Iterator<Item = &PluginMeta> {
+        self.plugins.values()
     }
 }

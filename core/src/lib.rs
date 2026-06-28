@@ -41,11 +41,13 @@ pub use pipeline::{CapRole, CapabilityResolver, Engine, FieldValue, Op, Pipeline
 pub use producer::ProducerHook;
 pub use project::{ProjectError, FORMAT_VERSION};
 pub use registry::{
-    ActionMeta, Builder, ComponentMeta, EventMeta, FieldSpec, FieldType, Registry, RegistryError,
+    ActionMeta, Builder, ComponentMeta, EventMeta, FieldSpec, FieldType, PluginMeta, Registry,
+    RegistryError,
 };
 pub use resolve::{resolve, resolve_local, Match, NextTier, Resolution, Resolved};
 pub use rules::{
     propose_mirror, validate_rule, Action, CompareOp, Condition, RuleData, RuleError, RuleId,
+    RUN_PLUGIN_ACTION,
 };
 pub use state_machine::{
     validate_state_machine, StateMachine, StateMachineError, StateMachineId, StateMachineReport,

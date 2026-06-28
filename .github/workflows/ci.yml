@@ -86,6 +86,20 @@ jobs:
           fi
           echo "no rapier/parry outside /physics — Physics-trait boundary intact"
 
+      - name: No extism/wasmtime types leak outside the /plugins crate (invariant 5, M12.3/ADR-047)
+        run: |
+          # extism::/wasmtime:: (the WASM host SDK) must live ONLY behind the PluginHost trait, in /plugins —
+          # the same discipline as rapier-in-/physics, loro-in-/core, gltf::-in-the-importer. Every other crate
+          # drives plugins through the project-owned PluginHost trait + our neutral types (&[u8] in/out,
+          # PluginError/Sandbox), never an extism/wasmtime type. The example WASM plugin (plugins/example-plugin)
+          # is excluded from the workspace; its extism-pdk use is the plugin side, not the host API. Prose
+          # comments mentioning "extism"/"wasmtime" (no `::`) are fine.
+          if grep -rn "extism::\|extism_pdk\|wasmtime::" core ecs transport assets economy physics interchange gizmo skeleton deform editor-shell tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::extism/wasmtime leaked outside /plugins — host types must stay behind the PluginHost trait (invariant 5; mirrors ADR-001/021)"
+            exit 1
+          fi
+          echo "no extism/wasmtime outside /plugins — PluginHost-trait boundary intact"
+
       - name: No urdf/openusd types leak outside the /interchange crate (invariant 5, M8.5/ADR-024)
         run: |
           # The robotics/VFX import crates (urdf_rs, openusd) must live ONLY behind the Interchange trait,

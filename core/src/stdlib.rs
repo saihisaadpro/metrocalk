@@ -5,7 +5,7 @@
 //! Capabilities form the relational web: e.g. `Sprite` and `MeshRenderer` both *provide* `Renderable`
 //! and *require* `Spatial`; `HealthBar` *requires* + *observes* `Health` and *provides* `UIElement`.
 
-use crate::registry::{ActionMeta, ComponentMeta, EventMeta, FieldType};
+use crate::registry::{ActionMeta, ComponentMeta, EventMeta, FieldType, PluginMeta};
 
 /// The standard component kinds. Registering all of them populates the relational catalog.
 #[allow(clippy::too_many_lines)] // a flat data table of component definitions, not branching logic
@@ -253,5 +253,25 @@ pub fn standard_actions() -> Vec<ActionMeta> {
     vec![
         ActionMeta::new("SetField", "set a component field to a value"),
         ActionMeta::new("AdjustCounter", "add a number to a numeric counter field"),
+        // M12.3 (ADR-047) — the honest-ceiling escape: hand off to a sandboxed WASM plugin for genuinely
+        // algorithmic behavior (a boss AI, a procedural generator, a custom solver). Still a CLOSED verb —
+        // the algorithm is the plugin's, not free code in a Rule.
+        ActionMeta::new(
+            "RunPlugin",
+            "run a sandboxed WASM plugin for algorithmic behavior (the honest ceiling)",
+        ),
     ]
+}
+
+/// The standard **WASM-plugin** components (M12.3 / ADR-047) — the algorithmic escape a `RunPlugin` rule
+/// action invokes. The example `arrange` plugin is a deterministic procedural arrangement (so it's eligible
+/// for the Play/replay lockstep path). Registering a plugin makes it referenceable + typed (reveal/explain);
+/// the host (`/plugins`) loads each by name from its sandboxed `.wasm`.
+#[must_use]
+pub fn standard_plugins() -> Vec<PluginMeta> {
+    vec![PluginMeta::new(
+        "arrange",
+        "deterministically arrange entities in a procedural spiral",
+        true,
+    )]
 }

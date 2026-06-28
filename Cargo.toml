@@ -8,7 +8,11 @@ members = ["core", "ecs", "transport", "plugins", "assets", "economy", "physics"
 # `unsafe` (peak-RSS counters) which this workspace forbids. Excluding them keeps the workspace the
 # real code, keeps `cargo build` from dragging in the Flecs C core, and lets them keep building
 # standalone in their own dirs (the wasm-tripwire CI cd's into `spikes/wasm`).
-exclude = ["spikes/loro", "spikes/flecs", "spikes/wasm", "spikes/render-scene", "spikes/shell-composite", "spikes/tauri-shell", "spikes/physics"]
+exclude = ["spikes/loro", "spikes/flecs", "spikes/wasm", "spikes/render-scene", "spikes/shell-composite", "spikes/tauri-shell", "spikes/physics", "plugins/example-plugin"]
+# `plugins/example-plugin` (M12.3) is the real example WASM plugin: it targets wasm32-unknown-unknown via
+# extism-pdk, so it can't build for the host target and is NOT a workspace member. Its built artifact is
+# checked in at `plugins/tests/fixtures/arrange.wasm` (like the .glb fixtures), so host tests + CI don't
+# build wasm. Rebuild: `cd plugins/example-plugin && cargo build --release --target wasm32-unknown-unknown`.
 
 [workspace.package]
 edition = "2021"

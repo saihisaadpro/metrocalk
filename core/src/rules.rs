@@ -22,6 +22,12 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
 
+/// The action verb that invokes a **WASM plugin** (M12.3 / ADR-047) — the *honest ceiling*. A `RunPlugin`
+/// action's `component` slot names a registry-known plugin ([`crate::registry::PluginMeta`]); the
+/// algorithmic work runs sandboxed in `/plugins`, and its effect comes back as an undoable transaction.
+/// Rules **orchestrate** (when/if); a plugin **computes** — the line is drawn here and held.
+pub const RUN_PLUGIN_ACTION: &str = "RunPlugin";
+
 /// A stable rule identifier — the key under the Loro `rules` map. Peer-namespaced (allocated by
 /// [`crate::pipeline::Engine::alloc_rule_id`]) so two peers authoring rules concurrently never collide.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -155,6 +161,8 @@ pub enum RuleError {
     UnknownEvent(String),
     /// A `Then` action verb isn't in the registry vocabulary.
     UnknownAction(String),
+    /// A `RunPlugin` action references a plugin the registry doesn't know (M12.3 / ADR-047).
+    UnknownPlugin(String),
     /// A condition/action references an entity that doesn't exist.
     UnknownEntity(String),
     /// A condition/action references a component the registry doesn't know.
@@ -188,6 +196,12 @@ impl fmt::Display for RuleError {
                 write!(
                     f,
                     "'{a}' isn't an action the engine knows - pick one from the list"
+                )
+            }
+            Self::UnknownPlugin(p) => {
+                write!(
+                    f,
+                    "'{p}' isn't a plugin the engine knows - install or pick a registered plugin"
                 )
             }
             Self::UnknownEntity(e) => write!(f, "the entity '{e}' no longer exists"),
@@ -248,7 +262,17 @@ where
             return Err(RuleError::UnknownAction(a.action.clone()));
         }
         check_entity(&a.entity, &entity_exists)?;
-        check_field(registry, &a.component, &a.field, &a.value)?;
+        if a.action == RUN_PLUGIN_ACTION {
+            // The Rules->plugin boundary (the honest ceiling, M12.3): a `RunPlugin` action's `component`
+            // slot names a REGISTERED plugin (typo-proof — reveal/explain applies); the algorithmic work
+            // lives in the sandboxed plugin, not in Rules. `field`/`value` carry the plugin's own input
+            // contract, not a registry-typed component field, so the field-type check doesn't apply.
+            if !registry.has_plugin(&a.component) {
+                return Err(RuleError::UnknownPlugin(a.component.clone()));
+            }
+        } else {
+            check_field(registry, &a.component, &a.field, &a.value)?;
+        }
     }
     Ok(())
 }

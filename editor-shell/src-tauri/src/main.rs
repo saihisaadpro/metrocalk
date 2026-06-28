@@ -402,6 +402,14 @@ enum EngineCmd {
         id: String,
         reply: Sender<bool>,
     },
+    /// M12.3 (ADR-047) — run a sandboxed WASM plugin `name` with `input` (the honest-ceiling escape): the
+    /// plugin computes an effect that lands as an **undoable transaction** through the commit pipeline (or is
+    /// rejected/contained). Echoes the resulting projection delta to the viewport + persists a replay record.
+    RunPlugin {
+        name: String,
+        input: String,
+        reply: Sender<RunPluginResult>,
+    },
     // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable transaction over the Movable Tree +
     // override pipeline. reparent reuses `ReparentPart`; delete=deactivate is distinct from `Remove`. ──
     /// Create an empty named entity at a position → reply its id (selected by the caller).
@@ -966,6 +974,18 @@ struct AuthorStateMachineResult {
     id: Option<String>,
     error: Option<String>,
     unreachable: Vec<String>,
+}
+
+/// M12.3 (ADR-047) — the outcome of running a sandboxed WASM plugin: `ok` + how many field ops its effect
+/// applied (committed as one undoable transaction), or a plain-language `error` if the plugin was Blocked
+/// (a rejected effect — the ADR-017 guard) or **contained** (a missing plugin / trap / timeout / over-budget
+/// / bad output — never a crash).
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct RunPluginResult {
+    ok: bool,
+    applied: usize,
+    error: Option<String>,
 }
 
 struct AppState {
@@ -2054,6 +2074,47 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     log.append(&Record::RemoveStateMachine { id });
                 }
                 let _ = reply.send(ok);
+            }
+            EngineCmd::RunPlugin { name, input, reply } => {
+                // Run the sandboxed plugin; its effect is applied through the ONE commit pipeline (undoable)
+                // by `run_plugin` via the ADR-017 patch contract. On success: echo the delta to the viewport
+                // (inv. 2) + persist a replay record (so a plugin-driven change survives reload). A rejected
+                // effect (the plugin reached past validation) or a contained run failure (trap/timeout/budget/
+                // bad output) replies an explained error — never an engine crash.
+                let resp = match metrocalk_editor_shell::plugin_host::run_plugin(
+                    &mut engine,
+                    &metrocalk_core::stdlib::standard_components(),
+                    &name,
+                    &input,
+                ) {
+                    Ok(delta) if delta.rejects.is_empty() => {
+                        let applied = delta.ops.len();
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, delta);
+                        }
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                        log.append(&Record::RunPlugin {
+                            name: name.clone(),
+                            input,
+                        });
+                        RunPluginResult {
+                            ok: true,
+                            applied,
+                            error: None,
+                        }
+                    }
+                    Ok(delta) => RunPluginResult {
+                        ok: false,
+                        applied: 0,
+                        error: delta.rejects.first().map(|r| r.reason.clone()),
+                    },
+                    Err(e) => RunPluginResult {
+                        ok: false,
+                        applied: 0,
+                        error: Some(e.to_string()),
+                    },
+                };
+                let _ = reply.send(resp);
             }
             EngineCmd::Generate { query, reply } => {
                 // Tier 3, opt-in. Offline/unconfigured → an honest seam, no placeholder, never a fake
@@ -6036,6 +6097,22 @@ fn delete_state_machine(state: State<AppState>, id: String) -> bool {
     rx.recv().unwrap_or(false)
 }
 
+/// M12.3 (ADR-047) — run a sandboxed WASM plugin (the honest-ceiling escape) with a JSON `input`; its effect
+/// lands as one undoable transaction, or an explained Blocked/contained reason. Returns the outcome.
+#[tauri::command]
+fn run_plugin(state: State<AppState>, name: String, input: String) -> RunPluginResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::RunPlugin { name, input, reply })
+        .is_err()
+    {
+        return RunPluginResult::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 /// Generate (M6, tier 3) — opt-in last resort. Drops a grey placeholder instantly + kicks off async
 /// text-to-3D; the real mesh streams in later over the projection Channel. Returns the placeholder + the
 /// inert token cost, or the offline seam.
@@ -6379,6 +6456,7 @@ fn main() {
             state_machines,
             author_state_machine,
             delete_state_machine,
+            run_plugin,
             generate,
             ai_edit,
             top_up,

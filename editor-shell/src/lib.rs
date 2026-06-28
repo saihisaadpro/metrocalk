@@ -19,6 +19,7 @@ pub mod generate;
 pub mod metering;
 pub mod persist;
 pub mod physics_intent;
+pub mod plugin_host;
 pub mod project;
 pub mod reveal;
 pub mod transform_solver;

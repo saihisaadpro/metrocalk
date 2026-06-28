@@ -7,6 +7,17 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Extism WASM host (BSD-3), wrapped behind our own `PluginHost` trait (invariant 5 — no `extism::` in the
+# public API, grep-gated). default-features=false drops Extism's AMBIENT host functions (http / ureq /
+# register-filesystem / register-http) — a sandboxed plugin gets ONLY the host fns we explicitly allow-list;
+# we keep just the wasmtime backing (the JIT runtime). Native-only (wasmtime); the browser host is a named
+# seam. Pinned to the latest confirmed at execution (2026-06-28): extism 1.30.0 (pins wasmtime >=27 <31).
+extism = { version = "1.30", default-features = false, features = ["wasmtime-default-features"] }
+thiserror = "2"
+
+[dev-dependencies]
+# Only the tests parse the example plugin's JSON output (an AiPatch); the host itself is bytes-in/bytes-out.
+serde_json = "1"
 
 [lints]
 workspace = true
