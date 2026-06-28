@@ -7,6 +7,7 @@
 //! ADR-010). The native viewport hot path never crosses this layer (invariant 4).
 
 import { projectionStore } from "../store/projection";
+import { pushToast } from "../store/toasts";
 import type { ProjectInfo } from "../store/project";
 import type { PlayInfo } from "../store/play";
 import type {
@@ -242,7 +243,7 @@ export const isTauri = (): boolean => tauriCore() !== null;
 /** The REAL shell transport: `connect` streams committed `ProjectionDelta`s into the store; edits go out
  *  through the shell's commands (`submit_edit` / `bind_target`) — the exact contract the vanilla scaffold
  *  used, so the 61 commands + the Channel are unchanged (M10.1 swaps the UI, not the core). */
-class TauriClient implements EditorClient {
+export class TauriClient implements EditorClient {
   private opCounter = 0;
   private readonly core: TauriCore;
 
@@ -489,11 +490,44 @@ class TauriClient implements EditorClient {
   addItem(id: string, source: string): Promise<AddResponse> {
     return this.core.invoke<AddResponse>("add_item", { id, source }).catch((e: unknown) => { console.error("add_item failed", e); throw e; });
   }
-  importAsset(path: string): Promise<string | null> {
-    return this.core.invoke<string | null>("import_asset", { path }).catch((e: unknown) => { console.error("import_asset failed", e); throw e; });
+  async importAsset(path: string): Promise<string | null> {
+    try {
+      const id = await this.core.invoke<string | null>("import_asset", { path });
+      await this.hintNearDuplicate(id);
+      return id;
+    } catch (e: unknown) {
+      console.error("import_asset failed", e);
+      throw e;
+    }
   }
-  importAssetDialog(): Promise<string | null> {
-    return this.core.invoke<string | null>("import_asset_dialog").catch((e: unknown) => { console.error("import_asset_dialog failed", e); throw e; });
+  async importAssetDialog(): Promise<string | null> {
+    try {
+      const id = await this.core.invoke<string | null>("import_asset_dialog");
+      await this.hintNearDuplicate(id);
+      return id;
+    } catch (e: unknown) {
+      console.error("import_asset_dialog failed", e);
+      throw e;
+    }
+  }
+  /** M11.5 (ADR-044, SA-34) — a lightweight import-time HINT: if the just-imported asset perceptually
+   *  matches an already-loaded one (different bytes — a rescaled/recompressed copy the exact content-hash
+   *  dedup misses), surface a non-blocking toast. It was imported anyway as a distinct asset — never a silent
+   *  merge. Reads the `asset_provenance` projection already computed on import; the persistent panel + the
+   *  thumbnail treatment are deferred to M14.3. Best-effort: a hint failure never breaks the import. */
+  private async hintNearDuplicate(id: string | null): Promise<void> {
+    if (!id) return;
+    try {
+      const prov = await this.core.invoke<{ nearDuplicateOf?: string | null } | null>(
+        "asset_provenance",
+        { id },
+      );
+      if (prov?.nearDuplicateOf) {
+        pushToast(`Near-duplicate of ${prov.nearDuplicateOf} — kept as a separate asset`, "info");
+      }
+    } catch (e: unknown) {
+      console.error("near-duplicate hint failed", e);
+    }
   }
 
   projectState(): Promise<ProjectInfo> {

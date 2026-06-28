@@ -15,7 +15,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use metrocalk_assets::AssetId;
+use metrocalk_assets::{AssetId, ContentAddressTrust};
 
 /// The filename for a blob: the content hash (the `AssetId`'s hex, without the `mtkasset:` scheme) + a
 /// `.blob` extension. Self-describing and collision-free (it *is* the content address).
@@ -64,14 +64,16 @@ pub fn load_all(dir: &Path) -> Vec<(AssetId, Vec<u8>)> {
             continue;
         }
         let Ok(bytes) = fs::read(&path) else { continue };
-        // Verify the content matches the name — a blob is only trusted if it hashes to its own address.
-        let id = AssetId::of_bytes(&bytes);
-        let name_matches = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n == blob_name(&id));
-        if name_matches {
-            out.push((id, bytes));
+        // The tampered-asset guard (M11.5 / ADR-044): reconstruct the handle the FILENAME claims, then verify
+        // the bytes against it through the project-owned trust primitive (`ContentAddressTrust`). A blob is
+        // trusted only if its bytes still hash to their own address — a corrupt/tampered/swapped blob fails
+        // the check and is skipped, never resolved to a wrong handle (and never a panic).
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let claimed = AssetId::from_handle(format!("mtkasset:{stem}"));
+        if ContentAddressTrust::verify_handle(&bytes, claimed.as_str()).is_ok() {
+            out.push((claimed, bytes));
         }
     }
     // Deterministic order (read_dir order is OS-dependent) so a reload is reproducible.

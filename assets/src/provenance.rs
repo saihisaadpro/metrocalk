@@ -17,6 +17,7 @@
 )]
 
 use crate::mesh::Texture;
+use crate::store::AssetId;
 
 /// How an asset entered the project — drives the trust surface (an AI-generated asset is honestly flagged).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +141,102 @@ pub fn is_near_duplicate(a: u64, b: u64, threshold: u32) -> bool {
     hamming_distance(a, b) <= threshold
 }
 
+// ── SA-34 trust: the tampered-asset guard, behind a project-owned trait (ADR-044, invariant 5) ──────────
+
+/// An asset failed its provenance check — its bytes don't match what the sealed provenance claims (a
+/// tampered, corrupt, or swapped asset). The caller MUST reject it (never resolve/render it as trusted).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TamperError {
+    /// Which trust backend rejected it ("content-address", "c2pa", …).
+    pub backend: &'static str,
+    /// The integrity proof the sealed provenance claims (e.g. the content-address handle).
+    pub expected: String,
+    /// What the actual bytes produce — differs from `expected` because the bytes changed.
+    pub actual: String,
+}
+
+impl std::fmt::Display for TamperError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "asset failed the {} provenance check — expected {}, got {} (rejected as tampered)",
+            self.backend, self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for TamperError {}
+
+/// The **SA-34 trust backing**: bind a [`Provenance`] record to asset bytes (seal), and later verify the
+/// bytes haven't been tampered with (verify → reject). A **project-owned trait** (invariant 5) so the heavy,
+/// native-leaning **C2PA** manifest path drops in BEHIND it — the `c2pa` crate stays confined to a
+/// feature-gated, grep-gated backing (no `c2pa::` type leaks across the engine), **wasm-verified or seamed**
+/// — without the portable core ever depending on it. The dependency-free first backing is
+/// [`ContentAddressTrust`], which rides the store's existing content hash; a C2PA backing
+/// (`C2paTrust: ProvenanceVerifier`) is the next increment (it additionally embeds a signed manifest in the
+/// bytes + checks a perceptual soft-binding — see ADR-044).
+pub trait ProvenanceVerifier {
+    /// A short, stable backend tag for logs / the inspector ("content-address", "c2pa", …).
+    fn backend(&self) -> &'static str;
+
+    /// Bind `record` to `bytes` so the asset can later be verified, returning the sealed record. For the
+    /// content-address backing this stamps the content-address into `content_hash`; a C2PA backing
+    /// additionally embeds a signed manifest (which changes the bytes — surfaced via that backing's own API).
+    #[must_use]
+    fn seal(&self, bytes: &[u8], record: Provenance) -> Provenance;
+
+    /// Verify `bytes` against `sealed`'s integrity proof.
+    ///
+    /// # Errors
+    /// [`TamperError`] when the bytes don't match what the sealed provenance claims — a tampered / corrupt /
+    /// swapped asset the caller must reject.
+    fn verify(&self, bytes: &[u8], sealed: &Provenance) -> Result<(), TamperError>;
+}
+
+/// The dependency-free, `wasm32`-clean first trust backing (ADR-044): integrity = the store's **content
+/// address** (FNV-1a 128-bit, [`AssetId::of_bytes`]). Sealing stamps the content hash into the record;
+/// verifying re-derives it from the actual bytes and compares — any byte change flips the hash, so a
+/// tampered asset is rejected. This is the same primitive the persisted-blob loader already gates on; the
+/// trait makes it a first-class, C2PA-pluggable contract. (Cryptographic *authorship* — who signed it — is
+/// the C2PA backing's job; this proves *integrity* — the bytes are exactly what the provenance names.)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContentAddressTrust;
+
+impl ContentAddressTrust {
+    /// Verify `bytes` hash to `claimed_handle` (a `mtkasset:…` content address). The shared primitive both
+    /// [`ProvenanceVerifier::verify`] and the persisted-blob loader express.
+    ///
+    /// # Errors
+    /// [`TamperError`] when the bytes don't hash to `claimed_handle`.
+    pub fn verify_handle(bytes: &[u8], claimed_handle: &str) -> Result<(), TamperError> {
+        let actual = AssetId::of_bytes(bytes).as_str().to_string();
+        if actual == claimed_handle {
+            Ok(())
+        } else {
+            Err(TamperError {
+                backend: "content-address",
+                expected: claimed_handle.to_string(),
+                actual,
+            })
+        }
+    }
+}
+
+impl ProvenanceVerifier for ContentAddressTrust {
+    fn backend(&self) -> &'static str {
+        "content-address"
+    }
+
+    fn seal(&self, bytes: &[u8], mut record: Provenance) -> Provenance {
+        record.content_hash = AssetId::of_bytes(bytes).as_str().to_string();
+        record
+    }
+
+    fn verify(&self, bytes: &[u8], sealed: &Provenance) -> Result<(), TamperError> {
+        Self::verify_handle(bytes, &sealed.content_hash)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +311,68 @@ mod tests {
                 rgba8: vec![]
             }),
             0
+        );
+    }
+
+    #[test]
+    fn content_address_trust_seals_then_verifies_matching_bytes() {
+        // Seal binds the content address; verify accepts the exact same bytes (the trusted path).
+        let bytes = b"a faithful asset payload";
+        let sealed = ContentAddressTrust.seal(bytes, Provenance::imported("model.glb", "", 0));
+        assert_eq!(
+            sealed.content_hash,
+            AssetId::of_bytes(bytes).as_str(),
+            "seal stamps the content address into the record"
+        );
+        assert!(
+            ContentAddressTrust.verify(bytes, &sealed).is_ok(),
+            "the untouched bytes verify"
+        );
+        assert_eq!(ContentAddressTrust.backend(), "content-address");
+    }
+
+    #[test]
+    fn content_address_trust_rejects_a_tampered_asset() {
+        // The tampered-asset guard (ADR-044): seal an asset, then flip a single byte → verify MUST reject it,
+        // naming the expected vs actual content address (never silently resolve a swapped/corrupt asset).
+        let original = b"the original, sealed asset bytes".to_vec();
+        let sealed = ContentAddressTrust.seal(&original, Provenance::imported("model.glb", "", 0));
+
+        let mut tampered = original.clone();
+        tampered[3] ^= 0x01; // a one-bit edit anywhere
+
+        let err = ContentAddressTrust
+            .verify(&tampered, &sealed)
+            .expect_err("a tampered asset is rejected");
+        assert_eq!(err.backend, "content-address");
+        assert_eq!(err.expected, sealed.content_hash);
+        assert_ne!(
+            err.actual, err.expected,
+            "the tampered bytes hash differently"
+        );
+        assert!(
+            err.to_string().contains("rejected as tampered"),
+            "the error explains the rejection"
+        );
+
+        // A completely different asset swapped in under the same record is also rejected.
+        assert!(
+            ContentAddressTrust
+                .verify(b"an entirely different asset", &sealed)
+                .is_err(),
+            "a swapped asset is rejected"
+        );
+    }
+
+    #[test]
+    fn verify_handle_matches_the_store_content_address() {
+        // The shared primitive the persisted-blob loader expresses: bytes must hash to their claimed handle.
+        let bytes = b"persisted blob contents";
+        let handle = AssetId::of_bytes(bytes).as_str().to_string();
+        assert!(ContentAddressTrust::verify_handle(bytes, &handle).is_ok());
+        assert!(
+            ContentAddressTrust::verify_handle(b"different bytes", &handle).is_err(),
+            "a content/handle mismatch is a tamper"
         );
     }
 
