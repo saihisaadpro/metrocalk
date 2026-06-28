@@ -16,6 +16,7 @@
 
 pub mod caps;
 pub mod catalog;
+pub mod compose;
 pub mod entity_id;
 pub mod marketplace;
 pub mod merge;
@@ -32,6 +33,12 @@ pub mod undo;
 pub mod variant;
 
 pub use catalog::{CatalogItem, CatalogSearch, SearchSeam, Source};
+// NB: `compose::Composition` is NOT re-exported at the crate root (the name `variant::Composition` already
+// is); reach it via `metrocalk_core::compose::Composition`.
+pub use compose::{
+    apply_composition, composition_grammar, grammar_coverage, validate_composition, ComposeError,
+    ComposeOp, CoverageReport,
+};
 pub use entity_id::{EntityId, IdGenerator};
 pub use marketplace::{
     CapDecl, LocalCatalog, MarketplaceEntry, MarketplaceIndex, MarketplaceMatch,

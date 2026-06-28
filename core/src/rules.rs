@@ -318,7 +318,7 @@ fn check_field<W: World>(
 /// Whether `value`'s scalar kind satisfies the registry field type. A `Number` field also accepts an
 /// `Integer` literal (a whole number is a valid number — the int-vs-number JSON footgun), but an `Integer`
 /// field rejects a `Number` (no silent truncation).
-fn field_type_matches(value: &FieldValue, ty: FieldType) -> bool {
+pub(crate) fn field_type_matches(value: &FieldValue, ty: FieldType) -> bool {
     matches!(
         (value, ty),
         (FieldValue::Integer(_), FieldType::Integer)
@@ -331,7 +331,7 @@ fn field_type_matches(value: &FieldValue, ty: FieldType) -> bool {
     )
 }
 
-fn value_type_name(v: &FieldValue) -> &'static str {
+pub(crate) fn value_type_name(v: &FieldValue) -> &'static str {
     match v {
         FieldValue::Integer(_) => "integer",
         FieldValue::Number(_) => "number",
