@@ -1,6 +1,6 @@
 //! The project-owned `PluginHost` interface (invariant 5) — the ONLY surface the rest of the engine uses
 //! to run a WASM plugin. **No `extism::` type crosses it** (the Extism backend lives in
-//! [`crate::extism_host`], grep-gated, exactly as rapier lives in `/physics` and loro in `/core`). A
+//! [`crate::extism_host`], grep-gated, exactly as rapier lives only in `/physics`). A
 //! plugin is sandboxed — a memory + execution-time budget + a host-function allow-list — and any
 //! misbehaviour (a trap, a panic, a timeout, an out-of-budget, a disallowed host call) is **contained +
 //! explained** ([`PluginError`], ADR-016 spirit): a plugin can never crash the engine.
