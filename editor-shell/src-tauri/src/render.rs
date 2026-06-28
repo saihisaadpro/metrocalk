@@ -548,6 +548,8 @@ fn new_light_storage(device: &wgpu::Device, cap: u64) -> wgpu::Buffer {
 }
 
 const SHADER: &str = include_str!("scene.wgsl");
+/// M11.4 (ADR-043) — the bloom post-processing shaders (separate module; see `post.wgsl`).
+const POST: &str = include_str!("post.wgsl");
 const CUBE_INDICES: [u16; 36] = [
     0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6, 0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4, 2, 6,
     7, 2, 7, 3,
@@ -713,6 +715,92 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let mut depth = make_depth(&device, w, h, samples);
     // The multisampled scene COLOR target (resolved to the swapchain at pass end); `None` when off.
     let mut msaa = make_msaa(&device, format, w, h, samples);
+
+    // M11.4 (ADR-043) — bloom post-processing. When on, the scene renders/resolves into an offscreen target,
+    // then bright-pass → separable Gaussian blur → composite (scene + bloom) → swapchain. `MTK_BLOOM=off`
+    // skips it entirely (scene → swapchain, byte-identical to pre-bloom). Display-space bloom (the cheap,
+    // overlay-safe path): it operates on the tonemapped scene, so it never touches the scene shaders.
+    let bloom = bloom_enabled();
+    eprintln!("[viewport] bloom={bloom}");
+    let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("post"),
+        source: wgpu::ShaderSource::Wgsl(POST.into()),
+    });
+    let post_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("post-sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        ..Default::default()
+    });
+    let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let samp_entry = wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    };
+    let post_bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("post-bgl-1tex"),
+        entries: &[samp_entry, tex_entry(1)],
+    });
+    let post_bgl2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("post-bgl-2tex"),
+        entries: &[samp_entry, tex_entry(1), tex_entry(2)],
+    });
+    let post_layout1 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("post-layout-1"),
+        bind_group_layouts: &[Some(&post_bgl1)],
+        immediate_size: 0,
+    });
+    let post_layout2 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("post-layout-2"),
+        bind_group_layouts: &[Some(&post_bgl2)],
+        immediate_size: 0,
+    });
+    let bright_pipeline = make_post_pipeline(
+        &device,
+        &post_shader,
+        &post_layout1,
+        format,
+        "fs_bright",
+        "bloom-bright",
+    );
+    let blur_h_pipeline = make_post_pipeline(
+        &device,
+        &post_shader,
+        &post_layout1,
+        format,
+        "fs_blur_h",
+        "bloom-blur-h",
+    );
+    let blur_v_pipeline = make_post_pipeline(
+        &device,
+        &post_shader,
+        &post_layout1,
+        format,
+        "fs_blur_v",
+        "bloom-blur-v",
+    );
+    let composite_pipeline = make_post_pipeline(
+        &device,
+        &post_shader,
+        &post_layout2,
+        format,
+        "fs_composite",
+        "bloom-composite",
+    );
+    let mut bloom_t = make_bloom_targets(&device, format, w, h, &post_samp, &post_bgl1, &post_bgl2);
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("scene"),
@@ -1239,6 +1327,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 surface.configure(&device, &config);
                 depth = make_depth(&device, w, h, samples);
                 msaa = make_msaa(&device, format, w, h, samples);
+                bloom_t =
+                    make_bloom_targets(&device, format, w, h, &post_samp, &post_bgl1, &post_bgl2);
             }
         }
 
@@ -1622,9 +1712,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         {
             // M11.4 — with MSAA on, the scene draws into the multisampled target and RESOLVES to the
             // swapchain at pass end; off, it draws straight to the swapchain (resolve_target None).
+            // M11.4 — the scene's final color destination: the bloom offscreen when bloom is on, else the
+            // swapchain. With MSAA it's the resolve target; without, the direct color attachment.
+            let scene_dest = if bloom { &bloom_t.scene } else { &view };
             let (scene_color, scene_resolve) = match msaa.as_ref() {
-                Some(m) => (m, Some(&view)),
-                None => (&view, None),
+                Some(m) => (m, Some(scene_dest)),
+                None => (scene_dest, None),
             };
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
@@ -1723,6 +1816,37 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.set_bind_group(1, &gizmo_buf.bg, &[]);
                 rp.draw(0..gizmo_buf.n, 0..1);
             }
+        }
+        // M11.4 (ADR-043) — bloom post chain: bright-pass → separable Gaussian (H then V) → composite, each
+        // a fullscreen triangle. The scene pass wrote `bloom_t.scene`; composite writes the swapchain.
+        if bloom {
+            let mut post = |target: &wgpu::TextureView,
+                            pipeline: &wgpu::RenderPipeline,
+                            bg: &wgpu::BindGroup| {
+                let mut p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("bloom"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                p.set_pipeline(pipeline);
+                p.set_bind_group(0, bg, &[]);
+                p.draw(0..3, 0..1);
+            };
+            post(&bloom_t.a, &bright_pipeline, &bloom_t.bg_bright); // scene → bloom_a (extract highlights)
+            post(&bloom_t.b, &blur_h_pipeline, &bloom_t.bg_blur_h); // a → b (blur horizontal)
+            post(&bloom_t.a, &blur_v_pipeline, &bloom_t.bg_blur_v); // b → a (blur vertical)
+            post(&view, &composite_pipeline, &bloom_t.bg_composite); // scene + bloom_a → swapchain
         }
         queue.submit([enc.finish()]);
         frame.present();
@@ -2094,6 +2218,143 @@ fn make_msaa(
             })
             .create_view(&wgpu::TextureViewDescriptor::default()),
     )
+}
+
+/// M11.4 (ADR-043) — whether bloom post-processing is on. `MTK_BLOOM` = `off`/`0`/`false` disables it
+/// (the min-spec path: the scene renders straight to the swapchain, byte-identical to the pre-bloom frame).
+fn bloom_enabled() -> bool {
+    !matches!(
+        std::env::var("MTK_BLOOM").ok().as_deref(),
+        Some("off" | "0" | "false")
+    )
+}
+
+/// A sampleable post-pass color target (RENDER_ATTACHMENT + TEXTURE_BINDING). The returned view keeps its
+/// texture alive (wgpu resources are ref-counted), so the texture handle isn't returned.
+fn make_post_tex(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    w: u32,
+    h: u32,
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("post-target"),
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// A fullscreen post-processing pipeline (no vertex buffer, no depth, single-sample) running `vs_post` +
+/// the given fragment entry, writing `format`.
+fn make_post_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    fs: &str,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_post"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fs),
+            targets: &[Some(format.into())],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// M11.4 — the bloom render targets + their bind groups. `scene` is the full-res offscreen the scene pass
+/// renders/resolves into; `a`/`b` are half-res ping-pong buffers. Recreated on resize (texture views change).
+struct BloomTargets {
+    scene: wgpu::TextureView,
+    a: wgpu::TextureView,
+    b: wgpu::TextureView,
+    bg_bright: wgpu::BindGroup,    // reads scene → bloom_a
+    bg_blur_h: wgpu::BindGroup,    // reads a → b
+    bg_blur_v: wgpu::BindGroup,    // reads b → a
+    bg_composite: wgpu::BindGroup, // reads scene + a → swapchain
+}
+
+fn make_bloom_targets(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    w: u32,
+    h: u32,
+    samp: &wgpu::Sampler,
+    bgl1: &wgpu::BindGroupLayout,
+    bgl2: &wgpu::BindGroupLayout,
+) -> BloomTargets {
+    let scene = make_post_tex(device, format, w, h);
+    let a = make_post_tex(device, format, w / 2, h / 2);
+    let b = make_post_tex(device, format, w / 2, h / 2);
+    let bg1 = |label: &str, tex: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: bgl1,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(tex),
+                },
+            ],
+        })
+    };
+    let bg_composite = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bloom-composite"),
+        layout: bgl2,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Sampler(samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&scene),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&a),
+            },
+        ],
+    });
+    BloomTargets {
+        bg_bright: bg1("bloom-bright", &scene),
+        bg_blur_h: bg1("bloom-blur-h", &a),
+        bg_blur_v: bg1("bloom-blur-v", &b),
+        bg_composite,
+        scene,
+        a,
+        b,
+    }
 }
 
 #[cfg(test)]
