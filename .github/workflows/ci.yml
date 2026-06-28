@@ -61,6 +61,22 @@ jobs:
           done
           echo "the free engine (core/ecs) does not link the economy — free-path boundary intact"
 
+      - name: The free engine never depends on the AI/LLM tier (M12.4 AI-is-a-guest, ADR-048)
+        run: |
+          # core/ecs (the FREE, OFFLINE engine) must NEVER link the AI tier's network deps (an MCP / LLM /
+          # HTTP crate) — AI is a GUEST: the engine + Rules + clicks-authoring + the compose validate/apply
+          # path (core/src/compose.rs) all work with the LLM off. The compose grammar/validation is pure
+          # /core data; the LLM that PRODUCES a Composition is a network SEAM (editor-shell / the MCP server),
+          # never on the offline engine path. Mirrors the M7 free-path proof above. (rmcp = the M12.4 MCP
+          # server crate; reqwest/hyper = a remote-LLM HTTP client.)
+          for crate in metrocalk-core metrocalk-ecs; do
+            if cargo tree -p "$crate" -e normal | grep -qiE "rmcp|reqwest|hyper"; then
+              echo "::error::$crate links an AI/LLM/MCP crate — AI must stay a GUEST (ADR-048 offline-first); the engine must work with the LLM off"
+              exit 1
+            fi
+          done
+          echo "the free engine (core/ecs) does not link the AI/LLM/MCP tier — AI-is-a-guest boundary intact"
+
       - name: No foreign decoder types leak past the asset-importer wrappers (invariant 5)
         run: |
           # gltf:: / image:: / tobj:: / ufbx:: / basis_universal:: must live ONLY behind the MeshSource trait,
