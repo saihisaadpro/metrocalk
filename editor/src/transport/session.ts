@@ -34,6 +34,9 @@ import type {
   RuleData,
   RuleRegistryInfo,
   RuleSummary,
+  AuthorStateMachineResult,
+  StateMachine,
+  StateMachineInfo,
   SnapHit,
   SolveResult,
   TimelineTuple,
@@ -236,6 +239,15 @@ export interface EditorClient {
   authorRule(rule: RuleData, id?: string | null): Promise<AuthorRuleResult>;
   /** Remove a rule (one undoable transaction). */
   deleteRule(id: string): Promise<boolean>;
+
+  // ── M12.2 state machines (states + transitions = Rules) — the visual state-graph (ADR-046) ───────────
+  /** All authored state machines for the state-graph view (the full machine + the live current state). */
+  stateMachines(): Promise<StateMachineInfo[]>;
+  /** Author (or replace, if `id` is given) a state machine: the new id + the unreachable warning, or a
+   *  Blocked reason (no-dangling / typo'd transition Rule / not-a-state-change). One undoable transaction. */
+  authorStateMachine(sm: StateMachine, id?: string | null): Promise<AuthorStateMachineResult>;
+  /** Remove a state machine (one undoable transaction). */
+  deleteStateMachine(id: string): Promise<boolean>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -584,6 +596,15 @@ export class TauriClient implements EditorClient {
   deleteRule(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("delete_rule", { id }).catch((e: unknown) => { console.error("delete_rule failed", e); throw e; });
   }
+  stateMachines(): Promise<StateMachineInfo[]> {
+    return this.core.invoke<StateMachineInfo[]>("state_machines").catch((e: unknown) => { console.error("state_machines failed", e); throw e; });
+  }
+  authorStateMachine(sm: StateMachine, id: string | null = null): Promise<AuthorStateMachineResult> {
+    return this.core.invoke<AuthorStateMachineResult>("author_state_machine", { sm, id }).catch((e: unknown) => { console.error("author_state_machine failed", e); throw e; });
+  }
+  deleteStateMachine(id: string): Promise<boolean> {
+    return this.core.invoke<boolean>("delete_state_machine", { id }).catch((e: unknown) => { console.error("delete_state_machine failed", e); throw e; });
+  }
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
@@ -646,6 +667,11 @@ class MockClient implements EditorClient {
   private playInfo: PlayInfo = { playing: false, paused: false };
   private placeSeq = 0;
   private saveSeq = 0;
+  // M12.2 (dev MockCore): authored machines are kept in-memory so the state-graph actually RENDERS in
+  // `npm run dev` (a graph needs data — unlike the inert rules mock). The real validation/no-dangling +
+  // undo + reload are the live `.exe` path; this dev mock stores + returns, it does not validate.
+  private machines: StateMachineInfo[] = [];
+  private smSeq = 0;
   constructor(
     private readonly inner: DeltaClient,
     private readonly core: MockCore,
@@ -1017,6 +1043,27 @@ class MockClient implements EditorClient {
     return Promise.resolve({ id: "rule-dev", error: null, mirror: null });
   }
   deleteRule(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  // M12.2 state machines (dev MockCore): stateful so the state-graph renders in `npm run dev`. Each new
+  // (empty-id) transition gets a dev edge id; `current` defaults to `initial` (the M12.5 seam).
+  stateMachines(): Promise<StateMachineInfo[]> {
+    return Promise.resolve(this.machines.map((m) => ({ ...m, machine: { ...m.machine } })));
+  }
+  authorStateMachine(sm: StateMachine, id: string | null = null): Promise<AuthorStateMachineResult> {
+    const machine: StateMachine = {
+      ...sm,
+      transitions: sm.transitions.map((t) => (t.id ? t : { ...t, id: `t-dev-${this.smSeq++}` })),
+    };
+    const smId = id ?? `sm-dev-${this.smSeq++}`;
+    const info: StateMachineInfo = { id: smId, current: machine.initial, machine };
+    const at = this.machines.findIndex((m) => m.id === smId);
+    if (at >= 0) this.machines[at] = info;
+    else this.machines.push(info);
+    return Promise.resolve({ id: smId, error: null, unreachable: [] });
+  }
+  deleteStateMachine(id: string): Promise<boolean> {
+    this.machines = this.machines.filter((m) => m.id !== id);
     return Promise.resolve(true);
   }
 }

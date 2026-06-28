@@ -317,6 +317,50 @@ export interface AuthorRuleResult {
   mirror: RuleData | null;
 }
 
+// ── M12.2 state machines (states + transitions = Rules) — the visual state-graph (ADR-046) ───────────────
+// A transition IS a `RuleData` (the reuse, not a parallel model). The machine is data on the Loro doc; the
+// state-graph reuses the M2.5 React Flow layer. Mirrors `metrocalk_core::state_machine` serde (plain field
+// names) — so a `StateMachine` round-trips JS → core → JS unchanged.
+
+/** One transition — a graph EDGE: from one state to another, guarded by an M12.1 `RuleData` (When/If) whose
+ *  single action enters `to`. `id` is the stable React Flow edge id (server-allocated; the e2e keys off it). */
+export interface Transition {
+  id: string;
+  from: string;
+  to: string;
+  rule: RuleData;
+}
+
+/** A whole state machine — the shape `author_state_machine` takes + `state_machines` returns. States are the
+ *  graph NODES (`states`, ids = the names); transitions are the EDGES. */
+export interface StateMachine {
+  name: string;
+  entity: string;
+  component: string;
+  field: string;
+  states: string[];
+  initial: string;
+  transitions: Transition[];
+}
+
+/** One state machine for the state-graph view (`state_machines`, camelCase serde): the full machine (so the
+ *  React Flow graph can render nodes + edges), its `id`, and the live `current` state (the M12.5 seam,
+ *  defaults to `initial`). */
+export interface StateMachineInfo {
+  id: string;
+  current: string;
+  machine: StateMachine;
+}
+
+/** `author_state_machine` outcome: the new `id`, a plain-language `error` if Blocked (ADR-016: no name /
+ *  dangling transition / a typo'd transition Rule / not-a-state-change), and the `unreachable` states — a
+ *  warning surfaced (explained), never a rejection. */
+export interface AuthorStateMachineResult {
+  id: string | null;
+  error: string | null;
+  unreachable: string[];
+}
+
 const te = new TextEncoder();
 const td = new TextDecoder();
 export const encodeJson = (v: unknown): Uint8Array => te.encode(JSON.stringify(v));

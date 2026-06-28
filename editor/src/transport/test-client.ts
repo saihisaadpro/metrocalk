@@ -90,6 +90,10 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     listRules: vi.fn(() => Promise.resolve([])),
     authorRule: vi.fn(() => Promise.resolve({ id: "rule-1", error: null, mirror: null })),
     deleteRule: vi.fn(() => Promise.resolve(true)),
+    // M12.2 state machines (a test overrides what it exercises).
+    stateMachines: vi.fn(() => Promise.resolve([])),
+    authorStateMachine: vi.fn(() => Promise.resolve({ id: "sm-1", error: null, unreachable: [] })),
+    deleteStateMachine: vi.fn(() => Promise.resolve(true)),
     ...over,
   };
 }
