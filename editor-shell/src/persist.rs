@@ -82,6 +82,15 @@ pub enum Record {
     },
     /// M12.1 (ADR-045) — a removed rule; replayed as the same `RemoveRule`.
     RemoveRule { id: String },
+    /// M12.2 (ADR-046) — an authored state machine (states + transitions). The whole `StateMachine` is kept
+    /// so replay re-commits the same `SetStateMachine` on the same id → the machine survives close→reopen
+    /// (the Loro `state_machines` map is rebuilt from the replayed ops, exactly like the `rules` map).
+    AuthorStateMachine {
+        id: String,
+        machine: metrocalk_core::StateMachine,
+    },
+    /// M12.2 (ADR-046) — a removed state machine; replayed as the same `RemoveStateMachine`.
+    RemoveStateMachine { id: String },
     /// A physics-body spawn (M8.2): a dynamic RigidBody + ball Collider + its ball mesh handle, at a
     /// position. Replayed by re-spawning deterministically (same id alloc); the sim body itself is
     /// RE-HYDRATED from the restored RigidBody entity by the engine thread after replay. Loro stores the
@@ -329,6 +338,23 @@ impl Log {
                         "remove rule",
                         vec![metrocalk_core::Op::RemoveRule {
                             id: metrocalk_core::RuleId::new(id),
+                        }],
+                    )
+                    .is_ok(),
+                Record::AuthorStateMachine { id, machine } => engine
+                    .commit(
+                        "author state machine",
+                        vec![metrocalk_core::Op::SetStateMachine {
+                            id: metrocalk_core::StateMachineId::new(id),
+                            sm: machine,
+                        }],
+                    )
+                    .is_ok(),
+                Record::RemoveStateMachine { id } => engine
+                    .commit(
+                        "remove state machine",
+                        vec![metrocalk_core::Op::RemoveStateMachine {
+                            id: metrocalk_core::StateMachineId::new(id),
                         }],
                     )
                     .is_ok(),

@@ -11,6 +11,7 @@
 use crate::entity_id::{EntityId, IdGenerator};
 use crate::merge::{self, MergeReport};
 use crate::rules::{RuleData, RuleId};
+use crate::state_machine::{StateMachine, StateMachineId};
 use crate::undo::{InverseOp, InverseTransaction};
 use loro::{
     Container, ContainerTrait, ContainerType, ExportMode, LoroDoc, LoroMap, LoroValue, TreeID,
@@ -157,12 +158,40 @@ pub enum Op {
     SetRule { id: RuleId, rule: RuleData },
     /// Remove a rule from the `rules` collection (undoable — the inverse restores it).
     RemoveRule { id: RuleId },
+
+    // ── State machines (M12.2 / ADR-046) ───────────────────────────────────
+    /// Author (create or replace) a **state machine** — named states + transitions (each transition an
+    /// M12.1 [`RuleData`]) — under the document's `state_machines` collection, keyed by [`StateMachineId`].
+    /// The whole machine travels in one op, so adding a state or drawing/editing a transition is **one
+    /// undoable transaction**. Registry/structural validity (typo-proof, no-dangling) is enforced by
+    /// [`crate::state_machine::validate_state_machine`] at the authoring layer *before* commit (the engine
+    /// is registry-agnostic, exactly as [`Op::SetRule`] is); the pipeline persists it as a **mergeable**
+    /// child map so two peers authoring different machines converge (invariant 1). The runtime `current`
+    /// slot is **not** written here — it is the named M12.5 seam ([`Engine::state_machine_current`]).
+    SetStateMachine {
+        id: StateMachineId,
+        sm: StateMachine,
+    },
+    /// Remove a state machine from the `state_machines` collection (undoable — the inverse restores it).
+    RemoveStateMachine { id: StateMachineId },
 }
 
 /// The top-level Loro map holding the project's **rules** (M12.1 / ADR-045), a sibling of
 /// `components`/`bindings`/`overrides`/`caps`. Each rule's slot under it is a **mergeable** child map
 /// keyed by [`RuleId`] (so concurrent first-creation of distinct rules converges, never clobbers).
 pub(crate) const RULES: &str = "rules";
+
+/// The top-level Loro map holding the project's **state machines** (M12.2 / ADR-046), a sibling of
+/// `rules`/`components`/`bindings`/`overrides`/`caps`. Each machine's slot under it is a **mergeable** child
+/// map keyed by [`StateMachineId`] (so concurrent first-creation of distinct machines converges, never
+/// clobbers) — the same ADR-026 pattern the `rules` map uses.
+pub(crate) const STATE_MACHINES: &str = "state_machines";
+
+/// The reserved scalar key, inside a state-machine slot, under which the **live current state** lives. It is
+/// the named **M12.5 seam**: M12.2 reserves + reads it (defaulting to `initial`), M12.5 *ticks* it. Never
+/// written by the authoring path (`apply_set_state_machine`) so re-authoring a running machine can't reset
+/// its current state.
+const STATE_MACHINE_CURRENT_KEY: &str = "current";
 
 /// The top-level Loro map holding every instance's sparse override layer (ADR-026), a sibling of
 /// `components`/`bindings`/`hierarchy`. Each part's slot under it is a **mergeable** child map.
@@ -301,6 +330,7 @@ impl<W: World> Engine<W> {
         let _ = doc.get_map(OVERRIDES); // the override/variant layer (ADR-026)
         let _ = doc.get_map(CAPS); // the capability-pair mirror (ADR-032)
         let _ = doc.get_map(RULES); // the Rules layer (ADR-045)
+        let _ = doc.get_map(STATE_MACHINES); // the state-machine layer (ADR-046)
 
         Self {
             world,
@@ -346,6 +376,20 @@ impl<W: World> Engine<W> {
         RuleId::new(format!("rule_{}", self.id_gen.next_id().to_loro_key()))
     }
 
+    /// Allocate a peer-namespaced [`StateMachineId`] (M12.2 / ADR-046) — does not author the machine
+    /// (submit an [`Op::SetStateMachine`] to do that). Peer-namespaced like a rule id, so two peers
+    /// authoring machines concurrently never collide on the same key.
+    pub fn alloc_state_machine_id(&mut self) -> StateMachineId {
+        StateMachineId::new(format!("sm_{}", self.id_gen.next_id().to_loro_key()))
+    }
+
+    /// Allocate a peer-namespaced **transition** id (the stable [`crate::state_machine::Transition::id`] /
+    /// React-Flow edge id). Peer-namespaced so two peers drawing transitions concurrently get distinct
+    /// stable edge ids (the e2e keys off these ids, never the edge label).
+    pub fn alloc_transition_id(&mut self) -> String {
+        format!("t_{}", self.id_gen.next_id().to_loro_key())
+    }
+
     /// Read one rule by id from the document (`None` if absent).
     #[must_use]
     pub fn rule(&self, id: &RuleId) -> Option<RuleData> {
@@ -368,6 +412,47 @@ impl<W: World> Engine<W> {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// Read one state machine by id from the document (`None` if absent).
+    #[must_use]
+    pub fn state_machine(&self, id: &StateMachineId) -> Option<StateMachine> {
+        let sms = self.doc.get_map(STATE_MACHINES);
+        let slot = get_child_map(&sms, id.as_str())?;
+        read_state_machine_slot(&slot)
+    }
+
+    /// All authored state machines as `(id, machine)`, sorted by id (deterministic — the editor's
+    /// state-graph list source).
+    #[must_use]
+    pub fn state_machines(&self) -> Vec<(StateMachineId, StateMachine)> {
+        let sms = self.doc.get_map(STATE_MACHINES);
+        let mut out = Vec::new();
+        for k in sms.keys() {
+            if let Some(slot) = get_child_map(&sms, &k) {
+                if let Some(sm) = read_state_machine_slot(&slot) {
+                    out.push((StateMachineId::new(k.to_string()), sm));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The **live current state** of a machine (M12.2 / ADR-046) — the named **M12.5 seam**. M12.2 defines
+    /// and reads the slot; until M12.5 *ticks* it, the value defaults to the machine's `initial`. `None` if
+    /// the machine doesn't exist. Reading it now keeps the typed model complete and lets M12.5 light up the
+    /// truth-state debugger without re-shaping the data.
+    #[must_use]
+    pub fn state_machine_current(&self, id: &StateMachineId) -> Option<String> {
+        let sms = self.doc.get_map(STATE_MACHINES);
+        let slot = get_child_map(&sms, id.as_str())?;
+        let machine = read_state_machine_slot(&slot)?;
+        let stored = match slot.get(STATE_MACHINE_CURRENT_KEY) {
+            Some(ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
+            _ => None,
+        };
+        Some(stored.unwrap_or(machine.initial))
     }
 
     pub fn entity_exists(&self, id: EntityId) -> bool {
@@ -676,7 +761,14 @@ impl<W: World> Engine<W> {
                 //   (typo-proof events/fields/actions) is enforced by `rules::validate_rule` at the
                 //   authoring layer before commit — the pipeline is registry-agnostic, exactly as it is
                 //   for a `SetField`'s component/field — and `RemoveRule` is a tolerant no-op if absent.
-                Op::RemoveBinding { .. } | Op::SetRule { .. } | Op::RemoveRule { .. } => {}
+                //   State machines (ADR-046) are document-level data too — registry/structural validity
+                //   (typo-proof, no-dangling) is enforced by `state_machine::validate_state_machine` at the
+                //   authoring layer before commit, and `RemoveStateMachine` is a tolerant no-op if absent.
+                Op::RemoveBinding { .. }
+                | Op::SetRule { .. }
+                | Op::RemoveRule { .. }
+                | Op::SetStateMachine { .. }
+                | Op::RemoveStateMachine { .. } => {}
             }
         }
         Ok(())
@@ -780,6 +872,8 @@ impl<W: World> Engine<W> {
             Op::SetActive { entity, active } => self.apply_set_active(*entity, *active),
             Op::SetRule { id, rule } => self.apply_set_rule(id, rule),
             Op::RemoveRule { id } => self.apply_remove_rule(id),
+            Op::SetStateMachine { id, sm } => self.apply_set_state_machine(id, sm),
+            Op::RemoveStateMachine { id } => self.apply_remove_state_machine(id),
         }
     }
 
@@ -1223,6 +1317,51 @@ impl<W: World> Engine<W> {
         Ok(())
     }
 
+    // ── State-machine apply (M12.2 / ADR-046) ──────────────────────────
+
+    /// Write a state machine into its **mergeable** slot under `state_machines` (so two peers authoring
+    /// distinct machines converge — the ADR-026 pattern the `rules` map uses). `name`/`entity`/`component`/
+    /// `field`/`initial` are scalar keys (field-level merge); the variable-length `states`/`transitions`
+    /// lists ride as JSON strings (machine-level merge — the same honest bound `rules` documents for
+    /// `conditions`/`actions`). The runtime `current` key is intentionally **not** touched here: it is the
+    /// named M12.5 seam, so re-authoring a running machine can never reset its live state.
+    fn apply_set_state_machine(
+        &mut self,
+        id: &StateMachineId,
+        sm: &StateMachine,
+    ) -> Result<(), PipelineError> {
+        let slot = self
+            .doc
+            .get_map(STATE_MACHINES)
+            .ensure_mergeable_map(id.as_str())
+            .map_err(loro_err)?;
+        slot.insert("name", sm.name.as_str()).map_err(loro_err)?;
+        slot.insert("entity", sm.entity.as_str())
+            .map_err(loro_err)?;
+        slot.insert("component", sm.component.as_str())
+            .map_err(loro_err)?;
+        slot.insert("field", sm.field.as_str()).map_err(loro_err)?;
+        slot.insert("initial", sm.initial.as_str())
+            .map_err(loro_err)?;
+        let states =
+            serde_json::to_string(&sm.states).map_err(|e| PipelineError::Loro(e.to_string()))?;
+        slot.insert("states", states.as_str()).map_err(loro_err)?;
+        let transitions = serde_json::to_string(&sm.transitions)
+            .map_err(|e| PipelineError::Loro(e.to_string()))?;
+        slot.insert("transitions", transitions.as_str())
+            .map_err(loro_err)?;
+        Ok(())
+    }
+
+    /// Remove a state machine's slot from `state_machines` (a no-op if it isn't present).
+    fn apply_remove_state_machine(&mut self, id: &StateMachineId) -> Result<(), PipelineError> {
+        let sms = self.doc.get_map(STATE_MACHINES);
+        if sms.get(id.as_str()).is_some() {
+            sms.delete(id.as_str()).map_err(loro_err)?;
+        }
+        Ok(())
+    }
+
     // ── override / variant reads (the stronger read layer) ─────────────
 
     /// The raw deep value of a part's override slot (a `LoroValue::Map` of `key → value`), or `None`
@@ -1532,6 +1671,17 @@ impl<W: World> Engine<W> {
                 id: id.clone(),
                 old: self.rule(id),
             }),
+
+            // Authoring and removing a state machine share one inverse: restore the machine's prior data
+            // (`old: Some`), or — if there was none — `old: None`, whose forward form is a precise
+            // `RemoveStateMachine`. So undo of an authored machine removes it, and undo of a removed one
+            // restores it exactly (ADR-046, the one-undoable-transaction guarantee; identical to SetRule).
+            Op::SetStateMachine { id, .. } | Op::RemoveStateMachine { id } => {
+                Ok(InverseOp::SetStateMachine {
+                    id: id.clone(),
+                    old: self.state_machine(id),
+                })
+            }
         }
     }
 
@@ -1784,6 +1934,35 @@ fn read_rule_slot(slot: &LoroMap) -> Option<RuleData> {
         event,
         conditions,
         actions,
+    })
+}
+
+/// Read a [`StateMachine`] back from its Loro slot (M12.2 / ADR-046) — the inverse of
+/// [`Engine::apply_set_state_machine`]. `None` if a required scalar key is missing or the JSON lists don't
+/// parse (a corrupt/foreign slot is skipped, never trusted — the same discipline as [`read_rule_slot`]).
+/// The runtime `current` key is intentionally ignored here (it isn't authoring data — see
+/// [`Engine::state_machine_current`]).
+fn read_state_machine_slot(slot: &LoroMap) -> Option<StateMachine> {
+    let get_str = |k: &str| match slot.get(k) {
+        Some(ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
+        _ => None,
+    };
+    let name = get_str("name")?;
+    let entity = get_str("entity")?;
+    let component = get_str("component")?;
+    let field = get_str("field")?;
+    let initial = get_str("initial")?;
+    let states = serde_json::from_str(&get_str("states").unwrap_or_else(|| "[]".into())).ok()?;
+    let transitions =
+        serde_json::from_str(&get_str("transitions").unwrap_or_else(|| "[]".into())).ok()?;
+    Some(StateMachine {
+        name,
+        entity,
+        component,
+        field,
+        states,
+        initial,
+        transitions,
     })
 }
 

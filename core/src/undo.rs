@@ -10,6 +10,7 @@
 use crate::entity_id::EntityId;
 use crate::pipeline::{FieldValue, Op};
 use crate::rules::{RuleData, RuleId};
+use crate::state_machine::{StateMachine, StateMachineId};
 use metrocalk_ecs::Entity;
 use std::collections::HashMap;
 
@@ -104,6 +105,13 @@ pub enum InverseOp {
     SetRule {
         id: RuleId,
         old: Option<RuleData>,
+    },
+
+    /// Inverse of SetStateMachine/RemoveStateMachine (ADR-046) — restore the machine's prior data, or
+    /// remove it if it didn't exist (`old: None` → a precise `RemoveStateMachine`).
+    SetStateMachine {
+        id: StateMachineId,
+        old: Option<StateMachine>,
     },
 }
 
@@ -222,6 +230,15 @@ impl InverseOp {
                 },
                 // Precise inverse of authoring a brand-new rule: remove it.
                 None => Op::RemoveRule { id: id.clone() },
+            },
+
+            Self::SetStateMachine { id, old } => match old {
+                Some(sm) => Op::SetStateMachine {
+                    id: id.clone(),
+                    sm: sm.clone(),
+                },
+                // Precise inverse of authoring a brand-new machine: remove it.
+                None => Op::RemoveStateMachine { id: id.clone() },
             },
         }
     }

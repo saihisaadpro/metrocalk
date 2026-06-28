@@ -383,6 +383,25 @@ enum EngineCmd {
         id: String,
         reply: Sender<bool>,
     },
+    /// M12.2 (ADR-046) — list all authored state machines (the editor state-graph view) — a read. Returns
+    /// each machine in full (states + transitions, so the React Flow graph can render) + its live current
+    /// state (the M12.5 seam).
+    ListStateMachines {
+        reply: Sender<Vec<StateMachineInfo>>,
+    },
+    /// M12.2 (ADR-046) — author (or replace, if `id` is given) a state machine: validate (Blocked +
+    /// explained, no-dangling), commit one undoable `SetStateMachine`, and reply the new id + the
+    /// unreachable-states warning.
+    AuthorStateMachine {
+        sm: metrocalk_core::StateMachine,
+        id: Option<String>,
+        reply: Sender<AuthorStateMachineResult>,
+    },
+    /// M12.2 (ADR-046) — remove a state machine (one undoable `RemoveStateMachine`). Replies success.
+    DeleteStateMachine {
+        id: String,
+        reply: Sender<bool>,
+    },
     // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable transaction over the Movable Tree +
     // override pipeline. reparent reuses `ReparentPart`; delete=deactivate is distinct from `Remove`. ──
     /// Create an empty named entity at a position → reply its id (selected by the caller).
@@ -924,6 +943,29 @@ struct AuthorRuleResult {
     id: Option<String>,
     error: Option<String>,
     mirror: Option<metrocalk_core::RuleData>,
+}
+
+/// M12.2 (ADR-046) — a state machine for the editor's state-graph view: the **full** machine (states +
+/// transitions, so the React Flow graph can render nodes + edges) plus its id and live **current** state
+/// (the M12.5 seam, defaulting to `initial`). The graph keys off the stable state names + transition ids
+/// inside `machine`, never any label copy.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct StateMachineInfo {
+    id: String,
+    current: String,
+    machine: metrocalk_core::StateMachine,
+}
+
+/// The result of authoring a state machine: the new id on success, a plain-language `error` if it was
+/// **Blocked** (ADR-016: no name / dangling transition / a typo'd transition Rule / not-a-state-change),
+/// and the **unreachable** states — a warning surfaced (explained), never a rejection (ADR-046).
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct AuthorStateMachineResult {
+    id: Option<String>,
+    error: Option<String>,
+    unreachable: Vec<String>,
 }
 
 struct AppState {
@@ -1932,6 +1974,84 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .is_ok();
                 if ok {
                     log.append(&Record::RemoveRule { id });
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::ListStateMachines { reply } => {
+                let out = engine
+                    .state_machines()
+                    .into_iter()
+                    .map(|(id, m)| StateMachineInfo {
+                        current: engine
+                            .state_machine_current(&id)
+                            .unwrap_or_else(|| m.initial.clone()),
+                        id: id.as_str().to_string(),
+                        machine: m,
+                    })
+                    .collect();
+                let _ = reply.send(out);
+            }
+            EngineCmd::AuthorStateMachine { mut sm, id, reply } => {
+                // Stamp a peer-namespaced stable id onto any NEW (empty-id) transition before validating —
+                // so the React Flow edge ids are server-allocated + collision-free (the e2e keys off them).
+                for t in &mut sm.transitions {
+                    if t.id.trim().is_empty() {
+                        t.id = engine.alloc_transition_id();
+                    }
+                }
+                // Validate FIRST (typo-proof, no-dangling, transition-is-a-Rule — Blocked + explained,
+                // ADR-016): a dangling/typo'd machine is refused with a plain-language reason and never
+                // committed. Reachability is a WARNING (the unreachable list), not a rejection. Only a valid
+                // machine becomes one undoable `SetStateMachine` (+ a replay Record so it survives reload).
+                let resp = match metrocalk_core::validate_state_machine(&rules_registry, &sm, |e| {
+                    engine.entity_exists(e)
+                }) {
+                    Err(e) => AuthorStateMachineResult {
+                        error: Some(e.to_string()),
+                        ..Default::default()
+                    },
+                    Ok(report) => {
+                        let sm_id = id
+                            .map(metrocalk_core::StateMachineId::new)
+                            .unwrap_or_else(|| engine.alloc_state_machine_id());
+                        match engine.commit(
+                            "author state machine",
+                            vec![metrocalk_core::Op::SetStateMachine {
+                                id: sm_id.clone(),
+                                sm: sm.clone(),
+                            }],
+                        ) {
+                            Ok(()) => {
+                                log.append(&Record::AuthorStateMachine {
+                                    id: sm_id.as_str().to_string(),
+                                    machine: sm,
+                                });
+                                AuthorStateMachineResult {
+                                    id: Some(sm_id.as_str().to_string()),
+                                    unreachable: report.unreachable,
+                                    ..Default::default()
+                                }
+                            }
+                            Err(e) => AuthorStateMachineResult {
+                                error: Some(e.to_string()),
+                                ..Default::default()
+                            },
+                        }
+                    }
+                };
+                let _ = reply.send(resp);
+            }
+            EngineCmd::DeleteStateMachine { id, reply } => {
+                let ok = engine
+                    .commit(
+                        "remove state machine",
+                        vec![metrocalk_core::Op::RemoveStateMachine {
+                            id: metrocalk_core::StateMachineId::new(id.clone()),
+                        }],
+                    )
+                    .is_ok();
+                if ok {
+                    log.append(&Record::RemoveStateMachine { id });
                 }
                 let _ = reply.send(ok);
             }
@@ -5864,6 +5984,58 @@ fn delete_rule(state: State<AppState>, id: String) -> bool {
     rx.recv().unwrap_or(false)
 }
 
+/// M12.2 (ADR-046) — all authored state machines for the editor's state-graph view (states + transitions +
+/// the live current state). Fetched on change, not per frame.
+#[tauri::command]
+fn state_machines(state: State<AppState>) -> Vec<StateMachineInfo> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ListStateMachines { reply })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// M12.2 (ADR-046) — author (or replace, if `id` is given) a state machine: validate (Blocked + explained,
+/// no-dangling, registry-fed transitions), commit one undoable transaction, reply the new id + the
+/// unreachable-states warning.
+#[tauri::command]
+fn author_state_machine(
+    state: State<AppState>,
+    sm: metrocalk_core::StateMachine,
+    id: Option<String>,
+) -> AuthorStateMachineResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AuthorStateMachine { sm, id, reply })
+        .is_err()
+    {
+        return AuthorStateMachineResult::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// M12.2 (ADR-046) — remove a state machine (one undoable transaction). Returns success.
+#[tauri::command]
+fn delete_state_machine(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::DeleteStateMachine { id, reply })
+        .is_err()
+    {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
 /// Generate (M6, tier 3) — opt-in last resort. Drops a grey placeholder instantly + kicks off async
 /// text-to-3D; the real mesh streams in later over the projection Channel. Returns the placeholder + the
 /// inert token cost, or the offline seam.
@@ -6204,6 +6376,9 @@ fn main() {
             list_rules,
             author_rule,
             delete_rule,
+            state_machines,
+            author_state_machine,
+            delete_state_machine,
             generate,
             ai_edit,
             top_up,
