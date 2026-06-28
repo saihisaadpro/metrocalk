@@ -93,6 +93,10 @@ struct AssetsRuntime {
     meshes: Vec<MeshGpu>,
     /// The ball mesh handle (M8.2) — a spawned physics body renders as this.
     sphere: String,
+    /// M11.5 (ADR-044) — per-asset provenance, keyed by the content-address handle (riding the store, not
+    /// rebuilding it). Populated for IMPORTED assets (built-in catalog meshes have none). Carries the
+    /// identity record + the perceptual hash used for near-duplicate hints.
+    provenance: HashMap<String, metrocalk_assets::Provenance>,
 }
 
 /// Re-import ONE persisted asset blob into the store on boot, routed by MAGIC — mirrors `import_any`'s
@@ -166,15 +170,41 @@ fn load_assets() -> AssetsRuntime {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
 
+    // M11.5 (ADR-044) — label the three built-in fixtures so a boot-time provenance record reads honestly;
+    // anything else in the store is a user import restored from the content-addressed sidecar (its original
+    // file name isn't carried by the blob — a provenance sidecar is the named seam).
+    let builtins: HashMap<&str, &str> = [
+        (healthbar.as_str(), "healthbar.glb (built-in)"),
+        (prop.as_str(), "prop.glb (built-in)"),
+        (sphere.as_str(), "sphere.glb (built-in)"),
+    ]
+    .into_iter()
+    .collect();
+
     let mut meshes = Vec::new();
     let mut handle_to_slot = HashMap::new();
     let mut scales = Vec::new();
+    let mut provenance: HashMap<String, metrocalk_assets::Provenance> = HashMap::new();
     for (id, asset) in store.iter() {
         let slot = meshes.len();
         meshes.push(MeshGpu::from_asset(asset));
         let ext = asset.bounds().max_extent();
         scales.push(if ext > 0.0 { 0.9 / ext } else { 1.0 });
         handle_to_slot.insert(id.as_str().to_string(), slot);
+        // Record provenance for every boot-loaded asset (recomputing the perceptual hash from its primary
+        // texture) so near-duplicate hints + the inspector field survive a reload, not just in-session imports.
+        let phash = asset
+            .textures
+            .first()
+            .map_or(0, metrocalk_assets::perceptual_hash);
+        let source = builtins
+            .get(id.as_str())
+            .copied()
+            .unwrap_or("(restored on reload)");
+        provenance.insert(
+            id.as_str().to_string(),
+            metrocalk_assets::Provenance::imported(source, id.as_str().to_string(), phash),
+        );
     }
     eprintln!(
         "[shell] imported {} mesh assets ({} verts total) in {import_ms:.3} ms (one-shot)",
@@ -188,6 +218,7 @@ fn load_assets() -> AssetsRuntime {
         scales,
         meshes,
         sphere: sphere.as_str().to_string(),
+        provenance,
     }
 }
 
@@ -330,6 +361,11 @@ enum EngineCmd {
     Details {
         id: String,
         reply: Sender<Option<EntityDetails>>,
+    },
+    /// M11.5 (ADR-044) — the selected entity's asset provenance (identity/AI-flag/near-dup) — a read.
+    AssetProvenance {
+        id: String,
+        reply: Sender<Option<ProvenanceInfo>>,
     },
     // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable transaction over the Movable Tree +
     // override pipeline. reparent reuses `ReparentPart`; delete=deactivate is distinct from `Remove`. ──
@@ -790,6 +826,28 @@ struct EntityDetails {
     provides: Vec<String>,
     requires: Vec<String>,
     bound_to: Vec<String>,
+}
+
+/// M11.5 (ADR-044) — the inspector's asset-IDENTITY surface for a selected entity: where its mesh came
+/// from, whether it was AI-generated (honestly flagged), and a near-duplicate hint. A read-only projection
+/// over [`AssetsRuntime::provenance`]; `None` if the entity has no store-resolvable mesh. The perceptual
+/// hash is rendered as hex so the React side can show it without a u64-precision-loss round-trip through JS.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ProvenanceInfo {
+    /// "imported" / "generated" / "unknown".
+    kind: String,
+    /// File name, provider tag, or "(restored on reload)".
+    source: String,
+    /// Honestly surfaced — true only for the generation tier.
+    ai_generated: bool,
+    /// The store's content-address handle (referenced, not rebuilt).
+    content_hash: String,
+    /// The perceptual (dHash) fingerprint, hex — `"0"` when the asset carries no texture.
+    perceptual_hash: String,
+    /// The `source` of an already-loaded, different-bytes asset this one perceptually matches (a HINT —
+    /// never a silent merge). `None` when nothing similar is loaded.
+    near_duplicate_of: Option<String>,
 }
 
 struct AppState {
@@ -1629,6 +1687,43 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             st.meshes.push(gpu);
                             st.meshes_revision = st.meshes_revision.wrapping_add(1);
                         }
+                        // M11.5 (ADR-044) — record the asset's provenance keyed by its content address, and
+                        // surface a near-duplicate HINT: a perceptual-hash match against an already-imported
+                        // asset with DIFFERENT bytes (a rescaled/recompressed copy the exact dedup misses).
+                        // Never a silent merge — the exact-dedup above already collapsed identical bytes.
+                        let source = std::path::Path::new(&path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(path.as_str())
+                            .to_string();
+                        let phash = asset
+                            .textures
+                            .first()
+                            .map_or(0, metrocalk_assets::perceptual_hash);
+                        if phash != 0 {
+                            if let Some(dup_of) = assets
+                                .provenance
+                                .values()
+                                .filter(|p| p.content_hash != handle && p.perceptual_hash != 0)
+                                .find(|p| {
+                                    metrocalk_assets::is_near_duplicate(
+                                        phash,
+                                        p.perceptual_hash,
+                                        10,
+                                    )
+                                })
+                                .map(|p| p.source.clone())
+                            {
+                                eprintln!(
+                                    "[shell] import: '{source}' looks like a near-duplicate of \
+                                     '{dup_of}' (perceptual-hash match) — kept as a distinct asset"
+                                );
+                            }
+                        }
+                        assets.provenance.insert(
+                            handle.clone(),
+                            metrocalk_assets::Provenance::imported(source, handle.clone(), phash),
+                        );
                         // Persist the bytes content-addressed so the handle re-resolves on reload (audit F3):
                         // log a write failure rather than swallow it — else the imported mesh silently
                         // vanishes after restart (the saved handle dangles).
@@ -1668,6 +1763,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let details = EntityId::from_loro_key(&id)
                     .and_then(|e| build_entity_details(&engine, &scene, e));
                 let _ = reply.send(details);
+            }
+            EngineCmd::AssetProvenance { id, reply } => {
+                let info = EntityId::from_loro_key(&id)
+                    .and_then(|e| asset_provenance_of(&assets, &engine, e));
+                let _ = reply.send(info);
             }
             EngineCmd::Generate { query, reply } => {
                 // Tier 3, opt-in. Offline/unconfigured → an honest seam, no placeholder, never a fake
@@ -3121,6 +3221,49 @@ fn next_import_pos(engine: &Engine<FlecsWorld>) -> [f32; 3] {
     let col = (n % COLS) as f32;
     let row = (n / COLS) as f32;
     [(col - 1.5) * SPACING, 1.0, row * SPACING]
+}
+
+/// M11.5 (ADR-044) — the asset-IDENTITY projection for an entity: resolve its `MeshRenderer.mesh` handle to
+/// the stored [`Provenance`] and render it for the inspector, computing a near-duplicate hint against the
+/// OTHER loaded assets (a perceptual-hash match on different bytes — a HINT, never a silent merge). `None`
+/// if the entity carries no store-resolvable mesh (a placeholder-cube / pure marker has no asset identity).
+fn asset_provenance_of(
+    assets: &AssetsRuntime,
+    engine: &Engine<FlecsWorld>,
+    id: EntityId,
+) -> Option<ProvenanceInfo> {
+    let comps = engine.components_of(id);
+    let FieldValue::Str(handle) = comps
+        .get("MeshRenderer")
+        .and_then(|m| m.get(capscene::MESH_FIELD))?
+    else {
+        return None;
+    };
+    let p = assets.provenance.get(handle)?;
+    let kind = match p.kind {
+        Some(metrocalk_assets::AssetKind::Imported) => "imported",
+        Some(metrocalk_assets::AssetKind::Generated) => "generated",
+        None => "unknown",
+    };
+    // A near-duplicate hint: another loaded asset, different bytes, perceptually similar.
+    let near_duplicate_of = if p.perceptual_hash == 0 {
+        None
+    } else {
+        assets
+            .provenance
+            .values()
+            .filter(|o| o.content_hash != p.content_hash && o.perceptual_hash != 0)
+            .find(|o| metrocalk_assets::is_near_duplicate(p.perceptual_hash, o.perceptual_hash, 10))
+            .map(|o| o.source.clone())
+    };
+    Some(ProvenanceInfo {
+        kind: kind.to_string(),
+        source: p.source.clone(),
+        ai_generated: p.ai_generated,
+        content_hash: p.content_hash.clone(),
+        perceptual_hash: format!("{:x}", p.perceptual_hash),
+        near_duplicate_of,
+    })
 }
 
 /// The entity's mesh geometry (positions as f64 + indices) from its `MeshRenderer.mesh` slot — for M8.3
@@ -5451,6 +5594,22 @@ fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
     rx.recv().unwrap_or_default()
 }
 
+/// M11.5 (ADR-044) — the selected entity's asset provenance for the inspector identity surface (where it
+/// came from, AI-generated?, a near-duplicate hint). Fetched on selection change, not per frame.
+#[tauri::command]
+fn asset_provenance(state: State<AppState>, id: String) -> Option<ProvenanceInfo> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AssetProvenance { id, reply })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv().unwrap_or_default()
+}
+
 /// Generate (M6, tier 3) — opt-in last resort. Drops a grey placeholder instantly + kicks off async
 /// text-to-3D; the real mesh streams in later over the projection Channel. Returns the placeholder + the
 /// inert token cost, or the offline seam.
@@ -5786,6 +5945,7 @@ fn main() {
             remove_entity,
             duplicate_entity,
             entity_details,
+            asset_provenance,
             generate,
             ai_edit,
             top_up,

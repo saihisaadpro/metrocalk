@@ -477,6 +477,43 @@ pub fn textured_quad_glb() -> Vec<u8> {
     build_glb("textured", &[prim], &[checker_png()])
 }
 
+/// M11.5 (ADR-044) near-duplicate fixture pair — a quad whose **base-color** texture is the structured
+/// 64×64 ripple pattern (large + textured enough to carry a meaningful perceptual fingerprint, unlike the
+/// 2×2 checker which is too small to dHash). [`ripple_quad_glb`] and [`ripple_quad_wide_glb`] share the
+/// SAME ripple bytes but differ in geometry → distinct content addresses (no exact dedup) yet an identical
+/// perceptual hash → the near-duplicate hint fires. The `wide` variant spans x∈[-1,1] (a stretched copy).
+#[must_use]
+pub fn ripple_quad_glb() -> Vec<u8> {
+    ripple_quad(-0.5, 0.5)
+}
+
+/// The stretched counterpart of [`ripple_quad_glb`] — same ripple base texture, wider geometry (different
+/// bytes). The two are a perceptual near-duplicate pair the exact-dedup store keeps as distinct assets.
+#[must_use]
+pub fn ripple_quad_wide_glb() -> Vec<u8> {
+    ripple_quad(-1.0, 1.0)
+}
+
+/// A flat quad spanning x∈[x0,x1] with the structured 64×64 ripple as its base-color texture + UVs over
+/// [0,1] (so the pattern samples spatially → a non-trivial dHash). Shared by the near-duplicate pair above.
+fn ripple_quad(x0: f32, x1: f32) -> Vec<u8> {
+    let prim = PrimSpec {
+        positions: vec![
+            [x0, -0.5, 0.0],
+            [x1, -0.5, 0.0],
+            [x1, 0.5, 0.0],
+            [x0, 0.5, 0.0],
+        ],
+        normals: Some(vec![[0.0, 0.0, 1.0]; 4]),
+        uvs: Some(vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]),
+        indices: vec![0, 1, 2, 0, 2, 3],
+        base_color: [1.0, 1.0, 1.0, 1.0],
+        texture: Some(0),
+        ..Default::default()
+    };
+    build_glb("ripple", &[prim], &[ripple_normal_png()])
+}
+
 /// A unit quad (XY plane, +Z normal, UVs spanning [0,1]) carrying a **full PBR texture set**: a solid
 /// light base color, a metallic-roughness map split left|right (smooth metal | rough dielectric), and a
 /// tangent-space **normal map** encoding a sinusoidal ripple relief. This is the M11.2 follow-up fixture

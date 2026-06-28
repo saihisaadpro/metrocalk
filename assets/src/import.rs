@@ -256,6 +256,52 @@ mod tests {
     }
 
     #[test]
+    fn import_path_fingerprints_textures_and_flags_perceptual_near_duplicates() {
+        // M11.5 (ADR-044) — guards the whole import→provenance chain the editor shell wires: compute the
+        // perceptual hash of `textures.first()` on import, then HINT when a newly-imported asset matches an
+        // already-loaded one perceptually (a rescaled/recompressed copy) on top of the store's EXACT dedup.
+        let tex0 = |bytes: &[u8]| match import_any(bytes).expect("glb imports") {
+            ImportedAsset::Mesh(m) => m.textures.first().cloned().expect("a primary texture"),
+            ImportedAsset::Audio(_) => panic!("a glb must route to a mesh"),
+        };
+
+        // The near-duplicate pair: same structured ripple base texture, different geometry.
+        let a = crate::demo::ripple_quad_glb();
+        let b = crate::demo::ripple_quad_wide_glb();
+        // Exact dedup does NOT fire — different bytes → different content address (distinct store slots).
+        assert_ne!(
+            crate::AssetId::of_bytes(&a).as_str(),
+            crate::AssetId::of_bytes(&b).as_str(),
+            "the stretched copy is a distinct asset (no exact dedup)"
+        );
+        let (ha, hb) = (
+            crate::perceptual_hash(&tex0(&a)),
+            crate::perceptual_hash(&tex0(&b)),
+        );
+        assert_ne!(
+            ha, 0,
+            "a structured texture yields a non-trivial fingerprint through the import path"
+        );
+        assert!(
+            crate::is_near_duplicate(ha, hb, 10),
+            "the shared structured texture[0] makes them near-duplicates (Hamming dist {})",
+            crate::hamming_distance(ha, hb)
+        );
+
+        // Honest limitation, guarded so it can't regress into FALSE hints: the 2×2 checker is far too small
+        // to fingerprint (dHash → 0), so a real textured asset is NEVER flagged as its near-duplicate.
+        let checker = crate::perceptual_hash(&tex0(&crate::demo::textured_quad_glb()));
+        assert_eq!(
+            checker, 0,
+            "a 2×2 texture is too small to dHash (degenerate → 0)"
+        );
+        assert!(
+            !crate::is_near_duplicate(ha, checker, 10),
+            "a structured asset is not a near-duplicate of an un-fingerprintable one"
+        );
+    }
+
+    #[test]
     fn detect_is_extension_independent_and_rejects_unknown() {
         assert_eq!(detect(&crate::demo::checker_png()), Some(Detected::Image));
         assert_eq!(detect(&crate::demo::healthbar_glb()), Some(Detected::Gltf));

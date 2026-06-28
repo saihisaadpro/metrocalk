@@ -53,9 +53,7 @@ pub use ktx2_import::{transcode_to_rgba8, KtxImporter};
 pub use lod::{GridClusterLod, LodConfig, LodGenerator, MeshLod};
 pub use mesh::{Bounds, Material, MeshAsset, Primitive, Texture};
 pub use obj_import::ObjImporter;
-pub use provenance::{
-    hamming_distance, is_near_duplicate, perceptual_hash, AssetKind, Provenance,
-};
+pub use provenance::{hamming_distance, is_near_duplicate, perceptual_hash, AssetKind, Provenance};
 pub use source::{ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES};
 pub use store::{AssetId, AssetStore};
 

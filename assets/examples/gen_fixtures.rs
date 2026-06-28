@@ -29,15 +29,32 @@ fn main() {
             "normal_mapped_quad.glb",
             metrocalk_assets::demo::normal_mapped_quad_glb(),
         ),
+        // M11.2 single-texture tile (checker base color) — also the M11.5 near-duplicate counterpart of
+        // multi_material_quad.glb: both carry the SAME checker as texture[0] but differ in geometry, so they
+        // hash to different content addresses (no exact dedup) yet match perceptually (the dHash hint fires).
+        (
+            "textured_quad.glb",
+            metrocalk_assets::demo::textured_quad_glb(),
+        ),
         // M11.2 multi-texture-per-mesh fixture — two materials, two base textures, side by side.
         (
             "multi_material_quad.glb",
             metrocalk_assets::demo::multi_material_quad_glb(),
         ),
+        // M11.5 near-duplicate pair (ADR-044) — same structured ripple base texture, different geometry:
+        // distinct content addresses (no exact dedup) but an identical perceptual hash (the dHash hint fires).
+        ("ripple_quad.glb", metrocalk_assets::demo::ripple_quad_glb()),
+        (
+            "ripple_quad_wide.glb",
+            metrocalk_assets::demo::ripple_quad_wide_glb(),
+        ),
         // M11.1 static-collider fixture — a plain cube (flat top a dropped ball rests on).
         ("cube.glb", metrocalk_assets::demo::cube_glb()),
         // M11.1 LOD fixture — a dense sphere (fine enough that distance LOD is visible).
-        ("dense_sphere.glb", metrocalk_assets::demo::dense_sphere_glb()),
+        (
+            "dense_sphere.glb",
+            metrocalk_assets::demo::dense_sphere_glb(),
+        ),
     ] {
         let path = out.join(name);
         std::fs::write(&path, &bytes).expect("write fixture");
