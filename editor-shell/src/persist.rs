@@ -73,6 +73,15 @@ pub enum Record {
         fov: f32,
         active: bool,
     },
+    /// M12.1 (ADR-045) — an authored rule (When/If/Then). The whole `RuleData` is kept so replay re-commits
+    /// the same `SetRule` on the same id → the rule survives close→reopen (the Loro `rules` map is rebuilt
+    /// from the replayed ops, same as every other doc state in the session-restore path).
+    AuthorRule {
+        id: String,
+        rule: metrocalk_core::RuleData,
+    },
+    /// M12.1 (ADR-045) — a removed rule; replayed as the same `RemoveRule`.
+    RemoveRule { id: String },
     /// A physics-body spawn (M8.2): a dynamic RigidBody + ball Collider + its ball mesh handle, at a
     /// position. Replayed by re-spawning deterministically (same id alloc); the sim body itself is
     /// RE-HYDRATED from the restored RigidBody entity by the engine thread after replay. Loro stores the
@@ -306,6 +315,23 @@ impl Log {
                 Record::AddCamera { pos, fov, active } => {
                     capscene::add_camera(engine, scene, pos, fov, active).is_ok()
                 }
+                Record::AuthorRule { id, rule } => engine
+                    .commit(
+                        "author rule",
+                        vec![metrocalk_core::Op::SetRule {
+                            id: metrocalk_core::RuleId::new(id),
+                            rule,
+                        }],
+                    )
+                    .is_ok(),
+                Record::RemoveRule { id } => engine
+                    .commit(
+                        "remove rule",
+                        vec![metrocalk_core::Op::RemoveRule {
+                            id: metrocalk_core::RuleId::new(id),
+                        }],
+                    )
+                    .is_ok(),
                 Record::SpawnBody { pos, mesh } => {
                     capscene::spawn_physics_body(engine, scene, mesh.as_deref(), pos, 0.45).is_ok()
                 }

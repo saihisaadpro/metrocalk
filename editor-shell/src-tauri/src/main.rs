@@ -367,6 +367,22 @@ enum EngineCmd {
         id: String,
         reply: Sender<Option<ProvenanceInfo>>,
     },
+    /// M12.1 (ADR-045) — list all authored rules (the editor Rule list) — a read.
+    ListRules {
+        reply: Sender<Vec<RuleSummary>>,
+    },
+    /// M12.1 (ADR-045) — author (or replace, if `id` is given) a rule: registry-validate (Blocked+
+    /// explained), commit one undoable `SetRule`, and reply the new id + the offered mirror rule.
+    AuthorRule {
+        rule: metrocalk_core::RuleData,
+        id: Option<String>,
+        reply: Sender<AuthorRuleResult>,
+    },
+    /// M12.1 (ADR-045) — remove a rule (one undoable `RemoveRule`). Replies success.
+    DeleteRule {
+        id: String,
+        reply: Sender<bool>,
+    },
     // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable transaction over the Movable Tree +
     // override pipeline. reparent reuses `ReparentPart`; delete=deactivate is distinct from `Remove`. ──
     /// Create an empty named entity at a position → reply its id (selected by the caller).
@@ -850,6 +866,66 @@ struct ProvenanceInfo {
     near_duplicate_of: Option<String>,
 }
 
+// ── M12.1 (ADR-045) Rules-layer wire types ─────────────────────────────────
+
+/// One entry in the Rules builder's "When"/"Then" dropdowns — a registry event or action verb.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RuleVocabItem {
+    name: String,
+    description: String,
+}
+
+/// A component the builder's If/Then can target, with its fields + scalar types (so the builder offers only
+/// real `component.field`s and a type-matched value input — typo-proof by construction).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RuleComponentVocab {
+    name: String,
+    fields: Vec<RuleFieldVocab>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RuleFieldVocab {
+    name: String,
+    /// `"integer"` / `"number"` / `"boolean"` / `"string"`.
+    ty: String,
+}
+
+/// The whole registry-fed vocabulary the Rules builder is assembled from (ADR-045 deliverable 2) — what
+/// makes every dropdown typo-proof. A pure read of the standard library; no engine round-trip needed.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RuleRegistryInfo {
+    events: Vec<RuleVocabItem>,
+    actions: Vec<RuleVocabItem>,
+    components: Vec<RuleComponentVocab>,
+}
+
+/// A row in the editor's Rule list — a compact projection of an authored rule.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RuleSummary {
+    id: String,
+    name: String,
+    enabled: bool,
+    event: String,
+    condition_count: usize,
+    action_count: usize,
+}
+
+/// The result of authoring a rule: the new id on success, a plain-language `error` if the registry
+/// **Blocked** it (ADR-016), and the proactively-offered **mirror** "cleanup" rule (the missing-"off"-switch
+/// guard) for the UI to surface — `None` if there's no well-defined inverse.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct AuthorRuleResult {
+    id: Option<String>,
+    error: Option<String>,
+    mirror: Option<metrocalk_core::RuleData>,
+}
+
 struct AppState {
     tx: Sender<EngineCmd>,
     shared: Shared,
@@ -1000,6 +1076,23 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // pair is mirrored — this is what makes the future `.mtk` Loro-document load path keep reveal/bind
     // working (the replay-log path doesn't need it, but the project format does).
     engine.set_capability_resolver(Box::new(capscene::CapResolver::from_scene(&scene)));
+    // M12.1 (ADR-045) — the Rules-layer vocabulary registry: the events/actions/components the registry-fed
+    // builder offers + `validate_rule` checks (typo-proof, Blocked+explained). A SEPARATE throwaway
+    // FlecsWorld — `validate_rule`'s event/action/component-field lookups read the registry's own maps, never
+    // the world (only capability-pair queries touch it, which the Rules layer doesn't use).
+    let rules_registry = {
+        let mut reg = metrocalk_core::Registry::new(FlecsWorld::new());
+        for c in metrocalk_core::stdlib::standard_components() {
+            let _ = reg.register(c);
+        }
+        for e in metrocalk_core::stdlib::standard_events() {
+            reg.register_event(e);
+        }
+        for a in metrocalk_core::stdlib::standard_actions() {
+            reg.register_action(a);
+        }
+        reg
+    };
     // The seed count defaults to the M2 stress target (`SCENE_N`), but `MTK_SCENE_N` overrides it — a
     // clean low-/zero-entity scene for visually inspecting a single imported asset (e.g. an FBX) without
     // 5000 cubes burying it. The fingerprint folds the count in, so a non-default seed just gets its own
@@ -1768,6 +1861,79 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let info = EntityId::from_loro_key(&id)
                     .and_then(|e| asset_provenance_of(&assets, &engine, e));
                 let _ = reply.send(info);
+            }
+            EngineCmd::ListRules { reply } => {
+                let out = engine
+                    .rules()
+                    .into_iter()
+                    .map(|(id, r)| RuleSummary {
+                        id: id.as_str().to_string(),
+                        name: r.name,
+                        enabled: r.enabled,
+                        event: r.event,
+                        condition_count: r.conditions.len(),
+                        action_count: r.actions.len(),
+                    })
+                    .collect();
+                let _ = reply.send(out);
+            }
+            EngineCmd::AuthorRule { rule, id, reply } => {
+                // Registry-validate FIRST (typo-proof, Blocked + explained — ADR-016): an unknown event/
+                // component/field/action or a wrong-typed value is refused with a plain-language reason and
+                // never committed. Only a valid rule becomes one undoable `SetRule` (+ a replay Record so it
+                // survives reload), and the engine offers its mirror "cleanup" rule for the UI to surface.
+                let resp = match metrocalk_core::validate_rule(&rules_registry, &rule, |e| {
+                    engine.entity_exists(e)
+                }) {
+                    Err(e) => AuthorRuleResult {
+                        error: Some(e.to_string()),
+                        ..Default::default()
+                    },
+                    Ok(()) => {
+                        let rule_id = id
+                            .map(metrocalk_core::RuleId::new)
+                            .unwrap_or_else(|| engine.alloc_rule_id());
+                        let mirror = metrocalk_core::propose_mirror(&rule);
+                        match engine.commit(
+                            "author rule",
+                            vec![metrocalk_core::Op::SetRule {
+                                id: rule_id.clone(),
+                                rule: rule.clone(),
+                            }],
+                        ) {
+                            Ok(()) => {
+                                log.append(&Record::AuthorRule {
+                                    id: rule_id.as_str().to_string(),
+                                    rule,
+                                });
+                                AuthorRuleResult {
+                                    id: Some(rule_id.as_str().to_string()),
+                                    mirror,
+                                    ..Default::default()
+                                }
+                            }
+                            Err(e) => AuthorRuleResult {
+                                error: Some(e.to_string()),
+                                ..Default::default()
+                            },
+                        }
+                    }
+                };
+                let _ = reply.send(resp);
+            }
+            EngineCmd::DeleteRule { id, reply } => {
+                let ok = engine
+                    .commit(
+                        "remove rule",
+                        vec![metrocalk_core::Op::RemoveRule {
+                            id: metrocalk_core::RuleId::new(id.clone()),
+                        }],
+                    )
+                    .is_ok();
+                if ok {
+                    log.append(&Record::RemoveRule { id });
+                }
+                let _ = reply.send(ok);
             }
             EngineCmd::Generate { query, reply } => {
                 // Tier 3, opt-in. Offline/unconfigured → an honest seam, no placeholder, never a fake
@@ -5610,6 +5776,94 @@ fn asset_provenance(state: State<AppState>, id: String) -> Option<ProvenanceInfo
     rx.recv().unwrap_or_default()
 }
 
+/// M12.1 (ADR-045) — the registry-fed Rules vocabulary the builder is assembled from (events · actions ·
+/// components+fields+types) — what makes every dropdown typo-proof. A pure read of the standard library.
+#[tauri::command]
+fn rule_registry() -> RuleRegistryInfo {
+    ipc();
+    let field_ty = |t: metrocalk_core::FieldType| -> String {
+        match t {
+            metrocalk_core::FieldType::Integer => "integer",
+            metrocalk_core::FieldType::Number => "number",
+            metrocalk_core::FieldType::Boolean => "boolean",
+            metrocalk_core::FieldType::String => "string",
+        }
+        .to_string()
+    };
+    RuleRegistryInfo {
+        events: metrocalk_core::stdlib::standard_events()
+            .into_iter()
+            .map(|e| RuleVocabItem {
+                name: e.name,
+                description: e.description,
+            })
+            .collect(),
+        actions: metrocalk_core::stdlib::standard_actions()
+            .into_iter()
+            .map(|a| RuleVocabItem {
+                name: a.name,
+                description: a.description,
+            })
+            .collect(),
+        components: metrocalk_core::stdlib::standard_components()
+            .into_iter()
+            .map(|c| RuleComponentVocab {
+                name: c.name,
+                fields: c
+                    .fields
+                    .into_iter()
+                    .map(|f| RuleFieldVocab {
+                        name: f.name,
+                        ty: field_ty(f.ty),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// M12.1 (ADR-045) — all authored rules for the editor Rule list. Fetched on change, not per frame.
+#[tauri::command]
+fn list_rules(state: State<AppState>) -> Vec<RuleSummary> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::ListRules { reply }).is_err() {
+        return Vec::new();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// M12.1 (ADR-045) — author (or replace, if `id` is given) a rule: registry-validate (Blocked + explained),
+/// commit one undoable transaction, reply the new id + the offered mirror "cleanup" rule.
+#[tauri::command]
+fn author_rule(
+    state: State<AppState>,
+    rule: metrocalk_core::RuleData,
+    id: Option<String>,
+) -> AuthorRuleResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AuthorRule { rule, id, reply })
+        .is_err()
+    {
+        return AuthorRuleResult::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// M12.1 (ADR-045) — remove a rule (one undoable transaction). Returns success.
+#[tauri::command]
+fn delete_rule(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::DeleteRule { id, reply }).is_err() {
+        return false;
+    }
+    rx.recv().unwrap_or(false)
+}
+
 /// Generate (M6, tier 3) — opt-in last resort. Drops a grey placeholder instantly + kicks off async
 /// text-to-3D; the real mesh streams in later over the projection Channel. Returns the placeholder + the
 /// inert token cost, or the offline seam.
@@ -5946,6 +6200,10 @@ fn main() {
             duplicate_entity,
             entity_details,
             asset_provenance,
+            rule_registry,
+            list_rules,
+            author_rule,
+            delete_rule,
             generate,
             ai_edit,
             top_up,
