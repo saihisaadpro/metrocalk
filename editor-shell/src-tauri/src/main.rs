@@ -56,7 +56,11 @@ use tauri::ipc::Channel;
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
-const SCENE_N: usize = 5000; // the real M1.4 stress scene (the M2 gate target)
+// C10: a real first-run must open onto a SMALL, navigable scene — never the 5,000-entity stress wall. The
+// seed still forces entity 0 to a HealthBar near the origin (+ a few Health providers), so bind-by-intent
+// (north-star #1) is demonstrable out of the box. The 5k stress fixture stays one `MTK_SCENE_N=5000` away
+// (the perf/acceptance/base/reload e2e configs pin it; the dev MockCore already does this via `sampleScene`).
+const SAMPLE_N: usize = 16;
 
 /// Send a projection delta to the WebView, LOGGING a send failure instead of swallowing it (audit F1).
 /// A dead channel (webview closed mid-op) used to drop every confirm/undo/create/bind delta silently →
@@ -328,7 +332,11 @@ struct PlayInfo {
 enum EngineCmd {
     Connect(Channel<ProjectionDelta>),
     Edit(EditTx),
-    Undo,
+    /// Undo the last transaction; reply whether anything was actually reverted (so the UI can be honest —
+    /// "undo" vs "nothing to undo" — instead of always claiming a revert on an empty history).
+    Undo {
+        reply: mpsc::Sender<bool>,
+    },
     /// Compute the reveal for a selected entity and reply (request/response — a read).
     Reveal {
         id: String,
@@ -427,6 +435,30 @@ enum EngineCmd {
     Compose {
         composition: metrocalk_core::compose::Composition,
         reply: Sender<ComposeResult>,
+    },
+    // ── M12.5 (ADR-049) Rules in Play + the live truth-state debugger ──────────────────────────────────
+    /// Fire a live gameplay **event** into the running Rules (only in Play) — the When-channel: the event is
+    /// recorded into the Play recording + one tick advances, so a later scrub replays it deterministically
+    /// (the M8.4 input channel for logic). `selected` is the clicked entity, so the reply carries its fresh
+    /// truth-state. A render/runtime **projection** — never the ECS/Loro doc (ADR-021/034).
+    FireRuleEvent {
+        event: String,
+        subject: Option<String>,
+        selected: Option<String>,
+        reply: Sender<RuleDebugInfo>,
+    },
+    /// The **live truth-state** for the clicked entity + the decision history (the "debug by looking" read,
+    /// test #5 box 3) — a non-mutating projection over the runtime state. `id = None` ⇒ history only.
+    RuleDebug {
+        id: Option<String>,
+        reply: Sender<RuleDebugInfo>,
+    },
+    /// **Scrub** the decision history to `frame` over the M8.4 replay channel (rewind = rebuild-from-recording,
+    /// then replay forward — deterministic-by-rebuild) and reply the truth-state at that frame (test #5 box 4).
+    RuleScrub {
+        frame: u64,
+        selected: Option<String>,
+        reply: Sender<RuleDebugInfo>,
     },
     // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable transaction over the Movable Tree +
     // override pipeline. reparent reuses `ReparentPart`; delete=deactivate is distinct from `Remove`. ──
@@ -1033,6 +1065,38 @@ struct ComposeResult {
     error: Option<String>,
 }
 
+/// M12.5 (ADR-049) — one rule's plain-language **explanation** at the current frame (`explain_rule`, the
+/// M3.1/M8.4 explain engine on logic): why it did / didn't fire, shown not logged.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RuleExplain {
+    rule: String,
+    text: String,
+}
+
+/// M12.5 (ADR-049) — the **live truth-state debugger** payload: the clicked entity's truth-state (rules with
+/// per-condition ✅/❌ + machine current state — `debug by looking`), each rule's `explain_rule` narration, the
+/// frame-stamped **decision history** (time-travelable), and any rules **flagged** out of the deterministic
+/// path (a non-deterministic plugin). `playing=false` ⇒ not in Play (the rest is empty). All a projection —
+/// reading it never mutates the run or the doc.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct RuleDebugInfo {
+    playing: bool,
+    /// The current decision-history frame the cursor is at.
+    frame: u64,
+    /// The highest frame reached (the scrubber's max — the live head).
+    head: u64,
+    /// The clicked entity's live truth-state (`None` if no entity was asked for / not in Play).
+    truth: Option<metrocalk_core::TruthState>,
+    /// Per-rule plain-language explanations for the rules in `truth`.
+    explanations: Vec<RuleExplain>,
+    /// The decision history up to the current frame (frame-stamped).
+    decisions: Vec<metrocalk_core::DecisionEvent>,
+    /// Rules excluded from the deterministic Play path (non-deterministic plugin) — surfaced, never silent.
+    flagged: Vec<metrocalk_core::FlaggedRule>,
+}
+
 struct AppState {
     tx: Sender<EngineCmd>,
     shared: Shared,
@@ -1202,6 +1266,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
         for a in metrocalk_core::stdlib::standard_actions() {
             reg.register_action(a);
         }
+        // M12.5 (ADR-049) — register the plugin vocabulary too, so the Play-time determinism partition
+        // (`play_rules::build_recording`) can read each plugin's `deterministic` flag to hold a
+        // non-deterministic plugin out of the lockstep replay path.
+        for p in metrocalk_core::stdlib::standard_plugins() {
+            reg.register_plugin(p);
+        }
         reg
     };
     // The seed count defaults to the M2 stress target (`SCENE_N`), but `MTK_SCENE_N` overrides it — a
@@ -1211,7 +1281,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     let scene_n: usize = std::env::var("MTK_SCENE_N")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(SCENE_N);
+        .unwrap_or(SAMPLE_N); // C10: small named-able first-run by default; MTK_SCENE_N=5000 = stress fixture
     let index = capscene::seed(&mut engine, &scene, scene_n).expect("seed capability scene");
     // M9.2: a small **composed character** (a body root + two rigid child parts) for part editing —
     // seeded as deterministic scene construction right after the seed (its ids are stable across launches
@@ -1346,6 +1416,15 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // camera's view into the render override (`cam_override`, a projection — never Loro/undo, ADR-021),
     // saving whatever the editor view was (fly-cam or a manual look-through); on Stop we restore it.
     let mut pre_play_cam: Option<render::CamView> = None;
+    // M12.5 (ADR-049) — the Play-time Rules session: the authored Rules + state machines, captured into a
+    // deterministic `RuleReplay` at Play-start (`play_rules::build_recording`) and dropped on Stop. It runs
+    // the Rules as a PROJECTION over a `RuntimeState` — never the ECS/Loro doc (ADR-021/034), so a Rule
+    // firing in Play can't corrupt the authored scene (re-confirmed in `editor-shell/tests/rule_runtime.rs`).
+    // `rule_flagged` = rules held out of the deterministic path (a non-deterministic plugin); `rule_head` =
+    // the furthest decision-history frame reached (the scrubber's right edge — the M8.4 timeline for logic).
+    let mut rule_session: Option<metrocalk_core::RuleReplay> = None;
+    let mut rule_flagged: Vec<metrocalk_core::FlaggedRule> = Vec::new();
+    let mut rule_head: u64 = 0;
     // A fixed-cadence heartbeat (~60/s) on its own thread enqueues `Tick` via the engine's own sender, so
     // the sim advances ON the engine thread (off the JS hot path, invariant 4) without blocking the
     // command loop. A `Tick` is a no-op until the sim is running with at least one body.
@@ -1418,8 +1497,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     }
                 }
             }
-            EngineCmd::Undo => {
-                if engine.undo() {
+            EngineCmd::Undo { reply } => {
+                let did = engine.undo();
+                if did {
                     log.append(&Record::Undo); // persist the undo so replay reproduces the net state
                     if let Some(ch) = &channel {
                         send_proj!(ch, project_full(&engine)); // simplest correct post-undo sync
@@ -1438,6 +1518,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         sim_running = false;
                     }
                 }
+                let _ = reply.send(did);
             }
             EngineCmd::Reveal { id, reply } => {
                 let resp = EntityId::from_loro_key(&id)
@@ -1821,6 +1902,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let ok = EntityId::from_loro_key(&id)
                     .is_some_and(|e| capscene::delete_deactivate(&mut engine, &scene, e).is_ok());
                 if ok {
+                    // Persist the deactivate so it SURVIVES reload (R-NEXT-2) — replay re-runs it, and
+                    // `project_full` then re-emits `active:false` so the hierarchy dims the row on reopen.
+                    log.append(&Record::DeleteDeactivate { id: id.clone() });
                     if let Some(ch) = &channel {
                         send_proj!(ch, project_full(&engine));
                     }
@@ -2235,6 +2319,57 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     },
                 };
                 let _ = reply.send(resp);
+            }
+            EngineCmd::FireRuleEvent {
+                event,
+                subject,
+                selected,
+                reply,
+            } => {
+                // M12.5 (ADR-049) — fire a live gameplay event into the running Rules (the When-channel).
+                // ONLY in Play, and ONLY a PROJECTION: it advances the `RuleReplay`'s runtime state + decision
+                // history, never the ECS/Loro doc (ADR-021/034). Recorded into the Play recording so a later
+                // scrub replays it deterministically (M8.4). A no-op (empty info) when not playing.
+                if let Some(session) = rule_session.as_mut() {
+                    rule_head = session.fire(event, subject);
+                }
+                let _ = reply.send(rule_debug_info(
+                    play_mode,
+                    rule_session.as_ref(),
+                    &rule_flagged,
+                    rule_head,
+                    selected.as_deref(),
+                ));
+            }
+            EngineCmd::RuleDebug { id, reply } => {
+                // The "debug by looking" read (test #5 box 3): the clicked entity's live truth-state + the
+                // decision history. A non-mutating projection over the runtime state (the M8.4 overlay
+                // discipline — reading it never perturbs the run).
+                let _ = reply.send(rule_debug_info(
+                    play_mode,
+                    rule_session.as_ref(),
+                    &rule_flagged,
+                    rule_head,
+                    id.as_deref(),
+                ));
+            }
+            EngineCmd::RuleScrub {
+                frame: target,
+                selected,
+                reply,
+            } => {
+                // Scrub the decision history over the M8.4 channel (rewind = rebuild-from-recording, then
+                // replay forward — deterministic-by-rebuild) and reply the truth-state at that frame (box 4).
+                if let Some(session) = rule_session.as_mut() {
+                    session.seek(target.min(rule_head));
+                }
+                let _ = reply.send(rule_debug_info(
+                    play_mode,
+                    rule_session.as_ref(),
+                    &rule_flagged,
+                    rule_head,
+                    selected.as_deref(),
+                ));
             }
             EngineCmd::Generate { query, reply } => {
                 // Tier 3, opt-in. Offline/unconfigured → an honest seam, no placeholder, never a fake
@@ -2882,6 +3017,16 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     frame = 0;
                     max_frame = 0;
                     sim_running = true;
+                    // M12.5 (ADR-049) — capture the authored Rules + state machines into a deterministic
+                    // `RuleReplay` at Play-start (a projection over a RuntimeState, never the doc). A rule
+                    // with a non-deterministic plugin is held out of the lockstep path + surfaced.
+                    let session = metrocalk_editor_shell::play_rules::build_recording(
+                        &engine,
+                        &rules_registry,
+                    );
+                    rule_flagged = session.flagged;
+                    rule_session = Some(metrocalk_core::RuleReplay::new(session.recording));
+                    rule_head = 0;
                 }
                 let _ = reply.send(PlayInfo {
                     playing: play_mode,
@@ -2924,6 +3069,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     }
                     play_mode = false;
                     sim_running = false;
+                    // M12.5 (ADR-049) — drop the Play-time Rules session (its runtime state + decision history
+                    // are a projection; Stop discards them, restoring the authored doc bit-exactly).
+                    rule_session = None;
+                    rule_flagged.clear();
+                    rule_head = 0;
                     // M11.4 — leave look-through: restore the pre-Play editor view (fly-cam or manual).
                     shared.lock().unwrap().cam_override = pre_play_cam.take();
                     recency.clear(); // ECS handles changed on the restore swap — drop stale ranking state
@@ -4066,6 +4216,48 @@ fn clear_overlay(shared: &Shared) {
     }
 }
 
+/// M12.5 (ADR-049) — assemble the live truth-state debugger payload from the Play-time `RuleReplay` (the
+/// "debug by looking" read). For the selected entity: its truth-state (rules with per-condition ✅/❌ + the
+/// machine current state) + each rule's `explain_rule` narration, plus the frame-stamped decision history and
+/// the determinism-flagged rules. A pure read over the runtime state — never mutates the run or the doc. When
+/// not playing, an empty info (`playing:false`) so the UI shows the authoring state.
+fn rule_debug_info(
+    playing: bool,
+    session: Option<&metrocalk_core::RuleReplay>,
+    flagged: &[metrocalk_core::FlaggedRule],
+    head: u64,
+    selected: Option<&str>,
+) -> RuleDebugInfo {
+    let Some(session) = session else {
+        return RuleDebugInfo::default();
+    };
+    let truth = selected.map(|id| session.truth_state(id));
+    // One plain-language explanation per rule shown for the entity (the M3.1/M8.4 explain engine on logic).
+    let explanations = truth
+        .as_ref()
+        .map(|t| {
+            t.rules
+                .iter()
+                .filter_map(|r| {
+                    session.explain_rule(&r.rule).map(|text| RuleExplain {
+                        rule: r.rule.clone(),
+                        text,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    RuleDebugInfo {
+        playing,
+        frame: session.frame(),
+        head,
+        truth,
+        explanations,
+        decisions: session.history().to_vec(),
+        flagged: flagged.to_vec(),
+    }
+}
+
 /// M8.2 STEP 4 — the per-tick transform DELTA sync (hot path off JS). Writes each moved body's world
 /// position straight into the shared render [`SceneState`] (the projection the render loop reads every
 /// vsync) and bumps `revision` so the loop re-uploads — in place, no full rebuild, no `engine.commit`,
@@ -4788,9 +4980,13 @@ fn submit_edit(state: State<AppState>, tx: EditTx) {
 }
 
 #[tauri::command]
-fn undo(state: State<AppState>) {
+fn undo(state: State<AppState>) -> bool {
     ipc();
-    let _ = state.tx.send(EngineCmd::Undo);
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Undo { reply }).is_err() {
+        return false;
+    }
+    rx.recv().unwrap_or(false) // true iff a transaction was actually reverted (honest "undo" vs "nothing to undo")
 }
 
 /// Reveal bindable targets for a selected entity (north-star test #1). Blocks briefly on the engine
@@ -6540,6 +6736,66 @@ fn play_state(state: State<AppState>) -> PlayInfo {
     rx.recv().unwrap_or_default()
 }
 
+// ── M12.5 (ADR-049): Rules in Play + the live truth-state debugger ─────────────────────────────────
+
+/// Fire a live gameplay `event` (e.g. `EnemyDied`) into the running Rules — the When-channel. A projection
+/// (never the doc); recorded so a scrub replays it. Returns the fresh truth-state for `selected`.
+#[tauri::command]
+fn fire_rule_event(
+    state: State<AppState>,
+    event: String,
+    subject: Option<String>,
+    selected: Option<String>,
+) -> RuleDebugInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::FireRuleEvent {
+            event,
+            subject,
+            selected,
+            reply,
+        })
+        .is_err()
+    {
+        return RuleDebugInfo::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// The live truth-state debugger read (test #5 box 3) — click an entity → its rule truth (✅/❌ per condition),
+/// machine current state, `explain_rule` narration, the decision history, and any determinism-flagged rules.
+#[tauri::command]
+fn rule_debug(state: State<AppState>, id: Option<String>) -> RuleDebugInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::RuleDebug { id, reply }).is_err() {
+        return RuleDebugInfo::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Scrub the decision history to `frame` over the M8.4 replay channel (test #5 box 4) and return the
+/// truth-state at that frame for `selected` — watch exactly when a counter incremented / a transition fired.
+#[tauri::command]
+fn rule_scrub(state: State<AppState>, frame: u64, selected: Option<String>) -> RuleDebugInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::RuleScrub {
+            frame,
+            selected,
+            reply,
+        })
+        .is_err()
+    {
+        return RuleDebugInfo::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 fn main() {
     let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
     let (tx, rx) = mpsc::channel::<EngineCmd>();
@@ -6696,6 +6952,9 @@ fn main() {
             stop,
             pause,
             play_state,
+            fire_rule_event,
+            rule_debug,
+            rule_scrub,
             ipc_count
         ])
         .run(tauri::generate_context!())

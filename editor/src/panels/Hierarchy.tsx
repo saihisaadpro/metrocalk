@@ -12,6 +12,7 @@ import { memo, useState } from "react";
 import {
   projectionStore,
   useEntityOrder,
+  useIsDeactivated,
   useIsMultiSelected,
   useSelectedId,
   useSummary,
@@ -23,10 +24,21 @@ const VIEW_H = 560;
 const OVERSCAN = 6;
 const DRAG_MIME = "text/mtk-id";
 
-const Row = memo(function Row({ id, top, client }: { id: string; top: number; client: EditorClient }) {
+const Row = memo(function Row({
+  id,
+  top,
+  client,
+  onContextMenu,
+}: {
+  id: string;
+  top: number;
+  client: EditorClient;
+  onContextMenu?: (id: string, x: number, y: number) => void;
+}) {
   const s = useSummary(id);
   const primary = useSelectedId() === id;
   const inMulti = useIsMultiSelected(id);
+  const deactivated = useIsDeactivated(id);
   const [dropTarget, setDropTarget] = useState(false);
 
   // Selection: shift = range, ctrl/cmd = toggle, else single. The engine gizmo selection follows the
@@ -45,6 +57,16 @@ const Row = memo(function Row({ id, top, client }: { id: string; top: number; cl
       data-id={id}
       draggable
       onClick={click}
+      onContextMenu={(e) => {
+        // Right-click an entity in the LIST opens the same registry-driven context menu the viewport offers
+        // (it was previously reachable only by right-clicking the stage). Select the row first so the menu
+        // (and the inspector) act on it.
+        if (!onContextMenu) return;
+        e.preventDefault();
+        projectionStore.getState().select(id);
+        void client.gizmoSelect(id).catch(() => {});
+        onContextMenu(id, e.clientX, e.clientY);
+      }}
       onDragStart={(e) => {
         e.dataTransfer.setData(DRAG_MIME, id);
         e.dataTransfer.effectAllowed = "move";
@@ -74,7 +96,9 @@ const Row = memo(function Row({ id, top, client }: { id: string; top: number; cl
         padding: "0 8px",
         cursor: "pointer",
         font: "12px ui-monospace, monospace",
-        color: primary || inMulti ? "#fff" : "#cfd2d6",
+        // A deactivated ("deleted", recoverable) entity is dimmed + struck so Delete visibly lands (C11).
+        color: deactivated ? "#6b7280" : primary || inMulti ? "#fff" : "#cfd2d6",
+        textDecoration: deactivated ? "line-through" : "none",
         background: dropTarget ? "#3a5a3a" : primary ? "#2a4365" : inMulti ? "#23344f" : "transparent",
         outline: dropTarget ? "1px solid #6c6" : "none",
         whiteSpace: "nowrap",
@@ -82,11 +106,18 @@ const Row = memo(function Row({ id, top, client }: { id: string; top: number; cl
     >
       {s?.parentId ? "· " : ""}
       {s?.name ?? id}
+      {deactivated && <span style={{ opacity: 0.6, fontStyle: "italic" }}> · hidden</span>}
     </div>
   );
 });
 
-export function Hierarchy({ client }: { client: EditorClient }) {
+export function Hierarchy({
+  client,
+  onContextMenu,
+}: {
+  client: EditorClient;
+  onContextMenu?: (id: string, x: number, y: number) => void;
+}) {
   const order = useEntityOrder();
   const [scrollTop, setScrollTop] = useState(0);
   const start = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
@@ -107,7 +138,7 @@ export function Hierarchy({ client }: { client: EditorClient }) {
       >
         <div style={{ height: order.length * ROW_H, position: "relative" }}>
           {visible.map((id, i) => (
-            <Row key={id} id={id} top={(start + i) * ROW_H} client={client} />
+            <Row key={id} id={id} top={(start + i) * ROW_H} client={client} onContextMenu={onContextMenu} />
           ))}
         </div>
       </div>

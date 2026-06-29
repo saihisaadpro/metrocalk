@@ -21,6 +21,10 @@ const sceneLog = path.resolve(dir, "../src-tauri/target/release/metrocalk-scene.
 const nativeDriver = path.resolve(dir, ".driver/msedgedriver.exe");
 const tauriDriverBin = path.resolve(process.env.USERPROFILE, ".cargo/bin/tauri-driver.exe");
 
+// Reload regression pre-seeds a known-good log against the at-scale fingerprint; the shell default is now
+// the small C10 sample, so pin the stress fixture here to preserve this spec's seed/replay namespace.
+process.env.MTK_SCENE_N = process.env.MTK_SCENE_N || "5000";
+
 // A known-good log in the deterministic SCENE_N=5000 id space. The header must match
 // `capscene::fingerprint(5000)` byte-for-byte or replay discards it; 1_1129 is a seeded HealthBar and
 // 1_aac / 1_6ec are compatible Health providers (all verified live: `restored N (0 skipped)`).

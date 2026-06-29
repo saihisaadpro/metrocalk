@@ -23,6 +23,10 @@ const walletFile = path.resolve(dir, "../src-tauri/target/release/metrocalk-wall
 const nativeDriver = path.resolve(dir, ".driver/msedgedriver.exe");
 const tauriDriverBin = path.resolve(process.env.USERPROFILE, ".cargo/bin/tauri-driver.exe");
 
+// The acceptance gate measures perf AT SCALE; the shell's default first-run is now the small C10 sample,
+// so pin the 5k stress fixture here to keep the budget/selective-re-render measurements meaningful.
+process.env.MTK_SCENE_N = process.env.MTK_SCENE_N || "5000";
+
 let tauriDriver;
 
 export const config = {

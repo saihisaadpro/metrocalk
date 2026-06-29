@@ -20,6 +20,7 @@ pub mod generate;
 pub mod metering;
 pub mod persist;
 pub mod physics_intent;
+pub mod play_rules;
 pub mod plugin_host;
 pub mod project;
 pub mod reveal;
@@ -43,6 +44,7 @@ pub use generate::{
 };
 pub use metering::{ai_edit_material, buy_marketplace, material_patch, Outcome};
 pub use persist::{Log, Record};
+pub use play_rules::{build_recording, PlaySession};
 pub use project::{atomic_write, open_into, save, OpenError};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
 pub use wallet::Wallet;

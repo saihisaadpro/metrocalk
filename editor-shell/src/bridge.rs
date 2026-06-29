@@ -27,6 +27,11 @@ pub enum ProjectionOp {
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_id: Option<Option<String>>,
+        /// Deactivate-not-delete state (ADR-026): `Some(false)` marks a deactivated ("deleted",
+        /// recoverable) entity so the hierarchy can dim/strike it — and so the mark SURVIVES a reload
+        /// (the persisted SetActive replays, `project_full` re-emits `active:false`). Absent ⇒ unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        active: Option<bool>,
     },
     Remove {
         id: String,
@@ -205,6 +210,7 @@ pub fn project_full<W: World>(engine: &Engine<W>) -> ProjectionDelta {
             id: key.clone(),
             name: Some(entity_label(&comps, &key)),
             parent_id: Some(parent),
+            active: Some(engine.is_active(id)), // carry deactivate state so it survives reload (R-NEXT-2)
         });
         for (component, fields) in comps {
             for (field, value) in fields {
@@ -243,6 +249,7 @@ pub fn project_entity<W: World>(engine: &Engine<W>, id: EntityId) -> ProjectionD
         id: key.clone(),
         name: Some(entity_label(&comps, &key)),
         parent_id: Some(parent),
+        active: Some(engine.is_active(id)), // carry deactivate state (R-NEXT-2)
     }];
     for (component, fields) in comps {
         for (field, value) in fields {

@@ -16,7 +16,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     topUp: () => Promise.resolve({ ok: true, balance: 200, cost: 100, message: null }),
     aiEdit: () => Promise.resolve({ ok: true, balance: 198, cost: 2, message: null }),
     generate: () => Promise.resolve({ created: "gen-1", cost: 10, available: true, seam: null, balance: 90 }),
-    undo: vi.fn(),
+    undo: vi.fn(() => Promise.resolve(false)),
     entityActions: () => Promise.resolve([]),
     entityDetails: () => Promise.resolve(null),
     removeEntity: vi.fn(),
@@ -97,6 +97,10 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     // M12.4 AI compose (a test overrides what it exercises).
     proposeComposition: vi.fn(() => Promise.resolve({ ok: false, composition: null, ops: 0, error: null })),
     compose: vi.fn(() => Promise.resolve({ ok: true, applied: 0, rules: 0, stateMachines: 0, error: null })),
+    // M12.5 Rules in Play + the truth-state debugger (a test overrides what it exercises).
+    fireRuleEvent: vi.fn(() => Promise.resolve({ playing: true, frame: 0, head: 0, truth: null, explanations: [], decisions: [], flagged: [] })),
+    ruleDebug: vi.fn(() => Promise.resolve({ playing: false, frame: 0, head: 0, truth: null, explanations: [], decisions: [], flagged: [] })),
+    ruleScrub: vi.fn(() => Promise.resolve({ playing: true, frame: 0, head: 0, truth: null, explanations: [], decisions: [], flagged: [] })),
     ...over,
   };
 }

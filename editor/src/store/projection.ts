@@ -49,6 +49,12 @@ export interface ProjectionState {
   /** M10.6 multi-selection (always includes `selectedId` as the primary/anchor). Verbs that act on a
    *  selection (group, multi-edit, multi-delete) read this; the inspector/reveal read `selectedId`. */
   multiSelect: string[];
+  /** Entities the user has deactivated ("deleted" = deactivate-not-destroy, M10.6). The read-model must
+   *  REPRESENT deactivation so the hierarchy can dim/badge it — otherwise Delete only flashes a toast and
+   *  the row looks untouched (the "close-the-loop" failure). Per-id boolean so a row re-renders only when
+   *  ITS own deactivation flips (same selective-subscription discipline as `multiSelect`). Cleared on a
+   *  full re-projection (undo/open/connect rebuild the authoritative scene). */
+  deactivated: Record<string, true>;
 
   applyDelta(delta: ProjectionDelta): void;
   optimisticEdit(op: PendingOp): void;
@@ -58,6 +64,10 @@ export interface ProjectionState {
   /** Shift-click — extend the selection from the current primary to `id` over the visible `order`. */
   selectRange(id: string): void;
   dismissRejection(clientOpId: string): void;
+  /** Mark entities deactivated (Delete/Cut/deactivate-part) so the hierarchy reflects it immediately. */
+  markDeactivated(ids: string[]): void;
+  /** Un-mark entities (reactivate) — kept for an explicit reactivate path; a full re-projection also clears. */
+  markActivated(ids: string[]): void;
   bulkLoad(entities: EntityProjection[]): void;
   reset(): void;
 }
@@ -95,6 +105,7 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
   rejections: [],
   selectedId: null,
   multiSelect: [],
+  deactivated: {},
 
   bulkLoad(entities) {
     const base: Record<string, EntityProjection> = {};
@@ -105,7 +116,7 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
       summaries[e.id] = { id: e.id, name: e.name, parentId: e.parentId };
       order.push(e.id);
     }
-    set({ base, displayed: { ...base }, summaries, order, edges: {}, pending: {}, rejections: [] });
+    set({ base, displayed: { ...base }, summaries, order, edges: {}, pending: {}, rejections: [], deactivated: {} });
   },
 
   optimisticEdit(op) {
@@ -139,6 +150,9 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
     const base = full ? {} : { ...s.base };
     const summaries = full ? {} : { ...s.summaries };
     const edges = full ? {} : { ...s.edges };
+    // Deactivate state rebuilt from the wire (R-NEXT-2): a full re-projection starts empty and is
+    // repopulated from each upsert's authoritative `active` flag, so the "hidden" mark survives reload.
+    const deactivated = full ? {} : { ...s.deactivated };
     let order = full ? [] : s.order;
     let orderCopied = full;
     const orderMut = (): string[] => {
@@ -168,6 +182,10 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
             summaries[id] = { id, name: next.name, parentId: next.parentId };
           }
           if (!prev) orderMut().push(id);
+          // Authoritative deactivate state (R-NEXT-2): drives the hierarchy dim/strike; absent ⇒ leave any
+          // optimistic mark untouched (so a partial delta doesn't wrongly re-activate a hidden row).
+          if (op.active === false) deactivated[id] = true;
+          else if (op.active === true) delete deactivated[id];
           touched.add(id);
           break;
         }
@@ -175,6 +193,7 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
           if (base[op.id]) {
             delete base[op.id];
             delete summaries[op.id];
+            delete deactivated[op.id];
             order = orderMut().filter((x) => x !== op.id);
             touched.add(op.id);
           }
@@ -242,7 +261,9 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
       }
     }
 
-    set({ base, displayed, summaries, order, edges, pending, rejections });
+    // `deactivated` was rebuilt above from each upsert's authoritative `active` flag (full = from scratch),
+    // so deactivate state is correct on reload/undo and incremental deltas keep optimistic marks.
+    set({ base, displayed, summaries, order, edges, pending, rejections, deactivated });
   },
 
   select(id) {
@@ -274,8 +295,23 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
     set({ rejections: get().rejections.filter((r) => r.clientOpId !== clientOpId) });
   },
 
+  markDeactivated(ids) {
+    if (!ids.length) return;
+    const next = { ...get().deactivated };
+    for (const id of ids) next[id] = true;
+    set({ deactivated: next });
+  },
+
+  markActivated(ids) {
+    if (!ids.length) return;
+    const next = { ...get().deactivated };
+    let changed = false;
+    for (const id of ids) if (next[id]) { delete next[id]; changed = true; }
+    if (changed) set({ deactivated: next });
+  },
+
   reset() {
-    set({ base: {}, displayed: {}, summaries: {}, order: [], edges: {}, pending: {}, rejections: [], selectedId: null, multiSelect: [] });
+    set({ base: {}, displayed: {}, summaries: {}, order: [], edges: {}, pending: {}, rejections: [], selectedId: null, multiSelect: [], deactivated: {} });
   },
 }));
 
@@ -297,6 +333,10 @@ export const useMultiSelect = (): string[] => useStore(projectionStore, (s) => s
  *  membership changes, not on every selection change (selective re-render at 5k, principle 3). */
 export const useIsMultiSelected = (id: string): boolean =>
   useStore(projectionStore, (s) => s.multiSelect.includes(id));
+
+/** Per-row deactivation flag — a row re-renders only when ITS deactivation flips (selective at 5k). */
+export const useIsDeactivated = (id: string): boolean =>
+  useStore(projectionStore, (s) => s.deactivated[id] === true);
 
 export const useRejections = (): RejectInfo[] => useStore(projectionStore, (s) => s.rejections);
 

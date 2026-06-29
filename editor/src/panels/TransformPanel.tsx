@@ -13,6 +13,7 @@
 import { useEffect, useState } from "react";
 import type { EditorClient } from "../transport/session";
 import { setStatus } from "../store/ui";
+import { projectionStore, useSelectedId } from "../store/projection";
 
 type GizmoInfo = [string, boolean, boolean, string, string]; // [mode, hasSel, dragging, space, pivot]
 
@@ -20,6 +21,7 @@ const btn: React.CSSProperties = { margin: "3px 0", padding: "5px 8px", backgrou
 const MODE_LABEL: Record<string, string> = { translate: "⬌ Move (W)", rotate: "⟳ Rotate (E)", scale: "⇲ Scale (R)" };
 
 export function TransformPanel({ client }: { client: EditorClient }) {
+  const sel = useSelectedId();
   const [lastComp, setLastComp] = useState<string | null>(null);
   const [snapOn, setSnapOn] = useState(true);
   const [gizmo, setGizmo] = useState<GizmoInfo | null>(null);
@@ -64,6 +66,7 @@ export function TransformPanel({ client }: { client: EditorClient }) {
   async function deactivatePart() {
     await withSelection("deactivate it", async (id) => {
       const ok = await client.setPartActive(id, false).catch(() => false);
+      if (ok) projectionStore.getState().markDeactivated([id]); // hierarchy dims/strikes the row
       setStatus(ok ? "part deactivated (data preserved — Ctrl-Z restores it)" : "deactivate failed (root parts can't be hidden)");
     });
   }
@@ -117,6 +120,15 @@ export function TransformPanel({ client }: { client: EditorClient }) {
         <span style={{ opacity: 0.45, marginLeft: 6 }}>Ctrl = snap</span>
       </div>
 
+      {/* Progressive disclosure (C-altitude): the part/placement verbs all act on a selection. Keep them
+          present (stable ids + explain-on-click, no poll race) but DIM them with a hint when nothing is
+          selected, so the panel doesn't read as a wall of active controls. */}
+      {!sel && (
+        <div style={{ opacity: 0.6, fontSize: 11, fontStyle: "italic", margin: "2px 0 4px" }}>
+          Select an entity to edit its parts &amp; placement.
+        </div>
+      )}
+      <div style={{ opacity: sel ? 1 : 0.5 }}>
       {/* G2 — rigid part editing */}
       <button id="saveChar" data-testid="saveChar" onClick={() => void saveChar()} style={btn}>💾 Save character for reuse</button>{" "}
       <button id="dropInst" data-testid="dropInst" onClick={() => void dropInstance()} disabled={!lastComp} style={{ ...btn, opacity: lastComp ? 1 : 0.5 }}>📋 Drop a fresh instance</button>{" "}
@@ -135,6 +147,7 @@ export function TransformPanel({ client }: { client: EditorClient }) {
       <div style={{ marginTop: 4, display: "flex", gap: 4, alignItems: "center" }}>
         <input id="placeSentence" data-testid="placeSentence" value={placeVal} onChange={(e) => setPlaceVal(e.target.value)} placeholder='e.g. "upright, 10 cm from the edge"' style={{ flex: 1, background: "#0a0c12", color: "#cde", border: "1px solid #2a3550", borderRadius: 4, font: "11px ui-monospace, monospace" }} />
         <button id="placeBtn" data-testid="placeBtn" onClick={() => void placeBySentence()} style={{ ...btn, padding: "2px 8px", margin: 0 }}>Place</button>
+      </div>
       </div>
     </div>
   );

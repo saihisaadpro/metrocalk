@@ -37,6 +37,7 @@ import { PhysicsPanel } from "../panels/PhysicsPanel";
 import { RulesPanel } from "../panels/RulesPanel";
 import { ComposePanel } from "../panels/ComposePanel";
 import { StateGraphPanel } from "../panels/StateGraphPanel";
+import { RuleDebugPanel } from "../panels/RuleDebugPanel";
 import { TransformPanel } from "../panels/TransformPanel";
 import { FocusBanner } from "../panels/FocusBanner";
 
@@ -158,8 +159,9 @@ export function App() {
         // Don't hijack TEXT undo while the user is typing in a field — only undo the SCENE otherwise.
         if (editing) return;
         e.preventDefault();
-        client.undo();
-        setStatus("undo");
+        // Honest feedback: only say "undo" when a transaction was actually reverted (the shell reports it),
+        // else "nothing to undo" — never claim a revert on an empty history.
+        void client.undo().then((did) => setStatus(did ? "undo" : "nothing to undo"));
       }
       // M9 gizmo mode — the universal W/E/R game-editor shortcut (sticky tool state; guarded off text fields
       // + modifier chords so it never fires while editing or during Ctrl-Z). A discrete command, not per-frame.
@@ -218,7 +220,14 @@ export function App() {
       </div>
       <AuthoringToolbar client={client} />
       <div style={{ flex: 1, overflow: "hidden", minHeight: 0 }}>
-        <Hierarchy client={client} />
+        <Hierarchy
+          client={client}
+          onContextMenu={(id, x, y) => {
+            // No context actions while Playing (editing is gated off in Play — mirrors the viewport menu).
+            if (playing) return;
+            setCtx({ id, x, y });
+          }}
+        />
       </div>
     </div>
   );
@@ -234,6 +243,7 @@ export function App() {
       <RulesPanel client={client} />
       <ComposePanel client={client} />
       <StateGraphPanel client={client} />
+      <RuleDebugPanel client={client} />
       <div style={{ borderTop: "1px solid #2a2d35", flex: 1, minHeight: 220 }}>
         <BindingGraph />
       </div>

@@ -52,6 +52,10 @@ function cleanSlate() {
 const nativeDriver = path.resolve(dir, ".driver/msedgedriver.exe");
 const tauriDriverBin = path.resolve(process.env.USERPROFILE, ".cargo/bin/tauri-driver.exe");
 
+// The shell's default first-run is now the SMALL C10 sample (not the 5k stress wall). These functional
+// specs were written against the at-scale seed, so pin the stress fixture here to keep them unchanged.
+process.env.MTK_SCENE_N = process.env.MTK_SCENE_N || "5000";
+
 let tauriDriver;
 
 export const config = {

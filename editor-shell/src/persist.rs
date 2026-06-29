@@ -191,6 +191,10 @@ pub enum Record {
     /// M9.2 deactivate-not-delete (G2): a part's `active` flag (USD deactivate ≡ reversible hide).
     /// Replayed by id so a removed part stays hidden (recoverable) after reload.
     SetPartActive { id: String, active: bool },
+    /// M10.6 Delete = deactivate (R-NEXT-2): the toolbar/context Delete (deactivate + free dependents).
+    /// Persisted so a "deleted" (recoverable) entity stays hidden across reload — replayed by id through
+    /// the same `delete_deactivate`, so the projection re-emits `active:false` and the hierarchy dims it.
+    DeleteDeactivate { id: String },
     /// M9.5 fidelity deformation (G5, ADR-029): a part's saved handle deform — the moved handle targets,
     /// stored as a G2 override (NOT baked geometry — the surface is reproduced deterministically from
     /// these). Replayed by re-emitting the override (`set_part_deform`) so the deformed surface survives
@@ -477,6 +481,8 @@ impl Log {
                 }),
                 Record::SetPartActive { id, active } => EntityId::from_loro_key(&id)
                     .is_some_and(|e| capscene::set_part_active(engine, e, active).is_ok()),
+                Record::DeleteDeactivate { id } => EntityId::from_loro_key(&id)
+                    .is_some_and(|e| capscene::delete_deactivate(engine, scene, e).is_ok()),
                 Record::Deform { id, handles } => EntityId::from_loro_key(&id)
                     .is_some_and(|e| capscene::set_part_deform(engine, e, &handles).is_ok()),
                 Record::ApplyMarketplace {

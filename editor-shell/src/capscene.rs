@@ -292,6 +292,10 @@ pub fn seed(
         // Role mix. Force the first entity to be a HealthBar near the origin so the live demo always
         // has an obvious starting click; otherwise draw a deterministic role.
         let is_bar = i == 0 || rng.chance(0.02);
+        // C10: guarantee the small first-run scene has bind candidates — force the next two entities to be
+        // UNBOUND Health providers so clicking the entity-0 HealthBar always reveals targets (north-star #1).
+        // Harmless at the 5k stress scale (just two pinned providers among thousands).
+        let force_provider = (i == 1 || i == 2) && !is_bar;
         if is_bar {
             // A HealthBar: requires Health (the click-to-reveal entity).
             ops.push(Op::SetField {
@@ -306,7 +310,7 @@ pub fn seed(
                 target: health,
             });
             health_bars.push(id);
-        } else if rng.chance(0.34) {
+        } else if force_provider || rng.chance(0.34) {
             // A Health provider — the candidate set. Some start already bound (greyed "already
             // bound" on first reveal); the rest are unbound (the ranked candidates).
             ops.push(Op::SetField {
@@ -326,7 +330,7 @@ pub fn seed(
                 rel: scene.rels.provides,
                 target: health,
             });
-            if rng.chance(0.25) {
+            if !force_provider && rng.chance(0.25) {
                 // pre-bound: an outgoing BindsTo marks it consumed (excluded by the reveal query).
                 ops.push(Op::AddPair {
                     entity: id,

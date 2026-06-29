@@ -25,7 +25,7 @@ export interface EntitySummary {
 }
 
 export type ProjectionOp =
-  | { op: "upsert"; id: string; name?: string; parentId?: string | null }
+  | { op: "upsert"; id: string; name?: string; parentId?: string | null; active?: boolean }
   | { op: "remove"; id: string }
   | { op: "setField"; id: string; component: string; field: string; value: Json }
   | { op: "removeField"; id: string; component: string; field: string }
@@ -388,6 +388,100 @@ export interface StateMachineInfo {
   id: string;
   current: string;
   machine: StateMachine;
+}
+
+// ── M12.5 Rules in Play + the live truth-state debugger (ADR-049) ────────────────────────────────────────
+// The "debug by looking" payload: running Rules are a PROJECTION over a runtime state (never the Loro doc,
+// ADR-021/034), so this mirrors `metrocalk_core::rule_runtime` serde. The structured fields (`satisfied` /
+// `actual` / `expected`) are the stable assertion surface; `display` is the human overlay copy.
+
+/** A scalar runtime value, as `metrocalk_core::FieldValue` serializes (`{ Integer: 4 }` / `{ Str: "x" }` /
+ *  `{ Bool: true }` / `{ Number: 1.5 }`) — the same untagged-by-key shape `RuleData` values use. */
+export type RuntimeValue =
+  | { Integer: number }
+  | { Number: number }
+  | { Bool: boolean }
+  | { Str: string };
+
+/** One If-condition's live truth at the current frame — the ✅/❌ fact made visible. `satisfied` drives the
+ *  check/cross; `display` is the human copy (e.g. `"KillCounter = 3 of 4"`). */
+export interface ConditionTruth {
+  satisfied: boolean;
+  entity: string;
+  component: string;
+  field: string;
+  actual: RuntimeValue | null;
+  expected: RuntimeValue;
+  display: string;
+}
+
+/** One rule's live truth for the clicked entity — does it fire now, and why/why not (per condition). */
+export interface RuleTruth {
+  rule: string;
+  name: string;
+  event: string;
+  fires: boolean;
+  conditions: ConditionTruth[];
+}
+
+/** A state machine's live current state for the clicked entity (e.g. `"state = FacingBoss"`). */
+export interface MachineTruth {
+  machine: string;
+  name: string;
+  field: string;
+  current: string;
+  display: string;
+}
+
+/** The full truth-state for one entity at the current frame — the debug projection the overlay renders. */
+export interface TruthState {
+  entity: string;
+  rules: RuleTruth[];
+  machines: MachineTruth[];
+}
+
+/** One frame-stamped decision-history entry — `kind` tags the consequence (`ruleFired` / `counterChanged` /
+ *  `fieldSet` / `stateTransition` / `pluginInvoked`), the rest are that variant's fields. Time-travelable. */
+export interface DecisionEvent {
+  frame: number;
+  kind: "ruleFired" | "counterChanged" | "fieldSet" | "stateTransition" | "pluginInvoked";
+  // Variant fields (present per `kind`):
+  rule?: string;
+  name?: string;
+  entity?: string;
+  component?: string;
+  field?: string;
+  from?: RuntimeValue | string;
+  to?: RuntimeValue | string;
+  value?: RuntimeValue;
+  machine?: string;
+  plugin?: string;
+}
+
+/** A rule held OUT of the deterministic Play path (a `RunPlugin` to a non-deterministic plugin) — surfaced,
+ *  never silently dropped. */
+export interface FlaggedRule {
+  rule: string;
+  reason: string;
+}
+
+/** One rule's plain-language `explain_rule` narration at the current frame (why it did/didn't fire). */
+export interface RuleExplain {
+  rule: string;
+  text: string;
+}
+
+/** The live truth-state debugger payload (`rule_debug` / `fire_rule_event` / `rule_scrub`): the clicked
+ *  entity's `truth`, each rule's `explanations`, the frame-stamped `decisions` history (scrubbable over
+ *  [0, `head`]), and the determinism-`flagged` rules. `playing:false` ⇒ not in Play (the rest is empty). */
+export interface RuleDebugInfo {
+  playing: boolean;
+  frame: number;
+  head: number;
+  truth: TruthState | null;
+  explanations: RuleExplain[];
+  decisions: DecisionEvent[];
+  flagged: FlaggedRule[];
 }
 
 /** `author_state_machine` outcome: the new `id`, a plain-language `error` if Blocked (ADR-016: no name /

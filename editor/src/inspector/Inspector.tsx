@@ -12,12 +12,13 @@ import { setStatus } from "../store/ui";
 import type { EditorClient } from "../transport/session";
 import type { Json } from "../transport/protocol";
 import { buildEntitySchema, buildEntityUiSchema } from "../schema/registry";
-import { ColorControl, colorTester, EntityRefControl, entityRefTester } from "./renderers";
+import { ColorControl, colorTester, EntityRefControl, entityRefTester, NumberControl, numberTester } from "./renderers";
 
 const renderers = [
   ...vanillaRenderers,
   { tester: colorTester, renderer: ColorControl },
   { tester: entityRefTester, renderer: EntityRefControl },
+  { tester: numberTester, renderer: NumberControl },
 ];
 
 type Components = Record<string, Record<string, Json>>;

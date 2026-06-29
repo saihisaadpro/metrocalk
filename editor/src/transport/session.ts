@@ -40,6 +40,10 @@ import type {
   Composition,
   ComposeProposal,
   ComposeResult,
+  RuleDebugInfo,
+  DecisionEvent,
+  TruthState,
+  RuleExplain,
   SnapHit,
   SolveResult,
   TimelineTuple,
@@ -71,8 +75,9 @@ export interface EditorClient {
   /** Generate (tier 3, opt-in — M6 / ADR-017): a placeholder drops in + the cost is metered; the real
    *  mesh streams in later over the projection Channel. The opt-in tier-3 generate, not the default path. */
   generate(query: string): Promise<GenerateResponse>;
-  /** Undo the last committed transaction (Ctrl-Z); the reverting delta streams back over the Channel. */
-  undo(): void;
+  /** Undo the last committed transaction (Ctrl-Z); the reverting delta streams back over the Channel.
+   *  Resolves to whether anything was actually reverted (false on an empty history → honest UI feedback). */
+  undo(): Promise<boolean>;
   /** The context-menu actions for an entity (M3.3) — each available-or-explained. */
   entityActions(id: string): Promise<ActionItem[]>;
   /** The hover-tooltip details for an entity (M3.3) — name + components + caps + bound. */
@@ -259,6 +264,17 @@ export interface EditorClient {
   /** Apply a reviewed `composition` through the one commit pipeline as a single undoable transaction, or
    *  reject it whole with a plain-language reason (nothing applied) — the AI is never a raw mutation. */
   compose(composition: Composition): Promise<ComposeResult>;
+
+  // ── M12.5 Rules in Play + the live truth-state debugger (ADR-049) ────────────────────────────────────
+  /** Fire a live gameplay `event` (e.g. `EnemyDied`) into the running Rules — the When-channel. A
+   *  PROJECTION (never the doc); recorded so a scrub replays it. Returns the fresh truth-state for `selected`. */
+  fireRuleEvent(event: string, subject: string | null, selected: string | null): Promise<RuleDebugInfo>;
+  /** The "debug by looking" read: the clicked entity's live truth-state (✅/❌ per condition + machine state),
+   *  `explain_rule` narration, the decision history, and the determinism-flagged rules. */
+  ruleDebug(id: string | null): Promise<RuleDebugInfo>;
+  /** Scrub the decision history to `frame` over the M8.4 replay channel (watch exactly when a counter
+   *  incremented / a transition fired) and return the truth-state at that frame for `selected`. */
+  ruleScrub(frame: number, selected: string | null): Promise<RuleDebugInfo>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -347,8 +363,13 @@ export class TauriClient implements EditorClient {
     return this.core.invoke<GenerateResponse>("generate", { query }).catch((e: unknown) => { console.error("generate failed", e); throw e; });
   }
 
-  undo(): void {
-    void this.core.invoke("undo").catch((e: unknown) => console.error("undo failed", e));
+  undo(): Promise<boolean> {
+    // Returns whether a transaction was actually reverted, so the UI can be honest ("undo" vs "nothing to
+    // undo") instead of always claiming a revert.
+    return this.core.invoke<boolean>("undo").catch((e: unknown) => {
+      console.error("undo failed", e);
+      return false;
+    });
   }
 
   entityActions(id: string): Promise<ActionItem[]> {
@@ -622,6 +643,15 @@ export class TauriClient implements EditorClient {
   compose(composition: Composition): Promise<ComposeResult> {
     return this.core.invoke<ComposeResult>("compose", { composition }).catch((e: unknown) => { console.error("compose failed", e); throw e; });
   }
+  fireRuleEvent(event: string, subject: string | null, selected: string | null): Promise<RuleDebugInfo> {
+    return this.core.invoke<RuleDebugInfo>("fire_rule_event", { event, subject, selected }).catch((e: unknown) => { console.error("fire_rule_event failed", e); throw e; });
+  }
+  ruleDebug(id: string | null): Promise<RuleDebugInfo> {
+    return this.core.invoke<RuleDebugInfo>("rule_debug", { id }).catch((e: unknown) => { console.error("rule_debug failed", e); throw e; });
+  }
+  ruleScrub(frame: number, selected: string | null): Promise<RuleDebugInfo> {
+    return this.core.invoke<RuleDebugInfo>("rule_scrub", { frame, selected }).catch((e: unknown) => { console.error("rule_scrub failed", e); throw e; });
+  }
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
@@ -689,6 +719,11 @@ class MockClient implements EditorClient {
   // undo + reload are the live `.exe` path; this dev mock stores + returns, it does not validate.
   private machines: StateMachineInfo[] = [];
   private smSeq = 0;
+  // M12.5 (dev MockCore): a tiny deterministic Rules-in-Play stub so the truth-state debugger RENDERS in
+  // `npm run dev` (the panel needs a running model). `ruleKills` = EnemyDied events fired so far (the live
+  // head); the canonical sword ignites at 4. This dev stub stores + projects; the real runtime + determinism
+  // + scrub-replay are the live `.exe`/headless path (`core::rule_runtime`).
+  private ruleKills = 0;
   constructor(
     private readonly inner: DeltaClient,
     private readonly core: MockCore,
@@ -727,13 +762,17 @@ class MockClient implements EditorClient {
     const s = projectionStore.getState();
     const sel = s.displayed[id];
     const isRequirer = !!sel && "HealthBar" in sel.components;
+    // Reflect existing (optimistic or confirmed) outgoing edges so a bind moves the target into
+    // "tracking" — the dev stand-in previously returned bound:[] always, so binding showed nothing.
+    const boundIds = new Set(Object.values(s.edges).filter((e) => e.from === id).map((e) => e.to));
     const providers = s.order
       .map((eid) => s.displayed[eid])
       .filter((e): e is EntityProjection => !!e && e.id !== id && "Health" in e.components);
+    const bound = providers.filter((e) => boundIds.has(e.id)).map((e) => ({ id: e.id, name: e.name, kind: "tracks" }));
     const compatible = isRequirer
-      ? providers.slice(0, 8).map((e, i) => ({ id: e.id, name: e.name, distance: i, affinity: 100 - i * 5 }))
+      ? providers.filter((e) => !boundIds.has(e.id)).slice(0, 8).map((e, i) => ({ id: e.id, name: e.name, distance: i, affinity: 100 - i * 5 }))
       : [];
-    return Promise.resolve({ required: isRequirer ? ["Health"] : [], compatible, greyed: [], bound: [] });
+    return Promise.resolve({ required: isRequirer ? ["Health"] : [], compatible, greyed: [], bound });
   }
   describe(query: string): Promise<DescribeResponse> {
     // The dev stand-in for the tiered resolver (ADR-012): a query that names a catalog kind resolves
@@ -790,8 +829,9 @@ class MockClient implements EditorClient {
     });
     return Promise.resolve({ created: id, cost: GENERATE_COST, available: true, seam: null, balance: this.balance });
   }
-  undo(): void {
-    /* the dev MockCore has no undo stack — a no-op (the real shell undoes over the Channel) */
+  undo(): Promise<boolean> {
+    /* the dev MockCore has no undo stack — a no-op; resolves false so the UI says "nothing to undo" honestly */
+    return Promise.resolve(false);
   }
   entityActions(id: string): Promise<ActionItem[]> {
     const e = projectionStore.getState().displayed[id];
@@ -1118,6 +1158,50 @@ class MockClient implements EditorClient {
   compose(composition: Composition): Promise<ComposeResult> {
     const rules = composition.ops.filter((o) => o.op === "authorRule").length;
     return Promise.resolve({ ok: true, applied: composition.ops.length, rules, stateMachines: 0, error: null });
+  }
+  // M12.5 (dev MockCore): a deterministic Rules-in-Play stub — fire EnemyDied → the sword's KillCounter
+  // climbs toward 4; click it → the truth-state shows "❌ KillCounter = N of 4" + "✅ state = FacingBoss"
+  // until the 4th kill ignites it. Scrub recomputes from the head. A projection only (no doc mutation).
+  fireRuleEvent(_event: string, _subject: string | null, selected: string | null): Promise<RuleDebugInfo> {
+    this.ruleKills += 1;
+    return Promise.resolve(this.ruleDebugAt(this.ruleKills, selected));
+  }
+  ruleDebug(id: string | null): Promise<RuleDebugInfo> {
+    return Promise.resolve(this.ruleDebugAt(this.ruleKills, id));
+  }
+  ruleScrub(frame: number, selected: string | null): Promise<RuleDebugInfo> {
+    return Promise.resolve(this.ruleDebugAt(Math.min(frame, this.ruleKills), selected));
+  }
+  /** Build the dev truth-state at `frame` kills (the head is `this.ruleKills`). */
+  private ruleDebugAt(frame: number, selected: string | null): RuleDebugInfo {
+    const lit = frame >= 4;
+    const decisions: DecisionEvent[] = [];
+    for (let k = 1; k <= frame; k++) {
+      decisions.push({ frame: k - 1, kind: "counterChanged", entity: selected ?? "1_0", component: "KillCounter", field: "count", from: { Integer: k - 1 }, to: { Integer: k } });
+      if (k === 4) decisions.push({ frame: k - 1, kind: "fieldSet", entity: selected ?? "1_0", component: "Flammable", field: "lit", value: { Bool: true } });
+    }
+    const truth: TruthState | null = selected
+      ? {
+          entity: selected,
+          rules: [
+            {
+              rule: "r_ignite",
+              name: "rusty sword ignites",
+              event: "EnemyDied",
+              fires: lit,
+              conditions: [
+                { satisfied: lit, entity: selected, component: "KillCounter", field: "count", actual: { Integer: frame }, expected: { Integer: 4 }, display: `KillCounter = ${frame} of 4` },
+                { satisfied: true, entity: selected, component: "Zone", field: "current", actual: { Str: "BossArena" }, expected: { Str: "BossArena" }, display: "Zone.current = BossArena (want to be exactly BossArena)" },
+              ],
+            },
+          ],
+          machines: [{ machine: "sm_quest", name: "quest", field: "state", current: "FacingBoss", display: "state = FacingBoss" }],
+        }
+      : null;
+    const explanations: RuleExplain[] = lit
+      ? [{ rule: "r_ignite", text: "'rusty sword ignites' is ready — every condition holds, so it fires on EnemyDied" }]
+      : [{ rule: "r_ignite", text: `'rusty sword ignites' is blocked: KillCounter.count is ${frame}, but the rule needs to be at least 4 (waiting on EnemyDied)` }];
+    return { playing: true, frame, head: this.ruleKills, truth, explanations, decisions, flagged: [] };
   }
 }
 

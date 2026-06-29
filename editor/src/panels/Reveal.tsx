@@ -9,6 +9,8 @@
 
 import { useEffect, useState } from "react";
 import { useSelectedId, useEdges } from "../store/projection";
+import { setStatus } from "../store/ui";
+import { pushToast } from "../store/toasts";
 import type { EditorClient } from "../transport/session";
 import type { RevealResponse } from "../transport/protocol";
 
@@ -90,7 +92,14 @@ export function Reveal({ client }: { client: EditorClient }) {
           className="cand"
           data-testid="candidate"
           data-id={c.id}
-          onClick={() => client.bind(id, "tracks", c.id)}
+          onClick={() => {
+            // Feedback AT THE GESTURE (C11): bind-by-intent (north-star #1) was silent — the candidate
+            // only moved to "tracking" after the authoritative round-trip, with no toast/status. Confirm
+            // optimistically; the bound row + edge follow.
+            client.bind(id, "tracks", c.id);
+            setStatus(`tracking ${c.name}`);
+            pushToast(`bound · now tracking ${c.name}`, "success");
+          }}
           title={`Click to bind — this object will track ${c.name} (match ${c.affinity} of 100)`}
           style={{ display: "block", width: "100%", textAlign: "left", margin: "2px 0", padding: "4px 6px", background: "#1c2030", color: "#cde", border: "1px solid #2a3550", borderRadius: 4, cursor: "pointer" }}
         >
