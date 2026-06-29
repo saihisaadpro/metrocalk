@@ -35,6 +35,7 @@ import { Inspector } from "../inspector/Inspector";
 import { BindingGraph } from "../graph/BindingGraph";
 import { PhysicsPanel } from "../panels/PhysicsPanel";
 import { RulesPanel } from "../panels/RulesPanel";
+import { ComposePanel } from "../panels/ComposePanel";
 import { StateGraphPanel } from "../panels/StateGraphPanel";
 import { TransformPanel } from "../panels/TransformPanel";
 import { FocusBanner } from "../panels/FocusBanner";
@@ -231,6 +232,7 @@ export function App() {
       <TransformPanel client={client} />
       <PhysicsPanel client={client} />
       <RulesPanel client={client} />
+      <ComposePanel client={client} />
       <StateGraphPanel client={client} />
       <div style={{ borderTop: "1px solid #2a2d35", flex: 1, minHeight: 220 }}>
         <BindingGraph />

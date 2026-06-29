@@ -94,6 +94,9 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     stateMachines: vi.fn(() => Promise.resolve([])),
     authorStateMachine: vi.fn(() => Promise.resolve({ id: "sm-1", error: null, unreachable: [] })),
     deleteStateMachine: vi.fn(() => Promise.resolve(true)),
+    // M12.4 AI compose (a test overrides what it exercises).
+    proposeComposition: vi.fn(() => Promise.resolve({ ok: false, composition: null, ops: 0, error: null })),
+    compose: vi.fn(() => Promise.resolve({ ok: true, applied: 0, rules: 0, stateMachines: 0, error: null })),
     ...over,
   };
 }

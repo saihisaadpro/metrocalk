@@ -37,6 +37,9 @@ import type {
   AuthorStateMachineResult,
   StateMachine,
   StateMachineInfo,
+  Composition,
+  ComposeProposal,
+  ComposeResult,
   SnapHit,
   SolveResult,
   TimelineTuple,
@@ -248,6 +251,14 @@ export interface EditorClient {
   authorStateMachine(sm: StateMachine, id?: string | null): Promise<AuthorStateMachineResult>;
   /** Remove a state machine (one undoable transaction). */
   deleteStateMachine(id: string): Promise<boolean>;
+
+  // ── M12.4 AI compose (ADR-048) — sentence → reviewable Composition → apply through the one pipeline ──────
+  /** Turn a natural-language `sentence` into a REVIEWABLE composition proposal (the in-app AI compose seam),
+   *  validated against the live scene. `target` = the selected entity the rule acts on. Nothing is applied. */
+  proposeComposition(sentence: string, target: string | null): Promise<ComposeProposal>;
+  /** Apply a reviewed `composition` through the one commit pipeline as a single undoable transaction, or
+   *  reject it whole with a plain-language reason (nothing applied) — the AI is never a raw mutation. */
+  compose(composition: Composition): Promise<ComposeResult>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -604,6 +615,12 @@ export class TauriClient implements EditorClient {
   }
   deleteStateMachine(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("delete_state_machine", { id }).catch((e: unknown) => { console.error("delete_state_machine failed", e); throw e; });
+  }
+  proposeComposition(sentence: string, target: string | null): Promise<ComposeProposal> {
+    return this.core.invoke<ComposeProposal>("propose_composition", { sentence, target }).catch((e: unknown) => { console.error("propose_composition failed", e); throw e; });
+  }
+  compose(composition: Composition): Promise<ComposeResult> {
+    return this.core.invoke<ComposeResult>("compose", { composition }).catch((e: unknown) => { console.error("compose failed", e); throw e; });
   }
 }
 
@@ -1065,6 +1082,42 @@ class MockClient implements EditorClient {
   deleteStateMachine(id: string): Promise<boolean> {
     this.machines = this.machines.filter((m) => m.id !== id);
     return Promise.resolve(true);
+  }
+  // M12.4 AI compose (dev MockCore): mirrors the DemoComposer — the ignite-on-kills intent composes; an
+  // unrecognized sentence / no target is an honest miss; compose echoes the op/rule counts (so the panel
+  // works in `npm run dev` + vitest without the real engine).
+  proposeComposition(sentence: string, target: string | null): Promise<ComposeProposal> {
+    const s = sentence.toLowerCase();
+    const onKill = /die|dies|kill|defeat|slain/.test(s);
+    const ignite = /fire|ignite|burn|flam|lit/.test(s);
+    if (!onKill || !ignite) {
+      return Promise.resolve({ ok: false, composition: null, ops: 0, error: `the offline demo composer doesn't recognize "${sentence}" — try "when an enemy dies, set it on fire"` });
+    }
+    if (!target) {
+      return Promise.resolve({ ok: false, composition: null, ops: 0, error: "select the entity the rule should act on first" });
+    }
+    const threshold = Number((s.match(/\d+/) ?? ["4"])[0]);
+    const composition: Composition = {
+      ops: [
+        { op: "setField", entity: target, component: "KillCounter", field: "count", value: { Integer: 0 } },
+        {
+          op: "authorRule",
+          id: "r_ai_ignite",
+          rule: {
+            name: "ignite on kills",
+            enabled: true,
+            event: "EnemyDied",
+            conditions: [{ entity: target, component: "KillCounter", field: "count", op: "ge", value: { Integer: threshold } }],
+            actions: [{ action: "SetField", entity: target, component: "Flammable", field: "lit", value: { Bool: true } }],
+          },
+        },
+      ],
+    };
+    return Promise.resolve({ ok: true, composition, ops: composition.ops.length, error: null });
+  }
+  compose(composition: Composition): Promise<ComposeResult> {
+    const rules = composition.ops.filter((o) => o.op === "authorRule").length;
+    return Promise.resolve({ ok: true, applied: composition.ops.length, rules, stateMachines: 0, error: null });
   }
 }
 

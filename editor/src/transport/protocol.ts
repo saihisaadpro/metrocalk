@@ -317,6 +317,44 @@ export interface AuthorRuleResult {
   mirror: RuleData | null;
 }
 
+// ── M12.4 AI compose (ADR-048) — a natural-language sentence → a validated Composition proposal → applied
+// through the SAME one commit pipeline a human/plugin uses. The AI only proposes; the engine validates +
+// commits (one undoable tx) or refuses. The shipped live path is the metrocalk-mcp server; this is the
+// in-editor seam beside it. The proposal's `composition` is opaque JSON handed straight back to `compose`. ──
+
+/** One allow-listed compose op (externally-tagged `op` — the SA-22 grammar's shape). The UI treats a
+ *  composition as opaque (it previews via the op count + the explained reason) and passes it back verbatim. */
+export type ComposeOp =
+  | { op: "setField"; entity: string; component: string; field: string; value: FieldValue }
+  | { op: "authorRule"; id: string; rule: RuleData }
+  | { op: "authorStateMachine"; id: string; machine: StateMachine };
+
+/** A composition the AI proposes — applied as ONE undoable transaction (or rejected whole). */
+export interface Composition {
+  ops: ComposeOp[];
+}
+
+/** `propose_composition` outcome: a reviewable `composition` (validated against the live scene) + its op
+ *  count, or a plain-language `error` (offline, no selected target, an unrecognized sentence, or a proposal
+ *  that fails validation). `ok` ⇒ safe to apply. Nothing is applied — review, then call `compose`. */
+export interface ComposeProposal {
+  ok: boolean;
+  composition: Composition | null;
+  ops: number;
+  error: string | null;
+}
+
+/** `compose` outcome: how many ops `applied` (one undoable transaction) + the project's `rules` /
+ *  `stateMachines` counts after, or a plain-language `error` if rejected-as-UX (nothing applied,
+ *  all-or-nothing). The AI is never a raw mutation — this is the same validated path a human uses. */
+export interface ComposeResult {
+  ok: boolean;
+  applied: number;
+  rules: number;
+  stateMachines: number;
+  error: string | null;
+}
+
 // ── M12.2 state machines (states + transitions = Rules) — the visual state-graph (ADR-046) ───────────────
 // A transition IS a `RuleData` (the reuse, not a parallel model). The machine is data on the Loro doc; the
 // state-graph reuses the M2.5 React Flow layer. Mirrors `metrocalk_core::state_machine` serde (plain field
