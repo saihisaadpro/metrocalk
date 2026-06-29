@@ -39,6 +39,22 @@ fn rusty_material() -> String {
     crate::metering::RUSTY_MATERIAL_NAME.to_string()
 }
 
+/// The stdlib registry (components + events + actions) the M12.4 compose replay validates against — the same
+/// vocabulary the live `author_rule`/`compose` paths use, rebuilt fresh for a (rare) replay of a `Compose`.
+fn stdlib_registry() -> metrocalk_core::Registry<FlecsWorld> {
+    let mut reg = metrocalk_core::Registry::new(FlecsWorld::new());
+    for m in metrocalk_core::stdlib::standard_components() {
+        let _ = reg.register(m);
+    }
+    for e in metrocalk_core::stdlib::standard_events() {
+        reg.register_event(e);
+    }
+    for a in metrocalk_core::stdlib::standard_actions() {
+        reg.register_action(a);
+    }
+    reg
+}
+
 /// One persisted user action, replayed in order to reconstruct the scene after a deterministic seed.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -96,6 +112,13 @@ pub enum Record {
     /// a plugin-driven scene change survives close→reopen. Replay relies on the plugin being deterministic
     /// (the registry's `PluginMeta.deterministic` gate) — same input → same effect.
     RunPlugin { name: String, input: String },
+    /// M12.4 (ADR-048) — an applied AI **composition** (the validated op-set: SetField / AuthorRule /
+    /// AuthorStateMachine). The whole `Composition` is kept so replay re-runs `apply_composition` on the same
+    /// ids (the AI provides rule/machine ids; SetField targets existing entities) → the composed Rules /
+    /// fields / machines survive close→reopen, rebuilt from the replayed ops exactly like a human edit.
+    Compose {
+        composition: metrocalk_core::compose::Composition,
+    },
     /// A physics-body spawn (M8.2): a dynamic RigidBody + ball Collider + its ball mesh handle, at a
     /// position. Replayed by re-spawning deterministically (same id alloc); the sim body itself is
     /// RE-HYDRATED from the restored RigidBody entity by the engine thread after replay. Loro stores the
@@ -370,6 +393,13 @@ impl Log {
                     &input,
                 )
                 .is_ok_and(|d| d.rejects.is_empty()),
+                Record::Compose { composition } => {
+                    // Re-run the same validated pipeline on the same ids — deterministic, so the composed
+                    // Rules / fields / machines reload exactly (it validated when authored; its targets were
+                    // created by earlier replayed records, so re-validation passes).
+                    metrocalk_core::apply_composition(engine, &stdlib_registry(), &composition)
+                        .is_ok()
+                }
                 Record::SpawnBody { pos, mesh } => {
                     capscene::spawn_physics_body(engine, scene, mesh.as_deref(), pos, 0.45).is_ok()
                 }

@@ -15,6 +15,7 @@ pub mod ai;
 pub mod blobstore;
 pub mod bridge;
 pub mod capscene;
+pub mod compose_ai;
 pub mod generate;
 pub mod metering;
 pub mod persist;
@@ -35,6 +36,7 @@ pub use capscene::{
     place_generation_placeholder, place_mesh, positions, remove_entity, seed, CapResolver,
     CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
 };
+pub use compose_ai::{ComposeAiError, Composer, DemoComposer, RemoteComposer};
 pub use generate::{
     FakeGenerator, GenError, GenRequest, MeshGenerator, MeterAction, RemoteGenerator, StubMeter,
     TokenMeter,

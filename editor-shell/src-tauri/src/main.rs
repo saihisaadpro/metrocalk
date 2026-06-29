@@ -29,6 +29,7 @@ use metrocalk_core::marketplace::{LocalCatalog, MarketplaceIndex};
 use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_economy::{HoldId, SandboxProvider, GENERATE_TOKENS};
 use metrocalk_ecs::{Entity, FlecsWorld, World};
+use metrocalk_editor_shell::compose_ai::Composer;
 use metrocalk_editor_shell::generate::{GenRequest, MeshGenerator};
 use metrocalk_editor_shell::physics_intent::{self, MeshMetrics, PhysicsWarning};
 use metrocalk_editor_shell::project as mtk_project;
@@ -409,6 +410,23 @@ enum EngineCmd {
         name: String,
         input: String,
         reply: Sender<RunPluginResult>,
+    },
+    /// M12.4 (ADR-048) — turn a natural-language `sentence` into a **reviewable** [`Composition`] PROPOSAL
+    /// (the in-app AI compose seam): the composer proposes; the engine **validates** it against the live
+    /// scene (so even the preview is pre-checked) and replies the JSON composition + an explained-if-not
+    /// reason. Nothing is applied — the user reviews, then calls `Compose`. `target` = the selected entity.
+    ProposeComposition {
+        sentence: String,
+        target: Option<String>,
+        reply: Sender<ComposeProposal>,
+    },
+    /// M12.4 (ADR-048) — apply a reviewed `composition` (the validated op-set: SetField / AuthorRule /
+    /// AuthorStateMachine) through the ONE commit pipeline as a **single undoable transaction**, or reject it
+    /// whole with a plain-language reason (nothing applied). The SAME validated path a human / plugin uses —
+    /// the AI is never a raw mutation. Echoes the projection + persists a `Compose` replay record on success.
+    Compose {
+        composition: metrocalk_core::compose::Composition,
+        reply: Sender<ComposeResult>,
     },
     // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable transaction over the Movable Tree +
     // override pipeline. reparent reuses `ReparentPart`; delete=deactivate is distinct from `Remove`. ──
@@ -988,6 +1006,33 @@ struct RunPluginResult {
     error: Option<String>,
 }
 
+/// M12.4 (ADR-048) — a reviewable AI-compose PROPOSAL: the `composition` (validated against the live scene,
+/// serialized so the UI can preview the patches) and a count of ops, or a plain-language `error` (offline,
+/// no target, an unrecognized sentence, or a proposal that fails validation). `ok` ⇒ safe to apply. Nothing
+/// is applied here — the user reviews, then submits the composition back via `compose` (the apply step).
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ComposeProposal {
+    ok: bool,
+    /// The proposed composition as JSON (the exact payload to hand back to `compose`); `null` on error.
+    composition: Option<serde_json::Value>,
+    ops: usize,
+    error: Option<String>,
+}
+
+/// M12.4 (ADR-048) — the outcome of APPLYING a composition: `ok` + how many ops `applied` (one undoable
+/// transaction) and the project's `rules` / `stateMachines` counts after, or a plain-language `error` if the
+/// composition was rejected-as-UX (nothing applied, all-or-nothing). Mirrors the MCP server's `ApplyResult`.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ComposeResult {
+    ok: bool,
+    applied: usize,
+    rules: usize,
+    state_machines: usize,
+    error: Option<String>,
+}
+
 struct AppState {
     tx: Sender<EngineCmd>,
     shared: Shared,
@@ -1116,6 +1161,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
         std::time::Duration::from_millis(700),
         true,
     );
+    // M12.4 (ADR-048) — the in-app AI COMPOSE seam: the deterministic DEMO composer (available offline so
+    // the demo + e2e work without a model/network); the REAL LLM composer is a documented seam beside the
+    // shipped `metrocalk-mcp` server. It only PROPOSES — `apply_composition` is the every-"no" gate.
+    let composer = metrocalk_editor_shell::compose_ai::DemoComposer::new(true);
     // The token wallet (M7) — the file-backed ledger the paid sinks meter against (free-tier seeded,
     // orphan holds released on load). The sandbox payment provider tops it up (no real money; the real
     // provider is a go-live seam). Separate from the scene log: replay never re-charges.
@@ -2112,6 +2161,77 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         ok: false,
                         applied: 0,
                         error: Some(e.to_string()),
+                    },
+                };
+                let _ = reply.send(resp);
+            }
+            EngineCmd::ProposeComposition {
+                sentence,
+                target,
+                reply,
+            } => {
+                // The in-app AI compose seam: the composer PROPOSES (offline demo / real-LLM seam); the
+                // engine then VALIDATES the proposal against the live scene (the ADR-017 gate) so even the
+                // preview is pre-checked — a proposal that wouldn't apply is surfaced as a plain-language
+                // reason NOW, before the user hits Apply. Nothing is committed here.
+                let grammar = metrocalk_core::composition_grammar(
+                    &metrocalk_core::stdlib::standard_components(),
+                );
+                let resp = match composer.propose(&sentence, target.as_deref(), &grammar) {
+                    Ok(comp) => {
+                        match metrocalk_core::validate_composition(&rules_registry, &comp, |e| {
+                            engine.entity_exists(e)
+                        }) {
+                            Ok(()) => ComposeProposal {
+                                ok: true,
+                                ops: comp.ops.len(),
+                                composition: serde_json::to_value(&comp).ok(),
+                                error: None,
+                            },
+                            Err(e) => ComposeProposal {
+                                ok: false,
+                                error: Some(e.to_string()),
+                                ..Default::default()
+                            },
+                        }
+                    }
+                    Err(e) => ComposeProposal {
+                        ok: false,
+                        error: Some(e.to_string()),
+                        ..Default::default()
+                    },
+                };
+                let _ = reply.send(resp);
+            }
+            EngineCmd::Compose { composition, reply } => {
+                // Apply a reviewed composition through the ONE commit pipeline (one undoable tx, all-or-
+                // nothing, rejected-as-UX). The SAME validated path a human / plugin uses — the AI is never a
+                // raw mutation. On success: echo the full projection (a SetField can move/retexture an
+                // entity) + rebuild the shared scene + persist a `Compose` replay record (survives reload).
+                let resp = match metrocalk_core::apply_composition(
+                    &mut engine,
+                    &rules_registry,
+                    &composition,
+                ) {
+                    Ok(()) => {
+                        let applied = composition.ops.len();
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, project_full(&engine)); // simplest correct post-compose sync
+                        }
+                        log.append(&Record::Compose { composition });
+                        ComposeResult {
+                            ok: true,
+                            applied,
+                            rules: engine.rules().len(),
+                            state_machines: engine.state_machines().len(),
+                            error: None,
+                        }
+                    }
+                    Err(e) => ComposeResult {
+                        ok: false,
+                        error: Some(e.to_string()),
+                        ..Default::default()
                     },
                 };
                 let _ = reply.send(resp);
@@ -6113,6 +6233,51 @@ fn run_plugin(state: State<AppState>, name: String, input: String) -> RunPluginR
     rx.recv().unwrap_or_default()
 }
 
+/// M12.4 (ADR-048) — turn a natural-language `sentence` into a REVIEWABLE composition proposal (the in-app AI
+/// compose seam). The composer proposes; the engine validates it against the live scene so the preview is
+/// pre-checked. `target` is the selected entity the rule acts on. Nothing is applied — call `compose` to apply.
+#[tauri::command]
+fn propose_composition(
+    state: State<AppState>,
+    sentence: String,
+    target: Option<String>,
+) -> ComposeProposal {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ProposeComposition {
+            sentence,
+            target,
+            reply,
+        })
+        .is_err()
+    {
+        return ComposeProposal::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// M12.4 (ADR-048) — apply a reviewed `composition` (the validated op-set) through the one commit pipeline as
+/// a single undoable transaction, or reject it whole with a plain-language reason (nothing applied). The same
+/// validated path a human / plugin uses — the AI is never a raw mutation. Returns the applied/counts or error.
+#[tauri::command]
+fn compose(
+    state: State<AppState>,
+    composition: metrocalk_core::compose::Composition,
+) -> ComposeResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::Compose { composition, reply })
+        .is_err()
+    {
+        return ComposeResult::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
 /// Generate (M6, tier 3) — opt-in last resort. Drops a grey placeholder instantly + kicks off async
 /// text-to-3D; the real mesh streams in later over the projection Channel. Returns the placeholder + the
 /// inert token cost, or the offline seam.
@@ -6457,6 +6622,8 @@ fn main() {
             author_state_machine,
             delete_state_machine,
             run_plugin,
+            propose_composition,
+            compose,
             generate,
             ai_edit,
             top_up,
