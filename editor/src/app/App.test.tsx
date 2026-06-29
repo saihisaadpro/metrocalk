@@ -17,8 +17,9 @@ afterEach(() => {
 describe("editor app — end-to-end wiring", () => {
   it("projects the first-run SAMPLE scene (named, not the 5k fixture) and renders an inspector form on select", () => {
     render(<App />);
-    // the small NAMED first-run scene loads through client → store → hierarchy (C10: never 5000 rows)
-    expect(screen.getByText(/hierarchy/i).textContent).not.toContain("5000");
+    // the small NAMED first-run scene loads through client → store → hierarchy (C10: never 5000 rows).
+    // Keys off the stable `data-testid="hierarchy"` (not the restyled header copy — structured-signal rule).
+    expect(screen.getByTestId("hierarchy").textContent).not.toContain("5000");
     // a meaningful named starter entity appears (not "Entity N")
     expect(screen.getAllByText("Player").length).toBeGreaterThanOrEqual(1);
 

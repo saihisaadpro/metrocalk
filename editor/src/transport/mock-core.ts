@@ -7,6 +7,7 @@
 
 import { decode, decodeDocUpdate, encodeDocUpdate, encodeEphemeral, FrameKind } from "./frame";
 import { decodeJson, encodeJson } from "./protocol";
+import { deriveKind, deriveRel } from "../store/relSummary";
 import type { EditTx, EntityProjection, ProjectionDelta, ProjectionOp, RejectInfo } from "./protocol";
 import type { DeltaTransport } from "./transport";
 
@@ -27,6 +28,9 @@ export class MockCore {
   private canBind: NonNullable<MockCoreOptions["canBind"]>;
   private defer: boolean;
   private queue: Uint8Array[] = [];
+  /** Outgoing-binding count per source entity (the dev stand-in for `bindings()`) — drives the `rel`
+   *  summary's `bound`/`needsBinding`, so a bind flips the requirer's "needs a binding" status (C6). */
+  private boundFrom = new Map<string, number>();
 
   constructor(
     private transport: DeltaTransport,
@@ -112,7 +116,13 @@ export class MockCore {
         this.emit({ ops: [], rejects });
         return;
       }
-      const ops: ProjectionOp[] = [{ op: "addEdge", from: intent.from, rel: intent.rel, to: intent.to }];
+      this.boundFrom.set(intent.from, (this.boundFrom.get(intent.from) ?? 0) + 1);
+      const ops: ProjectionOp[] = [
+        { op: "addEdge", from: intent.from, rel: intent.rel, to: intent.to },
+        // Re-project the source entity so its relational summary updates — `needsBinding` flips false and
+        // `bound` increments (the C6 live relational truth the hierarchy reads off the projection).
+        { op: "upsert", id: intent.from },
+      ];
       this.emit({ ops, confirms: [tx.clientOpId] });
       return;
     }
@@ -136,9 +146,24 @@ export class MockCore {
   }
 
   private emit(delta: ProjectionDelta): void {
-    const frame = encodeDocUpdate(ROOM, this.batch++, [encodeJson(delta)]);
+    // Attach the kind + relational summary to every upsert (the C6 projection — the dev stand-in for the real
+    // `bridge.rs` cap-query projection), computed from the authoritative base AFTER the ops are applied.
+    const ops = this.enrich(delta.ops);
+    const frame = encodeDocUpdate(ROOM, this.batch++, [encodeJson({ ...delta, ops })]);
     if (this.defer) this.queue.push(frame);
     else this.transport.send(frame);
+  }
+
+  /** Augment each `upsert` op with `kind` + `rel` from the authoritative base — the dev mirror of the real
+   *  `/core` relational projection (so the hierarchy/Requirers read the SAME structured signal in dev + live).
+   *  Reuses the shared [`deriveKind`]/[`deriveRel`] so dev + bulkLoad + the real-core vocabulary stay in sync. */
+  private enrich(ops: ProjectionOp[]): ProjectionOp[] {
+    return ops.map((op) => {
+      if (op.op !== "upsert") return op;
+      const e = this.base[op.id];
+      if (!e) return op;
+      return { ...op, kind: deriveKind(e.components), rel: deriveRel(e.components, this.boundFrom.get(op.id) ?? 0) };
+    });
   }
 
   /** Release deferred deltas (only meaningful with `defer: true`). */

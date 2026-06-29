@@ -199,6 +199,14 @@ export interface EditorClient {
   dragEnd(): void;
   /** Wheel zoom — folded into the camera distance natively next frame (one call per wheel tick). */
   zoom(delta: number): void;
+
+  // ── M14.2 live per-entity thumbnails (ADR-058) ───────────────────────────────────────────────────────
+  /** Render a live thumbnail of one entity as it ACTUALLY renders in the viewport — a **discrete off-frame
+   *  RTT** on the native renderer (its own encoder, before the swapchain frame, so it never touches the
+   *  0-IPC orbit path, invariant 4) → a `data:` PNG URL at `size` px, or **null** when the renderer can't
+   *  service it (over budget / no mesh / the dev/browser build has no wgpu surface → the icon fallback). */
+  thumbnail(id: string, size: number): Promise<string | null>;
+
   /** The browse catalog (M3.4 / ADR-019) — the ONE catalog (registry + marketplace + imported), grouped
    *  by category. The asset browser reuses this; it never forks the search/category logic. */
   catalog(): Promise<Record<string, CatalogItem[]>>;
@@ -537,6 +545,15 @@ export class TauriClient implements EditorClient {
   }
   zoom(delta: number): void {
     void this.core.invoke("zoom", { delta }).catch((e: unknown) => console.error("zoom failed", e));
+  }
+
+  thumbnail(id: string, size: number): Promise<string | null> {
+    // A discrete render (off the per-frame path). On any failure resolve null → the store shows the icon
+    // fallback (never throws into the dirty-tracking loop).
+    return this.core.invoke<string | null>("thumbnail", { id, size }).catch((e: unknown) => {
+      console.error("thumbnail failed", e);
+      return null;
+    });
   }
 
   catalog(): Promise<Record<string, CatalogItem[]>> {
@@ -983,6 +1000,11 @@ class MockClient implements EditorClient {
   dragStart(): void {}
   dragEnd(): void {}
   zoom(_delta: number): void {}
+  // The dev/browser MockCore has no native wgpu surface → no live render. Resolve null so the thumbnail store
+  // falls back to the styled type-icon (the documented ADR-006/ADR-058 divergence; real RTT pixels = the .exe).
+  thumbnail(_id: string, _size: number): Promise<string | null> {
+    return Promise.resolve(null);
+  }
   catalog(): Promise<Record<string, CatalogItem[]>> {
     const item = (id: string, label: string, category: string, source: string): CatalogItem => ({
       id, label, bucket: category, category, source, provides: [], requires: [],

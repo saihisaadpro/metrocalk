@@ -184,6 +184,16 @@ pub struct SceneState {
     /// (not just the direction) so the shader applies the single shadow map to ONLY its caster, not every
     /// directional light. Rebuilt with `lights` (a render projection).
     pub shadow_caster: Option<usize>,
+    /// M14.2 (ADR-058) — pending live-thumbnail render requests `(entity id, size px)`, pushed by the
+    /// `thumbnail` command and drained by the render thread, which renders each entity to a small offscreen
+    /// target on **its own encoder before the swapchain frame** (off the per-frame orbit path — invariant 4;
+    /// a discrete, dirty-only, budget-limited surface, NEVER per-frame). A presentation artifact: thumbnails
+    /// never enter the op-stream/Loro doc (zero determinism impact, like the M11.3 lights projection).
+    pub thumb_requests: Vec<(String, u32)>,
+    /// Serviced thumbnail results `(entity id → PNG bytes, or None when the entity has no renderable
+    /// instance)`. The `thumbnail` command polls this for its id, then removes the entry. Capped so a
+    /// timed-out request can't grow it unbounded.
+    pub thumb_results: Vec<(String, Option<Vec<u8>>)>,
 }
 
 pub type Shared = Arc<Mutex<SceneState>>;
@@ -1716,6 +1726,65 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         // M9.1: upload the gizmo handle geometry (tiny — regenerated each frame at the selection).
         gizmo_buf.upload(&device, &queue, &inst_bgl, &gizmo_verts);
 
+        // M14.2 (ADR-058) — service any pending live-thumbnail requests on our OWN encoder + readback,
+        // BEFORE acquiring the swapchain (so they never contend the per-frame orbit path — invariant 4).
+        // The JS side is dirty-only + budget-limited, so this list is EMPTY during an orbit (0 thumbnail IPC).
+        let thumb_jobs: Vec<(String, u32, Instance, i32)> = {
+            let mut st = shared.lock().unwrap();
+            if st.thumb_requests.is_empty() {
+                Vec::new()
+            } else {
+                let reqs = std::mem::take(&mut st.thumb_requests);
+                reqs.into_iter()
+                    .filter_map(|(id, size)| {
+                        st.ids.iter().position(|x| x == &id).map(|i| {
+                            (
+                                id,
+                                size,
+                                st.instances[i],
+                                st.mesh_slots.get(i).copied().unwrap_or(-1),
+                            )
+                        })
+                    })
+                    .collect()
+            }
+        };
+        if !thumb_jobs.is_empty() {
+            let mut results: Vec<(String, Option<Vec<u8>>)> = Vec::with_capacity(thumb_jobs.len());
+            for (id, size, inst, slot) in thumb_jobs {
+                let mesh = usize::try_from(slot)
+                    .ok()
+                    .and_then(|s| gpu_meshes.get(s))
+                    .and_then(|m| m.as_ref());
+                let png = render_thumbnail(
+                    &device,
+                    &queue,
+                    format,
+                    samples,
+                    &cam_bgl,
+                    &inst_bgl,
+                    &mesh_inst_bgl,
+                    &albedo_sampler,
+                    &cube_pipeline,
+                    &mesh_pipeline,
+                    &lights_buf.bg,
+                    &ibl.bind_group,
+                    &index_buf,
+                    &inst,
+                    mesh,
+                    size,
+                );
+                results.push((id, png));
+            }
+            let mut st = shared.lock().unwrap();
+            st.thumb_results.extend(results);
+            // Cap so a timed-out request can't grow the result list unbounded.
+            if st.thumb_results.len() > 64 {
+                let excess = st.thumb_results.len() - 64;
+                st.thumb_results.drain(0..excess);
+            }
+        }
+
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -2339,6 +2408,267 @@ fn make_post_tex(
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// M14.2 (ADR-058) — the flagship: render ONE entity to a small offscreen target (its **real** mesh +
+/// material + transform, framed at the origin and lit by the scene's lights/IBL — exactly how it renders on
+/// the stage, not a type icon), read it back, and PNG-encode it → the live side-panel thumbnail. A
+/// **discrete off-frame RTT** (its own encoder + readback): called by the render thread before the swapchain
+/// frame, so it never touches the per-frame orbit path (invariant 4). A presentation artifact — never in the
+/// op-stream/doc (zero determinism impact). Renders at the scene `samples` count (MSAA → resolve) so it
+/// reuses the existing scene pipelines verbatim. Returns the PNG bytes, or `None` if the readback fails.
+#[allow(clippy::too_many_arguments)]
+fn render_thumbnail(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    cam_bgl: &wgpu::BindGroupLayout,
+    inst_bgl: &wgpu::BindGroupLayout,
+    mesh_inst_bgl: &wgpu::BindGroupLayout,
+    albedo_sampler: &wgpu::Sampler,
+    cube_pipeline: &wgpu::RenderPipeline,
+    mesh_pipeline: &wgpu::RenderPipeline,
+    lights_bg: &wgpu::BindGroup,
+    ibl_bg: &wgpu::BindGroup,
+    cube_index_buf: &wgpu::Buffer,
+    instance: &Instance,
+    mesh: Option<&GpuMesh>,
+    size: u32,
+) -> Option<Vec<u8>> {
+    let size = size.clamp(32, 256);
+    // Frame a COPY of the entity at the origin — a consistent "portrait" regardless of its world position.
+    let scale = instance.scale.max(0.1);
+    let framed = Instance {
+        center: [0.0, 0.0, 0.0],
+        scale,
+        color: instance.color,
+        selected: 0.0,
+        rotation: instance.rotation,
+        material: instance.material,
+    };
+    let dist = (scale * 3.2).clamp(2.0, 200.0);
+    let cam = camera_matrix(std::f32::consts::FRAC_PI_4, 0.5, dist, 1.0, Vec3::ZERO);
+    let eye = camera_eye(std::f32::consts::FRAC_PI_4, 0.5, dist, [0.0; 3]);
+    let cam_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("thumb-cam"),
+        size: std::mem::size_of::<Camera>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &cam_buf,
+        0,
+        bytemuck::bytes_of(&Camera {
+            view_proj: cam.to_cols_array_2d(),
+            inv_view_proj: cam.inverse().to_cols_array_2d(),
+            // No shadow in the thumb: identity light VP ⇒ the lookup falls outside the unit cube ⇒ unshadowed.
+            light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            focus: [0.0, eye[0], eye[1], eye[2]],
+            shadow: [-1.0, 1.0, 0.0, 0.0], // caster -1 = none; exposure 1.0
+        }),
+    );
+    let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("thumb-cam-bg"),
+        layout: cam_bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: cam_buf.as_entire_binding(),
+        }],
+    });
+
+    // The single-entity instance buffer (group 1 of the cube path; the storage buffer of the mesh path).
+    let mut inst_buf = InstanceBuf::new(device, inst_bgl, 1);
+    inst_buf.upload(device, queue, inst_bgl, &[framed]);
+
+    // Offscreen targets: render at the scene `samples` count (so the scene pipelines match), resolving into a
+    // single-sample COPY_SRC target we read back. With MSAA off, render straight into the resolve target.
+    let resolve_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("thumb-resolve"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let resolve_view = resolve_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let msaa_view = (samples > 1).then(|| make_post_tex_msaa(device, format, size, size, samples));
+    let depth = make_depth(device, size, size, samples);
+    let (color_view, resolve_target) = match &msaa_view {
+        Some(m) => (m, Some(&resolve_view)),
+        None => (&resolve_view, None),
+    };
+
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("thumb-enc"),
+    });
+    {
+        let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("thumb"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                resolve_target,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.04,
+                        g: 0.05,
+                        b: 0.08,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_bind_group(0, &cam_bg, &[]);
+        if let Some(mesh) = mesh {
+            // The REAL mesh: lights(2) + IBL(3) like the scene, a per-submesh group 1 (this 1-instance buffer
+            // + the submesh's textures), drawn for instance 0.
+            rp.set_pipeline(mesh_pipeline);
+            rp.set_bind_group(2, lights_bg, &[]);
+            rp.set_bind_group(3, ibl_bg, &[]);
+            rp.set_vertex_buffer(0, mesh.vbuf.slice(..));
+            rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            for sm in &mesh.submeshes {
+                let bg = make_mesh_main_bg(
+                    device,
+                    mesh_inst_bgl,
+                    &inst_buf.buf,
+                    &sm.base_view,
+                    &sm.mr_view,
+                    &sm.normal_view,
+                    albedo_sampler,
+                );
+                rp.set_bind_group(1, &bg, &[]);
+                let end = sm.index_offset + sm.index_count;
+                rp.draw_indexed(sm.index_offset..end, 0, 0..1);
+            }
+        } else {
+            // The cube fallback (a primitive / no-mesh entity) — its real transform + material colour.
+            rp.set_pipeline(cube_pipeline);
+            rp.set_bind_group(1, &inst_buf.bg, &[]);
+            rp.set_index_buffer(cube_index_buf.slice(..), wgpu::IndexFormat::Uint16);
+            rp.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..1);
+        }
+    }
+
+    // Readback: copy the resolved color into a CPU-mappable buffer (256-byte row alignment).
+    let unpadded = size * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("thumb-readback"),
+        size: u64::from(padded * size),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &resolve_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(size),
+            },
+        },
+        wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([enc.finish()]);
+
+    let slice = buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r.is_ok());
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    if rx.recv().ok() != Some(true) {
+        return None;
+    }
+    let data = slice.get_mapped_range();
+
+    // De-pad rows + reorder to RGBA8 (the swapchain format is BGRA on the Windows/Vulkan path). Then PNG.
+    let bgra = matches!(
+        format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    );
+    let mut rgba = Vec::with_capacity((unpadded * size) as usize);
+    for row in 0..size {
+        let start = (row * padded) as usize;
+        let line = &data[start..start + unpadded as usize];
+        if bgra {
+            for px in line.chunks_exact(4) {
+                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        } else {
+            rgba.extend_from_slice(line);
+        }
+    }
+    drop(data);
+    buf.unmap();
+
+    let mut png_bytes: Vec<u8> = Vec::new();
+    {
+        let mut pe = png::Encoder::new(&mut png_bytes, size, size);
+        pe.set_color(png::ColorType::Rgba);
+        pe.set_depth(png::BitDepth::Eight);
+        let mut w = pe.write_header().ok()?;
+        w.write_image_data(&rgba).ok()?;
+    }
+    Some(png_bytes)
+}
+
+/// A multisampled offscreen color target (for the thumbnail RTT to resolve from). Mirrors [`make_msaa`] but
+/// always allocates (the caller only invokes it when `samples > 1`).
+fn make_post_tex_msaa(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    w: u32,
+    h: u32,
+    samples: u32,
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("thumb-msaa"),
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default())

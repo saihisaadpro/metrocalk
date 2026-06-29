@@ -7,6 +7,9 @@
 import type { ButtonHTMLAttributes, CSSProperties, ReactNode, InputHTMLAttributes } from "react";
 import { color, radius, space, font, fontSize, text } from "./tokens";
 
+/** A data-* / id passthrough the card/icon primitives accept for the stable e2e/Vitest hooks. */
+type DataAttrs = { id?: string; title?: string; "data-testid"?: string; "data-id"?: string; "data-source"?: string; "data-kind"?: string };
+
 export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger" | "toggle";
 
 export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, "className"> {
@@ -109,8 +112,9 @@ export function TextField({ style, mono = false, ...rest }: Omit<InputHTMLAttrib
   return <input type="text" className={mono ? "mtk-input mtk-input--mono" : "mtk-input"} style={style} {...rest} />;
 }
 
-/** A small, neutral pill/badge (for live readouts — view label, counts). Not a button. */
-export function Badge({ children, tone = "neutral", style }: { children: ReactNode; tone?: "neutral" | "accent" | "warn" | "success"; style?: CSSProperties }) {
+/** A small, neutral pill/badge (for live readouts — view label, counts). Not a button. The `title`
+ *  carries the plain-language explanation (a requirer's needed cap, a price) — never colour-alone. */
+export function Badge({ children, tone = "neutral", style, title }: { children: ReactNode; tone?: "neutral" | "accent" | "warn" | "success"; style?: CSSProperties; title?: string }) {
   const tones: Record<string, CSSProperties> = {
     neutral: { background: color.bg.inset, color: color.text.secondary, borderColor: color.border.default },
     accent: { background: color.accent.subtle, color: color.accent.base, borderColor: color.accent.border },
@@ -119,6 +123,7 @@ export function Badge({ children, tone = "neutral", style }: { children: ReactNo
   };
   return (
     <span
+      title={title}
       style={{
         display: "inline-flex",
         alignItems: "center",
@@ -128,11 +133,97 @@ export function Badge({ children, tone = "neutral", style }: { children: ReactNo
         border: "1px solid",
         font: font.mono,
         fontSize: fontSize.micro,
+        whiteSpace: "nowrap",
         ...tones[tone],
         ...style,
       }}
     >
       {children}
     </span>
+  );
+}
+
+/** The semantic kind of an entity/asset → a glyph + a deterministic dark-theme hue. Keys off a stable
+ *  `kind` string the caller derives from the **real** projection (the relational summary / salient
+ *  component) or a catalog item's source/category — never a styled string a test would couple to. */
+const ICON_KINDS: Record<string, { glyph: string; hue: number }> = {
+  mesh: { glyph: "◆", hue: 210 },
+  group: { glyph: "▣", hue: 220 },
+  light: { glyph: "☼", hue: 45 },
+  camera: { glyph: "◉", hue: 190 },
+  requirer: { glyph: "◇", hue: 150 }, // hollow = a needed binding not yet filled
+  physics: { glyph: "◍", hue: 270 },
+  rule: { glyph: "λ", hue: 30 },
+  audio: { glyph: "♪", hue: 330 },
+  marketplace: { glyph: "⬡", hue: 265 },
+  generated: { glyph: "✦", hue: 285 },
+  imported: { glyph: "▤", hue: 175 },
+  local: { glyph: "◆", hue: 210 },
+  default: { glyph: "◻", hue: 215 },
+};
+
+/** A styled type-icon — the graceful fallback when a live thumbnail isn't available (over budget / offline /
+ *  the dev/browser build / not yet rendered). A framed, hue-tinted glyph so the panel still reads at a glance.
+ *  The `data-kind` is the structured signal a test keys on. */
+export function TypeIcon({ kind, size = 40, style }: { kind: string; size?: number; style?: CSSProperties }) {
+  const k = ICON_KINDS[kind] ?? ICON_KINDS.default;
+  return (
+    <span
+      data-testid="type-icon"
+      data-kind={kind}
+      aria-hidden
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: size,
+        height: size,
+        flex: "none",
+        fontFamily: font.mono,
+        fontSize: Math.round(size * 0.5),
+        lineHeight: 1,
+        color: `hsl(${k.hue} 55% 70%)`,
+        background: `hsl(${k.hue} 32% 16%)`,
+        border: `1px solid hsl(${k.hue} 40% 30%)`,
+        borderRadius: radius.md,
+        ...style,
+      }}
+    >
+      {k.glyph}
+    </span>
+  );
+}
+
+/** One card surface — asset/component cards (M14.2 / ADR-058). Real hover/selected/unavailable/warning
+ *  states come from the `.mtk-card` classes (global.css); the metadata layout is the caller's. Renders a
+ *  `<button>` so it's keyboard-reachable; `disabled`/`tone:"unavailable"` explains *why it can't* via `title`. */
+export function Card({
+  selected = false,
+  tone = "default",
+  disabled = false,
+  onClick,
+  children,
+  style,
+  ...rest
+}: {
+  selected?: boolean;
+  tone?: "default" | "warn" | "unavailable";
+  disabled?: boolean;
+  onClick?: () => void;
+  children: ReactNode;
+  style?: CSSProperties;
+} & DataAttrs) {
+  const cls = [
+    "mtk-card",
+    selected && "is-selected",
+    tone === "warn" && "is-warn",
+    (tone === "unavailable" || disabled) && "is-unavailable",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <button type="button" className={cls} onClick={disabled ? undefined : onClick} disabled={disabled} style={style} {...rest}>
+      {children}
+    </button>
   );
 }

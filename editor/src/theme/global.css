@@ -136,6 +136,51 @@ html {
 .mtk-input:focus { outline: none; border-color: var(--mtk-accent-border); box-shadow: 0 0 0 2px #5b9bd533; }
 .mtk-input--mono { font-family: var(--mtk-font-mono); }
 
+/* ── Cards (asset/component cards — M14.2/ADR-058): one card surface with real hover/selected/unavailable
+ *    states inline styles can't express. The metadata (type · source · capability) is laid out in JS. ── */
+.mtk-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: var(--mtk-bg-raised);
+  color: var(--mtk-text-secondary);
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: 5px;
+  padding: 5px 7px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.mtk-card:hover { background: var(--mtk-bg-hover); color: var(--mtk-text); border-color: var(--mtk-border); }
+.mtk-card.is-selected { background: var(--mtk-accent-subtle); border-color: var(--mtk-accent-border); color: var(--mtk-text); }
+.mtk-card.is-warn { border-color: var(--mtk-warn-border); }
+.mtk-card.is-unavailable { opacity: 0.55; cursor: not-allowed; }
+.mtk-card.is-unavailable:hover { background: var(--mtk-bg-raised); }
+
+/* ── Hierarchy / list row (M14.2): hover + selected live here so a row paints consistently; selection is
+ *    applied via the `.is-selected`/`.is-multi` classes the row composes (token-driven, never colour-alone). ── */
+.mtk-hrow { transition: background 100ms ease, color 100ms ease; }
+.mtk-hrow:hover { background: var(--mtk-bg-hover); }
+.mtk-hrow.is-selected { background: var(--mtk-accent-subtle); }
+.mtk-hrow.is-selected:hover { background: #1b3148; }
+.mtk-hrow.is-multi { background: #15212f; }
+.mtk-hrow.is-drop { background: #18351f; outline: 1px solid var(--mtk-success-border); }
+
+/* ── Thumbnail frame (the live-render slot; an icon fallback sits inside the same framed inset). ── */
+.mtk-thumb {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  overflow: hidden;
+  background: var(--mtk-bg-inset);
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: 4px;
+}
+.mtk-thumb.is-selected { border-color: var(--mtk-accent-border); box-shadow: 0 0 0 1px var(--mtk-accent-border); }
+.mtk-thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+
 /* ── Keyframes ── */
 @keyframes mtk-toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes mtk-spin { to { transform: rotate(360deg); } }

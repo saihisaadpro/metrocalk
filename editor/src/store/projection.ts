@@ -15,6 +15,8 @@
 import { createStore } from "zustand/vanilla";
 import { useStore } from "zustand";
 import { projectStore } from "./project";
+import { thumbnailStore } from "./thumbnails";
+import { deriveKind, deriveRel } from "./relSummary";
 import type {
   EditIntent,
   EntityProjection,
@@ -22,7 +24,13 @@ import type {
   Json,
   ProjectionDelta,
   RejectInfo,
+  RelSummary,
 } from "../transport/protocol";
+
+/** A cheap stable signature of a relational summary so a hierarchy row re-renders only when its relational
+ *  status actually FLIPS (not on every delta carrying an unchanged `rel`). */
+const relSig = (r?: RelSummary): string =>
+  r ? `${r.needsBinding ? 1 : 0}|${r.bound}|${r.isGroup ? 1 : 0}|${r.requires.join(",")}|${r.provides.join(",")}` : "";
 
 export interface BindEdge {
   id: string; // `${from}|${rel}|${to}`
@@ -113,7 +121,9 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
     const order: string[] = [];
     for (const e of entities) {
       base[e.id] = e;
-      summaries[e.id] = { id: e.id, name: e.name, parentId: e.parentId };
+      // Carry the relational summary (M14.2 / ADR-058) so the hierarchy/Requirers read the live binding/
+      // requirer truth in the bulkLoad/dev/test path too (the real core projects the same fields).
+      summaries[e.id] = { id: e.id, name: e.name, parentId: e.parentId, kind: deriveKind(e.components), rel: deriveRel(e.components) };
       order.push(e.id);
     }
     set({ base, displayed: { ...base }, summaries, order, edges: {}, pending: {}, rejections: [], deactivated: {} });
@@ -176,10 +186,13 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
             components: prev?.components ?? {},
           };
           base[id] = next;
-          // summaries change only if name/parent changed (so field edits never touch the tree)
+          // summaries change only if name/parent/kind/relational-status changed (so field edits never touch
+          // the tree — M2.5; a relational FLIP, e.g. needs-binding→bound, re-renders only that one row).
           const sm = summaries[id];
-          if (!sm || sm.name !== next.name || sm.parentId !== next.parentId) {
-            summaries[id] = { id, name: next.name, parentId: next.parentId };
+          const kind = op.kind ?? sm?.kind;
+          const rel = op.rel ?? sm?.rel;
+          if (!sm || sm.name !== next.name || sm.parentId !== next.parentId || sm.kind !== kind || relSig(sm.rel) !== relSig(rel)) {
+            summaries[id] = { id, name: next.name, parentId: next.parentId, kind, rel };
           }
           if (!prev) orderMut().push(id);
           // Authoritative deactivate state (R-NEXT-2): drives the hierarchy dim/strike; absent ⇒ leave any
@@ -264,6 +277,11 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
     // `deactivated` was rebuilt above from each upsert's authoritative `active` flag (full = from scratch),
     // so deactivate state is correct on reload/undo and incremental deltas keep optimistic marks.
     set({ base, displayed, summaries, order, edges, pending, rejections, deactivated });
+
+    // Drive the live-thumbnail dirty-tracking off the SAME committed op-stream (M14.2 / ADR-058): only a
+    // silhouette-affecting op (mesh · material · transform · visibility) invalidates a thumbnail — a Health
+    // field edit or a camera orbit never does. The store decides WHEN to (re)render (visible-only + budget).
+    thumbnailStore.getState().ingestDelta(delta);
   },
 
   select(id) {

@@ -52,9 +52,8 @@ pollster = "0.4.0"
 raw-window-handle = "0.6.2"
 bytemuck = { version = "1.19", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck"] }
-
-[dev-dependencies]
-# PNG encode for the offscreen render-evidence bench (examples/mesh_frame_bench.rs). Pure Rust.
+# PNG encode (pure Rust) for the M14.2 live-thumbnail readback (render.rs RTT → a `data:` URL) AND the
+# offscreen render-evidence bench (examples/mesh_frame_bench.rs). Desktop-only crate (not in the wasm funnel).
 png = "0.18"
 
 [profile.dev]

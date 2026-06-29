@@ -30,7 +30,8 @@ pub mod wallet;
 pub use actions::{actions_for, Action, ActionItem};
 pub use ai::{apply_ai_patch, AiPatch, PatchOp};
 pub use bridge::{
-    apply_edit, project_entity, project_full, EditIntent, EditTx, ProjectionDelta, ProjectionOp,
+    apply_edit, enrich_relational, project_entity, project_full, EditIntent, EditTx,
+    ProjectionDelta, ProjectionOp, RelSummary,
 };
 pub use capscene::{
     add_kind, apply_marketplace_entry, bind, describe_create, duplicate_entity, instantiate,

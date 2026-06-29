@@ -8,10 +8,14 @@
 //! all-or-nothing validation (unknown entity, etc.) is the authoritative source of a "no" here;
 //! semantic compat-ranking of binds is M3, not M2.
 
+use std::collections::{HashMap, HashSet};
+
 use metrocalk_core::{Engine, EntityId, FieldValue, Op};
-use metrocalk_ecs::World;
+use metrocalk_ecs::{Entity, World};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
+
+use crate::reveal::{required_caps, Rels};
 
 // ── wire types (mirror editor/src/transport/protocol.ts) ───────────────────────
 
@@ -32,6 +36,16 @@ pub enum ProjectionOp {
         /// (the persisted SetActive replays, `project_full` re-emits `active:false`). Absent ⇒ unchanged.
         #[serde(skip_serializing_if = "Option::is_none")]
         active: Option<bool>,
+        /// M14.2 (ADR-058) — the salient type for the type-icon/thumbnail fallback, classified server-side
+        /// from the entity's components so the hierarchy needs no component subscription (M2.5). Absent ⇒
+        /// the UI keeps the entity's prior kind. Set by [`enrich_relational`] on the projection path only.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// M14.2 (ADR-058) — the live relational summary (the C6 closure): requires/provides/bound/
+        /// needsBinding keyed off the REAL `(Requires/Provides, cap)` ECS pairs + `bindings()`. A read/render
+        /// projection — never authored into the doc. Set by [`enrich_relational`]; absent ⇒ UI keeps prior.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rel: Option<RelSummary>,
     },
     Remove {
         id: String,
@@ -59,6 +73,26 @@ pub enum ProjectionOp {
         rel: String,
         to: String,
     },
+}
+
+/// M14.2 (ADR-058) — the live per-entity relational summary, the C6 closure. Mirrors the TS `RelSummary`
+/// (camelCase). Computed from the real `(Requires/Provides, cap)` ECS pairs + `bindings()`; a read/render
+/// projection that NEVER enters the op-stream/Loro doc (zero determinism impact). Rides the `Upsert` op so
+/// it lands on the hierarchy SUMMARY (a row re-renders only when its relational status flips — M2.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelSummary {
+    /// Capability names this entity REQUIRES (non-empty ⇒ a requirer).
+    pub requires: Vec<String>,
+    /// Capability names this entity PROVIDES.
+    pub provides: Vec<String>,
+    /// Count of this entity's outgoing bindings (BindsTo edges).
+    pub bound: usize,
+    /// A required capability is not yet satisfied by an existing binding ("needs a binding") — the
+    /// authoritative requirer signal (the same predicate `actions_for`'s `Bind…` availability uses).
+    pub needs_binding: bool,
+    /// This entity is a group/identity parent node. (Reserved; group membership is also carried by `parentId`.)
+    pub is_group: bool,
 }
 
 /// A committed delta from the core (authoritative ops + which optimistic ops it confirms/rejects).
@@ -211,6 +245,8 @@ pub fn project_full<W: World>(engine: &Engine<W>) -> ProjectionDelta {
             name: Some(entity_label(&comps, &key)),
             parent_id: Some(parent),
             active: Some(engine.is_active(id)), // carry deactivate state so it survives reload (R-NEXT-2)
+            kind: None, // filled by `enrich_relational` (M14.2) at the send boundary
+            rel: None,
         });
         for (component, fields) in comps {
             for (field, value) in fields {
@@ -250,6 +286,8 @@ pub fn project_entity<W: World>(engine: &Engine<W>, id: EntityId) -> ProjectionD
         name: Some(entity_label(&comps, &key)),
         parent_id: Some(parent),
         active: Some(engine.is_active(id)), // carry deactivate state (R-NEXT-2)
+        kind: None, // filled by `enrich_relational` (M14.2) at the send boundary
+        rel: None,
     }];
     for (component, fields) in comps {
         for (field, value) in fields {
@@ -321,5 +359,136 @@ fn json_to_field(v: &Json) -> Option<FieldValue> {
             }
         }
         _ => None,
+    }
+}
+
+/// M14.2 (ADR-058) — the C6 relational projection. Fill each `Upsert` op's `kind` + `rel` (the live
+/// binding/requirer truth) from the REAL `(Requires/Provides, cap)` ECS pairs + `engine.bindings()`,
+/// **reusing** the M3.1 [`required_caps`] query + the `actions_for` satisfaction correlation — so the
+/// hierarchy/Requirers read structured truth off the projection (retiring the brittle `HealthBar`
+/// component-name filter / MockCore's `Socket`/`Provides` fiction). A **read/render projection** — never
+/// authored into the doc (zero determinism impact). Computed off the discrete projection path (a full
+/// re-projection / a targeted echo), **never** per-frame (invariant 4). A delta carrying no `Upsert` is a
+/// no-op. `kind` is derived from THIS delta's own `SetField` components (no extra fetch); absent when the
+/// delta carries no fields for that entity (the UI then keeps the entity's prior kind).
+// `cap_name` is the app-owned, default-hasher registry map (mirrors `reveal`'s `implicit_hasher` allow).
+#[allow(clippy::implicit_hasher)]
+pub fn enrich_relational<W: World>(
+    delta: &mut ProjectionDelta,
+    engine: &Engine<W>,
+    rels: Rels,
+    cap_name: &HashMap<Entity, String>,
+) {
+    if !delta
+        .ops
+        .iter()
+        .any(|op| matches!(op, ProjectionOp::Upsert { .. }))
+    {
+        return;
+    }
+    // Component names per upserted id, from THIS delta's `SetField` ops (so `kind` needs no extra fetch).
+    // Owned (not `&str` into `delta.ops`) so the mutable pass below doesn't conflict with this borrow.
+    let mut comp_names: HashMap<String, Vec<String>> = HashMap::new();
+    for op in &delta.ops {
+        if let ProjectionOp::SetField { id, component, .. } = op {
+            comp_names
+                .entry(id.clone())
+                .or_default()
+                .push(component.clone());
+        }
+    }
+    // One bindings scan → from-entity → its bound providers (for `bound` + the satisfaction set).
+    let mut bound_to: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
+    for (from, _rel, to) in engine.bindings() {
+        bound_to.entry(from).or_default().push(to);
+    }
+    for op in &mut delta.ops {
+        let ProjectionOp::Upsert {
+            id, kind, rel, ..
+        } = op
+        else {
+            continue;
+        };
+        let Some(eid) = EntityId::from_loro_key(id) else {
+            continue;
+        };
+        let Some(ecs) = engine.ecs_entity(eid) else {
+            continue;
+        };
+        let req_caps = required_caps(engine.world(), ecs, rels);
+        let requires: Vec<String> = req_caps
+            .iter()
+            .filter_map(|c| cap_name.get(c).cloned())
+            .collect();
+        let provides: Vec<String> = engine
+            .world()
+            .targets(ecs, rels.provides)
+            .iter()
+            .filter_map(|c| cap_name.get(c).cloned())
+            .collect();
+        // The needs-binding predicate: a required cap NOT satisfied by an existing binding (correlate each
+        // outgoing binding to the caps its bound provider actually provides — the exact `actions_for` logic).
+        let mut satisfied: HashSet<Entity> = HashSet::new();
+        let bound = bound_to.get(&eid).map_or(0, |tos| {
+            for to in tos {
+                if let Some(to_ecs) = engine.ecs_entity(*to) {
+                    for cap in engine.world().targets(to_ecs, rels.provides) {
+                        satisfied.insert(cap);
+                    }
+                }
+            }
+            tos.len()
+        });
+        let needs_binding = req_caps.iter().any(|c| !satisfied.contains(c));
+        *rel = Some(RelSummary {
+            requires,
+            provides,
+            bound,
+            needs_binding,
+            is_group: false,
+        });
+        if let Some(cs) = comp_names.get(id.as_str()) {
+            *kind = Some(classify_kind(cs));
+        }
+    }
+}
+
+/// Classify an entity's salient type from its component names — the type-icon vocabulary the hierarchy
+/// renders (kept in sync with the TS `deriveKind`). Generic over `&str`/`String` so the projection path
+/// (owned `String`s) and the unit test (`&str` literals) share one implementation.
+fn classify_kind<S: AsRef<str>>(components: &[S]) -> String {
+    let has = |n: &str| components.iter().any(|c| c.as_ref() == n);
+    if has("Light") {
+        "light"
+    } else if has("Camera") {
+        "camera"
+    } else if has("RigidBody") || has("Collider") {
+        "physics"
+    } else if has("AudioSource") {
+        "audio"
+    } else if has("HealthBar") {
+        "requirer"
+    } else if has("MeshRenderer") {
+        "mesh"
+    } else {
+        "default"
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_kind_keys_off_the_real_component_vocabulary() {
+        assert_eq!(classify_kind(&["Transform", "HealthBar"]), "requirer");
+        assert_eq!(classify_kind(&["Transform", "MeshRenderer"]), "mesh");
+        assert_eq!(classify_kind(&["Light"]), "light");
+        assert_eq!(classify_kind(&["Camera"]), "camera");
+        assert_eq!(classify_kind(&["RigidBody", "MeshRenderer"]), "physics");
+        assert_eq!(classify_kind(&["Transform"]), "default");
+        // a renderable requirer (HealthBar + a mesh) reads as a requirer (the binding state is the salient cue)
+        assert_eq!(classify_kind(&["HealthBar", "MeshRenderer"]), "requirer");
     }
 }

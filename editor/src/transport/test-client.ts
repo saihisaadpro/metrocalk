@@ -71,6 +71,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     dragStart: vi.fn(),
     dragEnd: vi.fn(),
     zoom: vi.fn(),
+    thumbnail: () => Promise.resolve(null), // M14.2: default to the icon fallback (a test overrides for the ready path)
     catalog: () => Promise.resolve({}),
     catalogSearch: () => Promise.resolve({ items: [] }),
     addItem: vi.fn(() => Promise.resolve({ created: "e-new", balance: null, seam: null })),

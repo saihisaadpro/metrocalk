@@ -17,15 +17,38 @@ export interface EntityProjection {
   components: Record<string, Record<string, Json>>;
 }
 
-/** A `{id,name,parentId}` summary — the list/hierarchy reads this so detail edits never re-render the tree. */
+/** A per-entity **relational summary** (M14.2 / ADR-058) — the live relational/binding/requirer truth keyed
+ *  off the REAL `/core` `(Provides/Requires, cap)` pairs + `bindings()` (the C6 closure). Rides the `upsert`
+ *  op + the `EntitySummary` (NOT the components map), so a field edit never re-renders a hierarchy row (M2.5)
+ *  and a row re-renders only when its relational status flips. A read/render projection — never authored. */
+export interface RelSummary {
+  /** Capability names this entity REQUIRES (display names, e.g. `["Health"]`). Non-empty ⇒ a requirer. */
+  requires: string[];
+  /** Capability names this entity PROVIDES (e.g. `["Health"]`). */
+  provides: string[];
+  /** Count of this entity's outgoing bindings (BindsTo edges). */
+  bound: number;
+  /** A required capability is not yet satisfied by an existing binding ("needs a binding"). The authoritative
+   *  requirer signal — replaces the brittle `HealthBar`-component-name filter (C6). */
+  needsBinding: boolean;
+  /** This entity is a group/identity parent node (children grouped under it). */
+  isGroup: boolean;
+}
+
+/** A `{id,name,parentId}` summary — the list/hierarchy reads this so detail edits never re-render the tree.
+ *  M14.2 adds the type `kind` (for the type-icon, derived server-side from the salient component so the row
+ *  needs no component subscription) + the `rel`ational summary (the live binding/requirer truth). */
 export interface EntitySummary {
   id: string;
   name: string;
   parentId: string | null;
+  /** Salient type for the type-icon/thumbnail fallback (`mesh`/`group`/`light`/`camera`/`requirer`/…). */
+  kind?: string;
+  rel?: RelSummary;
 }
 
 export type ProjectionOp =
-  | { op: "upsert"; id: string; name?: string; parentId?: string | null; active?: boolean }
+  | { op: "upsert"; id: string; name?: string; parentId?: string | null; active?: boolean; kind?: string; rel?: RelSummary }
   | { op: "remove"; id: string }
   | { op: "setField"; id: string; component: string; field: string; value: Json }
   | { op: "removeField"; id: string; component: string; field: string }

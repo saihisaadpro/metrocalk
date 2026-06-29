@@ -39,8 +39,9 @@ use metrocalk_editor_shell::transform_solver::{
 };
 use metrocalk_editor_shell::{
     actions_for, ai_edit_material, apply_ai_patch, apply_edit, buy_marketplace, capscene,
-    project_entity, project_full, transform_solver, ActionItem, AiPatch, CapScene, EditIntent,
-    EditTx, Log, MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp, Record, Wallet,
+    enrich_relational, project_entity, project_full, transform_solver, ActionItem, AiPatch,
+    CapScene, EditIntent, EditTx, Log, MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp,
+    Record, Wallet,
 };
 use metrocalk_gizmo::{
     Gizmo, GizmoMode, GizmoPivot, GizmoSpace, Handle, Ray, Transform as GizmoTransform,
@@ -72,6 +73,18 @@ macro_rules! send_proj {
             eprintln!("[shell] projection channel send failed (UI may be out of sync): {e}");
         }
     };
+}
+
+/// M14.2 (ADR-058) — a full re-projection ENRICHED with the live relational summary (the C6 closure): each
+/// entity carries `requires/provides/bound/needsBinding` + a `kind`, keyed off the real `(Requires/Provides,
+/// cap)` ECS pairs + `bindings()`, so the hierarchy/Requirers surface the scene's real binding/requirer truth
+/// against the **live `/core`** (retiring the brittle `HealthBar` name filter). A read/render projection
+/// computed off the discrete projection path (connect / undo / open / sim-restart) — NEVER per-frame (inv. 4),
+/// and never authored into the doc (zero determinism impact, like the M11.3 lights / M8 sim projection).
+fn proj_full(engine: &Engine<FlecsWorld>, scene: &CapScene) -> ProjectionDelta {
+    let mut d = project_full(engine);
+    enrich_relational(&mut d, engine, scene.rels, &scene.cap_name);
+    d
 }
 
 /// The checked-in demo assets — **embedded** so the packaged app has no runtime file dependency, while
@@ -1444,7 +1457,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     while let Ok(cmd) = rx.recv() {
         match cmd {
             EngineCmd::Connect(ch) => {
-                send_proj!(ch, project_full(&engine)); // initial full-scene load
+                send_proj!(ch, proj_full(&engine, &scene)); // initial full-scene load
                 channel = Some(ch);
             }
             EngineCmd::Edit(tx) => {
@@ -1502,7 +1515,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 if did {
                     log.append(&Record::Undo); // persist the undo so replay reproduces the net state
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine)); // simplest correct post-undo sync
+                        send_proj!(ch, proj_full(&engine, &scene)); // simplest correct post-undo sync
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                     // The ECS is the single authority over which bodies EXIST — restart the run from the
@@ -1735,7 +1748,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let new = capscene::create_entity(&mut engine, [x, y, z], &name).ok();
                 if new.is_some() {
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1760,7 +1773,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         intensity,
                     });
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1794,7 +1807,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 if new.is_some() {
                     log.append(&Record::AddCamera { pos, fov, active });
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1836,7 +1849,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .is_some_and(|e| capscene::rename(&mut engine, e, &name).is_ok());
                 if ok {
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                 }
                 let _ = reply.send(ok);
@@ -1853,7 +1866,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 if g.is_some() {
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1864,7 +1877,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .is_some_and(|e| capscene::ungroup(&mut engine, e).is_ok());
                 if ok {
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1892,7 +1905,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .is_ok();
                 if ok {
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1906,7 +1919,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     // `project_full` then re-emits `active:false` so the hierarchy dims the row on reopen.
                     log.append(&Record::DeleteDeactivate { id: id.clone() });
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1930,7 +1943,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 if ok {
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -1942,7 +1955,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .and_then(|c| capscene::paste_composition(&mut engine, c).ok());
                 if new.is_some() {
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
@@ -2301,7 +2314,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         let applied = composition.ops.len();
                         rebuild(&engine, &shared, &mut positions, &assets);
                         if let Some(ch) = &channel {
-                            send_proj!(ch, project_full(&engine)); // simplest correct post-compose sync
+                            send_proj!(ch, proj_full(&engine, &scene)); // simplest correct post-compose sync
                         }
                         log.append(&Record::Compose { composition });
                         ComposeResult {
@@ -2914,7 +2927,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 touch = 0;
                 rebuild(&engine, &shared, &mut positions, &assets);
                 if let Some(ch) = &channel {
-                    send_proj!(ch, project_full(&engine));
+                    send_proj!(ch, proj_full(&engine, &scene));
                 }
                 (recording, rec_entities, sim, body_of) = restart_run(
                     &engine,
@@ -2959,7 +2972,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         touch = 0;
                         rebuild(&engine, &shared, &mut positions, &assets);
                         if let Some(ch) = &channel {
-                            send_proj!(ch, project_full(&engine));
+                            send_proj!(ch, proj_full(&engine, &scene));
                         }
                         (recording, rec_entities, sim, body_of) = restart_run(
                             &engine,
@@ -3080,7 +3093,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     touch = 0;
                     rebuild(&engine, &shared, &mut positions, &assets);
                     if let Some(ch) = &channel {
-                        send_proj!(ch, project_full(&engine));
+                        send_proj!(ch, proj_full(&engine, &scene));
                     }
                     (recording, rec_entities, sim, body_of) = restart_run(
                         &engine,
@@ -3376,7 +3389,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             parent: parent.clone(),
                         });
                         if let Some(ch) = &channel {
-                            send_proj!(ch, project_full(&engine));
+                            send_proj!(ch, proj_full(&engine, &scene));
                         }
                         rebuild(&engine, &shared, &mut positions, &assets);
                     }
@@ -5043,6 +5056,60 @@ fn drag_end(state: State<AppState>) {
 fn zoom(state: State<AppState>, delta: f32) {
     ipc();
     state.shared.lock().unwrap().zoom_delta += delta;
+}
+
+/// M14.2 (ADR-058) — render a live thumbnail of one entity (its REAL viewport render, off the per-frame
+/// path). Pushes a request onto the shared `SceneState`; the render thread services it on its own encoder +
+/// readback (invariant 4), then this polls the result and returns a `data:image/png;base64,…` URL — or
+/// `None` (the entity has no renderable instance, or the render timed out → the UI keeps the icon fallback).
+/// Discrete (counted like any IPC); the JS side is dirty-only + budget-limited, so it NEVER fires per frame
+/// (an orbit dirties nothing → 0 thumbnail IPC during orbit, so invariant 4 holds with thumbnails active).
+#[tauri::command]
+fn thumbnail(state: State<AppState>, id: String, size: u32) -> Option<String> {
+    ipc();
+    {
+        let mut st = state.shared.lock().unwrap();
+        st.thumb_requests.push((id.clone(), size));
+    }
+    // Poll for the serviced result (~250 ms cap; the render thread ticks ~125 Hz, a thumbnail is sub-ms once
+    // serviced). No lock is held during the sleep — zero contention with the render thread.
+    for _ in 0..50 {
+        {
+            let mut st = state.shared.lock().unwrap();
+            if let Some(pos) = st.thumb_results.iter().position(|(rid, _)| rid == &id) {
+                let (_, bytes) = st.thumb_results.remove(pos);
+                drop(st);
+                return bytes.map(|b| format!("data:image/png;base64,{}", base64_encode(&b)));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    None
+}
+
+/// Standard base64 (RFC 4648) — a tiny self-contained encoder for the thumbnail `data:` URL (no new dep).
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Pick in the viewport (Rust — invariant 4). `x`/`y` are a normalized [0,1] window fraction
@@ -6857,6 +6924,7 @@ fn main() {
             drag_start,
             drag_end,
             zoom,
+            thumbnail,
             viewport_pick,
             viewport_peek,
             focus_entity,
@@ -6992,6 +7060,27 @@ mod material_tests {
     fn unknown_material_is_no_override() {
         assert!(material_preset("banana").is_none());
         assert!(material_preset("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::base64_encode;
+
+    #[test]
+    fn rfc4648_known_vectors_with_padding() {
+        // The canonical RFC 4648 §10 vectors (incl. the 1- and 2-byte padding cases) — so a thumbnail
+        // `data:image/png;base64,…` URL is valid bytes a browser `<img>` decodes.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // a byte that exercises the high bits (`+`/`/` alphabet)
+        assert_eq!(base64_encode(&[0xff, 0xff, 0xff]), "////");
+        assert_eq!(base64_encode(&[0xfb]), "+w==");
     }
 }
 

@@ -11,6 +11,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createSession, isTauri, type EditorClient } from "../transport/session";
 import { projectionStore, useEntityOrder } from "../store/projection";
+import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
 import { Button } from "../theme/primitives";
@@ -134,6 +135,21 @@ export function App() {
       setStatus(`connected · ${order.length} entities`);
     }
   }, [order.length]);
+
+  // Wire the live-thumbnail store (M14.2 / ADR-058): give it the renderer seam, pick the min-spec budget on
+  // a low-core machine (the Rust command also caps resolution by MTK_PROFILE), and start the off-frame drain
+  // pump (the dirty backlog refreshes without waiting on a scroll). Cleaned up on unmount.
+  useEffect(() => {
+    const t = thumbnailStore.getState();
+    t.setClient(client);
+    const cores = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency ?? 8) : 8;
+    t.setMinSpec(cores <= 4);
+    const stop = startThumbnailPump();
+    return () => {
+      stop();
+      thumbnailStore.getState().setClient(null);
+    };
+  }, [client]);
 
   // Responsive layout — the stage is layout-priority; panels collapse to rails below a breakpoint (C8).
   const [vw, setVw] = useState(() => (typeof window !== "undefined" ? window.innerWidth : 1440));
