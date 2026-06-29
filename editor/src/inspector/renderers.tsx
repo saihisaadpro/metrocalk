@@ -1,59 +1,59 @@
 //! Custom JSON Forms renderers for Metrocalk's typed/semantic fields, registered via **testers**
 //! (the JSON-Forms model that fits typed fields — vs RJSF's template model). Each renderer is matched
 //! by a tester keyed on the field's `format`; everything else falls through to the vanilla renderers.
+//!
+//! **M14.3 (ADR-059):** the numeric control is now the scrub-capable `NumericField` (drag-to-scrub +
+//! keyboard nudge + type-to-set); a scrub-drag coalesces into ONE undoable transaction at pointer-up
+//! (`handleChange` → the Inspector's `emitChanges` → `client.setField`, the ADR-010 optimistic-echo path —
+//! NOT a commit per move). The components group under a **collapsible** section layout.
 
-import { and, isIntegerControl, isNumberControl, isStringControl, or, rankWith, schemaMatches, type ControlProps } from "@jsonforms/core";
-import { withJsonFormsControlProps } from "@jsonforms/react";
-import { useEffect, useState } from "react";
+import {
+  and,
+  isIntegerControl,
+  isNumberControl,
+  isStringControl,
+  or,
+  rankWith,
+  schemaMatches,
+  uiTypeIs,
+  type ControlProps,
+  type LayoutProps,
+  type UISchemaElement,
+} from "@jsonforms/core";
+import { JsonFormsDispatch, withJsonFormsControlProps, withJsonFormsLayoutProps } from "@jsonforms/react";
+import { useState } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
+import { NumericField } from "../theme/primitives";
 
 const hasFormat = (fmt: string) =>
   schemaMatches((s) => (s as { format?: string }).format === fmt);
 
-// ── numeric (typed) — NEVER silently coerce bad input to 0 (data-integrity) ───────────────────
-// The vanilla JSON-Forms number cell turns non-numeric input into 0 and commits it, silently zeroing
-// the field. This renderer keeps local text so partial input ("-", "1.") doesn't emit, rejects
-// non-numeric (no emit → the committed value stands) with a visible invalid state, and blurs on Enter so
-// the next Ctrl-Z is a SCENE undo (not the input's text undo).
+// ── numeric (typed) — scrub-to-edit, NEVER silently coerce bad input to 0 (data-integrity) ──────────────
+// The vanilla JSON-Forms number cell turns non-numeric input into 0 and commits it, silently zeroing the
+// field. The `NumericField` keeps local text (partial input "-"/"1." doesn't emit), reverts invalid input
+// (no emit → the committed value stands), and — the M14.3 level-up — supports drag-to-scrub + keyboard
+// nudge, COALESCING a whole scrub into ONE `handleChange` at pointer-up (one undo step, the ADR-010 tx).
 function NumberControlBase({ data, handleChange, path, label, schema, enabled }: ControlProps) {
   const isInt = (schema as { type?: string })?.type === "integer";
-  const [text, setText] = useState(data == null ? "" : String(data));
-  // Resync when the projection changes the value externally (an authoritative delta, undo, reselect).
-  useEffect(() => {
-    setText(data == null ? "" : String(data));
-  }, [data]);
-  const parsed = text.trim() === "" ? null : Number(text);
-  const valid = parsed !== null && Number.isFinite(parsed) && (!isInt || Number.isInteger(parsed));
+  const num = typeof data === "number" ? data : Number(data);
+  const value = Number.isFinite(num) ? num : 0;
+  // An "unbound/default" cue: the field has no concrete projected value yet (the C6 default state).
+  const unbound = data === undefined || data === null;
   return (
-    <label style={{ display: "flex", gap: 8, alignItems: "center", margin: "4px 0" }}>
-      <span style={{ minWidth: 90 }}>{label}</span>
-      <input
-        type="text"
-        inputMode={isInt ? "numeric" : "decimal"}
+    <label className="mtk-field-row">
+      <span className="mtk-field-label">{label}</span>
+      <NumericField
+        value={value}
+        integer={isInt}
+        step={isInt ? 1 : 0.1}
         disabled={enabled === false}
-        value={text}
-        title={text.trim() !== "" && !valid ? `Enter a ${isInt ? "whole number" : "number"} — this value was not applied` : undefined}
-        onChange={(e) => {
-          const v = e.target.value;
-          setText(v);
-          if (v.trim() === "") return; // empty is not 0 — emit nothing (no silent zeroing)
-          const n = Number(v);
-          if (Number.isFinite(n) && (!isInt || Number.isInteger(n))) handleChange(path, n); // valid only
-          // invalid → DO NOT emit; the prior committed value stands, and the field shows the invalid state
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") (e.target as HTMLInputElement).blur(); // commit + release focus → Ctrl-Z = scene undo
-        }}
-        style={{
-          flex: 1,
-          background: "#0a0c12",
-          color: valid || text.trim() === "" ? "#cde" : "#f9a8a8",
-          border: `1px solid ${valid || text.trim() === "" ? "#2a3550" : "#a33"}`,
-          borderRadius: 4,
-          font: "12px ui-monospace, monospace",
-          padding: "2px 6px",
-        }}
+        invalid={unbound}
+        title={unbound ? `${label}: no value set yet` : undefined}
+        ariaLabel={label}
+        data-testid={`num-${path}`}
+        onCommit={(v) => handleChange(path, v)}
+        style={{ flex: 1, width: "auto" }}
       />
     </label>
   );
@@ -63,16 +63,52 @@ export const NumberControl = withJsonFormsControlProps(NumberControlBase);
 // string controls, so they never collide with these numeric testers).
 export const numberTester = rankWith(6, or(isNumberControl, isIntegerControl));
 
+// ── collapsible component group (the inspector's section layout) ─────────────────────────────────────────
+// Replaces the vanilla GroupLayout: a section header per component (object identity · Transform · rendering ·
+// health bar · other) that collapses, so a dense inspector stays scannable. Renders its children through the
+// standard `JsonFormsDispatch` so every control (numeric/color/entity-ref) still resolves by tester.
+function GroupLayoutBase({ uischema, schema, path, renderers, cells, enabled, visible }: LayoutProps) {
+  const group = uischema as unknown as { label?: string; elements: UISchemaElement[] };
+  const [open, setOpen] = useState(true);
+  if (visible === false) return null;
+  return (
+    <div className="mtk-group" data-testid="inspectorGroup" data-group={group.label}>
+      <button type="button" className="mtk-group-head" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+        <span className={"mtk-group-caret" + (open ? " is-open" : "")}>▸</span>
+        {group.label ?? "Component"}
+      </button>
+      {open && (
+        <div className="mtk-group-body">
+          {group.elements.map((el, i) => (
+            <JsonFormsDispatch
+              key={i}
+              uischema={el}
+              schema={schema}
+              path={path}
+              renderers={renderers}
+              cells={cells}
+              enabled={enabled}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+export const CollapsibleGroup = withJsonFormsLayoutProps(GroupLayoutBase);
+export const groupTester = rankWith(5, uiTypeIs("Group"));
+
 // ── color (typed field, not a bare text box) ──────────────────────────────────
 function ColorControlBase({ data, handleChange, path, label, enabled }: ControlProps) {
   return (
-    <label style={{ display: "flex", gap: 8, alignItems: "center", margin: "4px 0" }}>
-      <span style={{ minWidth: 90 }}>{label}</span>
+    <label className="mtk-field-row">
+      <span className="mtk-field-label">{label}</span>
       <input
         type="color"
         disabled={enabled === false}
         value={typeof data === "string" ? data : "#ffffff"}
         onChange={(e) => handleChange(path, e.target.value)}
+        style={{ width: 36, height: 22, background: "transparent", border: "1px solid var(--mtk-border)", borderRadius: 4, cursor: "pointer" }}
       />
     </label>
   );
@@ -89,9 +125,14 @@ function EntityRefControlBase({ data, handleChange, path, label }: ControlProps)
     .sort((a, b) => a.name.localeCompare(b.name))
     .slice(0, 200); // never dump 5k into a <select>; the graph is the at-scale picker
   return (
-    <label style={{ display: "flex", gap: 8, alignItems: "center", margin: "4px 0" }}>
-      <span style={{ minWidth: 90 }}>{label}</span>
-      <select value={typeof data === "string" ? data : ""} onChange={(e) => handleChange(path, e.target.value)}>
+    <label className="mtk-field-row">
+      <span className="mtk-field-label">{label}</span>
+      <select
+        className="mtk-input"
+        value={typeof data === "string" ? data : ""}
+        onChange={(e) => handleChange(path, e.target.value)}
+        style={{ flex: 1 }}
+      >
         <option value="">— none —</option>
         {options.map((o) => (
           <option key={o.id} value={o.id}>

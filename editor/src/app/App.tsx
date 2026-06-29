@@ -34,6 +34,7 @@ import { PlayControls } from "../panels/PlayControls";
 import { ToastHost } from "../panels/ToastHost";
 import { EmptyState } from "../panels/EmptyState";
 import { AiEditPanel } from "../panels/AiEditPanel";
+import { Diagnostics } from "../panels/Diagnostics";
 import { Inspector } from "../inspector/Inspector";
 import { BindingGraph } from "../graph/BindingGraph";
 import { PhysicsPanel } from "../panels/PhysicsPanel";
@@ -251,6 +252,9 @@ export function App() {
     <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", height: "100%" }}>
       <Inspector client={client} />
       <AiEditPanel client={client} />
+      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
+        <Diagnostics client={client} />
+      </div>
       <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
         <Reveal client={client} />
       </div>

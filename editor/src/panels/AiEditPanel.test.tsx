@@ -77,6 +77,19 @@ test("M11.2 material palette: a chip assigns the chosen PBR preset through the m
   expect(toastStore.getState().toasts.some((t) => /chrome/i.test(t.text))).toBe(true);
 });
 
+test("the confirm shows an explicit before → after (the entity's CURRENT material → weathered metal)", () => {
+  // M14.3: the AI card reads the real current material from the projection for an honest before/after.
+  projectionStore.getState().bulkLoad([
+    { id: "e1", name: "Sword", parentId: null, components: { MeshRenderer: { mesh: "sword", material: "gold" } } },
+  ]);
+  projectionStore.getState().select("e1");
+  render(<AiEditPanel client={fakeClient()} />);
+  fireEvent.click(screen.getByTestId("rustier"));
+  const confirm = screen.getByTestId("rustierConfirm");
+  expect(confirm.textContent).toMatch(/gold/); // the BEFORE = the real current material
+  expect(confirm.textContent).toMatch(/weathered metal/i); // the AFTER
+});
+
 test("Cancel aborts the confirm — no spend", () => {
   selectAnEntity();
   const aiEdit = vi.fn();

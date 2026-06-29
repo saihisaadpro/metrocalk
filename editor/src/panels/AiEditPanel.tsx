@@ -1,16 +1,20 @@
-//! AiEditPanel (M10.10 / C3·C4) — the AI-edit suggestion, RELOCATED off the top-bar wallet (where it
-//! floated over + clipped the balance) to an inline panel near the SELECTED ENTITY (the right pane), in
-//! PLAIN language ("Add weathered-metal look", not the "rustier" in-joke). The spend is LEGIBLE +
-//! DELIBERATE: the price shows up-front, a click opens a one-line before/after CONFIRM, and only Apply
-//! charges (debit-on-success); the result is VISIBLE (the material change lands in the inspector + a
-//! toast). A refusal-when-broke is EXPLAINED and leaves the balance untouched (M7 / ADR-016). Keeps the
-//! `#rustier` id (prompt-40) on the trigger; `#rustierApply` on the confirm.
+//! AiEditPanel (M10.10 C3·C4 → M14.3 / ADR-059) — the AI-edit suggestion as a first-class **validated-patch**
+//! surface. Off the top-bar wallet, inline near the SELECTED ENTITY (the right pane), in PLAIN language
+//! ("Add weathered-metal look", not the "rustier" in-joke). The spend is LEGIBLE + DELIBERATE: the **real
+//! token cost** shows up-front, a click opens a confirm with an explicit **before → after** (the entity's
+//! current material → the chosen one), and only Apply charges (debit-on-success, the M7 ledger); the result
+//! is VISIBLE (the material change lands in the inspector + a toast). A refusal-when-broke is EXPLAINED and
+//! leaves the balance untouched (M7 / ADR-016/017 — the patch is a **validated, undoable transaction**).
+//! Keeps the `#rustier`/`#rustierApply` ids (prompt-40). Restyled with the M14.1 primitives (one accent —
+//! never the purple-SaaS the owner rejected).
 
 import { useState } from "react";
-import { useSelectedId, projectionStore } from "../store/projection";
+import { useSelectedId, useFieldValue, projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { setBalance } from "../store/wallet";
 import { pushToast } from "../store/toasts";
+import { Button, Badge } from "../theme/primitives";
+import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 
 const AI_EDIT_COST = 2;
@@ -28,11 +32,14 @@ const MATERIALS: { preset: string; label: string }[] = [
 
 export function AiEditPanel({ client }: { client: EditorClient }) {
   const selectedId = useSelectedId();
+  const currentMaterial = useFieldValue(selectedId ?? "", "MeshRenderer", "material");
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
 
   // Nothing selected → nothing to edit (the AI-edit only makes sense on an entity).
   if (!selectedId) return null;
+
+  const before = typeof currentMaterial === "string" && currentMaterial ? currentMaterial : "default";
 
   async function apply(material = "rusty", label = "Weathered-metal look") {
     if (!selectedId || busy) return;
@@ -65,65 +72,76 @@ export function AiEditPanel({ client }: { client: EditorClient }) {
   }
 
   return (
-    <div id="aiEdit" data-testid="aiEdit" style={{ padding: 12, fontSize: 13, borderTop: "1px solid #2a2d35" }}>
-      <div style={{ opacity: 0.6, fontSize: 11, marginBottom: 6 }}>AI suggestion</div>
+    <div
+      id="aiEdit"
+      data-testid="aiEdit"
+      style={{ padding: space.lg, fontSize: fontSize.body, borderTop: `1px solid ${color.border.subtle}` }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: space.sm, marginBottom: space.sm }}>
+        <span style={{ ...textMeta }}>AI suggestion</span>
+        <Badge tone="accent">✦ validated patch</Badge>
+      </div>
       {!confirming ? (
         <>
-          <button
+          <Button
             id="rustier"
             data-testid="rustier"
+            variant="secondary"
             onClick={() => setConfirming(true)}
-            title="Use AI to restyle the selected object — costs about 2 tokens"
-            style={{ display: "block", width: "100%", textAlign: "left", padding: "6px 8px", background: "#2b2233", color: "#e8dcff", border: "1px solid #4a3a5f", borderRadius: 4, cursor: "pointer" }}
+            title="Use AI to restyle the selected object — an undoable, validated patch (about 2 tokens)"
+            style={{ width: "100%", justifyContent: "flex-start", color: color.accent.base, borderColor: color.accent.border, background: color.accent.subtle }}
           >
             ✦ Add weathered-metal look · ~{AI_EDIT_COST} tokens
-          </button>
-          <div style={{ opacity: 0.6, fontSize: 11, marginTop: 4 }}>Changes this object’s material to a weathered metal finish.</div>
+          </Button>
+          <div style={{ ...textMeta, marginTop: space.xs }}>Changes this object’s material to a weathered metal finish — applied as an undoable patch.</div>
         </>
       ) : (
-        <div data-testid="rustierConfirm" style={{ padding: "8px 10px", background: "#221b33", border: "1px solid #5a4a8f", borderRadius: 6 }}>
-          <div style={{ marginBottom: 8, color: "#e8dcff" }}>
-            Apply the weathered-metal look for ~{AI_EDIT_COST} tokens? Material → weathered metal.
+        <div
+          data-testid="rustierConfirm"
+          style={{ padding: space.md, background: color.accent.subtle, border: `1px solid ${color.accent.border}`, borderRadius: radius.lg }}
+        >
+          <div style={{ color: color.text.primary, marginBottom: space.sm }}>
+            Apply the weathered-metal look for ~{AI_EDIT_COST} tokens?
           </div>
-          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-            <button
-              data-testid="rustierCancel"
-              onClick={() => setConfirming(false)}
-              style={{ padding: "4px 12px", background: "#1b1e26", color: "#e8e8e8", border: "1px solid #2a2d35", borderRadius: 4, cursor: "pointer" }}
-            >
+          {/* The explicit before → after (C3/C7 — show what changes). */}
+          <div style={{ display: "flex", alignItems: "center", gap: space.sm, marginBottom: space.md, ...textMeta }}>
+            <span>Material</span>
+            <Badge tone="neutral">{before}</Badge>
+            <span aria-hidden>→</span>
+            <Badge tone="accent">weathered metal</Badge>
+          </div>
+          <div style={{ display: "flex", gap: space.sm, justifyContent: "flex-end" }}>
+            <Button data-testid="rustierCancel" variant="secondary" compact onClick={() => setConfirming(false)}>
               Cancel
-            </button>
-            <button
-              id="rustierApply"
-              data-testid="rustierApply"
-              disabled={busy}
-              onClick={() => void apply()}
-              style={{ padding: "4px 12px", background: "#3a2f5a", color: "#e8dcff", border: "1px solid #5a4a8f", borderRadius: 4, cursor: busy ? "default" : "pointer" }}
-            >
+            </Button>
+            <Button id="rustierApply" data-testid="rustierApply" variant="primary" compact disabled={busy} onClick={() => void apply()}>
               {busy ? "Applying…" : `Apply · ~${AI_EDIT_COST} tokens`}
-            </button>
+            </Button>
           </div>
         </div>
       )}
       {/* M11.2 material palette — a deliberate, labelled pick (the cost is stated); each applies the same
-          metered AI-edit with the chosen PBR preset. */}
-      <div id="materialPalette" data-testid="materialPalette" style={{ marginTop: 10 }}>
-        <div style={{ opacity: 0.6, fontSize: 11, marginBottom: 4 }}>Materials · ~{AI_EDIT_COST} tokens each</div>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          metered, validated AI-edit with the chosen PBR preset, with a before/after toast. */}
+      <div id="materialPalette" data-testid="materialPalette" style={{ marginTop: space.md }}>
+        <div style={{ ...textMeta, marginBottom: space.xs }}>Materials · ~{AI_EDIT_COST} tokens each</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: space.xs }}>
           {MATERIALS.map((m) => (
-            <button
+            <Button
               key={m.preset}
               data-testid={`material-${m.preset}`}
+              variant="secondary"
+              compact
               disabled={busy}
               onClick={() => void apply(m.preset, `${m.label} material`)}
-              title={`Give this object a ${m.label.toLowerCase()} PBR finish — about ${AI_EDIT_COST} tokens`}
-              style={{ padding: "3px 9px", background: "#1b2233", color: "#cfe", border: "1px solid #2a3550", borderRadius: 4, cursor: busy ? "default" : "pointer", fontSize: 12 }}
+              title={`Give this object a ${m.label.toLowerCase()} PBR finish (${before} → ${m.label.toLowerCase()}) — an undoable patch, about ${AI_EDIT_COST} tokens`}
             >
               {m.label}
-            </button>
+            </Button>
           ))}
         </div>
       </div>
     </div>
   );
 }
+
+const textMeta: React.CSSProperties = { font: font.ui, fontSize: fontSize.meta, color: color.text.muted };

@@ -135,6 +135,27 @@ html {
 .mtk-input::placeholder { color: var(--mtk-text-muted); }
 .mtk-input:focus { outline: none; border-color: var(--mtk-accent-border); box-shadow: 0 0 0 2px #5b9bd533; }
 .mtk-input--mono { font-family: var(--mtk-font-mono); }
+/* Invalid/unbound input: a danger ring (never colour-alone — the control also carries a title explaining it). */
+.mtk-input.is-invalid { border-color: var(--mtk-danger-border); color: var(--mtk-danger); }
+.mtk-input.is-invalid:focus { box-shadow: 0 0 0 2px #7a443633; }
+/* Scrub field: an ew-resize cursor signals drag-to-scrub; while scrubbing the caret is hidden. */
+.mtk-numfield { cursor: ew-resize; }
+.mtk-numfield[data-scrubbing="1"] { caret-color: transparent; user-select: none; }
+
+/* ── Inspector property rows + collapsible groups (M14.3 / ADR-059) ── */
+.mtk-field-row { display: flex; align-items: center; gap: 8px; min-height: 24px; padding: 1px 0; }
+.mtk-field-label { flex: none; width: 84px; color: var(--mtk-text-muted); font-size: 12px; font-family: var(--mtk-font-ui); }
+.mtk-group { border: 1px solid var(--mtk-border-subtle); border-radius: 5px; margin-bottom: 6px; overflow: hidden; background: var(--mtk-bg-panel); }
+.mtk-group-head {
+  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+  padding: 5px 8px; background: var(--mtk-bg-raised); color: var(--mtk-text-secondary);
+  border: none; cursor: pointer; font-size: 11px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase;
+  font-family: var(--mtk-font-ui); transition: background 120ms ease, color 120ms ease;
+}
+.mtk-group-head:hover { background: var(--mtk-bg-hover); color: var(--mtk-text); }
+.mtk-group-caret { display: inline-block; transition: transform 120ms ease; color: var(--mtk-text-muted); }
+.mtk-group-caret.is-open { transform: rotate(90deg); }
+.mtk-group-body { padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; }
 
 /* ── Cards (asset/component cards — M14.2/ADR-058): one card surface with real hover/selected/unavailable
  *    states inline styles can't express. The metadata (type · source · capability) is laid out in JS. ── */

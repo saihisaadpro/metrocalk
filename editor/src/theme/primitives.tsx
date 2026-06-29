@@ -4,6 +4,7 @@
 //! `mtk-*` classes in `theme/global.css`; these components just pick the right class + forward the stable
 //! `id`/`data-testid` the prompt-40 e2e + Vitest key on. Non-colour layout values come from `theme/tokens`.
 
+import { useEffect, useRef, useState } from "react";
 import type { ButtonHTMLAttributes, CSSProperties, ReactNode, InputHTMLAttributes } from "react";
 import { color, radius, space, font, fontSize, text } from "./tokens";
 
@@ -101,10 +102,163 @@ export function ScrollArea({ children, style, ...rest }: { children: ReactNode; 
   );
 }
 
-/** A styled numeric field (integrated dark, mono — consumed by the M14.3 inspector; created here so the
- *  primitive layer is complete). */
-export function NumericField({ style, ...rest }: Omit<InputHTMLAttributes<HTMLInputElement>, "type" | "className">) {
-  return <input type="number" className="mtk-input mtk-input--mono" style={{ width: 72, ...style }} {...rest} />;
+export interface NumericFieldProps {
+  /** The authoritative (committed) value — the field resyncs to it when not being edited/scrubbed. */
+  value: number;
+  /** Commit a value as a transaction: at pointer-up of a scrub (ONE undo step, not N), on Enter/blur of a
+   *  typed value, and on each keyboard nudge. The inspector wires this to `client.setField` (ADR-010). */
+  onCommit: (v: number) => void;
+  /** Live during a scrub-drag — local visual feedback only (NO IPC, NOT a transaction). */
+  onScrub?: (v: number) => void;
+  /** Nudge/scrub base step (1 for integers, 0.1 for floats by default). */
+  step?: number;
+  integer?: boolean;
+  min?: number;
+  max?: number;
+  disabled?: boolean;
+  /** Externally-marked invalid/unbound/default state (a red ring — never colour-alone, paired with a title). */
+  invalid?: boolean;
+  /** Value units per drag pixel (defaults to `step`); Shift = ×10 (coarse), Alt = ×0.1 (fine). */
+  scrubSpeed?: number;
+  ariaLabel?: string;
+  title?: string;
+  style?: CSSProperties;
+  "data-testid"?: string;
+}
+
+/** The M14.1 styled numeric field, upgraded to a real number control (M14.3 / ADR-059): **drag-to-scrub**
+ *  (pointer-drag, modifier-scaled), **keyboard nudge** (Arrow ↑/↓, Shift ×10), and **type-to-set**. Each
+ *  *commit* is a transaction (`onCommit`) — a whole scrub-drag coalesces into ONE undo step (committed at
+ *  pointer-up, not per-move); a typed value commits on Enter/blur; invalid input reverts (no silent zeroing).
+ *  Local feedback during the drag streams no IPC. `data-scrubbing` is the structured test signal. */
+export function NumericField({
+  value,
+  onCommit,
+  onScrub,
+  step,
+  integer = false,
+  min,
+  max,
+  disabled = false,
+  invalid = false,
+  scrubSpeed,
+  ariaLabel,
+  title,
+  style,
+  ...rest
+}: NumericFieldProps) {
+  const testid = (rest as { "data-testid"?: string })["data-testid"];
+  const effStep = step ?? (integer ? 1 : 0.1); // integers nudge/scrub by 1, floats by 0.1, unless overridden
+  const fmt = (n: number): string => (integer ? String(Math.round(n)) : String(n));
+  const clampSnap = (n: number): number => {
+    let v = integer ? Math.round(n) : n;
+    if (min != null) v = Math.max(min, v);
+    if (max != null) v = Math.min(max, v);
+    return v;
+  };
+  const [textVal, setTextVal] = useState(() => fmt(value));
+  const [scrubbing, setScrubbing] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const editing = useRef(false); // focused OR scrubbing — don't resync the field out from under the user
+  const skipBlurCommit = useRef(false); // a scrub already committed → the trailing blur must NOT re-commit
+  const cleanup = useRef<(() => void) | null>(null);
+  // Resync to the authoritative value when not actively editing/scrubbing (an external delta / undo / reselect).
+  useEffect(() => {
+    if (!editing.current) setTextVal(fmt(value));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, scrubbing]);
+  // Remove any in-flight drag listeners if we unmount mid-scrub (the inspector swaps on reselect).
+  useEffect(() => () => cleanup.current?.(), []);
+
+  const parsed = textVal.trim() === "" ? null : Number(textVal);
+  const validText = parsed !== null && Number.isFinite(parsed) && (!integer || Number.isInteger(parsed));
+
+  // Drag-to-scrub via window listeners (the standard drag pattern — the cursor can leave the field; mouse
+  // events carry coordinates reliably across environments). A whole drag commits ONCE at mouse-up.
+  function onMouseDown(e: React.MouseEvent) {
+    if (disabled || e.button !== 0) return;
+    const startX = e.clientX;
+    const startVal = value;
+    let moved = false;
+    let lastVal = startVal;
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - startX;
+      if (!moved && Math.abs(dx) < 3) return; // a click, not a scrub (movement threshold)
+      if (!moved) {
+        moved = true;
+        editing.current = true;
+        setScrubbing(true);
+      }
+      ev.preventDefault(); // suppress text selection while scrubbing
+      const speed = (scrubSpeed ?? effStep) * (ev.shiftKey ? 10 : ev.altKey ? 0.1 : 1);
+      lastVal = clampSnap(startVal + dx * speed);
+      setTextVal(fmt(lastVal));
+      onScrub?.(lastVal);
+    };
+    const onUp = () => {
+      cleanup.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      if (moved) {
+        editing.current = false;
+        setScrubbing(false);
+        skipBlurCommit.current = true; // the trailing blur (the field kept focus) must not re-commit
+        inputRef.current?.blur();
+        onCommit(lastVal); // ONE coalesced transaction for the whole drag (one undo step)
+      }
+    };
+    cleanup.current = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function commitTyped() {
+    if (skipBlurCommit.current) {
+      skipBlurCommit.current = false;
+      return; // a scrub already committed this — don't double-commit on the trailing blur
+    }
+    if (validText && parsed !== null) onCommit(clampSnap(parsed));
+    else setTextVal(fmt(value)); // invalid → revert to the committed value (no silent zeroing)
+  }
+
+  return (
+    <input
+      ref={inputRef}
+      type="text"
+      inputMode={integer ? "numeric" : "decimal"}
+      role="spinbutton"
+      aria-label={ariaLabel}
+      aria-valuenow={value}
+      disabled={disabled}
+      title={title ?? (textVal.trim() !== "" && !validText ? `Enter a ${integer ? "whole number" : "number"} — not applied` : undefined)}
+      className={"mtk-input mtk-input--mono mtk-numfield" + (invalid || (!validText && textVal.trim() !== "") ? " is-invalid" : "")}
+      data-testid={testid}
+      data-scrubbing={scrubbing ? "1" : "0"}
+      value={textVal}
+      onMouseDown={onMouseDown}
+      onFocus={() => {
+        editing.current = true;
+      }}
+      onBlur={() => {
+        editing.current = false;
+        commitTyped();
+      }}
+      onChange={(e) => setTextVal(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+          e.preventDefault();
+          const mult = e.shiftKey ? 10 : 1;
+          onCommit(clampSnap(value + (e.key === "ArrowUp" ? effStep : -effStep) * mult));
+        } else if (e.key === "Enter") {
+          (e.target as HTMLInputElement).blur(); // commit + release → next Ctrl-Z is a SCENE undo
+        }
+      }}
+      style={{ width: 80, cursor: disabled ? "not-allowed" : "ew-resize", ...style }}
+    />
+  );
 }
 
 /** A styled text field (integrated dark) — the shared input the command bar + forms use. */
