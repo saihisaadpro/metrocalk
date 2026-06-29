@@ -9,13 +9,23 @@
 //! Keeps the scaffold's stable `#describe`/`#describeBtn` ids AND restores the `#genBtn` the prompt-40
 //! acceptance gate drives (the React port had dropped it — the literal C1 bug).
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { setBalance } from "../store/wallet";
 import { pushToast } from "../store/toasts";
 import { GENERATE_COST } from "../transport/protocol";
+import { Button } from "../theme/primitives";
+import { color, elevation, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
+
+/** The accepted-tier "registry-aware" preview (M14.1) — what the typed query WILL create, read live from the
+ *  real catalog (registry + marketplace + imported) + the ledger cost, BEFORE the user commits. Substrate
+ *  truth, not decoration: a match shows the real item + its real price; a no-match shows the generate cost. */
+type Preview =
+  | null
+  | { kind: "match"; label: string; source: string; price: number | null }
+  | { kind: "generate" };
 
 /** The inline outcome panel under the field: the no-match generate offer, the in-progress generate state,
  *  or an explained refusal (a marketplace/generation buy refused when broke — every "no" explained). */
@@ -28,12 +38,42 @@ type Panel =
 export function DescribeBar({ client }: { client: EditorClient }) {
   const [query, setQuery] = useState("");
   const [panel, setPanel] = useState<Panel>(null);
+  const [preview, setPreview] = useState<Preview>(null);
   const empty = query.trim().length === 0;
+
+  // Registry-aware preview (accepted-tier): debounced, non-mutating `catalog_search` over the typed query →
+  // show WHAT will be created + its real cost BEFORE commit. Local state only (never `setStatus` — the
+  // status line stays the action's, and the "empty query → no status churn" contract holds); a slow,
+  // off-hot-path read (discrete, debounced — invariant 4); best-effort (a failed read shows nothing).
+  useEffect(() => {
+    const q = query.trim();
+    if (!q || panel?.kind === "generating") {
+      setPreview(null);
+      return;
+    }
+    let live = true;
+    const t = setTimeout(() => {
+      void client
+        .catalogSearch(q)
+        .then((r) => {
+          if (!live) return;
+          const top = r.items[0];
+          if (top) setPreview({ kind: "match", label: top.label, source: top.source, price: top.price ?? null });
+          else setPreview({ kind: "generate" });
+        })
+        .catch(() => live && setPreview(null));
+    }, 250);
+    return () => {
+      live = false;
+      clearTimeout(t);
+    };
+  }, [query, client, panel?.kind]);
 
   async function submit() {
     const q = query.trim();
     if (!q) return; // empty guard (Create is also disabled) — never a silent inert CTA (C5)
     setPanel(null);
+    setPreview(null);
     try {
       const r = await client.describe(q);
       if (r.balance != null) setBalance(r.balance);
@@ -122,22 +162,14 @@ export function DescribeBar({ client }: { client: EditorClient }) {
     setStatus(`browsing the asset library for "${q}"`);
   }
 
-  const btn = (bg: string, fg: string, border: string): React.CSSProperties => ({
-    background: bg,
-    color: fg,
-    border: `1px solid ${border}`,
-    borderRadius: 4,
-    padding: "4px 10px",
-    cursor: "pointer",
-    font: "12px ui-monospace, monospace",
-  });
-
   return (
-    <div data-testid="describebar" style={{ padding: "6px 12px" }}>
-      <div style={{ display: "flex", gap: 6 }}>
+    <div data-testid="describebar" style={{ padding: `${space.sm}px ${space.lg}px` }}>
+      <div style={{ display: "flex", gap: space.sm, alignItems: "center" }}>
+        <span aria-hidden style={{ color: color.accent.base, fontSize: fontSize.title, lineHeight: 1 }}>✦</span>
         <input
           id="describe"
           data-testid="describe"
+          className="mtk-input"
           value={query}
           placeholder="Describe something to create — e.g. “a glowing health bar”"
           onChange={(e) => {
@@ -148,64 +180,77 @@ export function DescribeBar({ client }: { client: EditorClient }) {
           onKeyDown={(e) => {
             if (e.key === "Enter") void submit();
           }}
-          style={{ flex: 1, background: "#11131a", color: "#cfe", border: "1px solid #333", borderRadius: 3, padding: "2px 6px" }}
+          style={{ flex: 1 }}
         />
-        <button
+        <Button
           id="describeBtn"
           data-testid="describeBtn"
+          variant="primary"
           disabled={empty}
           title={empty ? "Describe something first" : undefined}
           onClick={() => void submit()}
-          style={{
-            background: empty ? "#23262e" : "#2a4365",
-            color: empty ? "#667" : "#fff",
-            border: "none",
-            borderRadius: 4,
-            padding: "3px 10px",
-            cursor: empty ? "not-allowed" : "pointer",
-          }}
         >
           Create
-        </button>
+        </Button>
       </div>
+
+      {/* Accepted-tier registry-aware preview: WHAT will be created + its real cost, before commit. Suppressed
+          while an offer/generating/refusal panel is showing (that panel is the more specific surface). */}
+      {!empty && !panel && preview && (
+        <div
+          data-testid="describePreview"
+          style={{ marginTop: space.xs, fontSize: fontSize.meta, color: color.text.muted, display: "flex", alignItems: "center", gap: space.sm }}
+        >
+          {preview.kind === "match" ? (
+            <>
+              <span style={{ color: color.success.text }}>✓ will place</span>
+              <span style={{ color: color.text.secondary }}>{preview.label}</span>
+              <span style={{ color: color.text.faint }}>· {preview.source}</span>
+              <span data-testid="previewCost" style={{ color: preview.price ? color.token : color.success.text }}>
+                · {preview.price ? `−${preview.price} tokens` : "free"}
+              </span>
+            </>
+          ) : (
+            <>
+              <span style={{ color: color.accent.base }}>✦ no match — will generate</span>
+              <span data-testid="previewCost" style={{ color: color.token }}>· ~{GENERATE_COST} tokens</span>
+            </>
+          )}
+        </div>
+      )}
 
       {panel?.kind === "offer" && (
         <div
           data-testid="describePanel"
-          style={{ marginTop: 6, padding: "8px 10px", background: "#171b27", border: "1px solid #2a3550", borderRadius: 6, fontSize: 12 }}
+          style={{ marginTop: space.sm, padding: `${space.md}px ${space.lg}px`, background: color.bg.raised, border: `1px solid ${color.border.default}`, borderRadius: radius.lg, fontSize: fontSize.body, boxShadow: elevation.e1 }}
         >
-          <div style={{ marginBottom: 6, color: "#cdd" }}>
+          <div style={{ marginBottom: space.sm, color: color.text.secondary }}>
             No match for “{panel.query}”. Generate it with AI, browse the asset library, or build it yourself.
           </div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button
+          <div style={{ display: "flex", gap: space.md, flexWrap: "wrap" }}>
+            <Button
               id="genBtn"
               data-testid="genBtn"
+              variant="primary"
               title={`Generate a new asset with AI — costs about ${GENERATE_COST} tokens`}
               onClick={() => void runGenerate(panel.query)}
-              style={btn("#3a2f5a", "#e8dcff", "#5a4a8f")}
             >
               ✦ Generate with AI · ~{GENERATE_COST} tokens
-            </button>
-            <button
-              id="browseMarket"
-              data-testid="browseMarket"
-              onClick={() => browseMarketplace(panel.query)}
-              style={btn("#1c2030", "#cde", "#2a3550")}
-            >
+            </Button>
+            <Button id="browseMarket" data-testid="browseMarket" variant="secondary" onClick={() => browseMarketplace(panel.query)}>
               Browse asset library
-            </button>
-            <button
+            </Button>
+            <Button
               id="buildManual"
               data-testid="buildManual"
+              variant="secondary"
               onClick={() => {
                 setPanel(null);
                 setStatus("build it manually — add an asset or components in the inspector");
               }}
-              style={btn("#1c2030", "#cde", "#2a3550")}
             >
               Build manually
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -213,8 +258,9 @@ export function DescribeBar({ client }: { client: EditorClient }) {
       {panel?.kind === "generating" && (
         <div
           data-testid="describePanel"
-          style={{ marginTop: 6, padding: "8px 10px", background: "#221b33", border: "1px solid #5a4a8f", borderRadius: 6, fontSize: 12, color: "#e8dcff" }}
+          style={{ marginTop: space.sm, padding: `${space.md}px ${space.lg}px`, background: color.accent.subtle, border: `1px solid ${color.accent.border}`, borderRadius: radius.lg, fontSize: fontSize.body, color: color.text.primary, display: "flex", alignItems: "center", gap: space.md }}
         >
+          <span className="mtk-spinner" aria-hidden />
           <span data-testid="genProgress">Generating “{panel.query}” … a placeholder drops in, the mesh streams in.</span>
         </div>
       )}
@@ -222,12 +268,12 @@ export function DescribeBar({ client }: { client: EditorClient }) {
       {panel?.kind === "refusal" && (
         <div
           data-testid="describePanel"
-          style={{ marginTop: 6, padding: "8px 10px", background: "#2a1b1b", border: "1px solid #6a3f2f", borderRadius: 6, fontSize: 12, color: "#fcd", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}
+          style={{ marginTop: space.sm, padding: `${space.md}px ${space.lg}px`, background: color.danger.bg, border: `1px solid ${color.danger.border}`, borderRadius: radius.lg, fontSize: fontSize.body, color: color.danger.text, display: "flex", alignItems: "center", justifyContent: "space-between", gap: space.md }}
         >
           <span>{panel.message}</span>
-          <button data-testid="describePanelDismiss" onClick={() => setPanel(null)} style={btn("#1c2030", "#cde", "#2a3550")}>
+          <Button data-testid="describePanelDismiss" variant="secondary" compact onClick={() => setPanel(null)}>
             Dismiss
-          </button>
+          </Button>
         </div>
       )}
     </div>

@@ -1,0 +1,148 @@
+/* Metrocalk editor — global design-system stylesheet (M14.1 / ADR-057, extends ADR-035).
+ *
+ * The SINGLE SOURCE OF TRUTH for the editor's COLOUR palette (the `--mtk-*` custom properties) plus the
+ * things inline styles can't reach: pseudo-state button variants, styled scrollbars, the `:focus-visible`
+ * ring, and keyframes. `theme/tokens.ts` references these vars (so components carry no magic hex) and adds
+ * the non-colour scales (space/radii/type/elevation/motion/z).
+ *
+ * COMPOSITE SAFETY (ADR-008): this file must NEVER paint an opaque background on `html`/`body`/`#root` — in
+ * the packaged `.exe` the wgpu viewport composites up through the transparent chain, and an opaque ancestor
+ * would occlude it (the bug that once left the viewport black). Panels paint their own opaque bg in JS.
+ * Imported once from `main.tsx`; components never import CSS (so jsdom/Vitest never load it). */
+
+:root {
+  /* ── backgrounds: deep near-black bases (not pure black), layered charcoal/navy/slate ── */
+  --mtk-bg-base: #0b0d12;     /* app backdrop (opaque only in dev — transparent in the .exe) */
+  --mtk-bg-panel: #0f1219;    /* side panels */
+  --mtk-bg-raised: #161a23;   /* toolbars, menus, dialogs, popovers */
+  --mtk-bg-inset: #0a0c11;    /* scroll wells, the viewport dev backdrop */
+  --mtk-bg-input: #121622;    /* form fields — integrated dark, never harsh native white */
+  --mtk-bg-hover: #1a1f2b;    /* hover fill on quiet surfaces */
+  --mtk-bg-active: #212a3a;   /* pressed fill */
+
+  /* ── borders: low-opacity cool-gray/blue ── */
+  --mtk-border-subtle: #1e222c;
+  --mtk-border: #282d39;
+  --mtk-border-strong: #39414f;
+
+  /* ── text roles ── */
+  --mtk-text: #e7e9ee;        /* primary */
+  --mtk-text-secondary: #aab1bd;
+  --mtk-text-muted: #6d7585;  /* metadata / disabled copy */
+  --mtk-text-faint: #4d5462;
+
+  /* ── the ONE restrained accent (steel azure — "precision engineering", not SaaS purple) ── */
+  --mtk-accent: #5b9bd5;          /* accent text / active foreground */
+  --mtk-accent-solid: #294c75;    /* primary button fill */
+  --mtk-accent-solid-hover: #335f92;
+  --mtk-accent-border: #3d6493;
+  --mtk-accent-subtle: #15263b;   /* selected/active row + toggle-on fill */
+  --mtk-ring: #5b9bd5;            /* focus ring */
+
+  /* ── semantic (used sparingly, never colour-alone — pair with an icon/glyph) ── */
+  --mtk-success: #74e39a; --mtk-success-solid: #1f5236; --mtk-success-border: #2f7a4f; --mtk-success-bg: #13301f;
+  --mtk-warn: #f0b941;    --mtk-warn-solid: #4a3a18;    --mtk-warn-border: #6a5326;    --mtk-warn-bg: #2a2110;
+  --mtk-danger: #f2a594;  --mtk-danger-solid: #5a2f23;  --mtk-danger-border: #7a4436;  --mtk-danger-bg: #2c1813;
+  --mtk-info: #8fb6e6;    --mtk-info-border: #2a3a55;   --mtk-info-bg: #14202f;
+  --mtk-token: #f0b941;   /* the economy/token amber (wallet) */
+
+  /* ── fonts ── */
+  --mtk-font-ui: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --mtk-font-mono: "JetBrains Mono", "SF Mono", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+}
+
+/* Base typography + dark form controls — NEVER a background (composite safety). */
+html {
+  color-scheme: dark;
+  font-family: var(--mtk-font-ui);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Visible, consistent keyboard focus everywhere — only for keyboard nav, not mouse clicks. */
+:focus-visible {
+  outline: 2px solid var(--mtk-ring);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+:focus:not(:focus-visible) { outline: none; }
+
+/* ── Styled scrollbars (never raw browser scrollbars) ── */
+.mtk-scroll { scrollbar-width: thin; scrollbar-color: var(--mtk-border-strong) transparent; }
+.mtk-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.mtk-scroll::-webkit-scrollbar-track { background: transparent; }
+.mtk-scroll::-webkit-scrollbar-thumb {
+  background: var(--mtk-border-strong);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.mtk-scroll::-webkit-scrollbar-thumb:hover { background: #4a5364; background-clip: padding-box; }
+.mtk-scroll::-webkit-scrollbar-corner { background: transparent; }
+
+/* ── Button system: one base + variants, with real hover/pressed/disabled states (inline can't do these) ── */
+.mtk-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: var(--mtk-font-ui);
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 500;
+  padding: 5px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--mtk-border);
+  background: var(--mtk-bg-raised);
+  color: var(--mtk-text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+  user-select: none;
+}
+.mtk-btn:hover { background: var(--mtk-bg-hover); color: var(--mtk-text); }
+.mtk-btn:active { background: var(--mtk-bg-active); }
+.mtk-btn:disabled { background: var(--mtk-bg-inset); color: var(--mtk-text-faint); border-color: var(--mtk-border-subtle); cursor: not-allowed; }
+
+.mtk-btn--compact { padding: 3px 7px; font-size: 11px; }
+.mtk-btn--icon { padding: 4px 6px; }
+
+.mtk-btn--primary { background: var(--mtk-accent-solid); color: #eaf2fb; border-color: var(--mtk-accent-border); }
+.mtk-btn--primary:hover { background: var(--mtk-accent-solid-hover); color: #fff; }
+.mtk-btn--primary:disabled { background: var(--mtk-bg-inset); color: var(--mtk-text-faint); border-color: var(--mtk-border-subtle); }
+
+.mtk-btn--ghost { background: transparent; border-color: transparent; color: var(--mtk-text-secondary); }
+.mtk-btn--ghost:hover { background: var(--mtk-bg-hover); color: var(--mtk-text); }
+
+.mtk-btn--danger { background: var(--mtk-danger-solid); color: var(--mtk-danger); border-color: var(--mtk-danger-border); }
+.mtk-btn--danger:hover { background: #6a3a2b; color: #ffdfd4; }
+
+/* Toggle: quiet when off, the accent when on (live state must be unmistakable). */
+.mtk-btn--toggle.is-active { background: var(--mtk-accent-subtle); color: var(--mtk-accent); border-color: var(--mtk-accent-border); }
+.mtk-btn--toggle.is-active:hover { background: #1b3148; color: #7fb4e8; }
+
+/* ── Inputs (integrated dark fields, not browser white) ── */
+.mtk-input {
+  font-family: var(--mtk-font-ui);
+  font-size: 12px;
+  color: var(--mtk-text);
+  background: var(--mtk-bg-input);
+  border: 1px solid var(--mtk-border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.mtk-input::placeholder { color: var(--mtk-text-muted); }
+.mtk-input:focus { outline: none; border-color: var(--mtk-accent-border); box-shadow: 0 0 0 2px #5b9bd533; }
+.mtk-input--mono { font-family: var(--mtk-font-mono); }
+
+/* ── Keyframes ── */
+@keyframes mtk-toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes mtk-spin { to { transform: rotate(360deg); } }
+@keyframes mtk-flash { 0% { color: #fff; } 100% { color: var(--mtk-token); } }
+.mtk-anim-toast { animation: mtk-toast-in 140ms ease; }
+.mtk-spinner {
+  width: 11px; height: 11px; border-radius: 50%;
+  border: 2px solid var(--mtk-accent-border); border-top-color: transparent;
+  display: inline-block; animation: mtk-spin 700ms linear infinite;
+}

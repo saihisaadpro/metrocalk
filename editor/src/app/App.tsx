@@ -13,6 +13,8 @@ import { createSession, isTauri, type EditorClient } from "../transport/session"
 import { projectionStore, useEntityOrder } from "../store/projection";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
+import { Button } from "../theme/primitives";
+import { color, font, fontSize, radius, space, z } from "../theme/tokens";
 import { panelLayout } from "./layout";
 import { Hierarchy } from "../panels/Hierarchy";
 import { AuthoringToolbar } from "../panels/AuthoringToolbar";
@@ -60,31 +62,28 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
       data-testid="playStageBadge"
       style={{
         position: "absolute",
-        top: 12,
+        top: space.lg,
         left: "50%",
         transform: "translateX(-50%)",
-        zIndex: 140,
+        zIndex: z.badge,
         display: "flex",
         alignItems: "center",
-        gap: 8,
-        padding: "4px 12px",
-        borderRadius: 999,
-        background: paused ? "#3a3416ee" : "#143a22ee",
-        border: `1px solid ${paused ? "#fbbf24" : "#2f9e54"}`,
-        color: paused ? "#fbbf24" : "#7fe39a",
-        font: "12px ui-monospace, monospace",
+        gap: space.md,
+        padding: `${space.xs}px ${space.lg}px`,
+        borderRadius: radius.pill,
+        background: paused ? color.warn.bg : color.success.bg,
+        border: `1px solid ${paused ? color.warn.border : color.success.border}`,
+        color: paused ? color.warn.text : color.success.text,
+        font: font.mono,
+        fontSize: fontSize.body,
         boxShadow: "0 4px 16px #0008",
       }}
     >
       <span>{paused ? "⏸ PAUSED" : "● PLAYING"}</span>
-      <span style={{ opacity: 0.7 }}>— Esc or</span>
-      <button
-        data-testid="stageStop"
-        onClick={onStop}
-        style={{ background: "#5a2f1f", color: "#fcd", border: "1px solid #6a3f2f", borderRadius: 4, padding: "1px 8px", cursor: "pointer", font: "11px ui-monospace, monospace" }}
-      >
+      <span style={{ color: color.text.muted }}>— Esc or</span>
+      <Button data-testid="stageStop" variant="danger" compact onClick={onStop}>
         ⏹ Stop
-      </button>
+      </Button>
     </div>
   );
 }
@@ -92,14 +91,15 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
 /** A collapsed side panel = a thin icon rail (C8): the stage keeps the space; one click opens the panel
  *  as an overlay drawer. */
 function Rail({ side, label, onOpen }: { side: "left" | "right"; label: string; onOpen: () => void }) {
-  const border = side === "left" ? { borderRight: "1px solid #2a2d35" } : { borderLeft: "1px solid #2a2d35" };
+  const border = side === "left" ? { borderRight: `1px solid ${color.border.subtle}` } : { borderLeft: `1px solid ${color.border.subtle}` };
   return (
-    <div style={{ ...border, display: "flex", alignItems: "center", justifyContent: "center", height: "100%", background: "#0a0a0f" }}>
+    <div style={{ ...border, display: "flex", alignItems: "center", justifyContent: "center", height: "100%", background: color.bg.panel }}>
       <button
         data-testid={`rail-${side}`}
+        className="mtk-btn mtk-btn--ghost"
         onClick={onOpen}
         title={`Open ${label} (window is narrow — the stage keeps priority)`}
-        style={{ background: "transparent", color: "#9aa0aa", border: "none", cursor: "pointer", writingMode: "vertical-rl", padding: "8px 2px", font: "11px ui-monospace, monospace", letterSpacing: 1 }}
+        style={{ color: color.text.secondary, writingMode: "vertical-rl", padding: `${space.md}px 2px`, fontSize: fontSize.meta, letterSpacing: 1 }}
       >
         ☰ {label}
       </button>
@@ -212,10 +212,10 @@ export function App() {
 
   const leftPanel = (
     <div style={{ overflow: "hidden", display: "flex", flexDirection: "column", height: "100%" }}>
-      <div style={{ borderBottom: "1px solid #2a2d35", maxHeight: 200, overflowY: "auto" }}>
+      <div style={{ borderBottom: "1px solid var(--mtk-border-subtle)", maxHeight: 200, overflowY: "auto" }}>
         <AssetBrowser client={client} />
       </div>
-      <div style={{ borderBottom: "1px solid #2a2d35", maxHeight: 140, overflowY: "auto" }}>
+      <div style={{ borderBottom: "1px solid var(--mtk-border-subtle)", maxHeight: 140, overflowY: "auto" }}>
         <Requirers />
       </div>
       <AuthoringToolbar client={client} />
@@ -235,7 +235,7 @@ export function App() {
     <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", height: "100%" }}>
       <Inspector client={client} />
       <AiEditPanel client={client} />
-      <div style={{ borderTop: "1px solid #2a2d35" }}>
+      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
         <Reveal client={client} />
       </div>
       <TransformPanel client={client} />
@@ -244,7 +244,7 @@ export function App() {
       <ComposePanel client={client} />
       <StateGraphPanel client={client} />
       <RuleDebugPanel client={client} />
-      <div style={{ borderTop: "1px solid #2a2d35", flex: 1, minHeight: 220 }}>
+      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)", flex: 1, minHeight: 220 }}>
         <BindingGraph />
       </div>
     </div>
@@ -255,16 +255,18 @@ export function App() {
     // composites up through the transparent viewport hole (ADR-008) — the panels below paint their OWN
     // opaque background so only the viewport stays a hole. (A `#0a0a0f` root here would occlude the wgpu
     // layer even behind the transparent viewport div — the bug that left the .exe viewport black.)
-    <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: native ? "transparent" : "#0a0a0f", color: "#e8e8e8" }}>
-      <div style={{ height: 40, display: "flex", alignItems: "center", gap: 12, padding: "0 12px", background: "#14161c", borderBottom: "1px solid #2a2d35", font: "13px ui-monospace, monospace", overflow: "hidden", minWidth: 0 }}>
-        <strong>metrocalk</strong>
+    <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: native ? "transparent" : color.bg.base, color: color.text.primary, font: font.ui }}>
+      <div style={{ height: 40, display: "flex", alignItems: "center", gap: space.lg, padding: `0 ${space.lg}px`, background: color.bg.raised, borderBottom: `1px solid ${color.border.subtle}`, font: font.ui, fontSize: fontSize.label, overflow: "hidden", minWidth: 0 }}>
+        <strong style={{ letterSpacing: 0.3, color: color.text.primary }}>
+          metrocalk<span style={{ color: color.accent.base }}>.</span>
+        </strong>
         <FileMenu client={client} />
         <PlayControls client={client} />
         <div style={{ marginLeft: "auto", minWidth: 0 }}>
           <Wallet client={client} />
         </div>
       </div>
-      <div style={{ borderBottom: "1px solid #2a2d35", background: "#101218" }}>
+      <div style={{ borderBottom: `1px solid ${color.border.subtle}`, background: color.bg.panel }}>
         <DescribeBar client={client} />
       </div>
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: layout.gridColumns, minHeight: 0 }}>
@@ -272,7 +274,7 @@ export function App() {
         {layout.collapsed ? (
           <Rail side="left" label="Scene" onOpen={() => setDrawer("left")} />
         ) : (
-          <div style={{ borderRight: "1px solid #2a2d35", overflow: "hidden", background: "#0a0a0f", ...chromeDim }}>{leftPanel}</div>
+          <div style={{ borderRight: "1px solid var(--mtk-border-subtle)", overflow: "hidden", background: "var(--mtk-bg-panel)", ...chromeDim }}>{leftPanel}</div>
         )}
 
         {/* viewport: native-owned (invariant 4). Inside the `.exe` it is **transparent** so the native wgpu
@@ -356,13 +358,14 @@ export function App() {
           }}
           style={{
             position: "relative",
-            background: native ? "transparent" : "#0d0f15", // transparent → wgpu composites through (.exe)
+            background: native ? "transparent" : "var(--mtk-bg-inset)", // transparent → wgpu composites through (.exe)
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            color: "#444",
-            font: "12px ui-monospace, monospace",
-            outline: playing ? `3px solid ${paused ? "#fbbf24" : "#2f9e54"}` : "none",
+            color: color.text.faint,
+            font: font.mono,
+            fontSize: fontSize.body,
+            outline: playing ? `3px solid ${paused ? "var(--mtk-warn-border)" : "var(--mtk-success-border)"}` : "none",
             outlineOffset: -3,
             boxShadow: playing ? `inset 0 0 60px ${paused ? "#fbbf2433" : "#2f9e5444"}` : "none",
             transition: "outline-color .2s, box-shadow .2s",
@@ -379,7 +382,7 @@ export function App() {
         {layout.collapsed ? (
           <Rail side="right" label="Inspector" onOpen={() => setDrawer("right")} />
         ) : (
-          <div style={{ borderLeft: "1px solid #2a2d35", overflow: "hidden", background: "#0a0a0f", ...chromeDim }}>{rightPanel}</div>
+          <div style={{ borderLeft: "1px solid var(--mtk-border-subtle)", overflow: "hidden", background: "var(--mtk-bg-panel)", ...chromeDim }}>{rightPanel}</div>
         )}
       </div>
 
@@ -393,10 +396,10 @@ export function App() {
               position: "fixed",
               top: 40,
               bottom: 0,
-              ...(drawer === "left" ? { left: 0, borderRight: "1px solid #2a2d35" } : { right: 0, borderLeft: "1px solid #2a2d35" }),
+              ...(drawer === "left" ? { left: 0, borderRight: "1px solid var(--mtk-border-subtle)" } : { right: 0, borderLeft: "1px solid var(--mtk-border-subtle)" }),
               width: 300,
               zIndex: 120,
-              background: "#0d0f15",
+              background: "var(--mtk-bg-inset)",
               overflow: "auto",
               boxShadow: "0 0 30px #000a",
             }}

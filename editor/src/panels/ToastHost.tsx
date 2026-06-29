@@ -6,23 +6,24 @@
 import { useEffect } from "react";
 import { toastStore, useToasts, TOAST_TTL_MS, type Toast } from "../store/toasts";
 
+// Semantic kinds → the design-system colour roles (theme/global.css vars).
 const BG: Record<Toast["kind"], string> = {
-  info: "#1c2433",
-  cost: "#3a2f16",
-  success: "#163322",
-  error: "#3a1f1f",
+  info: "var(--mtk-info-bg)",
+  cost: "var(--mtk-warn-bg)",
+  success: "var(--mtk-success-bg)",
+  error: "var(--mtk-danger-bg)",
 };
 const BORDER: Record<Toast["kind"], string> = {
-  info: "#2a3550",
-  cost: "#5a4a2f",
-  success: "#2f6a45",
-  error: "#6a3f2f",
+  info: "var(--mtk-info-border)",
+  cost: "var(--mtk-warn-border)",
+  success: "var(--mtk-success-border)",
+  error: "var(--mtk-danger-border)",
 };
 const FG: Record<Toast["kind"], string> = {
-  info: "#cde",
-  cost: "#fbbf24",
-  success: "#7fe39a",
-  error: "#fcd",
+  info: "var(--mtk-info)",
+  cost: "var(--mtk-warn)",
+  success: "var(--mtk-success)",
+  error: "var(--mtk-danger)",
 };
 
 function ToastRow({ toast }: { toast: Toast }) {
@@ -32,7 +33,7 @@ function ToastRow({ toast }: { toast: Toast }) {
   }, [toast.id]);
   return (
     <div
-      className="mtk-toast"
+      className="mtk-toast mtk-anim-toast"
       data-testid="toast"
       data-kind={toast.kind}
       onClick={() => toastStore.getState().dismiss(toast.id)}
@@ -44,7 +45,7 @@ function ToastRow({ toast }: { toast: Toast }) {
         borderRadius: 6,
         padding: "6px 12px",
         fontSize: 12,
-        font: "12px ui-monospace, monospace",
+        fontFamily: "var(--mtk-font-ui)",
         boxShadow: "0 6px 18px #0007",
         cursor: "pointer",
         maxWidth: 420,

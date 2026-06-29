@@ -10,6 +10,8 @@
 import { useEffect } from "react";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
+import { Button } from "../theme/primitives";
+import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type { PlayInfo } from "../store/play";
 
@@ -39,41 +41,41 @@ export function PlayControls({ client }: { client: EditorClient }) {
     setStatus(status(info));
   }
 
-  const btn = (bg: string): React.CSSProperties => ({
-    padding: "3px 10px",
-    background: bg,
-    color: "#e8e8e8",
-    border: "1px solid #2a2d35",
-    borderRadius: 4,
-    cursor: "pointer",
-    font: "12px ui-monospace, monospace",
-  });
-
   return (
-    <div id="playControls" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+    <div id="playControls" style={{ display: "flex", alignItems: "center", gap: space.sm }}>
       {!playing ? (
-        <button id="play" data-testid="play" onClick={() => void act(() => client.play(), () => "▶ playing")} style={btn("#1f4a2f")}>
+        <Button id="play" data-testid="play" variant="primary" compact onClick={() => void act(() => client.play(), () => "▶ playing")}>
           ▶ Play
-        </button>
+        </Button>
       ) : (
         <>
-          <button
+          <Button
             id="pause"
             data-testid="pause"
+            variant="secondary"
+            compact
             onClick={() => void act(() => client.pause(), (i) => (i.paused ? "⏸ paused" : "▶ resumed"))}
-            style={btn("#3a3416")}
           >
             {paused ? "▶ Resume" : "⏸ Pause"}
-          </button>
+          </Button>
           {/* Stop is ALWAYS reachable while playing (the escape hatch). */}
-          <button id="stop" data-testid="stop" onClick={() => void act(() => client.stop(), () => "⏹ stopped")} style={btn("#5a2f1f")}>
+          <Button id="stop" data-testid="stop" variant="danger" compact onClick={() => void act(() => client.stop(), () => "⏹ stopped")}>
             ⏹ Stop
-          </button>
+          </Button>
           <span
             id="playIndicator"
             data-testid="playIndicator"
             title="the scene is running — edits are disabled until you Stop"
-            style={{ marginLeft: 4, padding: "2px 8px", borderRadius: 4, background: paused ? "#3a3416" : "#1f4a2f", color: paused ? "#fbbf24" : "#7fe39a", font: "11px ui-monospace, monospace" }}
+            style={{
+              marginLeft: space.xs,
+              padding: `2px ${space.md}px`,
+              borderRadius: radius.md,
+              background: paused ? color.warn.bg : color.success.bg,
+              color: paused ? color.warn.text : color.success.text,
+              border: `1px solid ${paused ? color.warn.border : color.success.border}`,
+              font: font.mono,
+              fontSize: fontSize.meta,
+            }}
           >
             {paused ? "⏸ PAUSED" : "● PLAYING"}
           </span>

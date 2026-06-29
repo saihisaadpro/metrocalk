@@ -7,6 +7,8 @@
 import { projectionStore, useMultiSelect, useSelectedId } from "../store/projection";
 import { setStatus, setClipboard, useClipboardHasContent } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Button, type ButtonVariant } from "../theme/primitives";
+import { color, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 
 export function AuthoringToolbar({ client }: { client: EditorClient }) {
@@ -30,32 +32,18 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
     onClick: () => void,
     enabled = true,
     title?: string,
+    variant: ButtonVariant = "secondary",
   ) => (
-    <button
-      id={id}
-      data-testid={id}
-      disabled={!enabled}
-      title={title}
-      onClick={onClick}
-      style={{
-        background: enabled ? "#1c2433" : "#171b24",
-        color: enabled ? "#cde" : "#566",
-        border: "1px solid #2a3550",
-        borderRadius: 4,
-        padding: "3px 8px",
-        cursor: enabled ? "pointer" : "not-allowed",
-        font: "11px ui-monospace, monospace",
-      }}
-    >
+    <Button id={id} data-testid={id} variant={variant} compact disabled={!enabled} title={title} onClick={onClick}>
       {label}
-    </button>
+    </Button>
   );
 
   return (
     <div
       id="authbar"
       data-testid="authbar"
-      style={{ display: "flex", gap: 4, padding: "4px 8px", flexWrap: "wrap", borderBottom: "1px solid #222a3a" }}
+      style={{ display: "flex", gap: space.xs, padding: `${space.xs}px ${space.md}px`, flexWrap: "wrap", borderBottom: `1px solid ${color.border.subtle}` }}
     >
       {btn("authCreate", "+ Entity", async () => {
         // Honesty (C11): only confirm if the engine actually created it. A null return must NOT flash a
@@ -144,6 +132,7 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
         },
         !!primary,
         "deactivate-not-destroy — Ctrl-Z restores it",
+        "danger",
       )}
       {/* Duplicate — the verb exists on the client + as a context action, but was unreachable from the
           toolbar/hierarchy (the right-click menu only opened on the viewport). Surface it here. */}

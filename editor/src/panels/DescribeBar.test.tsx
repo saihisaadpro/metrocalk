@@ -162,3 +162,37 @@ test("Create is DISABLED while the field is empty (no enabled-inert CTA — C5)"
   fireEvent.change(screen.getByTestId("describe"), { target: { value: "x" } });
   expect((screen.getByTestId("describeBtn") as HTMLButtonElement).disabled).toBe(false);
 });
+
+// ── M14.1 accepted-tier: the registry-aware preview reads the REAL catalog + ledger cost BEFORE commit ──
+test("preview (match): a catalog hit shows WHAT will be created + its real cost, grounded in catalog_search", async () => {
+  const client = fakeClient({
+    catalogSearch: (q: string) => {
+      expect(q).toBe("health bar"); // the real query is searched (not a render)
+      return Promise.resolve({ items: [{ id: "c1", label: "Health Bar", bucket: "ui", category: "hud", source: "local", provides: [], requires: [] }] });
+    },
+  });
+  render(<DescribeBar client={client} />);
+  fireEvent.change(screen.getByTestId("describe"), { target: { value: "health bar" } });
+  // the preview is debounced (off-hot-path) → findBy waits for it
+  const preview = await screen.findByTestId("describePreview");
+  expect(preview.textContent).toMatch(/will place/i);
+  expect(preview.textContent).toContain("Health Bar");
+  expect(screen.getByTestId("previewCost").textContent).toMatch(/free/i); // local = no charge
+});
+
+test("preview (marketplace): a priced hit surfaces the real token cost from the catalog", async () => {
+  const client = fakeClient({
+    catalogSearch: () => Promise.resolve({ items: [{ id: "c2", label: "Steel Sword", bucket: "props", category: "weapon", source: "marketplace", provides: [], requires: [], price: 3 }] }),
+  });
+  render(<DescribeBar client={client} />);
+  fireEvent.change(screen.getByTestId("describe"), { target: { value: "sword" } });
+  expect((await screen.findByTestId("previewCost")).textContent).toContain("−3 tokens");
+});
+
+test("preview (no match): an unmatched query previews the generate cost from the ledger", async () => {
+  // fakeClient defaults catalogSearch → { items: [] } → the generate affordance + its cost
+  render(<DescribeBar client={fakeClient({})} />);
+  fireEvent.change(screen.getByTestId("describe"), { target: { value: "a flying dragon" } });
+  const cost = await screen.findByTestId("previewCost");
+  expect(cost.textContent).toContain(`~${GENERATE_COST} tokens`);
+});

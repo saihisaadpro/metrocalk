@@ -10,6 +10,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { setStatus } from "../store/ui";
+import { Button } from "../theme/primitives";
+import { color, font, fontSize, radius, space as sp, z } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 
 type Mode = "translate" | "rotate" | "scale";
@@ -37,10 +39,10 @@ export function ViewportToolbar({ client }: { client: EditorClient }) {
 
   async function refresh() {
     try {
-      const [m, sel, , sp, pv] = await client.gizmoDebug();
+      const [m, sel, , spaceVal, pv] = await client.gizmoDebug();
       setMode(m as Mode);
       setHasSel(sel);
-      setSpace(sp);
+      setSpace(spaceVal);
       setPivot(pv);
       setCam(await client.cameraDebug());
     } catch {
@@ -84,28 +86,15 @@ export function ViewportToolbar({ client }: { client: EditorClient }) {
     client.setSnap(!next); // setSnap(on)=false ⇒ snapping ON; track the user-facing "snap on"
   };
 
+  // The active state reads LIVE from the render-thread gizmo/camera state (the `is-active` accent), never a
+  // static highlight — the accepted-tier "surface live truth" bar (M14.1).
   const btn = (id: string, label: string, on: boolean, onClick: () => void, title?: string, enabled = true) => (
-    <button
-      id={id}
-      data-testid={id}
-      disabled={!enabled}
-      title={title}
-      onClick={onClick}
-      style={{
-        background: on ? "#2a4365" : enabled ? "#1c2433" : "#171b24",
-        color: on ? "#fff" : enabled ? "#cde" : "#566",
-        border: "1px solid #2a3550",
-        borderRadius: 4,
-        padding: "2px 7px",
-        cursor: enabled ? "pointer" : "not-allowed",
-        font: "11px ui-monospace, monospace",
-      }}
-    >
+    <Button id={id} data-testid={id} variant="toggle" active={on} compact disabled={!enabled} title={title} onClick={onClick}>
       {label}
-    </button>
+    </Button>
   );
 
-  const sep = <span style={{ width: 1, alignSelf: "stretch", background: "#2a3550", margin: "0 2px" }} />;
+  const sep = <span style={{ width: 1, alignSelf: "stretch", background: color.border.default, margin: `0 ${sp.xxs}px` }} />;
   const view = viewLabel(cam);
 
   return (
@@ -118,16 +107,17 @@ export function ViewportToolbar({ client }: { client: EditorClient }) {
       onContextMenu={(e) => e.stopPropagation()}
       style={{
         position: "absolute",
-        top: 6,
-        left: 6,
+        top: sp.sm,
+        left: sp.sm,
         display: "flex",
-        gap: 3,
+        gap: sp.xxs,
         alignItems: "center",
-        padding: "3px 5px",
-        background: "rgba(18,22,32,0.82)",
-        border: "1px solid #2a3550",
-        borderRadius: 6,
-        zIndex: 5,
+        padding: `${sp.xs}px ${sp.sm}px`,
+        background: color.bg.raised,
+        border: `1px solid ${color.border.default}`,
+        borderRadius: radius.lg,
+        boxShadow: "0 2px 8px #0006",
+        zIndex: z.chrome,
         pointerEvents: "auto",
       }}
     >
@@ -153,7 +143,7 @@ export function ViewportToolbar({ client }: { client: EditorClient }) {
       {btn("vpPersp", "Persp", view === "persp", () => preset("persp"))}
       {/* The orientation readout (the orientation cube's role — clickable presets above; a true 3D cube is
           a render-fidelity follow-up). */}
-      <span id="vpOrient" data-testid="vpOrient" data-view={view} style={{ color: "#8ab", font: "10px ui-monospace", padding: "0 3px" }}>
+      <span id="vpOrient" data-testid="vpOrient" data-view={view} style={{ color: color.accent.base, font: font.mono, fontSize: fontSize.micro, padding: `0 ${sp.xs}px` }}>
         ▣ {view}
       </span>
       {sep}

@@ -3,6 +3,9 @@
 //! asset"), never a blank canvas and never the 5k perf fixture. The CTA focuses the describe field so the
 //! front door is one click away.
 
+import { Button } from "../theme/primitives";
+import { color, font, fontSize, space } from "../theme/tokens";
+
 export function EmptyState() {
   return (
     <div
@@ -15,31 +18,26 @@ export function EmptyState() {
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
-        gap: 10,
+        gap: space.lg,
         textAlign: "center",
-        color: "#9aa0aa",
-        font: "13px ui-monospace, monospace",
+        color: color.text.secondary,
+        font: font.ui,
+        fontSize: fontSize.label,
         pointerEvents: "none",
       }}
     >
-      <div style={{ fontSize: 15, color: "#cfd2d6" }}>Your scene is empty</div>
-      <div style={{ maxWidth: 360 }}>Describe your first object above, or drag an asset in from the library.</div>
-      <button
+      <div aria-hidden style={{ fontSize: 40, color: color.text.faint, lineHeight: 1 }}>✦</div>
+      <div style={{ fontSize: fontSize.heading, color: color.text.primary, fontWeight: 600 }}>Your scene is empty</div>
+      <div style={{ maxWidth: 380, color: color.text.muted }}>Describe your first object above, or drag an asset in from the library.</div>
+      <Button
         data-testid="emptyDescribe"
+        variant="primary"
+        style={{ pointerEvents: "auto", marginTop: space.xs }}
         onClick={() => (document.getElementById("describe") as HTMLInputElement | null)?.focus()}
-        style={{
-          pointerEvents: "auto",
-          background: "#2a4365",
-          color: "#fff",
-          border: "none",
-          borderRadius: 4,
-          padding: "5px 12px",
-          cursor: "pointer",
-          font: "12px ui-monospace, monospace",
-        }}
       >
-        Describe your first object
-      </button>
+        ✦ Describe your first object
+      </Button>
+      <div style={{ fontSize: fontSize.meta, color: color.text.faint, marginTop: space.xs }}>or drop a .glb / .fbx / .png anywhere on the stage</div>
     </div>
   );
 }

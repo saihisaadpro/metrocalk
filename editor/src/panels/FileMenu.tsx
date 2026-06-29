@@ -14,6 +14,8 @@ import { projectStore, projectName, useProjectInfo, type ProjectInfo } from "../
 import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Button } from "../theme/primitives";
+import { color, elevation, font, fontSize, radius, space, z } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 
 /** The file's display name *with* its extension (so a save names the real file, not a stem). */
@@ -115,30 +117,25 @@ export function FileMenu({ client }: { client: EditorClient }) {
   }
 
   return (
-    <div id="fileMenuRoot" style={{ position: "relative", font: "12px ui-monospace, monospace" }}>
-      <button
-        id="fileMenu"
-        data-testid="fileMenu"
-        onClick={() => setOpen((o) => !o)}
-        style={{ padding: "3px 10px", background: "#1b1e26", color: "#e8e8e8", border: "1px solid #2a2d35", borderRadius: 4, cursor: "pointer" }}
-      >
+    <div id="fileMenuRoot" style={{ position: "relative", font: font.ui }}>
+      <Button id="fileMenu" data-testid="fileMenu" variant="ghost" compact onClick={() => setOpen((o) => !o)}>
         File
-        <span style={{ marginLeft: 8, opacity: 0.65 }}>{projectName(path)}</span>
+        <span style={{ marginLeft: space.xs, color: color.text.muted }}>{projectName(path)}</span>
         {dirty && (
-          <span id="projectDirty" data-testid="projectDirty" title="unsaved changes" style={{ marginLeft: 4, color: "#fbbf24" }}>
+          <span id="projectDirty" data-testid="projectDirty" title="unsaved changes" style={{ marginLeft: space.xxs, color: color.token }}>
             •
           </span>
         )}
-      </button>
+      </Button>
 
       {open && (
         <>
           {/* click-away closes the menu */}
-          <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />
+          <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: z.menu - 10 }} />
           <div
             id="fileMenuPanel"
             data-testid="fileMenuPanel"
-            style={{ position: "absolute", top: "100%", left: 0, marginTop: 4, minWidth: 220, zIndex: 100, background: "#14161c", border: "1px solid #2a2d35", borderRadius: 6, padding: 4, boxShadow: "0 8px 24px #0008" }}
+            style={{ position: "absolute", top: "100%", left: 0, marginTop: space.xs, minWidth: 220, zIndex: z.menu, background: color.bg.raised, border: `1px solid ${color.border.default}`, borderRadius: radius.lg, padding: space.xs, boxShadow: elevation.e3 }}
           >
             <MenuItem id="fileNew" label="New project" onClick={() => guarded(() => client.newProject(), "New", "new project")} />
             <MenuItem id="fileOpen" label="Open…" onClick={() => guarded(() => client.openProject(), "Open", "opened")} />
@@ -147,19 +144,19 @@ export function FileMenu({ client }: { client: EditorClient }) {
             <MenuItem id="fileSave" label="Save" onClick={() => void save(false)} />
             <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void save(true)} />
             <Divider />
-            <div style={{ padding: "4px 8px 2px", opacity: 0.5, fontSize: 11 }}>Recent</div>
+            <div style={{ color: color.text.muted, fontSize: fontSize.meta, padding: `${space.xs}px ${space.md}px 2px` }}>Recent</div>
             <div id="fileRecent" data-testid="fileRecent">
               {recents.length === 0 ? (
-                <div style={{ padding: "4px 8px", opacity: 0.4 }}>— none —</div>
+                <div style={{ padding: `${space.xs}px ${space.md}px`, color: color.text.faint, fontSize: fontSize.body }}>— none —</div>
               ) : (
                 recents.map((p) => (
                   <button
                     key={p}
-                    className="fileRecentItem"
+                    className="fileRecentItem mtk-btn mtk-btn--ghost"
                     data-path={p}
                     onClick={() => guarded(() => client.openProject(p), "Open", `opened ${projectName(p)}`)}
                     title={p}
-                    style={{ display: "block", width: "100%", textAlign: "left", padding: "4px 8px", background: "transparent", color: "#cdd", border: "none", cursor: "pointer", fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                    style={{ display: "block", width: "100%", textAlign: "left", padding: `${space.xs}px ${space.md}px`, color: color.text.secondary, fontSize: fontSize.body, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
                   >
                     {projectName(p)}
                   </button>
@@ -175,32 +172,28 @@ export function FileMenu({ client }: { client: EditorClient }) {
           id="unsavedGuard"
           data-testid="unsavedGuard"
           onClick={() => setPending(null)}
-          style={{ position: "fixed", inset: 0, zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", background: "#0008" }}
+          style={{ position: "fixed", inset: 0, zIndex: z.guard, display: "flex", alignItems: "center", justifyContent: "center", background: "#0009" }}
         >
           <div
             onClick={(e) => e.stopPropagation()} // clicks inside the dialog must not cancel
-            style={{ background: "#14161c", border: "1px solid #3a3d45", borderRadius: 8, padding: 18, maxWidth: 340 }}
+            style={{ background: color.bg.raised, border: `1px solid ${color.border.strong}`, borderRadius: radius.xl, padding: space.xl, maxWidth: 340, boxShadow: elevation.e3, color: color.text.primary }}
           >
-            <div style={{ marginBottom: 12 }}>
+            <div style={{ marginBottom: space.lg }}>
               Discard unsaved changes to <strong>{projectName(path)}</strong>?
             </div>
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button
-                id="guardCancel"
-                data-testid="guardCancel"
-                onClick={() => setPending(null)}
-                style={{ padding: "4px 12px", background: "#1b1e26", color: "#e8e8e8", border: "1px solid #2a2d35", borderRadius: 4, cursor: "pointer" }}
-              >
+            <div style={{ display: "flex", gap: space.md, justifyContent: "flex-end" }}>
+              <Button id="guardCancel" data-testid="guardCancel" variant="secondary" compact onClick={() => setPending(null)}>
                 Cancel
-              </button>
-              <button
+              </Button>
+              <Button
                 id="guardDiscard"
                 data-testid="guardDiscard"
+                variant="danger"
+                compact
                 onClick={() => void run(pending.run, pending.label === "New" ? "new project" : "opened", true)}
-                style={{ padding: "4px 12px", background: "#5a2f1f", color: "#fcd", border: "1px solid #6a3f2f", borderRadius: 4, cursor: "pointer" }}
               >
                 Discard &amp; {pending.label}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -214,8 +207,9 @@ function MenuItem({ id, label, onClick }: { id: string; label: string; onClick: 
     <button
       id={id}
       data-testid={id}
+      className="mtk-btn mtk-btn--ghost"
       onClick={onClick}
-      style={{ display: "block", width: "100%", textAlign: "left", padding: "5px 8px", background: "transparent", color: "#e8e8e8", border: "none", cursor: "pointer", fontSize: 12, borderRadius: 4 }}
+      style={{ display: "block", width: "100%", textAlign: "left", padding: `${space.sm}px ${space.md}px`, color: color.text.primary, fontSize: fontSize.body }}
     >
       {label}
     </button>
@@ -223,5 +217,5 @@ function MenuItem({ id, label, onClick }: { id: string; label: string; onClick: 
 }
 
 function Divider() {
-  return <div style={{ height: 1, background: "#2a2d35", margin: "4px 0" }} />;
+  return <div style={{ height: 1, background: color.border.subtle, margin: `${space.xs}px 0` }} />;
 }

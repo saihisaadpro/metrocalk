@@ -9,6 +9,8 @@ import { useEffect, useRef, useState } from "react";
 import { useBalance, setBalance } from "../store/wallet";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Button } from "../theme/primitives";
+import { color, font, fontSize, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 
 export function Wallet({ client }: { client: EditorClient }) {
@@ -56,24 +58,23 @@ export function Wallet({ client }: { client: EditorClient }) {
     <div
       id="wallet"
       data-testid="wallet"
-      style={{ padding: 12, fontSize: 13, color: "#fbbf24", display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap", minWidth: 0 }}
+      style={{ padding: `0 ${space.xs}px`, fontSize: fontSize.body, color: color.token, display: "flex", alignItems: "center", gap: space.sm, whiteSpace: "nowrap", minWidth: 0, font: font.mono }}
     >
-      <span>
-        ⊞{" "}
-        <span id="walletBal" data-testid="balance" style={{ transition: "color .2s", color: flash ? "#fff" : "#fbbf24" }}>
-          {balance ?? "…"}
-        </span>{" "}
-        tokens
+      <span aria-hidden style={{ opacity: 0.85 }}>⊞</span>
+      <span id="walletBal" data-testid="balance" style={{ transition: "color .2s", color: flash ? "#fff" : color.token, fontWeight: 600 }}>
+        {balance ?? "…"}
       </span>
-      <button
+      <span style={{ color: color.text.muted }}>tokens</span>
+      <Button
         id="topup"
         data-testid="topup"
+        variant="secondary"
+        compact
         onClick={onTopUp}
         title="Sandbox dev grant — no real purchase (ADR-004/018)"
-        style={{ padding: "2px 8px", fontSize: 11, background: "#4a3a1f", color: "#fbbf24", border: "1px solid #5a4a2f", borderRadius: 4, cursor: "pointer" }}
       >
         +100 dev tokens
-      </button>
+      </Button>
     </div>
   );
 }
