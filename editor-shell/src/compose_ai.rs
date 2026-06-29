@@ -15,6 +15,7 @@
 
 use metrocalk_core::compose::{ComposeOp, Composition};
 use metrocalk_core::rules::{Action, CompareOp, Condition, RuleData};
+use metrocalk_core::state_machine::{StateMachine, Transition};
 use metrocalk_core::FieldValue;
 
 /// Why a compose proposal produced nothing — flattened (no foreign provider-error type leaks across the seam).
@@ -120,21 +121,7 @@ impl Composer for DemoComposer {
             || s.contains("lit");
         if on_kill && ignite {
             let threshold = first_integer(&s).unwrap_or(4);
-            return Ok(Composition {
-                ops: vec![
-                    // Seed the counter the rule reads, so its condition references a real, typed field.
-                    ComposeOp::SetField {
-                        entity: target.to_string(),
-                        component: "KillCounter".to_string(),
-                        field: "count".to_string(),
-                        value: FieldValue::Integer(0),
-                    },
-                    ComposeOp::AuthorRule {
-                        id: "r_ai_ignite".to_string(),
-                        rule: ignite_rule(target, threshold),
-                    },
-                ],
-            });
+            return Ok(quest_composition(target, threshold));
         }
         Err(ComposeAiError::Provider(format!(
             "the offline demo composer doesn't recognize \"{sentence}\" — it knows the ignite-on-kills demo; \
@@ -143,26 +130,181 @@ impl Composer for DemoComposer {
     }
 }
 
-/// The demo's flagship rule: **when** an enemy dies, **if** this entity's `KillCounter.count` ≥ `threshold`,
-/// **then** set its `Flammable.lit` true. Targets a concrete entity (Rules reference real entities, ADR-045).
+/// The demo's flagship composition (M12.6 capstone, gates-doc test #5): the **complete, self-driving** flame
+/// quest the sentence assembles on `target` — *"a rusty sword that bursts into flame after `threshold` kills
+/// in the boss arena."* Every piece is an **ordinary registry-typed entity/component/rule** on the selected
+/// entity (no god-object): a seeded `KillCounter`/`Flammable`/`QuestState`, the `QuestState` **machine**
+/// (Hunting -> ReadyForBoss -> FacingBoss), a **tally** rule (each `EnemyDied` increments the counter), the
+/// **ignite** rule (in `FacingBoss` and at the threshold -> the sword catches fire), and the **offered mirror**
+/// "off switch" (test #5 box 2 — leaving the arena puts the flame out). It is driven entirely by the standard
+/// `EnemyDied`/`ZoneEntered` events, so Play -> 4 kills -> ignite needs no extra plumbing.
+///
+/// The rule ids sort `r_ai_count` < `r_ai_ignite`, so within a single `EnemyDied` tick the counter increments
+/// **before** the ignite rule re-checks it — the 4th kill both reaches `count = threshold` AND ignites in the
+/// same tick (the documented sorted-id cascade, ADR-049).
+fn quest_composition(target: &str, threshold: i64) -> Composition {
+    Composition {
+        ops: vec![
+            // Seed the typed fields the rules read, so every condition references a real, typed field.
+            set_field(target, "KillCounter", "count", FieldValue::Integer(0)),
+            set_field(target, "Flammable", "lit", FieldValue::Bool(false)),
+            set_field(
+                target,
+                "QuestState",
+                "state",
+                FieldValue::Str("Hunting".to_string()),
+            ),
+            // The QuestState machine: a kill begins the approach, entering the arena reaches the boss.
+            ComposeOp::AuthorStateMachine {
+                id: "sm_ai_quest".to_string(),
+                machine: quest_machine(target),
+            },
+            // r_ai_count: each EnemyDied tallies a kill (sorts before r_ai_ignite — the cascade).
+            ComposeOp::AuthorRule {
+                id: "r_ai_count".to_string(),
+                rule: tally_rule(target),
+            },
+            // r_ai_ignite: in FacingBoss AND at the threshold -> the sword catches fire.
+            ComposeOp::AuthorRule {
+                id: "r_ai_ignite".to_string(),
+                rule: ignite_rule(target, threshold),
+            },
+            // The offered mirror "off switch" (test #5 box 2): leaving the arena puts the flame out.
+            ComposeOp::AuthorRule {
+                id: "r_ai_cleanup".to_string(),
+                rule: cleanup_rule(target),
+            },
+        ],
+    }
+}
+
+/// A `SetField` compose op on `target`'s `component.field`.
+fn set_field(target: &str, component: &str, field: &str, value: FieldValue) -> ComposeOp {
+    ComposeOp::SetField {
+        entity: target.to_string(),
+        component: component.to_string(),
+        field: field.to_string(),
+        value,
+    }
+}
+
+/// The `QuestState` machine Hunting -> ReadyForBoss (on a kill) -> FacingBoss (on entering the arena). A
+/// transition IS a Rule (the M12.2 reuse); each "enter `to`" action sets `QuestState.state`, so the effect
+/// can never typo the state field. All three states are reachable.
+fn quest_machine(target: &str) -> StateMachine {
+    StateMachine {
+        name: "quest".to_string(),
+        entity: target.to_string(),
+        component: "QuestState".to_string(),
+        field: "state".to_string(),
+        states: vec![
+            "Hunting".to_string(),
+            "ReadyForBoss".to_string(),
+            "FacingBoss".to_string(),
+        ],
+        initial: "Hunting".to_string(),
+        transitions: vec![
+            transition("t_ai_1", "Hunting", "ReadyForBoss", "EnemyDied", target),
+            transition(
+                "t_ai_2",
+                "ReadyForBoss",
+                "FacingBoss",
+                "ZoneEntered",
+                target,
+            ),
+        ],
+    }
+}
+
+/// A state transition `from -> to` triggered by `event`, whose effect enters `to` (sets `QuestState.state`).
+fn transition(id: &str, from: &str, to: &str, event: &str, target: &str) -> Transition {
+    Transition {
+        id: id.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+        rule: RuleData {
+            name: format!("-> {to}"),
+            enabled: true,
+            event: event.to_string(),
+            conditions: vec![],
+            actions: vec![Action {
+                action: "SetField".to_string(),
+                entity: target.to_string(),
+                component: "QuestState".to_string(),
+                field: "state".to_string(),
+                value: FieldValue::Str(to.to_string()),
+            }],
+        },
+    }
+}
+
+/// The tally rule: **when** an enemy dies, **then** add one to this entity's `KillCounter.count`.
+fn tally_rule(target: &str) -> RuleData {
+    RuleData {
+        name: "tally kills".to_string(),
+        enabled: true,
+        event: "EnemyDied".to_string(),
+        conditions: vec![],
+        actions: vec![Action {
+            action: "AdjustCounter".to_string(),
+            entity: target.to_string(),
+            component: "KillCounter".to_string(),
+            field: "count".to_string(),
+            value: FieldValue::Integer(1),
+        }],
+    }
+}
+
+/// The demo's flagship rule: **when** an enemy dies, **if** this entity is in `FacingBoss` AND its
+/// `KillCounter.count` ≥ `threshold`, **then** set its `Flammable.lit` true. Targets a concrete entity (Rules
+/// reference real entities, ADR-045). The two conditions are the "after 4 kills AND reaches the boss arena"
+/// of test #5 — both shown in the live truth-state ("✅ state = FacingBoss, ❌ KillCounter = 3 of 4").
 fn ignite_rule(target: &str, threshold: i64) -> RuleData {
     RuleData {
         name: "ignite on kills".to_string(),
         enabled: true,
         event: "EnemyDied".to_string(),
-        conditions: vec![Condition {
-            entity: target.to_string(),
-            component: "KillCounter".to_string(),
-            field: "count".to_string(),
-            op: CompareOp::Ge,
-            value: FieldValue::Integer(threshold),
-        }],
+        conditions: vec![
+            Condition {
+                entity: target.to_string(),
+                component: "QuestState".to_string(),
+                field: "state".to_string(),
+                op: CompareOp::Eq,
+                value: FieldValue::Str("FacingBoss".to_string()),
+            },
+            Condition {
+                entity: target.to_string(),
+                component: "KillCounter".to_string(),
+                field: "count".to_string(),
+                op: CompareOp::Ge,
+                value: FieldValue::Integer(threshold),
+            },
+        ],
         actions: vec![Action {
             action: "SetField".to_string(),
             entity: target.to_string(),
             component: "Flammable".to_string(),
             field: "lit".to_string(),
             value: FieldValue::Bool(true),
+        }],
+    }
+}
+
+/// The offered mirror "off switch" (the missing-"off"-switch guard, test #5 box 2): **when** the entity
+/// leaves the arena (`ZoneExited`), **then** put the flame out (`Flammable.lit = false`). The AI proposes it
+/// alongside the ignite rule for the user to review — half of all game bugs are the missing cleanup.
+fn cleanup_rule(target: &str) -> RuleData {
+    RuleData {
+        name: "ignite on kills (cleanup)".to_string(),
+        enabled: true,
+        event: "ZoneExited".to_string(),
+        conditions: vec![],
+        actions: vec![Action {
+            action: "SetField".to_string(),
+            entity: target.to_string(),
+            component: "Flammable".to_string(),
+            field: "lit".to_string(),
+            value: FieldValue::Bool(false),
         }],
     }
 }
@@ -220,25 +362,48 @@ mod tests {
     }
 
     #[test]
-    fn the_demo_composer_turns_the_flagship_sentence_into_an_ignite_composition() {
+    fn the_demo_composer_turns_the_flagship_sentence_into_the_complete_self_driving_quest() {
         let c = DemoComposer::new(true);
         let comp = c
             .propose(
-                "when an enemy dies and kills reach 3, set it on fire",
+                "when an enemy dies and kills reach 3 in the boss arena, set the sword on fire",
                 Some("1_5"),
                 &grammar(),
             )
             .expect("the demo intent composes");
-        // Seeds the counter + authors exactly the ignite rule, targeting the selected entity at threshold 3.
-        assert_eq!(comp.ops.len(), 2);
-        match &comp.ops[1] {
-            ComposeOp::AuthorRule { rule, .. } => {
-                assert_eq!(rule.event, "EnemyDied");
-                assert_eq!(rule.conditions[0].entity, "1_5");
-                assert_eq!(rule.conditions[0].value, FieldValue::Integer(3));
-            }
-            other => panic!("expected an AuthorRule, got {other:?}"),
-        }
+
+        // The complete, self-driving quest (M12.6): seeds (KillCounter/Flammable/QuestState) + the QuestState
+        // machine + the tally rule + the ignite rule + the offered mirror — every piece an ordinary
+        // registry-typed op on the selected entity.
+        assert_eq!(comp.ops.len(), 7, "the full quest is assembled");
+        let rule = |id: &str| {
+            comp.ops.iter().find_map(|o| match o {
+                ComposeOp::AuthorRule { id: rid, rule } if rid == id => Some(rule),
+                _ => None,
+            })
+        };
+        assert!(
+            rule("r_ai_count").is_some(),
+            "the counter is tallied per kill"
+        );
+        let ignite = rule("r_ai_ignite").expect("the ignite rule is authored");
+        assert_eq!(ignite.event, "EnemyDied");
+        // Both test-#5 conditions: in the boss arena (FacingBoss) AND at the threshold.
+        assert!(ignite.conditions.iter().any(|cnd| cnd.entity == "1_5"
+            && cnd.component == "QuestState"
+            && cnd.value == FieldValue::Str("FacingBoss".to_string())));
+        assert!(ignite.conditions.iter().any(|cnd| cnd.entity == "1_5"
+            && cnd.component == "KillCounter"
+            && cnd.value == FieldValue::Integer(3)));
+        // The offered "off switch" mirror is part of the reviewable proposal (test #5 box 2).
+        let cleanup = rule("r_ai_cleanup").expect("the cleanup mirror is offered");
+        assert_eq!(cleanup.event, "ZoneExited");
+        assert_eq!(cleanup.actions[0].value, FieldValue::Bool(false));
+        // The QuestState machine is composed (Hunting -> ReadyForBoss -> FacingBoss).
+        assert!(comp.ops.iter().any(|o| matches!(
+            o,
+            ComposeOp::AuthorStateMachine { machine, .. } if machine.states.len() == 3
+        )));
     }
 
     #[test]

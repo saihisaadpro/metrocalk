@@ -81,7 +81,18 @@ fn a_sentence_proposes_a_composition_that_applies_as_one_undoable_transaction() 
     assert_eq!(a.get_field(eid(target), "KillCounter", "count"), None);
 
     apply_composition(&mut a, &registry, &comp).expect("the composition applies");
-    assert_eq!(a.rules().len(), 1, "the AI-composed rule is authored");
+    // The complete self-driving quest (M12.6): the tally + ignite + the offered mirror rules, plus the
+    // QuestState machine — every piece an ordinary registry op, all in ONE undoable transaction.
+    assert_eq!(
+        a.rules().len(),
+        3,
+        "the AI composed the tally + ignite + cleanup rules"
+    );
+    assert_eq!(
+        a.state_machines().len(),
+        1,
+        "the AI composed the QuestState machine"
+    );
     assert_eq!(
         a.get_field(eid(target), "KillCounter", "count"),
         Some(FieldValue::Integer(0)),
@@ -90,7 +101,12 @@ fn a_sentence_proposes_a_composition_that_applies_as_one_undoable_transaction() 
 
     // 4) ONE undo reverts the WHOLE composition (it's a single transaction — the AI is not a privileged path).
     assert!(a.undo());
-    assert_eq!(a.rules().len(), 0, "undo removed the composed rule");
+    assert_eq!(a.rules().len(), 0, "undo removed the composed rules");
+    assert_eq!(
+        a.state_machines().len(),
+        0,
+        "undo removed the composed machine"
+    );
     assert_eq!(
         a.get_field(eid(target), "KillCounter", "count"),
         None,
