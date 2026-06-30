@@ -18,6 +18,7 @@ pub mod bridge;
 pub mod capscene;
 pub mod compose_ai;
 pub mod csg_intent;
+pub mod feature_history;
 pub mod generate;
 pub mod metering;
 pub mod pdm;
@@ -43,6 +44,10 @@ pub use capscene::{
     CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
 };
 pub use compose_ai::{ComposeAiError, Composer, DemoComposer, RemoteComposer};
+pub use feature_history::{
+    eval_variables, rebuild, rebuild_reproduces, validate_feature_op, validate_history,
+    Configuration, Dim, Expr, FeatureError, FeatureHistory, FeatureId, FeatureOp, Rebuilt,
+};
 pub use generate::{
     FakeGenerator, GenError, GenRequest, MeshGenerator, MeterAction, RemoteGenerator, StubMeter,
     TokenMeter,

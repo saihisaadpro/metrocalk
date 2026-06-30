@@ -46,6 +46,10 @@ metrocalk-csg = { path = "../csg" }
 metrocalk-plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# M15.2 (ADR-072): the feature-history "a broken feature is a file" artifact serializes LOSSLESS (bit-exact
+# f64), reusing the M13.1/ADR-050 discipline — a JSON shortest-float round-trip would drift a parameter by
+# 1 ULP and break the bit-identical rebuild. Same pin as `/dst`.
+bincode = "1"
 
 [lints]
 workspace = true
