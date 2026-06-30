@@ -169,8 +169,14 @@ fn detect(doc: &LoroDoc, rep: &mut MergeReport) {
                     }
                     let ok = match fval {
                         LoroValue::String(s) => {
-                            s.starts_with("assets/")
-                                && ASSET_EXTS.iter().any(|e| s.ends_with(&format!(".{e}")))
+                            // A content-addressed store handle (ADR-014, `mtkasset:<hex>` — the canonical
+                            // asset identity `place_mesh`/the blobstore/CSG produce) OR a legacy
+                            // `assets/<name>.<ext>` path. Before this, a content-addressed mesh was flagged
+                            // corrupt on every merge/reload (a project saved with a generated/imported mesh
+                            // would not round-trip clean, and an ECO gating on 0 violations would reject it).
+                            s.starts_with("mtkasset:")
+                                || (s.starts_with("assets/")
+                                    && ASSET_EXTS.iter().any(|e| s.ends_with(&format!(".{e}"))))
                         }
                         _ => false,
                     };

@@ -341,6 +341,42 @@ fn class7_corrupt_asset_ref() {
 }
 
 #[test]
+fn class7_content_addressed_handle_is_a_valid_asset_ref() {
+    // Regression: a content-addressed store handle (ADR-014, `mtkasset:<hex>` — what `place_mesh`/the
+    // blobstore/CSG produce) is a VALID asset ref, not corrupt. Before the fix, a real scene with a
+    // generated/imported mesh was flagged on every merge/reload (and an ECO gating on 0 violations would
+    // wrongly reject it).
+    let doc = loro::LoroDoc::new();
+    let tree = doc.get_tree("hierarchy");
+    let comps = doc.get_map("components");
+    let _ = doc.get_map("bindings");
+
+    let tid = tree.create(loro::TreeParentId::Root).unwrap();
+    tree.get_meta(tid).unwrap().insert("eid", "1_0").unwrap();
+
+    let rec = comps.insert_container("1_0", loro::LoroMap::new()).unwrap();
+    let comp = rec
+        .insert_container("MeshRenderer", loro::LoroMap::new())
+        .unwrap();
+    comp.insert("mesh", "mtkasset:deadbeefcafef00d").unwrap(); // a content-addressed handle
+    doc.commit();
+
+    let snapshot = doc.export(loro::ExportMode::Snapshot).unwrap();
+    let mut e = engine(99);
+    let report = e.merge(&snapshot).unwrap();
+
+    assert!(
+        !report.violations.contains_key("corrupt-asset-ref"),
+        "a content-addressed `mtkasset:` handle is a valid asset ref, not corrupt"
+    );
+    assert_eq!(
+        report.total_violations(),
+        0,
+        "a content-addressed mesh merges clean"
+    );
+}
+
+#[test]
 fn class8_malformed_edge() {
     // Binding entry with missing required fields
     let doc = loro::LoroDoc::new();
