@@ -25,6 +25,7 @@ pub mod producer;
 pub mod project;
 pub mod registry;
 pub mod resolve;
+pub mod revision;
 pub mod rule_runtime;
 pub mod rules;
 pub mod state_machine;
@@ -53,6 +54,7 @@ pub use registry::{
     RegistryError,
 };
 pub use resolve::{resolve, resolve_local, Match, NextTier, Resolution, Resolved};
+pub use revision::{Lifecycle, LifecycleError, Revision};
 pub use rule_runtime::{
     partition_deterministic, ConditionTruth, DecisionEvent, DecisionKind, FlaggedRule,
     MachineTruth, RuleEvent, RuleRecording, RuleReplay, RuleTruth, RuntimeState, TruthState,

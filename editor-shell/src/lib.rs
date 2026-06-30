@@ -13,12 +13,14 @@
 pub mod actions;
 pub mod ai;
 pub mod blobstore;
+pub mod bom;
 pub mod bridge;
 pub mod capscene;
 pub mod compose_ai;
 pub mod csg_intent;
 pub mod generate;
 pub mod metering;
+pub mod pdm;
 pub mod persist;
 pub mod physics_intent;
 pub mod play_rules;
@@ -30,6 +32,7 @@ pub mod wallet;
 
 pub use actions::{actions_for, Action, ActionItem};
 pub use ai::{apply_ai_patch, AiPatch, PatchOp};
+pub use bom::{rollup as bom_rollup, Bom, BomLine};
 pub use bridge::{
     apply_edit, enrich_relational, project_entity, project_full, EditIntent, EditTx,
     ProjectionDelta, ProjectionOp, RelSummary,
@@ -45,6 +48,10 @@ pub use generate::{
     TokenMeter,
 };
 pub use metering::{ai_edit_material, buy_marketplace, material_patch, Outcome};
+pub use pdm::{
+    approval_delta, branch_from, merge_eco, release, state_identity, verify as verify_revision,
+    EcoOutcome, PdmError,
+};
 pub use persist::{Log, Record};
 pub use play_rules::{build_recording, PlaySession};
 pub use project::{atomic_write, open_into, save, OpenError};

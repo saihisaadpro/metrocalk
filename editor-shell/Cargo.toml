@@ -30,8 +30,11 @@ metrocalk-gizmo = { path = "../gizmo" }
 metrocalk-deform = { path = "../deform" }
 # The asset/import substrate (M4/M10.2/M11.1). Used by `blobstore` (M11.1) to persist generated/imported
 # asset bytes by content address (`AssetId`) so a generated mesh survives reload — the M6 residual. Pure
-# Rust + wasm32-clean, so it doesn't compromise the lib's portability.
-metrocalk-assets = { path = "../assets" }
+# Rust + wasm32-clean, so it doesn't compromise the lib's portability. The `signing` feature (M11.5 /
+# ADR-044) is enabled for the M15.1 PDM service (`pdm`): a released revision reuses the Ed25519
+# `SignedProvenanceTrust` for its tamper-evident content-addressed identity (the crypto stays confined to
+# `assets/src/signed.rs`, invariant 5; pure-Rust `ed25519-dalek`, so the lib stays wasm-clean).
+metrocalk-assets = { path = "../assets", features = ["signing"] }
 # Robust exact-predicate CSG (M13.2 / ADR-051). `csg_intent` drives a boolean over the asset store and
 # lands the result as a content-addressed MeshAsset + a place_mesh-style undoable commit (core stays
 # mesh-agnostic — the geometry lives in the store by handle, never in Loro). The `Csg` trait is the

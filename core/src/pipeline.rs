@@ -689,6 +689,23 @@ impl<W: World> Engine<W> {
         self.doc.export(ExportMode::Snapshot).unwrap()
     }
 
+    /// The document's **canonical logical state** — a deterministic, sorted-key serialization of the
+    /// merged scene (the same projection [`crate::merge::canon_doc`] uses for convergence comparison),
+    /// derived from Loro's deep value, *not* its op-log wire encoding.
+    ///
+    /// This is the basis for a **reproducible, content-addressable revision identity** (M15.1, ADR-071):
+    /// re-deriving it from the same logical state — e.g. after a save→reload round-trip, or after an
+    /// op-log compaction — yields identical bytes, so a released revision's content hash is stable where
+    /// a hash of the raw [`snapshot`](Self::snapshot) bytes would drift (the snapshot carries peer ids,
+    /// op ordering, and history that compaction rewrites). It is float-free of the JSON 1-ULP round-trip
+    /// hazard (`{:?}` shortest round-trip — the M13.1 canonical-serialization discipline, ADR-050).
+    /// Native-deterministic; the wasm32 float-divergence boundary (ADR-020) applies, so a web revision
+    /// hash is server-authoritative.
+    #[must_use]
+    pub fn canonical_state(&self) -> String {
+        merge::canon_doc(&self.doc)
+    }
+
     // ── internals ──────────────────────────────────────────────────────
 
     /// Pre-validate the whole batch against a running "alive" set (existing entities + in-batch
