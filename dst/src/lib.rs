@@ -186,7 +186,11 @@ pub struct SimVerdict {
 /// `partition_deterministic` guard (M12.5) keeps any non-deterministic plugin/neural op out of the recorded
 /// path, so what's validated here is exactly what runs live.
 #[must_use]
-pub fn validate_in_sim<F: Fn(&Replay) -> bool>(scenario: &Scenario, frame: u64, converges: F) -> SimVerdict {
+pub fn validate_in_sim<F: Fn(&Replay) -> bool>(
+    scenario: &Scenario,
+    frame: u64,
+    converges: F,
+) -> SimVerdict {
     let mut replay = Replay::new(scenario.recording.clone());
     replay.seek(frame);
     SimVerdict {
@@ -233,7 +237,9 @@ pub mod commute {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metrocalk_physics::{BodyDesc, BodyKind, ColliderDesc, ColliderShape, PhysicsConfig, Recording};
+    use metrocalk_physics::{
+        BodyDesc, BodyKind, ColliderDesc, ColliderShape, PhysicsConfig, Recording,
+    };
 
     /// The DST seed (the M8.1 spike seed — `"METROCAL"` as bytes, the documented reproducible-RNG seed).
     const SEED: u64 = 0x4D45_5452_4F43_414C;
@@ -269,8 +275,14 @@ mod tests {
         // every run (3 here ≥ the 2-run rule). A NON-deterministic engine would drift here; ours doesn't.
         let s = stack_scenario();
         let h = s.state_hash_at(300);
-        assert!(s.reproduces_at(300, 3), "bit-for-bit across 3 replays at the settled frame: GO");
-        assert!(s.reproduces_at(121, 3), "bit-for-bit at the diverging (post-shove) frame too");
+        assert!(
+            s.reproduces_at(300, 3),
+            "bit-for-bit across 3 replays at the settled frame: GO"
+        );
+        assert!(
+            s.reproduces_at(121, 3),
+            "bit-for-bit at the diverging (post-shove) frame too"
+        );
 
         // The hash actually REFLECTS the trajectory (it isn't a constant): drop the shove → a different end
         // state → a different hash (so "reproduces" is a real property, not a vacuous one).
@@ -290,14 +302,29 @@ mod tests {
         // reproduces the failure BIT-FOR-BIT, both at the post-shove diverging frame and the settled frame.
         let artifact = s.to_bytes();
         let loaded = Scenario::from_bytes(&artifact).expect("artifact reloads");
-        assert_eq!(loaded, s, "the bincode artifact round-trips bit-exactly (seed + op-log + envelope)");
-        assert_eq!(loaded.state_hash_at(121), s.state_hash_at(121), "the file reproduces the post-shove frame bit-for-bit");
-        assert_eq!(loaded.state_hash_at(300), s.state_hash_at(300), "the file reproduces the settled frame bit-for-bit");
+        assert_eq!(
+            loaded, s,
+            "the bincode artifact round-trips bit-exactly (seed + op-log + envelope)"
+        );
+        assert_eq!(
+            loaded.state_hash_at(121),
+            s.state_hash_at(121),
+            "the file reproduces the post-shove frame bit-for-bit"
+        );
+        assert_eq!(
+            loaded.state_hash_at(300),
+            s.state_hash_at(300),
+            "the file reproduces the settled frame bit-for-bit"
+        );
 
         // The human summary (JSON) is for a bug report — it names the seed + envelope but is NOT the
         // reproduction path (JSON float text isn't guaranteed bit-exact — the M13.1 finding).
         let summary = s.summary();
-        assert!(summary.contains("\"seed\"") && summary.contains("rustc-1.92.0") && summary.contains("human summary only"));
+        assert!(
+            summary.contains("\"seed\"")
+                && summary.contains("rustc-1.92.0")
+                && summary.contains("human summary only")
+        );
     }
 
     #[test]
@@ -308,8 +335,16 @@ mod tests {
             let mut r = Rng::new(seed);
             [r.next_u64(), r.next_u64(), r.next_u64()]
         };
-        assert_eq!(seq(SEED), seq(SEED), "same seed → identical stream (reproducible)");
-        assert_ne!(seq(SEED), seq(SEED + 1), "different seed → different stream (seed-sensitive)");
+        assert_eq!(
+            seq(SEED),
+            seq(SEED),
+            "same seed → identical stream (reproducible)"
+        );
+        assert_ne!(
+            seq(SEED),
+            seq(SEED + 1),
+            "different seed → different stream (seed-sensitive)"
+        );
         // f64 draws stay in [0,1) and are likewise reproducible.
         let mut a = Rng::new(7);
         let mut b = Rng::new(7);
@@ -328,10 +363,20 @@ mod tests {
         let s = stack_scenario();
         // converges: after the shove + settle, no box has fallen through the ground plane (a sane outcome).
         let good = validate_in_sim(&s, 300, |r| r.transforms().iter().all(|(p, _)| p[1] > -1.0));
-        assert!(good.converged, "a physically-sane AI sequence validates in sim");
+        assert!(
+            good.converged,
+            "a physically-sane AI sequence validates in sim"
+        );
         // a bogus claim (every box ends exactly at the origin) is REJECTED by the sim — caught before live.
-        let bad = validate_in_sim(&s, 300, |r| r.transforms().iter().all(|(p, _)| p[0] == 0.0 && p[1] == 0.0));
-        assert!(!bad.converged, "a non-converging AI sequence is rejected in sim, not live");
+        let bad = validate_in_sim(&s, 300, |r| {
+            r.transforms()
+                .iter()
+                .all(|(p, _)| p[0] == 0.0 && p[1] == 0.0)
+        });
+        assert!(
+            !bad.converged,
+            "a non-converging AI sequence is rejected in sim, not live"
+        );
         // the verdict carries the reproducible hash (a passing validation is itself a shareable artifact).
         assert_eq!(good.hash, s.state_hash_at(300));
     }
@@ -359,8 +404,14 @@ mod tests {
             run: |s| *s.entry("hp").or_insert(100) -= 3,
         };
         // The checkable property:
-        assert!(commutes(&GRAVITY, &HEAL), "disjoint writes (vel vs hp) commute");
-        assert!(!commutes(&HEAL, &DAMAGE), "both write hp → do NOT commute (real, not vacuous)");
+        assert!(
+            commutes(&GRAVITY, &HEAL),
+            "disjoint writes (vel vs hp) commute"
+        );
+        assert!(
+            !commutes(&HEAL, &DAMAGE),
+            "both write hp → do NOT commute (real, not vacuous)"
+        );
 
         // The consequence: commuting systems are order-INDEPENDENT → bit-identical either way.
         let run = |order: &[usize]| {
@@ -368,19 +419,40 @@ mod tests {
             run_order(&[&GRAVITY, &HEAL], order, &mut st);
             st
         };
-        assert_eq!(run(&[0, 1]), run(&[1, 0]), "commuting system-set: order-independent → bit-identical");
+        assert_eq!(
+            run(&[0, 1]),
+            run(&[1, 0]),
+            "commuting system-set: order-independent → bit-identical"
+        );
 
         // And the counter-example: non-commuting systems CAN differ by order (proving the disjointness check
         // is load-bearing — here the order doesn't change the final hp sum, so use a read-modify that does).
-        static SET10: System = System { name: "set10", writes: &["hp"], run: |s| { s.insert("hp", 10); } };
-        static DOUBLE: System = System { name: "double", writes: &["hp"], run: |s| { let v = *s.get("hp").unwrap_or(&1); s.insert("hp", v * 2); } };
+        static SET10: System = System {
+            name: "set10",
+            writes: &["hp"],
+            run: |s| {
+                s.insert("hp", 10);
+            },
+        };
+        static DOUBLE: System = System {
+            name: "double",
+            writes: &["hp"],
+            run: |s| {
+                let v = *s.get("hp").unwrap_or(&1);
+                s.insert("hp", v * 2);
+            },
+        };
         let run2 = |order: &[usize]| {
             let mut st: Store = Store::new();
             run_order(&[&SET10, &DOUBLE], order, &mut st);
             st
         };
         assert!(!commutes(&SET10, &DOUBLE));
-        assert_ne!(run2(&[0, 1]), run2(&[1, 0]), "non-commuting (both write hp): order CHANGES the result");
+        assert_ne!(
+            run2(&[0, 1]),
+            run2(&[1, 0]),
+            "non-commuting (both write hp): order CHANGES the result"
+        );
     }
 
     #[test]
@@ -390,9 +462,18 @@ mod tests {
         // (the Scenario is `Serialize`able by construction). This asserts the envelope discipline + the
         // injected seed; the type system enforces the rest (a clock/GPU handle isn't serde data).
         let s = stack_scenario();
-        assert!(s.envelope.enhanced_determinism, "the deterministic rapier config (libm, no SIMD) — ADR-020 #1");
-        assert!(s.envelope.dt_micros > 0, "a FIXED dt — runtime-adaptive substepping is banned (ADR-020 #4)");
-        assert_ne!(s.seed, 0, "an EXPLICIT injected seed, not system entropy (the VOPR shape)");
+        assert!(
+            s.envelope.enhanced_determinism,
+            "the deterministic rapier config (libm, no SIMD) — ADR-020 #1"
+        );
+        assert!(
+            s.envelope.dt_micros > 0,
+            "a FIXED dt — runtime-adaptive substepping is banned (ADR-020 #4)"
+        );
+        assert_ne!(
+            s.seed, 0,
+            "an EXPLICIT injected seed, not system entropy (the VOPR shape)"
+        );
         // The op-log IS the shipped M8.4 Recording channel (no parallel replay subsystem — reuse, don't fork).
         let _: &Recording = &s.recording;
         // The envelope round-trips (a replay can reject an out-of-envelope artifact rather than desync).
@@ -414,7 +495,10 @@ mod tests {
         let secs = t0.elapsed().as_secs_f64();
         let fps = f64::from(u32::try_from(n).unwrap()) / secs;
         // A sanity floor only (the real number is logged): headless replay must outrun real time by a lot.
-        assert!(fps > 60.0, "headless replay must beat real-time (got {fps:.0} frames/s)");
+        assert!(
+            fps > 60.0,
+            "headless replay must beat real-time (got {fps:.0} frames/s)"
+        );
         println!("[DST] headless replay throughput: {fps:.0} frames/s ({:.1}x real-time) over the stack scenario", fps / 60.0);
     }
 }

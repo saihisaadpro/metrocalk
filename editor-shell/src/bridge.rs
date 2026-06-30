@@ -403,10 +403,7 @@ pub fn enrich_relational<W: World>(
         bound_to.entry(from).or_default().push(to);
     }
     for op in &mut delta.ops {
-        let ProjectionOp::Upsert {
-            id, kind, rel, ..
-        } = op
-        else {
+        let ProjectionOp::Upsert { id, kind, rel, .. } = op else {
             continue;
         };
         let Some(eid) = EntityId::from_loro_key(id) else {
