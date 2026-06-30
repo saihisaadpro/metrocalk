@@ -1,0 +1,21 @@
+# metrocalk-dst (M13.1 / ADR-050) — Deterministic Simulation Testing: a gameplay/sim bug ships as a
+# seed + op-log that replays bit-for-bit on the CPU/sim path. UNIFIES the shipped replay channels
+# (physics M8.4 Recording/Replay; the Rules M12.5 channel is the sibling) — it does NOT fork a third
+# replay subsystem. Native-only (depends on rapier3d-f64 via /physics; the determinism is native-only per
+# ADR-020 — wasm32 diverges, web = server-authoritative), so it is NOT in the wasm tripwire.
+[package]
+name = "metrocalk-dst"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic Simulation Testing — seed + op-log → bit-for-bit replay on the CPU/sim path (M13.1)"
+publish = false
+
+[dependencies]
+metrocalk-physics = { path = "../physics" }
+serde = { version = "1", features = ["derive"] }
+# The "bug = a file" artifact is BINCODE (binary) — a determinism artifact must be LOSSLESS: JSON's
+# shortest-float text round-trip can shift an f64 by 1 ULP, which empirically changes the deterministic
+# trajectory hash (measured in M13.1). bincode serializes f64 as raw bytes ⇒ bit-exact reproduction.
+bincode = "1"
+# serde_json is the HUMAN-READABLE summary only (envelope + seed + counts) — never the reproduction artifact.
+serde_json = "1"
