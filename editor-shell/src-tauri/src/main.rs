@@ -5071,9 +5071,10 @@ fn thumbnail(state: State<AppState>, id: String, size: u32) -> Option<String> {
         let mut st = state.shared.lock().unwrap();
         st.thumb_requests.push((id.clone(), size));
     }
-    // Poll for the serviced result (~250 ms cap; the render thread ticks ~125 Hz, a thumbnail is sub-ms once
-    // serviced). No lock is held during the sleep — zero contention with the render thread.
-    for _ in 0..50 {
+    // Poll for the serviced result (~600 ms cap — the request may wait behind a queued burst before the
+    // render thread services it a few-per-frame; a thumbnail is off the hot path, so a brief wait is fine and
+    // the UI shows the icon fallback meanwhile). No lock is held during the sleep — zero render-thread contention.
+    for _ in 0..120 {
         {
             let mut st = state.shared.lock().unwrap();
             if let Some(pos) = st.thumb_results.iter().position(|(rid, _)| rid == &id) {

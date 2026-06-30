@@ -1726,28 +1726,26 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         // M9.1: upload the gizmo handle geometry (tiny — regenerated each frame at the selection).
         gizmo_buf.upload(&device, &queue, &inst_bgl, &gizmo_verts);
 
-        // M14.2 (ADR-058) — service any pending live-thumbnail requests on our OWN encoder + readback,
-        // BEFORE acquiring the swapchain (so they never contend the per-frame orbit path — invariant 4).
-        // The JS side is dirty-only + budget-limited, so this list is EMPTY during an orbit (0 thumbnail IPC).
+        // M14.2 (ADR-058) — service up to a FEW pending thumbnails per frame on our OWN encoder + readback,
+        // BEFORE acquiring the swapchain (so it never contends the per-frame orbit path — invariant 4). The
+        // small per-frame CAP bounds the per-frame readback stall (each readback briefly blocks the render
+        // thread) so a burst can't blow the frame budget — while draining the queue fast enough that a
+        // thumbnail request returns promptly (off the hot path). The JS side is dirty-only + budget-limited,
+        // so the queue is EMPTY during an orbit (0 thumbnail IPC). A request whose entity vanished is dropped.
+        const THUMB_PER_FRAME: usize = 4;
         let thumb_jobs: Vec<(String, u32, Instance, i32)> = {
             let mut st = shared.lock().unwrap();
-            if st.thumb_requests.is_empty() {
-                Vec::new()
-            } else {
-                let reqs = std::mem::take(&mut st.thumb_requests);
-                reqs.into_iter()
-                    .filter_map(|(id, size)| {
-                        st.ids.iter().position(|x| x == &id).map(|i| {
-                            (
-                                id,
-                                size,
-                                st.instances[i],
-                                st.mesh_slots.get(i).copied().unwrap_or(-1),
-                            )
-                        })
-                    })
-                    .collect()
+            let n = st.thumb_requests.len().min(THUMB_PER_FRAME);
+            let mut jobs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (id, size) = st.thumb_requests.remove(0);
+                if let Some(i) = st.ids.iter().position(|x| x == &id) {
+                    let inst = st.instances[i];
+                    let slot = st.mesh_slots.get(i).copied().unwrap_or(-1);
+                    jobs.push((id, size, inst, slot));
+                }
             }
+            jobs
         };
         if !thumb_jobs.is_empty() {
             let mut results: Vec<(String, Option<Vec<u8>>)> = Vec::with_capacity(thumb_jobs.len());
@@ -1778,7 +1776,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             }
             let mut st = shared.lock().unwrap();
             st.thumb_results.extend(results);
-            // Cap so a timed-out request can't grow the result list unbounded.
+            // Cap so timed-out requests can't grow the result list unbounded.
             if st.thumb_results.len() > 64 {
                 let excess = st.thumb_results.len() - 64;
                 st.thumb_results.drain(0..excess);
