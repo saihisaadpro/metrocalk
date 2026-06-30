@@ -7,7 +7,7 @@
 //! Min-spec is OWED: this measures the dev box, not a true low-core rig (the honest ceiling, per
 //! `<benchmark_discipline>` — never fabricate a min-spec number).
 
-use metrocalk_csg::{box_mesh, validate, Csg, ExactBspCsg, TriMesh};
+use metrocalk_csg::{box_mesh, validate, Csg, ExactBspCsg};
 use std::time::Instant;
 
 fn percentiles(mut us: Vec<u128>) -> (u128, u128) {
@@ -25,6 +25,7 @@ fn percentiles(mut us: Vec<u128>) -> (u128, u128) {
     ignore = "release-only timing budget (run by release-budgets.yml)"
 )]
 fn csg_boolean_holds_an_interactive_budget() {
+    const N: usize = 200;
     let csg = ExactBspCsg::new();
     let wall = box_mesh([0.0, 0.0, 0.0], [3.0, 1.5, 0.5]);
     let carve = box_mesh([0.0, 0.5, 0.0], [0.5, 0.5, 1.0]);
@@ -34,7 +35,6 @@ fn csg_boolean_holds_an_interactive_budget() {
         let _ = csg.difference(&wall, &carve).unwrap();
     }
 
-    const N: usize = 200;
     let mut single = Vec::with_capacity(N);
     for _ in 0..N {
         let t = Instant::now();
