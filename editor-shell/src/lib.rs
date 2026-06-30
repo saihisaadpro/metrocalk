@@ -16,6 +16,7 @@ pub mod blobstore;
 pub mod bridge;
 pub mod capscene;
 pub mod compose_ai;
+pub mod csg_intent;
 pub mod generate;
 pub mod metering;
 pub mod persist;

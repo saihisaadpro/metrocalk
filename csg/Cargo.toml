@@ -1,0 +1,32 @@
+# metrocalk-csg (M13.2 / ADR-051) — robust, exact-predicate constructive solid geometry.
+#
+# Unity/Godot ship FRAGILE booleans: a coplanar face / sliver / shared edge / near-duplicate vertex
+# misclassifies under a float-epsilon test and the result CRACKS (holes, non-manifold edges, NaN verts).
+# This crate ships the opposite: vertex-vs-plane TOPOLOGY DECISIONS are made with Shewchuk adaptive EXACT
+# predicates (the `robust` crate — georust's zero-dependency, no_std, post-1.0 port), so the classification
+# is never wrong; the mesh boolean (a BSP-tree CSG) and the always-on watertight/manifold VALIDATOR are
+# OWNED here (the ADR-029 rule: csgrs FAILED the audit — its default `f64` feature pulls a SECOND
+# rapier3d-f64 + parry3d-f64 + a heavy tree, unaudited rayon/determinism + wasm risk — so the boolean is
+# reimplemented behind a project-owned `Csg` trait, invariant 5). Deterministic by construction (exact
+# predicates + a fixed-order, rayon-free algorithm + a deterministic weld; no RNG, no seed).
+#
+# wasm-portable: `robust` is no_std/pure-arithmetic and the algorithm is plain Rust, so this crate is IN the
+# wasm tripwire (unlike metrocalk-dst, which is native-only via rapier). Foreign predicate types
+# (`robust::Coord3D`) never leak past the `Csg` trait — the public surface is plain `[f64; 3]` arrays
+# (invariant 5; CI grep-gated).
+[package]
+name = "metrocalk-csg"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Robust exact-predicate CSG — booleans that never crack (M13.2)"
+
+[dependencies]
+# Shewchuk adaptive-precision exact geometric predicates (orient2d/orient3d). Zero-dependency, no_std,
+# MIT/Apache, post-1.0 — passed the ADR-029 determinism + wasm audit. Used ONLY for the exact sign of a
+# point-vs-plane classification; its `Coord3D` type stays inside this crate.
+robust = "1.2"
+
+[lints]
+workspace = true

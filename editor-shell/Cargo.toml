@@ -32,6 +32,11 @@ metrocalk-deform = { path = "../deform" }
 # asset bytes by content address (`AssetId`) so a generated mesh survives reload — the M6 residual. Pure
 # Rust + wasm32-clean, so it doesn't compromise the lib's portability.
 metrocalk-assets = { path = "../assets" }
+# Robust exact-predicate CSG (M13.2 / ADR-051). `csg_intent` drives a boolean over the asset store and
+# lands the result as a content-addressed MeshAsset + a place_mesh-style undoable commit (core stays
+# mesh-agnostic — the geometry lives in the store by handle, never in Loro). The `Csg` trait is the
+# boundary; no `robust::`/`csgrs::` type crosses (grep-gated). Pure Rust + wasm-clean.
+metrocalk-csg = { path = "../csg" }
 # The WASM plugin host (M12.3 / ADR-047) — the honest-ceiling escape. editor-shell drives a sandboxed
 # plugin through the project-owned `PluginHost` trait (NO `extism::` type crosses — grep-gated) and lands
 # its effect as a schema-validated undoable transaction via the M6 `apply_ai_patch` contract.

@@ -146,6 +146,19 @@ jobs:
           fi
           echo "no egui/transform-gizmo/glam leak past the Gizmo trait — boundary intact"
 
+      - name: No exact-predicate / CSG types leak outside the /csg crate (invariant 5, M13.2/ADR-051)
+        run: |
+          # The robust geometric predicates (robust::) + any third-party CSG (csgrs::) must live ONLY behind
+          # the project-owned Csg trait, in /csg — the same discipline as rapier-in-/physics, gltf in the
+          # importer. Every other crate drives booleans through the Csg trait + plain-array boundary types
+          # (TriMesh / [f64;3]); editor-shell's csg_intent consumes the trait, never a predicate type. Prose
+          # comments mentioning "robust"/"csgrs" (no `::`) are fine.
+          if grep -rn "robust::\|csgrs::" core ecs transport plugins assets economy physics interchange gizmo skeleton deform editor-shell mcp tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::a CSG/predicate type (robust::/csgrs::) leaked outside /csg — booleans must stay behind the Csg trait (invariant 5; mirrors ADR-001/021/029)"
+            exit 1
+          fi
+          echo "no robust::/csgrs:: outside /csg — Csg-trait boundary intact"
+
       - name: test
         run: cargo test --workspace
 

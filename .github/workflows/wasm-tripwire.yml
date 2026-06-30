@@ -214,3 +214,29 @@ jobs:
         run: |
           cargo build -p metrocalk-deform --release --target wasm32-unknown-unknown
           echo "metrocalk-deform wasm32 build OK"
+
+  wasm32-csg:
+    name: build wasm32 (metrocalk-csg)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The robust exact-predicate CSG tier (M13.2 / ADR-051): a BSP mesh-boolean whose vertex-vs-plane
+      # classification is exact (Shewchuk `orient3d`, the zero-dependency `no_std` `robust` crate) + an
+      # always-on watertight/manifold validator, all behind our own `Csg` trait. Pure Rust, no rayon/GPU/C —
+      # so robust geometry crosses to the browser (a carve is server-authoritative on web, but the crate
+      # itself must keep compiling, ADR-006/020). `-p metrocalk-csg` pulls only `robust` — never
+      # core/ecs/Flecs/rapier. (Unlike metrocalk-dst, which is native-only via rapier and excluded.)
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-csg --release --target wasm32-unknown-unknown
+          echo "metrocalk-csg wasm32 build OK"
