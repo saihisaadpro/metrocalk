@@ -24,4 +24,7 @@ urdf-rs = "0.9"
 openusd = "0.5"
 # Our physics boundary types (BodyDesc/ColliderDesc/JointDesc/ColliderShape) — the neutral import target.
 metrocalk-physics = { path = "../physics" }
+# M13.2 CSG substrate (ADR-051): the `TriMesh` boundary type + the always-on watertight validator, reused
+# to tessellate an imported STEP B-rep for wgpu (M15.0 / ADR-070). No new geometry-predicate dep.
+metrocalk-csg = { path = "../csg" }
 serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,22 @@
+# metrocalk-sdf (M15.0 / ADR-070, Leg B) — the SDF/implicit **canonical geometry** rep.
+# "Geometry is a program" (FF-T8): an analytic signed-distance field with exact CSG (min/max), compiled
+# DOWN to a deterministic, watertight, manifold mesh for the wgpu rasterizer. Authoring/baked — never a
+# runtime raymarcher (FF-T8 honest-limit). Reuses metrocalk-csg's `TriMesh` + always-on validator + the
+# f64/exact-predicate precision (ADR-051); adds NO new geometry-predicate dep. Zero-dep beyond /csg ⇒
+# wasm-portable (the canonical-rep bet: it is IN the wasm tripwire). Native f64 bit-deterministic
+# (ADR-020); the web path is server-authoritative for cross-platform (the standing wasm32 boundary).
+[package]
+name = "metrocalk-sdf"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "SDF/implicit canonical geometry — exact-CSG fields compiled to a deterministic watertight mesh (M15.0)"
+
+[dependencies]
+# The M13.2 exact-predicate CSG substrate: we reuse its `TriMesh` boundary type + the always-on
+# watertight/manifold/oriented validator + `box_mesh` (for the exact-mesh cross-check). No new dep.
+metrocalk-csg = { path = "../csg" }
+
+[lints]
+workspace = true

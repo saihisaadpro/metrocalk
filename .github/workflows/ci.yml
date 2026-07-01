@@ -215,6 +215,22 @@ jobs:
           fi
           echo "no lattices::/dfir_rs::/hydroflow:: outside /lattice — Lattice-trait boundary intact"
 
+      - name: No STEP/OpenCascade geometry-kernel types leak outside the /interchange crate (invariant 5, M15.0/ADR-070)
+        run: |
+          # The M15.0 geometry-path decision: STEP AP242 rides interop behind the CadInterchange trait (the
+          # M8.5 pattern), and the FULL trimmed-NURBS path is OpenCascade (OCCT) FFI — native/server-only,
+          # OUT of the determinism guarantee. Whatever backs STEP import (a pure-Rust Part-21 reader now; an
+          # `opencascade`/`occt`/`steplib`/`ruststep` binding later) must live ONLY behind CadInterchange, in
+          # /interchange — exactly as rapier lives in /physics + robust in /csg. Every other crate consumes an
+          # import through the neutral CadScene (referenceable faces/edges + a `TriMesh`), never a STEP-kernel
+          # type — so OCCT's non-determinism can never leak into the lockstep/replay path (the M13.1 boundary).
+          # A reserve gate (no such dep is adopted yet). Prose comments are fine.
+          if grep -rn "opencascade::\|occt::\|steplib::\|ruststep::" core ecs transport plugins assets economy physics gizmo skeleton deform dst csg sdf hotpatch ivm authoring efficiency lattice editor-shell mcp tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::a STEP/OCCT kernel type (opencascade::/occt::/steplib::/ruststep::) leaked outside /interchange — CAD import must stay behind CadInterchange (invariant 5; OCCT is native/server-only, OUT of the determinism guarantee — ADR-070)"
+            exit 1
+          fi
+          echo "no opencascade/occt/steplib/ruststep outside /interchange — CadInterchange boundary intact"
+
       - name: test
         run: cargo test --workspace
 

@@ -15,6 +15,7 @@ pub mod ai;
 pub mod blobstore;
 pub mod bom;
 pub mod bridge;
+pub mod cad_intent;
 pub mod capscene;
 pub mod compose_ai;
 pub mod csg_intent;
@@ -28,6 +29,7 @@ pub mod play_rules;
 pub mod plugin_host;
 pub mod project;
 pub mod reveal;
+pub mod sdf_intent;
 pub mod transform_solver;
 pub mod wallet;
 
@@ -38,6 +40,7 @@ pub use bridge::{
     apply_edit, enrich_relational, project_entity, project_full, EditIntent, EditTx,
     ProjectionDelta, ProjectionOp, RelSummary,
 };
+pub use cad_intent::{import_step, StepImport};
 pub use capscene::{
     add_kind, apply_marketplace_entry, bind, describe_create, duplicate_entity, instantiate,
     place_generation_placeholder, place_mesh, positions, remove_entity, seed, CapResolver,
@@ -61,4 +64,5 @@ pub use persist::{Log, Record};
 pub use play_rules::{build_recording, PlaySession};
 pub use project::{atomic_write, open_into, save, OpenError};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
+pub use sdf_intent::{bake as bake_sdf, bake_auto as bake_sdf_auto, SdfBakeError};
 pub use wallet::Wallet;

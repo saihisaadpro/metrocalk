@@ -1,0 +1,87 @@
+name: sdf-determinism
+
+# M15.0 (ADR-070, Leg B) — is the SDF/implicit canonical rep's compile-to-mesh BIT-DETERMINISTIC across
+# platforms? Runs the `metrocalk-sdf` `hash` example (compile the canonical `box − cylinder` op via Marching
+# Tetrahedra, FNV-1a content hash of the mesh) on x86_64 (Linux + Windows) AND arm64 (macOS) — the ADR-020
+# cross-ISA property — plus wasm32-wasip1 (wasmtime). Each job prints FINAL_SDF_HASH as a ::notice:: so the
+# hashes are comparable from the check-runs annotations without auth. Toolchain PINNED to 1.92.0.
+#
+# Native f64 is bit-identical (ADR-020, re-confirmed test-first in the crate). Because this path uses ONLY
+# IEEE-754 correctly-rounded ops (no fma / no transcendentals), the wasm run is *designed* to match native
+# (a stronger position than the rapier f64 path, whose wasm diverges) — the wasm job's ::notice is where that
+# is observed; it is non-blocking, so the standing ADR-020 wasm32 boundary (web = server-authoritative until
+# confirmed) can never red this workflow.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "sdf/**"
+      - "csg/**"
+      - ".github/workflows/sdf-determinism.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: sdf hash ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest] # macos-latest = Apple Silicon (arm64)
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.92.0 (pinned — identical codegen across platforms)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: sdf compile hash (native f64)
+        run: |
+          out=$(cargo run -p metrocalk-sdf --example hash --release)
+          echo "$out"
+          hash=$(echo "$out" | grep -oE 'FINAL_SDF_HASH = [0-9a-f]+' | awk '{print $NF}')
+          echo "::notice title=sdf hash ${{ matrix.os }} ($RUNNER_ARCH)::$hash"
+          test -n "$hash" || { echo "::error::no SDF hash produced on ${{ matrix.os }}"; exit 1; }
+
+  wasm:
+    name: sdf hash wasm32-wasip1 (wasmtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Non-blocking: the standing ADR-020 wasm32 boundary means the web path is server-authoritative until
+    # this cross-platform number is confirmed; a wasmtime/setup hiccup must not red the workflow.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.92.0 + wasm32-wasip1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+          targets: wasm32-wasip1
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasmtime
+        run: |
+          curl -sSf https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: sdf compile hash on wasm32 (cross-platform IEEE-754)
+        run: |
+          cargo build -p metrocalk-sdf --example hash --release --target wasm32-wasip1
+          out=$(wasmtime run target/wasm32-wasip1/release/examples/hash.wasm)
+          echo "$out"
+          hash=$(echo "$out" | grep -oE 'FINAL_SDF_HASH = [0-9a-f]+' | awk '{print $NF}')
+          echo "::notice title=sdf hash wasm32-wasip1::$hash"
+          test -n "$hash" || { echo "::error::no SDF hash produced on wasm32"; exit 1; }

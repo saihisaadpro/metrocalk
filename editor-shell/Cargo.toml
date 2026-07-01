@@ -40,6 +40,10 @@ metrocalk-assets = { path = "../assets", features = ["signing"] }
 # mesh-agnostic — the geometry lives in the store by handle, never in Loro). The `Csg` trait is the
 # boundary; no `robust::`/`csgrs::` type crosses (grep-gated). Pure Rust + wasm-clean.
 metrocalk-csg = { path = "../csg" }
+# The SDF/implicit canonical geometry rep (M15.0 / ADR-070, Leg B). `sdf_intent` bakes an SDF program down
+# to a deterministic watertight mesh and lands it as a content-addressed MeshAsset + a place_mesh-style
+# undoable commit (like `csg_intent`). Reuses the M13.2 `TriMesh`/validator; pure Rust + wasm-clean.
+metrocalk-sdf = { path = "../sdf" }
 # The WASM plugin host (M12.3 / ADR-047) — the honest-ceiling escape. editor-shell drives a sandboxed
 # plugin through the project-owned `PluginHost` trait (NO `extism::` type crosses — grep-gated) and lands
 # its effect as a schema-validated undoable transaction via the M6 `apply_ai_patch` contract.

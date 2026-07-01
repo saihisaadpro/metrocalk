@@ -290,3 +290,27 @@ jobs:
         run: |
           cargo build -p metrocalk-lattice --release --target wasm32-unknown-unknown
           echo "metrocalk-lattice wasm32 build OK"
+
+  wasm32-sdf:
+    name: build wasm32 (metrocalk-sdf)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The SDF/implicit canonical geometry rep (M15.0 / ADR-070, Leg B): the "geometry is a program" field
+      # + exact-CSG (min/max) compiled down to a deterministic watertight mesh (Marching Tetrahedra),
+      # reusing the M13.2 `TriMesh`/validator. THE CANONICAL-REP BET is that geometry stays wasm-portable —
+      # this build IS the proof (zero-dep beyond /csg; `-p metrocalk-sdf` pulls only `metrocalk-csg` + std).
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-sdf --release --target wasm32-unknown-unknown
+          echo "metrocalk-sdf wasm32 build OK"

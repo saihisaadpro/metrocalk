@@ -2480,6 +2480,7 @@ dependencies = [
  "metrocalk-gizmo",
  "metrocalk-interchange",
  "metrocalk-plugins",
+ "metrocalk-sdf",
  "serde",
  "serde_json",
 ]
@@ -2509,6 +2510,7 @@ dependencies = [
 name = "metrocalk-interchange"
 version = "0.1.0"
 dependencies = [
+ "metrocalk-csg",
  "metrocalk-physics",
  "openusd",
  "serde",
@@ -2552,6 +2554,13 @@ dependencies = [
  "extism",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "metrocalk-sdf"
+version = "0.1.0"
+dependencies = [
+ "metrocalk-csg",
 ]
 
 [[package]]
