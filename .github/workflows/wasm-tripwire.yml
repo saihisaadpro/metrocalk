@@ -240,3 +240,28 @@ jobs:
         run: |
           cargo build -p metrocalk-csg --release --target wasm32-unknown-unknown
           echo "metrocalk-csg wasm32 build OK"
+
+  wasm32-ivm:
+    name: build wasm32 (metrocalk-ivm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The Incremental Engine spike (M13.4 / ADR-053): a hand-rolled minimal IVM operator (the compat-query
+      # maintained view) behind our own `IncrementalView` trait. THIS BUILD IS THE CRATE-AUDIT ANSWER — the
+      # hand-rolled operator is ZERO-DEP + wasm-clean, where `dbsp` (~106K SLoC) has an unconfirmed wasm32
+      # target. `-p metrocalk-ivm` pulls only std. (An incremental query is server-authoritative on web per
+      # ADR-006/020, but the operator itself must keep compiling to the browser.)
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-ivm --release --target wasm32-unknown-unknown
+          echo "metrocalk-ivm wasm32 build OK"

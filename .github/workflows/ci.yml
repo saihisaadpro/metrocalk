@@ -173,6 +173,20 @@ jobs:
           fi
           echo "no subsecond:: outside /hotpatch — HotPatch-trait boundary intact"
 
+      - name: No IVM engine types leak outside the /ivm crate (invariant 5, M13.4/ADR-053)
+        run: |
+          # The Incremental Engine spike hand-rolls a minimal operator behind the project-owned
+          # `IncrementalView` trait (the crate-audit verdict: dbsp is ~106K SLoC + wasm-unconfirmed → own it).
+          # If a heavier query family ever justifies adopting `dbsp` / `differential-dataflow` / `timely`, it
+          # must live ONLY in /ivm behind the trait — the same discipline as rapier-in-/physics. This gate
+          # RESERVES the boundary in advance (those crates are not dependencies today). Prose mentions of the
+          # crate names without `::` are fine.
+          if grep -rn "dbsp::\|differential_dataflow::\|timely::" core ecs transport plugins assets economy physics interchange gizmo skeleton deform dst csg hotpatch editor-shell mcp tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::an IVM engine type (dbsp::/differential_dataflow::/timely::) leaked outside /ivm — incremental views must stay behind the IncrementalView trait (invariant 5)"
+            exit 1
+          fi
+          echo "no dbsp::/differential_dataflow::/timely:: outside /ivm — IncrementalView-trait boundary intact"
+
       - name: test
         run: cargo test --workspace
 

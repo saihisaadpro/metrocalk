@@ -1,0 +1,24 @@
+# metrocalk-ivm (M13.4 / ADR-053) — the Incremental Engine SPIKE: IVM-vs-eager on ONE expensive
+# relational query (the capability compat-query), the measured crossover study.
+#
+# THE DELIVERABLE IS A MEASURED GO/NO-GO NUMBER, not an engine-wide rewrite. A hand-rolled minimal
+# incremental operator (the M9.5/ARAP "own-it-for-determinism/wasm/min-spec" precedent) behind a
+# project-owned `IncrementalView` trait — the crate-audit answer to `dbsp` (~106K SLoC, wasm
+# unconfirmed) / `differential-dataflow`: **zero dependencies, wasm-portable, deterministic**
+# (BTree-ordered → bit-identical output; no RNG in the operator).
+#
+# The op-CRDT log IS the IVM input stream (FM-T1.2, one delta-algebra): `Delta` is the serializable
+# projection of the shipped `Op::{AddPair, RemovePair, DeleteEntity}` capability-Provides/Requires
+# pairs (ADR-001) — the same reuse-don't-fork pattern as hotpatch's EditOp / dst's Scenario.
+[package]
+name = "metrocalk-ivm"
+version = "0.1.0"
+edition = "2021"
+description = "Incremental-view-maintenance spike — IVM-vs-eager crossover on the capability compat-query (M13.4)"
+publish = false
+
+[lints]
+workspace = true
+
+# Zero dependencies — the wasm/min-spec/determinism audit answer (a hand-rolled operator, not `dbsp`).
+[dependencies]
