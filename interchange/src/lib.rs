@@ -21,9 +21,9 @@ mod step;
 mod urdf;
 mod usd;
 pub use step::{
-    round_trip_deviation, CadEdge, CadFace, CadInterchange, CadScene, CadSolid, FaceKind,
-    StepError, StepInterchange, MAX_ENTITIES as STEP_MAX_ENTITIES, MAX_STEP_BYTES,
-    ROUND_TRIP_BUDGET,
+    gdt_entity_name, gdt_token, round_trip_deviation, CadEdge, CadFace, CadInterchange, CadPmi,
+    CadScene, CadSolid, FaceKind, StepError, StepInterchange, MAX_ENTITIES as STEP_MAX_ENTITIES,
+    MAX_STEP_BYTES, ROUND_TRIP_BUDGET,
 };
 pub use urdf::UrdfInterchange;
 pub use usd::UsdInterchange;

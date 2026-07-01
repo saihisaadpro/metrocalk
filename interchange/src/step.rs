@@ -75,6 +75,31 @@ pub struct CadSolid {
     pub faces: Vec<CadFace>,
 }
 
+/// **Neutral semantic PMI** (M15.5 / ADR-075) — one AP242 semantic feature-control-frame, as **string
+/// tokens** (no foreign `Fcf` enum crosses the interchange boundary; the editor maps this ↔ its typed
+/// `Characteristic`/`Standard`). It is **SEMANTIC** (a machine-readable `geometric_tolerance` entity — a
+/// typed characteristic + a numeric zone + a face/datum reference), **not GRAPHICAL** (a drawn callout /
+/// `annotation_occurrence` — a picture a human reads). The distinction is the whole M15.5 claim: PMI that
+/// survives a STEP round-trip **still semantic**, not downgraded to a graphic.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CadPmi {
+    /// The toleranced feature — a [`CadFace`] `#id` **in this scene** (the SHAPE_ASPECT-referenced face).
+    pub face_id: u64,
+    /// The GD&T characteristic as a canonical token (`"position"`/`"flatness"`/… — the editor's
+    /// `Characteristic::canonical()`), derived from the AP242 `geometric_tolerance` subtype entity name.
+    pub characteristic: String,
+    /// The tolerance-zone magnitude in millimetres (from the `LENGTH_MEASURE_WITH_UNIT`).
+    pub value_mm: f64,
+    /// The datum feature — a [`CadFace`] `#id` — for orientation/location tolerances; `None` for form.
+    pub datum_face_id: Option<u64>,
+    /// The authoring standard token (`"ASME_Y14.5"`/`"ISO_GPS"`), from the tolerance `description`.
+    pub standard: String,
+    /// **True** = parsed from a machine-readable `geometric_tolerance` chain (semantic); **false** = a
+    /// graphical-only callout was found (a downgrade — measured, never silently treated as semantic). Our
+    /// own writer only ever emits semantic entities, so a round-trip through this crate stays `true`.
+    pub semantic: bool,
+}
+
 /// The neutral CAD import — our types only, no foreign STEP-lib leak (invariant 5). The editor maps this to
 /// **referenceable registry entities** (faces/edges) + a tessellated `MeshAsset`, as one undoable commit.
 #[derive(Clone, PartialEq, Debug)]
@@ -87,6 +112,9 @@ pub struct CadScene {
     pub units: Units,
     /// The solids.
     pub solids: Vec<CadSolid>,
+    /// The **semantic PMI** attached to referenceable faces (M15.5) — round-tripped through STEP AP242 as
+    /// machine-readable `geometric_tolerance` entities, never a graphical downgrade.
+    pub pmi: Vec<CadPmi>,
     /// Every unsupported/approximated feature, explained (curved faces → the OCCT seam), never a silent drop.
     pub notes: Vec<UnsupportedNote>,
 }
@@ -429,6 +457,22 @@ fn parse_statement(stmt: &str) -> Result<(u64, Entity), StepError> {
         .parse()
         .map_err(|_| StepError::Malformed(format!("bad entity id in #{rest:.40}")))?;
     let body = rest[eq + 1..].trim();
+    // A **complex (AND-combined) instance** — `#id = (SUBTYPE_A(...) SUBTYPE_B(...) LEAF())` — the Part-21
+    // form AP242 uses for a datum-referencing geometric_tolerance. It is recorded as a synthetic
+    // [`COMPLEX_INSTANCE`] entity whose args are the sub-records (each a `Value::Typed`); the PMI interpreter
+    // finds the geometric_tolerance leaf among them. (`parse_paren_list` already tolerates the
+    // space-separated, comma-free sub-record sequence.)
+    if body.starts_with('(') {
+        let mut cur = Cursor::new(body);
+        let list = cur.parse_paren_list()?;
+        return Ok((
+            id,
+            Entity {
+                name: COMPLEX_INSTANCE.to_string(),
+                args: list,
+            },
+        ));
+    }
     let paren = body
         .find('(')
         .ok_or_else(|| StepError::Malformed(format!("no '(' after entity name in #{id}")))?;
@@ -442,9 +486,19 @@ fn parse_statement(stmt: &str) -> Result<(u64, Entity), StepError> {
     Ok((id, Entity { name, args }))
 }
 
+/// The synthetic entity name for a parsed complex (AND-combined) instance (its args are the sub-records).
+const COMPLEX_INSTANCE: &str = "!COMPLEX";
+
+/// The maximum `(...)` nesting the recursive value parser will descend before returning a `Malformed` error.
+/// Real Part-21 nests only a handful deep (a complex instance's sub-records, a coordinate list); a crafted
+/// deep-nesting file (`A(((((…)))))`, within [`MAX_STEP_BYTES`]) would otherwise recurse to a **stack overflow
+/// (process abort)** — a bounds-check, so an adversarial input is an explained [`StepError`], never a panic.
+const MAX_PAREN_DEPTH: u32 = 256;
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: u32,
 }
 
 impl<'a> Cursor<'a> {
@@ -452,6 +506,7 @@ impl<'a> Cursor<'a> {
         Cursor {
             bytes: s.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
     fn peek(&self) -> Option<u8> {
@@ -466,19 +521,27 @@ impl<'a> Cursor<'a> {
             }
         }
     }
-    /// Parse a `(...)` list at the cursor into a Vec of Values.
+    /// Parse a `(...)` list at the cursor into a Vec of Values. **Depth-bounded** ([`MAX_PAREN_DEPTH`]) — a
+    /// crafted deep-nesting input is an explained `Malformed` error, never a stack-overflow abort.
     fn parse_paren_list(&mut self) -> Result<Vec<Value>, StepError> {
         self.skip_ws();
         if self.peek() != Some(b'(') {
             return Err(StepError::Malformed("expected '('".into()));
         }
         self.pos += 1;
+        self.depth += 1;
+        if self.depth > MAX_PAREN_DEPTH {
+            return Err(StepError::Malformed(format!(
+                "STEP value nesting exceeds {MAX_PAREN_DEPTH} levels (deep-nesting guard)"
+            )));
+        }
         let mut items = Vec::new();
         loop {
             self.skip_ws();
             match self.peek() {
                 Some(b')') => {
                     self.pos += 1;
+                    self.depth -= 1;
                     return Ok(items);
                 }
                 Some(b',') => {
@@ -766,6 +829,11 @@ fn interpret(entities: &BTreeMap<u64, Entity>) -> Result<CadScene, StepError> {
         ));
     }
 
+    // Parse the semantic PMI (AP242 geometric_tolerance entities) attached to the resolved faces (M15.5).
+    let face_ids: std::collections::BTreeSet<u64> =
+        solids.iter().flat_map(|s| &s.faces).map(|f| f.id).collect();
+    let pmi = parse_pmi(entities, &face_ids, &mut notes);
+
     let name = file_name(entities).unwrap_or_else(|| "STEP part".to_string());
     Ok(CadScene {
         name,
@@ -776,6 +844,7 @@ fn interpret(entities: &BTreeMap<u64, Entity>) -> Result<CadScene, StepError> {
             kilograms_per_unit: 1.0,
         },
         solids,
+        pmi,
         notes,
     })
 }
@@ -998,6 +1067,8 @@ fn export_faceted(scene: &CadScene) -> Result<String, StepError> {
     };
 
     let mut face_ids: Vec<u64> = Vec::new();
+    // original CadFace.id → its emitted FACE #id, so a PMI shape_aspect points at the re-emitted face.
+    let mut emitted_face: BTreeMap<u64, u64> = BTreeMap::new();
     let mut n_curved = 0usize;
     for solid in &scene.solids {
         for face in &solid.faces {
@@ -1025,6 +1096,7 @@ fn export_faceted(scene: &CadScene) -> Result<String, StepError> {
             let f = next();
             out.push_str(&format!("#{f} = FACE('',(#{bound_id}));\n"));
             face_ids.push(f);
+            emitted_face.insert(face.id, f);
         }
     }
 
@@ -1049,6 +1121,16 @@ fn export_faceted(scene: &CadScene) -> Result<String, StepError> {
              the OpenCascade native/server seam (ADR-070) */\n"
         ));
     }
+
+    // Emit the semantic PMI (AP242 geometric_tolerance entities) — machine-readable, never a graphical
+    // downgrade (M15.5 / ADR-075). Any PMI that can't round-trip (curved-face reference / unknown
+    // characteristic) is an explained comment, never a silent drop.
+    let mut pmi_notes: Vec<String> = Vec::new();
+    export_pmi_entities(scene, &mut out, &mut next, &emitted_face, &mut pmi_notes);
+    for n in &pmi_notes {
+        out.push_str(&format!("/* {n} */\n"));
+    }
+
     out.push_str("ENDSEC;\n");
     out.push_str("END-ISO-10303-21;\n");
     Ok(out)
@@ -1102,6 +1184,265 @@ fn welded_vertices(scene: &CadScene) -> Vec<[f64; 3]> {
 fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
     let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
     d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+}
+
+// ============================================================================================
+// Semantic PMI — AP242 GD&T round-trip (M15.5 / ADR-075), a DECLARED SUBSET
+// ============================================================================================
+//
+// We read/write the AP242 **semantic** geometric_tolerance entity chain so a feature-control-frame survives
+// the round-trip **still semantic** (a typed characteristic + a numeric zone + a face/datum reference —
+// machine-readable), NOT downgraded to a **graphical** callout (a drawn annotation a human reads). The
+// honest bound (measured, not badged): a **declared subset** — the 10 form/orientation/location
+// characteristics (M15.3) on a **single datum**, with the simplifications that (1) the standard rides the
+// geometric_tolerance `description`, (2) the toleranced/datum shape_aspect references the face directly
+// rather than through the full product_definition_shape + geometric_item_specific_usage chain. Full AP242
+// ed4 conformance (the complex-instance datum_system algebra, MMC/LMC/composite frames) + wild-vendor
+// fidelity is the **OCCT-backed native/server seam** (ADR-070). Our own writer emits only semantic entities,
+// so a round-trip **through this crate** is 100% semantic on the declared subset — the fidelity we publish.
+
+/// The bijection between the editor's canonical GD&T characteristic token and the AP242 `geometric_tolerance`
+/// subtype entity name (ISO 10303-242). `circularity` maps to `ROUNDNESS_TOLERANCE` (the STEP spelling).
+const GDT_MAP: [(&str, &str); 10] = [
+    ("flatness", "FLATNESS_TOLERANCE"),
+    ("straightness", "STRAIGHTNESS_TOLERANCE"),
+    ("circularity", "ROUNDNESS_TOLERANCE"),
+    ("cylindricity", "CYLINDRICITY_TOLERANCE"),
+    ("parallelism", "PARALLELISM_TOLERANCE"),
+    ("perpendicularity", "PERPENDICULARITY_TOLERANCE"),
+    ("angularity", "ANGULARITY_TOLERANCE"),
+    ("position", "POSITION_TOLERANCE"),
+    ("concentricity", "CONCENTRICITY_TOLERANCE"),
+    ("symmetry", "SYMMETRY_TOLERANCE"),
+];
+
+/// The AP242 `geometric_tolerance` subtype entity name for a canonical GD&T token (e.g. `position` →
+/// `POSITION_TOLERANCE`). `None` if the token is not one of the declared-subset characteristics.
+#[must_use]
+pub fn gdt_entity_name(token: &str) -> Option<&'static str> {
+    GDT_MAP.iter().find(|(t, _)| *t == token).map(|(_, e)| *e)
+}
+
+/// The canonical GD&T token for an AP242 `geometric_tolerance` subtype entity name (the inverse of
+/// [`gdt_entity_name`]). `None` if the entity is not a recognized declared-subset tolerance.
+#[must_use]
+pub fn gdt_token(entity_name: &str) -> Option<&'static str> {
+    GDT_MAP
+        .iter()
+        .find(|(_, e)| *e == entity_name)
+        .map(|(t, _)| *t)
+}
+
+/// Resolve a `LENGTH_MEASURE_WITH_UNIT` (or a bare `LENGTH_MEASURE`) `#id` → its millimetre value.
+fn measure_value(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<f64> {
+    let e = entities.get(&id)?;
+    // LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(<v>), #unit) — arg 0 is the typed measure.
+    match e.args.first() {
+        Some(Value::Typed(_, inner)) => inner.first().and_then(Value::as_real),
+        Some(v) => v.as_real(),
+        None => None,
+    }
+}
+
+/// Resolve a `SHAPE_ASPECT` `#id` → the referenceable face `#id` it is bound to (the arg that is a `#ref`).
+fn shape_aspect_face(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<u64> {
+    let e = entities.get(&id)?;
+    if e.name != "SHAPE_ASPECT" {
+        return None;
+    }
+    // SHAPE_ASPECT(name, description, #of_shape, product_definitional) — the face ref is the first #ref arg.
+    e.args.iter().find_map(Value::as_ref_id)
+}
+
+/// Resolve a `DATUM` `#id` → its datum face `#id` (via its `SHAPE_ASPECT`).
+fn datum_face(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<u64> {
+    let e = entities.get(&id)?;
+    if e.name != "DATUM" {
+        return None;
+    }
+    // DATUM(name, description, #shape_aspect, product_definitional, identification) — follow the shape_aspect.
+    let sa = e.args.iter().find_map(Value::as_ref_id)?;
+    shape_aspect_face(entities, sa)
+}
+
+/// Pull one [`CadPmi`] from a `GEOMETRIC_TOLERANCE` record's args `(name, description, #magnitude,
+/// #toleranced_shape_aspect)` + an optional datum ref. `face_ids` gates the face reference to a real
+/// resolved face (never a dangle).
+fn pmi_from_gt(
+    entities: &BTreeMap<u64, Entity>,
+    gt_args: &[Value],
+    characteristic: &str,
+    datum_ref: Option<u64>,
+    face_ids: &std::collections::BTreeSet<u64>,
+) -> Option<CadPmi> {
+    let standard = match gt_args.get(1) {
+        Some(Value::Str(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let value_mm = gt_args
+        .get(2)
+        .and_then(Value::as_ref_id)
+        .and_then(|m| measure_value(entities, m))?;
+    let sa = gt_args.get(3).and_then(Value::as_ref_id)?;
+    let face_id = shape_aspect_face(entities, sa)?;
+    if !face_ids.contains(&face_id) {
+        return None;
+    }
+    let datum_face_id = datum_ref
+        .and_then(|d| datum_face(entities, d))
+        .filter(|d| face_ids.contains(d));
+    Some(CadPmi {
+        face_id,
+        characteristic: characteristic.to_string(),
+        value_mm,
+        datum_face_id,
+        standard,
+        semantic: true,
+    })
+}
+
+/// Scan the entity graph for AP242 semantic PMI (`geometric_tolerance` subtypes, simple or complex instance)
+/// and interpret each into a [`CadPmi`]. A **graphical-only** callout (`*ANNOTATION*` / `DRAUGHTING_CALLOUT`)
+/// that is *not* backed by a semantic tolerance is **not** surfaced as PMI — it is an explained note (the
+/// honest downgrade: a graphic is not machine-readable; the semantic path is what round-trips). Deterministic
+/// order (the entity map is a `BTreeMap`).
+fn parse_pmi(
+    entities: &BTreeMap<u64, Entity>,
+    face_ids: &std::collections::BTreeSet<u64>,
+    notes: &mut Vec<UnsupportedNote>,
+) -> Vec<CadPmi> {
+    let mut pmi = Vec::new();
+    let mut graphical = 0usize;
+    for (id, e) in entities {
+        // A simple-instance form tolerance: `FLATNESS_TOLERANCE(name, description, #mag, #tsa)`.
+        if let Some(token) = gdt_token(&e.name) {
+            if let Some(p) = pmi_from_gt(entities, &e.args, token, None, face_ids) {
+                pmi.push(p);
+            }
+            continue;
+        }
+        // A complex-instance datum-referencing tolerance:
+        //   `(GEOMETRIC_TOLERANCE(...) GEOMETRIC_TOLERANCE_WITH_DATUM_REFERENCE((#dat)) <LEAF>())`.
+        if e.name == COMPLEX_INSTANCE {
+            let sub = |n: &str| {
+                e.args.iter().find_map(|a| match a {
+                    Value::Typed(name, inner) if name == n => Some(inner.as_slice()),
+                    _ => None,
+                })
+            };
+            let leaf_token = e.args.iter().find_map(|a| match a {
+                Value::Typed(name, _) => gdt_token(name),
+                _ => None,
+            });
+            if let (Some(token), Some(gt)) = (leaf_token, sub("GEOMETRIC_TOLERANCE")) {
+                let datum_ref = sub("GEOMETRIC_TOLERANCE_WITH_DATUM_REFERENCE")
+                    .and_then(|d| d.first())
+                    .and_then(Value::as_list)
+                    .and_then(|l| l.first())
+                    .and_then(Value::as_ref_id);
+                if let Some(p) = pmi_from_gt(entities, gt, token, datum_ref, face_ids) {
+                    pmi.push(p);
+                }
+            }
+            continue;
+        }
+        // A graphical-only annotation (a drawn callout) — counted + explained, NOT surfaced as semantic PMI.
+        if e.name.contains("ANNOTATION") || e.name == "DRAUGHTING_CALLOUT" {
+            graphical += 1;
+        }
+        let _ = id;
+    }
+    if graphical > 0 {
+        notes.push(UnsupportedNote {
+            feature: format!("{graphical} graphical PMI callout(s)"),
+            detail: "a drawn annotation is NOT machine-readable — not surfaced as semantic PMI. Recovering \
+                     semantic tolerances from graphics-only PMI is the OCCT / full-AP242 native/server seam \
+                     (ADR-070/075)."
+                .into(),
+        });
+    }
+    pmi
+}
+
+/// Emit the AP242 semantic-PMI entities for a scene's [`CadScene::pmi`], into the DATA section of a faceted
+/// re-export. `emitted_face`: original `CadFace.id` → its emitted `FACE` `#id` (so the shape_aspect points at
+/// the re-emitted face). A PMI whose face wasn't emitted (curved → OCCT seam) is skipped with a note.
+#[allow(clippy::format_push_string)]
+fn export_pmi_entities(
+    scene: &CadScene,
+    out: &mut String,
+    next: &mut dyn FnMut() -> u64,
+    emitted_face: &BTreeMap<u64, u64>,
+    notes: &mut Vec<String>,
+) {
+    if scene.pmi.is_empty() {
+        return;
+    }
+    // One shared millimetre length unit.
+    let unit = next();
+    out.push_str(&format!("#{unit} = SI_UNIT(.MILLI.,.METRE.);\n"));
+
+    for p in &scene.pmi {
+        let Some(entity_name) = gdt_entity_name(&p.characteristic) else {
+            notes.push(format!(
+                "PMI '{}' on face #{} — unknown characteristic, not exported (semantic downgrade)",
+                p.characteristic, p.face_id
+            ));
+            continue;
+        };
+        let Some(&face) = emitted_face.get(&p.face_id) else {
+            notes.push(format!(
+                "PMI '{}' references face #{} which is not in the faceted export (curved → OCCT seam)",
+                p.characteristic, p.face_id
+            ));
+            continue;
+        };
+
+        let mag = next();
+        out.push_str(&format!(
+            "#{mag} = LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE({}),#{unit});\n",
+            real(p.value_mm)
+        ));
+        let fsa = next();
+        out.push_str(&format!(
+            "#{fsa} = SHAPE_ASPECT('{}','metrocalk-semantic-pmi',#{face},.T.);\n",
+            p.characteristic
+        ));
+
+        let std_tok = p.standard.replace('\'', "''");
+        if let Some(dface) = p.datum_face_id.and_then(|d| emitted_face.get(&d).copied()) {
+            // A datum-referencing tolerance → the faithful AP242 complex (AND-combined) instance.
+            let dsa = next();
+            out.push_str(&format!(
+                "#{dsa} = SHAPE_ASPECT('datum','metrocalk-semantic-pmi',#{dface},.T.);\n"
+            ));
+            let dat = next();
+            out.push_str(&format!(
+                "#{dat} = DATUM('A','datum feature',#{dsa},.T.,'A');\n"
+            ));
+            let tol = next();
+            out.push_str(&format!(
+                "#{tol} = (GEOMETRIC_TOLERANCE('{}','{}',#{mag},#{fsa})\
+                 GEOMETRIC_TOLERANCE_WITH_DATUM_REFERENCE((#{dat}))\
+                 {entity_name}());\n",
+                p.characteristic, std_tok
+            ));
+        } else {
+            if let Some(missing) = p.datum_face_id {
+                notes.push(format!(
+                    "PMI '{}' datum face #{missing} not in the faceted export (curved → OCCT seam); \
+                     exported datumless",
+                    p.characteristic,
+                ));
+            }
+            // A datumless form tolerance → a conformant simple instance.
+            let tol = next();
+            out.push_str(&format!(
+                "#{tol} = {entity_name}('{}','{}',#{mag},#{fsa});\n",
+                p.characteristic, std_tok
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1192,6 +1533,25 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_input_is_bounded_never_a_stack_overflow() {
+        // A crafted deep-nesting statement (`#1 = A(((…0…)))`, within MAX_STEP_BYTES) would recurse to a
+        // stack-overflow ABORT without the depth guard. It must be an explained StepError, never a panic —
+        // the M10.2 never-panic gate on adversarial input (the M15.5 hardening). 300 > MAX_PAREN_DEPTH (256),
+        // so the guard fires while the recursion is still shallow (no real overflow risk in this test).
+        let deep = format!("A{}0{}", "(".repeat(300), ")".repeat(300));
+        let s = format!(
+            "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#1 = {deep};\nENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        match StepInterchange.import(s.as_bytes()) {
+            Err(StepError::Malformed(why)) => assert!(
+                why.contains("nesting"),
+                "the deep-nesting guard explains it: {why}"
+            ),
+            other => panic!("expected a Malformed nesting error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_curved_surface_is_referenced_and_explained_not_dropped() {
         // A face over a CYLINDRICAL_SURFACE is kept as a referenceable Curved face + an explained note
         // (the OCCT seam), never silently lost.
@@ -1221,5 +1581,163 @@ mod tests {
             scene.notes.iter().any(|n| n.detail.contains("OpenCascade")),
             "the OCCT seam is explained, not silent"
         );
+    }
+
+    // ── M15.5 (ADR-075): AP242 semantic-PMI round-trip through the pure-Rust Part-21 subset ────────────────
+
+    /// The cube imported, with two semantic FCFs attached to its faces (a datum-referencing position + a
+    /// datumless flatness). The face ids come from the real import.
+    fn cube_with_pmi() -> CadScene {
+        let mut scene = StepInterchange
+            .import(CUBE_STEP.as_bytes())
+            .expect("import");
+        let f: Vec<u64> = scene.solids[0].faces.iter().map(|face| face.id).collect();
+        scene.pmi = vec![
+            CadPmi {
+                face_id: f[0],
+                characteristic: "position".into(),
+                value_mm: 0.10,
+                datum_face_id: Some(f[1]),
+                standard: "ASME_Y14.5".into(),
+                semantic: true,
+            },
+            CadPmi {
+                face_id: f[2],
+                characteristic: "flatness".into(),
+                value_mm: 0.02,
+                datum_face_id: None,
+                standard: "ISO_GPS".into(),
+                semantic: true,
+            },
+        ];
+        scene
+    }
+
+    #[test]
+    fn semantic_pmi_round_trips_as_machine_readable_structured_data() {
+        let step = StepInterchange;
+        let before = cube_with_pmi();
+        let exported = step.export(&before).expect("re-export with PMI");
+        // The exported STEP carries SEMANTIC geometric_tolerance entities, not graphical callouts.
+        assert!(
+            exported.contains("POSITION_TOLERANCE"),
+            "position is semantic"
+        );
+        assert!(
+            exported.contains("FLATNESS_TOLERANCE"),
+            "flatness is semantic"
+        );
+        assert!(exported.contains("GEOMETRIC_TOLERANCE_WITH_DATUM_REFERENCE"));
+        assert!(!exported.contains("ANNOTATION"), "no graphical downgrade");
+
+        let after = step
+            .import(exported.as_bytes())
+            .expect("re-import with PMI");
+        assert_eq!(after.pmi.len(), 2, "both FCFs survive the round-trip");
+
+        // The position FCF: still semantic, value + datum-presence + standard preserved, on a real face.
+        let pos = after
+            .pmi
+            .iter()
+            .find(|p| p.characteristic == "position")
+            .expect("position survived semantic");
+        assert!(pos.semantic, "still SEMANTIC, not graphical");
+        assert!((pos.value_mm - 0.10).abs() < 1e-12, "value bit-preserved");
+        assert!(pos.datum_face_id.is_some(), "datum reference preserved");
+        assert_eq!(pos.standard, "ASME_Y14.5", "standard preserved");
+        let face_ids: std::collections::BTreeSet<u64> = after
+            .solids
+            .iter()
+            .flat_map(|s| &s.faces)
+            .map(|f| f.id)
+            .collect();
+        assert!(face_ids.contains(&pos.face_id), "attached to a real face");
+
+        // The flatness FCF: datumless form tolerance survives semantic.
+        let flat = after
+            .pmi
+            .iter()
+            .find(|p| p.characteristic == "flatness")
+            .expect("flatness survived semantic");
+        assert!(flat.semantic && flat.datum_face_id.is_none());
+        assert!((flat.value_mm - 0.02).abs() < 1e-12);
+        assert_eq!(flat.standard, "ISO_GPS");
+
+        // Geometry still round-trips within budget (PMI didn't perturb the vertices).
+        assert!(round_trip_deviation(&before, &after) <= ROUND_TRIP_BUDGET);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // i is 0..9 — the usize→f64 cast is exact
+    fn all_ten_declared_characteristics_round_trip_semantic() {
+        let step = StepInterchange;
+        let mut scene = StepInterchange
+            .import(CUBE_STEP.as_bytes())
+            .expect("import");
+        let f: Vec<u64> = scene.solids[0].faces.iter().map(|face| face.id).collect();
+        // Attach every declared characteristic; orientation/location get a datum, form does not.
+        let datum = |t: &str| {
+            matches!(
+                t,
+                "parallelism"
+                    | "perpendicularity"
+                    | "angularity"
+                    | "position"
+                    | "concentricity"
+                    | "symmetry"
+            )
+        };
+        for (i, (token, _)) in GDT_MAP.iter().enumerate() {
+            scene.pmi.push(CadPmi {
+                face_id: f[i % f.len()],
+                characteristic: (*token).into(),
+                value_mm: 0.01 * (i as f64 + 1.0),
+                datum_face_id: datum(token).then(|| f[(i + 1) % f.len()]),
+                standard: "ASME_Y14.5".into(),
+                semantic: true,
+            });
+        }
+        let exported = step.export(&scene).expect("export all 10");
+        let after = step.import(exported.as_bytes()).expect("re-import all 10");
+        assert_eq!(after.pmi.len(), 10, "all 10 characteristics round-trip");
+        for (token, _) in GDT_MAP {
+            assert!(
+                after
+                    .pmi
+                    .iter()
+                    .any(|p| p.characteristic == token && p.semantic),
+                "{token} survived semantic"
+            );
+        }
+    }
+
+    #[test]
+    fn a_graphical_only_callout_is_noted_not_surfaced_as_semantic() {
+        // A file whose PMI is a GRAPHICAL annotation (a drawn callout) — NOT a geometric_tolerance. Our
+        // reader must NOT surface it as semantic PMI; it's an explained downgrade note (the honest boundary).
+        let mut scene = cube_with_pmi();
+        scene.pmi.clear();
+        let mut exported = step_export_no_pmi(&scene);
+        // Splice a graphical annotation before ENDSEC.
+        exported = exported.replace(
+            "ENDSEC;\nEND-ISO-10303-21;\n",
+            "#9001 = ANNOTATION_OCCURRENCE('drawn callout',$,$);\nENDSEC;\nEND-ISO-10303-21;\n",
+        );
+        let after = StepInterchange.import(exported.as_bytes()).expect("import");
+        assert!(
+            after.pmi.is_empty(),
+            "a graphical callout is NOT semantic PMI"
+        );
+        assert!(
+            after
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("machine-readable")),
+            "the graphical downgrade is explained, not silent"
+        );
+    }
+
+    fn step_export_no_pmi(scene: &CadScene) -> String {
+        StepInterchange.export(scene).expect("export")
     }
 }

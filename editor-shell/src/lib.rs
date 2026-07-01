@@ -18,6 +18,7 @@ pub mod bridge;
 pub mod cad_intent;
 pub mod capscene;
 pub mod compose_ai;
+pub mod cosim;
 pub mod csg_intent;
 pub mod feature_history;
 pub mod generate;
@@ -29,6 +30,7 @@ pub mod physics_intent;
 pub mod play_rules;
 pub mod plugin_host;
 pub mod pmi;
+pub mod pmi_step;
 pub mod project;
 pub mod reveal;
 pub mod sdf_intent;
@@ -49,6 +51,7 @@ pub use capscene::{
     CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
 };
 pub use compose_ai::{ComposeAiError, Composer, DemoComposer, RemoteComposer};
+pub use cosim::{co_simulate, land_cosim, CoSimRun, CoSimSchedule, CoSimStep, FmiSolver};
 pub use feature_history::{
     eval_variables, rebuild, rebuild_reproduces, validate_feature_op, validate_history,
     Configuration, Dim, Expr, FeatureError, FeatureHistory, FeatureId, FeatureOp, Rebuilt,
@@ -75,6 +78,10 @@ pub use pmi::{
     ai_adjust_tolerance, attach_fcf, fcf_component_meta, fcfs_on, is_cad_feature, read_fcf,
     validate_fcf, Characteristic, Contribution, Contributor, Fcf, Fix, McResult, PmiError, Stackup,
     StackupAnalysis, StackupCertificate, Standard, FCF_COMPONENT,
+};
+pub use pmi_step::{
+    collect_semantic_fcfs, export_step as export_step_pmi, import_step_text, measure_fidelity,
+    reimport_with_pmi, scene_with_pmi, FidelityRow, RoundTripFidelity, SemanticFcf,
 };
 pub use project::{atomic_write, open_into, save, OpenError};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
