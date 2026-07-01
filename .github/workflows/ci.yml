@@ -231,6 +231,24 @@ jobs:
           fi
           echo "no opencascade/occt/steplib/ruststep outside /interchange — CadInterchange boundary intact"
 
+      - name: No external FEA-solver types leak past the generative Solver seam (invariant 5, M15.4/ADR-074)
+        run: |
+          # The M15.4 intent-driven generative loop integrates a VALIDATED FEA (CalculiX/Gmsh/OpenFOAM) as an
+          # EXTERNAL solver behind the project-owned `Solver` trait (editor-shell/src/generative.rs) — the
+          # established couple is preCICE + the preCICE-FMI runner (server-side native; CalculiX/OpenFOAM are
+          # NOT native FMUs), and the Rust `fmi` crate is a native-only single-FMU importer. "Integrate, never
+          # rebuild Ansys" (§4): whatever backs the external solver (a `precice`/`fmi`/`fmpy` binding) must
+          # live ONLY behind the `Solver` trait — exactly as rapier lives in /physics + OCCT behind
+          # CadInterchange. Every other crate drives analysis through the trait + our neutral StructuralResult,
+          # so the external solver's FP non-determinism can never leak into the reproducibility guarantee (the
+          # deterministic ROM is IN the guarantee; the external FEA is OUT — the ADR-074 audit boundary). A
+          # RESERVE gate: no such dep is adopted yet (the seam returns Unavailable). Prose comments are fine.
+          if grep -rn "precice::\|\bfmi::\|fmpy::\|calculix::\|openfoam::" core ecs transport plugins assets economy physics interchange gizmo skeleton deform dst csg sdf hotpatch ivm authoring efficiency lattice editor-shell mcp tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::an external FEA-solver type (precice::/fmi::/fmpy::/calculix::/openfoam::) leaked past the Solver trait — validated FEA must stay behind the project-owned Solver seam, server-side, OUT of the reproducibility guarantee (invariant 5; integrate-not-rebuild, ADR-074)"
+            exit 1
+          fi
+          echo "no precice/fmi/calculix/openfoam past the Solver trait — the interop-FEA boundary is intact (ADR-074)"
+
       - name: test
         run: cargo test --workspace
 

@@ -60,5 +60,15 @@ serde_json = "1"
 # 1 ULP and break the bit-identical rebuild. Same pin as `/dst`.
 bincode = "1"
 
+# ── dev-only (the M15.4 spike test's DST validate-in-sim leg) ──────────────────────────────────────────────
+# The M13.1 DST determinism validation (ADR-050) is native-only (rapier3d-f64 via /physics) — so the
+# generative loop's `validate-in-sim` + the carry-forward DST re-verification are exercised by the spike test
+# as DEV-dependencies, NOT the lib. This keeps the wasm-portable `generative` ROM free of the physics backend
+# (the ROM-in-guarantee / heavy-solver-out split at the crate-graph level). editor-shell is the native host
+# lib (it is NOT in the wasm tripwire — it already links native-only /plugins), so these are safe here.
+[dev-dependencies]
+metrocalk-dst = { path = "../dst" }
+metrocalk-physics = { path = "../physics" }
+
 [lints]
 workspace = true

@@ -21,6 +21,7 @@ pub mod compose_ai;
 pub mod csg_intent;
 pub mod feature_history;
 pub mod generate;
+pub mod generative;
 pub mod metering;
 pub mod pdm;
 pub mod persist;
@@ -55,6 +56,13 @@ pub use feature_history::{
 pub use generate::{
     FakeGenerator, GenError, GenRequest, MeshGenerator, MeterAction, RemoteGenerator, StubMeter,
     TokenMeter,
+};
+pub use generative::{
+    apply_optimized_design, bake_design, baked_mesh_is_watertight, design_certificate,
+    design_component_meta, optimize, parse_spec, place_design_seed, propose_design,
+    CandidateOrigin, Design, DesignCandidate, GenerativeRun, GradientSource, LoadSpec, Material,
+    Objective, PreciceFmiSolver, RomBeamSolver, Solver, SolverError, SpecError, StructuralResult,
+    DESIGN_COMPONENT,
 };
 pub use metering::{ai_edit_material, buy_marketplace, material_patch, Outcome};
 pub use pdm::{
