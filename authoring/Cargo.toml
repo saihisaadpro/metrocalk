@@ -1,0 +1,26 @@
+# metrocalk-authoring (M13.5 / ADR-054) — the verifiable AI-authoring substrate (the PhD R1 home).
+#
+# The engine's DATA MODEL is the correctness boundary for AI authoring. This crate HARDENS the M12.4
+# `composition_grammar` (ADR-048/SA-22) into TRUE constrained decoding — a projection that makes an op
+# STRUCTURALLY schema-valid — measures the verifiability delta vs an unconstrained baseline, adds
+# reason-then-constrain (CRANE), and a neuro-symbolic PCG solver over the scene-graph with every
+# rejection a DERIVATION CERTIFICATE.
+#
+# HONEST: the claim is VERIFIABILITY, not capability (generation fidelity is complementary — the Genie
+# gap). The substrate is OFFLINE + AI-AS-GUEST: the grammar, the validation, and the solver are pure
+# `/core` data + a hand-rolled solver and run with NO LLM. The solver is native/offline (browser =
+# server-side seam, ADR-006); clingo/ASP is the heavier NAMED future (native-only C++ FFI, grounding
+# blow-up) — the hand-roll is the ARAP/M9.5 audit answer (deterministic, wasm-auditable, bounded).
+[package]
+name = "metrocalk-authoring"
+version = "0.1.0"
+edition = "2021"
+description = "The verifiable AI-authoring substrate — constrained decoding + neuro-symbolic PCG with derivation certificates (M13.5)"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Reuse the shipped M12.4 compose grammar + op set + rejection reasons — NOT a parallel authoring model.
+metrocalk-core = { path = "../core" }

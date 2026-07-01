@@ -187,6 +187,20 @@ jobs:
           fi
           echo "no dbsp::/differential_dataflow::/timely:: outside /ivm — IncrementalView-trait boundary intact"
 
+      - name: No ASP/solver runtime types leak outside the /authoring crate (invariant 5, M13.5/ADR-054)
+        run: |
+          # The verifiable AI-authoring substrate hand-rolls its bounded PCG solver behind the project-owned
+          # Pcg/Solver trait (the crate-audit verdict: clingo/ASP is native-only C++ FFI + grounding blow-up →
+          # own a bounded, deterministic, offline solver). If a heavier design space ever justifies adopting
+          # `clingo`, it must live ONLY in /authoring behind the trait — the AI-is-a-guest, no-solver-runtime-
+          # in-the-core discipline. This gate RESERVES the boundary (clingo is not a dependency today). Prose
+          # mentions of "clingo"/"ASP" without `::` are fine.
+          if grep -rn "clingo::" core ecs transport plugins assets economy physics interchange gizmo skeleton deform dst csg hotpatch ivm editor-shell mcp tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::a solver-runtime type (clingo::) leaked outside /authoring — PCG must stay behind the Pcg trait, AI-as-guest (invariant 5)"
+            exit 1
+          fi
+          echo "no clingo:: outside /authoring — Pcg-trait boundary intact (AI-is-a-guest)"
+
       - name: test
         run: cargo test --workspace
 

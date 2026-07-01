@@ -2408,6 +2408,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrocalk-authoring"
+version = "0.1.0"
+dependencies = [
+ "metrocalk-core",
+]
+
+[[package]]
 name = "metrocalk-core"
 version = "0.1.0"
 dependencies = [
