@@ -265,3 +265,28 @@ jobs:
         run: |
           cargo build -p metrocalk-ivm --release --target wasm32-unknown-unknown
           echo "metrocalk-ivm wasm32 build OK"
+
+  wasm32-lattice:
+    name: build wasm32 (metrocalk-lattice)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The Lattice Core (M13.7 / ADR-056): hand-rolled lattice types (GSet / MaxReg / the OR-Set
+      # ring-in-lattice) + the monotone/non-monotone classification behind our own `Lattice` trait. THIS
+      # BUILD IS THE CRATE-AUDIT ANSWER — the hand-roll is ZERO-DEP + wasm-clean, where Hydro/DFIR (`dfir_rs`)
+      # + the `lattices` crate are pre-1.0 research-grade with unconfirmed wasm. `-p metrocalk-lattice` pulls
+      # only std.
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-lattice --release --target wasm32-unknown-unknown
+          echo "metrocalk-lattice wasm32 build OK"

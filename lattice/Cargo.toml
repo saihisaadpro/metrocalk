@@ -1,0 +1,26 @@
+# metrocalk-lattice (M13.7 / ADR-056) — the Lattice Core: CALM + the explicit monotone/non-monotone
+# TYPED BOUNDARY, the deepest principled bet.
+#
+# The op-stream is ONE mathematical object — a join-semilattice of immutable facts. The single
+# load-bearing decision (CALM: monotone <=> coordination-free, IFF) is to make the monotone/non-monotone
+# boundary EXPLICIT + TYPED: every op is `Monotone` (coordination-free, deterministic, incremental-for-
+# free — feeds M13.4/M13.1) or `NonMonotone`/ring-in-lattice (delete/min/retract -> a logged coordination
+# point). The win is the TYPED BOUNDARY, NOT forcing monotonicity (the pure-monotone cathedral is the
+# named vanity over-reach — cut it; SERVES-THE-AXIS is the gate).
+#
+# Crate audit: Hydro/DFIR (`dfir_rs`) + the `lattices` crate are pre-1.0 Berkeley-research-grade; we need
+# only the lattice TYPES + the monotonicity CLASSIFICATION, not the Hydro dataflow runtime -> HAND-ROLL
+# (the ARAP/M9.5 rule): zero-dependency, wasm-clean, deterministic, behind a project-owned `Lattice`
+# trait. `lattices::`/`dfir_rs::`/`hydroflow::` grep-gated OUT. The OR-Set is the FM-T1.2 ring-in-lattice
+# — the SAME add/remove delta-algebra M13.4's IVM uses (one algebra for CRDT + IVM, not two).
+[package]
+name = "metrocalk-lattice"
+version = "0.1.0"
+edition = "2021"
+description = "The Lattice Core — CALM + the explicit monotone/non-monotone typed boundary (M13.7)"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
