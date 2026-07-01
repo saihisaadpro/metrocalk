@@ -1,0 +1,31 @@
+# metrocalk-hotpatch (M13.3 / ADR-052) — Instant iteration: a hot-patch + op-log-replay loop.
+# Edit a system → swap it live (the `HotPatch` seam) → replay the op-log ACROSS a component-schema
+# change to reconstruct the running state (migrate-or-explain) → see it live, state intact.
+#
+# REUSES the shipped substrate (does NOT fork): the M12.5/ADR-049 `RuntimeState` (the runtime
+# projection the Rules run over) + `FieldValue` + the `registry` schema types (`ComponentMeta` /
+# `FieldSpec` / `FieldType`), and mirrors the `core::project` (ADR-033) migrate-or-refuse discipline
+# at the component-schema level. The op-log is the serializable REPLAY PROJECTION of the shipped
+# `pipeline::Op::{SetField, RemoveField}` (which is non-serde + ECS-coupled) — the same sibling
+# pattern as RuntimeState / RuleRecording / physics::Recording.
+#
+# Native-only (depends on rapier-free metrocalk-core, but core pulls the native Flecs backend via
+# metrocalk-ecs), so — like metrocalk-dst — it is NOT in the wasm tripwire. Wasm is the named seam
+# (ADR-006/020): the browser funnel keeps its own reload story; the op-replay itself is pure data.
+[package]
+name = "metrocalk-hotpatch"
+version = "0.1.0"
+edition = "2021"
+description = "Instant iteration — sub-second hot-patch + op-log replay across a schema change (M13.3)"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+metrocalk-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+# A human-readable summary of a migration failure (the "a broken iteration is a file" report) rides
+# serde_json — the same role it plays for the DST artifact summary. Reproduction/determinism uses the
+# RuntimeState.digest() equality key (also serde_json, deterministic via BTreeMap ordering).
+serde_json = "1"

@@ -190,6 +190,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2411,10 +2420,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrocalk-csg"
+version = "0.1.0"
+dependencies = [
+ "robust",
+]
+
+[[package]]
 name = "metrocalk-deform"
 version = "0.1.0"
 dependencies = [
  "metrocalk-skeleton",
+]
+
+[[package]]
+name = "metrocalk-dst"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "metrocalk-physics",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2437,8 +2463,10 @@ dependencies = [
 name = "metrocalk-editor-shell"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "metrocalk-assets",
  "metrocalk-core",
+ "metrocalk-csg",
  "metrocalk-deform",
  "metrocalk-economy",
  "metrocalk-ecs",
@@ -2455,6 +2483,15 @@ version = "0.1.0"
 dependencies = [
  "glam 0.30.10",
  "serde",
+]
+
+[[package]]
+name = "metrocalk-hotpatch"
+version = "0.1.0"
+dependencies = [
+ "metrocalk-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
