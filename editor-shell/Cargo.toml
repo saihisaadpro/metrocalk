@@ -48,6 +48,11 @@ metrocalk-sdf = { path = "../sdf" }
 # plugin through the project-owned `PluginHost` trait (NO `extism::` type crosses — grep-gated) and lands
 # its effect as a schema-validated undoable transaction via the M6 `apply_ai_patch` contract.
 metrocalk-plugins = { path = "../plugins" }
+# The verifiable AI-authoring substrate (M13.5 / ADR-054). M15.3 (`pmi`) reuses its `Certificate` (the
+# unsat-core / derivation-certificate seed that "ties M13.9") as the base of a tolerance-stack-up violation's
+# "explain every no" — reusing the shipped every-no seed, NOT a new explainer (the full M13.9
+# semiring-provenance theorem, ADR-061, is a named future). Pure `/core` data, wasm-clean.
+metrocalk-authoring = { path = "../authoring" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # M15.2 (ADR-072): the feature-history "a broken feature is a file" artifact serializes LOSSLESS (bit-exact

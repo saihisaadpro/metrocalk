@@ -27,6 +27,7 @@ pub mod persist;
 pub mod physics_intent;
 pub mod play_rules;
 pub mod plugin_host;
+pub mod pmi;
 pub mod project;
 pub mod reveal;
 pub mod sdf_intent;
@@ -62,6 +63,11 @@ pub use pdm::{
 };
 pub use persist::{Log, Record};
 pub use play_rules::{build_recording, PlaySession};
+pub use pmi::{
+    ai_adjust_tolerance, attach_fcf, fcf_component_meta, fcfs_on, is_cad_feature, read_fcf,
+    validate_fcf, Characteristic, Contribution, Contributor, Fcf, Fix, McResult, PmiError, Stackup,
+    StackupAnalysis, StackupCertificate, Standard, FCF_COMPONENT,
+};
 pub use project::{atomic_write, open_into, save, OpenError};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
 pub use sdf_intent::{bake as bake_sdf, bake_auto as bake_sdf_auto, SdfBakeError};

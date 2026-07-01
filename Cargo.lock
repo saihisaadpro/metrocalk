@@ -2472,6 +2472,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "metrocalk-assets",
+ "metrocalk-authoring",
  "metrocalk-core",
  "metrocalk-csg",
  "metrocalk-deform",
