@@ -1,0 +1,26 @@
+# metrocalk-efficiency (M13.6 / ADR-055) — efficiency-per-watt + min-spec as a benchmarked release gate.
+#
+# TWO honest legs given the measurement reality (a headless box with NO power meter + NO GPU-render/
+# capture rig — so, per <benchmark_discipline>, NEVER an invented joule and NEVER a faked render):
+#   (A) the MIN-SPEC ADMISSION-CONTROL GATE (FF-T6 mixed-criticality / imprecise-computation) — a pure,
+#       deterministic, CI-gateable schedulability check that turns min-spec from perpetual debt into a
+#       GATE. Level-1 (input/physics/audio) must meet the deadline; Level-3 (shadows/LOD) degrades under
+#       overload. This is the shipped, measured GO.
+#   (B) the FRAMES-PER-JOULE + SCI harness (ISO/IEC 21031:2024 SCI-for-a-game) that STRUCTURALLY REFUSES
+#       to publish an SCI from a `Proxy` energy source — so it CANNOT emit a faked joule; the true-watt
+#       measurement is an explicit OWED item with the rig that closes it.
+#
+# The visibility-buffer render floor, the true-watt measurement, and watt-budget mode are NAMED FUTURES
+# (GPU + power-meter dependent). Zero-dependency + wasm-portable (pure methodology/scheduling data). The
+# GPU-efficiency layer is OUTSIDE the M13.1 determinism guarantee (a separable layer).
+[package]
+name = "metrocalk-efficiency"
+version = "0.1.0"
+edition = "2021"
+description = "Min-spec admission-control gate + frames-per-joule/SCI methodology (never a faked joule) (M13.6)"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
