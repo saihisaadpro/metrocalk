@@ -17,13 +17,25 @@
 use metrocalk_physics::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-mod step;
+mod cad_import;
+pub(crate) mod step;
 mod urdf;
 mod usd;
 pub use step::{
     gdt_entity_name, gdt_token, round_trip_deviation, CadEdge, CadFace, CadInterchange, CadPmi,
     CadScene, CadSolid, FaceKind, StepError, StepInterchange, MAX_ENTITIES as STEP_MAX_ENTITIES,
     MAX_STEP_BYTES, ROUND_TRIP_BUDGET,
+};
+// M15.7 (ADR-077) — the universal CAD import pipeline (never-empty · never-silent · multi-strategy cascade ·
+// dedup/instancing · content-addressed re-import diff · provenance) behind the project-owned `CadReader`
+// trait (invariant 5). The CATIA 3DXML reader is behind the native-only `3dxml` feature.
+#[cfg(feature = "3dxml")]
+pub use cad_import::ThreeDxmlReader;
+pub use cad_import::{
+    build_import, diff, mat4_mul, mesh_hash, source_hash, tessellate_faces, translation_of,
+    CadError, CadImport, CadMesh, CadReader, FidelityCounts, ImportStrategy, PartChange, PartDiff,
+    PartFidelity, PartReport, PartSource, RawPart, StepAssemblyReader, IDENTITY_4X4,
+    MAX_ASSEMBLY_DEPTH,
 };
 pub use urdf::UrdfInterchange;
 pub use usd::UsdInterchange;

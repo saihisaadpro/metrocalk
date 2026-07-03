@@ -2775,8 +2775,10 @@ dependencies = [
  "metrocalk-csg",
  "metrocalk-physics",
  "openusd",
+ "quick-xml",
  "serde",
  "urdf-rs",
+ "zip",
 ]
 
 [[package]]

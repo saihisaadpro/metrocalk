@@ -28,3 +28,24 @@ metrocalk-physics = { path = "../physics" }
 # to tessellate an imported STEP B-rep for wgpu (M15.0 / ADR-070). No new geometry-predicate dep.
 metrocalk-csg = { path = "../csg" }
 serde = { version = "1", features = ["derive"] }
+
+# ── M15.7 (ADR-077) universal CAD import — the CATIA 3DXML container reader ──────────────────────────────
+# 3DXML is a ZIP of XML: `PRODUCT.3dxml` (the readable product structure — 1,280 instances / 572 references
+# / RelativeMatrix transforms) + proprietary-binary `.3DRep` reps (CATIA `V5_CFV3`/`CB0001` — the licensed-
+# kernel seam) + a PLM briefcase. `zip` (deflate-only, pure Rust — no bzip2/zstd C deps) opens the archive;
+# `quick-xml` (already transitively present via urdf-rs) parses the product structure. Both are confined to
+# the `cad_import::threedxml` module (invariant 5, CI grep-gated) and gated behind the `3dxml` feature so the
+# DEFAULT crate stays wasm32-clean (the wasm-tripwire builds default features). The browser 3DXML path is a
+# server-side seam — coherent with the licensed CATIA kernel being native/server-only too (ADR-070).
+zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
+quick-xml = { version = "0.36", optional = true }
+
+[features]
+# Native-only CATIA 3DXML container reading (see the deps note above). Off by default → wasm-clean default.
+3dxml = ["dep:zip", "dep:quick-xml"]
+
+# The M15.7 spike tool: read a real CATIA 3DXML / STEP file → the never-empty/never-silent report. Needs the
+# 3dxml feature, so it's skipped by a default `cargo build --examples` (never breaks the wasm/default build).
+[[example]]
+name = "read_cad"
+required-features = ["3dxml"]

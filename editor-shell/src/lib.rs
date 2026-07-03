@@ -15,6 +15,7 @@ pub mod ai;
 pub mod blobstore;
 pub mod bom;
 pub mod bridge;
+pub mod cad_import;
 pub mod cad_intent;
 pub mod capscene;
 pub mod compose_ai;
@@ -44,6 +45,10 @@ pub use bom::{rollup as bom_rollup, Bom, BomLine};
 pub use bridge::{
     apply_edit, enrich_relational, project_entity, project_full, EditIntent, EditTx,
     ProjectionDelta, ProjectionOp, RelSummary,
+};
+pub use cad_import::{
+    changed_count, import_cad, land_import, read_cad, reimport_diff, CadImportError, CadLanding,
+    CAD_PART,
 };
 pub use cad_intent::{import_step, StepImport};
 pub use capscene::{

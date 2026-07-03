@@ -172,6 +172,19 @@ jobs:
           fi
           echo "no ezpz:: outside /constraint — Solver-trait boundary intact"
 
+      - name: No zip/quick-xml container types leak outside the interchange 3DXML reader (invariant 5, M15.7/ADR-077)
+        run: |
+          # The CATIA 3DXML container readers (`zip::` for the ZIP archive, `quick_xml::` for the product
+          # structure) — native-only, behind the `3dxml` feature — must live ONLY in the CadReader-trait reader
+          # module (interchange/src/cad_import/threedxml*), the same discipline as gltf-in-/assets and
+          # urdf-in-/interchange. Every other crate drives a 3DXML import through the neutral CadImport behind
+          # the CadReader trait; nothing else names zip/quick-xml. Prose comments (no `::`) are fine.
+          if grep -rn "zip::\|quick_xml::" core ecs transport plugins assets economy physics interchange gizmo skeleton deform dst csg sdf constraint hotpatch ivm authoring efficiency lattice editor-shell mcp tools --include='*.rs' | grep -v 'threedxml' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::a container type (zip::/quick_xml::) leaked outside the interchange 3DXML reader — 3DXML must stay behind the CadReader trait (invariant 5; mirrors ADR-024/040)"
+            exit 1
+          fi
+          echo "no zip::/quick_xml:: outside the interchange 3DXML reader — CadReader-trait boundary intact"
+
       - name: No hot-patch backend types leak outside the /hotpatch crate (invariant 5, M13.3/ADR-052)
         run: |
           # The `subsecond` binary hot-patch backend (subsecond::) — the pre-1.0, tip-crate-only, dev-only
@@ -305,6 +318,17 @@ jobs:
         run: |
           cargo clippy -p metrocalk-assets --all-targets --features signing -- -D warnings
           cargo test -p metrocalk-assets --features signing
+
+      # The native CATIA 3DXML container reader (M15.7/ADR-077) lives behind the non-default `3dxml` feature
+      # (pure-Rust `zip` + `quick-xml`, behind the CadReader trait) so the wasm-tripwire's default interchange
+      # build stays wasm32-clean. `editor-shell` enables it (so the workspace test above covers the wiring),
+      # but build + lint + test the interchange leg EXPLICITLY so the reader, the synthetic-3DXML failure-mode
+      # tests (proprietary→proxy · open-cache · missing-rep · deterministic assembly walk), and the `read_cad`
+      # spike tool are not dark. `--all-targets` also lints the required-features example.
+      - name: interchange 3DXML reader — clippy + test the native zip+xml path (dark on default)
+        run: |
+          cargo clippy -p metrocalk-interchange --all-targets --features 3dxml -- -D warnings
+          cargo test -p metrocalk-interchange --features 3dxml
 
   editor-vitest:
     # The React editor projection (editor/, ADR-010) has a real vitest suite (transport-frame decode,
