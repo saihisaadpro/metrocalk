@@ -159,6 +159,19 @@ jobs:
           fi
           echo "no robust::/csgrs:: outside /csg — Csg-trait boundary intact"
 
+      - name: No ezpz constraint-solver types leak outside the /constraint crate (invariant 5, M15.6/ADR-076)
+        run: |
+          # `ezpz::` (the embedded KittyCAD/Zoo 2D constraint solver — Levenberg-Marquardt over faer sparse-LU,
+          # its raw determinism unverified) must live ONLY behind the project-owned Solver trait, in /constraint
+          # — the same discipline as robust-in-/csg, rapier-in-/physics. Every other crate drives constraints
+          # through the plain-array Sketch/SolveResult boundary; editor-shell's constraint_intent consumes the
+          # trait, never an ezpz type. Prose comments mentioning "ezpz" (no `::`) are fine.
+          if grep -rn "ezpz::" core ecs transport plugins assets economy physics interchange gizmo skeleton deform dst csg sdf hotpatch ivm authoring efficiency lattice editor-shell mcp tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+            echo "::error::an ezpz constraint type (ezpz::) leaked outside /constraint — constraints must stay behind the Solver trait (invariant 5; mirrors ADR-051/ADR-029)"
+            exit 1
+          fi
+          echo "no ezpz:: outside /constraint — Solver-trait boundary intact"
+
       - name: No hot-patch backend types leak outside the /hotpatch crate (invariant 5, M13.3/ADR-052)
         run: |
           # The `subsecond` binary hot-patch backend (subsecond::) — the pre-1.0, tip-crate-only, dev-only

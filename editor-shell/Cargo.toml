@@ -44,6 +44,12 @@ metrocalk-csg = { path = "../csg" }
 # to a deterministic watertight mesh and lands it as a content-addressed MeshAsset + a place_mesh-style
 # undoable commit (like `csg_intent`). Reuses the M13.2 `TriMesh`/validator; pure Rust + wasm-clean.
 metrocalk-sdf = { path = "../sdf" }
+# 2D sketch constraint solving (M15.6 / ADR-076). `constraint_intent` drives it: intent-inference (reuse the
+# M9.4 `reveal::intent_order` ranker), the minimal-conflicting-set (wrapped in the M13.5 `Certificate`), and
+# the witness-config-in-the-op determinism — a solve lands as one undoable tx carrying its witness. `ezpz`
+# (the embedded LM solver) stays behind the `Solver` trait IN /constraint — no `ezpz::` type crosses here
+# (grep-gated). This pulls `ezpz`+`faer` into the workspace build — the honest cost of embedding a real solver.
+metrocalk-constraint = { path = "../constraint" }
 # The WASM plugin host (M12.3 / ADR-047) — the honest-ceiling escape. editor-shell drives a sandboxed
 # plugin through the project-owned `PluginHost` trait (NO `extism::` type crosses — grep-gated) and lands
 # its effect as a schema-validated undoable transaction via the M6 `apply_ai_patch` contract.

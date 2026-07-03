@@ -241,6 +241,32 @@ jobs:
           cargo build -p metrocalk-csg --release --target wasm32-unknown-unknown
           echo "metrocalk-csg wasm32 build OK"
 
+  wasm32-constraint:
+    name: build wasm32 (metrocalk-constraint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # 2D sketch constraint solving (M15.6 / ADR-076): `ezpz` (KittyCAD/Zoo, MIT, pure Rust) behind the
+      # project-owned Solver trait. `ezpz` ships an `ezpz-wasm` wrapper and this crate MEASURED-builds for
+      # wasm32-unknown-unknown (the x86 `gemm`/`raw-cpuid` legs are cfg-gated; `faer` falls to portable
+      # paths). A constraint solve is off-hot-path / server-authoritative on web (ADR-006/020), but the crate
+      # — solver + the witness-config determinism + the minimal-conflicting-set — must keep compiling to the
+      # browser (principle 3). `-p metrocalk-constraint` pulls ezpz+faer+serde+bincode, never core/ecs/Flecs.
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-constraint --release --target wasm32-unknown-unknown
+          echo "metrocalk-constraint wasm32 build OK"
+
   wasm32-ivm:
     name: build wasm32 (metrocalk-ivm)
     runs-on: ubuntu-latest

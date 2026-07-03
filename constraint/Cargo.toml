@@ -1,0 +1,28 @@
+# M15.6 (ADR-076) — 2D sketch constraint solving. `ezpz` (KittyCAD/Zoo) is the embedded solver math
+# (the "don't rebuild D-Cubed" line, dossier §4); it lives ONLY behind this crate's project-owned
+# `Solver`/`ConstraintDef` boundary — no `ezpz::` type crosses out (invariant 5, grep-gated). The value
+# Metrocalk adds is the LAYER: the witness-config-in-the-op determinism (the "flip" fix) + the genuine
+# minimal-conflicting-set. Lean like `csg`/`sdf`: the inherit form + the workspace lints.
+[package]
+name = "metrocalk-constraint"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "2D sketch constraint solving — ezpz embedded behind the project-owned Solver trait; the moat is the witness-config determinism + minimal-conflicting-set layer (M15.6)"
+
+[dependencies]
+# The embedded 2D geometric constraint solver (KittyCAD/Zoo). MIT, pure Rust, wasm32-clean (MEASURED —
+# builds for wasm32-unknown-unknown; the x86 gemm/raw-cpuid legs are cfg-gated, faer falls to portable
+# paths). Pinned EXACTLY for reproducible codegen (`<benchmark_discipline>`). A Levenberg-Marquardt solver
+# over faer sparse-LU: its RAW f64 determinism is UNVERIFIED (runtime SIMD dispatch), so determinism is
+# OURS — the witness fixes the branch, the quantized canonical state is cross-ISA-portable (ADR-076/029).
+ezpz = "=0.2.27"
+serde = { version = "1", features = ["derive"] }
+# LOSSLESS witness/solve artifact ("a sketch solve is a file"). The canonical state is i64 (quantized),
+# so bincode's raw bytes ARE the identity; a JSON shortest-float round-trip is not in the path at all —
+# the M13.1/ADR-050 "a bug is a file, bit-exact" discipline, applied to a constraint solve.
+bincode = "1"
+
+[lints]
+workspace = true

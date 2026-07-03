@@ -1,0 +1,120 @@
+name: constraint-determinism
+
+# M15.6 (ADR-076) — is the 2D constraint solve's CANONICAL state bit-identical ACROSS platforms? Runs the
+# `metrocalk-constraint` `hash` example (solve a fixed sketch — constrained rectangle + tangent circle —
+# from a fixed witness, quantize to the 1 nm canonical grid, FNV-1a content-address the result) on x86_64
+# (Linux + Windows) AND arm64 (macOS), then a `compare` job ASSERTS all three canonical hashes are IDENTICAL
+# — a real cross-ISA GATE (stronger than the sdf-determinism ::notice-only precedent). Plus a non-blocking
+# wasm32-wasip1 (wasmtime) observation. Toolchain PINNED to 1.92.0.
+#
+# The embedded `ezpz` solver's RAW f64 (Levenberg-Marquardt over faer sparse-LU with runtime SIMD dispatch)
+# is NOT guaranteed bit-identical cross-ISA. Determinism is OURS: the witness fixes the branch and the solved
+# state is quantized to i64 far above faer's cross-ISA ULP noise, so the CANONICAL state is DESIGNED to match
+# across ISAs (a boundary-flip — a coordinate landing within ~1 ULP of a grid boundary — is possible but
+# ~1e-9/coord; disclosed, not eliminated). This gate is where that design is VERIFIED. If arm64 ever diverges
+# it reds HERE, honestly surfacing the ADR-020 native/wasm float boundary — exactly the signal we want. The
+# wasm job stays non-blocking (continue-on-error): the standing ADR-020 wasm32 boundary (web =
+# server-authoritative) can never red this workflow.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "constraint/**"
+      - ".github/workflows/constraint-determinism.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: constraint hash ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest] # macos-latest = Apple Silicon (arm64)
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.92.0 (pinned — identical codegen across platforms)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: constraint solve hash (canonical, quantized)
+        run: |
+          out=$(cargo run -p metrocalk-constraint --example hash --release)
+          echo "$out"
+          hash=$(echo "$out" | grep -oE 'FINAL_CONSTRAINT_HASH = [0-9a-f]+' | awk '{print $NF}')
+          echo "::notice title=constraint hash ${{ matrix.os }} ($RUNNER_ARCH)::$hash"
+          test -n "$hash" || { echo "::error::no constraint hash produced on ${{ matrix.os }}"; exit 1; }
+          echo "$hash" > "constraint-hash.txt"
+
+      - name: Upload this platform's hash
+        uses: actions/upload-artifact@v4
+        with:
+          name: constraint-hash-${{ matrix.os }}
+          path: constraint-hash.txt
+
+  compare:
+    name: cross-ISA canonical hash must match (the gate)
+    runs-on: ubuntu-latest
+    needs: native
+    steps:
+      - name: Download all platform hashes
+        uses: actions/download-artifact@v4
+        with:
+          path: hashes
+
+      - name: Assert every platform produced the SAME canonical hash
+        run: |
+          echo "per-platform canonical hashes:"
+          for f in hashes/*/constraint-hash.txt; do printf '  %-40s %s\n' "$f" "$(cat "$f")"; done
+          uniq_count=$(cat hashes/*/constraint-hash.txt | sort -u | wc -l | tr -d ' ')
+          if [ "$uniq_count" -eq 1 ]; then
+            echo "::notice title=cross-ISA canonical hash::MATCH across all platforms ($(cat hashes/ubuntu-latest*/constraint-hash.txt 2>/dev/null || head -1 hashes/*/constraint-hash.txt))"
+            echo "cross-ISA canonical state is bit-identical (x86_64 Linux/Windows + arm64 macOS) — the quantized-canonical-portability claim holds"
+          else
+            echo "::error::the canonical constraint hash DIVERGED across ISAs — the quantized canonical state is NOT cross-ISA-portable on this fixture (the ADR-020 boundary; investigate the quantization/converged-satisfied margin)"
+            exit 1
+          fi
+
+  wasm:
+    name: constraint hash wasm32-wasip1 (wasmtime, observe-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Non-blocking: the standing ADR-020 wasm32 boundary means the web path is server-authoritative until this
+    # cross-platform number is confirmed; a wasmtime/setup/faer-simd hiccup must not red the workflow.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.92.0 + wasm32-wasip1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+          targets: wasm32-wasip1
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasmtime
+        run: |
+          curl -sSf https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: constraint solve hash on wasm32 (canonical state cross-platform)
+        run: |
+          cargo build -p metrocalk-constraint --example hash --release --target wasm32-wasip1
+          out=$(wasmtime run target/wasm32-wasip1/release/examples/hash.wasm)
+          echo "$out"
+          hash=$(echo "$out" | grep -oE 'FINAL_CONSTRAINT_HASH = [0-9a-f]+' | awk '{print $NF}')
+          echo "::notice title=constraint hash wasm32-wasip1::$hash"
+          test -n "$hash" || { echo "::error::no constraint hash produced on wasm32"; exit 1; }

@@ -18,6 +18,7 @@ pub mod bridge;
 pub mod cad_intent;
 pub mod capscene;
 pub mod compose_ai;
+pub mod constraint_intent;
 pub mod cosim;
 pub mod csg_intent;
 pub mod feature_history;
@@ -51,6 +52,10 @@ pub use capscene::{
     CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
 };
 pub use compose_ai::{ComposeAiError, Composer, DemoComposer, RemoteComposer};
+pub use constraint_intent::{
+    explain_conflict, propose_constraints, sketch_point_meta, solve_and_land, witness_from_doc,
+    ConstraintCertificate, ConstraintProposal, SolveLanding, SKETCH_POINT,
+};
 pub use cosim::{co_simulate, land_cosim, CoSimRun, CoSimSchedule, CoSimStep, FmiSolver};
 pub use feature_history::{
     eval_variables, rebuild, rebuild_reproduces, validate_feature_op, validate_history,
