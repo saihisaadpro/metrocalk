@@ -70,10 +70,29 @@ pub fn mesh_asset_to_trimesh(asset: &MeshAsset) -> TriMesh {
     }
 }
 
-/// Convert a CSG result back into a single-primitive, static [`MeshAsset`] (the packer derives flat
-/// normals — `normals`/`uvs` left empty; default matte material).
+/// Convert a CSG result back into a single-primitive, static [`MeshAsset`] (the packer derives crease-aware
+/// smooth normals — `normals`/`uvs` left empty; default/CAD material).
 #[must_use]
 pub fn trimesh_to_mesh_asset(mesh: &TriMesh, name: &str) -> MeshAsset {
+    trimesh_to_mesh_asset_colored(mesh, name, None)
+}
+
+/// As [`trimesh_to_mesh_asset`], but with an explicit authored display colour (linear RGB) for the CAD path —
+/// so an imported part renders in its real STEP/3DXML colour. `None` ⇒ the neutral machined-metal default.
+///
+/// Appearance policy: imported CAD (`"cad"`/`"step"`) gets a **satin machined-metal** look — glossier +
+/// slightly metallic vs the matte-plastic engine default — so parts catch a form-revealing specular highlight
+/// off the IBL and read as a machine, not a flat white clay model. Kept majority-diffuse (a moderate
+/// `metallic`) so an authored colour (or the neutral default) reads clearly and the outdoor env doesn't mirror
+/// onto every surface. The material is a **display** value on the `MeshAsset`, downstream of the
+/// content-address hash (`content_bytes` is geometry only), so it does not change asset ids or import
+/// dedup/determinism. Carve/SDF results keep the matte engine default.
+#[must_use]
+pub fn trimesh_to_mesh_asset_colored(
+    mesh: &TriMesh,
+    name: &str,
+    color: Option<[f32; 3]>,
+) -> MeshAsset {
     #[allow(clippy::cast_possible_truncation)] // f64→f32 is the asset layer's storage precision
     let positions: Vec<[f32; 3]> = mesh
         .positions
@@ -85,6 +104,17 @@ pub fn trimesh_to_mesh_asset(mesh: &TriMesh, name: &str) -> MeshAsset {
         .iter()
         .flat_map(|t| t.iter().copied())
         .collect();
+    let material = if matches!(name, "cad" | "step") {
+        let base = color.map_or([0.58, 0.59, 0.61, 1.0], |c| [c[0], c[1], c[2], 1.0]);
+        Material {
+            base_color: base,
+            metallic: 0.30,
+            roughness: 0.38,
+            ..Material::default()
+        }
+    } else {
+        Material::default()
+    };
     MeshAsset {
         name: name.to_string(),
         primitives: vec![Primitive {
@@ -96,7 +126,7 @@ pub fn trimesh_to_mesh_asset(mesh: &TriMesh, name: &str) -> MeshAsset {
             joints: Vec::new(),
             weights: Vec::new(),
         }],
-        materials: vec![Material::default()],
+        materials: vec![material],
         textures: Vec::new(),
         skeleton: None,
     }

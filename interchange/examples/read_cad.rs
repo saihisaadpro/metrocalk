@@ -7,7 +7,14 @@
 //!
 //! This is the head-to-head evidence vs the documented Unreal/Datasmith result (1 of ~1,280 parts; black
 //! screen). It reads the product structure + sniffs the reps + runs the multi-strategy cascade — no kernel.
-#![allow(clippy::cast_precision_loss)] // display-only ratios (part/mesh counts) — precision is immaterial
+// A local dev tool — display-only ratios/quantization (part/mesh counts, colour bytes); precision + length
+// are immaterial here.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
 
 use metrocalk_interchange::{
     mesh_hash, translation_of, CadImport, CadReader, StepAssemblyReader, ThreeDxmlReader,
@@ -101,11 +108,33 @@ fn main() {
         lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]
     );
 
+    // Authored per-part colours (from the STEP STYLED_ITEM chain).
+    let colored = imp.parts.iter().filter(|p| p.color.is_some()).count();
+    let mut palette: std::collections::BTreeSet<[u32; 3]> = std::collections::BTreeSet::new();
+    for p in &imp.parts {
+        if let Some(c) = p.color {
+            palette.insert([
+                (c[0] * 255.0) as u32,
+                (c[1] * 255.0) as u32,
+                (c[2] * 255.0) as u32,
+            ]);
+        }
+    }
+    println!(
+        "authored colours: {colored}/{} parts carry a colour · {} distinct colours\n",
+        imp.parts.len(),
+        palette.len()
+    );
+
     println!("sample parts (first 6):");
     for p in imp.parts.iter().take(6) {
         let t = translation_of(&p.transform);
+        let col = p.color.map_or_else(
+            || "(no colour)".to_string(),
+            |c| format!("rgb({:.2},{:.2},{:.2})", c[0], c[1], c[2]),
+        );
         println!(
-            "  '{}' [ref {}] {} @ ({:.0},{:.0},{:.0})mm — {}",
+            "  '{}' [ref {}] {} @ ({:.0},{:.0},{:.0})mm — {col} — {}",
             p.name,
             p.reference,
             p.fidelity.token(),

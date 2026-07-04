@@ -37,6 +37,7 @@ fn mixed_import() -> CadImport {
             reference: "bolt".into(),
             transform: IDENTITY_4X4,
             source: PartSource::ExactBrep(faces.clone()),
+            color: None,
         },
         RawPart {
             id: 2,
@@ -44,6 +45,7 @@ fn mixed_import() -> CadImport {
             reference: "bolt".into(),
             transform: t_bolt_b,
             source: PartSource::ExactBrep(faces),
+            color: None,
         },
         RawPart {
             id: 3,
@@ -53,6 +55,7 @@ fn mixed_import() -> CadImport {
             source: PartSource::ProprietaryRep {
                 encoding: "CATIA V5_CFV3/CB0001".into(),
             },
+            color: None,
         },
     ];
     // Millimetre units (STEP/3DXML convention) → land_import normalizes to metres.

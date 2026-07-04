@@ -569,6 +569,9 @@ fn emit_geometry(
             reference: ref_id.to_string(),
             transform: world,
             source,
+            // 3DXML per-part colour (SurfaceAttributes/Color) is a follow-up; the proprietary-rep proxy uses
+            // the viewer default for now.
+            color: None,
         });
     }
     true

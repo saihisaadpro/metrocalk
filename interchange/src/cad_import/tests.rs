@@ -46,6 +46,7 @@ fn raw(id: u64, source: PartSource) -> RawPart {
         reference: format!("ref-{id}"),
         transform: IDENTITY_4X4,
         source,
+        color: None,
     }
 }
 
@@ -133,6 +134,7 @@ fn identical_geometry_dedups_to_one_mesh_and_instances() {
             reference: "bolt".into(),
             transform: IDENTITY_4X4,
             source: PartSource::ExactBrep(faces.clone()),
+            color: None,
         },
         RawPart {
             id: 2,
@@ -140,6 +142,7 @@ fn identical_geometry_dedups_to_one_mesh_and_instances() {
             reference: "bolt".into(),
             transform: t2,
             source: PartSource::ExactBrep(faces),
+            color: None,
         },
     ];
     let imp = build_import(
@@ -223,6 +226,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
                 reference: "a".into(),
                 transform: IDENTITY_4X4,
                 source: PartSource::ExactBrep(faces.clone()),
+                color: None,
             },
             RawPart {
                 id: 2,
@@ -230,6 +234,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
                 reference: "b".into(),
                 transform: IDENTITY_4X4,
                 source: PartSource::ExactBrep(faces.clone()),
+                color: None,
             },
             RawPart {
                 id: 3,
@@ -237,6 +242,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
                 reference: "c".into(),
                 transform: IDENTITY_4X4,
                 source: PartSource::Encrypted,
+                color: None,
             },
         ]
     };
@@ -252,6 +258,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
             reference: "a".into(),
             transform: IDENTITY_4X4,
             source: PartSource::ExactBrep(faces.clone()),
+            color: None,
         },
         RawPart {
             id: 2,
@@ -259,6 +266,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
             reference: "b".into(),
             transform: moved,
             source: PartSource::ExactBrep(faces.clone()),
+            color: None,
         },
     ];
     after_parts.push(RawPart {
@@ -267,6 +275,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
         reference: "d".into(),
         transform: IDENTITY_4X4,
         source: PartSource::ExactBrep(faces),
+        color: None,
     });
     let after = build_import(
         "v2".into(),

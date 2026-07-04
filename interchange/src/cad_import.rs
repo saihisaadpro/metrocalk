@@ -143,6 +143,9 @@ pub struct PartReport {
     /// The index into [`CadImport::meshes`] this part renders — **always `Some`** (never-empty is structural:
     /// a proxy is a real mesh). A part is never a black hole.
     pub mesh: Option<usize>,
+    /// The authored display colour (linear RGB) from the source's presentation model, if any — the viewer
+    /// applies it as a per-entity material override so the part renders in its real colour. `None` ⇒ default.
+    pub color: Option<[f32; 3]>,
 }
 
 impl PartReport {
@@ -340,6 +343,9 @@ pub struct RawPart {
     pub transform: [f64; 16],
     /// The best geometry the reader could resolve for this part.
     pub source: PartSource,
+    /// The authored display colour (linear RGB) from the source's presentation model, if any — so the part
+    /// renders in its real colour. `None` ⇒ the viewer's default material.
+    pub color: Option<[f32; 3]>,
 }
 
 /// The geometry a reader resolved for a part — the cascade routes each variant to a strategy/fidelity.
@@ -500,6 +506,7 @@ fn resolve_part(
         fix,
         transform: raw.transform,
         mesh,
+        color: raw.color,
     }
 }
 
@@ -892,6 +899,7 @@ impl CadReader for StepAssemblyReader {
                     reference: p.reference,
                     transform: p.transform,
                     source: PartSource::Tessellation(p.mesh),
+                    color: p.color,
                 });
             }
             return Ok(build_import(
@@ -915,6 +923,7 @@ impl CadReader for StepAssemblyReader {
                 reference: format!("step-solid-{}", solid.id),
                 transform: IDENTITY_4X4,
                 source: PartSource::ExactBrep(solid.faces.clone()),
+                color: None,
             });
         }
         Ok(build_import(

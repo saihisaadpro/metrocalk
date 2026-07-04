@@ -22,6 +22,7 @@
 )]
 
 use crate::mesh::MeshAsset;
+use std::collections::BTreeMap;
 
 /// One packed vertex — position, normal (for lighting), a baked RGB base color, the baked
 /// metallic-roughness PBR factors (M11.2, ADR-041), and the **UV** for base-color texture sampling (M11.2
@@ -79,9 +80,10 @@ pub struct MeshGpu {
 }
 
 impl MeshGpu {
-    /// Pack `asset` (all primitives merged, materials baked to vertex color, smooth normals derived
-    /// when absent).
+    /// Pack `asset` (all primitives merged, materials baked to vertex color, crease-aware smooth normals
+    /// derived when absent).
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one linear packing pass; splitting it would only scatter the state
     pub fn from_asset(asset: &MeshAsset) -> Self {
         let mut vertices = Vec::with_capacity(asset.vertex_count());
         let mut indices = Vec::with_capacity(asset.index_count());
@@ -107,27 +109,47 @@ impl MeshGpu {
                 (m.metallic.clamp(0.0, 1.0), m.roughness.clamp(0.0, 1.0))
             });
 
-            let normals = if prim.normals.len() == prim.positions.len() {
-                prim.normals.clone()
+            // Normals: use the source's when it ships a full per-vertex set (order preserved). Otherwise
+            // DERIVE crease-aware smooth normals — welding coincident positions, Max-weighting each corner,
+            // and SPLITTING a welded vertex where adjacent faces meet across the crease angle. This is what
+            // turns a tessellated cylinder/cone (flat facets in the file) into a smooth surface while keeping
+            // a machined edge crisp — the fix for imported CAD reading as faceted. The derive path may remap
+            // positions/indices, so it also returns a `src` map from each output vertex back to an original
+            // one (for the per-vertex UV; color/metallic/roughness are per-primitive constants, no remap).
+            let (prim_pos, prim_nrm, prim_idx, uv_src) = if prim.normals.len()
+                == prim.positions.len()
+            {
+                (
+                    prim.positions.clone(),
+                    prim.normals.clone(),
+                    prim.indices.clone(),
+                    None,
+                )
             } else {
-                derive_normals(&prim.positions, &prim.indices)
+                let (p, nrm, idx, src) = smooth_normals(&prim.positions, &prim.indices, CREASE_COS);
+                (p, nrm, idx, Some(src))
             };
 
-            for (i, &position) in prim.positions.iter().enumerate() {
+            for (i, &position) in prim_pos.iter().enumerate() {
+                // UV when the source ships one; 0 otherwise (→ the 1×1 white dummy = factor unchanged).
+                let uv = match &uv_src {
+                    Some(src) => src.get(i).and_then(|&s| prim.uvs.get(s)).copied(),
+                    None => prim.uvs.get(i).copied(),
+                }
+                .unwrap_or([0.0, 0.0]);
                 vertices.push(MeshVertex {
                     position,
-                    normal: normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
+                    normal: prim_nrm.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
                     color,
                     metallic,
                     roughness,
-                    // UV when the source ships one; 0 otherwise (→ the 1×1 white dummy = factor unchanged).
-                    uv: prim.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                    uv,
                 });
             }
-            // Re-base this primitive's indices into the merged vertex buffer; drop any out-of-range
-            // index (a malformed primitive) rather than emitting a bad draw.
-            let n = prim.positions.len() as u32;
-            for tri in prim.indices.chunks_exact(3) {
+            // Re-base this primitive's (possibly remapped) indices into the merged vertex buffer; drop any
+            // out-of-range index (a malformed primitive) rather than emitting a bad draw.
+            let n = prim_pos.len() as u32;
+            for tri in prim_idx.chunks_exact(3) {
                 if tri.iter().all(|&i| i < n) {
                     indices.push(base + tri[0]);
                     indices.push(base + tri[1]);
@@ -302,33 +324,181 @@ impl MeshGpu {
     }
 }
 
-/// Smooth per-vertex normals: accumulate each triangle's face normal onto its vertices, then
-/// normalize. Used when a primitive ships no normals.
-fn derive_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
-    let mut acc = vec![[0.0f32; 3]; positions.len()];
-    for tri in indices.chunks_exact(3) {
-        let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-        let (Some(&p0), Some(&p1), Some(&p2)) =
-            (positions.get(i0), positions.get(i1), positions.get(i2))
-        else {
-            continue;
-        };
-        let face = cross(sub(p1, p0), sub(p2, p0));
-        for &vi in &[i0, i1, i2] {
-            acc[vi] = add(acc[vi], face);
+/// The crease angle above which a shared vertex is split into separate smoothing groups (so a machined edge
+/// stays hard). `cos(30°) ≈ 0.866`: faces meeting within 30° smooth together (a tessellated cylinder), faces
+/// meeting across more than 30° keep a crisp edge (a box corner). 30° is the common DCC/CAD default.
+const CREASE_COS: f32 = 0.866_025_4;
+
+/// Path-compressing union-find lookup.
+fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+/// **Crease-aware smooth vertex normals** for a primitive that ships none (CAD tessellation / OBJ). Coincident
+/// positions are welded (a quantized grid, tolerance relative to the bbox diagonal), each triangle corner
+/// contributes a **Max (Nelson Max, 1999) angle-weighted** face normal — `cross(e1,e2) / (|e1|²·|e2|²)`,
+/// which is `(sinθ / (|e1|·|e2|)) · n̂`, trig-free and weighting by the corner angle so a fan of thin slivers
+/// can't dominate a broad face — and a welded vertex is **split** into separate smoothing groups wherever
+/// incident faces meet across more than the crease angle (union-find over the incident faces). So a
+/// tessellated cylinder shades smooth while a machined edge stays crisp.
+///
+/// Returns remapped `(positions, normals, indices, src)` where `src[i]` is the ORIGINAL vertex output vertex
+/// `i` came from (for the per-vertex UV; a welded/split vertex may not align 1:1 with the input). Degenerate
+/// (zero-area) triangles are skipped so they can't poison a fan with a NaN. Deterministic: `BTreeMap`-ordered
+/// throughout (no `HashMap`), so the same mesh always packs identically on native and `wasm32`.
+#[allow(clippy::type_complexity, clippy::too_many_lines)] // one cohesive weld→weight→split→emit pass
+fn smooth_normals(
+    positions: &[[f32; 3]],
+    indices: &[u32],
+    crease_cos: f32,
+) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>, Vec<usize>) {
+    let tri_count = indices.len() / 3;
+
+    // Weld tolerance relative to the bounding-box diagonal (so it scales with model size, mm or m).
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for p in positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
         }
     }
-    for n in &mut acc {
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let tau = (diag * 1e-5).max(1e-6);
+    let key = |p: [f32; 3]| -> [i64; 3] {
+        [
+            (p[0] / tau).round() as i64,
+            (p[1] / tau).round() as i64,
+            (p[2] / tau).round() as i64,
+        ]
+    };
+
+    // Original vertex → welded representative id (deterministic: BTreeMap first-seen order).
+    let mut rep_of: BTreeMap<[i64; 3], usize> = BTreeMap::new();
+    let mut vtx_rep = vec![0usize; positions.len()];
+    for (i, &p) in positions.iter().enumerate() {
+        let next = rep_of.len();
+        vtx_rep[i] = *rep_of.entry(key(p)).or_insert(next);
+    }
+    let rep_count = rep_of.len();
+
+    // Per-triangle normalized face direction (for the crease test); invalid ⇒ degenerate, skipped throughout.
+    let mut face_dir = vec![[0.0f32; 3]; tri_count];
+    let mut valid = vec![false; tri_count];
+    for t in 0..tri_count {
+        let (a, b, c) = (
+            indices[t * 3] as usize,
+            indices[t * 3 + 1] as usize,
+            indices[t * 3 + 2] as usize,
+        );
+        if a.max(b).max(c) >= positions.len() {
+            continue;
+        }
+        let n = cross(
+            sub(positions[b], positions[a]),
+            sub(positions[c], positions[a]),
+        );
+        let len2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+        if len2 > 1e-24 {
+            let inv = 1.0 / len2.sqrt();
+            face_dir[t] = [n[0] * inv, n[1] * inv, n[2] * inv];
+            valid[t] = true;
+        }
+    }
+
+    // Incident triangles per welded rep.
+    let mut rep_tris: Vec<Vec<usize>> = vec![Vec::new(); rep_count];
+    for t in 0..tri_count {
+        if !valid[t] {
+            continue;
+        }
+        let reps = [
+            vtx_rep[indices[t * 3] as usize],
+            vtx_rep[indices[t * 3 + 1] as usize],
+            vtx_rep[indices[t * 3 + 2] as usize],
+        ];
+        for (j, &r) in reps.iter().enumerate() {
+            if !reps[..j].contains(&r) {
+                rep_tris[r].push(t);
+            }
+        }
+    }
+
+    // At each welded rep, union-find its incident tris by the crease test → each incident tri's group root.
+    let mut tri_group: BTreeMap<(usize, usize), usize> = BTreeMap::new(); // (rep, tri) → representative tri
+    for (r, tris) in rep_tris.iter().enumerate() {
+        let n = tris.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if dot(face_dir[tris[i]], face_dir[tris[j]]) >= crease_cos {
+                    let (ri, rj) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
+                    parent[ri] = rj;
+                }
+            }
+        }
+        for i in 0..n {
+            let root = uf_find(&mut parent, i);
+            tri_group.insert((r, tris[i]), tris[root]);
+        }
+    }
+
+    // Emit one output vertex per (rep, group-root); accumulate the Max-weighted corner normals into it.
+    let mut out_index: BTreeMap<(usize, usize), u32> = BTreeMap::new();
+    let mut out_pos: Vec<[f32; 3]> = Vec::new();
+    let mut out_nrm: Vec<[f32; 3]> = Vec::new();
+    let mut out_src: Vec<usize> = Vec::new();
+    let mut out_idx: Vec<u32> = Vec::with_capacity(tri_count * 3);
+    for t in 0..tri_count {
+        if !valid[t] {
+            continue;
+        }
+        let corners = [
+            indices[t * 3] as usize,
+            indices[t * 3 + 1] as usize,
+            indices[t * 3 + 2] as usize,
+        ];
+        for c in 0..3 {
+            let v = corners[c];
+            let r = vtx_rep[v];
+            let root = *tri_group.get(&(r, t)).unwrap_or(&t);
+            let ovi = *out_index.entry((r, root)).or_insert_with(|| {
+                let id = out_pos.len() as u32;
+                out_pos.push(positions[v]);
+                out_nrm.push([0.0; 3]);
+                out_src.push(v);
+                id
+            });
+            // Max weight at this corner: the two edges leaving vertex `v`.
+            let e1 = sub(positions[corners[(c + 1) % 3]], positions[v]);
+            let e2 = sub(positions[corners[(c + 2) % 3]], positions[v]);
+            let cr = cross(e1, e2);
+            let denom = dot(e1, e1) * dot(e2, e2);
+            if denom > 1e-24 {
+                let w = 1.0 / denom;
+                let n = &mut out_nrm[ovi as usize];
+                n[0] += cr[0] * w;
+                n[1] += cr[1] * w;
+                n[2] += cr[2] * w;
+            }
+            out_idx.push(ovi);
+        }
+    }
+    for n in &mut out_nrm {
         *n = normalize(*n, [0.0, 1.0, 0.0]);
     }
-    acc
+    (out_pos, out_nrm, out_idx, out_src)
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
-fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [
@@ -349,6 +519,64 @@ fn normalize(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smooth_normals_smooths_a_flat_quad_but_splits_a_hard_fold() {
+        // A flat quad (two coplanar tris sharing an edge). No crease → the shared edge verts weld and the
+        // whole quad has one up normal. 4 unique output verts, all normal +Y.
+        let quad_pos = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let quad_idx = [0u32, 1, 2, 0, 2, 3];
+        let (pos, nrm, idx, _src) = smooth_normals(&quad_pos, &quad_idx, CREASE_COS);
+        assert_eq!(
+            pos.len(),
+            4,
+            "a flat quad welds to 4 verts (no crease split)"
+        );
+        assert_eq!(idx.len(), 6);
+        for n in &nrm {
+            // Smooth: every vert shares ONE normal along the quad's axis (±Y depending on winding), flat.
+            assert!(
+                n[1].abs() > 0.99 && n[0].abs() < 1e-3 && n[2].abs() < 1e-3,
+                "every vert normal is the quad's face normal (Y-axis), consistent across the shared edge ({n:?})"
+            );
+        }
+
+        // A hard 90° fold: two quads meeting at a right angle along a shared edge. The shared-edge verts must
+        // SPLIT (each side keeps its own face normal) — a machined edge stays crisp, not smeared to 45°.
+        // Floor quad in the XZ plane (normal +Y) + wall quad in the XY plane (normal +Z... here -Z), folded at z=0.
+        let fold_pos = [
+            [0.0, 0.0, 0.0], // 0 shared
+            [1.0, 0.0, 0.0], // 1 shared
+            [1.0, 0.0, 1.0], // 2 floor
+            [0.0, 0.0, 1.0], // 3 floor
+            [1.0, 1.0, 0.0], // 4 wall
+            [0.0, 1.0, 0.0], // 5 wall
+        ];
+        let fold_idx = [
+            0u32, 1, 2, 0, 2, 3, // floor (normal +Y)
+            0, 4, 1, 0, 5, 4, // wall  (normal ±Z)
+        ];
+        let (fp, fnrm, _fi, _fs) = smooth_normals(&fold_pos, &fold_idx, CREASE_COS);
+        assert!(
+            fp.len() > 6,
+            "the 90° fold splits the shared-edge verts (> the 6 welded positions), not smoothed"
+        );
+        // No output normal is the blended 45° (which a naive smoother would produce at the fold) — every
+        // normal is a clean face normal (a single non-zero axis).
+        for n in &fnrm {
+            let axes = [n[0].abs(), n[1].abs(), n[2].abs()];
+            let dominant = axes.iter().copied().fold(0.0f32, f32::max);
+            assert!(
+                dominant > 0.98,
+                "a fold vert keeps a crisp face normal, not a blended 45° ({n:?})"
+            );
+        }
+    }
 
     fn vtx(p: [f32; 3]) -> MeshVertex {
         MeshVertex {

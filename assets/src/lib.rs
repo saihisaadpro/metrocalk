@@ -105,9 +105,11 @@ mod tests {
             asset.primitives[0].normals.is_empty(),
             "authored without normals"
         );
-        // The packer derives them.
+        // The packer derives crease-aware smooth normals. An octahedron's faces meet at ~109° — far above the
+        // 30° crease angle — so every welded vertex SPLITS per-face: 8 faces × 3 corners = 24 flat-shaded
+        // vertices (correctly faceted, not wrongly smoothed into a blob). The triangle count is unchanged.
         let gpu = MeshGpu::from_asset(&asset);
-        assert_eq!(gpu.vertex_count(), 6);
+        assert_eq!(gpu.vertex_count(), 24, "sharp facets crease-split per-face");
         assert_eq!(gpu.index_count(), 24);
         for v in &gpu.vertices {
             let len = (v.normal[0].powi(2) + v.normal[1].powi(2) + v.normal[2].powi(2)).sqrt();

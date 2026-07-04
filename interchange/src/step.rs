@@ -1036,6 +1036,9 @@ pub(crate) struct TessPart {
     pub transform: [f64; 16],
     /// The welded triangulated mesh (from the embedded tessellation).
     pub mesh: TriMesh,
+    /// The authored display colour (linear RGB) resolved from the STEP `STYLED_ITEM` chain, if any — so the
+    /// part renders in its real colour instead of a uniform default.
+    pub color: Option<[f32; 3]>,
 }
 
 /// Read a STEP file's embedded tessellation into placed [`TessPart`]s. Returns an empty Vec if the file
@@ -1072,6 +1075,10 @@ pub(crate) fn parse_tessellated_assembly(entities: &BTreeMap<u64, Entity>) -> Ve
         .collect();
     roots.sort_unstable();
 
+    // Per-geometry authored colours (from the STEP `STYLED_ITEM` chain) so each part renders in its real
+    // colour, keyed by the styled item id (the tessellated solid / geometric-set node).
+    let colors = styled_colors(entities);
+
     let mut out: Vec<TessPart> = Vec::new();
     let mut on_path: BTreeSet<u64> = BTreeSet::new();
     for root in roots {
@@ -1081,11 +1088,108 @@ pub(crate) fn parse_tessellated_assembly(entities: &BTreeMap<u64, Entity>) -> Ve
             root,
             crate::cad_import::IDENTITY_4X4,
             0,
+            &colors,
             &mut on_path,
             &mut out,
         );
     }
     out
+}
+
+/// Map a styled geometry item id → its authored display colour (linear RGB), from the STEP presentation model:
+/// `STYLED_ITEM(name, (styles), item)` where a bounded search from each style ref reaches a `COLOUR_RGB` (or a
+/// `DRAUGHTING_PRE_DEFINED_COLOUR` name) through the `PRESENTATION_STYLE_ASSIGNMENT → SURFACE_STYLE_USAGE →
+/// SURFACE_SIDE_STYLE → SURFACE_STYLE_FILL_AREA → FILL_AREA_STYLE → FILL_AREA_STYLE_COLOUR` (or
+/// `SURFACE_STYLE_RENDERING`) chain. Structure-agnostic: rather than hard-code every leg, it walks refs to the
+/// first colour (bounded depth). The colour is keyed on the `STYLED_ITEM.item` (commonly the `TESSELLATED_SOLID`).
+fn styled_colors(entities: &BTreeMap<u64, Entity>) -> BTreeMap<u64, [f32; 3]> {
+    let mut out: BTreeMap<u64, [f32; 3]> = BTreeMap::new();
+    for e in entities.values() {
+        if e.name != "STYLED_ITEM" {
+            continue;
+        }
+        // STYLED_ITEM(name, (styles), item) — the item is the last ref; styles are the list of style refs.
+        let refs: Vec<u64> = e.args.iter().filter_map(Value::as_ref_id).collect();
+        let Some(&item) = refs.last() else { continue };
+        let styles = e
+            .args
+            .iter()
+            .find_map(Value::as_list)
+            .map(|l| l.iter().filter_map(Value::as_ref_id).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for s in styles {
+            if let Some(c) = resolve_colour(entities, s, 0) {
+                out.entry(item).or_insert(c);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Follow refs from a style entity to the first `COLOUR_RGB` (linear RGB) or a named pre-defined colour,
+/// bounded in depth (the presentation graph is shallow). Structure-agnostic so it tolerates the AP242 style
+/// variants (`SURFACE_STYLE_RENDERING` vs `FILL_AREA_STYLE`).
+fn resolve_colour(entities: &BTreeMap<u64, Entity>, id: u64, depth: u32) -> Option<[f32; 3]> {
+    if depth > 8 {
+        return None;
+    }
+    let e = entities.get(&id)?;
+    if e.name == "COLOUR_RGB" {
+        // COLOUR_RGB(name, r, g, b) — the three reals are already 0..1 linear.
+        let vals: Vec<f64> = e.args.iter().filter_map(Value::as_real).collect();
+        if let [r, g, b] = vals[..] {
+            #[allow(clippy::cast_possible_truncation)]
+            return Some([r as f32, g as f32, b as f32]);
+        }
+        return None;
+    }
+    if e.name == "DRAUGHTING_PRE_DEFINED_COLOUR" || e.name == "PRE_DEFINED_COLOUR" {
+        if let Some(Value::Str(name)) = e.args.first() {
+            return predefined_colour(name);
+        }
+    }
+    // Otherwise recurse into every ref reachable in this style entity's args — INCLUDING refs nested inside
+    // lists (`PRESENTATION_STYLE_ASSIGNMENT((#style))`) and complex sub-records — taking the first colour.
+    let mut refs = Vec::new();
+    for a in &e.args {
+        collect_refs(a, &mut refs);
+    }
+    for r in refs {
+        if let Some(c) = resolve_colour(entities, r, depth + 1) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Collect every `#ref` reachable in a value, descending into lists + complex sub-records (the presentation
+/// graph nests its refs inside lists, e.g. `PRESENTATION_STYLE_ASSIGNMENT((#surface_style))`).
+fn collect_refs(v: &Value, out: &mut Vec<u64>) {
+    match v {
+        Value::Ref(id) => out.push(*id),
+        Value::List(items) | Value::Typed(_, items) => {
+            for it in items {
+                collect_refs(it, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The ISO-10303 pre-defined colour names → linear RGB.
+fn predefined_colour(name: &str) -> Option<[f32; 3]> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "red" => [1.0, 0.0, 0.0],
+        "green" => [0.0, 1.0, 0.0],
+        "blue" => [0.0, 0.0, 1.0],
+        "yellow" => [1.0, 1.0, 0.0],
+        "magenta" => [1.0, 0.0, 1.0],
+        "cyan" => [0.0, 1.0, 1.0],
+        "black" => [0.0, 0.0, 0.0],
+        "white" => [1.0, 1.0, 1.0],
+        _ => return None,
+    })
 }
 
 /// Is `e` a node in the tessellation graph (a leaf solid/shell, a set, a reposition, or a complex entity that
@@ -1161,6 +1265,7 @@ fn walk_tess(
     id: u64,
     world: [f64; 16],
     depth: u32,
+    colors: &BTreeMap<u64, [f32; 3]>,
     on_path: &mut BTreeSet<u64>,
     out: &mut Vec<TessPart>,
 ) {
@@ -1183,6 +1288,7 @@ fn walk_tess(
             reference: id.to_string(),
             transform: world,
             mesh,
+            color: colors.get(&id).copied(),
         });
         return;
     }
@@ -1193,7 +1299,7 @@ fn walk_tess(
     let child_world = crate::cad_import::mat4_mul(&world, &local);
     on_path.insert(id);
     for c in children {
-        walk_tess(entities, c, child_world, depth + 1, on_path, out);
+        walk_tess(entities, c, child_world, depth + 1, colors, on_path, out);
     }
     on_path.remove(&id);
 }
