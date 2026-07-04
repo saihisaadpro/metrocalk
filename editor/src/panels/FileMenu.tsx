@@ -9,13 +9,14 @@
 //! `#fileOpen`, `#fileSave`, `#fileSaveAs`, `.fileRecentItem`, `#unsavedGuard`) so the prompt-40
 //! acceptance page-object keys off them.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { projectStore, projectName, useProjectInfo, type ProjectInfo } from "../store/project";
 import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Modal, Popover } from "../theme/Popover";
 import { Button } from "../theme/primitives";
-import { color, elevation, font, fontSize, radius, space, z } from "../theme/tokens";
+import { color, elevation, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 
 /** The file's display name *with* its extension (so a save names the real file, not a stem). */
@@ -26,20 +27,11 @@ export function FileMenu({ client }: { client: EditorClient }) {
   const [open, setOpen] = useState(false);
   // A guarded action awaiting "discard unsaved changes?" confirmation, or `null` when none is pending.
   const [pending, setPending] = useState<{ run: () => Promise<ProjectInfo>; label: string } | null>(null);
+  // The trigger the dropdown anchors to (its on-screen rect drives the portaled panel's position).
+  const rootRef = useRef<HTMLDivElement>(null);
 
-  // Escape closes the unsaved-guard (cancel) first, else the open dropdown. Capture-phase + stopPropagation
-  // so it runs BEFORE App's window Esc handler — pressing Esc to dismiss a menu must not also Stop Play.
-  useEffect(() => {
-    if (!open && !pending) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.stopPropagation();
-      if (pending) setPending(null);
-      else setOpen(false);
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, pending]);
+  // (Escape-to-dismiss for both the dropdown and the guard is handled by `Popover`/`Modal` — capture-phase +
+  // stopPropagation, so pressing Esc to close a menu never also triggers App's Stop-Play.)
 
   // Refresh the authoritative project state (path · dirty · recents) whenever the menu opens, so the
   // guard reads the shell's truth, not just the optimistic indicator.
@@ -117,7 +109,7 @@ export function FileMenu({ client }: { client: EditorClient }) {
   }
 
   return (
-    <div id="fileMenuRoot" style={{ position: "relative", font: font.ui }}>
+    <div id="fileMenuRoot" ref={rootRef} style={{ position: "relative", font: font.ui }}>
       <Button id="fileMenu" data-testid="fileMenu" variant="ghost" compact onClick={() => setOpen((o) => !o)}>
         File
         <span style={{ marginLeft: space.xs, color: color.text.muted }}>{projectName(path)}</span>
@@ -128,54 +120,48 @@ export function FileMenu({ client }: { client: EditorClient }) {
         )}
       </Button>
 
-      {open && (
-        <>
-          {/* click-away closes the menu */}
-          <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: z.menu - 10 }} />
-          <div
-            id="fileMenuPanel"
-            data-testid="fileMenuPanel"
-            style={{ position: "absolute", top: "100%", left: 0, marginTop: space.xs, minWidth: 220, zIndex: z.menu, background: color.bg.raised, border: `1px solid ${color.border.default}`, borderRadius: radius.lg, padding: space.xs, boxShadow: elevation.e3 }}
-          >
-            <MenuItem id="fileNew" label="New project" onClick={() => guarded(() => client.newProject(), "New", "new project")} />
-            <MenuItem id="fileOpen" label="Open…" onClick={() => guarded(() => client.openProject(), "Open", "opened")} />
-            <MenuItem id="fileImport" label="Import asset…" onClick={() => void importFile()} />
-            <Divider />
-            <MenuItem id="fileSave" label="Save" onClick={() => void save(false)} />
-            <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void save(true)} />
-            <Divider />
-            <div style={{ color: color.text.muted, fontSize: fontSize.meta, padding: `${space.xs}px ${space.md}px 2px` }}>Recent</div>
-            <div id="fileRecent" data-testid="fileRecent">
-              {recents.length === 0 ? (
-                <div style={{ padding: `${space.xs}px ${space.md}px`, color: color.text.faint, fontSize: fontSize.body }}>— none —</div>
-              ) : (
-                recents.map((p) => (
-                  <button
-                    key={p}
-                    className="fileRecentItem mtk-btn mtk-btn--ghost"
-                    data-path={p}
-                    onClick={() => guarded(() => client.openProject(p), "Open", `opened ${projectName(p)}`)}
-                    title={p}
-                    style={{ display: "block", width: "100%", textAlign: "left", padding: `${space.xs}px ${space.md}px`, color: color.text.secondary, fontSize: fontSize.body, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
-                  >
-                    {projectName(p)}
-                  </button>
-                ))
-              )}
-            </div>
+      {/* The dropdown is portaled to the body (theme/Popover) so the app header's `overflow: hidden` can never
+          clip it and no sibling stacking context can bury it — the fix for "the File menu opens behind the
+          suggestion bar / tabs". Edge-aware + Escape/outside-click dismissal are handled by Popover. */}
+      <Popover open={open} anchor={rootRef} onClose={() => setOpen(false)}>
+        <div
+          id="fileMenuPanel"
+          data-testid="fileMenuPanel"
+          style={{ minWidth: 220, background: color.bg.raised, border: `1px solid ${color.border.default}`, borderRadius: radius.lg, padding: space.xs, boxShadow: elevation.e3 }}
+        >
+          <MenuItem id="fileNew" label="New project" onClick={() => guarded(() => client.newProject(), "New", "new project")} />
+          <MenuItem id="fileOpen" label="Open…" onClick={() => guarded(() => client.openProject(), "Open", "opened")} />
+          <MenuItem id="fileImport" label="Import asset…" onClick={() => void importFile()} />
+          <Divider />
+          <MenuItem id="fileSave" label="Save" onClick={() => void save(false)} />
+          <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void save(true)} />
+          <Divider />
+          <div style={{ color: color.text.muted, fontSize: fontSize.meta, padding: `${space.xs}px ${space.md}px 2px` }}>Recent</div>
+          <div id="fileRecent" data-testid="fileRecent">
+            {recents.length === 0 ? (
+              <div style={{ padding: `${space.xs}px ${space.md}px`, color: color.text.faint, fontSize: fontSize.body }}>— none —</div>
+            ) : (
+              recents.map((p) => (
+                <button
+                  key={p}
+                  className="fileRecentItem mtk-btn mtk-btn--ghost"
+                  data-path={p}
+                  onClick={() => guarded(() => client.openProject(p), "Open", `opened ${projectName(p)}`)}
+                  title={p}
+                  style={{ display: "block", width: "100%", textAlign: "left", padding: `${space.xs}px ${space.md}px`, color: color.text.secondary, fontSize: fontSize.body, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                >
+                  {projectName(p)}
+                </button>
+              ))
+            )}
           </div>
-        </>
-      )}
+        </div>
+      </Popover>
 
       {pending && (
-        <div
-          id="unsavedGuard"
-          data-testid="unsavedGuard"
-          onClick={() => setPending(null)}
-          style={{ position: "fixed", inset: 0, zIndex: z.guard, display: "flex", alignItems: "center", justifyContent: "center", background: "#0009" }}
-        >
+        <Modal open onClose={() => setPending(null)} id="unsavedGuard">
           <div
-            onClick={(e) => e.stopPropagation()} // clicks inside the dialog must not cancel
+            data-testid="unsavedGuard"
             style={{ background: color.bg.raised, border: `1px solid ${color.border.strong}`, borderRadius: radius.xl, padding: space.xl, maxWidth: 340, boxShadow: elevation.e3, color: color.text.primary }}
           >
             <div style={{ marginBottom: space.lg }}>
@@ -196,7 +182,7 @@ export function FileMenu({ client }: { client: EditorClient }) {
               </Button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

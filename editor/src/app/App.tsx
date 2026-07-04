@@ -14,6 +14,7 @@ import { projectionStore, useEntityOrder } from "../store/projection";
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
+import { Popover } from "../theme/Popover";
 import { Button } from "../theme/primitives";
 import { color, font, fontSize, radius, space, z } from "../theme/tokens";
 import { panelLayout } from "./layout";
@@ -409,7 +410,7 @@ export function App() {
       {/* Collapsed-panel overlay drawer (opened from a rail). */}
       {drawer && (
         <>
-          <div onClick={() => setDrawer(null)} style={{ position: "fixed", inset: 0, zIndex: 110, background: "#0006" }} />
+          <div onClick={() => setDrawer(null)} style={{ position: "fixed", inset: 0, zIndex: z.overlay, background: "#0006" }} />
           <div
             data-testid={`drawer-${drawer}`}
             style={{
@@ -418,7 +419,7 @@ export function App() {
               bottom: 0,
               ...(drawer === "left" ? { left: 0, borderRight: "1px solid var(--mtk-border-subtle)" } : { right: 0, borderLeft: "1px solid var(--mtk-border-subtle)" }),
               width: 300,
-              zIndex: 120,
+              zIndex: z.drawer,
               background: "var(--mtk-bg-inset)",
               overflow: "auto",
               boxShadow: "0 0 30px #000a",
@@ -430,17 +431,16 @@ export function App() {
       )}
 
       {ctx && (
-        <>
-          <div onClick={() => setCtx(null)} style={{ position: "fixed", inset: 0, zIndex: 90 }} />
-          <div style={{ position: "fixed", left: ctx.x, top: ctx.y, zIndex: 100 }}>
-            <ContextMenu
-              client={client}
-              id={ctx.id}
-              onClose={() => setCtx(null)}
-              onFocus={(id, dist) => setFocused({ id, dist })}
-            />
-          </div>
-        </>
+        // Portaled + edge-aware (Popover): the right-click menu can no longer be clipped by a panel's
+        // `overflow` or open off-screen near a viewport edge (it clamps/flips into view).
+        <Popover open anchorPoint={{ x: ctx.x, y: ctx.y }} onClose={() => setCtx(null)}>
+          <ContextMenu
+            client={client}
+            id={ctx.id}
+            onClose={() => setCtx(null)}
+            onFocus={(id, dist) => setFocused({ id, dist })}
+          />
+        </Popover>
       )}
       {focused && (
         <FocusBanner

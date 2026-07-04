@@ -96,7 +96,30 @@ export const motion = {
   slow: "240ms ease",
 } as const;
 
-/** z-layer scale — one ladder so overlays never fight (matches the existing App/menu/drawer/toast order). */
+/**
+ * **The app's z-layer ladder — one source of truth so overlays never fight.**
+ *
+ * THE RULE (read this before adding any floating UI): a raised `z-index` does NOT let an element escape an
+ * ancestor's `overflow: hidden` (it gets CLIPPED) or an ancestor stacking context (it gets BURIED). So any UI
+ * that floats above the layout — dropdown, popover, context menu, modal, tooltip, toast — MUST be rendered
+ * through a PORTAL to `document.body`, never as a `position: absolute` child of a normal panel. Use the shared
+ * primitives in [`theme/Popover.tsx`] (`Popover` for anchored menus/context menus, `Modal` for centered
+ * dialogs); they portal, are edge-aware, and dismiss on Escape / outside-click. Do NOT hand-roll a floating
+ * `position: absolute` panel inside a toolbar/panel row — that is exactly the bug that hid the File menu behind
+ * the header (the header row is `overflow: hidden`).
+ *
+ * The ladder (low → high). Pick a token, never a raw number:
+ *  - `base`    0   — normal document flow.
+ *  - `chrome`  5   — in-viewport chrome pinned over the stage (viewport toolbar, empty-state).
+ *  - `sticky`  10  — sticky headers within a scroll region.
+ *  - `menu`    100 — anchored floating menus / dropdowns / context menus / popovers (the default for `Popover`).
+ *  - `overlay` 110 — a full-screen scrim/backdrop behind a drawer or modal.
+ *  - `drawer`  120 — a slide-in side drawer (sits above its own scrim).
+ *  - `badge`   140 — persistent stage badges (e.g. "● PLAYING").
+ *  - `toast`   150 — transient notifications (toasts) — above menus so a toast is never hidden by a menu.
+ *  - `guard`   200 — blocking modal dialogs / confirmations (the top; must sit over everything, the default
+ *                    for `Modal`).
+ */
 export const z = {
   base: 0,
   chrome: 5,

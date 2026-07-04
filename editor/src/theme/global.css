@@ -206,6 +206,10 @@ html {
 @keyframes mtk-toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes mtk-spin { to { transform: rotate(360deg); } }
 @keyframes mtk-flash { 0% { color: #fff; } 100% { color: var(--mtk-token); } }
+/* Floating-overlay entrances (theme/Popover.tsx): a small scale/lift for anchored popovers, a fade for modals. */
+@keyframes mtk-pop-in { from { opacity: 0; transform: translateY(-4px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes mtk-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { @keyframes mtk-pop-in { from { opacity: 1; } to { opacity: 1; } } @keyframes mtk-fade-in { from { opacity: 1; } to { opacity: 1; } } }
 .mtk-anim-toast { animation: mtk-toast-in 140ms ease; }
 .mtk-spinner {
   width: 11px; height: 11px; border-radius: 50%;
