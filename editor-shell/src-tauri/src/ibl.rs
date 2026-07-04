@@ -49,23 +49,32 @@ fn texel_dir(x: usize, y: usize) -> Vec3 {
     )
 }
 
-/// Procedural, physically-plausible sky radiance (HDR: the sun disk is ≫1, so polished metals get a sharp
-/// specular glint). A cool zenith → warm horizon gradient over a dim ground, plus a warm sun in the
-/// upper-right that doubles as the scene's implied key direction.
+/// Procedural, physically-plausible **neutral studio** radiance (HDR) — a product/CAD-viewer environment (the
+/// look KeyShot / Fusion / Onshape default to), so imported machined parts read as studio-lit metal, not
+/// outdoor-tinted plastic. A bright soft "ceiling" → neutral-grey walls → darker floor, plus **two broad soft
+/// area lights** (a key upper-front-left + a fill upper-right): large + soft (a wide cosine lobe, not a hot
+/// pinpoint) so a metal surface picks up a clean, curvature-tracing streak highlight instead of a harsh glint.
+/// Neutral by construction — a polished part reflects grey, not blue sky.
 fn sky_radiance(d: Vec3) -> Vec3 {
     let t = d.y.clamp(-1.0, 1.0);
-    let zenith = Vec3::new(0.18, 0.34, 0.62);
-    let horizon = Vec3::new(0.70, 0.75, 0.82);
-    let ground = Vec3::new(0.10, 0.09, 0.08);
+    // Vertical neutral gradient: soft-box ceiling (bright), mid grey walls, darker seamless floor.
+    let ceiling = Vec3::new(0.80, 0.81, 0.83);
+    let walls = Vec3::new(0.42, 0.43, 0.45);
+    let floor = Vec3::new(0.14, 0.14, 0.15);
     let base = if t >= 0.0 {
-        horizon.lerp(zenith, t.powf(0.45))
+        walls.lerp(ceiling, t.powf(0.65))
     } else {
-        horizon.lerp(ground, (-t).powf(0.5))
+        walls.lerp(floor, (-t).powf(0.55))
     };
-    let sun_dir = Vec3::new(0.35, 0.55, 0.40).normalize();
-    let s = d.dot(sun_dir).max(0.0);
-    let sun = if s > 0.9992 { 22.0 } else { 0.0 } + 1.6 * s.powf(800.0);
-    base + Vec3::new(1.0, 0.93, 0.78) * sun
+    // Two broad soft-box lights. `powf(exp)` with a modest exponent = a large, soft source (a real soft-box),
+    // so metals get a smooth streak highlight; the intensity is HDR (> the diffuse base) to read as a light.
+    let softbox = |dir: Vec3, intensity: f32, tightness: f32| -> f32 {
+        intensity * d.dot(dir).max(0.0).powf(tightness)
+    };
+    let key = Vec3::new(-0.45, 0.72, 0.52).normalize(); // upper front-left key
+    let fill = Vec3::new(0.55, 0.55, -0.35).normalize(); // upper right fill
+    let lights = softbox(key, 3.0, 32.0) + softbox(fill, 1.4, 48.0);
+    base + Vec3::new(1.0, 1.0, 1.0) * lights
 }
 
 /// The procedural sky as a level-0 equirect (`ENV_W × ENV_H` linear-RGB texels).

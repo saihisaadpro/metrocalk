@@ -105,12 +105,23 @@ pub fn trimesh_to_mesh_asset_colored(
         .flat_map(|t| t.iter().copied())
         .collect();
     let material = if matches!(name, "cad" | "step") {
-        let base = color.map_or([0.58, 0.59, 0.61, 1.0], |c| [c[0], c[1], c[2], 1.0]);
-        Material {
-            base_color: base,
-            metallic: 0.30,
-            roughness: 0.38,
-            ..Material::default()
+        match color {
+            // A part with an AUTHORED colour reads as PAINTED equipment: a dielectric satin paint (no
+            // metalness, mid roughness) so the colour is the surface — a painted crane arm, not glossy plastic.
+            Some(c) => Material {
+                base_color: [c[0], c[1], c[2], 1.0],
+                metallic: 0.0,
+                roughness: 0.55,
+                ..Material::default()
+            },
+            // No authored colour ⇒ bare machined metal: neutral steel, glossier + slightly metallic so it
+            // catches a form-revealing highlight off the studio IBL.
+            None => Material {
+                base_color: [0.58, 0.59, 0.61, 1.0],
+                metallic: 0.30,
+                roughness: 0.38,
+                ..Material::default()
+            },
         }
     } else {
         Material::default()
