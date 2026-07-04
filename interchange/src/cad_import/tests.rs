@@ -3,7 +3,8 @@
 #![allow(clippy::float_cmp)] // transforms here are exact literals / exact integer arithmetic — exact compare
 
 use super::*;
-use crate::step::{CadEdge, CadFace, FaceKind};
+use crate::step::{CadEdge, CadFace, CadInterchange, FaceKind};
+use crate::StepInterchange;
 use metrocalk_csg::validate;
 
 /// A real ADVANCED_BREP cube (2×2×2 mm) — the same fixture the STEP reader tests use.
@@ -324,4 +325,110 @@ fn tessellate_faces_skips_curved_and_matches_the_scene_tessellation_for_one_soli
         }],
     }];
     assert_eq!(tessellate_faces(&curved).triangle_count(), 0);
+}
+
+/// The real AP242 tessellated-assembly shape (what commercial CAD exports, and what the M15.7 bar file uses):
+/// a nested `REPOSITIONED_TESSELLATED_ITEM` / `TESSELLATED_GEOMETRIC_SET` hierarchy, each node carrying its own
+/// `AXIS2_PLACEMENT_3D` reposition, down to `TESSELLATED_SOLID`s of `COMPLEX_TRIANGULATED_FACE`s. The reader
+/// must (a) find the leaf solid's mesh from its shared `COORDINATES_LIST`, and (b) place it at the COMPOSITION
+/// of every ancestor reposition (here z+10 over x+5 → (5,0,10)).
+const TESS_STEP: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_NAME('tess','',(''),(''),'','','');\nFILE_SCHEMA(('AP242'));\nENDSEC;\nDATA;\n\
+#5=COORDINATES_LIST('',3,((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));\n\
+#6=COMPLEX_TRIANGULATED_FACE('',#5,3,((0.,0.,1.)),$,(1,2,3),((1,2,3)),());\n\
+#10=TESSELLATED_SOLID('',(#6),$);\n\
+#20=DIRECTION('',(0.,0.,1.));\n\
+#21=DIRECTION('',(1.,0.,0.));\n\
+#22=CARTESIAN_POINT('',(5.,0.,0.));\n\
+#23=AXIS2_PLACEMENT_3D('',#22,#20,#21);\n\
+#30=CARTESIAN_POINT('',(0.,0.,10.));\n\
+#31=AXIS2_PLACEMENT_3D('',#30,#20,#21);\n\
+#100=(GEOMETRIC_REPRESENTATION_ITEM()REPOSITIONED_TESSELLATED_ITEM(#23)REPRESENTATION_ITEM('')\
+TESSELLATED_GEOMETRIC_SET((#10))TESSELLATED_ITEM());\n\
+#200=(GEOMETRIC_REPRESENTATION_ITEM()REPOSITIONED_TESSELLATED_ITEM(#31)REPRESENTATION_ITEM('')\
+TESSELLATED_GEOMETRIC_SET((#100))TESSELLATED_ITEM());\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+
+#[test]
+fn tessellated_assembly_places_leaf_at_composed_reposition() {
+    let entities = crate::step::parse_entities(TESS_STEP).unwrap();
+    let parts = crate::step::parse_tessellated_assembly(&entities);
+    assert_eq!(
+        parts.len(),
+        1,
+        "one leaf TESSELLATED_SOLID → one placed part"
+    );
+    let p = &parts[0];
+    assert_eq!(
+        p.mesh.triangle_count(),
+        1,
+        "the COMPLEX_TRIANGULATED_FACE's single triangle survives the pnindex→coords remap"
+    );
+    // World = reposition(z+10) ∘ reposition(x+5) — both pure translations → (5,0,10).
+    assert_eq!(
+        translation_of(&p.transform),
+        [5.0, 0.0, 10.0],
+        "leaf placed at the COMPOSITION of both ancestor repositions"
+    );
+    assert_eq!(
+        p.reference, "10",
+        "reference keyed on the solid id (dedup key)"
+    );
+}
+
+#[test]
+fn no_tessellation_falls_through_to_the_planar_interpreter() {
+    // A file with zero tessellation → parse_tessellated_assembly is empty so the reader takes the B-rep leg.
+    let entities = crate::step::parse_entities(CUBE_STEP).unwrap();
+    assert!(
+        crate::step::parse_tessellated_assembly(&entities).is_empty(),
+        "no TESSELLATED_* entities → empty, so StepAssemblyReader falls back to the planar interpret path"
+    );
+}
+
+/// A `COMPLEX_TRIANGULATED_FACE`'s `triangle_fans` attribute (the LAST connectivity arg) must triangulate with
+/// FAN topology — every triangle shares the first vertex — NOT the alternating-winding strip topology of the
+/// `triangle_strips` attribute. The two attributes are the identical list-of-int-lists shape, so the reader
+/// distinguishes them by POSITION (fans = last), not shape. Here the fan `(1,2,3,4)` → (0,1,2),(0,2,3); a strip
+/// would instead give (0,1,2),(2,1,3) — the silently-wrong geometry this locks out.
+const FAN_STEP: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_NAME('fan','',(''),(''),'','','');\nFILE_SCHEMA(('AP242'));\nENDSEC;\nDATA;\n\
+#5=COORDINATES_LIST('',4,((0.,0.,0.),(1.,0.,0.),(1.,1.,0.),(0.,1.,0.)));\n\
+#6=COMPLEX_TRIANGULATED_FACE('',#5,4,((0.,0.,1.)),$,(1,2,3,4),(),((1,2,3,4)));\n\
+#10=TESSELLATED_SOLID('',(#6),$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+
+#[test]
+fn complex_triangulated_face_fans_use_fan_topology_not_strip() {
+    let entities = crate::step::parse_entities(FAN_STEP).unwrap();
+    let parts = crate::step::parse_tessellated_assembly(&entities);
+    assert_eq!(
+        parts.len(),
+        1,
+        "the one tessellated solid → one placed part"
+    );
+    assert_eq!(
+        parts[0].mesh.triangles,
+        vec![[0u32, 1, 2], [0, 2, 3]],
+        "triangle_fans triangulate as a fan (shared apex vertex 0), not a strip"
+    );
+}
+
+/// A tessellated leaf whose faces yield NO usable triangles must STILL be reported (never-silent) — the reader
+/// emits it with an empty mesh so `build_import` routes it to a diagnosed bounding proxy, never dropping it.
+const EMPTY_LEAF_STEP: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+FILE_NAME('empty','',(''),(''),'','','');\nFILE_SCHEMA(('AP242'));\nENDSEC;\nDATA;\n\
+#10=TESSELLATED_SOLID('',(),$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+
+#[test]
+fn a_leaf_with_no_decodable_geometry_is_reported_not_silently_dropped() {
+    let entities = crate::step::parse_entities(EMPTY_LEAF_STEP).unwrap();
+    let parts = crate::step::parse_tessellated_assembly(&entities);
+    assert_eq!(
+        parts.len(),
+        1,
+        "the geometry-less leaf is still emitted (never-silent) — build_import will diagnose + proxy it"
+    );
+    assert_eq!(parts[0].mesh.triangle_count(), 0, "…with an empty mesh");
 }

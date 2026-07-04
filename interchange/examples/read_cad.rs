@@ -85,6 +85,22 @@ fn main() {
     println!("  access-denied     : {}", c.access_denied);
     println!("  failed            : {}\n", c.failed);
 
+    // Assembly bounding box over all placed part origins — confirms the placement spans a real extent (not an
+    // origin collapse) in every axis.
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in &imp.parts {
+        let t = translation_of(&p.transform);
+        for k in 0..3 {
+            lo[k] = lo[k].min(t[k]);
+            hi[k] = hi[k].max(t[k]);
+        }
+    }
+    println!(
+        "placement bbox (mm): x[{:.0}..{:.0}] y[{:.0}..{:.0}] z[{:.0}..{:.0}]\n",
+        lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]
+    );
+
     println!("sample parts (first 6):");
     for p in imp.parts.iter().take(6) {
         let t = translation_of(&p.transform);

@@ -24,13 +24,14 @@
 
 use crate::{Units, UnsupportedNote};
 use metrocalk_csg::TriMesh;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Reject a STEP text larger than this before parsing (the M10.2 size cap; mirrors `assets::MAX_IMPORT_BYTES`).
 pub const MAX_STEP_BYTES: usize = 64 * 1024 * 1024;
 /// Reject a file with more entity instances than this (the decode-bomb guard — a Part-21 file can name
-/// millions of `#id`s; cap before allocating the graph).
-pub const MAX_ENTITIES: usize = 4_000_000;
+/// millions of `#id`s; cap before allocating the graph). A real commercial-CAD assembly with embedded
+/// tessellation (the M15.7 case) legitimately has millions of entities, so the cap is generous but bounded.
+pub const MAX_ENTITIES: usize = 30_000_000;
 
 /// What kind of surface underlies a [`CadFace`] — planar faces are tessellated here; everything else is a
 /// referenceable face whose exact tessellation is the OCCT seam (an explained note is emitted).
@@ -363,7 +364,7 @@ impl Value {
 }
 
 #[derive(Clone, Debug)]
-struct Entity {
+pub(crate) struct Entity {
     name: String,
     args: Vec<Value>,
 }
@@ -687,8 +688,10 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Parse the whole file text and interpret the planar B-rep + faceted subset into a [`CadScene`].
-fn parse_and_interpret(text: &str) -> Result<CadScene, StepError> {
+/// Tokenize the whole Part-21 file text into the entity graph (`#id → Entity`). Reused by both the planar
+/// B-rep interpreter and the M15.7 tessellated-assembly reader. Bounds-checked (the decode-bomb guard);
+/// malformed → an explained [`StepError`], never a panic.
+pub(crate) fn parse_entities(text: &str) -> Result<BTreeMap<u64, Entity>, StepError> {
     if !text.contains("ISO-10303-21") || !text.contains("END-ISO-10303-21") {
         return Err(StepError::Malformed(
             "missing ISO-10303-21 / END-ISO-10303-21 wrapper".into(),
@@ -726,8 +729,12 @@ fn parse_and_interpret(text: &str) -> Result<CadScene, StepError> {
     if entities.is_empty() {
         return Err(StepError::Empty("no entity instances in DATA".into()));
     }
+    Ok(entities)
+}
 
-    interpret(&entities)
+/// Parse the whole file text and interpret the planar B-rep + faceted subset into a [`CadScene`].
+fn parse_and_interpret(text: &str) -> Result<CadScene, StepError> {
+    interpret(&parse_entities(text)?)
 }
 
 /// Look up an entity, or a dangling-ref error.
@@ -785,7 +792,7 @@ fn vertex_point(entities: &BTreeMap<u64, Entity>, id: u64) -> Result<[f64; 3], S
 }
 
 /// Build the CadScene from the entity graph — the planar B-rep + faceted interpreter.
-fn interpret(entities: &BTreeMap<u64, Entity>) -> Result<CadScene, StepError> {
+pub(crate) fn interpret(entities: &BTreeMap<u64, Entity>) -> Result<CadScene, StepError> {
     let mut notes: Vec<UnsupportedNote> = Vec::new();
 
     // Find the shells: every CLOSED_SHELL / OPEN_SHELL (directly, or referenced by a MANIFOLD_SOLID_BREP /
@@ -996,7 +1003,7 @@ fn interpret_loop(
 }
 
 /// Best-effort file name from FILE_NAME's first string arg.
-fn file_name(entities: &BTreeMap<u64, Entity>) -> Option<String> {
+pub(crate) fn file_name(entities: &BTreeMap<u64, Entity>) -> Option<String> {
     for e in entities.values() {
         if e.name == "PRODUCT" {
             if let Some(Value::Str(s)) = e.args.first() {
@@ -1009,6 +1016,443 @@ fn file_name(entities: &BTreeMap<u64, Entity>) -> Option<String> {
     None
 }
 
+// ============================================================================================
+// Tessellated-assembly AP242 reader (M15.7 / ADR-077) — the embedded-tessellation + assembly-placement leg
+// ============================================================================================
+//
+// A large curved commercial-CAD STEP (the "wild-CAD" case the planar B-rep subset can't cover — cylinders,
+// NURBS, thousands of parts) still carries an OPEN, readable **visualization tessellation**
+// (TESSELLATED_SOLID → TRIANGULATED_FACE → COORDINATES_LIST) plus the assembly-placement chain
+// (NEXT_ASSEMBLY_USAGE_OCCURRENCE → ITEM_DEFINED_TRANSFORMATION). This reader shows that cache — real
+// triangulated geometry, correctly placed — with NO kernel (the tessellation is standard STEP; exact curved
+// B-rep is still the OCCT seam). This is the "like a texture" path for a commercial STEP.
+
+/// One placed tessellated part from a STEP assembly.
+pub(crate) struct TessPart {
+    pub name: String,
+    /// The product-definition `#id` (the dedup / re-import key).
+    pub reference: String,
+    /// Column-major world transform (composed down the assembly tree).
+    pub transform: [f64; 16],
+    /// The welded triangulated mesh (from the embedded tessellation).
+    pub mesh: TriMesh,
+}
+
+/// Read a STEP file's embedded tessellation into placed [`TessPart`]s. Returns an empty Vec if the file
+/// carries no tessellation (the caller falls back to the planar B-rep interpreter).
+///
+/// **The real AP242 tessellated-assembly structure** (what commercial CAD — CATIA/NX — actually exports, and
+/// what this file uses): the geometry + placement live entirely in a nested tessellation graph, NOT in the
+/// NAUO/PRODUCT_DEFINITION assembly. A node is a complex entity
+/// `(GEOMETRIC_REPRESENTATION_ITEM() REPOSITIONED_TESSELLATED_ITEM(#axis) REPRESENTATION_ITEM('')
+/// TESSELLATED_GEOMETRIC_SET((#children)) TESSELLATED_ITEM())` — a *set* of child items, repositioned as a
+/// whole by `#axis` (an `AXIS2_PLACEMENT_3D`). Children are more such nodes (nested sub-assemblies) or leaf
+/// `TESSELLATED_SOLID`/`TESSELLATED_SHELL`s. Each leaf becomes one placed part; its world transform is the
+/// composition of every ancestor node's reposition axis. This captures the curved surfaces (cylinders / cones
+/// / B-splines) the planar B-rep reader can only proxy — the tessellation triangulates every surface.
+pub(crate) fn parse_tessellated_assembly(entities: &BTreeMap<u64, Entity>) -> Vec<TessPart> {
+    // A quick check: any tessellation at all?
+    if !entities.values().any(is_tess_node) {
+        return Vec::new();
+    }
+
+    // Every id that is a CHILD of some tessellation container — so roots are the nodes at the top of the
+    // tessellation forest (the items a SHAPE_REPRESENTATION would carry), which we place at identity.
+    let mut is_child: BTreeSet<u64> = BTreeSet::new();
+    for e in entities.values() {
+        let (_, children) = tess_container(entities, e);
+        for c in children {
+            is_child.insert(c);
+        }
+    }
+    let mut roots: Vec<u64> = entities
+        .iter()
+        .filter(|(id, e)| is_tess_node(e) && !is_child.contains(id))
+        .map(|(id, _)| *id)
+        .collect();
+    roots.sort_unstable();
+
+    let mut out: Vec<TessPart> = Vec::new();
+    let mut on_path: BTreeSet<u64> = BTreeSet::new();
+    for root in roots {
+        on_path.clear();
+        walk_tess(
+            entities,
+            root,
+            crate::cad_import::IDENTITY_4X4,
+            0,
+            &mut on_path,
+            &mut out,
+        );
+    }
+    out
+}
+
+/// Is `e` a node in the tessellation graph (a leaf solid/shell, a set, a reposition, or a complex entity that
+/// combines those)?
+fn is_tess_node(e: &Entity) -> bool {
+    matches!(
+        e.name.as_str(),
+        "TESSELLATED_SOLID"
+            | "TESSELLATED_SHELL"
+            | "TESSELLATED_GEOMETRIC_SET"
+            | "REPOSITIONED_TESSELLATED_ITEM"
+    ) || (e.name == COMPLEX_INSTANCE
+        && e.args
+            .iter()
+            .any(|a| matches!(a, Value::Typed(n, _) if n.contains("TESSELLATED"))))
+}
+
+/// A container node's `(reposition axis, child ids)`. A leaf `TESSELLATED_SOLID`/`SHELL` (or a non-tess entity)
+/// returns `(None, [])` — its geometry is read by [`mesh_of_tessellated_solid`], not recursed into.
+fn tess_container(entities: &BTreeMap<u64, Entity>, e: &Entity) -> (Option<u64>, Vec<u64>) {
+    if e.name == COMPLEX_INSTANCE {
+        // The complex node combines REPOSITIONED_TESSELLATED_ITEM(#axis) + TESSELLATED_GEOMETRIC_SET((#kids)).
+        let axis = e.args.iter().find_map(|a| match a {
+            Value::Typed(n, inner) if n == "REPOSITIONED_TESSELLATED_ITEM" => {
+                inner.iter().find_map(Value::as_ref_id)
+            }
+            _ => None,
+        });
+        let children = e
+            .args
+            .iter()
+            .find_map(|a| match a {
+                Value::Typed(n, inner) if n == "TESSELLATED_GEOMETRIC_SET" => Some(refs_in(inner)),
+                _ => None,
+            })
+            .unwrap_or_default();
+        (axis, children)
+    } else if e.name == "TESSELLATED_GEOMETRIC_SET" {
+        // Plain form: TESSELLATED_GEOMETRIC_SET(name, (#kids)).
+        (None, refs_in(&e.args))
+    } else if e.name == "REPOSITIONED_TESSELLATED_ITEM" {
+        // Plain form: REPOSITIONED_TESSELLATED_ITEM(name, #item, #location) — the AXIS2 arg is the location.
+        let refs: Vec<u64> = e.args.iter().filter_map(Value::as_ref_id).collect();
+        let axis = refs.iter().copied().find(|r| {
+            entities
+                .get(r)
+                .is_some_and(|x| x.name == "AXIS2_PLACEMENT_3D")
+        });
+        let children = refs.into_iter().filter(|r| Some(*r) != axis).collect();
+        (axis, children)
+    } else {
+        (None, Vec::new())
+    }
+}
+
+/// The `#ref`s inside a set of args: the first non-empty list-of-refs, else any direct `#ref` args.
+fn refs_in(values: &[Value]) -> Vec<u64> {
+    for v in values {
+        if let Some(list) = v.as_list() {
+            let refs: Vec<u64> = list.iter().filter_map(Value::as_ref_id).collect();
+            if !refs.is_empty() {
+                return refs;
+            }
+        }
+    }
+    values.iter().filter_map(Value::as_ref_id).collect()
+}
+
+/// Walk one tessellation node: emit a placed part for a leaf solid/shell, else compose this container's
+/// reposition axis onto `world` and recurse into its children.
+fn walk_tess(
+    entities: &BTreeMap<u64, Entity>,
+    id: u64,
+    world: [f64; 16],
+    depth: u32,
+    on_path: &mut BTreeSet<u64>,
+    out: &mut Vec<TessPart>,
+) {
+    if depth > crate::cad_import::MAX_ASSEMBLY_DEPTH
+        || out.len() >= 4_000_000
+        || on_path.contains(&id)
+    {
+        return;
+    }
+    let Some(e) = entities.get(&id) else { return };
+    if e.name == "TESSELLATED_SOLID" || e.name == "TESSELLATED_SHELL" {
+        // Never-silent on the tessellation path: EVERY reachable leaf becomes a placed part. A leaf that
+        // decodes to real triangles is `TessellationOnly`; one that yields NO usable mesh (unreadable faces /
+        // 0 triangles) is emitted with an EMPTY mesh so `build_import` routes it to a diagnosed bounding proxy
+        // at its real transform — classified + placed, never dropped without a report entry.
+        let mesh = mesh_of_tessellated_solid(entities, id)
+            .unwrap_or_else(|| TriMesh::new(Vec::new(), Vec::new()));
+        out.push(TessPart {
+            name: format!("part #{id}"),
+            reference: id.to_string(),
+            transform: world,
+            mesh,
+        });
+        return;
+    }
+    let (axis, children) = tess_container(entities, e);
+    let local = axis.map_or(crate::cad_import::IDENTITY_4X4, |a| {
+        axis_placement_matrix(entities, a)
+    });
+    let child_world = crate::cad_import::mat4_mul(&world, &local);
+    on_path.insert(id);
+    for c in children {
+        walk_tess(entities, c, child_world, depth + 1, on_path, out);
+    }
+    on_path.remove(&id);
+}
+
+/// A `TESSELLATED_SOLID`/`SHELL` → its welded [`TriMesh`]. The faces of a solid typically SHARE one
+/// `COORDINATES_LIST`, so we intern each coords list ONCE per solid (base offset) and rebase every face's
+/// triangle indices into that shared vertex buffer — avoiding the O(faces × coords) vertex blow-up.
+fn mesh_of_tessellated_solid(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<TriMesh> {
+    let e = entities.get(&id)?;
+    // TESSELLATED_SOLID/SHELL(name, (#face_refs), …) — the faces are the first list-of-refs arg.
+    let faces = refs_in(&e.args);
+    if faces.is_empty() {
+        return None;
+    }
+    let mut positions: Vec<[f64; 3]> = Vec::new();
+    let mut triangles: Vec<[u32; 3]> = Vec::new();
+    let mut base_of: BTreeMap<u64, (u32, u32)> = BTreeMap::new(); // coords id → (base offset, count)
+    for fid in faces {
+        let Some((coords_id, tris)) = face_triangles(entities, fid) else {
+            continue;
+        };
+        let (base, count) = *base_of.entry(coords_id).or_insert_with(|| {
+            #[allow(clippy::cast_possible_truncation)]
+            let base = positions.len() as u32;
+            let pts = coordinates_list(entities, coords_id).unwrap_or_default();
+            #[allow(clippy::cast_possible_truncation)]
+            let count = pts.len() as u32;
+            positions.extend(pts);
+            (base, count)
+        });
+        for t in tris {
+            if t[0] < count && t[1] < count && t[2] < count {
+                triangles.push([t[0] + base, t[1] + base, t[2] + base]);
+            }
+        }
+    }
+    if triangles.is_empty() {
+        return None;
+    }
+    Some(TriMesh::new(positions, triangles))
+}
+
+/// A `(COMPLEX_)TRIANGULATED_FACE` → `(coordinates-list id, 0-based triangle indices INTO that list)`.
+/// **Structure-agnostic** (tolerates the AP242 variants): it finds the coordinates by following the arg that
+/// references a COORDINATES_LIST, the optional `pnindex` remap as the first bare-int list, and the connectivity
+/// as EVERY arg that is a list of integer-lists — a 3-index list is one triangle; a longer list is a triangle
+/// STRIP (what COMPLEX_TRIANGULATED_FACE uses), triangulated with alternating winding. Face-local indices are
+/// 1-based and remapped through `pnindex` → the (0-based) coordinates list; the caller rebases them into the
+/// solid's shared vertex buffer and bounds-checks against the coordinate count.
+#[allow(clippy::cast_possible_truncation)]
+fn face_triangles(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<(u64, Vec<[u32; 3]>)> {
+    let e = entities.get(&id)?;
+    if !e.name.contains("TRIANGULATED") {
+        return None;
+    }
+    let coords_id = e.args.iter().find_map(|a| {
+        a.as_ref_id().filter(|r| {
+            entities
+                .get(r)
+                .is_some_and(|c| c.name == "COORDINATES_LIST")
+        })
+    })?;
+
+    // pnindex (optional): the first non-empty list of BARE ints — remaps face-local indices → coordinate
+    // indices (both 1-based). A COMPLEX_TRIANGULATED_FACE's strips/fans index into this. We keep its POSITION
+    // too: the connectivity attributes are the args that follow pnindex in the entity.
+    let pnindex_pos = e.args.iter().position(|a| {
+        matches!(a, Value::List(l) if !l.is_empty() && l.iter().all(|v| matches!(v, Value::Int(_))))
+    });
+    let pnindex: Vec<usize> = pnindex_pos
+        .and_then(|p| e.args.get(p))
+        .and_then(Value::as_list)
+        .map(|l| {
+            l.iter()
+                .filter_map(|v| match v {
+                    Value::Int(i) => usize::try_from(*i).ok(),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let map = |i: i64| -> u32 {
+        let one = usize::try_from(i).unwrap_or(0);
+        let coord_1b = if !pnindex.is_empty() && one >= 1 && one <= pnindex.len() {
+            pnindex[one - 1]
+        } else {
+            one
+        };
+        u32::try_from(coord_1b.saturating_sub(1)).unwrap_or(u32::MAX)
+    };
+
+    let mut tris: Vec<[u32; 3]> = Vec::new();
+    let mut add = |a: u32, b: u32, c: u32| {
+        if a != b && b != c && a != c {
+            tris.push([a, b, c]);
+        }
+    };
+
+    // Connectivity — distinguished by POSITION, not shape. A `(complex_)triangulated_face`'s connectivity
+    // attributes follow pnindex in schema order `[triangles?, triangle_strips, triangle_fans]`. `triangle_strips`
+    // and `triangle_fans` are the SAME list-of-int-lists shape, so a shape-only scan cannot tell them apart —
+    // it would fan-triangulate a strip (or vice-versa) and silently emit wrong triangles. So we take the args
+    // after pnindex that are connectivity lists (a list of int-lists of len ≥ 3, OR an empty list — an empty
+    // `triangle_fans ()` must still hold its slot so a real strips arg is not mis-read as fans), and treat the
+    // LAST of ≥2 such args as `triangle_fans` (fan topology: every triangle shares the first vertex). The
+    // earlier args (triangles / strips) use strip topology, which also emits a lone len-3 sublist as one
+    // triangle — so a plain `triangulated_face` (a single `triangles` arg) is handled correctly too.
+    let is_conn = |a: &Value| {
+        matches!(a, Value::List(l) if l.is_empty()
+            || l.iter().all(|x| matches!(x, Value::List(t) if t.len() >= 3 && t.iter().all(|v| matches!(v, Value::Int(_))))))
+    };
+    let conn: Vec<usize> = e
+        .args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| pnindex_pos.is_some_and(|p| *i > p) && is_conn(a))
+        .map(|(i, _)| i)
+        .collect();
+    let fans_slot = if conn.len() >= 2 {
+        conn.last().copied()
+    } else {
+        None
+    };
+    for &ai in &conn {
+        let Some(Value::List(list)) = e.args.get(ai) else {
+            continue;
+        };
+        let is_fan = Some(ai) == fans_slot;
+        for sub in list {
+            let Value::List(idxs) = sub else { continue };
+            let seq: Vec<i64> = idxs
+                .iter()
+                .filter_map(|v| match v {
+                    Value::Int(i) => Some(*i),
+                    _ => None,
+                })
+                .collect();
+            if seq.len() < 3 {
+                continue;
+            }
+            if is_fan {
+                // A triangle fan s0,s1,…: every triangle shares the first vertex → (s0, s_{k+1}, s_{k+2}).
+                for k in 0..seq.len() - 2 {
+                    add(map(seq[0]), map(seq[k + 1]), map(seq[k + 2]));
+                }
+            } else {
+                // A triangle strip s0,s1,… (a lone len-3 is one triangle): tri k = (sk,sk+1,sk+2), alt winding.
+                for k in 0..seq.len() - 2 {
+                    let (x, y, z) = if k % 2 == 0 {
+                        (seq[k], seq[k + 1], seq[k + 2])
+                    } else {
+                        (seq[k + 1], seq[k], seq[k + 2])
+                    };
+                    add(map(x), map(y), map(z));
+                }
+            }
+        }
+    }
+    if tris.is_empty() {
+        return None;
+    }
+    Some((coords_id, tris))
+}
+
+/// A COORDINATES_LIST → its vertices.
+fn coordinates_list(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<Vec<[f64; 3]>> {
+    let e = entities.get(&id)?;
+    if e.name != "COORDINATES_LIST" {
+        return None;
+    }
+    // COORDINATES_LIST(name, npoints, ((x,y,z),(x,y,z),...)) — the points are the last list arg.
+    let pts = e.args.iter().rev().find_map(Value::as_list)?;
+    let mut out = Vec::with_capacity(pts.len());
+    for p in pts {
+        if let Some(c) = p.as_list() {
+            let x = c.first().and_then(Value::as_real)?;
+            let y = c.get(1).and_then(Value::as_real)?;
+            let z = c.get(2).and_then(Value::as_real)?;
+            out.push([x, y, z]);
+        }
+    }
+    Some(out)
+}
+
+/// An AXIS2_PLACEMENT_3D → a column-major rigid 4×4 (orthonormal frame from the z + x-ref directions + the
+/// origin point). Missing axis/ref default to +Z / +X.
+fn axis_placement_matrix(entities: &BTreeMap<u64, Entity>, id: u64) -> [f64; 16] {
+    let Some(e) = entities.get(&id) else {
+        return crate::cad_import::IDENTITY_4X4;
+    };
+    // AXIS2_PLACEMENT_3D(name, #location, #axis(z), #ref_direction(x))
+    let origin = e
+        .args
+        .get(1)
+        .and_then(Value::as_ref_id)
+        .and_then(|p| point_of(entities, p).ok())
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let z = e
+        .args
+        .get(2)
+        .and_then(Value::as_ref_id)
+        .and_then(|d| direction_of(entities, d))
+        .unwrap_or([0.0, 0.0, 1.0]);
+    let xref = e
+        .args
+        .get(3)
+        .and_then(Value::as_ref_id)
+        .and_then(|d| direction_of(entities, d))
+        .unwrap_or([1.0, 0.0, 0.0]);
+    let z = normalize(z);
+    let x = normalize(sub(xref, scale3(z, dot(xref, z))));
+    let y = cross(z, x);
+    [
+        x[0], x[1], x[2], 0.0, //
+        y[0], y[1], y[2], 0.0, //
+        z[0], z[1], z[2], 0.0, //
+        origin[0], origin[1], origin[2], 1.0,
+    ]
+}
+
+/// A DIRECTION → its unit-ish vector.
+fn direction_of(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<[f64; 3]> {
+    let e = entities.get(&id)?;
+    if e.name != "DIRECTION" {
+        return None;
+    }
+    let c = e.args.get(1).and_then(Value::as_list)?;
+    Some([
+        c.first().and_then(Value::as_real)?,
+        c.get(1).and_then(Value::as_real)?,
+        c.get(2).and_then(Value::as_real)?,
+    ])
+}
+
+// ── small vector / rigid-matrix helpers ──────────────────────────────────────────────────────────────────
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn scale3(a: [f64; 3], s: f64) -> [f64; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn normalize(a: [f64; 3]) -> [f64; 3] {
+    let l = dot(a, a).sqrt();
+    if l > 1e-12 {
+        [a[0] / l, a[1] / l, a[2] / l]
+    } else {
+        [0.0, 0.0, 1.0]
+    }
+}
 // ============================================================================================
 // Faceted re-export (geometry preserved; NURBS not — the OCCT seam)
 // ============================================================================================

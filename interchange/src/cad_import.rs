@@ -32,8 +32,7 @@
 //! reader, [`crate::StepInterchange`]); mesh (glTF/STL/OBJ) is direct. AVOID hand-writing a CATIA/NX reader
 //! (research §6). The AI mesh→B-rep tier is a labeled, opt-in candidate, never a silent auto-replace.
 
-use crate::step::CadInterchange;
-use crate::{StepInterchange, Units, UnsupportedNote};
+use crate::{Units, UnsupportedNote};
 use metrocalk_csg::{box_mesh, TriMesh};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -852,18 +851,64 @@ impl CadReader for StepAssemblyReader {
     }
 
     fn read(&self, bytes: &[u8]) -> Result<CadImport, CadError> {
-        let scene = StepInterchange.import(bytes).map_err(|e| match e {
-            crate::step::StepError::TooLarge { .. }
-            | crate::step::StepError::TooManyEntities { .. } => CadError::TooLarge(e.to_string()),
-            crate::step::StepError::Empty(_) => CadError::Unrecognized(e.to_string()),
-            _ => CadError::Malformed(e.to_string()),
-        })?;
-
+        if bytes.len() > MAX_STEP_ASSEMBLY_BYTES {
+            return Err(CadError::TooLarge(format!(
+                "{} bytes > {MAX_STEP_ASSEMBLY_BYTES} STEP cap",
+                bytes.len()
+            )));
+        }
+        // Decode as text. STEP is ASCII for all structural tokens (keywords, `#refs`, numbers, parens), but
+        // real files are often Latin-1/Windows-1252 in string LITERALS (an accented part name). A hard UTF-8
+        // gate would reject an otherwise-parseable file over one stray high byte — a black screen for a file
+        // that is 99.99% ASCII. So borrow when it is valid UTF-8 (the common case, zero-copy) and otherwise
+        // decode byte→char (Latin-1), consistent with the parser's own `c as char` handling.
+        let owned;
+        let text: &str = if let Ok(s) = std::str::from_utf8(bytes) {
+            s
+        } else {
+            owned = bytes.iter().map(|&b| b as char).collect::<String>();
+            &owned
+        };
+        let entities = crate::step::parse_entities(text).map_err(|e| map_step_error(&e))?;
         let src = source_hash(bytes);
+        // STEP length unit is millimetres by convention.
+        let units = Units {
+            meters_per_unit: 0.001,
+            kilograms_per_unit: 1.0,
+        };
+
+        // (A) Tessellated-assembly first — the embedded-tessellation + placement leg (curved commercial CAD:
+        // cylinders/NURBS a planar reader can't cover, but the open tessellation cache + the assembly
+        // transforms are readable). This is the leg the 262 MB STEP re-export that black-screened Unreal takes.
+        let tess = crate::step::parse_tessellated_assembly(&entities);
+        if !tess.is_empty() {
+            let name =
+                crate::step::file_name(&entities).unwrap_or_else(|| "STEP assembly".to_string());
+            let mut raw_parts = Vec::with_capacity(tess.len());
+            for (i, p) in tess.into_iter().enumerate() {
+                raw_parts.push(RawPart {
+                    id: i as u64,
+                    name: p.name,
+                    reference: p.reference,
+                    transform: p.transform,
+                    source: PartSource::Tessellation(p.mesh),
+                });
+            }
+            return Ok(build_import(
+                name,
+                "STEP-AP242".into(),
+                units,
+                src,
+                raw_parts,
+                0,
+                Vec::new(),
+            ));
+        }
+
+        // (B) Planar B-rep fallback — the small-file exact leg (a hand/simple AP242 part with no tessellation).
+        let scene = crate::step::interpret(&entities).map_err(|e| map_step_error(&e))?;
         let mut raw_parts = Vec::with_capacity(scene.solids.len());
         for solid in &scene.solids {
-            // Each solid is a part; its faces are the exact B-rep (planar → tessellated; curved → the seam,
-            // handled inside the cascade when the planar tessellation is empty).
             raw_parts.push(RawPart {
                 id: solid.id,
                 name: format!("solid #{}", solid.id),
@@ -881,6 +926,21 @@ impl CadReader for StepAssemblyReader {
             0,
             scene.notes,
         ))
+    }
+}
+
+/// Cap for the tessellated-assembly STEP path — a commercial-CAD assembly with embedded tessellation is
+/// large (the M15.7 bar file's STEP re-export is 262 MB), so this is far above the planar-subset
+/// [`crate::MAX_STEP_BYTES`] (64 MB) cap, but still bounded (the decode-bomb guard).
+pub const MAX_STEP_ASSEMBLY_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Map a low-level [`crate::step::StepError`] to the pipeline's [`CadError`].
+fn map_step_error(e: &crate::step::StepError) -> CadError {
+    match e {
+        crate::step::StepError::TooLarge { .. }
+        | crate::step::StepError::TooManyEntities { .. } => CadError::TooLarge(e.to_string()),
+        crate::step::StepError::Empty(_) => CadError::Unrecognized(e.to_string()),
+        _ => CadError::Malformed(e.to_string()),
     }
 }
 
