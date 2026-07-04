@@ -49,13 +49,23 @@ fn texel_dir(x: usize, y: usize) -> Vec3 {
     )
 }
 
-/// Procedural, physically-plausible **neutral studio** radiance (HDR) — a product/CAD-viewer environment (the
-/// look KeyShot / Fusion / Onshape default to), so imported machined parts read as studio-lit metal, not
+/// The procedural environment radiance (HDR), dispatched by `MTK_ENV` (default `studio`; `sky` = the outdoor
+/// look). `studio` is a product/CAD-viewer environment; `sky` is the original outdoor daylight.
+fn sky_radiance(d: Vec3, studio: bool) -> Vec3 {
+    if studio {
+        studio_radiance(d)
+    } else {
+        outdoor_radiance(d)
+    }
+}
+
+/// **Neutral studio** radiance (the `MTK_ENV=studio` default) — a product/CAD-viewer environment (the look
+/// KeyShot / Fusion / Onshape default to), so imported machined parts read as studio-lit metal, not
 /// outdoor-tinted plastic. A bright soft "ceiling" → neutral-grey walls → darker floor, plus **two broad soft
 /// area lights** (a key upper-front-left + a fill upper-right): large + soft (a wide cosine lobe, not a hot
-/// pinpoint) so a metal surface picks up a clean, curvature-tracing streak highlight instead of a harsh glint.
-/// Neutral by construction — a polished part reflects grey, not blue sky.
-fn sky_radiance(d: Vec3) -> Vec3 {
+/// pinpoint) so a metal surface picks up a clean, curvature-tracing streak highlight. Neutral by construction —
+/// a polished part reflects grey, not blue sky.
+fn studio_radiance(d: Vec3) -> Vec3 {
     let t = d.y.clamp(-1.0, 1.0);
     // Vertical neutral gradient: soft-box ceiling (bright), mid grey walls, darker seamless floor.
     let ceiling = Vec3::new(0.80, 0.81, 0.83);
@@ -77,12 +87,33 @@ fn sky_radiance(d: Vec3) -> Vec3 {
     base + Vec3::new(1.0, 1.0, 1.0) * lights
 }
 
-/// The procedural sky as a level-0 equirect (`ENV_W × ENV_H` linear-RGB texels).
+/// **Outdoor daylight** radiance (`MTK_ENV=sky`) — a cool zenith → warm horizon gradient over a dim ground,
+/// plus a warm sun in the upper-right (HDR, so polished metals get a sharp glint) that doubles as the scene's
+/// implied key direction. The original environment before the studio default.
+fn outdoor_radiance(d: Vec3) -> Vec3 {
+    let t = d.y.clamp(-1.0, 1.0);
+    let zenith = Vec3::new(0.18, 0.34, 0.62);
+    let horizon = Vec3::new(0.70, 0.75, 0.82);
+    let ground = Vec3::new(0.10, 0.09, 0.08);
+    let base = if t >= 0.0 {
+        horizon.lerp(zenith, t.powf(0.45))
+    } else {
+        horizon.lerp(ground, (-t).powf(0.5))
+    };
+    let sun_dir = Vec3::new(0.35, 0.55, 0.40).normalize();
+    let s = d.dot(sun_dir).max(0.0);
+    let sun = if s > 0.9992 { 22.0 } else { 0.0 } + 1.6 * s.powf(800.0);
+    base + Vec3::new(1.0, 0.93, 0.78) * sun
+}
+
+/// The procedural sky as a level-0 equirect (`ENV_W × ENV_H` linear-RGB texels). `MTK_ENV` (read once here)
+/// picks `studio` (default) vs the outdoor `sky`.
 fn procedural_level0() -> (usize, usize, Vec<[f32; 3]>) {
+    let studio = std::env::var("MTK_ENV").map_or(true, |v| !v.eq_ignore_ascii_case("sky"));
     let mut level0 = vec![[0.0f32; 3]; ENV_W * ENV_H];
     for y in 0..ENV_H {
         for x in 0..ENV_W {
-            let c = sky_radiance(texel_dir(x, y));
+            let c = sky_radiance(texel_dir(x, y), studio);
             level0[y * ENV_W + x] = [c.x, c.y, c.z];
         }
     }
