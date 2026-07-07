@@ -7,58 +7,20 @@
 //! The `.cand` / `.boundrow` / `disabled` class hooks + `data-id` mirror the vanilla scaffold's stable
 //! signals, so the prompt-40 acceptance page-object re-greens by selector-swap, not a spec rewrite.
 
-import { useEffect, useState } from "react";
-import { useSelectedId, useEdges } from "../store/projection";
+import { useSelectedId } from "../store/projection";
+import { useReveal } from "../store/reveal";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import type { EditorClient } from "../transport/session";
-import type { RevealResponse } from "../transport/protocol";
-
-const EMPTY: RevealResponse = { required: [], compatible: [], greyed: [], bound: [] };
 
 export function Reveal({ client }: { client: EditorClient }) {
   const id = useSelectedId();
-  const edges = useEdges();
-  // Re-query the reveal when this entity's OUTGOING edges change — so a bind/undo immediately moves the
-  // target into/out of "tracking" (the command recomputes bound + drops the consumed provider from
-  // compatible). Without this the reveal only refreshed on (re)selection and a fresh bind never surfaced.
-  //
-  // The signature includes each edge's STATUS, not just its key: an optimistic bind adds the edge as
-  // `pending` (one fetch — which may race the engine commit and still read the target as "compatible"),
-  // then the authoritative `addEdge` flips the SAME key to `confirmed`. Keying on the key alone, that
-  // confirm would not change the signature → no re-fetch → the bound row would only appear on a manual
-  // re-select (a real intermittent "I clicked but nothing moved to tracking" bug). Including the status
-  // makes the confirm a distinct signature → the authoritative re-fetch always lands.
-  const edgeSig = id
-    ? Object.values(edges)
-        .filter((e) => e.from === id)
-        .map((e) => `${e.id}:${e.status}`)
-        .sort()
-        .join(",")
-    : "";
-
-  const [reveal, setReveal] = useState<RevealResponse>(EMPTY);
-
-  useEffect(() => {
-    if (!id) {
-      setReveal(EMPTY);
-      return;
-    }
-    let live = true;
-    client
-      .revealTargets(id)
-      .then((r) => {
-        if (live) setReveal(r);
-      })
-      .catch(() => {
-        if (live) setReveal(EMPTY);
-      });
-    return () => {
-      live = false;
-    };
-    // edgeSig in deps → re-fetch on a bind/undo touching this entity's edges
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, client, edgeSig]);
+  // The reveal (targets + greyed-with-reason + bound) comes from a SHARED, deduplicated cache keyed on
+  // `(id, edgeSig)` — see store/reveal.ts. The Diagnostics panel reads the same key, so a select now
+  // costs ONE `reveal_targets` round-trip, not two (perf audit F2). The key still includes each outgoing
+  // edge's STATUS so an optimistic bind's `pending → confirmed` flip re-fetches and moves the target into
+  // "tracking".
+  const reveal = useReveal(client);
 
   if (!id) {
     return <div style={{ padding: 12, color: "#888" }}>Select an entity to see compatible bind targets.</div>;

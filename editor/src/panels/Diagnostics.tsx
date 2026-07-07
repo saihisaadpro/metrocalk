@@ -6,49 +6,24 @@
 //! targets can't bind — grouped + collapsible). Tests key off the structured `data-severity`/`data-kind`
 //! model + the fix affordance, never the rendered prose.
 
-import { useEffect, useState } from "react";
-import { useSelectedId, useSummary, useEdges } from "../store/projection";
+import { useState } from "react";
+import { useSelectedId, useSummary } from "../store/projection";
+import { useReveal } from "../store/reveal";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Button, Badge } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
-import type { RevealResponse } from "../transport/protocol";
 
-const EMPTY: RevealResponse = { required: [], compatible: [], greyed: [], bound: [] };
 const meta: React.CSSProperties = { font: font.ui, fontSize: fontSize.meta, color: color.text.muted };
 
 export function Diagnostics({ client }: { client: EditorClient }) {
   const id = useSelectedId();
   const summary = useSummary(id ?? "");
-  const edges = useEdges();
-  const [reveal, setReveal] = useState<RevealResponse>(EMPTY);
+  // Shared, deduplicated reveal (perf audit F2) — the Reveal picker reads the same `(id, edgeSig)` key,
+  // so the actionable fix + "needs binding" diagnostic update live off ONE round-trip, not a second.
+  const reveal = useReveal(client);
   const [showWhy, setShowWhy] = useState(false);
-
-  // Re-fetch the reveal when this entity's OUTGOING edges change (a bind/undo) — so the actionable fix +
-  // the "needs binding" diagnostic update live. Same debounced, off-frame command the Reveal picker uses.
-  const edgeSig = id
-    ? Object.values(edges).filter((e) => e.from === id).map((e) => `${e.id}:${e.status}`).sort().join(",")
-    : "";
-  useEffect(() => {
-    if (!id) {
-      setReveal(EMPTY);
-      return;
-    }
-    let live = true;
-    client
-      .revealTargets(id)
-      .then((r) => {
-        if (live) setReveal(r);
-      })
-      .catch(() => {
-        if (live) setReveal(EMPTY);
-      });
-    return () => {
-      live = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, client, edgeSig]);
 
   if (!id) return null;
   const rel = summary?.rel;

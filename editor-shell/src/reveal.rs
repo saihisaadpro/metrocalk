@@ -168,11 +168,30 @@ pub fn why_not<W: World>(
     candidate: Entity,
     cap_name: &HashMap<Entity, String>,
 ) -> Option<WhyNot> {
+    let required = required_caps(world, selected, rels);
+    let req_set: HashSet<Entity> = required.iter().copied().collect();
+    why_not_with_required(
+        world, selected, rels, candidate, cap_name, &required, &req_set,
+    )
+}
+
+/// [`why_not`] with the selection's required caps precomputed by the caller — the loop-hoisted form
+/// (perf audit F3). `compute_reveal` greys up to 60 candidates against the SAME selection, so computing
+/// `required` per candidate re-ran `world.targets(selected, requires)` ~60× per select; the caller now
+/// computes it once and passes `required` + its `req_set` in. Still O(1) per candidate.
+#[must_use]
+pub fn why_not_with_required<W: World>(
+    world: &W,
+    selected: Entity,
+    rels: Rels,
+    candidate: Entity,
+    cap_name: &HashMap<Entity, String>,
+    required: &[Entity],
+    req_set: &HashSet<Entity>,
+) -> Option<WhyNot> {
     if candidate == selected {
         return None;
     }
-    let required = required_caps(world, selected, rels);
-    let req_set: HashSet<Entity> = required.iter().copied().collect();
     let provided = world.targets(candidate, rels.provides);
     let provides_required = provided.iter().any(|c| req_set.contains(c));
     let bound = world.has_pair(candidate, rels.binds_to, Target::Any);

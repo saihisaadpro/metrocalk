@@ -160,6 +160,10 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
     const base = full ? {} : { ...s.base };
     const summaries = full ? {} : { ...s.summaries };
     const edges = full ? {} : { ...s.edges };
+    // Track whether any edge op actually mutated `edges`. A pure-transform / field / camera delta (the 60 Hz
+    // common case) must keep the SAME `edges` reference so `useEdges()` (Reveal · Diagnostics · BindingGraph)
+    // does not re-render on every tick (perf audit F10). Only a real add/remove/rejected-bind swaps the ref.
+    let edgesChanged = full;
     // Deactivate state rebuilt from the wire (R-NEXT-2): a full re-projection starts empty and is
     // repopulated from each upsert's authoritative `active` flag, so the "hidden" mark survives reload.
     const deactivated = full ? {} : { ...s.deactivated };
@@ -232,10 +236,15 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
         case "addEdge": {
           const id = edgeId(op.from, op.rel, op.to);
           edges[id] = { id, from: op.from, rel: op.rel, to: op.to, status: "confirmed" };
+          edgesChanged = true;
           break;
         }
         case "removeEdge": {
-          delete edges[edgeId(op.from, op.rel, op.to)];
+          const k = edgeId(op.from, op.rel, op.to);
+          if (edges[k]) {
+            delete edges[k];
+            edgesChanged = true;
+          }
           break;
         }
       }
@@ -254,7 +263,11 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
       for (const r of delta.rejects) {
         const op = pending[r.clientOpId];
         if (op?.intent.kind === "bind") {
-          delete edges[edgeId(op.intent.from, op.intent.rel, op.intent.to)];
+          const k = edgeId(op.intent.from, op.intent.rel, op.intent.to);
+          if (edges[k]) {
+            delete edges[k];
+            edgesChanged = true;
+          }
         }
         if (op?.intent.kind === "setField") touched.add(op.intent.id);
         delete pending[r.clientOpId];
@@ -276,7 +289,7 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
 
     // `deactivated` was rebuilt above from each upsert's authoritative `active` flag (full = from scratch),
     // so deactivate state is correct on reload/undo and incremental deltas keep optimistic marks.
-    set({ base, displayed, summaries, order, edges, pending, rejections, deactivated });
+    set({ base, displayed, summaries, order, edges: edgesChanged ? edges : s.edges, pending, rejections, deactivated });
 
     // Drive the live-thumbnail dirty-tracking off the SAME committed op-stream (M14.2 / ADR-058): only a
     // silhouette-affecting op (mesh · material · transform · visibility) invalidates a thumbnail — a Health
