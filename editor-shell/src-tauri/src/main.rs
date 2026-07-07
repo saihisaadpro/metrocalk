@@ -16,7 +16,7 @@
 mod ibl;
 mod render;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -33,15 +33,15 @@ use metrocalk_editor_shell::compose_ai::Composer;
 use metrocalk_editor_shell::generate::{GenRequest, MeshGenerator};
 use metrocalk_editor_shell::physics_intent::{self, MeshMetrics, PhysicsWarning};
 use metrocalk_editor_shell::project as mtk_project;
-use metrocalk_editor_shell::reveal::{reveal, why_not, Context};
+use metrocalk_editor_shell::reveal::{required_caps, reveal, why_not_with_required, Context};
 use metrocalk_editor_shell::transform_solver::{
     Constraint, ConstraintIntent, SnapKind, SnapTarget,
 };
 use metrocalk_editor_shell::{
     actions_for, ai_edit_material, apply_ai_patch, apply_edit, buy_marketplace, capscene,
     enrich_relational, project_entity, project_full, transform_solver, ActionItem, AiPatch,
-    CapScene, EditIntent, EditTx, Log, MeshCatalog, Outcome, PatchOp, ProjectionDelta, ProjectionOp,
-    Record, Wallet,
+    CapScene, EditIntent, EditTx, Log, MeshCatalog, Outcome, PatchOp, ProjectionDelta,
+    ProjectionOp, Record, Wallet,
 };
 use metrocalk_gizmo::{
     Gizmo, GizmoMode, GizmoPivot, GizmoSpace, Handle, Ray, Transform as GizmoTransform,
@@ -223,6 +223,24 @@ fn load_assets() -> AssetsRuntime {
             id.as_str().to_string(),
             metrocalk_assets::Provenance::imported(source, id.as_str().to_string(), phash),
         );
+    }
+    // M15.7 (ADR-077) — restore the DERIVED CAD render meshes (the `mtkcad:` handles a saved doc's
+    // MeshRenderer fields carry) from the cad-mesh sidecar, so a reopened project renders its imported
+    // CAD parts instead of silently degrading them to placeholder cubes. Boot cost is deserialize + GPU
+    // pack of the ~dozens of UNIQUE meshes — never a re-parse of the multi-hundred-MB source container.
+    let cad_restored =
+        metrocalk_editor_shell::load_persisted_cad_meshes(&sidecar("metrocalk-cad-meshes"));
+    if !cad_restored.is_empty() {
+        eprintln!(
+            "[shell] restored {} persisted CAD mesh(es) from the cad-mesh sidecar",
+            cad_restored.len()
+        );
+    }
+    for (handle, asset) in cad_restored {
+        let slot = meshes.len();
+        meshes.push(MeshGpu::from_asset(&asset));
+        scales.push(1.0);
+        handle_to_slot.insert(handle, slot);
     }
     eprintln!(
         "[shell] imported {} mesh assets ({} verts total) in {import_ms:.3} ms (one-shot)",
@@ -1222,6 +1240,322 @@ fn restore_window_geom(window: &tauri::WebviewWindow) {
     }
 }
 
+/// M15.7 (ADR-077) — a scene-visible proxy box size (metres). Proxies stand in for geometry the licensed
+/// kernel would decode (proprietary CATIA reps); size them to ≈1/150 of the placement diagonal (clamped) so a
+/// 15 m factory cell isn't rendered as invisible 1 mm dots.
+fn cad_proxy_scale(report: &metrocalk_interchange::CadImport, m_per_unit: f64) -> f64 {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in &report.parts {
+        let t = metrocalk_interchange::translation_of(&p.transform);
+        for k in 0..3 {
+            lo[k] = lo[k].min(t[k] * m_per_unit);
+            hi[k] = hi[k].max(t[k] * m_per_unit);
+        }
+    }
+    let diag = (0..3)
+        .map(|k| (hi[k] - lo[k]).max(0.0))
+        .map(|d| d * d)
+        .sum::<f64>()
+        .sqrt();
+    (diag / 70.0).clamp(0.1, 3.0)
+}
+
+/// FNV-1a over the 3×3 basis's f64 bit patterns — the deterministic per-instance tag a BAKED (mirrored /
+/// scaled, non-rigid) placement's mesh handle carries, so same-basis instances of the same geometry still
+/// dedup to one GPU mesh while differently-mirrored twins stay distinct.
+fn basis_bits_hash(m: &[f64; 16]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for i in [0usize, 1, 2, 4, 5, 6, 8, 9, 10] {
+        for b in m[i].to_bits().to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// The rotation quaternion `[x, y, z, w]` of a column-major rigid 4×4 (the part's assembly orientation — the
+/// reposition axes carry rotation, not just translation, so a bracket welded at an angle lands at that angle).
+/// The basis columns are orthonormal (AXIS2_PLACEMENT frames), so this is the exact standard trace conversion.
+fn quat_of_transform(m: &[f64; 16]) -> [f32; 4] {
+    // R[row][col] = m[col*4 + row]; columns 0/1/2 are the x/y/z axes.
+    let (r00, r01, r02) = (m[0], m[4], m[8]);
+    let (r10, r11, r12) = (m[1], m[5], m[9]);
+    let (r20, r21, r22) = (m[2], m[6], m[10]);
+    let trace = r00 + r11 + r22;
+    let (x, y, z, w) = if trace > 0.0 {
+        let s = 0.5 / (trace + 1.0).sqrt();
+        ((r21 - r12) * s, (r02 - r20) * s, (r10 - r01) * s, 0.25 / s)
+    } else if r00 > r11 && r00 > r22 {
+        let s = 2.0 * (1.0 + r00 - r11 - r22).sqrt();
+        (0.25 * s, (r01 + r10) / s, (r02 + r20) / s, (r21 - r12) / s)
+    } else if r11 > r22 {
+        let s = 2.0 * (1.0 + r11 - r00 - r22).sqrt();
+        ((r01 + r10) / s, 0.25 * s, (r12 + r21) / s, (r02 - r20) / s)
+    } else {
+        let s = 2.0 * (1.0 + r22 - r00 - r11).sqrt();
+        ((r02 + r20) / s, (r12 + r21) / s, 0.25 * s, (r10 - r01) / s)
+    };
+    [x as f32, y as f32, z as f32, w as f32]
+}
+
+/// M15.7 (ADR-077) — land a CAD file (CATIA 3DXML / STEP AP242) onto the live scene: read it via the
+/// never-empty/never-silent pipeline, register each UNIQUE tessellated mesh on the GPU (dedup → instancing),
+/// and create one renderable entity per part at its real (units-normalized) transform as ONE undoable commit.
+/// Proxies get a scene-visible size; real geometry the metric unit scale. Returns the first entity id, or
+/// None + an explained log line on a container error (never a panic).
+fn land_cad(
+    bytes: &[u8],
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    assets: &mut AssetsRuntime,
+    shared: &Shared,
+) -> Option<EntityId> {
+    // File log (the .exe is a windows-subsystem GUI app → eprintln has no console; log to a temp file so a
+    // live import can be diagnosed).
+    let logf = std::env::temp_dir().join("mtk-cad-import.log");
+    let log = |m: &str| {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&logf)
+        {
+            let _ = writeln!(f, "{m}");
+        }
+        eprintln!("[shell] {m}");
+    };
+    log(&format!("CAD import start: {} bytes", bytes.len()));
+    let report = match metrocalk_editor_shell::read_cad(bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            log(&format!("CAD import FAILED (read): {e}"));
+            return None;
+        }
+    };
+    log(&format!("CAD import read OK: {}", report.summary()));
+
+    // Meshes are registered on the GPU on demand per part below, keyed by (geometry hash + authored colour) so
+    // a part renders in its real STEP colour (baked into the mesh material) while identical geometry+colour
+    // instances still share ONE GPU mesh (dedup → instancing).
+
+    // Units: the source is mm; normalize placement + geometry to metres. Proxies get a scene-visible size.
+    let m_per_unit = report.units.meters_per_unit;
+    let proxy_scale = cad_proxy_scale(&report, m_per_unit);
+    let renderable = scene
+        .caps
+        .get(&metrocalk_core::caps::canonical("Renderable"))
+        .copied();
+
+    let mut ops: Vec<metrocalk_core::Op> =
+        Vec::with_capacity(report.parts.len() * 7 + report.groups.len() * 4);
+    let mut first: Option<EntityId> = None;
+    // Map each source hierarchy-node id (assembly occurrence) → its allocated engine entity, so leaf parts +
+    // child groups resolve their `parent`. `report.groups` is topological (parent-before-child), so a group's
+    // parent entity always exists in the map before a child references it, and all groups precede the leaf
+    // parts — satisfying the commit's parent-before-child validation. (The OUTLINER reads the tree in pre-order
+    // regardless of creation order — `bridge::project_full` sorts the projection into tree order.)
+    let mut src_to_entity: std::collections::BTreeMap<u64, EntityId> =
+        std::collections::BTreeMap::new();
+
+    // (1) The NAMED structural tree: one geometry-free container entity per assembly occurrence, nested exactly
+    // as the source file. Each is an IDENTITY transform (leaf parts carry the world placement) marked
+    // `__meta__.kind = "group"` with NO MeshRenderer, so the rebuild skip renders nothing for it (no cube).
+    for g in &report.groups {
+        let ge = engine.alloc_entity_id();
+        if first.is_none() {
+            first = Some(ge);
+        }
+        src_to_entity.insert(g.id, ge);
+        let parent = g.parent.and_then(|pid| src_to_entity.get(&pid).copied());
+        ops.push(metrocalk_core::Op::CreateEntity { id: ge, parent });
+        for (f, v) in [
+            ("x", 0.0),
+            ("y", 0.0),
+            ("z", 0.0),
+            ("qx", 0.0),
+            ("qy", 0.0),
+            ("qz", 0.0),
+            ("qw", 1.0),
+            ("scale", 1.0),
+        ] {
+            ops.push(metrocalk_core::Op::SetField {
+                entity: ge,
+                component: "Transform".into(),
+                field: f.into(),
+                value: FieldValue::Number(v),
+            });
+        }
+        if !g.name.is_empty() {
+            ops.push(metrocalk_core::Op::SetField {
+                entity: ge,
+                component: metrocalk_core::variant::INSTANCE_META.into(),
+                field: "name".into(),
+                value: FieldValue::Str(g.name.clone()),
+            });
+        }
+        ops.push(metrocalk_core::Op::SetField {
+            entity: ge,
+            component: metrocalk_core::variant::INSTANCE_META.into(),
+            field: "kind".into(),
+            value: FieldValue::Str("group".into()),
+        });
+    }
+
+    // (2) The leaf parts — each parented under its source assembly occurrence (its `parent` group) so it nests
+    // in the outliner exactly where the source places it, while keeping its own world transform (identity
+    // groups don't perturb `global_transform`, so placement is byte-identical to the flat import).
+    for p in &report.parts {
+        let e = engine.alloc_entity_id();
+        if first.is_none() {
+            first = Some(e);
+        }
+        let parent = p.parent.and_then(|pid| src_to_entity.get(&pid).copied());
+        ops.push(metrocalk_core::Op::CreateEntity { id: e, parent });
+        let t = metrocalk_interchange::translation_of(&p.transform);
+        let scale = if p.fidelity.is_real_geometry() {
+            m_per_unit
+        } else {
+            proxy_scale
+        };
+        // Real geometry carries its assembly orientation (the reposition axes rotate parts); a proxy box is
+        // orientation-free, so only real tessellation writes the quaternion. A quaternion represents ONLY a
+        // proper rigid rotation — a CATIA mirror/scaled instance basis (det<0, symmetry instances) is instead
+        // BAKED into a per-instance mesh below, and the entity carries just the translation.
+        let rigid = metrocalk_editor_shell::basis_is_rigid(&p.transform);
+        let q = if p.fidelity.is_real_geometry() && rigid {
+            quat_of_transform(&p.transform)
+        } else {
+            [0.0, 0.0, 0.0, 1.0]
+        };
+        for (f, v) in [
+            ("x", t[0] * m_per_unit),
+            ("y", t[1] * m_per_unit),
+            ("z", t[2] * m_per_unit),
+            ("qx", f64::from(q[0])),
+            ("qy", f64::from(q[1])),
+            ("qz", f64::from(q[2])),
+            ("qw", f64::from(q[3])),
+            ("scale", scale),
+        ] {
+            ops.push(metrocalk_core::Op::SetField {
+                entity: e,
+                component: "Transform".into(),
+                field: f.into(),
+                value: FieldValue::Number(v),
+            });
+        }
+        if let Some(mi) = p.mesh {
+            let m = &report.meshes[mi];
+            // A non-rigid instance basis (mirror/scale) is baked into a per-instance mesh — a mirrored
+            // bracket is genuinely different geometry from its twin, so it keys its own handle (tagged with
+            // the basis-bits hash; same mirrored geometry still dedups across its instances).
+            let baked = if rigid || !p.fidelity.is_real_geometry() {
+                None
+            } else {
+                Some(metrocalk_editor_shell::bake_basis_into_mesh(
+                    &p.transform,
+                    &m.tris,
+                ))
+            };
+            let tris = baked.as_ref().unwrap_or(&m.tris);
+            let basis_tag = if baked.is_some() {
+                format!(":b{:016x}", basis_bits_hash(&p.transform))
+            } else {
+                String::new()
+            };
+            // Colour-aware GPU handle: the part's authored STEP colour is baked into the mesh material, so
+            // same-geometry-different-colour parts are distinct GPU meshes while same-geometry+colour instances
+            // still dedup to one (registered on demand here).
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let handle = match p.color {
+                Some(c) => format!(
+                    "mtkcad:{:016x}{basis_tag}:{:02x}{:02x}{:02x}",
+                    m.hash,
+                    (c[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (c[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+                ),
+                None => format!("mtkcad:{:016x}{basis_tag}", m.hash),
+            };
+            if !assets.handle_to_slot.contains_key(&handle) {
+                let asset = metrocalk_editor_shell::csg_intent::trimesh_to_mesh_asset_colored(
+                    tris, "cad", p.color,
+                );
+                let gpu = MeshGpu::from_asset(&asset);
+                let slot = assets.meshes.len();
+                assets.meshes.push(gpu.clone());
+                assets.scales.push(1.0);
+                assets.handle_to_slot.insert(handle.clone(), slot);
+                let mut st = shared.lock().unwrap();
+                st.meshes.push(gpu);
+                st.meshes_revision = st.meshes_revision.wrapping_add(1);
+                drop(st);
+                // Persist the DERIVED mesh so the saved doc's `mtkcad:` handle re-resolves after restart +
+                // open (load_assets restores it) — without this every imported part silently degraded to a
+                // placeholder cube on reload. Never-silent: a write failure is logged, not swallowed.
+                if let Err(e) = metrocalk_editor_shell::persist_cad_mesh(
+                    &sidecar("metrocalk-cad-meshes"),
+                    &handle,
+                    tris,
+                    p.color,
+                ) {
+                    log(&format!(
+                        "CAD import: failed to persist mesh {handle} — it may not survive reload: {e}"
+                    ));
+                }
+            }
+            ops.push(metrocalk_core::Op::SetField {
+                entity: e,
+                component: "MeshRenderer".into(),
+                field: "mesh".into(),
+                value: FieldValue::Str(handle),
+            });
+        }
+        for (field, value) in [
+            ("fidelity", p.fidelity.token().to_string()),
+            ("name", p.name.clone()),
+        ] {
+            ops.push(metrocalk_core::Op::SetField {
+                entity: e,
+                component: metrocalk_editor_shell::CAD_PART.into(),
+                field: field.into(),
+                value: FieldValue::Str(value),
+            });
+        }
+        // The user-facing OUTLINER name (`__meta__.name`) — the real source part name (CATIA `V_Name` / STEP
+        // product), so the scene tree reads "Overhead Crane", not a bare entity id.
+        if !p.name.is_empty() {
+            ops.push(metrocalk_core::Op::SetField {
+                entity: e,
+                component: metrocalk_core::variant::INSTANCE_META.into(),
+                field: "name".into(),
+                value: FieldValue::Str(p.name.clone()),
+            });
+        }
+        if let Some(c) = renderable {
+            ops.push(metrocalk_core::Op::AddPair {
+                entity: e,
+                rel: scene.rels.provides,
+                target: c,
+            });
+        }
+    }
+    log(&format!(
+        "CAD import: {} meshes registered, {} parts + {} group nodes, committing…",
+        report.meshes.len(),
+        report.parts.len(),
+        report.groups.len()
+    ));
+    if let Err(err) = engine.commit("import-cad", ops) {
+        log(&format!("CAD import commit REJECTED: {err:?}"));
+        return None;
+    }
+    log("CAD import commit OK");
+    first
+}
+
 fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<EngineCmd>) {
     // Import the demo mesh assets once (one-shot heavy op) before seeding, so the catalog is ready for
     // describe-to-create + replay and the viewport's geometry is published. `mut` so a *generated* asset
@@ -1968,7 +2302,20 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // An unsupported/malformed file → `None` (the React surface explains it).
                 let mut result = None;
                 if let Ok(bytes) = std::fs::read(&path) {
-                    if let Ok(metrocalk_assets::ImportedAsset::Mesh(asset)) =
+                    if metrocalk_editor_shell::is_cad_file(&bytes) {
+                        // M15.7 (ADR-077) — a CAD container (CATIA 3DXML / STEP AP242): the never-empty,
+                        // never-silent pipeline lands each part as a renderable entity in one undoable commit
+                        // (proxies for proprietary geometry the licensed kernel would decode, at real transforms).
+                        if let Some(root) =
+                            land_cad(&bytes, &mut engine, &scene, &mut assets, &shared)
+                        {
+                            rebuild(&engine, &shared, &mut positions, &assets);
+                            if let Some(ch) = &channel {
+                                send_proj!(ch, proj_full(&engine, &scene));
+                            }
+                            result = Some(root.to_loro_key());
+                        }
+                    } else if let Ok(metrocalk_assets::ImportedAsset::Mesh(asset)) =
                         metrocalk_assets::import_any(&bytes)
                     {
                         let handle = AssetId::of_bytes(&bytes).as_str().to_string();
@@ -4382,33 +4729,51 @@ fn compute_reveal(
         })
         .collect();
 
-    // Greyed: the nearest entities that have a reason they can't bind (bounded — the UI greys what it
-    // shows; `why_not` is O(1) per target, so this stays cheap even at scene scale).
+    // Greyed: the nearest entities that have a reason they can't bind (bounded to 60 — the UI greys what
+    // it shows). The selection's required caps are hoisted OUT of the per-candidate loop (perf audit F3) —
+    // previously `why_not` re-ran `world.targets(selected, requires)` ~60× per select. With that hoisted,
+    // `why_not_with_required` is O(1) per candidate, so a single O(n) pass + a bounded nearest-60
+    // partial-select replaces the old sort-the-whole-scene O(n log n). The deep-Loro `label` read is
+    // deferred to only the ≤60 kept.
+    let sel_required = required_caps(engine.world(), sel_ecs, scene.rels);
+    let req_set: HashSet<Entity> = sel_required.iter().copied().collect();
     let sel_pos = positions.get(&sel_ecs).copied().unwrap_or([0.0; 3]);
-    let mut others: Vec<(EntityId, Entity, f32)> = engine
+    let mut greyed_all: Vec<(f32, EntityId, String)> = engine
         .entity_ids()
         .into_iter()
         .filter(|&id| id != eid)
         .filter_map(|id| {
             let e = engine.ecs_entity(id)?;
+            let wn = why_not_with_required(
+                engine.world(),
+                sel_ecs,
+                scene.rels,
+                e,
+                &scene.cap_name,
+                &sel_required,
+                &req_set,
+            )?;
             let p = positions.get(&e).copied().unwrap_or([0.0; 3]);
-            Some((id, e, dist(sel_pos, p)))
+            Some((dist(sel_pos, p), id, wn.explain()))
         })
         .collect();
-    others.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-    let mut greyed = Vec::new();
-    for (id, e, _) in others {
-        if greyed.len() >= 60 {
-            break;
-        }
-        if let Some(wn) = why_not(engine.world(), sel_ecs, scene.rels, e, &scene.cap_name) {
-            greyed.push(Greyed {
-                id: id.to_loro_key(),
-                name: label(id),
-                reason: wn.explain(),
-            });
-        }
+    // Nearest-60 by distance: a bounded partial-select (O(n)) rather than a full sort, then order the
+    // kept few for a stable nearest-first presentation.
+    if greyed_all.len() > 60 {
+        greyed_all.select_nth_unstable_by(60, |a, b| {
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        greyed_all.truncate(60);
     }
+    greyed_all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let greyed: Vec<Greyed> = greyed_all
+        .into_iter()
+        .map(|(_, id, reason)| Greyed {
+            id: id.to_loro_key(),
+            name: label(id),
+            reason,
+        })
+        .collect();
 
     let bound: Vec<Bound> = engine
         .bindings()
@@ -4801,6 +5166,18 @@ fn rebuild(
             });
             continue;
         }
+        // A geometry-free ASSEMBLY/GROUP container from a CAD import (a named `__meta__.kind == "group"` node
+        // with no `MeshRenderer`): a pure hierarchy node — the outliner shows it (the source's exact assembly
+        // tree / grouping) and its parts parent under it, but it is NEVER scene geometry → render nothing (no
+        // placeholder cube, no glyph). Same pattern as the light/camera marker skip above.
+        if !comps.contains_key("MeshRenderer")
+            && comps
+                .get(metrocalk_core::variant::INSTANCE_META)
+                .and_then(|m| m.get("kind"))
+                == Some(&FieldValue::Str("group".into()))
+        {
+            continue;
+        }
         // Resolve the entity's mesh handle (if any) to a render slot + normalized scale.
         let slot = comps
             .get("MeshRenderer")
@@ -4980,6 +5357,57 @@ fn ipc() {
     render::IPC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// How long a command waits for the engine thread's reply before giving up (perf audit RC-1 / F1).
+/// The commands are `#[tauri::command(async)]` (off the tao event-loop thread), so this bound protects
+/// nothing per-frame — it only stops a *stalled/panicked* engine from parking a caller forever. It must
+/// therefore be LONGER than any legitimate op: a busy engine (mid-way through landing a 262 MB CAD
+/// import, a big undo, a whole-world rebuild) is *queued, not stalled* — a short bound here made every
+/// queued command falsely report failure (undo → "nothing to undo", open → no project) while the op then
+/// landed anyway. Fast-but-wrong is worse than slow-but-truthful; the window stays live either way.
+const ENGINE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The reply bound for the IMPORT-class commands (`import_asset`(+dialog) / `import_interchange`): a
+/// multi-hundred-MB CAD container legitimately takes minutes to parse + land on the serial engine
+/// thread, and a false `None` here reads as "unsupported/malformed" in the UI while the assembly then
+/// appears — the exact dishonest-state the M15.7 never-silent thesis forbids.
+const IMPORT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// One-shot latch so a genuine engine stall logs ONCE (not once per queued command) and again on
+/// recovery — never a hot-path spam of `eprintln!` (audit §8 flagged blocking stderr on hot paths).
+static ENGINE_STALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Bounded blocking wait for an engine-thread reply (perf audit RC-1 / F1). A drop-in for the old
+/// `recv()`: returns `Result` so every existing call site keeps its `.unwrap_or(..)` / `.ok().flatten()`
+/// combinator, but on timeout it returns `Err` (→ the caller's stale/default fallback) instead of the
+/// old unbounded `recv()` that parked the thread — the mechanism that painted *(Not Responding)*.
+fn recv_reply<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvTimeoutError> {
+    recv_reply_within(rx, ENGINE_REPLY_TIMEOUT)
+}
+
+/// [`recv_reply`] with an explicit bound — the import-class commands pass [`IMPORT_REPLY_TIMEOUT`].
+fn recv_reply_within<T>(
+    rx: &mpsc::Receiver<T>,
+    timeout: std::time::Duration,
+) -> Result<T, mpsc::RecvTimeoutError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    match rx.recv_timeout(timeout) {
+        Ok(v) => {
+            if ENGINE_STALLED.swap(false, Relaxed) {
+                eprintln!("[shell] engine thread responsive again");
+            }
+            Ok(v)
+        }
+        Err(e) => {
+            if matches!(e, mpsc::RecvTimeoutError::Timeout) && !ENGINE_STALLED.swap(true, Relaxed) {
+                eprintln!(
+                    "[shell] engine reply exceeded {timeout:?}; returning stale/default so the window stays live (perf audit F1)"
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
 #[tauri::command]
 fn connect(state: State<AppState>, channel: Channel<ProjectionDelta>) {
     ipc();
@@ -4992,26 +5420,26 @@ fn submit_edit(state: State<AppState>, tx: EditTx) {
     let _ = state.tx.send(EngineCmd::Edit(tx));
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn undo(state: State<AppState>) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Undo { reply }).is_err() {
         return false;
     }
-    rx.recv().unwrap_or(false) // true iff a transaction was actually reverted (honest "undo" vs "nothing to undo")
+    recv_reply(&rx).unwrap_or(false) // true iff a transaction was actually reverted (honest "undo" vs "nothing to undo")
 }
 
 /// Reveal bindable targets for a selected entity (north-star test #1). Blocks briefly on the engine
 /// thread's reply (a read).
-#[tauri::command]
+#[tauri::command(async)]
 fn reveal_targets(state: State<AppState>, id: String) -> RevealResponse {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Reveal { id, reply }).is_err() {
         return RevealResponse::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Bind the selection to a chosen compatible target (one undoable transaction).
@@ -5023,14 +5451,14 @@ fn bind_target(state: State<AppState>, from: String, to: String) {
 
 /// Describe-to-create (M3.2): resolve a free-text query + instantiate the top local match. Blocks
 /// briefly on the engine thread's reply.
-#[tauri::command]
+#[tauri::command(async)]
 fn describe(state: State<AppState>, query: String) -> DescribeResponse {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Describe { query, reply }).is_err() {
         return DescribeResponse::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Begin a right-drag orbit. The render loop then polls the cursor and orbits natively — **zero IPC
@@ -5246,14 +5674,14 @@ fn camera_debug(state: State<AppState>) -> [f32; 6] {
 
 /// The action model for an entity (M3.3) — valid actions + every-"no"-explained. A read; blocks
 /// briefly on the engine thread.
-#[tauri::command]
+#[tauri::command(async)]
 fn entity_actions(state: State<AppState>, id: String) -> Vec<ActionItem> {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Actions { id, reply }).is_err() {
         return Vec::new();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Remove an entity + its edges (M3.3) — one undoable transaction (Ctrl-Z restores).
@@ -5264,19 +5692,19 @@ fn remove_entity(state: State<AppState>, id: String) {
 }
 
 /// Duplicate an entity (M3.3) — one undoable transaction; returns the clone's id.
-#[tauri::command]
+#[tauri::command(async)]
 fn duplicate_entity(state: State<AppState>, id: String) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Duplicate { id, reply }).is_err() {
         return None;
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Spawn a physics body (M8.2) — one undoable ECS setup commit, mirrored into the deterministic sim and
 /// rendered as the ball; returns the new entity's id. Starts the sim running so it falls under gravity.
-#[tauri::command]
+#[tauri::command(async)]
 fn spawn_body(state: State<AppState>, x: f32, y: f32, z: f32) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5290,7 +5718,7 @@ fn spawn_body(state: State<AppState>, x: f32, y: f32, z: f32) -> Option<String> 
     {
         return None;
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Play/pause the deterministic physics sim (M8.2) — setup stays editable while paused.
@@ -5302,20 +5730,20 @@ fn set_sim_running(state: State<AppState>, run: bool) {
 
 /// Physics introspection (M8.2) — `[body_count, lowest_y, contacts]`. Lets the E2E confirm a dropped ball
 /// fell (lowest_y < spawn) and landed (contacts > 0). A read; the diagnostic seam is non-mutating.
-#[tauri::command]
+#[tauri::command(async)]
 fn physics_debug(state: State<AppState>) -> (usize, f64, usize) {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::PhysicsDebug { reply }).is_err() {
         return (0, 0.0, 0);
     }
-    rx.recv().unwrap_or((0, 0.0, 0))
+    recv_reply(&rx).unwrap_or((0, 0.0, 0))
 }
 
 /// M8 — a single body's CURRENT sim position `[x,y,z]` (the render-side transform the sim integrates). The
 /// sim is render-only (ADR-021), so a shove/impulse moves the body in the sim, NOT the authored `Transform`
 /// — so a test confirms motion against THIS, not `read_transform`. `[0,0,0]` if `id` isn't a live sim body.
-#[tauri::command]
+#[tauri::command(async)]
 fn body_sim_position(state: State<AppState>, id: String) -> [f64; 3] {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5326,34 +5754,34 @@ fn body_sim_position(state: State<AppState>, id: String) -> [f64; 3] {
     {
         return [0.0, 0.0, 0.0];
     }
-    rx.recv().unwrap_or([0.0, 0.0, 0.0])
+    recv_reply(&rx).unwrap_or([0.0, 0.0, 0.0])
 }
 
 /// M8.3 — make a dead mesh entity a correct dynamic body (the ≤2-click intent). Returns whether it applied.
-#[tauri::command]
+#[tauri::command(async)]
 fn make_dynamic(state: State<AppState>, id: String) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::MakeDynamic { id, reply }).is_err() {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M11.1 — make an imported mesh a STATIC collidable obstacle (a fixed body + a convex-hull collider) so
 /// dynamic bodies rest ON it. One undoable commit; survives reload. Returns whether it applied.
-#[tauri::command]
+#[tauri::command(async)]
 fn make_static(state: State<AppState>, id: String) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::MakeStatic { id, reply }).is_err() {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M8.3 — the collider-intelligence warnings for an entity (each explained + a one-click fix id). A read.
-#[tauri::command]
+#[tauri::command(async)]
 fn physics_check(state: State<AppState>, id: String) -> Vec<PhysicsWarning> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5364,12 +5792,12 @@ fn physics_check(state: State<AppState>, id: String) -> Vec<PhysicsWarning> {
     {
         return Vec::new();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M8.3 — apply a one-click physics fix (`add-collider`/`use-hull`/`fix-mass`/`fix-scale`). Returns whether
 /// it applied (the check then re-passes).
-#[tauri::command]
+#[tauri::command(async)]
 fn physics_fix(state: State<AppState>, id: String, action: String) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5380,32 +5808,32 @@ fn physics_fix(state: State<AppState>, id: String, action: String) -> bool {
     {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M8.4 — scrub the sim timeline to `frame` (deterministic replay over the sim-replay channel; pauses
 /// there). Returns the timeline state `[frame, max_frame, running, overlays_on, bodies]` for the slider.
-#[tauri::command]
+#[tauri::command(async)]
 fn sim_scrub(state: State<AppState>, frame: u64) -> (u64, u64, bool, bool, usize) {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::SimScrub { frame, reply }).is_err() {
         return (0, 0, false, false, 0);
     }
-    rx.recv()
+    recv_reply(&rx)
         .map(|t| (t.frame, t.max_frame, t.running, t.overlays_on, t.bodies))
         .unwrap_or((0, 0, false, false, 0))
 }
 
 /// M8.4 — the current sim timeline state `[frame, max_frame, running, overlays_on, bodies]` (a read).
-#[tauri::command]
+#[tauri::command(async)]
 fn sim_timeline(state: State<AppState>) -> (u64, u64, bool, bool, usize) {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::SimTimeline { reply }).is_err() {
         return (0, 0, false, false, 0);
     }
-    rx.recv()
+    recv_reply(&rx)
         .map(|t| (t.frame, t.max_frame, t.running, t.overlays_on, t.bodies))
         .unwrap_or((0, 0, false, false, 0))
 }
@@ -5419,7 +5847,7 @@ fn sim_overlay(state: State<AppState>, on: bool) {
 
 /// M8.4 — apply + record a one-shot "shove" impulse on a body (the sim-replay input channel). Returns
 /// whether it applied.
-#[tauri::command]
+#[tauri::command(async)]
 fn sim_shove(state: State<AppState>, id: String, impulse: [f64; 3]) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5430,24 +5858,24 @@ fn sim_shove(state: State<AppState>, id: String, impulse: [f64; 3]) -> bool {
     {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M8.4 — the live contacts at the current frame, each with its measured fields + a plain-language
 /// `explain` (the click-to-explain read). Non-mutating.
-#[tauri::command]
+#[tauri::command(async)]
 fn physics_contacts(state: State<AppState>) -> Vec<ContactInfo> {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::PhysicsContacts { reply }).is_err() {
         return Vec::new();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M8.5 — import a URDF / USD-Physics scene (`format` = "urdf" | "usd") as registry components (one
 /// undoable tx, units reconciled). Returns the summary (bodies/joints/units/notes) for the UI.
-#[tauri::command]
+#[tauri::command(async)]
 fn import_interchange(state: State<AppState>, format: String, source: String) -> ImportResult {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5462,7 +5890,7 @@ fn import_interchange(state: State<AppState>, format: String, source: String) ->
     {
         return ImportResult::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).unwrap_or_default()
 }
 
 // ── M9.1 transform gizmo ────────────────────────────────────────────────────────────────────────────
@@ -5715,6 +6143,19 @@ fn gizmo_handle_screen(
 #[tauri::command]
 fn gizmo_drag_end(window: tauri::WebviewWindow, state: State<AppState>) {
     ipc();
+    // Snapshot the OS/windowing queries BEFORE taking `shared` (perf audit F11 / RC-4): never hold the hot
+    // render mutex across a Win32 call. `aspect` + the real-cursor fallback are pure functions of the window;
+    // the test-cursor override (from the locked state) still wins inside the critical section below.
+    let aspect = window.inner_size().map_or(16.0 / 9.0, |s| {
+        s.width.max(1) as f32 / s.height.max(1) as f32
+    });
+    let window_cursor = match (window.cursor_position(), window.inner_size()) {
+        (Ok(p), Ok(s)) => Some((
+            p.x as f32 / s.width.max(1) as f32,
+            p.y as f32 / s.height.max(1) as f32,
+        )),
+        _ => None,
+    };
     let commit = {
         let mut st = state.shared.lock().unwrap();
         if !st.gizmo_dragging {
@@ -5723,17 +6164,7 @@ fn gizmo_drag_end(window: tauri::WebviewWindow, state: State<AppState>) {
             // Run ONE final drag_update with the current cursor so the committed position is the EXACT
             // release point — not the (up to one frame stale) last render-loop result (the race the review
             // flagged). drag_update is a pure function of the cursor, so re-running it is idempotent.
-            let aspect = window.inner_size().map_or(16.0 / 9.0, |s| {
-                s.width.max(1) as f32 / s.height.max(1) as f32
-            });
-            let cursor = st.gizmo_test_cursor.or_else(|| {
-                let p = window.cursor_position().ok()?;
-                let s = window.inner_size().ok()?;
-                Some((
-                    p.x as f32 / s.width.max(1) as f32,
-                    p.y as f32 / s.height.max(1) as f32,
-                ))
-            });
+            let cursor = st.gizmo_test_cursor.or(window_cursor);
             if let (Some(cur), Some(sel)) = (cursor, st.gizmo_sel) {
                 if sel < st.instances.len() {
                     let (ro, rd) = render::cursor_ray(
@@ -5793,7 +6224,7 @@ fn gizmo_drag_end(window: tauri::WebviewWindow, state: State<AppState>) {
 
 /// M9.1 — read an entity's committed Transform `[x,y,z,qx,qy,qz,qw,scale]` (the gizmo HUD + E2E confirm the
 /// move/rotate/scale landed in core, not just the render projection).
-#[tauri::command]
+#[tauri::command(async)]
 fn read_transform(state: State<AppState>, id: String) -> [f64; 8] {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5804,8 +6235,7 @@ fn read_transform(state: State<AppState>, id: String) -> [f64; 8] {
     {
         return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0];
     }
-    rx.recv()
-        .unwrap_or([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0])
+    recv_reply(&rx).unwrap_or([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0])
 }
 
 /// M9.2 — reparent a part ("drag in hierarchy"); `parent` `None` → root. Fire-and-forget (undoable).
@@ -5818,7 +6248,7 @@ fn reparent_part(state: State<AppState>, id: String, parent: Option<String>) {
 // ── M10.6 scene-authoring verbs (ADR-036) ────────────────────────────────────────────────────────────
 
 /// M10.6 — create an empty named entity at a position; reply its id (the UI selects it).
-#[tauri::command]
+#[tauri::command(async)]
 fn create_entity(state: State<AppState>, x: f32, y: f32, z: f32, name: String) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5835,13 +6265,13 @@ fn create_entity(state: State<AppState>, x: f32, y: f32, z: f32, name: String) -
     {
         return None;
     }
-    rx.recv().unwrap_or(None)
+    recv_reply(&rx).unwrap_or(None)
 }
 
 /// M11.3 (ADR-042) — author a Light entity (kind = directional|point|spot) at a position with a linear RGB
 /// colour + intensity; one undoable commit, persists. Reply its id (the UI selects it). Lighting is a render
 /// projection — only the light ENTITY enters Loro/undo, never the per-frame lit result.
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::needless_pass_by_value)]
 // Tauri commands bind args positionally from the JS invoke; a colour/pos struct would need a matching JS
 // shape, so the flat parameter list is the idiomatic command signature here.
@@ -5872,11 +6302,11 @@ fn add_light(
     {
         return None;
     }
-    rx.recv().unwrap_or(None)
+    recv_reply(&rx).unwrap_or(None)
 }
 
 /// M10.6 — rename an entity (`__meta__.name`), one undoable tx; reply applied.
-#[tauri::command]
+#[tauri::command(async)]
 fn rename_entity(state: State<AppState>, id: String, name: String) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5887,11 +6317,11 @@ fn rename_entity(state: State<AppState>, id: String, name: String) -> bool {
     {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M10.6 — group a selection under a new parent node; reply the group id.
-#[tauri::command]
+#[tauri::command(async)]
 fn group_entities(state: State<AppState>, ids: Vec<String>, name: String) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5902,11 +6332,11 @@ fn group_entities(state: State<AppState>, ids: Vec<String>, name: String) -> Opt
     {
         return None;
     }
-    rx.recv().unwrap_or(None)
+    recv_reply(&rx).unwrap_or(None)
 }
 
 /// M10.6 — ungroup (dissolve a group); reply applied.
-#[tauri::command]
+#[tauri::command(async)]
 fn ungroup_entity(state: State<AppState>, id: String) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5917,11 +6347,11 @@ fn ungroup_entity(state: State<AppState>, id: String) -> bool {
     {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M10.6 — multi-edit: set one numeric field on N entities as ONE batched, atomic, undoable tx.
-#[tauri::command]
+#[tauri::command(async)]
 fn multi_edit(
     state: State<AppState>,
     ids: Vec<String>,
@@ -5944,11 +6374,11 @@ fn multi_edit(
     {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M10.6 — delete = deactivate (non-destructive; frees dependents); reply applied.
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_deactivate(state: State<AppState>, id: String) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -5959,7 +6389,7 @@ fn delete_deactivate(state: State<AppState>, id: String) -> bool {
     {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M10.6 — copy a sub-tree to the clipboard (a read → fills the thread clipboard).
@@ -5970,29 +6400,29 @@ fn copy_subtree(state: State<AppState>, id: String) {
 }
 
 /// M10.6 — cut = copy + delete(deactivate); reply applied.
-#[tauri::command]
+#[tauri::command(async)]
 fn cut_subtree(state: State<AppState>, id: String) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::CutSubtree { id, reply }).is_err() {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M10.6 — paste the clipboard under fresh ids; reply the new root id.
-#[tauri::command]
+#[tauri::command(async)]
 fn paste_clipboard(state: State<AppState>) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::PasteClipboard { reply }).is_err() {
         return None;
     }
-    rx.recv().unwrap_or(None)
+    recv_reply(&rx).unwrap_or(None)
 }
 
 /// M11.1 (ADR-040) — import an asset file from a known path (the e2e drives this); reply the new entity id.
-#[tauri::command]
+#[tauri::command(async)]
 fn import_asset(state: State<AppState>, path: String) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6003,7 +6433,7 @@ fn import_asset(state: State<AppState>, path: String) -> Option<String> {
     {
         return None;
     }
-    rx.recv().unwrap_or(None)
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).unwrap_or(None)
 }
 
 /// M11.1 — **File → Import**: open a native file dialog filtered to 3D/asset formats, then import the
@@ -6016,8 +6446,11 @@ fn import_asset_dialog(app: tauri::AppHandle, state: State<AppState>) -> Option<
         .dialog()
         .file()
         .add_filter(
-            "3D models & assets",
-            &["fbx", "glb", "gltf", "obj", "png", "jpg", "jpeg"],
+            "3D models, CAD & assets",
+            &[
+                "fbx", "glb", "gltf", "obj", "png", "jpg", "jpeg", // meshes/textures
+                "3dxml", "stp", "step", // CAD (M15.7 / ADR-077): CATIA 3DXML · STEP AP242
+            ],
         )
         .blocking_pick_file()
         .and_then(|f| f.into_path().ok())
@@ -6030,11 +6463,11 @@ fn import_asset_dialog(app: tauri::AppHandle, state: State<AppState>) -> Option<
     {
         return None;
     }
-    rx.recv().unwrap_or(None)
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).unwrap_or(None)
 }
 
 /// M9.2 — deactivate-not-delete a part (or reactivate); replies whether it applied.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_part_active(state: State<AppState>, id: String, active: bool) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6045,11 +6478,11 @@ fn set_part_active(state: State<AppState>, id: String, active: bool) -> bool {
     {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M9.2 — save the selected part's whole character for reuse; replies the composition id.
-#[tauri::command]
+#[tauri::command(async)]
 fn save_character(state: State<AppState>, id: String) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6060,11 +6493,11 @@ fn save_character(state: State<AppState>, id: String) -> Option<String> {
     {
         return None;
     }
-    rx.recv().ok().flatten()
+    recv_reply(&rx).ok().flatten()
 }
 
 /// M9.2 — drop a fresh instance of a saved character; replies the new instance root id.
-#[tauri::command]
+#[tauri::command(async)]
 fn instantiate_character(state: State<AppState>, comp: String) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6078,24 +6511,24 @@ fn instantiate_character(state: State<AppState>, comp: String) -> Option<String>
     {
         return None;
     }
-    rx.recv().ok().flatten()
+    recv_reply(&rx).ok().flatten()
 }
 
 /// M11.3 — a non-mutating lighting read for the acceptance gate: (authored light entities, render light
 /// count incl. the synthesized default key light, shadow-caster index or -1, caster kind 0/1/2 or -1).
-#[tauri::command]
+#[tauri::command(async)]
 fn lighting_debug(state: State<AppState>) -> (usize, usize, i64, i64) {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::LightingDebug { reply }).is_err() {
         return (0, 0, -1, -1);
     }
-    rx.recv().unwrap_or((0, 0, -1, -1))
+    recv_reply(&rx).unwrap_or((0, 0, -1, -1))
 }
 
 /// M11.4 — author a scene Camera entity (one undoable commit; survives reload). `pos` world position,
 /// `fov` degrees, `active` whether it's the look-through/Play camera. Replies its id.
-#[tauri::command]
+#[tauri::command(async)]
 fn add_camera(
     state: State<AppState>,
     x: f32,
@@ -6118,57 +6551,57 @@ fn add_camera(
     {
         return None;
     }
-    rx.recv().unwrap_or(None)
+    recv_reply(&rx).unwrap_or(None)
 }
 
 /// M11.4 — look through the active scene camera (`on`) or back to the editor fly-cam (`!on`). Render-only
 /// (a projection, 0-IPC, never Loro). Replies whether an active camera was found (when `on`).
-#[tauri::command]
+#[tauri::command(async)]
 fn look_through_camera(state: State<AppState>, on: bool) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::LookThrough { on, reply }).is_err() {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M11.4 — non-mutating SCENE-camera read for the gate: (authored Camera entities, an active one present,
 /// the active fov in degrees or -1). Distinct from `camera_debug`, which reports the editor fly-cam state.
-#[tauri::command]
+#[tauri::command(async)]
 fn scene_camera_debug(state: State<AppState>) -> (usize, bool, f32) {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::CameraDebug { reply }).is_err() {
         return (0, false, -1.0);
     }
-    rx.recv().unwrap_or((0, false, -1.0))
+    recv_reply(&rx).unwrap_or((0, false, -1.0))
 }
 
 /// M9.2 — a part's resolved world position + active flag + override-key count (the E2E read).
-#[tauri::command]
+#[tauri::command(async)]
 fn part_debug(state: State<AppState>, id: String) -> (f64, f64, f64, bool, usize) {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::PartDebug { id, reply }).is_err() {
         return (0.0, 0.0, 0.0, false, 0);
     }
-    rx.recv().unwrap_or((0.0, 0.0, 0.0, false, 0))
+    recv_reply(&rx).unwrap_or((0.0, 0.0, 0.0, false, 0))
 }
 
 /// M9.2 — the seeded demo character's `(root, [parts])` ids (click a part to edit it).
-#[tauri::command]
+#[tauri::command(async)]
 fn demo_character(state: State<AppState>) -> Option<(String, Vec<String>)> {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::DemoCharacter { reply }).is_err() {
         return None;
     }
-    rx.recv().ok().flatten()
+    recv_reply(&rx).ok().flatten()
 }
 
 /// M9.2 — the entity at a structural rel-path within an instance root (e.g. `"0"` = first child).
-#[tauri::command]
+#[tauri::command(async)]
 fn part_at_path(state: State<AppState>, root: String, path: String) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6179,24 +6612,24 @@ fn part_at_path(state: State<AppState>, root: String, path: String) -> Option<St
     {
         return None;
     }
-    rx.recv().ok().flatten()
+    recv_reply(&rx).ok().flatten()
 }
 
 /// M9.2 — a part's current parent entity id (the `node.move` edge), `None` for a root. The stable
 /// structural read-back the acceptance gate keys a reparant + its Ctrl-Z restore off.
-#[tauri::command]
+#[tauri::command(async)]
 fn part_parent(state: State<AppState>, id: String) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::PartParent { id, reply }).is_err() {
         return None;
     }
-    rx.recv().ok().flatten()
+    recv_reply(&rx).ok().flatten()
 }
 
 /// M9.4 — the snap-graph for `id`: ranked candidate targets (the shared ADR-011 ranker) + each one's
 /// explained "why this", within `radius`.
-#[tauri::command]
+#[tauri::command(async)]
 fn snap_query(state: State<AppState>, id: String, radius: f32) -> Vec<SnapHit> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6207,11 +6640,11 @@ fn snap_query(state: State<AppState>, id: String, radius: f32) -> Vec<SnapHit> {
     {
         return Vec::new();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M9.4 — declare + apply a spatial constraint (solve + commit, undoable), or get the explained block.
-#[tauri::command]
+#[tauri::command(async)]
 fn apply_constraint(
     state: State<AppState>,
     id: String,
@@ -6234,11 +6667,11 @@ fn apply_constraint(
     {
         return SolveResult::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M9.4 — a natural-language placement sentence → editable intents → a schema-validated patch (ADR-017).
-#[tauri::command]
+#[tauri::command(async)]
 fn placement_sentence(state: State<AppState>, id: String, text: String) -> SolveResult {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6249,7 +6682,7 @@ fn placement_sentence(state: State<AppState>, id: String, text: String) -> Solve
     {
         return SolveResult::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M9.4 — toggle magnetic snapping (the live render-loop drag pulls the dragged entity onto the nearest
@@ -6315,19 +6748,19 @@ fn ipc_count() -> u64 {
 }
 
 /// Hover-tooltip details for an entity (M3.3) — fetched on hovered-entity change, not per frame.
-#[tauri::command]
+#[tauri::command(async)]
 fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Details { id, reply }).is_err() {
         return None;
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M11.5 (ADR-044) — the selected entity's asset provenance for the inspector identity surface (where it
 /// came from, AI-generated?, a near-duplicate hint). Fetched on selection change, not per frame.
-#[tauri::command]
+#[tauri::command(async)]
 fn asset_provenance(state: State<AppState>, id: String) -> Option<ProvenanceInfo> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6338,7 +6771,7 @@ fn asset_provenance(state: State<AppState>, id: String) -> Option<ProvenanceInfo
     {
         return None;
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M12.1 (ADR-045) — the registry-fed Rules vocabulary the builder is assembled from (events · actions ·
@@ -6388,19 +6821,19 @@ fn rule_registry() -> RuleRegistryInfo {
 }
 
 /// M12.1 (ADR-045) — all authored rules for the editor Rule list. Fetched on change, not per frame.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_rules(state: State<AppState>) -> Vec<RuleSummary> {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::ListRules { reply }).is_err() {
         return Vec::new();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M12.1 (ADR-045) — author (or replace, if `id` is given) a rule: registry-validate (Blocked + explained),
 /// commit one undoable transaction, reply the new id + the offered mirror "cleanup" rule.
-#[tauri::command]
+#[tauri::command(async)]
 fn author_rule(
     state: State<AppState>,
     rule: metrocalk_core::RuleData,
@@ -6415,23 +6848,23 @@ fn author_rule(
     {
         return AuthorRuleResult::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M12.1 (ADR-045) — remove a rule (one undoable transaction). Returns success.
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_rule(state: State<AppState>, id: String) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::DeleteRule { id, reply }).is_err() {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M12.2 (ADR-046) — all authored state machines for the editor's state-graph view (states + transitions +
 /// the live current state). Fetched on change, not per frame.
-#[tauri::command]
+#[tauri::command(async)]
 fn state_machines(state: State<AppState>) -> Vec<StateMachineInfo> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6442,13 +6875,13 @@ fn state_machines(state: State<AppState>) -> Vec<StateMachineInfo> {
     {
         return Vec::new();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M12.2 (ADR-046) — author (or replace, if `id` is given) a state machine: validate (Blocked + explained,
 /// no-dangling, registry-fed transitions), commit one undoable transaction, reply the new id + the
 /// unreachable-states warning.
-#[tauri::command]
+#[tauri::command(async)]
 fn author_state_machine(
     state: State<AppState>,
     sm: metrocalk_core::StateMachine,
@@ -6463,11 +6896,11 @@ fn author_state_machine(
     {
         return AuthorStateMachineResult::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M12.2 (ADR-046) — remove a state machine (one undoable transaction). Returns success.
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_state_machine(state: State<AppState>, id: String) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6478,12 +6911,12 @@ fn delete_state_machine(state: State<AppState>, id: String) -> bool {
     {
         return false;
     }
-    rx.recv().unwrap_or(false)
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// M12.3 (ADR-047) — run a sandboxed WASM plugin (the honest-ceiling escape) with a JSON `input`; its effect
 /// lands as one undoable transaction, or an explained Blocked/contained reason. Returns the outcome.
-#[tauri::command]
+#[tauri::command(async)]
 fn run_plugin(state: State<AppState>, name: String, input: String) -> RunPluginResult {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6494,13 +6927,13 @@ fn run_plugin(state: State<AppState>, name: String, input: String) -> RunPluginR
     {
         return RunPluginResult::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M12.4 (ADR-048) — turn a natural-language `sentence` into a REVIEWABLE composition proposal (the in-app AI
 /// compose seam). The composer proposes; the engine validates it against the live scene so the preview is
 /// pre-checked. `target` is the selected entity the rule acts on. Nothing is applied — call `compose` to apply.
-#[tauri::command]
+#[tauri::command(async)]
 fn propose_composition(
     state: State<AppState>,
     sentence: String,
@@ -6519,13 +6952,13 @@ fn propose_composition(
     {
         return ComposeProposal::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M12.4 (ADR-048) — apply a reviewed `composition` (the validated op-set) through the one commit pipeline as
 /// a single undoable transaction, or reject it whole with a plain-language reason (nothing applied). The same
 /// validated path a human / plugin uses — the AI is never a raw mutation. Returns the applied/counts or error.
-#[tauri::command]
+#[tauri::command(async)]
 fn compose(
     state: State<AppState>,
     composition: metrocalk_core::compose::Composition,
@@ -6539,25 +6972,25 @@ fn compose(
     {
         return ComposeResult::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Generate (M6, tier 3) — opt-in last resort. Drops a grey placeholder instantly + kicks off async
 /// text-to-3D; the real mesh streams in later over the projection Channel. Returns the placeholder + the
 /// inert token cost, or the offline seam.
-#[tauri::command]
+#[tauri::command(async)]
 fn generate(state: State<AppState>, query: String) -> GenerateResponse {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Generate { query, reply }).is_err() {
         return GenerateResponse::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// AI-edit (M7 + M11.2) — assign a named PBR `material` preset (rusty/metal/chrome/gold/…) to an entity: a
 /// schema-validated patch metered at the edit rate (debit-on-success). Blocks briefly on the engine reply.
-#[tauri::command]
+#[tauri::command(async)]
 fn ai_edit(state: State<AppState>, id: String, material: Option<String>) -> EconResponse {
     ipc();
     let material = material.unwrap_or_else(|| "rusty".to_string()); // back-compat: the original rustier edit
@@ -6573,45 +7006,45 @@ fn ai_edit(state: State<AppState>, id: String, material: Option<String>) -> Econ
     {
         return EconResponse::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Sandbox token top-up (M7) — $10 ≈ 100 tokens via the payment seam. **No real money moves** (the real
 /// provider is a go-live seam).
-#[tauri::command]
+#[tauri::command(async)]
 fn top_up(state: State<AppState>) -> EconResponse {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::TopUp { reply }).is_err() {
         return EconResponse::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// The user's token balance (M7) — a read for the wallet UI.
-#[tauri::command]
+#[tauri::command(async)]
 fn wallet_info(state: State<AppState>) -> EconResponse {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::WalletInfo { reply }).is_err() {
         return EconResponse::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// The browsable "+ Add" catalog (M3.4), grouped by category bucket.
-#[tauri::command]
+#[tauri::command(async)]
 fn catalog(state: State<AppState>) -> BTreeMap<String, Vec<CatalogItem>> {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Catalog { reply }).is_err() {
         return BTreeMap::new();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Search the "+ Add" catalog (M3.4) — reuses the tiered resolver (local → marketplace → generate seam).
-#[tauri::command]
+#[tauri::command(async)]
 fn catalog_search(state: State<AppState>, query: String) -> CatalogSearch {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6625,21 +7058,21 @@ fn catalog_search(state: State<AppState>, query: String) -> CatalogSearch {
             seam: None,
         };
     }
-    rx.recv().unwrap_or(CatalogSearch {
+    recv_reply(&rx).unwrap_or(CatalogSearch {
         items: Vec::new(),
         seam: None,
     })
 }
 
 /// Add a chosen catalog item (M3.4) — `source` is `"local"` (free instantiate) or `"marketplace"` (buy).
-#[tauri::command]
+#[tauri::command(async)]
 fn add_item(state: State<AppState>, id: String, source: String) -> AddResponse {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Add { id, source, reply }).is_err() {
         return AddResponse::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 // ── M10.3 (ADR-033): project lifecycle — New / Open / Save / Save As over the `.mtk` document ──────
@@ -6651,7 +7084,7 @@ fn query_project_state(state: &State<AppState>) -> ProjectInfoResp {
     if state.tx.send(EngineCmd::ProjectState { reply }).is_err() {
         return ProjectInfoResp::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Show a native Open dialog filtered to `.mtk`; the chosen path string, or `None` if cancelled.
@@ -6684,11 +7117,11 @@ fn run_project_cmd(
     if state.tx.send(cmd(reply)).is_err() {
         return ProjectInfoResp::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// The current project state (path · unsaved-changes · recents) for the File menu (ADR-033).
-#[tauri::command]
+#[tauri::command(async)]
 fn project_state(state: State<AppState>) -> ProjectInfoResp {
     ipc();
     query_project_state(&state)
@@ -6752,7 +7185,7 @@ fn open_project(
 }
 
 /// New empty project (a fresh engine/scene, the session log reset). Accepted on a GUI run.
-#[tauri::command]
+#[tauri::command(async)]
 fn new_project(state: State<AppState>) -> ProjectInfoResp {
     ipc();
     run_project_cmd(&state, |reply| EngineCmd::NewProject { reply })
@@ -6761,54 +7194,54 @@ fn new_project(state: State<AppState>) -> ProjectInfoResp {
 // ── M10.4 (ADR-034): Play mode — run the scene non-destructively ───────────────────────────────────
 
 /// Enter Play — run the deterministic sim on the current scene (snapshots the edit state for Stop).
-#[tauri::command]
+#[tauri::command(async)]
 fn play(state: State<AppState>) -> PlayInfo {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Play { reply }).is_err() {
         return PlayInfo::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Stop — restore the exact pre-Play edit state (non-destructive) and exit play mode.
-#[tauri::command]
+#[tauri::command(async)]
 fn stop(state: State<AppState>) -> PlayInfo {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Stop { reply }).is_err() {
         return PlayInfo::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Pause / resume the running sim (stays in play mode).
-#[tauri::command]
+#[tauri::command(async)]
 fn pause(state: State<AppState>) -> PlayInfo {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::Pause { reply }).is_err() {
         return PlayInfo::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// The current Play-mode state for the runtime controls (a read).
-#[tauri::command]
+#[tauri::command(async)]
 fn play_state(state: State<AppState>) -> PlayInfo {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::PlayStateQuery { reply }).is_err() {
         return PlayInfo::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 // ── M12.5 (ADR-049): Rules in Play + the live truth-state debugger ─────────────────────────────────
 
 /// Fire a live gameplay `event` (e.g. `EnemyDied`) into the running Rules — the When-channel. A projection
 /// (never the doc); recorded so a scrub replays it. Returns the fresh truth-state for `selected`.
-#[tauri::command]
+#[tauri::command(async)]
 fn fire_rule_event(
     state: State<AppState>,
     event: String,
@@ -6829,24 +7262,24 @@ fn fire_rule_event(
     {
         return RuleDebugInfo::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// The live truth-state debugger read (test #5 box 3) — click an entity → its rule truth (✅/❌ per condition),
 /// machine current state, `explain_rule` narration, the decision history, and any determinism-flagged rules.
-#[tauri::command]
+#[tauri::command(async)]
 fn rule_debug(state: State<AppState>, id: Option<String>) -> RuleDebugInfo {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::RuleDebug { id, reply }).is_err() {
         return RuleDebugInfo::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// Scrub the decision history to `frame` over the M8.4 replay channel (test #5 box 4) and return the
 /// truth-state at that frame for `selected` — watch exactly when a counter incremented / a transition fired.
-#[tauri::command]
+#[tauri::command(async)]
 fn rule_scrub(state: State<AppState>, frame: u64, selected: Option<String>) -> RuleDebugInfo {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -6861,7 +7294,7 @@ fn rule_scrub(state: State<AppState>, frame: u64, selected: Option<String>) -> R
     {
         return RuleDebugInfo::default();
     }
-    rx.recv().unwrap_or_default()
+    recv_reply(&rx).unwrap_or_default()
 }
 
 fn main() {
