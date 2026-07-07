@@ -15,6 +15,7 @@ import type {
   AddResponse,
   CatalogItem,
   CatalogSearch,
+  CadReport,
   ContactInfo,
   DescribeResponse,
   EconResponse,
@@ -82,6 +83,8 @@ export interface EditorClient {
   entityActions(id: string): Promise<ActionItem[]>;
   /** The hover-tooltip details for an entity (M3.3) — name + components + caps + bound. */
   entityDetails(id: string): Promise<EntityDetails | null>;
+  /** The per-part CAD import report (M15.7) — the fidelity breakdown + a capped part list, off the ECS. */
+  cadReport(): Promise<CadReport>;
   /** Remove an entity + its edges (M3.3) — one undoable transaction (the delta streams back). */
   removeEntity(id: string): void;
   /** Duplicate an entity (M3.3) — one undoable transaction; resolves to the clone's id. */
@@ -382,6 +385,9 @@ export class TauriClient implements EditorClient {
 
   entityActions(id: string): Promise<ActionItem[]> {
     return this.core.invoke<ActionItem[]>("entity_actions", { id }).catch((e: unknown) => { console.error("entity_actions failed", e); throw e; });
+  }
+  cadReport(): Promise<CadReport> {
+    return this.core.invoke<CadReport>("cad_report").catch((e: unknown) => { console.error("cad_report failed", e); throw e; });
   }
   entityDetails(id: string): Promise<EntityDetails | null> {
     return this.core.invoke<EntityDetails | null>("entity_details", { id }).catch((e: unknown) => { console.error("entity_details failed", e); throw e; });
@@ -873,6 +879,24 @@ class MockClient implements EditorClient {
       requires: "HealthBar" in c ? ["Health"] : [],
       boundTo: [],
     });
+  }
+  cadReport(): Promise<CadReport> {
+    // Dev stand-in: derive the report from the projection's persisted CadPart components (empty until a
+    // CAD file is imported, which only happens under the real Tauri core — so this is normally all zeros).
+    const r: CadReport = { total: 0, exactBrep: 0, tessellationOnly: 0, aiReconstructed: 0, proxy: 0, accessDenied: 0, failed: 0, parts: [] };
+    for (const [id, e] of Object.entries(projectionStore.getState().displayed)) {
+      const fidelity = e.components["CadPart"]?.["fidelity"];
+      if (typeof fidelity !== "string") continue;
+      r.total++;
+      if (fidelity === "exact-brep") r.exactBrep++;
+      else if (fidelity === "tessellation-only") r.tessellationOnly++;
+      else if (fidelity === "ai-reconstructed") r.aiReconstructed++;
+      else if (fidelity === "proxy") r.proxy++;
+      else if (fidelity === "access-denied") r.accessDenied++;
+      else r.failed++;
+      if (r.parts.length < 500) r.parts.push({ id, name: e.name, fidelity });
+    }
+    return Promise.resolve(r);
   }
   removeEntity(_id: string): void {}
   duplicateEntity(_id: string): Promise<string | null> {

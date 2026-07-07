@@ -176,6 +176,28 @@ export interface EntityDetails {
   boundTo: string[];
 }
 
+/** One row of the M15.7 (ADR-077) import report — a CAD part + its honesty class (the persisted `CadPart`
+ *  fidelity token, so this survives reload). Mirrors `CadReportPart`. */
+export interface CadReportPart {
+  id: string;
+  name: string;
+  fidelity: string; // "exact-brep" | "tessellation-only" | "ai-reconstructed" | "proxy" | "access-denied" | "failed"
+}
+
+/** The per-part CAD import report aggregated from the ECS — the fidelity breakdown (the header) + a capped
+ *  part list (the queryable body). "Explain every no" applied to import; nothing silent. Mirrors
+ *  `CadReportResp`. */
+export interface CadReport {
+  total: number;
+  exactBrep: number;
+  tessellationOnly: number;
+  aiReconstructed: number;
+  proxy: number;
+  accessDenied: number;
+  failed: number;
+  parts: CadReportPart[];
+}
+
 /** A catalog entry (M3.4 / ADR-019) — the ONE catalog surface the asset browser reuses (registry +
  *  marketplace + imported), mirroring `metrocalk_core::catalog::CatalogItem`. */
 export interface CatalogItem {

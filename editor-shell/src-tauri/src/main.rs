@@ -293,6 +293,33 @@ struct RevealResponse {
     bound: Vec<Bound>,
 }
 
+/// One row of the M15.7 (ADR-077) import report — a CAD part entity + its honesty class. The `fidelity`
+/// token is read straight off the persisted `CadPart` component (survives reload), so this is the
+/// ECS-native "explain every no" surface ("show tessellation-only parts"), not a side copy.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CadReportPart {
+    id: String,
+    name: String,
+    fidelity: String,
+}
+
+/// The per-part import report aggregated from the ECS: the fidelity breakdown (the header line) + a capped
+/// list of parts (the queryable body). Built from `CadPart` components, so it reflects whatever CAD is in
+/// the scene right now — never-empty + never-silent made visible.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CadReportResp {
+    total: usize,
+    exact_brep: usize,
+    tessellation_only: usize,
+    ai_reconstructed: usize,
+    proxy: usize,
+    access_denied: usize,
+    failed: usize,
+    parts: Vec<CadReportPart>,
+}
+
 /// The describe-to-create result: the created entity + kind, which tier it came from, and — for a
 /// marketplace hit — the inert economy seam (token price). On no match anywhere, the generate `seam`.
 #[derive(Serialize, Clone, Default)]
@@ -401,6 +428,10 @@ enum EngineCmd {
     Details {
         id: String,
         reply: Sender<Option<EntityDetails>>,
+    },
+    /// M15.7 (ADR-077) — the per-part CAD import report, aggregated from the ECS `CadPart` components (a read).
+    CadReport {
+        reply: Sender<CadReportResp>,
     },
     /// M11.5 (ADR-044) — the selected entity's asset provenance (identity/AI-flag/near-dup) — a read.
     AssetProvenance {
@@ -2411,6 +2442,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let details = EntityId::from_loro_key(&id)
                     .and_then(|e| build_entity_details(&engine, &scene, e));
                 let _ = reply.send(details);
+            }
+            EngineCmd::CadReport { reply } => {
+                let _ = reply.send(build_cad_report(&engine));
             }
             EngineCmd::AssetProvenance { id, reply } => {
                 let info = EntityId::from_loro_key(&id)
@@ -4656,6 +4690,46 @@ fn sync_out(
 }
 
 /// Build the hover-tooltip [`EntityDetails`] for `id` (name · components · provided/required caps via
+/// M15.7 (ADR-077) — the per-part CAD import report, scanned live off the ECS: every entity carrying a
+/// `CadPart` component contributes its persisted `fidelity` token to the breakdown + a capped list row.
+/// ECS-native + survives reload (the components persist), so this is the never-silent "explain every no"
+/// surface without a stored side copy. The list is capped so a 13k-part cell can't flood the IPC/DOM;
+/// the counts are always the true totals.
+fn build_cad_report(engine: &Engine<FlecsWorld>) -> CadReportResp {
+    const MAX_ROWS: usize = 500;
+    let mut r = CadReportResp::default();
+    for id in engine.entity_ids() {
+        let comps = engine.components_of(id);
+        let Some(cad) = comps.get(metrocalk_editor_shell::CAD_PART) else {
+            continue;
+        };
+        let Some(FieldValue::Str(fidelity)) = cad.get("fidelity") else {
+            continue;
+        };
+        r.total += 1;
+        match fidelity.as_str() {
+            "exact-brep" => r.exact_brep += 1,
+            "tessellation-only" => r.tessellation_only += 1,
+            "ai-reconstructed" => r.ai_reconstructed += 1,
+            "proxy" => r.proxy += 1,
+            "access-denied" => r.access_denied += 1,
+            _ => r.failed += 1, // "failed" + any future token → the honest catch-all
+        }
+        if r.parts.len() < MAX_ROWS {
+            let name = match cad.get("name") {
+                Some(FieldValue::Str(n)) if !n.is_empty() => n.clone(),
+                _ => label_of(engine, id),
+            };
+            r.parts.push(CadReportPart {
+                id: id.to_loro_key(),
+                name,
+                fidelity: fidelity.clone(),
+            });
+        }
+    }
+    r
+}
+
 /// their display names · the entities it's bound to). `None` if the id isn't a live entity.
 fn build_entity_details(
     engine: &Engine<FlecsWorld>,
@@ -6758,6 +6832,19 @@ fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
     recv_reply(&rx).unwrap_or_default()
 }
 
+/// M15.7 (ADR-077) — the per-part CAD import report for the panel: the fidelity breakdown + a capped part
+/// list, aggregated live from the ECS `CadPart` components. Fetched on an import / scene change, not per
+/// frame.
+#[tauri::command(async)]
+fn cad_report(state: State<AppState>) -> CadReportResp {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::CadReport { reply }).is_err() {
+        return CadReportResp::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
 /// M11.5 (ADR-044) — the selected entity's asset provenance for the inspector identity surface (where it
 /// came from, AI-generated?, a near-duplicate hint). Fetched on selection change, not per frame.
 #[tauri::command(async)]
@@ -7371,6 +7458,7 @@ fn main() {
             remove_entity,
             duplicate_entity,
             entity_details,
+            cad_report,
             asset_provenance,
             rule_registry,
             list_rules,
@@ -7663,5 +7751,91 @@ mod lighting_debug_tests {
             None,
             "with the only light's shadows toggled off, nothing casts (the authorable toggle works)"
         );
+    }
+}
+
+#[cfg(test)]
+mod cad_report_tests {
+    use super::build_cad_report;
+    use metrocalk_core::{Engine, FieldValue, Op};
+    use metrocalk_ecs::FlecsWorld;
+    use metrocalk_editor_shell::CAD_PART;
+
+    /// A CadPart entity carrying its persisted fidelity token — what `land_cad` writes onto each part.
+    fn cad_part(e: &mut Engine<FlecsWorld>, name: &str, fidelity: &str) {
+        let id = e.alloc_entity_id();
+        e.commit(
+            "cad-part",
+            vec![
+                Op::CreateEntity { id, parent: None },
+                Op::SetField {
+                    entity: id,
+                    component: CAD_PART.into(),
+                    field: "fidelity".into(),
+                    value: FieldValue::Str(fidelity.into()),
+                },
+                Op::SetField {
+                    entity: id,
+                    component: CAD_PART.into(),
+                    field: "name".into(),
+                    value: FieldValue::Str(name.into()),
+                },
+            ],
+        )
+        .expect("commit a cad part");
+    }
+
+    #[test]
+    fn the_report_accounts_for_every_part_by_its_honesty_class() {
+        // The never-silent guarantee, ECS-native: the report scanned off CadPart components counts EVERY
+        // part by fidelity, and a non-CAD entity contributes nothing (no CadPart → not counted).
+        let mut e = Engine::new(FlecsWorld::new(), 1);
+        cad_part(&mut e, "Plate", "exact-brep");
+        cad_part(&mut e, "Weld Gun", "tessellation-only");
+        cad_part(&mut e, "Conveyor", "tessellation-only");
+        cad_part(&mut e, "Overhead Crane", "proxy");
+        // A plain entity with no CadPart is invisible to the report.
+        let plain = e.alloc_entity_id();
+        e.commit(
+            "plain",
+            vec![Op::CreateEntity {
+                id: plain,
+                parent: None,
+            }],
+        )
+        .expect("commit a non-cad entity");
+
+        let r = build_cad_report(&e);
+        assert_eq!(
+            r.total, 4,
+            "every CAD part counted; the plain entity excluded"
+        );
+        assert_eq!(r.exact_brep, 1);
+        assert_eq!(r.tessellation_only, 2);
+        assert_eq!(r.proxy, 1);
+        assert_eq!(r.failed, 0);
+        // The breakdown sums to the total — nothing silently dropped.
+        assert_eq!(
+            r.exact_brep
+                + r.tessellation_only
+                + r.ai_reconstructed
+                + r.proxy
+                + r.access_denied
+                + r.failed,
+            r.total
+        );
+        // Each row carries its stable fidelity token + the source name (the queryable body).
+        let crane = r
+            .parts
+            .iter()
+            .find(|p| p.name == "Overhead Crane")
+            .expect("crane row");
+        assert_eq!(crane.fidelity, "proxy");
+    }
+
+    #[test]
+    fn an_empty_scene_reports_no_cad() {
+        let e = Engine::new(FlecsWorld::new(), 1);
+        assert_eq!(build_cad_report(&e).total, 0);
     }
 }

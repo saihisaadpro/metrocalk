@@ -19,6 +19,17 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     undo: vi.fn(() => Promise.resolve(false)),
     entityActions: () => Promise.resolve([]),
     entityDetails: () => Promise.resolve(null),
+    cadReport: () =>
+      Promise.resolve({
+        total: 0,
+        exactBrep: 0,
+        tessellationOnly: 0,
+        aiReconstructed: 0,
+        proxy: 0,
+        accessDenied: 0,
+        failed: 0,
+        parts: [],
+      }),
     removeEntity: vi.fn(),
     duplicateEntity: () => Promise.resolve(null),
     focusEntity: vi.fn(),
