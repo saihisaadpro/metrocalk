@@ -443,6 +443,11 @@ impl Csg for ExactBspCsg {
         if b.triangles.is_empty() {
             return Err(CsgError::InvalidInput("mesh B has no triangles".into()));
         }
+        // Guard malformed + extreme inputs up front so a bad mesh is Blocked-explained, never a panic
+        // (an out-of-bounds index, a NaN/inf vertex, or coordinates so far from the origin that f64 CSG
+        // is unreliable — the floating-origin limit, FM-T2.3).
+        check_input(a, "A")?;
+        check_input(b, "B")?;
 
         let pa = polygons_from(a);
         let pb = polygons_from(b);
@@ -949,15 +954,51 @@ fn pick_split_plane(polys: &[Polygon]) -> Plane {
     polys[best_ci].plane.clone()
 }
 
+/// Beyond this coordinate magnitude, f64 CSG is unreliable (the snap/weld tolerances scale with the
+/// plane offset, so the precision degrades, and the spatial-hash cell index can overflow). A scene this
+/// far from the origin is the **floating-origin** regime (FM-T2.3) — recentre, don't crash.
+const MAX_COORD: f64 = 1.0e9;
+
+/// Validate an input mesh up front so a malformed or extreme input is **Blocked-explained, never a
+/// panic** (the adversarial-review hardening): every triangle index in range, every vertex finite, and
+/// no coordinate beyond [`MAX_COORD`].
+fn check_input(mesh: &TriMesh, which: &str) -> Result<(), CsgError> {
+    let n = mesh.positions.len();
+    for (i, p) in mesh.positions.iter().enumerate() {
+        if !p.iter().all(|c| c.is_finite()) {
+            return Err(CsgError::InvalidInput(format!(
+                "mesh {which} vertex {i} is NaN or infinite"
+            )));
+        }
+        if p.iter().any(|c| c.abs() > MAX_COORD) {
+            return Err(CsgError::InvalidInput(format!(
+                "mesh {which} is too far from the origin (|coord| > 1e9) for robust f64 CSG — \
+                 recentre to a floating origin (FM-T2.3)"
+            )));
+        }
+    }
+    for t in &mesh.triangles {
+        if (t[0] as usize) >= n || (t[1] as usize) >= n || (t[2] as usize) >= n {
+            return Err(CsgError::InvalidInput(format!(
+                "mesh {which} has a triangle index out of bounds (>= {n} vertices)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn polygons_from(mesh: &TriMesh) -> Vec<Polygon> {
     let mut out = Vec::with_capacity(mesh.triangles.len());
     for t in &mesh.triangles {
-        let verts = vec![
-            mesh.positions[t[0] as usize],
-            mesh.positions[t[1] as usize],
-            mesh.positions[t[2] as usize],
-        ];
-        if let Some(p) = Polygon::new(verts) {
+        // Indices are validated by `check_input` before this runs; `.get` keeps it panic-free regardless.
+        let (Some(&va), Some(&vb), Some(&vc)) = (
+            mesh.positions.get(t[0] as usize),
+            mesh.positions.get(t[1] as usize),
+            mesh.positions.get(t[2] as usize),
+        ) else {
+            continue;
+        };
+        if let Some(p) = Polygon::new(vec![va, vb, vc]) {
             out.push(p); // zero-area input triangles are dropped (degenerate → robustly ignored)
         }
     }
@@ -1014,12 +1055,15 @@ fn csg_intersect(mut a: Node, mut b: Node) -> Vec<Polygon> {
 
 /// Deterministic vertex weld over polygon loops: fuse coincident vertices within `eps` into a shared set,
 /// returning the shared positions + each face as an integer index loop (consecutive duplicates dropped,
-/// degenerate <3 loops removed). A spatial hash on a grid of cell-size `eps` with a fixed-order neighbour
-/// scan; ties resolve to the lowest existing index → order-independent + bit-stable.
+/// degenerate <3 loops removed). A spatial grid of cell-size `eps` with a fixed-order neighbour scan; ties
+/// resolve to the lowest existing index. A **`BTreeMap`** (not a `HashMap`) keys the grid so the structure
+/// carries NO iteration-order dependence at all — determinism by construction, not by argument (the
+/// lowest-index tie-break already made the result order-independent; this removes any doubt). Cell offsets
+/// saturate, so even an extreme-coordinate input (already rejected by `check_input`) can't overflow.
 fn weld_polygons(polys: &[Polygon], eps: f64) -> (Vec<[f64; 3]>, Vec<Vec<u32>>) {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     let inv = if eps > 0.0 { 1.0 / eps } else { 0.0 };
-    // The grid cell index is an intentional floor-to-integer of the quantised coordinate.
+    // The grid cell index is an intentional floor-to-integer of the quantised coordinate (`as` saturates).
     #[allow(clippy::cast_possible_truncation)]
     let cell = |p: [f64; 3]| -> [i64; 3] {
         [
@@ -1030,7 +1074,7 @@ fn weld_polygons(polys: &[Polygon], eps: f64) -> (Vec<[f64; 3]>, Vec<Vec<u32>>) 
     };
     let eps2 = eps * eps;
 
-    let mut grid: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
+    let mut grid: BTreeMap<[i64; 3], Vec<u32>> = BTreeMap::new();
     let mut positions: Vec<[f64; 3]> = Vec::new();
 
     let mut intern = |p: [f64; 3], positions: &mut Vec<[f64; 3]>| -> u32 {
@@ -1039,7 +1083,12 @@ fn weld_polygons(polys: &[Polygon], eps: f64) -> (Vec<[f64; 3]>, Vec<Vec<u32>>) 
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
-                    if let Some(bucket) = grid.get(&[base[0] + dx, base[1] + dy, base[2] + dz]) {
+                    let key = [
+                        base[0].saturating_add(dx),
+                        base[1].saturating_add(dy),
+                        base[2].saturating_add(dz),
+                    ];
+                    if let Some(bucket) = grid.get(&key) {
                         for &vi in bucket {
                             let d = sub(p, positions[vi as usize]);
                             if dot(d, d) <= eps2 {
@@ -1470,5 +1519,56 @@ mod tests {
             .unwrap_err();
         // It does not panic; it returns an explained error.
         assert!(matches!(err, CsgError::InvalidInput(_)), "explained: {err}");
+    }
+
+    // ── adversarial-review hardening: malformed / extreme inputs are Blocked-explained, never a panic ──
+
+    /// A triangle index past the vertex array is Blocked-explained, not an out-of-bounds panic.
+    #[test]
+    fn an_out_of_bounds_index_is_blocked_not_a_panic() {
+        let good = box_mesh([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let bad = TriMesh::new(
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![[0, 1, 99]],
+        );
+        let err = ExactBspCsg::new().difference(&good, &bad).unwrap_err();
+        assert!(matches!(err, CsgError::InvalidInput(_)), "explained: {err}");
+        assert!(err.to_string().contains("out of bounds"));
+    }
+
+    /// A NaN/inf input vertex is Blocked-explained, never propagated into the boolean.
+    #[test]
+    fn a_nonfinite_input_vertex_is_blocked() {
+        let good = box_mesh([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let mut bad = box_mesh([0.5, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        bad.positions[0] = [f64::INFINITY, 0.0, 0.0];
+        let err = ExactBspCsg::new().difference(&good, &bad).unwrap_err();
+        assert!(matches!(err, CsgError::InvalidInput(_)), "explained: {err}");
+    }
+
+    /// Geometry far past the f64 floating-origin limit is Blocked-explained (FM-T2.3), NEVER a panic
+    /// (it used to overflow the weld's i64 cell index at ~1e11). Clean near the origin; explained beyond.
+    #[test]
+    fn far_from_origin_is_blocked_not_a_panic() {
+        let csg = ExactBspCsg::new();
+        let off = |o: f64| {
+            let t = |m: &TriMesh| TriMesh {
+                positions: m
+                    .positions
+                    .iter()
+                    .map(|p| [p[0] + o, p[1] + o, p[2] + o])
+                    .collect(),
+                triangles: m.triangles.clone(),
+            };
+            let wall = t(&box_mesh([0.0, 0.0, 0.0], [2.0, 1.0, 0.5]));
+            let carve = t(&box_mesh([0.0, 0.5, 0.0], [0.5, 0.5, 1.0]));
+            csg.difference(&wall, &carve)
+        };
+        // Near the origin: a clean carve.
+        assert!(off(10.0).is_ok());
+        // Way out: Blocked-explained, not a panic.
+        let err = off(1.0e11).unwrap_err();
+        assert!(matches!(err, CsgError::InvalidInput(_)), "explained: {err}");
+        assert!(err.to_string().contains("floating origin"));
     }
 }
