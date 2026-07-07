@@ -195,11 +195,14 @@ fn real_catia_3dxml_beats_the_documented_unreal_failure() {
     let (mut engine, scene) = engine();
     let mut store = AssetStore::new();
     let landing = import_cad(&mut engine, &scene, &mut store, &bytes).expect("land the real file");
+    // Every part is a queryable entity, PLUS the source's named assembly tree lands as geometry-free
+    // group-folder entities (hierarchy preserved, never flattened).
     assert_eq!(
         engine.entity_count(),
-        report.part_count(),
-        "every part is a queryable entity"
+        report.part_count() + report.groups.len(),
+        "every part is a queryable entity + the named group folders"
     );
+    assert_eq!(landing.group_entities.len(), report.groups.len());
     assert!(
         landing.unique_meshes <= report.unique_geometry_count() + 1,
         "meshes deduped (proxy shared)"

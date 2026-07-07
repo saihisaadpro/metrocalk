@@ -47,8 +47,9 @@ pub use bridge::{
     ProjectionDelta, ProjectionOp, RelSummary,
 };
 pub use cad_import::{
-    changed_count, import_cad, land_import, read_cad, reimport_diff, CadImportError, CadLanding,
-    CAD_PART,
+    bake_basis_into_mesh, basis_is_rigid, changed_count, import_cad, is_cad_file, land_import,
+    load_persisted_cad_meshes, persist_cad_mesh, read_cad, reimport_diff, CadImportError,
+    CadLanding, CAD_PART,
 };
 pub use cad_intent::{import_step, StepImport};
 pub use capscene::{

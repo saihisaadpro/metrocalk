@@ -7,7 +7,8 @@ use metrocalk_assets::AssetStore;
 use metrocalk_core::{Engine, FieldValue};
 use metrocalk_ecs::FlecsWorld;
 use metrocalk_interchange::{
-    build_import, CadInterchange, PartSource, RawPart, StepInterchange, Units, IDENTITY_4X4,
+    build_import, CadInterchange, GroupNode, PartSource, RawPart, StepInterchange, Units,
+    IDENTITY_4X4,
 };
 
 const CUBE_STEP: &str = include_str!("../../../interchange/tests/fixtures/cube_ap242.step");
@@ -38,6 +39,7 @@ fn mixed_import() -> CadImport {
             transform: IDENTITY_4X4,
             source: PartSource::ExactBrep(faces.clone()),
             color: None,
+            parent: None,
         },
         RawPart {
             id: 2,
@@ -46,6 +48,7 @@ fn mixed_import() -> CadImport {
             transform: t_bolt_b,
             source: PartSource::ExactBrep(faces),
             color: None,
+            parent: None,
         },
         RawPart {
             id: 3,
@@ -56,6 +59,7 @@ fn mixed_import() -> CadImport {
                 encoding: "CATIA V5_CFV3/CB0001".into(),
             },
             color: None,
+            parent: None,
         },
     ];
     // Millimetre units (STEP/3DXML convention) → land_import normalizes to metres.
@@ -68,7 +72,7 @@ fn mixed_import() -> CadImport {
         },
         42,
         parts,
-        0,
+        vec![],
         vec![],
     )
 }
@@ -154,6 +158,100 @@ fn read_cad_routes_step_and_lands_exact_geometry() {
     // The mesh is real (content-addressed), stored.
     assert_eq!(landing.unique_meshes, 1);
     assert!(landing.report.never_empty() && landing.report.never_silent());
+}
+
+#[test]
+fn a_cad_import_preserves_the_source_hierarchy_as_named_group_folders() {
+    // (adversarial review) land_import must land the SAME named assembly tree the live app path does —
+    // not silently flatten the groups + parents the report now carries.
+    let (mut engine, scene) = engine();
+    let mut store = AssetStore::new();
+    let faces = StepInterchange.import(CUBE_STEP.as_bytes()).unwrap().solids[0]
+        .faces
+        .clone();
+    let groups = vec![
+        GroupNode {
+            id: 100,
+            name: "Skid Line".into(),
+            parent: None,
+        },
+        GroupNode {
+            id: 101,
+            name: "Robot Cell".into(),
+            parent: Some(100),
+        },
+    ];
+    let parts = vec![RawPart {
+        id: 1,
+        name: "Weld Gun".into(),
+        reference: "gun".into(),
+        transform: IDENTITY_4X4,
+        source: PartSource::ExactBrep(faces),
+        color: None,
+        parent: Some(101),
+    }];
+    let report = build_import(
+        "nested".into(),
+        "TEST".into(),
+        Units {
+            meters_per_unit: 0.001,
+            kilograms_per_unit: 1.0,
+        },
+        7,
+        parts,
+        groups,
+        vec![],
+    );
+    let landing = land_import(&mut engine, &scene, &mut store, report).expect("land");
+    assert_eq!(landing.group_entities.len(), 2);
+    assert_eq!(engine.entity_count(), 3, "2 group folders + 1 part");
+    let (line, cell) = (landing.group_entities[0], landing.group_entities[1]);
+    let meta = metrocalk_core::variant::INSTANCE_META;
+    assert_eq!(
+        engine.get_field(line, meta, "name"),
+        Some(FieldValue::Str("Skid Line".into()))
+    );
+    assert_eq!(
+        engine.get_field(cell, meta, "kind"),
+        Some(FieldValue::Str("group".into())),
+        "folders are marked group (the outliner's folder icon)"
+    );
+    // The source nesting survives: gun › cell › line.
+    assert_eq!(engine.parent_of(landing.entities[0]), Some(cell));
+    assert_eq!(engine.parent_of(cell), Some(line));
+    assert_eq!(engine.parent_of(line), None);
+    // Still ONE undoable transaction — the tree peels with the parts.
+    assert!(engine.undo());
+    assert_eq!(engine.entity_count(), 0);
+}
+
+#[test]
+fn persisted_cad_meshes_reload_under_the_same_handle() {
+    // (adversarial review) the derived-mesh sidecar: what the live import persists must reload under the
+    // SAME handle with the same geometry — the guarantee that a saved doc's `mtkcad:` field re-resolves
+    // after restart instead of silently degrading to a placeholder cube.
+    let dir = std::env::temp_dir().join(format!("mtk-cad-mesh-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mesh = metrocalk_csg::TriMesh::new(
+        vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+        vec![[0, 1, 2]],
+    );
+    persist_cad_mesh(
+        &dir,
+        "mtkcad:00000000deadbeef:ff0000",
+        &mesh,
+        Some([1.0, 0.0, 0.0]),
+    )
+    .expect("persist");
+    let loaded = load_persisted_cad_meshes(&dir);
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].0, "mtkcad:00000000deadbeef:ff0000");
+    let extent = loaded[0].1.bounds().max_extent();
+    assert!(
+        (extent - 10.0).abs() < 1e-6,
+        "the restored asset carries the same geometry (max extent {extent}, expected 10.0)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

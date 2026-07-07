@@ -146,6 +146,10 @@ pub struct PartReport {
     /// The authored display colour (linear RGB) from the source's presentation model, if any — the viewer
     /// applies it as a per-entity material override so the part renders in its real colour. `None` ⇒ default.
     pub color: Option<[f32; 3]>,
+    /// The id of the [`GroupNode`] (assembly occurrence) this part is nested under — `None` for a top-level
+    /// part. The viewer parents the part's entity under this group so the outliner shows the source's exact
+    /// hierarchy/grouping/names. Structural only: the part's `transform` stays its own world placement.
+    pub parent: Option<u64>,
 }
 
 impl PartReport {
@@ -154,6 +158,23 @@ impl PartReport {
     pub fn is_real_geometry(&self) -> bool {
         self.fidelity.is_real_geometry()
     }
+}
+
+/// A **structural assembly node** in the source hierarchy — a named sub-assembly / product occurrence that
+/// carries no leaf geometry of its own (parts nest under it). Promoted from a mere count (`structural_nodes`)
+/// to a real, named, parented node so the importer preserves the source file's **exact** tree shape, grouping,
+/// and names (CATIA product `V_Name` / STEP assembly product). It is purely organizational: it holds no
+/// transform (leaf `PartReport.transform`s are already world-composed), so it never perturbs placement — the
+/// viewer materializes it as an identity-transform, geometry-free container the outliner shows as a folder.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct GroupNode {
+    /// Stable per-occurrence id — the key that leaf [`PartReport::parent`] and child [`GroupNode::parent`]
+    /// point at (distinct from any part id). Stable across re-imports (the same occurrence path hashes same).
+    pub id: u64,
+    /// The source assembly/product name shown in the outliner.
+    pub name: String,
+    /// The parent group id — `None` for a top-level product root (a forest root). Forms the tree.
+    pub parent: Option<u64>,
 }
 
 /// One **unique** tessellated mesh (deduped by geometry hash) — many [`PartReport`]s can instance it.
@@ -192,8 +213,12 @@ pub struct CadImport {
     /// `1` for a single-scene source (STEP/mesh).
     pub products: usize,
     /// Structural assembly nodes with no leaf geometry (sub-assemblies) — counted so the accounting is honest
-    /// (they are the tree, not parts; not rendered, not a failure).
+    /// (they are the tree, not parts; not rendered, not a failure). Equals `groups.len()`.
     pub structural_nodes: usize,
+    /// The **named structural tree** — every assembly/sub-assembly occurrence as a parented [`GroupNode`], so
+    /// the importer preserves the source's exact hierarchy, grouping, and names. Leaf `parts` reference these
+    /// via [`PartReport::parent`]. Empty for a flat single-part source.
+    pub groups: Vec<GroupNode>,
     /// Every unsupported/approximated feature at the *scene* level, explained (never a silent drop).
     pub notes: Vec<UnsupportedNote>,
 }
@@ -346,6 +371,10 @@ pub struct RawPart {
     /// The authored display colour (linear RGB) from the source's presentation model, if any — so the part
     /// renders in its real colour. `None` ⇒ the viewer's default material.
     pub color: Option<[f32; 3]>,
+    /// The id of the [`GroupNode`] (assembly / sub-assembly occurrence) this part sits under in the source
+    /// hierarchy — `None` for a top-level part. Preserves the source's grouping/tree exactly (the outliner
+    /// nests the part under its named container). Purely structural: the part keeps its own world `transform`.
+    pub parent: Option<u64>,
 }
 
 /// The geometry a reader resolved for a part — the cascade routes each variant to a strategy/fidelity.
@@ -507,6 +536,7 @@ fn resolve_part(
         transform: raw.transform,
         mesh,
         color: raw.color,
+        parent: raw.parent,
     }
 }
 
@@ -541,7 +571,7 @@ pub fn build_import(
     units: Units,
     source_hash: u64,
     raw_parts: Vec<RawPart>,
-    structural_nodes: usize,
+    groups: Vec<GroupNode>,
     notes: Vec<UnsupportedNote>,
 ) -> CadImport {
     let mut meshes: Vec<CadMesh> = Vec::new();
@@ -552,6 +582,7 @@ pub fn build_import(
         parts.push(resolve_part(raw, &mut meshes, &mut by_hash, &mut proxy_idx));
     }
     let total_occurrences = parts.len();
+    let structural_nodes = groups.len();
     CadImport {
         name,
         source_format,
@@ -562,6 +593,7 @@ pub fn build_import(
         products: 1,
         parts,
         structural_nodes,
+        groups,
         notes,
     }
 }
@@ -884,15 +916,51 @@ impl CadReader for StepAssemblyReader {
             kilograms_per_unit: 1.0,
         };
 
-        // (A) Tessellated-assembly first — the embedded-tessellation + placement leg (curved commercial CAD:
-        // cylinders/NURBS a planar reader can't cover, but the open tessellation cache + the assembly
-        // transforms are readable). This is the leg the 262 MB STEP re-export that black-screened Unreal takes.
+        // (A) The **full commercial-CAD assembly** — a 3DEXPERIENCE/CATIA/NX export carries geometry in TWO
+        // parallel structures, and a complete model needs BOTH:
+        //   • the embedded-tessellation graph (`REPOSITIONED_TESSELLATED_ITEM` → curved/cast parts a planar
+        //     reader can't cover — cylinders/NURBS/cones), and
+        //   • the exact B-rep product tree (`NEXT_ASSEMBLY_USAGE_OCCURRENCE` → the structural steel:
+        //     `MANIFOLD_SOLID_BREP` plates/beams/gussets in per-product shape reps at LOCAL coords, placed
+        //     only by the PDM assembly transforms).
+        // The two are disjoint in this export class (a part is exported as one OR the other), so we UNION
+        // them — this is what turns the crane from "235 tessellated parts floating" into the whole placed
+        // assembly. (The 262 MB STEP re-export that black-screened Unreal is exactly this dual structure.)
+        // KNOWN LIMIT (tracked): a CAx-IF dual-representation export (the SAME product carrying both an
+        // exact-B-rep rep AND a tessellated rep) would emit twice here — cross-leg dedup needs the
+        // TESSELLATED_SOLID→product linkage.
+        //
+        // The gate requires embedded tessellation OR a real NAUO assembly graph: a single-product planar
+        // AP242 part (the M15.5 exact/PMI leg) has the standard PRODUCT_DEFINITION/SDR structure too, and
+        // must NOT be hijacked into a "tessellation-only" diagnosis — it takes leg (B) below (exact faces,
+        // exact fidelity, PMI, interpret()'s notes).
         let tess = crate::step::parse_tessellated_assembly(&entities);
-        if !tess.is_empty() {
+        let (brep, brep_notes) = crate::step::parse_brep_assembly(&entities);
+        let is_assembly = crate::step::has_nauo(&entities);
+        if !tess.is_empty() || (is_assembly && !brep.is_empty()) {
             let name =
                 crate::step::file_name(&entities).unwrap_or_else(|| "STEP assembly".to_string());
-            let mut raw_parts = Vec::with_capacity(tess.len());
-            for (i, p) in tess.into_iter().enumerate() {
+            let mut placements: Vec<crate::step::TessPart> =
+                Vec::with_capacity(tess.len() + brep.len());
+            placements.extend(tess);
+            placements.extend(brep);
+            let total_occurrences = placements.len();
+
+            // A huge assembly (this crane expands to ~13 k occurrences) has FAR more entities than the
+            // single-threaded editor engine + outliner projection can carry — the window freezes ("Not
+            // Responding") and never repaints. Above a threshold, MERGE instances by geometry+colour: bake
+            // each occurrence's world transform into its vertices and union same-(mesh, colour) instances
+            // into ONE part. All triangles + colours still render at their real world positions (visually
+            // identical), but a repeated bolt becomes one entity instead of hundreds → ~370 parts, not 13 k.
+            // Below the threshold, parts stay individual (per-part selection / instancing preserved).
+            let parts_out = if placements.len() > MERGE_ABOVE_PARTS {
+                merge_by_geometry(placements)
+            } else {
+                placements
+            };
+
+            let mut raw_parts = Vec::with_capacity(parts_out.len());
+            for (i, p) in parts_out.into_iter().enumerate() {
                 raw_parts.push(RawPart {
                     id: i as u64,
                     name: p.name,
@@ -900,17 +968,22 @@ impl CadReader for StepAssemblyReader {
                     transform: p.transform,
                     source: PartSource::Tessellation(p.mesh),
                     color: p.color,
+                    // Flat placement for now (each part carries its real world transform); the named
+                    // NEXT_ASSEMBLY_USAGE_OCCURRENCE folder tree is a follow-up.
+                    parent: None,
                 });
             }
-            return Ok(build_import(
+            let mut imp = build_import(
                 name,
                 "STEP-AP242".into(),
                 units,
                 src,
                 raw_parts,
-                0,
                 Vec::new(),
-            ));
+                brep_notes,
+            );
+            imp.total_occurrences = total_occurrences;
+            return Ok(imp);
         }
 
         // (B) Planar B-rep fallback — the small-file exact leg (a hand/simple AP242 part with no tessellation).
@@ -924,6 +997,7 @@ impl CadReader for StepAssemblyReader {
                 transform: IDENTITY_4X4,
                 source: PartSource::ExactBrep(solid.faces.clone()),
                 color: None,
+                parent: None,
             });
         }
         Ok(build_import(
@@ -932,7 +1006,7 @@ impl CadReader for StepAssemblyReader {
             scene.units,
             src,
             raw_parts,
-            0,
+            Vec::new(),
             scene.notes,
         ))
     }
@@ -942,6 +1016,78 @@ impl CadReader for StepAssemblyReader {
 /// large (the M15.7 bar file's STEP re-export is 262 MB), so this is far above the planar-subset
 /// [`crate::MAX_STEP_BYTES`] (64 MB) cap, but still bounded (the decode-bomb guard).
 pub const MAX_STEP_ASSEMBLY_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Above this many placed STEP occurrences, merge instances by geometry+colour (see [`merge_by_geometry`])
+/// so the entity count stays inside what the single-threaded editor engine + outliner projection render
+/// without freezing. Below it, parts stay individual (per-part selection + GPU instancing preserved). The
+/// 3DXML proxy import at ~2.7 k entities stays responsive; the crane's ~13 k B-rep occurrences do not.
+const MERGE_ABOVE_PARTS: usize = 3000;
+
+/// Merge placed parts sharing the SAME geometry (mesh content hash) AND colour into one world-baked part
+/// each: every instance's world transform is applied to its vertices, then same-key instances are unioned
+/// into a single mesh placed at identity. Visually identical (all triangles land at their real world
+/// positions) but collapses a high-instance assembly from tens of thousands of entities to a few hundred.
+/// Deterministic (`BTreeMap` key order).
+fn merge_by_geometry(parts: Vec<crate::step::TessPart>) -> Vec<crate::step::TessPart> {
+    use metrocalk_csg::TriMesh;
+    type Group = (
+        Vec<[f64; 3]>,
+        Vec<[u32; 3]>,
+        Option<[f32; 3]>,
+        String,
+        String,
+    );
+    let mut groups: std::collections::BTreeMap<(u128, [u32; 3]), Group> =
+        std::collections::BTreeMap::new();
+    for p in parts {
+        let hash = p.mesh.content_hash();
+        let ckey = p.color.map_or([u32::MAX; 3], |c| {
+            [c[0].to_bits(), c[1].to_bits(), c[2].to_bits()]
+        });
+        let entry = groups.entry((hash, ckey)).or_insert_with(|| {
+            (
+                Vec::new(),
+                Vec::new(),
+                p.color,
+                p.name.clone(),
+                p.reference.clone(),
+            )
+        });
+        let base = u32::try_from(entry.0.len()).unwrap_or(u32::MAX);
+        for v in &p.mesh.positions {
+            entry.0.push(apply_transform(&p.transform, *v));
+        }
+        for t in &p.mesh.triangles {
+            entry.1.push([
+                t[0].saturating_add(base),
+                t[1].saturating_add(base),
+                t[2].saturating_add(base),
+            ]);
+        }
+    }
+    groups
+        .into_values()
+        .map(
+            |(positions, triangles, color, name, reference)| crate::step::TessPart {
+                name,
+                reference,
+                transform: IDENTITY_4X4,
+                mesh: TriMesh::new(positions, triangles),
+                color,
+            },
+        )
+        .collect()
+}
+
+/// Apply a column-major rigid 4×4 to a point (implicit `w = 1`) — bakes an occurrence's world placement
+/// into its mesh vertices for [`merge_by_geometry`].
+fn apply_transform(m: &[f64; 16], p: [f64; 3]) -> [f64; 3] {
+    [
+        m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
+        m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
+        m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
+    ]
+}
 
 /// Map a low-level [`crate::step::StepError`] to the pipeline's [`CadError`].
 fn map_step_error(e: &crate::step::StepError) -> CadError {

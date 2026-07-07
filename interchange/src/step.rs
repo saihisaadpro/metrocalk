@@ -1342,6 +1342,482 @@ fn mesh_of_tessellated_solid(entities: &BTreeMap<u64, Entity>, id: u64) -> Optio
     Some(TriMesh::new(positions, triangles))
 }
 
+// ============================================================================================
+// The AP242 **exact B-rep assembly** reader (ADR-077 follow-up): place every product's exact
+// B-rep solids at their real world transform by walking the NEXT_ASSEMBLY_USAGE_OCCURRENCE
+// product tree. Commercial STEP exports (this 3DEXPERIENCE crane) carry curved/cast parts as
+// tessellation (handled by `parse_tessellated_assembly`) and the STRUCTURAL steel — plates,
+// beams, gussets — as exact `MANIFOLD_SOLID_BREP` in per-product shape reps at LOCAL coords,
+// placed only by the PDM assembly graph. Without this walk those (the bulk of the model) are
+// invisible. Planar faces are tessellated exactly (`CadScene::tessellate`); curved faces ride the
+// OCCT seam (a bolt hole / fillet is missing, the plate is not).
+// ============================================================================================
+
+/// The bound on placed B-rep occurrences (the decode-bomb / runaway-instancing guard).
+const MAX_BREP_PARTS: usize = 2_000_000;
+
+/// A product's tessellated B-rep, cached by product-definition id so an instanced part is triangulated
+/// once and cloned per occurrence: `(local welded mesh, authored colour, display name)`.
+type BrepMesh = (TriMesh, Option<[f32; 3]>, String);
+
+/// A single B-rep solid whose local geometry spans more than this in any axis is a **construction /
+/// reference artifact** (an unbounded plane exported as a giant plate, a symmetry body), not a real part —
+/// dropped so it never blows up the assembly's bounding box + camera framing. Generous: no physical member
+/// of a crane / weld station is a single 120 m solid (the real ones here top out ~30 m), while the artifacts
+/// are 262 m.
+const MAX_PART_EXTENT_MM: f64 = 120_000.0;
+
+/// Whether the file carries a `NEXT_ASSEMBLY_USAGE_OCCURRENCE` product-assembly graph — the signal that
+/// the B-rep **assembly** union leg applies. A single-product file with no assembly graph must instead
+/// take the exact planar-B-rep leg (exact fidelity + PMI + interpret()'s notes), not be hijacked into a
+/// "tessellation-only" diagnosis by the mere presence of its standard PRODUCT_DEFINITION/SDR structure.
+pub(crate) fn has_nauo(entities: &BTreeMap<u64, Entity>) -> bool {
+    entities
+        .values()
+        .any(|e| e.name == "NEXT_ASSEMBLY_USAGE_OCCURRENCE")
+}
+
+/// Walk the STEP product-assembly tree and place each product's exact B-rep solids at their composed
+/// world transform. Returns the placed parts (empty when the file has no NAUO product tree / no B-rep —
+/// the caller still has the tessellated-assembly parts and the planar single-file fallback) plus the
+/// **never-silent** notes: every curved-only product proxied, every construction-artifact solid filtered,
+/// and every per-face curved-surface approximation is named, never dropped without a word.
+pub(crate) fn parse_brep_assembly(
+    entities: &BTreeMap<u64, Entity>,
+) -> (Vec<TessPart>, Vec<UnsupportedNote>) {
+    let mut notes: Vec<UnsupportedNote> = Vec::new();
+    // (1) product_definition → ALL its SHAPE_REPRESENTATIONs.
+    let pd_to_sr = collect_pd_shape_reps(entities);
+    if pd_to_sr.is_empty() {
+        return (Vec::new(), notes);
+    }
+
+    // (2) Each NAUO occurrence's placement transform.
+    let nauo_xform = collect_nauo_transforms(entities);
+
+    // (3) The assembly edges (parent product-definition → (child, nauo)), and the roots (a
+    // product-definition that is never a child).
+    let mut children: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+    let mut is_child: BTreeSet<u64> = BTreeSet::new();
+    let mut all_pd: BTreeSet<u64> = BTreeSet::new();
+    for (id, e) in entities {
+        if e.name != "NEXT_ASSEMBLY_USAGE_OCCURRENCE" {
+            continue;
+        }
+        let refs: Vec<u64> = e.args.iter().filter_map(Value::as_ref_id).collect();
+        // NAUO(id, name, desc, relating_pd, related_pd, ref) — the last two refs are parent, child.
+        let (Some(&parent), Some(&child)) = (refs.get(refs.len().wrapping_sub(2)), refs.last())
+        else {
+            continue;
+        };
+        children.entry(parent).or_default().push((child, *id));
+        is_child.insert(child);
+        all_pd.insert(parent);
+        all_pd.insert(child);
+    }
+    let mut roots: Vec<u64> = all_pd
+        .iter()
+        .copied()
+        .filter(|p| !is_child.contains(p))
+        .collect();
+    // A single product with geometry but no assembly graph is its own root.
+    if roots.is_empty() {
+        roots = pd_to_sr.keys().copied().collect();
+    }
+    roots.sort_unstable();
+
+    // (4) Walk, composing transforms, tessellating each product's B-rep ONCE (cached — an instanced
+    // bolt is tessellated once and cloned per occurrence; land_cad dedups the GPU mesh by hash).
+    let colors = styled_colors(entities);
+    let mut mesh_cache: BTreeMap<u64, Option<BrepMesh>> = BTreeMap::new();
+    let mut out: Vec<TessPart> = Vec::new();
+    let mut on_path: BTreeSet<u64> = BTreeSet::new();
+    let mut reached: BTreeSet<u64> = BTreeSet::new();
+    for root in roots {
+        walk_brep(
+            entities,
+            root,
+            crate::cad_import::IDENTITY_4X4,
+            0,
+            &pd_to_sr,
+            &children,
+            &nauo_xform,
+            &colors,
+            &mut mesh_cache,
+            &mut on_path,
+            &mut reached,
+            &mut notes,
+            &mut out,
+        );
+    }
+    // (5) NEVER-SILENT: a product with geometry that is OUTSIDE the NAUO graph (a loose reference part, a
+    // second model in the same export, a fixture alongside the assembly) is never a child of any root —
+    // walk it at identity so its geometry still lands instead of silently vanishing.
+    let unreached: Vec<u64> = pd_to_sr
+        .keys()
+        .copied()
+        .filter(|pd| !reached.contains(pd))
+        .collect();
+    for pd in unreached {
+        walk_brep(
+            entities,
+            pd,
+            crate::cad_import::IDENTITY_4X4,
+            0,
+            &pd_to_sr,
+            &children,
+            &nauo_xform,
+            &colors,
+            &mut mesh_cache,
+            &mut on_path,
+            &mut reached,
+            &mut notes,
+            &mut out,
+        );
+    }
+    (out, notes)
+}
+
+/// Each `NEXT_ASSEMBLY_USAGE_OCCURRENCE` → its placement transform. A PRODUCT_DEFINITION_SHAPE whose
+/// definition is a NAUO is that occurrence's shape → find the
+/// `CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(rep_rel, pds)` that carries its ITEM_DEFINED_TRANSFORMATION.
+fn collect_nauo_transforms(entities: &BTreeMap<u64, Entity>) -> BTreeMap<u64, [f64; 16]> {
+    let mut pds_to_nauo: BTreeMap<u64, u64> = BTreeMap::new();
+    for (id, e) in entities {
+        if e.name == "PRODUCT_DEFINITION_SHAPE" {
+            if let Some(def) = e.args.iter().filter_map(Value::as_ref_id).next_back() {
+                if entities
+                    .get(&def)
+                    .is_some_and(|x| x.name == "NEXT_ASSEMBLY_USAGE_OCCURRENCE")
+                {
+                    pds_to_nauo.insert(*id, def);
+                }
+            }
+        }
+    }
+    let mut nauo_xform: BTreeMap<u64, [f64; 16]> = BTreeMap::new();
+    for e in entities.values() {
+        if e.name != "CONTEXT_DEPENDENT_SHAPE_REPRESENTATION" {
+            continue;
+        }
+        let refs: Vec<u64> = e.args.iter().filter_map(Value::as_ref_id).collect();
+        let (Some(&rep_rel), Some(&pds)) = (refs.first(), refs.get(1)) else {
+            continue;
+        };
+        let Some(&nauo) = pds_to_nauo.get(&pds) else {
+            continue;
+        };
+        if let Some(t) = occurrence_transform(entities, rep_rel) {
+            nauo_xform.insert(nauo, t);
+        }
+    }
+    nauo_xform
+}
+
+/// product_definition → ALL its SHAPE_REPRESENTATIONs (via `SHAPE_DEFINITION_REPRESENTATION(PDS(pd), sr)`).
+/// A multimap: AP242 exporters routinely attach several shape reps to one PRODUCT_DEFINITION (a
+/// geometry-bearing brep rep + a placement-only rep) — keeping only one would silently drop whichever rep
+/// lost the insert order.
+fn collect_pd_shape_reps(entities: &BTreeMap<u64, Entity>) -> BTreeMap<u64, Vec<u64>> {
+    let mut pd_to_sr: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for e in entities.values() {
+        if e.name != "SHAPE_DEFINITION_REPRESENTATION" {
+            continue;
+        }
+        let refs: Vec<u64> = e.args.iter().filter_map(Value::as_ref_id).collect();
+        let (Some(&pds), Some(&sr)) = (refs.first(), refs.get(1)) else {
+            continue;
+        };
+        if let Some(pd) = pds_definition(entities, pds) {
+            if entities
+                .get(&pd)
+                .is_some_and(|x| x.name == "PRODUCT_DEFINITION")
+            {
+                pd_to_sr.entry(pd).or_default().push(sr);
+            }
+        }
+    }
+    pd_to_sr
+}
+
+/// A `PRODUCT_DEFINITION_SHAPE` / `..._SHAPE_ASPECT` → the definition ref it characterises (a
+/// `PRODUCT_DEFINITION` for a part shape, or a `NEXT_ASSEMBLY_USAGE_OCCURRENCE` for an occurrence shape).
+fn pds_definition(entities: &BTreeMap<u64, Entity>, pds: u64) -> Option<u64> {
+    let e = entities.get(&pds)?;
+    // PRODUCT_DEFINITION_SHAPE(name, desc, #definition) — the definition is the last ref.
+    e.args
+        .iter()
+        .filter_map(Value::as_ref_id)
+        .next_back()
+        .filter(|d| entities.contains_key(d))
+}
+
+/// The relative placement transform an occurrence's representation-relationship carries: follow the
+/// `rep_rel` (a complex `REPRESENTATION_RELATIONSHIP + REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION +
+/// SHAPE_REPRESENTATION_RELATIONSHIP`) to its `ITEM_DEFINED_TRANSFORMATION(item1, item2)` and compose
+/// `M(item2) · M(item1)⁻¹` (item1 is the local origin frame, item2 the placement in the parent).
+fn occurrence_transform(entities: &BTreeMap<u64, Entity>, rep_rel: u64) -> Option<[f64; 16]> {
+    let e = entities.get(&rep_rel)?;
+    // The IDT is reachable from the (complex) rep-relationship — collect its refs and take the first
+    // that resolves to an ITEM_DEFINED_TRANSFORMATION.
+    let mut refs = Vec::new();
+    for a in &e.args {
+        collect_refs(a, &mut refs);
+    }
+    let idt = refs.into_iter().find(|r| {
+        entities
+            .get(r)
+            .is_some_and(|x| x.name == "ITEM_DEFINED_TRANSFORMATION")
+    })?;
+    let ie = entities.get(&idt)?;
+    let axes: Vec<u64> = ie.args.iter().filter_map(Value::as_ref_id).collect();
+    let (Some(&a1), Some(&a2)) = (axes.first(), axes.get(1)) else {
+        return None;
+    };
+    let m1 = axis_placement_matrix(entities, a1);
+    let m2 = axis_placement_matrix(entities, a2);
+    Some(crate::cad_import::mat4_mul(&m2, &rigid_inverse(&m1)))
+}
+
+/// The inverse of a rigid (rotation + translation, orthonormal basis) column-major 4×4 — exact for an
+/// `AXIS2_PLACEMENT_3D` frame (no scale/shear): `R⁻¹ = Rᵀ`, `t⁻¹ = −Rᵀt`.
+fn rigid_inverse(m: &[f64; 16]) -> [f64; 16] {
+    let t = [m[12], m[13], m[14]];
+    [
+        m[0],
+        m[4],
+        m[8],
+        0.0, // col0 = Rᵀ row 0
+        m[1],
+        m[5],
+        m[9],
+        0.0, // col1
+        m[2],
+        m[6],
+        m[10],
+        0.0, // col2
+        -(m[0] * t[0] + m[1] * t[1] + m[2] * t[2]),
+        -(m[4] * t[0] + m[5] * t[1] + m[6] * t[2]),
+        -(m[8] * t[0] + m[9] * t[1] + m[10] * t[2]),
+        1.0,
+    ]
+}
+
+/// Depth-first walk of the product-assembly tree: emit a placed part for each product carrying B-rep
+/// geometry, then recurse into child occurrences with the composed transform. Bounded depth + a
+/// current-path cycle guard (a malformed self-referential assembly is bounded, never a hang).
+#[allow(clippy::too_many_arguments)]
+fn walk_brep(
+    entities: &BTreeMap<u64, Entity>,
+    pd: u64,
+    world: [f64; 16],
+    depth: u32,
+    pd_to_sr: &BTreeMap<u64, Vec<u64>>,
+    children: &BTreeMap<u64, Vec<(u64, u64)>>,
+    nauo_xform: &BTreeMap<u64, [f64; 16]>,
+    colors: &BTreeMap<u64, [f32; 3]>,
+    cache: &mut BTreeMap<u64, Option<BrepMesh>>,
+    on_path: &mut BTreeSet<u64>,
+    reached: &mut BTreeSet<u64>,
+    notes: &mut Vec<UnsupportedNote>,
+    out: &mut Vec<TessPart>,
+) {
+    if depth > crate::cad_import::MAX_ASSEMBLY_DEPTH
+        || out.len() >= MAX_BREP_PARTS
+        || on_path.contains(&pd)
+    {
+        return;
+    }
+    reached.insert(pd);
+    // This product's own geometry (if any), tessellated once + cached (the product-level notes are pushed
+    // exactly once, at cache-fill).
+    if let Some(srs) = pd_to_sr.get(&pd) {
+        let entry = cache
+            .entry(pd)
+            .or_insert_with(|| tessellate_product_brep(entities, srs, colors, notes))
+            .clone();
+        if let Some((mesh, color, name)) = entry {
+            out.push(TessPart {
+                name,
+                reference: pd.to_string(),
+                transform: world,
+                mesh,
+                color,
+            });
+        }
+    }
+    on_path.insert(pd);
+    if let Some(kids) = children.get(&pd) {
+        for &(child, nauo) in kids {
+            if out.len() >= MAX_BREP_PARTS {
+                break;
+            }
+            let t = nauo_xform
+                .get(&nauo)
+                .copied()
+                .unwrap_or(crate::cad_import::IDENTITY_4X4);
+            let child_world = crate::cad_import::mat4_mul(&world, &t);
+            walk_brep(
+                entities,
+                child,
+                child_world,
+                depth + 1,
+                pd_to_sr,
+                children,
+                nauo_xform,
+                colors,
+                cache,
+                on_path,
+                reached,
+                notes,
+                out,
+            );
+        }
+    }
+    on_path.remove(&pd);
+}
+
+/// Tessellate all exact B-rep solids across a product's `SHAPE_REPRESENTATION`s into one welded local
+/// mesh (planar faces; curved faces ride the OCCT seam) + its authored colour + a display name. `None`
+/// when the reps carry no solid geometry at all (a pure sub-assembly placement node). **Never silent:**
+/// a curved-only product (faces present, planar tessellation empty) returns an EMPTY mesh — the pipeline
+/// diagnoses + proxies it downstream — and the per-face approximation notes + the construction-artifact
+/// filter each land in `notes`, so no real part vanishes without a word.
+fn tessellate_product_brep(
+    entities: &BTreeMap<u64, Entity>,
+    srs: &[u64],
+    colors: &BTreeMap<u64, [f32; 3]>,
+    notes: &mut Vec<UnsupportedNote>,
+) -> Option<BrepMesh> {
+    let mut name = String::new();
+    let mut faces: Vec<CadFace> = Vec::new();
+    let mut color: Option<[f32; 3]> = None;
+    let mut sink: Vec<UnsupportedNote> = Vec::new();
+    let mut first_sr = 0u64;
+    for &sr in srs {
+        let Some(e) = entities.get(&sr) else {
+            continue;
+        };
+        if first_sr == 0 {
+            first_sr = sr;
+        }
+        if name.is_empty() {
+            if let Some(Value::Str(s)) = e.args.first() {
+                if !s.trim().is_empty() {
+                    name.clone_from(s);
+                }
+            }
+        }
+        // Every item in the shape rep; a geometry item resolves to one or more shells, an axis item to none.
+        for item in refs_in(&e.args) {
+            let shells = brep_item_shells(entities, item);
+            if shells.is_empty() {
+                continue;
+            }
+            color = color.or_else(|| colors.get(&item).copied());
+            for shell in shells {
+                let Some(sh) = entities.get(&shell) else {
+                    continue;
+                };
+                let Some(face_refs) = sh.args.get(1).and_then(Value::as_list) else {
+                    continue;
+                };
+                for fr in face_refs {
+                    if let Some(fid) = fr.as_ref_id() {
+                        if let Ok(face) = interpret_face(entities, fid, &mut sink) {
+                            faces.push(face);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if name.is_empty() {
+        name = format!("solid #{first_sr}");
+    }
+    if faces.is_empty() {
+        return None; // no geometry in any rep — a pure placement node, nothing to show or explain
+    }
+    // Per-face approximations (curved surfaces the planar tessellator can't cover) are REPORTED, not
+    // discarded — one note per product naming the count (the raw sink is one note per face).
+    if !sink.is_empty() {
+        notes.push(UnsupportedNote {
+            feature: format!("B-rep product \"{name}\""),
+            detail: format!(
+                "{} curved face(s) approximated/skipped by the planar tessellator (exact curved \
+                 surfaces ride the OCCT seam)",
+                sink.len()
+            ),
+        });
+    }
+    let scene = CadScene {
+        name: String::new(),
+        format: String::new(),
+        units: Units {
+            meters_per_unit: 0.001,
+            kilograms_per_unit: 1.0,
+        },
+        solids: vec![CadSolid {
+            id: first_sr,
+            faces,
+        }],
+        pmi: Vec::new(),
+        notes: Vec::new(),
+    };
+    let mesh = scene.tessellate();
+    let extent = mesh_axis_extent(&mesh);
+    if mesh.triangle_count() > 0 && extent > MAX_PART_EXTENT_MM {
+        // The construction-artifact filter (an unbounded reference plane exported as a giant plate) —
+        // EXPLAINED, never silent: if this ever catches a real 120 m+ part (a runway rail, a hull block),
+        // the note names it and the threshold so the user knows exactly what to re-check.
+        notes.push(UnsupportedNote {
+            feature: format!("B-rep product \"{name}\""),
+            detail: format!(
+                "dropped as a construction/reference artifact: its solid spans {extent:.0} mm in \
+                 one axis (> the {MAX_PART_EXTENT_MM:.0} mm artifact threshold)"
+            ),
+        });
+        return None;
+    }
+    // A curved-only product tessellates to 0 triangles — return it EMPTY so the pipeline places a
+    // diagnosed proxy (never a silently-vanished part).
+    Some((mesh, color, name))
+}
+
+/// The largest per-axis extent of a mesh's local bounding box (the construction-artifact filter — a
+/// per-axis span, not the diagonal, so a long-but-real beam is kept while a 262 m reference plate is not).
+fn mesh_axis_extent(mesh: &TriMesh) -> f64 {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in &mesh.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    (0..3).map(|k| hi[k] - lo[k]).fold(0.0, f64::max)
+}
+
+/// The `CLOSED_SHELL` / `OPEN_SHELL` ids a geometry item resolves to — handles `MANIFOLD_SOLID_BREP`,
+/// `BREP_WITH_VOIDS`, `FACETED_BREP`, and `SHELL_BASED_SURFACE_MODEL` uniformly by collecting every
+/// shell reachable in the item's args (a non-geometry item — an `AXIS2_PLACEMENT_3D` — yields none).
+fn brep_item_shells(entities: &BTreeMap<u64, Entity>, item: u64) -> Vec<u64> {
+    let Some(e) = entities.get(&item) else {
+        return Vec::new();
+    };
+    let mut refs = Vec::new();
+    for a in &e.args {
+        collect_refs(a, &mut refs);
+    }
+    refs.into_iter()
+        .filter(|r| {
+            entities
+                .get(r)
+                .is_some_and(|x| x.name == "CLOSED_SHELL" || x.name == "OPEN_SHELL")
+        })
+        .collect()
+}
+
 /// A `(COMPLEX_)TRIANGULATED_FACE` → `(coordinates-list id, 0-based triangle indices INTO that list)`.
 /// **Structure-agnostic** (tolerates the AP242 variants): it finds the coordinates by following the arg that
 /// references a COORDINATES_LIST, the optional `pnindex` remap as the first bare-int list, and the connectivity

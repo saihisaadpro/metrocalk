@@ -33,8 +33,8 @@ pub use step::{
 pub use cad_import::ThreeDxmlReader;
 pub use cad_import::{
     build_import, diff, mat4_mul, mesh_hash, source_hash, tessellate_faces, translation_of,
-    CadError, CadImport, CadMesh, CadReader, FidelityCounts, ImportStrategy, PartChange, PartDiff,
-    PartFidelity, PartReport, PartSource, RawPart, StepAssemblyReader, IDENTITY_4X4,
+    CadError, CadImport, CadMesh, CadReader, FidelityCounts, GroupNode, ImportStrategy, PartChange,
+    PartDiff, PartFidelity, PartReport, PartSource, RawPart, StepAssemblyReader, IDENTITY_4X4,
     MAX_ASSEMBLY_DEPTH,
 };
 pub use urdf::UrdfInterchange;

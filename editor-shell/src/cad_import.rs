@@ -34,6 +34,10 @@ pub const CAD_PART: &str = "CadPart";
 pub struct CadLanding {
     /// One entity per part placement (never-empty: every one has a placed mesh).
     pub entities: Vec<EntityId>,
+    /// One geometry-free container entity per [`metrocalk_interchange::GroupNode`] (aligned with
+    /// `report.groups`) — the source's named assembly tree, preserved (not flattened), exactly as the live
+    /// app path lands it.
+    pub group_entities: Vec<EntityId>,
     /// The neutral never-silent report (fidelity counts, notes, per-part diagnosis + fix).
     pub report: CadImport,
     /// The count of UNIQUE meshes stored (the dedup denominator — instances share these).
@@ -59,6 +63,13 @@ impl std::fmt::Display for CadImportError {
 }
 
 impl std::error::Error for CadImportError {}
+
+/// Cheap magic-byte sniff: are these bytes a CAD container this pipeline handles (CATIA 3DXML / STEP AP242)?
+/// The live editor uses this to route a dropped/picked file to [`import_cad`] vs the mesh `import_any` path.
+#[must_use]
+pub fn is_cad_file(bytes: &[u8]) -> bool {
+    ThreeDxmlReader.can_read(bytes) || StepAssemblyReader.can_read(bytes)
+}
 
 /// Read `bytes` into a neutral [`CadImport`], routing by content: CATIA 3DXML (ZIP) → the native 3DXML reader;
 /// STEP AP242 (ISO-10303-21) → the pure-Rust neutral reader. Mesh formats (glTF/OBJ) ride the existing
@@ -120,13 +131,50 @@ pub fn land_import(
     let m_per_unit = report.units.meters_per_unit;
     let renderable = scene.caps.get(&canonical("Renderable")).copied();
 
-    let mut ops: Vec<Op> = Vec::with_capacity(report.parts.len() * 8);
+    let mut ops: Vec<Op> = Vec::with_capacity(report.parts.len() * 8 + report.groups.len() * 7);
+
+    // The NAMED structural tree first (report.groups is topological, parent-before-child): one geometry-
+    // free identity-transform container per assembly occurrence, marked `__meta__.kind = "group"` — the
+    // source's exact hierarchy/grouping/names, never flattened (mirrors the live `land_cad` path).
+    let mut group_entities = Vec::with_capacity(report.groups.len());
+    let mut src_to_entity: std::collections::BTreeMap<u64, EntityId> =
+        std::collections::BTreeMap::new();
+    for g in &report.groups {
+        let ge = engine.alloc_entity_id();
+        src_to_entity.insert(g.id, ge);
+        let parent = g.parent.and_then(|pid| src_to_entity.get(&pid).copied());
+        ops.push(Op::CreateEntity { id: ge, parent });
+        for (f, v) in [("x", 0.0), ("y", 0.0), ("z", 0.0), ("scale", 1.0)] {
+            ops.push(Op::SetField {
+                entity: ge,
+                component: "Transform".into(),
+                field: f.into(),
+                value: FieldValue::Number(v),
+            });
+        }
+        if !g.name.is_empty() {
+            ops.push(Op::SetField {
+                entity: ge,
+                component: metrocalk_core::variant::INSTANCE_META.into(),
+                field: "name".into(),
+                value: FieldValue::Str(g.name.clone()),
+            });
+        }
+        ops.push(Op::SetField {
+            entity: ge,
+            component: metrocalk_core::variant::INSTANCE_META.into(),
+            field: "kind".into(),
+            value: FieldValue::Str("group".into()),
+        });
+        group_entities.push(ge);
+    }
+
     let mut entities = Vec::with_capacity(report.parts.len());
     for p in &report.parts {
         let e = engine.alloc_entity_id();
         ops.push(Op::CreateEntity {
             id: e,
-            parent: None,
+            parent: p.parent.and_then(|pid| src_to_entity.get(&pid).copied()),
         });
         // Real placement (units-normalized) — the pivot/position, never the assembly-origin collapse. Both
         // the placement translation AND the mesh geometry live in the source units (mm), so we scale BOTH to
@@ -186,8 +234,131 @@ pub fn land_import(
     Ok(CadLanding {
         unique_meshes: handles.len(),
         entities,
+        group_entities,
         report,
     })
+}
+
+/// Whether a column-major 4×4's 3×3 basis is a **proper rigid rotation** (unit-length, mutually
+/// orthogonal columns, det > 0) — the precondition for the exact trace quaternion conversion. STEP
+/// `AXIS2_PLACEMENT_3D` frames always are; a CATIA 3DXML instance chain can carry a **mirror** (symmetry
+/// instances, det < 0) or scale in the basis, which NO quaternion represents — feeding one to the trace
+/// formulas emits a plausible-looking but silently wrong rotation.
+#[must_use]
+pub fn basis_is_rigid(m: &[f64; 16]) -> bool {
+    let col = |i: usize| [m[i * 4], m[i * 4 + 1], m[i * 4 + 2]];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let (x, y, z) = (col(0), col(1), col(2));
+    let eps = 1e-4;
+    let det = x[0] * (y[1] * z[2] - y[2] * z[1]) - y[0] * (x[1] * z[2] - x[2] * z[1])
+        + z[0] * (x[1] * y[2] - x[2] * y[1]);
+    (dot(x, x) - 1.0).abs() < eps
+        && (dot(y, y) - 1.0).abs() < eps
+        && (dot(z, z) - 1.0).abs() < eps
+        && dot(x, y).abs() < eps
+        && dot(y, z).abs() < eps
+        && dot(x, z).abs() < eps
+        && det > 0.0
+}
+
+/// Bake a transform's 3×3 basis (rotation **including** any mirror/scale a quaternion can't carry) into
+/// the mesh's vertices — the placement fallback for a non-rigid instance basis. The translation is NOT
+/// applied (the entity still carries it), so instances of the same mirrored geometry still dedup.
+#[must_use]
+pub fn bake_basis_into_mesh(
+    m: &[f64; 16],
+    mesh: &metrocalk_csg::TriMesh,
+) -> metrocalk_csg::TriMesh {
+    let positions = mesh
+        .positions
+        .iter()
+        .map(|p| {
+            [
+                m[0] * p[0] + m[4] * p[1] + m[8] * p[2],
+                m[1] * p[0] + m[5] * p[1] + m[9] * p[2],
+                m[2] * p[0] + m[6] * p[1] + m[10] * p[2],
+            ]
+        })
+        .collect();
+    metrocalk_csg::TriMesh::new(positions, mesh.triangles.clone())
+}
+
+/// One persisted **derived** CAD render mesh (bincode, in the app's `metrocalk-cad-meshes` sidecar): the
+/// unique (geometry, colour) mesh the live import registered on the GPU, keyed by its handle — so a saved
+/// scene's `MeshRenderer.mesh = "mtkcad:…"` re-resolves after restart + open **without re-parsing the
+/// multi-hundred-MB source container** (the boot cost is deserialize + GPU upload, proportional to the
+/// ~dozens of unique meshes, not the 262 MB file). Without this, every imported CAD part silently degraded
+/// to a placeholder cube on reload — the never-silent violation the adversarial review flagged.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PersistedCadMesh {
+    /// The exact handle the doc's `MeshRenderer.mesh` field carries (`mtkcad:<geom-hash>[:<rgb>]`).
+    pub handle: String,
+    pub positions: Vec<[f64; 3]>,
+    pub triangles: Vec<[u32; 3]>,
+    pub color: Option<[f32; 3]>,
+}
+
+/// Persist one derived CAD render mesh into `dir`, keyed by its handle (`:` → `-` for a valid filename).
+/// The caller logs a failure (never-silent) — a part that can't persist still renders this session.
+///
+/// # Errors
+/// Any I/O error creating the dir or writing the record.
+pub fn persist_cad_mesh(
+    dir: &std::path::Path,
+    handle: &str,
+    mesh: &metrocalk_csg::TriMesh,
+    color: Option<[f32; 3]>,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let rec = PersistedCadMesh {
+        handle: handle.to_string(),
+        positions: mesh.positions.clone(),
+        triangles: mesh.triangles.clone(),
+        color,
+    };
+    let bytes = bincode::serialize(&rec).map_err(std::io::Error::other)?;
+    std::fs::write(dir.join(format!("{}.bin", handle.replace(':', "-"))), bytes)
+}
+
+/// Load every persisted CAD render mesh from `dir` (boot-time restore): each record becomes the same
+/// colour-baked [`metrocalk_assets::MeshAsset`] the live import built, under the SAME handle. A corrupt
+/// record is skipped with a log line (never trusted, never a boot abort); order is deterministic (sorted
+/// by handle, not OS dir order).
+#[must_use]
+pub fn load_persisted_cad_meshes(
+    dir: &std::path::Path,
+) -> Vec<(String, metrocalk_assets::MeshAsset)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out; // no sidecar yet — no CAD was ever imported
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!(
+                "[shell] cad-mesh sidecar {} unreadable — skipped",
+                path.display()
+            );
+            continue;
+        };
+        match bincode::deserialize::<PersistedCadMesh>(&bytes) {
+            Ok(rec) => {
+                let mesh = metrocalk_csg::TriMesh::new(rec.positions, rec.triangles);
+                let asset =
+                    crate::csg_intent::trimesh_to_mesh_asset_colored(&mesh, "cad", rec.color);
+                out.push((rec.handle, asset));
+            }
+            Err(e) => eprintln!(
+                "[shell] cad-mesh sidecar {} corrupt — skipped: {e}",
+                path.display()
+            ),
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// The **O(1) content-addressed re-import diff**: which of the N parts changed between two imports of the same

@@ -16,8 +16,8 @@
 //! [`CadError`] or a diagnosed proxy, **never a panic**.
 
 use super::{
-    build_import, mat4_mul, source_hash, CadError, CadImport, CadReader, PartSource, RawPart,
-    IDENTITY_4X4, MAX_ASSEMBLY_DEPTH,
+    build_import, mat4_mul, source_hash, CadError, CadImport, CadReader, GroupNode, PartSource,
+    RawPart, IDENTITY_4X4, MAX_ASSEMBLY_DEPTH,
 };
 use crate::{Units, UnsupportedNote};
 use metrocalk_csg::TriMesh;
@@ -363,7 +363,7 @@ fn read_3dxml(bytes: &[u8]) -> Result<CadImport, CadError> {
     roots.sort_unstable();
 
     let mut raw_parts: Vec<RawPart> = Vec::new();
-    let mut structural = 0usize;
+    let mut groups: Vec<GroupNode> = Vec::new();
     let mut visits: u64 = 0;
     for &r in &roots {
         let mut on_path: BTreeSet<u64> = BTreeSet::new();
@@ -373,10 +373,11 @@ fn read_3dxml(bytes: &[u8]) -> Result<CadImport, CadError> {
             IDENTITY_4X4,
             0,
             path_combine(ROOT_PATH_HASH, r),
+            None, // a forest root has no parent group
             &ps,
             &sniff,
             &mut raw_parts,
-            &mut structural,
+            &mut groups,
             &mut on_path,
             &mut visits,
         );
@@ -398,6 +399,7 @@ fn read_3dxml(bytes: &[u8]) -> Result<CadImport, CadError> {
             ref_id,
             path_combine(ROOT_PATH_HASH, ref_id),
             IDENTITY_4X4,
+            None, // a disconnected reference has no assembly parent — a top-level part
             &ps,
             &sniff,
             &mut raw_parts,
@@ -447,6 +449,15 @@ fn read_3dxml(bytes: &[u8]) -> Result<CadImport, CadError> {
             ),
         });
     }
+    if groups.len() >= MAX_PARTS {
+        notes.push(UnsupportedNote {
+            feature: "structural-node cap".into(),
+            detail: format!(
+                "the assembly walk hit the {MAX_PARTS}-structural-node cap — subtrees beyond it were not \
+                 expanded (bounded, never a hang; unreached geometry is origin-placed + reported below)"
+            ),
+        });
+    }
     if ps.ref_geom.is_empty() {
         notes.push(UnsupportedNote {
             feature: "no geometry".into(),
@@ -484,7 +495,7 @@ fn read_3dxml(bytes: &[u8]) -> Result<CadImport, CadError> {
         },
         source_hash(bytes),
         raw_parts,
-        structural,
+        groups,
         notes,
     );
     // The honest headline numbers: the raw source instance count (the research's "1,280") + the number of
@@ -520,6 +531,7 @@ fn emit_geometry(
     ref_id: u64,
     path_hash: u64,
     world: [f64; 16],
+    parent: Option<u64>,
     ps: &ProductStructure,
     sniff: &BTreeMap<String, RepSniff>,
     out: &mut Vec<RawPart>,
@@ -572,35 +584,71 @@ fn emit_geometry(
             // 3DXML per-part colour (SurfaceAttributes/Color) is a follow-up; the proprietary-rep proxy uses
             // the viewer default for now.
             color: None,
+            // The named assembly occurrence (GroupNode) this part nests under — preserves the source tree.
+            parent,
         });
     }
     true
 }
 
-/// Depth-first assembly walk: compose transforms, emit a part per geometry-bearing occurrence. `visits` is a
-/// global work counter (the diamond-DAG bound); a walk beyond [`MAX_WALK_VISITS`] stops (surfaced by the
-/// caller as a note), never hangs.
+/// A fixed salt mixed into an occurrence's path hash to derive its [`GroupNode`] id, keeping the structural
+/// container distinct from its own leaf part ids (the bare path hash / `path_combine(path_hash, rep_id)`) in
+/// the id→entity map. Chosen far above any plausible source rep id so the (probabilistic, like the whole
+/// path-hash scheme) collision floor is the same 64-bit guarantee the leaf ids already rely on.
+const GROUP_ID_SALT: u64 = 0xA55E_3B19_6D01_0007;
+
+/// The stable id of the [`GroupNode`] for an assembly occurrence with the given path hash.
+fn occurrence_group_id(path_hash: u64) -> u64 {
+    path_combine(path_hash, GROUP_ID_SALT)
+}
+
+/// Depth-first assembly walk: compose transforms, emit a part per geometry-bearing occurrence, AND build the
+/// **named structural tree** — each assembly occurrence (a reference WITH children) becomes a [`GroupNode`]
+/// and every leaf part / child group records it as `parent`, so the source's exact hierarchy + grouping +
+/// names are preserved. Approach: identity organizational groups + world-composed leaf transforms, so
+/// placement stays byte-identical to the flat walk (the group carries no transform). `visits` is the global
+/// diamond-DAG work bound; a walk beyond [`MAX_WALK_VISITS`] stops (surfaced as a note), never hangs.
 #[allow(clippy::too_many_arguments)]
 fn walk(
     ref_id: u64,
     world: [f64; 16],
     depth: u32,
     path_hash: u64,
+    parent_group: Option<u64>,
     ps: &ProductStructure,
     sniff: &BTreeMap<String, RepSniff>,
     out: &mut Vec<RawPart>,
-    structural: &mut usize,
+    groups: &mut Vec<GroupNode>,
     on_path: &mut BTreeSet<u64>,
     visits: &mut u64,
 ) {
     *visits += 1;
-    if depth > MAX_ASSEMBLY_DEPTH || out.len() >= MAX_PARTS || *visits > MAX_WALK_VISITS {
+    if depth > MAX_ASSEMBLY_DEPTH
+        || out.len() >= MAX_PARTS
+        || groups.len() >= MAX_PARTS
+        || *visits > MAX_WALK_VISITS
+    {
         return;
     }
+    let has_children = ps.children.get(&ref_id).is_some_and(|c| !c.is_empty());
+    // A reference WITH children is an assembly occurrence → materialize a NAMED group container; its own
+    // geometry + child occurrences nest under it. A pure leaf (no children) needs no self-group — its geometry
+    // nests directly under the enclosing parent group (no redundant "Bolt › Bolt" wrapping).
+    let group_for_children = if has_children {
+        let gid = occurrence_group_id(path_hash);
+        let name = ps.ref_name.get(&ref_id).cloned().unwrap_or_default();
+        groups.push(GroupNode {
+            id: gid,
+            name,
+            parent: parent_group,
+        });
+        Some(gid)
+    } else {
+        parent_group
+    };
     // This reference's own geometry (a ref can be both a sub-assembly and carry rep(s)).
-    let has_geom = emit_geometry(ref_id, path_hash, world, ps, sniff, out);
+    emit_geometry(ref_id, path_hash, world, group_for_children, ps, sniff, out);
     // Recurse into sub-assembly children.
-    let mut recursed = false;
     if let Some(children) = ps.children.get(&ref_id) {
         for edge in children {
             if *visits > MAX_WALK_VISITS {
@@ -609,7 +657,6 @@ fn walk(
             if on_path.contains(&edge.instance_of) {
                 continue; // cycle guard — never revisit a reference already on the current path
             }
-            recursed = true;
             on_path.insert(edge.instance_of);
             let child_world = mat4_mul(&world, &edge.matrix);
             walk(
@@ -617,19 +664,16 @@ fn walk(
                 child_world,
                 depth + 1,
                 path_combine(path_hash, edge.inst_id),
+                group_for_children,
                 ps,
                 sniff,
                 out,
-                structural,
+                groups,
                 on_path,
                 visits,
             );
             on_path.remove(&edge.instance_of);
         }
-    }
-    // A node that neither carries geometry nor is a pure structural passthrough … count structural nodes.
-    if !has_geom && recursed {
-        *structural += 1;
     }
 }
 

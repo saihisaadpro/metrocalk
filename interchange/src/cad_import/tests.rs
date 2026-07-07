@@ -47,6 +47,7 @@ fn raw(id: u64, source: PartSource) -> RawPart {
         transform: IDENTITY_4X4,
         source,
         color: None,
+        parent: None,
     }
 }
 
@@ -74,7 +75,7 @@ fn the_cascade_places_and_diagnoses_every_hard_case_never_a_black_hole() {
         Units::SI,
         123,
         parts,
-        0,
+        vec![],
         vec![],
     );
     // NEVER-EMPTY: all three render (as the shared proxy) — a part that would 0-triangle-fail in Datasmith
@@ -110,12 +111,90 @@ fn a_zero_triangle_tessellation_cache_is_diagnosed_never_a_silent_success() {
         Units::SI,
         1,
         vec![raw(1, PartSource::Tessellation(empty))],
-        0,
+        vec![],
         vec![],
     );
     assert!(imp.never_empty(), "the 0-tri part still gets a proxy");
     assert_eq!(imp.parts[0].fidelity, PartFidelity::Failed);
     assert!(imp.parts[0].mesh.is_some());
+}
+
+// ── The B-rep NAUO assembly leg: never-silent under the adversarial-review failure modes ─────────────────
+
+/// An NAUO assembly whose root carries a 200 m construction-artifact plane, one planar child, one
+/// CURVED-ONLY child (no tessellation twin), a product OUTSIDE the NAUO graph, and a dual-SDR product
+/// (a geometry rep + a later placement-only rep).
+const ASSEMBLY_NEVER_SILENT_STEP: &str =
+    include_str!("../../tests/fixtures/assembly_never_silent.step");
+
+#[test]
+fn brep_assembly_never_silently_drops_a_product() {
+    let imp = StepAssemblyReader
+        .read(ASSEMBLY_NEVER_SILENT_STEP.as_bytes())
+        .expect("import");
+    assert!(imp.never_empty());
+    assert!(imp.never_silent());
+    let by_name = |n: &str| imp.parts.iter().find(|p| p.name.contains(n));
+    // A product OUTSIDE the NAUO graph (a loose reference part / second model), with its geometry in the
+    // FIRST of two shape reps, still lands — pre-fix it was never walked AND its geometry rep was
+    // clobbered by the later placement-only rep (silently vanished twice over).
+    let loose = by_name("loose").expect("the loose product is placed, not dropped");
+    assert!(
+        imp.meshes[loose.mesh.unwrap()].tris.triangle_count() > 0,
+        "real geometry, not a proxy"
+    );
+    // The planar NAUO child lands as real geometry.
+    let plate = by_name("plate").expect("the plate child is placed");
+    assert!(!imp.meshes[plate.mesh.unwrap()].is_proxy);
+    // A CURVED-ONLY product (planar tessellation empty) is PLACED as a diagnosed proxy — pre-fix it
+    // silently vanished (the exact Datasmith failure the thesis forbids) …
+    let shaft = by_name("shaft").expect("the curved-only product is placed (proxy), not dropped");
+    assert_eq!(shaft.fidelity, PartFidelity::Failed);
+    assert!(imp.meshes[shaft.mesh.unwrap()].is_proxy);
+    // … and its curved faces are NAMED in the notes (the per-face sink is no longer discarded).
+    assert!(
+        imp.notes.iter().any(|n| n.detail.contains("curved face")),
+        "curved-face note surfaced: {:?}",
+        imp.notes
+    );
+    // The 200 m construction artifact is dropped WITH a note naming it + the threshold, never silently.
+    assert!(
+        imp.notes
+            .iter()
+            .any(|n| n.detail.contains("construction/reference artifact")),
+        "extent-filter note surfaced: {:?}",
+        imp.notes
+    );
+    assert!(
+        by_name("root").is_none(),
+        "the artifact plane itself is not placed"
+    );
+}
+
+#[test]
+fn a_single_product_planar_step_keeps_the_exact_brep_leg() {
+    // A real single-product planar AP242 file carries the standard PRODUCT_DEFINITION/SDR structure; its
+    // mere presence must NOT hijack the file into the tessellation leg with a false "tessellation-only /
+    // re-export as AP242" diagnosis — with no NAUO assembly graph it takes the exact planar leg.
+    let idx = CUBE_STEP.rfind("ENDSEC;").expect("fixture has a DATA end");
+    let with_product = format!(
+        "{}#110 = PRODUCT_DEFINITION('cube','',$,$);\n\
+         #111 = PRODUCT_DEFINITION_SHAPE('','',#110);\n\
+         #112 = SHAPE_REPRESENTATION('cube rep',(#109),$);\n\
+         #113 = SHAPE_DEFINITION_REPRESENTATION(#111,#112);\n{}",
+        &CUBE_STEP[..idx],
+        &CUBE_STEP[idx..]
+    );
+    let imp = StepAssemblyReader
+        .read(with_product.as_bytes())
+        .expect("import");
+    assert_eq!(imp.part_count(), 1);
+    assert_eq!(
+        imp.parts[0].fidelity,
+        PartFidelity::ExactBrep,
+        "exact fidelity — not a false 'tessellation-only' diagnosis"
+    );
+    assert_eq!(imp.parts[0].strategy, ImportStrategy::ExactBrep);
 }
 
 // ── Dedup / instancing (CAD is bolt-heavy) ──────────────────────────────────────────────────────────────
@@ -135,6 +214,7 @@ fn identical_geometry_dedups_to_one_mesh_and_instances() {
             transform: IDENTITY_4X4,
             source: PartSource::ExactBrep(faces.clone()),
             color: None,
+            parent: None,
         },
         RawPart {
             id: 2,
@@ -143,6 +223,7 @@ fn identical_geometry_dedups_to_one_mesh_and_instances() {
             transform: t2,
             source: PartSource::ExactBrep(faces),
             color: None,
+            parent: None,
         },
     ];
     let imp = build_import(
@@ -151,7 +232,7 @@ fn identical_geometry_dedups_to_one_mesh_and_instances() {
         Units::SI,
         9,
         parts,
-        0,
+        vec![],
         vec![],
     );
     assert_eq!(imp.meshes.len(), 1, "identical geometry → ONE unique mesh");
@@ -227,6 +308,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
                 transform: IDENTITY_4X4,
                 source: PartSource::ExactBrep(faces.clone()),
                 color: None,
+                parent: None,
             },
             RawPart {
                 id: 2,
@@ -235,6 +317,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
                 transform: IDENTITY_4X4,
                 source: PartSource::ExactBrep(faces.clone()),
                 color: None,
+                parent: None,
             },
             RawPart {
                 id: 3,
@@ -243,10 +326,19 @@ fn reimport_diff_detects_moved_changed_added_removed() {
                 transform: IDENTITY_4X4,
                 source: PartSource::Encrypted,
                 color: None,
+                parent: None,
             },
         ]
     };
-    let before = build_import("v1".into(), "TEST".into(), Units::SI, 1, base(), 0, vec![]);
+    let before = build_import(
+        "v1".into(),
+        "TEST".into(),
+        Units::SI,
+        1,
+        base(),
+        vec![],
+        vec![],
+    );
 
     // v2: part 2 moved; part 3 removed; part 4 added; part 1 unchanged.
     let mut moved = IDENTITY_4X4;
@@ -259,6 +351,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
             transform: IDENTITY_4X4,
             source: PartSource::ExactBrep(faces.clone()),
             color: None,
+            parent: None,
         },
         RawPart {
             id: 2,
@@ -267,6 +360,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
             transform: moved,
             source: PartSource::ExactBrep(faces.clone()),
             color: None,
+            parent: None,
         },
     ];
     after_parts.push(RawPart {
@@ -276,6 +370,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
         transform: IDENTITY_4X4,
         source: PartSource::ExactBrep(faces),
         color: None,
+        parent: None,
     });
     let after = build_import(
         "v2".into(),
@@ -283,7 +378,7 @@ fn reimport_diff_detects_moved_changed_added_removed() {
         Units::SI,
         2,
         after_parts,
-        0,
+        vec![],
         vec![],
     );
 

@@ -170,6 +170,103 @@ fn the_3dxml_import_is_deterministic_across_runs() {
 }
 
 #[test]
+fn the_source_hierarchy_is_preserved_as_a_named_group_tree() {
+    // The user's ask: imported CAD keeps its original hierarchy / grouping / names, not a flat pile of hex ids.
+    let bytes = skid_3dxml();
+    let imp = ThreeDxmlReader.read(&bytes).expect("import the 3dxml");
+
+    // The root assembly is preserved as ONE named GROUP container (the source `V_Name`), at the top of the tree.
+    assert_eq!(
+        imp.groups.len(),
+        1,
+        "the root assembly is one group container"
+    );
+    assert_eq!(
+        imp.structural_nodes,
+        imp.groups.len(),
+        "the structural-node count mirrors the emitted tree"
+    );
+    let root = &imp.groups[0];
+    assert_eq!(
+        root.name, "Skid Test Assembly",
+        "the source product name survives on the group (not a bare id)"
+    );
+    assert_eq!(root.parent, None, "the product root is a forest root");
+
+    // Every leaf part nests UNDER a real named group (its source assembly occurrence) — grouping preserved.
+    let group_ids: std::collections::BTreeSet<u64> = imp.groups.iter().map(|g| g.id).collect();
+    assert!(
+        imp.parts
+            .iter()
+            .all(|p| p.parent.is_some_and(|pid| group_ids.contains(&pid))),
+        "every part is parented under a named group (the source tree), never orphaned/flat"
+    );
+    assert!(
+        imp.parts.iter().all(|p| p.parent == Some(root.id)),
+        "the three occurrences group under the root assembly exactly as the source nests them"
+    );
+}
+
+#[test]
+fn nested_subassemblies_are_preserved_as_a_multi_level_group_tree() {
+    // root(1 "Weld Line") aggregates sub(2 "Robot Cell") via inst 10; the cell aggregates part(3 "Weld Bolt")
+    // via inst 20 (at x=100); the part carries an open rep. Expect a 2-level tree: Weld Line › Robot Cell ›
+    // (bolt leaf), with the leaf's transform WORLD-composed down the tree.
+    let product = r#"<?xml version="1.0"?>
+<Model_3dxml xmlns="http://www.3ds.com/xsd/3DXML">
+ <ProductStructure root="1">
+  <Reference3D id="1" name="line"><V_Name>Weld Line</V_Name></Reference3D>
+  <Reference3D id="2" name="cell"><V_Name>Robot Cell</V_Name></Reference3D>
+  <Reference3D id="3" name="bolt"><V_Name>Weld Bolt</V_Name></Reference3D>
+  <ReferenceRep id="4" associatedFile="urn:3DXML:bolt.3DRep"><V_Name>Bolt Rep</V_Name></ReferenceRep>
+  <InstanceRep id="40"><IsAggregatedBy>3</IsAggregatedBy><IsInstanceOf>4</IsInstanceOf></InstanceRep>
+  <Instance3D id="10"><IsAggregatedBy>1</IsAggregatedBy><IsInstanceOf>2</IsInstanceOf><RelativeMatrix>1 0 0 0 1 0 0 0 1 0 0 0</RelativeMatrix></Instance3D>
+  <Instance3D id="20"><IsAggregatedBy>2</IsAggregatedBy><IsInstanceOf>3</IsInstanceOf><RelativeMatrix>1 0 0 0 1 0 0 0 1 100 0 0</RelativeMatrix></Instance3D>
+ </ProductStructure>
+</Model_3dxml>"#;
+    let bytes = build_zip(&[
+        ("Manifest.xml", MANIFEST.as_bytes()),
+        ("PRODUCT.3dxml", product.as_bytes()),
+        ("bolt.3DRep", OPEN_REP.as_bytes()),
+    ]);
+    let imp = ThreeDxmlReader.read(&bytes).expect("import");
+    assert!(imp.never_empty() && imp.never_silent());
+
+    // TWO groups (Weld Line, Robot Cell) — the two assembly levels; the bolt is a leaf under the cell.
+    assert_eq!(imp.groups.len(), 2, "two assembly levels → two group nodes");
+    let by_name = |n: &str| {
+        imp.groups
+            .iter()
+            .find(|g| g.name == n)
+            .expect("group present")
+    };
+    let line = by_name("Weld Line");
+    let cell = by_name("Robot Cell");
+    assert_eq!(line.parent, None, "the line is the forest root");
+    assert_eq!(
+        cell.parent,
+        Some(line.id),
+        "the cell nests under the line (real multi-level nesting, not flattened)"
+    );
+
+    // The single bolt part nests under the CELL (the deepest assembly), exactly as the source nests it.
+    assert_eq!(imp.part_count(), 1);
+    assert_eq!(
+        imp.parts[0].parent,
+        Some(cell.id),
+        "the part nests under its immediate sub-assembly"
+    );
+    assert_eq!(imp.parts[0].name, "Bolt Rep", "the human name survives");
+    // Placement stays world-composed down the tree (identity cell + x=100 bolt → world x=100) — the leaf keeps
+    // its true world transform, so the identity group containers never perturb placement.
+    assert_eq!(
+        translation_of(&imp.parts[0].transform)[0],
+        100.0,
+        "the leaf transform is world-composed down the assembly tree"
+    );
+}
+
+#[test]
 fn a_missing_rep_is_a_diagnosed_proxy_never_silent() {
     // The ZIP references native.3DRep but doesn't include it → the part is placed + diagnosed, never dropped.
     let bytes = build_zip(&[

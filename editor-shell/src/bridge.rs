@@ -236,7 +236,7 @@ pub fn apply_edit<W: World>(engine: &mut Engine<W>, tx: &EditTx) -> ProjectionDe
 /// same way (ADR-006). No `confirms`/`rejects` — it's a server-initiated load, not an echo.
 pub fn project_full<W: World>(engine: &Engine<W>) -> ProjectionDelta {
     let mut ops = Vec::new();
-    for id in engine.entity_ids() {
+    for id in preorder_entities(engine) {
         let key = id.to_loro_key();
         let parent = engine.parent_of(id).map(|p| p.to_loro_key());
         let comps = engine.components_of(id);
@@ -272,6 +272,45 @@ pub fn project_full<W: World>(engine: &Engine<W>) -> ProjectionDelta {
         rejects: vec![],
         full: true, // a FULL re-projection → the UI store REPLACES (drops stale entities/edges, e.g. on undo)
     }
+}
+
+/// Entities in **tree pre-order** (each parent immediately followed by its whole subtree) instead of raw
+/// storage order. The hierarchy panel lists entities in arrival order, so this makes a nested scene — an
+/// imported CAD assembly, a composed character — READ as its real tree (a group and its parts contiguous),
+/// not scrambled by ECS archetype/storage order. **Stable + flat-preserving:** siblings keep their engine
+/// order, and a scene with no parent relationships emits in the exact same order as `entity_ids()` (zero
+/// change). Cycle-safe (a `visited` set) and never drops an entity (any unreached one is appended in order).
+fn preorder_entities<W: World>(engine: &Engine<W>) -> Vec<EntityId> {
+    let ids = engine.entity_ids();
+    // Children bucketed by parent, preserving engine order among siblings (`None` ⇒ a root).
+    let mut children: HashMap<Option<EntityId>, Vec<EntityId>> = HashMap::new();
+    for &id in &ids {
+        children.entry(engine.parent_of(id)).or_default().push(id);
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    let mut visited: HashSet<EntityId> = HashSet::new();
+    // Iterative DFS from the roots; push children reversed so they pop in forward (stable) order.
+    let mut stack: Vec<EntityId> = children.get(&None).cloned().unwrap_or_default();
+    stack.reverse();
+    while let Some(id) = stack.pop() {
+        if !visited.insert(id) {
+            continue; // guards against a (validated-impossible) parent cycle — never a hang
+        }
+        out.push(id);
+        if let Some(kids) = children.get(&Some(id)) {
+            for &k in kids.iter().rev() {
+                stack.push(k);
+            }
+        }
+    }
+    // Safety net: any entity whose parent is outside the id set (a dangling parent) is unreached above —
+    // append it (in engine order) so the projection NEVER silently drops an entity.
+    for &id in &ids {
+        if visited.insert(id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// Project a **single** entity into a delta — an `upsert` + one `setField` per component field. The
@@ -389,12 +428,25 @@ pub fn enrich_relational<W: World>(
     // Component names per upserted id, from THIS delta's `SetField` ops (so `kind` needs no extra fetch).
     // Owned (not `&str` into `delta.ops`) so the mutable pass below doesn't conflict with this borrow.
     let mut comp_names: HashMap<String, Vec<String>> = HashMap::new();
+    // CAD-import assembly containers self-mark `__meta__.kind == "group"` — collect them so the hierarchy
+    // renders them as named FOLDERS (the reserved `is_group` + the "group" type-icon), preserving the source's
+    // grouping visually (assemblies vs parts), not just the parent edges.
+    let mut group_ids: HashSet<String> = HashSet::new();
     for op in &delta.ops {
-        if let ProjectionOp::SetField { id, component, .. } = op {
+        if let ProjectionOp::SetField {
+            id,
+            component,
+            field,
+            value,
+        } = op
+        {
             comp_names
                 .entry(id.clone())
                 .or_default()
                 .push(component.clone());
+            if component == "__meta__" && field == "kind" && value.as_str() == Some("group") {
+                group_ids.insert(id.clone());
+            }
         }
     }
     // One bindings scan → from-entity → its bound providers (for `bound` + the satisfaction set).
@@ -437,14 +489,18 @@ pub fn enrich_relational<W: World>(
             tos.len()
         });
         let needs_binding = req_caps.iter().any(|c| !satisfied.contains(c));
+        let is_group = group_ids.contains(id.as_str());
         *rel = Some(RelSummary {
             requires,
             provides,
             bound,
             needs_binding,
-            is_group: false,
+            is_group,
         });
-        if let Some(cs) = comp_names.get(id.as_str()) {
+        // A group container renders as a folder; otherwise classify the salient type from the components.
+        if is_group {
+            *kind = Some("group".into());
+        } else if let Some(cs) = comp_names.get(id.as_str()) {
             *kind = Some(classify_kind(cs));
         }
     }
@@ -487,5 +543,73 @@ mod tests {
         assert_eq!(classify_kind(&["Transform"]), "default");
         // a renderable requirer (HealthBar + a mesh) reads as a requirer (the binding state is the salient cue)
         assert_eq!(classify_kind(&["HealthBar", "MeshRenderer"]), "requirer");
+    }
+
+    #[test]
+    fn preorder_entities_reads_a_hierarchy_as_a_contiguous_tree_never_dropping_an_entity() {
+        use metrocalk_core::{Engine, Op};
+        use metrocalk_ecs::FlecsWorld;
+        let mut engine = Engine::new(FlecsWorld::new(), 1);
+        // A tree — root R → { A → A1, B } — plus a flat sibling F with no parent (the imported-assembly shape).
+        let (r, a, a1, b, f) = (
+            engine.alloc_entity_id(),
+            engine.alloc_entity_id(),
+            engine.alloc_entity_id(),
+            engine.alloc_entity_id(),
+            engine.alloc_entity_id(),
+        );
+        engine
+            .commit(
+                "seed-tree",
+                vec![
+                    Op::CreateEntity {
+                        id: r,
+                        parent: None,
+                    },
+                    Op::CreateEntity {
+                        id: a,
+                        parent: Some(r),
+                    },
+                    Op::CreateEntity {
+                        id: a1,
+                        parent: Some(a),
+                    },
+                    Op::CreateEntity {
+                        id: b,
+                        parent: Some(r),
+                    },
+                    Op::CreateEntity {
+                        id: f,
+                        parent: None,
+                    },
+                ],
+            )
+            .expect("commit the tree");
+
+        let order = preorder_entities(&engine);
+        let pos = |e: EntityId| order.iter().position(|&x| x == e).expect("entity present");
+
+        // NEVER drops an entity — every id appears exactly once (the projection can't lose a node).
+        assert_eq!(order.len(), engine.entity_ids().len());
+        assert_eq!(order.len(), 5);
+        // PRE-ORDER + CONTIGUOUS SUBTREES (the guarantee that makes the panel read as a tree — independent of
+        // which sibling storage order lists first): a node is the FIRST of its subtree, and its whole subtree is
+        // a consecutive block.
+        assert!(
+            pos(r) < pos(a) && pos(r) < pos(a1) && pos(r) < pos(b),
+            "root R is first in its subtree"
+        );
+        assert_eq!(
+            pos(a1),
+            pos(a) + 1,
+            "grandchild A1 sits immediately after its parent A (subtree adjacency)"
+        );
+        // R's whole subtree {R, A, A1, B} occupies 4 consecutive positions (F, the other root, is outside it).
+        let sub = [pos(r), pos(a), pos(a1), pos(b)];
+        assert_eq!(
+            *sub.iter().max().unwrap() - *sub.iter().min().unwrap(),
+            3,
+            "R's subtree is one contiguous block"
+        );
     }
 }
