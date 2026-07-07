@@ -862,6 +862,90 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             resource: camera_buf.as_entire_binding(),
         }],
     });
+    // ── SSAO (screen-space ambient occlusion): a post pass that darkens creases / contact points so an
+    // imported CAD assembly reads as solid, connected parts. When on, the scene renders to `scene_raw`, the
+    // AO pass writes the darkened colour to `bloom_t.scene` (which then feeds bloom, or a blit to the
+    // swapchain). `MTK_SSAO=off` restores the exact pre-SSAO path. Group 0 = camera (for depth→position),
+    // group 1 = { sampler, scene colour, scene depth (multisampled) }. ─────────────────────────────────────
+    //
+    // The AO pass reads the scene depth through a MULTISAMPLED depth binding (`ssao.wgsl`
+    // `texture_depth_multisampled_2d`), so it requires MSAA > 1. With MSAA at 1 (`MTK_MSAA=off`, or an
+    // adapter that can't MSAA this surface format — the min-spec fallback) the depth texture is
+    // single-sampled, and binding it would be a wgpu validation error that kills the render loop — a dead
+    // black viewport at launch. Honest degrade instead: SSAO off, viewport alive.
+    let ssao_requested = ssao_enabled();
+    let ssao = ssao_requested && samples > 1;
+    if ssao_requested && !ssao {
+        eprintln!("[viewport] ssao requested but MSAA=1 (single-sampled depth) — ssao disabled");
+    }
+    eprintln!("[viewport] ssao={ssao}");
+    let ssao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("ssao"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("ssao.wgsl").into()),
+    });
+    let ssao_input_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("ssao-input-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: true,
+                },
+                count: None,
+            },
+        ],
+    });
+    let ssao_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("ssao-layout"),
+        bind_group_layouts: &[Some(&cam_bgl), Some(&ssao_input_bgl)],
+        immediate_size: 0,
+    });
+    let ssao_pipeline = make_post_pipeline(
+        &device,
+        &ssao_shader,
+        &ssao_layout,
+        format,
+        "fs_ssao",
+        "ssao",
+    );
+    let ssao_blit_pipeline = make_post_pipeline(
+        &device,
+        &ssao_shader,
+        &ssao_layout,
+        format,
+        "fs_blit",
+        "ssao-blit",
+    );
+    // The size-dependent SSAO resources — ONLY when the pass can run (multisampled depth exists): the
+    // offscreen the scene renders to (`scene_raw`), the AO input bind group, and the blit input (SSAO on +
+    // bloom off: the AO'd colour in `bloom_t.scene` → swapchain). Creating these against a single-sampled
+    // depth would be the validation panic this gate exists to prevent.
+    let mut ssao_t: Option<(wgpu::TextureView, wgpu::BindGroup, wgpu::BindGroup)> =
+        ssao.then(|| {
+            let scene_raw = make_post_tex(&device, format, w, h);
+            let bg = make_ssao_bg(&device, &ssao_input_bgl, &post_samp, &scene_raw, &depth);
+            let blit = make_ssao_bg(&device, &ssao_input_bgl, &post_samp, &bloom_t.scene, &depth);
+            (scene_raw, bg, blit)
+        });
     // Cube instances (the M2.2 placeholder/fallback path + the perf baseline) — the subset of entities
     // with NO mesh asset. Grows with the scene.
     let mut cube = InstanceBuf::new(&device, &inst_bgl, 1024);
@@ -1354,8 +1438,22 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 msaa = make_msaa(&device, format, w, h, samples);
                 bloom_t =
                     make_bloom_targets(&device, format, w, h, &post_samp, &post_bgl1, &post_bgl2);
+                // SSAO targets follow the window + the recreated depth/scene views (only when the pass runs).
+                ssao_t = ssao.then(|| {
+                    let scene_raw = make_post_tex(&device, format, w, h);
+                    let bg = make_ssao_bg(&device, &ssao_input_bgl, &post_samp, &scene_raw, &depth);
+                    let blit =
+                        make_ssao_bg(&device, &ssao_input_bgl, &post_samp, &bloom_t.scene, &depth);
+                    (scene_raw, bg, blit)
+                });
             }
         }
+
+        // Snapshot the OS cursor BEFORE locking `shared` (perf audit F11 / RC-4): on the render thread a
+        // `window.cursor_position()` marshals to the main (tao) thread, so holding the hot render mutex
+        // across it convoys tao behind the render frame. Read once up-front (like the resize `inner_size`
+        // above); the orbit-drag and gizmo-drag branches below consume the snapshot inside the lock.
+        let cursor_pos = window.cursor_position().ok();
 
         // read shared state; re-upload instances on revision change (picking is NOT serviced here —
         // it's done synchronously in the viewport_pick command, decoupled from the frame cadence)
@@ -1376,7 +1474,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 st.zoom_delta = 0.0;
             }
             if st.dragging {
-                if let Ok(p) = window.cursor_position() {
+                if let Some(p) = cursor_pos {
                     if let Some((lx, ly)) = st.drag_last {
                         st.orbit += (p.x - lx) as f32 * 0.01;
                         st.elevation = (st.elevation + (p.y - ly) as f32 * 0.01).clamp(-1.45, 1.45);
@@ -1391,10 +1489,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // instance live. Only gizmo_pick_drag/gizmo_drag_end cross JS (2 per gesture), never per frame.
             if st.gizmo_dragging {
                 let cursor = st.gizmo_test_cursor.or_else(|| {
-                    window
-                        .cursor_position()
-                        .ok()
-                        .map(|p| (p.x as f32 / w.max(1) as f32, p.y as f32 / h.max(1) as f32))
+                    cursor_pos.map(|p| (p.x as f32 / w.max(1) as f32, p.y as f32 / h.max(1) as f32))
                 });
                 if let Some(cur) = cursor {
                     let aspect = w as f32 / h.max(1) as f32;
@@ -1848,7 +1943,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // swapchain at pass end; off, it draws straight to the swapchain (resolve_target None).
             // M11.4 — the scene's final color destination: the bloom offscreen when bloom is on, else the
             // swapchain. With MSAA it's the resolve target; without, the direct color attachment.
-            let scene_dest = if bloom { &bloom_t.scene } else { &view };
+            // When SSAO is on, the scene renders to `scene_raw` (the AO pass then writes `bloom_t.scene`);
+            // else the pre-SSAO destination (bloom offscreen, or the swapchain directly).
+            let scene_dest = match &ssao_t {
+                Some((scene_raw, _, _)) => scene_raw,
+                None if bloom => &bloom_t.scene,
+                None => &view,
+            };
             let (scene_color, scene_resolve) = match msaa.as_ref() {
                 Some(m) => (m, Some(scene_dest)),
                 None => (scene_dest, None),
@@ -1973,6 +2074,31 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.draw(0..gizmo_buf.n, 0..1);
             }
         }
+        // SSAO: darken creases / contact points. Reads the offscreen scene (`scene_raw`) + the scene depth,
+        // reconstructs positions via the camera uniform, and writes the AO-multiplied colour to
+        // `bloom_t.scene` — which then feeds the bloom chain (below) or the blit (else-branch).
+        if let Some((_, ssao_bg, _)) = &ssao_t {
+            let mut ap = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ssao"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &bloom_t.scene,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            ap.set_pipeline(&ssao_pipeline);
+            ap.set_bind_group(0, &cam_bg, &[]);
+            ap.set_bind_group(1, ssao_bg, &[]);
+            ap.draw(0..3, 0..1);
+        }
         // M11.4 (ADR-043) — bloom post chain: bright-pass → separable Gaussian (H then V) → composite, each
         // a fullscreen triangle. The scene pass wrote `bloom_t.scene`; composite writes the swapchain.
         if bloom {
@@ -2003,6 +2129,28 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             post(&bloom_t.b, &blur_h_pipeline, &bloom_t.bg_blur_h); // a → b (blur horizontal)
             post(&bloom_t.a, &blur_v_pipeline, &bloom_t.bg_blur_v); // b → a (blur vertical)
             post(&view, &composite_pipeline, &bloom_t.bg_composite); // scene + bloom_a → swapchain
+        } else if let Some((_, _, ssao_blit_bg)) = &ssao_t {
+            // SSAO on + bloom off: the AO'd colour is in `bloom_t.scene`; blit it to the swapchain.
+            let mut bp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ssao-blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            bp.set_pipeline(&ssao_blit_pipeline);
+            bp.set_bind_group(0, &cam_bg, &[]);
+            bp.set_bind_group(1, ssao_blit_bg, &[]);
+            bp.draw(0..3, 0..1);
         }
         queue.submit([enc.finish()]);
         frame.present();
@@ -2225,10 +2373,45 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32, samples: u32) -> wgpu::Text
             sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // TEXTURE_BINDING so the SSAO post pass can sample the scene depth (MSAA → textureLoad sample 0).
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// SSAO on unless `MTK_SSAO=off` — the screen-space ambient-occlusion post pass (crease/contact darkening).
+fn ssao_enabled() -> bool {
+    std::env::var("MTK_SSAO").map_or(true, |v| !v.eq_ignore_ascii_case("off"))
+}
+
+/// The SSAO input bind group (group 1): a filtering sampler + the offscreen scene colour + the scene depth
+/// (multisampled — read via `textureLoad`). Rebuilt on resize when the views change.
+fn make_ssao_bg(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    samp: &wgpu::Sampler,
+    color: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ssao-input"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Sampler(samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(color),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(depth),
+            },
+        ],
+    })
 }
 
 fn make_inst_bg(
