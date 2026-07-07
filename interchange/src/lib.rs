@@ -17,10 +17,17 @@
 use metrocalk_physics::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod analytic;
 mod cad_import;
 pub(crate) mod step;
 mod urdf;
 mod usd;
+// M15.8 (ADR-078) — closed-form analytic curved-surface tessellation (cylinder/cone/sphere/torus), the
+// kernel-free half of the curved-fidelity gap. NURBS/freeform stays the licensed-kernel/OCCT seam.
+pub use analytic::{
+    max_normal_deviation, plan_analytic, tessellate_analytic, AnalyticPatch, AnalyticSurface,
+    DEFLECTION,
+};
 pub use step::{
     gdt_entity_name, gdt_token, round_trip_deviation, CadEdge, CadFace, CadInterchange, CadPmi,
     CadScene, CadSolid, FaceKind, StepError, StepInterchange, MAX_ENTITIES as STEP_MAX_ENTITIES,
@@ -32,10 +39,10 @@ pub use step::{
 #[cfg(feature = "3dxml")]
 pub use cad_import::ThreeDxmlReader;
 pub use cad_import::{
-    build_import, diff, mat4_mul, mesh_hash, source_hash, tessellate_faces, translation_of,
-    CadError, CadImport, CadMesh, CadReader, FidelityCounts, GroupNode, ImportStrategy, PartChange,
-    PartDiff, PartFidelity, PartReport, PartSource, RawPart, StepAssemblyReader, IDENTITY_4X4,
-    MAX_ASSEMBLY_DEPTH,
+    build_import, diff, mat4_mul, mesh_hash, native_kernel_probe, source_hash, tessellate_faces,
+    translation_of, CadError, CadImport, CadMesh, CadReader, FidelityCounts, GroupNode,
+    ImportStrategy, KernelProbe, PartChange, PartDiff, PartFidelity, PartReport, PartSource,
+    RawPart, StepAssemblyReader, IDENTITY_4X4, KERNEL_DIR_ENV, MAX_ASSEMBLY_DEPTH,
 };
 pub use urdf::UrdfInterchange;
 pub use usd::UsdInterchange;

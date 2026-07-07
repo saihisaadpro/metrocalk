@@ -65,6 +65,13 @@ pub struct CadFace {
     pub outer: Vec<[f64; 3]>,
     /// The face's referenceable edges.
     pub edges: Vec<CadEdge>,
+    /// M15.8 (ADR-078) — the recognized **analytic** surface under a `Curved` face (cylinder / cone /
+    /// sphere / torus), tessellated closed-form + deterministic by this crate. `None` for planar faces and
+    /// for NURBS/freeform (which stay the licensed-kernel/OCCT seam — never hand-rolled).
+    pub surface: Option<crate::analytic::AnalyticSurface>,
+    /// The `ADVANCED_FACE` `same_sense` flag — whether the face's outward side agrees with the surface's
+    /// positive normal (a bore's cylinder wall faces INWARD → `.F.`). Drives exact analytic orientation.
+    pub same_sense: bool,
 }
 
 /// One solid body (a `CLOSED_SHELL` / `MANIFOLD_SOLID_BREP`).
@@ -184,6 +191,35 @@ impl CadScene {
 
         for solid in &self.solids {
             for face in &solid.faces {
+                // M15.8 (ADR-078) — an ANALYTIC curved face (cylinder/cone/sphere/torus) tessellates
+                // closed-form, smooth + adaptive at the fixed absolute deflection. Beyond-subset faces
+                // (complex trims / off-surface bounds) fall through silently HERE only because
+                // `interpret_face` / the tessellation caller already carries the explained seam note —
+                // the never-silent record lives in `notes`, not in this hot loop.
+                if let Some(surface) = &face.surface {
+                    if let Ok(patch) = crate::analytic::tessellate_analytic(
+                        face.id,
+                        surface,
+                        &face.outer,
+                        face.same_sense,
+                    ) {
+                        // Weld the patch's grid through the shared exact-coordinate intern so seams shared
+                        // between analytic faces (e.g. two half-cylinders) stitch.
+                        let remap: Vec<u32> = patch
+                            .positions
+                            .iter()
+                            .map(|&p| vid(p, &mut positions))
+                            .collect();
+                        for t in &patch.triangles {
+                            triangles.push([
+                                remap[t[0] as usize],
+                                remap[t[1] as usize],
+                                remap[t[2] as usize],
+                            ]);
+                        }
+                        continue;
+                    }
+                }
                 if face.kind != FaceKind::Planar || face.outer.len() < 3 {
                     continue;
                 }
@@ -870,18 +906,25 @@ fn interpret_face(
         .and_then(Value::as_list)
         .ok_or_else(|| StepError::Malformed(format!("face #{fid} has no bound list")))?;
     let surface_id = f.args.get(2).and_then(Value::as_ref_id);
+    let same_sense = !matches!(f.args.get(3), Some(Value::Enum(e)) if e == "F");
 
-    // Classify the surface: PLANE (or a faceted FACE with no surface entity) → tessellated here; any
-    // named curved surface → referenced but the OCCT seam.
+    // Classify the surface: PLANE (or a faceted FACE with no surface entity) → tessellated here; an
+    // ANALYTIC curved surface (cylinder/cone/sphere/torus — M15.8/ADR-078) → recognized + tessellated
+    // closed-form; NURBS/freeform → referenced but the licensed-kernel/OCCT seam (never hand-rolled).
+    let mut surface = None;
     let kind = match surface_id.and_then(|sid| entities.get(&sid)) {
         Some(s) if s.name == "PLANE" => FaceKind::Planar,
         Some(s) => {
-            notes.push(UnsupportedNote {
-                feature: format!("{} on face #{fid}", s.name),
-                detail: "curved/freeform surface — referenced (M15.3 PMI can attach) but NOT tessellated \
-                         here; exact tessellation is the OpenCascade native/server seam (ADR-070)"
-                    .into(),
-            });
+            surface = analytic_surface_of(entities, s);
+            if surface.is_none() {
+                notes.push(UnsupportedNote {
+                    feature: format!("{} on face #{fid}", s.name),
+                    detail: "curved/freeform surface — referenced (M15.3 PMI can attach) but NOT \
+                             tessellated here; exact tessellation is the OpenCascade native/server seam \
+                             (ADR-070)"
+                        .into(),
+                });
+            }
             FaceKind::Curved
         }
         // A faceted FACE (FACETED_BREP) carries no surface entity — it is a planar polygon facet.
@@ -915,12 +958,71 @@ fn interpret_face(
         }
     }
 
+    // The declared-subset gate runs at parse time (where the notes live): a recognized analytic face whose
+    // boundary can't be tessellated (off-surface bounds / a non-rectangular trim / a degenerate patch)
+    // DOWNGRADES to the explained seam note — every curved face either renders smooth or is accounted for,
+    // never silent.
+    if let Some(s) = &surface {
+        if let Err(note) = crate::analytic::plan_analytic(fid, s, &outer) {
+            notes.push(note);
+            surface = None;
+        }
+    }
+
     Ok(CadFace {
         id: fid,
         kind,
         outer,
         edges,
+        surface,
+        same_sense,
     })
+}
+
+/// Recognize the four ANALYTIC surface kinds (M15.8/ADR-078) into their closed forms. `None` for anything
+/// else (NURBS/freeform — the kernel seam). Arg shapes:
+/// `CYLINDRICAL_SURFACE('', #placement, radius)` · `CONICAL_SURFACE('', #placement, radius, semi_angle)` ·
+/// `SPHERICAL_SURFACE('', #placement, radius)` · `TOROIDAL_SURFACE('', #placement, major, minor)`.
+fn analytic_surface_of(
+    entities: &BTreeMap<u64, Entity>,
+    s: &Entity,
+) -> Option<crate::analytic::AnalyticSurface> {
+    use crate::analytic::AnalyticSurface as A;
+    let frame = s
+        .args
+        .get(1)
+        .and_then(Value::as_ref_id)
+        .map(|p| axis_placement_matrix(entities, p))?;
+    let real = |i: usize| s.args.get(i).and_then(Value::as_real);
+    let positive = |x: f64| (x.is_finite() && x > 0.0).then_some(x);
+    match s.name.as_str() {
+        "CYLINDRICAL_SURFACE" => Some(A::Cylinder {
+            frame,
+            radius: positive(real(2)?)?,
+        }),
+        "CONICAL_SURFACE" => Some(A::Cone {
+            frame,
+            radius: positive(real(2)?)?,
+            // The semi-angle is in the file's plane_angle unit (radians by convention in AP242 exports we
+            // read); a degenerate/reflex angle is beyond the subset.
+            semi_angle: real(3)
+                .filter(|a| a.is_finite() && a.abs() < std::f64::consts::FRAC_PI_2)?,
+        }),
+        "SPHERICAL_SURFACE" => Some(A::Sphere {
+            frame,
+            radius: positive(real(2)?)?,
+        }),
+        "TOROIDAL_SURFACE" => {
+            let major = positive(real(2)?)?;
+            let minor = positive(real(3)?)?;
+            (minor < major).then_some(A::Torus {
+                frame,
+                major,
+                minor,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Interpret an EDGE_LOOP (advanced b-rep) or POLY_LOOP (faceted) into an ordered vertex polygon + edges.
@@ -2607,6 +2709,92 @@ mod tests {
             scene.notes.iter().any(|n| n.detail.contains("OpenCascade")),
             "the OCCT seam is explained, not silent"
         );
+    }
+
+    // ── M15.8 (ADR-078): analytic curved-surface tessellation — smooth, deterministic, kernel-free ─────────
+
+    /// A real cylinder wall (radius 5, height 10, z axis) as a full ADVANCED_FACE over a placed
+    /// CYLINDRICAL_SURFACE — the bore/boss shape every machined part carries.
+    const CYL_STEP: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+        FILE_NAME('cyl','',(''),(''),'','','');\nFILE_SCHEMA(('AP242'));\nENDSEC;\nDATA;\n\
+        #1 = CARTESIAN_POINT('',(0.,0.,0.));\n\
+        #2 = DIRECTION('',(0.,0.,1.));\n\
+        #3 = DIRECTION('',(1.,0.,0.));\n\
+        #4 = AXIS2_PLACEMENT_3D('',#1,#2,#3);\n\
+        #5 = CARTESIAN_POINT('',(5.,0.,0.));\n\
+        #6 = CARTESIAN_POINT('',(5.,0.,10.));\n\
+        #7 = VERTEX_POINT('',#5);\n\
+        #8 = VERTEX_POINT('',#6);\n\
+        #9 = EDGE_CURVE('',#7,#7,$,.T.);\n\
+        #10 = EDGE_CURVE('',#7,#8,$,.T.);\n\
+        #11 = EDGE_CURVE('',#8,#8,$,.T.);\n\
+        #12 = ORIENTED_EDGE('',*,*,#9,.T.);\n\
+        #13 = ORIENTED_EDGE('',*,*,#10,.T.);\n\
+        #14 = ORIENTED_EDGE('',*,*,#11,.T.);\n\
+        #15 = EDGE_LOOP('',(#12,#13,#14));\n\
+        #16 = FACE_OUTER_BOUND('',#15,.T.);\n\
+        #17 = CYLINDRICAL_SURFACE('',#4,5.);\n\
+        #18 = ADVANCED_FACE('',(#16),#17,.T.);\n\
+        #19 = CLOSED_SHELL('',(#18));\n\
+        #20 = MANIFOLD_SOLID_BREP('cyl',#19);\n\
+        ENDSEC;\nEND-ISO-10303-21;\n";
+
+    #[test]
+    fn an_analytic_cylinder_tessellates_smooth_not_faceted_and_deterministic() {
+        let scene = StepInterchange.import(CYL_STEP.as_bytes()).expect("import");
+        let face = &scene.solids[0].faces[0];
+        assert_eq!(
+            face.kind,
+            FaceKind::Curved,
+            "still a referenceable curved face"
+        );
+        let surface = face
+            .surface
+            .expect("the cylinder is RECOGNIZED, not the kernel seam");
+        assert!(
+            !scene.notes.iter().any(|n| n.feature.contains("face #18")),
+            "a handled analytic face carries no seam note: {:?}",
+            scene.notes
+        );
+
+        // It TESSELLATES — smooth real geometry, not a skip (the old behavior) and not a facet or two.
+        let mesh = scene.tessellate();
+        assert!(
+            mesh.triangle_count() >= 32,
+            "adaptive full revolution, got {} triangles",
+            mesh.triangle_count()
+        );
+        // Every wall vertex sits exactly on the cylinder (closed-form, no sag beyond fp noise).
+        for p in &mesh.positions {
+            let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            assert!((r - 5.0).abs() < 1e-9, "vertex off the wall: r={r}");
+            assert!((-1e-9..=10.0 + 1e-9).contains(&p[2]), "outside the height");
+        }
+        // THE SMOOTHNESS GATE ("a faceted cylinder is a FAIL"): facet normals within the deflection-derived
+        // bound of the exact analytic normal.
+        let patch =
+            crate::analytic::tessellate_analytic(18, &surface, &face.outer, face.same_sense)
+                .expect("plan validated at parse time");
+        let dev = crate::analytic::max_normal_deviation(&patch, &surface);
+        let bound = 2.0 * (1.0 - crate::analytic::DEFLECTION / 5.0).acos();
+        assert!(
+            dev <= bound.max(0.5),
+            "faceted: worst facet-normal deviation {dev} rad"
+        );
+
+        // DETERMINISTIC: same file → bit-identical mesh hash, ×3 (the regression-corpus property).
+        let h = crate::cad_import::mesh_hash(&mesh);
+        for _ in 0..3 {
+            let again = StepInterchange
+                .import(CYL_STEP.as_bytes())
+                .expect("re-import")
+                .tessellate();
+            assert_eq!(
+                crate::cad_import::mesh_hash(&again),
+                h,
+                "tessellation drifted"
+            );
+        }
     }
 
     // ── M15.5 (ADR-075): AP242 semantic-PMI round-trip through the pure-Rust Part-21 subset ────────────────

@@ -197,6 +197,43 @@ fn a_single_product_planar_step_keeps_the_exact_brep_leg() {
     assert_eq!(imp.parts[0].strategy, ImportStrategy::ExactBrep);
 }
 
+// ── The native-kernel dependency probe (M15.8 / ADR-078): diagnosed, never a silent import crash ────────
+
+#[test]
+fn the_kernel_probe_diagnoses_missing_and_broken_installs_by_name() {
+    // Env-var isolation: this test owns KERNEL_DIR_ENV for its duration (serial by var, not by thread —
+    // no other test touches it).
+    // (a) Not configured → a named diagnosis + the install/re-export fix path, available=false.
+    std::env::remove_var(KERNEL_DIR_ENV);
+    let p = native_kernel_probe();
+    assert!(!p.available);
+    assert!(p.diagnosis.contains(KERNEL_DIR_ENV), "{}", p.diagnosis);
+    assert!(p.fix.contains("STEP AP242"), "the fix names the fallback");
+
+    // (b) Configured but pointing nowhere → diagnosed by path.
+    std::env::set_var(KERNEL_DIR_ENV, r"Z:\definitely\not\a\real\dir");
+    let p = native_kernel_probe();
+    assert!(!p.available);
+    assert!(p.diagnosis.contains("not a directory"), "{}", p.diagnosis);
+
+    // (c) A present-but-hand-pruned distribution (the libalias anti-pattern) → the MISSING MODULE is named
+    // up front, refusing the install before a first-import crash could happen.
+    let dir = std::env::temp_dir().join(format!("mtk-kernel-probe-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::env::set_var(KERNEL_DIR_ENV, &dir);
+    let p = native_kernel_probe();
+    assert!(!p.available);
+    assert!(p.diagnosis.contains("A3DLIBS.dll"), "{}", p.diagnosis);
+
+    // (d) A complete distribution → available, located.
+    std::fs::write(dir.join("A3DLIBS.dll"), b"marker").expect("write marker");
+    let p = native_kernel_probe();
+    assert!(p.available, "{}", p.diagnosis);
+
+    std::env::remove_var(KERNEL_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── Dedup / instancing (CAD is bolt-heavy) ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -418,7 +455,8 @@ fn tessellate_faces_skips_curved_and_matches_the_scene_tessellation_for_one_soli
         mesh_hash(&whole),
         "single-solid per-part tessellation == whole-scene tessellation"
     );
-    // A curved face contributes no triangles here (the OCCT seam).
+    // A curved face with NO recognized analytic surface (NURBS/freeform — the kernel seam) contributes no
+    // triangles here; an analytic one now tessellates via `surface: Some(..)` (M15.8, tested in step.rs).
     let curved = vec![CadFace {
         id: 1,
         kind: FaceKind::Curved,
@@ -427,6 +465,8 @@ fn tessellate_faces_skips_curved_and_matches_the_scene_tessellation_for_one_soli
             id: 1,
             ends: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
         }],
+        surface: None,
+        same_sense: true,
     }];
     assert_eq!(tessellate_faces(&curved).triangle_count(), 0);
 }

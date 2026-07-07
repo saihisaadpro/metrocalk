@@ -642,6 +642,28 @@ pub fn tessellate_faces(faces: &[crate::step::CadFace]) -> TriMesh {
     };
 
     for face in faces {
+        // M15.8 (ADR-078) — a recognized analytic curved face (cylinder/cone/sphere/torus) tessellates
+        // closed-form, smooth + deterministic; beyond-subset faces already carry their explained note
+        // from `interpret_face` (surface downgraded to None there — never silent).
+        if let Some(surface) = &face.surface {
+            if let Ok(patch) =
+                crate::analytic::tessellate_analytic(face.id, surface, &face.outer, face.same_sense)
+            {
+                let remap: Vec<u32> = patch
+                    .positions
+                    .iter()
+                    .map(|&p| vid(p, &mut positions))
+                    .collect();
+                for t in &patch.triangles {
+                    triangles.push([
+                        remap[t[0] as usize],
+                        remap[t[1] as usize],
+                        remap[t[2] as usize],
+                    ]);
+                }
+                continue;
+            }
+        }
         if face.kind != FaceKind::Planar || face.outer.len() < 3 {
             continue;
         }
@@ -1087,6 +1109,88 @@ fn apply_transform(m: &[f64; 16], p: [f64; 3]) -> [f64; 3] {
         m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
         m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
     ]
+}
+
+// ============================================================================================
+// The native translation-kernel seam + the startup dependency probe (M15.8 / ADR-078)
+// ============================================================================================
+
+/// The result of probing for the licensed native CAD translation kernel (HOOPS Exchange / Spatial 3D
+/// InterOp) — the backend that decodes proprietary CGR/native CATIA/NX/Creo/SolidWorks geometry (the same
+/// engine Datasmith licenses). **The anti-Datasmith discipline:** a missing/broken kernel install is a
+/// **named diagnosis + a fix path**, probed loudly at startup — never a silent first-import crash (the
+/// `libalias_api.dll` anti-pattern) and never a black screen.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct KernelProbe {
+    /// Whether a usable kernel distribution was found.
+    pub available: bool,
+    /// The plain-language state ("found at …" / "not installed" / "the folder is missing modules").
+    pub diagnosis: String,
+    /// The one-click fix path when unavailable.
+    pub fix: String,
+}
+
+/// The env var naming the kernel distribution folder (the HOOPS Exchange eval/production install). The
+/// distribution ships as ONE atomic versioned artifact — never hand-pruned DLLs.
+pub const KERNEL_DIR_ENV: &str = "MTK_CAD_KERNEL_DIR";
+
+/// Marker files that must ALL be present in a kernel distribution for it to be loadable — probing them up
+/// front turns "crash on first import" into a named startup diagnosis. (`A3DLIBS`-class marquee module +
+/// the license file; extend as the real eval lands.)
+const KERNEL_MARKERS: &[&str] = &["A3DLIBS.dll"];
+
+/// Probe the native translation-kernel installation. This is the **seam** for the licensed backend
+/// (deliverables land behind it when the HOOPS 60-day eval / license is provisioned — ≈$55–75k/yr for
+/// production, honestly classed): today it reports the diagnosed not-installed state, so a proprietary
+/// part's fix path can NAME what to install, and a half-broken install (folder present, module missing) is
+/// caught at startup, not at import #1.
+#[must_use]
+pub fn native_kernel_probe() -> KernelProbe {
+    let fix = format!(
+        "install the licensed CAD translation kernel (HOOPS Exchange eval/production) and point \
+         {KERNEL_DIR_ENV} at its distribution folder (ship the WHOLE folder as one atomic artifact — \
+         never hand-pruned DLLs), or re-export the source as STEP AP242"
+    );
+    let Some(dir) = std::env::var_os(KERNEL_DIR_ENV) else {
+        return KernelProbe {
+            available: false,
+            diagnosis: format!("no native CAD kernel configured ({KERNEL_DIR_ENV} is not set)"),
+            fix,
+        };
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if !dir.is_dir() {
+        return KernelProbe {
+            available: false,
+            diagnosis: format!(
+                "{KERNEL_DIR_ENV} points at {} which is not a directory",
+                dir.display()
+            ),
+            fix,
+        };
+    }
+    // Every required module must be present — a partial install is diagnosed BY NAME, up front.
+    for marker in KERNEL_MARKERS {
+        let found = dir.join(marker).is_file()
+            || dir.join("bin").join(marker).is_file()
+            || dir.join("bin").join("win64_v142").join(marker).is_file();
+        if !found {
+            return KernelProbe {
+                available: false,
+                diagnosis: format!(
+                    "the kernel distribution at {} is missing {marker} — a hand-pruned/incomplete \
+                     install would crash on first import; refusing it up front",
+                    dir.display()
+                ),
+                fix,
+            };
+        }
+    }
+    KernelProbe {
+        available: true,
+        diagnosis: format!("native CAD kernel distribution found at {}", dir.display()),
+        fix: String::new(),
+    }
 }
 
 /// Map a low-level [`crate::step::StepError`] to the pipeline's [`CadError`].
