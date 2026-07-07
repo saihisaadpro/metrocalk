@@ -495,10 +495,12 @@ mod tests {
 
     #[test]
     fn sun_is_hdr_and_ground_is_dim() {
+        // The OUTDOOR env (`MTK_ENV=sky`, studio=false) — the sun/ground contrast this asserts is a
+        // property of the sky look, not the neutral studio.
         let sun_dir = Vec3::new(0.35, 0.55, 0.40).normalize();
-        assert!(sky_radiance(sun_dir).x > 5.0, "the sun is HDR (≫1)");
+        assert!(sky_radiance(sun_dir, false).x > 5.0, "the sun is HDR (≫1)");
         assert!(
-            sky_radiance(Vec3::NEG_Y).length() < 0.4,
+            sky_radiance(Vec3::NEG_Y, false).length() < 0.4,
             "the ground is dim"
         );
     }
