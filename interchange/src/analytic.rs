@@ -58,9 +58,23 @@ const ON_SURFACE_TOL: f64 = 1e-3;
 /// determinism precondition the research names.
 pub const DEFLECTION: f64 = 0.2;
 
+/// The PREVIEW-grade deflection for multi-thousand-occurrence assemblies (the quality-preset principle:
+/// the importer picks intent, not the user picking tolerances): 1 mm sag reads smooth at factory scale
+/// while keeping a 13k-occurrence bake's total triangle volume inside the "on screen in seconds" budget
+/// (measured: exact-grade assembly meshes ballooned registration+persist past 4 minutes). A single-part
+/// file keeps [`DEFLECTION`] (exact-viewer grade); hero-part re-tessellation is the named exact path.
+pub const PREVIEW_DEFLECTION: f64 = 1.0;
+
 /// The max angular sweep of one segment (radians) — caps segment size on huge radii where the sag bound
 /// alone would allow visibly-flat 90° facets.
 const MAX_SEG_ANGLE: f64 = std::f64::consts::PI / 8.0; // 22.5°
+
+/// The per-face QUAD budget (min-spec, product principle 3): a huge-radius sphere/torus would satisfy the
+/// absolute deflection with a ~512×512 grid — half a million triangles for ONE face (measured: single
+/// merged crane meshes ballooned to 43 MB and stalled GPU upload + persistence). Above the budget both
+/// axes coarsen PROPORTIONALLY (deterministic — an integer function of the same inputs); the deflection
+/// bound may be exceeded on such faces, a bounded quality floor — honest and finite, never a hang/OOM.
+const MAX_FACE_QUADS: u32 = 4096;
 
 /// Segment count for an arc of `sweep` radians at curvature radius `r`, from the absolute sag `d`:
 /// a chord over angle θ sags `r·(1−cos(θ/2))` → θ = 2·acos(1 − d/r), capped by [`MAX_SEG_ANGLE`], with a
@@ -320,6 +334,17 @@ pub fn plan_analytic(
     surface: &AnalyticSurface,
     boundary: &[[f64; 3]],
 ) -> Result<AnalyticPlan, UnsupportedNote> {
+    plan_with(face_id, surface, boundary, DEFLECTION)
+}
+
+/// [`plan_analytic`] at an explicit deflection (the subset GATES are deflection-independent; only the
+/// segment counts change — [`PREVIEW_DEFLECTION`] for assemblies, [`DEFLECTION`] for single parts).
+fn plan_with(
+    face_id: u64,
+    surface: &AnalyticSurface,
+    boundary: &[[f64; 3]],
+    deflection: f64,
+) -> Result<AnalyticPlan, UnsupportedNote> {
     let beyond = |why: &str| UnsupportedNote {
         feature: format!("analytic surface on face #{face_id}"),
         detail: format!(
@@ -417,12 +442,26 @@ pub fn plan_analytic(
 
     // Adaptive segment counts from the ABSOLUTE deflection.
     let (ru, rv) = surface.curvatures();
-    let nu = segments(sweep, ru, DEFLECTION);
-    let nv = match rv {
+    let mut nu = segments(sweep, ru, deflection);
+    let mut nv = match rv {
         // The v direction is curved too (sphere latitude / torus tube) — its sweep is the v-range itself.
-        Some(r) => segments((v1 - v0).abs(), r, DEFLECTION),
+        Some(r) => segments((v1 - v0).abs(), r, deflection),
         None => 1, // straight generator (cylinder/cone) — one segment spans it exactly
     };
+    // The per-face quad budget (see MAX_FACE_QUADS): proportional, deterministic coarsening.
+    let quads = u64::from(nu) * u64::from(nv);
+    if quads > u64::from(MAX_FACE_QUADS) {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        {
+            let s = (f64::from(MAX_FACE_QUADS) / quads as f64).sqrt();
+            nu = ((f64::from(nu) * s).floor() as u32).max(2);
+            nv = ((f64::from(nv) * s).floor() as u32).max(1);
+        }
+    }
     Ok(AnalyticPlan {
         u0,
         sweep,
@@ -433,16 +472,31 @@ pub fn plan_analytic(
     })
 }
 
-/// Tessellate an analytic face bounded by `boundary` into a smooth adaptive grid (plan + grid).
+/// Tessellate an analytic face bounded by `boundary` into a smooth adaptive grid (plan + grid) at the
+/// exact-viewer grade ([`DEFLECTION`]).
 ///
 /// # Errors
 /// The face is beyond the declared subset — the note explains why (the caller surfaces it).
-#[allow(clippy::cast_precision_loss)]
 pub fn tessellate_analytic(
     face_id: u64,
     surface: &AnalyticSurface,
     boundary: &[[f64; 3]],
     same_sense: bool,
+) -> Result<AnalyticPatch, UnsupportedNote> {
+    tessellate_analytic_with(face_id, surface, boundary, same_sense, DEFLECTION)
+}
+
+/// [`tessellate_analytic`] at an explicit deflection — [`PREVIEW_DEFLECTION`] for assembly bakes.
+///
+/// # Errors
+/// The face is beyond the declared subset — the note explains why (the caller surfaces it).
+#[allow(clippy::cast_precision_loss)]
+pub fn tessellate_analytic_with(
+    face_id: u64,
+    surface: &AnalyticSurface,
+    boundary: &[[f64; 3]],
+    same_sense: bool,
+    deflection: f64,
 ) -> Result<AnalyticPatch, UnsupportedNote> {
     let AnalyticPlan {
         u0,
@@ -451,7 +505,7 @@ pub fn tessellate_analytic(
         v1,
         nu,
         nv,
-    } = plan_analytic(face_id, surface, boundary)?;
+    } = plan_with(face_id, surface, boundary, deflection)?;
 
     // The grid.
     let mut positions = Vec::with_capacity(((nu + 1) * (nv + 1)) as usize);

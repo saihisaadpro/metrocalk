@@ -293,6 +293,23 @@ struct RevealResponse {
     bound: Vec<Bound>,
 }
 
+/// M15.9 (ADR-079) — a joint's state for the panel: type, the REAL axis + pivot, the honesty-labeled
+/// source rung ("manual" gizmo-authored · "inferred" · "urdf"), the DOF value + limits, and the track end
+/// (the timeline length). A read.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct JointInfoResp {
+    joint_type: String,
+    axis: [f64; 3],
+    pivot: [f64; 3],
+    source: String,
+    value: f64,
+    min: f64,
+    max: f64,
+    track_end: f64,
+    keys: usize,
+}
+
 /// One row of the M15.7 (ADR-077) import report — a CAD part entity + its honesty class. The `fidelity`
 /// token is read straight off the persisted `CadPart` component (survives reload), so this is the
 /// ECS-native "explain every no" surface ("show tessellation-only parts"), not a side copy.
@@ -432,6 +449,41 @@ enum EngineCmd {
     /// M15.7 (ADR-077) — the per-part CAD import report, aggregated from the ECS `CadPart` components (a read).
     CadReport {
         reply: Sender<CadReportResp>,
+    },
+    /// M15.9 (ADR-079) — author a joint on an entity (ONE undoable commit); reply applied.
+    SetJoint {
+        id: String,
+        revolute: bool,
+        axis: [f64; 3],
+        pivot: [f64; 3],
+        limits: (f64, f64),
+        source: String,
+        reply: Sender<bool>,
+    },
+    /// M15.9 — key the joint's CURRENT value at time `t` on the entity's track (ONE undoable commit).
+    JointKey {
+        id: String,
+        t: f64,
+        reply: Sender<bool>,
+    },
+    /// M15.9 — set a joint's DOF: `commit=false` previews (a render-only posed override), `commit=true`
+    /// writes the posed Transform + the value as ONE undoable commit (the gizmo_drag_end pattern).
+    JointValue {
+        id: String,
+        value: f64,
+        commit: bool,
+        reply: Sender<bool>,
+    },
+    /// M15.9 — scrub every jointed entity's pose to time `t` (a render-only projection — the doc is never
+    /// mutated by playback; `t < 0` clears the scrub). Reply = the number of posed entities.
+    JointScrub {
+        t: f64,
+        reply: Sender<usize>,
+    },
+    /// M15.9 — a joint's state for the panel (a read).
+    JointInfo {
+        id: String,
+        reply: Sender<Option<JointInfoResp>>,
     },
     /// M11.5 (ADR-044) — the selected entity's asset provenance (identity/AI-flag/near-dup) — a read.
     AssetProvenance {
@@ -1358,6 +1410,7 @@ fn land_cad(
         eprintln!("[shell] {m}");
     };
     log(&format!("CAD import start: {} bytes", bytes.len()));
+    let t_read = std::time::Instant::now();
     let report = match metrocalk_editor_shell::read_cad(bytes) {
         Ok(r) => r,
         Err(e) => {
@@ -1365,7 +1418,17 @@ fn land_cad(
             return None;
         }
     };
-    log(&format!("CAD import read OK: {}", report.summary()));
+    log(&format!(
+        "CAD import read OK in {:.1}s: {}",
+        t_read.elapsed().as_secs_f64(),
+        report.summary()
+    ));
+    let t_register = std::time::Instant::now();
+    // The derived-mesh persistence jobs run on a DETACHED writer thread after the commit (off the
+    // land path — a 400-mesh assembly's sidecar writes were serialising minutes into the import).
+    // Never-silent: failures log from the writer; a crash before a write only costs that mesh's
+    // reload fidelity (it re-imports from source).
+    let mut persist_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
 
     // Meshes are registered on the GPU on demand per part below, keyed by (geometry hash + authored colour) so
     // a part renders in its real STEP colour (baked into the mesh material) while identical geometry+colour
@@ -1434,6 +1497,113 @@ fn land_cad(
         });
     }
 
+    // Colour-aware GPU handle for a part: the geometry hash + (for a non-rigid mirror/scale instance basis)
+    // the basis-bits tag + the authored colour — same-geometry+colour instances share ONE GPU mesh (dedup →
+    // instancing) while a mirrored or recoloured twin keys its own.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let handle_for = |p: &metrocalk_interchange::PartReport| -> Option<String> {
+        let m = &report.meshes[p.mesh?];
+        let rigid = metrocalk_editor_shell::basis_is_rigid(&p.transform);
+        let basis_tag = if rigid || !p.fidelity.is_real_geometry() {
+            String::new()
+        } else {
+            format!(":b{:016x}", basis_bits_hash(&p.transform))
+        };
+        Some(match p.color {
+            Some(c) => format!(
+                "mtkcad:{:016x}{basis_tag}:{:02x}{:02x}{:02x}",
+                m.hash,
+                (c[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (c[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+            ),
+            None => format!("mtkcad:{:016x}{basis_tag}", m.hash),
+        })
+    };
+
+    // Register the UNIQUE GPU meshes up front, in PARALLEL: the per-mesh conversion (basis bake +
+    // crease-aware normal derivation + GPU packing) dominates a many-mesh assembly land when run serially
+    // (a measured multi-minute stall on the 400-mesh bar STEP), and it is pure CPU per mesh. Worker threads
+    // convert; the results land serially in first-seen part order (slot assignment stays deterministic),
+    // under ONE shared-state lock + ONE revision bump (not one per mesh).
+    let mut reg_work: Vec<(String, &metrocalk_interchange::PartReport)> = Vec::new();
+    {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for p in &report.parts {
+            if let Some(h) = handle_for(p) {
+                if !assets.handle_to_slot.contains_key(&h) && seen.insert(h.clone()) {
+                    reg_work.push((h, p));
+                }
+            }
+        }
+    }
+    if !reg_work.is_empty() {
+        type RegOut = (
+            String,
+            MeshGpu,
+            metrocalk_editor_shell::TriMesh,
+            Option<[f32; 3]>,
+        );
+        let results: std::sync::Mutex<Vec<Option<RegOut>>> =
+            std::sync::Mutex::new((0..reg_work.len()).map(|_| None).collect());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get().saturating_sub(2))
+            .clamp(1, 12)
+            .min(reg_work.len());
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((handle, p)) = reg_work.get(i) else {
+                        break;
+                    };
+                    let m = &report.meshes[p.mesh.expect("reg_work parts have meshes")];
+                    let rigid = metrocalk_editor_shell::basis_is_rigid(&p.transform);
+                    // A non-rigid instance basis (mirror/scale) is baked into a per-instance mesh — a
+                    // mirrored bracket is genuinely different geometry from its twin.
+                    let tris = if rigid || !p.fidelity.is_real_geometry() {
+                        m.tris.clone()
+                    } else {
+                        metrocalk_editor_shell::bake_basis_into_mesh(&p.transform, &m.tris)
+                    };
+                    let asset = metrocalk_editor_shell::csg_intent::trimesh_to_mesh_asset_colored(
+                        &tris, "cad", p.color,
+                    );
+                    let gpu = MeshGpu::from_asset(&asset);
+                    results.lock().unwrap()[i] = Some((handle.clone(), gpu, tris, p.color));
+                });
+            }
+        });
+        let results = results.into_inner().unwrap();
+        let mut st = shared.lock().unwrap();
+        for out in results.into_iter().flatten() {
+            let (handle, gpu, tris, color) = out;
+            let slot = assets.meshes.len();
+            assets.meshes.push(gpu.clone());
+            assets.scales.push(1.0);
+            assets.handle_to_slot.insert(handle.clone(), slot);
+            st.meshes.push(gpu);
+            // Persist the DERIVED mesh so the saved doc's `mtkcad:` handle re-resolves after restart +
+            // open (load_assets restores it) — queued for the detached writer thread below (the writes
+            // were serialising minutes into a 400-mesh land). Never-silent: failures log.
+            persist_jobs.push(Box::new(move || {
+                if let Err(e) = metrocalk_editor_shell::persist_cad_mesh(
+                    &sidecar("metrocalk-cad-meshes"),
+                    &handle,
+                    &tris,
+                    color,
+                ) {
+                    eprintln!(
+                        "[shell] CAD import: failed to persist mesh {handle} — it may not survive \
+                         reload: {e}"
+                    );
+                }
+            }));
+        }
+        st.meshes_revision = st.meshes_revision.wrapping_add(1);
+    }
+
     // (2) The leaf parts — each parented under its source assembly occurrence (its `parent` group) so it nests
     // in the outliner exactly where the source places it, while keeping its own world transform (identity
     // groups don't perturb `global_transform`, so placement is byte-identical to the flat import).
@@ -1477,66 +1647,8 @@ fn land_cad(
                 value: FieldValue::Number(v),
             });
         }
-        if let Some(mi) = p.mesh {
-            let m = &report.meshes[mi];
-            // A non-rigid instance basis (mirror/scale) is baked into a per-instance mesh — a mirrored
-            // bracket is genuinely different geometry from its twin, so it keys its own handle (tagged with
-            // the basis-bits hash; same mirrored geometry still dedups across its instances).
-            let baked = if rigid || !p.fidelity.is_real_geometry() {
-                None
-            } else {
-                Some(metrocalk_editor_shell::bake_basis_into_mesh(
-                    &p.transform,
-                    &m.tris,
-                ))
-            };
-            let tris = baked.as_ref().unwrap_or(&m.tris);
-            let basis_tag = if baked.is_some() {
-                format!(":b{:016x}", basis_bits_hash(&p.transform))
-            } else {
-                String::new()
-            };
-            // Colour-aware GPU handle: the part's authored STEP colour is baked into the mesh material, so
-            // same-geometry-different-colour parts are distinct GPU meshes while same-geometry+colour instances
-            // still dedup to one (registered on demand here).
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let handle = match p.color {
-                Some(c) => format!(
-                    "mtkcad:{:016x}{basis_tag}:{:02x}{:02x}{:02x}",
-                    m.hash,
-                    (c[0] * 255.0).round().clamp(0.0, 255.0) as u8,
-                    (c[1] * 255.0).round().clamp(0.0, 255.0) as u8,
-                    (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
-                ),
-                None => format!("mtkcad:{:016x}{basis_tag}", m.hash),
-            };
-            if !assets.handle_to_slot.contains_key(&handle) {
-                let asset = metrocalk_editor_shell::csg_intent::trimesh_to_mesh_asset_colored(
-                    tris, "cad", p.color,
-                );
-                let gpu = MeshGpu::from_asset(&asset);
-                let slot = assets.meshes.len();
-                assets.meshes.push(gpu.clone());
-                assets.scales.push(1.0);
-                assets.handle_to_slot.insert(handle.clone(), slot);
-                let mut st = shared.lock().unwrap();
-                st.meshes.push(gpu);
-                st.meshes_revision = st.meshes_revision.wrapping_add(1);
-                drop(st);
-                // Persist the DERIVED mesh so the saved doc's `mtkcad:` handle re-resolves after restart +
-                // open (load_assets restores it) — without this every imported part silently degraded to a
-                // placeholder cube on reload. Never-silent: a write failure is logged, not swallowed.
-                if let Err(e) = metrocalk_editor_shell::persist_cad_mesh(
-                    &sidecar("metrocalk-cad-meshes"),
-                    &handle,
-                    tris,
-                    p.color,
-                ) {
-                    log(&format!(
-                        "CAD import: failed to persist mesh {handle} — it may not survive reload: {e}"
-                    ));
-                }
-            }
+        if let Some(handle) = handle_for(p) {
+            // Registered (GPU + persist queue) by the parallel pass above — this loop only authors the op.
             ops.push(metrocalk_core::Op::SetField {
                 entity: e,
                 component: "MeshRenderer".into(),
@@ -1574,8 +1686,9 @@ fn land_cad(
         }
     }
     log(&format!(
-        "CAD import: {} meshes registered, {} parts + {} group nodes, committing…",
+        "CAD import: {} meshes registered in {:.1}s, {} parts + {} group nodes, committing…",
         report.meshes.len(),
+        t_register.elapsed().as_secs_f64(),
         report.parts.len(),
         report.groups.len()
     ));
@@ -1584,6 +1697,20 @@ fn land_cad(
         return None;
     }
     log("CAD import commit OK");
+    // Sidecar persistence runs DETACHED so the land path replies "on screen" without waiting on disk.
+    if !persist_jobs.is_empty() {
+        let n = persist_jobs.len();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            for job in persist_jobs {
+                job();
+            }
+            eprintln!(
+                "[shell] CAD import: {n} derived mesh(es) persisted in {:.1}s (background)",
+                t0.elapsed().as_secs_f64()
+            );
+        });
+    }
     first
 }
 
@@ -2445,6 +2572,217 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             }
             EngineCmd::CadReport { reply } => {
                 let _ = reply.send(build_cad_report(&engine));
+            }
+            EngineCmd::SetJoint {
+                id,
+                revolute,
+                axis,
+                pivot,
+                limits,
+                source,
+                reply,
+            } => {
+                // M15.9 — author the joint (axis on the REAL geometry, never a silent origin default) as
+                // one undoable commit; the honesty label ("manual"/"inferred"/"urdf") rides the component.
+                let mut ok = false;
+                if let Some(eid) = EntityId::from_loro_key(&id) {
+                    let ops = metrocalk_editor_shell::set_joint_ops(
+                        eid, revolute, axis, pivot, limits, &source,
+                    );
+                    ok = engine.commit("set-joint", ops).is_ok();
+                    if ok {
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, project_entity(&engine, eid));
+                        }
+                    }
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::JointKey { id, t, reply } => {
+                // Key the CURRENT DOF value at time t (append/replace in the sorted track) — one undoable
+                // commit; the track is doc state (survives reload, merges).
+                let mut ok = false;
+                if let Some(eid) = EntityId::from_loro_key(&id) {
+                    if let Some(joint) = metrocalk_editor_shell::joint_of(&engine, eid) {
+                        let comps = engine.components_of(eid);
+                        let existing = comps
+                            .get(metrocalk_editor_shell::JOINT_TRACK)
+                            .and_then(|m| m.get("keys"))
+                            .and_then(|v| match v {
+                                FieldValue::Str(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        let mut keys = metrocalk_editor_shell::parse_track(&existing);
+                        keys.retain(|(kt, _)| (kt - t).abs() > 1e-9); // re-keying a time replaces it
+                        keys.push((t, joint.value));
+                        let encoded = metrocalk_editor_shell::encode_track(&keys);
+                        ok = engine
+                            .commit(
+                                "joint-key",
+                                vec![metrocalk_core::Op::SetField {
+                                    entity: eid,
+                                    component: metrocalk_editor_shell::JOINT_TRACK.into(),
+                                    field: "keys".into(),
+                                    value: FieldValue::Str(encoded),
+                                }],
+                            )
+                            .is_ok();
+                    }
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::JointValue {
+                id,
+                value,
+                commit,
+                reply,
+            } => {
+                let mut ok = false;
+                if let Some(eid) = EntityId::from_loro_key(&id) {
+                    if let Some(joint) = metrocalk_editor_shell::joint_of(&engine, eid) {
+                        let comps = engine.components_of(eid);
+                        let t = comps.get("Transform");
+                        let num = |f: &str| -> f64 {
+                            t.and_then(|m| m.get(f)).map_or(0.0, |v| match v {
+                                FieldValue::Number(n) => *n,
+                                #[allow(clippy::cast_precision_loss)]
+                                FieldValue::Integer(i) => *i as f64,
+                                _ => 0.0,
+                            })
+                        };
+                        let base_pos = [num("x"), num("y"), num("z")];
+                        let bq = [num("qx"), num("qy"), num("qz"), num("qw")];
+                        let base_quat = if bq == [0.0; 4] { [0.0, 0.0, 0.0, 1.0] } else { bq };
+                        // Pose relative to the joint's ZERO: undo the current value, apply the new one (so
+                        // repeated drags don't compound error — the pose is a pure function of `value`).
+                        let (zero_pos, zero_quat) =
+                            metrocalk_editor_shell::joint_pose(&joint, base_pos, base_quat, -joint.value);
+                        let (pos, quat) =
+                            metrocalk_editor_shell::joint_pose(&joint, zero_pos, zero_quat, value);
+                        if commit {
+                            // The committed pose: Transform + Joint.value in ONE undoable tx.
+                            let mut ops = Vec::with_capacity(8);
+                            for (f, v) in [
+                                ("x", pos[0]),
+                                ("y", pos[1]),
+                                ("z", pos[2]),
+                                ("qx", quat[0]),
+                                ("qy", quat[1]),
+                                ("qz", quat[2]),
+                                ("qw", quat[3]),
+                            ] {
+                                ops.push(metrocalk_core::Op::SetField {
+                                    entity: eid,
+                                    component: "Transform".into(),
+                                    field: f.into(),
+                                    value: FieldValue::Number(v),
+                                });
+                            }
+                            ops.push(metrocalk_core::Op::SetField {
+                                entity: eid,
+                                component: metrocalk_editor_shell::JOINT.into(),
+                                field: "value".into(),
+                                value: FieldValue::Number(value.clamp(joint.min, joint.max)),
+                            });
+                            ok = engine.commit("joint-drag", ops).is_ok();
+                            if ok {
+                                JOINT_POSES.with(|jp| jp.borrow_mut().remove(&eid));
+                                rebuild(&engine, &shared, &mut positions, &assets);
+                                if let Some(ch) = &channel {
+                                    send_proj!(ch, project_entity(&engine, eid));
+                                }
+                            }
+                        } else {
+                            // Preview: a render-only posed override — the doc is untouched.
+                            JOINT_POSES.with(|jp| {
+                                jp.borrow_mut().insert(eid, (pos, quat));
+                            });
+                            rebuild(&engine, &shared, &mut positions, &assets);
+                            ok = true;
+                        }
+                    }
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::JointScrub { t, reply } => {
+                // Scrub the whole mechanism to time t: every entity with a Joint + a track poses via the
+                // closed-form kinematic solve (deterministic — same t, same pose bits). Render-only.
+                let mut posed = 0usize;
+                JOINT_POSES.with(|jp| jp.borrow_mut().clear());
+                if t >= 0.0 {
+                    for eid in engine.entity_ids() {
+                        let Some(joint) = metrocalk_editor_shell::joint_of(&engine, eid) else {
+                            continue;
+                        };
+                        let comps = engine.components_of(eid);
+                        let Some(keys) = comps
+                            .get(metrocalk_editor_shell::JOINT_TRACK)
+                            .and_then(|m| m.get("keys"))
+                            .and_then(|v| match v {
+                                FieldValue::Str(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                        else {
+                            continue;
+                        };
+                        let track = metrocalk_editor_shell::parse_track(&keys);
+                        if track.is_empty() {
+                            continue;
+                        }
+                        let value = metrocalk_editor_shell::track_value(&track, t);
+                        let tf = comps.get("Transform");
+                        let num = |f: &str| -> f64 {
+                            tf.and_then(|m| m.get(f)).map_or(0.0, |v| match v {
+                                FieldValue::Number(n) => *n,
+                                #[allow(clippy::cast_precision_loss)]
+                                FieldValue::Integer(i) => *i as f64,
+                                _ => 0.0,
+                            })
+                        };
+                        let base_pos = [num("x"), num("y"), num("z")];
+                        let bq = [num("qx"), num("qy"), num("qz"), num("qw")];
+                        let base_quat = if bq == [0.0; 4] { [0.0, 0.0, 0.0, 1.0] } else { bq };
+                        // The base is the pose at the joint's committed value — solve relative to zero.
+                        let (zero_pos, zero_quat) =
+                            metrocalk_editor_shell::joint_pose(&joint, base_pos, base_quat, -joint.value);
+                        let pose =
+                            metrocalk_editor_shell::joint_pose(&joint, zero_pos, zero_quat, value);
+                        JOINT_POSES.with(|jp| {
+                            jp.borrow_mut().insert(eid, pose);
+                        });
+                        posed += 1;
+                    }
+                }
+                rebuild(&engine, &shared, &mut positions, &assets);
+                let _ = reply.send(posed);
+            }
+            EngineCmd::JointInfo { id, reply } => {
+                let info = EntityId::from_loro_key(&id).and_then(|eid| {
+                    let joint = metrocalk_editor_shell::joint_of(&engine, eid)?;
+                    let keys = engine
+                        .components_of(eid)
+                        .get(metrocalk_editor_shell::JOINT_TRACK)
+                        .and_then(|m| m.get("keys"))
+                        .and_then(|v| match v {
+                            FieldValue::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let track = metrocalk_editor_shell::parse_track(&keys);
+                    Some(JointInfoResp {
+                        joint_type: if joint.revolute { "revolute" } else { "prismatic" }.into(),
+                        axis: joint.axis,
+                        pivot: joint.pivot,
+                        source: metrocalk_editor_shell::joint_source(&engine, eid),
+                        value: joint.value,
+                        min: joint.min,
+                        max: joint.max,
+                        track_end: metrocalk_editor_shell::track_end(&track),
+                        keys: track.len(),
+                    })
+                });
+                let _ = reply.send(info);
             }
             EngineCmd::AssetProvenance { id, reply } => {
                 let info = EntityId::from_loro_key(&id)
@@ -5190,6 +5528,18 @@ fn camera_glyph(p: [f32; 3]) -> Vec<Instance> {
     out
 }
 
+/// A posed `(position, quaternion)` kinematic override (see [`JOINT_POSES`]).
+type JointPose = ([f64; 3], [f64; 4]);
+
+thread_local! {
+    /// M15.9 (ADR-079) — render-only kinematic pose overrides (entity → posed `(position, quat)`), applied
+    /// by `rebuild` ON TOP of the authored ECS transforms during a timeline scrub / joint-drag preview.
+    /// NEVER written to the doc (the M8.4 sim-scrub discipline: playback is a projection); cleared when the
+    /// scrub ends. Engine-thread-local — `rebuild` only runs there.
+    static JOINT_POSES: std::cell::RefCell<HashMap<EntityId, JointPose>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
 fn rebuild(
     engine: &Engine<FlecsWorld>,
     shared: &Shared,
@@ -5308,6 +5658,17 @@ fn rebuild(
             };
             (p, rot, scale)
         };
+        // M15.9 (ADR-079) — a render-only kinematic pose override (timeline scrub / joint-drag preview):
+        // the authored doc transform stays untouched; the posed transform is a PROJECTION.
+        #[allow(clippy::cast_possible_truncation)]
+        let (p, rot) = JOINT_POSES.with(|jp| {
+            jp.borrow().get(&id).map_or((p, rot), |(op, oq)| {
+                (
+                    [op[0] as f32, op[1] as f32, op[2] as f32],
+                    [oq[0] as f32, oq[1] as f32, oq[2] as f32, oq[3] as f32],
+                )
+            })
+        });
         if let Some(e) = engine.ecs_entity(id) {
             positions.insert(e, p);
         }
@@ -6845,6 +7206,97 @@ fn cad_report(state: State<AppState>) -> CadReportResp {
     recv_reply(&rx).unwrap_or_default()
 }
 
+/// M15.9 (ADR-079) — author a joint on an entity: the REAL axis + pivot (from the geometry / the
+/// designer's pick — never a silent origin default), typed revolute/prismatic, limits, and the honesty
+/// label ("manual" · "inferred" · "urdf"). ONE undoable commit.
+#[tauri::command(async)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+// Tauri commands bind args positionally from the JS invoke — the flat list is the idiomatic signature.
+fn set_joint(
+    state: State<AppState>,
+    id: String,
+    revolute: bool,
+    axis: [f64; 3],
+    pivot: [f64; 3],
+    min: f64,
+    max: f64,
+    source: String,
+) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SetJoint {
+            id,
+            revolute,
+            axis,
+            pivot,
+            limits: (min, max),
+            source,
+            reply,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    recv_reply(&rx).unwrap_or(false)
+}
+
+/// M15.9 — key the joint's current DOF value at time `t` (ONE undoable commit; the track survives reload).
+#[tauri::command(async)]
+fn joint_key(state: State<AppState>, id: String, t: f64) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::JointKey { id, t, reply }).is_err() {
+        return false;
+    }
+    recv_reply(&rx).unwrap_or(false)
+}
+
+/// M15.9 — drive a joint's DOF: `commit=false` previews (render-only), `commit=true` lands the posed
+/// Transform + value as ONE undoable commit (the gizmo-drag pattern applied to a kinematic DOF).
+#[tauri::command(async)]
+fn joint_value(state: State<AppState>, id: String, value: f64, commit: bool) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::JointValue {
+            id,
+            value,
+            commit,
+            reply,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    recv_reply(&rx).unwrap_or(false)
+}
+
+/// M15.9 — scrub the whole mechanism's timeline to `t` (deterministic closed-form; render-only — the doc
+/// is never mutated by playback; `t < 0` clears). Returns the number of posed entities.
+#[tauri::command(async)]
+fn joint_scrub(state: State<AppState>, t: f64) -> usize {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::JointScrub { t, reply }).is_err() {
+        return 0;
+    }
+    recv_reply(&rx).unwrap_or(0)
+}
+
+/// M15.9 — the selected joint's state for the panel (a read; fetched on selection change).
+#[tauri::command(async)]
+fn joint_info(state: State<AppState>, id: String) -> Option<JointInfoResp> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::JointInfo { id, reply }).is_err() {
+        return None;
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
 /// M11.5 (ADR-044) — the selected entity's asset provenance for the inspector identity surface (where it
 /// came from, AI-generated?, a near-duplicate hint). Fetched on selection change, not per frame.
 #[tauri::command(async)]
@@ -7459,6 +7911,11 @@ fn main() {
             duplicate_entity,
             entity_details,
             cad_report,
+            set_joint,
+            joint_key,
+            joint_value,
+            joint_scrub,
+            joint_info,
             asset_provenance,
             rule_registry,
             list_rules,

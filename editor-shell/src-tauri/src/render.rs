@@ -209,7 +209,11 @@ impl SceneState {
         let mut lo = [f32::INFINITY; 3];
         let mut hi = [f32::NEG_INFINITY; 3];
         for inst in &self.instances {
-            let r = inst.scale.max(0.5);
+            // The per-instance radius floor is CM-SCALE (0.05), not the old 0.5: a centimetre-scale CAD
+            // part (a mm-unit import at scale 0.001) was being inflated to a half-metre sphere, so
+            // frame-all parked the camera metres away and the part rendered sub-pixel — "first-class CAD"
+            // failed for small parts (the M15.9 screenshot assessment caught it).
+            let r = inst.scale.max(0.05);
             for k in 0..3 {
                 lo[k] = lo[k].min(inst.center[k] - r);
                 hi[k] = hi[k].max(inst.center[k] + r);
@@ -223,11 +227,11 @@ impl SceneState {
         let radius = (0..3)
             .map(|k| (hi[k] - lo[k]) * 0.5)
             .fold(0.0_f32, f32::max)
-            .max(1.0);
-        // Floor at 3.0 (not 6.0): a single small object (radius ~1 → 2.4) was being pushed out to 6.0 and
-        // rendered tiny — "create something → see it" (the close-the-loop UX). Multi-object scenes have a
-        // larger radius, so the floor only tightens framing for small/single-object scenes.
-        self.distance = (radius * 2.4).clamp(3.0, 400.0);
+            .max(0.02);
+        // Distance floor 0.3 (3× the 0.1 near plane), not the old metre-scale 3.0: the computed fit
+        // (radius × 2.4) already frames a unit prop at ~2.4; the metre floor pushed small CAD out of
+        // view. Multi-object scenes have a larger radius, so the floor only affects tiny scenes.
+        self.distance = (radius * 2.4).clamp(0.3, 400.0);
         self.clear_focus();
         self.revision = self.revision.wrapping_add(1);
     }
@@ -290,8 +294,11 @@ impl SceneState {
                 self.distance
             });
         }
-        let half_extent = self.instances[i].scale.max(0.5);
-        self.distance = (half_extent * 4.0).clamp(6.0, 40.0);
+        // CM-SCALE floors (not the old 0.5 m / 6 m): focusing a centimetre-scale CAD part must get the
+        // camera NEAR it (the old 6 m floor parked a 2 cm part sub-pixel — the same M15.9 defect family
+        // as frame-all's metre floors).
+        let half_extent = self.instances[i].scale.max(0.02);
+        self.distance = (half_extent * 4.0).clamp(0.15, 40.0);
         self.focused = Some(i);
         self.revision = self.revision.wrapping_add(1);
     }
@@ -1470,7 +1477,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // right-drag is active, poll the OS cursor and orbit by its per-frame delta. No `invoke`
             // here; the JS side only sent drag_start/drag_end (2 calls per gesture), never per frame.
             if st.zoom_delta != 0.0 {
-                st.distance = (st.distance + st.zoom_delta).clamp(5.0, 400.0);
+                // Per-unit step = 15% of the current distance, capped at the legacy 1 m/unit: wheel feel
+                // is unchanged for metre-scale scenes (≥ ~7 m), while a cm-scale CAD scene zooms
+                // proportionally. Floor just past the 0.1 near plane — the old 5 m floor made any zoom
+                // leap a centimetre-scale mechanism out to 5 m (sub-pixel parts; the M15.9 screenshot
+                // assessment caught it).
+                let step = (st.distance * 0.15).min(1.0);
+                st.distance = (st.distance + st.zoom_delta * step).clamp(0.12, 400.0);
                 st.zoom_delta = 0.0;
             }
             if st.dragging {
@@ -3030,8 +3043,9 @@ mod tests {
         st.focus_on(2);
         // Center: the orbit target is the focused entity's position.
         assert_eq!(st.cam_target, [4.0, 1.0, 0.0]);
-        // Get nearby: zoomed in from 60 → scale(1.0)*4 clamped to [6,40] = 6.
-        assert_eq!(st.distance, 6.0);
+        // Get nearby: zoomed in from 60 → half_extent(max(1.0, 0.02))*4 clamped to [0.15, 40] = 4.
+        // (The floor is cm-scale, 0.15 m — the old 6 m floor parked a cm-scale CAD part sub-pixel; M15.9.)
+        assert_eq!(st.distance, 4.0);
         assert!(st.distance < 60.0, "focus must zoom IN (get nearby)");
         // Selected + focused are the same entity; the shader keeps it lit while dimming the rest.
         assert_eq!(st.selected, Some(2));

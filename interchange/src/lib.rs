@@ -25,8 +25,8 @@ mod usd;
 // M15.8 (ADR-078) — closed-form analytic curved-surface tessellation (cylinder/cone/sphere/torus), the
 // kernel-free half of the curved-fidelity gap. NURBS/freeform stays the licensed-kernel/OCCT seam.
 pub use analytic::{
-    max_normal_deviation, plan_analytic, tessellate_analytic, AnalyticPatch, AnalyticSurface,
-    DEFLECTION,
+    max_normal_deviation, plan_analytic, tessellate_analytic, tessellate_analytic_with,
+    AnalyticPatch, AnalyticSurface, DEFLECTION, PREVIEW_DEFLECTION,
 };
 pub use step::{
     gdt_entity_name, gdt_token, round_trip_deviation, CadEdge, CadFace, CadInterchange, CadPmi,

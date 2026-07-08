@@ -36,6 +36,7 @@ import { ToastHost } from "../panels/ToastHost";
 import { EmptyState } from "../panels/EmptyState";
 import { AiEditPanel } from "../panels/AiEditPanel";
 import { ImportReport } from "../panels/ImportReport";
+import { JointPanel } from "../panels/JointPanel";
 import { Diagnostics } from "../panels/Diagnostics";
 import { Inspector } from "../inspector/Inspector";
 import { BindingGraph } from "../graph/BindingGraph";
@@ -254,6 +255,10 @@ export function App() {
     <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", height: "100%" }}>
       <Inspector client={client} />
       <AiEditPanel client={client} />
+      {/* M15.9 — rig + animate the selected part as a mechanism joint (real axis, undoable, scrubbable). */}
+      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
+        <JointPanel client={client} />
+      </div>
       {/* M15.7 — the never-silent CAD import report (renders only when the scene has imported CAD). */}
       <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
         <ImportReport client={client} />

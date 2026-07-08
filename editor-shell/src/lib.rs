@@ -25,6 +25,7 @@ pub mod csg_intent;
 pub mod feature_history;
 pub mod generate;
 pub mod generative;
+pub mod kinematics;
 pub mod metering;
 pub mod pdm;
 pub mod persist;
@@ -78,7 +79,14 @@ pub use generative::{
     Objective, PreciceFmiSolver, RomBeamSolver, Solver, SolverError, SpecError, StructuralResult,
     DESIGN_COMPONENT,
 };
+pub use kinematics::{
+    encode_track, joint_of, joint_pose, joint_source, parse_track, set_joint_ops, track_end,
+    track_value, Joint, JOINT, JOINT_TRACK,
+};
 pub use metering::{ai_edit_material, buy_marketplace, material_patch, Outcome};
+// The project-owned triangle-mesh type (what `bake_basis_into_mesh` takes/returns and `persist_cad_mesh`
+// stores) — re-exported so the app shell can NAME it (`RegOut`) without a direct `metrocalk-csg` dep.
+pub use metrocalk_csg::TriMesh;
 pub use pdm::{
     approval_delta, branch_from, merge_eco, release, state_identity, verify as verify_revision,
     EcoOutcome, PdmError,

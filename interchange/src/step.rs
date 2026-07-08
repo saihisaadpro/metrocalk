@@ -150,8 +150,16 @@ impl CadScene {
     /// non-convex case uses the parsed surface normal + `same_sense` — a named refinement). Curved faces
     /// are skipped here (their tessellation is the OCCT seam).
     #[must_use]
-    #[allow(clippy::cast_precision_loss)] // polygon vertex counts are tiny
     pub fn tessellate(&self) -> TriMesh {
+        self.tessellate_with(crate::analytic::DEFLECTION)
+    }
+
+    /// [`Self::tessellate`] at an explicit analytic deflection — the assembly bake passes
+    /// [`crate::analytic::PREVIEW_DEFLECTION`] (quality by context: a 13k-occurrence factory cell at
+    /// preview grade stays inside the "on screen in seconds" budget; a single part gets viewer grade).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // polygon vertex counts are tiny
+    pub fn tessellate_with(&self, deflection: f64) -> TriMesh {
         let mut weld: BTreeMap<[u64; 3], u32> = BTreeMap::new();
         let mut positions: Vec<[f64; 3]> = Vec::new();
         let mut triangles: Vec<[u32; 3]> = Vec::new();
@@ -197,11 +205,12 @@ impl CadScene {
                 // `interpret_face` / the tessellation caller already carries the explained seam note —
                 // the never-silent record lives in `notes`, not in this hot loop.
                 if let Some(surface) = &face.surface {
-                    if let Ok(patch) = crate::analytic::tessellate_analytic(
+                    if let Ok(patch) = crate::analytic::tessellate_analytic_with(
                         face.id,
                         surface,
                         &face.outer,
                         face.same_sense,
+                        deflection,
                     ) {
                         // Weld the patch's grid through the shared exact-coordinate intern so seams shared
                         // between analytic faces (e.g. two half-cylinders) stitch.
@@ -1866,7 +1875,9 @@ fn tessellate_product_brep(
         pmi: Vec::new(),
         notes: Vec::new(),
     };
-    let mesh = scene.tessellate();
+    // Assembly bakes tessellate at PREVIEW grade (quality by context): a 13k-occurrence cell at exact
+    // viewer grade measured minutes of registration/persist for invisible gain at factory scale.
+    let mesh = scene.tessellate_with(crate::analytic::PREVIEW_DEFLECTION);
     let extent = mesh_axis_extent(&mesh);
     if mesh.triangle_count() > 0 && extent > MAX_PART_EXTENT_MM {
         // The construction-artifact filter (an unbounded reference plane exported as a giant plate) —

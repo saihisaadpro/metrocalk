@@ -176,6 +176,21 @@ export interface EntityDetails {
   boundTo: string[];
 }
 
+/** M15.9 (ADR-079) — a joint's state for the panel: type, the REAL axis + pivot, the honesty-labeled
+ *  source rung ("manual" gizmo-authored · "inferred" · "urdf"), the DOF value + limits, and the timeline
+ *  length. Mirrors `JointInfoResp`. */
+export interface JointInfo {
+  jointType: "revolute" | "prismatic" | string;
+  axis: [number, number, number];
+  pivot: [number, number, number];
+  source: string;
+  value: number;
+  min: number;
+  max: number;
+  trackEnd: number;
+  keys: number;
+}
+
 /** One row of the M15.7 (ADR-077) import report — a CAD part + its honesty class (the persisted `CadPart`
  *  fidelity token, so this survives reload). Mirrors `CadReportPart`. */
 export interface CadReportPart {

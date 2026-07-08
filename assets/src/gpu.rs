@@ -329,6 +329,14 @@ impl MeshGpu {
 /// meeting across more than 30° keep a crisp edge (a box corner). 30° is the common DCC/CAD default.
 const CREASE_COS: f32 = 0.866_025_4;
 
+/// The largest incident-triangle fan a welded vertex may smooth across. A real manifold vertex has ~6
+/// incident tris; a fan past this is a weld ARTIFACT (the bbox-relative tolerance on a factory-spanning
+/// instance-merged CAD mesh collapses unrelated fine detail into one rep) — the pairwise crease test there
+/// is O(fan²) (a measured multi-minute registration stall), and smoothing across unrelated geometry would
+/// be wrong anyway. Such reps skip grouping: each incident tri keeps its own corner normal (locally
+/// faceted, geometrically honest).
+const MAX_SMOOTH_FAN: usize = 64;
+
 /// Path-compressing union-find lookup.
 fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
     while parent[x] != x {
@@ -429,9 +437,16 @@ fn smooth_normals(
     }
 
     // At each welded rep, union-find its incident tris by the crease test → each incident tri's group root.
+    // A fan past MAX_SMOOTH_FAN is a weld artifact — skip the O(fan²) grouping (see the const's doc).
     let mut tri_group: BTreeMap<(usize, usize), usize> = BTreeMap::new(); // (rep, tri) → representative tri
     for (r, tris) in rep_tris.iter().enumerate() {
         let n = tris.len();
+        if n > MAX_SMOOTH_FAN {
+            for &t in tris {
+                tri_group.insert((r, t), t);
+            }
+            continue;
+        }
         let mut parent: Vec<usize> = (0..n).collect();
         for i in 0..n {
             for j in (i + 1)..n {

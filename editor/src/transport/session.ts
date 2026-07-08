@@ -17,6 +17,7 @@ import type {
   CatalogSearch,
   CadReport,
   ContactInfo,
+  JointInfo,
   DescribeResponse,
   EconResponse,
   EditIntent,
@@ -85,6 +86,16 @@ export interface EditorClient {
   entityDetails(id: string): Promise<EntityDetails | null>;
   /** The per-part CAD import report (M15.7) — the fidelity breakdown + a capped part list, off the ECS. */
   cadReport(): Promise<CadReport>;
+  /** M15.9 — author a joint (real axis + pivot; honesty-labeled source) as ONE undoable commit. */
+  setJoint(id: string, revolute: boolean, axis: [number, number, number], pivot: [number, number, number], min: number, max: number, source: string): Promise<boolean>;
+  /** M15.9 — key the joint's current DOF value at time t (ONE undoable commit). */
+  jointKey(id: string, t: number): Promise<boolean>;
+  /** M15.9 — drive a joint's DOF (preview or commit — the gizmo-drag pattern on a kinematic DOF). */
+  jointValue(id: string, value: number, commit: boolean): Promise<boolean>;
+  /** M15.9 — scrub the mechanism timeline to t (deterministic, render-only; t<0 clears). */
+  jointScrub(t: number): Promise<number>;
+  /** M15.9 — the selected joint's state (a read). */
+  jointInfo(id: string): Promise<JointInfo | null>;
   /** Remove an entity + its edges (M3.3) — one undoable transaction (the delta streams back). */
   removeEntity(id: string): void;
   /** Duplicate an entity (M3.3) — one undoable transaction; resolves to the clone's id. */
@@ -388,6 +399,21 @@ export class TauriClient implements EditorClient {
   }
   cadReport(): Promise<CadReport> {
     return this.core.invoke<CadReport>("cad_report").catch((e: unknown) => { console.error("cad_report failed", e); throw e; });
+  }
+  setJoint(id: string, revolute: boolean, axis: [number, number, number], pivot: [number, number, number], min: number, max: number, source: string): Promise<boolean> {
+    return this.core.invoke<boolean>("set_joint", { id, revolute, axis, pivot, min, max, source }).catch((e: unknown) => { console.error("set_joint failed", e); return false; });
+  }
+  jointKey(id: string, t: number): Promise<boolean> {
+    return this.core.invoke<boolean>("joint_key", { id, t }).catch((e: unknown) => { console.error("joint_key failed", e); return false; });
+  }
+  jointValue(id: string, value: number, commit: boolean): Promise<boolean> {
+    return this.core.invoke<boolean>("joint_value", { id, value, commit }).catch((e: unknown) => { console.error("joint_value failed", e); return false; });
+  }
+  jointScrub(t: number): Promise<number> {
+    return this.core.invoke<number>("joint_scrub", { t }).catch((e: unknown) => { console.error("joint_scrub failed", e); return 0; });
+  }
+  jointInfo(id: string): Promise<JointInfo | null> {
+    return this.core.invoke<JointInfo | null>("joint_info", { id }).catch((e: unknown) => { console.error("joint_info failed", e); return null; });
   }
   entityDetails(id: string): Promise<EntityDetails | null> {
     return this.core.invoke<EntityDetails | null>("entity_details", { id }).catch((e: unknown) => { console.error("entity_details failed", e); throw e; });
@@ -879,6 +905,21 @@ class MockClient implements EditorClient {
       requires: "HealthBar" in c ? ["Health"] : [],
       boundTo: [],
     });
+  }
+  setJoint(): Promise<boolean> {
+    return Promise.resolve(false); // joints ride the real core (kinematic solve is engine-side)
+  }
+  jointKey(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+  jointValue(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+  jointScrub(): Promise<number> {
+    return Promise.resolve(0);
+  }
+  jointInfo(): Promise<JointInfo | null> {
+    return Promise.resolve(null);
   }
   cadReport(): Promise<CadReport> {
     // Dev stand-in: derive the report from the projection's persisted CadPart components (empty until a
