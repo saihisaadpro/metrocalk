@@ -2653,11 +2653,19 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         };
                         let base_pos = [num("x"), num("y"), num("z")];
                         let bq = [num("qx"), num("qy"), num("qz"), num("qw")];
-                        let base_quat = if bq == [0.0; 4] { [0.0, 0.0, 0.0, 1.0] } else { bq };
+                        let base_quat = if bq == [0.0; 4] {
+                            [0.0, 0.0, 0.0, 1.0]
+                        } else {
+                            bq
+                        };
                         // Pose relative to the joint's ZERO: undo the current value, apply the new one (so
                         // repeated drags don't compound error — the pose is a pure function of `value`).
-                        let (zero_pos, zero_quat) =
-                            metrocalk_editor_shell::joint_pose(&joint, base_pos, base_quat, -joint.value);
+                        let (zero_pos, zero_quat) = metrocalk_editor_shell::joint_pose(
+                            &joint,
+                            base_pos,
+                            base_quat,
+                            -joint.value,
+                        );
                         let (pos, quat) =
                             metrocalk_editor_shell::joint_pose(&joint, zero_pos, zero_quat, value);
                         if commit {
@@ -2742,10 +2750,18 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         };
                         let base_pos = [num("x"), num("y"), num("z")];
                         let bq = [num("qx"), num("qy"), num("qz"), num("qw")];
-                        let base_quat = if bq == [0.0; 4] { [0.0, 0.0, 0.0, 1.0] } else { bq };
+                        let base_quat = if bq == [0.0; 4] {
+                            [0.0, 0.0, 0.0, 1.0]
+                        } else {
+                            bq
+                        };
                         // The base is the pose at the joint's committed value — solve relative to zero.
-                        let (zero_pos, zero_quat) =
-                            metrocalk_editor_shell::joint_pose(&joint, base_pos, base_quat, -joint.value);
+                        let (zero_pos, zero_quat) = metrocalk_editor_shell::joint_pose(
+                            &joint,
+                            base_pos,
+                            base_quat,
+                            -joint.value,
+                        );
                         let pose =
                             metrocalk_editor_shell::joint_pose(&joint, zero_pos, zero_quat, value);
                         JOINT_POSES.with(|jp| {
@@ -2771,7 +2787,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         .unwrap_or_default();
                     let track = metrocalk_editor_shell::parse_track(&keys);
                     Some(JointInfoResp {
-                        joint_type: if joint.revolute { "revolute" } else { "prismatic" }.into(),
+                        joint_type: if joint.revolute {
+                            "revolute"
+                        } else {
+                            "prismatic"
+                        }
+                        .into(),
                         axis: joint.axis,
                         pivot: joint.pivot,
                         source: metrocalk_editor_shell::joint_source(&engine, eid),
