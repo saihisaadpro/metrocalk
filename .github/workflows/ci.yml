@@ -37,7 +37,15 @@ jobs:
         run: cargo fmt --all --check
 
       - name: clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          set +e
+          OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+          CODE=$?
+          echo "$OUT"
+          if [ $CODE -ne 0 ]; then
+            echo "$OUT" | grep -E '^error|^warning:|-->' | head -20 | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
 
       - name: No flecs_ecs leakage outside the ecs wrapper crate (ADR-001/006)
         run: |
