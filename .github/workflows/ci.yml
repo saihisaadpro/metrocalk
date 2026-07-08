@@ -18,16 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Pinned to 1.92.0 (the toolchain the workspace is fmt'd + clippy-clean against) so `cargo fmt --check`
-      # and `clippy -D warnings` match the local/authoritative gates EXACTLY. An UNPINNED `@stable` rustfmt/
-      # clippy silently drifts to a newer release that reformats or ADDS lints, redding already-canonical code
-      # (the exact failure mode `editor-shell-app.yml` already pins 1.92.0 to avoid, verbatim) — that drift
-      # rode M15.8→M15.9→M15.10 as an ambient step-6 clippy red; this pin clears it. Bump deliberately (like
-      # fmt) when adopting a newer toolchain's lints, not by silent `@stable` drift.
-      - name: Install Rust 1.92.0 + rustfmt + clippy
-        uses: dtolnay/rust-toolchain@master
+      # `rust-toolchain.toml` (channel = "stable") governs the toolchain here — the dtolnay action resolves to
+      # the same current stable, so a lint added by a newer stable is a REAL lint to fix, not a drift to pin
+      # around (the M15.10 convergence fixed the `collapsible_match` a newer clippy surfaced in the 3DXML
+      # reader; contributors on an older local stable won't see it, so keep the code clean against current
+      # stable). If a future stable's lints ever churn the gate, pin `rust-toolchain.toml` deliberately.
+      - name: Install Rust (stable) + rustfmt + clippy
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.92.0
           components: rustfmt, clippy
 
       - name: Cache cargo + target
@@ -37,15 +35,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: clippy (deny warnings)
-        run: |
-          set +e
-          OUT=$(cargo clippy --workspace --all-targets --color=never -- -D warnings 2>&1)
-          CODE=$?
-          echo "$OUT"
-          if [ $CODE -ne 0 ]; then
-            echo "$OUT" | grep -E 'error(\[|:)|warning:|-->|= (help|note)' | head -24 | while IFS= read -r line; do echo "::error::$line"; done
-            exit 1
-          fi
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: No flecs_ecs leakage outside the ecs wrapper crate (ADR-001/006)
         run: |
