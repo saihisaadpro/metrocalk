@@ -337,6 +337,28 @@ pub fn plan_analytic(
     plan_with(face_id, surface, boundary, DEFLECTION)
 }
 
+/// The per-face quad budget (see [`MAX_FACE_QUADS`]): if `nu·nv` exceeds it, coarsen BOTH axes by the same
+/// `sqrt(budget/quads)` factor — proportional + deterministic, so a huge-radius face stays bounded without
+/// distorting its aspect. Floors keep at least a triangle (`nu≥2`, `nv≥1`).
+fn clamp_to_quad_budget(nu: u32, nv: u32) -> (u32, u32) {
+    let quads = u64::from(nu) * u64::from(nv);
+    if quads <= u64::from(MAX_FACE_QUADS) {
+        return (nu, nv);
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    {
+        let s = (f64::from(MAX_FACE_QUADS) / quads as f64).sqrt();
+        (
+            ((f64::from(nu) * s).floor() as u32).max(2),
+            ((f64::from(nv) * s).floor() as u32).max(1),
+        )
+    }
+}
+
 /// [`plan_analytic`] at an explicit deflection (the subset GATES are deflection-independent; only the
 /// segment counts change — [`PREVIEW_DEFLECTION`] for assemblies, [`DEFLECTION`] for single parts).
 fn plan_with(
@@ -440,28 +462,15 @@ fn plan_with(
         return Err(beyond("the boundary projects to a zero-height patch"));
     }
 
-    // Adaptive segment counts from the ABSOLUTE deflection.
+    // Adaptive segment counts from the ABSOLUTE deflection, then bounded by the per-face quad budget.
     let (ru, rv) = surface.curvatures();
-    let mut nu = segments(sweep, ru, deflection);
-    let mut nv = match rv {
+    let nu = segments(sweep, ru, deflection);
+    let nv = match rv {
         // The v direction is curved too (sphere latitude / torus tube) — its sweep is the v-range itself.
         Some(r) => segments((v1 - v0).abs(), r, deflection),
         None => 1, // straight generator (cylinder/cone) — one segment spans it exactly
     };
-    // The per-face quad budget (see MAX_FACE_QUADS): proportional, deterministic coarsening.
-    let quads = u64::from(nu) * u64::from(nv);
-    if quads > u64::from(MAX_FACE_QUADS) {
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        {
-            let s = (f64::from(MAX_FACE_QUADS) / quads as f64).sqrt();
-            nu = ((f64::from(nu) * s).floor() as u32).max(2);
-            nv = ((f64::from(nv) * s).floor() as u32).max(1);
-        }
-    }
+    let (nu, nv) = clamp_to_quad_budget(nu, nv);
     Ok(AnalyticPlan {
         u0,
         sweep,
