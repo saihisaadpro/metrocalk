@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod analytic;
 mod cad_import;
+mod reimport_identity;
 pub(crate) mod step;
 mod urdf;
 mod usd;
@@ -43,6 +44,14 @@ pub use cad_import::{
     translation_of, CadError, CadImport, CadMesh, CadReader, FidelityCounts, GroupNode,
     ImportStrategy, KernelProbe, PartChange, PartDiff, PartFidelity, PartReport, PartSource,
     RawPart, StepAssemblyReader, IDENTITY_4X4, KERNEL_DIR_ENV, MAX_ASSEMBLY_DEPTH,
+};
+// M15.10 (ADR-080) — persistent re-import identity: match an edited re-import's parts to the previous
+// import from a rotation/translation-invariant geometric fingerprint (prefer-miss-over-wrong), so the engine
+// re-binds every override onto the geometrically-matched part. The deterministic analytic matcher; a learned
+// model is the named upgrade behind the same seam.
+pub use reimport_identity::{
+    fingerprint, identities, match_identities, match_reimport, MatchKind, PartFingerprint,
+    PartIdentity, PartMatch, ReimportPlan,
 };
 pub use urdf::UrdfInterchange;
 pub use usd::UsdInterchange;

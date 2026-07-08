@@ -35,6 +35,7 @@ pub mod plugin_host;
 pub mod pmi;
 pub mod pmi_step;
 pub mod project;
+pub mod reimport;
 pub mod reveal;
 pub mod sdf_intent;
 pub mod transform_solver;
@@ -103,6 +104,10 @@ pub use pmi_step::{
     reimport_with_pmi, scene_with_pmi, FidelityRow, RoundTripFidelity, SemanticFcf,
 };
 pub use project::{atomic_write, open_into, save, OpenError};
+pub use reimport::{
+    capture_overrides, match_scene_against, plan_rebind, rebind_ops, reimport_identity_of,
+    set_reimport_id_ops, Adjudication, OrphanedOverride, OverrideSet, RebindOutcome, REIMPORT_ID,
+};
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
 pub use sdf_intent::{bake as bake_sdf, bake_auto as bake_sdf_auto, SdfBakeError};
 pub use wallet::Wallet;
