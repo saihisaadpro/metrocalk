@@ -285,6 +285,7 @@ fn a_low_confidence_match_is_held_for_adjudication_never_auto_applied() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one cohesive end-to-end re-import scenario (import → work → re-import → assert)
 fn reimport_over_scene_rebinds_deactivates_old_and_reports_every_part() {
     // D1 (ADR-080 convergence): the LIVE re-import orchestration end-to-end (headless). Import A (bracket +
     // plate with overrides), then re-import an edited B over the live scene: reimport_over_scene must produce
