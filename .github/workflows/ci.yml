@@ -18,9 +18,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust (stable) + rustfmt + clippy
-        uses: dtolnay/rust-toolchain@stable
+      # Pinned to 1.92.0 (the toolchain the workspace is fmt'd + clippy-clean against) so `cargo fmt --check`
+      # and `clippy -D warnings` match the local/authoritative gates EXACTLY. An UNPINNED `@stable` rustfmt/
+      # clippy silently drifts to a newer release that reformats or ADDS lints, redding already-canonical code
+      # (the exact failure mode `editor-shell-app.yml` already pins 1.92.0 to avoid, verbatim) — that drift
+      # rode M15.8→M15.9→M15.10 as an ambient step-6 clippy red; this pin clears it. Bump deliberately (like
+      # fmt) when adopting a newer toolchain's lints, not by silent `@stable` drift.
+      - name: Install Rust 1.92.0 + rustfmt + clippy
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.92.0
           components: rustfmt, clippy
 
       - name: Cache cargo + target
