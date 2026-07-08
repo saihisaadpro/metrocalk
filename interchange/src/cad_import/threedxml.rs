@@ -755,10 +755,8 @@ fn parse_open_3drep(bytes: &[u8]) -> Option<TriMesh> {
                     }
                 }
             }
-            Ok(Event::End(e)) => {
-                if e.local_name().as_ref() == b"Positions" {
-                    in_positions = false;
-                }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"Positions" => {
+                in_positions = false;
             }
             _ => {}
         }
