@@ -906,9 +906,7 @@ impl CadReader for StepAssemblyReader {
     fn can_read(&self, bytes: &[u8]) -> bool {
         // The ISO-10303-21 wrapper (allow a UTF-8 BOM / leading whitespace).
         let head = &bytes[..bytes.len().min(256)];
-        std::str::from_utf8(head)
-            .map(|s| s.contains("ISO-10303-21"))
-            .unwrap_or(false)
+        std::str::from_utf8(head).is_ok_and(|s| s.contains("ISO-10303-21"))
     }
 
     fn read(&self, bytes: &[u8]) -> Result<CadImport, CadError> {

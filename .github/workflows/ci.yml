@@ -39,11 +39,11 @@ jobs:
       - name: clippy (deny warnings)
         run: |
           set +e
-          OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1)
+          OUT=$(cargo clippy --workspace --all-targets --color=never -- -D warnings 2>&1)
           CODE=$?
           echo "$OUT"
           if [ $CODE -ne 0 ]; then
-            echo "$OUT" | grep -E '^error|^warning:|-->' | head -20 | while IFS= read -r line; do echo "::error::$line"; done
+            echo "$OUT" | grep -E 'error(\[|:)|warning:|-->|= (help|note)' | head -24 | while IFS= read -r line; do echo "::error::$line"; done
             exit 1
           fi
 
