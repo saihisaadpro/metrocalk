@@ -55,6 +55,14 @@ pub struct PartFingerprint {
     /// exact-B-rep part (M15.8 [`crate::analytic::AnalyticSurface`]); all-zero for a tessellation-only part.
     /// A strong discriminator when available (a bracket and a shaft differ sharply here).
     pub surface_hist: [u32; 5],
+    /// **Chirality / handedness** — `+1`, `-1`, or `0` (achiral/ambiguous). The other fields (volume · area ·
+    /// principal moments) are IDENTICAL for a part and its mirror twin (a left/right bracket pair), so without
+    /// this a re-import would happily cross-match a left part onto its right twin and corrupt the override.
+    /// The sign of the eigenvalue-ordered principal frame, each axis oriented by its third-moment (skewness)
+    /// sign — a rotation-invariant pseudo-scalar that FLIPS under reflection. `0` when the part is
+    /// reflection-symmetric along a principal axis (genuinely achiral) or its axes are degenerate (a
+    /// near-symmetric part — then chirality carries no information and must not gate the match).
+    pub chirality: i8,
 }
 
 impl PartFingerprint {
@@ -67,6 +75,7 @@ impl PartFingerprint {
             moments: [0.0; 3],
             tri_count: 0,
             surface_hist: [0; 5],
+            chirality: 0,
         }
     }
 }
@@ -204,9 +213,10 @@ pub fn fingerprint(tris: &TriMesh, faces: Option<&[crate::step::CadFace]>) -> Pa
     if tris.triangles.is_empty() {
         return PartFingerprint::degenerate();
     }
-    let (volume, _centroid, cov) = volume_centroid_covariance(tris);
+    let (volume, centroid, cov) = volume_centroid_covariance(tris);
     let area = surface_area(tris);
     let moments = sym3_eigenvalues_sorted(cov);
+    let chirality = chirality_sign(tris, centroid, cov, moments);
     #[allow(clippy::cast_possible_truncation)]
     let tri_count = tris.triangles.len() as u32;
     let mut surface_hist = [0u32; 5];
@@ -229,6 +239,7 @@ pub fn fingerprint(tris: &TriMesh, faces: Option<&[crate::step::CadFace]>) -> Pa
         moments,
         tri_count,
         surface_hist,
+        chirality,
     }
 }
 
@@ -424,6 +435,13 @@ fn confidence(o: &PartIdentity, n: &PartIdentity, scale: f64) -> f64 {
     if fo.tri_count == 0 || fn_.tri_count == 0 {
         return 0.0; // a degenerate/proxy part can't be geometrically matched
     }
+    // CHIRALITY GATE: a part and its mirror twin share volume/area/moments but have OPPOSITE handedness. If
+    // both sides are definitively chiral (±1) and DISAGREE, they are a left/right pair, not the same edited
+    // part — force a MISS (prefer-miss-over-wrong; a wrong bind onto a mirror twin silently corrupts). A `0`
+    // on either side (achiral or a near-symmetric part whose axes are ambiguous) carries no info → no gate.
+    if fo.chirality != 0 && fn_.chirality != 0 && fo.chirality != fn_.chirality {
+        return 0.0;
+    }
     // Relative similarity of a scalar pair: 1 when equal, → 0 as they diverge (symmetric relative difference).
     let rel = |a: f64, b: f64| -> f64 {
         let d = (a - b).abs();
@@ -602,6 +620,112 @@ fn sym3_eigenvalues_sorted(m: [[f64; 3]; 3]) -> [f64; 3] {
     e
 }
 
+/// The **chirality (handedness) pseudo-scalar** of a mesh: `+1`, `-1`, or `0` (achiral / ambiguous). Volume,
+/// area, and the principal moments are IDENTICAL for a part and its mirror twin — this is the ONE fingerprint
+/// term that flips under reflection, so a left bracket doesn't cross-match its right twin on re-import.
+///
+/// Construction: the eigenvalue-ordered principal frame `[e0,e1,e2]` (ascending), each axis **oriented by the
+/// sign of its third moment** (skewness) so the frame is reflection-covariant, then `sign(det[e0 e1 e2])`.
+/// Returns `0` (no chirality gate) when the shape is reflection-symmetric along a principal axis (third moment
+/// ≈ 0 → genuinely achiral, e.g. a box) OR its principal axes are DEGENERATE (near-equal eigenvalues → the
+/// axes aren't well-defined, the near-symmetric case — chirality must not gate an already-hard match).
+fn chirality_sign(tris: &TriMesh, centroid: [f64; 3], cov: [[f64; 3]; 3], evals: [f64; 3]) -> i8 {
+    let spread = evals[2] - evals[0];
+    if spread <= 1e-12 {
+        return 0; // spherical inertia — achiral
+    }
+    // Degenerate principal axes (a plate/rod/near-symmetric part): the eigenvectors of a repeated eigenvalue
+    // are an arbitrary basis of the eigenspace → the frame (and its determinant) is meaningless. Don't gate.
+    if (evals[1] - evals[0]) < 0.03 * spread || (evals[2] - evals[1]) < 0.03 * spread {
+        return 0;
+    }
+    // The largest-extent axis for the third-moment tolerance (scale-aware).
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in &tris.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let ext = (0..3)
+        .map(|k| hi[k] - lo[k])
+        .fold(0.0_f64, f64::max)
+        .max(1e-9);
+    #[allow(clippy::cast_precision_loss)]
+    // a vertex count → f64 divisor; precision is irrelevant here
+    let n = tris.positions.len().max(1) as f64;
+
+    let mut frame = [[0.0; 3]; 3];
+    for i in 0..3 {
+        let mut e = eigenvector(cov, evals[i]);
+        // Orient by the third central moment along this axis: Σ ((v−c)·e)³ / N, normalized by ext³.
+        let mut m3 = 0.0;
+        for p in &tris.positions {
+            let d = (p[0] - centroid[0]) * e[0]
+                + (p[1] - centroid[1]) * e[1]
+                + (p[2] - centroid[2]) * e[2];
+            m3 += d * d * d;
+        }
+        let m3n = m3 / (n * ext * ext * ext);
+        if m3n.abs() < 1e-4 {
+            return 0; // reflection-symmetric along this axis → achiral (a box, a symmetric bracket)
+        }
+        if m3n < 0.0 {
+            e = [-e[0], -e[1], -e[2]];
+        }
+        frame[i] = e;
+    }
+    // det([e0 e1 e2]) = e0 · (e1 × e2) → ±1 for an orthonormal frame; its sign is the handedness.
+    let cross = [
+        frame[1][1] * frame[2][2] - frame[1][2] * frame[2][1],
+        frame[1][2] * frame[2][0] - frame[1][0] * frame[2][2],
+        frame[1][0] * frame[2][1] - frame[1][1] * frame[2][0],
+    ];
+    let det = frame[0][0] * cross[0] + frame[0][1] * cross[1] + frame[0][2] * cross[2];
+    if det > 0.0 {
+        1
+    } else if det < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// A unit eigenvector of a symmetric 3×3 `m` for the (known) eigenvalue `lambda` — the null space of
+/// `(m − λI)`, found as the longest cross product of its rows (rank-2 for a simple eigenvalue). Deterministic.
+fn eigenvector(m: [[f64; 3]; 3], lambda: f64) -> [f64; 3] {
+    let r = [
+        [m[0][0] - lambda, m[0][1], m[0][2]],
+        [m[1][0], m[1][1] - lambda, m[1][2]],
+        [m[2][0], m[2][1], m[2][2] - lambda],
+    ];
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let cands = [cross(r[0], r[1]), cross(r[1], r[2]), cross(r[2], r[0])];
+    // The most numerically robust null-space direction = the longest cross product.
+    let best = cands
+        .iter()
+        .copied()
+        .max_by(|a, b| {
+            let la = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
+            let lb = b[0] * b[0] + b[1] * b[1] + b[2] * b[2];
+            la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or([1.0, 0.0, 0.0]);
+    let len = (best[0] * best[0] + best[1] * best[1] + best[2] * best[2]).sqrt();
+    if len <= 1e-30 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [best[0] / len, best[1] / len, best[2] / len]
+    }
+}
+
 // ── small helpers ───────────────────────────────────────────────────────────────────────────────────────────
 
 fn apply_transform(m: &[f64; 16], p: [f64; 3]) -> [f64; 3] {
@@ -703,6 +827,96 @@ mod tests {
             positions,
             triangles: mesh.triangles.clone(),
         }
+    }
+
+    /// An IRREGULAR (chiral) tetrahedron — 4 generic points with no reflection symmetry → a genuine
+    /// left/right pair under mirroring. Its `mirror` (x negated, winding flipped to stay outward) has the
+    /// SAME volume/area/moments but the OPPOSITE chirality sign.
+    fn chiral_tet(mirror: bool) -> TriMesh {
+        let sx = if mirror { -1.0 } else { 1.0 };
+        let v = [
+            [0.0, 0.0, 0.0],
+            [2.0 * sx, 0.2, 0.1],
+            [0.3 * sx, 1.4, 0.2],
+            [0.5 * sx, 0.4, 1.7],
+        ];
+        // Faces wound outward; when mirrored (sx<0) reverse each winding so normals stay outward.
+        let f = if mirror {
+            [[0u32, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2]]
+        } else {
+            [[0u32, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]]
+        };
+        TriMesh {
+            positions: v.to_vec(),
+            triangles: f.to_vec(),
+        }
+    }
+
+    #[test]
+    fn chirality_distinguishes_a_mirror_pair_that_shares_all_other_invariants() {
+        let left = fingerprint(&chiral_tet(false), None);
+        let right = fingerprint(&chiral_tet(true), None);
+        // The scalar invariants are identical (the mirror shares them) — that's why chirality is NEEDED.
+        assert_eq!(
+            quantize(left.volume),
+            quantize(right.volume),
+            "mirror shares volume"
+        );
+        assert_eq!(
+            quantize(left.area),
+            quantize(right.area),
+            "mirror shares area"
+        );
+        for k in 0..3 {
+            assert_eq!(
+                quantize(left.moments[k]),
+                quantize(right.moments[k]),
+                "mirror shares moment {k}"
+            );
+        }
+        // …but the chirality sign is OPPOSITE and definite (both non-zero).
+        assert!(
+            left.chirality != 0 && right.chirality != 0,
+            "a chiral tet is definitively handed"
+        );
+        assert_eq!(
+            left.chirality, -right.chirality,
+            "the mirror flips handedness: {} vs {}",
+            left.chirality, right.chirality
+        );
+    }
+
+    #[test]
+    fn a_box_is_achiral_so_chirality_never_falsely_gates_a_symmetric_part() {
+        // A symmetric part (a box) must report chirality 0 — else a fillet that breaks a near-symmetry could
+        // flip a spurious sign and wrongly MISS a true match.
+        assert_eq!(
+            fingerprint(&box_mesh(1.0, 0.6, 0.3), None).chirality,
+            0,
+            "a box is achiral"
+        );
+    }
+
+    #[test]
+    fn a_mirror_twin_does_not_cross_match_its_pair() {
+        // THE REAL-CAD FAILURE MODE: an assembly with a left AND a right bracket. On re-import the matcher
+        // must NOT bind old-left → new-right (a silent override corruption). The chirality gate forces a miss.
+        let left = chiral_tet(false);
+        let right = chiral_tet(true);
+        // Old scene: only the LEFT bracket (id 1). Re-import: only the RIGHT twin at the same spot (id 9).
+        let old = vec![ident(1, &left, Some(0x1E11), [0.0, 0.0, 0.0])];
+        let new = vec![ident(9, &right, Some(0x1247), [0.05, 0.0, 0.0])];
+        let plan = match_identities(&old, &new);
+        let m = plan.matches.iter().find(|x| x.old_id == 1).unwrap();
+        assert_eq!(
+            m.kind,
+            MatchKind::Miss,
+            "the left bracket does NOT cross-match its right twin: {m:?}"
+        );
+        assert!(
+            plan.added.contains(&9),
+            "the right twin is a new part, not a re-bind target"
+        );
     }
 
     fn ident(id: u64, mesh: &TriMesh, hash: Option<u64>, centroid: [f64; 3]) -> PartIdentity {
@@ -880,6 +1094,164 @@ mod tests {
         assert_eq!(
             plan.matches.iter().find(|m| m.old_id == 1).unwrap().kind,
             MatchKind::Unchanged
+        );
+    }
+
+    /// A `PartIdentity` with an explicit surface histogram (to measure the histogram's discriminating lift).
+    fn ident_h(
+        id: u64,
+        mesh: &TriMesh,
+        hash: u64,
+        centroid: [f64; 3],
+        hist: [u32; 5],
+    ) -> PartIdentity {
+        let mut fp = fingerprint(mesh, None);
+        fp.surface_hist = hist;
+        PartIdentity {
+            id,
+            reference: format!("r{id}"),
+            mesh_hash: Some(hash),
+            world_centroid: centroid,
+            fingerprint: fp,
+            name: format!("part{id}"),
+            parent: None,
+        }
+    }
+
+    #[test]
+    fn near_symmetric_adjudication_rate_is_measured_and_deterministic() {
+        // D4 (ADR-080 convergence): the HONEST accuracy ceiling of the analytic descriptor on a
+        // symmetric-part-heavy assembly. Near-square plates have near-equal principal moments (soft eigenvalue
+        // ordering) + chirality 0 → the geometric term is weak, the match leans on volume/area + the spatial
+        // bootstrap. Build 12 thin plates edited (each thinned a distinct amount so the byte-hash differs and
+        // the GEOMETRIC layer runs), re-imported at their own positions; measure the true-match band.
+        let count = 12usize;
+        // `spacing` controls how much the spatial bootstrap can disambiguate: DISTINCT (3.0 units apart — a
+        // realistic factory layout) vs CLUSTERED (0.15 apart — the spatial prior saturates for every
+        // candidate, so the near-symmetric SHAPE DESCRIPTOR alone must decide — its honest ceiling).
+        let build = |spacing: f64| {
+            let mut old = Vec::new();
+            let mut new = Vec::new();
+            for i in 0..count {
+                #[allow(clippy::cast_precision_loss)]
+                let x = i as f64 * spacing;
+                // A near-square plate; each one a hair different so they're not literally identical.
+                #[allow(clippy::cast_precision_loss)]
+                let s = 1.0 + (i as f64) * 0.01;
+                let plate = box_mesh(s, s * 0.99, 0.08);
+                #[allow(clippy::cast_precision_loss)]
+                let edited = box_mesh(s, s * 0.99, 0.075 - (i as f64) * 0.0005); // thinned (a small edit)
+                old.push(ident(
+                    i as u64,
+                    &plate,
+                    Some(0x1000 + i as u64),
+                    [x, 0.0, 0.0],
+                ));
+                new.push(ident(
+                    100 + i as u64,
+                    &edited,
+                    Some(0x2000 + i as u64),
+                    [x, 0.0, 0.0],
+                ));
+            }
+            (old, new)
+        };
+
+        let measure = |spacing: f64| {
+            let (old, new) = build(spacing);
+            let plan = match_identities(&old, &new);
+            let (mut strong, mut adj, mut miss, mut wrong) = (0usize, 0usize, 0usize, 0usize);
+            for i in 0..count {
+                let m = plan.matches.iter().find(|m| m.old_id == i as u64).unwrap();
+                // The TRUE match for old i is new (100+i) at the same position.
+                let true_new = Some(100 + i as u64);
+                match m.kind {
+                    MatchKind::Strong | MatchKind::Unchanged | MatchKind::Moved => {
+                        if m.new_id == true_new {
+                            strong += 1;
+                        } else {
+                            wrong += 1; // matched, but to the WRONG part — the corruption we must never do
+                        }
+                    }
+                    MatchKind::LowConfidence => {
+                        if m.new_id == true_new {
+                            adj += 1;
+                        } else {
+                            wrong += 1;
+                        }
+                    }
+                    MatchKind::Miss => miss += 1,
+                }
+            }
+            (strong, adj, miss, wrong)
+        };
+
+        // Determinism: same assembly → same bands, both layouts (the ADR-020 quantized-decision gate).
+        assert_eq!(
+            measure(3.0),
+            measure(3.0),
+            "distinct-layout measurement is deterministic"
+        );
+        assert_eq!(
+            measure(0.15),
+            measure(0.15),
+            "clustered-layout measurement is deterministic"
+        );
+
+        for (label, spacing) in [
+            ("DISTINCT positions", 3.0),
+            ("CLUSTERED (spatial-prior saturated)", 0.15),
+        ] {
+            let (strong, adj, miss, wrong) = measure(spacing);
+            #[allow(clippy::cast_precision_loss)]
+            let adj_rate = adj as f64 / count as f64;
+            eprintln!(
+                "[D4 near-symmetric analytic descriptor · {label}] {count} plates: strong(auto)={strong} \
+                 adjudicate={adj} miss(false)={miss} wrong={wrong} → adjudication_rate={:.1}%",
+                adj_rate * 100.0
+            );
+            // THE INVIOLABLE GATE, in BOTH layouts: a true match is NEVER silently bound to the WRONG part
+            // (prefer-miss-over-wrong; the histogram/learned matcher lifts the adjudicate/miss band — it never
+            // needs to relax this). A wrong-bind here would be a silent override corruption = the milestone FAIL.
+            assert_eq!(
+                wrong, 0,
+                "{label}: no near-symmetric true match wrong-binds — corruption is impossible"
+            );
+        }
+    }
+
+    #[test]
+    fn the_surface_histogram_lifts_a_near_moment_equal_confusable_pair() {
+        // D5 (ADR-080 convergence): the histogram's discriminating lift. Two parts with NEAR-EQUAL moments but
+        // DIFFERENT surface-type mixes — a square plate (all planar) and a puck of matching moments (planar
+        // caps + a cylindrical rim). Placed so their positions are ambiguous (both near the origin), the
+        // shape-only term confuses them; the surface histogram separates them.
+        let plate = box_mesh(1.0, 1.0, 0.1);
+        let puck = box_mesh(1.0, 1.0, 0.1); // same mesh → same moments (the worst confusable case)
+        let plate_hist = [6, 0, 0, 0, 0]; // 6 planar faces
+        let puck_hist = [2, 4, 0, 0, 0]; // 2 planar caps + a cylindrical rim (4 quads)
+
+        // Old scene: a plate (id 1) and a puck (id 2), co-located-ish. Re-import: both EDITED (new hashes) at
+        // the same spots. Without the histogram the matcher could swap them; with it, each keeps identity.
+        let old = vec![
+            ident_h(1, &plate, 0xA1, [0.0, 0.0, 0.0], plate_hist),
+            ident_h(2, &puck, 0xB1, [0.2, 0.0, 0.0], puck_hist),
+        ];
+        let new = vec![
+            ident_h(11, &plate, 0xA2, [0.0, 0.0, 0.0], plate_hist),
+            ident_h(12, &puck, 0xB2, [0.2, 0.0, 0.0], puck_hist),
+        ];
+        let plan = match_identities(&old, &new);
+        // The plate maps to the plate, the puck to the puck — the histogram broke the moment tie.
+        assert_eq!(
+            plan.rebind_target(1),
+            Some(11),
+            "the plate keeps identity (histogram-disambiguated)"
+        );
+        assert_eq!(
+            plan.rebind_target(2),
+            Some(12),
+            "the puck keeps identity (not swapped with the plate)"
         );
     }
 

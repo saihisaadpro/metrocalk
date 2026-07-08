@@ -247,6 +247,7 @@ pub fn set_reimport_id_ops(
     set("m1", FieldValue::Number(fp.moments[1]));
     set("m2", FieldValue::Number(fp.moments[2]));
     set("tris", FieldValue::Integer(i64::from(fp.tri_count)));
+    set("chi", FieldValue::Integer(i64::from(fp.chirality)));
     set(
         "surf",
         FieldValue::Str(
@@ -288,6 +289,8 @@ pub fn reimport_identity_of(engine: &Engine<FlecsWorld>, entity: EntityId) -> Op
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let tri_count = num_of("tris").unwrap_or(0.0) as u32;
+    #[allow(clippy::cast_possible_truncation)]
+    let chirality = num_of("chi").unwrap_or(0.0) as i8;
     Some(PartIdentity {
         id: pid,
         reference: str_of("reference").unwrap_or_default(),
@@ -299,6 +302,7 @@ pub fn reimport_identity_of(engine: &Engine<FlecsWorld>, entity: EntityId) -> Op
             moments: [num_of("m0")?, num_of("m1")?, num_of("m2")?],
             tri_count,
             surface_hist,
+            chirality,
         },
         name: String::new(),
         parent: None,
