@@ -337,6 +337,57 @@ struct CadReportResp {
     parts: Vec<CadReportPart>,
 }
 
+/// M15.10 (ADR-080) — the never-silent re-import diff the React surfaces render: every previous + new part's
+/// fate explained, the flagged orphans (removed-part overrides), and the pending adjudications (low-confidence
+/// matches held for confirm/reject). Empty `isReimport=false` when the last import was a first import.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ReimportReportResp {
+    is_reimport: bool,
+    rebound: usize,
+    added: usize,
+    removed: usize,
+    adjudicate: usize,
+    rows: Vec<ReimportDiffRow>,
+    orphans: Vec<ReimportOrphanRow>,
+    pending: Vec<ReimportAdjRow>,
+}
+
+/// One per-part fate row (matched/moved/added/removed/adjudicate) — the assembly diff.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ReimportDiffRow {
+    /// The matched new part's entity key (for select-on-click) — `null` for a removed part.
+    new_entity: Option<String>,
+    name: String,
+    kind: String,
+    confidence: f64,
+    reason: String,
+    had_overrides: bool,
+}
+
+/// A removed part whose overrides are preserved + flagged ("reassign or discard").
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ReimportOrphanRow {
+    old_id: String,
+    name: String,
+    material: Option<String>,
+    has_joint: bool,
+}
+
+/// A low-confidence match held for the user's confirm/reject (never auto-applied).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ReimportAdjRow {
+    old_id: String,
+    new_entity: String,
+    name: String,
+    confidence: f64,
+    material: Option<String>,
+    has_joint: bool,
+}
+
 /// The describe-to-create result: the created entity + kind, which tier it came from, and — for a
 /// marketplace hit — the inert economy seam (token price). On no match anywhere, the generate `seam`.
 #[derive(Serialize, Clone, Default)]
@@ -449,6 +500,17 @@ enum EngineCmd {
     /// M15.7 (ADR-077) — the per-part CAD import report, aggregated from the ECS `CadPart` components (a read).
     CadReport {
         reply: Sender<CadReportResp>,
+    },
+    /// M15.10 (ADR-080) — the last import's re-import diff (matched/added/removed/adjudicate + orphans) — a read.
+    ReimportReport {
+        reply: Sender<ReimportReportResp>,
+    },
+    /// M15.10 — resolve a held low-confidence match: `accept` re-binds its overrides onto the matched new
+    /// entity (one undoable commit); reject discards them. Returns the updated report.
+    ReimportResolve {
+        old_id: u64,
+        accept: bool,
+        reply: Sender<ReimportReportResp>,
     },
     /// M15.9 (ADR-079) — author a joint on an entity (ONE undoable commit); reply applied.
     SetJoint {
@@ -1604,11 +1666,51 @@ fn land_cad(
         st.meshes_revision = st.meshes_revision.wrapping_add(1);
     }
 
+    // M15.10 (ADR-080) — persistent re-import identity. The neutral per-part geometric identities of THIS
+    // import (fingerprint + world centroid + byte-hash), aligned 1:1 with `report.parts`; each part entity
+    // carries its `ReimportId` so a LATER re-import matches the live scene. And: detect the PREVIOUS import's
+    // still-active CAD parts (entities carrying a `ReimportId`) — if any, this is a RE-IMPORT, and after the
+    // new entities are authored we match + re-bind every override onto the geometrically-matched part.
+    let new_ids = metrocalk_interchange::identities(&report);
+    let mut old_reimport: std::collections::BTreeMap<u64, EntityId> =
+        std::collections::BTreeMap::new();
+    let mut old_names: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    for id in engine.entity_ids() {
+        if !engine.is_active(id) {
+            continue;
+        }
+        let comps = engine.components_of(id);
+        if let Some(ri) = comps.get(metrocalk_editor_shell::REIMPORT_ID) {
+            if let Some(FieldValue::Str(pid_hex)) = ri.get("pid") {
+                if let Ok(pid) = u64::from_str_radix(pid_hex, 16) {
+                    old_reimport.insert(pid, id);
+                    let name = comps
+                        .get(metrocalk_editor_shell::CAD_PART)
+                        .and_then(|m| m.get("name"))
+                        .or_else(|| {
+                            comps
+                                .get(metrocalk_core::variant::INSTANCE_META)
+                                .and_then(|m| m.get("name"))
+                        })
+                        .and_then(|v| match v {
+                            FieldValue::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    old_names.insert(pid, name);
+                }
+            }
+        }
+    }
+    let mut new_entities: std::collections::BTreeMap<u64, EntityId> =
+        std::collections::BTreeMap::new();
+
     // (2) The leaf parts — each parented under its source assembly occurrence (its `parent` group) so it nests
     // in the outliner exactly where the source places it, while keeping its own world transform (identity
     // groups don't perturb `global_transform`, so placement is byte-identical to the flat import).
-    for p in &report.parts {
+    for (pi, p) in report.parts.iter().enumerate() {
         let e = engine.alloc_entity_id();
+        new_entities.insert(p.id, e);
         if first.is_none() {
             first = Some(e);
         }
@@ -1684,6 +1786,47 @@ fn land_cad(
                 target: c,
             });
         }
+        // M15.10 — the part's persistent geometric identity (its fingerprint + world centroid + byte-hash),
+        // so a later re-import matches THIS part from geometry alone (native IDs don't survive translation).
+        if let Some(pid) = new_ids.get(pi) {
+            ops.extend(metrocalk_editor_shell::set_reimport_id_ops(
+                e,
+                p.id,
+                &p.reference,
+                pid.mesh_hash,
+                pid.world_centroid,
+                &pid.fingerprint,
+            ));
+        }
+    }
+
+    // M15.10 (ADR-080) — if the scene already held CAD parts, this is a RE-IMPORT: match the new parts to the
+    // previous ones (byte-hash → geometric fingerprint, prefer-miss-over-wrong), re-bind every matched override
+    // (material · collider · the M15.9 joint animation) onto the geometrically-matched NEW entity, deactivate
+    // the previous entities (deactivate-not-delete → one Ctrl-Z peels the whole re-import), and record the
+    // never-silent per-part diff for the report + adjudication surfaces. All in the SAME import commit.
+    if !old_reimport.is_empty() {
+        let session = metrocalk_editor_shell::reimport_over_scene(
+            engine,
+            &old_reimport,
+            &old_names,
+            &new_ids,
+            &new_entities,
+        );
+        log(&format!(
+            "CAD RE-IMPORT: {} previous parts → {} overrides re-bound · {} removed(flagged) · {} to \
+             adjudicate · {} added",
+            old_reimport.len(),
+            session.rebound,
+            session.orphans.len(),
+            session.adjudicate.len(),
+            session.report.iter().filter(|r| r.kind == "added").count()
+        ));
+        // Record the diff + held adjudications for the UI (borrows `session`) BEFORE moving its ops out.
+        store_reimport_session(&session, &new_entities);
+        ops.extend(session.commit_ops);
+    } else {
+        clear_reimport_session();
     }
     log(&format!(
         "CAD import: {} meshes registered in {:.1}s, {} parts + {} group nodes, committing…",
@@ -2572,6 +2715,51 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             }
             EngineCmd::CadReport { reply } => {
                 let _ = reply.send(build_cad_report(&engine));
+            }
+            EngineCmd::ReimportReport { reply } => {
+                let resp = LAST_REIMPORT.with(|s| s.borrow().resp.clone());
+                let _ = reply.send(resp);
+            }
+            EngineCmd::ReimportResolve {
+                old_id,
+                accept,
+                reply,
+            } => {
+                // Resolve a HELD low-confidence match. On accept: re-bind the preserved overrides onto the
+                // matched new entity (ONE undoable commit). On reject: discard (the override is dropped — the
+                // user chose not to keep it). Either way the pending item leaves the queue. Never silent: the
+                // updated report reflects the decision.
+                let held = LAST_REIMPORT.with(|s| {
+                    let mut st = s.borrow_mut();
+                    if let Some(pos) = st.pending.iter().position(|(oid, _, _)| *oid == old_id) {
+                        Some(st.pending.remove(pos))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((_oid, new_e, overrides)) = held {
+                    if accept {
+                        let ops = metrocalk_editor_shell::rebind_ops(new_e, &overrides);
+                        if engine.commit("reimport-adjudicate", ops).is_ok() {
+                            rebuild(&engine, &shared, &mut positions, &assets);
+                            if let Some(ch) = &channel {
+                                send_proj!(ch, project_entity(&engine, new_e));
+                            }
+                        }
+                    }
+                    // Update the cached report: drop the resolved pending row + decrement the count.
+                    LAST_REIMPORT.with(|s| {
+                        let mut st = s.borrow_mut();
+                        let key = format!("{old_id:016x}");
+                        st.resp.pending.retain(|r| r.old_id != key);
+                        st.resp.adjudicate = st.resp.pending.len();
+                        if accept {
+                            st.resp.rebound += 1;
+                        }
+                    });
+                }
+                let resp = LAST_REIMPORT.with(|s| s.borrow().resp.clone());
+                let _ = reply.send(resp);
             }
             EngineCmd::SetJoint {
                 id,
@@ -5559,6 +5747,93 @@ thread_local! {
     /// scrub ends. Engine-thread-local — `rebuild` only runs there.
     static JOINT_POSES: std::cell::RefCell<HashMap<EntityId, JointPose>> =
         std::cell::RefCell::new(HashMap::new());
+
+    /// M15.10 (ADR-080) — the last CAD import's re-import diff (the never-silent report the UI renders) + the
+    /// held pending adjudications (a low-confidence match's overrides, kept until the user confirms/rejects —
+    /// NEVER auto-applied). Engine-thread-local; `land_cad` writes it, the `cad_reimport_*` commands read it.
+    static LAST_REIMPORT: std::cell::RefCell<StoredReimport> =
+        std::cell::RefCell::new(StoredReimport::default());
+}
+
+/// The engine-thread store for the last re-import (see [`LAST_REIMPORT`]).
+#[derive(Default)]
+struct StoredReimport {
+    resp: ReimportReportResp,
+    /// The held low-confidence matches: `(old part id, the new entity to re-bind onto, the preserved
+    /// overrides)`. A confirm re-binds; a reject discards (the override becomes a flagged orphan).
+    pending: Vec<(u64, EntityId, metrocalk_editor_shell::OverrideSet)>,
+}
+
+/// Record a re-import session for the UI + the adjudication commands (called from `land_cad`, engine thread).
+/// `new_entities` maps a matcher part id → the created entity, so pids resolve to entity keys for the UI.
+fn store_reimport_session(
+    session: &metrocalk_editor_shell::ReimportSession,
+    new_entities: &std::collections::BTreeMap<u64, EntityId>,
+) {
+    let key_of = |pid: Option<u64>| {
+        pid.and_then(|p| new_entities.get(&p))
+            .map(|e| e.to_loro_key())
+    };
+    let rows = session
+        .report
+        .iter()
+        .map(|r| ReimportDiffRow {
+            new_entity: key_of(r.new_id),
+            name: r.name.clone(),
+            kind: r.kind.clone(),
+            confidence: r.confidence,
+            reason: r.reason.clone(),
+            had_overrides: r.had_overrides,
+        })
+        .collect();
+    let orphans = session
+        .orphans
+        .iter()
+        .map(|o| ReimportOrphanRow {
+            old_id: format!("{:016x}", o.old_id),
+            name: o.name.clone(),
+            material: o.overrides.material.clone(),
+            has_joint: o.overrides.components.contains_key("Joint"),
+        })
+        .collect();
+    // The held low-confidence matches: resolve each to its new entity + preserve its overrides so a confirm
+    // can re-bind (and a reject can discard). NEVER auto-applied.
+    let mut pending_rows = Vec::new();
+    let mut pending = Vec::new();
+    for a in &session.adjudicate {
+        let Some(&new_e) = new_entities.get(&a.new_id) else {
+            continue;
+        };
+        pending_rows.push(ReimportAdjRow {
+            old_id: format!("{:016x}", a.old_id),
+            new_entity: new_e.to_loro_key(),
+            name: String::new(),
+            confidence: a.confidence,
+            material: a.overrides.material.clone(),
+            has_joint: a.overrides.components.contains_key("Joint"),
+        });
+        pending.push((a.old_id, new_e, a.overrides.clone()));
+    }
+    let resp = ReimportReportResp {
+        is_reimport: true,
+        rebound: session.rebound,
+        added: session.report.iter().filter(|r| r.kind == "added").count(),
+        removed: session
+            .report
+            .iter()
+            .filter(|r| r.kind == "removed")
+            .count(),
+        adjudicate: session.adjudicate.len(),
+        rows,
+        orphans,
+        pending: pending_rows,
+    };
+    LAST_REIMPORT.with(|s| *s.borrow_mut() = StoredReimport { resp, pending });
+}
+
+/// Clear the re-import store — a FIRST import (no previous CAD parts) has no diff.
+fn clear_reimport_session() {
+    LAST_REIMPORT.with(|s| *s.borrow_mut() = StoredReimport::default());
 }
 
 fn rebuild(
@@ -7227,6 +7502,47 @@ fn cad_report(state: State<AppState>) -> CadReportResp {
     recv_reply(&rx).unwrap_or_default()
 }
 
+/// M15.10 (ADR-080) — the last CAD import's re-import diff: every previous + new part's fate (matched/moved/
+/// added/removed/adjudicate), the flagged orphans (removed-part overrides), and the held low-confidence
+/// matches to adjudicate. `isReimport=false` when the last import was a first import. Fetched on an import.
+#[tauri::command(async)]
+fn cad_reimport_report(state: State<AppState>) -> ReimportReportResp {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::ReimportReport { reply }).is_err() {
+        return ReimportReportResp::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
+/// M15.10 — resolve a held low-confidence match (the adjudication card's confirm/reject): `accept` re-binds
+/// the preserved overrides onto the matched new entity (ONE undoable commit), reject discards them. Returns
+/// the updated report. Never auto-applied — this is the ONLY path a low-confidence override re-binds.
+#[tauri::command(async)]
+fn cad_reimport_resolve(
+    state: State<AppState>,
+    old_id: String,
+    accept: bool,
+) -> ReimportReportResp {
+    ipc();
+    let Ok(oid) = u64::from_str_radix(old_id.trim_start_matches("0x"), 16) else {
+        return ReimportReportResp::default();
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ReimportResolve {
+            old_id: oid,
+            accept,
+            reply,
+        })
+        .is_err()
+    {
+        return ReimportReportResp::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
 /// M15.9 (ADR-079) — author a joint on an entity: the REAL axis + pivot (from the geometry / the
 /// designer's pick — never a silent origin default), typed revolute/prismatic, limits, and the honesty
 /// label ("manual" · "inferred" · "urdf"). ONE undoable commit.
@@ -7932,6 +8248,8 @@ fn main() {
             duplicate_entity,
             entity_details,
             cad_report,
+            cad_reimport_report,
+            cad_reimport_resolve,
             set_joint,
             joint_key,
             joint_value,

@@ -30,6 +30,10 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
         failed: 0,
         parts: [],
       }),
+    cadReimportReport: () =>
+      Promise.resolve({ isReimport: false, rebound: 0, added: 0, removed: 0, adjudicate: 0, rows: [], orphans: [], pending: [] }),
+    cadReimportResolve: () =>
+      Promise.resolve({ isReimport: false, rebound: 0, added: 0, removed: 0, adjudicate: 0, rows: [], orphans: [], pending: [] }),
     setJoint: () => Promise.resolve(true),
     jointKey: () => Promise.resolve(true),
     jointValue: () => Promise.resolve(true),

@@ -36,6 +36,7 @@ import { ToastHost } from "../panels/ToastHost";
 import { EmptyState } from "../panels/EmptyState";
 import { AiEditPanel } from "../panels/AiEditPanel";
 import { ImportReport } from "../panels/ImportReport";
+import { ReimportPanel } from "../panels/ReimportPanel";
 import { JointPanel } from "../panels/JointPanel";
 import { Diagnostics } from "../panels/Diagnostics";
 import { Inspector } from "../inspector/Inspector";
@@ -258,6 +259,10 @@ export function App() {
       {/* M15.9 — rig + animate the selected part as a mechanism joint (real axis, undoable, scrubbable). */}
       <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
         <JointPanel client={client} />
+      </div>
+      {/* M15.10 — the re-import diff + adjudication (renders only after a re-import over an existing CAD scene). */}
+      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
+        <ReimportPanel client={client} />
       </div>
       {/* M15.7 — the never-silent CAD import report (renders only when the scene has imported CAD). */}
       <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>

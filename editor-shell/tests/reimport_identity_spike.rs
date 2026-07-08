@@ -285,6 +285,128 @@ fn a_low_confidence_match_is_held_for_adjudication_never_auto_applied() {
 }
 
 #[test]
+fn reimport_over_scene_rebinds_deactivates_old_and_reports_every_part() {
+    // D1 (ADR-080 convergence): the LIVE re-import orchestration end-to-end (headless). Import A (bracket +
+    // plate with overrides), then re-import an edited B over the live scene: reimport_over_scene must produce
+    // ONE undoable batch that re-binds the matched overrides onto the new entities AND deactivates the old
+    // ones, plus a never-silent per-part diff. Commit it and assert the live result off structured signals.
+    let mut e = engine();
+    let bracket = place_part(
+        &mut e,
+        1,
+        "bracket",
+        &box_mesh(1.0, 1.0, 1.0),
+        [0.0, 0.0, 0.0],
+    );
+    let plate = place_part(
+        &mut e,
+        2,
+        "plate",
+        &box_mesh(2.0, 2.0, 0.15),
+        [5.0, 0.0, 0.0],
+    );
+    set_material(&mut e, bracket, "chrome");
+    set_joint(&mut e, bracket);
+    set_material(&mut e, plate, "gold");
+
+    let old_entities: BTreeMap<u64, EntityId> = [(1u64, bracket), (2, plate)].into();
+    let old_names: BTreeMap<u64, String> = [(1u64, "Bracket".into()), (2, "Plate".into())].into();
+
+    // Re-import B: bracket filleted (matches), gusset added, plate deleted.
+    let ent_b2 = place_part(
+        &mut e,
+        10,
+        "bracket",
+        &box_mesh(0.96, 0.96, 0.96),
+        [0.0, 0.0, 0.0],
+    );
+    let ent_g = place_part(
+        &mut e,
+        11,
+        "gusset",
+        &box_mesh(0.4, 0.1, 0.7),
+        [9.0, 0.0, 0.0],
+    );
+    let new_entities: BTreeMap<u64, EntityId> = [(10u64, ent_b2), (11, ent_g)].into();
+    let new_ids: Vec<PartIdentity> = [ent_b2, ent_g]
+        .iter()
+        .map(|&ent| metrocalk_editor_shell::reimport_identity_of(&e, ent).unwrap())
+        .collect();
+
+    let session = metrocalk_editor_shell::reimport_over_scene(
+        &e,
+        &old_entities,
+        &old_names,
+        &new_ids,
+        &new_entities,
+    );
+
+    // The report accounts for EVERY part (never-silent): bracket matched, plate removed, gusset added.
+    let by_old = |oid: u64| session.report.iter().find(|r| r.old_id == oid).cloned();
+    assert_eq!(
+        by_old(1).unwrap().kind,
+        "matched",
+        "the bracket is reported matched"
+    );
+    assert_eq!(by_old(1).unwrap().new_id, Some(10));
+    assert!(
+        by_old(1).unwrap().had_overrides,
+        "the bracket's overrides are noted"
+    );
+    assert_eq!(
+        by_old(2).unwrap().kind,
+        "removed",
+        "the plate is reported removed"
+    );
+    assert!(
+        session
+            .report
+            .iter()
+            .any(|r| r.kind == "added" && r.new_id == Some(11)),
+        "the gusset is reported added"
+    );
+    assert_eq!(session.rebound, 1);
+    assert_eq!(
+        session
+            .orphans
+            .iter()
+            .find(|o| o.old_id == 2)
+            .unwrap()
+            .overrides
+            .material
+            .as_deref(),
+        Some("gold")
+    );
+
+    // Apply the whole re-import as ONE undoable commit.
+    e.commit("reimport", session.commit_ops)
+        .expect("commit reimport");
+
+    // The bracket's work survived onto the NEW entity; the old entities are deactivated (deactivate-not-delete).
+    assert_eq!(
+        material_of(&e, ent_b2).as_deref(),
+        Some("chrome"),
+        "material re-bound onto the new bracket"
+    );
+    assert!(
+        metrocalk_editor_shell::joint_of(&e, ent_b2).is_some(),
+        "joint re-bound onto the new bracket"
+    );
+    assert!(
+        !e.is_active(bracket),
+        "the previous bracket entity is deactivated"
+    );
+    assert!(
+        !e.is_active(plate),
+        "the previous plate entity is deactivated"
+    );
+    assert!(
+        e.is_active(ent_b2) && e.is_active(ent_g),
+        "the new entities stay active"
+    );
+}
+
+#[test]
 fn capture_overrides_reads_material_and_joint_but_not_import_authored_fields() {
     // capture_overrides must grab the user's work (material, joint) and NOT the import-authored mesh handle
     // (which the new import re-authors) — else the re-bind would clobber the new geometry with the old.

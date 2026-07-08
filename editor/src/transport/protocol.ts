@@ -213,6 +213,49 @@ export interface CadReport {
   parts: CadReportPart[];
 }
 
+/** M15.10 (ADR-080) — one per-part fate in the re-import diff. `kind`: "unchanged" | "moved" | "matched" |
+ *  "adjudicate" | "removed" | "added". Mirrors `ReimportDiffRow`. */
+export interface ReimportDiffRow {
+  newEntity: string | null;
+  name: string;
+  kind: string;
+  confidence: number;
+  reason: string;
+  hadOverrides: boolean;
+}
+
+/** A removed part whose overrides are preserved + flagged. Mirrors `ReimportOrphanRow`. */
+export interface ReimportOrphanRow {
+  oldId: string;
+  name: string;
+  material: string | null;
+  hasJoint: boolean;
+}
+
+/** A held low-confidence match to confirm/reject (never auto-applied). Mirrors `ReimportAdjRow`. */
+export interface ReimportAdjRow {
+  oldId: string;
+  newEntity: string;
+  name: string;
+  confidence: number;
+  material: string | null;
+  hasJoint: boolean;
+}
+
+/** The M15.10 re-import diff the editor renders: matched/added/removed/adjudicate + orphans + the held
+ *  low-confidence matches. `isReimport=false` when the last import was a first import. Mirrors
+ *  `ReimportReportResp`. */
+export interface ReimportReport {
+  isReimport: boolean;
+  rebound: number;
+  added: number;
+  removed: number;
+  adjudicate: number;
+  rows: ReimportDiffRow[];
+  orphans: ReimportOrphanRow[];
+  pending: ReimportAdjRow[];
+}
+
 /** A catalog entry (M3.4 / ADR-019) — the ONE catalog surface the asset browser reuses (registry +
  *  marketplace + imported), mirroring `metrocalk_core::catalog::CatalogItem`. */
 export interface CatalogItem {

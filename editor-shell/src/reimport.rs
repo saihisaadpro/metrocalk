@@ -20,6 +20,7 @@ use metrocalk_ecs::FlecsWorld;
 use metrocalk_interchange::{
     match_identities, MatchKind, PartFingerprint, PartIdentity, ReimportPlan,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// The component that carries a CAD part's **persistent geometric identity** on its entity (M15.10). Written
@@ -323,4 +324,141 @@ pub fn match_scene_against(
         .filter_map(|&e| reimport_identity_of(engine, e))
         .collect();
     match_identities(&old, new)
+}
+
+// ── The live re-import orchestration + the never-silent per-part diff report (M15.10 convergence) ────────────
+
+/// One row of the re-import diff — **every** previous + new part accounted for (the M15.7 never-silent
+/// discipline applied to re-import: nothing silent, every fate explained). ECS/UI-queryable structured data.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct ReimportDiffEntry {
+    /// The previous part id (`0` for a purely-new/added part).
+    pub old_id: u64,
+    /// The re-imported part id it maps to (`None` for a removed part).
+    pub new_id: Option<u64>,
+    /// The human name.
+    pub name: String,
+    /// The fate: `"unchanged"` · `"moved"` · `"matched"` (re-bound) · `"adjudicate"` (held for the user) ·
+    /// `"removed"` (overrides flagged) · `"added"` (new, bare). Assert off THIS, never UI copy.
+    pub kind: String,
+    /// Match confidence `[0,1]` (`1.0` for byte-hash unchanged/moved; `0.0` for removed/added).
+    pub confidence: f64,
+    /// Plain-language why (surfaced to the user — the never-silent reason).
+    pub reason: String,
+    /// `true` when this part had user overrides that were re-bound / flagged / held (so the UI can highlight
+    /// the ones where "keep my work" actually did something).
+    pub had_overrides: bool,
+}
+
+/// The full re-import outcome the live `land_cad` applies + the React surface renders.
+#[derive(Clone, Debug, Default)]
+pub struct ReimportSession {
+    /// The ops to append to the import commit: the auto-re-binds (matched overrides onto the new entities) +
+    /// the deactivation of every previous CAD entity (the stale version; deactivate-not-delete → undoable).
+    pub commit_ops: Vec<Op>,
+    /// The never-silent per-part diff (matched/moved/added/removed/adjudicate) — every part's fate explained.
+    pub report: Vec<ReimportDiffEntry>,
+    /// Removed parts whose overrides are preserved + flagged ("reassign or discard").
+    pub orphans: Vec<OrphanedOverride>,
+    /// Low-confidence matches held for confirm/reject (their overrides preserved, NOT applied).
+    pub adjudicate: Vec<Adjudication>,
+    /// How many overrides auto-re-bound with no user action.
+    pub rebound: usize,
+}
+
+/// Orchestrate a re-import over the live scene: match the previous CAD parts (`old_entities`) to the freshly-
+/// imported parts (`new_identities` + `new_entities`), then produce the ops to **re-bind every matched
+/// override + deactivate every previous entity** (one undoable commit with the import), plus the never-silent
+/// per-part diff report, the flagged orphans (removed), and the held adjudications (low-confidence). The
+/// **prefer-miss-over-wrong discipline is preserved**: only `Unchanged`/`Moved`/`Strong` auto-re-bind; a
+/// `LowConfidence` override is HELD, a `Miss` override is FLAGGED — never a silent wrong-bind.
+#[must_use]
+pub fn reimport_over_scene(
+    engine: &Engine<FlecsWorld>,
+    old_entities: &BTreeMap<u64, EntityId>,
+    old_names: &BTreeMap<u64, String>,
+    new_identities: &[PartIdentity],
+    new_entities: &BTreeMap<u64, EntityId>,
+) -> ReimportSession {
+    let plan = match_scene_against(engine, old_entities, new_identities);
+    let rb = plan_rebind(engine, old_entities, new_entities, &plan, old_names);
+    let new_names: BTreeMap<u64, String> = new_identities
+        .iter()
+        .map(|p| (p.id, p.name.clone()))
+        .collect();
+
+    let mut session = ReimportSession {
+        commit_ops: rb.ops,
+        rebound: rb.rebound,
+        orphans: rb.orphans,
+        adjudicate: rb.adjudicate,
+        ..Default::default()
+    };
+
+    // Deactivate every PREVIOUS CAD entity — it is the stale version, replaced by the new import's entity.
+    // Deactivate-not-delete (ADR-026) so one Ctrl-Z restores the whole re-import. The re-bound overrides
+    // already live on the NEW entities; the held/flagged ones are preserved in the session.
+    for &e in old_entities.values() {
+        session.commit_ops.push(Op::SetActive {
+            entity: e,
+            active: false,
+        });
+    }
+
+    // The never-silent per-part diff — one row per previous part, plus one per added part.
+    let has_override = |old_id: u64| -> bool {
+        old_entities
+            .get(&old_id)
+            .is_some_and(|&e| !capture_overrides(engine, e).is_empty())
+    };
+    for m in &plan.matches {
+        let name = old_names.get(&m.old_id).cloned().unwrap_or_default();
+        let ov = has_override(m.old_id);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let pct = (m.confidence * 100.0).round() as u32;
+        let (kind, reason) = match m.kind {
+            MatchKind::Unchanged => ("unchanged", "kept — geometry unchanged".to_string()),
+            MatchKind::Moved => (
+                "moved",
+                "kept — same part, moved to a new position; overrides re-bound".to_string(),
+            ),
+            MatchKind::Strong => (
+                "matched",
+                format!("kept — edited part matched ({pct}% confidence); overrides re-bound"),
+            ),
+            MatchKind::LowConfidence => (
+                "adjudicate",
+                format!("changed a lot ({pct}% confidence) — confirm this is the same part to keep its overrides"),
+            ),
+            MatchKind::Miss => (
+                "removed",
+                if ov {
+                    "deleted from the CAD — its overrides are held for you to reassign or discard".to_string()
+                } else {
+                    "deleted from the CAD".to_string()
+                },
+            ),
+        };
+        session.report.push(ReimportDiffEntry {
+            old_id: m.old_id,
+            new_id: m.new_id,
+            name,
+            kind: kind.to_string(),
+            confidence: m.confidence,
+            reason,
+            had_overrides: ov,
+        });
+    }
+    for &new_id in &plan.added {
+        session.report.push(ReimportDiffEntry {
+            old_id: 0,
+            new_id: Some(new_id),
+            name: new_names.get(&new_id).cloned().unwrap_or_default(),
+            kind: "added".to_string(),
+            confidence: 0.0,
+            reason: "new part — no previous overrides".to_string(),
+            had_overrides: false,
+        });
+    }
+    session
 }

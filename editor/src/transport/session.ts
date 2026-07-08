@@ -16,6 +16,7 @@ import type {
   CatalogItem,
   CatalogSearch,
   CadReport,
+  ReimportReport,
   ContactInfo,
   JointInfo,
   DescribeResponse,
@@ -86,6 +87,11 @@ export interface EditorClient {
   entityDetails(id: string): Promise<EntityDetails | null>;
   /** The per-part CAD import report (M15.7) — the fidelity breakdown + a capped part list, off the ECS. */
   cadReport(): Promise<CadReport>;
+  /** M15.10 — the last import's re-import diff (matched/added/removed/adjudicate + orphans + held matches). */
+  cadReimportReport(): Promise<ReimportReport>;
+  /** M15.10 — resolve a held low-confidence match: accept re-binds its overrides onto the matched new entity
+   *  (one undoable commit), reject discards. Returns the updated report. */
+  cadReimportResolve(oldId: string, accept: boolean): Promise<ReimportReport>;
   /** M15.9 — author a joint (real axis + pivot; honesty-labeled source) as ONE undoable commit. */
   setJoint(id: string, revolute: boolean, axis: [number, number, number], pivot: [number, number, number], min: number, max: number, source: string): Promise<boolean>;
   /** M15.9 — key the joint's current DOF value at time t (ONE undoable commit). */
@@ -397,6 +403,14 @@ export class TauriClient implements EditorClient {
   entityActions(id: string): Promise<ActionItem[]> {
     return this.core.invoke<ActionItem[]>("entity_actions", { id }).catch((e: unknown) => { console.error("entity_actions failed", e); throw e; });
   }
+  cadReimportReport(): Promise<ReimportReport> {
+    return this.core.invoke<ReimportReport>("cad_reimport_report").catch((e: unknown) => { console.error("cad_reimport_report failed", e); throw e; });
+  }
+
+  cadReimportResolve(oldId: string, accept: boolean): Promise<ReimportReport> {
+    return this.core.invoke<ReimportReport>("cad_reimport_resolve", { oldId, accept }).catch((e: unknown) => { console.error("cad_reimport_resolve failed", e); throw e; });
+  }
+
   cadReport(): Promise<CadReport> {
     return this.core.invoke<CadReport>("cad_report").catch((e: unknown) => { console.error("cad_report failed", e); throw e; });
   }
@@ -938,6 +952,12 @@ class MockClient implements EditorClient {
       if (r.parts.length < 500) r.parts.push({ id, name: e.name, fidelity });
     }
     return Promise.resolve(r);
+  }
+  cadReimportReport(): Promise<ReimportReport> {
+    return Promise.resolve({ isReimport: false, rebound: 0, added: 0, removed: 0, adjudicate: 0, rows: [], orphans: [], pending: [] });
+  }
+  cadReimportResolve(): Promise<ReimportReport> {
+    return Promise.resolve({ isReimport: false, rebound: 0, added: 0, removed: 0, adjudicate: 0, rows: [], orphans: [], pending: [] });
   }
   removeEntity(_id: string): void {}
   duplicateEntity(_id: string): Promise<string | null> {
