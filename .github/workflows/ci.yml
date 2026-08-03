@@ -14,7 +14,10 @@ jobs:
   workspace:
     name: fmt + clippy + test (workspace)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Raised 10 -> 20 when the MOB arc added `gameplay` + `match-server` to the workspace: this job
+    # went from 6.1 min to hitting the 10 min ceiling, because --workspace now also builds and runs
+    # their ~91 tests and lints their targets. The budget grew because the workspace genuinely did.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
