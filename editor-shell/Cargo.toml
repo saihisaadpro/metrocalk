@@ -62,6 +62,10 @@ metrocalk-plugins = { path = "../plugins" }
 # "explain every no" — reusing the shipped every-no seed, NOT a new explainer (the full M13.9
 # semiring-provenance theorem, ADR-061, is a named future). Pure `/core` data, wasm-clean.
 metrocalk-authoring = { path = "../authoring" }
+# The deterministic match kernel. `match_cook` is the authoring→runtime conversion layer: it reads the
+# authored ECS/Loro document and emits the kernel's own definition types. Keeping the cook here (rather
+# than in the Tauri shell) is what puts it in the workspace test matrix — the shell only calls it.
+metrocalk-gameplay = { path = "../gameplay" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # M15.2 (ADR-072): the feature-history "a broken feature is a file" artifact serializes LOSSLESS (bit-exact

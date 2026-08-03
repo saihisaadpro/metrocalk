@@ -26,6 +26,7 @@ pub mod feature_history;
 pub mod generate;
 pub mod generative;
 pub mod kinematics;
+pub mod match_cook;
 pub mod metering;
 pub mod pdm;
 pub mod persist;
