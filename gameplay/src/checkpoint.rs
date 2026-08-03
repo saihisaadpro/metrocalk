@@ -13,9 +13,10 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::model::{
     AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorKind, ActorProvenance,
-    BasicAttackSpec, CombatStats, DamageSchool, DeathRule, MatchConfig, MatchEndReason,
-    MatchOutcome, MatchPhase, ModifierId, ModifierOp, PlayerId, RectMm, StatKind, StatModifier,
-    TeamId, Tick, Vec2Mm, MAX_ABILITY_DEFINITIONS, MAX_RUNTIME_CHECKPOINT_BYTES,
+    BasicAttackSpec, CombatStats, ControlMask, DamageSchool, DeathRule, MatchConfig,
+    MatchEndReason, MatchOutcome, MatchPhase, ModifierId, ModifierOp, PlayerId, RectMm, StatKind,
+    StatModifier, StatusEffectId, TeamId, Tick, Vec2Mm, MAX_ABILITY_DEFINITIONS,
+    MAX_RUNTIME_CHECKPOINT_BYTES,
 };
 use crate::protocol::{
     CastTarget, CommandKind, CommandReceipt, CommandRejectReason, CommandRejection, PlayerCommand,
@@ -23,16 +24,17 @@ use crate::protocol::{
 };
 use crate::runtime::{
     AbilityState, ActorState, BasicAttackState, MatchRuntime, PendingAttack, PendingCast,
-    SubmissionRecord,
+    StatusEffect, SubmissionRecord,
 };
 
 const MAGIC: [u8; 8] = *b"MTCKPT01";
-// v3 adds per-actor base stats plus the applied stat-modifier list; the resolved stat cache is deliberately
+// v4 adds per-actor timed status effects; the resolved control mask is NOT encoded (same reasoning).
+// v3 added per-actor base stats plus the applied stat-modifier list; the resolved stat cache is deliberately
 // NOT encoded, because it is derivable and a stored copy could disagree with its own inputs.
 // v2 added the immutable per-actor creation provenance record. The format is not yet persisted by any
 // production host, so the version is bumped rather than carrying a compatibility shim: a v1 payload has no
 // provenance to reconstruct, and inferring one would fabricate creation evidence.
-const FORMAT_VERSION: u16 = 3;
+const FORMAT_VERSION: u16 = 4;
 const HEADER_BYTES: usize = 64;
 const PAYLOAD_LENGTH_OFFSET: usize = 44;
 const PAYLOAD_CHECKSUM_OFFSET: usize = 48;
@@ -42,8 +44,11 @@ const MIN_COMMAND_BYTES: usize = 29;
 // 8 id + 1 kind tag + 1 op tag + 4 smallest payload.
 const MIN_MODIFIER_BYTES: usize = 14;
 // 8 id + 1 provenance tag + 1 owner tag + 1 team + 1 kind + 8 position + 1 destination tag + 16 base
-// stats + 4 modifier count + 4 health + 4 resource + 4 ability count + 5 option tags.
-const MIN_ACTOR_BYTES: usize = 58;
+// stats + 4 modifier count + 4 status-effect count + 4 health + 4 resource + 4 ability count
+// + 5 option tags.
+const MIN_ACTOR_BYTES: usize = 62;
+// 8 id + 8 expiry + 1 controls + 4 owned-modifier count.
+const MIN_STATUS_EFFECT_BYTES: usize = 21;
 
 /// Identity of the exact cooked rules/content bundle required to interpret a checkpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -221,6 +226,7 @@ impl MatchRuntime {
         // Encoded, not derived from the live modifiers: removing every modifier must NOT let the allocator
         // regress and reissue an ID, because ID order defines aggregation order and override precedence.
         encode_option_u64(&mut encoder, self.next_modifier_id)?;
+        encode_option_u64(&mut encoder, self.next_status_effect_id)?;
 
         if self.ability_specs.len() > usize::try_from(MAX_ABILITY_DEFINITIONS).unwrap_or(usize::MAX)
         {
@@ -347,6 +353,7 @@ impl MatchRuntime {
         let phase = decode_phase(&mut decoder)?;
         let next_dynamic_actor_id = decode_option_u64(&mut decoder, "dynamic actor allocator")?;
         let next_modifier_id = decode_option_u64(&mut decoder, "stat modifier allocator")?;
+        let next_status_effect_id = decode_option_u64(&mut decoder, "status effect allocator")?;
 
         let ability_count = decoder.count(
             usize::try_from(MAX_ABILITY_DEFINITIONS).unwrap_or(usize::MAX),
@@ -444,6 +451,7 @@ impl MatchRuntime {
             objective_claims: BTreeSet::new(),
             next_dynamic_actor_id,
             next_modifier_id,
+            next_status_effect_id,
             checkpoint_ready: true,
         };
         runtime.validate_restored_state()?;
@@ -834,6 +842,7 @@ fn encode_config(encoder: &mut Encoder, config: MatchConfig) -> Result<(), Check
     encoder.u16(config.max_wave_schedules)?;
     encoder.u16(config.max_units_per_wave)?;
     encoder.u16(config.max_modifiers_per_actor)?;
+    encoder.u16(config.max_status_effects_per_actor)?;
     encoder.u32(config.max_checkpoint_bytes)
 }
 
@@ -854,6 +863,7 @@ fn decode_config(decoder: &mut Decoder<'_>) -> Result<MatchConfig, CheckpointErr
         max_wave_schedules: decoder.u16()?,
         max_units_per_wave: decoder.u16()?,
         max_modifiers_per_actor: decoder.u16()?,
+        max_status_effects_per_actor: decoder.u16()?,
         max_checkpoint_bytes: decoder.u32()?,
     })
 }
@@ -1042,6 +1052,16 @@ fn encode_actor(encoder: &mut Encoder, actor: &ActorState) -> Result<(), Checkpo
         encode_stat_kind(encoder, modifier.kind)?;
         encode_modifier_op(encoder, modifier.op)?;
     }
+    encoder.count(actor.status_effects.len())?;
+    for effect in &actor.status_effects {
+        encoder.u64(effect.id.get())?;
+        encoder.u64(effect.expires_at)?;
+        encoder.u8(effect.controls.bits())?;
+        encoder.count(effect.modifiers.len())?;
+        for owned in &effect.modifiers {
+            encoder.u64(owned.get())?;
+        }
+    }
     encoder.u32(actor.health)?;
     encoder.u32(actor.resource)?;
     encoder.count(actor.abilities.len())?;
@@ -1092,6 +1112,13 @@ fn decode_actor(
     let base_stats = decode_stats(decoder)?;
     let modifiers = decode_modifiers(decoder, config)?;
     let stats = base_stats.with_modifiers(&modifiers);
+    let status_effects = decode_status_effects(decoder, config)?;
+    // Re-derived, never trusted from the payload - same rule as the stat cache.
+    let control_mask = status_effects
+        .iter()
+        .fold(ControlMask::EMPTY, |mask, effect| {
+            mask.union(effect.controls)
+        });
     let health = decoder.u32()?;
     let resource = decoder.u32()?;
     let ability_limit = usize::try_from(config.max_abilities_per_actor).unwrap_or(usize::MAX);
@@ -1162,6 +1189,8 @@ fn decode_actor(
         destination,
         base_stats,
         modifiers,
+        status_effects,
+        control_mask,
         stats,
         health,
         resource,
@@ -1198,6 +1227,49 @@ fn decode_modifiers(
         ));
     }
     Ok(modifiers)
+}
+
+/// Decode one actor's timed status effects.
+///
+/// Split out of `decode_actor` so that function stays inside its line budget, and because the ownership rule
+/// is worth stating on its own: each effect names the modifiers it granted, and strict ID ordering is
+/// enforced so a payload cannot reorder effects into an expiry sequence different from the one that wrote it.
+fn decode_status_effects(
+    decoder: &mut Decoder<'_>,
+    config: MatchConfig,
+) -> Result<Vec<StatusEffect>, CheckpointError> {
+    let limit = usize::from(config.max_status_effects_per_actor);
+    let count = decoder.count(limit, "actor status effect count exceeds budget")?;
+    decoder.require_minimum(count, MIN_STATUS_EFFECT_BYTES)?;
+    let mut effects = allocate_vec(count)?;
+    for _ in 0..count {
+        let id = StatusEffectId(decoder.u64()?);
+        let expires_at = decoder.u64()?;
+        let controls = ControlMask::from_bits(decoder.u8()?).ok_or(
+            CheckpointError::InvalidData("status effect carries an undefined control bit"),
+        )?;
+        let granted_count = decoder.count(
+            usize::from(config.max_modifiers_per_actor),
+            "status effect modifier count exceeds budget",
+        )?;
+        decoder.require_minimum(granted_count, 8)?;
+        let mut granted = allocate_vec(granted_count)?;
+        for _ in 0..granted_count {
+            granted.push(ModifierId(decoder.u64()?));
+        }
+        effects.push(StatusEffect {
+            id,
+            expires_at,
+            controls,
+            modifiers: granted,
+        });
+    }
+    if effects.windows(2).any(|pair| pair[0].id >= pair[1].id) {
+        return Err(CheckpointError::InvalidData(
+            "actor status effects are not strictly sorted by identity",
+        ));
+    }
+    Ok(effects)
 }
 
 fn encode_stat_kind(encoder: &mut Encoder, kind: StatKind) -> Result<(), CheckpointError> {
@@ -1640,6 +1712,10 @@ fn encode_rejection_reason(
             encoder.u64(ready_at)
         }
         CommandRejectReason::AttackExceedsMatchDuration => encoder.u8(26),
+        CommandRejectReason::ActorStunned => encoder.u8(27),
+        CommandRejectReason::ActorRooted => encoder.u8(28),
+        CommandRejectReason::ActorSilenced => encoder.u8(29),
+        CommandRejectReason::ActorDisarmed => encoder.u8(30),
     }
 }
 
@@ -1681,6 +1757,10 @@ fn decode_rejection_reason(
             ready_at: decoder.u64()?,
         }),
         26 => Ok(CommandRejectReason::AttackExceedsMatchDuration),
+        27 => Ok(CommandRejectReason::ActorStunned),
+        28 => Ok(CommandRejectReason::ActorRooted),
+        29 => Ok(CommandRejectReason::ActorSilenced),
+        30 => Ok(CommandRejectReason::ActorDisarmed),
         tag => Err(CheckpointError::InvalidTag {
             field: "command rejection reason",
             tag,
@@ -1783,6 +1863,8 @@ mod tests {
                 destination: None,
                 base_stats: stats(),
                 modifiers: hero_modifiers.clone(),
+                status_effects: Vec::new(),
+                control_mask: ControlMask::EMPTY,
                 stats: stats().with_modifiers(&hero_modifiers),
                 health: 850,
                 resource: 150,
@@ -1822,6 +1904,8 @@ mod tests {
                 destination: None,
                 base_stats: stats(),
                 modifiers: Vec::new(),
+                status_effects: Vec::new(),
+                control_mask: ControlMask::EMPTY,
                 stats: stats(),
                 health: 700,
                 resource: 125,
@@ -1851,6 +1935,8 @@ mod tests {
                 destination: None,
                 base_stats: stats(),
                 modifiers: Vec::new(),
+                status_effects: Vec::new(),
+                control_mask: ControlMask::EMPTY,
                 stats: stats(),
                 health: 0,
                 resource: 0,
@@ -1932,6 +2018,7 @@ mod tests {
             objective_claims: BTreeSet::new(),
             next_dynamic_actor_id: Some(44),
             next_modifier_id: Some(12),
+            next_status_effect_id: Some(1),
             checkpoint_ready: true,
         }
     }
@@ -2212,6 +2299,7 @@ mod tests {
         decode_phase(&mut decoder).unwrap();
         decode_option_u64(&mut decoder, "actor allocator").unwrap();
         decode_option_u64(&mut decoder, "modifier allocator").unwrap();
+        decode_option_u64(&mut decoder, "status effect allocator").unwrap();
         let ability_count = decoder.count(usize::MAX, "test ability count").unwrap();
         for _ in 0..ability_count {
             decode_ability(&mut decoder).unwrap();
@@ -2360,6 +2448,7 @@ mod tests {
         decode_phase(&mut probe).unwrap();
         decode_option_u64(&mut probe, "actor allocator").unwrap();
         decode_option_u64(&mut probe, "modifier allocator").unwrap();
+        decode_option_u64(&mut probe, "status effect allocator").unwrap();
         let ability_count_offset = HEADER_BYTES + probe.offset;
         hostile[ability_count_offset..ability_count_offset + 4]
             .copy_from_slice(&u32::MAX.to_le_bytes());

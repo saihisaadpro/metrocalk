@@ -23,14 +23,16 @@ mod runtime;
 pub use checkpoint::{CheckpointError, ContentId, RuntimeCheckpoint};
 pub use model::{
     AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorKind, ActorProvenance,
-    ActorSpawn, BasicAttackSpec, CombatStats, DamageSchool, DeathRule, DynamicActorProvenance,
-    DynamicActorSpawn, MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, ModifierId,
-    ModifierOp, PlayerId, RectMm, RuntimeError, StatKind, StatModifier, TeamId, Tick, Vec2Mm,
-    BASIS_POINTS, MAX_ABILITIES_PER_ACTOR_BUDGET, MAX_ABILITY_DEFINITIONS, MAX_ACTOR_BUDGET,
+    ActorSpawn, BasicAttackSpec, CombatStats, ControlKind, ControlMask, DamageSchool, DeathRule,
+    DynamicActorProvenance, DynamicActorSpawn, MatchConfig, MatchEndReason, MatchOutcome,
+    MatchPhase, ModifierId, ModifierOp, PlayerId, RectMm, RuntimeError, StatKind, StatModifier,
+    StatusEffectId, StatusEffectView, TeamId, Tick, Vec2Mm, BASIS_POINTS,
+    MAX_ABILITIES_PER_ACTOR_BUDGET, MAX_ABILITY_DEFINITIONS, MAX_ACTOR_BUDGET,
     MAX_COMMANDS_PER_PLAYER_PER_TICK_BUDGET, MAX_COMMANDS_PER_TICK_BUDGET, MAX_COMMAND_LEAD_TICKS,
     MAX_LANE_BUDGET, MAX_LANE_POINTS_PER_LANE_BUDGET, MAX_MATCH_TICKS,
     MAX_MODIFIERS_PER_ACTOR_BUDGET, MAX_PLAYER_BUDGET, MAX_REJECTION_EVENTS_PER_FRAME_BUDGET,
-    MAX_RUNTIME_CHECKPOINT_BYTES, MAX_UNITS_PER_WAVE_BUDGET, MAX_WAVE_SCHEDULE_BUDGET,
+    MAX_RUNTIME_CHECKPOINT_BYTES, MAX_STATUS_EFFECTS_PER_ACTOR_BUDGET, MAX_UNITS_PER_WAVE_BUDGET,
+    MAX_WAVE_SCHEDULE_BUDGET,
 };
 pub use protocol::{
     ActorIntent, ActorView, BasicAttackProgress, CastProgress, CastTarget, CommandKind,

@@ -1,6 +1,6 @@
 use crate::model::{
-    AbilityId, ActorId, ActorKind, ActorProvenance, DamageSchool, MatchEndReason, MatchOutcome,
-    MatchPhase, PlayerId, TeamId, Tick, Vec2Mm,
+    AbilityId, ActorId, ActorKind, ActorProvenance, ControlMask, DamageSchool, MatchEndReason,
+    MatchOutcome, MatchPhase, PlayerId, StatusEffectId, TeamId, Tick, Vec2Mm,
 };
 
 /// Deterministic equality key for authoritative gameplay simulation state.
@@ -86,6 +86,10 @@ pub enum CommandRejectReason {
     BasicAttackUnavailable,
     BasicAttackOnCooldown { ready_at: Tick },
     AttackExceedsMatchDuration,
+    ActorStunned,
+    ActorRooted,
+    ActorSilenced,
+    ActorDisarmed,
 }
 
 /// Accepted queue position. A later state change can still make the command invalid at execution time; that
@@ -151,6 +155,8 @@ pub struct ActorView {
     /// actor dirty while emitting a byte-identical view — a delta that claims a change it cannot show.
     pub physical_reduction_bps: u16,
     pub magic_reduction_bps: u16,
+    /// Active crowd-control restrictions. A client needs these to grey out abilities and show CC bars.
+    pub controls: ControlMask,
     pub alive: bool,
     pub cast: Option<CastProgress>,
     pub basic_attack: Option<BasicAttackProgress>,
@@ -248,6 +254,10 @@ pub enum MatchEvent {
     InternalIntentRejected {
         actor: ActorId,
         reason: CommandRejectReason,
+    },
+    StatusEffectExpired {
+        actor: ActorId,
+        effect: StatusEffectId,
     },
     ActorSpawned {
         actor: ActorId,

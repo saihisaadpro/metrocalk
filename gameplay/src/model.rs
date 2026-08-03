@@ -29,6 +29,7 @@ pub const MAX_LANE_POINTS_PER_LANE_BUDGET: u16 = 1_024;
 pub const MAX_WAVE_SCHEDULE_BUDGET: u16 = 256;
 pub const MAX_UNITS_PER_WAVE_BUDGET: u16 = 256;
 pub const MAX_MODIFIERS_PER_ACTOR_BUDGET: u16 = 64;
+pub const MAX_STATUS_EFFECTS_PER_ACTOR_BUDGET: u16 = 32;
 
 macro_rules! id_type {
     ($name:ident, $inner:ty, $description:literal) => {
@@ -234,6 +235,109 @@ impl ModifierId {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+/// One crowd-control restriction. These are the genre's load-bearing interaction verbs: they decide what an
+/// actor may *do*, independently of what its stats are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ControlKind {
+    /// Blocks movement, casting, and attacking, and interrupts anything already in progress.
+    Stun,
+    /// Blocks movement only.
+    Root,
+    /// Blocks casting only. Does not interrupt a cast already resolving.
+    Silence,
+    /// Blocks basic attacks only.
+    Disarm,
+}
+
+impl ControlKind {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Stun => 1,
+            Self::Root => 1 << 1,
+            Self::Silence => 1 << 2,
+            Self::Disarm => 1 << 3,
+        }
+    }
+
+    pub(crate) const ALL: [Self; 4] = [Self::Stun, Self::Root, Self::Silence, Self::Disarm];
+}
+
+/// A set of active restrictions, held as a bitmask.
+///
+/// A mask rather than a list on purpose: union is order-free and idempotent, so combining the restrictions of
+/// several overlapping effects cannot depend on iteration order — the same reasoning that made stat stage 3
+/// order by magnitude.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ControlMask(u8);
+
+impl ControlMask {
+    pub const EMPTY: Self = Self(0);
+    const VALID_BITS: u8 = 0b1111;
+
+    #[must_use]
+    pub fn from_kinds(kinds: &[ControlKind]) -> Self {
+        Self(kinds.iter().fold(0, |bits, kind| bits | kind.bit()))
+    }
+
+    #[must_use]
+    pub const fn contains(self, kind: ControlKind) -> bool {
+        self.0 & kind.bit() != 0
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Reject unknown bits rather than silently masking them: an undefined restriction decoded from a
+    /// checkpoint is corruption, not a future feature to tolerate.
+    pub(crate) const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !Self::VALID_BITS == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn kinds(self) -> Vec<ControlKind> {
+        ControlKind::ALL
+            .into_iter()
+            .filter(|kind| self.contains(*kind))
+            .collect()
+    }
+}
+
+/// Monotonic never-reused identity for one applied status effect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StatusEffectId(pub u64);
+
+impl StatusEffectId {
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Read-only projection of one active status effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusEffectView {
+    pub id: StatusEffectId,
+    pub expires_at: Tick,
+    pub controls: ControlMask,
+    pub modifiers: Vec<ModifierId>,
 }
 
 /// One modifier bound to one actor. Lifetime is deliberately absent: this layer resolves *how* stats
@@ -463,6 +567,7 @@ pub struct MatchConfig {
     pub max_wave_schedules: u16,
     pub max_units_per_wave: u16,
     pub max_modifiers_per_actor: u16,
+    pub max_status_effects_per_actor: u16,
     pub max_checkpoint_bytes: u32,
 }
 
@@ -490,6 +595,7 @@ impl MatchConfig {
             max_wave_schedules: 8,
             max_units_per_wave: 16,
             max_modifiers_per_actor: 16,
+            max_status_effects_per_actor: 8,
             max_checkpoint_bytes: 4 * 1024 * 1024,
         }
     }
@@ -514,6 +620,7 @@ impl MatchConfig {
             || self.max_wave_schedules == 0
             || self.max_units_per_wave == 0
             || self.max_modifiers_per_actor == 0
+            || self.max_status_effects_per_actor == 0
             || self.max_checkpoint_bytes == 0
         {
             return Err(RuntimeError::InvalidConfig(
@@ -537,6 +644,7 @@ impl MatchConfig {
             || self.max_wave_schedules > MAX_WAVE_SCHEDULE_BUDGET
             || self.max_units_per_wave > MAX_UNITS_PER_WAVE_BUDGET
             || self.max_modifiers_per_actor > MAX_MODIFIERS_PER_ACTOR_BUDGET
+            || self.max_status_effects_per_actor > MAX_STATUS_EFFECTS_PER_ACTOR_BUDGET
         {
             return Err(RuntimeError::InvalidConfig(
                 "target profile exceeds a hard decoded-state budget",
@@ -611,6 +719,8 @@ pub enum RuntimeError {
     ActorBudgetExceeded,
     ActorIdExhausted,
     ModifierIdExhausted,
+    StatusEffectIdExhausted,
+    UnknownStatusEffect(StatusEffectId),
     UnknownActor(ActorId),
     UnknownModifier(ModifierId),
     UnknownAbility(AbilityId),
@@ -636,6 +746,12 @@ impl Display for RuntimeError {
             Self::ActorBudgetExceeded => formatter.write_str("actor budget exceeded"),
             Self::ActorIdExhausted => formatter.write_str("dynamic actor ID space exhausted"),
             Self::ModifierIdExhausted => formatter.write_str("stat modifier ID space exhausted"),
+            Self::StatusEffectIdExhausted => {
+                formatter.write_str("status effect ID space exhausted")
+            }
+            Self::UnknownStatusEffect(id) => {
+                write!(formatter, "unknown status effect {}", id.get())
+            }
             Self::UnknownActor(id) => write!(formatter, "unknown actor {}", id.get()),
             Self::UnknownModifier(id) => write!(formatter, "unknown stat modifier {}", id.get()),
             Self::UnknownAbility(id) => write!(formatter, "unknown ability {}", id.get()),

@@ -1,10 +1,10 @@
 use crate::{
     AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorIntent, ActorKind,
     ActorProvenance, ActorSpawn, BasicAttackSpec, CastTarget, CombatStats, CommandKind,
-    CommandRejectReason, ContentId, DamageCause, DamageSchool, DeathRule, DynamicActorProvenance,
-    DynamicActorSpawn, MatchConfig, MatchEndReason, MatchEvent, MatchOutcome, MatchPhase,
-    MatchRuntime, ModifierOp, PlayerCommand, PlayerId, RuntimeError, Scenario, ScenarioFinish,
-    ScenarioSubmission, StatKind, TeamId, Vec2Mm, BASIS_POINTS,
+    CommandRejectReason, ContentId, ControlKind, DamageCause, DamageSchool, DeathRule,
+    DynamicActorProvenance, DynamicActorSpawn, MatchConfig, MatchEndReason, MatchEvent,
+    MatchOutcome, MatchPhase, MatchRuntime, ModifierOp, PlayerCommand, PlayerId, RuntimeError,
+    Scenario, ScenarioFinish, ScenarioSubmission, StatKind, TeamId, Vec2Mm, BASIS_POINTS,
 };
 
 const PLAYER_ONE: PlayerId = PlayerId(1);
@@ -409,6 +409,282 @@ fn permute(items: &mut Vec<usize>, start: usize, visit: &mut impl FnMut(&[usize]
         permute(items, start + 1, visit);
         items.swap(start, index);
     }
+}
+
+#[test]
+fn crowd_control_gates_exactly_the_actions_it_names() {
+    // Each restriction must block its own verb and leave the others alone. A Root that also stopped casting
+    // would be a Stun by accident, and the difference between them is the whole counterplay of the genre.
+    let cases = [
+        (ControlKind::Root, CommandRejectReason::ActorRooted),
+        (ControlKind::Silence, CommandRejectReason::ActorSilenced),
+        (ControlKind::Disarm, CommandRejectReason::ActorDisarmed),
+    ];
+    for (control, expected) in cases {
+        let mut runtime = duel_runtime();
+        runtime
+            .apply_status_effect(HERO_ONE, 10, &[control], &[])
+            .unwrap();
+        let blocked = match control {
+            ControlKind::Root => CommandKind::MoveTo {
+                destination: Vec2Mm::new(100, 0),
+            },
+            ControlKind::Silence => CommandKind::Cast {
+                ability: STRIKE,
+                target: CastTarget::Actor(HERO_TWO),
+            },
+            _ => CommandKind::BasicAttack { target: HERO_TWO },
+        };
+        let rejection = runtime
+            .submit(command(PLAYER_ONE, 1, 1, HERO_ONE, blocked))
+            .unwrap_err();
+        assert_eq!(rejection.reason, expected, "{control:?} rejected wrongly");
+
+        // Stop is never gated: it only cancels, so refusing it would be pure rejection noise.
+        assert!(runtime
+            .submit(command(PLAYER_ONE, 2, 1, HERO_ONE, CommandKind::Stop))
+            .is_ok());
+    }
+}
+
+#[test]
+fn a_stun_blocks_every_verb_and_interrupts_what_is_already_running() {
+    let mut runtime = duel_runtime();
+    runtime
+        .submit(command(
+            PLAYER_ONE,
+            1,
+            1,
+            HERO_ONE,
+            CommandKind::Cast {
+                ability: STRIKE,
+                target: CastTarget::Actor(HERO_TWO),
+            },
+        ))
+        .unwrap();
+    runtime.step().unwrap();
+    assert!(
+        runtime.actor(HERO_ONE).unwrap().cast.is_some(),
+        "the cast must be in flight for the interrupt to mean anything"
+    );
+
+    runtime
+        .apply_status_effect(HERO_ONE, 10, &[ControlKind::Stun], &[])
+        .unwrap();
+    assert!(
+        runtime.actor(HERO_ONE).unwrap().cast.is_none(),
+        "a stun must interrupt an in-progress cast"
+    );
+
+    // Every verb is refused while stunned.
+    for (sequence, kind) in [
+        (
+            2,
+            CommandKind::MoveTo {
+                destination: Vec2Mm::new(50, 0),
+            },
+        ),
+        (
+            3,
+            CommandKind::Cast {
+                ability: STRIKE,
+                target: CastTarget::Actor(HERO_TWO),
+            },
+        ),
+        (4, CommandKind::BasicAttack { target: HERO_TWO }),
+    ] {
+        assert_eq!(
+            runtime
+                .submit(command(
+                    PLAYER_ONE,
+                    sequence,
+                    runtime.tick() + 1,
+                    HERO_ONE,
+                    kind
+                ))
+                .unwrap_err()
+                .reason,
+            CommandRejectReason::ActorStunned
+        );
+    }
+}
+
+#[test]
+fn an_expiring_effect_frees_the_actor_on_the_tick_after_its_last() {
+    // The off-by-one that matters: expiry runs at the TOP of the tick, so an effect whose final tick was the
+    // previous one cannot block the order this tick delivers.
+    let mut runtime = duel_runtime();
+    let applied_at = runtime.tick();
+    runtime
+        .apply_status_effect(HERO_ONE, 3, &[ControlKind::Root], &[])
+        .unwrap();
+    let effects = runtime.status_effects(HERO_ONE).unwrap();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].expires_at, applied_at + 3);
+
+    // Rooted through its final tick.
+    while runtime.tick() < applied_at + 3 {
+        runtime.step().unwrap();
+        if runtime.tick() <= applied_at + 3 {
+            assert!(
+                runtime
+                    .actor(HERO_ONE)
+                    .unwrap()
+                    .controls
+                    .contains(ControlKind::Root),
+                "must stay rooted through tick {}",
+                runtime.tick()
+            );
+        }
+    }
+    let frame = runtime.step().unwrap();
+    assert!(!runtime
+        .actor(HERO_ONE)
+        .unwrap()
+        .controls
+        .contains(ControlKind::Root));
+    assert!(frame.events.iter().any(
+        |event| matches!(event, MatchEvent::StatusEffectExpired { actor, .. } if *actor == HERO_ONE)
+    ));
+    runtime.check_invariants().unwrap();
+}
+
+#[test]
+fn an_expiring_effect_takes_its_modifiers_with_it() {
+    // The composition property GP-07 was built for: a slow is a control plus a stat penalty, and neither may
+    // outlive the effect that granted them.
+    let mut runtime = duel_runtime();
+    let base = runtime.actor(HERO_ONE).unwrap().move_speed_mm_per_tick;
+    runtime
+        .apply_status_effect(
+            HERO_ONE,
+            2,
+            &[],
+            &[(StatKind::MoveSpeed, ModifierOp::PercentAdd { bps: -5_000 })],
+        )
+        .unwrap();
+    assert_eq!(runtime.modifiers(HERO_ONE).unwrap().len(), 1);
+    assert_eq!(
+        runtime.actor(HERO_ONE).unwrap().move_speed_mm_per_tick,
+        base / 2
+    );
+
+    while !runtime.status_effects(HERO_ONE).unwrap().is_empty() {
+        runtime.step().unwrap();
+    }
+    assert!(
+        runtime.modifiers(HERO_ONE).unwrap().is_empty(),
+        "the granted modifier must expire with its effect - no orphan buffs"
+    );
+    assert_eq!(
+        runtime.actor(HERO_ONE).unwrap().move_speed_mm_per_tick,
+        base
+    );
+    runtime.check_invariants().unwrap();
+}
+
+#[test]
+fn an_immobilised_actor_stops_moving_not_just_taking_orders() {
+    let mut runtime = duel_runtime();
+    runtime
+        .submit(command(
+            PLAYER_ONE,
+            1,
+            1,
+            HERO_ONE,
+            CommandKind::MoveTo {
+                destination: Vec2Mm::new(5_000, 0),
+            },
+        ))
+        .unwrap();
+    runtime.step().unwrap();
+    let moved_to = runtime.actor(HERO_ONE).unwrap().position;
+    assert!(moved_to.x > 0, "the actor must be under way");
+
+    runtime
+        .apply_status_effect(HERO_ONE, 5, &[ControlKind::Root], &[])
+        .unwrap();
+    runtime.step().unwrap();
+    assert_eq!(
+        runtime.actor(HERO_ONE).unwrap().position,
+        moved_to,
+        "a rooted actor must hold position, not keep walking its old destination"
+    );
+}
+
+#[test]
+fn removing_an_effect_early_is_atomic_and_status_state_survives_a_checkpoint() {
+    let mut runtime = duel_runtime();
+    let effect = runtime
+        .apply_status_effect(
+            HERO_ONE,
+            50,
+            &[ControlKind::Stun, ControlKind::Silence],
+            &[(StatKind::MoveSpeed, ModifierOp::Flat { magnitude: -20 })],
+        )
+        .unwrap();
+    runtime.step().unwrap();
+
+    let checkpoint = runtime
+        .capture_checkpoint(ContentId::new([0x44; 32]))
+        .unwrap();
+    let restored =
+        MatchRuntime::restore_checkpoint(&checkpoint, ContentId::new([0x44; 32])).unwrap();
+    assert_eq!(restored.world_digest(), runtime.world_digest());
+    assert_eq!(
+        restored.status_effects(HERO_ONE).unwrap(),
+        runtime.status_effects(HERO_ONE).unwrap()
+    );
+    assert!(restored
+        .actor(HERO_ONE)
+        .unwrap()
+        .controls
+        .contains(ControlKind::Stun));
+
+    // A dispel takes the control AND the modifier, together.
+    let mut dispelled = restored;
+    dispelled.remove_status_effect(HERO_ONE, effect).unwrap();
+    assert!(dispelled.status_effects(HERO_ONE).unwrap().is_empty());
+    assert!(dispelled.modifiers(HERO_ONE).unwrap().is_empty());
+    assert!(dispelled.actor(HERO_ONE).unwrap().controls.is_empty());
+    dispelled.check_invariants().unwrap();
+    assert!(matches!(
+        dispelled.remove_status_effect(HERO_ONE, effect),
+        Err(RuntimeError::UnknownStatusEffect(_))
+    ));
+}
+
+#[test]
+fn a_rejected_status_effect_consumes_no_identity_and_leaves_no_partial_state() {
+    let mut runtime = duel_runtime();
+    let before_effects = runtime.next_status_effect_id;
+    let before_modifiers = runtime.next_modifier_id;
+
+    // Duration zero is refused outright.
+    assert!(matches!(
+        runtime.apply_status_effect(HERO_ONE, 0, &[ControlKind::Stun], &[]),
+        Err(RuntimeError::InvalidActor(_))
+    ));
+    // An unknown actor is refused before anything is allocated.
+    assert!(matches!(
+        runtime.apply_status_effect(ActorId(999), 5, &[ControlKind::Stun], &[]),
+        Err(RuntimeError::UnknownActor(_))
+    ));
+    // Overflowing the modifier budget mid-bundle must roll the WHOLE effect back, not leave half its
+    // modifiers applied with no effect owning them.
+    let limit = usize::from(runtime.config().max_modifiers_per_actor);
+    let oversized: Vec<(StatKind, ModifierOp)> = (0..=limit)
+        .map(|_| (StatKind::MoveSpeed, ModifierOp::Flat { magnitude: 1 }))
+        .collect();
+    assert!(runtime
+        .apply_status_effect(HERO_ONE, 5, &[], &oversized)
+        .is_err());
+
+    assert!(runtime.status_effects(HERO_ONE).unwrap().is_empty());
+    assert!(runtime.modifiers(HERO_ONE).unwrap().is_empty());
+    assert_eq!(runtime.next_status_effect_id, before_effects);
+    assert_eq!(runtime.next_modifier_id, before_modifiers);
+    runtime.check_invariants().unwrap();
 }
 
 #[test]

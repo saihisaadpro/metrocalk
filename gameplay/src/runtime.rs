@@ -4,10 +4,10 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::model::{
     AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorKind, ActorProvenance,
-    ActorSpawn, BasicAttackSpec, CombatStats, DamageSchool, DeathRule, DynamicActorProvenance,
-    DynamicActorSpawn, MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, ModifierId,
-    ModifierOp, PlayerId, RuntimeError, StatKind, StatModifier, TeamId, Tick, Vec2Mm, BASIS_POINTS,
-    MAX_ABILITY_DEFINITIONS,
+    ActorSpawn, BasicAttackSpec, CombatStats, ControlKind, ControlMask, DamageSchool, DeathRule,
+    DynamicActorProvenance, DynamicActorSpawn, MatchConfig, MatchEndReason, MatchOutcome,
+    MatchPhase, ModifierId, ModifierOp, PlayerId, RuntimeError, StatKind, StatModifier,
+    StatusEffectId, StatusEffectView, TeamId, Tick, Vec2Mm, BASIS_POINTS, MAX_ABILITY_DEFINITIONS,
 };
 use crate::protocol::{
     ActorIntent, ActorView, BasicAttackProgress, CastProgress, CastTarget, CommandKind,
@@ -98,6 +98,21 @@ impl Display for InvariantViolation {
 
 impl Error for InvariantViolation {}
 
+/// One timed restriction-and-buff bundle bound to an actor.
+///
+/// It owns the modifier IDs it created. Expiry removes both together, atomically, so a slow's speed penalty
+/// cannot survive the slow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StatusEffect {
+    pub(crate) id: StatusEffectId,
+    /// The last tick on which this effect still restricts. It is removed at the top of `expires_at + 1`, so a
+    /// duration of N applied during tick T covers ticks T+1 through T+N inclusive — exactly N ticks of
+    /// gameplay effect, which is what a designer authoring "a 30-tick stun" means.
+    pub(crate) expires_at: Tick,
+    pub(crate) controls: ControlMask,
+    pub(crate) modifiers: Vec<ModifierId>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ActorState {
     pub(crate) id: ActorId,
@@ -110,6 +125,11 @@ pub(crate) struct ActorState {
     pub(crate) base_stats: CombatStats,
     /// Applied modifiers, kept sorted by ID and unique. This plus `base_stats` is the whole stat state.
     pub(crate) modifiers: Vec<StatModifier>,
+    /// Active timed status effects, kept sorted by ID. Each OWNS the modifiers it applied and takes them
+    /// with it when it expires, so a buff can never outlive the effect that granted it.
+    pub(crate) status_effects: Vec<StatusEffect>,
+    /// Derived cache: the union of every active effect's restrictions. Audited like `stats`.
+    pub(crate) control_mask: ControlMask,
     /// Derived cache: exactly `base_stats.with_modifiers(&modifiers)`. Every read site in the simulation
     /// uses this so the hot path never re-aggregates, and the frame-boundary audit re-derives it to prove
     /// the cache has not drifted — the same reconstructible-not-trusted discipline the checkpoints use.
@@ -143,6 +163,8 @@ impl ActorState {
             destination: None,
             base_stats: spawn.stats,
             modifiers: Vec::new(),
+            status_effects: Vec::new(),
+            control_mask: ControlMask::EMPTY,
             stats: spawn.stats,
             health: spawn.stats.max_health,
             resource: spawn.stats.max_resource,
@@ -170,6 +192,15 @@ impl ActorState {
     /// Lowering `max_health` must pull current health down with it, or the very next frame-boundary audit
     /// would fail on `health > max_health`. Health is only ever clamped DOWN here: resolving stats must not
     /// heal, and a heal is a damage-pipeline concern, not a stat-aggregation one.
+    fn resolve_controls(&mut self) {
+        self.control_mask = self
+            .status_effects
+            .iter()
+            .fold(ControlMask::EMPTY, |mask, effect| {
+                mask.union(effect.controls)
+            });
+    }
+
     fn resolve_stats(&mut self) {
         self.stats = self.base_stats.with_modifiers(&self.modifiers);
         self.health = self.health.min(self.stats.max_health);
@@ -191,6 +222,7 @@ impl ActorState {
             move_speed_mm_per_tick: self.stats.move_speed_mm_per_tick,
             physical_reduction_bps: self.stats.physical_reduction_bps,
             magic_reduction_bps: self.stats.magic_reduction_bps,
+            controls: self.control_mask,
             alive: self.alive(),
             cast: self.cast.map(|cast| CastProgress {
                 ability: cast.ability,
@@ -240,6 +272,7 @@ pub struct MatchRuntime {
     pub(crate) objective_claims: BTreeSet<TeamId>,
     pub(crate) next_dynamic_actor_id: Option<u64>,
     pub(crate) next_modifier_id: Option<u64>,
+    pub(crate) next_status_effect_id: Option<u64>,
     pub(crate) checkpoint_ready: bool,
 }
 
@@ -263,6 +296,7 @@ impl MatchRuntime {
             objective_claims: BTreeSet::new(),
             next_dynamic_actor_id: Some(1),
             next_modifier_id: Some(1),
+            next_status_effect_id: Some(1),
             checkpoint_ready: false,
         })
     }
@@ -501,6 +535,192 @@ impl MatchRuntime {
         self.checkpoint_ready = false;
         self.dirty.insert(actor);
         Ok(())
+    }
+
+    /// Apply one timed status effect: a bundle of crowd-control restrictions plus the stat modifiers it
+    /// grants, both expiring together.
+    ///
+    /// Atomic: if any part fails, nothing is applied and no identity is consumed. A `Stun` additionally
+    /// **interrupts** an in-progress cast or basic attack, because a stun that let a channel finish would not
+    /// be crowd control in any sense a player would recognise.
+    pub fn apply_status_effect(
+        &mut self,
+        actor: ActorId,
+        duration_ticks: u32,
+        controls: &[ControlKind],
+        modifiers: &[(StatKind, ModifierOp)],
+    ) -> Result<StatusEffectId, RuntimeError> {
+        if self.phase != MatchPhase::Active {
+            return Err(RuntimeError::InvalidPhase(
+                "status effects require an active match",
+            ));
+        }
+        if duration_ticks == 0 {
+            return Err(RuntimeError::InvalidActor(
+                "status effect duration must be positive",
+            ));
+        }
+        let index = self
+            .actors
+            .binary_search_by_key(&actor, |candidate| candidate.id)
+            .map_err(|_| RuntimeError::UnknownActor(actor))?;
+        if self.actors[index].status_effects.len()
+            >= usize::from(self.config.max_status_effects_per_actor)
+        {
+            return Err(RuntimeError::InvalidActor(
+                "actor status effect budget exceeded",
+            ));
+        }
+        let raw_id = self
+            .next_status_effect_id
+            .ok_or(RuntimeError::StatusEffectIdExhausted)?;
+        let expires_at = self
+            .tick
+            .checked_add(u64::from(duration_ticks))
+            .ok_or(RuntimeError::TickOverflow)?;
+
+        // Applied to a clone first: a mid-way modifier-budget rejection must not leave a half-built effect.
+        let mut candidate = self.clone();
+        let mut applied = Vec::with_capacity(modifiers.len());
+        for (kind, op) in modifiers {
+            applied.push(candidate.apply_stat_modifier(actor, *kind, *op)?);
+        }
+        let id = StatusEffectId(raw_id);
+        let mask = ControlMask::from_kinds(controls);
+        let slot = candidate
+            .actors
+            .binary_search_by_key(&actor, |candidate| candidate.id)
+            .map_err(|_| RuntimeError::UnknownActor(actor))?;
+        candidate.actors[slot].status_effects.push(StatusEffect {
+            id,
+            expires_at,
+            controls: mask,
+            modifiers: applied,
+        });
+        candidate.actors[slot].resolve_controls();
+        candidate.next_status_effect_id = raw_id.checked_add(1);
+        *self = candidate;
+
+        if mask.contains(ControlKind::Stun) {
+            self.interrupt_actor(actor);
+        }
+        self.checkpoint_ready = false;
+        self.dirty.insert(actor);
+        Ok(id)
+    }
+
+    /// Remove one status effect early (a dispel or cleanse), taking its modifiers with it.
+    pub fn remove_status_effect(
+        &mut self,
+        actor: ActorId,
+        effect: StatusEffectId,
+    ) -> Result<(), RuntimeError> {
+        if self.phase != MatchPhase::Active {
+            return Err(RuntimeError::InvalidPhase(
+                "status effects require an active match",
+            ));
+        }
+        let index = self
+            .actors
+            .binary_search_by_key(&actor, |candidate| candidate.id)
+            .map_err(|_| RuntimeError::UnknownActor(actor))?;
+        let position = self.actors[index]
+            .status_effects
+            .iter()
+            .position(|entry| entry.id == effect)
+            .ok_or(RuntimeError::UnknownStatusEffect(effect))?;
+        let removed = self.actors[index].status_effects.remove(position);
+        self.actors[index]
+            .modifiers
+            .retain(|modifier| !removed.modifiers.contains(&modifier.id));
+        self.actors[index].resolve_controls();
+        self.actors[index].resolve_stats();
+        self.checkpoint_ready = false;
+        self.dirty.insert(actor);
+        Ok(())
+    }
+
+    /// Bounded read of one actor's active status effects.
+    #[must_use]
+    pub fn status_effects(&self, actor: ActorId) -> Option<Vec<StatusEffectView>> {
+        self.actor_state(actor).map(|state| {
+            state
+                .status_effects
+                .iter()
+                .map(|effect| StatusEffectView {
+                    id: effect.id,
+                    expires_at: effect.expires_at,
+                    controls: effect.controls,
+                    modifiers: effect.modifiers.clone(),
+                })
+                .collect()
+        })
+    }
+
+    /// Cancel whatever an actor is currently doing. Used by `Stun`; emits the same cancellation events a
+    /// player-visible interrupt would, so the causal trace stays complete.
+    fn interrupt_actor(&mut self, actor: ActorId) {
+        let Ok(index) = self
+            .actors
+            .binary_search_by_key(&actor, |candidate| candidate.id)
+        else {
+            return;
+        };
+        if let Some(cast) = self.actors[index].cast.take() {
+            self.pending_events.push(MatchEvent::CastCancelled {
+                source: actor,
+                ability: cast.ability,
+                reason: CommandRejectReason::ActorStunned,
+            });
+            self.dirty.insert(actor);
+        }
+        if let Some(attack) = self.actors[index].attack.take() {
+            self.pending_events.push(MatchEvent::BasicAttackCancelled {
+                source: actor,
+                target: attack.target,
+                reason: CommandRejectReason::ActorStunned,
+            });
+            self.dirty.insert(actor);
+        }
+    }
+
+    /// Drop every effect whose window has closed, taking its modifiers with it.
+    ///
+    /// Runs at the top of the tick, before any command executes, so an effect that ends this tick cannot
+    /// still block the orders this tick delivers. Expiry is by ascending effect ID, which is only a
+    /// tie-break for the emitted event order — removal itself is set-based and order-independent.
+    fn expire_status_effects(&mut self) {
+        let now = self.tick;
+        for index in 0..self.actors.len() {
+            if self.actors[index]
+                .status_effects
+                .iter()
+                .all(|effect| effect.expires_at >= now)
+            {
+                continue;
+            }
+            let actor = self.actors[index].id;
+            let mut expired = Vec::new();
+            self.actors[index].status_effects.retain(|effect| {
+                let live = effect.expires_at >= now;
+                if !live {
+                    expired.push(effect.clone());
+                }
+                live
+            });
+            for effect in &expired {
+                self.actors[index]
+                    .modifiers
+                    .retain(|modifier| !effect.modifiers.contains(&modifier.id));
+                self.pending_events.push(MatchEvent::StatusEffectExpired {
+                    actor,
+                    effect: effect.id,
+                });
+            }
+            self.actors[index].resolve_controls();
+            self.actors[index].resolve_stats();
+            self.dirty.insert(actor);
+        }
     }
 
     /// Bounded read of one actor's applied modifiers, for diagnostics and the status-effect layer above.
@@ -803,6 +1023,70 @@ impl MatchRuntime {
         // With no modifiers the aggregation is the identity, so comparing against `base_stats` directly is
         // the same assertion without five `resolve_stat` passes. That matters: this audit runs for every
         // actor every frame, and the unmodified actor is overwhelmingly the common case.
+        if actor.status_effects.len() > usize::from(self.config.max_status_effects_per_actor) {
+            return Err(Self::violation(
+                Some(actor.id),
+                "actor status effect budget exceeded",
+            ));
+        }
+        if actor
+            .status_effects
+            .windows(2)
+            .any(|pair| pair[0].id >= pair[1].id)
+        {
+            return Err(Self::violation(
+                Some(actor.id),
+                "actor status effects are not strictly sorted by identity",
+            ));
+        }
+        if self.next_status_effect_id.is_some_and(|next| {
+            actor
+                .status_effects
+                .iter()
+                .any(|effect| effect.id.get() >= next)
+        }) {
+            return Err(Self::violation(
+                Some(actor.id),
+                "status effect allocator does not exceed every allocated effect ID",
+            ));
+        }
+        // An effect whose window closed must have been retired at the top of the tick.
+        if actor
+            .status_effects
+            .iter()
+            .any(|effect| effect.expires_at < self.tick)
+        {
+            return Err(Self::violation(
+                Some(actor.id),
+                "an expired status effect survived the frame boundary",
+            ));
+        }
+        // Every modifier an effect claims to own must actually exist, or expiry would leave an orphan buff
+        // that nothing can ever remove.
+        if actor.status_effects.iter().any(|effect| {
+            effect
+                .modifiers
+                .iter()
+                .any(|owned| !actor.modifiers.iter().any(|entry| entry.id == *owned))
+        }) {
+            return Err(Self::violation(
+                Some(actor.id),
+                "a status effect owns a modifier the actor does not carry",
+            ));
+        }
+        if actor.control_mask
+            != actor
+                .status_effects
+                .iter()
+                .fold(ControlMask::EMPTY, |mask, effect| {
+                    mask.union(effect.controls)
+                })
+        {
+            return Err(Self::violation(
+                Some(actor.id),
+                "resolved control mask does not match its status effects",
+            ));
+        }
         let resolved_matches = if actor.modifiers.is_empty() {
             actor.stats == actor.base_stats
         } else {
@@ -1132,6 +1416,11 @@ impl MatchRuntime {
         self.checkpoint_ready = false;
         self.tick = next_tick;
 
+        // Phase 1 of the tick: retire expired restrictions BEFORE any order is executed, so an effect whose
+        // final tick was the previous one cannot block a command delivered now. Placing this after command
+        // execution would silently extend every effect by exactly one tick.
+        self.expire_status_effects();
+
         let mut commands = self.queued_commands.remove(&self.tick).unwrap_or_default();
         commands.sort_unstable_by_key(command_order_key);
         for command in commands {
@@ -1192,7 +1481,7 @@ impl MatchRuntime {
     #[must_use]
     pub fn world_digest(&self) -> WorldDigest {
         let mut hash = StableHash::new();
-        hash.bytes(b"metrocalk-gameplay-mob2-v6");
+        hash.bytes(b"metrocalk-gameplay-mob2-v7");
         hash.u64(self.seed);
         hash.u64(self.tick);
         hash.phase(self.phase);
@@ -1207,6 +1496,13 @@ impl MatchRuntime {
         // The modifier allocator is authoritative checkpointed state and its value decides future aggregation
         // and override precedence, so it must be part of simulation truth — not just carried in the codec.
         match self.next_modifier_id {
+            Some(next) => {
+                hash.bool(true);
+                hash.u64(next);
+            }
+            None => hash.bool(false),
+        }
+        match self.next_status_effect_id {
             Some(next) => {
                 hash.bool(true);
                 hash.u64(next);
@@ -1312,6 +1608,28 @@ impl MatchRuntime {
     ) -> Result<(), CommandRejectReason> {
         if !actor.alive() {
             return Err(CommandRejectReason::ActorDead);
+        }
+        // Crowd control gates here because this is the one place BOTH player commands and server-owned bot
+        // intents are validated: a stun that only stopped players would be a competitive asymmetry.
+        // `Stop` is deliberately never gated — it only cancels, so refusing it would produce rejection noise
+        // without preventing anything.
+        let controls = actor.control_mask;
+        if !controls.is_empty() && !matches!(kind, CommandKind::Stop) {
+            if controls.contains(ControlKind::Stun) {
+                return Err(CommandRejectReason::ActorStunned);
+            }
+            match kind {
+                CommandKind::MoveTo { .. } if controls.contains(ControlKind::Root) => {
+                    return Err(CommandRejectReason::ActorRooted);
+                }
+                CommandKind::Cast { .. } if controls.contains(ControlKind::Silence) => {
+                    return Err(CommandRejectReason::ActorSilenced);
+                }
+                CommandKind::BasicAttack { .. } if controls.contains(ControlKind::Disarm) => {
+                    return Err(CommandRejectReason::ActorDisarmed);
+                }
+                _ => {}
+            }
         }
 
         match kind {
@@ -1559,6 +1877,13 @@ impl MatchRuntime {
     fn integrate_movement(&mut self) {
         for actor in &mut self.actors {
             if !actor.alive() || actor.cast.is_some() || actor.attack.is_some() {
+                continue;
+            }
+            // Immobilised actors hold position. Gating only the ORDER would let an actor stunned mid-path
+            // keep walking to a destination it can no longer be told to abandon.
+            if actor.control_mask.contains(ControlKind::Stun)
+                || actor.control_mask.contains(ControlKind::Root)
+            {
                 continue;
             }
             let Some(destination) = actor.destination else {
@@ -2078,7 +2403,7 @@ fn integer_sqrt_ceil(value: u128) -> u128 {
 
 fn digest_frame(frame: &ServerFrame) -> FrameDigest {
     let mut hash = StableHash::new();
-    hash.bytes(b"metrocalk-gameplay-frame-v4");
+    hash.bytes(b"metrocalk-gameplay-frame-v5");
     hash.u64(frame.tick);
     hash.phase(frame.phase);
     hash.len(frame.changed.len());
@@ -2255,6 +2580,7 @@ impl StableHash {
         self.u16(config.max_wave_schedules);
         self.u16(config.max_units_per_wave);
         self.u16(config.max_modifiers_per_actor);
+        self.u16(config.max_status_effects_per_actor);
         self.u32(config.max_checkpoint_bytes);
     }
 
@@ -2319,8 +2645,19 @@ impl StableHash {
         for modifier in &actor.modifiers {
             self.modifier(*modifier);
         }
-        // The resolved cache is hashed as well as its inputs: a drifted cache would otherwise be invisible
-        // to a digest comparison between two runtimes.
+        self.len(actor.status_effects.len());
+        for effect in &actor.status_effects {
+            self.u64(effect.id.get());
+            self.u64(effect.expires_at);
+            self.u8(effect.controls.bits());
+            self.len(effect.modifiers.len());
+            for owned in &effect.modifiers {
+                self.u64(owned.get());
+            }
+        }
+        // The resolved caches are hashed as well as their inputs: a drifted cache would otherwise be
+        // invisible to a digest comparison between two runtimes.
+        self.u8(actor.control_mask.bits());
         self.stats(actor.stats);
         self.death_rule(actor.death_rule);
         self.u32(actor.health);
@@ -2411,6 +2748,7 @@ impl StableHash {
         self.u32(actor.move_speed_mm_per_tick);
         self.u16(actor.physical_reduction_bps);
         self.u16(actor.magic_reduction_bps);
+        self.u8(actor.controls.bits());
         self.bool(actor.alive);
         match actor.cast {
             Some(cast) => {
@@ -2499,6 +2837,10 @@ impl StableHash {
                 self.u64(ready_at);
             }
             CommandRejectReason::AttackExceedsMatchDuration => self.u8(26),
+            CommandRejectReason::ActorStunned => self.u8(27),
+            CommandRejectReason::ActorRooted => self.u8(28),
+            CommandRejectReason::ActorSilenced => self.u8(29),
+            CommandRejectReason::ActorDisarmed => self.u8(30),
         }
     }
 
@@ -2670,6 +3012,11 @@ impl StableHash {
                 self.u8(17);
                 self.u64(actor.get());
                 self.rejection_reason(reason);
+            }
+            MatchEvent::StatusEffectExpired { actor, effect } => {
+                self.u8(19);
+                self.u64(actor.get());
+                self.u64(effect.get());
             }
             MatchEvent::ActorSpawned { actor } => {
                 self.u8(18);
