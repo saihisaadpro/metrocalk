@@ -219,6 +219,23 @@ impl OneLaneMatch {
         &self.runtime
     }
 
+    /// Apply a server-owned status effect to an actor inside the composed match.
+    ///
+    /// Delegated deliberately rather than exposing `&mut MatchRuntime`: a caller with mutable access to the
+    /// runtime could spawn or remove actors behind the controller's back and desync the wave bookkeeping
+    /// that `capture_checkpoint` insists must stay reconstructible. Status effects are a server rule effect,
+    /// which the controller already owns, so this widening is safe where a raw handle would not be.
+    pub fn apply_status_effect(
+        &mut self,
+        actor: ActorId,
+        duration_ticks: u32,
+        controls: &[crate::ControlKind],
+        modifiers: &[(crate::StatKind, crate::ModifierOp)],
+    ) -> Result<crate::StatusEffectId, RuntimeError> {
+        self.runtime
+            .apply_status_effect(actor, duration_ticks, controls, modifiers)
+    }
+
     /// Bounded count of commands still queued in the core runtime. Exposed so a caller can prove a rejected
     /// submission left no residue.
     #[must_use]
