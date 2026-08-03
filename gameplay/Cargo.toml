@@ -1,0 +1,20 @@
+# metrocalk-gameplay (MOB-1 / ADR-091) — the portable authoritative match kernel.
+#
+# This crate is deliberately below the editor, Flecs, Loro, rendering, sockets, and platform hosts. Authoring
+# data cooks into these compact typed definitions; mobile clients, a headless match server, replay tests, and
+# a future transport adapter all consume the same deterministic fixed-step contract.
+#
+# Zero foreign dependencies keeps the kernel wasm-portable and makes every source of ordering, arithmetic,
+# allocation, and nondeterminism visible. A real wire codec remains a separately spike-gated transport layer.
+[package]
+name = "metrocalk-gameplay"
+version = "0.1.0"
+edition = "2021"
+description = "Portable deterministic server-authoritative gameplay kernel for mobile competitive games"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+

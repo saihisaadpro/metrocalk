@@ -340,3 +340,26 @@ jobs:
         run: |
           cargo build -p metrocalk-sdf --release --target wasm32-unknown-unknown
           echo "metrocalk-sdf wasm32 build OK"
+
+  wasm32-gameplay:
+    name: build wasm32 (metrocalk-gameplay)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # MOB-1 / ADR-091: the compact authoritative match contract is shared by the headless server,
+      # mobile client prediction, browser/replay tooling, and tests. It is deliberately zero-dependency
+      # and cannot pull Flecs/Loro/Tauri/rendering/socket code into the fixed-step gameplay kernel.
+      - name: Build wasm32 (release)
+        run: |
+          cargo build -p metrocalk-gameplay --release --target wasm32-unknown-unknown
+          echo "metrocalk-gameplay wasm32 build OK"

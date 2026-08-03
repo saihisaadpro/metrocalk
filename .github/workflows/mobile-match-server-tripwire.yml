@@ -1,0 +1,199 @@
+# Implement this feature in accordance with the Engine UI/UX Architecture Constitution.
+#
+# Candidate verification only. This workflow DOES build and run an OCI image, and asserts that the packaged
+# binary reproduces the same golden evidence as the host build. It deliberately does NOT sign, scan, generate
+# an SBOM for, push, or orchestrate that image; those remain acceptance blockers in
+# production/mobile-moba/contract.json and must not be inferred from a green run here.
+name: Mobile match-server candidate tripwire
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "gameplay/**"
+      - "match-server/**"
+      - "production/mobile-moba/server/**"
+      - ".github/workflows/mobile-match-server-tripwire.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "gameplay/**"
+      - "match-server/**"
+      - "production/mobile-moba/server/**"
+      - ".github/workflows/mobile-match-server-tripwire.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-host:
+    name: Deterministic host candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Validate declared server profile
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+
+          root = Path("production/mobile-moba/server")
+          schema = json.loads((root / "reference-smoke.schema.json").read_text(encoding="utf-8"))
+          config = json.loads((root / "reference-smoke.config.json").read_text(encoding="utf-8"))
+          assert schema["properties"]["profileId"]["const"] == config["profileId"]
+          assert config["artifactStatus"] == "candidate-not-production"
+          assert config["simulation"] == {
+              "mode": "max-speed-no-wall-clock-pacing",
+              "fixtureScope": "core-objective-host",
+              "seed": 5570744111020900354,
+              "tickRateHz": 30,
+              "maxTicks": 64,
+              "laneId": 0,
+              "laneLengthMm": 2000,
+              "laneController": "not-exercised",
+              "botAuthority": "server-owned-intents-no-player-quota",
+              "expectedOutcome": "draw",
+              "expectedReason": "objective-destroyed",
+          }
+          assert config["transport"] == {
+              "status": "not-implemented",
+              "listensOnNetwork": False,
+          }
+          assert config["expectedEvidence"] == {
+              "finalTick": 3,
+              "worldDigest": 15389063363729834330,
+              "terminalFrameDigest": 1391732016741718711,
+          }
+          # Exact, not a set membership test: every packaging claim must name what CI actually performs, and
+          # the unmet gates must stay spelled out rather than collapsing into a passing aggregate.
+          assert config["packagingEvidence"] == {
+              "ociBuild": "ci-built-not-retained",
+              "packagedEvidenceParity": "ci-asserted",
+              "runtimeHardeningAsserts": "ci-asserted",
+              "imageSigning": "not-run",
+              "sbom": "not-run",
+              "vulnerabilityScan": "not-run",
+              "registryPush": "not-run",
+              "orchestratedDrain": "not-run",
+          }
+
+          # The schema pins the same evidence as consts. Without this check the two files can drift and a
+          # refreshed golden passes here while the schema still asserts the superseded digests.
+          evidence_schema = schema["properties"]["expectedEvidence"]["properties"]
+          for key in ("finalTick", "worldDigest", "terminalFrameDigest"):
+              assert evidence_schema[key]["const"] == config["expectedEvidence"][key], key
+      - name: Check formatting
+        run: cargo fmt --manifest-path match-server/Cargo.toml -- --check
+      - name: Test deterministic host
+        run: cargo test -p metrocalk-gameplay -p metrocalk-match-server
+      - name: Test deterministic host (release)
+        run: cargo test -p metrocalk-gameplay -p metrocalk-match-server --release
+      - name: Run full-duration full-actor release soak
+        run: cargo test --release -p metrocalk-gameplay --test mob2_resilience release_only_108000_tick_512_live_actor_constant_memory_soak -- --ignored --exact
+      - name: Measure full-actor release tick-work percentiles
+        run: cargo test --release -p metrocalk-gameplay --test mob2_resilience release_only_512_actor_tick_work_p99_gate -- --ignored --exact --nocapture
+      - name: Lint gameplay and host
+        run: cargo clippy -p metrocalk-gameplay -p metrocalk-match-server --all-targets -- -D warnings
+      - name: Verify immutable metadata and smoke JSON
+        shell: bash
+        run: |
+          cargo run --quiet -p metrocalk-match-server -- --version-json > version.json
+          cargo run --quiet -p metrocalk-match-server -- --smoke-json > smoke-debug.json
+          cargo run --quiet -p metrocalk-match-server --release -- --smoke-json > smoke-release.json
+          cmp smoke-debug.json smoke-release.json
+          python - <<'PY'
+          import json
+
+          version = json.load(open("version.json", encoding="utf-8"))
+          smoke = json.load(open("smoke-release.json", encoding="utf-8"))
+          config = json.load(open("production/mobile-moba/server/reference-smoke.config.json", encoding="utf-8"))
+          assert version["artifact"] == "metrocalk-match-server"
+          assert version["status"] == "mob2-candidate-not-production"
+          assert version["transport"] == "none"
+          assert smoke["profileId"] == "mob2-core-objective-host-smoke-v1"
+          assert smoke["seed"] == 5570744111020900354
+          assert smoke["outcome"] == "draw"
+          assert smoke["reason"] == "objective-destroyed"
+          assert smoke["finalTick"] == config["expectedEvidence"]["finalTick"]
+          assert smoke["worldDigest"] == config["expectedEvidence"]["worldDigest"]
+          assert smoke["terminalFrameDigest"] == config["expectedEvidence"]["terminalFrameDigest"]
+          PY
+
+  candidate-image:
+    name: Packaged candidate image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The image is only worth building if the host contract already holds; otherwise a red image job would
+    # just restate a host failure.
+    needs: candidate-host
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Loaded into the local daemon only. Nothing is pushed, and no registry credential is available to
+      # this workflow: `permissions` grants `contents: read` and nothing else.
+      - name: Build the candidate image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: production/mobile-moba/server/Dockerfile
+          tags: metrocalk-match-server:candidate
+          push: false
+          load: true
+
+      - name: Assert the packaged binary reproduces the host golden evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none metrocalk-match-server:candidate --version-json > image-version.json
+          docker run --rm --network none metrocalk-match-server:candidate --smoke-json > image-smoke.json
+          cat image-version.json image-smoke.json
+          python - <<'PY'
+          import json
+
+          version = json.load(open("image-version.json", encoding="utf-8"))
+          smoke = json.load(open("image-smoke.json", encoding="utf-8"))
+          config = json.load(open("production/mobile-moba/server/reference-smoke.config.json", encoding="utf-8"))
+
+          assert version["artifact"] == "metrocalk-match-server"
+          assert version["status"] == "mob2-candidate-not-production"
+          assert version["transport"] == "none"
+
+          # The packaged binary must be evidence-identical to the host build, not merely "a working server".
+          assert smoke["profileId"] == config["profileId"]
+          assert smoke["seed"] == config["simulation"]["seed"]
+          assert smoke["outcome"] == config["simulation"]["expectedOutcome"]
+          assert smoke["reason"] == config["simulation"]["expectedReason"]
+          for key in ("finalTick", "worldDigest", "terminalFrameDigest"):
+              assert smoke[key] == config["expectedEvidence"][key], key
+          PY
+
+      - name: Assert the image ships no root user, shell, or listener
+        shell: bash
+        run: |
+          set -euo pipefail
+          user="$(docker image inspect metrocalk-match-server:candidate --format '{{.Config.User}}')"
+          ports="$(docker image inspect metrocalk-match-server:candidate --format '{{json .Config.ExposedPorts}}')"
+          entrypoint="$(docker image inspect metrocalk-match-server:candidate --format '{{json .Config.Entrypoint}}')"
+          echo "user=$user ports=$ports entrypoint=$entrypoint"
+          test "$user" = "nonroot:nonroot"
+          test "$ports" = "null"
+          test "$entrypoint" = '["/usr/local/bin/metrocalk-match-server"]'
+          # A distroless runtime has no shell. If this ever succeeds, the base image silently gained one.
+          if docker run --rm --entrypoint /bin/sh metrocalk-match-server:candidate -c 'echo reachable'; then
+            echo "::error::the candidate image exposes a shell; the distroless runtime assumption is broken"
+            exit 1
+          fi
+
+      # Records what this job did and did not do, so a green check cannot be read as production packaging.
+      - name: Restate the unmet packaging gates
+        run: |
+          echo "::notice::image built and evidence-verified in CI; NOT signed, NOT SBOM'd, NOT scanned, NOT pushed, NOT orchestrated"

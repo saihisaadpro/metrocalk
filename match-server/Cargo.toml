@@ -1,0 +1,16 @@
+# Implement this feature in accordance with the Engine UI/UX Architecture Constitution.
+#
+# MOB-2 candidate only: the crate is a deterministic in-process host boundary. Network transport,
+# orchestration, persistence, signing, container packaging, and production readiness remain later gates.
+[package]
+name = "metrocalk-match-server"
+version = "0.1.0"
+edition = "2021"
+description = "Transport-free deterministic match-server candidate for the mobile MOBA pipeline"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+metrocalk-gameplay = { path = "../gameplay" }

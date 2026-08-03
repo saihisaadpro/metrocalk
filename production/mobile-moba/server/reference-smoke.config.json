@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "profileId": "mob2-core-objective-host-smoke-v1",
+  "artifactStatus": "candidate-not-production",
+  "simulation": {
+    "mode": "max-speed-no-wall-clock-pacing",
+    "fixtureScope": "core-objective-host",
+    "seed": 5570744111020900354,
+    "tickRateHz": 30,
+    "maxTicks": 64,
+    "laneId": 0,
+    "laneLengthMm": 2000,
+    "laneController": "not-exercised",
+    "botAuthority": "server-owned-intents-no-player-quota",
+    "expectedOutcome": "draw",
+    "expectedReason": "objective-destroyed"
+  },
+  "host": {
+    "concurrentMatches": 1,
+    "diagnosticCapacity": 32,
+    "drainOutcome": "draw",
+    "drainReason": "host"
+  },
+  "expectedEvidence": {
+    "finalTick": 3,
+    "worldDigest": 15389063363729834330,
+    "terminalFrameDigest": 1391732016741718711
+  },
+  "transport": {
+    "status": "not-implemented",
+    "listensOnNetwork": false
+  },
+  "packagingEvidence": {
+    "ociBuild": "ci-built-not-retained",
+    "packagedEvidenceParity": "ci-asserted",
+    "runtimeHardeningAsserts": "ci-asserted",
+    "imageSigning": "not-run",
+    "sbom": "not-run",
+    "vulnerabilityScan": "not-run",
+    "registryPush": "not-run",
+    "orchestratedDrain": "not-run"
+  }
+}

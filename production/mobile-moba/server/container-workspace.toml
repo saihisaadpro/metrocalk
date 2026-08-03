@@ -1,0 +1,24 @@
+# Container-only workspace root for the MOB-2 match-server image.
+#
+# This is NOT the repository workspace. It exists so the image build compiles exactly the two dependency-free
+# crates the headless host needs, without dragging the editor, renderer, asset pipeline, or Flecs C core into
+# a server image. It is copied to /build/Cargo.toml by production/mobile-moba/server/Dockerfile.
+#
+# Both member crates declare `[lints] workspace = true`, so this root must define the lint table they inherit.
+# Only the invariant-bearing lint is mirrored here: the pedantic/style tuning that shapes review lives in the
+# repository root and is enforced by the workspace clippy gate in CI, which runs against the real workspace.
+# Nothing in this file affects the emitted binary.
+
+[workspace]
+resolver = "2"
+members = ["gameplay", "match-server"]
+
+[workspace.lints.rust]
+# Matches the repository invariant: no unsafe in our own code. `forbid` cannot be downgraded by an inner
+# `allow`, so an image build cannot quietly relax it.
+unsafe_code = "forbid"
+
+[profile.release]
+# Symbol stripping is expressed here rather than as a `strip` invocation in the Dockerfile, so the image
+# build depends on cargo alone and not on binutils being present in the builder base image.
+strip = true

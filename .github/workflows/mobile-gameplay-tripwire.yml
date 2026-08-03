@@ -1,0 +1,67 @@
+name: mobile-gameplay-tripwire
+
+# MOB-1 / ADR-091: wasm portability is useful but is not evidence of Android/iOS portability. These
+# compile-only jobs keep the dependency-free match contract honest on the two mobile ABIs before the
+# MOB-2 platform-host boot spikes add NDK/Xcode linking, lifecycle, and real surface/device evidence.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  mob1-host:
+    name: test deterministic gameplay contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate machine-readable production contract
+        run: python -m json.tool production/mobile-moba/contract.json > /dev/null
+
+      - name: Test exact replay and runtime invariants
+        run: cargo test -p metrocalk-gameplay
+
+      - name: Test optimized runtime invariants
+        run: cargo test -p metrocalk-gameplay --release
+
+      - name: Lint every gameplay target
+        run: cargo clippy -p metrocalk-gameplay --all-targets -- -D warnings
+
+  mobile-check:
+    name: check gameplay (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-android
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # `cargo check` intentionally stops before platform linking. A minimal GameActivity/Xcode host boot,
+      # suspend/resume surface lifecycle, and physical-device install are separate MOB-2/MOB-5 gates.
+      - name: Check the portable match kernel
+        run: cargo check -p metrocalk-gameplay --target ${{ matrix.target }}

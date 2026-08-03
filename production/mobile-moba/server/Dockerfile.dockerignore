@@ -1,0 +1,28 @@
+# BuildKit reads this file for `-f production/mobile-moba/server/Dockerfile`, so the exclusions stay scoped
+# to the match-server image instead of becoming a repository-wide .dockerignore that surprises other builds.
+#
+# The Dockerfile only COPYs `gameplay/`, `match-server/`, and one manifest, but the daemon still receives the
+# whole context first. This repository carries multi-hundred-megabyte CAD fixtures, a renderer, an editor
+# front end, and huge build outputs; without these exclusions the context transfer dominates the build.
+#
+# Deny everything, then re-include the exact three paths. A nested re-include needs its whole parent chain
+# spelled out — excluding `production/` outright would stop the walk before it can reach the manifest — so
+# each level is re-included and then narrowed again.
+
+*
+
+!gameplay
+!match-server
+
+!production
+production/*
+!production/mobile-moba
+production/mobile-moba/*
+!production/mobile-moba/server
+production/mobile-moba/server/*
+!production/mobile-moba/server/container-workspace.toml
+
+# Build outputs inside the re-included crates. These come last so they win over the re-includes above.
+gameplay/target
+match-server/target
+**/*.rs.bk

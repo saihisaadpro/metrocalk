@@ -1,0 +1,320 @@
+{
+  "schemaVersion": 1,
+  "programme": "mobile-moba",
+  "status": "provisional-not-shipped",
+  "authority": {
+    "authoring": "ecs-loro-revision",
+    "match": "dedicated-server-fixed-step",
+    "account": "authenticated-idempotent-services"
+  },
+  "editorUxArchitecture": {
+    "constitution": "docs/UI/ENGINE_UI_UX_ARCHITECTURE_CONSTITUTION.md",
+    "authoritativePrompt": "docs/UI/prompt.txt",
+    "gateOrder": [
+      "workspace-registry-shell-overlays",
+      "docking-viewport-input",
+      "complete-shared-inspector",
+      "shared-timeline",
+      "shared-graph",
+      "production-asset-library-and-composed-moba-workspace"
+    ],
+    "existingConsumersMigrateBeforeMobaAdapters": true,
+    "subsystemSpecificVisualOrInteractionPrimitivesAllowed": false,
+    "visibleProductionTruthUsesProductionJobState": true
+  },
+  "productionJobStates": [
+    "blocked",
+    "ready",
+    "queued",
+    "running",
+    "cancelling",
+    "cancelled",
+    "failed",
+    "stale",
+    "current"
+  ],
+  "evidencePolicy": {
+    "requiredKeys": [
+      "sourceRevision",
+      "target",
+      "environment",
+      "toolchain",
+      "runId",
+      "outputDigest",
+      "artifactUri",
+      "createdAt",
+      "expiresAt"
+    ],
+    "releaseEvidenceRetention": "release-lifetime-plus-365-days",
+    "currentRequiresExactRevisionAndTarget": true,
+    "localReportsAreReleaseEvidence": false
+  },
+  "runtimeTargets": [
+    {
+      "target": "workspace-host",
+      "evidence": "execute-tests-and-lints"
+    },
+    {
+      "target": "wasm32-unknown-unknown",
+      "evidence": "release-compile"
+    },
+    {
+      "target": "aarch64-linux-android",
+      "evidence": "compile-only-until-MOB-2-host"
+    },
+    {
+      "target": "aarch64-apple-ios",
+      "evidence": "compile-only-until-MOB-2-host"
+    },
+    {
+      "target": "aarch64-apple-ios-sim",
+      "evidence": "compile-only-until-MOB-2-host"
+    }
+  ],
+  "physicalDeviceQualification": {
+    "selectionStatus": "blocked-until-product-market-and-min-spec-approval",
+    "requiredBefore": "MOB-5A-exit",
+    "requiredDimensions": [
+      "commercial-model",
+      "soc-gpu",
+      "ram",
+      "os-version",
+      "screen-safe-area",
+      "thermal-profile",
+      "android-lmk-or-ios-jetsam-margin",
+      "touch-and-controller",
+      "audio-routes"
+    ]
+  },
+  "referenceBudgets": {
+    "authoritativeTickHz": 30,
+    "serverTickWorkP99Ms": 10,
+    "clientPresentationFps": 60,
+    "optionalHighTierFps": 90,
+    "activeReplicatedActors": 512,
+    "commandsPerAuthoritativeTick": 128,
+    "commandsPerPlayerPerAuthoritativeTick": 8,
+    "commandReservationValidatedAgainstAuthoredRoster": true,
+    "lanes": 1,
+    "lanePointsPerLane": 64,
+    "waveSchedules": 8,
+    "unitsPerWave": 16,
+    "checkpointBytes": 4194304,
+    "clientNetworkP95KiBPerSecond": 35,
+    "memory": "per-approved-device-tier-no-global-placeholder"
+  },
+  "launchSloCatalogue": {
+    "status": "provisional-until-load-device-and-business-validation",
+    "crashFreeUsersPercent": 99.9,
+    "crashFreeSessionsPercent": 99.7,
+    "anrOrHangSessionsPercentMax": 0.3,
+    "coldStartP95SecondsMax": 5,
+    "warmStartP95SecondsMax": 2,
+    "patchApplySuccessPercent": 99.5,
+    "patchRollbackSuccessPercent": 99.9,
+    "matchmakingP95SecondsMax": 90,
+    "matchmakingAbandonmentPercentMax": 8,
+    "reconnectSuccessPercent": 95,
+    "reconnectP95SecondsMax": 15,
+    "reconnectStateDigestMismatchPercent": 0,
+    "serverTickOverloadPercentMax": 0.1,
+    "serviceAvailabilityPercent": 99.9,
+    "resultAndEntitlementCorrectnessPercent": 100,
+    "costPerCompletedMatchCurrency": "GBP",
+    "costPerCompletedMatchMax": 0.03
+  },
+  "mob1Checks": [
+    {
+      "id": "gameplay-tests-debug",
+      "command": "cargo test -p metrocalk-gameplay",
+      "workflow": ".github/workflows/mobile-gameplay-tripwire.yml",
+      "requiredStatus": "current"
+    },
+    {
+      "id": "gameplay-tests-release",
+      "command": "cargo test -p metrocalk-gameplay --release",
+      "workflow": ".github/workflows/mobile-gameplay-tripwire.yml",
+      "requiredStatus": "current"
+    },
+    {
+      "id": "gameplay-clippy",
+      "command": "cargo clippy -p metrocalk-gameplay --all-targets -- -D warnings",
+      "workflow": ".github/workflows/mobile-gameplay-tripwire.yml",
+      "requiredStatus": "current"
+    },
+    {
+      "id": "gameplay-wasm-release",
+      "command": "cargo build -p metrocalk-gameplay --release --target wasm32-unknown-unknown",
+      "workflow": ".github/workflows/wasm-tripwire.yml",
+      "requiredStatus": "current"
+    },
+    {
+      "id": "gameplay-mobile-compile",
+      "command": "cargo check -p metrocalk-gameplay --target $TARGET",
+      "workflow": ".github/workflows/mobile-gameplay-tripwire.yml",
+      "requiredStatus": "current"
+    }
+  ],
+  "mob2Candidate": {
+    "status": "in-progress-not-accepted",
+    "implemented": [
+      "owned-player-post-attach-command-ingress-corridor-anchored",
+      "winner-or-draw-terminal-truth",
+      "hard-time-limit-draw",
+      "cooked-one-route-lane-coordinate",
+      "one-shot-basic-attacks",
+      "unified-ability-and-attack-health-settlement",
+      "server-owned-intents-outside-player-quotas",
+      "death-respawn-despawn-and-objective-rules",
+      "monotonic-atomic-dynamic-wave-spawns",
+      "deterministic-lane-bots-and-wave-schedules",
+      "frame-boundary-runtime-invariant-audit",
+      "constant-memory-108000-tick-empty-world-time-limit-soak",
+      "versioned-bounded-core-runtime-checkpoint-and-restore",
+      "versioned-bounded-one-lane-composite-checkpoint-and-restore",
+      "multi-wave-uninterrupted-versus-restored-suffix-equality",
+      "immutable-allocator-stamped-actor-creation-provenance",
+      "exact-authored-occurrence-wave-cursor-restoration",
+      "provenance-derived-wave-membership-instead-of-trusted-list",
+      "canonical-checkpoint-command-encoding",
+      "seeded-checkpoint-arbitrary-and-mutation-decoder-corpus",
+      "seeded-256-tick-command-resilience-replay",
+      "local-release-108000-tick-512-live-actor-constant-memory-soak",
+      "local-release-512-actor-p99-tick-work-under-10ms",
+      "transport-free-core-objective-headless-host-candidate",
+      "bounded-host-diagnostics-and-metrics",
+      "host-drain-without-invented-winner",
+      "registry-free-offline-two-crate-container-build",
+      "packaged-image-golden-evidence-parity-gate",
+      "distroless-nonroot-no-shell-no-listener-image-asserts",
+      "deterministic-set-ordered-stat-modifier-aggregation",
+      "derived-stat-cache-re-audited-every-frame",
+      "clamped-stat-domains-preventing-immortality-and-lethal-aggregation"
+    ],
+    "acceptanceBlockers": [
+      "replay-file-checkpoint-index-and-scrub-integration",
+      "headless-one-lane-controller-and-wave-host-integration",
+      "coverage-guided-command-and-checkpoint-decoder-fuzz-artifacts",
+      "retained-linux-ci-soak-and-p99-evidence",
+      "authenticated-checkpoint-storage-envelope-and-key-management",
+      "real-time-server-pacing-and-control-plane",
+      "image-signing-sbom-and-vulnerability-scan",
+      "registry-publication-and-build-provenance-attestation",
+      "base-image-digest-pinning-and-rebuild-reproducibility",
+      "orchestrated-rollout-and-drain-evidence",
+      "android-gameactivity-emulator-boot-evidence",
+      "ios-xcode-simulator-boot-evidence",
+      "clean-idle-host-p99-and-soak-re-measurement-after-gp07",
+      "corridor-following-movement-for-owned-actors-needs-an-owner-safe-server-rules-channel"
+    ]
+  },
+  "mob2LocalEvidence": {
+    "scope": "windows-local-development-only-not-acceptance",
+    "date": "2026-08-03",
+    "retainedCiArtifact": false,
+    "fullLoadSoak": {
+      "mode": "release",
+      "actors": 512,
+      "ticks": 108000,
+      "constantMemory": true,
+      "status": "INVALID-CONTENDED-HOST",
+      "contendedElapsedSeconds": 313.27,
+      "priorIdleRangeSeconds": [
+        61.37,
+        115.5
+      ],
+      "result": "passed",
+      "note": "Passed, but the elapsed time was measured under the same background load and is not comparable to the prior range. Whether GP-07's per-frame stat audit costs measurable time is UNRESOLVED until a clean run."
+    },
+    "tickWork": {
+      "mode": "release",
+      "actors": 512,
+      "warmupTicks": 1000,
+      "sampleTicks": 10000,
+      "status": "INVALID-CONTENDED-HOST",
+      "reason": "Re-measured after GP-07 on a machine at ~32% background load (multiple concurrent agent/browser processes). The project's benchmark discipline requires an otherwise-idle host, so these are NOT recorded as evidence.",
+      "contendedObservation": {
+        "p50Ns": 1171400,
+        "p95Ns": 6287700,
+        "p99Ns": 7892600,
+        "maxNs": 13925900
+      },
+      "p99BudgetNs": 10000000,
+      "gateResult": "passed-even-under-contention",
+      "rollingDigest": "3e3b1373744059fb",
+      "owed": "a clean serial re-measurement on an idle host, plus the still-owed true min-spec profile"
+    },
+    "measurementCaveat": "Wall-clock numbers from one unpaced Windows developer machine. This round was additionally taken under heavy background load and is explicitly marked invalid rather than recorded as a regression or a non-regression. Only the executable p99 budget gate (which passed even contended) and the retained-CI blocker carry weight."
+  },
+  "mob2Packaging": {
+    "artifact": "production/mobile-moba/server/Dockerfile",
+    "runtimeBase": "gcr.io/distroless/cc-debian12:nonroot",
+    "buildScope": "two-dependency-free-crates-only-not-the-repository-workspace",
+    "registryAccessDuringBuild": "none-cargo-runs-offline",
+    "locallyVerified": [
+      "the synthetic two-crate container workspace resolves and builds with --offline and zero registry access",
+      "the binary built from that isolated workspace emits --smoke-json byte-identical to the repository release build"
+    ],
+    "notVerifiedLocally": {
+      "reason": "the Docker daemon is not running on this development machine; the Dockerfile itself has never been executed here",
+      "firstRealExecution": "the candidate-image job in .github/workflows/mobile-match-server-tripwire.yml",
+      "unexercised": [
+        "the image build itself",
+        "the distroless runtime layer",
+        "the nonroot, no-shell, no-exposed-port asserts"
+      ]
+    },
+    "deliberatelyNotDone": [
+      "image signing",
+      "SBOM generation",
+      "vulnerability scanning",
+      "registry publication",
+      "base-image digest pinning",
+      "orchestrated rollout or drain"
+    ]
+  },
+  "mob2CandidateChecks": [
+    {
+      "id": "mob2-gameplay-and-server-debug",
+      "command": "cargo test -p metrocalk-gameplay -p metrocalk-match-server",
+      "workflow": ".github/workflows/mobile-match-server-tripwire.yml",
+      "requiredStatus": "current"
+    },
+    {
+      "id": "mob2-gameplay-and-server-release",
+      "command": "cargo test -p metrocalk-gameplay -p metrocalk-match-server --release",
+      "workflow": ".github/workflows/mobile-match-server-tripwire.yml",
+      "requiredStatus": "current"
+    },
+    {
+      "id": "mob2-108000-tick-512-live-actor-release-soak",
+      "command": "cargo test --release -p metrocalk-gameplay --test mob2_resilience release_only_108000_tick_512_live_actor_constant_memory_soak -- --ignored --exact",
+      "workflow": ".github/workflows/mobile-match-server-tripwire.yml",
+      "requiredStatus": "current"
+    },
+    {
+      "id": "mob2-512-actor-release-p99-tick-work",
+      "command": "cargo test --release -p metrocalk-gameplay --test mob2_resilience release_only_512_actor_tick_work_p99_gate -- --ignored --exact --nocapture",
+      "workflow": ".github/workflows/mobile-match-server-tripwire.yml",
+      "requiredStatus": "current"
+    },
+    {
+      "id": "mob2-gameplay-and-server-clippy",
+      "command": "cargo clippy -p metrocalk-gameplay -p metrocalk-match-server --all-targets -- -D warnings",
+      "workflow": ".github/workflows/mobile-match-server-tripwire.yml",
+      "requiredStatus": "current"
+    },
+    {
+      "id": "mob2-reference-smoke-byte-equality-and-golden-digests",
+      "command": "compare debug and release --smoke-json output and assert reference-smoke.config.json expectedEvidence",
+      "workflow": ".github/workflows/mobile-match-server-tripwire.yml",
+      "requiredStatus": "current"
+    },
+    {
+      "id": "mob2-packaged-image-evidence-parity-and-runtime-hardening",
+      "command": "build production/mobile-moba/server/Dockerfile, run --version-json and --smoke-json in the container, assert the config goldens plus nonroot/no-shell/no-exposed-ports",
+      "workflow": ".github/workflows/mobile-match-server-tripwire.yml",
+      "requiredStatus": "never-run-first-execution-pending"
+    }
+  ]
+}

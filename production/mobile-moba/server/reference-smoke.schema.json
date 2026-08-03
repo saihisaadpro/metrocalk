@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://metrocalk.invalid/schemas/mobile-moba/reference-smoke-v1.schema.json",
+  "title": "Metrocalk MOB-2 core-objective match server candidate",
+  "description": "Implement this feature in accordance with the Engine UI/UX Architecture Constitution.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "profileId",
+    "artifactStatus",
+    "simulation",
+    "host",
+    "expectedEvidence",
+    "transport",
+    "packagingEvidence"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "profileId": {
+      "const": "mob2-core-objective-host-smoke-v1"
+    },
+    "artifactStatus": {
+      "const": "candidate-not-production"
+    },
+    "simulation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "fixtureScope",
+        "seed",
+        "tickRateHz",
+        "maxTicks",
+        "laneId",
+        "laneLengthMm",
+        "laneController",
+        "botAuthority",
+        "expectedOutcome",
+        "expectedReason"
+      ],
+      "properties": {
+        "mode": {
+          "const": "max-speed-no-wall-clock-pacing"
+        },
+        "fixtureScope": {
+          "const": "core-objective-host"
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tickRateHz": {
+          "const": 30
+        },
+        "maxTicks": {
+          "const": 64
+        },
+        "laneId": {
+          "const": 0
+        },
+        "laneLengthMm": {
+          "const": 2000
+        },
+        "laneController": {
+          "const": "not-exercised"
+        },
+        "botAuthority": {
+          "const": "server-owned-intents-no-player-quota"
+        },
+        "expectedOutcome": {
+          "const": "draw"
+        },
+        "expectedReason": {
+          "const": "objective-destroyed"
+        }
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "concurrentMatches",
+        "diagnosticCapacity",
+        "drainOutcome",
+        "drainReason"
+      ],
+      "properties": {
+        "concurrentMatches": {
+          "const": 1
+        },
+        "diagnosticCapacity": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "drainOutcome": {
+          "const": "draw"
+        },
+        "drainReason": {
+          "const": "host"
+        }
+      }
+    },
+    "expectedEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "finalTick",
+        "worldDigest",
+        "terminalFrameDigest"
+      ],
+      "properties": {
+        "finalTick": {
+          "const": 3
+        },
+        "worldDigest": {
+          "const": 15389063363729834330
+        },
+        "terminalFrameDigest": {
+          "const": 1391732016741718711
+        }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "listensOnNetwork"
+      ],
+      "properties": {
+        "status": {
+          "const": "not-implemented"
+        },
+        "listensOnNetwork": {
+          "const": false
+        }
+      }
+    },
+    "packagingEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ociBuild",
+        "packagedEvidenceParity",
+        "runtimeHardeningAsserts",
+        "imageSigning",
+        "sbom",
+        "vulnerabilityScan",
+        "registryPush",
+        "orchestratedDrain"
+      ],
+      "properties": {
+        "ociBuild": {
+          "const": "ci-built-not-retained"
+        },
+        "packagedEvidenceParity": {
+          "const": "ci-asserted"
+        },
+        "runtimeHardeningAsserts": {
+          "const": "ci-asserted"
+        },
+        "imageSigning": {
+          "const": "not-run"
+        },
+        "sbom": {
+          "const": "not-run"
+        },
+        "vulnerabilityScan": {
+          "const": "not-run"
+        },
+        "registryPush": {
+          "const": "not-run"
+        },
+        "orchestratedDrain": {
+          "const": "not-run"
+        }
+      }
+    }
+  }
+}
