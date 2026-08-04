@@ -95,7 +95,12 @@ test("scrubbing the decision history calls ruleScrub (time-travel)", async () =>
   const ruleScrub = vi.fn(() => Promise.resolve(threeKills()));
   render(<RuleDebugPanel client={fakeClient({ ruleDebug: () => Promise.resolve(threeKills()), ruleScrub })} />);
 
-  const slider = await screen.findByTestId("ruleScrub");
+  const slider = (await screen.findByTestId("ruleScrub")) as HTMLInputElement;
+  // The slider exists before the debug info lands, and is `disabled={head === 0}` until it does. Firing a
+  // change on a disabled input is silently swallowed, so waiting only for the element to EXIST raced the
+  // async `ruleDebug()` promise and made this test flaky under CI load. Wait for it to be enabled — that
+  // is the moment the panel actually has a history to scrub.
+  await waitFor(() => expect(slider.disabled).toBe(false));
   fireEvent.change(slider, { target: { value: "1" } });
   await waitFor(() => expect(ruleScrub).toHaveBeenCalledWith(1, "1_0"));
   // The history is shown as a readable story.
