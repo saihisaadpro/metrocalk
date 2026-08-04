@@ -12,22 +12,28 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use crate::model::{
-    AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
-    ActorKind, ActorProvenance, BasicAttackSpec, CombatStats, ControlMask, DamageSchool, DeathRule,
-    ImpactShape, MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, ModifierId, ModifierOp,
-    PlayerId, ProjectileId, RectMm, StatKind, StatModifier, StatusEffectId, TeamId, Tick, Vec2Mm,
-    MAX_ABILITY_DEFINITIONS, MAX_RUNTIME_CHECKPOINT_BYTES,
+    level_for_experience, passive_gold_owed, AbilityAim, AbilityDelivery, AbilityEffect, AbilityId,
+    AbilitySpec, AbilityTargeting, ActorId, ActorKind, ActorProvenance, BasicAttackSpec, Bounty,
+    CombatStats, ControlMask, DamageSchool, DeathRule, ImpactShape, MatchConfig, MatchEndReason,
+    MatchOutcome, MatchPhase, ModifierId, ModifierOp, PlayerId, ProjectileId, RectMm, StatGrowth,
+    StatKind, StatModifier, StatusEffectId, TeamId, Tick, Vec2Mm, MAX_ABILITY_DEFINITIONS,
+    MAX_RUNTIME_CHECKPOINT_BYTES,
 };
 use crate::protocol::{
     CastTarget, CommandKind, CommandReceipt, CommandRejectReason, CommandRejection, PlayerCommand,
     WorldDigest,
 };
 use crate::runtime::{
-    AbilityState, ActorState, BasicAttackState, MatchRuntime, PendingAttack, PendingCast,
-    ProjectileState, StatusEffect, SubmissionRecord,
+    AbilityState, ActorState, BasicAttackState, DamageCredit, MatchRuntime, PendingAttack,
+    PendingCast, ProjectileState, ScoreEntry, StatusEffect, SubmissionRecord,
 };
 
 const MAGIC: [u8; 8] = *b"MTCKPT01";
+// v6 adds authored stat growth, kill bounties, experience, unspent ability points, the per-actor assist
+// window, per-ability ranks, and the permanent scoreboard. It deliberately does NOT encode `level`,
+// `base_stats`, `stats`, `control_mask`, or `passive_gold_paid`: every one of those is re-derived on decode
+// from inputs the payload cannot forge, which is what makes a self-consistent forged checkpoint fail the
+// restore audit rather than pass it.
 // v5 adds in-flight projectiles plus their allocator, and the projectile budget inside the config. Speed,
 // hit radius, footprint, and effect are NOT encoded per projectile: they are read from the immutable ability
 // spec, so a tampered payload cannot give one missile different physics from the ability that launched it.
@@ -37,7 +43,7 @@ const MAGIC: [u8; 8] = *b"MTCKPT01";
 // v2 added the immutable per-actor creation provenance record. The format is not yet persisted by any
 // production host, so the version is bumped rather than carrying a compatibility shim: a v1 payload has no
 // provenance to reconstruct, and inferring one would fabricate creation evidence.
-const FORMAT_VERSION: u16 = 5;
+const FORMAT_VERSION: u16 = 6;
 const HEADER_BYTES: usize = 64;
 const PAYLOAD_LENGTH_OFFSET: usize = 44;
 const PAYLOAD_CHECKSUM_OFFSET: usize = 48;
@@ -46,14 +52,18 @@ const MIN_ABILITY_BYTES: usize = 24;
 const MIN_COMMAND_BYTES: usize = 29;
 // 8 id + 1 kind tag + 1 op tag + 4 smallest payload.
 const MIN_MODIFIER_BYTES: usize = 14;
-// 8 id + 1 provenance tag + 1 owner tag + 1 team + 1 kind + 8 position + 1 destination tag + 16 base
-// stats + 4 modifier count + 4 status-effect count + 4 health + 4 resource + 4 ability count
-// + 5 option tags.
-const MIN_ACTOR_BYTES: usize = 62;
+// 8 id + 1 provenance tag + 1 owner tag + 1 team + 1 kind + 8 position + 1 destination tag
+// + 16 authored stats + 16 growth + 8 bounty + 4 experience + 1 unspent point + 4 credit count
+// + 4 modifier count + 4 status-effect count + 4 health + 4 resource + 4 ability count + 5 option tags.
+const MIN_ACTOR_BYTES: usize = 95;
 // 8 id + 8 expiry + 1 controls + 4 owned-modifier count.
 const MIN_STATUS_EFFECT_BYTES: usize = 21;
-// 8 id + 8 source + 1 team + 4 ability + 8 position + 8 flight terminus.
-const MIN_PROJECTILE_BYTES: usize = 37;
+// 8 id + 8 source + 1 team + 4 ability + 8 position + 8 flight terminus + 4 launch magnitude.
+const MIN_PROJECTILE_BYTES: usize = 41;
+// 8 actor + 1 owner tag + 1 team + 8 since + 4 earned + 4 kills + 4 deaths + 4 assists + 2 + 2 streaks.
+const MIN_SCORE_ENTRY_BYTES: usize = 38;
+// 8 source + 8 last tick.
+const MIN_DAMAGE_CREDIT_BYTES: usize = 16;
 
 /// Identity of the exact cooked rules/content bundle required to interpret a checkpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -255,6 +265,11 @@ impl MatchRuntime {
             encode_projectile(&mut encoder, *projectile)?;
         }
 
+        encoder.count(self.scores.len())?;
+        for entry in &self.scores {
+            encode_score_entry(&mut encoder, *entry)?;
+        }
+
         encoder.count(self.player_roster.len())?;
         for player in &self.player_roster {
             encoder.u64(player.get())?;
@@ -379,9 +394,7 @@ impl MatchRuntime {
 
         let actor_limit = usize::try_from(config.max_actors).unwrap_or(usize::MAX);
         let actor_count = decoder.count(actor_limit, "actor count exceeds configured budget")?;
-        // 54 = the smallest legal encoded actor: 8 id + 1 provenance tag + 1 owner tag + 1 team + 1 kind
-        // + 8 position + 1 destination tag + 16 stats + 4 health + 4 resource + 4 ability count + 5 option
-        // tags (cast, basic attack, attack, death rule, respawn).
+        // The authoritative breakdown lives at `MIN_ACTOR_BYTES`; recompute it there, from the encoder.
         decoder.require_minimum(actor_count, MIN_ACTOR_BYTES)?;
         let mut actors = allocate_vec(actor_count)?;
         for _ in 0..actor_count {
@@ -403,6 +416,24 @@ impl MatchRuntime {
         {
             return Err(CheckpointError::InvalidData(
                 "projectiles are not strictly sorted by identity",
+            ));
+        }
+
+        let score_count = decoder.count(
+            usize::from(config.max_score_entries),
+            "scoreboard count exceeds configured budget",
+        )?;
+        decoder.require_minimum(score_count, MIN_SCORE_ENTRY_BYTES)?;
+        let mut scores = allocate_vec(score_count)?;
+        for _ in 0..score_count {
+            scores.push(decode_score_entry(&mut decoder, tick, config)?);
+        }
+        if scores
+            .windows(2)
+            .any(|pair: &[ScoreEntry]| pair[0].actor >= pair[1].actor)
+        {
+            return Err(CheckpointError::InvalidData(
+                "scoreboard entries are not strictly sorted by actor",
             ));
         }
 
@@ -472,12 +503,14 @@ impl MatchRuntime {
             ability_specs,
             actors,
             projectiles,
+            scores,
             player_roster,
             queued_commands,
             last_submissions,
             dirty: BTreeSet::new(),
             removed: BTreeSet::new(),
             removed_projectiles: BTreeSet::new(),
+            dirty_scores: BTreeSet::new(),
             pending_events: Vec::new(),
             rejection_events_in_frame: 0,
             objective_claims: BTreeSet::new(),
@@ -503,6 +536,7 @@ impl MatchRuntime {
             && self.dirty.is_empty()
             && self.removed.is_empty()
             && self.removed_projectiles.is_empty()
+            && self.dirty_scores.is_empty()
             && self.pending_events.is_empty()
             && self.rejection_events_in_frame == 0
             && self.objective_claims.is_empty()
@@ -559,9 +593,17 @@ fn validate_restored_actor(
     // Validate the AUTHORED base, not the derived cache: the cache is recomputed from base+modifiers on
     // decode, so validating it would be a tautology and would leave base_stats checked nowhere.
     actor
-        .base_stats
+        .authored_stats
         .validate()
-        .map_err(|_| CheckpointError::InvalidData("actor base stats failed validation"))?;
+        .map_err(|_| CheckpointError::InvalidData("actor authored stats failed validation"))?;
+    actor
+        .growth
+        .validate()
+        .map_err(|_| CheckpointError::InvalidData("actor stat growth failed validation"))?;
+    actor
+        .bounty
+        .validate()
+        .map_err(|_| CheckpointError::InvalidData("actor bounty failed validation"))?;
     if let Some(basic_attack) = actor.basic_attack {
         basic_attack
             .spec
@@ -878,6 +920,11 @@ fn encode_config(encoder: &mut Encoder, config: MatchConfig) -> Result<(), Check
     encoder.u16(config.max_modifiers_per_actor)?;
     encoder.u16(config.max_status_effects_per_actor)?;
     encoder.u16(config.max_projectiles)?;
+    encoder.u16(config.max_score_entries)?;
+    encoder.u16(config.max_damage_credits_per_actor)?;
+    encoder.u32(config.assist_window_ticks)?;
+    encoder.u32(config.xp_share_radius_mm)?;
+    encoder.u32(config.passive_gold_per_100s)?;
     encoder.u32(config.max_checkpoint_bytes)
 }
 
@@ -900,6 +947,11 @@ fn decode_config(decoder: &mut Decoder<'_>) -> Result<MatchConfig, CheckpointErr
         max_modifiers_per_actor: decoder.u16()?,
         max_status_effects_per_actor: decoder.u16()?,
         max_projectiles: decoder.u16()?,
+        max_score_entries: decoder.u16()?,
+        max_damage_credits_per_actor: decoder.u16()?,
+        assist_window_ticks: decoder.u32()?,
+        xp_share_radius_mm: decoder.u32()?,
+        passive_gold_per_100s: decoder.u32()?,
         max_checkpoint_bytes: decoder.u32()?,
     })
 }
@@ -1018,6 +1070,7 @@ fn encode_ability(encoder: &mut Encoder, ability: AbilitySpec) -> Result<(), Che
     encoder.u32(ability.resource_cost)?;
     encoder.u32(ability.cooldown_ticks)?;
     encoder.u16(ability.cast_ticks)?;
+    encoder.u32(ability.per_rank_amount)?;
     match ability.delivery {
         AbilityDelivery::Instant => encoder.u8(0)?,
         AbilityDelivery::Projectile {
@@ -1077,6 +1130,7 @@ fn decode_ability(decoder: &mut Decoder<'_>) -> Result<AbilitySpec, CheckpointEr
     let resource_cost = decoder.u32()?;
     let cooldown_ticks = decoder.u32()?;
     let cast_ticks = decoder.u16()?;
+    let per_rank_amount = decoder.u32()?;
     let delivery = match decoder.u8()? {
         0 => AbilityDelivery::Instant,
         1 => AbilityDelivery::Projectile {
@@ -1128,6 +1182,116 @@ fn decode_ability(decoder: &mut Decoder<'_>) -> Result<AbilitySpec, CheckpointEr
         delivery,
         impact,
         effect,
+        per_rank_amount,
+    })
+}
+
+fn encode_growth(encoder: &mut Encoder, growth: StatGrowth) -> Result<(), CheckpointError> {
+    encoder.u32(growth.max_health_per_level)?;
+    encoder.u32(growth.max_resource_per_level)?;
+    encoder.u32(growth.move_speed_mm_per_tick_per_level)?;
+    encoder.u16(growth.physical_reduction_bps_per_level)?;
+    encoder.u16(growth.magic_reduction_bps_per_level)
+}
+
+fn decode_growth(decoder: &mut Decoder<'_>) -> Result<StatGrowth, CheckpointError> {
+    Ok(StatGrowth {
+        max_health_per_level: decoder.u32()?,
+        max_resource_per_level: decoder.u32()?,
+        move_speed_mm_per_tick_per_level: decoder.u32()?,
+        physical_reduction_bps_per_level: decoder.u16()?,
+        magic_reduction_bps_per_level: decoder.u16()?,
+    })
+}
+
+fn encode_bounty(encoder: &mut Encoder, bounty: Bounty) -> Result<(), CheckpointError> {
+    encoder.u32(bounty.gold)?;
+    encoder.u32(bounty.experience)
+}
+
+fn decode_bounty(decoder: &mut Decoder<'_>) -> Result<Bounty, CheckpointError> {
+    Ok(Bounty {
+        gold: decoder.u32()?,
+        experience: decoder.u32()?,
+    })
+}
+
+/// Decode one actor's assist window. Strict source ordering is enforced here because that order is what
+/// makes the assist set a function of the SET of contributors rather than of decode order.
+fn decode_damage_credits(
+    decoder: &mut Decoder<'_>,
+    config: MatchConfig,
+) -> Result<Vec<DamageCredit>, CheckpointError> {
+    let count = decoder.count(
+        usize::from(config.max_damage_credits_per_actor),
+        "actor damage credit count exceeds configured budget",
+    )?;
+    decoder.require_minimum(count, MIN_DAMAGE_CREDIT_BYTES)?;
+    let mut credits = allocate_vec(count)?;
+    for _ in 0..count {
+        credits.push(DamageCredit {
+            source: ActorId(decoder.u64()?),
+            last_tick: decoder.u64()?,
+        });
+    }
+    if credits
+        .windows(2)
+        .any(|pair: &[DamageCredit]| pair[0].source >= pair[1].source)
+    {
+        return Err(CheckpointError::InvalidData(
+            "damage credits are not strictly sorted by source",
+        ));
+    }
+    Ok(credits)
+}
+
+fn encode_score_entry(encoder: &mut Encoder, entry: ScoreEntry) -> Result<(), CheckpointError> {
+    encoder.u64(entry.actor.get())?;
+    encode_option_player(encoder, entry.owner)?;
+    encoder.u8(entry.team.get())?;
+    encoder.u64(entry.since_tick)?;
+    encoder.u32(entry.earned_gold)?;
+    // `passive_gold_paid` is deliberately NOT encoded: it is a closed form of the tick, so re-deriving it
+    // on decode makes the entire passive half of the economy impossible to forge.
+    encoder.u32(entry.kills)?;
+    encoder.u32(entry.deaths)?;
+    encoder.u32(entry.assists)?;
+    encoder.u16(entry.kill_streak)?;
+    encoder.u16(entry.best_kill_streak)
+}
+
+fn decode_score_entry(
+    decoder: &mut Decoder<'_>,
+    tick: Tick,
+    config: MatchConfig,
+) -> Result<ScoreEntry, CheckpointError> {
+    let actor = ActorId(decoder.u64()?);
+    let owner = decode_option_player(decoder)?;
+    let team = TeamId(decoder.u8()?);
+    let since_tick = decoder.u64()?;
+    if since_tick > tick {
+        return Err(CheckpointError::InvalidData(
+            "scoreboard entry claims to predate the match",
+        ));
+    }
+    let earned_gold = decoder.u32()?;
+    let kills = decoder.u32()?;
+    let deaths = decoder.u32()?;
+    let assists = decoder.u32()?;
+    let kill_streak = decoder.u16()?;
+    let best_kill_streak = decoder.u16()?;
+    Ok(ScoreEntry {
+        actor,
+        owner,
+        team,
+        since_tick,
+        earned_gold,
+        passive_gold_paid: passive_gold_owed(tick.saturating_sub(since_tick), config),
+        kills,
+        deaths,
+        assists,
+        kill_streak,
+        best_kill_streak,
     })
 }
 
@@ -1140,7 +1304,8 @@ fn encode_projectile(
     encoder.u8(projectile.team.get())?;
     encoder.u32(projectile.ability.get())?;
     encode_point(encoder, projectile.position)?;
-    encode_point(encoder, projectile.end)
+    encode_point(encoder, projectile.end)?;
+    encoder.u32(projectile.amount)
 }
 
 /// Decode one in-flight projectile.
@@ -1159,6 +1324,7 @@ fn decode_projectile(
     let ability = AbilityId(decoder.u32()?);
     let position = decode_point(decoder)?;
     let end = decode_point(decoder)?;
+    let amount = decoder.u32()?;
     if !config.map_bounds.contains(position) || !config.map_bounds.contains(end) {
         return Err(CheckpointError::InvalidData(
             "projectile position or flight terminus is outside map bounds",
@@ -1171,6 +1337,7 @@ fn decode_projectile(
         ability,
         position,
         end,
+        amount,
     })
 }
 
@@ -1182,9 +1349,19 @@ fn encode_actor(encoder: &mut Encoder, actor: &ActorState) -> Result<(), Checkpo
     encode_actor_kind(encoder, actor.kind)?;
     encode_point(encoder, actor.position)?;
     encode_option_point(encoder, actor.destination)?;
-    // Base stats plus modifiers only. The resolved cache is re-derived on decode and then re-asserted by
-    // the frame-boundary audit, so a tampered checkpoint cannot assert stats its own inputs do not produce.
-    encode_stats(encoder, actor.base_stats)?;
+    // AUTHORED stats plus authored growth plus experience. `level` and `base_stats` are both re-derived on
+    // decode and then re-asserted by the frame-boundary audit, so a tampered checkpoint cannot assert a
+    // level, a growth curve, or stats its own inputs do not produce.
+    encode_stats(encoder, actor.authored_stats)?;
+    encode_growth(encoder, actor.growth)?;
+    encode_bounty(encoder, actor.bounty)?;
+    encoder.u32(actor.experience)?;
+    encoder.u8(actor.unspent_ability_points)?;
+    encoder.count(actor.damage_credits.len())?;
+    for credit in &actor.damage_credits {
+        encoder.u64(credit.source.get())?;
+        encoder.u64(credit.last_tick)?;
+    }
     encoder.count(actor.modifiers.len())?;
     for modifier in &actor.modifiers {
         encoder.u64(modifier.id.get())?;
@@ -1207,6 +1384,7 @@ fn encode_actor(encoder: &mut Encoder, actor: &ActorState) -> Result<(), Checkpo
     for ability in &actor.abilities {
         encoder.u32(ability.id.get())?;
         encoder.u64(ability.ready_at)?;
+        encoder.u8(ability.rank)?;
     }
     match actor.cast {
         Some(cast) => {
@@ -1237,6 +1415,10 @@ fn encode_actor(encoder: &mut Encoder, actor: &ActorState) -> Result<(), Checkpo
     encode_option_u64(encoder, actor.respawn_at)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the decoder must mirror the encoder field for field, in one readable sequence"
+)]
 fn decode_actor(
     decoder: &mut Decoder<'_>,
     config: MatchConfig,
@@ -1248,7 +1430,15 @@ fn decode_actor(
     let kind = decode_actor_kind(decoder)?;
     let position = decode_point(decoder)?;
     let destination = decode_option_point(decoder)?;
-    let base_stats = decode_stats(decoder)?;
+    let authored_stats = decode_stats(decoder)?;
+    let growth = decode_growth(decoder)?;
+    let bounty = decode_bounty(decoder)?;
+    let experience = decoder.u32()?;
+    let unspent_ability_points = decoder.u8()?;
+    let damage_credits = decode_damage_credits(decoder, config)?;
+    // Re-derived, never trusted from the payload - the same rule the stat and control caches follow.
+    let level = level_for_experience(experience);
+    let base_stats = authored_stats.with_growth(growth, level);
     let modifiers = decode_modifiers(decoder, config)?;
     let stats = base_stats.with_modifiers(&modifiers);
     let status_effects = decode_status_effects(decoder, config)?;
@@ -1262,12 +1452,13 @@ fn decode_actor(
     let resource = decoder.u32()?;
     let ability_limit = usize::try_from(config.max_abilities_per_actor).unwrap_or(usize::MAX);
     let ability_count = decoder.count(ability_limit, "actor ability count exceeds budget")?;
-    decoder.require_minimum(ability_count, 12)?;
+    decoder.require_minimum(ability_count, 13)?;
     let mut abilities = allocate_vec(ability_count)?;
     for _ in 0..ability_count {
         abilities.push(AbilityState {
             id: AbilityId(decoder.u32()?),
             ready_at: decoder.u64()?,
+            rank: decoder.u8()?,
         });
     }
     let cast = match decoder.u8()? {
@@ -1326,6 +1517,13 @@ fn decode_actor(
         kind,
         position,
         destination,
+        authored_stats,
+        growth,
+        bounty,
+        experience,
+        level,
+        unspent_ability_points,
+        damage_credits,
         base_stats,
         modifiers,
         status_effects,
@@ -1734,6 +1932,10 @@ fn encode_command(encoder: &mut Encoder, command: PlayerCommand) -> Result<(), C
             encoder.u8(3)?;
             encoder.u64(target.get())
         }
+        CommandKind::UpgradeAbility { ability } => {
+            encoder.u8(4)?;
+            encoder.u32(ability.get())
+        }
     }
 }
 
@@ -1863,6 +2065,13 @@ fn encode_rejection_reason(
         CommandRejectReason::InvalidTargetForm => encoder.u8(31),
         CommandRejectReason::TargetPointOutOfBounds => encoder.u8(32),
         CommandRejectReason::ProjectileBudgetExceeded => encoder.u8(33),
+        CommandRejectReason::NoAbilityPointAvailable => encoder.u8(34),
+        CommandRejectReason::AbilityRankMaxed => encoder.u8(35),
+        CommandRejectReason::AbilityRankLocked { unlocks_at_level } => {
+            encoder.u8(36)?;
+            encoder.u8(unlocks_at_level)
+        }
+        CommandRejectReason::ActorHasNoProgression => encoder.u8(37),
     }
 }
 
@@ -1911,6 +2120,12 @@ fn decode_rejection_reason(
         31 => Ok(CommandRejectReason::InvalidTargetForm),
         32 => Ok(CommandRejectReason::TargetPointOutOfBounds),
         33 => Ok(CommandRejectReason::ProjectileBudgetExceeded),
+        34 => Ok(CommandRejectReason::NoAbilityPointAvailable),
+        35 => Ok(CommandRejectReason::AbilityRankMaxed),
+        36 => Ok(CommandRejectReason::AbilityRankLocked {
+            unlocks_at_level: decoder.u8()?,
+        }),
+        37 => Ok(CommandRejectReason::ActorHasNoProgression),
         tag => Err(CheckpointError::InvalidTag {
             field: "command rejection reason",
             tag,
@@ -1958,6 +2173,22 @@ mod tests {
         reason = "the fixture intentionally exercises every core checkpoint state family"
     )]
     fn active_fixture() -> MatchRuntime {
+        // Non-default progression throughout: a field left at its default encodes as zeros, and the whole
+        // seeded mutation corpus goes blind to it.
+        const HERO_GROWTH: StatGrowth = StatGrowth {
+            max_health_per_level: 90,
+            max_resource_per_level: 25,
+            move_speed_mm_per_tick_per_level: 1,
+            physical_reduction_bps_per_level: 40,
+            magic_reduction_bps_per_level: 20,
+        };
+        const HERO_BOUNTY: Bounty = Bounty {
+            gold: 300,
+            experience: 175,
+        };
+        // Level 5 costs 1,720 cumulative experience, leaving four points to account for: two on STRIKE
+        // (rank 3, which unlocks at level 5), one on HEAL (rank 2), and one unspent.
+        const HERO_EXPERIENCE: u32 = 1_720;
         let config = MatchConfig {
             max_match_ticks: 100,
             ..MatchConfig::default()
@@ -1973,6 +2204,7 @@ mod tests {
                 resource_cost: 20,
                 cooldown_ticks: 10,
                 cast_ticks: 2,
+                per_rank_amount: 0,
                 effect: AbilityEffect::Damage {
                     amount: 120,
                     school: DamageSchool::Magic,
@@ -1988,6 +2220,7 @@ mod tests {
                 resource_cost: 10,
                 cooldown_ticks: 8,
                 cast_ticks: 1,
+                per_rank_amount: 0,
                 effect: AbilityEffect::Heal { amount: 80 },
             },
             AbilitySpec {
@@ -2003,6 +2236,7 @@ mod tests {
                 resource_cost: 15,
                 cooldown_ticks: 12,
                 cast_ticks: 1,
+                per_rank_amount: 35,
                 effect: AbilityEffect::Damage {
                     amount: 90,
                     school: DamageSchool::Physical,
@@ -2036,21 +2270,35 @@ mod tests {
                 kind: ActorKind::Hero,
                 position: Vec2Mm::new(0, 0),
                 destination: None,
-                base_stats: stats(),
+                authored_stats: stats(),
+                growth: HERO_GROWTH,
+                bounty: HERO_BOUNTY,
+                experience: HERO_EXPERIENCE,
+                level: 5,
+                unspent_ability_points: 1,
+                damage_credits: vec![DamageCredit {
+                    source: ActorId(2),
+                    last_tick: 4,
+                }],
+                base_stats: stats().with_growth(HERO_GROWTH, 5),
                 modifiers: hero_modifiers.clone(),
                 status_effects: Vec::new(),
                 control_mask: ControlMask::EMPTY,
-                stats: stats().with_modifiers(&hero_modifiers),
+                stats: stats()
+                    .with_growth(HERO_GROWTH, 5)
+                    .with_modifiers(&hero_modifiers),
                 health: 850,
                 resource: 150,
                 abilities: vec![
                     AbilityState {
                         id: STRIKE,
                         ready_at: 12,
+                        rank: 3,
                     },
                     AbilityState {
                         id: HEAL,
                         ready_at: 0,
+                        rank: 2,
                     },
                 ],
                 cast: Some(PendingCast {
@@ -2077,6 +2325,13 @@ mod tests {
                 kind: ActorKind::Hero,
                 position: Vec2Mm::new(1_000, 0),
                 destination: None,
+                authored_stats: stats(),
+                growth: HERO_GROWTH,
+                bounty: HERO_BOUNTY,
+                experience: 0,
+                level: 1,
+                unspent_ability_points: 0,
+                damage_credits: Vec::new(),
                 base_stats: stats(),
                 modifiers: Vec::new(),
                 status_effects: Vec::new(),
@@ -2087,6 +2342,7 @@ mod tests {
                 abilities: vec![AbilityState {
                     id: STRIKE,
                     ready_at: 0,
+                    rank: 1,
                 }],
                 cast: None,
                 basic_attack: Some(BasicAttackState {
@@ -2108,6 +2364,16 @@ mod tests {
                 kind: ActorKind::Minion,
                 position: Vec2Mm::new(250, 0),
                 destination: None,
+                authored_stats: stats(),
+                growth: StatGrowth::NONE,
+                bounty: Bounty {
+                    gold: 21,
+                    experience: 60,
+                },
+                experience: 0,
+                level: 1,
+                unspent_ability_points: 0,
+                damage_credits: Vec::new(),
                 base_stats: stats(),
                 modifiers: Vec::new(),
                 status_effects: Vec::new(),
@@ -2166,7 +2432,37 @@ mod tests {
                 ability: LANCE,
                 position: Vec2Mm::new(1_200, -400),
                 end: Vec2Mm::new(6_000, -400),
+                // Launched at LANCE rank 3: 90 base + 2 x 35 per rank.
+                amount: 160,
             }],
+            scores: vec![
+                ScoreEntry {
+                    actor: ActorId(1),
+                    owner: Some(PLAYER_ONE),
+                    team: TeamId(0),
+                    since_tick: 0,
+                    earned_gold: 640,
+                    passive_gold_paid: passive_gold_owed(5, config),
+                    kills: 2,
+                    deaths: 1,
+                    assists: 1,
+                    kill_streak: 2,
+                    best_kill_streak: 2,
+                },
+                ScoreEntry {
+                    actor: ActorId(2),
+                    owner: Some(PLAYER_TWO),
+                    team: TeamId(1),
+                    since_tick: 0,
+                    earned_gold: 150,
+                    passive_gold_paid: passive_gold_owed(5, config),
+                    kills: 1,
+                    deaths: 2,
+                    assists: 0,
+                    kill_streak: 0,
+                    best_kill_streak: 3,
+                },
+            ],
             player_roster: [PLAYER_ONE, PLAYER_TWO, RETAINED_DESPAWNED_PLAYER]
                 .into_iter()
                 .collect(),
@@ -2200,6 +2496,7 @@ mod tests {
             dirty: BTreeSet::new(),
             removed: BTreeSet::new(),
             removed_projectiles: BTreeSet::new(),
+            dirty_scores: BTreeSet::new(),
             pending_events: Vec::new(),
             rejection_events_in_frame: 0,
             objective_claims: BTreeSet::new(),
@@ -2280,6 +2577,7 @@ mod tests {
                 resource_cost: 0,
                 cooldown_ticks: 1,
                 cast_ticks: 0,
+                per_rank_amount: 0,
                 effect: AbilityEffect::Damage {
                     amount: 2_000,
                     school: DamageSchool::True,
@@ -2293,6 +2591,8 @@ mod tests {
                 team: TeamId(0),
                 kind: ActorKind::Hero,
                 position: Vec2Mm::new(0, 0),
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
                 stats: stats(),
                 abilities: vec![STRIKE],
                 basic_attack: None,
@@ -2306,6 +2606,8 @@ mod tests {
                 team: TeamId(1),
                 kind: ActorKind::Minion,
                 position: Vec2Mm::new(100, 0),
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
                 stats: stats(),
                 abilities: Vec::new(),
                 basic_attack: None,
@@ -2361,6 +2663,8 @@ mod tests {
                 team: TeamId(0),
                 kind: ActorKind::Hero,
                 position: Vec2Mm::new(0, 0),
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
                 stats: stats(),
                 abilities: Vec::new(),
                 basic_attack: None,
@@ -2400,6 +2704,8 @@ mod tests {
                         team,
                         kind: ActorKind::Hero,
                         position: Vec2Mm::new(i32::try_from(id.get()).unwrap() * 100, 0),
+                        growth: StatGrowth::NONE,
+                        bounty: Bounty::NONE,
                         stats: stats(),
                         abilities: Vec::new(),
                         basic_attack: None,

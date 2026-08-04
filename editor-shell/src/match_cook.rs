@@ -44,9 +44,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_ecs::FlecsWorld;
 use metrocalk_gameplay::{
-    ActorKind, ActorSpawn, BasicAttackSpec, CombatStats, DamageSchool, DeathRule, LaneId,
-    LanePosition, LaneSpec, MatchConfig, MatchRuntime, OneLaneMatch, PlayerId, RectMm, TeamId,
-    Vec2Mm, WaveId, WaveSpec, WaveUnitSpec,
+    ActorKind, ActorSpawn, BasicAttackSpec, Bounty, CombatStats, DamageSchool, DeathRule, LaneId,
+    LanePosition, LaneSpec, MatchConfig, MatchRuntime, OneLaneMatch, PlayerId, RectMm, StatGrowth,
+    TeamId, Vec2Mm, WaveId, WaveSpec, WaveUnitSpec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +62,7 @@ pub const MATCH_ACTOR: &str = "MatchActor";
 pub const MATCH_WAVE: &str = "MatchWave";
 
 /// The cooked-artifact schema version. Bump on any change to [`CookedMatch`]'s shape or meaning.
-pub const MATCH_COOK_SCHEMA_VERSION: u32 = 1;
+pub const MATCH_COOK_SCHEMA_VERSION: u32 = 2;
 
 /// The single lane the MOB-2 one-route profile permits.
 const LANE: LaneId = LaneId(0);
@@ -189,6 +189,11 @@ pub struct CookedActor {
     pub max_health: u32,
     pub move_speed_mm_per_tick: u32,
     pub physical_reduction_bps: u16,
+    /// What killing this actor pays the killer, and what it grows per level. Both default to nothing, so
+    /// a scene authored before these fields existed cooks to exactly the match it cooked before.
+    pub bounty_gold: u32,
+    pub bounty_experience: u32,
+    pub health_per_level: u32,
     pub attack: Option<CookedAttack>,
     /// `Some(delay)` = respawn at the authored position after `delay` ticks; `None` = stays dead. A
     /// structure whose loss ends the match is expressed by `objective_for` instead.
@@ -238,6 +243,8 @@ pub struct CookedWave {
     pub unit_max_health: u32,
     pub unit_move_speed_mm_per_tick: u32,
     pub unit_physical_reduction_bps: u16,
+    pub unit_bounty_gold: u32,
+    pub unit_bounty_experience: u32,
     pub unit_attack: Option<CookedAttack>,
     pub source: String,
 }
@@ -308,6 +315,14 @@ impl CookedMatch {
                         physical_reduction_bps: actor.physical_reduction_bps,
                         magic_reduction_bps: 0,
                     },
+                    growth: StatGrowth {
+                        max_health_per_level: actor.health_per_level,
+                        ..StatGrowth::NONE
+                    },
+                    bounty: Bounty {
+                        gold: actor.bounty_gold,
+                        experience: actor.bounty_experience,
+                    },
                     abilities: vec![],
                     basic_attack: actor.attack.map(kernel_attack),
                     death_rule,
@@ -355,6 +370,10 @@ impl CookedMatch {
                             move_speed_mm_per_tick: wave.unit_move_speed_mm_per_tick,
                             physical_reduction_bps: wave.unit_physical_reduction_bps,
                             magic_reduction_bps: 0,
+                        },
+                        bounty: Bounty {
+                            gold: wave.unit_bounty_gold,
+                            experience: wave.unit_bounty_experience,
                         },
                         abilities: vec![],
                         basic_attack: wave.unit_attack.map(kernel_attack),
@@ -704,6 +723,35 @@ impl Cook {
             format!("`{field}` is {value}; it must be zero or a positive whole number."),
         );
         None
+    }
+
+    /// An optional whole number, refused at cook time if it exceeds the kernel's own ceiling.
+    ///
+    /// Bounding here rather than letting `spawn_actor` refuse it is what keeps the standing invariant
+    /// true: anything the cook accepts, the kernel must accept. An out-of-range value surfaces as an
+    /// authored-content error naming the field, not as an opaque runtime rejection.
+    fn bounded_u32(
+        &mut self,
+        comps: &Components,
+        entity: EntityId,
+        component: &str,
+        field: &str,
+        ceiling: u32,
+    ) -> u32 {
+        match self.optional_u32(comps, entity, component, field) {
+            Some(value) if value > ceiling => {
+                self.error(
+                    "out-of-range",
+                    entity,
+                    component,
+                    Some(field),
+                    format!("`{field}` is {value}; it must be at most {ceiling}."),
+                );
+                0
+            }
+            Some(value) => value,
+            None => 0,
+        }
     }
 
     /// Authored metres-per-second → kernel millimetres-per-tick.
@@ -1125,6 +1173,30 @@ pub fn cook_match(engine: &Engine<FlecsWorld>) -> CookOutcome {
             Some(bps) => u16::try_from(bps).unwrap_or_default(),
             None => 0,
         };
+        // Bounded here against the SAME ceilings the kernel enforces: anything the cook accepts, the
+        // kernel must accept, so an out-of-range authored bounty has to be refused at cook time rather
+        // than surfacing as an opaque `InvalidActor` from `spawn_actor`.
+        let bounty_gold = cook.bounded_u32(
+            &comps,
+            id,
+            MATCH_ACTOR,
+            "bountyGold",
+            metrocalk_gameplay::MAX_BOUNTY_GOLD,
+        );
+        let bounty_experience = cook.bounded_u32(
+            &comps,
+            id,
+            MATCH_ACTOR,
+            "bountyExperience",
+            metrocalk_gameplay::MAX_BOUNTY_EXPERIENCE,
+        );
+        let health_per_level = cook.bounded_u32(
+            &comps,
+            id,
+            MATCH_ACTOR,
+            "healthPerLevel",
+            metrocalk_gameplay::MAX_STAT_GROWTH_PER_LEVEL,
+        );
         let attack = cook.attack(&comps, id, MATCH_ACTOR, "attack");
 
         let owned = flag(&comps, MATCH_ACTOR, "owned").unwrap_or(false);
@@ -1169,6 +1241,9 @@ pub fn cook_match(engine: &Engine<FlecsWorld>) -> CookOutcome {
             max_health,
             move_speed_mm_per_tick,
             physical_reduction_bps,
+            bounty_gold,
+            bounty_experience,
+            health_per_level,
             attack,
             respawn_delay_ticks,
             objective_for,
@@ -1325,8 +1400,25 @@ pub fn cook_match(engine: &Engine<FlecsWorld>) -> CookOutcome {
             );
         }
 
+        let unit_bounty_gold = cook.bounded_u32(
+            &comps,
+            id,
+            MATCH_WAVE,
+            "unitBountyGold",
+            metrocalk_gameplay::MAX_BOUNTY_GOLD,
+        );
+        let unit_bounty_experience = cook.bounded_u32(
+            &comps,
+            id,
+            MATCH_WAVE,
+            "unitBountyExperience",
+            metrocalk_gameplay::MAX_BOUNTY_EXPERIENCE,
+        );
+
         waves.push(CookedWave {
             id: u32::try_from(ordinal).unwrap_or(u32::MAX).saturating_add(1),
+            unit_bounty_gold,
+            unit_bounty_experience,
             team,
             spawn_progress_mm,
             goal_progress_mm,
@@ -1602,6 +1694,9 @@ fn digest_of(cooked: &CookedMatch) -> u64 {
         hash.u64(u64::from(actor.max_health));
         hash.u64(u64::from(actor.move_speed_mm_per_tick));
         hash.u64(u64::from(actor.physical_reduction_bps));
+        hash.u64(u64::from(actor.bounty_gold));
+        hash.u64(u64::from(actor.bounty_experience));
+        hash.u64(u64::from(actor.health_per_level));
         hash.attack(actor.attack);
         hash.u64(actor.respawn_delay_ticks.map_or(u64::MAX, u64::from));
         hash.u64(actor.objective_for.map_or(u64::MAX, u64::from));
@@ -1621,6 +1716,8 @@ fn digest_of(cooked: &CookedMatch) -> u64 {
         hash.u64(u64::from(wave.unit_max_health));
         hash.u64(u64::from(wave.unit_move_speed_mm_per_tick));
         hash.u64(u64::from(wave.unit_physical_reduction_bps));
+        hash.u64(u64::from(wave.unit_bounty_gold));
+        hash.u64(u64::from(wave.unit_bounty_experience));
         hash.attack(wave.unit_attack);
     }
     hash.finish()

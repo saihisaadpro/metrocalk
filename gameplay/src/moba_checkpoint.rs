@@ -963,9 +963,9 @@ fn checksum(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use crate::{
-        ActorSpawn, BasicAttackSpec, CombatStats, DamageSchool, DeathRule, DynamicActorProvenance,
-        DynamicActorSpawn, LaneId, LanePosition, MatchConfig, RectMm, TeamId, Vec2Mm, WaveId,
-        WaveUnitSpec,
+        ActorSpawn, BasicAttackSpec, Bounty, CombatStats, DamageSchool, DeathRule,
+        DynamicActorProvenance, DynamicActorSpawn, LaneId, LanePosition, MatchConfig, RectMm,
+        StatGrowth, TeamId, Vec2Mm, WaveId, WaveUnitSpec,
     };
 
     const CONTENT: ContentId = ContentId::new([0x31; 32]);
@@ -1018,12 +1018,14 @@ mod tests {
             max_alive: 8,
             units: vec![
                 WaveUnitSpec {
+                    bounty: Bounty::NONE,
                     progress_offset_mm: 0,
                     stats: unit_stats(),
                     abilities: Vec::new(),
                     basic_attack: Some(attack()),
                 },
                 WaveUnitSpec {
+                    bounty: Bounty::NONE,
                     progress_offset_mm: if team == 0 { 100 } else { -100 },
                     stats: unit_stats(),
                     abilities: Vec::new(),
@@ -1047,6 +1049,8 @@ mod tests {
                 team: TeamId(0),
                 kind: ActorKind::Hero,
                 position: Vec2Mm::new(5_000, 0),
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
                 stats: unit_stats(),
                 abilities: Vec::new(),
                 basic_attack: None,
@@ -1336,7 +1340,10 @@ mod tests {
 
         let tight_config = MatchConfig {
             map_bounds: RectMm::new(Vec2Mm::new(-1_000, -1_000), Vec2Mm::new(11_000, 1_000)),
-            max_checkpoint_bytes: 220,
+            // Deliberately pitched BETWEEN the two sizes: large enough that the core payload fits, small
+            // enough that the composite envelope on top of it cannot. Re-derive it whenever the encoded
+            // config grows - a budget that the CORE overflows would make this assert the wrong ceiling.
+            max_checkpoint_bytes: 260,
             ..MatchConfig::default()
         };
         let mut tight_runtime = MatchRuntime::new(tight_config, 1).unwrap();
@@ -1393,6 +1400,8 @@ mod tests {
                     team: TeamId(0),
                     kind: ActorKind::Minion,
                     position: Vec2Mm::new(5_000, 0),
+                    growth: StatGrowth::NONE,
+                    bounty: Bounty::NONE,
                     stats: unit_stats(),
                     abilities: Vec::new(),
                     basic_attack: Some(attack()),

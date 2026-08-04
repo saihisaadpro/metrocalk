@@ -1,6 +1,7 @@
 use crate::model::{
-    AbilityId, ActorId, ActorKind, ActorProvenance, ControlMask, DamageSchool, MatchEndReason,
-    MatchOutcome, MatchPhase, PlayerId, ProjectileId, StatusEffectId, TeamId, Tick, Vec2Mm,
+    AbilityId, ActorId, ActorKind, ActorProvenance, ControlMask, DamageSchool, GoldReason,
+    MatchEndReason, MatchOutcome, MatchPhase, PlayerId, ProjectileId, ScoreView, StatusEffectId,
+    TeamId, Tick, Vec2Mm,
 };
 
 /// Deterministic equality key for authoritative gameplay simulation state.
@@ -42,6 +43,14 @@ pub enum CommandKind {
     },
     BasicAttack {
         target: ActorId,
+    },
+    /// Spend one unspent ability point to raise one equipped ability by a rank.
+    ///
+    /// A player command rather than a server-owned mutator because choosing *which* ability to raise is
+    /// the decision this genre puts in the player's hands. It routes through the same single validation
+    /// choke point as every other command, so a bot intent expresses it identically.
+    UpgradeAbility {
+        ability: AbilityId,
     },
 }
 
@@ -112,6 +121,16 @@ pub enum CommandRejectReason {
     /// The match already carries its configured maximum of in-flight projectiles. Fail-closed: the cast is
     /// cancelled rather than silently dropping a projectile the client was told to expect.
     ProjectileBudgetExceeded,
+    /// No unspent ability point is available.
+    NoAbilityPointAvailable,
+    /// The ability is already at its maximum rank.
+    AbilityRankMaxed,
+    /// The actor's level does not yet unlock this rank.
+    AbilityRankLocked {
+        unlocks_at_level: u8,
+    },
+    /// Only heroes carry progression, so only a hero can spend a point.
+    ActorHasNoProgression,
 }
 
 /// Accepted queue position. A later state change can still make the command invalid at execution time; that
@@ -136,6 +155,8 @@ pub struct CommandRejection {
 pub struct CooldownView {
     pub ability: AbilityId,
     pub ready_at: Tick,
+    /// Current rank, always at least 1. A client needs it to draw the ability's real magnitude.
+    pub rank: u8,
 }
 
 /// Read-only cast progress in an authoritative actor delta.
@@ -185,6 +206,11 @@ pub struct ActorView {
     pub basic_attack_ready_at: Option<Tick>,
     pub basic_attack_range_mm: Option<u32>,
     pub respawn_at: Option<Tick>,
+    /// Progression. `level` is DERIVED from `experience` and is projected rather than stored, so a client
+    /// and the server can never disagree about which one is authoritative.
+    pub level: u8,
+    pub experience: u32,
+    pub unspent_ability_points: u8,
     /// Immutable creation record. Controllers above the runtime use this to re-derive which schedule owns an
     /// actor instead of trusting a separately stored membership list.
     pub provenance: ActorProvenance,
@@ -321,6 +347,39 @@ pub enum MatchEvent {
         projectile: ProjectileId,
         reason: CommandRejectReason,
     },
+    /// A kill was credited to a scoreboard line. Distinct from `ActorDied`, which stays byte-stable: this
+    /// carries the scoreboard-grade detail without rewriting a shipped tag's payload.
+    KillCredited {
+        killer: ActorId,
+        victim: ActorId,
+        streak_after: u16,
+    },
+    /// One assist, emitted once per assister so the event stays `Copy` rather than carrying a list.
+    AssistCredited {
+        actor: ActorId,
+        victim: ActorId,
+    },
+    GoldGranted {
+        actor: ActorId,
+        amount: u32,
+        reason: GoldReason,
+        total_after: u32,
+    },
+    ExperienceGranted {
+        actor: ActorId,
+        amount: u32,
+        total_after: u32,
+    },
+    HeroLevelUp {
+        actor: ActorId,
+        level: u8,
+        unspent_ability_points: u8,
+    },
+    AbilityRankUp {
+        actor: ActorId,
+        ability: AbilityId,
+        rank: u8,
+    },
     MatchFinished {
         outcome: MatchOutcome,
         reason: MatchEndReason,
@@ -342,6 +401,11 @@ pub struct ServerFrame {
     pub removed: Vec<ActorId>,
     pub projectiles: Vec<ProjectileView>,
     pub removed_projectiles: Vec<ProjectileId>,
+    /// Scoreboard lines changed since the previous frame — a genuine dirty subset, unlike `projectiles`.
+    /// The contrast is the point: a projectile always moves, so its full set IS the delta, whereas a score
+    /// line changes only on a kill or on the roughly one tick in fifteen where closed-form passive income
+    /// crosses a whole gold unit. There is no `removed_scores`, because a line is never removed.
+    pub scores: Vec<ScoreView>,
     pub events: Vec<MatchEvent>,
     pub world_digest: WorldDigest,
     pub frame_digest: FrameDigest,

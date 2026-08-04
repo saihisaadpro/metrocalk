@@ -23,8 +23,8 @@
   },
   "expectedEvidence": {
     "finalTick": 3,
-    "worldDigest": 301266237096915548,
-    "terminalFrameDigest": 10569925040670444284
+    "worldDigest": 15625938791520406616,
+    "terminalFrameDigest": 12808248929836969599
   },
   "transport": {
     "status": "not-implemented",

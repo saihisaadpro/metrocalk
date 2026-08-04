@@ -4,10 +4,10 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::{
     AbilityAim, AbilityId, AbilityTargeting, ActorId, ActorIntent, ActorKind, ActorView,
-    BasicAttackSpec, CastTarget, CombatStats, CommandKind, CommandReceipt, CommandRejection,
-    CompiledLane, DeathRule, DynamicActorProvenance, DynamicActorSpawn, LaneError, LanePosition,
-    LaneSpec, MatchPhase, MatchRuntime, PlayerCommand, PlayerId, RuntimeError, ServerFrame, TeamId,
-    Tick,
+    BasicAttackSpec, Bounty, CastTarget, CombatStats, CommandKind, CommandReceipt,
+    CommandRejection, CompiledLane, DeathRule, DynamicActorProvenance, DynamicActorSpawn,
+    LaneError, LanePosition, LaneSpec, MatchPhase, MatchRuntime, PlayerCommand, PlayerId,
+    RuntimeError, ServerFrame, StatGrowth, TeamId, Tick,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -35,6 +35,10 @@ pub struct LaneBotSpec {
 pub struct WaveUnitSpec {
     pub progress_offset_mm: i64,
     pub stats: CombatStats,
+    /// What killing this wave unit is worth. Part of the immutable authored definition, and therefore
+    /// hashed into the definition digest: without that, a host could restore a checkpoint against a
+    /// different bounty table and still pass the definition-identity check.
+    pub bounty: Bounty,
     pub abilities: Vec<AbilityId>,
     pub basic_attack: Option<BasicAttackSpec>,
 }
@@ -265,9 +269,10 @@ impl OneLaneMatch {
                     ..command
                 })
             }
-            CommandKind::Stop | CommandKind::Cast { .. } | CommandKind::BasicAttack { .. } => {
-                Ok(command)
-            }
+            CommandKind::Stop
+            | CommandKind::Cast { .. }
+            | CommandKind::BasicAttack { .. }
+            | CommandKind::UpgradeAbility { .. } => Ok(command),
         }
     }
 
@@ -297,7 +302,7 @@ impl OneLaneMatch {
     #[must_use]
     pub fn lane_digest(&self) -> LaneMatchDigest {
         let mut hash = LaneHash::new();
-        hash.bytes(b"metrocalk-one-lane-mob2-v2");
+        hash.bytes(b"metrocalk-one-lane-mob2-v3");
         hash.u64(self.runtime.world_digest().0);
         hash.u64(self.definition_digest);
         hash.u16(self.lane.id().get());
@@ -575,6 +580,9 @@ impl OneLaneMatch {
                         progress_mm: progress,
                     })?,
                     stats: unit.stats,
+                    // Minions never level, so they carry no growth; their worth is authored.
+                    growth: StatGrowth::NONE,
+                    bounty: unit.bounty,
                     abilities: unit.abilities.clone(),
                     basic_attack: unit.basic_attack,
                     death_rule: DeathRule::Despawn,
@@ -648,7 +656,7 @@ pub(crate) fn one_lane_definition_digest(
     waves: &[WaveSpec],
 ) -> u64 {
     let mut hash = LaneHash::new();
-    hash.bytes(b"metrocalk-one-lane-definitions-v1");
+    hash.bytes(b"metrocalk-one-lane-definitions-v2");
     hash.u16(lane.id().get());
     hash.u64(lane.length_mm());
     hash.u32(lane.half_width_mm());
@@ -998,6 +1006,10 @@ impl LaneHash {
             self.u32(unit.stats.move_speed_mm_per_tick);
             self.u16(unit.stats.physical_reduction_bps);
             self.u16(unit.stats.magic_reduction_bps);
+            // The authored bounty is part of the definition identity: omit it and a host could restore a
+            // checkpoint against a different bounty table and still pass `DefinitionMismatch`.
+            self.u32(unit.bounty.gold);
+            self.u32(unit.bounty.experience);
             self.len(unit.abilities.len());
             for ability in &unit.abilities {
                 self.u32(ability.get());
@@ -1098,6 +1110,8 @@ mod tests {
             team: TeamId(team),
             kind,
             position: Vec2Mm::new(x, 0),
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
             stats: stats(health, speed),
             abilities: vec![],
             basic_attack: attack,
@@ -1564,12 +1578,14 @@ mod tests {
             max_alive: 2,
             units: vec![
                 WaveUnitSpec {
+                    bounty: Bounty::NONE,
                     progress_offset_mm: 0,
                     stats: stats(100, 0),
                     abilities: vec![],
                     basic_attack: None,
                 },
                 WaveUnitSpec {
+                    bounty: Bounty::NONE,
                     progress_offset_mm: 100,
                     stats: stats(100, 0),
                     abilities: vec![],
@@ -1756,6 +1772,7 @@ mod tests {
                 resource_cost: 0,
                 cooldown_ticks: 1,
                 cast_ticks: 0,
+                per_rank_amount: 0,
                 effect: AbilityEffect::Damage {
                     amount: 1,
                     school: DamageSchool::True,
@@ -1820,6 +1837,7 @@ mod tests {
                         resource_cost: 0,
                         cooldown_ticks: 1,
                         cast_ticks: 0,
+                        per_rank_amount: 0,
                         effect: AbilityEffect::Damage {
                             amount: 1,
                             school: DamageSchool::True,
@@ -1848,6 +1866,7 @@ mod tests {
             interval_ticks: 2,
             max_alive: 1,
             units: vec![WaveUnitSpec {
+                bounty: Bounty::NONE,
                 progress_offset_mm: 0,
                 stats: stats(100, 100),
                 abilities,
@@ -1956,6 +1975,7 @@ mod tests {
                 resource_cost: 0,
                 cooldown_ticks: 4,
                 cast_ticks: 0,
+                per_rank_amount: 0,
                 delivery: AbilityDelivery::Projectile {
                     speed_mm_per_tick: 900,
                     hit_radius_mm: 300,

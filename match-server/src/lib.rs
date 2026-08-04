@@ -10,10 +10,10 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use metrocalk_gameplay::{
-    ActorId, ActorIntent, ActorKind, ActorSpawn, BasicAttackSpec, CombatStats, CommandKind,
+    ActorId, ActorIntent, ActorKind, ActorSpawn, BasicAttackSpec, Bounty, CombatStats, CommandKind,
     CompiledLane, DamageSchool, DeathRule, FrameDigest, InvariantViolation, LaneError, LaneId,
     LanePosition, LaneSpec, MatchConfig, MatchEndReason, MatchEvent, MatchOutcome, MatchPhase,
-    MatchRuntime, RuntimeError, TeamId, Tick, Vec2Mm, WorldDigest,
+    MatchRuntime, RuntimeError, StatGrowth, TeamId, Tick, Vec2Mm, WorldDigest,
 };
 
 /// Immutable build metadata exposed by the `--version-json` command.
@@ -441,6 +441,8 @@ fn reference_hero(id: ActorId, team: TeamId, position: Vec2Mm) -> ActorSpawn {
         team,
         kind: ActorKind::Hero,
         position,
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
         stats: CombatStats {
             max_health: 500,
             max_resource: 0,
@@ -467,6 +469,8 @@ fn reference_core(id: ActorId, team: TeamId, winner: TeamId, position: Vec2Mm) -
         team,
         kind: ActorKind::Structure,
         position,
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
         stats: CombatStats {
             max_health: 300,
             max_resource: 0,

@@ -16,11 +16,11 @@ use std::fmt::Write as _;
 
 use metrocalk_gameplay::{
     AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
-    ActorKind, ActorSpawn, ActorView, BasicAttackSpec, CastTarget, CombatStats, CommandKind,
-    CommandRejectReason, CompiledLane, ContentId, ControlKind, DamageSchool, DeathRule,
-    ImpactShape, LaneId, LanePosition, LaneSpec, MatchConfig, MatchEvent, MatchPhase, MatchRuntime,
-    ModifierOp, OneLaneMatch, PlayerCommand, PlayerId, RectMm, StatKind, TeamId, Tick, Vec2Mm,
-    WaveSpec, WaveUnitSpec,
+    ActorIntent, ActorKind, ActorSpawn, ActorView, BasicAttackSpec, Bounty, CastTarget,
+    CombatStats, CommandKind, CommandRejectReason, CompiledLane, ContentId, ControlKind,
+    DamageSchool, DeathRule, GoldReason, ImpactShape, LaneId, LanePosition, LaneSpec, MatchConfig,
+    MatchEvent, MatchPhase, MatchRuntime, ModifierOp, OneLaneMatch, PlayerCommand, PlayerId,
+    RectMm, StatGrowth, StatKind, TeamId, Tick, Vec2Mm, WaveSpec, WaveUnitSpec,
 };
 
 const PLAYER: PlayerId = PlayerId(1);
@@ -64,6 +64,8 @@ fn scenarios() -> Vec<String> {
         ground_burst_spares_allies(),
         skillshot_flies_and_strikes_the_nearest_body(),
         skillshot_can_miss(),
+        kill_bounty_assist_and_shutdown(),
+        levelling_ranks_an_ability_and_raises_stats(),
         checkpoint_restore_suffix_equality(),
     ]
 }
@@ -156,6 +158,25 @@ impl Recorder {
                 projectile.hit_radius_mm
             );
         }
+        // The scoreboard is authoritative state too. Without it a reader can watch a hero die and never
+        // see who was paid for it.
+        frame.push_str("],\"scores\":[");
+        for (index, line) in runtime.scores().iter().enumerate() {
+            if index > 0 {
+                frame.push(',');
+            }
+            let _ = write!(
+                frame,
+                "{{\"actor\":{},\"team\":{},\"gold\":{},\"kills\":{},\"deaths\":{},\"assists\":{},\"streak\":{}}}",
+                line.actor.get(),
+                line.team.get(),
+                line.gold,
+                line.kills,
+                line.deaths,
+                line.assists,
+                line.kill_streak
+            );
+        }
         frame.push_str("],\"events\":[");
         for (index, event) in events.iter().enumerate() {
             if index > 0 {
@@ -221,11 +242,15 @@ fn actor_json(actor: &ActorView, runtime: &MatchRuntime) -> String {
     }
     format!(
         concat!(
-            "{{\"id\":{},\"team\":{},\"kind\":\"{}\",\"owned\":{},\"x\":{},\"y\":{},",
+            "{{\"level\":{},\"xp\":{},\"points\":{},",
+            "\"id\":{},\"team\":{},\"kind\":\"{}\",\"owned\":{},\"x\":{},\"y\":{},",
             "\"health\":{},\"maxHealth\":{},\"speed\":{},\"physBps\":{},\"magicBps\":{},",
             "\"alive\":{},\"casting\":{},\"attacking\":{},\"controls\":[{}],\"effectExpiries\":[{}],",
             "\"modifierCount\":{}}}"
         ),
+        actor.level,
+        actor.experience,
+        actor.unspent_ability_points,
         actor.id.get(),
         actor.team.get(),
         kind_name(actor.kind),
@@ -274,6 +299,18 @@ const fn phase_name(phase: MatchPhase) -> &'static str {
     }
 }
 
+const fn gold_reason_name(reason: GoldReason) -> &'static str {
+    match reason {
+        GoldReason::Kill => "kill",
+        GoldReason::Shutdown => "shutdown",
+        GoldReason::Assist => "assist",
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per event keeps the capture's vocabulary exhaustive and visible"
+)]
 fn event_label(event: MatchEvent) -> String {
     match event {
         MatchEvent::MatchStarted => "MatchStarted".to_owned(),
@@ -345,6 +382,50 @@ fn event_label(event: MatchEvent) -> String {
             ),
             None => format!("ProjectileResolved p{} at flight end", projectile.get()),
         },
+        MatchEvent::KillCredited {
+            killer,
+            victim,
+            streak_after,
+        } => format!(
+            "KillCredited a{} killed a{} (streak {streak_after})",
+            killer.get(),
+            victim.get()
+        ),
+        MatchEvent::AssistCredited { actor, victim } => {
+            format!("AssistCredited a{} on a{}", actor.get(), victim.get())
+        }
+        MatchEvent::GoldGranted {
+            actor,
+            amount,
+            reason,
+            total_after,
+        } => format!(
+            "Gold +{amount} ({}) to a{} -> {total_after}",
+            gold_reason_name(reason),
+            actor.get()
+        ),
+        MatchEvent::ExperienceGranted {
+            actor,
+            amount,
+            total_after,
+        } => format!("XP +{amount} to a{} -> {total_after}", actor.get()),
+        MatchEvent::HeroLevelUp {
+            actor,
+            level,
+            unspent_ability_points,
+        } => format!(
+            "LevelUp a{} -> L{level} ({unspent_ability_points} unspent)",
+            actor.get()
+        ),
+        MatchEvent::AbilityRankUp {
+            actor,
+            ability,
+            rank,
+        } => format!(
+            "RankUp a{} ability {} -> rank {rank}",
+            actor.get(),
+            ability.get()
+        ),
         MatchEvent::ProjectileCancelled { projectile, reason } => format!(
             "ProjectileCancelled p{} ({})",
             projectile.get(),
@@ -402,6 +483,8 @@ fn hero(id: ActorId, owner: Option<PlayerId>, team: u8, x: i32, mitigation: u16)
         team: TeamId(team),
         kind: ActorKind::Hero,
         position: Vec2Mm::new(x, 0),
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
         stats: CombatStats {
             physical_reduction_bps: mitigation,
             ..stats(1_000, 100, 500)
@@ -431,6 +514,7 @@ fn duel(mitigation: u16) -> MatchRuntime {
             resource_cost: 10,
             cooldown_ticks: 4,
             cast_ticks: 2,
+            per_rank_amount: 0,
             effect: AbilityEffect::Damage {
                 amount: 300,
                 school: DamageSchool::Magic,
@@ -448,6 +532,7 @@ fn duel(mitigation: u16) -> MatchRuntime {
             resource_cost: 5,
             cooldown_ticks: 4,
             cast_ticks: 1,
+            per_rank_amount: 0,
             effect: AbilityEffect::Heal { amount: 150 },
         })
         .expect("mend");
@@ -1055,6 +1140,8 @@ fn lane_match() -> (OneLaneMatch, LaneSpec) {
                 team: TeamId(team),
                 kind: ActorKind::Structure,
                 position: Vec2Mm::new(x, 0),
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
                 stats: stats(400, 0, 0),
                 abilities: vec![],
                 basic_attack: None,
@@ -1071,6 +1158,8 @@ fn lane_match() -> (OneLaneMatch, LaneSpec) {
             team: TeamId(0),
             kind: ActorKind::Hero,
             position: Vec2Mm::new(1_000, 0),
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
             stats: stats(900, 0, 400),
             abilities: vec![],
             basic_attack: Some(BasicAttackSpec {
@@ -1104,12 +1193,14 @@ fn lane_match() -> (OneLaneMatch, LaneSpec) {
         max_alive: 6,
         units: vec![
             WaveUnitSpec {
+                bounty: Bounty::NONE,
                 progress_offset_mm: 0,
                 stats: stats(200, 0, 350),
                 abilities: vec![],
                 basic_attack: None,
             },
             WaveUnitSpec {
+                bounty: Bounty::NONE,
                 progress_offset_mm: -300,
                 stats: stats(200, 0, 350),
                 abilities: vec![],
@@ -1349,6 +1440,7 @@ fn shaped_ability_match() -> MatchRuntime {
             cast_ticks: 0,
             delivery: AbilityDelivery::Instant,
             impact: ImpactShape::Circle { radius_mm: 1_500 },
+            per_rank_amount: 0,
             effect: AbilityEffect::Damage {
                 amount: 250,
                 school: DamageSchool::True,
@@ -1364,6 +1456,7 @@ fn shaped_ability_match() -> MatchRuntime {
             resource_cost: 0,
             cooldown_ticks: 4,
             cast_ticks: 0,
+            per_rank_amount: 0,
             delivery: AbilityDelivery::Projectile {
                 speed_mm_per_tick: 900,
                 hit_radius_mm: 300,
@@ -1394,6 +1487,8 @@ fn shaped_ability_match() -> MatchRuntime {
                 team: TeamId(team),
                 kind: ActorKind::Minion,
                 position: Vec2Mm::new(x, y),
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
                 stats: stats(1_000, 0, 0),
                 abilities: vec![],
                 basic_attack: None,
@@ -1570,6 +1665,183 @@ fn skillshot_can_miss() -> String {
         runtime.actor(NEAR_FOE).expect("near").health == 1_000
             && runtime.actor(FAR_FOE).expect("far").health == 1_000
             && runtime.actor(SIDE_FOE).expect("side").health == 1_000,
+    );
+    rec.finish()
+}
+
+// ---------------------------------------------------------------------------------------------
+// GP-14 match statistics and GP-05 progression
+// ---------------------------------------------------------------------------------------------
+
+const RIFLE: AbilityId = AbilityId(41);
+const COMRADE: ActorId = ActorId(304);
+
+fn progression_match() -> MatchRuntime {
+    let mut runtime = MatchRuntime::new(config(), 0x_9105).expect("config");
+    runtime
+        .register_ability(AbilitySpec {
+            id: RIFLE,
+            aim: AbilityAim::Unit,
+            targeting: AbilityTargeting::Enemy,
+            range_mm: 20_000,
+            resource_cost: 0,
+            cooldown_ticks: 1,
+            cast_ticks: 0,
+            delivery: AbilityDelivery::Instant,
+            impact: ImpactShape::Single,
+            effect: AbilityEffect::Damage {
+                amount: 300,
+                school: DamageSchool::True,
+            },
+            per_rank_amount: 250,
+        })
+        .expect("rifle");
+
+    let growth = StatGrowth {
+        max_health_per_level: 120,
+        max_resource_per_level: 0,
+        move_speed_mm_per_tick_per_level: 10,
+        physical_reduction_bps_per_level: 0,
+        magic_reduction_bps_per_level: 0,
+    };
+    let bounty = Bounty {
+        gold: 300,
+        experience: 600,
+    };
+    for (id, owner, team, x, health) in [
+        (HERO, Some(PLAYER), 0_u8, 0_i32, 2_000_u32),
+        (COMRADE, None, 0, 1_000, 2_000),
+        (FOE, Some(ENEMY_PLAYER), 1, 4_000, 600),
+    ] {
+        let mut spawn = hero(id, owner, team, x, 0);
+        spawn.abilities = vec![RIFLE];
+        spawn.basic_attack = None;
+        spawn.growth = growth;
+        spawn.bounty = bounty;
+        spawn.stats = CombatStats {
+            max_health: health,
+            ..spawn.stats
+        };
+        runtime.spawn_actor(&spawn).expect("hero");
+    }
+    runtime.start().expect("start");
+    runtime
+}
+
+fn shoot(sequence: u32, at: Tick, actor: ActorId, target: ActorId) -> PlayerCommand {
+    PlayerCommand {
+        player: if actor == HERO { PLAYER } else { ENEMY_PLAYER },
+        sequence,
+        execute_at: at,
+        actor,
+        kind: CommandKind::Cast {
+            ability: RIFLE,
+            target: CastTarget::Actor(target),
+        },
+    }
+}
+
+fn kill_bounty_assist_and_shutdown() -> String {
+    let mut rec = Recorder::new(
+        "gp14-kill-assist",
+        "GP-14 \u{b7} a kill pays the killer, the window pays the assister",
+        "An ally who damaged the victim inside the assist window is credited an assist and paid a separately-minted half bounty; the killer's own take is unaffected by the assist existing.",
+    );
+    let mut runtime = progression_match();
+    rec.record(&runtime, &[], "before the fight");
+    rec.note("The COMRADE is a server-owned hero, so it acts through an internal intent rather than a player command.");
+
+    // The ally softens the target first.
+    let frame = runtime
+        .step_with_intents(&[ActorIntent {
+            actor: COMRADE,
+            kind: CommandKind::Cast {
+                ability: RIFLE,
+                target: CastTarget::Actor(FOE),
+            },
+        }])
+        .expect("step");
+    rec.record(&runtime, &frame.events, "ally chips in");
+
+    // The player finishes it, twice, so a streak forms.
+    runtime.submit(shoot(1, 2, HERO, FOE)).expect("accepted");
+    let frame = runtime.step().expect("step");
+    rec.record(&runtime, &frame.events, "player lands the kill");
+
+    let killer = runtime.score(HERO).expect("killer");
+    let assister = runtime.score(COMRADE).expect("assister");
+    let victim = runtime.score(FOE).expect("victim");
+    rec.check("the killing blow took the full bounty", killer.gold == 300);
+    rec.check(
+        "the assister was paid a separately-minted half",
+        assister.gold == 150,
+    );
+    rec.check("the killer is credited one kill", killer.kills == 1);
+    rec.check("the assister is credited one assist", assister.assists == 1);
+    rec.check("the victim is credited one death", victim.deaths == 1);
+    rec.check(
+        "experience was shared with the nearby ally, conserving the pool",
+        runtime.actor(HERO).expect("h").experience + runtime.actor(COMRADE).expect("a").experience
+            == 600,
+    );
+    rec.finish()
+}
+
+fn levelling_ranks_an_ability_and_raises_stats() -> String {
+    let mut rec = Recorder::new(
+        "gp05-levelling",
+        "GP-05 \u{b7} levelling grows stats and buys ability ranks",
+        "Experience raises the level; the level grows the authored base stats through growth (never through a modifier) and grants a point; spending the point raises an ability's rank AND its real magnitude.",
+    );
+    let mut runtime = progression_match();
+    let before = runtime.actor(HERO).expect("hero");
+    rec.record(&runtime, &[], "level 1");
+    rec.note("Rank 2 unlocks at level 3, so the point cannot be spent until the level allows it.");
+
+    runtime.award_experience(HERO, 660).expect("xp");
+    rec.record(&runtime, &[], "level 3 reached");
+    let levelled = runtime.actor(HERO).expect("hero");
+    rec.check("the level rose to 3", levelled.level == 3);
+    rec.check(
+        "max health grew by exactly two levels of growth",
+        levelled.max_health == before.max_health + 240,
+    );
+    rec.check(
+        "growth consumed no modifier budget",
+        runtime.modifiers(HERO).expect("m").is_empty(),
+    );
+    rec.check("levelling did not heal", levelled.health == before.health);
+    rec.check(
+        "two points are unspent",
+        levelled.unspent_ability_points == 2,
+    );
+
+    runtime
+        .submit(PlayerCommand {
+            player: PLAYER,
+            sequence: 1,
+            execute_at: runtime.tick() + 1,
+            actor: HERO,
+            kind: CommandKind::UpgradeAbility { ability: RIFLE },
+        })
+        .expect("accepted");
+    let frame = runtime.step().expect("step");
+    rec.record(&runtime, &frame.events, "point spent on RIFLE");
+    rec.check(
+        "the ability is now rank 2",
+        runtime.ability_rank(HERO, RIFLE) == Some(2),
+    );
+
+    let target_before = runtime.actor(FOE).expect("foe").health;
+    runtime
+        .submit(shoot(2, runtime.tick() + 1, HERO, FOE))
+        .expect("accepted");
+    let frame = runtime.step().expect("step");
+    rec.record(&runtime, &frame.events, "rank-2 shot lands");
+    let dealt = target_before - runtime.actor(FOE).expect("foe").health;
+    rec.check(
+        "the rank-2 shot really hits harder (300 base + 250 per rank)",
+        dealt == 550,
     );
     rec.finish()
 }

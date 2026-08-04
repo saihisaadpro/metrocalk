@@ -10,10 +10,10 @@ use std::time::Instant;
 
 use metrocalk_gameplay::{
     AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
-    ActorIntent, ActorKind, ActorSpawn, BasicAttackSpec, CastTarget, CombatStats, CommandKind,
-    CommandReceipt, CommandRejection, DamageSchool, DeathRule, FrameDigest, ImpactShape,
-    MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, MatchRuntime, PlayerCommand, PlayerId,
-    ServerFrame, TeamId, Vec2Mm, WorldDigest,
+    ActorIntent, ActorKind, ActorSpawn, BasicAttackSpec, Bounty, CastTarget, CombatStats,
+    CommandKind, CommandReceipt, CommandRejection, DamageSchool, DeathRule, FrameDigest,
+    ImpactShape, MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, MatchRuntime,
+    PlayerCommand, PlayerId, ServerFrame, StatGrowth, TeamId, Vec2Mm, WorldDigest,
 };
 
 const RESILIENCE_SEED: u64 = 0x6d6f_6232_5f72_6573;
@@ -87,6 +87,7 @@ fn resilience_runtime() -> MatchRuntime {
             resource_cost: 3,
             cooldown_ticks: 3,
             cast_ticks: 1,
+            per_rank_amount: 0,
             effect: AbilityEffect::Damage {
                 amount: 7,
                 school: DamageSchool::Magic,
@@ -108,6 +109,8 @@ fn resilience_runtime() -> MatchRuntime {
             team: TeamId(0),
             kind: ActorKind::Hero,
             position: Vec2Mm::new(-1_000, 0),
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
             stats: stats(1_000_000, 1_000_000, 37),
             abilities: vec![STRIKE],
             basic_attack: Some(attack),
@@ -119,6 +122,8 @@ fn resilience_runtime() -> MatchRuntime {
             team: TeamId(1),
             kind: ActorKind::Hero,
             position: Vec2Mm::new(1_000, 0),
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
             stats: stats(1_000_000, 1_000_000, 41),
             abilities: vec![STRIKE],
             basic_attack: Some(attack),
@@ -363,6 +368,8 @@ fn full_load_fixture() -> FullLoadFixture {
                 team: TeamId(0),
                 kind: ActorKind::Minion,
                 position: Vec2Mm::new(-400_000, y),
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
                 stats: stats(100, 0, 1),
                 abilities: Vec::new(),
                 basic_attack: None,

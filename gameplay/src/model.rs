@@ -44,6 +44,132 @@ pub const MAX_PROJECTILE_RADIUS_MM: u32 = 100_000;
 /// Same reasoning for an area impact: the overlap test squares this against a `u128` distance.
 pub const MAX_IMPACT_RADIUS_MM: u32 = 1_000_000;
 
+pub const MAX_SCORE_ENTRY_BUDGET: u16 = 64;
+pub const MAX_DAMAGE_CREDITS_PER_ACTOR_BUDGET: u16 = 32;
+pub const MAX_ASSIST_WINDOW_TICKS: u32 = 3_600;
+pub const MAX_PASSIVE_GOLD_PER_100S: u32 = 10_000;
+/// Arithmetic-safety ceiling, not a balance knob — the share test squares this against the `u128`
+/// [`Vec2Mm::squared_distance`], exactly like [`MAX_IMPACT_RADIUS_MM`].
+pub const MAX_XP_SHARE_RADIUS_MM: u32 = 1_000_000;
+pub const MAX_BOUNTY_GOLD: u32 = 10_000;
+pub const MAX_BOUNTY_EXPERIENCE: u32 = 10_000;
+pub const MAX_STAT_GROWTH_PER_LEVEL: u32 = 10_000;
+pub const MAX_ABILITY_PER_RANK_AMOUNT: u32 = 1_000_000;
+pub const MAX_HERO_LEVEL: u8 = 18;
+pub const MAX_ABILITY_RANK: u8 = 5;
+/// `experience_for_level(MAX_HERO_LEVEL)`. Experience past the cap is **not banked**, which is what turns
+/// an otherwise unbounded counter into a quantity a restore audit can actually check.
+pub const EXPERIENCE_CAP: u32 = 18_360;
+/// `streak_gold(10)`. Named because the earned-gold restore relation is derived from it.
+pub const MAX_STREAK_GOLD: u32 = 550;
+
+/// Cumulative experience required to *be* `level`: `10 × (L−1) × (5L + 18)`.
+///
+/// Level 1 costs nothing and level 18 costs 18,360. This is League of Legends' shipped curve, copied
+/// rather than invented so the pacing is a known quantity, and kept closed-form rather than a table so it
+/// needs no authored content and cannot drift from its inverse.
+#[must_use]
+pub const fn experience_for_level(level: u8) -> u32 {
+    let level = if level > MAX_HERO_LEVEL {
+        MAX_HERO_LEVEL
+    } else if level < 1 {
+        1
+    } else {
+        level
+    } as u32;
+    10 * (level - 1) * (5 * level + 18)
+}
+
+/// The exact inverse of [`experience_for_level`]: `L = (isqrt(2x + 529) − 13) / 10`, clamped to `1..=18`.
+///
+/// Integer square root only — no float, no lookup table, no per-tick loop. `level` is therefore **derived**
+/// state: it is never encoded in a checkpoint, so a payload cannot assert a level its own experience does
+/// not produce.
+#[must_use]
+pub fn level_for_experience(experience: u32) -> u8 {
+    let capped = if experience > EXPERIENCE_CAP {
+        EXPERIENCE_CAP
+    } else {
+        experience
+    };
+    let root = integer_sqrt(u128::from(capped) * 2 + 529);
+    let level = u8::try_from((root.saturating_sub(13)) / 10).unwrap_or(MAX_HERO_LEVEL);
+    level.clamp(1, MAX_HERO_LEVEL)
+}
+
+/// Shutdown gold for ending a `streak`-long kill streak: `5x(x + 1)`, zero below three, clamped at ten.
+///
+/// Dota 2's shipped polynomial. Pure multiply/add — no division, so no rounding rule to get wrong.
+#[must_use]
+pub const fn streak_gold(streak: u16) -> u32 {
+    if streak < 3 {
+        return 0;
+    }
+    let streak = if streak > 10 { 10 } else { streak } as u32;
+    5 * streak * (streak + 1)
+}
+
+/// Largest-remainder apportionment of `pool` across `recipients`.
+///
+/// Returns `(base, remainder)`; the caller awards one extra to the first `remainder` recipients **in
+/// ascending `ActorId` order**. Conserving rather than truncating on purpose: it makes "every unit a death
+/// mints is awarded" a statable invariant, where truncation leaves the shortfall invisible.
+#[must_use]
+pub const fn apportion(pool: u32, recipients: u32) -> (u32, u32) {
+    if recipients == 0 {
+        return (0, 0);
+    }
+    (pool / recipients, pool % recipients)
+}
+
+/// Passive gold owed after `elapsed_ticks`, as a closed form of the tick rather than an accumulator.
+///
+/// Being a pure function of the tick is the whole point: there is no running total to drift, to desync
+/// between two runtimes, or to tamper with in a checkpoint — the value is re-derived and compared exactly
+/// on every frame boundary.
+#[must_use]
+pub const fn passive_gold_owed(elapsed_ticks: Tick, config: MatchConfig) -> u32 {
+    let denominator = 100 * config.tick_rate_hz as u64;
+    if denominator == 0 {
+        return 0;
+    }
+    let owed = elapsed_ticks.saturating_mul(config.passive_gold_per_100s as u64) / denominator;
+    // Clamped first, so the narrowing below is exact rather than a truncation.
+    if owed > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the branch above proves the value fits"
+        )]
+        {
+            owed as u32
+        }
+    }
+}
+
+pub(crate) fn integer_sqrt(value: u128) -> u128 {
+    if value < 2 {
+        return value;
+    }
+    let mut estimate = value;
+    let mut next = estimate.div_ceil(2);
+    while next < estimate {
+        estimate = next;
+        next = u128::midpoint(estimate, value / estimate);
+    }
+    estimate
+}
+
+pub(crate) fn integer_sqrt_ceil(value: u128) -> u128 {
+    let floor = integer_sqrt(value);
+    if floor * floor == value {
+        floor
+    } else {
+        floor + 1
+    }
+}
+
 macro_rules! id_type {
     ($name:ident, $inner:ty, $description:literal) => {
         #[doc = $description]
@@ -185,6 +311,59 @@ impl CombatStats {
     ///
     /// Division truncates toward zero. Every intermediate is `i64`, which cannot overflow for `u32` bases
     /// and basis-point multipliers, and saturating arithmetic backstops the impossible case.
+    /// Authored stats grown to `level`.
+    ///
+    /// Level 1 is the identity — which is both the semantics (level 1 *is* the authored hero) and the fast
+    /// path the frame-boundary audit needs, since every minion, structure, objective and pet in a match is
+    /// permanently level 1 and would otherwise pay for five saturating multiplies per actor per tick.
+    ///
+    /// Growth is clamped into the same [`StatKind::domain`] bounds as modifiers, so no stack of growth can
+    /// reach 100 % mitigation any more than a stack of buffs can.
+    #[must_use]
+    pub fn with_growth(self, growth: StatGrowth, level: u8) -> Self {
+        if level <= 1 {
+            return self;
+        }
+        let steps = u64::from(level - 1);
+        let grow = |base: u32, per_level: u32, kind: StatKind| -> u32 {
+            let (minimum, maximum) = kind.domain();
+            let raised = u64::from(base).saturating_add(u64::from(per_level).saturating_mul(steps));
+            let clamped = i64::try_from(raised)
+                .unwrap_or(i64::MAX)
+                .clamp(minimum, maximum);
+            u32::try_from(clamped).unwrap_or(0)
+        };
+        Self {
+            max_health: grow(
+                self.max_health,
+                growth.max_health_per_level,
+                StatKind::MaxHealth,
+            ),
+            max_resource: grow(
+                self.max_resource,
+                growth.max_resource_per_level,
+                StatKind::MaxResource,
+            ),
+            move_speed_mm_per_tick: grow(
+                self.move_speed_mm_per_tick,
+                growth.move_speed_mm_per_tick_per_level,
+                StatKind::MoveSpeed,
+            ),
+            physical_reduction_bps: u16::try_from(grow(
+                u32::from(self.physical_reduction_bps),
+                u32::from(growth.physical_reduction_bps_per_level),
+                StatKind::PhysicalReduction,
+            ))
+            .unwrap_or(BASIS_POINTS - 1),
+            magic_reduction_bps: u16::try_from(grow(
+                u32::from(self.magic_reduction_bps),
+                u32::from(growth.magic_reduction_bps_per_level),
+                StatKind::MagicReduction,
+            ))
+            .unwrap_or(BASIS_POINTS - 1),
+        }
+    }
+
     #[must_use]
     pub fn with_modifiers(self, modifiers: &[StatModifier]) -> Self {
         Self {
@@ -209,6 +388,101 @@ impl CombatStats {
             .unwrap_or(BASIS_POINTS - 1),
         }
     }
+}
+
+/// What killing this actor is worth.
+///
+/// Authored on the spawn and carried immutably on the actor, rather than looked up through
+/// [`ActorProvenance`]: `Authored` provenance carries no content anchor at all and `Dynamic` carries only
+/// an ordinal, so a provenance lookup would work for wave minions and for no hero, tower, or objective in
+/// the crate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bounty {
+    pub gold: u32,
+    pub experience: u32,
+}
+
+impl Bounty {
+    pub const NONE: Self = Self {
+        gold: 0,
+        experience: 0,
+    };
+
+    pub(crate) const fn validate(self) -> Result<(), RuntimeError> {
+        if self.gold > MAX_BOUNTY_GOLD || self.experience > MAX_BOUNTY_EXPERIENCE {
+            return Err(RuntimeError::InvalidActor(
+                "bounty exceeds its hard ceiling",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-level stat growth, applied as `authored + growth × (level − 1)`.
+///
+/// Growth is authored and immutable, so the stats a level produces stay **re-derivable** from data a
+/// checkpoint cannot forge — which is what lets `base_stats` be a derived cache rather than a mutable
+/// number a tampered payload could assert freely.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatGrowth {
+    pub max_health_per_level: u32,
+    pub max_resource_per_level: u32,
+    pub move_speed_mm_per_tick_per_level: u32,
+    pub physical_reduction_bps_per_level: u16,
+    pub magic_reduction_bps_per_level: u16,
+}
+
+impl StatGrowth {
+    pub const NONE: Self = Self {
+        max_health_per_level: 0,
+        max_resource_per_level: 0,
+        move_speed_mm_per_tick_per_level: 0,
+        physical_reduction_bps_per_level: 0,
+        magic_reduction_bps_per_level: 0,
+    };
+
+    pub(crate) const fn validate(self) -> Result<(), RuntimeError> {
+        if self.max_health_per_level > MAX_STAT_GROWTH_PER_LEVEL
+            || self.max_resource_per_level > MAX_STAT_GROWTH_PER_LEVEL
+            || self.move_speed_mm_per_tick_per_level > MAX_STAT_GROWTH_PER_LEVEL
+            || self.physical_reduction_bps_per_level as u32 > MAX_STAT_GROWTH_PER_LEVEL
+            || self.magic_reduction_bps_per_level as u32 > MAX_STAT_GROWTH_PER_LEVEL
+        {
+            return Err(RuntimeError::InvalidActor(
+                "stat growth exceeds its hard ceiling",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read-only projection of one scoreboard line.
+///
+/// A line is opened for every hero and is **never removed**, so it outlives an actor that despawns. That is
+/// the point: a scoreboard whose rows vanish when a body does cannot report the match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScoreView {
+    pub actor: ActorId,
+    pub owner: Option<PlayerId>,
+    pub team: TeamId,
+    /// Earned plus passive. The two are stored separately for tamper resistance, not for the client.
+    pub gold: u32,
+    pub kills: u32,
+    pub deaths: u32,
+    pub assists: u32,
+    pub kill_streak: u16,
+    pub best_kill_streak: u16,
+}
+
+/// Why gold was granted.
+///
+/// Passive income is deliberately absent: it is exactly derivable from the tick and the config, so an
+/// event per hero per accrual would be pure noise on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoldReason {
+    Kill,
+    Shutdown,
+    Assist,
 }
 
 /// One resolvable actor attribute. Every variant maps to exactly one [`CombatStats`] field.
@@ -501,6 +775,12 @@ pub struct AbilitySpec {
     pub delivery: AbilityDelivery,
     pub impact: ImpactShape,
     pub effect: AbilityEffect,
+    /// Added to the effect magnitude for each rank above the first.
+    ///
+    /// The magnitude is resolved **when the cast lands or the projectile launches**, never re-read later.
+    /// That is what keeps a rank-up from retroactively rewriting a missile already in the air, which would
+    /// contradict the "decided at launch" contract the projectile is built on.
+    pub per_rank_amount: u32,
 }
 
 impl AbilitySpec {
@@ -529,7 +809,21 @@ impl AbilitySpec {
             delivery: AbilityDelivery::Instant,
             impact: ImpactShape::Single,
             effect,
+            per_rank_amount: 0,
         }
+    }
+
+    /// The effect magnitude this ability produces at `rank`.
+    ///
+    /// Saturating rather than wrapping, and bounded by the authored per-rank ceiling, so a maxed ability
+    /// cannot overflow into a trivial number.
+    #[must_use]
+    pub fn amount_at_rank(self, rank: u8) -> u32 {
+        let base = match self.effect {
+            AbilityEffect::Damage { amount, .. } | AbilityEffect::Heal { amount } => amount,
+        };
+        let steps = u32::from(rank.saturating_sub(1));
+        base.saturating_add(self.per_rank_amount.saturating_mul(steps))
     }
 
     pub(crate) fn validate(self) -> Result<(), RuntimeError> {
@@ -593,6 +887,12 @@ impl AbilitySpec {
                     "an area impact radius must be positive and within the arithmetic safety ceiling",
                 ));
             }
+        }
+        if self.per_rank_amount > MAX_ABILITY_PER_RANK_AMOUNT {
+            return Err(RuntimeError::InvalidAbility(
+                self.id,
+                "per-rank magnitude exceeds its hard ceiling",
+            ));
         }
         Ok(())
     }
@@ -685,6 +985,8 @@ pub struct ActorSpawn {
     pub kind: ActorKind,
     pub position: Vec2Mm,
     pub stats: CombatStats,
+    pub growth: StatGrowth,
+    pub bounty: Bounty,
     pub abilities: Vec<AbilityId>,
     pub basic_attack: Option<BasicAttackSpec>,
     pub death_rule: DeathRule,
@@ -698,6 +1000,8 @@ pub struct DynamicActorSpawn {
     pub kind: ActorKind,
     pub position: Vec2Mm,
     pub stats: CombatStats,
+    pub growth: StatGrowth,
+    pub bounty: Bounty,
     pub abilities: Vec<AbilityId>,
     pub basic_attack: Option<BasicAttackSpec>,
     pub death_rule: DeathRule,
@@ -723,6 +1027,14 @@ pub struct MatchConfig {
     pub max_modifiers_per_actor: u16,
     pub max_status_effects_per_actor: u16,
     pub max_projectiles: u16,
+    pub max_score_entries: u16,
+    pub max_damage_credits_per_actor: u16,
+    pub assist_window_ticks: u32,
+    pub xp_share_radius_mm: u32,
+    pub passive_gold_per_100s: u32,
+    // New budgets are inserted BEFORE this field on purpose: `truncation_and_both_size_ceilings_fail_closed`
+    // locates the checkpoint-byte ceiling by walking `encode_config` and subtracting four, on the stated
+    // premise that this is the last field written. Appending after it silently retargets that test.
     pub max_checkpoint_bytes: u32,
 }
 
@@ -752,6 +1064,14 @@ impl MatchConfig {
             max_modifiers_per_actor: 16,
             max_status_effects_per_actor: 8,
             max_projectiles: 64,
+            max_score_entries: 16,
+            max_damage_credits_per_actor: 8,
+            // 15 s at 30 Hz - League of Legends' documented Summoner's Rift assist window, the only such
+            // duration any source states numerically.
+            assist_window_ticks: 450,
+            xp_share_radius_mm: 8_000,
+            // 20.4 gold per 10 s, League's shipped base income, expressed per 100 s to stay integral.
+            passive_gold_per_100s: 204,
             max_checkpoint_bytes: 4 * 1024 * 1024,
         }
     }
@@ -778,6 +1098,12 @@ impl MatchConfig {
             || self.max_modifiers_per_actor == 0
             || self.max_status_effects_per_actor == 0
             || self.max_projectiles == 0
+            || self.max_score_entries == 0
+            || self.max_damage_credits_per_actor == 0
+            || self.assist_window_ticks == 0
+            || self.xp_share_radius_mm == 0
+            // `passive_gold_per_100s` is deliberately NOT in this chain: zero passive income is a
+            // legitimate profile, and folding it in would make an income stream silently mandatory.
             || self.max_checkpoint_bytes == 0
         {
             return Err(RuntimeError::InvalidConfig(
@@ -803,6 +1129,11 @@ impl MatchConfig {
             || self.max_modifiers_per_actor > MAX_MODIFIERS_PER_ACTOR_BUDGET
             || self.max_status_effects_per_actor > MAX_STATUS_EFFECTS_PER_ACTOR_BUDGET
             || self.max_projectiles > MAX_PROJECTILE_BUDGET
+            || self.max_score_entries > MAX_SCORE_ENTRY_BUDGET
+            || self.max_damage_credits_per_actor > MAX_DAMAGE_CREDITS_PER_ACTOR_BUDGET
+            || self.assist_window_ticks > MAX_ASSIST_WINDOW_TICKS
+            || self.xp_share_radius_mm > MAX_XP_SHARE_RADIUS_MM
+            || self.passive_gold_per_100s > MAX_PASSIVE_GOLD_PER_100S
         {
             return Err(RuntimeError::InvalidConfig(
                 "target profile exceeds a hard decoded-state budget",
@@ -888,6 +1219,10 @@ pub enum RuntimeError {
     InvalidInternalIntents(&'static str),
     MatchDurationExceeded,
     TickOverflow,
+    ScoreBudgetExceeded,
+    UnknownScoreEntry(ActorId),
+    InvalidAbilityRank(&'static str),
+    InvalidProgression(&'static str),
 }
 
 impl Display for RuntimeError {
@@ -927,6 +1262,16 @@ impl Display for RuntimeError {
                 formatter.write_str("maximum authoritative match duration reached")
             }
             Self::TickOverflow => formatter.write_str("authoritative tick overflow"),
+            Self::ScoreBudgetExceeded => formatter.write_str("scoreboard entry budget exceeded"),
+            Self::UnknownScoreEntry(id) => {
+                write!(formatter, "no scoreboard entry for actor {}", id.get())
+            }
+            Self::InvalidAbilityRank(reason) => {
+                write!(formatter, "invalid ability rank: {reason}")
+            }
+            Self::InvalidProgression(reason) => {
+                write!(formatter, "invalid progression: {reason}")
+            }
         }
     }
 }

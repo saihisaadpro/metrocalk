@@ -1,11 +1,11 @@
 use crate::{
     AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
-    ActorIntent, ActorKind, ActorProvenance, ActorSpawn, BasicAttackSpec, CastTarget, CombatStats,
-    CommandKind, CommandRejectReason, ContentId, ControlKind, DamageCause, DamageSchool, DeathRule,
-    DynamicActorProvenance, DynamicActorSpawn, ImpactShape, MatchConfig, MatchEndReason,
-    MatchEvent, MatchOutcome, MatchPhase, MatchRuntime, ModifierOp, PlayerCommand, PlayerId,
-    RuntimeError, Scenario, ScenarioFinish, ScenarioSubmission, StatKind, TeamId, Vec2Mm,
-    BASIS_POINTS,
+    ActorIntent, ActorKind, ActorProvenance, ActorSpawn, BasicAttackSpec, Bounty, CastTarget,
+    CombatStats, CommandKind, CommandRejectReason, ContentId, ControlKind, DamageCause,
+    DamageSchool, DeathRule, DynamicActorProvenance, DynamicActorSpawn, ImpactShape, MatchConfig,
+    MatchEndReason, MatchEvent, MatchOutcome, MatchPhase, MatchRuntime, ModifierOp, PlayerCommand,
+    PlayerId, RuntimeError, Scenario, ScenarioFinish, ScenarioSubmission, StatGrowth, StatKind,
+    TeamId, Vec2Mm, BASIS_POINTS,
 };
 
 const PLAYER_ONE: PlayerId = PlayerId(1);
@@ -41,6 +41,8 @@ fn hero(
         team,
         kind: ActorKind::Hero,
         position,
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
         stats: stats(health, 100, 100),
         abilities,
         basic_attack: None,
@@ -59,6 +61,7 @@ const fn strike() -> AbilitySpec {
         resource_cost: 20,
         cooldown_ticks: 5,
         cast_ticks: 1,
+        per_rank_amount: 0,
         effect: AbilityEffect::Damage {
             amount: 600,
             school: DamageSchool::True,
@@ -77,6 +80,7 @@ const fn heal() -> AbilitySpec {
         resource_cost: 10,
         cooldown_ticks: 3,
         cast_ticks: 0,
+        per_rank_amount: 0,
         effect: AbilityEffect::Heal { amount: 100 },
     }
 }
@@ -352,6 +356,8 @@ fn modifier_runtime() -> MatchRuntime {
             team: TeamId(0),
             kind: ActorKind::Hero,
             position: Vec2Mm::new(0, 0),
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
             stats: CombatStats {
                 max_health: 1_000,
                 max_resource: 100,
@@ -1135,6 +1141,7 @@ fn terminal_tick_cancels_due_respawn_and_remains_checkpointable() {
             resource_cost: 0,
             cooldown_ticks: 1,
             cast_ticks: 0,
+            per_rank_amount: 0,
             effect: AbilityEffect::Damage {
                 amount: 1_000,
                 school: DamageSchool::True,
@@ -1148,6 +1155,8 @@ fn terminal_tick_cancels_due_respawn_and_remains_checkpointable() {
             team: TeamId(0),
             kind: ActorKind::Hero,
             position: Vec2Mm::new(0, 0),
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
             stats: stats(1_000, 0, 0),
             abilities: vec![LETHAL],
             basic_attack: None,
@@ -1161,6 +1170,8 @@ fn terminal_tick_cancels_due_respawn_and_remains_checkpointable() {
             team: TeamId(1),
             kind: ActorKind::Hero,
             position: Vec2Mm::new(100, 0),
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
             stats: stats(100, 0, 0),
             abilities: Vec::new(),
             basic_attack: None,
@@ -1259,6 +1270,7 @@ fn initial_baseline_then_actor_level_delta_is_not_a_full_world_copy() {
 #[test]
 fn physical_damage_uses_integer_basis_point_mitigation() {
     let ability = AbilitySpec {
+        per_rank_amount: 0,
         effect: AbilityEffect::Damage {
             amount: 500,
             school: DamageSchool::Physical,
@@ -1803,10 +1815,12 @@ fn mixed_same_tick_health_effects_do_not_make_actor_ids_initiative() {
     fn run(healer_id: ActorId, damager_id: ActorId) -> (bool, usize) {
         let instant_strike = AbilitySpec {
             cast_ticks: 1,
+            per_rank_amount: 0,
             ..strike()
         };
         let delayed_heal = AbilitySpec {
             cast_ticks: 1,
+            per_rank_amount: 0,
             ..heal()
         };
         let target_id = ActorId(900);
@@ -1893,6 +1907,7 @@ fn accepted_command_execution_rejection_is_never_dropped_by_ingress_cap() {
     };
     let instant_strike = AbilitySpec {
         cast_ticks: 0,
+        per_rank_amount: 0,
         ..strike()
     };
     let mut runtime = MatchRuntime::new(config, 11).unwrap();
@@ -1970,6 +1985,7 @@ fn commands_and_casts_cannot_cross_match_duration() {
     };
     let long_cast = AbilitySpec {
         cast_ticks: 2,
+        per_rank_amount: 0,
         ..strike()
     };
     let mut runtime = MatchRuntime::new(config, 12).unwrap();
@@ -2412,6 +2428,8 @@ fn simultaneous_terminal_towers_produce_an_objective_draw() {
         team: TeamId(0),
         kind: ActorKind::Structure,
         position: Vec2Mm::new(900, 0),
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
         stats: stats(600, 0, 0),
         abilities: vec![],
         basic_attack: None,
@@ -2423,6 +2441,8 @@ fn simultaneous_terminal_towers_produce_an_objective_draw() {
         team: TeamId(1),
         kind: ActorKind::Structure,
         position: Vec2Mm::new(100, 0),
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
         stats: stats(600, 0, 0),
         abilities: vec![],
         basic_attack: None,
@@ -2597,6 +2617,8 @@ fn dead_minions_are_removed_from_replication() {
         team: TeamId(1),
         kind: ActorKind::Minion,
         position: Vec2Mm::new(100, 0),
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
         stats: stats(600, 0, 100),
         abilities: vec![],
         basic_attack: None,
@@ -2654,6 +2676,8 @@ fn internal_bot_intents_are_canonical_and_do_not_require_players() {
             team: TeamId(team),
             kind: ActorKind::Minion,
             position: Vec2Mm::new(x, 0),
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
             stats: stats(100, 0, 0),
             abilities: vec![],
             basic_attack: Some(attack),
@@ -2734,6 +2758,8 @@ fn dynamic_actor_ids_are_monotonic_and_replication_is_explicit() {
         team: TeamId(1),
         kind: ActorKind::Minion,
         position: Vec2Mm::new(1_000, 0),
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
         stats: stats(100, 0, 100),
         abilities: vec![],
         basic_attack: None,
@@ -2799,6 +2825,7 @@ const fn burst() -> AbilitySpec {
         cast_ticks: 0,
         delivery: AbilityDelivery::Instant,
         impact: ImpactShape::Circle { radius_mm: 1_500 },
+        per_rank_amount: 0,
         effect: AbilityEffect::Damage {
             amount: 300,
             school: DamageSchool::True,
@@ -2816,6 +2843,7 @@ const fn lance(id: AbilityId, speed_mm_per_tick: u32, amount: u32) -> AbilitySpe
         resource_cost: 0,
         cooldown_ticks: 1,
         cast_ticks: 0,
+        per_rank_amount: 0,
         delivery: AbilityDelivery::Projectile {
             speed_mm_per_tick,
             hit_radius_mm: 200,
@@ -2838,6 +2866,7 @@ const fn bomb() -> AbilitySpec {
         resource_cost: 0,
         cooldown_ticks: 1,
         cast_ticks: 0,
+        per_rank_amount: 0,
         delivery: AbilityDelivery::Projectile {
             speed_mm_per_tick: 1_000,
             hit_radius_mm: 200,
@@ -2860,6 +2889,7 @@ const fn rail() -> AbilitySpec {
         resource_cost: 0,
         cooldown_ticks: 1,
         cast_ticks: 0,
+        per_rank_amount: 0,
         delivery: AbilityDelivery::Projectile {
             speed_mm_per_tick: 5_000,
             hit_radius_mm: 100,
@@ -2895,6 +2925,8 @@ fn minion(id: ActorId, team: TeamId, position: Vec2Mm, health: u32) -> ActorSpaw
         team,
         kind: ActorKind::Minion,
         position,
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
         stats: stats(health, 0, 0),
         abilities: Vec::new(),
         basic_attack: None,
@@ -3636,6 +3668,7 @@ fn contradictory_ability_shapes_are_refused_at_authoring_time() {
         resource_cost: 0,
         cooldown_ticks: 1,
         cast_ticks: 0,
+        per_rank_amount: 0,
         delivery: AbilityDelivery::Instant,
         impact: ImpactShape::Circle { radius_mm: 500 },
         effect: damage,
@@ -3847,6 +3880,36 @@ fn every_match_event_has_a_distinct_digest_tag() {
             projectile: crate::ProjectileId(1),
             reason: CommandRejectReason::MatchNotActive,
         },
+        MatchEvent::KillCredited {
+            killer: HERO_ONE,
+            victim: HERO_TWO,
+            streak_after: 1,
+        },
+        MatchEvent::AssistCredited {
+            actor: HERO_ONE,
+            victim: HERO_TWO,
+        },
+        MatchEvent::GoldGranted {
+            actor: HERO_ONE,
+            amount: 1,
+            reason: crate::GoldReason::Kill,
+            total_after: 1,
+        },
+        MatchEvent::ExperienceGranted {
+            actor: HERO_ONE,
+            amount: 1,
+            total_after: 1,
+        },
+        MatchEvent::HeroLevelUp {
+            actor: HERO_ONE,
+            level: 2,
+            unspent_ability_points: 1,
+        },
+        MatchEvent::AbilityRankUp {
+            actor: HERO_ONE,
+            ability: STRIKE,
+            rank: 2,
+        },
     ];
     let mut tags: Vec<u8> = events
         .iter()
@@ -3904,4 +3967,1137 @@ fn an_area_impact_skips_a_dead_actor() {
     let frame = runtime.step().unwrap();
     assert_eq!(frame.tick, 3);
     assert_eq!(damaged_targets(&frame), vec![MINION_TWO]);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// GP-05 progression and GP-14 match statistics.
+//
+// The arithmetic tests pin exact published values so a later "simplification" cannot quietly change the
+// pacing of the game. The behavioural tests drive the public command surface and read the public
+// scoreboard, never the private tables.
+// ---------------------------------------------------------------------------------------------------
+
+const ALPHA: ActorId = ActorId(501);
+const BRAVO: ActorId = ActorId(502);
+const CHARLIE: ActorId = ActorId(503);
+const DELTA: ActorId = ActorId(504);
+const TOWER: ActorId = ActorId(505);
+const SNIPE_ID: AbilityId = AbilityId(31);
+const NOVA: AbilityId = AbilityId(32);
+
+const HERO_GROWTH: StatGrowth = StatGrowth {
+    max_health_per_level: 100,
+    max_resource_per_level: 20,
+    move_speed_mm_per_tick_per_level: 5,
+    physical_reduction_bps_per_level: 0,
+    magic_reduction_bps_per_level: 0,
+};
+const HERO_BOUNTY: Bounty = Bounty {
+    gold: 300,
+    experience: 400,
+};
+
+/// A long-range single-target instant, cheap and off cooldown, used to land exact damage on demand.
+const fn marksman(amount: u32, per_rank_amount: u32) -> AbilitySpec {
+    AbilitySpec {
+        id: SNIPE_ID,
+        aim: AbilityAim::Unit,
+        targeting: AbilityTargeting::Enemy,
+        range_mm: 50_000,
+        resource_cost: 0,
+        cooldown_ticks: 1,
+        cast_ticks: 0,
+        delivery: AbilityDelivery::Instant,
+        impact: ImpactShape::Single,
+        effect: AbilityEffect::Damage {
+            amount,
+            school: DamageSchool::True,
+        },
+        per_rank_amount,
+    }
+}
+
+/// A point-aimed projectile, so the launch-captured magnitude can be observed separately from the spec.
+const fn nova(amount: u32, per_rank_amount: u32) -> AbilitySpec {
+    AbilitySpec {
+        id: NOVA,
+        aim: AbilityAim::Point,
+        targeting: AbilityTargeting::Enemy,
+        range_mm: 20_000,
+        resource_cost: 0,
+        cooldown_ticks: 1,
+        cast_ticks: 0,
+        delivery: AbilityDelivery::Projectile {
+            speed_mm_per_tick: 1_000,
+            hit_radius_mm: 400,
+        },
+        impact: ImpactShape::Single,
+        effect: AbilityEffect::Damage {
+            amount,
+            school: DamageSchool::True,
+        },
+        per_rank_amount,
+    }
+}
+
+fn progression_hero(
+    id: ActorId,
+    owner: PlayerId,
+    team: TeamId,
+    position: Vec2Mm,
+    health: u32,
+    abilities: Vec<AbilityId>,
+) -> ActorSpawn {
+    ActorSpawn {
+        growth: HERO_GROWTH,
+        bounty: HERO_BOUNTY,
+        ..hero(id, owner, team, position, health, abilities)
+    }
+}
+
+/// Two team-0 heroes and one frail team-1 hero, all inside the default XP share radius.
+fn arena() -> MatchRuntime {
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x9105).unwrap();
+    runtime.register_ability(marksman(400, 250)).unwrap();
+    runtime.register_ability(nova(300, 200)).unwrap();
+    runtime
+        .spawn_actor(&progression_hero(
+            ALPHA,
+            PLAYER_ONE,
+            TeamId(0),
+            Vec2Mm::new(0, 0),
+            2_000,
+            vec![SNIPE_ID, NOVA],
+        ))
+        .unwrap();
+    runtime
+        .spawn_actor(&progression_hero(
+            CHARLIE,
+            PLAYER_THREE,
+            TeamId(0),
+            Vec2Mm::new(1_000, 0),
+            2_000,
+            vec![SNIPE_ID],
+        ))
+        .unwrap();
+    runtime
+        .spawn_actor(&progression_hero(
+            BRAVO,
+            PLAYER_TWO,
+            TeamId(1),
+            Vec2Mm::new(3_000, 0),
+            600,
+            vec![SNIPE_ID],
+        ))
+        .unwrap();
+    runtime
+}
+
+fn cast_on(
+    player: PlayerId,
+    sequence: u32,
+    execute_at: u64,
+    actor: ActorId,
+    target: ActorId,
+) -> PlayerCommand {
+    command(
+        player,
+        sequence,
+        execute_at,
+        actor,
+        CommandKind::Cast {
+            ability: SNIPE_ID,
+            target: CastTarget::Actor(target),
+        },
+    )
+}
+
+// --- Arithmetic -------------------------------------------------------------------------------------
+
+#[test]
+fn the_experience_curve_matches_its_published_table_and_inverts_exactly() {
+    // League of Legends' shipped cumulative table, pinned value by value so a rewrite of the closed form
+    // cannot silently re-pace the whole game.
+    let table = [
+        (1_u8, 0_u32),
+        (2, 280),
+        (3, 660),
+        (4, 1_140),
+        (5, 1_720),
+        (6, 2_400),
+        (7, 3_180),
+        (8, 4_060),
+        (9, 5_040),
+        (10, 6_120),
+        (11, 7_300),
+        (12, 8_580),
+        (13, 9_960),
+        (14, 11_440),
+        (15, 13_020),
+        (16, 14_700),
+        (17, 16_480),
+        (18, 18_360),
+    ];
+    for (level, cumulative) in table {
+        assert_eq!(
+            crate::experience_for_level(level),
+            cumulative,
+            "cumulative experience for level {level}"
+        );
+        // The inverse must flip at exactly the boundary, not one either side of it.
+        assert_eq!(crate::level_for_experience(cumulative), level);
+        if cumulative > 0 {
+            assert_eq!(crate::level_for_experience(cumulative - 1), level - 1);
+        }
+    }
+    assert_eq!(crate::EXPERIENCE_CAP, 18_360);
+    assert_eq!(
+        crate::level_for_experience(u32::MAX),
+        crate::MAX_HERO_LEVEL,
+        "experience past the cap must not roll the level over"
+    );
+}
+
+#[test]
+fn streak_gold_matches_its_published_table() {
+    assert_eq!(crate::streak_gold(0), 0);
+    assert_eq!(crate::streak_gold(2), 0, "a shutdown starts at a 3-streak");
+    for (streak, gold) in [
+        (3_u16, 60_u32),
+        (4, 100),
+        (5, 150),
+        (6, 210),
+        (7, 280),
+        (8, 360),
+        (9, 450),
+        (10, 550),
+    ] {
+        assert_eq!(crate::streak_gold(streak), gold);
+    }
+    assert_eq!(
+        crate::streak_gold(50),
+        crate::MAX_STREAK_GOLD,
+        "the bounty is clamped, not unbounded"
+    );
+}
+
+#[test]
+fn apportionment_conserves_the_pool_where_truncation_would_lose_it() {
+    for pool in 0_u32..40 {
+        for recipients in 1_u32..7 {
+            let (base, remainder) = crate::apportion(pool, recipients);
+            let awarded: u32 = (0..recipients)
+                .map(|index| base + u32::from(index < remainder))
+                .sum();
+            assert_eq!(awarded, pool, "pool {pool} across {recipients}");
+            let smallest = base;
+            let largest = base + u32::from(remainder > 0);
+            assert!(largest - smallest <= 1, "shares differ by more than one");
+        }
+    }
+    // Negative control: the case this exists for. Plain truncation destroys two units of the pool, so the
+    // conservation assertion above is a real property and not a restatement of integer division.
+    let (base, _) = crate::apportion(10, 3);
+    assert_eq!(base * 3, 9);
+    assert_ne!(base * 3, 10);
+}
+
+#[test]
+fn passive_gold_is_drift_free_where_a_naive_accumulator_is_not() {
+    let config = MatchConfig::default();
+    let elapsed = 30 * 60 * 20; // twenty minutes at 30 Hz.
+    let closed_form = crate::passive_gold_owed(elapsed, config);
+    assert_eq!(
+        closed_form,
+        u32::try_from(
+            elapsed * u64::from(config.passive_gold_per_100s)
+                / (100 * u64::from(config.tick_rate_hz))
+        )
+        .unwrap()
+    );
+
+    // Negative control: the per-tick accumulator this closed form replaces. Integer division truncates to
+    // zero every tick, so it pays nothing at all - which is exactly the drift the closed form prevents.
+    let mut naive = 0_u32;
+    for _ in 0..elapsed {
+        naive += config.passive_gold_per_100s / (100 * u32::from(config.tick_rate_hz));
+    }
+    assert_ne!(naive, closed_form);
+    assert_eq!(naive, 0);
+    assert!(closed_form > 0);
+}
+
+// --- Attribution ------------------------------------------------------------------------------------
+
+#[test]
+fn the_killing_blow_takes_the_bounty_and_the_window_takes_the_assists() {
+    let mut runtime = arena();
+    runtime.start().unwrap();
+
+    // CHARLIE softens BRAVO first, ALPHA lands the kill. Both are inside the assist window.
+    runtime
+        .submit(cast_on(PLAYER_THREE, 1, 1, CHARLIE, BRAVO))
+        .unwrap();
+    runtime.step().unwrap();
+    runtime
+        .submit(cast_on(PLAYER_ONE, 1, 3, ALPHA, BRAVO))
+        .unwrap();
+    runtime.step().unwrap();
+    let frame = runtime.step().unwrap();
+
+    assert!(frame.events.iter().any(
+        |event| matches!(event, MatchEvent::ActorDied { actor, killer }
+            if *actor == BRAVO && *killer == ALPHA)
+    ));
+    let assists: Vec<ActorId> = frame
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            MatchEvent::AssistCredited { actor, .. } => Some(*actor),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assists,
+        vec![CHARLIE],
+        "the killer is never its own assister"
+    );
+
+    let killer = runtime.score(ALPHA).unwrap();
+    let assister = runtime.score(CHARLIE).unwrap();
+    let victim = runtime.score(BRAVO).unwrap();
+    assert_eq!(killer.kills, 1);
+    assert_eq!(killer.kill_streak, 1);
+    assert_eq!(assister.assists, 1);
+    assert_eq!(victim.deaths, 1);
+    assert_eq!(victim.kill_streak, 0);
+    // 300 bounty to the killer; half of it minted separately for the single assister.
+    assert_eq!(killer.gold, 300);
+    assert_eq!(assister.gold, 150);
+    // Minted, not deducted: the killer's take is unaffected by the assist existing.
+    assert_eq!(killer.gold + assister.gold, 450);
+}
+
+#[test]
+fn an_overkill_entry_does_not_earn_an_assist() {
+    let mut runtime = arena();
+    // BRAVO must die to the FIRST entry in the batch, so the second one genuinely applies nothing. With a
+    // victim that survives the first hit there is no overkill entry and the test proves nothing.
+    let index = runtime.actors.iter().position(|a| a.id == BRAVO).unwrap();
+    runtime.actors[index].health = 300;
+    runtime.start().unwrap();
+    // Both land on the same tick. The first is lethal, so the second applies zero and must credit nobody.
+    runtime
+        .submit(cast_on(PLAYER_ONE, 1, 1, ALPHA, BRAVO))
+        .unwrap();
+    runtime
+        .submit(cast_on(PLAYER_THREE, 1, 1, CHARLIE, BRAVO))
+        .unwrap();
+    let frame = runtime.step().unwrap();
+
+    let zero_damage = frame.events.iter().any(|event| {
+        matches!(event, MatchEvent::DamageApplied { target, amount, .. }
+            if *target == BRAVO && *amount == 0)
+    });
+    assert!(
+        zero_damage,
+        "this fixture only proves the gate if an overkill entry really is emitted"
+    );
+    assert!(
+        !frame
+            .events
+            .iter()
+            .any(|event| matches!(event, MatchEvent::AssistCredited { .. })),
+        "an entry that applied nothing must not buy an assist"
+    );
+    assert_eq!(runtime.score(CHARLIE).unwrap().assists, 0);
+}
+
+#[test]
+fn the_assist_window_closes_at_exactly_the_authored_tick() {
+    fn run(gap: u64) -> u32 {
+        let config = MatchConfig {
+            assist_window_ticks: 10,
+            ..MatchConfig::default()
+        };
+        let mut runtime = MatchRuntime::new(config, 5).unwrap();
+        runtime.register_ability(marksman(100, 0)).unwrap();
+        for spawn in [
+            progression_hero(
+                ALPHA,
+                PLAYER_ONE,
+                TeamId(0),
+                Vec2Mm::new(0, 0),
+                2_000,
+                vec![SNIPE_ID],
+            ),
+            progression_hero(
+                CHARLIE,
+                PLAYER_THREE,
+                TeamId(0),
+                Vec2Mm::new(1_000, 0),
+                2_000,
+                vec![SNIPE_ID],
+            ),
+            progression_hero(
+                BRAVO,
+                PLAYER_TWO,
+                TeamId(1),
+                Vec2Mm::new(3_000, 0),
+                150,
+                vec![],
+            ),
+        ] {
+            runtime.spawn_actor(&spawn).unwrap();
+        }
+        runtime.start().unwrap();
+        // CHARLIE contributes on tick 1, ALPHA kills on tick 1 + gap.
+        runtime
+            .submit(cast_on(PLAYER_THREE, 1, 1, CHARLIE, BRAVO))
+            .unwrap();
+        runtime.step().unwrap();
+        while runtime.tick() < gap {
+            runtime.step().unwrap();
+        }
+        runtime
+            .submit(cast_on(PLAYER_ONE, 1, gap + 1, ALPHA, BRAVO))
+            .unwrap();
+        while runtime.tick() < gap + 1 {
+            runtime.step().unwrap();
+        }
+        runtime.score(CHARLIE).unwrap().assists
+    }
+
+    // Contributed on tick 1; a 10-tick window still covers a kill on tick 11 and not on tick 12.
+    assert_eq!(run(10), 1, "the window is inclusive of its final tick");
+    assert_eq!(run(11), 0, "one tick later the window has closed");
+}
+
+#[test]
+fn a_full_credit_list_evicts_the_oldest_contributor() {
+    let config = MatchConfig {
+        max_damage_credits_per_actor: 2,
+        ..MatchConfig::default()
+    };
+    let mut runtime = MatchRuntime::new(config, 6).unwrap();
+    runtime.register_ability(marksman(10, 0)).unwrap();
+    for (index, actor) in [ALPHA, CHARLIE, DELTA].into_iter().enumerate() {
+        let index = u64::try_from(index).unwrap_or(0);
+        runtime
+            .spawn_actor(&progression_hero(
+                actor,
+                PlayerId(10 + index),
+                TeamId(0),
+                Vec2Mm::new(i32::try_from(index).unwrap_or(0) * 100, 0),
+                2_000,
+                vec![SNIPE_ID],
+            ))
+            .unwrap();
+    }
+    runtime
+        .spawn_actor(&progression_hero(
+            BRAVO,
+            PLAYER_TWO,
+            TeamId(1),
+            Vec2Mm::new(3_000, 0),
+            2_000,
+            vec![],
+        ))
+        .unwrap();
+    runtime.start().unwrap();
+
+    // Three distinct contributors on three distinct ticks into a two-slot list.
+    for (index, actor) in [ALPHA, CHARLIE, DELTA].into_iter().enumerate() {
+        let index = u64::try_from(index).unwrap_or(0);
+        runtime
+            .submit(cast_on(PlayerId(10 + index), 1, index + 1, actor, BRAVO))
+            .unwrap();
+        runtime.step().unwrap();
+    }
+    let credits: Vec<ActorId> = runtime
+        .damage_credits(BRAVO)
+        .unwrap()
+        .into_iter()
+        .map(|(actor, _)| actor)
+        .collect();
+    assert_eq!(
+        credits,
+        vec![CHARLIE, DELTA],
+        "the oldest contributor is the one dropped, not the newest refused"
+    );
+}
+
+#[test]
+fn a_despawned_hero_keeps_its_scoreboard_line() {
+    let mut runtime = arena();
+    // A hero that vanishes on death. Its body leaves authoritative state entirely; its record must not.
+    runtime
+        .spawn_actor(&ActorSpawn {
+            death_rule: DeathRule::Despawn,
+            ..progression_hero(
+                DELTA,
+                PlayerId(9),
+                TeamId(1),
+                Vec2Mm::new(4_000, 0),
+                200,
+                vec![],
+            )
+        })
+        .unwrap();
+    runtime.start().unwrap();
+    runtime
+        .submit(command(
+            PLAYER_ONE,
+            1,
+            1,
+            ALPHA,
+            CommandKind::Cast {
+                ability: SNIPE_ID,
+                target: CastTarget::Actor(DELTA),
+            },
+        ))
+        .unwrap();
+    runtime.step().unwrap();
+
+    assert!(runtime.actor(DELTA).is_none(), "the body despawned");
+    let line = runtime
+        .score(DELTA)
+        .expect("the scoreboard line outlives the body it was opened for");
+    assert_eq!(line.deaths, 1);
+    runtime.check_invariants().unwrap();
+}
+
+#[test]
+fn a_structure_kill_forfeits_the_bounty_without_panicking() {
+    let mut runtime = arena();
+    runtime
+        .spawn_actor(&ActorSpawn {
+            id: TOWER,
+            owner: None,
+            team: TeamId(0),
+            kind: ActorKind::Structure,
+            position: Vec2Mm::new(2_500, 0),
+            stats: stats(5_000, 0, 0),
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
+            abilities: vec![SNIPE_ID],
+            basic_attack: None,
+            death_rule: DeathRule::StayDead,
+        })
+        .unwrap();
+    runtime.start().unwrap();
+    // Server-owned intents: the tower has no owner, so it can only act through the internal channel. Two
+    // are needed, because one 400-damage shot does not finish a 600 hp hero.
+    let intent = [ActorIntent {
+        actor: TOWER,
+        kind: CommandKind::Cast {
+            ability: SNIPE_ID,
+            target: CastTarget::Actor(BRAVO),
+        },
+    }];
+    let mut frame = runtime.step_with_intents(&intent).unwrap();
+    for _ in 0..4 {
+        if frame
+            .events
+            .iter()
+            .any(|event| matches!(event, MatchEvent::ActorDied { .. }))
+        {
+            break;
+        }
+        frame = runtime.step_with_intents(&intent).unwrap();
+    }
+
+    assert!(frame.events.iter().any(
+        |event| matches!(event, MatchEvent::ActorDied { actor, killer }
+            if *actor == BRAVO && *killer == TOWER)
+    ));
+    assert!(
+        runtime.score(TOWER).is_none(),
+        "a structure opens no scoreboard line"
+    );
+    assert!(
+        !frame
+            .events
+            .iter()
+            .any(|event| matches!(event, MatchEvent::KillCredited { .. })),
+        "there is nowhere to credit the kill, and that is not an error"
+    );
+    assert_eq!(runtime.score(BRAVO).unwrap().deaths, 1);
+    runtime.check_invariants().unwrap();
+}
+
+#[test]
+fn a_self_kill_counts_a_death_and_credits_nothing() {
+    let config = MatchConfig::default();
+    let mut runtime = MatchRuntime::new(config, 8).unwrap();
+    // An `AnyUnit` area burst centred on the caster reaches the caster: an area impact deliberately does
+    // not exclude its source, so this is a reachable state rather than a contrived one.
+    runtime
+        .register_ability(AbilitySpec {
+            id: NOVA,
+            aim: AbilityAim::Point,
+            targeting: AbilityTargeting::AnyUnit,
+            range_mm: 5_000,
+            resource_cost: 0,
+            cooldown_ticks: 1,
+            cast_ticks: 0,
+            delivery: AbilityDelivery::Instant,
+            impact: ImpactShape::Circle { radius_mm: 1_000 },
+            effect: AbilityEffect::Damage {
+                amount: 5_000,
+                school: DamageSchool::True,
+            },
+            per_rank_amount: 0,
+        })
+        .unwrap();
+    runtime
+        .spawn_actor(&progression_hero(
+            ALPHA,
+            PLAYER_ONE,
+            TeamId(0),
+            Vec2Mm::new(0, 0),
+            500,
+            vec![NOVA],
+        ))
+        .unwrap();
+    runtime.start().unwrap();
+    runtime
+        .submit(command(
+            PLAYER_ONE,
+            1,
+            1,
+            ALPHA,
+            CommandKind::Cast {
+                ability: NOVA,
+                target: CastTarget::Point(Vec2Mm::new(200, 0)),
+            },
+        ))
+        .unwrap();
+    let frame = runtime.step().unwrap();
+
+    assert!(frame.events.iter().any(
+        |event| matches!(event, MatchEvent::ActorDied { actor, killer }
+            if *actor == ALPHA && *killer == ALPHA)
+    ));
+    let line = runtime.score(ALPHA).unwrap();
+    assert_eq!(line.deaths, 1);
+    assert_eq!(line.kills, 0, "you cannot farm yourself");
+    assert_eq!(line.gold, 0);
+    runtime.check_invariants().unwrap();
+}
+
+// --- Progression ------------------------------------------------------------------------------------
+
+#[test]
+fn a_kill_shares_experience_by_proximity_and_conserves_the_pool() {
+    let mut runtime = arena();
+    // DELTA is an ally of the killer but far outside the 8 m share radius.
+    runtime
+        .spawn_actor(&progression_hero(
+            DELTA,
+            PlayerId(9),
+            TeamId(0),
+            Vec2Mm::new(200_000, 0),
+            2_000,
+            vec![],
+        ))
+        .unwrap();
+    runtime.start().unwrap();
+    runtime
+        .submit(cast_on(PLAYER_ONE, 1, 1, ALPHA, BRAVO))
+        .unwrap();
+    runtime
+        .submit(cast_on(PLAYER_ONE, 2, 2, ALPHA, BRAVO))
+        .unwrap();
+    runtime.step().unwrap();
+    let frame = runtime.step().unwrap();
+
+    let granted: u32 = frame
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            MatchEvent::ExperienceGranted { amount, .. } => Some(*amount),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        granted, HERO_BOUNTY.experience,
+        "every unit the death minted is awarded - no remainder is destroyed"
+    );
+    // 400 split two ways between the killer and the nearby ally.
+    assert_eq!(runtime.actor(ALPHA).unwrap().experience, 200);
+    assert_eq!(runtime.actor(CHARLIE).unwrap().experience, 200);
+    assert_eq!(
+        runtime.actor(DELTA).unwrap().experience,
+        0,
+        "an ally outside the share radius earns nothing"
+    );
+    assert_eq!(
+        runtime.actor(BRAVO).unwrap().experience,
+        0,
+        "the victim's own team shares nothing from its death"
+    );
+}
+
+#[test]
+fn a_level_up_raises_stats_through_growth_and_never_through_a_modifier() {
+    let mut runtime = arena();
+    runtime.start().unwrap();
+    let before = runtime.actor(ALPHA).unwrap();
+    assert_eq!(before.level, 1);
+    assert_eq!(before.max_health, 2_000);
+
+    // 280 experience is exactly level 2.
+    let level = runtime.award_experience(ALPHA, 280).unwrap();
+    assert_eq!(level, 2);
+    let after = runtime.actor(ALPHA).unwrap();
+    assert_eq!(after.level, 2);
+    assert_eq!(
+        after.max_health,
+        2_000 + HERO_GROWTH.max_health_per_level,
+        "growth raises the base, one level's worth"
+    );
+    assert_eq!(after.unspent_ability_points, 1);
+    assert!(
+        runtime.modifiers(ALPHA).unwrap().is_empty(),
+        "growth must not consume the actor's modifier budget"
+    );
+    assert_eq!(
+        after.health, before.health,
+        "a level-up raises the maximum; it does not heal"
+    );
+    runtime.check_invariants().unwrap();
+}
+
+#[test]
+fn an_ability_rank_raises_its_magnitude_and_a_missile_keeps_the_rank_it_launched_with() {
+    let mut runtime = arena();
+    runtime.start().unwrap();
+    // Two levels: one point spent on NOVA, one left over.
+    runtime.award_experience(ALPHA, 660).unwrap();
+    assert_eq!(runtime.actor(ALPHA).unwrap().level, 3);
+
+    runtime
+        .submit(command(
+            PLAYER_ONE,
+            1,
+            1,
+            ALPHA,
+            CommandKind::UpgradeAbility { ability: NOVA },
+        ))
+        .unwrap();
+    let frame = runtime.step().unwrap();
+    assert!(frame.events.iter().any(|event| matches!(
+        event,
+        MatchEvent::AbilityRankUp { actor, ability, rank }
+            if *actor == ALPHA && *ability == NOVA && *rank == 2
+    )));
+    assert_eq!(runtime.ability_rank(ALPHA, NOVA), Some(2));
+
+    // Launch at rank 2: 300 base + 200 per rank.
+    runtime
+        .submit(command(
+            PLAYER_ONE,
+            2,
+            2,
+            ALPHA,
+            CommandKind::Cast {
+                ability: NOVA,
+                target: CastTarget::Point(Vec2Mm::new(3_000, 0)),
+            },
+        ))
+        .unwrap();
+    let launch = runtime.step().unwrap();
+    assert_eq!(launch.projectiles.len(), 1);
+
+    // Rank up again WHILE the missile is in the air. Rank 3 unlocks at level 5, so the level comes first.
+    // The magnitude the missile was fired with must not move.
+    runtime.award_experience(ALPHA, 1_060).unwrap();
+    assert_eq!(runtime.actor(ALPHA).unwrap().level, 5);
+    runtime
+        .submit(command(
+            PLAYER_ONE,
+            3,
+            3,
+            ALPHA,
+            CommandKind::UpgradeAbility { ability: NOVA },
+        ))
+        .unwrap();
+    runtime.step().unwrap();
+    assert_eq!(runtime.ability_rank(ALPHA, NOVA), Some(3));
+
+    let before = runtime.actor(BRAVO).unwrap().health;
+    let mut applied = None;
+    for _ in 0..12 {
+        let frame = runtime.step().unwrap();
+        if let Some(amount) = frame.events.iter().find_map(|event| match event {
+            MatchEvent::DamageApplied { target, amount, .. } if *target == BRAVO => Some(*amount),
+            _ => None,
+        }) {
+            applied = Some(amount);
+            break;
+        }
+    }
+    assert_eq!(
+        applied,
+        Some(500),
+        "the missile lands for the rank-2 magnitude it launched with, not the rank-3 one"
+    );
+    assert_eq!(runtime.actor(BRAVO).unwrap().health, before - 500);
+}
+
+#[test]
+fn upgrading_is_refused_without_a_point_or_before_its_unlock_level() {
+    let mut runtime = arena();
+    runtime.start().unwrap();
+
+    // No level, no point.
+    let rejection = runtime
+        .submit(command(
+            PLAYER_ONE,
+            1,
+            1,
+            ALPHA,
+            CommandKind::UpgradeAbility { ability: NOVA },
+        ))
+        .unwrap_err();
+    assert_eq!(
+        rejection.reason,
+        CommandRejectReason::NoAbilityPointAvailable
+    );
+
+    // Level 2 grants a point, but rank 2 needs level 3.
+    runtime.award_experience(ALPHA, 280).unwrap();
+    let rejection = runtime
+        .submit(command(
+            PLAYER_ONE,
+            2,
+            1,
+            ALPHA,
+            CommandKind::UpgradeAbility { ability: NOVA },
+        ))
+        .unwrap_err();
+    assert_eq!(
+        rejection.reason,
+        CommandRejectReason::AbilityRankLocked {
+            unlocks_at_level: 3
+        }
+    );
+
+    // An unequipped ability is refused as such, not as a rank problem.
+    runtime.award_experience(ALPHA, 380).unwrap();
+    let rejection = runtime
+        .submit(command(
+            PLAYER_ONE,
+            3,
+            1,
+            ALPHA,
+            CommandKind::UpgradeAbility {
+                ability: AbilityId(9_999),
+            },
+        ))
+        .unwrap_err();
+    assert_eq!(rejection.reason, CommandRejectReason::AbilityNotEquipped);
+}
+
+#[test]
+fn upgrading_an_ability_is_not_blocked_by_crowd_control() {
+    let mut runtime = arena();
+    runtime.start().unwrap();
+    runtime.award_experience(ALPHA, 660).unwrap();
+    runtime
+        .apply_status_effect(ALPHA, 30, &[ControlKind::Stun], &[])
+        .unwrap();
+
+    // A stun blocks casting outright...
+    let rejection = runtime
+        .submit(command(
+            PLAYER_ONE,
+            1,
+            1,
+            ALPHA,
+            CommandKind::Cast {
+                ability: NOVA,
+                target: CastTarget::Point(Vec2Mm::new(1_000, 0)),
+            },
+        ))
+        .unwrap_err();
+    assert_eq!(rejection.reason, CommandRejectReason::ActorStunned);
+
+    // ...but spending a level-up point is a menu action, not something the body does.
+    runtime
+        .submit(command(
+            PLAYER_ONE,
+            2,
+            1,
+            ALPHA,
+            CommandKind::UpgradeAbility { ability: NOVA },
+        ))
+        .unwrap();
+    runtime.step().unwrap();
+    assert_eq!(runtime.ability_rank(ALPHA, NOVA), Some(2));
+}
+
+#[test]
+fn progression_survives_death_and_respawn_but_the_assist_window_does_not() {
+    let mut runtime = arena();
+    runtime
+        .spawn_actor(&ActorSpawn {
+            death_rule: DeathRule::Respawn {
+                delay_ticks: 2,
+                at: Vec2Mm::new(9_000, 0),
+            },
+            ..progression_hero(
+                DELTA,
+                PlayerId(9),
+                TeamId(1),
+                Vec2Mm::new(4_000, 0),
+                300,
+                vec![],
+            )
+        })
+        .unwrap();
+    runtime.start().unwrap();
+    runtime.award_experience(DELTA, 1_720).unwrap();
+    let before = runtime.actor(DELTA).unwrap();
+    assert_eq!(before.level, 5);
+
+    runtime
+        .submit(command(
+            PLAYER_ONE,
+            1,
+            1,
+            ALPHA,
+            CommandKind::Cast {
+                ability: SNIPE_ID,
+                target: CastTarget::Actor(DELTA),
+            },
+        ))
+        .unwrap();
+    for _ in 0..4 {
+        runtime.step().unwrap();
+    }
+    let after = runtime.actor(DELTA).unwrap();
+    assert!(after.alive, "the hero respawned");
+    assert_eq!(after.level, 5, "levels are not lost on death");
+    assert_eq!(after.experience, before.experience);
+    assert_eq!(after.unspent_ability_points, before.unspent_ability_points);
+    assert!(
+        runtime.damage_credits(DELTA).unwrap().is_empty(),
+        "the assist window died with the body"
+    );
+    assert_eq!(runtime.score(DELTA).unwrap().deaths, 1);
+}
+
+// --- Tamper resistance ------------------------------------------------------------------------------
+
+#[test]
+fn a_forged_level_or_rank_or_gold_is_rejected_by_the_restore_audit() {
+    let content = ContentId::new([0x51; 32]);
+    let build = || {
+        let mut runtime = arena();
+        runtime.start().unwrap();
+        runtime.award_experience(ALPHA, 660).unwrap();
+        runtime.step().unwrap();
+        runtime
+    };
+
+    // Control: the honest runtime captures and restores cleanly, so the failures below are about the
+    // forgery and not about the fixture.
+    let honest = build();
+    let checkpoint = honest.capture_checkpoint(content).unwrap();
+    MatchRuntime::restore_checkpoint(&checkpoint, content).unwrap();
+
+    // A level that its own experience does not produce.
+    let mut forged = build();
+    let index = forged.actors.iter().position(|a| a.id == ALPHA).unwrap();
+    forged.actors[index].level = crate::MAX_HERO_LEVEL;
+    assert!(forged.check_invariants().is_err());
+
+    // A rank raised without spending a point.
+    let mut forged = build();
+    let index = forged.actors.iter().position(|a| a.id == ALPHA).unwrap();
+    forged.actors[index].abilities[0].rank = 2;
+    assert!(forged.check_invariants().is_err());
+
+    // Passive gold shifted off its closed form by a single unit.
+    let mut forged = build();
+    let slot = forged.scores.iter().position(|s| s.actor == ALPHA).unwrap();
+    forged.scores[slot].passive_gold_paid += 1;
+    assert!(forged.check_invariants().is_err());
+
+    // Earned gold beyond what its kills and assists can account for, and the control one unit below it.
+    let ceiling = crate::MAX_BOUNTY_GOLD + crate::MAX_STREAK_GOLD;
+    let mut at_ceiling = build();
+    let slot = at_ceiling
+        .scores
+        .iter()
+        .position(|s| s.actor == ALPHA)
+        .unwrap();
+    at_ceiling.scores[slot].kills = 1;
+    at_ceiling.scores[slot].best_kill_streak = 1;
+    at_ceiling.scores[slot].earned_gold = ceiling;
+    at_ceiling.check_invariants().unwrap();
+    at_ceiling.scores[slot].earned_gold = ceiling + 1;
+    assert!(at_ceiling.check_invariants().is_err());
+}
+
+#[test]
+fn progression_and_the_scoreboard_are_part_of_both_digests() {
+    let mut runtime = arena();
+    runtime.start().unwrap();
+    runtime.award_experience(ALPHA, 660).unwrap();
+    // Experience lives on the ACTOR, so it does not by itself dirty a score line. Gold does.
+    runtime
+        .grant_gold(ALPHA, 250, crate::GoldReason::Kill)
+        .unwrap();
+    let frame = runtime.step().unwrap();
+    assert!(!frame.scores.is_empty());
+
+    // Each strip removes exactly ONE thing. If any of these were absent from the digest, two runtimes that
+    // disagreed about it would still claim to be identical.
+    let mut without_scores = runtime.clone();
+    without_scores.scores.clear();
+    assert_ne!(runtime.world_digest(), without_scores.world_digest());
+
+    let mut without_experience = runtime.clone();
+    let index = without_experience
+        .actors
+        .iter()
+        .position(|a| a.id == ALPHA)
+        .unwrap();
+    without_experience.actors[index].experience = 0;
+    assert_ne!(runtime.world_digest(), without_experience.world_digest());
+
+    let mut without_rank = runtime.clone();
+    let index = without_rank
+        .actors
+        .iter()
+        .position(|a| a.id == ALPHA)
+        .unwrap();
+    without_rank.actors[index].abilities[0].rank = 4;
+    assert_ne!(runtime.world_digest(), without_rank.world_digest());
+
+    let mut frame_without = frame.clone();
+    frame_without.scores.clear();
+    assert_ne!(
+        crate::runtime::digest_frame(&frame),
+        crate::runtime::digest_frame(&frame_without)
+    );
+}
+
+#[test]
+fn a_completed_match_keeps_its_scoreboard_and_closes_every_assist_window() {
+    let mut runtime = arena();
+    runtime.start().unwrap();
+    runtime
+        .submit(cast_on(PLAYER_ONE, 1, 1, ALPHA, BRAVO))
+        .unwrap();
+    runtime.step().unwrap();
+    assert!(!runtime.damage_credits(BRAVO).unwrap().is_empty());
+
+    runtime
+        .finish(MatchOutcome::Winner(TeamId(0)), MatchEndReason::Host)
+        .unwrap();
+    assert!(
+        !runtime.scores().is_empty(),
+        "a match result that erased its own scoreboard would be useless"
+    );
+    assert!(runtime.damage_credits(BRAVO).unwrap().is_empty());
+    runtime.check_invariants().unwrap();
+}
+
+#[test]
+fn progression_budgets_are_validated_and_zero_passive_income_stays_legal() {
+    let base = MatchConfig::default();
+    for zeroed in [
+        MatchConfig {
+            max_score_entries: 0,
+            ..base
+        },
+        MatchConfig {
+            max_damage_credits_per_actor: 0,
+            ..base
+        },
+        MatchConfig {
+            assist_window_ticks: 0,
+            ..base
+        },
+        MatchConfig {
+            xp_share_radius_mm: 0,
+            ..base
+        },
+    ] {
+        assert!(MatchRuntime::new(zeroed, 0).is_err());
+    }
+    for over in [
+        MatchConfig {
+            max_score_entries: crate::MAX_SCORE_ENTRY_BUDGET + 1,
+            ..base
+        },
+        MatchConfig {
+            max_damage_credits_per_actor: crate::MAX_DAMAGE_CREDITS_PER_ACTOR_BUDGET + 1,
+            ..base
+        },
+        MatchConfig {
+            assist_window_ticks: crate::MAX_ASSIST_WINDOW_TICKS + 1,
+            ..base
+        },
+        MatchConfig {
+            xp_share_radius_mm: crate::MAX_XP_SHARE_RADIUS_MM + 1,
+            ..base
+        },
+        MatchConfig {
+            passive_gold_per_100s: crate::MAX_PASSIVE_GOLD_PER_100S + 1,
+            ..base
+        },
+    ] {
+        assert!(MatchRuntime::new(over, 0).is_err());
+    }
+    // Deliberately legal: a profile with no passive income at all. Pinned so a later author cannot tidy
+    // this field into the positivity chain and make an income stream silently mandatory.
+    MatchRuntime::new(
+        MatchConfig {
+            passive_gold_per_100s: 0,
+            ..base
+        },
+        0,
+    )
+    .unwrap();
+}
+
+#[test]
+fn the_scoreboard_budget_is_a_lifetime_budget() {
+    let config = MatchConfig {
+        max_score_entries: 1,
+        ..MatchConfig::default()
+    };
+    let mut runtime = MatchRuntime::new(config, 3).unwrap();
+    runtime.register_ability(marksman(10, 0)).unwrap();
+    runtime
+        .spawn_actor(&progression_hero(
+            ALPHA,
+            PLAYER_ONE,
+            TeamId(0),
+            Vec2Mm::new(0, 0),
+            100,
+            vec![],
+        ))
+        .unwrap();
+    assert!(matches!(
+        runtime.spawn_actor(&progression_hero(
+            BRAVO,
+            PLAYER_TWO,
+            TeamId(1),
+            Vec2Mm::new(1_000, 0),
+            100,
+            vec![],
+        )),
+        Err(RuntimeError::ScoreBudgetExceeded)
+    ));
+    // A non-hero opens no line, so it is unaffected by the exhausted budget.
+    runtime
+        .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(2_000, 0), 100))
+        .unwrap();
+    assert_eq!(runtime.scores().len(), 1);
 }

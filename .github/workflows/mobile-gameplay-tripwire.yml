@@ -54,7 +54,7 @@ jobs:
           checks = [(s["id"], c["label"], c["passed"]) for s in scenarios for c in s["checks"]]
           failed = [(i, label) for i, label, passed in checks if not passed]
           assert not failed, failed
-          assert len(checks) >= 49, f"capture coverage regressed to {len(checks)} checks"
+          assert len(checks) >= 62, f"capture coverage regressed to {len(checks)} checks"
           frames = sum(len(s["frames"]) for s in scenarios)
           print(
               f"::notice::capture harness: {len(scenarios)} scenarios, {frames} frames, "

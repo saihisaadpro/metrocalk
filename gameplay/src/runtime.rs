@@ -3,12 +3,14 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use crate::model::{
-    AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
-    ActorKind, ActorProvenance, ActorSpawn, BasicAttackSpec, CombatStats, ControlKind, ControlMask,
-    DamageSchool, DeathRule, DynamicActorProvenance, DynamicActorSpawn, ImpactShape, MatchConfig,
-    MatchEndReason, MatchOutcome, MatchPhase, ModifierId, ModifierOp, PlayerId, ProjectileId,
-    RectMm, RuntimeError, StatKind, StatModifier, StatusEffectId, StatusEffectView, TeamId, Tick,
-    Vec2Mm, BASIS_POINTS, MAX_ABILITY_DEFINITIONS,
+    apportion, integer_sqrt_ceil, level_for_experience, passive_gold_owed, streak_gold, AbilityAim,
+    AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorKind,
+    ActorProvenance, ActorSpawn, BasicAttackSpec, Bounty, CombatStats, ControlKind, ControlMask,
+    DamageSchool, DeathRule, DynamicActorProvenance, DynamicActorSpawn, GoldReason, ImpactShape,
+    MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, ModifierId, ModifierOp, PlayerId,
+    ProjectileId, RectMm, RuntimeError, ScoreView, StatGrowth, StatKind, StatModifier,
+    StatusEffectId, StatusEffectView, TeamId, Tick, Vec2Mm, BASIS_POINTS, EXPERIENCE_CAP,
+    MAX_ABILITY_DEFINITIONS, MAX_ABILITY_RANK,
 };
 use crate::protocol::{
     ActorIntent, ActorView, BasicAttackProgress, CastProgress, CastTarget, CommandKind,
@@ -20,6 +22,10 @@ use crate::protocol::{
 pub(crate) struct AbilityState {
     pub(crate) id: AbilityId,
     pub(crate) ready_at: Tick,
+    /// Always at least 1. Rank 0 is deliberately not a state: starting at 1 keeps every ability castable
+    /// from spawn, so no cast can ever fail for want of a rank, and the point-spend invariant
+    /// `Σ(rank − 1) + unspent == level − 1` stays exactly derivable from the level.
+    pub(crate) rank: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +137,76 @@ pub(crate) struct ProjectileState {
     /// Fixed flight terminus decided at launch. Reaching it ends the flight; there is no separate expiry
     /// deadline, because a redundant one could disagree with the geometry it is supposed to describe.
     pub(crate) end: Vec2Mm,
+    /// Effect magnitude resolved from the caster's ability rank **at launch**.
+    ///
+    /// Carried rather than re-read for the same reason `team` is: a rank-up while the missile is in the air
+    /// must not retroactively rewrite the damage it was fired with.
+    pub(crate) amount: u32,
+}
+
+/// One contributor's most recent damaging contact with an actor.
+///
+/// Keyed by contributor and kept sorted by it, so the assist set is a function of the SET of contributors
+/// rather than of the order damage happened to arrive in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DamageCredit {
+    pub(crate) source: ActorId,
+    pub(crate) last_tick: Tick,
+}
+
+/// One permanent scoreboard line.
+///
+/// Opened for every hero and **never removed for the whole match**, carrying its own owner/team snapshot.
+/// That is deliberate: `DeathRule::Despawn` removes an actor from authoritative state entirely, and IDs are
+/// never reused, so an actor-resident scoreboard would evaporate at the moment it matters most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScoreEntry {
+    pub(crate) actor: ActorId,
+    pub(crate) owner: Option<PlayerId>,
+    pub(crate) team: TeamId,
+    pub(crate) since_tick: Tick,
+    /// Gold minted by kills, shutdowns and assists. Bounded relationally by the counters below, so a
+    /// tampered payload cannot claim income it has no kills or assists to account for.
+    pub(crate) earned_gold: u32,
+    /// Derived cache of `passive_gold_owed(tick − since_tick)`, re-derived and compared exactly every
+    /// frame. It is NOT encoded: the entire passive half of the economy is closed-form and untamperable.
+    pub(crate) passive_gold_paid: u32,
+    pub(crate) kills: u32,
+    pub(crate) deaths: u32,
+    pub(crate) assists: u32,
+    pub(crate) kill_streak: u16,
+    pub(crate) best_kill_streak: u16,
+}
+
+impl ScoreEntry {
+    fn view(&self) -> ScoreView {
+        ScoreView {
+            actor: self.actor,
+            owner: self.owner,
+            team: self.team,
+            gold: self.earned_gold.saturating_add(self.passive_gold_paid),
+            kills: self.kills,
+            deaths: self.deaths,
+            assists: self.assists,
+            kill_streak: self.kill_streak,
+            best_kill_streak: self.best_kill_streak,
+        }
+    }
+}
+
+/// One death, snapshotted at the instant it happened so progression can settle after the health batch.
+///
+/// The victim's position and credit list are captured here because `apply_death_rule` may despawn the
+/// actor before progression runs, and a despawned body can still be worth a bounty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KillRecord {
+    victim: ActorId,
+    victim_team: TeamId,
+    victim_position: Vec2Mm,
+    victim_streak: u16,
+    bounty: Bounty,
+    killer: ActorId,
+    assisters: Vec<ActorId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,7 +217,27 @@ pub(crate) struct ActorState {
     pub(crate) kind: ActorKind,
     pub(crate) position: Vec2Mm,
     pub(crate) destination: Option<Vec2Mm>,
-    /// Authored stats, never mutated after spawn. The durable truth a modifier resolves against.
+    /// Authored stats, never mutated after spawn. The one non-tautological anchor of the stat system: a
+    /// restore validates THIS, so it must stay something a payload cannot assert freely.
+    pub(crate) authored_stats: CombatStats,
+    /// Immutable authored per-level growth.
+    pub(crate) growth: StatGrowth,
+    /// Immutable authored worth of killing this actor.
+    pub(crate) bounty: Bounty,
+    /// Total experience earned, hard-capped at `EXPERIENCE_CAP`. Experience past max level is not banked,
+    /// which is what turns an unbounded counter into a quantity a restore audit can check.
+    pub(crate) experience: u32,
+    /// Derived cache: exactly `level_for_experience(experience)`. Never encoded, so a payload cannot
+    /// assert a level its own experience does not produce.
+    pub(crate) level: u8,
+    pub(crate) unspent_ability_points: u8,
+    /// Recent damaging contributors, strictly sorted by source and bounded by the configured budget.
+    /// Lives on the victim so it inherits the per-actor machinery that is already bounded, audited,
+    /// encoded, hashed, and destroyed with the actor — nobody can assist on the death of an actor that
+    /// no longer exists.
+    pub(crate) damage_credits: Vec<DamageCredit>,
+    /// Derived cache: exactly `authored_stats.with_growth(growth, level)`. The durable truth a modifier
+    /// resolves against, and itself re-derived rather than stored so growth cannot be forged.
     pub(crate) base_stats: CombatStats,
     /// Applied modifiers, kept sorted by ID and unique. This plus `base_stats` is the whole stat state.
     pub(crate) modifiers: Vec<StatModifier>,
@@ -181,6 +277,14 @@ impl ActorState {
             kind: spawn.kind,
             position: spawn.position,
             destination: None,
+            authored_stats: spawn.stats,
+            growth: spawn.growth,
+            bounty: spawn.bounty,
+            experience: 0,
+            // Level 1 is the identity of `with_growth`, so the authored stats ARE the level-1 base stats.
+            level: 1,
+            unspent_ability_points: 0,
+            damage_credits: Vec::new(),
             base_stats: spawn.stats,
             modifiers: Vec::new(),
             status_effects: Vec::new(),
@@ -190,7 +294,11 @@ impl ActorState {
             resource: spawn.stats.max_resource,
             abilities: abilities
                 .into_iter()
-                .map(|id| AbilityState { id, ready_at: 0 })
+                .map(|id| AbilityState {
+                    id,
+                    ready_at: 0,
+                    rank: 1,
+                })
                 .collect(),
             cast: None,
             basic_attack: spawn
@@ -227,6 +335,17 @@ impl ActorState {
         self.resource = self.resource.min(self.stats.max_resource);
     }
 
+    /// Re-derive the whole stat chain from experience down.
+    ///
+    /// This is the ONLY site that writes `level` or `base_stats`. Both are derived caches, and the
+    /// frame-boundary audit re-derives and compares both, so any other writer would be found — but a single
+    /// writer is what makes that guarantee cheap to reason about.
+    fn resolve_growth(&mut self) {
+        self.level = level_for_experience(self.experience);
+        self.base_stats = self.authored_stats.with_growth(self.growth, self.level);
+        self.resolve_stats();
+    }
+
     fn view(&self) -> ActorView {
         ActorView {
             id: self.id,
@@ -256,6 +375,9 @@ impl ActorState {
             basic_attack_ready_at: self.basic_attack.map(|attack| attack.ready_at),
             basic_attack_range_mm: self.basic_attack.map(|attack| attack.spec.range_mm),
             respawn_at: self.respawn_at,
+            level: self.level,
+            experience: self.experience,
+            unspent_ability_points: self.unspent_ability_points,
             provenance: self.provenance,
             cooldowns: self
                 .abilities
@@ -263,6 +385,7 @@ impl ActorState {
                 .map(|ability| CooldownView {
                     ability: ability.id,
                     ready_at: ability.ready_at,
+                    rank: ability.rank,
                 })
                 .collect(),
         }
@@ -285,12 +408,18 @@ pub struct MatchRuntime {
     /// Live projectiles, kept sorted by their monotonic ID. Sorted order is the canonical resolution order,
     /// so two runtimes cannot resolve simultaneous impacts in different sequences.
     pub(crate) projectiles: Vec<ProjectileState>,
+    /// Permanent scoreboard, one line per hero, sorted by actor. Keyed on `ActorId` rather than `PlayerId`
+    /// because bot heroes have no owner and a one-lane bot match is the only composed match this crate has.
+    /// The budget is a LIFETIME budget: a line is never removed, so a match cannot open more than the
+    /// configured number however many heroes come and go.
+    pub(crate) scores: Vec<ScoreEntry>,
     pub(crate) player_roster: BTreeSet<PlayerId>,
     pub(crate) queued_commands: BTreeMap<Tick, Vec<PlayerCommand>>,
     pub(crate) last_submissions: BTreeMap<PlayerId, SubmissionRecord>,
     pub(crate) dirty: BTreeSet<ActorId>,
     pub(crate) removed: BTreeSet<ActorId>,
     pub(crate) removed_projectiles: BTreeSet<ProjectileId>,
+    pub(crate) dirty_scores: BTreeSet<ActorId>,
     pub(crate) pending_events: Vec<MatchEvent>,
     pub(crate) rejection_events_in_frame: u32,
     pub(crate) objective_claims: BTreeSet<TeamId>,
@@ -312,12 +441,14 @@ impl MatchRuntime {
             ability_specs: Vec::new(),
             actors: Vec::new(),
             projectiles: Vec::new(),
+            scores: Vec::new(),
             player_roster: BTreeSet::new(),
             queued_commands: BTreeMap::new(),
             last_submissions: BTreeMap::new(),
             dirty: BTreeSet::new(),
             removed: BTreeSet::new(),
             removed_projectiles: BTreeSet::new(),
+            dirty_scores: BTreeSet::new(),
             pending_events: Vec::new(),
             rejection_events_in_frame: 0,
             objective_claims: BTreeSet::new(),
@@ -392,8 +523,21 @@ impl MatchRuntime {
             return Err(RuntimeError::PlayerBudgetExceeded);
         }
         spawn.stats.validate()?;
+        spawn.growth.validate()?;
+        spawn.bounty.validate()?;
         if let Some(basic_attack) = spawn.basic_attack {
             basic_attack.validate()?;
+        }
+        // A hero opens a permanent scoreboard line. Checked BEFORE the actor is inserted so a refused
+        // budget leaves no half-registered hero behind.
+        if spawn.kind == ActorKind::Hero
+            && self
+                .scores
+                .binary_search_by_key(&spawn.id, |entry| entry.actor)
+                .is_err()
+            && self.scores.len() >= usize::from(self.config.max_score_entries)
+        {
+            return Err(RuntimeError::ScoreBudgetExceeded);
         }
         if let DeathRule::Respawn { delay_ticks, at } = spawn.death_rule {
             if delay_ticks == 0 {
@@ -441,6 +585,32 @@ impl MatchRuntime {
                 {
                     self.next_dynamic_actor_id = id.get().checked_add(1);
                 }
+                if spawn.kind == ActorKind::Hero {
+                    // Authored actors arrive in caller order, so insert at the sorted position rather than
+                    // pushing: the strict-sort audit is what makes the scoreboard binary-searchable.
+                    if let Err(slot) = self
+                        .scores
+                        .binary_search_by_key(&spawn.id, |entry| entry.actor)
+                    {
+                        self.scores.insert(
+                            slot,
+                            ScoreEntry {
+                                actor: spawn.id,
+                                owner: spawn.owner,
+                                team: spawn.team,
+                                since_tick: self.tick,
+                                earned_gold: 0,
+                                passive_gold_paid: 0,
+                                kills: 0,
+                                deaths: 0,
+                                assists: 0,
+                                kill_streak: 0,
+                                best_kill_streak: 0,
+                            },
+                        );
+                        self.dirty_scores.insert(spawn.id);
+                    }
+                }
                 self.dirty.insert(id);
                 Ok(())
             }
@@ -482,6 +652,8 @@ impl MatchRuntime {
             kind: spawn.kind,
             position: spawn.position,
             stats: spawn.stats,
+            growth: spawn.growth,
+            bounty: spawn.bounty,
             abilities: spawn.abilities.clone(),
             basic_attack: spawn.basic_attack,
             death_rule: spawn.death_rule,
@@ -896,6 +1068,20 @@ impl MatchRuntime {
                 reason,
             });
         }
+        // A completed match can produce no further kill, so no assist window can still be open. The
+        // scoreboard itself is deliberately NOT cleared - a match result that erased its own scoreboard
+        // would be useless.
+        let stale: Vec<ActorId> = self
+            .actors
+            .iter()
+            .filter(|actor| !actor.damage_credits.is_empty())
+            .map(|actor| actor.id)
+            .collect();
+        for actor in stale {
+            let index = self.actor_index(actor).expect("listed actor exists");
+            self.actors[index].damage_credits.clear();
+            self.dirty.insert(actor);
+        }
         // In-flight projectiles are cancelled, never resolved: a match that has already produced its
         // terminal outcome must not have a missile land afterwards and rewrite health the result was
         // computed from.
@@ -930,6 +1116,344 @@ impl MatchRuntime {
     #[must_use]
     pub fn live_actor_count(&self) -> usize {
         self.actors.iter().filter(|actor| actor.alive()).count()
+    }
+
+    /// Bounded read of one scoreboard line.
+    #[must_use]
+    pub fn score(&self, actor: ActorId) -> Option<ScoreView> {
+        self.scores
+            .binary_search_by_key(&actor, |entry| entry.actor)
+            .ok()
+            .map(|index| self.scores[index].view())
+    }
+
+    /// The whole scoreboard, in canonical actor order.
+    #[must_use]
+    pub fn scores(&self) -> Vec<ScoreView> {
+        self.scores.iter().map(ScoreEntry::view).collect()
+    }
+
+    /// Bounded read of one actor's live assist window, for diagnostics and the layer above.
+    #[must_use]
+    pub fn damage_credits(&self, actor: ActorId) -> Option<Vec<(ActorId, Tick)>> {
+        self.actor_state(actor).map(|state| {
+            state
+                .damage_credits
+                .iter()
+                .map(|credit| (credit.source, credit.last_tick))
+                .collect()
+        })
+    }
+
+    /// Current rank of one equipped ability.
+    #[must_use]
+    pub fn ability_rank(&self, actor: ActorId, ability: AbilityId) -> Option<u8> {
+        self.actor_state(actor).and_then(|state| {
+            state
+                .abilities
+                .binary_search_by_key(&ability, |candidate| candidate.id)
+                .ok()
+                .map(|index| state.abilities[index].rank)
+        })
+    }
+
+    /// Grant experience to one hero and return its level afterwards.
+    ///
+    /// Experience saturates at `EXPERIENCE_CAP` rather than accumulating past the level cap: an unbounded
+    /// counter cannot be range-checked on restore, and banked experience past max level buys nothing.
+    pub fn award_experience(&mut self, actor: ActorId, amount: u32) -> Result<u8, RuntimeError> {
+        if self.phase != MatchPhase::Active {
+            return Err(RuntimeError::InvalidPhase(
+                "experience requires an active match",
+            ));
+        }
+        let index = self
+            .actors
+            .binary_search_by_key(&actor, |candidate| candidate.id)
+            .map_err(|_| RuntimeError::UnknownActor(actor))?;
+        if self.actors[index].kind != ActorKind::Hero {
+            return Err(RuntimeError::InvalidProgression(
+                "only a hero carries experience",
+            ));
+        }
+        let before = self.actors[index].level;
+        let total = self.actors[index]
+            .experience
+            .saturating_add(amount)
+            .min(EXPERIENCE_CAP);
+        let granted = total - self.actors[index].experience;
+        self.actors[index].experience = total;
+        self.actors[index].resolve_growth();
+        let after = self.actors[index].level;
+        if after > before {
+            // One point per level. The unspent counter plus the spent ranks reconstruct the level exactly,
+            // which is what stops a tampered payload asserting a maxed hero.
+            self.actors[index].unspent_ability_points = self.actors[index]
+                .unspent_ability_points
+                .saturating_add(after - before);
+        }
+        self.checkpoint_ready = false;
+        self.dirty.insert(actor);
+        if granted > 0 {
+            self.pending_events.push(MatchEvent::ExperienceGranted {
+                actor,
+                amount: granted,
+                total_after: total,
+            });
+        }
+        if after > before {
+            self.pending_events.push(MatchEvent::HeroLevelUp {
+                actor,
+                level: after,
+                unspent_ability_points: self.actors[index].unspent_ability_points,
+            });
+        }
+        Ok(after)
+    }
+
+    /// Grant gold to one scoreboard line and return its earned total afterwards.
+    pub fn grant_gold(
+        &mut self,
+        actor: ActorId,
+        amount: u32,
+        reason: GoldReason,
+    ) -> Result<u32, RuntimeError> {
+        if self.phase != MatchPhase::Active {
+            return Err(RuntimeError::InvalidPhase("gold requires an active match"));
+        }
+        let index = self
+            .scores
+            .binary_search_by_key(&actor, |entry| entry.actor)
+            .map_err(|_| RuntimeError::UnknownScoreEntry(actor))?;
+        self.scores[index].earned_gold = self.scores[index].earned_gold.saturating_add(amount);
+        let total_after = self.scores[index].view().gold;
+        self.checkpoint_ready = false;
+        self.dirty_scores.insert(actor);
+        if amount > 0 {
+            self.pending_events.push(MatchEvent::GoldGranted {
+                actor,
+                amount,
+                reason,
+                total_after,
+            });
+        }
+        Ok(self.scores[index].earned_gold)
+    }
+
+    /// Accrue closed-form passive income for every scoreboard line.
+    ///
+    /// Runs FIRST in the tick, before the objective and time-limit early returns, because
+    /// `passive_gold_paid` is compared exactly against `passive_gold_owed` by the frame audit: skipping the
+    /// accrual on a deciding tick would fail the very next audit. It depends on nothing but the tick, so
+    /// the earliest legal position is the correct one.
+    fn accrue_passive_gold(&mut self) {
+        for index in 0..self.scores.len() {
+            let elapsed = self.tick.saturating_sub(self.scores[index].since_tick);
+            let owed = passive_gold_owed(elapsed, self.config);
+            if owed != self.scores[index].passive_gold_paid {
+                self.scores[index].passive_gold_paid = owed;
+                let actor = self.scores[index].actor;
+                self.dirty_scores.insert(actor);
+            }
+        }
+    }
+
+    /// Drop assist credits whose window has closed.
+    ///
+    /// At the TOP of the tick, for exactly the reason status-effect expiry is: running it after command
+    /// execution silently extends every assist window by one tick, and nothing that inspects only the final
+    /// frame could ever see it.
+    fn expire_damage_credits(&mut self) {
+        let window = u64::from(self.config.assist_window_ticks);
+        let horizon = self.tick.saturating_sub(window);
+        for actor in &mut self.actors {
+            if actor
+                .damage_credits
+                .iter()
+                .all(|credit| credit.last_tick >= horizon)
+            {
+                continue;
+            }
+            actor
+                .damage_credits
+                .retain(|credit| credit.last_tick >= horizon);
+            self.dirty.insert(actor.id);
+        }
+    }
+
+    /// Record that `source` damaged `target` on this tick.
+    ///
+    /// When the list is full the entry with the lowest `(last_tick, source)` is evicted rather than the
+    /// newcomer refused: refusing keeps the contributor whose window is closest to closing and drops the one
+    /// who just landed a hit, which is backwards, and it would make the assist set depend on arrival order.
+    fn credit_damage(&mut self, target_index: usize, source: ActorId) {
+        let limit = usize::from(self.config.max_damage_credits_per_actor);
+        let tick = self.tick;
+        let credits = &mut self.actors[target_index].damage_credits;
+        match credits.binary_search_by_key(&source, |credit| credit.source) {
+            Ok(index) => credits[index].last_tick = tick,
+            Err(index) => {
+                if credits.len() >= limit {
+                    let Some(oldest) = credits
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, credit)| (credit.last_tick, credit.source))
+                        .map(|(position, _)| position)
+                    else {
+                        return;
+                    };
+                    if credits[oldest].last_tick >= tick && credits[oldest].source < source {
+                        // Everything already recorded is at least as recent as this hit, so there is
+                        // nothing older to give up. Refuse rather than churn a full list every tick.
+                        return;
+                    }
+                    credits.remove(oldest);
+                    let slot = credits
+                        .binary_search_by_key(&source, |credit| credit.source)
+                        .unwrap_or_else(|slot| slot);
+                    credits.insert(
+                        slot,
+                        DamageCredit {
+                            source,
+                            last_tick: tick,
+                        },
+                    );
+                } else {
+                    credits.insert(
+                        index,
+                        DamageCredit {
+                            source,
+                            last_tick: tick,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Settle every death's bounty: kill credit, streaks, shutdown gold, assists, and shared experience.
+    ///
+    /// Runs AFTER the whole health batch has settled, never inside it. `HEALTH_SETTLEMENT_POLICY` promises
+    /// that ordering decides credit but never survival; a bounty that raised a level that raised max health
+    /// mid-settlement would let ascending target order decide who survives a simultaneous exchange.
+    fn settle_progression(&mut self, kills: Vec<KillRecord>) -> Result<(), RuntimeError> {
+        for kill in kills {
+            if let Ok(index) = self
+                .scores
+                .binary_search_by_key(&kill.victim, |entry| entry.actor)
+            {
+                self.scores[index].deaths = self.scores[index].deaths.saturating_add(1);
+                self.scores[index].kill_streak = 0;
+                self.dirty_scores.insert(kill.victim);
+            }
+
+            // A self-kill counts a death and nothing else: no credit, no gold, no streak.
+            if kill.killer == kill.victim {
+                continue;
+            }
+
+            let shutdown = streak_gold(kill.victim_streak);
+            if let Ok(index) = self
+                .scores
+                .binary_search_by_key(&kill.killer, |entry| entry.actor)
+            {
+                self.scores[index].kills = self.scores[index].kills.saturating_add(1);
+                let streak = self.scores[index].kill_streak.saturating_add(1);
+                self.scores[index].kill_streak = streak;
+                self.scores[index].best_kill_streak =
+                    self.scores[index].best_kill_streak.max(streak);
+                self.dirty_scores.insert(kill.killer);
+                self.pending_events.push(MatchEvent::KillCredited {
+                    killer: kill.killer,
+                    victim: kill.victim,
+                    streak_after: streak,
+                });
+                self.grant_gold(kill.killer, kill.bounty.gold, GoldReason::Kill)?;
+                if shutdown > 0 {
+                    self.grant_gold(kill.killer, shutdown, GoldReason::Shutdown)?;
+                }
+            }
+            // A killer with no scoreboard line — a tower or a minion landing the blow — forfeits the credit
+            // and the gold. Silently, and without panicking: that is an ordinary MOBA outcome.
+
+            let assisters: Vec<ActorId> = kill
+                .assisters
+                .iter()
+                .copied()
+                .filter(|actor| *actor != kill.killer)
+                .filter(|actor| {
+                    self.scores
+                        .binary_search_by_key(actor, |entry| entry.actor)
+                        .is_ok()
+                })
+                .collect();
+            if !assisters.is_empty() {
+                // Minted, not deducted. If the assist pool came out of the killer's take, a killer's income
+                // would silently depend on whether a team-mate happened to poke.
+                let pool = kill.bounty.gold / 2;
+                let count = u32::try_from(assisters.len()).unwrap_or(u32::MAX);
+                let (base, mut remainder) = apportion(pool, count);
+                for actor in &assisters {
+                    let extra = u32::from(remainder > 0);
+                    remainder = remainder.saturating_sub(extra);
+                    if let Ok(index) = self.scores.binary_search_by_key(actor, |e| e.actor) {
+                        self.scores[index].assists = self.scores[index].assists.saturating_add(1);
+                        self.dirty_scores.insert(*actor);
+                    }
+                    self.pending_events.push(MatchEvent::AssistCredited {
+                        actor: *actor,
+                        victim: kill.victim,
+                    });
+                    self.grant_gold(*actor, base + extra, GoldReason::Assist)?;
+                }
+            }
+
+            self.share_experience(&kill)?;
+        }
+        Ok(())
+    }
+
+    /// Split a death's experience across the killer plus every living enemy hero inside the share radius.
+    ///
+    /// Recipients come from `self.scores`, which is sorted by actor, so the award order is canonical for
+    /// free — no spatial query's output order can ever reach the split. The remainder is CONSERVED rather
+    /// than truncated, which is what makes "every unit a death mints is awarded" a testable invariant.
+    fn share_experience(&mut self, kill: &KillRecord) -> Result<(), RuntimeError> {
+        if kill.bounty.experience == 0 {
+            return Ok(());
+        }
+        let radius_squared = u128::from(self.config.xp_share_radius_mm).pow(2);
+        let recipients: Vec<ActorId> = self
+            .scores
+            .iter()
+            .filter(|entry| entry.team != kill.victim_team)
+            .filter(|entry| entry.actor != kill.victim)
+            .filter(|entry| {
+                // The killer always shares, in range or not and alive or not: a posthumous projectile kill
+                // must still pay its dead caster.
+                entry.actor == kill.killer
+                    || self.actor_state(entry.actor).is_some_and(|actor| {
+                        actor.alive()
+                            && kill.victim_position.squared_distance(actor.position)
+                                <= radius_squared
+                    })
+            })
+            .map(|entry| entry.actor)
+            .collect();
+        let count = u32::try_from(recipients.len()).unwrap_or(u32::MAX);
+        if count == 0 {
+            return Ok(());
+        }
+        let (base, mut remainder) = apportion(kill.bounty.experience, count);
+        for actor in recipients {
+            let extra = u32::from(remainder > 0);
+            remainder = remainder.saturating_sub(extra);
+            let amount = base + extra;
+            if amount > 0 && self.actor_state(actor).is_some() {
+                self.award_experience(actor, amount)?;
+            }
+        }
+        Ok(())
     }
 
     /// Bounded canonical snapshot of every projectile currently in flight.
@@ -1017,17 +1541,120 @@ impl MatchRuntime {
             }
         }
         self.check_projectile_invariants()?;
+        self.check_score_invariants()?;
+        // The scoreboard and per-actor progression deliberately SURVIVE `Complete`: a match result that
+        // erased its own scoreboard would be useless. Assist windows do not - a completed match can produce
+        // no further kill, so an open window would be state nothing can ever consume.
         if matches!(self.phase, MatchPhase::Complete { .. })
             && (!self.queued_commands.is_empty()
                 || !self.projectiles.is_empty()
                 || self.actors.iter().any(|actor| {
-                    actor.cast.is_some() || actor.attack.is_some() || actor.respawn_at.is_some()
+                    actor.cast.is_some()
+                        || actor.attack.is_some()
+                        || actor.respawn_at.is_some()
+                        || !actor.damage_credits.is_empty()
                 }))
         {
             return Err(Self::violation(
                 None,
-                "terminal state retains commands, projectiles, pending actions, or respawn deadlines",
+                "terminal state retains commands, projectiles, credits, actions, or respawn deadlines",
             ));
+        }
+        Ok(())
+    }
+
+    /// Audit the permanent scoreboard.
+    ///
+    /// The reverse referential check - that every line still has a live actor - is **deliberately absent**:
+    /// a line outliving the body it was opened for is the feature, not a leak.
+    fn check_score_invariants(&self) -> Result<(), InvariantViolation> {
+        if self.scores.len() > usize::from(self.config.max_score_entries) {
+            return Err(Self::violation(None, "scoreboard budget exceeded"));
+        }
+        if self
+            .scores
+            .windows(2)
+            .any(|pair| pair[0].actor >= pair[1].actor)
+        {
+            return Err(Self::violation(
+                None,
+                "scoreboard entries are not strictly sorted by actor",
+            ));
+        }
+        for entry in &self.scores {
+            if self
+                .next_dynamic_actor_id
+                .is_some_and(|next| entry.actor.get() >= next)
+            {
+                return Err(Self::violation(
+                    Some(entry.actor),
+                    "scoreboard entry names an actor beyond the allocator",
+                ));
+            }
+            if entry
+                .owner
+                .is_some_and(|owner| !self.player_roster.contains(&owner))
+            {
+                return Err(Self::violation(
+                    Some(entry.actor),
+                    "scoreboard owner is absent from the player roster",
+                ));
+            }
+            if entry.since_tick > self.tick {
+                return Err(Self::violation(
+                    Some(entry.actor),
+                    "scoreboard entry claims to predate the match",
+                ));
+            }
+            // The whole passive economy is closed-form, so it is compared EXACTLY rather than bounded. This
+            // is the check that makes half the gold supply untamperable.
+            if entry.passive_gold_paid
+                != passive_gold_owed(self.tick.saturating_sub(entry.since_tick), self.config)
+            {
+                return Err(Self::violation(
+                    Some(entry.actor),
+                    "passive gold does not match its closed form",
+                ));
+            }
+            if entry.best_kill_streak < entry.kill_streak {
+                return Err(Self::violation(
+                    Some(entry.actor),
+                    "best kill streak is below the live streak",
+                ));
+            }
+            // Earned gold is bounded by the counters that justify it: a payload cannot claim income it has
+            // no kills or assists to account for.
+            let ceiling = u64::from(entry.kills)
+                * (u64::from(crate::model::MAX_BOUNTY_GOLD)
+                    + u64::from(crate::model::MAX_STREAK_GOLD))
+                + u64::from(entry.assists) * (u64::from(crate::model::MAX_BOUNTY_GOLD) / 2);
+            if u64::from(entry.earned_gold) > ceiling {
+                return Err(Self::violation(
+                    Some(entry.actor),
+                    "earned gold exceeds what its kills and assists can account for",
+                ));
+            }
+            if let Some(actor) = self.actor_state(entry.actor) {
+                if actor.team != entry.team {
+                    return Err(Self::violation(
+                        Some(entry.actor),
+                        "scoreboard entry disagrees with its live actor about team",
+                    ));
+                }
+            }
+        }
+        for actor in &self.actors {
+            if actor.kind == ActorKind::Hero
+                && self
+                    .scores
+                    .binary_search_by_key(&actor.id, |entry| entry.actor)
+                    .is_err()
+            {
+                return Err(Self::violation(
+                    Some(actor.id),
+                    "a live hero has no scoreboard entry",
+                ));
+            }
         }
         Ok(())
     }
@@ -1201,6 +1828,115 @@ impl MatchRuntime {
             return Err(Self::violation(
                 Some(actor.id),
                 "resolved control mask does not match its status effects",
+            ));
+        }
+        // The progression chain is three derived links, each re-derived and compared rather than trusted:
+        //   level      == level_for_experience(experience)
+        //   base_stats == authored_stats.with_growth(growth, level)
+        //   stats      == base_stats.with_modifiers(modifiers)
+        // Breaking any link is what a forged checkpoint would have to do, and each is checked here.
+        if actor.experience > EXPERIENCE_CAP {
+            return Err(Self::violation(
+                Some(actor.id),
+                "experience exceeds its hard cap",
+            ));
+        }
+        if actor.level != level_for_experience(actor.experience) {
+            return Err(Self::violation(
+                Some(actor.id),
+                "level does not match its experience",
+            ));
+        }
+        let grown_matches = if actor.level == 1 {
+            actor.base_stats == actor.authored_stats
+        } else {
+            actor.base_stats == actor.authored_stats.with_growth(actor.growth, actor.level)
+        };
+        if !grown_matches {
+            return Err(Self::violation(
+                Some(actor.id),
+                "base stats do not match their authored stats and growth",
+            ));
+        }
+        if actor.kind != ActorKind::Hero
+            && (actor.level != 1 || actor.experience != 0 || actor.unspent_ability_points != 0)
+        {
+            return Err(Self::violation(
+                Some(actor.id),
+                "a non-hero carries progression",
+            ));
+        }
+        // Ranks reconstruct the level exactly. This relation is what stops a tampered payload asserting a
+        // maxed hero: spent points plus unspent points must equal the levels actually earned.
+        let mut spent: u32 = 0;
+        for ability in &actor.abilities {
+            if ability.rank < 1 || ability.rank > MAX_ABILITY_RANK {
+                return Err(Self::violation(
+                    Some(actor.id),
+                    "ability rank is outside its legal range",
+                ));
+            }
+            if actor.level < rank_unlock_level(ability.rank) {
+                return Err(Self::violation(
+                    Some(actor.id),
+                    "ability rank is not unlocked at this level",
+                ));
+            }
+            spent += u32::from(ability.rank - 1);
+        }
+        if spent + u32::from(actor.unspent_ability_points) != u32::from(actor.level - 1) {
+            return Err(Self::violation(
+                Some(actor.id),
+                "spent and unspent ability points do not reconstruct the level",
+            ));
+        }
+        if actor.damage_credits.len() > usize::from(self.config.max_damage_credits_per_actor) {
+            return Err(Self::violation(
+                Some(actor.id),
+                "actor damage credit budget exceeded",
+            ));
+        }
+        if actor
+            .damage_credits
+            .windows(2)
+            .any(|pair| pair[0].source >= pair[1].source)
+        {
+            return Err(Self::violation(
+                Some(actor.id),
+                "damage credits are not strictly sorted by source",
+            ));
+        }
+        let horizon = self
+            .tick
+            .saturating_sub(u64::from(self.config.assist_window_ticks));
+        for credit in &actor.damage_credits {
+            if credit.last_tick > self.tick {
+                return Err(Self::violation(
+                    Some(actor.id),
+                    "damage credit is stamped in the future",
+                ));
+            }
+            // This is the assertion that proves top-of-tick expiry actually ran.
+            if credit.last_tick < horizon {
+                return Err(Self::violation(
+                    Some(actor.id),
+                    "an expired damage credit survived the frame boundary",
+                ));
+            }
+            if self
+                .next_dynamic_actor_id
+                .is_some_and(|next| credit.source.get() >= next)
+            {
+                return Err(Self::violation(
+                    Some(actor.id),
+                    "damage credit names a source beyond the allocator",
+                ));
+            }
+        }
+        if !actor.alive() && !actor.damage_credits.is_empty() {
+            return Err(Self::violation(
+                Some(actor.id),
+                "a dead actor retains an assist window",
             ));
         }
         let resolved_matches = if actor.modifiers.is_empty() {
@@ -1532,10 +2268,18 @@ impl MatchRuntime {
         self.checkpoint_ready = false;
         self.tick = next_tick;
 
+        // Phase 0 of the tick: closed-form passive income. It depends on nothing but the tick, and the
+        // frame audit compares it exactly, so it must run before the objective and time-limit early
+        // returns - otherwise the deciding tick of every match would fail its own audit.
+        self.accrue_passive_gold();
+
         // Phase 1 of the tick: retire expired restrictions BEFORE any order is executed, so an effect whose
         // final tick was the previous one cannot block a command delivered now. Placing this after command
         // execution would silently extend every effect by exactly one tick.
         self.expire_status_effects();
+        // Same argument, same placement: an assist window that closed last tick must not still be open for
+        // a kill delivered now.
+        self.expire_damage_credits();
 
         let mut commands = self.queued_commands.remove(&self.tick).unwrap_or_default();
         commands.sort_unstable_by_key(command_order_key);
@@ -1597,7 +2341,7 @@ impl MatchRuntime {
     #[must_use]
     pub fn world_digest(&self) -> WorldDigest {
         let mut hash = StableHash::new();
-        hash.bytes(b"metrocalk-gameplay-mob2-v8");
+        hash.bytes(b"metrocalk-gameplay-mob2-v9");
         hash.u64(self.seed);
         hash.u64(self.tick);
         hash.phase(self.phase);
@@ -1648,6 +2392,11 @@ impl MatchRuntime {
         hash.len(self.projectiles.len());
         for projectile in &self.projectiles {
             hash.projectile(*projectile);
+        }
+
+        hash.len(self.scores.len());
+        for entry in &self.scores {
+            hash.score_entry(*entry);
         }
 
         hash.len(self.player_roster.len());
@@ -1744,7 +2493,12 @@ impl MatchRuntime {
         // `Stop` is deliberately never gated — it only cancels, so refusing it would produce rejection noise
         // without preventing anything.
         let controls = actor.control_mask;
-        if !controls.is_empty() && !matches!(kind, CommandKind::Stop) {
+        // `UpgradeAbility` joins `Stop` in never being crowd-control gated: spending a level-up point is a
+        // menu action, not something an actor performs with its body, so a stun that blocked it would be
+        // punishing the player's interface rather than their character.
+        if !controls.is_empty()
+            && !matches!(kind, CommandKind::Stop | CommandKind::UpgradeAbility { .. })
+        {
             if controls.contains(ControlKind::Stun) {
                 return Err(CommandRejectReason::ActorStunned);
             }
@@ -1811,7 +2565,37 @@ impl MatchRuntime {
                 }
                 Ok(())
             }
+            CommandKind::UpgradeAbility { ability } => Self::validate_upgrade(actor, ability),
         }
+    }
+
+    /// Can this actor spend a point on this ability right now?
+    ///
+    /// Every refusal names its own cause rather than collapsing into one reason, because a client has to
+    /// tell "you have no points" from "this rank is not unlocked yet" to show anything useful.
+    fn validate_upgrade(actor: &ActorState, ability: AbilityId) -> Result<(), CommandRejectReason> {
+        if actor.kind != ActorKind::Hero {
+            return Err(CommandRejectReason::ActorHasNoProgression);
+        }
+        let state = actor
+            .abilities
+            .binary_search_by_key(&ability, |candidate| candidate.id)
+            .ok()
+            .map(|index| actor.abilities[index])
+            .ok_or(CommandRejectReason::AbilityNotEquipped)?;
+        if actor.unspent_ability_points == 0 {
+            return Err(CommandRejectReason::NoAbilityPointAvailable);
+        }
+        if state.rank >= MAX_ABILITY_RANK {
+            return Err(CommandRejectReason::AbilityRankMaxed);
+        }
+        // Rank N unlocks at level 2N-1, so ranks 2..5 unlock at levels 3/5/7/9 - the shipped shape, and a
+        // relation the restore audit can re-derive from the level alone.
+        let unlocks_at_level = rank_unlock_level(state.rank + 1);
+        if actor.level < unlocks_at_level {
+            return Err(CommandRejectReason::AbilityRankLocked { unlocks_at_level });
+        }
+        Ok(())
     }
 
     fn validate_cast(
@@ -1936,6 +2720,10 @@ impl MatchRuntime {
         self.apply_intent(command.actor, command.kind)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one function per command verb keeps the whole applied-intent surface auditable"
+    )]
     fn apply_intent(&mut self, actor_id: ActorId, kind: CommandKind) -> Result<(), RuntimeError> {
         match kind {
             CommandKind::MoveTo { destination } => {
@@ -1993,6 +2781,22 @@ impl MatchRuntime {
                     ability,
                     target,
                     resolves_at,
+                });
+            }
+            CommandKind::UpgradeAbility { ability } => {
+                let index = self.actor_index(actor_id).expect("validated actor");
+                let slot = self.actors[index]
+                    .abilities
+                    .binary_search_by_key(&ability, |candidate| candidate.id)
+                    .expect("validated equipped ability");
+                let rank = self.actors[index].abilities[slot].rank + 1;
+                self.actors[index].abilities[slot].rank = rank;
+                self.actors[index].unspent_ability_points -= 1;
+                self.dirty.insert(actor_id);
+                self.pending_events.push(MatchEvent::AbilityRankUp {
+                    actor: actor_id,
+                    ability,
+                    rank,
                 });
             }
             CommandKind::BasicAttack { target } => {
@@ -2072,7 +2876,11 @@ impl MatchRuntime {
     fn resolve_combat(&mut self) -> Result<(), RuntimeError> {
         let mut effects = self.advance_projectiles()?;
         effects.extend(self.resolve_due_casts());
-        self.settle_health_effects(effects)
+        let kills = self.settle_health_effects(effects)?;
+        // Progression settles AFTER the health batch, never inside it, and still inside `resolve_combat`
+        // so a bounty is not silently forfeited on the deciding tick of a match that ends by objective or
+        // time limit - both of those return early, before the later phases run.
+        self.settle_progression(kills)
     }
 
     /// Step every live projectile one tick, resolving any that strike a body or reach the end of flight.
@@ -2123,6 +2931,7 @@ impl MatchRuntime {
                 projectile.source,
                 projectile.team,
                 spec,
+                projectile.amount,
                 impact_at,
                 victim,
                 &mut effects,
@@ -2171,11 +2980,16 @@ impl MatchRuntime {
     /// that satisfies the ability's relation filter. Unlike projectile collision, an area impact does **not**
     /// exclude the caster — an ally-targeted healing burst is supposed to heal the actor standing at its
     /// centre.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the impact's magnitude is passed explicitly rather than re-read, which is the point"
+    )]
     fn admit_impact(
         &self,
         source: ActorId,
         source_team: TeamId,
         spec: AbilitySpec,
+        amount: u32,
         centre: Vec2Mm,
         single_victim: Option<ActorId>,
         effects: &mut Vec<AdmittedHealthEffect>,
@@ -2196,15 +3010,17 @@ impl MatchRuntime {
             }
         };
         for target in victims {
+            // The magnitude is the one resolved when this landed, not one re-read from the spec now: that
+            // is what keeps a rank-up from retroactively rewriting an effect already committed.
             effects.push(match spec.effect {
-                AbilityEffect::Damage { amount, school } => AdmittedHealthEffect::Damage {
+                AbilityEffect::Damage { school, .. } => AdmittedHealthEffect::Damage {
                     source,
                     target,
                     cause: DamageCause::Ability(spec.id),
                     amount,
                     school,
                 },
-                AbilityEffect::Heal { amount } => AdmittedHealthEffect::Heal {
+                AbilityEffect::Heal { .. } => AdmittedHealthEffect::Heal {
                     source,
                     target,
                     ability: spec.id,
@@ -2221,6 +3037,7 @@ impl MatchRuntime {
         source_team: TeamId,
         position: Vec2Mm,
         spec: AbilitySpec,
+        amount: u32,
         target: CastTarget,
     ) -> Result<(), CommandRejectReason> {
         if self.projectiles.len() >= usize::from(self.config.max_projectiles) {
@@ -2239,6 +3056,7 @@ impl MatchRuntime {
             ability: spec.id,
             position,
             end,
+            amount,
         });
         self.next_projectile_id = raw_id.checked_add(1);
         self.pending_events.push(MatchEvent::ProjectileSpawned {
@@ -2358,6 +3176,12 @@ impl MatchRuntime {
                         .expect("equipped ability has a registered spec");
                     let source_team = self.actors[source_index].team;
                     let source_position = self.actors[source_index].position;
+                    // Resolved once, here, from the rank the caster holds at the instant the cast lands.
+                    let rank = self.actors[source_index]
+                        .abilities
+                        .binary_search_by_key(&cast.ability, |candidate| candidate.id)
+                        .map_or(1, |index| self.actors[source_index].abilities[index].rank);
+                    let amount = spec.amount_at_rank(rank);
                     if matches!(spec.delivery, AbilityDelivery::Projectile { .. }) {
                         // A launch failure cancels the cast rather than silently swallowing it: the client
                         // was told a cast started, so it is owed exactly one outcome.
@@ -2366,6 +3190,7 @@ impl MatchRuntime {
                             source_team,
                             source_position,
                             spec,
+                            amount,
                             cast.target,
                         ) {
                             self.cancel_action(source_id, action, reason);
@@ -2400,6 +3225,7 @@ impl MatchRuntime {
                         source_id,
                         source_team,
                         spec,
+                        amount,
                         centre,
                         single_victim,
                         &mut effects,
@@ -2457,7 +3283,7 @@ impl MatchRuntime {
     fn settle_health_effects(
         &mut self,
         effects: Vec<AdmittedHealthEffect>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<Vec<KillRecord>, RuntimeError> {
         let mut by_target: BTreeMap<ActorId, Vec<AdmittedHealthEffect>> = BTreeMap::new();
         for effect in effects {
             let target = match effect {
@@ -2468,6 +3294,7 @@ impl MatchRuntime {
         }
 
         let mut deaths = Vec::new();
+        let mut kills = Vec::new();
         for (target, effects) in by_target {
             let target_index = self.actor_index(target).expect("validated cast target");
             let health_before = self.actors[target_index].health;
@@ -2521,6 +3348,12 @@ impl MatchRuntime {
                     killer = Some(source);
                 }
                 settled_health = health_after;
+                // Gated on APPLIED, not on the authored amount: every overkill entry in the same batch
+                // still emits `DamageApplied { amount: 0 }`, and crediting those would turn one area
+                // ability into a mass assist event.
+                if applied > 0 && source != target {
+                    self.credit_damage(target_index, source);
+                }
                 self.pending_events.push(MatchEvent::DamageApplied {
                     source,
                     target,
@@ -2551,10 +3384,29 @@ impl MatchRuntime {
                         reason: CommandRejectReason::ActorDead,
                     });
                 }
+                let killer =
+                    killer.expect("only admitted damage can settle positive health at zero");
                 self.pending_events.push(MatchEvent::ActorDied {
                     actor: target,
-                    killer: killer
-                        .expect("only admitted damage can settle positive health at zero"),
+                    killer,
+                });
+                // Snapshotted here, before `apply_death_rule` can despawn the body: a despawned actor is
+                // still worth a bounty, and its assist window still names who earned a share of it.
+                let assisters = std::mem::take(&mut self.actors[target_index].damage_credits)
+                    .into_iter()
+                    .map(|credit| credit.source)
+                    .collect();
+                kills.push(KillRecord {
+                    victim: target,
+                    victim_team: self.actors[target_index].team,
+                    victim_position: self.actors[target_index].position,
+                    victim_streak: self
+                        .scores
+                        .binary_search_by_key(&target, |entry| entry.actor)
+                        .map_or(0, |index| self.scores[index].kill_streak),
+                    bounty: self.actors[target_index].bounty,
+                    killer,
+                    assisters,
                 });
                 deaths.push(target);
             }
@@ -2562,7 +3414,7 @@ impl MatchRuntime {
         for actor in deaths {
             self.apply_death_rule(actor)?;
         }
-        Ok(())
+        Ok(kills)
     }
 
     fn apply_death_rule(&mut self, actor_id: ActorId) -> Result<(), RuntimeError> {
@@ -2655,6 +3507,11 @@ impl MatchRuntime {
             .filter_map(|id| self.actor(id))
             .collect();
         let removed_projectiles = std::mem::take(&mut self.removed_projectiles);
+        let changed_scores = std::mem::take(&mut self.dirty_scores);
+        let scores = changed_scores
+            .into_iter()
+            .filter_map(|actor| self.score(actor))
+            .collect();
         let mut frame = ServerFrame {
             tick: self.tick,
             phase: self.phase,
@@ -2662,6 +3519,7 @@ impl MatchRuntime {
             removed: removed_ids.into_iter().collect(),
             projectiles: self.projectile_views(),
             removed_projectiles: removed_projectiles.into_iter().collect(),
+            scores,
             events: std::mem::take(&mut self.pending_events),
             world_digest: self.world_digest(),
             frame_digest: FrameDigest::default(),
@@ -2721,6 +3579,16 @@ impl MatchRuntime {
 
 fn command_order_key(command: &PlayerCommand) -> (PlayerId, u32, ActorId) {
     (command.player, command.sequence, command.actor)
+}
+
+/// The hero level at which `rank` becomes available: `2N − 1`, so ranks 2–5 unlock at 3/5/7/9.
+///
+/// A relation rather than a table, because the restore audit re-derives it from the level alone.
+pub(crate) const fn rank_unlock_level(rank: u8) -> u8 {
+    if rank <= 1 {
+        return 1;
+    }
+    (rank * 2).saturating_sub(1)
 }
 
 const fn target_actor_id(source: ActorId, target: CastTarget) -> Option<ActorId> {
@@ -2902,28 +3770,6 @@ fn step_towards(current: Vec2Mm, target: Vec2Mm, max_step: u32) -> (Vec2Mm, bool
     )
 }
 
-fn integer_sqrt(value: u128) -> u128 {
-    if value < 2 {
-        return value;
-    }
-    let mut estimate = value;
-    let mut next = estimate.div_ceil(2);
-    while next < estimate {
-        estimate = next;
-        next = u128::midpoint(estimate, value / estimate);
-    }
-    estimate
-}
-
-fn integer_sqrt_ceil(value: u128) -> u128 {
-    let floor = integer_sqrt(value);
-    if floor * floor == value {
-        floor
-    } else {
-        floor + 1
-    }
-}
-
 /// The stable one-byte discriminant for one authoritative event.
 ///
 /// It lives apart from the payload encoding so it is a single table that a test can walk. That matters:
@@ -2956,12 +3802,18 @@ pub(crate) const fn event_tag(event: MatchEvent) -> u8 {
         MatchEvent::ProjectileSpawned { .. } => 21,
         MatchEvent::ProjectileResolved { .. } => 22,
         MatchEvent::ProjectileCancelled { .. } => 23,
+        MatchEvent::KillCredited { .. } => 24,
+        MatchEvent::AssistCredited { .. } => 25,
+        MatchEvent::GoldGranted { .. } => 26,
+        MatchEvent::ExperienceGranted { .. } => 27,
+        MatchEvent::HeroLevelUp { .. } => 28,
+        MatchEvent::AbilityRankUp { .. } => 29,
     }
 }
 
 pub(crate) fn digest_frame(frame: &ServerFrame) -> FrameDigest {
     let mut hash = StableHash::new();
-    hash.bytes(b"metrocalk-gameplay-frame-v6");
+    hash.bytes(b"metrocalk-gameplay-frame-v7");
     hash.u64(frame.tick);
     hash.phase(frame.phase);
     hash.len(frame.changed.len());
@@ -2979,6 +3831,10 @@ pub(crate) fn digest_frame(frame: &ServerFrame) -> FrameDigest {
     hash.len(frame.removed_projectiles.len());
     for projectile in &frame.removed_projectiles {
         hash.u64(projectile.get());
+    }
+    hash.len(frame.scores.len());
+    for entry in &frame.scores {
+        hash.score_view(*entry);
     }
     hash.len(frame.events.len());
     for event in &frame.events {
@@ -3148,16 +4004,116 @@ impl StableHash {
         self.u16(config.max_modifiers_per_actor);
         self.u16(config.max_status_effects_per_actor);
         self.u16(config.max_projectiles);
+        self.u16(config.max_score_entries);
+        self.u16(config.max_damage_credits_per_actor);
+        self.u32(config.assist_window_ticks);
+        self.u32(config.xp_share_radius_mm);
+        self.u32(config.passive_gold_per_100s);
         self.u32(config.max_checkpoint_bytes);
     }
 
     fn projectile(&mut self, projectile: ProjectileState) {
-        self.u64(projectile.id.get());
-        self.u64(projectile.source.get());
-        self.u8(projectile.team.get());
-        self.u32(projectile.ability.get());
-        self.point(projectile.position);
-        self.point(projectile.end);
+        let ProjectileState {
+            id,
+            source,
+            team,
+            ability,
+            position,
+            end,
+            amount,
+        } = projectile;
+        self.u64(id.get());
+        self.u64(source.get());
+        self.u8(team.get());
+        self.u32(ability.get());
+        self.point(position);
+        self.point(end);
+        self.u32(amount);
+    }
+
+    fn bounty(&mut self, bounty: Bounty) {
+        self.u32(bounty.gold);
+        self.u32(bounty.experience);
+    }
+
+    fn growth(&mut self, growth: StatGrowth) {
+        self.u32(growth.max_health_per_level);
+        self.u32(growth.max_resource_per_level);
+        self.u32(growth.move_speed_mm_per_tick_per_level);
+        self.u16(growth.physical_reduction_bps_per_level);
+        self.u16(growth.magic_reduction_bps_per_level);
+    }
+
+    fn gold_reason(&mut self, reason: GoldReason) {
+        self.u8(match reason {
+            GoldReason::Kill => 0,
+            GoldReason::Shutdown => 1,
+            GoldReason::Assist => 2,
+        });
+    }
+
+    fn score_entry(&mut self, entry: ScoreEntry) {
+        let ScoreEntry {
+            actor,
+            owner,
+            team,
+            since_tick,
+            earned_gold,
+            passive_gold_paid,
+            kills,
+            deaths,
+            assists,
+            kill_streak,
+            best_kill_streak,
+        } = entry;
+        self.u64(actor.get());
+        match owner {
+            Some(owner) => {
+                self.bool(true);
+                self.u64(owner.get());
+            }
+            None => self.bool(false),
+        }
+        self.u8(team.get());
+        self.u64(since_tick);
+        self.u32(earned_gold);
+        // The derived passive half is hashed alongside its inputs, exactly as the stat cache is: a drifted
+        // cache must not be invisible to a digest comparison between two runtimes.
+        self.u32(passive_gold_paid);
+        self.u32(kills);
+        self.u32(deaths);
+        self.u32(assists);
+        self.u16(kill_streak);
+        self.u16(best_kill_streak);
+    }
+
+    fn score_view(&mut self, view: ScoreView) {
+        let ScoreView {
+            actor,
+            owner,
+            team,
+            gold,
+            kills,
+            deaths,
+            assists,
+            kill_streak,
+            best_kill_streak,
+        } = view;
+        self.u64(actor.get());
+        match owner {
+            Some(owner) => {
+                self.bool(true);
+                self.u64(owner.get());
+            }
+            None => self.bool(false),
+        }
+        self.u8(team.get());
+        self.u32(gold);
+        self.u32(kills);
+        self.u32(deaths);
+        self.u32(assists);
+        self.u16(kill_streak);
+        self.u16(best_kill_streak);
     }
 
     fn projectile_view(&mut self, projectile: ProjectileView) {
@@ -3186,6 +4142,7 @@ impl StableHash {
         self.u32(spec.resource_cost);
         self.u32(spec.cooldown_ticks);
         self.u16(spec.cast_ticks);
+        self.u32(spec.per_rank_amount);
         match spec.delivery {
             AbilityDelivery::Instant => self.u8(0),
             AbilityDelivery::Projectile {
@@ -3221,7 +4178,43 @@ impl StableHash {
         }
     }
 
+    /// Destructured on purpose: omitting a field here is the one failure mode in the whole state layer
+    /// that nothing else would catch - the digest would simply stop covering it, silently. Binding every
+    /// field by name turns that into a compile error the next time one is added.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive destructured actor encoding is intentionally one visible block"
+    )]
     fn actor(&mut self, actor: &ActorState) {
+        let ActorState {
+            id: _,
+            owner: _,
+            team: _,
+            kind: _,
+            position: _,
+            destination: _,
+            authored_stats,
+            growth,
+            bounty,
+            experience,
+            level,
+            unspent_ability_points,
+            damage_credits,
+            base_stats: _,
+            modifiers: _,
+            status_effects: _,
+            control_mask: _,
+            stats: _,
+            health: _,
+            resource: _,
+            abilities: _,
+            cast: _,
+            basic_attack: _,
+            attack: _,
+            death_rule: _,
+            respawn_at: _,
+            provenance: _,
+        } = actor;
         self.u64(actor.id.get());
         self.provenance(actor.provenance);
         match actor.owner {
@@ -3248,6 +4241,18 @@ impl StableHash {
             }
             None => self.bool(false),
         }
+        self.stats(*authored_stats);
+        self.growth(*growth);
+        self.bounty(*bounty);
+        self.u32(*experience);
+        self.u8(*unspent_ability_points);
+        self.len(damage_credits.len());
+        for credit in damage_credits {
+            self.u64(credit.source.get());
+            self.u64(credit.last_tick);
+        }
+        // Derived caches are hashed alongside their inputs, per the rule the stat cache already follows.
+        self.u8(*level);
         self.stats(actor.base_stats);
         self.len(actor.modifiers.len());
         for modifier in &actor.modifiers {
@@ -3274,6 +4279,7 @@ impl StableHash {
         for ability in &actor.abilities {
             self.u32(ability.id.get());
             self.u64(ability.ready_at);
+            self.u8(ability.rank);
         }
         match actor.cast {
             Some(cast) => {
@@ -3400,10 +4406,14 @@ impl StableHash {
             }
             None => self.bool(false),
         }
+        self.u8(actor.level);
+        self.u32(actor.experience);
+        self.u8(actor.unspent_ability_points);
         self.len(actor.cooldowns.len());
         for cooldown in &actor.cooldowns {
             self.u32(cooldown.ability.get());
             self.u64(cooldown.ready_at);
+            self.u8(cooldown.rank);
         }
     }
 
@@ -3456,6 +4466,13 @@ impl StableHash {
             CommandRejectReason::InvalidTargetForm => self.u8(31),
             CommandRejectReason::TargetPointOutOfBounds => self.u8(32),
             CommandRejectReason::ProjectileBudgetExceeded => self.u8(33),
+            CommandRejectReason::NoAbilityPointAvailable => self.u8(34),
+            CommandRejectReason::AbilityRankMaxed => self.u8(35),
+            CommandRejectReason::AbilityRankLocked { unlocks_at_level } => {
+                self.u8(36);
+                self.u8(unlocks_at_level);
+            }
+            CommandRejectReason::ActorHasNoProgression => self.u8(37),
         }
     }
 
@@ -3647,6 +4664,57 @@ impl StableHash {
                 self.u64(projectile.get());
                 self.rejection_reason(reason);
             }
+            MatchEvent::KillCredited {
+                killer,
+                victim,
+                streak_after,
+            } => {
+                self.u64(killer.get());
+                self.u64(victim.get());
+                self.u16(streak_after);
+            }
+            MatchEvent::AssistCredited { actor, victim } => {
+                self.u64(actor.get());
+                self.u64(victim.get());
+            }
+            MatchEvent::GoldGranted {
+                actor,
+                amount,
+                reason,
+                total_after,
+            } => {
+                self.u64(actor.get());
+                self.u32(amount);
+                self.gold_reason(reason);
+                self.u32(total_after);
+            }
+            MatchEvent::ExperienceGranted {
+                actor,
+                amount,
+                total_after,
+            } => {
+                self.u64(actor.get());
+                self.u32(amount);
+                self.u32(total_after);
+            }
+            MatchEvent::HeroLevelUp {
+                actor,
+                level,
+                unspent_ability_points,
+            } => {
+                self.u64(actor.get());
+                self.u8(level);
+                self.u8(unspent_ability_points);
+            }
+            MatchEvent::AbilityRankUp {
+                actor,
+                ability,
+                rank,
+            } => {
+                self.u64(actor.get());
+                self.u32(ability.get());
+                self.u8(rank);
+            }
         }
     }
 
@@ -3669,6 +4737,10 @@ impl StableHash {
             CommandKind::BasicAttack { target } => {
                 self.u8(3);
                 self.u64(target.get());
+            }
+            CommandKind::UpgradeAbility { ability } => {
+                self.u8(4);
+                self.u32(ability.get());
             }
         }
     }

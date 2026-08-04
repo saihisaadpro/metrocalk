@@ -202,7 +202,16 @@
       "single-batch-settlement-across-projectile-impacts-and-casts",
       "fail-closed-projectile-budget-and-terminal-projectile-cancellation",
       "aim-aware-bots-that-can-fire-and-miss-skillshots",
-      "ci-executed-capture-harness-observations"
+      "ci-executed-capture-harness-observations",
+      "derived-level-and-growth-chain-re-audited-every-frame",
+      "permanent-actor-keyed-scoreboard-outliving-despawned-heroes",
+      "bounded-top-of-tick-pruned-assist-window-gated-on-applied-damage",
+      "closed-form-untamperable-passive-gold",
+      "conserving-largest-remainder-experience-sharing-in-canonical-order",
+      "minted-not-deducted-assist-gold-and-victim-streak-shutdowns",
+      "ability-ranks-that-change-magnitude-and-reconstruct-the-level",
+      "player-issued-never-cc-gated-ability-upgrade-command",
+      "authored-bounty-and-growth-cooked-from-the-document"
     ],
     "acceptanceBlockers": [
       "replay-file-checkpoint-index-and-scrub-integration",
@@ -223,10 +232,10 @@
       "certified-idle-host-and-min-spec-perf-profile"
     ],
     "ciEvidence": {
-      "status": "green",
-      "commit": "740cc7e",
-      "checks": 24,
-      "note": "The MOB crates are committed and gated. The editor bridge and its e2e capture are NOT committed (parallel-lane entanglement) and are therefore local-only. The capture harness is now CI-executed."
+      "status": "pending-push",
+      "commit": "pending",
+      "checks": 25,
+      "note": "Re-verify after the GP-05/GP-14 push. The capture harness floor is now 62 observable checks."
     }
   },
   "mob2LocalEvidence": {
@@ -266,13 +275,12 @@
       "owed": "a certified-idle host and the still-owed true min-spec profile"
     },
     "captureHarness": {
-      "scenarios": 18,
-      "frames": 114,
-      "observableChecks": 49,
+      "scenarios": 20,
+      "frames": 121,
+      "observableChecks": 62,
       "failing": 0,
       "ciExecuted": true,
-      "workflow": ".github/workflows/mobile-gameplay-tripwire.yml",
-      "note": "Previously compiled but never executed by any job, so every observation it computed was a dark test."
+      "workflow": ".github/workflows/mobile-gameplay-tripwire.yml"
     },
     "measurementCaveat": "Wall-clock numbers from one unpaced Windows developer machine at ~11% background load. Only the executable p99 budget gate and the retained-CI blocker carry weight; the soak elapsed time is comparative evidence against the prior idle range, not a published bound."
   },
