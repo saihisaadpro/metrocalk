@@ -291,43 +291,7 @@ impl CookedMatch {
         let mut runtime = MatchRuntime::new(config, self.seed).map_err(debug)?;
 
         for actor in &self.actors {
-            let death_rule = match (actor.objective_for, actor.respawn_delay_ticks) {
-                (Some(team), _) => DeathRule::ObjectiveVictory {
-                    winner: TeamId(team),
-                },
-                (None, Some(delay)) => DeathRule::Respawn {
-                    delay_ticks: delay,
-                    at: Vec2Mm::new(actor.x_mm, actor.y_mm),
-                },
-                (None, None) => DeathRule::StayDead,
-            };
-            runtime
-                .spawn_actor(&ActorSpawn {
-                    id: metrocalk_gameplay::ActorId(actor.id),
-                    owner: actor.owned.then_some(LOCAL_PLAYER),
-                    team: TeamId(actor.team),
-                    kind: actor_kind(&actor.role),
-                    position: Vec2Mm::new(actor.x_mm, actor.y_mm),
-                    stats: CombatStats {
-                        max_health: actor.max_health,
-                        max_resource: 0,
-                        move_speed_mm_per_tick: actor.move_speed_mm_per_tick,
-                        physical_reduction_bps: actor.physical_reduction_bps,
-                        magic_reduction_bps: 0,
-                    },
-                    growth: StatGrowth {
-                        max_health_per_level: actor.health_per_level,
-                        ..StatGrowth::NONE
-                    },
-                    bounty: Bounty {
-                        gold: actor.bounty_gold,
-                        experience: actor.bounty_experience,
-                    },
-                    abilities: vec![],
-                    basic_attack: actor.attack.map(kernel_attack),
-                    death_rule,
-                })
-                .map_err(debug)?;
+            runtime.spawn_actor(&kernel_spawn(actor)).map_err(debug)?;
         }
         runtime.start().map_err(debug)?;
 
@@ -341,46 +305,7 @@ impl CookedMatch {
                 .collect(),
             half_width_mm: self.lane.half_width_mm,
         };
-        let waves = self
-            .waves
-            .iter()
-            .map(|wave| WaveSpec {
-                id: WaveId(wave.id),
-                team: TeamId(wave.team),
-                spawn: LanePosition {
-                    lane: LANE,
-                    progress_mm: wave.spawn_progress_mm,
-                },
-                goal: LanePosition {
-                    lane: LANE,
-                    progress_mm: wave.goal_progress_mm,
-                },
-                aggro_range_mm: wave.aggro_range_mm,
-                target_priority: vec![ActorKind::Structure, ActorKind::Hero],
-                cast_ability: None,
-                first_tick: wave.first_tick,
-                interval_ticks: wave.interval_ticks,
-                max_alive: wave.max_alive,
-                units: (0..wave.unit_count)
-                    .map(|index| WaveUnitSpec {
-                        progress_offset_mm: -wave.unit_spacing_mm * i64::from(index),
-                        stats: CombatStats {
-                            max_health: wave.unit_max_health,
-                            max_resource: 0,
-                            move_speed_mm_per_tick: wave.unit_move_speed_mm_per_tick,
-                            physical_reduction_bps: wave.unit_physical_reduction_bps,
-                            magic_reduction_bps: 0,
-                        },
-                        bounty: Bounty {
-                            gold: wave.unit_bounty_gold,
-                            experience: wave.unit_bounty_experience,
-                        },
-                        abilities: vec![],
-                        basic_attack: wave.unit_attack.map(kernel_attack),
-                    })
-                    .collect(),
-            })
-            .collect();
+        let waves = self.waves.iter().map(kernel_wave).collect();
         OneLaneMatch::attach(runtime, &lane, vec![], waves).map_err(debug)
     }
 
@@ -391,6 +316,88 @@ impl CookedMatch {
             .iter()
             .find(|actor| actor.id == actor_id)
             .map(|actor| actor.source.as_str())
+    }
+}
+
+/// One cooked actor as the kernel's spawn record.
+///
+/// Extracted from `build` so each translation stays readable on its own; `build` itself is then just the
+/// ordered pipeline config -> actors -> start -> lane -> waves -> attach.
+fn kernel_spawn(actor: &CookedActor) -> ActorSpawn {
+    let death_rule = match (actor.objective_for, actor.respawn_delay_ticks) {
+        (Some(team), _) => DeathRule::ObjectiveVictory {
+            winner: TeamId(team),
+        },
+        (None, Some(delay)) => DeathRule::Respawn {
+            delay_ticks: delay,
+            at: Vec2Mm::new(actor.x_mm, actor.y_mm),
+        },
+        (None, None) => DeathRule::StayDead,
+    };
+    ActorSpawn {
+        id: metrocalk_gameplay::ActorId(actor.id),
+        owner: actor.owned.then_some(LOCAL_PLAYER),
+        team: TeamId(actor.team),
+        kind: actor_kind(&actor.role),
+        position: Vec2Mm::new(actor.x_mm, actor.y_mm),
+        stats: CombatStats {
+            max_health: actor.max_health,
+            max_resource: 0,
+            move_speed_mm_per_tick: actor.move_speed_mm_per_tick,
+            physical_reduction_bps: actor.physical_reduction_bps,
+            magic_reduction_bps: 0,
+        },
+        growth: StatGrowth {
+            max_health_per_level: actor.health_per_level,
+            ..StatGrowth::NONE
+        },
+        bounty: Bounty {
+            gold: actor.bounty_gold,
+            experience: actor.bounty_experience,
+        },
+        abilities: vec![],
+        basic_attack: actor.attack.map(kernel_attack),
+        death_rule,
+    }
+}
+
+/// One cooked wave as the kernel's authored schedule.
+fn kernel_wave(wave: &CookedWave) -> WaveSpec {
+    WaveSpec {
+        id: WaveId(wave.id),
+        team: TeamId(wave.team),
+        spawn: LanePosition {
+            lane: LANE,
+            progress_mm: wave.spawn_progress_mm,
+        },
+        goal: LanePosition {
+            lane: LANE,
+            progress_mm: wave.goal_progress_mm,
+        },
+        aggro_range_mm: wave.aggro_range_mm,
+        target_priority: vec![ActorKind::Structure, ActorKind::Hero],
+        cast_ability: None,
+        first_tick: wave.first_tick,
+        interval_ticks: wave.interval_ticks,
+        max_alive: wave.max_alive,
+        units: (0..wave.unit_count)
+            .map(|index| WaveUnitSpec {
+                progress_offset_mm: -wave.unit_spacing_mm * i64::from(index),
+                stats: CombatStats {
+                    max_health: wave.unit_max_health,
+                    max_resource: 0,
+                    move_speed_mm_per_tick: wave.unit_move_speed_mm_per_tick,
+                    physical_reduction_bps: wave.unit_physical_reduction_bps,
+                    magic_reduction_bps: 0,
+                },
+                bounty: Bounty {
+                    gold: wave.unit_bounty_gold,
+                    experience: wave.unit_bounty_experience,
+                },
+                abilities: vec![],
+                basic_attack: wave.unit_attack.map(kernel_attack),
+            })
+            .collect(),
     }
 }
 
