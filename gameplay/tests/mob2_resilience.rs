@@ -9,11 +9,11 @@
 use std::time::Instant;
 
 use metrocalk_gameplay::{
-    AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorIntent, ActorKind,
-    ActorSpawn, BasicAttackSpec, CastTarget, CombatStats, CommandKind, CommandReceipt,
-    CommandRejection, DamageSchool, DeathRule, FrameDigest, MatchConfig, MatchEndReason,
-    MatchOutcome, MatchPhase, MatchRuntime, PlayerCommand, PlayerId, ServerFrame, TeamId, Vec2Mm,
-    WorldDigest,
+    AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
+    ActorIntent, ActorKind, ActorSpawn, BasicAttackSpec, CastTarget, CombatStats, CommandKind,
+    CommandReceipt, CommandRejection, DamageSchool, DeathRule, FrameDigest, ImpactShape,
+    MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, MatchRuntime, PlayerCommand, PlayerId,
+    ServerFrame, TeamId, Vec2Mm, WorldDigest,
 };
 
 const RESILIENCE_SEED: u64 = 0x6d6f_6232_5f72_6573;
@@ -79,6 +79,9 @@ fn resilience_runtime() -> MatchRuntime {
     runtime
         .register_ability(AbilitySpec {
             id: STRIKE,
+            aim: AbilityAim::Unit,
+            delivery: AbilityDelivery::Instant,
+            impact: ImpactShape::Single,
             targeting: AbilityTargeting::Enemy,
             range_mm: 50_000,
             resource_cost: 3,

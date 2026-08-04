@@ -12,11 +12,11 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use crate::model::{
-    AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorKind, ActorProvenance,
-    BasicAttackSpec, CombatStats, ControlMask, DamageSchool, DeathRule, MatchConfig,
-    MatchEndReason, MatchOutcome, MatchPhase, ModifierId, ModifierOp, PlayerId, RectMm, StatKind,
-    StatModifier, StatusEffectId, TeamId, Tick, Vec2Mm, MAX_ABILITY_DEFINITIONS,
-    MAX_RUNTIME_CHECKPOINT_BYTES,
+    AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
+    ActorKind, ActorProvenance, BasicAttackSpec, CombatStats, ControlMask, DamageSchool, DeathRule,
+    ImpactShape, MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, ModifierId, ModifierOp,
+    PlayerId, ProjectileId, RectMm, StatKind, StatModifier, StatusEffectId, TeamId, Tick, Vec2Mm,
+    MAX_ABILITY_DEFINITIONS, MAX_RUNTIME_CHECKPOINT_BYTES,
 };
 use crate::protocol::{
     CastTarget, CommandKind, CommandReceipt, CommandRejectReason, CommandRejection, PlayerCommand,
@@ -24,17 +24,20 @@ use crate::protocol::{
 };
 use crate::runtime::{
     AbilityState, ActorState, BasicAttackState, MatchRuntime, PendingAttack, PendingCast,
-    StatusEffect, SubmissionRecord,
+    ProjectileState, StatusEffect, SubmissionRecord,
 };
 
 const MAGIC: [u8; 8] = *b"MTCKPT01";
+// v5 adds in-flight projectiles plus their allocator, and the projectile budget inside the config. Speed,
+// hit radius, footprint, and effect are NOT encoded per projectile: they are read from the immutable ability
+// spec, so a tampered payload cannot give one missile different physics from the ability that launched it.
 // v4 adds per-actor timed status effects; the resolved control mask is NOT encoded (same reasoning).
 // v3 added per-actor base stats plus the applied stat-modifier list; the resolved stat cache is deliberately
 // NOT encoded, because it is derivable and a stored copy could disagree with its own inputs.
 // v2 added the immutable per-actor creation provenance record. The format is not yet persisted by any
 // production host, so the version is bumped rather than carrying a compatibility shim: a v1 payload has no
 // provenance to reconstruct, and inferring one would fabricate creation evidence.
-const FORMAT_VERSION: u16 = 4;
+const FORMAT_VERSION: u16 = 5;
 const HEADER_BYTES: usize = 64;
 const PAYLOAD_LENGTH_OFFSET: usize = 44;
 const PAYLOAD_CHECKSUM_OFFSET: usize = 48;
@@ -49,6 +52,8 @@ const MIN_MODIFIER_BYTES: usize = 14;
 const MIN_ACTOR_BYTES: usize = 62;
 // 8 id + 8 expiry + 1 controls + 4 owned-modifier count.
 const MIN_STATUS_EFFECT_BYTES: usize = 21;
+// 8 id + 8 source + 1 team + 4 ability + 8 position + 8 flight terminus.
+const MIN_PROJECTILE_BYTES: usize = 37;
 
 /// Identity of the exact cooked rules/content bundle required to interpret a checkpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -227,6 +232,7 @@ impl MatchRuntime {
         // regress and reissue an ID, because ID order defines aggregation order and override precedence.
         encode_option_u64(&mut encoder, self.next_modifier_id)?;
         encode_option_u64(&mut encoder, self.next_status_effect_id)?;
+        encode_option_u64(&mut encoder, self.next_projectile_id)?;
 
         if self.ability_specs.len() > usize::try_from(MAX_ABILITY_DEFINITIONS).unwrap_or(usize::MAX)
         {
@@ -242,6 +248,11 @@ impl MatchRuntime {
         encoder.count(self.actors.len())?;
         for actor in &self.actors {
             encode_actor(&mut encoder, actor)?;
+        }
+
+        encoder.count(self.projectiles.len())?;
+        for projectile in &self.projectiles {
+            encode_projectile(&mut encoder, *projectile)?;
         }
 
         encoder.count(self.player_roster.len())?;
@@ -354,6 +365,7 @@ impl MatchRuntime {
         let next_dynamic_actor_id = decode_option_u64(&mut decoder, "dynamic actor allocator")?;
         let next_modifier_id = decode_option_u64(&mut decoder, "stat modifier allocator")?;
         let next_status_effect_id = decode_option_u64(&mut decoder, "status effect allocator")?;
+        let next_projectile_id = decode_option_u64(&mut decoder, "projectile allocator")?;
 
         let ability_count = decoder.count(
             usize::try_from(MAX_ABILITY_DEFINITIONS).unwrap_or(usize::MAX),
@@ -374,6 +386,24 @@ impl MatchRuntime {
         let mut actors = allocate_vec(actor_count)?;
         for _ in 0..actor_count {
             actors.push(decode_actor(&mut decoder, config)?);
+        }
+
+        let projectile_count = decoder.count(
+            usize::from(config.max_projectiles),
+            "projectile count exceeds configured budget",
+        )?;
+        decoder.require_minimum(projectile_count, MIN_PROJECTILE_BYTES)?;
+        let mut projectiles = allocate_vec(projectile_count)?;
+        for _ in 0..projectile_count {
+            projectiles.push(decode_projectile(&mut decoder, config)?);
+        }
+        if projectiles
+            .windows(2)
+            .any(|pair: &[ProjectileState]| pair[0].id >= pair[1].id)
+        {
+            return Err(CheckpointError::InvalidData(
+                "projectiles are not strictly sorted by identity",
+            ));
         }
 
         let roster_limit = usize::try_from(config.max_players).unwrap_or(usize::MAX);
@@ -441,17 +471,20 @@ impl MatchRuntime {
             phase,
             ability_specs,
             actors,
+            projectiles,
             player_roster,
             queued_commands,
             last_submissions,
             dirty: BTreeSet::new(),
             removed: BTreeSet::new(),
+            removed_projectiles: BTreeSet::new(),
             pending_events: Vec::new(),
             rejection_events_in_frame: 0,
             objective_claims: BTreeSet::new(),
             next_dynamic_actor_id,
             next_modifier_id,
             next_status_effect_id,
+            next_projectile_id,
             checkpoint_ready: true,
         };
         runtime.validate_restored_state()?;
@@ -469,6 +502,7 @@ impl MatchRuntime {
         if self.checkpoint_ready
             && self.dirty.is_empty()
             && self.removed.is_empty()
+            && self.removed_projectiles.is_empty()
             && self.pending_events.is_empty()
             && self.rejection_events_in_frame == 0
             && self.objective_claims.is_empty()
@@ -843,6 +877,7 @@ fn encode_config(encoder: &mut Encoder, config: MatchConfig) -> Result<(), Check
     encoder.u16(config.max_units_per_wave)?;
     encoder.u16(config.max_modifiers_per_actor)?;
     encoder.u16(config.max_status_effects_per_actor)?;
+    encoder.u16(config.max_projectiles)?;
     encoder.u32(config.max_checkpoint_bytes)
 }
 
@@ -864,6 +899,7 @@ fn decode_config(decoder: &mut Decoder<'_>) -> Result<MatchConfig, CheckpointErr
         max_units_per_wave: decoder.u16()?,
         max_modifiers_per_actor: decoder.u16()?,
         max_status_effects_per_actor: decoder.u16()?,
+        max_projectiles: decoder.u16()?,
         max_checkpoint_bytes: decoder.u32()?,
     })
 }
@@ -968,6 +1004,10 @@ fn decode_option_u64(
 
 fn encode_ability(encoder: &mut Encoder, ability: AbilitySpec) -> Result<(), CheckpointError> {
     encoder.u32(ability.id.get())?;
+    encoder.u8(match ability.aim {
+        AbilityAim::Unit => 0,
+        AbilityAim::Point => 1,
+    })?;
     encoder.u8(match ability.targeting {
         AbilityTargeting::SelfOnly => 0,
         AbilityTargeting::Ally => 1,
@@ -978,6 +1018,24 @@ fn encode_ability(encoder: &mut Encoder, ability: AbilitySpec) -> Result<(), Che
     encoder.u32(ability.resource_cost)?;
     encoder.u32(ability.cooldown_ticks)?;
     encoder.u16(ability.cast_ticks)?;
+    match ability.delivery {
+        AbilityDelivery::Instant => encoder.u8(0)?,
+        AbilityDelivery::Projectile {
+            speed_mm_per_tick,
+            hit_radius_mm,
+        } => {
+            encoder.u8(1)?;
+            encoder.u32(speed_mm_per_tick)?;
+            encoder.u32(hit_radius_mm)?;
+        }
+    }
+    match ability.impact {
+        ImpactShape::Single => encoder.u8(0)?,
+        ImpactShape::Circle { radius_mm } => {
+            encoder.u8(1)?;
+            encoder.u32(radius_mm)?;
+        }
+    }
     match ability.effect {
         AbilityEffect::Damage { amount, school } => {
             encoder.u8(0)?;
@@ -993,6 +1051,16 @@ fn encode_ability(encoder: &mut Encoder, ability: AbilitySpec) -> Result<(), Che
 
 fn decode_ability(decoder: &mut Decoder<'_>) -> Result<AbilitySpec, CheckpointError> {
     let id = AbilityId(decoder.u32()?);
+    let aim = match decoder.u8()? {
+        0 => AbilityAim::Unit,
+        1 => AbilityAim::Point,
+        tag => {
+            return Err(CheckpointError::InvalidTag {
+                field: "ability aim",
+                tag,
+            });
+        }
+    };
     let targeting = match decoder.u8()? {
         0 => AbilityTargeting::SelfOnly,
         1 => AbilityTargeting::Ally,
@@ -1009,6 +1077,31 @@ fn decode_ability(decoder: &mut Decoder<'_>) -> Result<AbilitySpec, CheckpointEr
     let resource_cost = decoder.u32()?;
     let cooldown_ticks = decoder.u32()?;
     let cast_ticks = decoder.u16()?;
+    let delivery = match decoder.u8()? {
+        0 => AbilityDelivery::Instant,
+        1 => AbilityDelivery::Projectile {
+            speed_mm_per_tick: decoder.u32()?,
+            hit_radius_mm: decoder.u32()?,
+        },
+        tag => {
+            return Err(CheckpointError::InvalidTag {
+                field: "ability delivery",
+                tag,
+            });
+        }
+    };
+    let impact = match decoder.u8()? {
+        0 => ImpactShape::Single,
+        1 => ImpactShape::Circle {
+            radius_mm: decoder.u32()?,
+        },
+        tag => {
+            return Err(CheckpointError::InvalidTag {
+                field: "ability impact",
+                tag,
+            });
+        }
+    };
     let effect = match decoder.u8()? {
         0 => AbilityEffect::Damage {
             amount: decoder.u32()?,
@@ -1026,12 +1119,58 @@ fn decode_ability(decoder: &mut Decoder<'_>) -> Result<AbilitySpec, CheckpointEr
     };
     Ok(AbilitySpec {
         id,
+        aim,
         targeting,
         range_mm,
         resource_cost,
         cooldown_ticks,
         cast_ticks,
+        delivery,
+        impact,
         effect,
+    })
+}
+
+fn encode_projectile(
+    encoder: &mut Encoder,
+    projectile: ProjectileState,
+) -> Result<(), CheckpointError> {
+    encoder.u64(projectile.id.get())?;
+    encoder.u64(projectile.source.get())?;
+    encoder.u8(projectile.team.get())?;
+    encoder.u32(projectile.ability.get())?;
+    encode_point(encoder, projectile.position)?;
+    encode_point(encoder, projectile.end)
+}
+
+/// Decode one in-flight projectile.
+///
+/// Bounds are checked here rather than left to the frame audit so a hostile payload cannot place a missile
+/// off the map and have it swept against every actor before anything rejects it. Its ability reference is
+/// validated later, by the same frame-boundary audit that guards a live match, because the ability table has
+/// not finished decoding at this point.
+fn decode_projectile(
+    decoder: &mut Decoder<'_>,
+    config: MatchConfig,
+) -> Result<ProjectileState, CheckpointError> {
+    let id = ProjectileId(decoder.u64()?);
+    let source = ActorId(decoder.u64()?);
+    let team = TeamId(decoder.u8()?);
+    let ability = AbilityId(decoder.u32()?);
+    let position = decode_point(decoder)?;
+    let end = decode_point(decoder)?;
+    if !config.map_bounds.contains(position) || !config.map_bounds.contains(end) {
+        return Err(CheckpointError::InvalidData(
+            "projectile position or flight terminus is outside map bounds",
+        ));
+    }
+    Ok(ProjectileState {
+        id,
+        source,
+        team,
+        ability,
+        position,
+        end,
     })
 }
 
@@ -1556,6 +1695,10 @@ fn encode_cast_target(encoder: &mut Encoder, target: CastTarget) -> Result<(), C
             encoder.u8(1)?;
             encoder.u64(actor.get())
         }
+        CastTarget::Point(point) => {
+            encoder.u8(2)?;
+            encode_point(encoder, point)
+        }
     }
 }
 
@@ -1563,6 +1706,7 @@ fn decode_cast_target(decoder: &mut Decoder<'_>) -> Result<CastTarget, Checkpoin
     match decoder.u8()? {
         0 => Ok(CastTarget::SelfActor),
         1 => Ok(CastTarget::Actor(ActorId(decoder.u64()?))),
+        2 => Ok(CastTarget::Point(decode_point(decoder)?)),
         tag => Err(CheckpointError::InvalidTag {
             field: "cast target",
             tag,
@@ -1716,6 +1860,9 @@ fn encode_rejection_reason(
         CommandRejectReason::ActorRooted => encoder.u8(28),
         CommandRejectReason::ActorSilenced => encoder.u8(29),
         CommandRejectReason::ActorDisarmed => encoder.u8(30),
+        CommandRejectReason::InvalidTargetForm => encoder.u8(31),
+        CommandRejectReason::TargetPointOutOfBounds => encoder.u8(32),
+        CommandRejectReason::ProjectileBudgetExceeded => encoder.u8(33),
     }
 }
 
@@ -1761,6 +1908,9 @@ fn decode_rejection_reason(
         28 => Ok(CommandRejectReason::ActorRooted),
         29 => Ok(CommandRejectReason::ActorSilenced),
         30 => Ok(CommandRejectReason::ActorDisarmed),
+        31 => Ok(CommandRejectReason::InvalidTargetForm),
+        32 => Ok(CommandRejectReason::TargetPointOutOfBounds),
+        33 => Ok(CommandRejectReason::ProjectileBudgetExceeded),
         tag => Err(CheckpointError::InvalidTag {
             field: "command rejection reason",
             tag,
@@ -1778,6 +1928,7 @@ mod tests {
     const OTHER_CONTENT: ContentId = ContentId::new([0xa5; 32]);
     const STRIKE: AbilityId = AbilityId(1);
     const HEAL: AbilityId = AbilityId(2);
+    const LANCE: AbilityId = AbilityId(3);
     const PLAYER_ONE: PlayerId = PlayerId(10);
     const PLAYER_TWO: PlayerId = PlayerId(20);
     const RETAINED_DESPAWNED_PLAYER: PlayerId = PlayerId(30);
@@ -1814,6 +1965,9 @@ mod tests {
         let ability_specs = vec![
             AbilitySpec {
                 id: STRIKE,
+                aim: AbilityAim::Unit,
+                delivery: AbilityDelivery::Instant,
+                impact: ImpactShape::Single,
                 targeting: AbilityTargeting::Enemy,
                 range_mm: 2_000,
                 resource_cost: 20,
@@ -1826,12 +1980,33 @@ mod tests {
             },
             AbilitySpec {
                 id: HEAL,
+                aim: AbilityAim::Unit,
+                delivery: AbilityDelivery::Instant,
+                impact: ImpactShape::Single,
                 targeting: AbilityTargeting::SelfOnly,
                 range_mm: 0,
                 resource_cost: 10,
                 cooldown_ticks: 8,
                 cast_ticks: 1,
                 effect: AbilityEffect::Heal { amount: 80 },
+            },
+            AbilitySpec {
+                id: LANCE,
+                aim: AbilityAim::Point,
+                delivery: AbilityDelivery::Projectile {
+                    speed_mm_per_tick: 400,
+                    hit_radius_mm: 250,
+                },
+                impact: ImpactShape::Circle { radius_mm: 600 },
+                targeting: AbilityTargeting::Enemy,
+                range_mm: 5_000,
+                resource_cost: 15,
+                cooldown_ticks: 12,
+                cast_ticks: 1,
+                effect: AbilityEffect::Damage {
+                    amount: 90,
+                    school: DamageSchool::Physical,
+                },
             },
         ];
         // The first actor carries a real modifier set so the round-trip corpus exercises every encoded
@@ -1981,6 +2156,17 @@ mod tests {
             phase: MatchPhase::Active,
             ability_specs,
             actors,
+            // One missile is in flight so the round-trip corpus exercises the v5 projectile section, and so
+            // a decoded projectile that referenced an ability with no projectile delivery would fail the
+            // restore audit rather than sit still forever.
+            projectiles: vec![ProjectileState {
+                id: ProjectileId(7),
+                source: ActorId(1),
+                team: TeamId(0),
+                ability: LANCE,
+                position: Vec2Mm::new(1_200, -400),
+                end: Vec2Mm::new(6_000, -400),
+            }],
             player_roster: [PLAYER_ONE, PLAYER_TWO, RETAINED_DESPAWNED_PLAYER]
                 .into_iter()
                 .collect(),
@@ -2013,12 +2199,14 @@ mod tests {
             .collect(),
             dirty: BTreeSet::new(),
             removed: BTreeSet::new(),
+            removed_projectiles: BTreeSet::new(),
             pending_events: Vec::new(),
             rejection_events_in_frame: 0,
             objective_claims: BTreeSet::new(),
             next_dynamic_actor_id: Some(44),
             next_modifier_id: Some(12),
             next_status_effect_id: Some(1),
+            next_projectile_id: Some(8),
             checkpoint_ready: true,
         }
     }
@@ -2084,6 +2272,9 @@ mod tests {
         runtime
             .register_ability(AbilitySpec {
                 id: STRIKE,
+                aim: AbilityAim::Unit,
+                delivery: AbilityDelivery::Instant,
+                impact: ImpactShape::Single,
                 targeting: AbilityTargeting::Enemy,
                 range_mm: 2_000,
                 resource_cost: 0,
@@ -2300,6 +2491,7 @@ mod tests {
         decode_option_u64(&mut decoder, "actor allocator").unwrap();
         decode_option_u64(&mut decoder, "modifier allocator").unwrap();
         decode_option_u64(&mut decoder, "status effect allocator").unwrap();
+        decode_option_u64(&mut decoder, "projectile allocator").unwrap();
         let ability_count = decoder.count(usize::MAX, "test ability count").unwrap();
         for _ in 0..ability_count {
             decode_ability(&mut decoder).unwrap();
@@ -2449,6 +2641,7 @@ mod tests {
         decode_option_u64(&mut probe, "actor allocator").unwrap();
         decode_option_u64(&mut probe, "modifier allocator").unwrap();
         decode_option_u64(&mut probe, "status effect allocator").unwrap();
+        decode_option_u64(&mut probe, "projectile allocator").unwrap();
         let ability_count_offset = HEADER_BYTES + probe.offset;
         hostile[ability_count_offset..ability_count_offset + 4]
             .copy_from_slice(&u32::MAX.to_le_bytes());

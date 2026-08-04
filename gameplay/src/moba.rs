@@ -3,10 +3,11 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use crate::{
-    AbilityId, AbilityTargeting, ActorId, ActorIntent, ActorKind, ActorView, BasicAttackSpec,
-    CastTarget, CombatStats, CommandKind, CommandReceipt, CommandRejection, CompiledLane,
-    DeathRule, DynamicActorProvenance, DynamicActorSpawn, LaneError, LanePosition, LaneSpec,
-    MatchPhase, MatchRuntime, PlayerCommand, PlayerId, RuntimeError, ServerFrame, TeamId, Tick,
+    AbilityAim, AbilityId, AbilityTargeting, ActorId, ActorIntent, ActorKind, ActorView,
+    BasicAttackSpec, CastTarget, CombatStats, CommandKind, CommandReceipt, CommandRejection,
+    CompiledLane, DeathRule, DynamicActorProvenance, DynamicActorSpawn, LaneError, LanePosition,
+    LaneSpec, MatchPhase, MatchRuntime, PlayerCommand, PlayerId, RuntimeError, ServerFrame, TeamId,
+    Tick,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -442,12 +443,14 @@ impl OneLaneMatch {
                     ))?;
             let target = select_target(source, source_lane, bot, snapshot, &positions);
             if let Some((target, target_lane, distance)) = target {
-                if let Some(ability) = self.ready_bot_cast(source, bot, distance, next_tick) {
+                if let Some((ability, cast_target)) =
+                    self.ready_bot_cast(source, target, bot, distance, next_tick)
+                {
                     intents.push(ActorIntent {
                         actor: source.id,
                         kind: CommandKind::Cast {
                             ability,
-                            target: CastTarget::Actor(target.id),
+                            target: cast_target,
                         },
                     });
                     continue;
@@ -475,13 +478,20 @@ impl OneLaneMatch {
         Ok(intents)
     }
 
+    /// The bot's authored ability plus the target form that ability actually accepts.
+    ///
+    /// A bot that always sent `CastTarget::Actor` could never fire a skillshot: a point-aimed ability
+    /// refuses a unit target outright. Aiming at the victim's current position is the honest bot equivalent
+    /// of a player's finger — it is the same non-homing line a human would draw, so a bot skillshot can miss
+    /// exactly as a human's can.
     fn ready_bot_cast(
         &self,
         source: &ActorView,
+        target: &ActorView,
         bot: &LaneBotSpec,
         distance: u64,
         next_tick: Tick,
-    ) -> Option<AbilityId> {
+    ) -> Option<(AbilityId, CastTarget)> {
         let ability = bot.cast_ability?;
         let spec = self.runtime.ability(ability)?;
         let ready = source
@@ -489,10 +499,14 @@ impl OneLaneMatch {
             .iter()
             .find(|cooldown| cooldown.ability == ability)?
             .ready_at;
+        let cast_target = match spec.aim {
+            AbilityAim::Unit => CastTarget::Actor(target.id),
+            AbilityAim::Point => CastTarget::Point(target.position),
+        };
         (ready <= next_tick
             && source.resource >= spec.resource_cost
             && distance <= u64::from(spec.range_mm))
-        .then_some(ability)
+        .then_some((ability, cast_target))
     }
 
     fn move_intent(
@@ -1041,8 +1055,9 @@ const fn actor_kind_tag(kind: ActorKind) -> u8 {
 mod tests {
     use super::*;
     use crate::{
-        AbilityEffect, AbilitySpec, ActorSpawn, DamageSchool, MatchConfig, MatchEndReason,
-        MatchEvent, MatchOutcome, PlayerCommand, PlayerId, RectMm, Vec2Mm,
+        AbilityAim, AbilityDelivery, AbilityEffect, AbilitySpec, ActorSpawn, ContentId,
+        DamageSchool, ImpactShape, MatchConfig, MatchEndReason, MatchEvent, MatchOutcome,
+        PlayerCommand, PlayerId, RectMm, Vec2Mm,
     };
 
     const fn stats(health: u32, speed: u32) -> CombatStats {
@@ -1733,6 +1748,9 @@ mod tests {
         runtime
             .register_ability(AbilitySpec {
                 id: ability,
+                aim: AbilityAim::Unit,
+                delivery: AbilityDelivery::Instant,
+                impact: ImpactShape::Single,
                 targeting: AbilityTargeting::Enemy,
                 range_mm: 1_000,
                 resource_cost: 0,
@@ -1794,6 +1812,9 @@ mod tests {
                 runtime
                     .register_ability(AbilitySpec {
                         id,
+                        aim: AbilityAim::Unit,
+                        delivery: AbilityDelivery::Instant,
+                        impact: ImpactShape::Single,
                         targeting: AbilityTargeting::Enemy,
                         range_mm: 1_000,
                         resource_cost: 0,
@@ -1898,5 +1919,162 @@ mod tests {
         assert_eq!(actual.peak_actor_count, 0);
         assert_eq!(actual.peak_live_actor_count, 0);
         assert_eq!(actual.peak_queued_commands, 0);
+    }
+
+    const SKILLSHOT: crate::AbilityId = crate::AbilityId(5);
+
+    fn skillshot_bots() -> Vec<LaneBotSpec> {
+        vec![LaneBotSpec {
+            actor: ActorId(101),
+            goal: LanePosition {
+                lane: crate::LaneId(0),
+                progress_mm: 10_000,
+            },
+            aggro_range_mm: 10_000,
+            target_priority: vec![ActorKind::Minion],
+            cast_ability: Some(SKILLSHOT),
+        }]
+    }
+
+    /// A bot armed with a point-aimed skillshot, in the composed one-lane match.
+    ///
+    /// Bots previously always sent `CastTarget::Actor`, which a point-aimed ability refuses outright — so
+    /// this fixture is what proves a bot can fire the genre's defining ability archetype at all.
+    fn skillshot_bot_match() -> OneLaneMatch {
+        let config = MatchConfig {
+            map_bounds: RectMm::new(Vec2Mm::new(-1_000, -1_000), Vec2Mm::new(11_000, 1_000)),
+            max_match_ticks: 100,
+            ..MatchConfig::default()
+        };
+        let mut runtime = MatchRuntime::new(config, 0x5c17).unwrap();
+        runtime
+            .register_ability(AbilitySpec {
+                id: SKILLSHOT,
+                aim: AbilityAim::Point,
+                targeting: AbilityTargeting::Enemy,
+                range_mm: 8_000,
+                resource_cost: 0,
+                cooldown_ticks: 4,
+                cast_ticks: 0,
+                delivery: AbilityDelivery::Projectile {
+                    speed_mm_per_tick: 900,
+                    hit_radius_mm: 300,
+                },
+                impact: ImpactShape::Single,
+                effect: AbilityEffect::Damage {
+                    amount: 60,
+                    school: DamageSchool::True,
+                },
+            })
+            .unwrap();
+        runtime
+            .spawn_actor(&spawn(
+                20,
+                1,
+                ActorKind::Structure,
+                10_000,
+                100,
+                0,
+                None,
+                DeathRule::ObjectiveVictory { winner: TeamId(0) },
+            ))
+            .unwrap();
+        let mut caster = spawn(
+            101,
+            0,
+            ActorKind::Hero,
+            1_000,
+            500,
+            200,
+            None,
+            DeathRule::StayDead,
+        );
+        caster.abilities = vec![SKILLSHOT];
+        runtime.spawn_actor(&caster).unwrap();
+        runtime
+            .spawn_actor(&spawn(
+                202,
+                1,
+                ActorKind::Minion,
+                5_000,
+                5_000,
+                0,
+                None,
+                DeathRule::StayDead,
+            ))
+            .unwrap();
+        runtime.start().unwrap();
+        OneLaneMatch::attach(runtime, &lane(), skillshot_bots(), vec![]).unwrap()
+    }
+
+    #[test]
+    fn a_bot_fires_a_point_aimed_skillshot_and_the_lane_run_is_reproducible() {
+        fn run() -> (Vec<LaneFrameDigest>, u32, u32) {
+            let mut lane_match = skillshot_bot_match();
+            let mut digests = Vec::new();
+            let mut spawned = 0_u32;
+            let mut resolved = 0_u32;
+            for _ in 0..40 {
+                let frame = lane_match.step().unwrap();
+                for event in &frame.server.events {
+                    match event {
+                        MatchEvent::ProjectileSpawned { .. } => spawned += 1,
+                        MatchEvent::ProjectileResolved { .. } => resolved += 1,
+                        _ => {}
+                    }
+                }
+                digests.push(frame.lane_frame_digest);
+                if !matches!(frame.server.phase, MatchPhase::Active) {
+                    break;
+                }
+            }
+            (digests, spawned, resolved)
+        }
+
+        let (digests, spawned, resolved) = run();
+        assert!(
+            spawned > 0,
+            "the bot never fired its skillshot, so this fixture proves nothing"
+        );
+        assert_eq!(
+            spawned, resolved,
+            "every launched missile leaves the world exactly once"
+        );
+        let (repeat_digests, repeat_spawned, repeat_resolved) = run();
+        assert_eq!(digests, repeat_digests);
+        assert_eq!((spawned, resolved), (repeat_spawned, repeat_resolved));
+    }
+
+    #[test]
+    fn a_lane_match_with_a_missile_in_flight_survives_the_composite_checkpoint() {
+        const CONTENT: ContentId = ContentId::new([0x7c; 32]);
+        let mut lane_match = skillshot_bot_match();
+        let mut launched = None;
+        for _ in 0..40 {
+            lane_match.step().unwrap();
+            if !lane_match.runtime().projectiles().is_empty() {
+                launched = Some(lane_match.runtime().projectiles());
+                break;
+            }
+        }
+        let in_flight = launched.expect("the bot launches a missile within the observed window");
+
+        let checkpoint = lane_match
+            .capture_checkpoint(CONTENT, &lane(), &skillshot_bots(), &[])
+            .unwrap();
+        let mut restored =
+            OneLaneMatch::restore_checkpoint(&checkpoint, CONTENT, &lane(), &skillshot_bots(), &[])
+                .unwrap();
+        assert_eq!(restored.runtime().projectiles(), in_flight);
+        assert_eq!(restored.lane_digest(), lane_match.lane_digest());
+
+        for _ in 0..20 {
+            let expected = lane_match.step().unwrap();
+            let actual = restored.step().unwrap();
+            assert_eq!(actual.lane_frame_digest, expected.lane_frame_digest);
+            if !matches!(expected.server.phase, MatchPhase::Active) {
+                break;
+            }
+        }
     }
 }

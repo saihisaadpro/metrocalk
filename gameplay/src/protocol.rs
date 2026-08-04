@@ -1,6 +1,6 @@
 use crate::model::{
     AbilityId, ActorId, ActorKind, ActorProvenance, ControlMask, DamageSchool, MatchEndReason,
-    MatchOutcome, MatchPhase, PlayerId, StatusEffectId, TeamId, Tick, Vec2Mm,
+    MatchOutcome, MatchPhase, PlayerId, ProjectileId, StatusEffectId, TeamId, Tick, Vec2Mm,
 };
 
 /// Deterministic equality key for authoritative gameplay simulation state.
@@ -14,11 +14,18 @@ pub struct WorldDigest(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameDigest(pub u64);
 
-/// Unit target carried by a cast command.
+/// Target carried by a cast command.
+///
+/// The variant must match the ability's declared [`AbilityAim`](crate::AbilityAim): a unit-aimed ability
+/// refuses a `Point` and a point-aimed ability refuses a unit, both with `InvalidTarget`. Mismatch is a
+/// protocol error rather than a silent coercion, because coercing one into the other would let a client
+/// choose which targeting rules its ability obeys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CastTarget {
     SelfActor,
     Actor(ActorId),
+    /// A map point, in the same integer millimetres as actor positions.
+    Point(Vec2Mm),
 }
 
 /// Player intent accepted by the authoritative runtime. Presentation coordinates must be converted and
@@ -73,8 +80,13 @@ pub enum CommandRejectReason {
     DestinationOutOfBounds,
     ActorCasting,
     AbilityNotEquipped,
-    AbilityOnCooldown { ready_at: Tick },
-    InsufficientResource { required: u32, available: u32 },
+    AbilityOnCooldown {
+        ready_at: Tick,
+    },
+    InsufficientResource {
+        required: u32,
+        available: u32,
+    },
     InvalidTarget,
     TargetNotFound,
     TargetDead,
@@ -84,12 +96,22 @@ pub enum CommandRejectReason {
     CastExceedsMatchDuration,
     ActorBusy,
     BasicAttackUnavailable,
-    BasicAttackOnCooldown { ready_at: Tick },
+    BasicAttackOnCooldown {
+        ready_at: Tick,
+    },
     AttackExceedsMatchDuration,
     ActorStunned,
     ActorRooted,
     ActorSilenced,
     ActorDisarmed,
+    /// The cast's target form does not match the ability's declared aim, or a point-aimed skillshot was
+    /// aimed exactly at the caster and so has no direction to travel.
+    InvalidTargetForm,
+    /// The aimed point lies outside the authoritative map bounds.
+    TargetPointOutOfBounds,
+    /// The match already carries its configured maximum of in-flight projectiles. Fail-closed: the cast is
+    /// cancelled rather than silently dropping a projectile the client was told to expect.
+    ProjectileBudgetExceeded,
 }
 
 /// Accepted queue position. A later state change can still make the command invalid at execution time; that
@@ -167,6 +189,23 @@ pub struct ActorView {
     /// actor instead of trusting a separately stored membership list.
     pub provenance: ActorProvenance,
     pub cooldowns: Vec<CooldownView>,
+}
+
+/// Network-facing authoritative state for one in-flight projectile.
+///
+/// `hit_radius_mm` is a projection of the launching ability's spec, carried so a client can draw and
+/// predict the missile without holding the ability table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectileView {
+    pub id: ProjectileId,
+    pub source: ActorId,
+    pub team: TeamId,
+    pub ability: AbilityId,
+    pub position: Vec2Mm,
+    /// Fixed flight terminus, decided at launch. Exposed because it is what makes the missile predictable:
+    /// a client can interpolate the whole flight from one frame.
+    pub end: Vec2Mm,
+    pub hit_radius_mm: u32,
 }
 
 /// Authoritative causal trace. Presentation systems consume these events; cosmetic feedback never writes
@@ -262,6 +301,26 @@ pub enum MatchEvent {
     ActorSpawned {
         actor: ActorId,
     },
+    ProjectileSpawned {
+        projectile: ProjectileId,
+        source: ActorId,
+        ability: AbilityId,
+        position: Vec2Mm,
+        end: Vec2Mm,
+    },
+    /// The projectile left the world. `victim` is `Some` when it struck a body and `None` when it reached
+    /// the end of its flight. One event covers both because a client draws the same thing either way — an
+    /// impact at a position — and splitting them would let the two drift apart.
+    ProjectileResolved {
+        projectile: ProjectileId,
+        position: Vec2Mm,
+        victim: Option<ActorId>,
+    },
+    /// The projectile was removed without resolving its effect — today only by match completion.
+    ProjectileCancelled {
+        projectile: ProjectileId,
+        reason: CommandRejectReason,
+    },
     MatchFinished {
         outcome: MatchOutcome,
         reason: MatchEndReason,
@@ -270,12 +329,19 @@ pub enum MatchEvent {
 
 /// One actor-level authoritative delta frame. `changed` contains only actors dirtied since the previous
 /// frame. A transport can split reliable events from sequenced state while retaining this causal identity.
+///
+/// `projectiles` carries **every** live projectile rather than a dirty subset. That is not a departure from
+/// the delta rule: a projectile whose speed is zero is refused at authoring time, so every live projectile
+/// moves on every tick and the full set *is* the delta. Tracking a dirty subset would cost state and
+/// produce the same bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerFrame {
     pub tick: Tick,
     pub phase: MatchPhase,
     pub changed: Vec<ActorView>,
     pub removed: Vec<ActorId>,
+    pub projectiles: Vec<ProjectileView>,
+    pub removed_projectiles: Vec<ProjectileId>,
     pub events: Vec<MatchEvent>,
     pub world_digest: WorldDigest,
     pub frame_digest: FrameDigest,

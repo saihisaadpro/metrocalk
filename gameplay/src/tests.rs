@@ -1,10 +1,11 @@
 use crate::{
-    AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorIntent, ActorKind,
-    ActorProvenance, ActorSpawn, BasicAttackSpec, CastTarget, CombatStats, CommandKind,
-    CommandRejectReason, ContentId, ControlKind, DamageCause, DamageSchool, DeathRule,
-    DynamicActorProvenance, DynamicActorSpawn, MatchConfig, MatchEndReason, MatchEvent,
-    MatchOutcome, MatchPhase, MatchRuntime, ModifierOp, PlayerCommand, PlayerId, RuntimeError,
-    Scenario, ScenarioFinish, ScenarioSubmission, StatKind, TeamId, Vec2Mm, BASIS_POINTS,
+    AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
+    ActorIntent, ActorKind, ActorProvenance, ActorSpawn, BasicAttackSpec, CastTarget, CombatStats,
+    CommandKind, CommandRejectReason, ContentId, ControlKind, DamageCause, DamageSchool, DeathRule,
+    DynamicActorProvenance, DynamicActorSpawn, ImpactShape, MatchConfig, MatchEndReason,
+    MatchEvent, MatchOutcome, MatchPhase, MatchRuntime, ModifierOp, PlayerCommand, PlayerId,
+    RuntimeError, Scenario, ScenarioFinish, ScenarioSubmission, StatKind, TeamId, Vec2Mm,
+    BASIS_POINTS,
 };
 
 const PLAYER_ONE: PlayerId = PlayerId(1);
@@ -50,6 +51,9 @@ fn hero(
 const fn strike() -> AbilitySpec {
     AbilitySpec {
         id: STRIKE,
+        aim: AbilityAim::Unit,
+        delivery: AbilityDelivery::Instant,
+        impact: ImpactShape::Single,
         targeting: AbilityTargeting::Enemy,
         range_mm: 2_000,
         resource_cost: 20,
@@ -65,6 +69,9 @@ const fn strike() -> AbilitySpec {
 const fn heal() -> AbilitySpec {
     AbilitySpec {
         id: HEAL,
+        aim: AbilityAim::Unit,
+        delivery: AbilityDelivery::Instant,
+        impact: ImpactShape::Single,
         targeting: AbilityTargeting::Ally,
         range_mm: 1_500,
         resource_cost: 10,
@@ -1120,6 +1127,9 @@ fn terminal_tick_cancels_due_respawn_and_remains_checkpointable() {
     runtime
         .register_ability(AbilitySpec {
             id: LETHAL,
+            aim: AbilityAim::Unit,
+            delivery: AbilityDelivery::Instant,
+            impact: ImpactShape::Single,
             targeting: AbilityTargeting::Enemy,
             range_mm: 5_000,
             resource_cost: 0,
@@ -2758,4 +2768,1140 @@ fn dynamic_actor_ids_are_monotonic_and_replication_is_explicit() {
     );
     assert!(runtime.actor(first).is_some());
     assert!(runtime.actor(second).is_some());
+}
+
+// ---------------------------------------------------------------------------------------------------
+// GP-04 shaped targeting and GP-03 projectiles.
+//
+// Every test below drives the public command surface. None reaches into the projectile list to place a
+// missile by hand, because a projectile only a test can create proves nothing about the ability system
+// that is supposed to create them.
+// ---------------------------------------------------------------------------------------------------
+
+const BURST: AbilityId = AbilityId(11);
+const LANCE: AbilityId = AbilityId(12);
+const BOMB: AbilityId = AbilityId(13);
+const RAIL: AbilityId = AbilityId(14);
+const SNIPE: AbilityId = AbilityId(15);
+const MINION_ONE: ActorId = ActorId(401);
+const MINION_TWO: ActorId = ActorId(402);
+const MINION_THREE: ActorId = ActorId(403);
+
+/// An instant ground burst: aimed at a point, detonating in a circle, hurting only enemies.
+const fn burst() -> AbilitySpec {
+    AbilitySpec {
+        id: BURST,
+        aim: AbilityAim::Point,
+        targeting: AbilityTargeting::Enemy,
+        range_mm: 5_000,
+        resource_cost: 0,
+        cooldown_ticks: 1,
+        cast_ticks: 0,
+        delivery: AbilityDelivery::Instant,
+        impact: ImpactShape::Circle { radius_mm: 1_500 },
+        effect: AbilityEffect::Damage {
+            amount: 300,
+            school: DamageSchool::True,
+        },
+    }
+}
+
+/// A line skillshot: a single-victim projectile that travels its full range along the aimed direction.
+const fn lance(id: AbilityId, speed_mm_per_tick: u32, amount: u32) -> AbilitySpec {
+    AbilitySpec {
+        id,
+        aim: AbilityAim::Point,
+        targeting: AbilityTargeting::Enemy,
+        range_mm: 6_000,
+        resource_cost: 0,
+        cooldown_ticks: 1,
+        cast_ticks: 0,
+        delivery: AbilityDelivery::Projectile {
+            speed_mm_per_tick,
+            hit_radius_mm: 200,
+        },
+        impact: ImpactShape::Single,
+        effect: AbilityEffect::Damage {
+            amount,
+            school: DamageSchool::True,
+        },
+    }
+}
+
+/// A lobbed bomb: a projectile that detonates in a circle where it was aimed.
+const fn bomb() -> AbilitySpec {
+    AbilitySpec {
+        id: BOMB,
+        aim: AbilityAim::Point,
+        targeting: AbilityTargeting::Enemy,
+        range_mm: 6_000,
+        resource_cost: 0,
+        cooldown_ticks: 1,
+        cast_ticks: 0,
+        delivery: AbilityDelivery::Projectile {
+            speed_mm_per_tick: 1_000,
+            hit_radius_mm: 200,
+        },
+        impact: ImpactShape::Circle { radius_mm: 1_200 },
+        effect: AbilityEffect::Damage {
+            amount: 250,
+            school: DamageSchool::True,
+        },
+    }
+}
+
+/// Deliberately faster than any body is wide: the fixture that would tunnel under a point-collision test.
+const fn rail() -> AbilitySpec {
+    AbilitySpec {
+        id: RAIL,
+        aim: AbilityAim::Point,
+        targeting: AbilityTargeting::AnyUnit,
+        range_mm: 20_000,
+        resource_cost: 0,
+        cooldown_ticks: 1,
+        cast_ticks: 0,
+        delivery: AbilityDelivery::Projectile {
+            speed_mm_per_tick: 5_000,
+            hit_radius_mm: 100,
+        },
+        impact: ImpactShape::Single,
+        effect: AbilityEffect::Damage {
+            amount: 999,
+            school: DamageSchool::True,
+        },
+    }
+}
+
+/// A long-range unit-targeted instant, used to land a second lethal effect on a chosen tick.
+const fn snipe() -> AbilitySpec {
+    AbilitySpec::unit_targeted(
+        SNIPE,
+        AbilityTargeting::Enemy,
+        10_000,
+        0,
+        1,
+        0,
+        AbilityEffect::Damage {
+            amount: 600,
+            school: DamageSchool::True,
+        },
+    )
+}
+
+fn minion(id: ActorId, team: TeamId, position: Vec2Mm, health: u32) -> ActorSpawn {
+    ActorSpawn {
+        id,
+        owner: None,
+        team,
+        kind: ActorKind::Minion,
+        position,
+        stats: stats(health, 0, 0),
+        abilities: Vec::new(),
+        basic_attack: None,
+        death_rule: DeathRule::StayDead,
+    }
+}
+
+/// One team-0 hero at the origin holding every shaped ability, in an otherwise empty match.
+fn skirmish() -> MatchRuntime {
+    skirmish_with_hero_health(1_000)
+}
+
+fn skirmish_with_hero_health(health: u32) -> MatchRuntime {
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x5175_6944).unwrap();
+    for spec in [burst(), lance(LANCE, 300, 400), bomb(), rail(), snipe()] {
+        runtime.register_ability(spec).unwrap();
+    }
+    runtime
+        .spawn_actor(&hero(
+            HERO_ONE,
+            PLAYER_ONE,
+            TeamId(0),
+            Vec2Mm::new(0, 0),
+            health,
+            vec![BURST, LANCE, BOMB, RAIL, SNIPE],
+        ))
+        .unwrap();
+    runtime
+}
+
+fn cast_at(
+    sequence: u32,
+    execute_at: u64,
+    ability: AbilityId,
+    target: CastTarget,
+) -> PlayerCommand {
+    command(
+        PLAYER_ONE,
+        sequence,
+        execute_at,
+        HERO_ONE,
+        CommandKind::Cast { ability, target },
+    )
+}
+
+fn spawned_projectile(frame: &crate::ServerFrame) -> (crate::ProjectileId, Vec2Mm, Vec2Mm) {
+    frame
+        .events
+        .iter()
+        .find_map(|event| match event {
+            MatchEvent::ProjectileSpawned {
+                projectile,
+                position,
+                end,
+                ..
+            } => Some((*projectile, *position, *end)),
+            _ => None,
+        })
+        .expect("a projectile ability spawns a projectile when its cast resolves")
+}
+
+fn damaged_targets(frame: &crate::ServerFrame) -> Vec<ActorId> {
+    frame
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            MatchEvent::DamageApplied { target, .. } => Some(*target),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run ticks until the projectile leaves the world, returning the frame it left in and its resolution.
+fn fly_until_resolved(runtime: &mut MatchRuntime, limit: u64) -> (crate::ServerFrame, MatchEvent) {
+    for _ in 0..limit {
+        let frame = runtime.step().unwrap();
+        if let Some(event) = frame
+            .events
+            .iter()
+            .find(|event| matches!(event, MatchEvent::ProjectileResolved { .. }))
+            .copied()
+        {
+            return (frame, event);
+        }
+    }
+    panic!("projectile never resolved within the tick limit");
+}
+
+#[test]
+fn point_aimed_and_unit_aimed_abilities_refuse_each_others_target_form() {
+    let mut runtime = skirmish();
+    runtime
+        .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(1_000, 0), 500))
+        .unwrap();
+    runtime.start().unwrap();
+
+    // A ground burst refuses a unit target...
+    let rejection = runtime
+        .submit(cast_at(1, 1, BURST, CastTarget::Actor(MINION_ONE)))
+        .unwrap_err();
+    assert_eq!(rejection.reason, CommandRejectReason::InvalidTargetForm);
+
+    // ...and a unit-targeted strike refuses a point.
+    let rejection = runtime
+        .submit(cast_at(
+            2,
+            1,
+            SNIPE,
+            CastTarget::Point(Vec2Mm::new(1_000, 0)),
+        ))
+        .unwrap_err();
+    assert_eq!(rejection.reason, CommandRejectReason::InvalidTargetForm);
+
+    // A single-victim skillshot aimed exactly at the caster has no direction, and is refused rather than
+    // given an invented one.
+    let rejection = runtime
+        .submit(cast_at(3, 1, LANCE, CastTarget::Point(Vec2Mm::new(0, 0))))
+        .unwrap_err();
+    assert_eq!(rejection.reason, CommandRejectReason::InvalidTargetForm);
+}
+
+#[test]
+fn an_aimed_point_outside_the_map_or_beyond_range_is_refused() {
+    let mut runtime = skirmish();
+    runtime.start().unwrap();
+
+    let rejection = runtime
+        .submit(cast_at(
+            1,
+            1,
+            BURST,
+            CastTarget::Point(Vec2Mm::new(i32::MAX, 0)),
+        ))
+        .unwrap_err();
+    assert_eq!(
+        rejection.reason,
+        CommandRejectReason::TargetPointOutOfBounds
+    );
+
+    // In bounds, but past the ability's five-metre reach.
+    let rejection = runtime
+        .submit(cast_at(
+            2,
+            1,
+            BURST,
+            CastTarget::Point(Vec2Mm::new(9_000, 0)),
+        ))
+        .unwrap_err();
+    assert_eq!(rejection.reason, CommandRejectReason::TargetOutOfRange);
+}
+
+#[test]
+fn an_instant_ground_burst_hits_every_enemy_in_radius_and_no_ally() {
+    let mut runtime = skirmish();
+    // Two enemies inside the 1.5 m footprint, one enemy outside it, and one ALLY standing in the middle.
+    runtime
+        .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(3_000, 0), 1_000))
+        .unwrap();
+    runtime
+        .spawn_actor(&minion(
+            MINION_TWO,
+            TeamId(1),
+            Vec2Mm::new(3_000, 1_400),
+            1_000,
+        ))
+        .unwrap();
+    runtime
+        .spawn_actor(&minion(
+            MINION_THREE,
+            TeamId(1),
+            Vec2Mm::new(3_000, 4_000),
+            1_000,
+        ))
+        .unwrap();
+    runtime
+        .spawn_actor(&hero(
+            HERO_TWO,
+            PLAYER_TWO,
+            TeamId(0),
+            Vec2Mm::new(3_000, 200),
+            1_000,
+            Vec::new(),
+        ))
+        .unwrap();
+    runtime.start().unwrap();
+
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            BURST,
+            CastTarget::Point(Vec2Mm::new(3_000, 0)),
+        ))
+        .unwrap();
+    let frame = runtime.step().unwrap();
+
+    assert_eq!(damaged_targets(&frame), vec![MINION_ONE, MINION_TWO]);
+    assert_eq!(runtime.actor(MINION_ONE).unwrap().health, 700);
+    assert_eq!(runtime.actor(MINION_TWO).unwrap().health, 700);
+    assert_eq!(runtime.actor(MINION_THREE).unwrap().health, 1_000);
+    assert_eq!(runtime.actor(HERO_TWO).unwrap().health, 1_000);
+    // An instant ability leaves nothing in flight.
+    assert!(runtime.projectiles().is_empty());
+}
+
+#[test]
+fn a_skillshot_travels_its_full_range_even_when_aimed_short() {
+    let mut runtime = skirmish();
+    runtime
+        .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(3_000, 0), 1_000))
+        .unwrap();
+    runtime.start().unwrap();
+
+    // Aimed at half a metre, well short of the enemy three metres away.
+    runtime
+        .submit(cast_at(1, 1, LANCE, CastTarget::Point(Vec2Mm::new(500, 0))))
+        .unwrap();
+    let launch = runtime.step().unwrap();
+    let (_, position, end) = spawned_projectile(&launch);
+    assert_eq!(position, Vec2Mm::new(0, 0));
+    assert_eq!(
+        end,
+        Vec2Mm::new(6_000, 0),
+        "a single-victim skillshot extends to the ability's full range, not the aim point"
+    );
+
+    let (_, resolved) = fly_until_resolved(&mut runtime, 40);
+    let MatchEvent::ProjectileResolved { victim, .. } = resolved else {
+        unreachable!()
+    };
+    assert_eq!(victim, Some(MINION_ONE));
+    assert_eq!(runtime.actor(MINION_ONE).unwrap().health, 600);
+}
+
+#[test]
+fn a_fast_skillshot_cannot_tunnel_through_a_body_between_ticks() {
+    let mut runtime = skirmish();
+    // RAIL moves 5,000 mm per tick with a 100 mm hit radius. Its tick-boundary positions along the line
+    // are 0, 5,000, 10,000 ... — a victim at 2,000 mm is never within 100 mm of ANY of them, so a
+    // collision test that only sampled the projectile's position would miss it every time.
+    runtime
+        .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(2_000, 0), 5_000))
+        .unwrap();
+    runtime.start().unwrap();
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            RAIL,
+            CastTarget::Point(Vec2Mm::new(9_000, 0)),
+        ))
+        .unwrap();
+    let launch = runtime.step().unwrap();
+    let (_, position, end) = spawned_projectile(&launch);
+    assert_eq!(position, Vec2Mm::new(0, 0));
+    assert_eq!(end, Vec2Mm::new(20_000, 0));
+
+    // The negative control, stated as arithmetic rather than trusted from the engine: neither the position
+    // the projectile starts its first tick at nor the one it ends that tick at is inside the hit radius.
+    for sampled_x in [0_i32, 5_000] {
+        let gap = (2_000 - sampled_x).abs();
+        assert!(
+            gap > 100,
+            "sample at {sampled_x} is {gap} mm from the victim, so the fixture no longer proves sweeping"
+        );
+    }
+
+    let (frame, resolved) = fly_until_resolved(&mut runtime, 4);
+    assert_eq!(
+        frame.tick, 2,
+        "the strike lands on the first tick of flight"
+    );
+    let MatchEvent::ProjectileResolved {
+        victim, position, ..
+    } = resolved
+    else {
+        unreachable!()
+    };
+    assert_eq!(victim, Some(MINION_ONE));
+    assert_eq!(position, Vec2Mm::new(2_000, 0));
+    assert_eq!(runtime.actor(MINION_ONE).unwrap().health, 4_001);
+}
+
+#[test]
+fn a_skillshot_that_touches_nothing_resolves_at_its_flight_end_without_damage() {
+    let mut runtime = skirmish();
+    // Far off the flight line.
+    runtime
+        .spawn_actor(&minion(
+            MINION_ONE,
+            TeamId(1),
+            Vec2Mm::new(3_000, 4_000),
+            1_000,
+        ))
+        .unwrap();
+    runtime.start().unwrap();
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            LANCE,
+            CastTarget::Point(Vec2Mm::new(1_000, 0)),
+        ))
+        .unwrap();
+    runtime.step().unwrap();
+
+    let (frame, resolved) = fly_until_resolved(&mut runtime, 40);
+    let MatchEvent::ProjectileResolved {
+        victim, position, ..
+    } = resolved
+    else {
+        unreachable!()
+    };
+    assert_eq!(victim, None);
+    assert_eq!(position, Vec2Mm::new(6_000, 0));
+    assert!(
+        damaged_targets(&frame).is_empty(),
+        "a single-victim skillshot that reaches its flight end fizzles"
+    );
+    assert_eq!(runtime.actor(MINION_ONE).unwrap().health, 1_000);
+    assert!(runtime.projectiles().is_empty());
+}
+
+#[test]
+fn a_lobbed_bomb_detonates_where_it_was_aimed_rather_than_running_to_max_range() {
+    let mut runtime = skirmish();
+    runtime
+        .spawn_actor(&minion(
+            MINION_ONE,
+            TeamId(1),
+            Vec2Mm::new(4_000, 800),
+            1_000,
+        ))
+        .unwrap();
+    runtime.start().unwrap();
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            BOMB,
+            CastTarget::Point(Vec2Mm::new(4_000, 0)),
+        ))
+        .unwrap();
+    let launch = runtime.step().unwrap();
+    let (_, _, end) = spawned_projectile(&launch);
+    assert_eq!(
+        end,
+        Vec2Mm::new(4_000, 0),
+        "an area impact lands where it was aimed"
+    );
+
+    let (frame, resolved) = fly_until_resolved(&mut runtime, 40);
+    let MatchEvent::ProjectileResolved { victim, .. } = resolved else {
+        unreachable!()
+    };
+    // Nothing stood on the flight line, but the burst still catches the enemy beside the target point.
+    assert_eq!(victim, None);
+    assert_eq!(damaged_targets(&frame), vec![MINION_ONE]);
+    assert_eq!(runtime.actor(MINION_ONE).unwrap().health, 750);
+}
+
+#[test]
+fn a_skillshot_strikes_the_nearest_body_on_its_line_not_the_lowest_actor_id() {
+    let mut runtime = skirmish();
+    // MINION_ONE has the LOWER id but stands FURTHER away: ID order and distance order disagree on purpose.
+    runtime
+        .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(4_000, 0), 1_000))
+        .unwrap();
+    runtime
+        .spawn_actor(&minion(MINION_TWO, TeamId(1), Vec2Mm::new(1_500, 0), 1_000))
+        .unwrap();
+    runtime.start().unwrap();
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            RAIL,
+            CastTarget::Point(Vec2Mm::new(6_000, 0)),
+        ))
+        .unwrap();
+    runtime.step().unwrap();
+
+    let (_, resolved) = fly_until_resolved(&mut runtime, 10);
+    let MatchEvent::ProjectileResolved { victim, .. } = resolved else {
+        unreachable!()
+    };
+    assert_eq!(victim, Some(MINION_TWO));
+    assert_eq!(runtime.actor(MINION_ONE).unwrap().health, 1_000);
+}
+
+#[test]
+fn a_projectile_never_collides_with_its_own_caster() {
+    let mut runtime = skirmish();
+    runtime
+        .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(6_000, 0), 5_000))
+        .unwrap();
+    runtime.start().unwrap();
+    // RAIL targets ANY unit, so without the source exclusion the caster is the nearest legal body to its
+    // own missile and would be struck on the first tick of flight.
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            RAIL,
+            CastTarget::Point(Vec2Mm::new(9_000, 0)),
+        ))
+        .unwrap();
+    runtime.step().unwrap();
+    let (_, resolved) = fly_until_resolved(&mut runtime, 10);
+    let MatchEvent::ProjectileResolved { victim, .. } = resolved else {
+        unreachable!()
+    };
+    assert_eq!(victim, Some(MINION_ONE));
+    assert_eq!(runtime.actor(HERO_ONE).unwrap().health, 1_000);
+}
+
+#[test]
+fn a_projectile_outlives_its_caster_and_still_lands_with_its_attribution_intact() {
+    // The caster is frail enough that one SNIPE kills it while its own missile is still in the air.
+    let mut runtime = skirmish_with_hero_health(500);
+    runtime
+        .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(3_000, 0), 1_000))
+        .unwrap();
+    runtime
+        .spawn_actor(&hero(
+            HERO_TWO,
+            PLAYER_TWO,
+            TeamId(1),
+            Vec2Mm::new(0, 1_500),
+            1_000,
+            vec![SNIPE],
+        ))
+        .unwrap();
+    runtime.start().unwrap();
+
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            LANCE,
+            CastTarget::Point(Vec2Mm::new(3_000, 0)),
+        ))
+        .unwrap();
+    runtime
+        .submit(command(
+            PLAYER_TWO,
+            1,
+            1,
+            HERO_TWO,
+            CommandKind::Cast {
+                ability: SNIPE,
+                target: CastTarget::Actor(HERO_ONE),
+            },
+        ))
+        .unwrap();
+    let frame = runtime.step().unwrap();
+    assert!(frame
+        .events
+        .iter()
+        .any(|event| matches!(event, MatchEvent::ActorDied { actor, .. } if *actor == HERO_ONE)));
+    assert!(!runtime.actor(HERO_ONE).unwrap().alive);
+    assert_eq!(
+        runtime.projectiles().len(),
+        1,
+        "the missile is already in the air and does not die with its caster"
+    );
+
+    let (frame, resolved) = fly_until_resolved(&mut runtime, 40);
+    let MatchEvent::ProjectileResolved { victim, .. } = resolved else {
+        unreachable!()
+    };
+    assert_eq!(victim, Some(MINION_ONE));
+    assert!(frame.events.iter().any(|event| matches!(
+        event,
+        MatchEvent::DamageApplied { source, target, .. }
+            if *source == HERO_ONE && *target == MINION_ONE
+    )));
+}
+
+#[test]
+fn a_projectile_flight_is_clamped_inside_the_map_along_its_own_line() {
+    let config = MatchConfig {
+        map_bounds: crate::RectMm::new(Vec2Mm::new(-10_000, -10_000), Vec2Mm::new(10_000, 10_000)),
+        ..MatchConfig::default()
+    };
+    let mut runtime = MatchRuntime::new(config, 7).unwrap();
+    // A thirty-metre reach inside a ten-metre box, so extending the flight to full range genuinely leaves
+    // the map and the clamp is actually exercised rather than silently skipped.
+    runtime
+        .register_ability(AbilitySpec {
+            range_mm: 30_000,
+            ..lance(LANCE, 300, 400)
+        })
+        .unwrap();
+    runtime
+        .spawn_actor(&hero(
+            HERO_ONE,
+            PLAYER_ONE,
+            TeamId(0),
+            Vec2Mm::new(0, 0),
+            1_000,
+            vec![LANCE],
+        ))
+        .unwrap();
+    runtime.start().unwrap();
+    // Aimed diagonally: extending to full range leaves the box on both axes at once.
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            LANCE,
+            CastTarget::Point(Vec2Mm::new(4_000, 4_000)),
+        ))
+        .unwrap();
+    let launch = runtime.step().unwrap();
+    let (_, _, end) = spawned_projectile(&launch);
+    assert!(config.map_bounds.contains(end));
+    assert_eq!(
+        end.x, end.y,
+        "clamping shortens the flight along its own line; it must not bend the aim"
+    );
+    assert_eq!(end, Vec2Mm::new(10_000, 10_000));
+}
+
+#[test]
+fn a_projectile_impact_and_a_cast_settle_in_one_batch_as_a_mutual_kill() {
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x6d75_7475).unwrap();
+    // A 2,000 mm/tick lance covers the three-metre gap on its SECOND tick of flight, which is match tick 3.
+    runtime.register_ability(lance(LANCE, 2_000, 400)).unwrap();
+    runtime.register_ability(snipe()).unwrap();
+    runtime
+        .spawn_actor(&hero(
+            HERO_ONE,
+            PLAYER_ONE,
+            TeamId(0),
+            Vec2Mm::new(0, 0),
+            100,
+            vec![LANCE],
+        ))
+        .unwrap();
+    runtime
+        .spawn_actor(&hero(
+            HERO_TWO,
+            PLAYER_TWO,
+            TeamId(1),
+            Vec2Mm::new(3_000, 0),
+            100,
+            vec![SNIPE],
+        ))
+        .unwrap();
+    runtime.start().unwrap();
+
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            LANCE,
+            CastTarget::Point(Vec2Mm::new(3_000, 0)),
+        ))
+        .unwrap();
+    runtime
+        .submit(command(
+            PLAYER_TWO,
+            1,
+            3,
+            HERO_TWO,
+            CommandKind::Cast {
+                ability: SNIPE,
+                target: CastTarget::Actor(HERO_ONE),
+            },
+        ))
+        .unwrap();
+
+    runtime.step().unwrap();
+    runtime.step().unwrap();
+    let frame = runtime.step().unwrap();
+    assert_eq!(frame.tick, 3);
+    let deaths: Vec<ActorId> = frame
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            MatchEvent::ActorDied { actor, .. } => Some(*actor),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deaths,
+        vec![HERO_ONE, HERO_TWO],
+        "a missile impact and a spell that both reach lethal on one tick are a legal mutual kill"
+    );
+}
+
+#[test]
+fn the_projectile_budget_is_fail_closed_and_cancels_the_cast_that_would_exceed_it() {
+    let config = MatchConfig {
+        max_projectiles: 1,
+        ..MatchConfig::default()
+    };
+    let mut runtime = MatchRuntime::new(config, 11).unwrap();
+    runtime.register_ability(lance(LANCE, 300, 400)).unwrap();
+    for (actor, player) in [(HERO_ONE, PLAYER_ONE), (HERO_THREE, PLAYER_THREE)] {
+        runtime
+            .spawn_actor(&hero(
+                actor,
+                player,
+                TeamId(0),
+                Vec2Mm::new(0, 0),
+                1_000,
+                vec![LANCE],
+            ))
+            .unwrap();
+    }
+    runtime.start().unwrap();
+
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            LANCE,
+            CastTarget::Point(Vec2Mm::new(3_000, 0)),
+        ))
+        .unwrap();
+    runtime
+        .submit(command(
+            PLAYER_THREE,
+            1,
+            1,
+            HERO_THREE,
+            CommandKind::Cast {
+                ability: LANCE,
+                target: CastTarget::Point(Vec2Mm::new(3_000, 0)),
+            },
+        ))
+        .unwrap();
+    let frame = runtime.step().unwrap();
+
+    assert_eq!(runtime.projectiles().len(), 1);
+    assert!(frame.events.iter().any(|event| matches!(
+        event,
+        MatchEvent::CastCancelled { source, reason, .. }
+            if *source == HERO_THREE
+                && *reason == CommandRejectReason::ProjectileBudgetExceeded
+    )));
+    runtime.check_invariants().unwrap();
+}
+
+#[test]
+fn match_completion_cancels_in_flight_projectiles_without_applying_their_damage() {
+    let mut runtime = skirmish();
+    runtime
+        .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(3_000, 0), 1_000))
+        .unwrap();
+    runtime.start().unwrap();
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            LANCE,
+            CastTarget::Point(Vec2Mm::new(3_000, 0)),
+        ))
+        .unwrap();
+    let launch = runtime.step().unwrap();
+    let (projectile, _, _) = spawned_projectile(&launch);
+
+    let terminal = runtime
+        .finish(MatchOutcome::Draw, MatchEndReason::Host)
+        .unwrap();
+    assert!(terminal.events.iter().any(|event| matches!(
+        event,
+        MatchEvent::ProjectileCancelled { projectile: id, reason }
+            if *id == projectile && *reason == CommandRejectReason::MatchNotActive
+    )));
+    assert_eq!(terminal.removed_projectiles, vec![projectile]);
+    assert!(runtime.projectiles().is_empty());
+    assert_eq!(
+        runtime.actor(MINION_ONE).unwrap().health,
+        1_000,
+        "a match that already produced its terminal outcome must not have a missile land afterwards"
+    );
+    runtime.check_invariants().unwrap();
+}
+
+#[test]
+fn an_in_flight_projectile_survives_the_checkpoint_round_trip_and_lands_identically() {
+    let content = ContentId::new([0x33; 32]);
+    let build = || {
+        let mut runtime = skirmish();
+        runtime
+            .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(3_000, 0), 1_000))
+            .unwrap();
+        runtime.start().unwrap();
+        runtime
+            .submit(cast_at(
+                1,
+                1,
+                LANCE,
+                CastTarget::Point(Vec2Mm::new(3_000, 0)),
+            ))
+            .unwrap();
+        // Launch, then two ticks of flight, so the captured missile is genuinely mid-air.
+        for _ in 0..3 {
+            runtime.step().unwrap();
+        }
+        runtime
+    };
+
+    let mut uninterrupted = build();
+    let checkpointed = build();
+    assert_eq!(checkpointed.projectiles().len(), 1);
+    let checkpoint = checkpointed.capture_checkpoint(content).unwrap();
+    let mut restored = MatchRuntime::restore_checkpoint(&checkpoint, content).unwrap();
+    assert_eq!(restored.projectiles(), checkpointed.projectiles());
+    assert_eq!(restored.world_digest(), checkpointed.world_digest());
+
+    for _ in 0..10 {
+        let expected = uninterrupted.step().unwrap();
+        let actual = restored.step().unwrap();
+        assert_eq!(actual.frame_digest, expected.frame_digest);
+    }
+    assert_eq!(
+        uninterrupted.actor(MINION_ONE).unwrap().health,
+        restored.actor(MINION_ONE).unwrap().health
+    );
+    assert_eq!(uninterrupted.actor(MINION_ONE).unwrap().health, 600);
+}
+
+#[test]
+fn contradictory_ability_shapes_are_refused_at_authoring_time() {
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 3).unwrap();
+    let damage = AbilityEffect::Damage {
+        amount: 10,
+        school: DamageSchool::True,
+    };
+    let base = AbilitySpec {
+        id: AbilityId(1),
+        aim: AbilityAim::Point,
+        targeting: AbilityTargeting::Enemy,
+        range_mm: 1_000,
+        resource_cost: 0,
+        cooldown_ticks: 1,
+        cast_ticks: 0,
+        delivery: AbilityDelivery::Instant,
+        impact: ImpactShape::Circle { radius_mm: 500 },
+        effect: damage,
+    };
+    let refused = [
+        // A point cast cannot be self-only.
+        AbilitySpec {
+            targeting: AbilityTargeting::SelfOnly,
+            ..base
+        },
+        // An instant point cast with a single-victim impact names nobody and covers nothing.
+        AbilitySpec {
+            impact: ImpactShape::Single,
+            ..base
+        },
+        AbilitySpec {
+            delivery: AbilityDelivery::Projectile {
+                speed_mm_per_tick: 0,
+                hit_radius_mm: 100,
+            },
+            ..base
+        },
+        AbilitySpec {
+            delivery: AbilityDelivery::Projectile {
+                speed_mm_per_tick: 100,
+                hit_radius_mm: 0,
+            },
+            ..base
+        },
+        AbilitySpec {
+            delivery: AbilityDelivery::Projectile {
+                speed_mm_per_tick: crate::MAX_PROJECTILE_SPEED_MM_PER_TICK + 1,
+                hit_radius_mm: 100,
+            },
+            ..base
+        },
+        // A projectile with no range can never travel.
+        AbilitySpec {
+            range_mm: 0,
+            delivery: AbilityDelivery::Projectile {
+                speed_mm_per_tick: 100,
+                hit_radius_mm: 100,
+            },
+            ..base
+        },
+        AbilitySpec {
+            impact: ImpactShape::Circle { radius_mm: 0 },
+            ..base
+        },
+        AbilitySpec {
+            impact: ImpactShape::Circle {
+                radius_mm: crate::MAX_IMPACT_RADIUS_MM + 1,
+            },
+            ..base
+        },
+    ];
+    for (index, spec) in refused.into_iter().enumerate() {
+        assert!(
+            matches!(
+                runtime.register_ability(spec),
+                Err(RuntimeError::InvalidAbility(..))
+            ),
+            "contradictory ability shape {index} was accepted"
+        );
+    }
+    // The coherent baseline still registers, so the loop above refuses shapes rather than everything.
+    runtime.register_ability(base).unwrap();
+}
+
+#[test]
+fn an_in_flight_projectile_is_part_of_both_digests() {
+    let mut runtime = skirmish();
+    runtime.start().unwrap();
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            LANCE,
+            CastTarget::Point(Vec2Mm::new(3_000, 0)),
+        ))
+        .unwrap();
+    let frame = runtime.step().unwrap();
+    assert_eq!(frame.projectiles.len(), 1);
+
+    // Negative control: strip ONLY the projectile and nothing else. If the missile were absent from the
+    // digest, two runtimes that disagree about a live projectile would still claim to be identical.
+    let mut without = runtime.clone();
+    without.projectiles.clear();
+    assert_ne!(runtime.world_digest(), without.world_digest());
+
+    let mut frame_without = frame.clone();
+    frame_without.projectiles.clear();
+    assert_ne!(
+        crate::runtime::digest_frame(&frame),
+        crate::runtime::digest_frame(&frame_without)
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the guard is only meaningful if it names every event variant exhaustively"
+)]
+fn every_match_event_has_a_distinct_digest_tag() {
+    // One representative of every variant. `StatusEffectExpired` and `RespawnCancelled` both used to
+    // encode tag 19, and a duplicate discriminant is a hole in an encoding whose whole job is that two
+    // different causal traces cannot hash the same.
+    let events = [
+        MatchEvent::MatchStarted,
+        MatchEvent::CommandRejected {
+            player: PLAYER_ONE,
+            sequence: 1,
+            reason: CommandRejectReason::ActorDead,
+        },
+        MatchEvent::MoveStarted {
+            actor: HERO_ONE,
+            destination: Vec2Mm::new(1, 1),
+        },
+        MatchEvent::MoveStopped { actor: HERO_ONE },
+        MatchEvent::CastStarted {
+            source: HERO_ONE,
+            ability: STRIKE,
+            target: CastTarget::SelfActor,
+            resolves_at: 1,
+        },
+        MatchEvent::CastCancelled {
+            source: HERO_ONE,
+            ability: STRIKE,
+            reason: CommandRejectReason::ActorDead,
+        },
+        MatchEvent::CastResolved {
+            source: HERO_ONE,
+            ability: STRIKE,
+            target: CastTarget::SelfActor,
+        },
+        MatchEvent::DamageApplied {
+            source: HERO_ONE,
+            target: HERO_TWO,
+            cause: DamageCause::BasicAttack,
+            school: DamageSchool::True,
+            amount: 1,
+            health_after: 1,
+        },
+        MatchEvent::HealingApplied {
+            source: HERO_ONE,
+            target: HERO_TWO,
+            ability: HEAL,
+            amount: 1,
+            health_after: 1,
+        },
+        MatchEvent::ActorDied {
+            actor: HERO_ONE,
+            killer: HERO_TWO,
+        },
+        MatchEvent::MatchFinished {
+            outcome: MatchOutcome::Draw,
+            reason: MatchEndReason::Host,
+        },
+        MatchEvent::BasicAttackStarted {
+            source: HERO_ONE,
+            target: HERO_TWO,
+            resolves_at: 1,
+        },
+        MatchEvent::BasicAttackCancelled {
+            source: HERO_ONE,
+            target: HERO_TWO,
+            reason: CommandRejectReason::ActorDead,
+        },
+        MatchEvent::BasicAttackResolved {
+            source: HERO_ONE,
+            target: HERO_TWO,
+        },
+        MatchEvent::ActorDespawned { actor: HERO_ONE },
+        MatchEvent::RespawnScheduled {
+            actor: HERO_ONE,
+            at_tick: 1,
+        },
+        MatchEvent::RespawnCancelled {
+            actor: HERO_ONE,
+            at_tick: 1,
+            reason: MatchEndReason::Host,
+        },
+        MatchEvent::ActorRespawned {
+            actor: HERO_ONE,
+            position: Vec2Mm::new(0, 0),
+        },
+        MatchEvent::InternalIntentRejected {
+            actor: HERO_ONE,
+            reason: CommandRejectReason::ActorDead,
+        },
+        MatchEvent::StatusEffectExpired {
+            actor: HERO_ONE,
+            effect: crate::StatusEffectId(1),
+        },
+        MatchEvent::ActorSpawned { actor: HERO_ONE },
+        MatchEvent::ProjectileSpawned {
+            projectile: crate::ProjectileId(1),
+            source: HERO_ONE,
+            ability: LANCE,
+            position: Vec2Mm::new(0, 0),
+            end: Vec2Mm::new(1, 0),
+        },
+        MatchEvent::ProjectileResolved {
+            projectile: crate::ProjectileId(1),
+            position: Vec2Mm::new(1, 0),
+            victim: None,
+        },
+        MatchEvent::ProjectileCancelled {
+            projectile: crate::ProjectileId(1),
+            reason: CommandRejectReason::MatchNotActive,
+        },
+    ];
+    let mut tags: Vec<u8> = events
+        .iter()
+        .map(|event| crate::runtime::event_tag(*event))
+        .collect();
+    let total = tags.len();
+    tags.sort_unstable();
+    tags.dedup();
+    assert_eq!(
+        tags.len(),
+        total,
+        "two authoritative events share a digest tag"
+    );
+}
+
+#[test]
+fn an_area_impact_skips_a_dead_actor() {
+    let mut runtime = skirmish();
+    runtime
+        .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(3_000, 0), 200))
+        .unwrap();
+    runtime
+        .spawn_actor(&minion(
+            MINION_TWO,
+            TeamId(1),
+            Vec2Mm::new(3_000, 500),
+            1_000,
+        ))
+        .unwrap();
+    runtime.start().unwrap();
+
+    // The first burst kills MINION_ONE outright; it stays in authoritative state because it never despawns.
+    runtime
+        .submit(cast_at(
+            1,
+            1,
+            BURST,
+            CastTarget::Point(Vec2Mm::new(3_000, 0)),
+        ))
+        .unwrap();
+    runtime.step().unwrap();
+    assert!(!runtime.actor(MINION_ONE).unwrap().alive);
+
+    // Cooldown legality is judged against the CURRENT tick, not the requested one, so the second cast is
+    // submitted after the burst has come off cooldown.
+    runtime.step().unwrap();
+    runtime
+        .submit(cast_at(
+            2,
+            3,
+            BURST,
+            CastTarget::Point(Vec2Mm::new(3_000, 0)),
+        ))
+        .unwrap();
+    let frame = runtime.step().unwrap();
+    assert_eq!(frame.tick, 3);
+    assert_eq!(damaged_targets(&frame), vec![MINION_TWO]);
 }

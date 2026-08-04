@@ -15,11 +15,12 @@
 use std::fmt::Write as _;
 
 use metrocalk_gameplay::{
-    AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorKind, ActorSpawn,
-    ActorView, BasicAttackSpec, CastTarget, CombatStats, CommandKind, CommandRejectReason,
-    CompiledLane, ContentId, ControlKind, DamageSchool, DeathRule, LaneId, LanePosition, LaneSpec,
-    MatchConfig, MatchEvent, MatchPhase, MatchRuntime, ModifierOp, OneLaneMatch, PlayerCommand,
-    PlayerId, RectMm, StatKind, TeamId, Tick, Vec2Mm, WaveSpec, WaveUnitSpec,
+    AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
+    ActorKind, ActorSpawn, ActorView, BasicAttackSpec, CastTarget, CombatStats, CommandKind,
+    CommandRejectReason, CompiledLane, ContentId, ControlKind, DamageSchool, DeathRule,
+    ImpactShape, LaneId, LanePosition, LaneSpec, MatchConfig, MatchEvent, MatchPhase, MatchRuntime,
+    ModifierOp, OneLaneMatch, PlayerCommand, PlayerId, RectMm, StatKind, TeamId, Tick, Vec2Mm,
+    WaveSpec, WaveUnitSpec,
 };
 
 const PLAYER: PlayerId = PlayerId(1);
@@ -60,6 +61,9 @@ fn scenarios() -> Vec<String> {
         lane_waves_and_bots(),
         owned_player_corridor_anchoring(),
         determinism_two_identical_runs(),
+        ground_burst_spares_allies(),
+        skillshot_flies_and_strikes_the_nearest_body(),
+        skillshot_can_miss(),
         checkpoint_restore_suffix_equality(),
     ]
 }
@@ -131,6 +135,26 @@ impl Recorder {
                 frame.push(',');
             }
             frame.push_str(&actor_json(actor, runtime));
+        }
+        // Projectiles are authoritative state, so the capture carries them for the same reason it carries
+        // actors: a missile that only exists between two health values is invisible to a reader.
+        frame.push_str("],\"projectiles\":[");
+        for (index, projectile) in runtime.projectiles().iter().enumerate() {
+            if index > 0 {
+                frame.push(',');
+            }
+            let _ = write!(
+                frame,
+                "{{\"id\":{},\"source\":{},\"team\":{},\"x\":{},\"y\":{},\"endX\":{},\"endY\":{},\"hitRadiusMm\":{}}}",
+                projectile.id.get(),
+                projectile.source.get(),
+                projectile.team.get(),
+                projectile.position.x,
+                projectile.position.y,
+                projectile.end.x,
+                projectile.end.y,
+                projectile.hit_radius_mm
+            );
         }
         frame.push_str("],\"events\":[");
         for (index, event) in events.iter().enumerate() {
@@ -304,6 +328,28 @@ fn event_label(event: MatchEvent) -> String {
             format!("StatusEffectExpired a{} e{}", actor.get(), effect.get())
         }
         MatchEvent::ActorSpawned { actor } => format!("ActorSpawned a{}", actor.get()),
+        MatchEvent::ProjectileSpawned {
+            projectile, source, ..
+        } => format!(
+            "ProjectileSpawned p{} from a{}",
+            projectile.get(),
+            source.get()
+        ),
+        MatchEvent::ProjectileResolved {
+            projectile, victim, ..
+        } => match victim {
+            Some(victim) => format!(
+                "ProjectileResolved p{} hit a{}",
+                projectile.get(),
+                victim.get()
+            ),
+            None => format!("ProjectileResolved p{} at flight end", projectile.get()),
+        },
+        MatchEvent::ProjectileCancelled { projectile, reason } => format!(
+            "ProjectileCancelled p{} ({})",
+            projectile.get(),
+            reason_name(reason)
+        ),
         MatchEvent::MatchFinished { outcome, reason } => {
             format!("MatchFinished {outcome:?} ({reason:?})")
         }
@@ -377,6 +423,9 @@ fn duel(mitigation: u16) -> MatchRuntime {
     runtime
         .register_ability(AbilitySpec {
             id: STRIKE,
+            aim: AbilityAim::Unit,
+            delivery: AbilityDelivery::Instant,
+            impact: ImpactShape::Single,
             targeting: AbilityTargeting::Enemy,
             range_mm: 3_000,
             resource_cost: 10,
@@ -391,6 +440,9 @@ fn duel(mitigation: u16) -> MatchRuntime {
     runtime
         .register_ability(AbilitySpec {
             id: MEND,
+            aim: AbilityAim::Unit,
+            delivery: AbilityDelivery::Instant,
+            impact: ImpactShape::Single,
             targeting: AbilityTargeting::SelfOnly,
             range_mm: 0,
             resource_cost: 5,
@@ -1271,4 +1323,253 @@ fn checkpoint_restore_suffix_equality() -> String {
 #[allow(dead_code)]
 fn public_surface_guard(lane: &CompiledLane) -> u64 {
     lane.length_mm()
+}
+
+// ---------------------------------------------------------------------------------------------
+// GP-04 shaped targeting and GP-03 projectiles
+// ---------------------------------------------------------------------------------------------
+
+const BURST: AbilityId = AbilityId(21);
+const LANCE: AbilityId = AbilityId(22);
+const NEAR_FOE: ActorId = ActorId(301);
+const FAR_FOE: ActorId = ActorId(302);
+const ALLY: ActorId = ActorId(303);
+const SIDE_FOE: ActorId = ActorId(304);
+
+fn shaped_ability_match() -> MatchRuntime {
+    let mut runtime = MatchRuntime::new(config(), 0x_5107).expect("config");
+    runtime
+        .register_ability(AbilitySpec {
+            id: BURST,
+            aim: AbilityAim::Point,
+            targeting: AbilityTargeting::Enemy,
+            range_mm: 6_000,
+            resource_cost: 0,
+            cooldown_ticks: 4,
+            cast_ticks: 0,
+            delivery: AbilityDelivery::Instant,
+            impact: ImpactShape::Circle { radius_mm: 1_500 },
+            effect: AbilityEffect::Damage {
+                amount: 250,
+                school: DamageSchool::True,
+            },
+        })
+        .expect("burst");
+    runtime
+        .register_ability(AbilitySpec {
+            id: LANCE,
+            aim: AbilityAim::Point,
+            targeting: AbilityTargeting::Enemy,
+            range_mm: 8_000,
+            resource_cost: 0,
+            cooldown_ticks: 4,
+            cast_ticks: 0,
+            delivery: AbilityDelivery::Projectile {
+                speed_mm_per_tick: 900,
+                hit_radius_mm: 300,
+            },
+            impact: ImpactShape::Single,
+            effect: AbilityEffect::Damage {
+                amount: 400,
+                school: DamageSchool::True,
+            },
+        })
+        .expect("lance");
+
+    let mut caster = hero(HERO, Some(PLAYER), 0, 0, 0);
+    caster.abilities = vec![BURST, LANCE];
+    runtime.spawn_actor(&caster).expect("caster");
+    for (id, team, x, y) in [
+        (NEAR_FOE, 1_u8, 3_000_i32, 0_i32),
+        (FAR_FOE, 1, 5_000, 0),
+        (ALLY, 0, 3_000, 400),
+        // Inside the 1.5 m burst footprint, but 1.2 m off the skillshot line and well outside its 0.3 m
+        // hit radius, so one fixture serves both scenarios without either one weakening the other.
+        (SIDE_FOE, 1, 3_000, -1_200),
+    ] {
+        runtime
+            .spawn_actor(&ActorSpawn {
+                id,
+                owner: None,
+                team: TeamId(team),
+                kind: ActorKind::Minion,
+                position: Vec2Mm::new(x, y),
+                stats: stats(1_000, 0, 0),
+                abilities: vec![],
+                basic_attack: None,
+                death_rule: DeathRule::StayDead,
+            })
+            .expect("body");
+    }
+    runtime.start().expect("start");
+    runtime
+}
+
+fn ground_burst_spares_allies() -> String {
+    let mut rec = Recorder::new(
+        "gp04-ground-burst",
+        "GP-04 · a ground burst covers an area and reads friend from foe",
+        "One point-aimed burst damages every ENEMY inside its 1.5 m footprint and no ally, all in one tick.",
+    );
+    let mut runtime = shaped_ability_match();
+    rec.record(&runtime, &[], "before the burst");
+    rec.note(
+        "Aimed at the point 3 m ahead. NEAR_FOE stands on it; ALLY stands 0.4 m away from it.",
+    );
+
+    runtime
+        .submit(command(
+            1,
+            1,
+            HERO,
+            CommandKind::Cast {
+                ability: BURST,
+                target: CastTarget::Point(Vec2Mm::new(3_000, 0)),
+            },
+        ))
+        .expect("accepted");
+    let frame = runtime.step().expect("step");
+    rec.record(&runtime, &frame.events, "burst detonated");
+
+    let near = runtime.actor(NEAR_FOE).expect("near").health;
+    let far = runtime.actor(FAR_FOE).expect("far").health;
+    let ally = runtime.actor(ALLY).expect("ally").health;
+    let side = runtime.actor(SIDE_FOE).expect("side").health;
+    rec.check("the enemy standing on the point was hurt", near == 750);
+    rec.check(
+        "the second enemy 1.2 m away was hurt too, so this really is an AREA",
+        side == 750,
+    );
+    rec.check("the ally standing 0.4 m away was NOT hurt", ally == 1_000);
+    rec.check(
+        "the enemy 2 m outside the footprint was NOT hurt",
+        far == 1_000,
+    );
+    rec.check(
+        "an instant ability leaves nothing in flight",
+        runtime.projectiles().is_empty(),
+    );
+    rec.finish()
+}
+
+fn skillshot_flies_and_strikes_the_nearest_body() -> String {
+    let mut rec = Recorder::new(
+        "gp03-skillshot",
+        "GP-03 · a skillshot travels a fixed line and strikes the first body on it",
+        "The missile occupies a visible position every tick, extends to the ability's full range even though it was aimed short, and strikes the NEARER enemy while the farther one is untouched.",
+    );
+    let mut runtime = shaped_ability_match();
+    rec.record(&runtime, &[], "before the cast");
+    rec.note("Aimed at 1 m; the ability's range is 8 m, so the flight line runs the full 8 m.");
+
+    runtime
+        .submit(command(
+            1,
+            1,
+            HERO,
+            CommandKind::Cast {
+                ability: LANCE,
+                target: CastTarget::Point(Vec2Mm::new(1_000, 0)),
+            },
+        ))
+        .expect("accepted");
+    let frame = runtime.step().expect("step");
+    rec.record(&runtime, &frame.events, "launched");
+    let launched = runtime.projectiles();
+    rec.check("exactly one missile is in the air", launched.len() == 1);
+    rec.check(
+        "the flight terminus is the ability's full 8 m range, not the 1 m aim point",
+        launched
+            .first()
+            .is_some_and(|p| p.end == Vec2Mm::new(8_000, 0)),
+    );
+
+    let mut struck = None;
+    for beat in 0..12 {
+        let frame = runtime.step().expect("step");
+        let label = format!("flight tick {}", beat + 1);
+        rec.record(&runtime, &frame.events, &label);
+        if let Some(event) = frame.events.iter().find_map(|event| match event {
+            MatchEvent::ProjectileResolved { victim, .. } => Some(*victim),
+            _ => None,
+        }) {
+            struck = Some(event);
+            break;
+        }
+    }
+
+    rec.check(
+        "the missile struck the NEARER enemy",
+        struck == Some(Some(NEAR_FOE)),
+    );
+    rec.check(
+        "the farther enemy on the same line is untouched",
+        runtime.actor(FAR_FOE).expect("far").health == 1_000,
+    );
+    rec.check(
+        "the caster was never hit by its own missile",
+        runtime.actor(HERO).expect("hero").health == 1_000,
+    );
+    rec.check(
+        "the missile left the world exactly once",
+        runtime.projectiles().is_empty(),
+    );
+    rec.finish()
+}
+
+fn skillshot_can_miss() -> String {
+    let mut rec = Recorder::new(
+        "gp03-skillshot-miss",
+        "GP-03 · a skillshot is dodgeable",
+        "The same missile, aimed along an empty line, reaches the end of its flight and fizzles: no damage, no victim. A skillshot that could not miss would not be a skill mechanic.",
+    );
+    let mut runtime = shaped_ability_match();
+    runtime
+        .submit(command(
+            1,
+            1,
+            HERO,
+            CommandKind::Cast {
+                ability: LANCE,
+                target: CastTarget::Point(Vec2Mm::new(1_000, 1_500)),
+            },
+        ))
+        .expect("accepted");
+    let frame = runtime.step().expect("step");
+    rec.record(&runtime, &frame.events, "launched off-line");
+    rec.note(
+        "Aimed 1.5 m off the axis the enemies stand on, so nothing is within the 0.3 m hit radius.",
+    );
+    rec.note("The flight is short because the terminus is clamped into the 2 m-tall capture map along its own line — the aim ratio is preserved, the distance is not.");
+
+    let mut resolved_without_victim = false;
+    let mut damage_seen = false;
+    for beat in 0..14 {
+        let frame = runtime.step().expect("step");
+        let label = format!("flight tick {}", beat + 1);
+        rec.record(&runtime, &frame.events, &label);
+        damage_seen |= frame
+            .events
+            .iter()
+            .any(|event| matches!(event, MatchEvent::DamageApplied { .. }));
+        if let Some(victim) = frame.events.iter().find_map(|event| match event {
+            MatchEvent::ProjectileResolved { victim, .. } => Some(*victim),
+            _ => None,
+        }) {
+            resolved_without_victim = victim.is_none();
+            break;
+        }
+    }
+    rec.check(
+        "the missile reached its flight end with no victim",
+        resolved_without_victim,
+    );
+    rec.check("no damage was dealt anywhere", !damage_seen);
+    rec.check(
+        "every enemy is at full health",
+        runtime.actor(NEAR_FOE).expect("near").health == 1_000
+            && runtime.actor(FAR_FOE).expect("far").health == 1_000
+            && runtime.actor(SIDE_FOE).expect("side").health == 1_000,
+    );
+    rec.finish()
 }

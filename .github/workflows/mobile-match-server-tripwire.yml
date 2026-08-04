@@ -68,8 +68,8 @@ jobs:
           }
           assert config["expectedEvidence"] == {
               "finalTick": 3,
-              "worldDigest": 15966660102157349917,
-              "terminalFrameDigest": 11839527925153085005,
+              "worldDigest": 301266237096915548,
+              "terminalFrameDigest": 10569925040670444284,
           }
           # Exact, not a set membership test: every packaging claim must name what CI actually performs, and
           # the unmet gates must stay spelled out rather than collapsing into a passing aggregate.

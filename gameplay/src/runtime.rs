@@ -3,16 +3,17 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use crate::model::{
-    AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorKind, ActorProvenance,
-    ActorSpawn, BasicAttackSpec, CombatStats, ControlKind, ControlMask, DamageSchool, DeathRule,
-    DynamicActorProvenance, DynamicActorSpawn, MatchConfig, MatchEndReason, MatchOutcome,
-    MatchPhase, ModifierId, ModifierOp, PlayerId, RuntimeError, StatKind, StatModifier,
-    StatusEffectId, StatusEffectView, TeamId, Tick, Vec2Mm, BASIS_POINTS, MAX_ABILITY_DEFINITIONS,
+    AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
+    ActorKind, ActorProvenance, ActorSpawn, BasicAttackSpec, CombatStats, ControlKind, ControlMask,
+    DamageSchool, DeathRule, DynamicActorProvenance, DynamicActorSpawn, ImpactShape, MatchConfig,
+    MatchEndReason, MatchOutcome, MatchPhase, ModifierId, ModifierOp, PlayerId, ProjectileId,
+    RectMm, RuntimeError, StatKind, StatModifier, StatusEffectId, StatusEffectView, TeamId, Tick,
+    Vec2Mm, BASIS_POINTS, MAX_ABILITY_DEFINITIONS,
 };
 use crate::protocol::{
     ActorIntent, ActorView, BasicAttackProgress, CastProgress, CastTarget, CommandKind,
     CommandReceipt, CommandRejectReason, CommandRejection, CooldownView, DamageCause, FrameDigest,
-    MatchEvent, PlayerCommand, ServerFrame, WorldDigest,
+    MatchEvent, PlayerCommand, ProjectileView, ServerFrame, WorldDigest,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +112,25 @@ pub(crate) struct StatusEffect {
     pub(crate) expires_at: Tick,
     pub(crate) controls: ControlMask,
     pub(crate) modifiers: Vec<ModifierId>,
+}
+
+/// One travelling ability delivery.
+///
+/// It carries the launching team rather than reading it from `source`, because the caster may die, despawn,
+/// or change nothing at all while the missile is still in the air — a projectile's friend-or-foe rules are
+/// decided at launch and cannot be re-derived from an actor that no longer exists. Everything else the
+/// impact needs (speed, hit radius, footprint, effect) is read from the immutable ability spec, so no copy
+/// of it can drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectileState {
+    pub(crate) id: ProjectileId,
+    pub(crate) source: ActorId,
+    pub(crate) team: TeamId,
+    pub(crate) ability: AbilityId,
+    pub(crate) position: Vec2Mm,
+    /// Fixed flight terminus decided at launch. Reaching it ends the flight; there is no separate expiry
+    /// deadline, because a redundant one could disagree with the geometry it is supposed to describe.
+    pub(crate) end: Vec2Mm,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,17 +282,22 @@ pub struct MatchRuntime {
     pub(crate) phase: MatchPhase,
     pub(crate) ability_specs: Vec<AbilitySpec>,
     pub(crate) actors: Vec<ActorState>,
+    /// Live projectiles, kept sorted by their monotonic ID. Sorted order is the canonical resolution order,
+    /// so two runtimes cannot resolve simultaneous impacts in different sequences.
+    pub(crate) projectiles: Vec<ProjectileState>,
     pub(crate) player_roster: BTreeSet<PlayerId>,
     pub(crate) queued_commands: BTreeMap<Tick, Vec<PlayerCommand>>,
     pub(crate) last_submissions: BTreeMap<PlayerId, SubmissionRecord>,
     pub(crate) dirty: BTreeSet<ActorId>,
     pub(crate) removed: BTreeSet<ActorId>,
+    pub(crate) removed_projectiles: BTreeSet<ProjectileId>,
     pub(crate) pending_events: Vec<MatchEvent>,
     pub(crate) rejection_events_in_frame: u32,
     pub(crate) objective_claims: BTreeSet<TeamId>,
     pub(crate) next_dynamic_actor_id: Option<u64>,
     pub(crate) next_modifier_id: Option<u64>,
     pub(crate) next_status_effect_id: Option<u64>,
+    pub(crate) next_projectile_id: Option<u64>,
     pub(crate) checkpoint_ready: bool,
 }
 
@@ -286,17 +311,20 @@ impl MatchRuntime {
             phase: MatchPhase::Setup,
             ability_specs: Vec::new(),
             actors: Vec::new(),
+            projectiles: Vec::new(),
             player_roster: BTreeSet::new(),
             queued_commands: BTreeMap::new(),
             last_submissions: BTreeMap::new(),
             dirty: BTreeSet::new(),
             removed: BTreeSet::new(),
+            removed_projectiles: BTreeSet::new(),
             pending_events: Vec::new(),
             rejection_events_in_frame: 0,
             objective_claims: BTreeSet::new(),
             next_dynamic_actor_id: Some(1),
             next_modifier_id: Some(1),
             next_status_effect_id: Some(1),
+            next_projectile_id: Some(1),
             checkpoint_ready: false,
         })
     }
@@ -868,6 +896,16 @@ impl MatchRuntime {
                 reason,
             });
         }
+        // In-flight projectiles are cancelled, never resolved: a match that has already produced its
+        // terminal outcome must not have a missile land afterwards and rewrite health the result was
+        // computed from.
+        for projectile in std::mem::take(&mut self.projectiles) {
+            self.removed_projectiles.insert(projectile.id);
+            self.pending_events.push(MatchEvent::ProjectileCancelled {
+                projectile: projectile.id,
+                reason: CommandRejectReason::MatchNotActive,
+            });
+        }
         self.pending_events
             .push(MatchEvent::MatchFinished { outcome, reason });
         Ok(self.emit_frame())
@@ -892,6 +930,30 @@ impl MatchRuntime {
     #[must_use]
     pub fn live_actor_count(&self) -> usize {
         self.actors.iter().filter(|actor| actor.alive()).count()
+    }
+
+    /// Bounded canonical snapshot of every projectile currently in flight.
+    #[must_use]
+    pub fn projectiles(&self) -> Vec<ProjectileView> {
+        self.projectile_views()
+    }
+
+    fn projectile_views(&self) -> Vec<ProjectileView> {
+        self.projectiles
+            .iter()
+            .map(|projectile| ProjectileView {
+                id: projectile.id,
+                source: projectile.source,
+                team: projectile.team,
+                ability: projectile.ability,
+                position: projectile.position,
+                end: projectile.end,
+                hit_radius_mm: self
+                    .ability_spec(projectile.ability)
+                    .and_then(|spec| spec.projectile())
+                    .map_or(0, |(_, hit_radius_mm)| hit_radius_mm),
+            })
+            .collect()
     }
 
     #[must_use]
@@ -954,16 +1016,70 @@ impl MatchRuntime {
                 ));
             }
         }
+        self.check_projectile_invariants()?;
         if matches!(self.phase, MatchPhase::Complete { .. })
             && (!self.queued_commands.is_empty()
+                || !self.projectiles.is_empty()
                 || self.actors.iter().any(|actor| {
                     actor.cast.is_some() || actor.attack.is_some() || actor.respawn_at.is_some()
                 }))
         {
             return Err(Self::violation(
                 None,
-                "terminal state retains commands, pending actions, or respawn deadlines",
+                "terminal state retains commands, projectiles, pending actions, or respawn deadlines",
             ));
+        }
+        Ok(())
+    }
+
+    /// Projectiles are authoritative simulation state, so they are audited exactly like actors: bounded,
+    /// strictly ordered, allocator-consistent, inside the map, and referentially intact against the
+    /// immutable ability table their behaviour is read from.
+    fn check_projectile_invariants(&self) -> Result<(), InvariantViolation> {
+        if self.projectiles.len() > usize::from(self.config.max_projectiles) {
+            return Err(Self::violation(None, "projectile budget exceeded"));
+        }
+        if self
+            .projectiles
+            .windows(2)
+            .any(|pair| pair[0].id >= pair[1].id)
+        {
+            return Err(Self::violation(
+                None,
+                "projectiles are not strictly sorted by identity",
+            ));
+        }
+        if self.next_projectile_id.is_some_and(|next| {
+            self.projectiles
+                .iter()
+                .any(|projectile| projectile.id.get() >= next)
+        }) {
+            return Err(Self::violation(
+                None,
+                "projectile allocator does not exceed every allocated projectile ID",
+            ));
+        }
+        for projectile in &self.projectiles {
+            if !self.config.map_bounds.contains(projectile.position)
+                || !self.config.map_bounds.contains(projectile.end)
+            {
+                return Err(Self::violation(
+                    None,
+                    "projectile position or flight terminus is outside map bounds",
+                ));
+            }
+            // Without a projectile delivery there is no speed, so the missile would sit still forever and
+            // the "every live projectile moves every tick" delta rule would silently become false.
+            if self
+                .ability_spec(projectile.ability)
+                .and_then(|spec| spec.projectile())
+                .is_none()
+            {
+                return Err(Self::violation(
+                    None,
+                    "projectile references an unknown ability or one with no projectile delivery",
+                ));
+            }
         }
         Ok(())
     }
@@ -1449,7 +1565,7 @@ impl MatchRuntime {
         }
 
         self.integrate_movement();
-        self.resolve_due_casts()?;
+        self.resolve_combat()?;
         if !self.objective_claims.is_empty() {
             let outcome = if self.objective_claims.len() == 1 {
                 MatchOutcome::Winner(
@@ -1481,7 +1597,7 @@ impl MatchRuntime {
     #[must_use]
     pub fn world_digest(&self) -> WorldDigest {
         let mut hash = StableHash::new();
-        hash.bytes(b"metrocalk-gameplay-mob2-v7");
+        hash.bytes(b"metrocalk-gameplay-mob2-v8");
         hash.u64(self.seed);
         hash.u64(self.tick);
         hash.phase(self.phase);
@@ -1509,6 +1625,15 @@ impl MatchRuntime {
             }
             None => hash.bool(false),
         }
+        // The projectile allocator decides future resolution order, so it is simulation truth, not codec
+        // bookkeeping — the same argument that put the modifier allocator here.
+        match self.next_projectile_id {
+            Some(next) => {
+                hash.bool(true);
+                hash.u64(next);
+            }
+            None => hash.bool(false),
+        }
 
         hash.len(self.ability_specs.len());
         for spec in &self.ability_specs {
@@ -1518,6 +1643,11 @@ impl MatchRuntime {
         hash.len(self.actors.len());
         for actor in &self.actors {
             hash.actor(actor);
+        }
+
+        hash.len(self.projectiles.len());
+        for projectile in &self.projectiles {
+            hash.projectile(*projectile);
         }
 
         hash.len(self.player_roster.len());
@@ -1721,21 +1851,47 @@ impl MatchRuntime {
             }
         }
 
-        let target_id = target_actor_id(source.id, target);
-        let target_actor = self
-            .actor_state(target_id)
-            .ok_or(CommandRejectReason::TargetNotFound)?;
-        if !target_actor.alive() {
-            return Err(CommandRejectReason::TargetDead);
-        }
-        if !target_matches(spec.targeting, source, target_actor) {
-            return Err(CommandRejectReason::TargetRelationMismatch);
-        }
         let range_squared = u128::from(spec.range_mm).pow(2);
-        if source.position.squared_distance(target_actor.position) > range_squared {
-            return Err(CommandRejectReason::TargetOutOfRange);
+        match (spec.aim, target) {
+            (AbilityAim::Unit, CastTarget::SelfActor | CastTarget::Actor(_)) => {
+                let target_id = target_actor_id(source.id, target)
+                    .expect("a unit cast target names a unit or the caster");
+                let target_actor = self
+                    .actor_state(target_id)
+                    .ok_or(CommandRejectReason::TargetNotFound)?;
+                if !target_actor.alive() {
+                    return Err(CommandRejectReason::TargetDead);
+                }
+                if !relation_matches(spec.targeting, source.id, source.team, target_actor) {
+                    return Err(CommandRejectReason::TargetRelationMismatch);
+                }
+                if source.position.squared_distance(target_actor.position) > range_squared {
+                    return Err(CommandRejectReason::TargetOutOfRange);
+                }
+                // A single-victim projectile needs a direction to travel, and two actors may legally share
+                // a position. Refusing is fail-closed: there is no defensible flight line to invent.
+                if matches!(spec.delivery, AbilityDelivery::Projectile { .. })
+                    && matches!(spec.impact, ImpactShape::Single)
+                    && target_actor.position == source.position
+                {
+                    return Err(CommandRejectReason::InvalidTargetForm);
+                }
+                Ok(())
+            }
+            (AbilityAim::Point, CastTarget::Point(point)) => {
+                if !self.config.map_bounds.contains(point) {
+                    return Err(CommandRejectReason::TargetPointOutOfBounds);
+                }
+                if source.position.squared_distance(point) > range_squared {
+                    return Err(CommandRejectReason::TargetOutOfRange);
+                }
+                if matches!(spec.impact, ImpactShape::Single) && point == source.position {
+                    return Err(CommandRejectReason::InvalidTargetForm);
+                }
+                Ok(())
+            }
+            _ => Err(CommandRejectReason::InvalidTargetForm),
         }
-        Ok(())
     }
 
     fn validate_basic_attack(
@@ -1907,11 +2063,238 @@ impl MatchRuntime {
         }
     }
 
+    /// One combat phase: projectiles advance, this tick's casts and attacks land, and **both** feed a single
+    /// health settlement.
+    ///
+    /// Sharing the settlement is what preserves the kernel's order-independent same-tick truth. If impacts
+    /// settled separately from casts, a missile and a spell that both reach lethal on tick T would resolve
+    /// as a race decided by phase order instead of the legal mutual kill the settlement policy promises.
+    fn resolve_combat(&mut self) -> Result<(), RuntimeError> {
+        let mut effects = self.advance_projectiles()?;
+        effects.extend(self.resolve_due_casts());
+        self.settle_health_effects(effects)
+    }
+
+    /// Step every live projectile one tick, resolving any that strike a body or reach the end of flight.
+    ///
+    /// Collision is a **swept segment** test, not a point test at the new position: at 30 Hz a fast missile
+    /// covers more than a body's hit radius in one tick, so a point test would let it tunnel straight
+    /// through its victim. Among the bodies the swept path touches, the one nearest the projectile's
+    /// pre-step position is struck, with the actor ID only as a tie-break — a projectile must hit the body
+    /// in front of it, never whichever body happens to hold the lower ID.
+    fn advance_projectiles(&mut self) -> Result<Vec<AdmittedHealthEffect>, RuntimeError> {
+        if self.projectiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut effects = Vec::new();
+        let mut survivors = Vec::with_capacity(self.projectiles.len());
+        for projectile in std::mem::take(&mut self.projectiles) {
+            let spec = *self
+                .ability_spec(projectile.ability)
+                .ok_or(RuntimeError::UnknownAbility(projectile.ability))?;
+            let (speed_mm_per_tick, hit_radius_mm) =
+                spec.projectile().ok_or(RuntimeError::InvalidAbility(
+                    projectile.ability,
+                    "an in-flight projectile references an ability with no projectile delivery",
+                ))?;
+            let (next, arrived) =
+                step_towards(projectile.position, projectile.end, speed_mm_per_tick);
+            let struck = self.swept_victim(&projectile, spec, next, hit_radius_mm);
+
+            let (impact_at, victim) = match struck {
+                // The impact centres on the body that was struck, which is where a client draws it.
+                Some((victim, position)) => (position, Some(victim)),
+                None if arrived => (next, None),
+                None => {
+                    survivors.push(ProjectileState {
+                        position: next,
+                        ..projectile
+                    });
+                    continue;
+                }
+            };
+            self.removed_projectiles.insert(projectile.id);
+            self.pending_events.push(MatchEvent::ProjectileResolved {
+                projectile: projectile.id,
+                position: impact_at,
+                victim,
+            });
+            self.admit_impact(
+                projectile.source,
+                projectile.team,
+                spec,
+                impact_at,
+                victim,
+                &mut effects,
+            );
+        }
+        self.projectiles = survivors;
+        Ok(effects)
+    }
+
+    /// The nearest legal body the projectile's swept path touches this tick, with its position.
+    ///
+    /// The source is excluded outright rather than left to the relation filter: an `AnyUnit` skillshot would
+    /// otherwise collide with its own caster on the first tick of flight and never leave the ground.
+    fn swept_victim(
+        &self,
+        projectile: &ProjectileState,
+        spec: AbilitySpec,
+        next: Vec2Mm,
+        hit_radius_mm: u32,
+    ) -> Option<(ActorId, Vec2Mm)> {
+        self.actors
+            .iter()
+            .filter(|actor| {
+                actor.alive()
+                    && actor.id != projectile.source
+                    && relation_matches(spec.targeting, projectile.source, projectile.team, actor)
+                    && segment_within(
+                        projectile.position,
+                        next,
+                        actor.position,
+                        u128::from(hit_radius_mm).pow(2),
+                    )
+            })
+            .min_by_key(|actor| {
+                (
+                    projectile.position.squared_distance(actor.position),
+                    actor.id,
+                )
+            })
+            .map(|actor| (actor.id, actor.position))
+    }
+
+    /// Expand one landed ability into the health effects it admits.
+    ///
+    /// `Single` affects exactly the named or struck body; `Circle` sweeps every actor the footprint covers
+    /// that satisfies the ability's relation filter. Unlike projectile collision, an area impact does **not**
+    /// exclude the caster — an ally-targeted healing burst is supposed to heal the actor standing at its
+    /// centre.
+    fn admit_impact(
+        &self,
+        source: ActorId,
+        source_team: TeamId,
+        spec: AbilitySpec,
+        centre: Vec2Mm,
+        single_victim: Option<ActorId>,
+        effects: &mut Vec<AdmittedHealthEffect>,
+    ) {
+        let victims: Vec<ActorId> = match spec.impact {
+            ImpactShape::Single => single_victim.into_iter().collect(),
+            ImpactShape::Circle { radius_mm } => {
+                let radius_squared = u128::from(radius_mm).pow(2);
+                self.actors
+                    .iter()
+                    .filter(|actor| {
+                        actor.alive()
+                            && relation_matches(spec.targeting, source, source_team, actor)
+                            && centre.squared_distance(actor.position) <= radius_squared
+                    })
+                    .map(|actor| actor.id)
+                    .collect()
+            }
+        };
+        for target in victims {
+            effects.push(match spec.effect {
+                AbilityEffect::Damage { amount, school } => AdmittedHealthEffect::Damage {
+                    source,
+                    target,
+                    cause: DamageCause::Ability(spec.id),
+                    amount,
+                    school,
+                },
+                AbilityEffect::Heal { amount } => AdmittedHealthEffect::Heal {
+                    source,
+                    target,
+                    ability: spec.id,
+                    amount,
+                },
+            });
+        }
+    }
+
+    /// Launch one projectile for a cast that has just resolved.
+    fn launch_projectile(
+        &mut self,
+        source: ActorId,
+        source_team: TeamId,
+        position: Vec2Mm,
+        spec: AbilitySpec,
+        target: CastTarget,
+    ) -> Result<(), CommandRejectReason> {
+        if self.projectiles.len() >= usize::from(self.config.max_projectiles) {
+            return Err(CommandRejectReason::ProjectileBudgetExceeded);
+        }
+        let raw_id = self
+            .next_projectile_id
+            .ok_or(CommandRejectReason::ProjectileBudgetExceeded)?;
+        let end = self.flight_end(source, position, spec, target)?;
+        let id = ProjectileId(raw_id);
+        // Monotonic IDs keep the vector sorted by construction; the frame-boundary audit proves it.
+        self.projectiles.push(ProjectileState {
+            id,
+            source,
+            team: source_team,
+            ability: spec.id,
+            position,
+            end,
+        });
+        self.next_projectile_id = raw_id.checked_add(1);
+        self.pending_events.push(MatchEvent::ProjectileSpawned {
+            projectile: id,
+            source,
+            ability: spec.id,
+            position,
+            end,
+        });
+        Ok(())
+    }
+
+    /// Where a projectile's flight ends.
+    ///
+    /// An **area** impact lands where it was aimed: a lobbed burst detonates at the chosen point. A
+    /// **single-victim** impact travels the ability's full range along the aimed direction, because a
+    /// skillshot that stopped at the finger position would fizzle harmlessly whenever the player aimed
+    /// short of their opponent. The terminus is then clamped along its own line into the map bounds, so the
+    /// flight direction is preserved exactly and the projectile can never leave the playable rectangle.
+    fn flight_end(
+        &self,
+        source: ActorId,
+        from: Vec2Mm,
+        spec: AbilitySpec,
+        target: CastTarget,
+    ) -> Result<Vec2Mm, CommandRejectReason> {
+        let aimed = match target {
+            CastTarget::Point(point) => point,
+            CastTarget::SelfActor | CastTarget::Actor(_) => {
+                self.actor_state(
+                    target_actor_id(source, target)
+                        .ok_or(CommandRejectReason::InvalidTargetForm)?,
+                )
+                .ok_or(CommandRejectReason::TargetNotFound)?
+                .position
+            }
+        };
+        match spec.impact {
+            ImpactShape::Circle { .. } => Ok(aimed),
+            ImpactShape::Single => {
+                let extended = extend_to_range(from, aimed, spec.range_mm)
+                    .ok_or(CommandRejectReason::InvalidTargetForm)?;
+                Ok(clamp_segment_into_bounds(
+                    from,
+                    extended,
+                    self.config.map_bounds,
+                ))
+            }
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one visible admission phase makes cross-action settlement ordering auditable"
     )]
-    fn resolve_due_casts(&mut self) -> Result<(), RuntimeError> {
+    fn resolve_due_casts(&mut self) -> Vec<AdmittedHealthEffect> {
         let due: Vec<(ActorId, DueAction)> = self
             .actors
             .iter()
@@ -1973,31 +2356,54 @@ impl MatchRuntime {
                     let spec = *self
                         .ability_spec(cast.ability)
                         .expect("equipped ability has a registered spec");
-                    let target = target_actor_id(source_id, cast.target);
+                    let source_team = self.actors[source_index].team;
+                    let source_position = self.actors[source_index].position;
+                    if matches!(spec.delivery, AbilityDelivery::Projectile { .. }) {
+                        // A launch failure cancels the cast rather than silently swallowing it: the client
+                        // was told a cast started, so it is owed exactly one outcome.
+                        if let Err(reason) = self.launch_projectile(
+                            source_id,
+                            source_team,
+                            source_position,
+                            spec,
+                            cast.target,
+                        ) {
+                            self.cancel_action(source_id, action, reason);
+                            continue;
+                        }
+                        self.pending_events.push(MatchEvent::CastResolved {
+                            source: source_id,
+                            ability: cast.ability,
+                            target: cast.target,
+                        });
+                        continue;
+                    }
+                    // An instant cast lands on the named unit, or centres its footprint on the aimed point.
+                    let (centre, single_victim) = match cast.target {
+                        CastTarget::Point(point) => (point, None),
+                        CastTarget::SelfActor | CastTarget::Actor(_) => {
+                            let target = target_actor_id(source_id, cast.target)
+                                .expect("a unit-aimed cast names a unit");
+                            let position = self
+                                .actor_state(target)
+                                .expect("validated cast target")
+                                .position;
+                            (position, Some(target))
+                        }
+                    };
                     self.pending_events.push(MatchEvent::CastResolved {
                         source: source_id,
                         ability: cast.ability,
                         target: cast.target,
                     });
-                    match spec.effect {
-                        AbilityEffect::Damage { amount, school } => {
-                            effects.push(AdmittedHealthEffect::Damage {
-                                source: source_id,
-                                target,
-                                cause: DamageCause::Ability(cast.ability),
-                                amount,
-                                school,
-                            });
-                        }
-                        AbilityEffect::Heal { amount } => {
-                            effects.push(AdmittedHealthEffect::Heal {
-                                source: source_id,
-                                target,
-                                ability: cast.ability,
-                                amount,
-                            });
-                        }
-                    }
+                    self.admit_impact(
+                        source_id,
+                        source_team,
+                        spec,
+                        centre,
+                        single_victim,
+                        &mut effects,
+                    );
                 }
                 DueAction::Attack(attack) => {
                     if let Err(reason) =
@@ -2024,8 +2430,7 @@ impl MatchRuntime {
                 }
             }
         }
-        self.settle_health_effects(effects)?;
-        Ok(())
+        effects
     }
 
     fn cancel_action(&mut self, source: ActorId, action: DueAction, reason: CommandRejectReason) {
@@ -2249,11 +2654,14 @@ impl MatchRuntime {
             .into_iter()
             .filter_map(|id| self.actor(id))
             .collect();
+        let removed_projectiles = std::mem::take(&mut self.removed_projectiles);
         let mut frame = ServerFrame {
             tick: self.tick,
             phase: self.phase,
             changed,
             removed: removed_ids.into_iter().collect(),
+            projectiles: self.projectile_views(),
+            removed_projectiles: removed_projectiles.into_iter().collect(),
             events: std::mem::take(&mut self.pending_events),
             world_digest: self.world_digest(),
             frame_digest: FrameDigest::default(),
@@ -2315,20 +2723,135 @@ fn command_order_key(command: &PlayerCommand) -> (PlayerId, u32, ActorId) {
     (command.player, command.sequence, command.actor)
 }
 
-const fn target_actor_id(source: ActorId, target: CastTarget) -> ActorId {
+const fn target_actor_id(source: ActorId, target: CastTarget) -> Option<ActorId> {
     match target {
-        CastTarget::SelfActor => source,
-        CastTarget::Actor(id) => id,
+        CastTarget::SelfActor => Some(source),
+        CastTarget::Actor(id) => Some(id),
+        CastTarget::Point(_) => None,
     }
 }
 
-fn target_matches(targeting: AbilityTargeting, source: &ActorState, target: &ActorState) -> bool {
+/// Does `target` satisfy the relation an ability filters by?
+///
+/// Deliberately keyed on the source's *identity and team* rather than a live `ActorState`: a projectile's
+/// caster may already be dead or despawned when its missile lands, and the relation it launched under must
+/// not change because of that.
+fn relation_matches(
+    targeting: AbilityTargeting,
+    source: ActorId,
+    source_team: TeamId,
+    target: &ActorState,
+) -> bool {
     match targeting {
-        AbilityTargeting::SelfOnly => source.id == target.id,
-        AbilityTargeting::Ally => source.team == target.team,
-        AbilityTargeting::Enemy => source.team != target.team,
+        AbilityTargeting::SelfOnly => source == target.id,
+        AbilityTargeting::Ally => source_team == target.team,
+        AbilityTargeting::Enemy => source_team != target.team,
         AbilityTargeting::AnyUnit => true,
     }
+}
+
+/// Is `point` within `radius_squared` of the segment `from`→`to`?
+///
+/// Pure integer arithmetic with no division: the perpendicular case compares `cross²` against
+/// `radius² × |segment|²` instead of dividing to recover the distance. With map coordinates bounded to
+/// ±500,000 mm and the projectile speed/radius ceilings in `model`, every intermediate stays several orders
+/// of magnitude inside `i128`.
+fn segment_within(from: Vec2Mm, to: Vec2Mm, point: Vec2Mm, radius_squared: u128) -> bool {
+    let segment_x = i128::from(to.x) - i128::from(from.x);
+    let segment_y = i128::from(to.y) - i128::from(from.y);
+    let to_point_x = i128::from(point.x) - i128::from(from.x);
+    let to_point_y = i128::from(point.y) - i128::from(from.y);
+    let segment_squared = segment_x * segment_x + segment_y * segment_y;
+    if segment_squared == 0 {
+        return from.squared_distance(point) <= radius_squared;
+    }
+    let projection = to_point_x * segment_x + to_point_y * segment_y;
+    if projection <= 0 {
+        return from.squared_distance(point) <= radius_squared;
+    }
+    if projection >= segment_squared {
+        return to.squared_distance(point) <= radius_squared;
+    }
+    let cross = to_point_x * segment_y - to_point_y * segment_x;
+    let Ok(radius_squared) = i128::try_from(radius_squared) else {
+        return true;
+    };
+    cross.saturating_mul(cross) <= radius_squared.saturating_mul(segment_squared)
+}
+
+/// The point `range_mm` away from `from` along the direction `from`→`towards`.
+///
+/// `None` when the two points coincide: there is no direction, and inventing one would make a skillshot's
+/// flight line depend on an arbitrary convention.
+fn extend_to_range(from: Vec2Mm, towards: Vec2Mm, range_mm: u32) -> Option<Vec2Mm> {
+    if from == towards {
+        return None;
+    }
+    let delta_x = i128::from(towards.x) - i128::from(from.x);
+    let delta_y = i128::from(towards.y) - i128::from(from.y);
+    let distance =
+        i128::try_from(integer_sqrt_ceil(from.squared_distance(towards))).unwrap_or(i128::MAX);
+    if distance == 0 {
+        return None;
+    }
+    let range = i128::from(range_mm);
+    let x = i128::from(from.x) + delta_x * range / distance;
+    let y = i128::from(from.y) + delta_y * range / distance;
+    Some(Vec2Mm::new(
+        i32::try_from(x).unwrap_or(if x.is_negative() { i32::MIN } else { i32::MAX }),
+        i32::try_from(y).unwrap_or(if y.is_negative() { i32::MIN } else { i32::MAX }),
+    ))
+}
+
+/// Shorten `from`→`to` along its own line until it stays inside `bounds`.
+///
+/// Truncating the scaled offset always moves the result **toward** `from`, which is inside the rectangle, so
+/// the clamp can only ever land inside. Clamping the coordinates independently would have been simpler and
+/// wrong: it bends the flight line, so a skillshot aimed at a corner would travel somewhere the player did
+/// not aim.
+fn clamp_segment_into_bounds(from: Vec2Mm, to: Vec2Mm, bounds: RectMm) -> Vec2Mm {
+    if bounds.contains(to) {
+        return to;
+    }
+    let delta_x = i128::from(to.x) - i128::from(from.x);
+    let delta_y = i128::from(to.y) - i128::from(from.y);
+    let mut numerator = 1_i128;
+    let mut denominator = 1_i128;
+    for (delta, headroom) in [
+        (
+            delta_x,
+            axis_headroom(from.x, delta_x, bounds.min.x, bounds.max.x),
+        ),
+        (
+            delta_y,
+            axis_headroom(from.y, delta_y, bounds.min.y, bounds.max.y),
+        ),
+    ] {
+        if delta == 0 {
+            continue;
+        }
+        let magnitude = delta.abs();
+        if headroom * denominator < numerator * magnitude {
+            numerator = headroom;
+            denominator = magnitude;
+        }
+    }
+    let x = i128::from(from.x) + delta_x * numerator / denominator;
+    let y = i128::from(from.y) + delta_y * numerator / denominator;
+    Vec2Mm::new(
+        i32::try_from(x).unwrap_or(from.x),
+        i32::try_from(y).unwrap_or(from.y),
+    )
+}
+
+/// How far the coordinate may still travel in the direction of `delta` before leaving `[minimum, maximum]`.
+fn axis_headroom(from: i32, delta: i128, minimum: i32, maximum: i32) -> i128 {
+    if delta > 0 {
+        i128::from(maximum) - i128::from(from)
+    } else {
+        i128::from(from) - i128::from(minimum)
+    }
+    .max(0)
 }
 
 fn reduce_damage(amount: u32, reduction_bps: u16) -> u32 {
@@ -2401,9 +2924,44 @@ fn integer_sqrt_ceil(value: u128) -> u128 {
     }
 }
 
-fn digest_frame(frame: &ServerFrame) -> FrameDigest {
+/// The stable one-byte discriminant for one authoritative event.
+///
+/// It lives apart from the payload encoding so it is a single table that a test can walk. That matters:
+/// `StatusEffectExpired` and `RespawnCancelled` were both emitting tag **19**, and a duplicate tag is a hole
+/// in an encoding whose entire job is that two different causal traces cannot hash the same. The table is
+/// append-only — a shipped tag is never reused for a different event.
+pub(crate) const fn event_tag(event: MatchEvent) -> u8 {
+    match event {
+        MatchEvent::MatchStarted => 0,
+        MatchEvent::CommandRejected { .. } => 1,
+        MatchEvent::MoveStarted { .. } => 2,
+        MatchEvent::MoveStopped { .. } => 3,
+        MatchEvent::CastStarted { .. } => 4,
+        MatchEvent::CastCancelled { .. } => 5,
+        MatchEvent::CastResolved { .. } => 6,
+        MatchEvent::DamageApplied { .. } => 7,
+        MatchEvent::HealingApplied { .. } => 8,
+        MatchEvent::ActorDied { .. } => 9,
+        MatchEvent::MatchFinished { .. } => 10,
+        MatchEvent::BasicAttackStarted { .. } => 11,
+        MatchEvent::BasicAttackCancelled { .. } => 12,
+        MatchEvent::BasicAttackResolved { .. } => 13,
+        MatchEvent::ActorDespawned { .. } => 14,
+        MatchEvent::RespawnScheduled { .. } => 15,
+        MatchEvent::ActorRespawned { .. } => 16,
+        MatchEvent::InternalIntentRejected { .. } => 17,
+        MatchEvent::ActorSpawned { .. } => 18,
+        MatchEvent::RespawnCancelled { .. } => 19,
+        MatchEvent::StatusEffectExpired { .. } => 20,
+        MatchEvent::ProjectileSpawned { .. } => 21,
+        MatchEvent::ProjectileResolved { .. } => 22,
+        MatchEvent::ProjectileCancelled { .. } => 23,
+    }
+}
+
+pub(crate) fn digest_frame(frame: &ServerFrame) -> FrameDigest {
     let mut hash = StableHash::new();
-    hash.bytes(b"metrocalk-gameplay-frame-v5");
+    hash.bytes(b"metrocalk-gameplay-frame-v6");
     hash.u64(frame.tick);
     hash.phase(frame.phase);
     hash.len(frame.changed.len());
@@ -2413,6 +2971,14 @@ fn digest_frame(frame: &ServerFrame) -> FrameDigest {
     hash.len(frame.removed.len());
     for actor in &frame.removed {
         hash.u64(actor.get());
+    }
+    hash.len(frame.projectiles.len());
+    for projectile in &frame.projectiles {
+        hash.projectile_view(*projectile);
+    }
+    hash.len(frame.removed_projectiles.len());
+    for projectile in &frame.removed_projectiles {
+        hash.u64(projectile.get());
     }
     hash.len(frame.events.len());
     for event in &frame.events {
@@ -2581,11 +3147,35 @@ impl StableHash {
         self.u16(config.max_units_per_wave);
         self.u16(config.max_modifiers_per_actor);
         self.u16(config.max_status_effects_per_actor);
+        self.u16(config.max_projectiles);
         self.u32(config.max_checkpoint_bytes);
+    }
+
+    fn projectile(&mut self, projectile: ProjectileState) {
+        self.u64(projectile.id.get());
+        self.u64(projectile.source.get());
+        self.u8(projectile.team.get());
+        self.u32(projectile.ability.get());
+        self.point(projectile.position);
+        self.point(projectile.end);
+    }
+
+    fn projectile_view(&mut self, projectile: ProjectileView) {
+        self.u64(projectile.id.get());
+        self.u64(projectile.source.get());
+        self.u8(projectile.team.get());
+        self.u32(projectile.ability.get());
+        self.point(projectile.position);
+        self.point(projectile.end);
+        self.u32(projectile.hit_radius_mm);
     }
 
     fn ability_spec(&mut self, spec: AbilitySpec) {
         self.u32(spec.id.get());
+        self.u8(match spec.aim {
+            AbilityAim::Unit => 0,
+            AbilityAim::Point => 1,
+        });
         self.u8(match spec.targeting {
             AbilityTargeting::SelfOnly => 0,
             AbilityTargeting::Ally => 1,
@@ -2596,6 +3186,24 @@ impl StableHash {
         self.u32(spec.resource_cost);
         self.u32(spec.cooldown_ticks);
         self.u16(spec.cast_ticks);
+        match spec.delivery {
+            AbilityDelivery::Instant => self.u8(0),
+            AbilityDelivery::Projectile {
+                speed_mm_per_tick,
+                hit_radius_mm,
+            } => {
+                self.u8(1);
+                self.u32(speed_mm_per_tick);
+                self.u32(hit_radius_mm);
+            }
+        }
+        match spec.impact {
+            ImpactShape::Single => self.u8(0),
+            ImpactShape::Circle { radius_mm } => {
+                self.u8(1);
+                self.u32(radius_mm);
+            }
+        }
         match spec.effect {
             AbilityEffect::Damage { amount, school } => {
                 self.u8(0);
@@ -2711,6 +3319,10 @@ impl StableHash {
             CastTarget::Actor(actor) => {
                 self.u8(1);
                 self.u64(actor.get());
+            }
+            CastTarget::Point(point) => {
+                self.u8(2);
+                self.point(point);
             }
         }
     }
@@ -2841,6 +3453,9 @@ impl StableHash {
             CommandRejectReason::ActorRooted => self.u8(28),
             CommandRejectReason::ActorSilenced => self.u8(29),
             CommandRejectReason::ActorDisarmed => self.u8(30),
+            CommandRejectReason::InvalidTargetForm => self.u8(31),
+            CommandRejectReason::TargetPointOutOfBounds => self.u8(32),
+            CommandRejectReason::ProjectileBudgetExceeded => self.u8(33),
         }
     }
 
@@ -2866,25 +3481,26 @@ impl StableHash {
         reason = "the stable exhaustive event encoding is intentionally centralized"
     )]
     fn match_event(&mut self, event: MatchEvent) {
+        self.u8(event_tag(event));
         match event {
-            MatchEvent::MatchStarted => self.u8(0),
+            MatchEvent::MatchStarted => {}
             MatchEvent::CommandRejected {
                 player,
                 sequence,
                 reason,
             } => {
-                self.u8(1);
                 self.u64(player.get());
                 self.u32(sequence);
                 self.rejection_reason(reason);
             }
             MatchEvent::MoveStarted { actor, destination } => {
-                self.u8(2);
                 self.u64(actor.get());
                 self.point(destination);
             }
-            MatchEvent::MoveStopped { actor } => {
-                self.u8(3);
+            // One shared payload: the discriminant emitted above is what tells these three apart.
+            MatchEvent::MoveStopped { actor }
+            | MatchEvent::ActorDespawned { actor }
+            | MatchEvent::ActorSpawned { actor } => {
                 self.u64(actor.get());
             }
             MatchEvent::CastStarted {
@@ -2893,7 +3509,6 @@ impl StableHash {
                 target,
                 resolves_at,
             } => {
-                self.u8(4);
                 self.u64(source.get());
                 self.u32(ability.get());
                 self.cast_target(target);
@@ -2904,7 +3519,6 @@ impl StableHash {
                 ability,
                 reason,
             } => {
-                self.u8(5);
                 self.u64(source.get());
                 self.u32(ability.get());
                 self.rejection_reason(reason);
@@ -2914,7 +3528,6 @@ impl StableHash {
                 ability,
                 target,
             } => {
-                self.u8(6);
                 self.u64(source.get());
                 self.u32(ability.get());
                 self.cast_target(target);
@@ -2927,7 +3540,6 @@ impl StableHash {
                 amount,
                 health_after,
             } => {
-                self.u8(7);
                 self.u64(source.get());
                 self.u64(target.get());
                 self.damage_cause(cause);
@@ -2942,7 +3554,6 @@ impl StableHash {
                 amount,
                 health_after,
             } => {
-                self.u8(8);
                 self.u64(source.get());
                 self.u64(target.get());
                 self.u32(ability.get());
@@ -2950,12 +3561,10 @@ impl StableHash {
                 self.u32(health_after);
             }
             MatchEvent::ActorDied { actor, killer } => {
-                self.u8(9);
                 self.u64(actor.get());
                 self.u64(killer.get());
             }
             MatchEvent::MatchFinished { outcome, reason } => {
-                self.u8(10);
                 self.outcome(outcome);
                 self.end_reason(reason);
             }
@@ -2964,7 +3573,6 @@ impl StableHash {
                 target,
                 resolves_at,
             } => {
-                self.u8(11);
                 self.u64(source.get());
                 self.u64(target.get());
                 self.u64(resolves_at);
@@ -2974,22 +3582,15 @@ impl StableHash {
                 target,
                 reason,
             } => {
-                self.u8(12);
                 self.u64(source.get());
                 self.u64(target.get());
                 self.rejection_reason(reason);
             }
             MatchEvent::BasicAttackResolved { source, target } => {
-                self.u8(13);
                 self.u64(source.get());
                 self.u64(target.get());
             }
-            MatchEvent::ActorDespawned { actor } => {
-                self.u8(14);
-                self.u64(actor.get());
-            }
             MatchEvent::RespawnScheduled { actor, at_tick } => {
-                self.u8(15);
                 self.u64(actor.get());
                 self.u64(at_tick);
             }
@@ -2998,29 +3599,53 @@ impl StableHash {
                 at_tick,
                 reason,
             } => {
-                self.u8(19);
                 self.u64(actor.get());
                 self.u64(at_tick);
                 self.end_reason(reason);
             }
             MatchEvent::ActorRespawned { actor, position } => {
-                self.u8(16);
                 self.u64(actor.get());
                 self.point(position);
             }
             MatchEvent::InternalIntentRejected { actor, reason } => {
-                self.u8(17);
                 self.u64(actor.get());
                 self.rejection_reason(reason);
             }
             MatchEvent::StatusEffectExpired { actor, effect } => {
-                self.u8(19);
                 self.u64(actor.get());
                 self.u64(effect.get());
             }
-            MatchEvent::ActorSpawned { actor } => {
-                self.u8(18);
-                self.u64(actor.get());
+            MatchEvent::ProjectileSpawned {
+                projectile,
+                source,
+                ability,
+                position,
+                end,
+            } => {
+                self.u64(projectile.get());
+                self.u64(source.get());
+                self.u32(ability.get());
+                self.point(position);
+                self.point(end);
+            }
+            MatchEvent::ProjectileResolved {
+                projectile,
+                position,
+                victim,
+            } => {
+                self.u64(projectile.get());
+                self.point(position);
+                match victim {
+                    Some(victim) => {
+                        self.bool(true);
+                        self.u64(victim.get());
+                    }
+                    None => self.bool(false),
+                }
+            }
+            MatchEvent::ProjectileCancelled { projectile, reason } => {
+                self.u64(projectile.get());
+                self.rejection_reason(reason);
             }
         }
     }

@@ -30,6 +30,19 @@ pub const MAX_WAVE_SCHEDULE_BUDGET: u16 = 256;
 pub const MAX_UNITS_PER_WAVE_BUDGET: u16 = 256;
 pub const MAX_MODIFIERS_PER_ACTOR_BUDGET: u16 = 64;
 pub const MAX_STATUS_EFFECTS_PER_ACTOR_BUDGET: u16 = 32;
+pub const MAX_PROJECTILE_BUDGET: u16 = 512;
+
+/// Hard ceilings on projectile flight speed and hit radius.
+///
+/// These are arithmetic safety bounds, not balance knobs. Swept collision compares
+/// `cross²` against `radius² × |step|²` in `i128`; with map coordinates bounded to ±500,000 mm these
+/// ceilings keep every intermediate three orders of magnitude below `i128::MAX`, so the collision test can
+/// never wrap. A speed above 100 m per tick would also outrun the map in a single tick, making the swept
+/// test the only thing standing between a projectile and every actor on the board.
+pub const MAX_PROJECTILE_SPEED_MM_PER_TICK: u32 = 100_000;
+pub const MAX_PROJECTILE_RADIUS_MM: u32 = 100_000;
+/// Same reasoning for an area impact: the overlap test squares this against a `u128` distance.
+pub const MAX_IMPACT_RADIUS_MM: u32 = 1_000_000;
 
 macro_rules! id_type {
     ($name:ident, $inner:ty, $description:literal) => {
@@ -61,6 +74,11 @@ id_type!(
     AbilityId,
     u32,
     "Dense-build-compatible identity for an ability definition."
+);
+id_type!(
+    ProjectileId,
+    u64,
+    "Monotonic never-reused identity for one in-flight projectile."
 );
 
 /// A deterministic two-dimensional gameplay position in integer millimetres.
@@ -412,7 +430,10 @@ pub enum DamageSchool {
     True,
 }
 
-/// Legal relationship between caster and unit target.
+/// Legal relationship between caster and affected unit.
+///
+/// For a unit-aimed ability this filters the named target. For a point-aimed ability it filters every actor
+/// the impact footprint covers, so the same vocabulary decides friendly fire for an area effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AbilityTargeting {
     SelfOnly,
@@ -421,7 +442,46 @@ pub enum AbilityTargeting {
     AnyUnit,
 }
 
-/// MOB-1's bounded effect set. Later gates extend this centrally with statuses, areas, and projectiles.
+/// What form of target a cast command must carry.
+///
+/// This is the *form* axis; [`AbilityTargeting`] is the *relation* axis. Keeping them separate is what lets
+/// one ground-targeted ability heal allies and another damage enemies without duplicating either enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbilityAim {
+    /// The command names a unit (or the caster). Range is measured to that unit.
+    Unit,
+    /// The command names a map point. Range is measured to that point.
+    ///
+    /// A direction is *derived* from caster→point rather than carried separately: every real touch client
+    /// sends a world point under the finger, and a separate direction vector would be a second
+    /// representation of the same intent that could disagree with it.
+    Point,
+}
+
+/// How an admitted ability effect reaches its victims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbilityDelivery {
+    /// Lands on the cast's resolution tick, at the named unit or point.
+    Instant,
+    /// Spawns a travelling entity. It resolves on the first legal actor its swept path touches, or at the
+    /// end of its flight. It is deliberately **not** homing: the flight line is fixed at launch, so a
+    /// skillshot can be dodged and can strike a body that steps into it.
+    Projectile {
+        speed_mm_per_tick: u32,
+        hit_radius_mm: u32,
+    },
+}
+
+/// The footprint one admitted effect covers when it lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImpactShape {
+    /// Exactly the unit the cast named, or the single body a projectile struck.
+    Single,
+    /// Every actor within `radius_mm` of the impact point that satisfies the ability's relation filter.
+    Circle { radius_mm: u32 },
+}
+
+/// MOB-1's bounded effect set. Later gates extend this centrally with statuses and summons.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AbilityEffect {
     Damage { amount: u32, school: DamageSchool },
@@ -432,15 +492,46 @@ pub enum AbilityEffect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AbilitySpec {
     pub id: AbilityId,
+    pub aim: AbilityAim,
     pub targeting: AbilityTargeting,
     pub range_mm: u32,
     pub resource_cost: u32,
     pub cooldown_ticks: u32,
     pub cast_ticks: u16,
+    pub delivery: AbilityDelivery,
+    pub impact: ImpactShape,
     pub effect: AbilityEffect,
 }
 
 impl AbilitySpec {
+    /// A unit-targeted, instantly-resolving, single-victim ability — the MOB-1 shape.
+    ///
+    /// Every ability authored before aim/delivery/impact existed had exactly these three values, so this
+    /// constructor is what keeps the older call sites honest instead of spraying three defaults through them.
+    #[must_use]
+    pub const fn unit_targeted(
+        id: AbilityId,
+        targeting: AbilityTargeting,
+        range_mm: u32,
+        resource_cost: u32,
+        cooldown_ticks: u32,
+        cast_ticks: u16,
+        effect: AbilityEffect,
+    ) -> Self {
+        Self {
+            id,
+            aim: AbilityAim::Unit,
+            targeting,
+            range_mm,
+            resource_cost,
+            cooldown_ticks,
+            cast_ticks,
+            delivery: AbilityDelivery::Instant,
+            impact: ImpactShape::Single,
+            effect,
+        }
+    }
+
     pub(crate) fn validate(self) -> Result<(), RuntimeError> {
         let amount = match self.effect {
             AbilityEffect::Damage { amount, .. } | AbilityEffect::Heal { amount } => amount,
@@ -451,7 +542,70 @@ impl AbilitySpec {
                 "effect amount must be positive",
             ));
         }
+        if matches!(self.aim, AbilityAim::Point)
+            && matches!(self.targeting, AbilityTargeting::SelfOnly)
+        {
+            return Err(RuntimeError::InvalidAbility(
+                self.id,
+                "a point-aimed ability cannot be self-only",
+            ));
+        }
+        // An instant point cast with a single-victim impact names no unit and covers no area, so it could
+        // never affect anything. Refusing it at authoring time is the difference between a designer seeing
+        // an error and a player seeing an ability that silently does nothing.
+        if matches!(self.aim, AbilityAim::Point)
+            && matches!(self.delivery, AbilityDelivery::Instant)
+            && matches!(self.impact, ImpactShape::Single)
+        {
+            return Err(RuntimeError::InvalidAbility(
+                self.id,
+                "an instant point-aimed ability needs an area impact to reach anything",
+            ));
+        }
+        if let AbilityDelivery::Projectile {
+            speed_mm_per_tick,
+            hit_radius_mm,
+        } = self.delivery
+        {
+            if speed_mm_per_tick == 0 || speed_mm_per_tick > MAX_PROJECTILE_SPEED_MM_PER_TICK {
+                return Err(RuntimeError::InvalidAbility(
+                    self.id,
+                    "projectile speed must be positive and within the arithmetic safety ceiling",
+                ));
+            }
+            if hit_radius_mm == 0 || hit_radius_mm > MAX_PROJECTILE_RADIUS_MM {
+                return Err(RuntimeError::InvalidAbility(
+                    self.id,
+                    "projectile hit radius must be positive and within the arithmetic safety ceiling",
+                ));
+            }
+            if self.range_mm == 0 {
+                return Err(RuntimeError::InvalidAbility(
+                    self.id,
+                    "a projectile ability needs a positive range to travel",
+                ));
+            }
+        }
+        if let ImpactShape::Circle { radius_mm } = self.impact {
+            if radius_mm == 0 || radius_mm > MAX_IMPACT_RADIUS_MM {
+                return Err(RuntimeError::InvalidAbility(
+                    self.id,
+                    "an area impact radius must be positive and within the arithmetic safety ceiling",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// The flight speed and hit radius of this ability's projectile, if it has one.
+    pub(crate) const fn projectile(self) -> Option<(u32, u32)> {
+        match self.delivery {
+            AbilityDelivery::Instant => None,
+            AbilityDelivery::Projectile {
+                speed_mm_per_tick,
+                hit_radius_mm,
+            } => Some((speed_mm_per_tick, hit_radius_mm)),
+        }
     }
 }
 
@@ -568,6 +722,7 @@ pub struct MatchConfig {
     pub max_units_per_wave: u16,
     pub max_modifiers_per_actor: u16,
     pub max_status_effects_per_actor: u16,
+    pub max_projectiles: u16,
     pub max_checkpoint_bytes: u32,
 }
 
@@ -596,6 +751,7 @@ impl MatchConfig {
             max_units_per_wave: 16,
             max_modifiers_per_actor: 16,
             max_status_effects_per_actor: 8,
+            max_projectiles: 64,
             max_checkpoint_bytes: 4 * 1024 * 1024,
         }
     }
@@ -621,6 +777,7 @@ impl MatchConfig {
             || self.max_units_per_wave == 0
             || self.max_modifiers_per_actor == 0
             || self.max_status_effects_per_actor == 0
+            || self.max_projectiles == 0
             || self.max_checkpoint_bytes == 0
         {
             return Err(RuntimeError::InvalidConfig(
@@ -645,6 +802,7 @@ impl MatchConfig {
             || self.max_units_per_wave > MAX_UNITS_PER_WAVE_BUDGET
             || self.max_modifiers_per_actor > MAX_MODIFIERS_PER_ACTOR_BUDGET
             || self.max_status_effects_per_actor > MAX_STATUS_EFFECTS_PER_ACTOR_BUDGET
+            || self.max_projectiles > MAX_PROJECTILE_BUDGET
         {
             return Err(RuntimeError::InvalidConfig(
                 "target profile exceeds a hard decoded-state budget",

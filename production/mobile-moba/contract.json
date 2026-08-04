@@ -189,7 +189,20 @@
       "distroless-nonroot-no-shell-no-listener-image-asserts",
       "deterministic-set-ordered-stat-modifier-aggregation",
       "derived-stat-cache-re-audited-every-frame",
-      "clamped-stat-domains-preventing-immortality-and-lethal-aggregation"
+      "clamped-stat-domains-preventing-immortality-and-lethal-aggregation",
+      "timed-status-effects-and-crowd-control",
+      "editor-render-projection-bridge-non-destructive",
+      "os-composited-pixel-capture-of-a-live-match",
+      "real-fbx-fixture-suite-binary-ascii-compressed-rigged",
+      "authored-entity-to-kernel-match-cook-with-no-hand-authored-path",
+      "aim-axis-separate-from-relation-with-fail-closed-target-form",
+      "point-aimed-ground-targeting-and-circular-area-impacts",
+      "first-class-checkpointed-projectiles-with-swept-segment-collision",
+      "nearest-body-on-path-resolution-not-actor-id-order",
+      "single-batch-settlement-across-projectile-impacts-and-casts",
+      "fail-closed-projectile-budget-and-terminal-projectile-cancellation",
+      "aim-aware-bots-that-can-fire-and-miss-skillshots",
+      "ci-executed-capture-harness-observations"
     ],
     "acceptanceBlockers": [
       "replay-file-checkpoint-index-and-scrub-integration",
@@ -204,47 +217,64 @@
       "orchestrated-rollout-and-drain-evidence",
       "android-gameactivity-emulator-boot-evidence",
       "ios-xcode-simulator-boot-evidence",
-      "clean-idle-host-p99-and-soak-re-measurement-after-gp07",
-      "corridor-following-movement-for-owned-actors-needs-an-owner-safe-server-rules-channel"
-    ]
+      "corridor-following-movement-for-owned-actors-needs-an-owner-safe-server-rules-channel",
+      "editor-bridge-wiring-commit-blocked-by-parallel-lane-entanglement",
+      "in-game-hud-input-and-client-runtime",
+      "certified-idle-host-and-min-spec-perf-profile"
+    ],
+    "ciEvidence": {
+      "status": "green",
+      "commit": "740cc7e",
+      "checks": 24,
+      "note": "The MOB crates are committed and gated. The editor bridge and its e2e capture are NOT committed (parallel-lane entanglement) and are therefore local-only. The capture harness is now CI-executed."
+    }
   },
   "mob2LocalEvidence": {
     "scope": "windows-local-development-only-not-acceptance",
-    "date": "2026-08-03",
+    "date": "2026-08-04",
     "retainedCiArtifact": false,
+    "hostBackgroundLoadPercent": 11,
     "fullLoadSoak": {
       "mode": "release",
       "actors": 512,
       "ticks": 108000,
       "constantMemory": true,
-      "status": "INVALID-CONTENDED-HOST",
-      "contendedElapsedSeconds": 313.27,
+      "status": "measured-low-contention-host",
+      "elapsedSeconds": 70.79,
       "priorIdleRangeSeconds": [
         61.37,
         115.5
       ],
       "result": "passed",
-      "note": "Passed, but the elapsed time was measured under the same background load and is not comparable to the prior range. Whether GP-07's per-frame stat audit costs measurable time is UNRESOLVED until a clean run."
+      "note": "Inside the prior idle range, so GP-07's per-frame stat audit plus GP-03's projectile phase show no measurable regression. The host was at ~11% background load, well below the ~32% that invalidated the previous round, but this is still not a certified-idle rig."
     },
     "tickWork": {
       "mode": "release",
       "actors": 512,
       "warmupTicks": 1000,
       "sampleTicks": 10000,
-      "status": "INVALID-CONTENDED-HOST",
-      "reason": "Re-measured after GP-07 on a machine at ~32% background load (multiple concurrent agent/browser processes). The project's benchmark discipline requires an otherwise-idle host, so these are NOT recorded as evidence.",
-      "contendedObservation": {
-        "p50Ns": 1171400,
-        "p95Ns": 6287700,
-        "p99Ns": 7892600,
-        "maxNs": 13925900
+      "status": "measured-low-contention-host",
+      "observation": {
+        "p50Ns": 629300,
+        "p95Ns": 727400,
+        "p99Ns": 821300,
+        "maxNs": 1151600
       },
       "p99BudgetNs": 10000000,
-      "gateResult": "passed-even-under-contention",
-      "rollingDigest": "3e3b1373744059fb",
-      "owed": "a clean serial re-measurement on an idle host, plus the still-owed true min-spec profile"
+      "gateResult": "passed-with-12x-headroom",
+      "rollingDigest": "ffd259f9bd53515c",
+      "owed": "a certified-idle host and the still-owed true min-spec profile"
     },
-    "measurementCaveat": "Wall-clock numbers from one unpaced Windows developer machine. This round was additionally taken under heavy background load and is explicitly marked invalid rather than recorded as a regression or a non-regression. Only the executable p99 budget gate (which passed even contended) and the retained-CI blocker carry weight."
+    "captureHarness": {
+      "scenarios": 18,
+      "frames": 114,
+      "observableChecks": 49,
+      "failing": 0,
+      "ciExecuted": true,
+      "workflow": ".github/workflows/mobile-gameplay-tripwire.yml",
+      "note": "Previously compiled but never executed by any job, so every observation it computed was a dark test."
+    },
+    "measurementCaveat": "Wall-clock numbers from one unpaced Windows developer machine at ~11% background load. Only the executable p99 budget gate and the retained-CI blocker carry weight; the soak elapsed time is comparative evidence against the prior idle range, not a published bound."
   },
   "mob2Packaging": {
     "artifact": "production/mobile-moba/server/Dockerfile",
