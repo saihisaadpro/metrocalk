@@ -38,6 +38,30 @@ jobs:
       - name: Lint every gameplay target
         run: cargo clippy -p metrocalk-gameplay --all-targets -- -D warnings
 
+      # The capture harness computes real pass/fail observations from the frames the kernel emitted. Until
+      # this step existed it was compiled but never RUN, so every one of those observations was a dark
+      # test: a failing check would have been invisible to CI. The floor stops the harness from silently
+      # losing coverage; raise it in the same change that adds scenarios.
+      - name: Assert every captured gameplay observation
+        run: |
+          cargo run --release -p metrocalk-gameplay --example capture_trace > capture-trace.json
+          python - <<'PY'
+          import json
+
+          trace = json.load(open("capture-trace.json"))
+          assert trace["schema"] == "metrocalk.gameplay.capture.v1", trace["schema"]
+          scenarios = trace["scenarios"]
+          checks = [(s["id"], c["label"], c["passed"]) for s in scenarios for c in s["checks"]]
+          failed = [(i, label) for i, label, passed in checks if not passed]
+          assert not failed, failed
+          assert len(checks) >= 49, f"capture coverage regressed to {len(checks)} checks"
+          frames = sum(len(s["frames"]) for s in scenarios)
+          print(
+              f"::notice::capture harness: {len(scenarios)} scenarios, {frames} frames, "
+              f"{len(checks)} observable checks, 0 failing"
+          )
+          PY
+
   mobile-check:
     name: check gameplay (${{ matrix.target }})
     runs-on: ubuntu-latest
