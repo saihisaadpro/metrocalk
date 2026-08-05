@@ -656,7 +656,7 @@ pub fn plan_defeature<W: World>(
         };
         candidates.push((id, kind, size, face_ids));
     }
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.sort_by_key(|candidate| candidate.0);
     if candidates.is_empty() {
         return plan;
     }
