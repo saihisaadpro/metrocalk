@@ -222,7 +222,11 @@
       "nearest-first-acquisition-with-an-actor-id-tie-break",
       "acquisition-range-authored-wider-than-weapon-reach",
       "per-session-monotonic-command-sequence-independent-of-the-tick",
-      "every-command-kind-round-trips-the-pending-queue"
+      "every-command-kind-round-trips-the-pending-queue",
+      "authored-cooked-and-registered-abilities-castable-by-a-player",
+      "zero-means-simple-authoring-reaching-instant-or-projectile-and-single-or-circle",
+      "abilities-registered-before-any-spawn-names-them",
+      "no-ability-authored-refused-in-the-bridge-by-field-name-not-as-a-kernel-rejection"
     ],
     "acceptanceBlockers": [
       "replay-file-checkpoint-index-and-scrub-integration",
@@ -344,6 +348,27 @@
       "sizeBefore": 9782232,
       "sizeAfter": 420348,
       "why": "The projection tints every actor by TEAM, so a baked albedo fights the one colour on screen that carries gameplay meaning — and these are include_bytes!-embedded into the shell binary."
+    },
+    "abilityReachability": {
+      "date": "2026-08-05",
+      "adr": "ADR-102",
+      "gapFound": "the cook emitted `abilities: vec![]` at both sites and never called register_ability; the shell had no cast verb; the only crowd control was the stun_hero developer cheat",
+      "spec": "editor-shell/e2e/specs/moba-cast.e2e.js",
+      "interactions": 6,
+      "screenshots": 12,
+      "authoredDamage": 260,
+      "observedHostileHealth": [
+        3920,
+        3660
+      ],
+      "cooldownTicks": [
+        0,
+        24,
+        0
+      ],
+      "ciExecuted": false,
+      "reason": "the packaged-.exe WebDriver harness is local-only",
+      "stillOpen": "stun_hero survives; deleting it honestly requires an ApplyStatus effect in the settlement batch so crowd control can come from a spell"
     }
   },
   "mob2Packaging": {
