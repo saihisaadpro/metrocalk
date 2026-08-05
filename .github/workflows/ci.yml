@@ -95,7 +95,11 @@ jobs:
           # discipline as flecs_ecs-in-/ecs. Comment lines (prose mentioning the types) skipped. demo.rs is a
           # test-FIXTURE generator (it ENCODES demo PNGs via `image::write_to` — the inverse of the import/
           # decode path this gate guards), so it's exempt like the wrappers, not a decode-path leak.
-          if grep -rn "gltf::\|image::\|tobj::\|ufbx::\|basis_universal::\|ed25519_dalek::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'gltf_export.rs' | grep -v 'image_import.rs' | grep -v 'obj_import.rs' | grep -v 'fbx_import.rs' | grep -v 'ktx2_import.rs' | grep -v 'env_import.rs' | grep -v 'signed.rs' | grep -v 'demo.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+          # animation_import.rs is the glTF ANIMATION wrapper - the same boundary role as gltf_import.rs,
+          # one format in and engine-owned types out - so it joins the wrapper list rather than being a leak.
+          # gltf_scene_export.rs is on the ENCODE side like gltf_export.rs/demo.rs: it writes PNG texture
+          # bytes out of engine-owned pixels. That is the inverse of the decode path this gate guards.
+          if grep -rn "gltf::\|image::\|tobj::\|ufbx::\|basis_universal::\|ed25519_dalek::" assets/src --include='*.rs' | grep -v 'gltf_import.rs' | grep -v 'gltf_export.rs' | grep -v 'gltf_scene_export.rs' | grep -v 'animation_import.rs' | grep -v 'image_import.rs' | grep -v 'obj_import.rs' | grep -v 'fbx_import.rs' | grep -v 'ktx2_import.rs' | grep -v 'env_import.rs' | grep -v 'signed.rs' | grep -v 'demo.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
             echo "::error::a foreign type (gltf::/image::/tobj::/ufbx::/basis_universal::/ed25519_dalek::) leaked outside its format/trust wrapper (invariant 5; mirrors ADR-001/006/040/044)"
             exit 1
           fi
@@ -133,7 +137,11 @@ jobs:
           # in /interchange — exactly as rapier lives in /physics + gltf in the importer. Every other crate
           # consumes an import through the project-owned Interchange trait + our neutral types (SceneImport
           # carrying the /physics boundary types), never a urdf_rs/openusd type. Prose comments are fine.
-          if grep -rn "urdf_rs\|openusd" core ecs transport plugins assets economy physics editor-shell tools --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
+          # Two round-trip checks are exempt BY NAME: they open our own exported USDA in the reference
+          # reader to prove the export is real. That is the inverse of a leak - it is the only way to show
+          # the neutral writer produces a stage a third-party reader accepts - and it is test-only, so no
+          # production path gains a dependency. Everything under assets/src stays gated.
+          if grep -rn "urdf_rs\|openusd" core ecs transport plugins assets economy physics editor-shell tools --include='*.rs' | grep -v 'assets/tests/usda_scene_export.rs' | grep -v 'assets/examples/scene_export_smoke.rs' | grep -vE ':[0-9]+:[[:space:]]*//'; then
             echo "::error::urdf/openusd leaked outside /interchange — import types must stay behind the Interchange trait (invariant 5; mirrors ADR-001/014)"
             exit 1
           fi
