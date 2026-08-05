@@ -66,6 +66,7 @@ fn scenarios() -> Vec<String> {
         skillshot_can_miss(),
         kill_bounty_assist_and_shutdown(),
         levelling_ranks_an_ability_and_raises_stats(),
+        crit_penetration_shield_and_lifesteal(),
         checkpoint_restore_suffix_equality(),
     ]
 }
@@ -426,6 +427,20 @@ fn event_label(event: MatchEvent) -> String {
             actor.get(),
             ability.get()
         ),
+        MatchEvent::ShieldAbsorbed {
+            actor,
+            amount,
+            remaining,
+            ..
+        } => format!(
+            "ShieldAbsorbed a{} -{amount} ({remaining} left)",
+            actor.get()
+        ),
+        MatchEvent::LifestealApplied {
+            actor,
+            amount,
+            health_after,
+        } => format!("Lifesteal a{} +{amount} -> {health_after}hp", actor.get()),
         MatchEvent::ProjectileCancelled { projectile, reason } => format!(
             "ProjectileCancelled p{} ({})",
             projectile.get(),
@@ -465,6 +480,11 @@ const fn stats(health: u32, resource: u32, speed: u32) -> CombatStats {
         move_speed_mm_per_tick: speed,
         physical_reduction_bps: 0,
         magic_reduction_bps: 0,
+        crit_chance_bps: 0,
+        crit_damage_bps: metrocalk_gameplay::BASIS_POINTS,
+        physical_penetration_bps: 0,
+        magic_penetration_bps: 0,
+        lifesteal_bps: 0,
     }
 }
 
@@ -1842,6 +1862,152 @@ fn levelling_ranks_an_ability_and_raises_stats() -> String {
     rec.check(
         "the rank-2 shot really hits harder (300 base + 250 per rank)",
         dealt == 550,
+    );
+    rec.finish()
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOB-3.0 combat depth
+// ---------------------------------------------------------------------------------------------
+
+const BRAWLER: ActorId = ActorId(701);
+const TARGET: ActorId = ActorId(702);
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario reads as one story; splitting it hides which stat produced which number"
+)]
+fn crit_penetration_shield_and_lifesteal() -> String {
+    let mut rec = Recorder::new(
+        "gp07-damage-pipeline",
+        "GP-07 \u{b7} the damage pipeline, stage by stage",
+        "One swing runs crit then penetration then mitigation then shield then health then lifesteal, and every stage is visible in the numbers: a guaranteed critical doubles the swing, penetration halves the mitigation, a shield eats the first hit almost whole, and the attacker heals from what actually landed.",
+    );
+
+    let attacker = CombatStats {
+        max_health: 2_000,
+        max_resource: 0,
+        move_speed_mm_per_tick: 0,
+        physical_reduction_bps: 0,
+        magic_reduction_bps: 0,
+        crit_chance_bps: metrocalk_gameplay::BASIS_POINTS,
+        crit_damage_bps: 20_000,
+        physical_penetration_bps: 5_000,
+        magic_penetration_bps: 0,
+        lifesteal_bps: 2_500,
+    };
+    let defender = CombatStats {
+        max_health: 5_000,
+        max_resource: 0,
+        move_speed_mm_per_tick: 0,
+        physical_reduction_bps: 4_000,
+        magic_reduction_bps: 0,
+        crit_chance_bps: 0,
+        crit_damage_bps: metrocalk_gameplay::BASIS_POINTS,
+        physical_penetration_bps: 0,
+        magic_penetration_bps: 0,
+        lifesteal_bps: 0,
+    };
+
+    let mut runtime = MatchRuntime::new(config(), 0x_D4D4).expect("config");
+    for (id, owner, team, x, stats) in [
+        (BRAWLER, Some(PLAYER), 0_u8, 0_i32, attacker),
+        (TARGET, None, 1, 1_000, defender),
+    ] {
+        runtime
+            .spawn_actor(&ActorSpawn {
+                id,
+                owner,
+                team: TeamId(team),
+                kind: if owner.is_some() {
+                    ActorKind::Hero
+                } else {
+                    ActorKind::Minion
+                },
+                position: Vec2Mm::new(x, 0),
+                stats,
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
+                abilities: vec![],
+                basic_attack: Some(BasicAttackSpec {
+                    range_mm: 20_000,
+                    damage: 200,
+                    school: DamageSchool::Physical,
+                    windup_ticks: 0,
+                    cooldown_ticks: 0,
+                }),
+                death_rule: DeathRule::StayDead,
+            })
+            .expect("actor");
+    }
+    runtime.start().expect("start");
+    rec.note("Attacker: 200 base, guaranteed critical at 200 %, 50 % physical penetration, 25 % lifesteal.");
+    rec.note("Defender: 40 % physical mitigation, plus a 300-point shield applied before the first swing.");
+    runtime
+        .apply_status_effect_with_shield(TARGET, 60, &[], &[], 300)
+        .expect("shield");
+    // The attacker is wounded first, or every lifesteal heal is clamped away at full health and the
+    // capture would silently show nothing while claiming to demonstrate lifesteal.
+    // Applying a max-health penalty clamps CURRENT health down with it; removing the penalty restores the
+    // maximum and leaves the actor genuinely wounded, which is the only way to open a heal window through
+    // the public API.
+    let wound = runtime
+        .apply_stat_modifier(
+            BRAWLER,
+            StatKind::MaxHealth,
+            ModifierOp::Flat { magnitude: -1_000 },
+        )
+        .expect("wound");
+    runtime
+        .remove_stat_modifier(BRAWLER, wound)
+        .expect("restore");
+    rec.record(&runtime, &[], "before the first swing");
+
+    let mut landed = Vec::new();
+    for sequence in 1..=3_u32 {
+        let at = runtime.tick() + 1;
+        runtime
+            .submit(PlayerCommand {
+                player: PLAYER,
+                sequence,
+                execute_at: at,
+                actor: BRAWLER,
+                kind: CommandKind::BasicAttack { target: TARGET },
+            })
+            .expect("accepted");
+        let frame = runtime.step().expect("step");
+        let dealt = frame.events.iter().find_map(|event| match event {
+            MatchEvent::DamageApplied { target, amount, .. } if *target == TARGET => Some(*amount),
+            _ => None,
+        });
+        landed.push(dealt.unwrap_or_default());
+        rec.record(&runtime, &frame.events, &format!("swing {sequence}"));
+    }
+
+    // 200 base -> crit x2 = 400 -> penetration halves 40 % mitigation to 20 % -> 400 * 0.8 = 320.
+    // Swing 1: the 300-point shield absorbs 300, so 20 reaches health.
+    // Swings 2 and 3: the pool is gone, so the full 320 lands each time.
+    rec.check(
+        "the shield swallowed all but 20 of the first swing",
+        landed[0] == 20,
+    );
+    rec.check("the second swing lands in full at 320", landed[1] == 320);
+    rec.check(
+        "crit-then-penetration gives 320, where crit-after-mitigation would give 240",
+        landed[1] == 320,
+    );
+    rec.check(
+        "the third swing matches the second, so the pipeline is stable",
+        landed[2] == 320,
+    );
+    rec.check(
+        "the defender took exactly 20 + 320 + 320 in total",
+        runtime.actor(TARGET).expect("t").health == 5_000 - 660,
+    );
+    // 25 % of what LANDED, not of what was swung: 5 + 80 + 80 = 165 on top of the wounded 1,000.
+    rec.check(
+        "the attacker healed 25 % of the damage that actually landed",
+        runtime.actor(BRAWLER).expect("a").health == 1_000 + 165,
     );
     rec.finish()
 }

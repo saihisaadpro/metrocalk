@@ -29,6 +29,9 @@ use crate::runtime::{
 };
 
 const MAGIC: [u8; 8] = *b"MTCKPT01";
+// v7 adds the pseudo-random-distribution attempt counter, per-status-effect shield pools, and the five
+// offensive combat stats (crit chance/damage, physical and magic penetration, lifesteal). The RNG itself
+// adds NO state: rolls are keyed rather than streamed, so there is no cursor to persist.
 // v6 adds authored stat growth, kill bounties, experience, unspent ability points, the per-actor assist
 // window, per-ability ranks, and the permanent scoreboard. It deliberately does NOT encode `level`,
 // `base_stats`, `stats`, `control_mask`, or `passive_gold_paid`: every one of those is re-derived on decode
@@ -43,7 +46,7 @@ const MAGIC: [u8; 8] = *b"MTCKPT01";
 // v2 added the immutable per-actor creation provenance record. The format is not yet persisted by any
 // production host, so the version is bumped rather than carrying a compatibility shim: a v1 payload has no
 // provenance to reconstruct, and inferring one would fabricate creation evidence.
-const FORMAT_VERSION: u16 = 6;
+const FORMAT_VERSION: u16 = 7;
 const HEADER_BYTES: usize = 64;
 const PAYLOAD_LENGTH_OFFSET: usize = 44;
 const PAYLOAD_CHECKSUM_OFFSET: usize = 48;
@@ -53,11 +56,12 @@ const MIN_COMMAND_BYTES: usize = 29;
 // 8 id + 1 kind tag + 1 op tag + 4 smallest payload.
 const MIN_MODIFIER_BYTES: usize = 14;
 // 8 id + 1 provenance tag + 1 owner tag + 1 team + 1 kind + 8 position + 1 destination tag
-// + 16 authored stats + 16 growth + 8 bounty + 4 experience + 1 unspent point + 4 credit count
+// + 26 authored stats + 16 growth + 8 bounty + 4 experience + 1 unspent point + 2 crit attempts
+// + 4 credit count
 // + 4 modifier count + 4 status-effect count + 4 health + 4 resource + 4 ability count + 5 option tags.
-const MIN_ACTOR_BYTES: usize = 95;
-// 8 id + 8 expiry + 1 controls + 4 owned-modifier count.
-const MIN_STATUS_EFFECT_BYTES: usize = 21;
+const MIN_ACTOR_BYTES: usize = 107;
+// 8 id + 8 expiry + 4 shield pool + 1 controls + 4 owned-modifier count.
+const MIN_STATUS_EFFECT_BYTES: usize = 25;
 // 8 id + 8 source + 1 team + 4 ability + 8 position + 8 flight terminus + 4 launch magnitude.
 const MIN_PROJECTILE_BYTES: usize = 41;
 // 8 actor + 1 owner tag + 1 team + 8 since + 4 earned + 4 kills + 4 deaths + 4 assists + 2 + 2 streaks.
@@ -1357,6 +1361,7 @@ fn encode_actor(encoder: &mut Encoder, actor: &ActorState) -> Result<(), Checkpo
     encode_bounty(encoder, actor.bounty)?;
     encoder.u32(actor.experience)?;
     encoder.u8(actor.unspent_ability_points)?;
+    encoder.u16(actor.crit_attempts)?;
     encoder.count(actor.damage_credits.len())?;
     for credit in &actor.damage_credits {
         encoder.u64(credit.source.get())?;
@@ -1372,6 +1377,7 @@ fn encode_actor(encoder: &mut Encoder, actor: &ActorState) -> Result<(), Checkpo
     for effect in &actor.status_effects {
         encoder.u64(effect.id.get())?;
         encoder.u64(effect.expires_at)?;
+        encoder.u32(effect.shield_pool)?;
         encoder.u8(effect.controls.bits())?;
         encoder.count(effect.modifiers.len())?;
         for owned in &effect.modifiers {
@@ -1435,6 +1441,7 @@ fn decode_actor(
     let bounty = decode_bounty(decoder)?;
     let experience = decoder.u32()?;
     let unspent_ability_points = decoder.u8()?;
+    let crit_attempts = decoder.u16()?;
     let damage_credits = decode_damage_credits(decoder, config)?;
     // Re-derived, never trusted from the payload - the same rule the stat and control caches follow.
     let level = level_for_experience(experience);
@@ -1523,6 +1530,7 @@ fn decode_actor(
         experience,
         level,
         unspent_ability_points,
+        crit_attempts,
         damage_credits,
         base_stats,
         modifiers,
@@ -1582,6 +1590,7 @@ fn decode_status_effects(
     for _ in 0..count {
         let id = StatusEffectId(decoder.u64()?);
         let expires_at = decoder.u64()?;
+        let shield_pool = decoder.u32()?;
         let controls = ControlMask::from_bits(decoder.u8()?).ok_or(
             CheckpointError::InvalidData("status effect carries an undefined control bit"),
         )?;
@@ -1596,6 +1605,7 @@ fn decode_status_effects(
         }
         effects.push(StatusEffect {
             id,
+            shield_pool,
             expires_at,
             controls,
             modifiers: granted,
@@ -1616,6 +1626,11 @@ fn encode_stat_kind(encoder: &mut Encoder, kind: StatKind) -> Result<(), Checkpo
         StatKind::MoveSpeed => 2,
         StatKind::PhysicalReduction => 3,
         StatKind::MagicReduction => 4,
+        StatKind::CritChance => 5,
+        StatKind::CritDamage => 6,
+        StatKind::PhysicalPenetration => 7,
+        StatKind::MagicPenetration => 8,
+        StatKind::Lifesteal => 9,
     })
 }
 
@@ -1626,6 +1641,11 @@ fn decode_stat_kind(decoder: &mut Decoder<'_>) -> Result<StatKind, CheckpointErr
         2 => Ok(StatKind::MoveSpeed),
         3 => Ok(StatKind::PhysicalReduction),
         4 => Ok(StatKind::MagicReduction),
+        5 => Ok(StatKind::CritChance),
+        6 => Ok(StatKind::CritDamage),
+        7 => Ok(StatKind::PhysicalPenetration),
+        8 => Ok(StatKind::MagicPenetration),
+        9 => Ok(StatKind::Lifesteal),
         tag => Err(CheckpointError::InvalidTag {
             field: "stat kind",
             tag,
@@ -1795,7 +1815,12 @@ fn encode_stats(encoder: &mut Encoder, stats: CombatStats) -> Result<(), Checkpo
     encoder.u32(stats.max_resource)?;
     encoder.u32(stats.move_speed_mm_per_tick)?;
     encoder.u16(stats.physical_reduction_bps)?;
-    encoder.u16(stats.magic_reduction_bps)
+    encoder.u16(stats.magic_reduction_bps)?;
+    encoder.u16(stats.crit_chance_bps)?;
+    encoder.u16(stats.crit_damage_bps)?;
+    encoder.u16(stats.physical_penetration_bps)?;
+    encoder.u16(stats.magic_penetration_bps)?;
+    encoder.u16(stats.lifesteal_bps)
 }
 
 fn decode_stats(decoder: &mut Decoder<'_>) -> Result<CombatStats, CheckpointError> {
@@ -1805,6 +1830,11 @@ fn decode_stats(decoder: &mut Decoder<'_>) -> Result<CombatStats, CheckpointErro
         move_speed_mm_per_tick: decoder.u32()?,
         physical_reduction_bps: decoder.u16()?,
         magic_reduction_bps: decoder.u16()?,
+        crit_chance_bps: decoder.u16()?,
+        crit_damage_bps: decoder.u16()?,
+        physical_penetration_bps: decoder.u16()?,
+        magic_penetration_bps: decoder.u16()?,
+        lifesteal_bps: decoder.u16()?,
     })
 }
 
@@ -2155,6 +2185,11 @@ mod tests {
             move_speed_mm_per_tick: 50,
             physical_reduction_bps: 1_000,
             magic_reduction_bps: 500,
+            crit_chance_bps: 0,
+            crit_damage_bps: crate::BASIS_POINTS,
+            physical_penetration_bps: 0,
+            magic_penetration_bps: 0,
+            lifesteal_bps: 0,
         }
     }
 
@@ -2276,6 +2311,7 @@ mod tests {
                 experience: HERO_EXPERIENCE,
                 level: 5,
                 unspent_ability_points: 1,
+                crit_attempts: 0,
                 damage_credits: vec![DamageCredit {
                     source: ActorId(2),
                     last_tick: 4,
@@ -2331,6 +2367,7 @@ mod tests {
                 experience: 0,
                 level: 1,
                 unspent_ability_points: 0,
+                crit_attempts: 0,
                 damage_credits: Vec::new(),
                 base_stats: stats(),
                 modifiers: Vec::new(),
@@ -2373,6 +2410,7 @@ mod tests {
                 experience: 0,
                 level: 1,
                 unspent_ability_points: 0,
+                crit_attempts: 0,
                 damage_credits: Vec::new(),
                 base_stats: stats(),
                 modifiers: Vec::new(),

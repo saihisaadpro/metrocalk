@@ -380,6 +380,20 @@ pub enum MatchEvent {
         ability: AbilityId,
         rank: u8,
     },
+    /// A shield absorbed damage before it reached health. Separate from `DamageApplied` so a client can
+    /// show the absorb without inferring it from a health value that did not move.
+    ShieldAbsorbed {
+        actor: ActorId,
+        effect: StatusEffectId,
+        amount: u32,
+        remaining: u32,
+    },
+    /// An attacker healed from damage it dealt.
+    LifestealApplied {
+        actor: ActorId,
+        amount: u32,
+        health_after: u32,
+    },
     MatchFinished {
         outcome: MatchOutcome,
         reason: MatchEndReason,

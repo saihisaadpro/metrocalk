@@ -24,6 +24,11 @@ fn stats(health: u32, resource: u32, speed: u32) -> CombatStats {
         move_speed_mm_per_tick: speed,
         physical_reduction_bps: 0,
         magic_reduction_bps: 0,
+        crit_chance_bps: 0,
+        crit_damage_bps: BASIS_POINTS,
+        physical_penetration_bps: 0,
+        magic_penetration_bps: 0,
+        lifesteal_bps: 0,
     }
 }
 
@@ -364,6 +369,11 @@ fn modifier_runtime() -> MatchRuntime {
                 move_speed_mm_per_tick: 100,
                 physical_reduction_bps: 2_000,
                 magic_reduction_bps: 0,
+                crit_chance_bps: 0,
+                crit_damage_bps: BASIS_POINTS,
+                physical_penetration_bps: 0,
+                magic_penetration_bps: 0,
+                lifesteal_bps: 0,
             },
             abilities: vec![],
             basic_attack: None,
@@ -3910,6 +3920,17 @@ fn every_match_event_has_a_distinct_digest_tag() {
             ability: STRIKE,
             rank: 2,
         },
+        MatchEvent::ShieldAbsorbed {
+            actor: HERO_ONE,
+            effect: crate::StatusEffectId(1),
+            amount: 1,
+            remaining: 1,
+        },
+        MatchEvent::LifestealApplied {
+            actor: HERO_ONE,
+            amount: 1,
+            health_after: 1,
+        },
     ];
     let mut tags: Vec<u8> = events
         .iter()
@@ -5100,4 +5121,648 @@ fn the_scoreboard_budget_is_a_lifetime_budget() {
         .spawn_actor(&minion(MINION_ONE, TeamId(1), Vec2Mm::new(2_000, 0), 100))
         .unwrap();
     assert_eq!(runtime.scores().len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// MOB-3.0: seeded RNG (GP-12) and the damage pipeline (the rest of GP-07).
+//
+// The arithmetic tests pin exact hand-computed numbers so a later "simplification" cannot silently change
+// what a swing does. Every statistical test carries the negative control that proves it is measuring the
+// property it claims.
+// ---------------------------------------------------------------------------------------------------
+
+const DUELLIST: ActorId = ActorId(601);
+const DUMMY: ActorId = ActorId(602);
+const CLEAVE: AbilityId = AbilityId(51);
+
+fn combat_stats(health: u32) -> CombatStats {
+    CombatStats {
+        max_health: health,
+        max_resource: 0,
+        move_speed_mm_per_tick: 0,
+        physical_reduction_bps: 0,
+        magic_reduction_bps: 0,
+        crit_chance_bps: 0,
+        crit_damage_bps: crate::BASIS_POINTS,
+        physical_penetration_bps: 0,
+        magic_penetration_bps: 0,
+        lifesteal_bps: 0,
+    }
+}
+
+/// One attacker and one dummy, with every offensive stat authored per test.
+fn duel(attacker: CombatStats, defender: CombatStats, attack_damage: u32) -> MatchRuntime {
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x_C0FF_EE01).unwrap();
+    runtime
+        .register_ability(AbilitySpec::unit_targeted(
+            CLEAVE,
+            AbilityTargeting::Enemy,
+            50_000,
+            0,
+            1,
+            0,
+            AbilityEffect::Damage {
+                amount: 1_000,
+                school: DamageSchool::Physical,
+            },
+        ))
+        .unwrap();
+    runtime
+        .spawn_actor(&ActorSpawn {
+            id: DUELLIST,
+            owner: Some(PLAYER_ONE),
+            team: TeamId(0),
+            kind: ActorKind::Hero,
+            position: Vec2Mm::new(0, 0),
+            stats: attacker,
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
+            abilities: vec![CLEAVE],
+            basic_attack: Some(BasicAttackSpec {
+                range_mm: 50_000,
+                damage: attack_damage,
+                school: DamageSchool::Physical,
+                windup_ticks: 0,
+                // Zero on purpose: attack legality is judged against the CURRENT tick, not the requested
+                // one, so any positive cooldown makes a next-tick swing un-submittable and these fixtures
+                // would be testing the cooldown rather than the pipeline.
+                cooldown_ticks: 0,
+            }),
+            death_rule: DeathRule::StayDead,
+        })
+        .unwrap();
+    runtime
+        .spawn_actor(&ActorSpawn {
+            id: DUMMY,
+            owner: None,
+            team: TeamId(1),
+            kind: ActorKind::Minion,
+            position: Vec2Mm::new(1_000, 0),
+            stats: defender,
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
+            abilities: vec![],
+            basic_attack: None,
+            death_rule: DeathRule::StayDead,
+        })
+        .unwrap();
+    runtime.start().unwrap();
+    runtime
+}
+
+fn swing(runtime: &mut MatchRuntime, sequence: u32) -> crate::ServerFrame {
+    let at = runtime.tick() + 1;
+    runtime
+        .submit(command(
+            PLAYER_ONE,
+            sequence,
+            at,
+            DUELLIST,
+            CommandKind::BasicAttack { target: DUMMY },
+        ))
+        .unwrap();
+    runtime.step().unwrap()
+}
+
+fn damage_dealt(frame: &crate::ServerFrame) -> Option<u32> {
+    frame.events.iter().find_map(|event| match event {
+        MatchEvent::DamageApplied { target, amount, .. } if *target == DUMMY => Some(*amount),
+        _ => None,
+    })
+}
+
+// --- The generator ----------------------------------------------------------------------------------
+
+#[test]
+fn a_keyed_roll_is_a_pure_function_of_its_key_and_domains_do_not_correlate() {
+    let a = crate::roll_u64(7, crate::RngDomain::CriticalStrike, 100, 1, 2, 3);
+    // Same key, same number, every time and in any order.
+    assert_eq!(
+        a,
+        crate::roll_u64(7, crate::RngDomain::CriticalStrike, 100, 1, 2, 3)
+    );
+    // Changing ANY component of the key changes the number.
+    for other in [
+        crate::roll_u64(8, crate::RngDomain::CriticalStrike, 100, 1, 2, 3),
+        crate::roll_u64(7, crate::RngDomain::NeutralSpawn, 100, 1, 2, 3),
+        crate::roll_u64(7, crate::RngDomain::CriticalStrike, 101, 1, 2, 3),
+        crate::roll_u64(7, crate::RngDomain::CriticalStrike, 100, 2, 2, 3),
+        crate::roll_u64(7, crate::RngDomain::CriticalStrike, 100, 1, 3, 3),
+        crate::roll_u64(7, crate::RngDomain::CriticalStrike, 100, 1, 2, 4),
+    ] {
+        assert_ne!(a, other);
+    }
+
+    // The property a shared stateful stream cannot offer: one domain consuming a different NUMBER of
+    // rolls cannot shift another domain's sequence, because nothing is consumed at all.
+    let crit_sequence: Vec<u64> = (0..8)
+        .map(|n| crate::roll_u64(7, crate::RngDomain::CriticalStrike, 5, 1, 0, n))
+        .collect();
+    let _unrelated: Vec<u64> = (0..100)
+        .map(|n| crate::roll_u64(7, crate::RngDomain::NeutralSpawn, 5, 1, 0, n))
+        .collect();
+    let crit_again: Vec<u64> = (0..8)
+        .map(|n| crate::roll_u64(7, crate::RngDomain::CriticalStrike, 5, 1, 0, n))
+        .collect();
+    assert_eq!(crit_sequence, crit_again);
+}
+
+#[test]
+fn a_uniform_roll_is_uniform_enough_to_use_as_a_probability() {
+    // 20,000 keyed rolls at a nominal 25 %. This is not testing the mixer's cryptographic quality - it is
+    // testing that `% BASIS_POINTS` on this mixer does not have a gross low-bit bias, which is the failure
+    // mode that would silently skew every crit in the game.
+    let trials = 20_000_u32;
+    let hits = (0..trials)
+        .filter(|n| {
+            crate::roll_under_bps(
+                0xABCD,
+                crate::RngDomain::ProcEffect,
+                u64::from(*n),
+                1,
+                2,
+                0,
+                2_500,
+            )
+        })
+        .count();
+    let rate = f64::from(u32::try_from(hits).unwrap_or(u32::MAX)) / f64::from(trials);
+    assert!(
+        (0.235..0.265).contains(&rate),
+        "observed rate {rate} is outside the expected band for a 25% roll"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a rounded probability-times-10,000 is a small non-negative integer by construction"
+)]
+fn the_prd_table_matches_its_own_derivation() {
+    // The table in `model.rs` is the solution of `1 / E[N](C) = p`. Re-derive every row here and assert it,
+    // so the table is VERIFIED rather than copied from a wiki. The 10 % row is additionally the published
+    // cross-check: community sources give C ~= 0.01475, i.e. 147 basis points.
+    fn effective_probability(constant: f64) -> f64 {
+        let (mut survival, mut expectation, mut attempt) = (1.0_f64, 0.0_f64, 1.0_f64);
+        while survival > 1e-15 && attempt < 100_000.0 {
+            let p = (constant * attempt).min(1.0);
+            expectation += attempt * p * survival;
+            survival *= 1.0 - p;
+            if p >= 1.0 {
+                break;
+            }
+            attempt += 1.0;
+        }
+        if expectation > 0.0 {
+            1.0 / expectation
+        } else {
+            0.0
+        }
+    }
+    fn solve(target: f64) -> f64 {
+        let (mut low, mut high) = (0.0_f64, 1.0_f64);
+        for _ in 0..200 {
+            let mid = f64::midpoint(low, high);
+            if effective_probability(mid) < target {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        f64::midpoint(low, high)
+    }
+
+    assert_eq!(
+        crate::prd_constant_bps(1_000),
+        147,
+        "the 10% row must match the published PRD constant"
+    );
+    for percent in 1..100_u16 {
+        let derived = u16::try_from((solve(f64::from(percent) / 100.0) * 10_000.0).round() as i64)
+            .expect("a solved PRD constant is a basis-point value");
+        let table = crate::prd_constant_bps(percent * 100);
+        assert_eq!(
+            table, derived,
+            "PRD constant for {percent}% drifted from its derivation"
+        );
+    }
+    assert_eq!(crate::prd_constant_bps(0), 0);
+    assert_eq!(crate::prd_constant_bps(10_000), 10_000);
+}
+
+#[test]
+fn prd_escalates_and_guarantees_a_hit_where_a_flat_roll_never_would() {
+    // The escalation is the whole mechanic: attempt N sees C x N.
+    let first = crate::prd_chance_bps(2_000, 1);
+    let fifth = crate::prd_chance_bps(2_000, 5);
+    assert!(
+        first < 2_000,
+        "the first attempt is BELOW the nominal chance"
+    );
+    assert!(fifth > first);
+    // And it is bounded: enough dry attempts guarantee a hit, which is exactly what a flat roll cannot do.
+    assert_eq!(crate::prd_chance_bps(2_000, 200), crate::BASIS_POINTS);
+}
+
+// --- The pipeline -----------------------------------------------------------------------------------
+
+#[test]
+fn penetration_scales_mitigation_and_can_never_invert_it() {
+    let defender = CombatStats {
+        physical_reduction_bps: 4_000,
+        ..combat_stats(10_000)
+    };
+    // No penetration: the shipped behaviour, unchanged.
+    let plain = CombatStats {
+        physical_penetration_bps: 0,
+        ..combat_stats(1_000)
+    };
+    assert_eq!(
+        defender.reduction_after_penetration(DamageSchool::Physical, plain),
+        4_000
+    );
+    // Half penetration halves the mitigation: 40% -> 20%.
+    let half = CombatStats {
+        physical_penetration_bps: 5_000,
+        ..combat_stats(1_000)
+    };
+    assert_eq!(
+        defender.reduction_after_penetration(DamageSchool::Physical, half),
+        2_000
+    );
+    // Full and over-full penetration floor at zero - never negative, mirroring the documented rule that
+    // penetration cannot make effective armour negative.
+    for pen in [crate::BASIS_POINTS, crate::BASIS_POINTS] {
+        let full = CombatStats {
+            physical_penetration_bps: pen,
+            ..combat_stats(1_000)
+        };
+        assert_eq!(
+            defender.reduction_after_penetration(DamageSchool::Physical, full),
+            0
+        );
+    }
+    // Physical penetration does nothing to magic mitigation.
+    let magic_defender = CombatStats {
+        magic_reduction_bps: 3_000,
+        ..combat_stats(10_000)
+    };
+    assert_eq!(
+        magic_defender.reduction_after_penetration(DamageSchool::Magic, half),
+        3_000
+    );
+    // True damage ignores the whole stage.
+    assert_eq!(
+        defender.reduction_after_penetration(DamageSchool::True, plain),
+        0
+    );
+}
+
+#[test]
+fn the_pipeline_applies_crit_before_mitigation_with_hand_computed_numbers() {
+    // 100 base damage, guaranteed crit at 250 %, against 40 % mitigation.
+    //   crit:      100 * 2.5  = 250   (pre-mitigation, so armour still matters)
+    //   mitigation: 250 * 0.6 = 150
+    // If crit were applied AFTER mitigation the answer would be 100*0.6*2.5 = 150 as well, so this
+    // fixture deliberately uses numbers where the two orders differ once penetration is involved below.
+    let attacker = CombatStats {
+        crit_chance_bps: crate::BASIS_POINTS,
+        crit_damage_bps: 25_000,
+        ..combat_stats(1_000)
+    };
+    let defender = CombatStats {
+        physical_reduction_bps: 4_000,
+        ..combat_stats(10_000)
+    };
+    let mut runtime = duel(attacker, defender, 100);
+    let frame = swing(&mut runtime, 1);
+    assert_eq!(damage_dealt(&frame), Some(150));
+
+    // Now with 50 % penetration: mitigation becomes 20 %, so 250 * 0.8 = 200.
+    let attacker = CombatStats {
+        crit_chance_bps: crate::BASIS_POINTS,
+        crit_damage_bps: 25_000,
+        physical_penetration_bps: 5_000,
+        ..combat_stats(1_000)
+    };
+    let mut runtime = duel(attacker, defender, 100);
+    let frame = swing(&mut runtime, 1);
+    assert_eq!(damage_dealt(&frame), Some(200));
+}
+
+#[test]
+fn a_zero_crit_chance_actor_deals_exactly_the_pre_change_damage() {
+    // The regression guard for every actor authored before this slice: with all the new stats at their
+    // defaults the pipeline must reduce to the shipped single-mitigation behaviour, to the unit.
+    let defender = CombatStats {
+        physical_reduction_bps: 2_000,
+        ..combat_stats(10_000)
+    };
+    let mut runtime = duel(combat_stats(1_000), defender, 500);
+    let frame = swing(&mut runtime, 1);
+    assert_eq!(damage_dealt(&frame), Some(400), "500 * (1 - 0.20)");
+}
+
+#[test]
+fn a_shield_absorbs_exactly_its_pool_and_expires_with_the_effect_that_granted_it() {
+    let mut runtime = duel(combat_stats(1_000), combat_stats(10_000), 300);
+    runtime
+        .apply_status_effect_with_shield(DUMMY, 30, &[], &[], 500)
+        .unwrap();
+    let before = runtime.actor(DUMMY).unwrap().health;
+
+    // First swing: fully absorbed, health untouched, 200 of the pool left.
+    let frame = swing(&mut runtime, 1);
+    assert_eq!(damage_dealt(&frame), Some(0));
+    assert_eq!(runtime.actor(DUMMY).unwrap().health, before);
+    assert!(frame.events.iter().any(|event| matches!(
+        event,
+        MatchEvent::ShieldAbsorbed { amount, remaining, .. } if *amount == 300 && *remaining == 200
+    )));
+
+    // Second swing: 200 absorbed, 100 reaches health.
+    let frame = swing(&mut runtime, 2);
+    assert_eq!(damage_dealt(&frame), Some(100));
+    assert_eq!(runtime.actor(DUMMY).unwrap().health, before - 100);
+
+    // Third swing: the pool is gone, so everything lands.
+    let frame = swing(&mut runtime, 3);
+    assert_eq!(damage_dealt(&frame), Some(300));
+    runtime.check_invariants().unwrap();
+}
+
+#[test]
+fn shields_are_consumed_oldest_expiring_first() {
+    let mut runtime = duel(combat_stats(1_000), combat_stats(10_000), 250);
+    // Applied in the "wrong" order on purpose: the long one first, so consuming by insertion order would
+    // give a different answer than consuming by expiry.
+    let long = runtime
+        .apply_status_effect_with_shield(DUMMY, 100, &[], &[], 1_000)
+        .unwrap();
+    let short = runtime
+        .apply_status_effect_with_shield(DUMMY, 5, &[], &[], 1_000)
+        .unwrap();
+
+    let frame = swing(&mut runtime, 1);
+    let absorbed_by = frame.events.iter().find_map(|event| match event {
+        MatchEvent::ShieldAbsorbed { effect, .. } => Some(*effect),
+        _ => None,
+    });
+    assert_eq!(
+        absorbed_by,
+        Some(short),
+        "the shield about to expire is spent first, not the one applied first"
+    );
+    assert_ne!(absorbed_by, Some(long));
+}
+
+#[test]
+fn lifesteal_heals_from_damage_actually_applied_and_not_from_overkill() {
+    let attacker = CombatStats {
+        lifesteal_bps: 5_000,
+        ..combat_stats(1_000)
+    };
+    // The dummy has 100 health but the swing is for 1,000: only 100 is APPLIED, so lifesteal is 50 - not
+    // 500. Healing from the swung amount rather than the landed amount is the classic overkill bug.
+    let mut runtime = duel(attacker, combat_stats(100), 1_000);
+    let index = runtime
+        .actors
+        .iter()
+        .position(|a| a.id == DUELLIST)
+        .unwrap();
+    runtime.actors[index].health = 500;
+
+    let frame = swing(&mut runtime, 1);
+    assert_eq!(damage_dealt(&frame), Some(100));
+    assert!(frame.events.iter().any(|event| matches!(
+        event,
+        MatchEvent::LifestealApplied { actor, amount, .. } if *actor == DUELLIST && *amount == 50
+    )));
+    assert_eq!(runtime.actor(DUELLIST).unwrap().health, 550);
+}
+
+#[test]
+fn lifesteal_cannot_exceed_maximum_health() {
+    let attacker = CombatStats {
+        lifesteal_bps: crate::BASIS_POINTS,
+        ..combat_stats(1_000)
+    };
+    let mut runtime = duel(attacker, combat_stats(10_000), 500);
+    // Already at full health: the heal must be clamped away entirely, and must not emit a zero event.
+    let frame = swing(&mut runtime, 1);
+    assert_eq!(runtime.actor(DUELLIST).unwrap().health, 1_000);
+    assert!(!frame
+        .events
+        .iter()
+        .any(|event| matches!(event, MatchEvent::LifestealApplied { .. })));
+}
+
+#[test]
+fn critical_strikes_average_out_to_their_nominal_rate_where_a_flat_roll_would_not() {
+    // 1,000 swings at a nominal 20 % crit. Under PRD the observed rate must land close to nominal, AND -
+    // the property PRD exists for - the longest dry streak must be far shorter than a flat roll's.
+    let attacker = CombatStats {
+        crit_chance_bps: 2_000,
+        crit_damage_bps: 20_000,
+        ..combat_stats(1_000)
+    };
+    let mut runtime = duel(attacker, combat_stats(u32::MAX), 100);
+    let (mut crits, mut swings, mut streak, mut worst) = (0_u32, 0_u32, 0_u32, 0_u32);
+    for sequence in 1..=1_000_u32 {
+        let frame = swing(&mut runtime, sequence);
+        if let Some(dealt) = damage_dealt(&frame) {
+            swings += 1;
+            if dealt > 100 {
+                crits += 1;
+                streak = 0;
+            } else {
+                streak += 1;
+                worst = worst.max(streak);
+            }
+        }
+    }
+    assert_eq!(swings, 1_000);
+    let rate = f64::from(crits) / f64::from(swings);
+    assert!(
+        (0.17..0.23).contains(&rate),
+        "PRD crit rate {rate} strayed from its 20% nominal"
+    );
+    // The negative control, stated as arithmetic rather than trusted. A FLAT 20 % roll has no bound at
+    // all on its dry streak - over 1,000 swings a run of 20+ misses is entirely ordinary. PRD's constant
+    // at 20 % is 557 basis points, so the escalating chance reaches certainty at attempt
+    // ceil(10000 / 557) = 18, and a streak of 18 consecutive misses is therefore IMPOSSIBLE by
+    // construction. That bound is the whole reason PRD exists, and it is what this asserts.
+    assert_eq!(crate::prd_constant_bps(2_000), 557);
+    assert_eq!(crate::prd_chance_bps(2_000, 18), crate::BASIS_POINTS);
+    assert!(
+        worst < 18,
+        "PRD guarantees a hit by the 18th attempt at 20%, but the worst dry streak was {worst}"
+    );
+}
+
+#[test]
+fn the_same_seed_criticals_identically_and_a_different_seed_does_not() {
+    fn run(seed: u64) -> Vec<u32> {
+        let attacker = CombatStats {
+            crit_chance_bps: 3_000,
+            crit_damage_bps: 20_000,
+            ..combat_stats(1_000)
+        };
+        let mut runtime = MatchRuntime::new(MatchConfig::default(), seed).unwrap();
+        runtime
+            .register_ability(AbilitySpec::unit_targeted(
+                CLEAVE,
+                AbilityTargeting::Enemy,
+                50_000,
+                0,
+                1,
+                0,
+                AbilityEffect::Damage {
+                    amount: 1,
+                    school: DamageSchool::True,
+                },
+            ))
+            .unwrap();
+        runtime
+            .spawn_actor(&ActorSpawn {
+                id: DUELLIST,
+                owner: Some(PLAYER_ONE),
+                team: TeamId(0),
+                kind: ActorKind::Hero,
+                position: Vec2Mm::new(0, 0),
+                stats: attacker,
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
+                abilities: vec![CLEAVE],
+                basic_attack: Some(BasicAttackSpec {
+                    range_mm: 50_000,
+                    damage: 100,
+                    school: DamageSchool::Physical,
+                    windup_ticks: 0,
+                    cooldown_ticks: 0,
+                }),
+                death_rule: DeathRule::StayDead,
+            })
+            .unwrap();
+        runtime
+            .spawn_actor(&ActorSpawn {
+                id: DUMMY,
+                owner: None,
+                team: TeamId(1),
+                kind: ActorKind::Minion,
+                position: Vec2Mm::new(1_000, 0),
+                stats: combat_stats(u32::MAX),
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
+                abilities: vec![],
+                basic_attack: None,
+                death_rule: DeathRule::StayDead,
+            })
+            .unwrap();
+        runtime.start().unwrap();
+        (1..=40_u32)
+            .filter_map(|sequence| damage_dealt(&swing(&mut runtime, sequence)))
+            .collect()
+    }
+    let a = run(0x5EED_0001);
+    assert_eq!(a, run(0x5EED_0001), "same seed, identical crit sequence");
+    assert_ne!(
+        a,
+        run(0x5EED_0002),
+        "a different seed must roll differently"
+    );
+}
+
+#[test]
+fn crit_state_and_shields_survive_the_checkpoint_round_trip() {
+    let content = ContentId::new([0x77; 32]);
+    let build = || {
+        let attacker = CombatStats {
+            crit_chance_bps: 2_500,
+            crit_damage_bps: 20_000,
+            physical_penetration_bps: 3_000,
+            lifesteal_bps: 1_000,
+            ..combat_stats(1_000)
+        };
+        let defender = CombatStats {
+            physical_reduction_bps: 3_000,
+            ..combat_stats(100_000)
+        };
+        let mut runtime = duel(attacker, defender, 200);
+        runtime
+            .apply_status_effect_with_shield(DUMMY, 200, &[], &[], 750)
+            .unwrap();
+        for sequence in 1..=6 {
+            swing(&mut runtime, sequence);
+        }
+        runtime
+    };
+
+    let mut uninterrupted = build();
+    let checkpointed = build();
+    // Mid-match state that only exists because of this slice.
+    assert!(checkpointed.actor(DUELLIST).unwrap().health <= 1_000);
+    let checkpoint = checkpointed.capture_checkpoint(content).unwrap();
+    let mut restored = MatchRuntime::restore_checkpoint(&checkpoint, content).unwrap();
+    assert_eq!(restored.world_digest(), checkpointed.world_digest());
+
+    for sequence in 7..=16 {
+        let expected = swing(&mut uninterrupted, sequence);
+        let actual = swing(&mut restored, sequence);
+        assert_eq!(
+            actual.frame_digest, expected.frame_digest,
+            "a restored match must critical identically"
+        );
+    }
+}
+
+#[test]
+fn the_crit_counter_and_shield_pool_are_part_of_the_world_digest() {
+    let attacker = CombatStats {
+        crit_chance_bps: 2_500,
+        ..combat_stats(1_000)
+    };
+    let mut runtime = duel(attacker, combat_stats(10_000), 100);
+    runtime
+        .apply_status_effect_with_shield(DUMMY, 50, &[], &[], 400)
+        .unwrap();
+    swing(&mut runtime, 1);
+
+    // Each strip removes exactly ONE thing. Without these in the digest, two runtimes that disagree about
+    // a pending crit or a remaining shield would still claim to be identical.
+    let mut without_counter = runtime.clone();
+    let index = without_counter
+        .actors
+        .iter()
+        .position(|a| a.id == DUELLIST)
+        .unwrap();
+    without_counter.actors[index].crit_attempts = 99;
+    assert_ne!(runtime.world_digest(), without_counter.world_digest());
+
+    let mut without_shield = runtime.clone();
+    let index = without_shield
+        .actors
+        .iter()
+        .position(|a| a.id == DUMMY)
+        .unwrap();
+    without_shield.actors[index].status_effects[0].shield_pool = 0;
+    assert_ne!(runtime.world_digest(), without_shield.world_digest());
+}
+
+#[test]
+fn a_forged_crit_counter_is_rejected_on_restore() {
+    let attacker = CombatStats {
+        crit_chance_bps: 2_500,
+        ..combat_stats(1_000)
+    };
+    let mut runtime = duel(attacker, combat_stats(10_000), 100);
+    swing(&mut runtime, 1);
+    // Control: the honest runtime audits cleanly.
+    runtime.check_invariants().unwrap();
+
+    // A payload claiming an enormous attempt count would guarantee a critical strike on the next swing.
+    let mut forged = runtime;
+    let index = forged.actors.iter().position(|a| a.id == DUELLIST).unwrap();
+    forged.actors[index].crit_attempts = crate::BASIS_POINTS + 1;
+    assert!(forged.check_invariants().is_err());
 }

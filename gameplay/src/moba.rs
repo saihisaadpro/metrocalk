@@ -1079,6 +1079,11 @@ mod tests {
             move_speed_mm_per_tick: speed,
             physical_reduction_bps: 0,
             magic_reduction_bps: 0,
+            crit_chance_bps: 0,
+            crit_damage_bps: crate::BASIS_POINTS,
+            physical_penetration_bps: 0,
+            magic_penetration_bps: 0,
+            lifesteal_bps: 0,
         }
     }
 

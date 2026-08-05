@@ -346,6 +346,11 @@ fn kernel_spawn(actor: &CookedActor) -> ActorSpawn {
             move_speed_mm_per_tick: actor.move_speed_mm_per_tick,
             physical_reduction_bps: actor.physical_reduction_bps,
             magic_reduction_bps: 0,
+            crit_chance_bps: 0,
+            crit_damage_bps: metrocalk_gameplay::BASIS_POINTS,
+            physical_penetration_bps: 0,
+            magic_penetration_bps: 0,
+            lifesteal_bps: 0,
         },
         growth: StatGrowth {
             max_health_per_level: actor.health_per_level,
@@ -389,6 +394,11 @@ fn kernel_wave(wave: &CookedWave) -> WaveSpec {
                     move_speed_mm_per_tick: wave.unit_move_speed_mm_per_tick,
                     physical_reduction_bps: wave.unit_physical_reduction_bps,
                     magic_reduction_bps: 0,
+                    crit_chance_bps: 0,
+                    crit_damage_bps: metrocalk_gameplay::BASIS_POINTS,
+                    physical_penetration_bps: 0,
+                    magic_penetration_bps: 0,
+                    lifesteal_bps: 0,
                 },
                 bounty: Bounty {
                     gold: wave.unit_bounty_gold,

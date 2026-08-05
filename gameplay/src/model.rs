@@ -148,6 +148,138 @@ pub const fn passive_gold_owed(elapsed_ticks: Tick, config: MatchConfig) -> u32 
     }
 }
 
+/// Stable identity for one source of randomness.
+///
+/// Every roll mixes its domain into the key, so two domains cannot correlate and — the property that
+/// actually matters — **a domain that skips a roll cannot shift any other domain's sequence**. A shared
+/// stateful stream does not have that property: two runs of the same match may legitimately evaluate a
+/// different number of crit rolls before a given spawn, and with one cursor the second run's numbers all
+/// shift. That is the desync class this design removes by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RngDomain {
+    CriticalStrike,
+    /// Reserved so later slices claim a stable constant rather than renumbering an existing one.
+    /// A shipped domain constant is never reused.
+    NeutralSpawn,
+    ProcEffect,
+    AiTieBreak,
+}
+
+impl RngDomain {
+    /// Append-only, and part of simulation truth: changing one silently re-rolls every historical match
+    /// that replays through it.
+    const fn key(self) -> u64 {
+        match self {
+            Self::CriticalStrike => 0x4352_4954_5f31,
+            Self::NeutralSpawn => 0x4e45_5554_5f31,
+            Self::ProcEffect => 0x5052_4f43_5f31,
+            Self::AiTieBreak => 0x4149_5442_5f31,
+        }
+    }
+}
+
+/// The integer mixer every roll is built from — SplitMix64's finalizer.
+///
+/// Chosen over the crate's FNV-1a `StableHash` deliberately: FNV is a *hash*, not a generator, and its
+/// avalanche in the low bits is poor — which is exactly where a `% BASIS_POINTS` comparison reads. This
+/// finalizer is a handful of integer operations, carries no state, and is bit-identical on every target
+/// the kernel compiles for.
+const fn mix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// One deterministic roll, **keyed rather than streamed**.
+///
+/// The result is a pure function of `(seed, domain, tick, subject, object, counter)`. Nothing is consumed
+/// and no cursor advances, so the same logical event yields the same number regardless of the order the
+/// simulation evaluated things in — which is precisely why iteration order can never leak into a roll.
+#[must_use]
+pub fn roll_u64(
+    seed: u64,
+    domain: RngDomain,
+    tick: Tick,
+    subject: u64,
+    object: u64,
+    counter: u64,
+) -> u64 {
+    let mut value = mix64(seed ^ domain.key());
+    value = mix64(value ^ mix64(tick));
+    value = mix64(value ^ mix64(subject));
+    value = mix64(value ^ mix64(object));
+    mix64(value ^ mix64(counter))
+}
+
+/// Does a keyed roll land under `chance_bps`?
+///
+/// Modulo bias is negligible: the reduction is from `2^64` to 10,000 buckets, so the worst-case bias is
+/// on the order of `10^-16` — far below anything a match could observe.
+#[must_use]
+pub fn roll_under_bps(
+    seed: u64,
+    domain: RngDomain,
+    tick: Tick,
+    subject: u64,
+    object: u64,
+    counter: u64,
+    chance_bps: u16,
+) -> bool {
+    if chance_bps == 0 {
+        return false;
+    }
+    if chance_bps >= BASIS_POINTS {
+        return true;
+    }
+    let value = roll_u64(seed, domain, tick, subject, object, counter);
+    (value % u64::from(BASIS_POINTS)) < u64::from(chance_bps)
+}
+
+/// Pseudo-random-distribution constants, in basis points, indexed by whole percent `0..=100`.
+///
+/// PRD (Warcraft III, inherited by Dota 2) replaces a flat roll with an escalating one: on the `N`-th
+/// attempt since the last success the probability is `C x N`. That removes both the long dry streak and
+/// the improbable double-proc a flat roll produces, which is why players read it as fairer than true
+/// randomness even though it is less random.
+///
+/// **`C` is not the nominal chance** — it is the constant whose resulting distribution *averages* to it,
+/// and it has no closed form. This table is the solution of `1 / E[N](C) = p`, and
+/// `the_prd_table_matches_its_own_derivation` re-derives every row and asserts it, so the table is
+/// verified rather than copied. The 10 % row is the published cross-check: community-derived sources give
+/// `C ~= 0.01475`, and this independently-solved table lands on **147** basis points.
+const PRD_CONSTANTS_BPS: [u16; 101] = [
+    0, 2, 6, 14, 24, 38, 54, 74, 96, 120, 147, 177, 210, 245, 282, 322, 365, 409, 456, 505, 557,
+    611, 667, 725, 785, 847, 912, 978, 1047, 1117, 1189, 1264, 1340, 1418, 1498, 1580, 1663, 1749,
+    1836, 1925, 2015, 2109, 2204, 2299, 2395, 2493, 2599, 2705, 2810, 2916, 3021, 3127, 3233, 3341,
+    3474, 3604, 3732, 3858, 3983, 4105, 4226, 4346, 4464, 4581, 4697, 4811, 4925, 5075, 5294, 5507,
+    5714, 5915, 6111, 6301, 6486, 6667, 6842, 7013, 7179, 7342, 7500, 7654, 7805, 7952, 8095, 8235,
+    8372, 8506, 8636, 8764, 8889, 9011, 9130, 9247, 9362, 9474, 9583, 9691, 9796, 9899, 10000,
+];
+
+/// The PRD constant for a nominal chance, rounded to the nearest whole percent.
+///
+/// Whole-percent resolution is deliberate: the table is regenerated by test, and a per-basis-point table
+/// would be 10,001 entries to buy a difference no player can perceive.
+#[must_use]
+pub fn prd_constant_bps(chance_bps: u16) -> u16 {
+    let percent = usize::from(chance_bps.min(BASIS_POINTS)).div_euclid(100);
+    let remainder = usize::from(chance_bps.min(BASIS_POINTS)).rem_euclid(100);
+    let index = (percent + usize::from(remainder >= 50)).min(100);
+    PRD_CONSTANTS_BPS[index]
+}
+
+/// The escalating probability for the `attempts`-th try since the last success, in basis points.
+///
+/// `attempts` is 1-based: the first attempt after a success is attempt 1 and sees exactly `C`.
+#[must_use]
+pub fn prd_chance_bps(chance_bps: u16, attempts: u16) -> u16 {
+    let constant = u32::from(prd_constant_bps(chance_bps));
+    let escalated = constant.saturating_mul(u32::from(attempts.max(1)));
+    u16::try_from(escalated.min(u32::from(BASIS_POINTS))).unwrap_or(BASIS_POINTS)
+}
+
 pub(crate) fn integer_sqrt(value: u128) -> u128 {
     if value < 2 {
         return value;
@@ -272,6 +404,18 @@ pub struct CombatStats {
     pub move_speed_mm_per_tick: u32,
     pub physical_reduction_bps: u16,
     pub magic_reduction_bps: u16,
+    /// Nominal critical-strike chance. It is *nominal* on purpose: the roll runs under pseudo-random
+    /// distribution, so this is the long-run average rather than a per-swing probability.
+    pub crit_chance_bps: u16,
+    /// Total damage on a critical strike, as a multiplier: 20,000 bps = 200 % damage.
+    pub crit_damage_bps: u16,
+    /// Percentage penetration of the target's PHYSICAL mitigation. It scales the target's reduction, it
+    /// does not subtract an armour value — this kernel models mitigation directly in basis points, and a
+    /// separate armour stat would be a second representation of the same quantity that could disagree.
+    pub physical_penetration_bps: u16,
+    pub magic_penetration_bps: u16,
+    /// Fraction of damage actually applied that is returned to the attacker as health.
+    pub lifesteal_bps: u16,
 }
 
 impl CombatStats {
@@ -361,6 +505,14 @@ impl CombatStats {
                 StatKind::MagicReduction,
             ))
             .unwrap_or(BASIS_POINTS - 1),
+            // Growth deliberately does not scale the offensive stats: per-level crit and penetration are
+            // an item-and-ability concern, and a hero that criticals harder purely for surviving is a
+            // balance decision nobody authored.
+            crit_chance_bps: self.crit_chance_bps,
+            crit_damage_bps: self.crit_damage_bps,
+            physical_penetration_bps: self.physical_penetration_bps,
+            magic_penetration_bps: self.magic_penetration_bps,
+            lifesteal_bps: self.lifesteal_bps,
         }
     }
 
@@ -386,8 +538,70 @@ impl CombatStats {
                 modifiers,
             ))
             .unwrap_or(BASIS_POINTS - 1),
+            crit_chance_bps: resolve_bps(self.crit_chance_bps, StatKind::CritChance, modifiers),
+            crit_damage_bps: resolve_bps(self.crit_damage_bps, StatKind::CritDamage, modifiers),
+            physical_penetration_bps: resolve_bps(
+                self.physical_penetration_bps,
+                StatKind::PhysicalPenetration,
+                modifiers,
+            ),
+            magic_penetration_bps: resolve_bps(
+                self.magic_penetration_bps,
+                StatKind::MagicPenetration,
+                modifiers,
+            ),
+            lifesteal_bps: resolve_bps(self.lifesteal_bps, StatKind::Lifesteal, modifiers),
         }
     }
+
+    /// A stat block that contributes nothing.
+    ///
+    /// Used when a damage source no longer exists — a projectile outliving its caster, for instance. It
+    /// deliberately has zero crit chance, zero penetration and zero lifesteal, so a dead attacker's hit
+    /// lands as a plain one rather than inheriting whatever the last live actor happened to have.
+    #[must_use]
+    pub const fn inert() -> Self {
+        Self {
+            max_health: 1,
+            max_resource: 0,
+            move_speed_mm_per_tick: 0,
+            physical_reduction_bps: 0,
+            magic_reduction_bps: 0,
+            crit_chance_bps: 0,
+            crit_damage_bps: BASIS_POINTS,
+            physical_penetration_bps: 0,
+            magic_penetration_bps: 0,
+            lifesteal_bps: 0,
+        }
+    }
+
+    /// The mitigation this actor applies to one damage school, after the attacker's penetration.
+    ///
+    /// Penetration SCALES the reduction rather than subtracting an armour value, and it can drive the
+    /// reduction to zero but never below it — mirroring the documented rule that penetration cannot make
+    /// effective armour negative.
+    #[must_use]
+    pub fn reduction_after_penetration(self, school: DamageSchool, attacker: Self) -> u16 {
+        let (reduction, penetration) = match school {
+            DamageSchool::Physical => (
+                self.physical_reduction_bps,
+                attacker.physical_penetration_bps,
+            ),
+            DamageSchool::Magic => (self.magic_reduction_bps, attacker.magic_penetration_bps),
+            DamageSchool::True => return 0,
+        };
+        let remaining =
+            u32::from(BASIS_POINTS).saturating_sub(u32::from(penetration.min(BASIS_POINTS)));
+        let scaled = u32::from(reduction) * remaining / u32::from(BASIS_POINTS);
+        u16::try_from(scaled).unwrap_or(BASIS_POINTS - 1)
+    }
+}
+
+/// Resolve a basis-point stat, saturating into `u16` at its clamped domain.
+fn resolve_bps(base: u16, kind: StatKind, modifiers: &[StatModifier]) -> u16 {
+    let (_, maximum) = kind.domain();
+    let resolved = resolve_stat(u32::from(base), kind, modifiers);
+    u16::try_from(resolved).unwrap_or_else(|_| u16::try_from(maximum).unwrap_or(u16::MAX))
 }
 
 /// What killing this actor is worth.
@@ -493,6 +707,11 @@ pub enum StatKind {
     MoveSpeed,
     PhysicalReduction,
     MagicReduction,
+    CritChance,
+    CritDamage,
+    PhysicalPenetration,
+    MagicPenetration,
+    Lifesteal,
 }
 
 impl StatKind {
@@ -504,6 +723,16 @@ impl StatKind {
             Self::MaxHealth => (1, u32::MAX as i64),
             Self::MaxResource | Self::MoveSpeed => (0, u32::MAX as i64),
             Self::PhysicalReduction | Self::MagicReduction => (0, BASIS_POINTS as i64 - 1),
+            // Chance and penetration are fractions of a whole and may reach it; a 100 % crit chance and a
+            // 100 % penetration are both legal end-states. Reductions above are the exception, and stay
+            // strictly below whole so no stack can produce an immortal actor.
+            Self::CritChance | Self::PhysicalPenetration | Self::MagicPenetration => {
+                (0, BASIS_POINTS as i64)
+            }
+            // Lifesteal is bounded well above 100 % so a build can exceed it, but not unboundedly.
+            Self::Lifesteal => (0, 4 * BASIS_POINTS as i64),
+            // A critical strike may not deal LESS than a normal hit, so the multiplier floors at whole.
+            Self::CritDamage => (BASIS_POINTS as i64, 10 * BASIS_POINTS as i64),
         }
     }
 }

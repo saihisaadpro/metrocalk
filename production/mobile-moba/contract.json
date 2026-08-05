@@ -211,7 +211,12 @@
       "minted-not-deducted-assist-gold-and-victim-streak-shutdowns",
       "ability-ranks-that-change-magnitude-and-reconstruct-the-level",
       "player-issued-never-cc-gated-ability-upgrade-command",
-      "authored-bounty-and-growth-cooked-from-the-document"
+      "authored-bounty-and-growth-cooked-from-the-document",
+      "keyed-not-streamed-deterministic-rng-with-domain-separation",
+      "derived-and-test-reverified-pseudo-random-distribution-table",
+      "ordered-damage-pipeline-crit-penetration-shield-lifesteal",
+      "shields-as-status-effects-owning-a-pool-with-co-expiry",
+      "lifesteal-from-applied-damage-settling-after-the-batch"
     ],
     "acceptanceBlockers": [
       "replay-file-checkpoint-index-and-scrub-integration",
@@ -229,7 +234,9 @@
       "corridor-following-movement-for-owned-actors-needs-an-owner-safe-server-rules-channel",
       "editor-bridge-wiring-commit-blocked-by-parallel-lane-entanglement",
       "in-game-hud-input-and-client-runtime",
-      "certified-idle-host-and-min-spec-perf-profile"
+      "certified-idle-host-and-min-spec-perf-profile",
+      "auto-attack-loop-and-attack-move-gp08-deferred-from-adr-100",
+      "isolate-the-adr-100-tick-work-and-soak-regression"
     ],
     "ciEvidence": {
       "status": "pending-push",
@@ -240,49 +247,60 @@
   },
   "mob2LocalEvidence": {
     "scope": "windows-local-development-only-not-acceptance",
-    "date": "2026-08-04",
+    "date": "2026-08-05",
     "retainedCiArtifact": false,
-    "hostBackgroundLoadPercent": 11,
+    "hostBackgroundLoadPercent": 13,
     "fullLoadSoak": {
       "mode": "release",
       "actors": 512,
       "ticks": 108000,
       "constantMemory": true,
-      "status": "measured-low-contention-host",
-      "elapsedSeconds": 70.79,
+      "status": "measured-regression-tracked",
+      "elapsedSeconds": 194.3,
+      "priorElapsedSeconds": 70.79,
       "priorIdleRangeSeconds": [
         61.37,
         115.5
       ],
       "result": "passed",
-      "note": "Inside the prior idle range, so GP-07's per-frame stat audit plus GP-03's projectile phase show no measurable regression. The host was at ~11% background load, well below the ~32% that invalidated the previous round, but this is still not a certified-idle rig."
+      "note": "2.7x slower than the previous run and outside the prior idle range. The cause is NOT isolated and is not claimed. Tracked as an owned follow-up; the closing gate is a profile that names the cost and either removes it or justifies it."
     },
     "tickWork": {
       "mode": "release",
       "actors": 512,
       "warmupTicks": 1000,
       "sampleTicks": 10000,
-      "status": "measured-low-contention-host",
+      "status": "measured-regression-tracked",
       "observation": {
-        "p50Ns": 629300,
-        "p95Ns": 727400,
-        "p99Ns": 821300,
-        "maxNs": 1151600
+        "p50Ns": 1489800,
+        "p95Ns": 1599300,
+        "p99Ns": 1738700,
+        "maxNs": 2120800
       },
+      "priorP99Ns": 821300,
       "p99BudgetNs": 10000000,
-      "gateResult": "passed-with-12x-headroom",
-      "rollingDigest": "ffd259f9bd53515c",
-      "owed": "a certified-idle host and the still-owed true min-spec profile"
+      "gateResult": "passed-with-5.7x-headroom",
+      "rollingDigest": "b2f48c54f8b540e3"
     },
     "captureHarness": {
-      "scenarios": 20,
-      "frames": 121,
-      "observableChecks": 62,
+      "scenarios": 21,
+      "frames": 125,
+      "observableChecks": 68,
       "failing": 0,
       "ciExecuted": true,
       "workflow": ".github/workflows/mobile-gameplay-tripwire.yml"
     },
-    "measurementCaveat": "Wall-clock numbers from one unpaced Windows developer machine at ~11% background load. Only the executable p99 budget gate and the retained-CI blocker carry weight; the soak elapsed time is comparative evidence against the prior idle range, not a published bound."
+    "mobileAbiChecks": {
+      "status": "RUN-LOCALLY-FIRST-TIME",
+      "targets": [
+        "aarch64-linux-android",
+        "aarch64-apple-ios",
+        "aarch64-apple-ios-sim"
+      ],
+      "toolchain": "pinned 1.92.0-x86_64-pc-windows-msvc (same compiler as the default, so no drift)",
+      "note": "rustup was missing as a CLI and was installed. The prior 'CI is green and wasm32 is the local proxy' caveat is closed. This is a COMPILE check, not a device boot."
+    },
+    "measurementCaveat": "One unpaced Windows developer machine at ~13% background load. The soak regression is recorded as a regression, not explained away."
   },
   "mob2Packaging": {
     "artifact": "production/mobile-moba/server/Dockerfile",

@@ -112,6 +112,13 @@ impl Error for InvariantViolation {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StatusEffect {
     pub(crate) id: StatusEffectId,
+    /// Remaining absorption, if this effect is a shield.
+    ///
+    /// A shield lives here rather than in its own per-actor list so it inherits the co-expiry rule for
+    /// free: the pool cannot outlive the effect that granted it, exactly as a slow's speed penalty cannot
+    /// outlive the slow. A separate list would need its own bound, order, audit, codec and expiry to
+    /// re-implement what this one already proves.
+    pub(crate) shield_pool: u32,
     /// The last tick on which this effect still restricts. It is removed at the top of `expires_at + 1`, so a
     /// duration of N applied during tick T covers ticks T+1 through T+N inclusive — exactly N ticks of
     /// gameplay effect, which is what a designer authoring "a 30-tick stun" means.
@@ -231,6 +238,12 @@ pub(crate) struct ActorState {
     /// assert a level its own experience does not produce.
     pub(crate) level: u8,
     pub(crate) unspent_ability_points: u8,
+    /// Attempts since this actor's last critical strike, driving the pseudo-random distribution.
+    ///
+    /// This is the ONLY mutable state the RNG has. The generator itself is keyed and stateless, so the
+    /// single thing that can desync is this counter — and it is checkpointed, digested and audited like
+    /// every other piece of simulation truth.
+    pub(crate) crit_attempts: u16,
     /// Recent damaging contributors, strictly sorted by source and bounded by the configured budget.
     /// Lives on the victim so it inherits the per-actor machinery that is already bounded, audited,
     /// encoded, hashed, and destroyed with the actor — nobody can assist on the death of an actor that
@@ -284,6 +297,7 @@ impl ActorState {
             // Level 1 is the identity of `with_growth`, so the authored stats ARE the level-1 base stats.
             level: 1,
             unspent_ability_points: 0,
+            crit_attempts: 0,
             damage_credits: Vec::new(),
             base_stats: spawn.stats,
             modifiers: Vec::new(),
@@ -750,6 +764,21 @@ impl MatchRuntime {
         controls: &[ControlKind],
         modifiers: &[(StatKind, ModifierOp)],
     ) -> Result<StatusEffectId, RuntimeError> {
+        self.apply_status_effect_with_shield(actor, duration_ticks, controls, modifiers, 0)
+    }
+
+    /// Apply a timed effect that additionally carries an absorption pool.
+    ///
+    /// A shield is expressed this way rather than as its own concept so its pool expires WITH the effect
+    /// that granted it - the same co-expiry rule that stops a slow's speed penalty outliving the slow.
+    pub fn apply_status_effect_with_shield(
+        &mut self,
+        actor: ActorId,
+        duration_ticks: u32,
+        controls: &[ControlKind],
+        modifiers: &[(StatKind, ModifierOp)],
+        shield_pool: u32,
+    ) -> Result<StatusEffectId, RuntimeError> {
         if self.phase != MatchPhase::Active {
             return Err(RuntimeError::InvalidPhase(
                 "status effects require an active match",
@@ -793,6 +822,7 @@ impl MatchRuntime {
             .map_err(|_| RuntimeError::UnknownActor(actor))?;
         candidate.actors[slot].status_effects.push(StatusEffect {
             id,
+            shield_pool,
             expires_at,
             controls: mask,
             modifiers: applied,
@@ -1890,6 +1920,16 @@ impl MatchRuntime {
                 "spent and unspent ability points do not reconstruct the level",
             ));
         }
+        // The PRD counter is bounded by construction (it resets on a success and saturates), but a
+        // decoded one is not: a payload could assert an enormous attempt count to force a guaranteed
+        // critical strike on the next swing. Bound it against the largest attempt count that can still
+        // matter - past `BASIS_POINTS / smallest-constant` the chance is already pinned at 100 %.
+        if actor.crit_attempts > BASIS_POINTS {
+            return Err(Self::violation(
+                Some(actor.id),
+                "critical-strike attempt counter is beyond any chance it could escalate",
+            ));
+        }
         if actor.damage_credits.len() > usize::from(self.config.max_damage_credits_per_actor) {
             return Err(Self::violation(
                 Some(actor.id),
@@ -2341,7 +2381,7 @@ impl MatchRuntime {
     #[must_use]
     pub fn world_digest(&self) -> WorldDigest {
         let mut hash = StableHash::new();
-        hash.bytes(b"metrocalk-gameplay-mob2-v9");
+        hash.bytes(b"metrocalk-gameplay-mob2-v10");
         hash.u64(self.seed);
         hash.u64(self.tick);
         hash.phase(self.phase);
@@ -3295,6 +3335,10 @@ impl MatchRuntime {
 
         let mut deaths = Vec::new();
         let mut kills = Vec::new();
+        // Collected during the loop and applied after it: the PRD counter belongs to the ATTACKER, not the
+        // target the loop is grouped by, and lifesteal heals the attacker.
+        let mut crit_rolls: Vec<(ActorId, bool)> = Vec::new();
+        let mut lifesteal: Vec<(ActorId, u32)> = Vec::new();
         for (target, effects) in by_target {
             let target_index = self.actor_index(target).expect("validated cast target");
             let health_before = self.actors[target_index].health;
@@ -3335,14 +3379,59 @@ impl MatchRuntime {
                 else {
                     continue;
                 };
-                let reduction = match school {
-                    DamageSchool::Physical => {
-                        self.actors[target_index].stats.physical_reduction_bps
-                    }
-                    DamageSchool::Magic => self.actors[target_index].stats.magic_reduction_bps,
-                    DamageSchool::True => 0,
+                // ---- THE DAMAGE PIPELINE. This order IS the determinism contract. ----
+                // 1. Critical strike, rolled under PRD and applied PRE-mitigation, so armour still
+                //    matters against a crit. Only a basic attack may critical: letting every ability
+                //    crit is a balance decision nobody authored, and it is trivially added later per
+                //    ability rather than silently assumed here.
+                // 2. Penetration scales the target's mitigation (never below zero).
+                // 3. Mitigation applies to the crit-multiplied amount.
+                // 4. Shields absorb what mitigation left, oldest-expiring first.
+                // 5. Health takes the remainder.
+                // 6. Lifesteal is computed from what was ACTUALLY applied, and lands after the batch.
+                let attacker_stats = self
+                    .actor_state(source)
+                    .map_or_else(CombatStats::inert, |actor| actor.stats);
+                let critical = matches!(cause, DamageCause::BasicAttack)
+                    && attacker_stats.crit_chance_bps > 0
+                    && {
+                        let attempts = self
+                            .actor_state(source)
+                            .map_or(0, |actor| actor.crit_attempts)
+                            .saturating_add(1);
+                        crate::model::roll_under_bps(
+                            self.seed,
+                            crate::model::RngDomain::CriticalStrike,
+                            self.tick,
+                            source.get(),
+                            target.get(),
+                            u64::from(attempts),
+                            crate::model::prd_chance_bps(attacker_stats.crit_chance_bps, attempts),
+                        )
+                    };
+                if matches!(cause, DamageCause::BasicAttack) && attacker_stats.crit_chance_bps > 0 {
+                    crit_rolls.push((source, critical));
+                }
+                let struck = if critical {
+                    u32::try_from(
+                        u64::from(amount) * u64::from(attacker_stats.crit_damage_bps)
+                            / u64::from(BASIS_POINTS),
+                    )
+                    .unwrap_or(u32::MAX)
+                } else {
+                    amount
                 };
-                let applied = reduce_damage(amount, reduction).min(settled_health);
+                let reduction = self.actors[target_index]
+                    .stats
+                    .reduction_after_penetration(school, attacker_stats);
+                let mitigated = reduce_damage(struck, reduction);
+                let absorbed = self.absorb_with_shields(target_index, mitigated);
+                let applied = absorbed.min(settled_health);
+                if applied > 0 && attacker_stats.lifesteal_bps > 0 {
+                    let healed = u64::from(applied) * u64::from(attacker_stats.lifesteal_bps)
+                        / u64::from(BASIS_POINTS);
+                    lifesteal.push((source, u32::try_from(healed).unwrap_or(u32::MAX)));
+                }
                 let health_after = settled_health - applied;
                 if settled_health > 0 && health_after == 0 {
                     killer = Some(source);
@@ -3411,10 +3500,93 @@ impl MatchRuntime {
                 deaths.push(target);
             }
         }
+        // The PRD counter advances once per attempt and resets on a success. Applied after the batch so a
+        // single swing cannot see its own counter move mid-settlement.
+        for (actor, critical) in crit_rolls {
+            let Some(index) = self.actor_index(actor) else {
+                continue;
+            };
+            self.actors[index].crit_attempts = if critical {
+                0
+            } else {
+                self.actors[index].crit_attempts.saturating_add(1)
+            };
+            self.dirty.insert(actor);
+        }
+        // Lifesteal lands AFTER the batch, which is a rule worth naming: it cannot rescue an attacker from
+        // damage that was lethal on the same tick. That keeps the order-independent mutual kill the
+        // settlement policy promises - a heal that could undo a simultaneous death would make survival
+        // depend on which target the loop reached first.
+        for (actor, amount) in lifesteal {
+            let Some(index) = self.actor_index(actor) else {
+                continue;
+            };
+            if !self.actors[index].alive() || amount == 0 {
+                continue;
+            }
+            let max_health = self.actors[index].stats.max_health;
+            let before = self.actors[index].health;
+            let after = before.saturating_add(amount).min(max_health);
+            if after == before {
+                continue;
+            }
+            self.actors[index].health = after;
+            self.dirty.insert(actor);
+            self.pending_events.push(MatchEvent::LifestealApplied {
+                actor,
+                amount: after - before,
+                health_after: after,
+            });
+        }
         for actor in deaths {
             self.apply_death_rule(actor)?;
         }
         Ok(kills)
+    }
+
+    /// Consume shields against `damage`, returning what reaches health.
+    ///
+    /// Shields are consumed **oldest-expiring first**: spending the pool that is about to vanish anyway is
+    /// the player-favourable choice and it is deterministic, since expiry ties break on the monotonic
+    /// effect id. A shield whose pool reaches zero is NOT removed here — it expires on its own schedule,
+    /// because its other half (the restrictions and modifiers it owns) may still be doing work.
+    fn absorb_with_shields(&mut self, target_index: usize, damage: u32) -> u32 {
+        if damage == 0 || self.actors[target_index].status_effects.is_empty() {
+            return damage;
+        }
+        let mut order: Vec<(Tick, StatusEffectId, usize)> = self.actors[target_index]
+            .status_effects
+            .iter()
+            .enumerate()
+            .filter(|(_, effect)| effect.shield_pool > 0)
+            .map(|(index, effect)| (effect.expires_at, effect.id, index))
+            .collect();
+        if order.is_empty() {
+            return damage;
+        }
+        order.sort_unstable();
+        let mut remaining = damage;
+        for (_, _, index) in order {
+            if remaining == 0 {
+                break;
+            }
+            let pool = self.actors[target_index].status_effects[index].shield_pool;
+            let absorbed = pool.min(remaining);
+            self.actors[target_index].status_effects[index].shield_pool = pool - absorbed;
+            remaining -= absorbed;
+            if absorbed > 0 {
+                let actor = self.actors[target_index].id;
+                let effect = self.actors[target_index].status_effects[index].id;
+                self.dirty.insert(actor);
+                self.pending_events.push(MatchEvent::ShieldAbsorbed {
+                    actor,
+                    effect,
+                    amount: absorbed,
+                    remaining: pool - absorbed,
+                });
+            }
+        }
+        remaining
     }
 
     fn apply_death_rule(&mut self, actor_id: ActorId) -> Result<(), RuntimeError> {
@@ -3808,12 +3980,14 @@ pub(crate) const fn event_tag(event: MatchEvent) -> u8 {
         MatchEvent::ExperienceGranted { .. } => 27,
         MatchEvent::HeroLevelUp { .. } => 28,
         MatchEvent::AbilityRankUp { .. } => 29,
+        MatchEvent::ShieldAbsorbed { .. } => 30,
+        MatchEvent::LifestealApplied { .. } => 31,
     }
 }
 
 pub(crate) fn digest_frame(frame: &ServerFrame) -> FrameDigest {
     let mut hash = StableHash::new();
-    hash.bytes(b"metrocalk-gameplay-frame-v7");
+    hash.bytes(b"metrocalk-gameplay-frame-v8");
     hash.u64(frame.tick);
     hash.phase(frame.phase);
     hash.len(frame.changed.len());
@@ -3906,6 +4080,11 @@ impl StableHash {
             StatKind::MoveSpeed => 2,
             StatKind::PhysicalReduction => 3,
             StatKind::MagicReduction => 4,
+            StatKind::CritChance => 5,
+            StatKind::CritDamage => 6,
+            StatKind::PhysicalPenetration => 7,
+            StatKind::MagicPenetration => 8,
+            StatKind::Lifesteal => 9,
         });
         match modifier.op {
             ModifierOp::Flat { magnitude } => {
@@ -3933,6 +4112,11 @@ impl StableHash {
         self.u32(stats.move_speed_mm_per_tick);
         self.u16(stats.physical_reduction_bps);
         self.u16(stats.magic_reduction_bps);
+        self.u16(stats.crit_chance_bps);
+        self.u16(stats.crit_damage_bps);
+        self.u16(stats.physical_penetration_bps);
+        self.u16(stats.magic_penetration_bps);
+        self.u16(stats.lifesteal_bps);
     }
 
     fn provenance(&mut self, provenance: ActorProvenance) {
@@ -4199,6 +4383,7 @@ impl StableHash {
             experience,
             level,
             unspent_ability_points,
+            crit_attempts,
             damage_credits,
             base_stats: _,
             modifiers: _,
@@ -4246,6 +4431,7 @@ impl StableHash {
         self.bounty(*bounty);
         self.u32(*experience);
         self.u8(*unspent_ability_points);
+        self.u16(*crit_attempts);
         self.len(damage_credits.len());
         for credit in damage_credits {
             self.u64(credit.source.get());
@@ -4262,6 +4448,7 @@ impl StableHash {
         for effect in &actor.status_effects {
             self.u64(effect.id.get());
             self.u64(effect.expires_at);
+            self.u32(effect.shield_pool);
             self.u8(effect.controls.bits());
             self.len(effect.modifiers.len());
             for owned in &effect.modifiers {
@@ -4714,6 +4901,26 @@ impl StableHash {
                 self.u64(actor.get());
                 self.u32(ability.get());
                 self.u8(rank);
+            }
+            MatchEvent::ShieldAbsorbed {
+                actor,
+                effect,
+                amount,
+                remaining,
+            } => {
+                self.u64(actor.get());
+                self.u64(effect.get());
+                self.u32(amount);
+                self.u32(remaining);
+            }
+            MatchEvent::LifestealApplied {
+                actor,
+                amount,
+                health_after,
+            } => {
+                self.u64(actor.get());
+                self.u32(amount);
+                self.u32(health_after);
             }
         }
     }
