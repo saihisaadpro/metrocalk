@@ -269,6 +269,13 @@ pub struct CamView {
 /// Scene state shared between the app (writer, from core deltas + input) and the render loop (reader).
 #[derive(Default)]
 pub struct SceneState {
+    /// The live surface aspect (width/height), published by the render loop each frame.
+    ///
+    /// Without this, `frame_all` framed against a compile-time constant and produced the SAME camera
+    /// distance at 900x900 as at 1600x850 — the resize captures in the viewport stress audit were
+    /// byte-identical in camera state, which is how this was found. A framing routine that cannot see
+    /// the shape of the frame is guessing.
+    pub surface_aspect: f32,
     pub instances: Vec<Instance>,
     /// Entity id (Loro key) parallel to `instances` — maps a picked index back to an entity.
     pub ids: Vec<String>,
@@ -411,7 +418,14 @@ impl SceneState {
     /// that fits them in view. A pure camera op (invariant 4 — render-state only, not undoable). No-op on an
     /// empty scene. Exits focus dim (framing-all looks at everything).
     pub fn frame_all(&mut self) {
-        self.frame_all_with_aspect(DEFAULT_ASPECT);
+        // The aspect the user is actually looking through, not a constant. Falls back only before the
+        // first frame has published one.
+        let aspect = if self.surface_aspect > 0.01 {
+            self.surface_aspect
+        } else {
+            DEFAULT_ASPECT
+        };
+        self.frame_all_with_aspect(aspect);
     }
 
     /// Frame the whole scene through a lens of the given aspect ratio.
@@ -1866,6 +1880,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // through rather than an assumed one.
             let aspect_hint = config.width as f32 / config.height.max(1) as f32;
             let mut st = shared.lock().unwrap();
+            // Publish it before anything reads it, so a `frame_all` arriving from the UI this frame
+            // frames against the surface as it is now rather than as it was when the window opened.
+            st.surface_aspect = aspect_hint;
             if st.distance == 0.0 {
                 // The camera has never been placed. Frame the scene rather than falling back to a
                 // hard-coded distance of 60: that constant is the reason every asset, at every scale,
@@ -3594,6 +3611,47 @@ mod tests {
     // ── viewport framing ──────────────────────────────────────────────────────────────────────
     // These exist because `frame_all` had NO test coverage at all, which is why a framing constant
     // that ignored both the field of view and the aspect ratio survived unnoticed.
+
+    #[test]
+    fn frame_all_uses_the_live_surface_aspect_not_a_constant() {
+        // The regression the stress audit caught: resizing the window from 1600x850 to 900x900 left the
+        // camera distance byte-identical, because `frame_all` framed against a compile-time constant.
+        let mut wide = SceneState {
+            surface_aspect: 1600.0 / 850.0,
+            ..SceneState::default()
+        };
+        let mut tall = SceneState {
+            surface_aspect: 900.0 / 900.0,
+            ..SceneState::default()
+        };
+        // A subject WIDER than it is tall, viewed front-on so its width maps to the screen's horizontal
+        // axis. A cube would prove nothing: for any aspect >= 1 the vertical axis limits, so a cube is
+        // correctly framed at the same distance in a square window and a wide one — as an earlier
+        // version of this test discovered the hard way.
+        let unit = |x: f32| Instance {
+            center: [x, 0.0, 0.0],
+            scale: 1.0,
+            color: [1.0, 1.0, 1.0],
+            selected: 0.0,
+            rotation: IDENTITY_QUAT,
+            material: [0.0, 0.5, 0.0, 0.0],
+        };
+        for st in [&mut wide, &mut tall] {
+            st.instances = vec![unit(-6.0), unit(6.0)];
+            st.mesh_slots = vec![-1, -1];
+            st.orbit = std::f32::consts::FRAC_PI_2; // front-on: world X becomes screen right
+            st.elevation = 0.0;
+            st.frame_all();
+        }
+        assert!(
+            (wide.distance - tall.distance).abs() > 1e-3,
+            "a square window and a wide one must not produce the same framing: {} vs {}",
+            wide.distance,
+            tall.distance
+        );
+        // The squarer window sees LESS horizontally, so it needs more distance for the same subject.
+        assert!(tall.distance > wide.distance);
+    }
 
     #[test]
     fn framing_fits_the_tighter_viewport_axis_not_always_the_vertical_one() {
