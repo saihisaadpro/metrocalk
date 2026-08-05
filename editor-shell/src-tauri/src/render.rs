@@ -85,6 +85,34 @@ impl LocalBounds {
     }
 }
 
+impl SceneState {
+    /// Half-height of the mesh in `slot`, in the mesh's own local units.
+    ///
+    /// Exists so a projection can SEAT an actor on the ground instead of guessing its height. Every
+    /// imported asset is normalised by `AssetAffine::unit_from_bounds` to a max extent of 1.0 and
+    /// recentred on its bounding-box centre, so an asset's half-height is 0.5 only along its LONGEST
+    /// axis and less along the others. A caller that assumes 0.5 sinks tall assets into the floor and
+    /// floats wide ones above it — and a floating caster throws a shadow that is visibly detached from
+    /// it, which is exactly how this was found.
+    ///
+    /// Falls back to 0.5, the half-extent of the unit cube the placeholder path draws.
+    #[must_use]
+    pub fn mesh_half_height(&self, slot: i32) -> f32 {
+        usize::try_from(slot)
+            .ok()
+            .and_then(|slot| self.meshes.get(slot))
+            .and_then(local_mesh_bounds)
+            .map_or(0.5, |bounds| bounds.half_size[1])
+    }
+}
+
+/// The presentation ground's albedo.
+///
+/// Darkened from 0.62-ish grey: the ground measured BRIGHTER than the lit characters standing on it, so
+/// silhouettes had nothing to read against and the whole frame collapsed into one mid-grey band. A
+/// viewport floor's job is to be the value everything else is legible against, not to compete.
+pub const GROUND_ALBEDO: [f32; 3] = [0.30, 0.31, 0.34];
+
 fn local_mesh_bounds(mesh: &MeshGpu) -> Option<LocalBounds> {
     let mut lo = Vec3::splat(f32::INFINITY);
     let mut hi = Vec3::splat(f32::NEG_INFINITY);
@@ -134,6 +162,75 @@ fn instance_world_bounds(instance: &Instance, local: LocalBounds) -> (Vec3, Vec3
 /// Rendered world bounds using each instance's authored mesh bounds (or the placeholder unit cube).
 /// Keeping this in one place prevents camera framing and shadow fitting from quietly disagreeing on CAD
 /// assets whose vertices are authored in millimetres and displayed through a small instance scale.
+/// The viewport's vertical field of view. Named once so the projection and the framing that fits
+/// against it can never disagree — they were two unrelated literals before.
+pub const CAMERA_FOV_DEG: f32 = 55.0;
+
+/// Viewport exposure. Placed so the lit scene lands near the tone curve's mid-grey rather than a stop
+/// and a half above it. Named once because a second, independent default in the thumbnail path had
+/// already drifted from the viewport's.
+pub const DEFAULT_EXPOSURE: f32 = 0.45;
+
+/// The aspect assumed when framing happens before a real surface size is known. 16:9 rather than 1:1 so
+/// the pre-surface guess errs toward the shape of a real editor viewport.
+pub const DEFAULT_ASPECT: f32 = 16.0 / 9.0;
+
+/// The fraction of the tighter viewport half-extent the subject should span. 0.72 sits inside the
+/// 55-75% band a professional viewport targets, leaving a margin that reads as deliberate framing
+/// rather than as a crop.
+pub const FRAME_OCCUPANCY: f32 = 0.72;
+
+/// Distance at which the scene's bounding box fills `FRAME_OCCUPANCY` of the frame, fitted per axis
+/// against the lens actually in use.
+///
+/// A **projected-AABB** fit, not a bounding-sphere one, and that distinction is the whole point. The
+/// sphere around a 12 m x 1 m lane is 12 m tall, so a sphere fit reserves 12 m of VERTICAL frame for
+/// content that is one metre tall and pushes the camera back by an order of magnitude. That is exactly
+/// what the baseline screenshot shows: a wide, flat scene stranded in empty grey. Projecting the box
+/// onto the camera's own right/up axes and fitting each against its own half-angle spends the frame on
+/// the extent that is really there.
+///
+/// The previous implementation was `max_half_edge * 2.4`, which read neither the field of view nor the
+/// aspect ratio nor the view direction - three independent ways for the framing to be wrong.
+#[must_use]
+pub fn fit_distance(half_extent: Vec3, aspect: f32, orbit: f32, elevation: f32) -> f32 {
+    let aspect = if aspect.is_finite() && aspect > 0.01 {
+        aspect
+    } else {
+        DEFAULT_ASPECT
+    };
+    let half_v = (CAMERA_FOV_DEG.to_radians() * 0.5).clamp(0.01, 1.5);
+    let half_h = (half_v.tan() * aspect).atan().max(0.01);
+
+    // The camera basis this distance will be used with, so the fit matches the view it frames.
+    let forward = -Vec3::new(
+        orbit.cos() * elevation.cos(),
+        elevation.sin(),
+        orbit.sin() * elevation.cos(),
+    )
+    .normalize_or_zero();
+    let world_up = if forward.y.abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let right = forward.cross(world_up).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+
+    // An axis-aligned box's extent along an arbitrary unit axis is the dot of its half-extents with
+    // that axis's absolute components - no corner enumeration needed.
+    let h = half_extent.abs();
+    let ext_r = h.dot(right.abs()).max(1e-4);
+    let ext_u = h.dot(up.abs()).max(1e-4);
+    let ext_f = h.dot(forward.abs());
+
+    // Each axis needs its own distance; the frame must satisfy the more demanding one. `ext_f` is
+    // added because the box has depth: fitting its centre would push its near face through the lens.
+    let need_v = ext_u / half_v.tan();
+    let need_h = ext_r / half_h.tan();
+    (need_v.max(need_h) / FRAME_OCCUPANCY + ext_f).clamp(0.3, 4000.0)
+}
+
 fn scene_world_bounds(
     instances: &[Instance],
     mesh_slots: &[i32],
@@ -314,6 +411,27 @@ impl SceneState {
     /// that fits them in view. A pure camera op (invariant 4 — render-state only, not undoable). No-op on an
     /// empty scene. Exits focus dim (framing-all looks at everything).
     pub fn frame_all(&mut self) {
+        self.frame_all_with_aspect(DEFAULT_ASPECT);
+    }
+
+    /// Frame the whole scene through a lens of the given aspect ratio.
+    ///
+    /// The previous implementation was `distance = max_half_edge * 2.4`, and every part of that was
+    /// wrong in a way that only shows up as "the asset looks small":
+    ///
+    /// * **It never read the field of view.** 2.4 is only a fit for one particular FOV; the projection
+    ///   uses a hard 55 degrees, and nothing tied the two together. Changing the lens silently changed
+    ///   how much of the frame the subject filled.
+    /// * **It never read the aspect ratio.** It fitted the scene's longest axis against the VERTICAL
+    ///   extent regardless of orientation, so a wide, flat scene — a lane, an assembly, a character
+    ///   turntable — was pushed back by the full aspect ratio and left empty bands above and below.
+    /// * **It used the longest half-EDGE, not the bounding-sphere radius**, which under-covers a
+    ///   diagonal by up to sqrt(3) and makes the fit orientation-dependent.
+    ///
+    /// This computes the true tangency distance for a bounding sphere against whichever of the two
+    /// half-angles is the tighter, then divides by a target occupancy so the subject fills a chosen
+    /// fraction of the shorter viewport dimension with deliberate padding rather than an accident.
+    pub fn frame_all_with_aspect(&mut self, aspect: f32) {
         if self.instances.is_empty() {
             return;
         }
@@ -322,11 +440,7 @@ impl SceneState {
             return;
         };
         self.cam_target = ((lo + hi) * 0.5).to_array();
-        let radius = ((hi - lo) * 0.5).max_element().max(0.02);
-        // Distance floor 0.3 (3× the 0.1 near plane), not the old metre-scale 3.0: the computed fit
-        // (radius × 2.4) already frames a unit prop at ~2.4; the metre floor pushed small CAD out of
-        // view. Multi-object scenes have a larger radius, so the floor only affects tiny scenes.
-        self.distance = (radius * 2.4).clamp(0.3, 400.0);
+        self.distance = fit_distance((hi - lo) * 0.5, aspect, self.orbit, self.elevation);
         self.clear_focus();
         self.revision = self.revision.wrapping_add(1);
     }
@@ -1261,7 +1375,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let ground_vert = |x: f32, z: f32| MeshVertex {
         position: [x, 0.0, z],
         normal: [0.0, 1.0, 0.0],
-        color: [0.30, 0.31, 0.34],
+        color: GROUND_ALBEDO,
         metallic: 0.0,
         roughness: 0.95,
         uv: [0.0, 0.0], // untextured (binds the white dummy)
@@ -1748,13 +1862,28 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             render_profile,
             grid_meta,
         ) = {
+            // The real surface aspect, so the very first framing fits the lens the user is looking
+            // through rather than an assumed one.
+            let aspect_hint = config.width as f32 / config.height.max(1) as f32;
             let mut st = shared.lock().unwrap();
             if st.distance == 0.0 {
-                st.distance = 60.0;
+                // The camera has never been placed. Frame the scene rather than falling back to a
+                // hard-coded distance of 60: that constant is the reason every asset, at every scale,
+                // opened as a speck in an empty viewport. `frame_all` is a no-op on an empty scene, so
+                // the literal survives only as the genuinely-nothing-to-look-at case.
                 st.elevation = 0.4;
+                st.frame_all_with_aspect(aspect_hint);
+                if st.distance == 0.0 {
+                    st.distance = 60.0;
+                }
             }
             if st.exposure == 0.0 {
-                st.exposure = 1.0; // M11.4 — default exposure (0 = uninitialised)
+                // 0.45, not 1.0. At unity the lit scene sits about 1.6 stops above the value the ACES
+                // curve is fitted around, so every pixel landed in the top half of the range with no
+                // black point and no white point, and the curve's shoulder flattened the material
+                // contrast that separates a rough surface from a smooth one. This is the single
+                // largest pixel change in the frame. (0 = uninitialised.)
+                st.exposure = DEFAULT_EXPOSURE;
             }
             // Camera input — entirely native (invariant 4): fold in any wheel zoom, and while a
             // right-drag is active, poll the OS cursor and orbit by its per-frame delta. No `invoke`
@@ -2334,8 +2463,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             rp.set_bind_group(2, &empty_bg, &[]);
             rp.set_bind_group(3, &ibl.bind_group, &[]);
             rp.draw(0..3, 0..1);
-            rp.set_pipeline(&grid_pipeline);
-            rp.draw(0..GRID_VERTS, 0..1);
+            // The grid is drawn AFTER the ground quad, further down this pass. It writes no depth, so
+            // drawing it here — before the opaque ground — meant the ground painted over it completely
+            // and the viewport had no visible grid at all.
             // Cube pass: the placeholder/fallback (entities with no mesh asset) + the M2.2 perf baseline.
             if cube.n > 0 {
                 rp.set_pipeline(&cube_pipeline);
@@ -2394,6 +2524,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             rp.set_vertex_buffer(0, ground_vbuf.slice(..));
             rp.set_index_buffer(ground_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rp.draw_indexed(0..GROUND_IDX.len() as u32, 0, 0..1);
+            // The grid, now that the surface it describes has been laid down.
+            rp.set_pipeline(&grid_pipeline);
+            rp.draw(0..GRID_VERTS, 0..1);
             // Tracking lines (binding-by-intent overlay) last, with the always-pass depth state.
             if lines.n > 0 {
                 rp.set_pipeline(&line_pipeline);
@@ -3076,7 +3209,9 @@ fn render_thumbnail(
             // No shadow in the thumb: identity light VP ⇒ the lookup falls outside the unit cube ⇒ unshadowed.
             light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             focus: [0.0, eye[0], eye[1], eye[2]],
-            shadow: [-1.0, 1.0, 0.0, 0.0], // caster -1 = none; exposure 1.0
+            // Exposure shared with the viewport rather than re-stated: these two had already drifted, so
+            // an asset-browser thumbnail was graded differently from the same asset in the scene.
+            shadow: [-1.0, DEFAULT_EXPOSURE, 0.0, 0.0], // caster -1 = none
             grid: [0.0, 0.0, dist, 0.0],
         }),
     );
@@ -3455,6 +3590,92 @@ fn pipe_graph_preview_vertices(
 
 #[cfg(test)]
 mod tests {
+
+    // ── viewport framing ──────────────────────────────────────────────────────────────────────
+    // These exist because `frame_all` had NO test coverage at all, which is why a framing constant
+    // that ignored both the field of view and the aspect ratio survived unnoticed.
+
+    #[test]
+    fn framing_fits_the_tighter_viewport_axis_not_always_the_vertical_one() {
+        // A wide, flat scene — a lane, a turntable, an assembly. The old fit pushed the camera back by
+        // the full aspect ratio because it measured the longest axis against the VERTICAL extent, and
+        // left empty bands above and below. A wider window must never require MORE distance.
+        // Viewed from above, so the 12 m spans the screen's horizontal axis and the 1 m the vertical.
+        // A sphere fit reserves 12 m of VERTICAL frame for 1 m of content; the projected fit spends the
+        // frame on the axis the content actually occupies.
+        let half = Vec3::new(6.0, 0.5, 0.5);
+        let (orbit, elevation) = (-std::f32::consts::FRAC_PI_2, 1.4);
+        let projected = fit_distance(half, 16.0 / 9.0, orbit, elevation);
+        let as_a_cube = fit_distance(Vec3::splat(half.length()), 16.0 / 9.0, orbit, elevation);
+        assert!(
+            projected < as_a_cube * 0.6,
+            "a flat scene must not be framed as though it were a cube: {projected} vs {as_a_cube}"
+        );
+        // A wider lens sees more horizontally, so a horizontally-limited scene needs LESS distance.
+        let narrow = fit_distance(half, 1.0, orbit, elevation);
+        assert!(
+            projected < narrow,
+            "{projected} should be closer than {narrow}"
+        );
+    }
+
+    #[test]
+    fn framing_is_orientation_independent() {
+        // The same box, turned. A fit built on the longest half-EDGE changes answer as the scene
+        // rotates, which reads in the viewport as the subject breathing while you orbit.
+        // A cube is the case where orientation genuinely must not change the answer.
+        let a = fit_distance(Vec3::splat(2.0), 1.6, 0.3, 0.5);
+        let b = fit_distance(
+            Vec3::splat(2.0),
+            1.6,
+            0.3 + std::f32::consts::FRAC_PI_2,
+            0.5,
+        );
+        assert!((a - b).abs() < 1e-3, "{a} != {b}");
+    }
+
+    #[test]
+    fn framing_scales_linearly_with_the_subject() {
+        // Tiny and enormous assets must both be framed, not clamped into a default. Ten times the
+        // object is ten times the distance, so the subject occupies the same fraction of frame.
+        // Both above the 0.3 distance floor, so this measures the fit and not the clamp.
+        let small = fit_distance(Vec3::splat(0.5), 1.6, 0.3, 0.5);
+        let large = fit_distance(Vec3::splat(5.0), 1.6, 0.3, 0.5);
+        assert!(
+            (large / small - 10.0).abs() < 0.01,
+            "framing must be scale-invariant: {small} -> {large}"
+        );
+    }
+
+    #[test]
+    fn the_subject_actually_occupies_the_intended_fraction_of_the_frame() {
+        // The claim the whole change rests on, checked rather than asserted: at the returned distance
+        // the subject's angular radius is FRAME_OCCUPANCY of the tighter half-angle.
+        // A cube viewed straight on: its screen half-height over the frame half-height.
+        let half = Vec3::splat(1.0);
+        let aspect = 16.0 / 9.0;
+        let d = fit_distance(half, aspect, 0.0, 0.0);
+        let half_v = (CAMERA_FOV_DEG.to_radians() * 0.5).clamp(0.01, 1.5);
+        // Discount the near-face depth the fit added, then compare screen extent to frame extent.
+        let occupancy = half.y / ((d - half.z) * half_v.tan());
+        assert!(
+            (occupancy - FRAME_OCCUPANCY).abs() < 0.02,
+            "subject fills {occupancy} of the frame, wanted {FRAME_OCCUPANCY}"
+        );
+        // ...and that lands inside the professional 55-75% band the brief asks for.
+        assert!((0.55..=0.75).contains(&occupancy));
+    }
+
+    #[test]
+    fn framing_a_degenerate_or_empty_scene_cannot_produce_a_nonsense_camera() {
+        // A single point, a zero extent, and a garbage aspect must all still yield a usable distance
+        // rather than zero, NaN or infinity — any of which strands the camera with nothing on screen.
+        for aspect in [0.0, -1.0, f32::NAN, f32::INFINITY, 1.6] {
+            let d = fit_distance(Vec3::ZERO, aspect, 0.7, 0.4);
+            assert!(d.is_finite() && d >= 0.3, "aspect {aspect} gave {d}");
+        }
+    }
+
     use super::*;
 
     #[test]

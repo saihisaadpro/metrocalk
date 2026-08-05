@@ -32,6 +32,10 @@ use metrocalk_gameplay::{
 
 use crate::render::{Instance, SceneState, IDENTITY_QUAT};
 
+/// The top of the presentation ground, in viewport units. Actors are seated ON this rather than at a
+/// guessed height, so their contact shadows land under their feet.
+const GROUND_Y: f32 = 0.0;
+
 /// Millimetres per viewport unit. The kernel is authoritative in millimetres and never learns about metres.
 const MM_PER_UNIT: f32 = 1_000.0;
 
@@ -491,7 +495,6 @@ impl MobaSession {
             if !actor.alive {
                 continue;
             }
-            let structure = matches!(actor.kind, ActorKind::Structure | ActorKind::Objective);
             let colour = match (actor.team.get(), actor.owner.is_some()) {
                 (0, true) => [0.35, 0.75, 1.0],
                 (0, false) => [0.20, 0.45, 0.85],
@@ -514,25 +517,44 @@ impl MobaSession {
             // An actor under a standing order is lifted slightly, so "it is fighting on its own" is legible
             // in the viewport and not only in the panel's text.
             let under_orders = actor.attack_order.is_some();
+            // Resolved before the instance is built: seating reads this mesh's real height.
+            let mesh_slot = match actor.kind {
+                ActorKind::Structure | ActorKind::Objective => self.meshes.structure,
+                ActorKind::Hero => self.meshes.hero,
+                _ => self.meshes.minion,
+            };
+            let scale = if stunned {
+                base_scale * 1.25
+            } else {
+                base_scale
+            };
+            // SEAT the actor on the ground from its OWN mesh height, then lift.
+            //
+            // These were four hard-coded heights (0.5 / 0.60 / 0.45 / 0.35) carried over from when every
+            // actor was a cube. A cube's half-extent equals its scale, so a constant worked. Real meshes
+            // do not: `AssetAffine::unit_from_bounds` normalises each import to a max extent of 1.0
+            // recentred on its bounding box, so half-height is 0.5 only along the asset's LONGEST axis.
+            // The lantern (tall) sank about 0.28 into the floor, the rigged figure about 0.13, and the
+            // fox — long rather than tall — FLOATED. A floating caster under a 58-degree key light
+            // throws its shadow offset by 0.6x its float height with a visible gap between the two,
+            // which is what "the shadows look detached" actually was.
+            let seat = GROUND_Y + scene.mesh_half_height(mesh_slot) * scale;
+            // The stun/orders lift is now genuinely ADDITIVE on top of a seated pose, which is what it
+            // always claimed to be; before, it was competing with the guessed height.
+            let lift = if stunned {
+                0.25
+            } else if under_orders {
+                0.10
+            } else {
+                0.0
+            };
             instances.push(Instance {
                 center: [
                     actor.position.x as f32 / MM_PER_UNIT,
-                    if structure {
-                        0.5
-                    } else if stunned {
-                        0.60
-                    } else if under_orders {
-                        0.45
-                    } else {
-                        0.35
-                    },
+                    seat + lift,
                     actor.position.y as f32 / MM_PER_UNIT,
                 ],
-                scale: if stunned {
-                    base_scale * 1.25
-                } else {
-                    base_scale
-                },
+                scale,
                 color: colour,
                 selected: 0.0,
                 rotation: IDENTITY_QUAT,
@@ -542,11 +564,7 @@ impl MobaSession {
             // document key here would let selection, the outliner or an edit reach a thing that does not
             // exist in the document (ADR-021/034). The authored source travels in the status payload.
             ids.push(format!("moba:{}", actor.id.get()));
-            slots.push(match actor.kind {
-                ActorKind::Structure | ActorKind::Objective => self.meshes.structure,
-                ActorKind::Hero => self.meshes.hero,
-                _ => self.meshes.minion,
-            });
+            slots.push(mesh_slot);
         }
         scene.instances = instances;
         scene.ids = ids;
