@@ -4032,6 +4032,7 @@ impl StableHash {
         self.0
     }
 
+    #[inline]
     fn bytes(&mut self, bytes: &[u8]) {
         for byte in bytes {
             self.0 ^= u64::from(*byte);
@@ -4039,34 +4040,42 @@ impl StableHash {
         }
     }
 
+    #[inline]
     fn bool(&mut self, value: bool) {
         self.u8(u8::from(value));
     }
 
+    #[inline]
     fn u8(&mut self, value: u8) {
         self.bytes(&[value]);
     }
 
+    #[inline]
     fn u16(&mut self, value: u16) {
         self.bytes(&value.to_le_bytes());
     }
 
+    #[inline]
     fn u32(&mut self, value: u32) {
         self.bytes(&value.to_le_bytes());
     }
 
+    #[inline]
     fn i32(&mut self, value: i32) {
         self.bytes(&value.to_le_bytes());
     }
 
+    #[inline]
     fn u64(&mut self, value: u64) {
         self.bytes(&value.to_le_bytes());
     }
 
+    #[inline]
     fn len(&mut self, value: usize) {
         self.u64(u64::try_from(value).unwrap_or(u64::MAX));
     }
 
+    #[inline]
     fn point(&mut self, point: Vec2Mm) {
         self.i32(point.x);
         self.i32(point.y);
@@ -4106,6 +4115,7 @@ impl StableHash {
         }
     }
 
+    #[inline]
     fn stats(&mut self, stats: CombatStats) {
         self.u32(stats.max_health);
         self.u32(stats.max_resource);

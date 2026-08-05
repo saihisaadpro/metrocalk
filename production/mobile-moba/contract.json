@@ -235,8 +235,7 @@
       "editor-bridge-wiring-commit-blocked-by-parallel-lane-entanglement",
       "in-game-hud-input-and-client-runtime",
       "certified-idle-host-and-min-spec-perf-profile",
-      "auto-attack-loop-and-attack-move-gp08-deferred-from-adr-100",
-      "isolate-the-adr-100-tick-work-and-soak-regression"
+      "auto-attack-loop-and-attack-move-gp08-deferred-from-adr-100"
     ],
     "ciEvidence": {
       "status": "pending-push",
@@ -255,32 +254,34 @@
       "actors": 512,
       "ticks": 108000,
       "constantMemory": true,
-      "status": "measured-regression-tracked",
-      "elapsedSeconds": 194.3,
+      "status": "measured-regression-isolated-and-fixed",
+      "elapsedSeconds": 107.21,
       "priorElapsedSeconds": 70.79,
       "priorIdleRangeSeconds": [
         61.37,
         115.5
       ],
       "result": "passed",
-      "note": "2.7x slower than the previous run and outside the prior idle range. The cause is NOT isolated and is not claimed. Tracked as an owned follow-up; the closing gate is a profile that names the cost and either removes it or justifies it."
+      "note": "Regressed to 194.3 s, isolated to an inlining cliff in the digest's write primitives, and fixed with #[inline]. Back inside the prior idle range of 61.4-115.5 s. The rolling digest is byte-identical before and after the fix."
     },
     "tickWork": {
       "mode": "release",
       "actors": 512,
       "warmupTicks": 1000,
       "sampleTicks": 10000,
-      "status": "measured-regression-tracked",
+      "status": "measured-regression-isolated-and-fixed",
       "observation": {
-        "p50Ns": 1489800,
-        "p95Ns": 1599300,
-        "p99Ns": 1738700,
-        "maxNs": 2120800
+        "p50Ns": 750400,
+        "p95Ns": 849600,
+        "p99Ns": 909800,
+        "maxNs": 1273000
       },
       "priorP99Ns": 821300,
       "p99BudgetNs": 10000000,
-      "gateResult": "passed-with-5.7x-headroom",
-      "rollingDigest": "b2f48c54f8b540e3"
+      "gateResult": "passed-with-11x-headroom",
+      "rollingDigest": "b2f48c54f8b540e3",
+      "regressedP99Ns": 1738700,
+      "baselineP99NsAtCdc6ccb": 877700
     },
     "captureHarness": {
       "scenarios": 21,
