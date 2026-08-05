@@ -11,6 +11,9 @@ import { useSelectedId } from "../store/projection";
 import { useReveal } from "../store/reveal";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Button, Surface } from "../theme/primitives";
+import { color, fontSize, space } from "../theme/tokens";
+import { EmptyPanelState } from "../theme/workspace";
 import type { EditorClient } from "../transport/session";
 
 export function Reveal({ client }: { client: EditorClient }) {
@@ -23,33 +26,40 @@ export function Reveal({ client }: { client: EditorClient }) {
   const reveal = useReveal(client);
 
   if (!id) {
-    return <div style={{ padding: 12, color: "#888" }}>Select an entity to see compatible bind targets.</div>;
+    return (
+      <EmptyPanelState
+        compact
+        icon="⌘"
+        title="Select an object to find compatible targets"
+        description="Ranked matches and clear incompatibility reasons will appear here."
+      />
+    );
   }
 
   const empty = reveal.compatible.length === 0 && reveal.greyed.length === 0 && reveal.bound.length === 0;
 
   return (
-    <div id="reveal" data-testid="reveal" style={{ padding: 12, fontSize: 13 }}>
+    <div id="reveal" data-testid="reveal" style={{ padding: space.lg, fontSize: fontSize.body }}>
       {reveal.required.length > 0 && (
         <div
-          style={{ opacity: 0.7, marginBottom: 6 }}
+          style={{ color: color.text.secondary, marginBottom: space.sm, lineHeight: 1.45 }}
           title={`This object needs a source of ${reveal.required.join(", ")} — bind it to one of the matches below.`}
         >
           Needs {reveal.required.join(", ")} — pick a match to bind
         </div>
       )}
       {reveal.bound.length > 0 && (
-        <div style={{ marginBottom: 8 }}>
-          <div style={{ opacity: 0.6, fontSize: 11 }}>tracking</div>
+        <div style={{ marginBottom: space.md }}>
+          <div style={{ color: color.text.muted, fontSize: fontSize.micro, marginBottom: space.xs }}>Tracking</div>
           {reveal.bound.map((b) => (
-            <div key={b.id} className="boundrow" data-testid="bound">
-              {b.name} <span style={{ opacity: 0.5 }}>· {b.kind}</span>
-            </div>
+            <Surface key={b.id} tone="inset" className="boundrow" data-testid="bound" style={{ padding: space.md, marginBottom: space.xs }}>
+              {b.name} <span style={{ color: color.text.muted }}>· {b.kind}</span>
+            </Surface>
           ))}
         </div>
       )}
       {reveal.compatible.map((c) => (
-        <button
+        <Button
           key={c.id}
           className="cand"
           data-testid="candidate"
@@ -63,26 +73,27 @@ export function Reveal({ client }: { client: EditorClient }) {
             pushToast(`bound · now tracking ${c.name}`, "success");
           }}
           title={`Click to bind — this object will track ${c.name} (match ${c.affinity} of 100)`}
-          style={{ display: "block", width: "100%", textAlign: "left", margin: "2px 0", padding: "4px 6px", background: "#1c2030", color: "#cde", border: "1px solid #2a3550", borderRadius: 4, cursor: "pointer" }}
+          style={{ display: "flex", width: "100%", justifyContent: "flex-start", marginBottom: space.xs, textAlign: "left" }}
         >
           {c.name}{" "}
-          <span style={{ opacity: 0.5 }} title="How well this target fits (higher = better match)">
+          <span style={{ color: color.text.muted }} title="How well this target fits (higher = better match)">
             · match {c.affinity}
           </span>
-        </button>
+        </Button>
       ))}
       {reveal.greyed.map((g) => (
-        <div
+        <Surface
           key={g.id}
+          tone="inset"
           className="cand disabled"
           data-testid="greyed"
           data-id={g.id}
-          style={{ margin: "2px 0", padding: "4px 6px", color: "#667", border: "1px solid #222", borderRadius: 4 }}
+          style={{ marginBottom: space.xs, padding: space.md, color: color.text.faint }}
         >
           {g.name} <span style={{ opacity: 0.75 }}>— {g.reason}</span>
-        </div>
+        </Surface>
       ))}
-      {empty && <div style={{ color: "#888" }}>no compatible targets</div>}
+      {empty && <div style={{ color: color.text.muted }}>No compatible targets</div>}
     </div>
   );
 }

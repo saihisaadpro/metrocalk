@@ -16,11 +16,11 @@ use std::fmt::Write as _;
 
 use metrocalk_gameplay::{
     AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
-    ActorIntent, ActorKind, ActorSpawn, ActorView, BasicAttackSpec, Bounty, CastTarget,
-    CombatStats, CommandKind, CommandRejectReason, CompiledLane, ContentId, ControlKind,
-    DamageSchool, DeathRule, GoldReason, ImpactShape, LaneId, LanePosition, LaneSpec, MatchConfig,
-    MatchEvent, MatchPhase, MatchRuntime, ModifierOp, OneLaneMatch, PlayerCommand, PlayerId,
-    RectMm, StatGrowth, StatKind, TeamId, Tick, Vec2Mm, WaveSpec, WaveUnitSpec,
+    ActorIntent, ActorKind, ActorSpawn, ActorView, AttackOrder, BasicAttackSpec, Bounty,
+    CastTarget, CombatStats, CommandKind, CommandRejectReason, CompiledLane, ContentId,
+    ControlKind, DamageSchool, DeathRule, GoldReason, ImpactShape, LaneId, LanePosition, LaneSpec,
+    MatchConfig, MatchEvent, MatchPhase, MatchRuntime, ModifierOp, OneLaneMatch, PlayerCommand,
+    PlayerId, RectMm, StatGrowth, StatKind, TeamId, Tick, Vec2Mm, WaveSpec, WaveUnitSpec,
 };
 
 const PLAYER: PlayerId = PlayerId(1);
@@ -67,6 +67,9 @@ fn scenarios() -> Vec<String> {
         kill_bounty_assist_and_shutdown(),
         levelling_ranks_an_ability_and_raises_stats(),
         crit_penetration_shield_and_lifesteal(),
+        attack_move_advances_engages_and_resumes(),
+        a_hold_holds_and_a_named_target_is_not_traded(),
+        crowd_control_and_stop_both_bind_a_standing_order(),
         checkpoint_restore_suffix_equality(),
     ]
 }
@@ -320,6 +323,22 @@ fn event_label(event: MatchEvent) -> String {
         }
         MatchEvent::MoveStarted { actor, .. } => format!("MoveStarted a{}", actor.get()),
         MatchEvent::MoveStopped { actor } => format!("MoveStopped a{}", actor.get()),
+        MatchEvent::TargetAcquired { actor, target } => {
+            format!("TargetAcquired a{} -> a{}", actor.get(), target.get())
+        }
+        MatchEvent::AttackOrderChanged { actor, order } => match order {
+            None => format!("AttackOrderCleared a{}", actor.get()),
+            Some(AttackOrder::Target(target)) => {
+                format!("AttackOrder a{} target a{}", actor.get(), target.get())
+            }
+            Some(AttackOrder::Move(destination)) => format!(
+                "AttackOrder a{} move ({},{})",
+                actor.get(),
+                destination.x,
+                destination.y
+            ),
+            Some(AttackOrder::Hold) => format!("AttackOrder a{} hold", actor.get()),
+        },
         MatchEvent::CastStarted { source, .. } => format!("CastStarted a{}", source.get()),
         MatchEvent::CastCancelled { source, reason, .. } => {
             format!("CastCancelled a{} ({})", source.get(), reason_name(reason))
@@ -512,6 +531,7 @@ fn hero(id: ActorId, owner: Option<PlayerId>, team: u8, x: i32, mitigation: u16)
         abilities: vec![STRIKE, MEND],
         basic_attack: Some(BasicAttackSpec {
             range_mm: 1_500,
+            acquisition_range_mm: 0,
             damage: 200,
             school: DamageSchool::Physical,
             windup_ticks: 1,
@@ -718,6 +738,7 @@ fn death_and_respawn() -> String {
             abilities: vec![],
             basic_attack: Some(BasicAttackSpec {
                 range_mm: 2_000,
+                acquisition_range_mm: 0,
                 damage: 5_000,
                 school: DamageSchool::True,
                 windup_ticks: 0,
@@ -1184,6 +1205,7 @@ fn lane_match() -> (OneLaneMatch, LaneSpec) {
             abilities: vec![],
             basic_attack: Some(BasicAttackSpec {
                 range_mm: 900,
+                acquisition_range_mm: 0,
                 damage: 90,
                 school: DamageSchool::Physical,
                 windup_ticks: 0,
@@ -1931,6 +1953,7 @@ fn crit_penetration_shield_and_lifesteal() -> String {
                 abilities: vec![],
                 basic_attack: Some(BasicAttackSpec {
                     range_mm: 20_000,
+                    acquisition_range_mm: 0,
                     damage: 200,
                     school: DamageSchool::Physical,
                     windup_ticks: 0,
@@ -2009,5 +2032,277 @@ fn crit_penetration_shield_and_lifesteal() -> String {
         "the attacker healed 25 % of the damage that actually landed",
         runtime.actor(BRAWLER).expect("a").health == 1_000 + 165,
     );
+    rec.finish()
+}
+
+// ---------------------------------------------------------------------------------------------
+// GP-08 - the standing attack order
+// ---------------------------------------------------------------------------------------------
+
+const SOLDIER: ActorId = ActorId(801);
+const WATCHER: ActorId = ActorId(802);
+const NEAR_CREEP: ActorId = ActorId(901);
+const FAR_CREEP: ActorId = ActorId(902);
+
+/// One mobile soldier with a weapon that notices further than it reaches, plus hostiles.
+fn standing_order_world(speed: u32, hostiles: &[(ActorId, i32, i32, u32)]) -> MatchRuntime {
+    let mut runtime = MatchRuntime::new(config(), 0x_0A77).expect("config");
+    runtime
+        .spawn_actor(&ActorSpawn {
+            id: SOLDIER,
+            owner: Some(PLAYER),
+            team: TeamId(0),
+            kind: ActorKind::Hero,
+            position: Vec2Mm::new(0, 0),
+            stats: CombatStats {
+                max_health: 4_000,
+                max_resource: 0,
+                move_speed_mm_per_tick: speed,
+                physical_reduction_bps: 0,
+                magic_reduction_bps: 0,
+                crit_chance_bps: 0,
+                crit_damage_bps: metrocalk_gameplay::BASIS_POINTS,
+                physical_penetration_bps: 0,
+                magic_penetration_bps: 0,
+                lifesteal_bps: 0,
+            },
+            growth: StatGrowth::NONE,
+            bounty: Bounty::NONE,
+            abilities: vec![],
+            basic_attack: Some(BasicAttackSpec {
+                range_mm: 1_000,
+                // Wider than reach on purpose: this is what lets the capture distinguish "noticed" from
+                // "can hit", which is the whole difference between a hold and an attack-move.
+                acquisition_range_mm: 5_000,
+                damage: 120,
+                school: DamageSchool::Physical,
+                windup_ticks: 0,
+                cooldown_ticks: 3,
+            }),
+            death_rule: DeathRule::StayDead,
+        })
+        .expect("soldier");
+    for &(id, x, y, health) in hostiles {
+        runtime
+            .spawn_actor(&ActorSpawn {
+                id,
+                owner: None,
+                team: TeamId(1),
+                kind: ActorKind::Minion,
+                position: Vec2Mm::new(x, y),
+                stats: CombatStats {
+                    max_health: health,
+                    max_resource: 0,
+                    move_speed_mm_per_tick: 0,
+                    physical_reduction_bps: 0,
+                    magic_reduction_bps: 0,
+                    crit_chance_bps: 0,
+                    crit_damage_bps: metrocalk_gameplay::BASIS_POINTS,
+                    physical_penetration_bps: 0,
+                    magic_penetration_bps: 0,
+                    lifesteal_bps: 0,
+                },
+                growth: StatGrowth::NONE,
+                bounty: Bounty::NONE,
+                abilities: vec![],
+                basic_attack: None,
+                death_rule: DeathRule::StayDead,
+            })
+            .expect("hostile");
+    }
+    runtime.start().expect("start");
+    runtime
+}
+
+fn hostile_health(runtime: &MatchRuntime, id: ActorId) -> u32 {
+    runtime.actor(id).map_or(0, |actor| actor.health)
+}
+
+fn attack_move_advances_engages_and_resumes() -> String {
+    let mut rec = Recorder::new(
+        "gp08-attack-move",
+        "GP-08 \u{b7} one order, many swings",
+        "A single attack-move makes the hero advance, stop dead at weapon reach of the first thing it notices, keep swinging on its own with no further command, and then resume advancing once that target is down. The order is never consumed - it is still standing at the end.",
+    );
+    let mut runtime = standing_order_world(
+        300,
+        &[(NEAR_CREEP, 4_000, 0, 400), (FAR_CREEP, 9_000, 0, 400)],
+    );
+    runtime
+        .submit(command(
+            1,
+            1,
+            SOLDIER,
+            CommandKind::AttackMove {
+                // The capture's map ends at x=12000; the order aims at its far edge, not past it.
+                destination: Vec2Mm::new(12_000, 0),
+            },
+        ))
+        .expect("accepted");
+    rec.note("ONE command is submitted in this entire capture. Every swing after it is the kernel's own.");
+    let mut swings = 0_usize;
+    let mut halted_at = None;
+    for tick in 0..48 {
+        let frame = runtime.step().expect("step");
+        swings += frame
+            .events
+            .iter()
+            .filter(|event| matches!(event, MatchEvent::BasicAttackStarted { source, .. } if *source == SOLDIER))
+            .count();
+        if halted_at.is_none()
+            && frame
+                .events
+                .iter()
+                .any(|event| matches!(event, MatchEvent::TargetAcquired { .. }))
+        {
+            halted_at = Some(runtime.actor(SOLDIER).expect("s").position.x);
+        }
+        let label = if tick < 8 {
+            "advancing"
+        } else {
+            "engaged / advancing"
+        };
+        rec.record(&runtime, &frame.events, label);
+    }
+    rec.check(format!("swung {swings} times from ONE order"), swings >= 8);
+    rec.check(
+        "halted at weapon reach rather than walking through the first creep",
+        halted_at.is_some_and(|x| (3_000..=4_000).contains(&x)),
+    );
+    rec.check(
+        "the first creep it noticed is dead",
+        hostile_health(&runtime, NEAR_CREEP) == 0,
+    );
+    rec.check(
+        "moved on to the second creep once the first was down",
+        hostile_health(&runtime, FAR_CREEP) < 400,
+    );
+    rec.check(
+        "the order is STILL standing - it was never consumed",
+        runtime.actor(SOLDIER).expect("s").attack_order.is_some(),
+    );
+    rec.finish()
+}
+
+fn a_hold_holds_and_a_named_target_is_not_traded() -> String {
+    let mut rec = Recorder::new(
+        "gp08-hold-and-target",
+        "GP-08 \u{b7} an order does what it says and nothing more",
+        "A hold engages what walks into reach but never walks to find it, even with something noticed and out of range. And a named target is fought to the end while a CLOSER hostile stands untouched beside it, because naming a target is an instruction and not a hint.",
+    );
+
+    // ── a hold really holds ──────────────────────────────────────────────────────────────────────────
+    let mut held = standing_order_world(300, &[(FAR_CREEP, 4_000, 0, 4_000)]);
+    held.submit(command(1, 1, SOLDIER, CommandKind::HoldPosition))
+        .expect("accepted");
+    for _ in 0..20 {
+        let frame = held.step().expect("step");
+        rec.record(
+            &held,
+            &frame.events,
+            "holding, target noticed but out of reach",
+        );
+    }
+    rec.check(
+        "held position for 20 ticks with a target NOTICED and out of reach",
+        held.actor(SOLDIER).expect("s").position == Vec2Mm::new(0, 0),
+    );
+    rec.check(
+        "and never landed a hit it could not reach",
+        hostile_health(&held, FAR_CREEP) == 4_000,
+    );
+
+    // ── a named target is not traded for a closer one ────────────────────────────────────────────────
+    let mut named = standing_order_world(
+        0,
+        &[(NEAR_CREEP, 300, 0, 4_000), (FAR_CREEP, 900, 0, 4_000)],
+    );
+    named
+        .submit(command(
+            1,
+            1,
+            SOLDIER,
+            CommandKind::AttackTarget { target: FAR_CREEP },
+        ))
+        .expect("accepted");
+    rec.note("Both creeps are in reach. Only the player's naming distinguishes them.");
+    for _ in 0..18 {
+        let frame = named.step().expect("step");
+        rec.record(&named, &frame.events, "locked onto the FARTHER creep");
+    }
+    rec.check(
+        "hit the named target repeatedly",
+        hostile_health(&named, FAR_CREEP) < 4_000,
+    );
+    rec.check(
+        "never touched the CLOSER one",
+        hostile_health(&named, NEAR_CREEP) == 4_000,
+    );
+
+    rec.finish()
+}
+
+fn crowd_control_and_stop_both_bind_a_standing_order() -> String {
+    let mut rec = Recorder::new(
+        "gp08-cc-and-stop",
+        "GP-08 \u{b7} a standing order is bound by the same rules a command is",
+        "A disarm gates an automatic swing exactly as it gates a commanded one - the driver goes through the same single validation choke point a player command does, so there is no second path into combat that crowd control could miss. And STOP clears the order outright, rather than leaving a stopped unit still swinging at whatever wanders past.",
+    );
+
+    // ── crowd control gates the automatic swing ──────────────────────────────────────────────────────
+    let mut disarmed = standing_order_world(0, &[(NEAR_CREEP, 900, 0, 4_000)]);
+    disarmed
+        .submit(command(1, 1, SOLDIER, CommandKind::HoldPosition))
+        .expect("accepted");
+    disarmed
+        .apply_status_effect(SOLDIER, 12, &[ControlKind::Disarm], &[])
+        .expect("disarm");
+    rec.record(&disarmed, &[], "DISARM applied over a standing order");
+    for _ in 0..12 {
+        let frame = disarmed.step().expect("step");
+        rec.record(&disarmed, &frame.events, "disarmed under a standing order");
+    }
+    let during = hostile_health(&disarmed, NEAR_CREEP);
+    rec.check(
+        "a standing order cannot out-swing a disarm",
+        during == 4_000,
+    );
+    for _ in 0..12 {
+        let frame = disarmed.step().expect("step");
+        rec.record(&disarmed, &frame.events, "disarm expired");
+    }
+    rec.check(
+        "and resumed by itself once the disarm expired, with no new command",
+        hostile_health(&disarmed, NEAR_CREEP) < during,
+    );
+
+    // ── stop means stop ──────────────────────────────────────────────────────────────────────────────
+    let mut stopped = standing_order_world(0, &[(NEAR_CREEP, 900, 0, 40_000)]);
+    stopped
+        .submit(command(1, 1, SOLDIER, CommandKind::HoldPosition))
+        .expect("accepted");
+    for _ in 0..9 {
+        let frame = stopped.step().expect("step");
+        rec.record(&stopped, &frame.events, "swinging under a hold");
+    }
+    let before_stop = hostile_health(&stopped, NEAR_CREEP);
+    let at = stopped.tick() + 1;
+    stopped
+        .submit(command(2, at, SOLDIER, CommandKind::Stop))
+        .expect("accepted");
+    for _ in 0..15 {
+        let frame = stopped.step().expect("step");
+        rec.record(&stopped, &frame.events, "stopped");
+    }
+    rec.check(
+        "STOP cleared the standing order",
+        stopped.actor(SOLDIER).expect("s").attack_order.is_none(),
+    );
+    rec.check(
+        "and no further damage landed after it",
+        hostile_health(&stopped, NEAR_CREEP) == before_stop,
+    );
+    // WATCHER is unused geometry in this scenario; naming it keeps the id table honest.
+    let _ = WATCHER;
     rec.finish()
 }

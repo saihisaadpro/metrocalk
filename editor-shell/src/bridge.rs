@@ -490,6 +490,9 @@ pub fn enrich_relational<W: World>(
         });
         let needs_binding = req_caps.iter().any(|c| !satisfied.contains(c));
         let is_group = group_ids.contains(id.as_str());
+        // Classified before `provides` is moved into the summary; the two describe the same entity, so
+        // reading it here rather than re-deriving it keeps them from ever disagreeing.
+        let by_capability = classify_by_capability(provides.as_slice());
         *rel = Some(RelSummary {
             requires,
             provides,
@@ -500,8 +503,17 @@ pub fn enrich_relational<W: World>(
         // A group container renders as a folder; otherwise classify the salient type from the components.
         if is_group {
             *kind = Some("group".into());
-        } else if let Some(cs) = comp_names.get(id.as_str()) {
-            *kind = Some(classify_kind(cs));
+        } else {
+            let from_components = comp_names.get(id.as_str()).map(|cs| classify_kind(cs));
+            // Components win when they say something specific; capabilities answer for the rest. Order
+            // matters: a Health provider that also has a mesh should read as the character it is.
+            *kind = Some(match from_components {
+                Some(k) if k != "default" => k,
+                other => by_capability
+                    .map(ToOwned::to_owned)
+                    .or(other)
+                    .unwrap_or_else(|| "default".to_owned()),
+            });
         }
     }
 }
@@ -523,10 +535,33 @@ fn classify_kind<S: AsRef<str>>(components: &[S]) -> String {
         "requirer"
     } else if has("MeshRenderer") {
         "mesh"
+    } else if has("Health") {
+        // A thing with hit points is a character, and reads as one. Without this arm every Health
+        // provider in the scene drew the same blank generic icon as an empty transform.
+        "character"
     } else {
         "default"
     }
     .to_string()
+}
+
+/// Classify an entity by the capabilities it PROVIDES, for entities whose components say nothing.
+///
+/// A provider carries its capability as an ECS pair rather than a component, so `classify_kind` cannot see
+/// it and every one of them fell back to the generic icon. This is the same `provides` list the row's
+/// relational summary already carries, so it costs no extra query — it just stops throwing the information
+/// away at the icon.
+fn classify_by_capability(provides: &[String]) -> Option<&'static str> {
+    let has = |n: &str| provides.iter().any(|c| c == n);
+    if has("Renderable") {
+        Some("mesh")
+    } else if has("Physics") {
+        Some("physics")
+    } else if has("Audio") {
+        Some("audio")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -541,8 +576,26 @@ mod tests {
         assert_eq!(classify_kind(&["Camera"]), "camera");
         assert_eq!(classify_kind(&["RigidBody", "MeshRenderer"]), "physics");
         assert_eq!(classify_kind(&["Transform"]), "default");
+        // A thing with hit points is a character, not an anonymous transform.
+        assert_eq!(classify_kind(&["Transform", "Health"]), "character");
         // a renderable requirer (HealthBar + a mesh) reads as a requirer (the binding state is the salient cue)
         assert_eq!(classify_kind(&["HealthBar", "MeshRenderer"]), "requirer");
+    }
+
+    #[test]
+    fn a_provider_is_classified_by_what_it_offers_when_its_components_say_nothing() {
+        // A capability lives on an ECS PAIR, not a component, so these entities carry only a `Transform`
+        // and every one of them drew the same blank icon before this fell back to the provides list.
+        let cap = |n: &str| vec![n.to_owned()];
+        assert_eq!(classify_by_capability(&cap("Renderable")), Some("mesh"));
+        assert_eq!(classify_by_capability(&cap("Physics")), Some("physics"));
+        assert_eq!(classify_by_capability(&cap("Audio")), Some("audio"));
+        // Spatial has no icon of its own; saying so is better than inventing one.
+        assert_eq!(classify_by_capability(&cap("Spatial")), None);
+        assert_eq!(classify_by_capability(&[]), None);
+        // Components stay authoritative where they are specific: a Health provider is a character, not a
+        // mesh, even when it also offers Renderable.
+        assert_eq!(classify_kind(&["Transform", "Health"]), "character");
     }
 
     #[test]

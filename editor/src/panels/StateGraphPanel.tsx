@@ -12,6 +12,7 @@ import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { pushToast } from "../store/toasts";
 import { StateGraph } from "../graph/StateGraph";
+import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type {
   CompareOp,
@@ -32,8 +33,16 @@ const OPS: { op: CompareOp; label: string }[] = [
   { op: "ge", label: "≥" },
 ];
 
-const box: React.CSSProperties = { font: "12px ui-monospace, monospace", padding: 10 };
-const ctrl: React.CSSProperties = { font: "11px ui-monospace, monospace", padding: "1px 3px" };
+const box: React.CSSProperties = { font: `${fontSize.meta}px ${font.mono}`, padding: space.lg };
+const ctrl: React.CSSProperties = {
+  minHeight: 30,
+  padding: `${space.xxs}px ${space.sm}px`,
+  border: `1px solid ${color.border.default}`,
+  borderRadius: radius.sm,
+  color: color.text.primary,
+  background: color.bg.input,
+  font: `${fontSize.micro}px ${font.mono}`,
+};
 
 /** Mirrors `core::state_machine::ENTER_STATE_ACTION` — the verb a transition's Then uses to enter `to`. */
 const ENTER_ACTION = "SetField";
@@ -82,10 +91,21 @@ function mkTransition(
 
 /** A value input whose KIND is dictated by the field's registry type (typo-proof — same discipline as the
  *  Rules builder). */
-function ValueInput({ ty, value, onChange }: { ty: string; value: FieldValue; onChange: (v: FieldValue) => void }) {
+function ValueInput({
+  ty,
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  ty: string;
+  value: FieldValue;
+  onChange: (v: FieldValue) => void;
+  ariaLabel: string;
+}) {
   if (ty === "boolean") {
     return (
       <select
+        aria-label={ariaLabel}
         data-testid="sm-cond-value"
         style={ctrl}
         value={"Bool" in value ? String(value.Bool) : "false"}
@@ -99,6 +119,7 @@ function ValueInput({ ty, value, onChange }: { ty: string; value: FieldValue; on
   if (ty === "integer" || ty === "number") {
     return (
       <input
+        aria-label={ariaLabel}
         data-testid="sm-cond-value"
         type="number"
         style={{ ...ctrl, width: 64 }}
@@ -112,6 +133,7 @@ function ValueInput({ ty, value, onChange }: { ty: string; value: FieldValue; on
   }
   return (
     <input
+      aria-label={ariaLabel}
       data-testid="sm-cond-value"
       type="text"
       style={{ ...ctrl, width: 96 }}
@@ -127,11 +149,13 @@ function ConditionEditor({
   reg,
   entityOptions,
   conditions,
+  contextLabel,
   onChange,
 }: {
   reg: RuleRegistryInfo;
   entityOptions: { id: string; name: string }[];
   conditions: RuleCondition[];
+  contextLabel: string;
   onChange: (next: RuleCondition[]) => void;
 }) {
   const firstComp = reg.components[0]?.name ?? "";
@@ -164,7 +188,13 @@ function ConditionEditor({
         const compFields = reg.components.find((x) => x.name === c.component)?.fields ?? [];
         return (
           <div key={i} data-testid="sm-cond" style={{ display: "flex", gap: 4, flexWrap: "wrap", margin: "3px 0" }}>
-            <select data-testid="sm-cond-entity" style={ctrl} value={c.entity} onChange={(e) => set({ entity: e.target.value })}>
+            <select
+              aria-label={`${contextLabel} condition ${i + 1} entity`}
+              data-testid="sm-cond-entity"
+              style={ctrl}
+              value={c.entity}
+              onChange={(e) => set({ entity: e.target.value })}
+            >
               <option value="">— entity —</option>
               {entityOptions.map((o) => (
                 <option key={o.id} value={o.id}>
@@ -173,6 +203,7 @@ function ConditionEditor({
               ))}
             </select>
             <select
+              aria-label={`${contextLabel} condition ${i + 1} component`}
               data-testid="sm-cond-component"
               style={ctrl}
               value={c.component}
@@ -187,22 +218,43 @@ function ConditionEditor({
                 </option>
               ))}
             </select>
-            <select data-testid="sm-cond-field" style={ctrl} value={c.field} onChange={(e) => set({ field: e.target.value })}>
+            <select
+              aria-label={`${contextLabel} condition ${i + 1} field`}
+              data-testid="sm-cond-field"
+              style={ctrl}
+              value={c.field}
+              onChange={(e) => set({ field: e.target.value })}
+            >
               {compFields.map((f) => (
                 <option key={f.name} value={f.name}>
                   {f.name}
                 </option>
               ))}
             </select>
-            <select data-testid="sm-cond-op" style={ctrl} value={c.op} onChange={(e) => set({ op: e.target.value as CompareOp })}>
+            <select
+              aria-label={`${contextLabel} condition ${i + 1} comparison operator`}
+              data-testid="sm-cond-op"
+              style={ctrl}
+              value={c.op}
+              onChange={(e) => set({ op: e.target.value as CompareOp })}
+            >
               {OPS.map((o) => (
                 <option key={o.op} value={o.op}>
                   {o.label}
                 </option>
               ))}
             </select>
-            <ValueInput ty={fieldTy(reg, c.component, c.field)} value={c.value} onChange={(v) => set({ value: v })} />
-            <button style={ctrl} onClick={() => onChange(conditions.filter((_, j) => j !== i))}>
+            <ValueInput
+              ariaLabel={`${contextLabel} condition ${i + 1} value`}
+              ty={fieldTy(reg, c.component, c.field)}
+              value={c.value}
+              onChange={(v) => set({ value: v })}
+            />
+            <button
+              aria-label={`Remove ${contextLabel.toLowerCase()} condition ${i + 1}`}
+              style={ctrl}
+              onClick={() => onChange(conditions.filter((_, j) => j !== i))}
+            >
               ×
             </button>
           </div>
@@ -399,7 +451,7 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
   }
 
   return (
-    <div id="stategraph" data-testid="state-graph-panel" style={{ ...box, borderTop: "1px solid #2a2d35" }}>
+    <div id="stategraph" data-testid="state-graph-panel" style={{ ...box, borderTop: `1px solid ${color.border.subtle}` }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
         <b>State machines</b>
         <span>
@@ -436,6 +488,7 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
           {/* target */}
           <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 6 }}>
             <input
+              aria-label="State machine name"
               data-testid="sm-name"
               type="text"
               placeholder="machine name"
@@ -444,7 +497,13 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
               onChange={(e) => setDraft({ ...draft, name: e.target.value })}
               onBlur={() => save(draft)}
             />
-            <select data-testid="sm-entity" style={ctrl} value={draft.entity} onChange={(e) => setTarget({ entity: e.target.value })}>
+            <select
+              aria-label="State machine target entity"
+              data-testid="sm-entity"
+              style={ctrl}
+              value={draft.entity}
+              onChange={(e) => setTarget({ entity: e.target.value })}
+            >
               <option value="">— entity —</option>
               {entityOptions.map((o) => (
                 <option key={o.id} value={o.id}>
@@ -452,14 +511,26 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
                 </option>
               ))}
             </select>
-            <select data-testid="sm-component" style={ctrl} value={draft.component} onChange={(e) => setTarget({ component: e.target.value })}>
+            <select
+              aria-label="State machine target component"
+              data-testid="sm-component"
+              style={ctrl}
+              value={draft.component}
+              onChange={(e) => setTarget({ component: e.target.value })}
+            >
               {stringComps.map((c) => (
                 <option key={c.name} value={c.name}>
                   {c.name}
                 </option>
               ))}
             </select>
-            <select data-testid="sm-field" style={ctrl} value={draft.field} onChange={(e) => setTarget({ field: e.target.value })}>
+            <select
+              aria-label="State machine state field"
+              data-testid="sm-field"
+              style={ctrl}
+              value={draft.field}
+              onChange={(e) => setTarget({ field: e.target.value })}
+            >
               {(stringComps.find((c) => c.name === draft.component)?.fields ?? [])
                 .filter((f) => f.ty === "string")
                 .map((f) => (
@@ -474,12 +545,12 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
           <StateGraph machine={draft} current={current} />
 
           {error && (
-            <div data-testid="sm-error" style={{ color: "#f88", margin: "4px 0" }}>
+            <div data-testid="sm-error" style={{ color: color.danger.text, margin: `${space.xs}px 0` }}>
               {error}
             </div>
           )}
           {unreachable.length > 0 && (
-            <div data-testid="sm-unreachable" style={{ color: "#fb4", margin: "4px 0" }}>
+            <div data-testid="sm-unreachable" style={{ color: color.warn.text, margin: `${space.xs}px 0` }}>
               Unreachable from {draft.initial}: {unreachable.join(", ")} — add a transition into{" "}
               {unreachable.length === 1 ? "it" : "them"}.
             </div>
@@ -494,6 +565,7 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
             {draft.states.map((s, i) => (
               <div key={i} data-testid="sm-state" style={{ display: "flex", gap: 4, alignItems: "center", margin: "3px 0" }}>
                 <input
+                  aria-label={`State ${i + 1} name`}
                   data-testid="sm-state-name"
                   type="text"
                   style={{ ...ctrl, width: 120 }}
@@ -506,10 +578,24 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
                     setStateEdits(rest);
                   }}
                 />
-                <label style={{ color: "#9bf" }}>
-                  <input type="radio" data-testid="sm-initial" name="sm-initial" checked={draft.initial === s} onChange={() => setInitial(s)} /> initial
+                <label style={{ color: color.info.text }}>
+                  <input
+                    aria-label={`Set ${s} as initial state`}
+                    type="radio"
+                    data-testid="sm-initial"
+                    name="sm-initial"
+                    checked={draft.initial === s}
+                    onChange={() => setInitial(s)}
+                  />{" "}
+                  initial
                 </label>
-                <button data-testid="sm-state-delete" style={ctrl} onClick={() => deleteState(i)} title="delete state">
+                <button
+                  aria-label={`Delete state ${s}`}
+                  data-testid="sm-state-delete"
+                  style={ctrl}
+                  onClick={() => deleteState(i)}
+                  title="delete state"
+                >
                   ×
                 </button>
               </div>
@@ -523,9 +609,15 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
               + transition
             </button>
             {draft.transitions.map((t, i) => (
-              <div key={t.id || i} data-testid="sm-transition" data-edge-id={t.id} style={{ border: "1px solid #23262d", borderRadius: 4, padding: 4, margin: "3px 0" }}>
+              <div key={t.id || i} data-testid="sm-transition" data-edge-id={t.id} style={{ border: `1px solid ${color.border.subtle}`, borderRadius: radius.md, padding: space.xs, margin: `${space.xxs}px 0` }}>
                 <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
-                  <select data-testid="sm-trans-from" style={ctrl} value={t.from} onChange={(e) => editTransition(i, { from: e.target.value })}>
+                  <select
+                    aria-label={`Transition ${i + 1} source state`}
+                    data-testid="sm-trans-from"
+                    style={ctrl}
+                    value={t.from}
+                    onChange={(e) => editTransition(i, { from: e.target.value })}
+                  >
                     {draft.states.map((s) => (
                       <option key={s} value={s}>
                         {s}
@@ -533,7 +625,13 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
                     ))}
                   </select>
                   <span>→</span>
-                  <select data-testid="sm-trans-to" style={ctrl} value={t.to} onChange={(e) => editTransition(i, { to: e.target.value })}>
+                  <select
+                    aria-label={`Transition ${i + 1} destination state`}
+                    data-testid="sm-trans-to"
+                    style={ctrl}
+                    value={t.to}
+                    onChange={(e) => editTransition(i, { to: e.target.value })}
+                  >
                     {draft.states.map((s) => (
                       <option key={s} value={s}>
                         {s}
@@ -541,14 +639,26 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
                     ))}
                   </select>
                   <span>when</span>
-                  <select data-testid="sm-trans-event" style={ctrl} value={t.rule.event} onChange={(e) => editTransition(i, { event: e.target.value })}>
+                  <select
+                    aria-label={`Transition ${i + 1} trigger event`}
+                    data-testid="sm-trans-event"
+                    style={ctrl}
+                    value={t.rule.event}
+                    onChange={(e) => editTransition(i, { event: e.target.value })}
+                  >
                     {reg.events.map((ev) => (
                       <option key={ev.name} value={ev.name} title={ev.description}>
                         {ev.name}
                       </option>
                     ))}
                   </select>
-                  <button data-testid="sm-trans-delete" style={ctrl} onClick={() => deleteTransition(i)} title="delete transition">
+                  <button
+                    aria-label={`Delete transition ${i + 1} from ${t.from} to ${t.to}`}
+                    data-testid="sm-trans-delete"
+                    style={ctrl}
+                    onClick={() => deleteTransition(i)}
+                    title="delete transition"
+                  >
                     ×
                   </button>
                 </div>
@@ -556,6 +666,7 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
                   reg={reg}
                   entityOptions={entityOptions}
                   conditions={t.rule.conditions}
+                  contextLabel={`Transition ${i + 1}`}
                   onChange={(conds) => editTransition(i, { conditions: conds })}
                 />
               </div>
@@ -565,7 +676,7 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
       )}
 
       {!draft && machines.length === 0 && (
-        <div style={{ color: "#888" }}>No state machines yet — click “+ New machine” to build one.</div>
+        <div style={{ color: color.text.muted }}>No state machines yet — click “+ New machine” to build one.</div>
       )}
     </div>
   );

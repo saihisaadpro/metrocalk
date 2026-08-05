@@ -13,11 +13,11 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::model::{
     level_for_experience, passive_gold_owed, AbilityAim, AbilityDelivery, AbilityEffect, AbilityId,
-    AbilitySpec, AbilityTargeting, ActorId, ActorKind, ActorProvenance, BasicAttackSpec, Bounty,
-    CombatStats, ControlMask, DamageSchool, DeathRule, ImpactShape, MatchConfig, MatchEndReason,
-    MatchOutcome, MatchPhase, ModifierId, ModifierOp, PlayerId, ProjectileId, RectMm, StatGrowth,
-    StatKind, StatModifier, StatusEffectId, TeamId, Tick, Vec2Mm, MAX_ABILITY_DEFINITIONS,
-    MAX_RUNTIME_CHECKPOINT_BYTES,
+    AbilitySpec, AbilityTargeting, ActorId, ActorKind, ActorProvenance, AttackOrder,
+    BasicAttackSpec, Bounty, CombatStats, ControlMask, DamageSchool, DeathRule, ImpactShape,
+    MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, ModifierId, ModifierOp, PlayerId,
+    ProjectileId, RectMm, StatGrowth, StatKind, StatModifier, StatusEffectId, TeamId, Tick, Vec2Mm,
+    MAX_ABILITY_DEFINITIONS, MAX_RUNTIME_CHECKPOINT_BYTES,
 };
 use crate::protocol::{
     CastTarget, CommandKind, CommandReceipt, CommandRejectReason, CommandRejection, PlayerCommand,
@@ -46,7 +46,7 @@ const MAGIC: [u8; 8] = *b"MTCKPT01";
 // v2 added the immutable per-actor creation provenance record. The format is not yet persisted by any
 // production host, so the version is bumped rather than carrying a compatibility shim: a v1 payload has no
 // provenance to reconstruct, and inferring one would fabricate creation evidence.
-const FORMAT_VERSION: u16 = 7;
+const FORMAT_VERSION: u16 = 8;
 const HEADER_BYTES: usize = 64;
 const PAYLOAD_LENGTH_OFFSET: usize = 44;
 const PAYLOAD_CHECKSUM_OFFSET: usize = 48;
@@ -58,8 +58,8 @@ const MIN_MODIFIER_BYTES: usize = 14;
 // 8 id + 1 provenance tag + 1 owner tag + 1 team + 1 kind + 8 position + 1 destination tag
 // + 26 authored stats + 16 growth + 8 bounty + 4 experience + 1 unspent point + 2 crit attempts
 // + 4 credit count
-// + 4 modifier count + 4 status-effect count + 4 health + 4 resource + 4 ability count + 5 option tags.
-const MIN_ACTOR_BYTES: usize = 107;
+// + 4 modifier count + 4 status-effect count + 4 health + 4 resource + 4 ability count + 6 option tags.
+const MIN_ACTOR_BYTES: usize = 108;
 // 8 id + 8 expiry + 4 shield pool + 1 controls + 4 owned-modifier count.
 const MIN_STATUS_EFFECT_BYTES: usize = 25;
 // 8 id + 8 source + 1 team + 4 ability + 8 position + 8 flight terminus + 4 launch magnitude.
@@ -1418,7 +1418,8 @@ fn encode_actor(encoder: &mut Encoder, actor: &ActorState) -> Result<(), Checkpo
         None => encoder.u8(0)?,
     }
     encode_death_rule(encoder, actor.death_rule)?;
-    encode_option_u64(encoder, actor.respawn_at)
+    encode_option_u64(encoder, actor.respawn_at)?;
+    encode_attack_order(encoder, actor.attack_order)
 }
 
 #[expect(
@@ -1517,6 +1518,14 @@ fn decode_actor(
         }
     }
     let respawn_at = decode_option_u64(decoder, "respawn deadline option")?;
+    let attack_order = decode_attack_order(decoder, config)?;
+    // A standing order needs a weapon to satisfy it, and the frame-boundary audit rejects the pair. Catch
+    // it here so the failure names the checkpoint that carried it rather than the tick that noticed.
+    if attack_order.is_some() && basic_attack.is_none() {
+        return Err(CheckpointError::InvalidData(
+            "standing attack order on an actor with no basic attack",
+        ));
+    }
     Ok(ActorState {
         id,
         owner,
@@ -1530,6 +1539,7 @@ fn decode_actor(
         experience,
         level,
         unspent_ability_points,
+        attack_order,
         crit_attempts,
         damage_credits,
         base_stats,
@@ -1838,11 +1848,58 @@ fn decode_stats(decoder: &mut Decoder<'_>) -> Result<CombatStats, CheckpointErro
     })
 }
 
+/// Encode a standing attack order. Tagged rather than optional-wrapped because the three orders carry
+/// different payloads, so one tag byte has to distinguish four cases regardless.
+fn encode_attack_order(
+    encoder: &mut Encoder,
+    order: Option<AttackOrder>,
+) -> Result<(), CheckpointError> {
+    match order {
+        None => encoder.u8(0),
+        Some(AttackOrder::Target(target)) => {
+            encoder.u8(1)?;
+            encoder.u64(target.get())
+        }
+        Some(AttackOrder::Move(destination)) => {
+            encoder.u8(2)?;
+            encode_point(encoder, destination)
+        }
+        Some(AttackOrder::Hold) => encoder.u8(3),
+    }
+}
+
+fn decode_attack_order(
+    decoder: &mut Decoder<'_>,
+    config: MatchConfig,
+) -> Result<Option<AttackOrder>, CheckpointError> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(AttackOrder::Target(ActorId(decoder.u64()?)))),
+        2 => {
+            let destination = decode_point(decoder)?;
+            // Bounds are checked HERE and not left to the audit, because an out-of-bounds attack-move is
+            // the one order a crafted file could use to walk an actor off the map before anything looked.
+            if !config.map_bounds.contains(destination) {
+                return Err(CheckpointError::InvalidData(
+                    "standing attack-move destination is outside map bounds",
+                ));
+            }
+            Ok(Some(AttackOrder::Move(destination)))
+        }
+        3 => Ok(Some(AttackOrder::Hold)),
+        tag => Err(CheckpointError::InvalidTag {
+            field: "attack order",
+            tag,
+        }),
+    }
+}
+
 fn encode_basic_attack(
     encoder: &mut Encoder,
     attack: BasicAttackSpec,
 ) -> Result<(), CheckpointError> {
     encoder.u32(attack.range_mm)?;
+    encoder.u32(attack.acquisition_range_mm)?;
     encoder.u32(attack.damage)?;
     encode_damage_school(encoder, attack.school)?;
     encoder.u16(attack.windup_ticks)?;
@@ -1852,6 +1909,7 @@ fn encode_basic_attack(
 fn decode_basic_attack(decoder: &mut Decoder<'_>) -> Result<BasicAttackSpec, CheckpointError> {
     Ok(BasicAttackSpec {
         range_mm: decoder.u32()?,
+        acquisition_range_mm: decoder.u32()?,
         damage: decoder.u32()?,
         school: decode_damage_school(decoder)?,
         windup_ticks: decoder.u16()?,
@@ -1966,6 +2024,15 @@ fn encode_command(encoder: &mut Encoder, command: PlayerCommand) -> Result<(), C
             encoder.u8(4)?;
             encoder.u32(ability.get())
         }
+        CommandKind::AttackMove { destination } => {
+            encoder.u8(5)?;
+            encode_point(encoder, destination)
+        }
+        CommandKind::AttackTarget { target } => {
+            encoder.u8(6)?;
+            encoder.u64(target.get())
+        }
+        CommandKind::HoldPosition => encoder.u8(7),
     }
 }
 
@@ -1986,6 +2053,16 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<PlayerCommand, Checkpoint
         3 => CommandKind::BasicAttack {
             target: ActorId(decoder.u64()?),
         },
+        4 => CommandKind::UpgradeAbility {
+            ability: AbilityId(decoder.u32()?),
+        },
+        5 => CommandKind::AttackMove {
+            destination: decode_point(decoder)?,
+        },
+        6 => CommandKind::AttackTarget {
+            target: ActorId(decoder.u64()?),
+        },
+        7 => CommandKind::HoldPosition,
         tag => {
             return Err(CheckpointError::InvalidTag {
                 field: "command kind",
@@ -2178,6 +2255,62 @@ mod tests {
     const PLAYER_TWO: PlayerId = PlayerId(20);
     const RETAINED_DESPAWNED_PLAYER: PlayerId = PlayerId(30);
 
+    /// Every command kind must survive the pending queue, and the ONLY way to be sure is to walk the
+    /// enum rather than to spot-check the ones a scenario happens to queue.
+    ///
+    /// This test was written because it found a real hole: `UpgradeAbility` was WRITTEN with tag 4 and
+    /// then rejected as an unknown tag on the way back in, so any match checkpointed with an upgrade
+    /// still in flight failed to restore. Nothing else in the suite queued one.
+    #[test]
+    fn every_command_kind_survives_the_pending_queue() {
+        let kinds = [
+            CommandKind::MoveTo {
+                destination: Vec2Mm::new(11, -22),
+            },
+            CommandKind::Stop,
+            CommandKind::Cast {
+                ability: STRIKE,
+                target: CastTarget::Actor(ActorId(7)),
+            },
+            CommandKind::BasicAttack {
+                target: ActorId(13),
+            },
+            CommandKind::UpgradeAbility { ability: HEAL },
+            CommandKind::AttackMove {
+                destination: Vec2Mm::new(-33, 44),
+            },
+            CommandKind::AttackTarget {
+                target: ActorId(17),
+            },
+            CommandKind::HoldPosition,
+        ];
+        // A tag walk, so a kind added later without a decoder arm fails HERE rather than in the field.
+        let mut tags = Vec::new();
+        for kind in kinds {
+            let command = PlayerCommand {
+                player: PLAYER_ONE,
+                sequence: 5,
+                execute_at: 99,
+                actor: ActorId(3),
+                kind,
+            };
+            let mut encoder = Encoder::new(1_024).unwrap();
+            encode_command(&mut encoder, command).unwrap();
+            let bytes = encoder.finish();
+            // 8 player + 4 sequence + 8 execute-at + 8 actor, then the kind tag.
+            tags.push(bytes[28]);
+            let mut reader = Decoder::new(&bytes);
+            assert_eq!(decode_command(&mut reader).unwrap(), command);
+        }
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(
+            tags.len(),
+            kinds.len(),
+            "every command kind must carry its own tag"
+        );
+    }
+
     const fn stats() -> CombatStats {
         CombatStats {
             max_health: 1_000,
@@ -2196,6 +2329,7 @@ mod tests {
     const fn attack() -> BasicAttackSpec {
         BasicAttackSpec {
             range_mm: 2_000,
+            acquisition_range_mm: 0,
             damage: 75,
             school: DamageSchool::Physical,
             windup_ticks: 2,
@@ -2352,6 +2486,7 @@ mod tests {
                     at: Vec2Mm::new(0, 0),
                 },
                 respawn_at: None,
+                attack_order: None,
                 provenance: ActorProvenance::Authored,
             },
             ActorState {
@@ -2392,6 +2527,7 @@ mod tests {
                 }),
                 death_rule: DeathRule::StayDead,
                 respawn_at: None,
+                attack_order: None,
                 provenance: ActorProvenance::Authored,
             },
             ActorState {
@@ -2428,6 +2564,7 @@ mod tests {
                     at: Vec2Mm::new(300, 0),
                 },
                 respawn_at: Some(8),
+                attack_order: None,
                 // The richest provenance variant is carried by the fixture so the round-trip corpus
                 // exercises every encoded field, not just the default tag.
                 provenance: ActorProvenance::Wave {

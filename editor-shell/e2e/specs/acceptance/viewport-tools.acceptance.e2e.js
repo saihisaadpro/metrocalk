@@ -21,6 +21,22 @@ const baseline = loadBaseline();
 const cam = () => invoke("camera_debug"); // [orbit, elevation, distance, tx, ty, tz]
 const giz = () => invoke("gizmo_debug"); // [mode, hasSel, dragging, space, pivot]
 
+const shown = async (selector) => {
+  const element = await $(selector);
+  return (await element.isExisting()) && (await element.isDisplayed());
+};
+
+async function revealPopupControl(triggerSelector, controlSelector) {
+  if (!(await shown(controlSelector))) await $(triggerSelector).click();
+  await browser.waitUntil(() => shown(controlSelector), {
+    timeout: 5000,
+    timeoutMsg: `${controlSelector} was not revealed by ${triggerSelector}`,
+  });
+  const control = await $(controlSelector);
+  expect(await control.getAttribute("aria-disabled")).not.toBe("true");
+  return control;
+}
+
 describe("acceptance / M10.7 — viewport tools (the M9 gizmo in React + camera ergonomics, live)", () => {
   before(async () => {
     await browser.waitUntil(
@@ -58,7 +74,7 @@ describe("acceptance / M10.7 — viewport tools (the M9 gizmo in React + camera 
 
     // Space toggle drives the native gizmo space (world ↔ local).
     const space0 = (await giz())[3];
-    await $("#vpSpace").click();
+    await (await revealPopupControl("#vpTransform", "#vpSpace")).click();
     await browser.waitUntil(async () => (await giz())[3] !== space0, {
       timeout: 5000,
       timeoutMsg: "the Space button didn't toggle world/local",
@@ -71,7 +87,7 @@ describe("acceptance / M10.7 — viewport tools (the M9 gizmo in React + camera 
     report.workflow(
       "viewport/gizmo-toolbar",
       { functional: rotated && translated && spaceToggled, inv1: true, inv4: true, clean, offline: true },
-      { controls: ["#vpMove", "#vpRotate", "#vpSpace"], commands: ["gizmo_mode", "gizmo_space_toggle", "gizmo_debug"] }
+      { controls: ["#vpMove", "#vpRotate", "#vpTransform", "#vpSpace"], commands: ["gizmo_mode", "gizmo_space_toggle", "gizmo_debug"] }
     );
     expect(rotated).toBe(true);
     expect(translated).toBe(true);
@@ -83,7 +99,7 @@ describe("acceptance / M10.7 — viewport tools (the M9 gizmo in React + camera 
   it("camera ergonomics: Frame-all + view presets (top/front/side/persp) snap the camera", async () => {
     await clearConsole();
     // Frame all → a non-degenerate framing (a positive fit distance).
-    await $("#vpFrameAll").click();
+    await (await revealPopupControl("#vpView", "#vpFrameAll")).click();
     await browser.waitUntil(async () => (await cam())[2] > 0, {
       timeout: 5000,
       timeoutMsg: "Frame-all didn't set a fit distance",
@@ -91,21 +107,32 @@ describe("acceptance / M10.7 — viewport tools (the M9 gizmo in React + camera 
     const framed = (await cam())[2] > 0;
 
     // View presets set the canonical orbit/elevation. camera_debug = [orbit, elevation, distance, …].
-    await $("#vpTop").click();
+    await (await revealPopupControl("#vpView", "#vpTop")).click();
     await browser.waitUntil(async () => (await cam())[1] > 1.2, {
       timeout: 5000,
       timeoutMsg: "Top view didn't pitch the camera down",
     });
     const top = (await cam())[1] > 1.2;
 
-    await $("#vpFront").click();
+    await (await revealPopupControl("#vpView", "#vpFront")).click();
     await browser.waitUntil(async () => Math.abs((await cam())[1]) < 0.15, {
       timeout: 5000,
       timeoutMsg: "Front view didn't level the camera",
     });
     const front = Math.abs((await cam())[1]) < 0.15;
 
-    await $("#vpPersp").click();
+    await (await revealPopupControl("#vpView", "#vpSide")).click();
+    await browser.waitUntil(
+      async () => {
+        const [orbit, elevation] = await cam();
+        return Math.abs(orbit) < 0.2 && Math.abs(elevation) < 0.15;
+      },
+      { timeout: 5000, timeoutMsg: "Side view didn't align the camera" }
+    );
+    const [sideOrbit, sideElevation] = await cam();
+    const side = Math.abs(sideOrbit) < 0.2 && Math.abs(sideElevation) < 0.15;
+
+    await (await revealPopupControl("#vpView", "#vpPersp")).click();
     await browser.waitUntil(
       async () => {
         const e = (await cam())[1];
@@ -116,19 +143,20 @@ describe("acceptance / M10.7 — viewport tools (the M9 gizmo in React + camera 
     const persp = (await cam())[1] > 0.2 && (await cam())[1] < 1.0;
 
     // The orientation readout reflects the view.
-    const orient = await $("#vpOrient").getAttribute("data-view");
+    const orient = await (await revealPopupControl("#vpView", "#vpOrient")).getAttribute("data-view");
 
     const errs = await consoleErrors();
     const clean = errs.length === 0;
     if (!clean) report.consoleErrorCount += errs.length;
     report.workflow(
       "viewport/camera-framing",
-      { functional: framed && top && front && persp && orient === "persp", inv1: true, clean, offline: true },
-      { controls: ["#vpFrameAll", "#vpTop", "#vpFront", "#vpSide", "#vpPersp", "#vpOrient"], commands: ["frame_all", "view_preset", "camera_debug"] }
+      { functional: framed && top && front && side && persp && orient === "persp", inv1: true, clean, offline: true },
+      { controls: ["#vpView", "#vpFrameAll", "#vpTop", "#vpFront", "#vpSide", "#vpPersp", "#vpOrient"], commands: ["frame_all", "view_preset", "camera_debug"] }
     );
     expect(framed).toBe(true);
     expect(top).toBe(true);
     expect(front).toBe(true);
+    expect(side).toBe(true);
     expect(persp).toBe(true);
     expect(clean).toBe(true);
   });

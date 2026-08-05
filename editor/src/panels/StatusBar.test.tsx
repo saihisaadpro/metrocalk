@@ -21,6 +21,9 @@ test("empty status renders the neutral placeholder, then setStatus drives a live
   const bar = screen.getByTestId("status");
   expect(bar.id).toBe("status");
   expect(bar.textContent).toBe("ready");
+  expect(bar.getAttribute("role")).toBe("status");
+  expect(bar.getAttribute("aria-live")).toBe("polite");
+  expect(bar.getAttribute("aria-atomic")).toBe("true");
 
   // a real action message arrives on the ephemeral store → the SAME bar updates live (subscription)
   act(() => setStatus("bound HealthBar"));

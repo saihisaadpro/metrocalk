@@ -59,5 +59,5 @@ test("ranked compatible targets render, every greyed 'no' carries its reason, on
 
 test("no selection → a prompt, not a crash", () => {
   render(<Reveal client={stubClient(REVEAL)} />);
-  expect(screen.getByText(/select an entity/i)).toBeTruthy();
+  expect(screen.getByText(/select an object/i)).toBeTruthy();
 });

@@ -10,10 +10,11 @@ import { useBalance, setBalance } from "../store/wallet";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Button } from "../theme/primitives";
-import { color, font, fontSize, space } from "../theme/tokens";
+import { MenuPopup, PopupMenuGroup, PopupMenuItem } from "../theme/workspace";
+import { color, font, fontSize, motion, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 
-export function Wallet({ client }: { client: EditorClient }) {
+export function Wallet({ client, compact = false }: { client: EditorClient; compact?: boolean }) {
   const balance = useBalance();
   const [flash, setFlash] = useState(false);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -54,6 +55,47 @@ export function Wallet({ client }: { client: EditorClient }) {
     }
   }
 
+  if (compact) {
+    return (
+      <div id="wallet" data-testid="wallet">
+        <MenuPopup
+          id="wallet-popup"
+          label="AI credits"
+          placement="bottom-end"
+          trigger={(
+            <>
+              <span aria-hidden="true">⊞</span>
+              <span id="walletBal" data-testid="balance" style={{ transition: `color ${motion.base}`, color: flash ? color.text.primary : color.token, fontWeight: 650 }}>
+                {balance ?? "…"}
+              </span>
+            </>
+          )}
+          triggerProps={{
+            "data-testid": "wallet-trigger",
+            variant: "ghost",
+            compact: true,
+            title: "AI credits and sandbox grant",
+            style: { color: color.token, font: font.mono, gap: space.xs },
+          }}
+        >
+          {(close) => (
+            <PopupMenuGroup label="AI credits">
+              <PopupMenuItem
+                id="topup"
+                data-testid="topup"
+                label={`${balance ?? "…"} tokens available`}
+                description="Add 100 sandbox development tokens — no purchase"
+                leading="⊞"
+                onSelect={onTopUp}
+                onRequestClose={close}
+              />
+            </PopupMenuGroup>
+          )}
+        </MenuPopup>
+      </div>
+    );
+  }
+
   return (
     <div
       id="wallet"
@@ -61,7 +103,7 @@ export function Wallet({ client }: { client: EditorClient }) {
       style={{ padding: `0 ${space.xs}px`, fontSize: fontSize.body, color: color.token, display: "flex", alignItems: "center", gap: space.sm, whiteSpace: "nowrap", minWidth: 0, font: font.mono }}
     >
       <span aria-hidden style={{ opacity: 0.85 }}>⊞</span>
-      <span id="walletBal" data-testid="balance" style={{ transition: "color .2s", color: flash ? "#fff" : color.token, fontWeight: 600 }}>
+      <span id="walletBal" data-testid="balance" style={{ transition: `color ${motion.base}`, color: flash ? color.text.primary : color.token, fontWeight: 600 }}>
         {balance ?? "…"}
       </span>
       <span style={{ color: color.text.muted }}>tokens</span>

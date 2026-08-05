@@ -3,75 +3,100 @@
 //! toast auto-dismisses after `TOAST_TTL_MS` (the timer lives here, not the store) and is click-to-dismiss.
 //! Stable hooks (`#toastHost`, `data-testid="toast"`, `data-kind`) for the review flow + Vitest.
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { toastStore, useToasts, TOAST_TTL_MS, type Toast } from "../store/toasts";
+import { Button } from "../theme/primitives";
+import { color, elevation, font, fontSize, radius, space, z } from "../theme/tokens";
 
 // Semantic kinds → the design-system colour roles (theme/global.css vars).
-const BG: Record<Toast["kind"], string> = {
-  info: "var(--mtk-info-bg)",
-  cost: "var(--mtk-warn-bg)",
-  success: "var(--mtk-success-bg)",
-  error: "var(--mtk-danger-bg)",
-};
-const BORDER: Record<Toast["kind"], string> = {
-  info: "var(--mtk-info-border)",
-  cost: "var(--mtk-warn-border)",
-  success: "var(--mtk-success-border)",
-  error: "var(--mtk-danger-border)",
-};
-const FG: Record<Toast["kind"], string> = {
-  info: "var(--mtk-info)",
-  cost: "var(--mtk-warn)",
-  success: "var(--mtk-success)",
-  error: "var(--mtk-danger)",
+const TONE: Record<Toast["kind"], { background: string; border: string; foreground: string }> = {
+  info: { background: color.info.bg, border: color.info.border, foreground: color.info.text },
+  cost: { background: color.warn.bg, border: color.warn.border, foreground: color.warn.text },
+  success: { background: color.success.bg, border: color.success.border, foreground: color.success.text },
+  error: { background: color.danger.bg, border: color.danger.border, foreground: color.danger.text },
 };
 
 function ToastRow({ toast }: { toast: Toast }) {
+  const [paused, setPaused] = useState(false);
+
   useEffect(() => {
+    if (paused) return;
     const t = setTimeout(() => toastStore.getState().dismiss(toast.id), TOAST_TTL_MS);
     return () => clearTimeout(t);
-  }, [toast.id]);
+  }, [paused, toast.id]);
+
+  const tone = TONE[toast.kind];
+  const live = toast.kind === "error" ? "assertive" : "polite";
+
   return (
     <div
       className="mtk-toast mtk-anim-toast"
       data-testid="toast"
       data-kind={toast.kind}
-      onClick={() => toastStore.getState().dismiss(toast.id)}
+      role={toast.kind === "error" ? "alert" : "status"}
+      aria-live={live}
+      aria-atomic="true"
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}
+      onFocusCapture={() => setPaused(true)}
+      onBlurCapture={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setPaused(false);
+      }}
       style={{
-        pointerEvents: "auto",
-        background: BG[toast.kind],
-        color: FG[toast.kind],
-        border: `1px solid ${BORDER[toast.kind]}`,
-        borderRadius: 6,
-        padding: "6px 12px",
-        fontSize: 12,
-        fontFamily: "var(--mtk-font-ui)",
-        boxShadow: "0 6px 18px #0007",
-        cursor: "pointer",
-        maxWidth: 420,
+        // Passive feedback must never intercept viewport/toolbar gestures. Only the explicitly interactive
+        // dismiss control opts back into pointer events; focusing or hovering that control still pauses TTL.
+        pointerEvents: "none",
+        display: "flex",
+        alignItems: "center",
+        gap: space.sm,
+        background: tone.background,
+        color: tone.foreground,
+        border: `1px solid ${tone.border}`,
+        borderRadius: radius.lg,
+        padding: `${space.sm}px ${space.sm}px ${space.sm}px ${space.lg}px`,
+        fontSize: fontSize.body,
+        fontFamily: font.ui,
+        boxShadow: elevation.e2,
+        width: "max-content",
+        maxWidth: `calc(100vw - ${space.xxl * 2}px)`,
       }}
     >
-      {toast.text}
+      <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>{toast.text}</span>
+      <Button
+        type="button"
+        variant="ghost"
+        compact
+        icon
+        data-testid="toast-dismiss"
+        aria-label={`Dismiss notification: ${toast.text}`}
+        title="Dismiss notification"
+        onClick={() => toastStore.getState().dismiss(toast.id)}
+        style={{ flex: "none", color: tone.foreground, pointerEvents: "auto" }}
+      >
+        <span aria-hidden="true">×</span>
+      </Button>
     </div>
   );
 }
 
-export function ToastHost({ top = 14 }: { top?: number }) {
+export function ToastHost({ top = 58 }: { top?: number }) {
   const toasts = useToasts();
   if (toasts.length === 0) return null;
   return (
     <div
       id="toastHost"
       data-testid="toastHost"
+      role="region"
+      aria-label="Notifications"
       style={{
         position: "absolute",
         top,
         left: "50%",
         transform: "translateX(-50%)",
-        zIndex: 150,
+        zIndex: z.toast,
         display: "flex",
         flexDirection: "column",
-        gap: 6,
+        gap: space.sm,
         alignItems: "center",
         pointerEvents: "none",
       }}

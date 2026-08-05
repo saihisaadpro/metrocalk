@@ -1142,6 +1142,12 @@ impl AbilitySpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BasicAttackSpec {
     pub range_mm: u32,
+    /// How far this actor looks for a target it was not explicitly given.
+    ///
+    /// Separate from `range_mm` because they answer different questions: acquisition is "what do I notice",
+    /// range is "what can I reach". Shipped games keep acquisition wider so a unit steps toward a target it
+    /// has already committed to. Zero means "acquire only what I can already hit".
+    pub acquisition_range_mm: u32,
     pub damage: u32,
     pub school: DamageSchool,
     pub windup_ticks: u16,
@@ -1149,10 +1155,25 @@ pub struct BasicAttackSpec {
 }
 
 impl BasicAttackSpec {
+    /// The distance at which this actor will notice a target on its own.
+    #[must_use]
+    pub const fn acquisition_mm(self) -> u32 {
+        if self.acquisition_range_mm == 0 {
+            self.range_mm
+        } else {
+            self.acquisition_range_mm
+        }
+    }
+
     pub(crate) const fn validate(self) -> Result<(), RuntimeError> {
         if self.range_mm == 0 {
             return Err(RuntimeError::InvalidActor(
                 "basic-attack range must be positive",
+            ));
+        }
+        if self.acquisition_range_mm != 0 && self.acquisition_range_mm < self.range_mm {
+            return Err(RuntimeError::InvalidActor(
+                "acquisition range must be at least the attack range, or zero to mean the same",
             ));
         }
         if self.damage == 0 {
@@ -1162,6 +1183,24 @@ impl BasicAttackSpec {
         }
         Ok(())
     }
+}
+
+/// A standing order that keeps an actor attacking without a command per swing.
+///
+/// This is the difference between "every swing is a separate command" and an auto-attack: the order
+/// persists, and the runtime re-acquires under it. It is deliberately a small closed set rather than a
+/// script — each variant answers "what do I do when I have no target right now?" differently, and that is
+/// the whole behavioural surface a MOBA needs from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttackOrder {
+    /// Attack one named target until it dies, despawns, or the order is replaced. Does NOT re-acquire:
+    /// a player who named a target meant that target, and silently switching would steal their intent.
+    Target(ActorId),
+    /// Advance toward a point, but stop and engage anything hostile that comes within acquisition range.
+    /// Resumes advancing once nothing is in range — the classic attack-move.
+    Move(Vec2Mm),
+    /// Hold position and engage anything hostile that comes within acquisition range.
+    Hold,
 }
 
 /// Cooked lifecycle behavior after authoritative death classification.

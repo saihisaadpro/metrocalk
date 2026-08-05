@@ -1,8 +1,9 @@
 //! Post-merge validation and repair layer (invariant 3, second sentence).
 //!
 //! After importing/merging Loro updates, this module detects and repairs the eight invalid-state
-//! classes catalogued in `spikes/loro` (F1). Uses regular containers per F1 (the `ensure_mergeable_*`
-//! helper breaks under undo/redo).
+//! classes catalogued in `spikes/loro` (F1). New child maps use Loro 1.13's reworked Mergeable
+//! Containers; unlike the original UndoManager-era spike, these have been re-verified against the
+//! engine's operational inverse-op undo in `core/tests/override_model.rs`.
 //!
 //! ## Adversarial analysis: in-memory inverse-op stack vs Loro op history
 //!
@@ -345,14 +346,25 @@ fn loro_str(v: &LoroValue) -> Option<String> {
     }
 }
 
-/// Deterministic deep-value serialization for convergence comparison.
+/// Deterministic logical-state serialization for convergence comparison. Physical empty component
+/// maps are retained so a mergeable child stays attached for concurrent sibling edits, but they are
+/// not authored scene data and therefore do not affect canonical revision identity. No other empty
+/// maps are normalized.
 pub fn canon_doc(doc: &LoroDoc) -> String {
     let mut s = String::new();
-    canon(&doc.get_deep_value(), &mut s);
+    canon(&doc.get_deep_value(), &mut s, CanonScope::Root);
     s
 }
 
-fn canon(v: &LoroValue, out: &mut String) {
+#[derive(Clone, Copy)]
+enum CanonScope {
+    Root,
+    Components,
+    EntityComponents,
+    Other,
+}
+
+fn canon(v: &LoroValue, out: &mut String, scope: CanonScope) {
     match v {
         LoroValue::Null => out.push_str("null"),
         LoroValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -367,7 +379,7 @@ fn canon(v: &LoroValue, out: &mut String) {
         LoroValue::List(l) => {
             out.push('[');
             for x in l.iter() {
-                canon(x, out);
+                canon(x, out, CanonScope::Other);
                 out.push(',');
             }
             out.push(']');
@@ -377,9 +389,22 @@ fn canon(v: &LoroValue, out: &mut String) {
             keys.sort();
             out.push('{');
             for k in keys {
+                let value = &m[k];
+                if matches!(scope, CanonScope::EntityComponents)
+                    && matches!(value, LoroValue::Map(fields) if fields.is_empty())
+                {
+                    continue;
+                }
                 out.push_str(k);
                 out.push(':');
-                canon(&m[k], out);
+                let child_scope = match scope {
+                    CanonScope::Root if k == "components" => CanonScope::Components,
+                    CanonScope::Components => CanonScope::EntityComponents,
+                    CanonScope::Root | CanonScope::EntityComponents | CanonScope::Other => {
+                        CanonScope::Other
+                    }
+                };
+                canon(value, out, child_scope);
                 out.push(',');
             }
             out.push('}');

@@ -5,7 +5,7 @@
 //! is driven by the panel reporting its visible window. `data-thumb-status` is the structured signal tests
 //! key on (`ready` vs `fallback`), never a styled string.
 
-import { useThumb } from "../store/thumbnails";
+import { thumbnailStore, useThumb } from "../store/thumbnails";
 import { TypeIcon } from "./primitives";
 
 export function Thumbnail({
@@ -33,7 +33,15 @@ export function Thumbnail({
       style={{ width: size, height: size }}
     >
       {ready ? (
-        <img src={entry!.url!} alt="" draggable={false} />
+        <img
+          src={entry!.url!}
+          alt=""
+          width={size}
+          height={size}
+          decoding="async"
+          draggable={false}
+          onError={() => thumbnailStore.getState().receive(id, null)}
+        />
       ) : (
         <TypeIcon kind={kind} size={size} style={{ border: "none", borderRadius: 0 }} />
       )}

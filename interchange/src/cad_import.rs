@@ -219,6 +219,11 @@ pub struct CadImport {
     /// the importer preserves the source's exact hierarchy, grouping, and names. Leaf `parts` reference these
     /// via [`PartReport::parent`]. Empty for a flat single-part source.
     pub groups: Vec<GroupNode>,
+    /// M15.11 (ADR-081) — the decoded B-rep faces per **unique geometry** (keyed by [`PartReport::reference`],
+    /// in the part's LOCAL frame). The semantic pass (feature recognition · classification · defeaturing ·
+    /// the re-import surface histogram) reads these; a tessellation-only source has no entry (its parts ride
+    /// the mesh-recovery tier). Populated once per unique reference, never per occurrence.
+    pub breps: std::collections::BTreeMap<String, Vec<crate::step::CadFace>>,
     /// Every unsupported/approximated feature at the *scene* level, explained (never a silent drop).
     pub notes: Vec<UnsupportedNote>,
 }
@@ -384,6 +389,16 @@ pub enum PartSource {
     ExactBrep(Vec<crate::step::CadFace>),
     /// An embedded/open tessellation cache already decoded to a mesh (open XML 3DRep · glTF · JT LOD).
     Tessellation(TriMesh),
+    /// A shared, already-tessellated geometry prototype. Large assemblies use this variant so thousands of
+    /// occurrences clone only an [`std::sync::Arc`], never the complete vertex/index arrays. `exact_brep`
+    /// means the source B-rep was decoded and retained separately in [`CadImport::breps`]; `false` means this
+    /// is a visualization tessellation supplied by the source file.
+    SharedTessellation {
+        /// The immutable local-space mesh prototype shared by every occurrence.
+        mesh: std::sync::Arc<TriMesh>,
+        /// Whether this mesh was generated from a decoded exact B-rep.
+        exact_brep: bool,
+    },
     /// A proprietary tessellation cache the reader **cannot** decode without the licensed kernel — carries
     /// the detected encoding (e.g. `"CATIA V5_CFV3/CB0001"`). Placed as a proxy at its transform + diagnosed.
     ProprietaryRep {
@@ -408,6 +423,7 @@ fn resolve_part(
     meshes: &mut Vec<CadMesh>,
     by_hash: &mut BTreeMap<u64, Vec<usize>>,
     proxy_idx: &mut Option<usize>,
+    breps: &mut BTreeMap<String, Vec<crate::step::CadFace>>,
 ) -> PartReport {
     // Intern a real mesh by geometry hash (dedup). Returns None for a degenerate (0-triangle) mesh so the
     // cascade falls through to the proxy — a 0-triangle "success" is exactly the Datasmith silent failure.
@@ -415,11 +431,11 @@ fn resolve_part(
     // collision must NEVER silently merge two distinct geometries (that would be silent geometry loss
     // masquerading as an exact success). Identical geometry shares one mesh; a genuine collision keeps both.
     let intern_real =
-        |tris: TriMesh, meshes: &mut Vec<CadMesh>, by_hash: &mut BTreeMap<u64, Vec<usize>>| {
+        |tris: &TriMesh, meshes: &mut Vec<CadMesh>, by_hash: &mut BTreeMap<u64, Vec<usize>>| {
             if tris.triangle_count() == 0 {
                 return None;
             }
-            let h = mesh_hash(&tris);
+            let h = mesh_hash(tris);
             let chain = by_hash.entry(h).or_default();
             for &idx in chain.iter() {
                 let m = &meshes[idx];
@@ -430,7 +446,7 @@ fn resolve_part(
             let i = meshes.len();
             chain.push(i);
             meshes.push(CadMesh {
-                tris,
+                tris: tris.clone(),
                 hash: h,
                 is_proxy: false,
             });
@@ -447,7 +463,10 @@ fn resolve_part(
     ) = match raw.source {
         PartSource::ExactBrep(faces) => {
             let tris = tessellate_faces(&faces);
-            match intern_real(tris, meshes, by_hash) {
+            // Keep the decoded faces per unique geometry (the M15.11 semantic-pass input) — the mesh index
+            // alone was the M15.10 `brep_faces()` gap that left the surface histogram unpopulated in-pipeline.
+            breps.entry(raw.reference.clone()).or_insert(faces);
+            match intern_real(&tris, meshes, by_hash) {
                 Some(i) => (
                     ImportStrategy::ExactBrep,
                     PartFidelity::ExactBrep,
@@ -473,7 +492,7 @@ fn resolve_part(
                 ),
             }
         }
-        PartSource::Tessellation(tris) => match intern_real(tris, meshes, by_hash) {
+        PartSource::Tessellation(tris) => match intern_real(&tris, meshes, by_hash) {
             Some(i) => (
                 ImportStrategy::TessellationCache,
                 PartFidelity::TessellationOnly,
@@ -493,6 +512,37 @@ fn resolve_part(
                 Some("re-export as STEP AP242 / verify the source tessellation".into()),
             ),
         },
+        PartSource::SharedTessellation { mesh: tris, exact_brep } => {
+            match intern_real(&tris, meshes, by_hash) {
+                Some(i) if exact_brep => (
+                    ImportStrategy::ExactBrep,
+                    PartFidelity::ExactBrep,
+                    Some(i),
+                    "exact STEP B-rep decoded and tessellated once; the B-rep remains available for \
+                     inspection and retessellation while occurrences instance the shared render mesh"
+                        .into(),
+                    None,
+                ),
+                Some(i) => (
+                    ImportStrategy::TessellationCache,
+                    PartFidelity::TessellationOnly,
+                    Some(i),
+                    "embedded AP242 tessellation rendered from one shared geometry prototype; exact B-rep \
+                     was not present for this body"
+                        .into(),
+                    Some("retessellation requires an exact B-rep representation for this body".into()),
+                ),
+                None => (
+                    ImportStrategy::BoundingProxy,
+                    PartFidelity::Failed,
+                    Some(intern_proxy(meshes, proxy_idx)),
+                    "the shared geometry prototype was degenerate (0 usable triangles); the affected \
+                     component is reported and unresolved"
+                        .into(),
+                    Some("repair or re-export the source geometry".into()),
+                ),
+            }
+        }
         PartSource::ProprietaryRep { encoding } => (
             ImportStrategy::BoundingProxy,
             PartFidelity::Proxy,
@@ -577,9 +627,16 @@ pub fn build_import(
     let mut meshes: Vec<CadMesh> = Vec::new();
     let mut by_hash: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     let mut proxy_idx: Option<usize> = None;
+    let mut breps: BTreeMap<String, Vec<crate::step::CadFace>> = BTreeMap::new();
     let mut parts = Vec::with_capacity(raw_parts.len());
     for raw in raw_parts {
-        parts.push(resolve_part(raw, &mut meshes, &mut by_hash, &mut proxy_idx));
+        parts.push(resolve_part(
+            raw,
+            &mut meshes,
+            &mut by_hash,
+            &mut proxy_idx,
+            &mut breps,
+        ));
     }
     let total_occurrences = parts.len();
     let structural_nodes = groups.len();
@@ -594,6 +651,7 @@ pub fn build_import(
         parts,
         structural_nodes,
         groups,
+        breps,
         notes,
     }
 }
@@ -955,7 +1013,7 @@ impl CadReader for StepAssemblyReader {
         // must NOT be hijacked into a "tessellation-only" diagnosis — it takes leg (B) below (exact faces,
         // exact fidelity, PMI, interpret()'s notes).
         let tess = crate::step::parse_tessellated_assembly(&entities);
-        let (brep, brep_notes) = crate::step::parse_brep_assembly(&entities);
+        let (brep, brep_notes, brep_faces, groups) = crate::step::parse_brep_assembly(&entities);
         let is_assembly = crate::step::has_nauo(&entities);
         if !tess.is_empty() || (is_assembly && !brep.is_empty()) {
             let name =
@@ -966,31 +1024,23 @@ impl CadReader for StepAssemblyReader {
             placements.extend(brep);
             let total_occurrences = placements.len();
 
-            // A huge assembly (this crane expands to ~13 k occurrences) has FAR more entities than the
-            // single-threaded editor engine + outliner projection can carry — the window freezes ("Not
-            // Responding") and never repaints. Above a threshold, MERGE instances by geometry+colour: bake
-            // each occurrence's world transform into its vertices and union same-(mesh, colour) instances
-            // into ONE part. All triangles + colours still render at their real world positions (visually
-            // identical), but a repeated bolt becomes one entity instead of hundreds → ~370 parts, not 13 k.
-            // Below the threshold, parts stay individual (per-part selection / instancing preserved).
-            let parts_out = if placements.len() > MERGE_ABOVE_PARTS {
-                merge_by_geometry(placements)
-            } else {
-                placements
-            };
-
-            let mut raw_parts = Vec::with_capacity(parts_out.len());
-            for (i, p) in parts_out.into_iter().enumerate() {
+            // Preserve every occurrence. Geometry prototypes are Arc-shared by the STEP reader and deduped
+            // again by `build_import`, while the renderer batches instances per mesh slot. World-baking by
+            // geometry used to reduce the entity count, but destroyed product hierarchy, pivots, per-part
+            // editing and instancing while multiplying vertex memory — the opposite of a CAD scene graph.
+            let mut raw_parts = Vec::with_capacity(placements.len());
+            for p in placements {
                 raw_parts.push(RawPart {
-                    id: i as u64,
+                    id: p.id,
                     name: p.name,
                     reference: p.reference,
                     transform: p.transform,
-                    source: PartSource::Tessellation(p.mesh),
+                    source: PartSource::SharedTessellation {
+                        mesh: p.mesh,
+                        exact_brep: p.exact_brep,
+                    },
                     color: p.color,
-                    // Flat placement for now (each part carries its real world transform); the named
-                    // NEXT_ASSEMBLY_USAGE_OCCURRENCE folder tree is a follow-up.
-                    parent: None,
+                    parent: p.parent,
                 });
             }
             let mut imp = build_import(
@@ -999,10 +1049,13 @@ impl CadReader for StepAssemblyReader {
                 units,
                 src,
                 raw_parts,
-                Vec::new(),
+                groups,
                 brep_notes,
             );
             imp.total_occurrences = total_occurrences;
+            // The NAUO leg's decoded faces, keyed by product-definition reference. Every occurrence keeps
+            // its source reference and local placement; shared meshes stay in their product-local frame.
+            imp.breps.extend(brep_faces);
             return Ok(imp);
         }
 
@@ -1036,78 +1089,6 @@ impl CadReader for StepAssemblyReader {
 /// large (the M15.7 bar file's STEP re-export is 262 MB), so this is far above the planar-subset
 /// [`crate::MAX_STEP_BYTES`] (64 MB) cap, but still bounded (the decode-bomb guard).
 pub const MAX_STEP_ASSEMBLY_BYTES: usize = 1024 * 1024 * 1024;
-
-/// Above this many placed STEP occurrences, merge instances by geometry+colour (see [`merge_by_geometry`])
-/// so the entity count stays inside what the single-threaded editor engine + outliner projection render
-/// without freezing. Below it, parts stay individual (per-part selection + GPU instancing preserved). The
-/// 3DXML proxy import at ~2.7 k entities stays responsive; the crane's ~13 k B-rep occurrences do not.
-const MERGE_ABOVE_PARTS: usize = 3000;
-
-/// Merge placed parts sharing the SAME geometry (mesh content hash) AND colour into one world-baked part
-/// each: every instance's world transform is applied to its vertices, then same-key instances are unioned
-/// into a single mesh placed at identity. Visually identical (all triangles land at their real world
-/// positions) but collapses a high-instance assembly from tens of thousands of entities to a few hundred.
-/// Deterministic (`BTreeMap` key order).
-fn merge_by_geometry(parts: Vec<crate::step::TessPart>) -> Vec<crate::step::TessPart> {
-    use metrocalk_csg::TriMesh;
-    type Group = (
-        Vec<[f64; 3]>,
-        Vec<[u32; 3]>,
-        Option<[f32; 3]>,
-        String,
-        String,
-    );
-    let mut groups: std::collections::BTreeMap<(u128, [u32; 3]), Group> =
-        std::collections::BTreeMap::new();
-    for p in parts {
-        let hash = p.mesh.content_hash();
-        let ckey = p.color.map_or([u32::MAX; 3], |c| {
-            [c[0].to_bits(), c[1].to_bits(), c[2].to_bits()]
-        });
-        let entry = groups.entry((hash, ckey)).or_insert_with(|| {
-            (
-                Vec::new(),
-                Vec::new(),
-                p.color,
-                p.name.clone(),
-                p.reference.clone(),
-            )
-        });
-        let base = u32::try_from(entry.0.len()).unwrap_or(u32::MAX);
-        for v in &p.mesh.positions {
-            entry.0.push(apply_transform(&p.transform, *v));
-        }
-        for t in &p.mesh.triangles {
-            entry.1.push([
-                t[0].saturating_add(base),
-                t[1].saturating_add(base),
-                t[2].saturating_add(base),
-            ]);
-        }
-    }
-    groups
-        .into_values()
-        .map(
-            |(positions, triangles, color, name, reference)| crate::step::TessPart {
-                name,
-                reference,
-                transform: IDENTITY_4X4,
-                mesh: TriMesh::new(positions, triangles),
-                color,
-            },
-        )
-        .collect()
-}
-
-/// Apply a column-major rigid 4×4 to a point (implicit `w = 1`) — bakes an occurrence's world placement
-/// into its mesh vertices for [`merge_by_geometry`].
-fn apply_transform(m: &[f64; 16], p: [f64; 3]) -> [f64; 3] {
-    [
-        m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
-        m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
-        m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
-    ]
-}
 
 // ============================================================================================
 // The native translation-kernel seam + the startup dependency probe (M15.8 / ADR-078)

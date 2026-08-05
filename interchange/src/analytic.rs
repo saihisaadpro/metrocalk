@@ -127,7 +127,7 @@ fn norm3(a: [f64; 3]) -> f64 {
 
 impl AnalyticSurface {
     /// The world point at parameters `(u, v)`.
-    fn point(&self, u: f64, v: f64) -> [f64; 3] {
+    pub(crate) fn point(&self, u: f64, v: f64) -> [f64; 3] {
         match *self {
             Self::Cylinder { frame, radius } => {
                 let radial = add3(
@@ -179,7 +179,7 @@ impl AnalyticSurface {
 
     /// The exact outward surface normal at `(u, v)` (before `same_sense`): radially out of the axis /
     /// centre / tube — the STEP convention for these surfaces' positive orientation.
-    fn normal(&self, u: f64, v: f64) -> [f64; 3] {
+    pub(crate) fn normal(&self, u: f64, v: f64) -> [f64; 3] {
         match *self {
             Self::Cylinder { frame, .. } => {
                 add3(scale3(f_x(&frame), u.cos()), scale3(f_y(&frame), u.sin()))
@@ -211,7 +211,7 @@ impl AnalyticSurface {
 
     /// Project a world point to `(u, v)` + its distance OFF the surface (the on-surface check). A point on
     /// a parameter pole (sphere pole / cone apex — u undefined) reports `u_valid = false`.
-    fn project(&self, p: [f64; 3]) -> Projected {
+    pub(crate) fn project(&self, p: [f64; 3]) -> Projected {
         match *self {
             Self::Cylinder { frame, radius } => {
                 let d = sub3(p, f_origin(&frame));
@@ -295,11 +295,13 @@ impl AnalyticSurface {
     }
 }
 
-struct Projected {
-    u: f64,
-    v: f64,
-    off: f64,
-    u_valid: bool,
+pub(crate) struct Projected {
+    pub(crate) u: f64,
+    pub(crate) v: f64,
+    #[allow(dead_code)]
+    // the off-surface distance is the tessellation gate's; the recognizer keys on u/v
+    pub(crate) off: f64,
+    pub(crate) u_valid: bool,
 }
 
 /// The tessellated patch for one analytic face: grid triangles + the exact per-triangle outward normal

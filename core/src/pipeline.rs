@@ -1033,18 +1033,25 @@ impl<W: World> Engine<W> {
         let key = entity.to_loro_key();
         let components = self.doc.get_map("components");
         if let Some(ValueOrContainer::Container(Container::Map(rec))) = components.get(&key) {
-            if rec.get(component).is_some() {
+            if let Some(ValueOrContainer::Container(Container::Map(cmap))) = rec.get(component) {
+                // A mergeable child has a deterministic identity. Deleting only its parent link
+                // does not erase the child map's operations; a later `ensure_mergeable_map` at the
+                // same path reattaches that identity and would resurrect every field that was still
+                // live inside it. Tombstone the fields first, then unlink the empty component so
+                // local absence and first-field undo retain their exact structural semantics.
+                for field in cmap.keys() {
+                    cmap.delete(&field).map_err(loro_err)?;
+                }
                 rec.delete(component).map_err(loro_err)?;
             }
         }
         Ok(())
     }
 
-    /// Remove a single field, leaving sibling fields intact. If the component record is left with no
-    /// fields, drop it too — so undoing the creation of a component's first field restores the exact
-    /// prior state (no lingering empty component). This is the precise inverse of an additive
-    /// [`Op::SetField`]; the old over-broad [`Op::RemoveComponent`] inverse destroyed sibling fields
-    /// written by earlier transactions (the M1 audit bug).
+    /// Remove a single field, leaving sibling fields intact. The mergeable component container stays
+    /// attached even when locally empty: unlinking it would turn a precise field removal into a
+    /// component-wide LWW delete that can hide a peer's concurrent sibling-field addition. Empty
+    /// component maps are omitted from semantic reads by [`Self::capture_components`].
     fn apply_remove_field(
         &mut self,
         entity: EntityId,
@@ -1060,9 +1067,6 @@ impl<W: World> Engine<W> {
             if let Some(ValueOrContainer::Container(Container::Map(cmap))) = rec.get(component) {
                 if cmap.get(field).is_some() {
                     cmap.delete(field).map_err(loro_err)?;
-                }
-                if cmap.is_empty() {
-                    rec.delete(component).map_err(loro_err)?;
                 }
             }
         }
@@ -1742,7 +1746,9 @@ impl<W: World> Engine<W> {
                                 fmap.insert(fname.clone(), fv);
                             }
                         }
-                        result.insert(comp_name.clone(), fmap);
+                        if !fmap.is_empty() {
+                            result.insert(comp_name.clone(), fmap);
+                        }
                     }
                 }
             }
@@ -1898,14 +1904,16 @@ impl<W: World> Engine<W> {
 
 // ── Loro helpers (crate-internal, no public leak) ──────────────────────────
 
-/// Get-or-create a child map, propagating a Loro failure as [`PipelineError::Loro`]. Used on the
-/// `apply_*` mutation path (deliverable 4: no `.unwrap()` on a fallible Loro op there).
+/// Get-or-create a child map, propagating a Loro failure as [`PipelineError::Loro`]. Existing regular
+/// maps remain valid for backwards compatibility; newly-created slots use Loro's deterministic
+/// mergeable identity so two offline peers performing the first write at the same logical path do not
+/// create competing child containers and silently hide one peer's fields. Loro 1.13's reworked
+/// Mergeable Containers are compatible with this engine's operational inverse-op undo (already proven
+/// for override slots in `core/tests/override_model.rs`).
 pub(crate) fn try_child_map(parent: &LoroMap, key: &str) -> Result<LoroMap, PipelineError> {
     match parent.get(key) {
         Some(ValueOrContainer::Container(Container::Map(m))) => Ok(m),
-        _ => parent
-            .insert_container(key, LoroMap::new())
-            .map_err(loro_err),
+        _ => parent.ensure_mergeable_map(key).map_err(loro_err),
     }
 }
 

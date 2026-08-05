@@ -387,6 +387,67 @@ fn a_speed_too_small_to_move_is_warned_about_not_silently_zeroed() {
     assert!(outcome.codes().contains(&"speed-rounds-to-zero".to_owned()));
 }
 
+#[test]
+fn acquisition_range_defaults_to_twice_reach_and_is_honoured_when_authored() {
+    // The field arrived AFTER these scenes could be authored, so absent must mean a sensible default and
+    // not a refusal. A default equal to reach would make a standing order look broken - the unit would
+    // only ever engage what had already walked into its face - so the default is deliberately wider.
+    let mut engine = starter();
+    let defaulted = cooked(&engine);
+    let attacker = defaulted
+        .actors
+        .iter()
+        .find_map(|actor| actor.attack)
+        .expect("the starter match authors an attacker");
+    assert_eq!(
+        attacker.acquisition_range_mm,
+        attacker.range_mm * 2,
+        "an unauthored acquisition range must default to twice reach"
+    );
+
+    // Authored, it is used verbatim. Set on every authored actor rather than guessing which one carries
+    // the weapon: the ones without an attack ignore it, and the test stays correct if the starter changes.
+    for index in 0..authored_with(&engine, MATCH_ACTOR).len() {
+        set_on_nth(
+            &mut engine,
+            MATCH_ACTOR,
+            index,
+            "attackAcquisitionRange",
+            FieldValue::Number(9.0),
+        );
+    }
+    let authored = cooked(&engine);
+    assert!(
+        authored
+            .actors
+            .iter()
+            .filter_map(|actor| actor.attack)
+            .any(|attack| attack.acquisition_range_mm == 9_000),
+        "an authored acquisition range must reach the artifact"
+    );
+}
+
+#[test]
+fn an_acquisition_range_shorter_than_reach_is_refused_by_name() {
+    // The kernel refuses this pair outright. Catching it here means the author is told which FIELD to fix
+    // instead of meeting a runtime error at start with no object attached to it.
+    let mut engine = starter();
+    for index in 0..authored_with(&engine, MATCH_ACTOR).len() {
+        set_on_nth(
+            &mut engine,
+            MATCH_ACTOR,
+            index,
+            "attackAcquisitionRange",
+            FieldValue::Number(0.1),
+        );
+    }
+    let outcome = cook_match(&engine);
+    assert!(!outcome.ok());
+    let message = format!("{:?}", outcome.diagnostics);
+    assert!(message.contains("attackAcquisitionRange"), "{message}");
+    assert!(message.contains("attackRange"), "{message}");
+}
+
 // ── refusals ─────────────────────────────────────────────────────────────────────────────────────────
 
 #[test]

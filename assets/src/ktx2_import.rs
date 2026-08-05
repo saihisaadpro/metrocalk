@@ -95,6 +95,7 @@ impl MeshSource for KtxImporter {
                 ],
                 normals: Vec::new(),
                 uvs: vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                tangents: Vec::new(),
                 indices: vec![0, 1, 2, 0, 2, 3],
                 material: 0,
                 joints: Vec::new(),

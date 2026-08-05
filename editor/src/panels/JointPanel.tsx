@@ -5,7 +5,7 @@
 //! timeline to play the mechanism back (deterministic, playback never edits the scene). The source label
 //! says HOW the rig was authored (manual / inferred / URDF) — never oversold as automatic.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSelectedId, projectionStore } from "../store/projection";
 import { useStore } from "zustand";
 import { setStatus } from "../store/ui";
@@ -26,6 +26,8 @@ export function JointPanel({ client }: { client: EditorClient }) {
   const [info, setInfo] = useState<JointInfo | null>(null);
   const [scrubT, setScrubT] = useState(0);
   const [keyT, setKeyT] = useState("0");
+  const [jointValue, setJointValue] = useState(0);
+  const lastCommitted = useRef<number | null>(null);
 
   const refresh = useCallback(() => {
     if (!id) {
@@ -38,6 +40,12 @@ export function JointPanel({ client }: { client: EditorClient }) {
       .catch(() => setInfo(null));
   }, [client, id]);
   useEffect(refresh, [refresh]);
+  useEffect(() => {
+    if (info) {
+      setJointValue(info.value);
+      lastCommitted.current = info.value;
+    }
+  }, [info]);
 
   if (!id) return null;
   const name = summaries[id]?.name ?? id;
@@ -50,7 +58,8 @@ export function JointPanel({ client }: { client: EditorClient }) {
     const num = (f: string) => (typeof t[f] === "number" ? (t[f] as number) : 0);
     const pivot: [number, number, number] = [num("x"), num("y"), num("z")];
     const axis: [number, number, number] = revolute ? [0, 0, 1] : [1, 0, 0];
-    const ok = await client.setJoint(id, revolute, axis, pivot, -1e6, 1e6, "manual");
+    const limits: [number, number] = revolute ? [-Math.PI * 2, Math.PI * 2] : [-30, 30];
+    const ok = await client.setJoint(id, revolute, axis, pivot, limits[0], limits[1], "manual");
     setStatus(ok ? `${name} is now a ${revolute ? "turning" : "sliding"} joint — drag the value, then key poses` : `couldn't make a joint on ${name}`);
     refresh();
   };
@@ -76,7 +85,17 @@ export function JointPanel({ client }: { client: EditorClient }) {
     );
   }
 
-  const range = info.jointType === "revolute" ? Math.PI * 2 : 30;
+  const fallback = info.jointType === "revolute" ? Math.PI * 2 : 30;
+  const rangeMin = Number.isFinite(info.min) && info.min < info.max ? info.min : -fallback;
+  const rangeMax = Number.isFinite(info.max) && info.max > info.min ? info.max : fallback;
+  const rangeStep = Math.max((rangeMax - rangeMin) / 400, 1e-6);
+  const commitValue = async (value: number) => {
+    if (lastCommitted.current === value) return;
+    lastCommitted.current = value;
+    const ok = await client.jointValue(id, value, true);
+    setStatus(ok ? `${name} moved — Ctrl-Z undoes it` : `${name} could not be moved`);
+    refresh();
+  };
   return (
     <div id="joint-panel" data-testid="joint-panel" data-joint-type={info.jointType} data-source={info.source} style={{ padding: `${space.md}px ${space.lg}px` }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, marginBottom: space.xs, font: font.ui, fontSize: fontSize.meta, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: color.text.secondary }}>
@@ -94,17 +113,29 @@ export function JointPanel({ client }: { client: EditorClient }) {
         <input
           type="range"
           data-testid="joint-value"
-          min={-range}
-          max={range}
-          step={range / 200}
-          defaultValue={info.value}
+          min={rangeMin}
+          max={rangeMax}
+          step={rangeStep}
+          value={jointValue}
           style={{ width: "100%" }}
-          onInput={(e) => void client.jointValue(id, Number((e.target as HTMLInputElement).value), false)}
-          onChange={(e) => {
-            void client.jointValue(id, Number((e.target as HTMLInputElement).value), true).then(() => {
-              setStatus(`${name} moved — Ctrl-Z undoes it`);
-              refresh();
-            });
+          onInput={(e) => {
+            const value = Number((e.target as HTMLInputElement).value);
+            setJointValue(value);
+            void client.jointValue(id, value, false);
+          }}
+          onPointerUp={(e) => {
+            void commitValue(Number((e.target as HTMLInputElement).value));
+          }}
+          onPointerCancel={(e) => {
+            void commitValue(Number((e.target as HTMLInputElement).value));
+          }}
+          onKeyUp={(e) => {
+            if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(e.key)) {
+              void commitValue(Number((e.target as HTMLInputElement).value));
+            }
+          }}
+          onBlur={(e) => {
+            void commitValue(Number((e.target as HTMLInputElement).value));
           }}
         />
       </label>

@@ -91,6 +91,171 @@ pub fn read_cad(bytes: &[u8]) -> Result<CadImport, CadError> {
     }
 }
 
+/// Read a CAD source with a standards-based geometry fallback for a 3DXML whose `.3DRep` payload is a
+/// licensed Dassault binary. Many PLM handoff packages place a STEP AP242 export beside the 3DXML product
+/// structure. When the assembly name or normalized file stem matches, use that companion's real geometry,
+/// hierarchy, names and colors instead of displaying thousands of placeholder cubes. The resolver is
+/// deliberately conservative: it searches only the source directory, accepts only STEP magic, validates the
+/// assembly identity, and falls back to the original never-silent 3DXML report if no trustworthy companion
+/// exists.
+///
+/// # Errors
+/// The primary source's [`CadError`]. Missing/unreadable/unrelated companion candidates never make an
+/// otherwise readable 3DXML fail; they remain documented by its proprietary-geometry report.
+pub fn read_cad_with_companion(
+    source_path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<CadImport, CadError> {
+    let primary = read_cad(bytes)?;
+    if primary.source_format != "CATIA-3DXML"
+        || primary.parts.iter().all(|part| part.is_real_geometry())
+    {
+        return Ok(primary);
+    }
+
+    let source_stem = source_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(normalized_cad_label)
+        .unwrap_or_default();
+    let source_name = normalized_cad_label(&primary.name);
+    for candidate_path in step_companion_candidates(source_path) {
+        let candidate_stem = candidate_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(normalized_cad_label)
+            .unwrap_or_default();
+        let stem_matches = !source_stem.is_empty() && source_stem == candidate_stem;
+        // A mismatched stem can still be a legitimate PLM export, but parse at most the small, bounded
+        // candidate set and require the product name to match before accepting it.
+        let Ok(candidate_bytes) = std::fs::read(&candidate_path) else {
+            continue;
+        };
+        if !StepAssemblyReader.can_read(&candidate_bytes) {
+            continue;
+        }
+        let Ok(mut candidate) = StepAssemblyReader.read(&candidate_bytes) else {
+            continue;
+        };
+        let name_matches =
+            !source_name.is_empty() && source_name == normalized_cad_label(&candidate.name);
+        if (!stem_matches && !name_matches)
+            || !candidate.parts.iter().any(|part| part.is_real_geometry())
+        {
+            continue;
+        }
+
+        let unresolved = primary
+            .parts
+            .iter()
+            .filter(|part| !part.is_real_geometry())
+            .count();
+        let original_occurrences = primary.total_occurrences;
+        let companion_display = candidate_path.display().to_string();
+        candidate.source_format = "CATIA-3DXML + STEP-AP242 companion".into();
+        candidate.source_hash = primary
+            .source_hash
+            .rotate_left(17)
+            .wrapping_add(candidate.source_hash);
+        candidate.notes.push(metrocalk_interchange::UnsupportedNote {
+            feature: "3DXML geometry resolution".into(),
+            detail: format!(
+                "the 3DXML product structure referenced {unresolved} proprietary V5_CFV3/CB0001 body \
+                 occurrence(s); resolved renderable geometry from the identity-matched STEP AP242 \
+                 companion '{companion_display}' (the 3DXML declared {original_occurrences} Instance3D \
+                 relationship(s))"
+            ),
+        });
+        return Ok(candidate);
+    }
+    Ok(primary)
+}
+
+fn step_companion_candidates(source_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    const MAX_CANDIDATES: usize = 32;
+    let Some(directory) = source_path.parent() else {
+        return Vec::new();
+    };
+    let source_stem = source_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(normalized_cad_label)
+        .unwrap_or_default();
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<(bool, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path == source_path || !path.is_file() {
+                return None;
+            }
+            let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+            if !matches!(extension.as_str(), "stp" | "step") {
+                return None;
+            }
+            let within_limit = path.metadata().ok().is_some_and(|metadata| {
+                metadata.len() <= metrocalk_interchange::MAX_STEP_ASSEMBLY_BYTES as u64
+            });
+            if !within_limit {
+                return None;
+            }
+            let stem_matches = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| normalized_cad_label(stem) == source_stem);
+            Some((stem_matches, path))
+        })
+        .collect();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates
+        .into_iter()
+        .take(MAX_CANDIDATES)
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn normalized_cad_label(value: &str) -> String {
+    let mut value = value.trim().to_ascii_lowercase();
+    // Strip common copy/version suffixes (`_(1)`, ` (2)`, `-3`) only when the final token is numeric.
+    loop {
+        let trimmed = value.trim_end();
+        let mut cut = None;
+        if trimmed.ends_with(')') {
+            if let Some(open) = trimmed.rfind('(') {
+                let digits = &trimmed[open + 1..trimmed.len() - 1];
+                if !digits.is_empty() && digits.chars().all(|character| character.is_ascii_digit())
+                {
+                    cut = Some(open);
+                }
+            }
+        }
+        let Some(index) = cut else { break };
+        value.truncate(index);
+        while value
+            .chars()
+            .next_back()
+            .is_some_and(|character| matches!(character, '_' | '-' | ' '))
+        {
+            value.pop();
+        }
+    }
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Import a CAD file as ONE undoable transaction: every part → a renderable entity with a queryable `CadPart`
 /// component (name/reference/fidelity/strategy) + a units-normalized `Transform` + a content-addressed mesh
 /// handle (dedup → instancing). Never-empty (each part has a placed mesh) + never-silent (each carries its
@@ -123,7 +288,7 @@ pub fn land_import(
     let handles: Vec<String> = report
         .meshes
         .iter()
-        .map(|m| store_mesh(store, &m.tris, "cad"))
+        .map(|m| store_mesh(store, &cad_z_up_to_editor_mesh(&m.tris), "cad"))
         .collect();
 
     // Units: the reader declares metres-per-unit (STEP/3DXML are mm → 0.001). Normalize positions to the
@@ -180,7 +345,8 @@ pub fn land_import(
         // the placement translation AND the mesh geometry live in the source units (mm), so we scale BOTH to
         // the scene's metres: the translation by `m_per_unit`, and the mesh via the entity's uniform `scale`
         // (else a real mm-valued mesh would render ~1000× oversized relative to its metric placement).
-        let t = translation_of(&p.transform);
+        let editor_transform = cad_z_up_to_editor_transform(&p.transform);
+        let t = translation_of(&editor_transform);
         for (f, v) in [
             ("x", t[0] * m_per_unit),
             ("y", t[1] * m_per_unit),
@@ -261,6 +427,31 @@ pub fn basis_is_rigid(m: &[f64; 16]) -> bool {
         && det > 0.0
 }
 
+/// Convert a CAD Z-up affine transform into the editor's right-handed Y-up basis. Both the local mesh and
+/// its occurrence transform use this basis change, so the conversion is `C * M * C^-1`, not a translation-
+/// only swizzle. Source `(x, y, z)` becomes editor `(x, z, -y)`.
+#[must_use]
+pub fn cad_z_up_to_editor_transform(m: &[f64; 16]) -> [f64; 16] {
+    [
+        m[0], m[2], -m[1], m[3], // C * source X
+        m[8], m[10], -m[9], m[11], // C * source Z (editor Y)
+        -m[4], -m[6], m[5], -m[7], // -C * source Y (editor Z)
+        m[12], m[14], -m[13], m[15], // converted translation
+    ]
+}
+
+/// Rotate CAD-local mesh coordinates from Z-up into the editor's Y-up basis. This is a proper rotation
+/// (determinant +1), so triangle winding and authored face orientation remain valid.
+#[must_use]
+pub fn cad_z_up_to_editor_mesh(mesh: &metrocalk_csg::TriMesh) -> metrocalk_csg::TriMesh {
+    let positions = mesh
+        .positions
+        .iter()
+        .map(|position| [position[0], position[2], -position[1]])
+        .collect();
+    metrocalk_csg::TriMesh::new(positions, mesh.triangles.clone())
+}
+
 /// Bake a transform's 3×3 basis (rotation **including** any mirror/scale a quaternion can't carry) into
 /// the mesh's vertices — the placement fallback for a non-rigid instance basis. The translation is NOT
 /// applied (the entity still carries it), so instances of the same mirrored geometry still dedup.
@@ -298,6 +489,85 @@ pub struct PersistedCadMesh {
     pub color: Option<[f32; 3]>,
 }
 
+const MAX_PERSISTED_CAD_MESH_BYTES: u64 = 512 * 1024 * 1024;
+
+fn cad_mesh_file_name(handle: &str) -> std::io::Result<String> {
+    // Project documents are user-controlled input. A mesh handle must never be able to turn a cache lookup
+    // into a path traversal; generated handles contain only ASCII alphanumerics and ':' separators.
+    if !handle.starts_with("mtkcad:")
+        || handle.len() > 160
+        || !handle
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == ':')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid persisted CAD mesh handle",
+        ));
+    }
+    Ok(format!("{}.bin", handle.replace(':', "-")))
+}
+
+#[allow(clippy::manual_let_else, clippy::single_match_else)] // Both read/decode failures log path-specific recovery before returning.
+fn load_persisted_cad_mesh(
+    path: &std::path::Path,
+    expected_handle: Option<&str>,
+) -> Option<(String, metrocalk_assets::MeshAsset)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_PERSISTED_CAD_MESH_BYTES {
+        eprintln!(
+            "[shell] cad-mesh sidecar {} exceeds the per-mesh safety limit — skipped",
+            path.display()
+        );
+        return None;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            eprintln!(
+                "[shell] cad-mesh sidecar {} unreadable — skipped",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let rec = match bincode::deserialize::<PersistedCadMesh>(&bytes) {
+        Ok(rec) => rec,
+        Err(error) => {
+            eprintln!(
+                "[shell] cad-mesh sidecar {} corrupt — skipped: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    if cad_mesh_file_name(&rec.handle).is_err()
+        || expected_handle.is_some_and(|expected| expected != rec.handle)
+        || rec
+            .positions
+            .iter()
+            .flatten()
+            .any(|coordinate| !coordinate.is_finite())
+        || rec
+            .triangles
+            .iter()
+            .flatten()
+            .any(|index| usize::try_from(*index).map_or(true, |index| index >= rec.positions.len()))
+        || rec
+            .color
+            .is_some_and(|color| color.iter().any(|channel| !channel.is_finite()))
+    {
+        eprintln!(
+            "[shell] cad-mesh sidecar {} failed identity or geometry validation — skipped",
+            path.display()
+        );
+        return None;
+    }
+    let mesh = metrocalk_csg::TriMesh::new(rec.positions, rec.triangles);
+    let asset = crate::csg_intent::trimesh_to_mesh_asset_colored(&mesh, "cad", rec.color);
+    Some((rec.handle, asset))
+}
+
 /// Persist one derived CAD render mesh into `dir`, keyed by its handle (`:` → `-` for a valid filename).
 /// The caller logs a failure (never-silent) — a part that can't persist still renders this session.
 ///
@@ -317,7 +587,7 @@ pub fn persist_cad_mesh(
         color,
     };
     let bytes = bincode::serialize(&rec).map_err(std::io::Error::other)?;
-    std::fs::write(dir.join(format!("{}.bin", handle.replace(':', "-"))), bytes)
+    std::fs::write(dir.join(cad_mesh_file_name(handle)?), bytes)
 }
 
 /// Load every persisted CAD render mesh from `dir` (boot-time restore): each record becomes the same
@@ -337,28 +607,30 @@ pub fn load_persisted_cad_meshes(
         if path.extension().and_then(|e| e.to_str()) != Some("bin") {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else {
-            eprintln!(
-                "[shell] cad-mesh sidecar {} unreadable — skipped",
-                path.display()
-            );
-            continue;
-        };
-        match bincode::deserialize::<PersistedCadMesh>(&bytes) {
-            Ok(rec) => {
-                let mesh = metrocalk_csg::TriMesh::new(rec.positions, rec.triangles);
-                let asset =
-                    crate::csg_intent::trimesh_to_mesh_asset_colored(&mesh, "cad", rec.color);
-                out.push((rec.handle, asset));
-            }
-            Err(e) => eprintln!(
-                "[shell] cad-mesh sidecar {} corrupt — skipped: {e}",
-                path.display()
-            ),
+        if let Some(restored) = load_persisted_cad_mesh(&path, None) {
+            out.push(restored);
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// Load only the persisted CAD meshes referenced by the active document. Lookup is direct by the
+/// content-derived filename, so an unrelated global cache does not make editor startup progressively
+/// slower. Missing, corrupt, identity-mismatched, or path-like handles are skipped; the caller compares
+/// the returned count with `handles.len()` and surfaces unresolved document assets.
+#[must_use]
+pub fn load_persisted_cad_meshes_for(
+    dir: &std::path::Path,
+    handles: &std::collections::BTreeSet<String>,
+) -> Vec<(String, metrocalk_assets::MeshAsset)> {
+    handles
+        .iter()
+        .filter_map(|handle| {
+            let file_name = cad_mesh_file_name(handle).ok()?;
+            load_persisted_cad_mesh(&dir.join(file_name), Some(handle))
+        })
+        .collect()
 }
 
 /// The **O(1) content-addressed re-import diff**: which of the N parts changed between two imports of the same
@@ -378,4 +650,5 @@ pub fn changed_count(diff: &[PartDiff]) -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // exact normalized fixture values are part of the import contract
 mod tests;

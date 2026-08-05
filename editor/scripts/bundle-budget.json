@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "baselineEntryBytes": 902633,
+  "maximumEntryBytes": 256000,
+  "maximumInitialJavaScriptBytes": 425984,
+  "maximumChunkBytes": 307200,
+  "maximumTotalJavaScriptBytes": 1177600,
+  "minimumJavaScriptChunks": 15,
+  "requiredChunkPrefixes": [
+    "AssetLabWorkspace-",
+    "BindingGraph-",
+    "Inspector-",
+    "PipeForge-",
+    "StateGraphPanel-",
+    "vendor-forms-",
+    "vendor-graph-",
+    "vendor-react-",
+    "vendor-state-"
+  ],
+  "forbiddenInitialChunkPrefixes": [
+    "AssetLabWorkspace-",
+    "BindingGraph-",
+    "PipeForge-",
+    "StateGraphPanel-",
+    "vendor-forms-",
+    "vendor-graph-"
+  ]
+}

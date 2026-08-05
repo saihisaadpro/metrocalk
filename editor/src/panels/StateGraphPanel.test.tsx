@@ -56,6 +56,41 @@ test("the transition builder is registry-fed + states-fed (typo-proof — no fre
   expect([...from.options].map((o) => o.value)).toEqual(["Hunting", "ReadyForBoss", "FacingBoss"]);
 });
 
+test("machine, state, transition, and condition controls expose row-context names", async () => {
+  await openNew();
+
+  expect(screen.getByRole("textbox", { name: "State machine name" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "State machine target entity" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "State machine target component" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "State machine state field" })).toBeTruthy();
+  expect(screen.getByRole("textbox", { name: "State 1 name" })).toBeTruthy();
+  expect(screen.getByRole("radio", { name: "Set Hunting as initial state" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Delete state Hunting" })).toBeTruthy();
+
+  fireEvent.click(screen.getByTestId("sm-add-transition"));
+  await screen.findByRole("combobox", { name: "Transition 1 trigger event" });
+  expect(screen.getByRole("combobox", { name: "Transition 1 source state" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Transition 1 destination state" })).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "Delete transition 1 from Hunting to ReadyForBoss" }),
+  ).toBeTruthy();
+
+  fireEvent.click(screen.getByTestId("sm-add-cond"));
+  fireEvent.click(screen.getByTestId("sm-add-cond"));
+  expect(screen.getByRole("combobox", { name: "Transition 1 condition 1 entity" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Transition 1 condition 1 component" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Transition 1 condition 1 field" })).toBeTruthy();
+  expect(
+    screen.getByRole("combobox", { name: "Transition 1 condition 1 comparison operator" }),
+  ).toBeTruthy();
+  expect(screen.getByRole("textbox", { name: "Transition 1 condition 1 value" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Transition 1 condition 2 entity" })).toBeTruthy();
+  expect(screen.getByRole("textbox", { name: "Transition 1 condition 2 value" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Remove transition 1 condition 1" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Remove transition 1 condition 2" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "×" })).toBeNull();
+});
+
 test("drawing a transition submits a structured machine whose transition IS an M12.1 Rule", async () => {
   const authorStateMachine = vi.fn((_sm: StateMachine) =>
     Promise.resolve({ id: "sm-1", error: null, unreachable: [] }),

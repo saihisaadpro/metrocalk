@@ -17,8 +17,18 @@
 use metrocalk_core::{Engine, EntityId, FieldValue, Op};
 use metrocalk_ecs::FlecsWorld;
 
-/// The joint component — a typed kinematic DOF on the moving part entity.
-pub const JOINT: &str = "Joint";
+/// The authored mechanism component — a typed kinematic DOF on the moving part entity.
+///
+/// This is intentionally distinct from the registry's physics `Joint` relation (`kind`/`bodyA`/`bodyB`).
+/// New mechanism data must use this name so a physics constraint can never be mistaken for an animation
+/// channel merely because both domains use the word "joint".
+pub const KINEMATIC_JOINT: &str = "KinematicJoint";
+/// The pre-split mechanism component name. Read-only compatibility keeps existing projects playable when
+/// (and only when) the component contains the complete kinematic field shape.
+pub const LEGACY_JOINT: &str = "Joint";
+/// Compatibility alias used by the existing authoring call sites. It deliberately points at the new,
+/// unambiguous component; legacy data is handled by [`joint_of_with_component`].
+pub const JOINT: &str = KINEMATIC_JOINT;
 /// The per-joint keyframe track component (`keys` = the encoded track).
 pub const JOINT_TRACK: &str = "JointTrack";
 
@@ -38,6 +48,58 @@ pub struct Joint {
     pub value: f64,
 }
 
+/// A stable, plain-language validation failure suitable for returning at the command boundary.
+pub type JointValidationResult = Result<(), &'static str>;
+
+/// Validate a newly-authored kinematic joint before committing it to the document.
+///
+/// Persisted legacy joints may omit limits (and therefore read as unbounded), but command-authored data is
+/// required to be finite. Keeping that distinction here prevents JSON/IPC NaNs and reversed ranges from
+/// reaching `f64::clamp`, transforms, or the GPU.
+pub fn validate_joint_spec(
+    axis: [f64; 3],
+    pivot: [f64; 3],
+    (min, max): (f64, f64),
+) -> JointValidationResult {
+    if !axis.iter().all(|part| part.is_finite()) {
+        return Err("joint axis must contain only finite numbers");
+    }
+    let axis_len_sq = axis.iter().map(|part| part * part).sum::<f64>();
+    if !axis_len_sq.is_finite() || axis_len_sq <= 1e-24 {
+        return Err("joint axis must have a non-zero direction");
+    }
+    if !pivot.iter().all(|part| part.is_finite()) {
+        return Err("joint pivot must contain only finite numbers");
+    }
+    if !min.is_finite() || !max.is_finite() {
+        return Err("joint limits must contain only finite numbers");
+    }
+    if min > max {
+        return Err("joint minimum must not exceed its maximum");
+    }
+    Ok(())
+}
+
+/// Validate a requested DOF value before previewing or committing it.
+pub fn validate_joint_value(value: f64) -> JointValidationResult {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err("joint value must be finite")
+    }
+}
+
+/// Validate a key/scrub time before it enters an authored track.
+pub fn validate_joint_time(time: f64) -> JointValidationResult {
+    if !time.is_finite() {
+        Err("joint time must be finite")
+    } else if time < 0.0 {
+        Err("joint time must be zero or greater")
+    } else {
+        Ok(())
+    }
+}
+
 /// Build the undoable ops that author a joint on `entity` (one commit = one Ctrl-Z). `source` is the
 /// honesty label: `"manual"` (gizmo-authored) · `"inferred"` · `"urdf"`.
 #[must_use]
@@ -49,6 +111,20 @@ pub fn set_joint_ops(
     (min, max): (f64, f64),
     source: &str,
 ) -> Vec<Op> {
+    try_set_joint_ops(entity, revolute, axis, pivot, (min, max), source).unwrap_or_default()
+}
+
+/// Validated form of [`set_joint_ops`]. New command-boundary code should prefer this API so a rejection
+/// carries an explanation; the compatibility wrapper above returns no ops for an invalid specification.
+pub fn try_set_joint_ops(
+    entity: EntityId,
+    revolute: bool,
+    axis: [f64; 3],
+    pivot: [f64; 3],
+    (min, max): (f64, f64),
+    source: &str,
+) -> Result<Vec<Op>, &'static str> {
+    validate_joint_spec(axis, pivot, (min, max))?;
     let axis = normalize(axis);
     let mut ops = Vec::with_capacity(10);
     let mut num = |field: &str, v: f64| {
@@ -80,7 +156,7 @@ pub fn set_joint_ops(
         field: "source".into(),
         value: FieldValue::Str(source.into()),
     });
-    ops
+    Ok(ops)
 }
 
 /// Read a number field that may have landed as either numeric arm (the FieldValue::Integer-vs-Number
@@ -94,29 +170,69 @@ fn num_of(v: Option<&FieldValue>) -> Option<f64> {
     }
 }
 
-/// Parse the `Joint` component off an entity. `None` when absent/malformed (a malformed joint is inert,
-/// never a panic or a guessed axis).
-#[must_use]
-pub fn joint_of(engine: &Engine<FlecsWorld>, id: EntityId) -> Option<Joint> {
+fn joint_from_component(
+    engine: &Engine<FlecsWorld>,
+    id: EntityId,
+    component: &str,
+) -> Option<Joint> {
     let comps = engine.components_of(id);
-    let j = comps.get(JOINT)?;
+    let j = comps.get(component)?;
     let n = |f: &str| num_of(j.get(f));
+    let raw_axis = [n("ax")?, n("ay")?, n("az")?];
+    let pivot = [n("px")?, n("py")?, n("pz")?];
+    if !raw_axis.iter().chain(&pivot).all(|part| part.is_finite()) {
+        return None;
+    }
+    let axis_len_sq = raw_axis.iter().map(|part| part * part).sum::<f64>();
+    if !axis_len_sq.is_finite() || axis_len_sq <= 1e-24 {
+        return None;
+    }
+    let min = n("min").unwrap_or(f64::NEG_INFINITY);
+    let max = n("max").unwrap_or(f64::INFINITY);
+    let value = n("value").unwrap_or(0.0);
+    if min.is_nan() || max.is_nan() || min > max || !value.is_finite() {
+        return None;
+    }
     let revolute = matches!(j.get("type"), Some(FieldValue::Str(s)) if s == "revolute");
-    let axis = normalize([n("ax")?, n("ay")?, n("az")?]);
     Some(Joint {
         revolute,
-        axis,
-        pivot: [n("px")?, n("py")?, n("pz")?],
-        min: n("min").unwrap_or(f64::NEG_INFINITY),
-        max: n("max").unwrap_or(f64::INFINITY),
-        value: n("value").unwrap_or(0.0),
+        axis: normalize(raw_axis),
+        pivot,
+        min,
+        max,
+        value,
     })
+}
+
+/// Parse the kinematic component off an entity and report which schema supplied it. The new component is
+/// preferred; a legacy `Joint` is accepted only if it has the complete kinematic field shape, so a physics
+/// relation with `kind/bodyA/bodyB` remains inert.
+#[must_use]
+pub fn joint_of_with_component(
+    engine: &Engine<FlecsWorld>,
+    id: EntityId,
+) -> Option<(Joint, &'static str)> {
+    joint_from_component(engine, id, KINEMATIC_JOINT)
+        .map(|joint| (joint, KINEMATIC_JOINT))
+        .or_else(|| {
+            joint_from_component(engine, id, LEGACY_JOINT).map(|joint| (joint, LEGACY_JOINT))
+        })
+}
+
+/// Parse a mechanism joint off an entity. `None` when absent/malformed (including physics-only `Joint`
+/// relations); malformed data is inert, never a panic or a guessed axis.
+#[must_use]
+pub fn joint_of(engine: &Engine<FlecsWorld>, id: EntityId) -> Option<Joint> {
+    joint_of_with_component(engine, id).map(|(joint, _)| joint)
 }
 
 /// The honesty label of a joint's source rung (`"manual"` when unlabeled — never oversold).
 #[must_use]
 pub fn joint_source(engine: &Engine<FlecsWorld>, id: EntityId) -> String {
-    match engine.components_of(id).get(JOINT).and_then(|j| {
+    let Some((_, component)) = joint_of_with_component(engine, id) else {
+        return "manual".into();
+    };
+    match engine.components_of(id).get(component).and_then(|j| {
         j.get("source").and_then(|v| match v {
             FieldValue::Str(s) => Some(s.clone()),
             _ => None,
@@ -137,7 +253,8 @@ pub fn parse_track(keys: &str) -> Vec<(f64, f64)> {
         .split(';')
         .filter_map(|seg| {
             let (t, v) = seg.split_once(':')?;
-            Some((t.trim().parse().ok()?, v.trim().parse().ok()?))
+            let sample: (f64, f64) = (t.trim().parse().ok()?, v.trim().parse().ok()?);
+            (sample.0.is_finite() && sample.1.is_finite()).then_some(sample)
         })
         .collect();
     out.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -148,7 +265,11 @@ pub fn parse_track(keys: &str) -> Vec<(f64, f64)> {
 /// bit-identically).
 #[must_use]
 pub fn encode_track(keys: &[(f64, f64)]) -> String {
-    let mut sorted: Vec<(f64, f64)> = keys.to_vec();
+    let mut sorted: Vec<(f64, f64)> = keys
+        .iter()
+        .copied()
+        .filter(|(time, value)| time.is_finite() && value.is_finite())
+        .collect();
     sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
     sorted
         .iter()
@@ -161,6 +282,9 @@ pub fn encode_track(keys: &[(f64, f64)]) -> String {
 /// result, the determinism gate). An empty track holds 0.
 #[must_use]
 pub fn track_value(keys: &[(f64, f64)], t: f64) -> f64 {
+    if !t.is_finite() {
+        return 0.0;
+    }
     match keys {
         [] => 0.0,
         [only] => only.1,
@@ -210,7 +334,7 @@ pub fn joint_pose(
     base_quat: [f64; 4],
     value: f64,
 ) -> ([f64; 3], [f64; 4]) {
-    let v = value.clamp(joint.min, joint.max);
+    let v = safe_clamp(value, joint.min, joint.max);
     if joint.revolute {
         let q = axis_angle_quat(joint.axis, v);
         // p' = pivot + R·(p − pivot)
@@ -220,6 +344,19 @@ pub fn joint_pose(
     } else {
         (add(base_pos, scale(joint.axis, v)), base_quat)
     }
+}
+
+/// Clamp without `f64::clamp`'s panic on reversed/NaN bounds. A malformed range is treated as unbounded,
+/// and a non-finite value becomes the neutral zero pose; command-authored data is rejected earlier by the
+/// public validation helpers, while this is the last defensive line for persisted legacy data.
+fn safe_clamp(value: f64, min: f64, max: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    if min.is_nan() || max.is_nan() || min > max {
+        return value;
+    }
+    value.max(min).min(max)
 }
 
 // ── small exact f64 vector/quaternion helpers ─────────────────────────────────────────────────────────────
@@ -273,6 +410,108 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 #[allow(clippy::float_cmp, clippy::unreadable_literal)] // bit-exact determinism IS the claim under test
 mod tests {
     use super::*;
+
+    fn legacy_joint_ops(id: EntityId) -> Vec<Op> {
+        let mut ops = set_joint_ops(
+            id,
+            true,
+            [0.0, 0.0, 2.0],
+            [4.0, 5.0, 6.0],
+            (-1.0, 1.0),
+            "manual",
+        );
+        for op in &mut ops {
+            if let Op::SetField { component, .. } = op {
+                *component = LEGACY_JOINT.into();
+            }
+        }
+        ops
+    }
+
+    #[test]
+    fn new_mechanisms_use_the_unambiguous_component_and_legacy_data_still_reads() {
+        let mut engine = Engine::new(FlecsWorld::new(), 17);
+        let new_id = engine.alloc_entity_id();
+        let legacy_id = engine.alloc_entity_id();
+        let mut ops = vec![
+            Op::CreateEntity {
+                id: new_id,
+                parent: None,
+            },
+            Op::CreateEntity {
+                id: legacy_id,
+                parent: None,
+            },
+        ];
+        ops.extend(set_joint_ops(
+            new_id,
+            false,
+            [1.0, 0.0, 0.0],
+            [1.0, 2.0, 3.0],
+            (-2.0, 2.0),
+            "manual",
+        ));
+        ops.extend(legacy_joint_ops(legacy_id));
+        engine
+            .commit("component-split", ops)
+            .expect("fixture commit");
+
+        assert!(engine.components_of(new_id).contains_key(KINEMATIC_JOINT));
+        assert!(!engine.components_of(new_id).contains_key(LEGACY_JOINT));
+        assert_eq!(
+            joint_of_with_component(&engine, new_id).map(|(_, name)| name),
+            Some(KINEMATIC_JOINT)
+        );
+        let (legacy, component) =
+            joint_of_with_component(&engine, legacy_id).expect("legacy joint");
+        assert_eq!(component, LEGACY_JOINT);
+        assert_eq!(legacy.axis, [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_physics_joint_relation_is_not_misread_as_a_mechanism() {
+        let mut engine = Engine::new(FlecsWorld::new(), 19);
+        let id = engine.alloc_entity_id();
+        let field = |name: &str, value: &str| Op::SetField {
+            entity: id,
+            component: LEGACY_JOINT.into(),
+            field: name.into(),
+            value: FieldValue::Str(value.into()),
+        };
+        engine
+            .commit(
+                "physics-joint",
+                vec![
+                    Op::CreateEntity { id, parent: None },
+                    field("kind", "revolute"),
+                    field("bodyA", "a"),
+                    field("bodyB", "b"),
+                ],
+            )
+            .expect("fixture commit");
+        assert_eq!(joint_of(&engine, id), None);
+    }
+
+    #[test]
+    fn command_boundary_validation_rejects_non_finite_and_reversed_specs() {
+        assert!(validate_joint_spec([0.0, 0.0, 1.0], [1.0, 2.0, 3.0], (-1.0, 1.0)).is_ok());
+        assert!(validate_joint_spec([0.0; 3], [0.0; 3], (-1.0, 1.0)).is_err());
+        assert!(validate_joint_spec([f64::NAN, 0.0, 1.0], [0.0; 3], (-1.0, 1.0)).is_err());
+        assert!(
+            validate_joint_spec([0.0, 0.0, 1.0], [f64::INFINITY, 0.0, 0.0], (-1.0, 1.0)).is_err()
+        );
+        assert!(validate_joint_spec([0.0, 0.0, 1.0], [0.0; 3], (2.0, 1.0)).is_err());
+        assert!(validate_joint_value(f64::NAN).is_err());
+        assert!(validate_joint_value(0.25).is_ok());
+        assert!(validate_joint_time(-0.01).is_err());
+        assert!(validate_joint_time(f64::INFINITY).is_err());
+        assert!(validate_joint_time(0.0).is_ok());
+
+        let mut engine = Engine::new(FlecsWorld::new(), 23);
+        let id = engine.alloc_entity_id();
+        assert!(try_set_joint_ops(id, true, [0.0; 3], [0.0; 3], (-1.0, 1.0), "manual").is_err());
+        assert!(set_joint_ops(id, true, [0.0; 3], [0.0; 3], (-1.0, 1.0), "manual").is_empty());
+    }
 
     #[test]
     fn a_revolute_joint_rotates_about_its_real_axis_not_the_origin() {
@@ -338,5 +577,44 @@ mod tests {
         assert_eq!(track_end(&back), 2.0);
         // A malformed segment is skipped, never a panic.
         assert_eq!(parse_track("0:1;garbage;2:3").len(), 2);
+        assert_eq!(
+            parse_track("0:1;1:NaN;2:inf;3:-inf;4:5"),
+            vec![(0.0, 1.0), (4.0, 5.0)],
+            "non-finite samples are inert"
+        );
+        assert_eq!(
+            encode_track(&[(0.0, 1.0), (f64::NAN, 2.0), (2.0, f64::INFINITY)]),
+            "0.00000000000000000e0:1.00000000000000000e0"
+        );
+        assert_eq!(track_value(&back, f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn malformed_limits_and_values_never_panic_or_emit_non_finite_transforms() {
+        let malformed = Joint {
+            revolute: false,
+            axis: [1.0, 0.0, 0.0],
+            pivot: [0.0; 3],
+            min: 5.0,
+            max: -5.0,
+            value: 0.0,
+        };
+        let (position, rotation) =
+            joint_pose(&malformed, [1.0, 2.0, 3.0], [0.0, 0.0, 0.0, 1.0], 2.0);
+        assert_eq!(
+            position,
+            [3.0, 2.0, 3.0],
+            "a reversed legacy range is treated as unbounded"
+        );
+        assert_eq!(rotation, [0.0, 0.0, 0.0, 1.0]);
+
+        let (position, rotation) =
+            joint_pose(&malformed, [1.0, 2.0, 3.0], [0.0, 0.0, 0.0, 1.0], f64::NAN);
+        assert_eq!(
+            position,
+            [1.0, 2.0, 3.0],
+            "a bad value resolves to the neutral pose"
+        );
+        assert!(position.into_iter().chain(rotation).all(f64::is_finite));
     }
 }

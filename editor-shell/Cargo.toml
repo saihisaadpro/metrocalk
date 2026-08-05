@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 metrocalk-core = { path = "../core" }
 metrocalk-ecs = { path = "../ecs" }
+metrocalk-animation = { path = "../animation" }
 # The token economy (M7) — the wallet/metering seam wraps the pure ledger + cost model + payment seam.
 metrocalk-economy = { path = "../economy" }
 # The interchange tier (M8.5) — URDF/USD import behind the `Interchange` trait, mapped to registry
@@ -38,6 +39,9 @@ metrocalk-deform = { path = "../deform" }
 # `SignedProvenanceTrust` for its tamper-evident content-addressed identity (the crypto stays confined to
 # `assets/src/signed.rs`, invariant 5; pure-Rust `ed25519-dalek`, so the lib stays wasm-clean).
 metrocalk-assets = { path = "../assets", features = ["signing"] }
+# Offline asset compiler: portable MikkTSpace plus native xatlas charting and meshoptimizer QEM, all
+# behind project-owned contracts. It is deliberately outside the viewport hot path.
+metrocalk-conditioning = { path = "../conditioning", features = ["native"] }
 # Robust exact-predicate CSG (M13.2 / ADR-051). `csg_intent` drives a boolean over the asset store and
 # lands the result as a content-addressed MeshAsset + a place_mesh-style undoable commit (core stays
 # mesh-agnostic — the geometry lives in the store by handle, never in Loro). The `Csg` trait is the
@@ -82,6 +86,7 @@ bincode = "1"
 [dev-dependencies]
 metrocalk-dst = { path = "../dst" }
 metrocalk-physics = { path = "../physics" }
+metrocalk-skeleton = { path = "../skeleton" }
 
 [lints]
 workspace = true

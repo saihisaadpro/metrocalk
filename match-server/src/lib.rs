@@ -458,6 +458,7 @@ fn reference_hero(id: ActorId, team: TeamId, position: Vec2Mm) -> ActorSpawn {
         abilities: Vec::new(),
         basic_attack: Some(BasicAttackSpec {
             range_mm: 3_000,
+            acquisition_range_mm: 0,
             damage: 100,
             school: DamageSchool::Physical,
             windup_ticks: 0,

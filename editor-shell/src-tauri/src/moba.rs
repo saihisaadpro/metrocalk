@@ -26,7 +26,7 @@ use metrocalk_editor_shell::match_cook::{
     cook_match, CookDiagnostic, CookSeverity, CookedMatch, MATCH_COOK_SCHEMA_VERSION,
 };
 use metrocalk_gameplay::{
-    ActorId, ActorKind, CommandKind, ControlKind, MatchPhase, ModifierOp, OneLaneMatch,
+    ActorId, ActorKind, AttackOrder, CommandKind, ControlKind, MatchPhase, ModifierOp, OneLaneMatch,
     PlayerCommand, PlayerId, StatKind, Vec2Mm,
 };
 
@@ -52,9 +52,27 @@ pub struct MobaActor {
     pub owned: bool,
     pub controls: Vec<String>,
     pub speed: u32,
+    /// The standing attack order in plain words, or `None` when this actor has none.
+    ///
+    /// Rendered here rather than in the UI because the kernel owns the vocabulary: a panel that invented
+    /// its own wording for "hold" could drift from what the runtime actually does.
+    pub attack_order: Option<String>,
     /// The authored entity this actor was cooked from, or `None` for a unit the match spawned at runtime.
     /// This is the link that lets a viewer trace what they are watching back to what someone authored.
     pub source: Option<String>,
+}
+
+/// Say what a standing order is, in the words a player would use.
+fn describe_order(order: AttackOrder) -> String {
+    match order {
+        AttackOrder::Hold => "hold position".to_owned(),
+        AttackOrder::Move(destination) => format!(
+            "attack-move to {:.1}, {:.1}",
+            destination.x as f32 / MM_PER_UNIT,
+            destination.y as f32 / MM_PER_UNIT
+        ),
+        AttackOrder::Target(target) => format!("attacking #{}", target.get()),
+    }
 }
 
 /// The observable state of a running match. Everything here is read back from the kernel.
@@ -206,6 +224,18 @@ fn lane_length_metres(cooked: &CookedMatch) -> f64 {
         / f64::from(MM_PER_UNIT)
 }
 
+/// The imported mesh slot to draw each actor role with.
+///
+/// Resolved once at boot from the real asset catalog and carried whole rather than passed as loose ints,
+/// because a hero drawn with the minion's slot is the kind of mix-up that reads as a rendering bug and
+/// costs an hour before anyone suspects an argument order.
+#[derive(Clone, Copy)]
+pub struct MobaMeshes {
+    pub hero: i32,
+    pub minion: i32,
+    pub structure: i32,
+}
+
 /// A live match plus the scene it replaced. Stopping restores the saved scene verbatim, so running a match
 /// can never be a destructive act on the user's project.
 pub struct MobaSession {
@@ -219,17 +249,23 @@ pub struct MobaSession {
     saved_instances: Vec<Instance>,
     saved_ids: Vec<String>,
     saved_slots: Vec<i32>,
-    unit_slot: i32,
-    structure_slot: i32,
+    meshes: MobaMeshes,
     last_events: Vec<String>,
     last_rejection: Option<String>,
+    /// The player's command sequence. Monotonic per session and INDEPENDENT of the tick.
+    ///
+    /// Deriving it from the tick looked equivalent and was not: two orders given inside one tick — two
+    /// button presses between steps, which is entirely ordinary in a stepped editor session — collide on
+    /// the same number, and the runtime correctly refuses the second as a reordered duplicate. Found by
+    /// driving the panel as a user rather than the command surface as a test.
+    sequence: u32,
 }
 
 impl MobaSession {
     /// Cook the authored scene and take over the viewport.
     ///
-    /// `unit_slot`/`structure_slot` are real imported mesh slots — the same catalog the editor draws
-    /// everything else from, not placeholder geometry.
+    /// `meshes` are real imported mesh slots — the same catalog the editor draws everything else from,
+    /// not placeholder geometry.
     ///
     /// # Errors
     /// Returns the kernel's refusal if the artifact does not build. The viewport is left untouched in
@@ -237,8 +273,7 @@ impl MobaSession {
     pub fn start(
         scene: &mut SceneState,
         plan: MatchPlan,
-        unit_slot: i32,
-        structure_slot: i32,
+        meshes: MobaMeshes,
     ) -> Result<Self, MobaStartError> {
         let MatchPlan {
             cooked,
@@ -269,10 +304,10 @@ impl MobaSession {
             saved_instances: scene.instances.clone(),
             saved_ids: scene.ids.clone(),
             saved_slots: scene.mesh_slots.clone(),
-            unit_slot,
-            structure_slot,
+            meshes,
             last_events: vec!["MatchStarted".to_owned()],
             last_rejection: None,
+            sequence: 0,
         };
         session.last_events.extend(
             outcome_warnings
@@ -311,17 +346,23 @@ impl MobaSession {
         self.status()
     }
 
-    /// Issue the player's hero a lane-anchored move order, exactly as a game client would.
-    pub fn order_move(&mut self, scene: &mut SceneState, x_mm: i32, y_mm: i32) -> MobaStatus {
-        let sequence = u32::try_from(self.game.runtime().tick() + 1).unwrap_or(1);
+    /// Submit one command for the player's hero, exactly as a game client would.
+    ///
+    /// Every player verb goes through here so they share one sequencing rule and one refusal path. A
+    /// second submission site is how a UI ends up with a verb that is accepted under different rules than
+    /// the rest — and the kernel's refusal taxonomy is the thing being demonstrated, so it must be the
+    /// thing the panel shows.
+    fn issue(&mut self, scene: &mut SceneState, kind: CommandKind) -> MobaStatus {
+        let execute_at = self.game.runtime().tick() + 1;
+        // Incremented on every ATTEMPT, including refused ones: the runtime advances its own cursor on any
+        // submission, so reusing a number after a refusal would refuse the next command too.
+        self.sequence = self.sequence.saturating_add(1);
         let command = PlayerCommand {
             player: PLAYER,
-            sequence,
-            execute_at: self.game.runtime().tick() + 1,
+            sequence: self.sequence,
+            execute_at,
             actor: self.hero,
-            kind: CommandKind::MoveTo {
-                destination: Vec2Mm::new(x_mm, y_mm),
-            },
+            kind,
         };
         self.last_rejection = match self.game.submit(command) {
             Ok(_) => None,
@@ -329,6 +370,46 @@ impl MobaSession {
         };
         self.project(scene);
         self.status()
+    }
+
+    /// Issue the player's hero a lane-anchored move order.
+    pub fn order_move(&mut self, scene: &mut SceneState, x_mm: i32, y_mm: i32) -> MobaStatus {
+        self.issue(
+            scene,
+            CommandKind::MoveTo {
+                destination: Vec2Mm::new(x_mm, y_mm),
+            },
+        )
+    }
+
+    /// Attack-move: advance, and engage anything hostile that comes into acquisition range on the way.
+    pub fn order_attack_move(&mut self, scene: &mut SceneState, x_mm: i32, y_mm: i32) -> MobaStatus {
+        self.issue(
+            scene,
+            CommandKind::AttackMove {
+                destination: Vec2Mm::new(x_mm, y_mm),
+            },
+        )
+    }
+
+    /// Lock onto one named target until it is gone. Never re-acquires.
+    pub fn order_attack_target(&mut self, scene: &mut SceneState, target: u64) -> MobaStatus {
+        self.issue(
+            scene,
+            CommandKind::AttackTarget {
+                target: ActorId(target),
+            },
+        )
+    }
+
+    /// Hold position and engage anything hostile that comes into acquisition range.
+    pub fn order_hold(&mut self, scene: &mut SceneState) -> MobaStatus {
+        self.issue(scene, CommandKind::HoldPosition)
+    }
+
+    /// Cancel movement AND any standing order.
+    pub fn order_stop(&mut self, scene: &mut SceneState) -> MobaStatus {
+        self.issue(scene, CommandKind::Stop)
     }
 
     /// Apply crowd control to the hero — the visible proof GP-02 is running in the live viewport.
@@ -364,7 +445,7 @@ impl MobaSession {
             if !actor.alive {
                 continue;
             }
-            let structure = matches!(actor.kind, ActorKind::Structure);
+            let structure = matches!(actor.kind, ActorKind::Structure | ActorKind::Objective);
             let colour = match (actor.team.get(), actor.owner.is_some()) {
                 (0, true) => [0.35, 0.75, 1.0],
                 (0, false) => [0.20, 0.45, 0.85],
@@ -377,7 +458,16 @@ impl MobaSession {
             // lists the control by name, so the state survives a colour-blind or greyscale reading.
             let stunned = actor.controls.contains(ControlKind::Stun);
             let colour = if stunned { [1.0, 0.85, 0.30] } else { colour };
-            let base_scale = if structure { 1.4 } else { 0.7 };
+            // Silhouette carries role: a tower towers, a hero out-reads its own minions. Size is a second
+            // channel beside colour, so the roles stay separable in a greyscale or colour-blind reading.
+            let base_scale = match actor.kind {
+                ActorKind::Structure | ActorKind::Objective => 1.6,
+                ActorKind::Hero => 1.0,
+                _ => 0.6,
+            };
+            // An actor under a standing order is lifted slightly, so "it is fighting on its own" is legible
+            // in the viewport and not only in the panel's text.
+            let under_orders = actor.attack_order.is_some();
             instances.push(Instance {
                 center: [
                     actor.position.x as f32 / MM_PER_UNIT,
@@ -385,6 +475,8 @@ impl MobaSession {
                         0.5
                     } else if stunned {
                         0.60
+                    } else if under_orders {
+                        0.45
                     } else {
                         0.35
                     },
@@ -404,10 +496,10 @@ impl MobaSession {
             // document key here would let selection, the outliner or an edit reach a thing that does not
             // exist in the document (ADR-021/034). The authored source travels in the status payload.
             ids.push(format!("moba:{}", actor.id.get()));
-            slots.push(if structure {
-                self.structure_slot
-            } else {
-                self.unit_slot
+            slots.push(match actor.kind {
+                ActorKind::Structure | ActorKind::Objective => self.meshes.structure,
+                ActorKind::Hero => self.meshes.hero,
+                _ => self.meshes.minion,
             });
         }
         scene.instances = instances;
@@ -439,6 +531,7 @@ impl MobaSession {
                     .map(|kind| format!("{kind:?}"))
                     .collect(),
                 speed: actor.move_speed_mm_per_tick,
+                attack_order: actor.attack_order.map(describe_order),
                 source: self.cooked.source_of(actor.id.get()).map(ToOwned::to_owned),
             })
             .collect();

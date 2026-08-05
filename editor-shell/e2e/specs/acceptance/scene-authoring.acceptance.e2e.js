@@ -25,6 +25,23 @@ const countEntities = async () => {
 };
 const yOf = async (id) => (await invoke("read_transform", { id }))[1];
 
+const shown = async (selector) => {
+  const element = await $(selector);
+  return (await element.isExisting()) && (await element.isDisplayed());
+};
+
+async function revealPopupControl(triggerSelector, controlSelector) {
+  const trigger = await $(triggerSelector);
+  if (!(await shown(controlSelector))) await trigger.click();
+  await browser.waitUntil(() => shown(controlSelector), {
+    timeout: 5000,
+    timeoutMsg: `${controlSelector} was not revealed by ${triggerSelector}`,
+  });
+  const control = await $(controlSelector);
+  expect(await control.getAttribute("aria-disabled")).not.toBe("true");
+  return control;
+}
+
 describe("acceptance / M10.6 — scene-authoring verbs (the hierarchy as a real tree editor, live)", () => {
   before(async () => {
     await browser.waitUntil(async () => (await countEntities()) > 0, {
@@ -197,7 +214,7 @@ describe("acceptance / M10.6 — scene-authoring verbs (the hierarchy as a real 
     await clearConsole();
     const before = await countEntities();
     // A real UI button → create_entity → project delta → the store grows (#count).
-    await $("#authCreate").click();
+    await (await revealPopupControl("#authAdd", "#authCreate")).click();
     await browser.waitUntil(async () => (await countEntities()) > before, {
       timeout: 8000,
       timeoutMsg: "#authCreate did not grow the scene (React surface not wired)",
@@ -208,7 +225,8 @@ describe("acceptance / M10.6 — scene-authoring verbs (the hierarchy as a real 
     let moved = true;
     if (sel) {
       const y0 = await yOf(sel);
-      await $("#authNudge").click();
+      // Successful popup actions close after settlement, so re-enter through Actions for the next verb.
+      await (await revealPopupControl("#authMore", "#authNudge")).click();
       await browser.waitUntil(async () => Math.abs((await yOf(sel)) - y0) > 0.5, {
         timeout: 6000,
         timeoutMsg: "#authNudge did not move the selection",
@@ -222,7 +240,7 @@ describe("acceptance / M10.6 — scene-authoring verbs (the hierarchy as a real 
     report.workflow(
       "authoring/react-surface",
       { functional: grew && moved, inv1: true, clean, offline: true },
-      { controls: ["#authCreate", "#authNudge"], commands: ["create_entity", "multi_edit"] }
+      { controls: ["#authAdd", "#authCreate", "#authMore", "#authNudge"], commands: ["create_entity", "multi_edit"] }
     );
     expect(grew).toBe(true);
     expect(moved).toBe(true);

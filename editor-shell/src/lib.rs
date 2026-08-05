@@ -12,6 +12,11 @@
 
 pub mod actions;
 pub mod ai;
+pub mod animation_bindings;
+pub mod animation_clip_intent;
+pub mod animation_graph_intent;
+pub mod animation_intent;
+pub mod asset_lab;
 pub mod blobstore;
 pub mod bom;
 pub mod bridge;
@@ -31,6 +36,7 @@ pub mod metering;
 pub mod pdm;
 pub mod persist;
 pub mod physics_intent;
+pub mod pipe_forge;
 pub mod play_rules;
 pub mod plugin_host;
 pub mod pmi;
@@ -38,21 +44,69 @@ pub mod pmi_step;
 pub mod project;
 pub mod reimport;
 pub mod reveal;
+pub mod scene_capture;
 pub mod sdf_intent;
+pub mod semantic;
 pub mod transform_solver;
 pub mod wallet;
 
 pub use actions::{actions_for, Action, ActionItem};
 pub use ai::{apply_ai_patch, AiPatch, PatchOp};
+pub use animation_bindings::{
+    built_in_animation_binding_descriptors, standard_animation_binding_registry,
+    AnimationBindingRegistry,
+};
+pub use animation_clip_intent::{
+    authored_animation_clip_instance_revision, delete_animation_clip_instance,
+    load_animation_clip_instances, save_animation_clip_instance,
+    validate_animation_clip_instance_document, AnimationClipInstanceDocument,
+    AnimationClipInstanceIntentError, AnimationClipInstanceIssue,
+    AnimationClipInstanceIssueSeverity, AnimationClipInstanceLoad, ANIMATION_CLIP_INSTANCE,
+    ANIMATION_CLIP_INSTANCE_SCHEMA_VERSION,
+};
+pub use animation_graph_intent::{
+    adapt_animation_graph_document, authored_animation_graph_revision, delete_animation_graph,
+    load_animation_graph, save_animation_graph, validate_animation_graph_document,
+    AdaptedAnimationGraph, AnimationGraphCondition, AnimationGraphConditionOperator,
+    AnimationGraphCurve, AnimationGraphDiagnostic, AnimationGraphDiagnosticSeverity,
+    AnimationGraphDocument, AnimationGraphEdge, AnimationGraphEdgeProvenance,
+    AnimationGraphIntentError, AnimationGraphInterruption, AnimationGraphLoad, AnimationGraphNode,
+    AnimationGraphNodeKind, AnimationGraphParameter, AnimationGraphParameterKind,
+    AnimationGraphParameterRoute, AnimationGraphPosition, AnimationGraphState,
+    AnimationGraphStateMachine, AnimationGraphTransition, AnimationGraphValue, ANIMATION_GRAPH,
+    ANIMATION_GRAPH_SCHEMA_VERSION,
+};
+pub use animation_intent::{
+    add_event as add_animation_event, add_marker as add_animation_marker,
+    authored_animation_revision, delete_event as delete_animation_event,
+    delete_key as delete_animation_key, delete_keys as delete_animation_keys,
+    delete_marker as delete_animation_marker, key_property as key_animation_property,
+    load_animation_document, property_catalog as animation_property_catalog,
+    set_track_enabled as set_animation_track_enabled,
+    set_track_interpolation as set_animation_interpolation,
+    set_track_locked as set_animation_track_locked, update_keys as update_animation_keys,
+    AnimatableProperty, AnimationDocument, AnimationIntentError, AnimationKeyDelete,
+    AnimationKeyReceipt, AnimationKeyUpdate, AnimationStorageIssue, ANIMATION_TRACK,
+    DEFAULT_TICKS_PER_SECOND, MAIN_SEQUENCE_ID,
+};
+pub use asset_lab::{
+    audit_asset, cleanup_asset, optimize_asset, AssetAuditReport, AssetChangeReport, AssetLabError,
+    AuditOptions, Availability, AvailabilityState, BoundsReport, ByteEstimate, CapabilityAudit,
+    CleanupChanges, CleanupConfig, CleanupResult, LodCandidateReport, MaterialAudit, NormalAudit,
+    NormalRepairMode, OptimizationConfig, OptimizationPreset, OptimizationResult, TextureAudit,
+    TextureDescriptor, UvAudit, UvGenerationMode, UvOverlapSignal, UvOverlapState,
+    DEFAULT_TOPOLOGY_WELD_THRESHOLD, DEFAULT_UV_PAIR_BUDGET,
+};
 pub use bom::{rollup as bom_rollup, Bom, BomLine};
 pub use bridge::{
     apply_edit, enrich_relational, project_entity, project_full, EditIntent, EditTx,
     ProjectionDelta, ProjectionOp, RelSummary,
 };
 pub use cad_import::{
-    bake_basis_into_mesh, basis_is_rigid, changed_count, import_cad, is_cad_file, land_import,
-    load_persisted_cad_meshes, persist_cad_mesh, read_cad, reimport_diff, CadImportError,
-    CadLanding, CAD_PART,
+    bake_basis_into_mesh, basis_is_rigid, cad_z_up_to_editor_mesh, cad_z_up_to_editor_transform,
+    changed_count, import_cad, is_cad_file, land_import, load_persisted_cad_meshes,
+    load_persisted_cad_meshes_for, persist_cad_mesh, read_cad, read_cad_with_companion,
+    reimport_diff, CadImportError, CadLanding, CAD_PART,
 };
 pub use cad_intent::{import_step, StepImport};
 pub use capscene::{
@@ -82,8 +136,10 @@ pub use generative::{
     DESIGN_COMPONENT,
 };
 pub use kinematics::{
-    encode_track, joint_of, joint_pose, joint_source, parse_track, set_joint_ops, track_end,
-    track_value, Joint, JOINT, JOINT_TRACK,
+    encode_track, joint_of, joint_of_with_component, joint_pose, joint_source, parse_track,
+    set_joint_ops, track_end, track_value, try_set_joint_ops, validate_joint_spec,
+    validate_joint_time, validate_joint_value, Joint, JointValidationResult, JOINT, JOINT_TRACK,
+    KINEMATIC_JOINT, LEGACY_JOINT,
 };
 pub use metering::{ai_edit_material, buy_marketplace, material_patch, Outcome};
 // The project-owned triangle-mesh type (what `bake_basis_into_mesh` takes/returns and `persist_cad_mesh`
@@ -94,6 +150,13 @@ pub use pdm::{
     EcoOutcome, PdmError,
 };
 pub use persist::{Log, Record};
+pub use pipe_forge::{
+    bake_pipe, decode_pipe_artifact, land_pipe_asset, rebake_pipe_in_place, replace_pipe_asset,
+    PipeBakeReport, PipeBuild, PipeFittingKind, PipeFittingPlacement, PipeForgeError,
+    PipeForgeOptions, PipeForgeStatus, PipeKit, PipeQuality, PipeRecipe, PipeRouteEdge,
+    PipeRouteGraph, PipeRouteHandle, PipeRouteNode, PipeToolSession, UserFittingCatalogEntry,
+    PIPE_ARTIFACT_MAGIC, PIPE_RECIPE_VERSION,
+};
 pub use play_rules::{build_recording, PlaySession};
 pub use pmi::{
     ai_adjust_tolerance, attach_fcf, fcf_component_meta, fcfs_on, is_cad_feature, read_fcf,
@@ -111,5 +174,16 @@ pub use reimport::{
     RebindOutcome, ReimportDiffEntry, ReimportSession, REIMPORT_ID,
 };
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
+pub use scene_capture::{capture_scene, CapturedMesh, SceneCaptureError};
 pub use sdf_intent::{bake as bake_sdf, bake_auto as bake_sdf_auto, SdfBakeError};
+// M15.11 (ADR-081) — the AI semantic pass landed on the substrate: features as validated typed component
+// data (child entities, one undoable commit), the confidence-gated adjudication hold, semantic search,
+// the defeaturing recommender, and the kernel-verified feature-informed collider planner.
+pub use semantic::{
+    all_cad_parts, class_ops, collider_ops, defeature_ops, feature_component_meta, feature_fields,
+    parse_semantic, part_class_component_meta, plan_defeature, plan_feature_collider,
+    plan_semantic_land, resolve_semantic, semantic_act_ops, validate_fields, ColliderPlan,
+    DefeaturePlan, DefeatureRow, HeldRecognition, SemanticIntent, SemanticLanding, SemanticMatches,
+    SemanticNoun, SemanticVerb, AUTO_COMMIT_CONFIDENCE, CAD_FEATURE, PART_CLASS,
+};
 pub use wallet::Wallet;

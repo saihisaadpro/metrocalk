@@ -1,40 +1,57 @@
-//! Focus-mode banner (M3.3 / M10.1 React parity). When the user Focuses an entity (context menu), the
-//! camera frames it and this banner appears, carrying the framed camera distance (read back from the live
-//! `focus_debug` command) as `data-dist`. Click it — or press Esc (App handles the key) — to exit focus.
-//!
-//! Mirrors the scaffold's `#focusbanner` DOM contract exactly (`data-dist` numeric, `data-focused="true"`,
-//! conditionally rendered so `display` is never "none" while focused) so the prompt-40 page-object greens
-//! by selector-swap, not a rewrite.
+//! Focus-mode banner. Focus is a live editor state, so it is announced politely and the visible banner is
+//! a native button: pointer, keyboard, and assistive-technology users all get the same clear exit action.
+
+import { Button } from "../theme/primitives";
+import { color, elevation, font, fontSize, radius, space, z } from "../theme/tokens";
 
 export function FocusBanner({ id, dist, onClear }: { id: string; dist: number; onClear: () => void }) {
   return (
     <div
-      id="focusbanner"
-      data-testid="focusbanner"
-      data-dist={String(dist)}
-      data-focused="true"
-      onClick={onClear}
-      title="Click or press Esc to exit focus"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
       style={{
         position: "fixed",
-        top: 12,
+        top: "calc(var(--mtk-header-height) + var(--mtk-space-4))",
         left: "50%",
         transform: "translateX(-50%)",
-        zIndex: 65,
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        padding: "4px 14px",
-        borderRadius: 999,
-        background: "#10203aee",
-        border: "1px solid #3a6ea5",
-        color: "#9ecbff",
-        font: "12px ui-monospace, monospace",
-        boxShadow: "0 4px 16px #0008",
-        cursor: "pointer",
+        zIndex: z.badge,
+        maxWidth: `calc(100vw - ${space.xxl * 2}px)`,
       }}
     >
-      🔍 Focused: {id} <span style={{ opacity: 0.6 }}>· click or Esc to exit</span>
+      <Button
+        id="focusbanner"
+        data-testid="focusbanner"
+        data-dist={String(dist)}
+        data-focused="true"
+        type="button"
+        variant="secondary"
+        onClick={onClear}
+        aria-label={`Focused on ${id}. Exit focus`}
+        title="Exit focus (Esc)"
+        style={{
+          display: "flex",
+          minWidth: 0,
+          maxWidth: "100%",
+          gap: space.md,
+          padding: `${space.xs}px ${space.lg}px`,
+          borderRadius: radius.pill,
+          background: color.info.bg,
+          borderColor: color.info.border,
+          color: color.info.text,
+          fontFamily: font.mono,
+          fontSize: fontSize.body,
+          boxShadow: elevation.e4,
+        }}
+      >
+        <span aria-hidden="true">◎</span>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          Focused: {id}
+        </span>
+        <span aria-hidden="true" style={{ color: color.text.muted }}>
+          · Esc to exit
+        </span>
+      </Button>
     </div>
   );
 }

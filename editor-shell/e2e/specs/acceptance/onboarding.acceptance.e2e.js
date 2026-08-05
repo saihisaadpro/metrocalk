@@ -45,6 +45,13 @@ describe("acceptance / M10.5 onboarding — first-run 'make your first thing' (s
     expect(text).toContain("save");
     expect(text).toContain("bind");
 
+    // Progressive disclosure: the first-run surface stays compact until the user asks for the steps.
+    const tourToggle = await $("#onboarding-toggle");
+    expect(await tourToggle.getAttribute("aria-expanded")).toBe("false");
+    await tourToggle.click();
+    expect(await tourToggle.getAttribute("aria-expanded")).toBe("true");
+    expect((await (await $("#onboarding-content")).getText()).toLowerCase()).toContain("one-minute");
+
     // ── SKIPPABLE: one click dismisses it (principle 1 — an on-ramp, never a wall) ──────────────────
     await (await $("#onboardSkip")).click();
     await browser.waitUntil(async () => !(await onboardingShown()), { timeout: 5000, timeoutMsg: "Skip did not dismiss the onboarding card" });

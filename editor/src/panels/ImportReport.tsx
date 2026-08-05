@@ -25,7 +25,7 @@ const CLASS: Record<string, { label: string; tone: "success" | "accent" | "warn"
   "exact-brep": { label: "Exact B-rep", tone: "success", reason: "Exact geometry resolved — precision retained." },
   "tessellation-only": { label: "Tessellation-only", tone: "accent", reason: "Rendered from the embedded tessellation cache (a visualization mesh; exact B-rep not resolved).", fix: "Re-export as STEP AP242 to resolve exact B-rep + semantic PMI." },
   "ai-reconstructed": { label: "AI-reconstructed", tone: "accent", reason: "A confidence-scored B-rep candidate reconstructed from the mesh.", fix: "Review + accept the candidate, or re-export as STEP AP242." },
-  proxy: { label: "Proxy", tone: "warn", reason: "Proprietary / undecodable geometry — placed as a bounding proxy at its real transform, never a silent empty shell.", fix: "Enable the licensed CAD kernel, or re-export as STEP AP242." },
+  proxy: { label: "Unresolved", tone: "warn", reason: "Proprietary / undecodable geometry is listed at its real transform without inventing visible geometry.", fix: "Enable the licensed CAD kernel, add the matching STEP companion, or re-export as STEP AP242." },
   "access-denied": { label: "Access-denied", tone: "warn", reason: "The part is encrypted / DRM-protected.", fix: "Unlock the source DRM, or re-export unencrypted." },
   failed: { label: "Failed", tone: "warn", reason: "The geometry cache was present but degenerate (0 triangles) — placed as a diagnosed proxy.", fix: "Re-export / verify the source tessellation." },
 };
@@ -115,6 +115,8 @@ export function ImportReport({ client }: { client: EditorClient }) {
       <div style={{ display: "flex", flexDirection: "column", gap: space.xxs }}>
         {rows.map((p) => {
           const cls = CLASS[p.fidelity] ?? CLASS.failed;
+          const reason = p.reason ?? cls.reason;
+          const fix = p.fix ?? cls.fix;
           return (
             <button
               key={p.id}
@@ -125,9 +127,9 @@ export function ImportReport({ client }: { client: EditorClient }) {
               data-fidelity={p.fidelity}
               onClick={() => {
                 projectionStore.getState().select(p.id);
-                setStatus(`${p.name} — ${cls.reason}`);
+                setStatus(`${p.name} — ${reason}`);
               }}
-              title={cls.fix ? `${cls.reason}\n\nFix: ${cls.fix}` : cls.reason}
+              title={fix ? `${reason}\n\nFix: ${fix}` : reason}
               style={{ display: "block", textAlign: "left" }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: space.sm }}>
@@ -136,9 +138,14 @@ export function ImportReport({ client }: { client: EditorClient }) {
                 </span>
                 <Badge tone={cls.tone}>{cls.label}</Badge>
               </div>
-              {cls.fix && (
+              {(p.reference || p.strategy || p.sourceFormat) && (
+                <div style={{ font: font.mono, fontSize: fontSize.meta, color: color.text.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {[p.reference, p.strategy, p.sourceFormat].filter(Boolean).join(" · ")}
+                </div>
+              )}
+              {fix && (
                 <div style={{ font: font.ui, fontSize: fontSize.meta, color: color.text.muted, marginTop: 2 }}>
-                  Fix: {cls.fix}
+                  Fix: {fix}
                 </div>
               )}
             </button>

@@ -461,12 +461,15 @@ fn tessellate_faces_skips_curved_and_matches_the_scene_tessellation_for_one_soli
         id: 1,
         kind: FaceKind::Curved,
         outer: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        inner: Vec::new(),
         edges: vec![CadEdge {
             id: 1,
             ends: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
         }],
         surface: None,
+        recognized: None,
         same_sense: true,
+        outer_sense: true,
     }];
     assert_eq!(tessellate_faces(&curved).triangle_count(), 0);
 }

@@ -2,7 +2,7 @@
 // is mutually occluded, so an imported CAD assembly reads as solid connected parts, not stacked floating
 // boxes. Runs AFTER the in-shader ACES tonemap (the scene is already display-space), so this is a
 // display-space AO multiply on the offscreen scene colour. Depth is the scene depth (MSAA → textureLoad
-// sample 0); positions are reconstructed via the camera's inv_view_proj; the geometric normal is
+// conservative min-depth resolve); positions are reconstructed via the camera's inv_view_proj; the geometric normal is
 // reconstructed from screen-space derivatives (no G-buffer normal needed).
 
 struct Camera {
@@ -11,6 +11,7 @@ struct Camera {
     light_view_proj: mat4x4<f32>,
     focus: vec4<f32>,   // focus.yzw = world-space camera eye
     shadow: vec4<f32>,
+    grid: vec4<f32>,    // grid.z = camera distance, used for scale-aware AO radius
 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 
@@ -41,28 +42,46 @@ fn world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return p.xyz / p.w;
 }
 
+// Resolve depth conservatively across MSAA coverage. Sampling only index 0 creates bright/dark AO fringes
+// whose shape changes with sub-pixel coverage; nearest covered depth keeps silhouettes stable.
+fn resolved_depth(uv: vec2<f32>) -> f32 {
+    let size = textureDimensions(depth_tex);
+    let coord = clamp(vec2<i32>(uv * vec2<f32>(size)), vec2<i32>(0), vec2<i32>(size) - 1);
+    let count = textureNumSamples(depth_tex);
+    var depth = 1.0;
+    for (var sample = 0u; sample < count; sample = sample + 1u) {
+        depth = min(depth, textureLoad(depth_tex, coord, i32(sample)));
+    }
+    return depth;
+}
+
 fn hash(p: vec2<f32>) -> f32 {
     return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 
 const SAMPLES: i32 = 24;       // more samples → less speckle (no separate blur pass)
-const RADIUS: f32 = 0.06;      // world units (metres) — the occlusion search radius
-const BIAS: f32 = 0.005;       // depth bias to avoid self-occlusion
-const STRENGTH: f32 = 0.72;    // 0 = no AO, 1 = full
 const POWER: f32 = 1.4;        // contrast of the AO term
 
 @fragment
 fn fs_ssao(in: VsOut) -> @location(0) vec4<f32> {
     let dim = vec2<f32>(textureDimensions(color_tex));
-    let icoord = vec2<i32>(in.uv * dim);
     let scene = textureSample(color_tex, samp, in.uv).rgb;
-    let d = textureLoad(depth_tex, icoord, 0);
+    let d = resolved_depth(in.uv);
     if (d >= 1.0) {
         return vec4<f32>(scene, 1.0); // background (no geometry) → no AO
     }
 
     let eye = cam.focus.yzw;
     let p = world_pos(in.uv, d);
+    // Scale from both local pixel footprint and camera distance. A fixed 6 cm radius was invisible on a
+    // factory assembly and swallowed a millimetre CAD part; this stays useful across both scales.
+    let pixel_world = max(length(dpdx(p)), length(dpdy(p)));
+    let radius = clamp(
+        max(pixel_world * 10.0, cam.grid.z * 0.0015),
+        0.001,
+        max(cam.grid.z * 0.03, 0.01),
+    );
+    let bias = max(radius * 0.06, 0.0001);
     // Geometric normal from screen-space derivatives of the reconstructed position. The cross-product sign is
     // ambiguous (depends on screen winding), so FORCE it to face the camera — otherwise the hemisphere points
     // into the surface and every sample self-occludes (the whole surface goes black).
@@ -84,11 +103,11 @@ fn fs_ssao(in: VsOut) -> @location(0) vec4<f32> {
         // A cosine-ish hemisphere spiral: golden-angle rotation, radius grows with sqrt(i).
         let fi = (f32(i) + 0.5) / f32(SAMPLES);
         let ang = rot + f32(i) * 2.3999632;
-        let r = RADIUS * sqrt(fi);
+        let r = radius * sqrt(fi);
         let dir = t * cos(ang) + b * sin(ang);
         // Lift the sample off the surface along the normal (grows toward the rim) so a flat surface doesn't
         // false-occlude itself — the main source of flat-area speckle.
-        let sample_pos = p + dir * r + n * (RADIUS * (0.35 + 0.4 * fi));
+        let sample_pos = p + dir * r + n * (radius * (0.35 + 0.4 * fi));
         let clip = cam.view_proj * vec4<f32>(sample_pos, 1.0);
         if (clip.w <= 0.0) {
             continue;
@@ -97,19 +116,23 @@ fn fs_ssao(in: VsOut) -> @location(0) vec4<f32> {
         if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {
             continue;
         }
-        let sd = textureLoad(depth_tex, vec2<i32>(suv * dim), 0);
+        let sd = resolved_depth(suv);
+        if (sd >= 1.0) {
+            continue;
+        }
         let surf = world_pos(suv, sd);
         let sample_dist = distance(eye, sample_pos);
         let surf_dist = distance(eye, surf);
         // The surface at suv occludes the sample point if it sits in front of it (closer to the eye).
         // Range-check so a far-away surface across a depth gap doesn't over-darken.
-        let range = smoothstep(0.0, 1.0, RADIUS / max(abs(sample_dist - surf_dist), 1e-4));
-        if (surf_dist < sample_dist - BIAS) {
+        let range = smoothstep(0.0, 1.0, radius / max(abs(sample_dist - surf_dist), 1e-4));
+        if (surf_dist < sample_dist - bias) {
             occ = occ + range;
         }
     }
     let ao = clamp(1.0 - occ / f32(SAMPLES), 0.0, 1.0);
-    let factor = mix(1.0, pow(ao, POWER), STRENGTH);
+    let strength = mix(0.62, 0.78, clamp(cam.shadow.z, 0.0, 1.0));
+    let factor = mix(1.0, pow(ao, POWER), strength);
     return vec4<f32>(scene * factor, 1.0);
 }
 

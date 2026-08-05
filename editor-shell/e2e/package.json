@@ -4,10 +4,21 @@
   "type": "module",
   "description": "Real-.exe E2E for the Metrocalk editor shell via WebdriverIO + tauri-driver (drives the WebView2 DOM, incl. the transparent viewport div → native pick round-trip).",
   "scripts": {
-    "test": "wdio run wdio.conf.js",
-    "test:reload": "wdio run wdio.reload.conf.js"
+    "bootstrap": "node bootstrap.mjs",
+    "test": "node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.conf.js",
+    "test:animation-native": "node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.animationtest.conf.js",
+    "test:reload": "node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.reload.conf.js",
+    "test:workbench": "node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.workbench.conf.js",
+    "accessibility:preflight": "node scripts/accessibility-preflight.mjs",
+    "accessibility:matrix": "node scripts/accessibility-report.mjs --matrix-only",
+    "accessibility:report": "node scripts/accessibility-report.mjs",
+    "accessibility:certification": "node scripts/accessibility-report.mjs --require-certified",
+    "test:accessibility-tools": "node --test scripts/accessibility-report.test.mjs",
+    "test:accessibility": "node scripts/accessibility-preflight.mjs && node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.accessibility.conf.js && node scripts/accessibility-report.mjs",
+    "test:visual": "powershell -ExecutionPolicy Bypass -File compare-renders.ps1 -BaselineDir baselines/render-quality -CandidateDir ../evidence/render-quality-qc/after -OutputJson ../evidence/render-quality-qc/baseline-verification.json"
   },
   "devDependencies": {
+    "@axe-core/webdriverio": "4.12.1",
     "@wdio/cli": "^9.0.0",
     "@wdio/local-runner": "^9.0.0",
     "@wdio/mocha-framework": "^9.0.0",

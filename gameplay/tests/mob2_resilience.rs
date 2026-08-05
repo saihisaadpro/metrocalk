@@ -102,6 +102,7 @@ fn resilience_runtime() -> MatchRuntime {
 
     let attack = BasicAttackSpec {
         range_mm: 50_000,
+        acquisition_range_mm: 0,
         damage: 5,
         school: DamageSchool::Physical,
         windup_ticks: 1,

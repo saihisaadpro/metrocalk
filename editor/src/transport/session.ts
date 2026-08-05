@@ -13,7 +13,12 @@ import type { PlayInfo } from "../store/play";
 import type {
   ActionItem,
   AddResponse,
+  AuthoredMatch,
   CatalogItem,
+  CookedMatch,
+  MatchActor,
+  MatchStatus,
+  MatchValidation,
   CatalogSearch,
   CadReport,
   ReimportReport,
@@ -50,13 +55,41 @@ import type {
   SnapHit,
   SolveResult,
   TimelineTuple,
+  PipeForgeOptions,
+  PipeForgeStatus,
+  PipeBakeReport,
+  PipeFittingKind,
+  UserFittingCatalogEntry,
+  AssetLabProcessRequest,
+  AssetLabResponse,
+  SceneExportResponse,
+  AnimationWorkspaceInfo,
+  AnimationClipInstanceSaveRequest,
+  AnimationClipInstanceSaveResult,
+  AnimationClipTargetMapping,
+  AnimationEditResult,
+  AnimationPlaybackInfo,
+  AnimationInterpolation,
+  AnimationLoopPolicy,
+  AnimationTrackInfo,
+  AnimationKeyUpdateInfo,
+  AnimationKeyDeleteInfo,
+  AnimationGraphStateInfo,
+  AnimationGraphSaveRequest,
+  AnimationGraphSaveResult,
+  AnimationGraphDeleteResult,
+  AnimationGraphDebugInfo,
+  AnimationGraphPreviewResult,
+  AnimationGraphValue,
 } from "./protocol";
-import { GENERATE_COST } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, GENERATE_COST } from "./protocol";
 import { DeltaClient } from "./client";
 import { MockCore } from "./mock-core";
 import { inProcessPair } from "./transport";
 
 /** The one client surface the React UI talks to (the real shell transport + the dev MockCore both satisfy it). */
+export type ViewportRenderProfile = "cinematic" | "cad";
+
 export interface EditorClient {
   /** Optimistic field edit → a JSON-Patch `EditTx` (the same language the AI layer emits). */
   setField(id: string, component: string, field: string, value: Json): string;
@@ -81,6 +114,8 @@ export interface EditorClient {
   /** Undo the last committed transaction (Ctrl-Z); the reverting delta streams back over the Channel.
    *  Resolves to whether anything was actually reverted (false on an empty history → honest UI feedback). */
   undo(): Promise<boolean>;
+  /** Reapply the most recently undone committed transaction. */
+  redo(): Promise<boolean>;
   /** The context-menu actions for an entity (M3.3) — each available-or-explained. */
   entityActions(id: string): Promise<ActionItem[]>;
   /** The hover-tooltip details for an entity (M3.3) — name + components + caps + bound. */
@@ -102,6 +137,49 @@ export interface EditorClient {
   jointScrub(t: number): Promise<number>;
   /** M15.9 — the selected joint's state (a read). */
   jointInfo(id: string): Promise<JointInfo | null>;
+  /** Read the compiled animation timeline, keyable properties and measured asset capabilities. */
+  animationState(id: string | null): Promise<AnimationWorkspaceInfo>;
+  /** Validate, persist and compile one explicit imported rigid-clip mapping. */
+  animationClipInstanceSave(request: AnimationClipInstanceSaveRequest): Promise<AnimationClipInstanceSaveResult>;
+  /** Revision-fenced discard of one explicitly chosen persisted clip instance. */
+  animationClipInstanceDelete(instanceId: string, expectedRevision: string, selectedId: string | null): Promise<AnimationClipInstanceSaveResult>;
+  /** Compile and play the exact mapping draft without changing document history or instance revision. */
+  animationClipInstancePreview(request: AnimationClipInstanceSaveRequest): Promise<AnimationPlaybackInfo>;
+  /** Tear down an unsaved imported-clip audition and restore authored preview authority.
+   * When supplied, `expectedRequestId` makes delayed cleanup incapable of stopping a newer audition. */
+  animationClipInstancePreviewStop(expectedRequestId?: string): Promise<AnimationPlaybackInfo>;
+  /** Key the selected entity's current property value as one undoable, mergeable authored operation. */
+  animationKey(id: string, component: string, property: string, tick: number, interpolation: AnimationInterpolation): Promise<AnimationEditResult>;
+  /** Remove one stable keyframe without replacing the rest of its track. */
+  animationDeleteKey(id: string, trackId: string, keyId: string): Promise<AnimationEditResult>;
+  /** Remove multiple keys atomically as one native transaction and one undo step. */
+  animationDeleteKeys(id: string | null, deletes: AnimationKeyDeleteInfo[]): Promise<AnimationEditResult>;
+  /** Change one track's interpolation independently of its keyframe fields. */
+  animationSetInterpolation(id: string, trackId: string, interpolation: AnimationInterpolation): Promise<AnimationEditResult>;
+  /** Mute/unmute a track while preserving all authored keys. */
+  animationSetTrackEnabled(id: string, trackId: string, enabled: boolean): Promise<AnimationEditResult>;
+  /** Lock/unlock collaborative authoring for one track. */
+  animationSetTrackLocked(id: string, trackId: string, locked: boolean): Promise<AnimationEditResult>;
+  /** Commit a multi-key drag/value/tangent edit as one undo step. */
+  animationUpdateKeys(id: string, trackId: string, updates: AnimationKeyUpdateInfo[]): Promise<AnimationEditResult>;
+  animationAddMarker(id: string, name: string, tick: number): Promise<AnimationEditResult>;
+  animationDeleteMarker(ownerId: string, markerId: string): Promise<AnimationEditResult>;
+  animationAddEvent(id: string, name: string, tick: number, payload?: Json): Promise<AnimationEditResult>;
+  animationDeleteEvent(ownerId: string, eventId: string): Promise<AnimationEditResult>;
+  /** Control render-only animation preview. Playback never writes sampled values into the document. */
+  animationTransport(action: "play" | "pause" | "stop" | "scrub", tick?: number, loopPolicy?: AnimationLoopPolicy): Promise<AnimationPlaybackInfo>;
+  /** Lightweight clock/event read; does not reload properties, tracks, keys, or asset diagnostics. */
+  animationPlaybackState(): Promise<AnimationPlaybackInfo>;
+  /** Read the sequence-global authored graph, compilation state, sources, and addressable diagnostics. */
+  animationGraphState(sequenceId: string): Promise<AnimationGraphStateInfo>;
+  /** Validate and atomically commit one complete structural draft as one undoable backend intent. */
+  animationGraphSave(sequenceId: string, request: AnimationGraphSaveRequest): Promise<AnimationGraphSaveResult>;
+  animationGraphDelete(sequenceId: string, graphId: string, expectedRevision: string, requestId: string): Promise<AnimationGraphDeleteResult>;
+  /** Bounded debug snapshot; poses never cross IPC. */
+  animationGraphDebug(graphId: string, instanceId: string | null, watches: readonly string[]): Promise<AnimationGraphDebugInfo>;
+  /** Transient preview overrides. These never dirty the authored graph or document. */
+  animationGraphSetPreviewParameters(graphId: string, values: Readonly<Record<string, AnimationGraphValue>>): Promise<AnimationGraphPreviewResult>;
+  animationGraphClearPreviewParameters(graphId: string): Promise<AnimationGraphPreviewResult>;
   /** Remove an entity + its edges (M3.3) — one undoable transaction (the delta streams back). */
   removeEntity(id: string): void;
   /** Duplicate an entity (M3.3) — one undoable transaction; resolves to the clone's id. */
@@ -110,11 +188,40 @@ export interface EditorClient {
   focusEntity(id: string): void;
   /** M8.3: turn a dead mesh into a correct dynamic body — one undoable transaction. */
   makeDynamic(id: string): Promise<boolean>;
+  /** Add a fixed rigid body and generated convex-hull collider as one undoable transaction. */
+  makeStatic(id: string): Promise<boolean>;
 
   // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable transaction over the Movable Tree +
   // override pipeline. reparent reuses `reparentPart`; delete=deactivate is distinct from `removeEntity`. ──
   /** Create an empty named entity at a position → its id (the caller selects it). */
   createEntity(x: number, y: number, z: number, name: string): Promise<string | null>;
+  /** Start the non-destructive Pipe Forge source session; clicks are routed through `pipeForgePoint`. */
+  pipeForgeStart(options: PipeForgeOptions): Promise<PipeForgeStatus>;
+  /** Place a point from normalized viewport coordinates (native ray → surface/workplane → snapped route). */
+  pipeForgePoint(x: number, y: number): Promise<PipeForgeStatus>;
+  pipeForgeUndo(): Promise<PipeForgeStatus>;
+  pipeForgeBake(): Promise<PipeBakeReport>;
+  pipeForgeCancel(): Promise<PipeForgeStatus>;
+  pipeForgeStatus(): Promise<PipeForgeStatus>;
+  /** Restore a baked V2 recipe into the viewport without destructively replacing its current artifact. */
+  pipeForgeEdit(id: string): Promise<PipeForgeStatus>;
+  /** Start extending a branch from a stable route handle; subsequent viewport clicks author that branch. */
+  pipeForgeBeginBranch(nodeId: number, diameterCm: number): Promise<PipeForgeStatus>;
+  pipeForgeEndBranch(): Promise<PipeForgeStatus>;
+  pipeForgeMoveHandle(nodeId: number, x: number, y: number, z: number): Promise<PipeForgeStatus>;
+  pipeForgeRemoveHandle(nodeId: number): Promise<PipeForgeStatus>;
+  pipeForgePlaceFitting(nodeId: number, kind: PipeFittingKind, catalogId?: string): Promise<PipeForgeStatus>;
+  pipeForgeRemoveFitting(fittingId: number): Promise<PipeForgeStatus>;
+  pipeForgeUpsertCatalog(entry: UserFittingCatalogEntry): Promise<PipeForgeStatus>;
+  pipeForgeRemoveCatalog(id: string): Promise<PipeForgeStatus>;
+  /** Measure topology, UV, material, texture and production-readiness facts for a selected mesh. */
+  assetLabAudit(id: string): Promise<AssetLabResponse>;
+  /** Build and place a content-addressed derivative while preserving the selected source. */
+  assetLabProcess(id: string, request: AssetLabProcessRequest): Promise<AssetLabResponse>;
+  /** Export a selected canonical mesh as an embedded-texture GLB. `path` is for automation. */
+  assetLabExport(id: string, path?: string): Promise<AssetLabResponse>;
+  /** Export the authoritative hierarchy, reusable meshes, skins and representable animation. */
+  sceneExport(format: "glb" | "usda", path?: string): Promise<SceneExportResponse>;
   /** M11.3 — author a Light entity (kind = directional|point|spot) at a position with a linear RGB colour +
    *  intensity → its id. One undoable commit; the lit result is a render projection (not in the doc). */
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null>;
@@ -206,6 +313,10 @@ export interface EditorClient {
   viewPreset(preset: string): void;
   /** The camera state `[orbit, elevation, distance, tx, ty, tz]` (the orientation cube + the e2e). */
   cameraDebug(): Promise<number[]>;
+  /** Switch display presentation while retaining the same HDR/PBR lighting and authored materials. */
+  setRenderProfile(profile: ViewportRenderProfile): Promise<ViewportRenderProfile>;
+  /** Authoritative active viewport presentation profile. */
+  renderProfileDebug(): Promise<ViewportRenderProfile>;
 
   // ── native viewport input (Tauri-only; the dev MockCore has no viewport) — the M10.1 composite closeout ─
   /** Pick over the native wgpu region at NORMALIZED viewport coords (x,y ∈ [0,1]) → the picked entity id
@@ -303,6 +414,37 @@ export interface EditorClient {
   /** Scrub the decision history to `frame` over the M8.4 replay channel (watch exactly when a counter
    *  incremented / a transition fired) and return the truth-state at that frame for `selected`. */
   ruleScrub(frame: number, selected: string | null): Promise<RuleDebugInfo>;
+
+  // ── the authored match: author → validate → cook → run (ADR-097) ─────────────────────────────────────
+  /** Validate the authored scene continuously. A read — it starts nothing and never touches the document.
+   *  This is what makes the match panel's feedback live rather than start-time-only. */
+  matchValidate(): Promise<MatchValidation>;
+  /** Author a complete, playable starter match as ONE undoable transaction — the discoverable way in. */
+  matchAuthorStarter(): Promise<AuthoredMatch>;
+  /** Cook the authored scene and start a match over the live viewport. Rejects with the cook's
+   *  diagnostics when the scene cannot run, so the panel can list the objects at fault. */
+  matchStart(): Promise<MatchStatus>;
+  /** Advance the authoritative match by `ticks` and redraw from its state. */
+  matchStep(ticks: number): Promise<MatchStatus>;
+  /** Order the player's hero to a lane position, exactly as a game client would. */
+  matchOrderMove(xMm: number, yMm: number): Promise<MatchStatus>;
+  /** Attack-move: advance and engage anything hostile noticed on the way. The order PERSISTS — this is
+   *  what makes the hero keep swinging without a command per swing. */
+  matchAttackMove(xMm: number, yMm: number): Promise<MatchStatus>;
+  /** Lock onto one named target until it is gone. Never re-acquires. */
+  matchAttackTarget(target: number): Promise<MatchStatus>;
+  /** Hold position and engage whatever comes into range. */
+  matchHold(): Promise<MatchStatus>;
+  /** Cancel movement AND any standing order. */
+  matchHalt(): Promise<MatchStatus>;
+  /** Apply crowd control to the hero — the live proof status effects run in the viewport. */
+  matchStun(ticks: number): Promise<MatchStatus>;
+  /** Read the match state without mutating it. */
+  matchStatus(): Promise<MatchStatus>;
+  /** The cooked definitions the running match was built from — the inspectable middle of the chain. */
+  matchCooked(): Promise<CookedMatch | null>;
+  /** End the match and restore the authored scene verbatim. */
+  matchStop(): Promise<MatchStatus>;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -400,6 +542,13 @@ export class TauriClient implements EditorClient {
     });
   }
 
+  redo(): Promise<boolean> {
+    return this.core.invoke<boolean>("redo").catch((e: unknown) => {
+      console.error("redo failed", e);
+      return false;
+    });
+  }
+
   entityActions(id: string): Promise<ActionItem[]> {
     return this.core.invoke<ActionItem[]>("entity_actions", { id }).catch((e: unknown) => { console.error("entity_actions failed", e); throw e; });
   }
@@ -429,6 +578,84 @@ export class TauriClient implements EditorClient {
   jointInfo(id: string): Promise<JointInfo | null> {
     return this.core.invoke<JointInfo | null>("joint_info", { id }).catch((e: unknown) => { console.error("joint_info failed", e); return null; });
   }
+  animationState(id: string | null): Promise<AnimationWorkspaceInfo> {
+    return this.core.invoke<AnimationWorkspaceInfo>("animation_state", { id }).catch((e: unknown) => { console.error("animation_state failed", e); throw e; });
+  }
+  animationClipInstanceSave(request: AnimationClipInstanceSaveRequest): Promise<AnimationClipInstanceSaveResult> {
+    return this.core.invoke<AnimationClipInstanceSaveResult>("animation_clip_instance_save", { request }).catch((e: unknown) => { console.error("animation_clip_instance_save failed", e); throw e; });
+  }
+  animationClipInstanceDelete(instanceId: string, expectedRevision: string, selectedId: string | null): Promise<AnimationClipInstanceSaveResult> {
+    return this.core.invoke<AnimationClipInstanceSaveResult>("animation_clip_instance_delete", {
+      instanceId,
+      expectedRevision,
+      selectedId,
+    }).catch((e: unknown) => { console.error("animation_clip_instance_delete failed", e); throw e; });
+  }
+  animationClipInstancePreview(request: AnimationClipInstanceSaveRequest): Promise<AnimationPlaybackInfo> {
+    return this.core.invoke<AnimationPlaybackInfo>("animation_clip_instance_preview", { request }).catch((e: unknown) => { console.error("animation_clip_instance_preview failed", e); throw e; });
+  }
+  animationClipInstancePreviewStop(expectedRequestId?: string): Promise<AnimationPlaybackInfo> {
+    return this.core.invoke<AnimationPlaybackInfo>("animation_clip_instance_preview_stop", {
+      expectedRequestId: expectedRequestId ?? null,
+    }).catch((e: unknown) => { console.error("animation_clip_instance_preview_stop failed", e); throw e; });
+  }
+  animationKey(id: string, component: string, property: string, tick: number, interpolation: AnimationInterpolation): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_key", { id, component, property, tick, interpolation }).catch((e: unknown) => { console.error("animation_key failed", e); throw e; });
+  }
+  animationDeleteKey(id: string, trackId: string, keyId: string): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_delete_key", { id, trackId, keyId }).catch((e: unknown) => { console.error("animation_delete_key failed", e); throw e; });
+  }
+  animationDeleteKeys(id: string | null, deletes: AnimationKeyDeleteInfo[]): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_delete_keys", { id, deletes }).catch((e: unknown) => { console.error("animation_delete_keys failed", e); throw e; });
+  }
+  animationSetInterpolation(id: string, trackId: string, interpolation: AnimationInterpolation): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_set_interpolation", { id, trackId, interpolation }).catch((e: unknown) => { console.error("animation_set_interpolation failed", e); throw e; });
+  }
+  animationSetTrackEnabled(id: string, trackId: string, enabled: boolean): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_set_track_enabled", { id, trackId, enabled }).catch((e: unknown) => { console.error("animation_set_track_enabled failed", e); throw e; });
+  }
+  animationSetTrackLocked(id: string, trackId: string, locked: boolean): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_set_track_locked", { id, trackId, locked }).catch((e: unknown) => { console.error("animation_set_track_locked failed", e); throw e; });
+  }
+  animationUpdateKeys(id: string, trackId: string, updates: AnimationKeyUpdateInfo[]): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_update_keys", { id, trackId, updates }).catch((e: unknown) => { console.error("animation_update_keys failed", e); throw e; });
+  }
+  animationAddMarker(id: string, name: string, tick: number): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_add_marker", { id, name, tick }).catch((e: unknown) => { console.error("animation_add_marker failed", e); throw e; });
+  }
+  animationDeleteMarker(ownerId: string, markerId: string): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_delete_marker", { ownerId, markerId }).catch((e: unknown) => { console.error("animation_delete_marker failed", e); throw e; });
+  }
+  animationAddEvent(id: string, name: string, tick: number, payload?: Json): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_add_event", { id, name, tick, payload: payload ?? null }).catch((e: unknown) => { console.error("animation_add_event failed", e); throw e; });
+  }
+  animationDeleteEvent(ownerId: string, eventId: string): Promise<AnimationEditResult> {
+    return this.core.invoke<AnimationEditResult>("animation_delete_event", { ownerId, eventId }).catch((e: unknown) => { console.error("animation_delete_event failed", e); throw e; });
+  }
+  animationTransport(action: "play" | "pause" | "stop" | "scrub", tick?: number, loopPolicy?: AnimationLoopPolicy): Promise<AnimationPlaybackInfo> {
+    return this.core.invoke<AnimationPlaybackInfo>("animation_transport", { action, tick: tick ?? null, loopPolicy: loopPolicy ?? null }).catch((e: unknown) => { console.error("animation_transport failed", e); throw e; });
+  }
+  animationPlaybackState(): Promise<AnimationPlaybackInfo> {
+    return this.core.invoke<AnimationPlaybackInfo>("animation_transport", { action: "status", tick: null, loopPolicy: null }).catch((e: unknown) => { console.error("animation playback state failed", e); throw e; });
+  }
+  animationGraphState(sequenceId: string): Promise<AnimationGraphStateInfo> {
+    return this.core.invoke<AnimationGraphStateInfo>("animation_graph_state", { sequenceId }).catch((e: unknown) => { console.error("animation_graph_state failed", e); throw e; });
+  }
+  animationGraphSave(sequenceId: string, request: AnimationGraphSaveRequest): Promise<AnimationGraphSaveResult> {
+    return this.core.invoke<AnimationGraphSaveResult>("animation_graph_save", { sequenceId, request }).catch((e: unknown) => { console.error("animation_graph_save failed", e); throw e; });
+  }
+  animationGraphDelete(sequenceId: string, graphId: string, expectedRevision: string, requestId: string): Promise<AnimationGraphDeleteResult> {
+    return this.core.invoke<AnimationGraphDeleteResult>("animation_graph_delete", { sequenceId, graphId, expectedRevision, requestId }).catch((e: unknown) => { console.error("animation_graph_delete failed", e); throw e; });
+  }
+  animationGraphDebug(graphId: string, instanceId: string | null, watches: readonly string[]): Promise<AnimationGraphDebugInfo> {
+    return this.core.invoke<AnimationGraphDebugInfo>("animation_graph_debug", { graphId, instanceId, watches }).catch((e: unknown) => { console.error("animation_graph_debug failed", e); throw e; });
+  }
+  animationGraphSetPreviewParameters(graphId: string, values: Readonly<Record<string, AnimationGraphValue>>): Promise<AnimationGraphPreviewResult> {
+    return this.core.invoke<AnimationGraphPreviewResult>("animation_graph_set_preview_parameters", { graphId, values }).catch((e: unknown) => { console.error("animation_graph_set_preview_parameters failed", e); throw e; });
+  }
+  animationGraphClearPreviewParameters(graphId: string): Promise<AnimationGraphPreviewResult> {
+    return this.core.invoke<AnimationGraphPreviewResult>("animation_graph_clear_preview_parameters", { graphId }).catch((e: unknown) => { console.error("animation_graph_clear_preview_parameters failed", e); throw e; });
+  }
   entityDetails(id: string): Promise<EntityDetails | null> {
     return this.core.invoke<EntityDetails | null>("entity_details", { id }).catch((e: unknown) => { console.error("entity_details failed", e); throw e; });
   }
@@ -444,10 +671,70 @@ export class TauriClient implements EditorClient {
   makeDynamic(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("make_dynamic", { id }).catch((e: unknown) => { console.error("make_dynamic failed", e); throw e; });
   }
+  makeStatic(id: string): Promise<boolean> {
+    return this.core.invoke<boolean>("make_static", { id }).catch((e: unknown) => { console.error("make_static failed", e); throw e; });
+  }
 
   // ── M10.6 scene-authoring verbs ──
   createEntity(x: number, y: number, z: number, name: string): Promise<string | null> {
     return this.core.invoke<string | null>("create_entity", { x, y, z, name }).catch((e: unknown) => { console.error("create_entity failed", e); throw e; });
+  }
+  pipeForgeStart(options: PipeForgeOptions): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_start", { options }).catch((e: unknown) => { console.error("pipe_forge_start failed", e); throw e; });
+  }
+  pipeForgePoint(x: number, y: number): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_point", { x, y }).catch((e: unknown) => { console.error("pipe_forge_point failed", e); throw e; });
+  }
+  pipeForgeUndo(): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_undo").catch((e: unknown) => { console.error("pipe_forge_undo failed", e); throw e; });
+  }
+  pipeForgeBake(): Promise<PipeBakeReport> {
+    return this.core.invoke<PipeBakeReport>("pipe_forge_bake").catch((e: unknown) => { console.error("pipe_forge_bake failed", e); throw e; });
+  }
+  pipeForgeCancel(): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_cancel").catch((e: unknown) => { console.error("pipe_forge_cancel failed", e); throw e; });
+  }
+  pipeForgeStatus(): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_status").catch((e: unknown) => { console.error("pipe_forge_status failed", e); throw e; });
+  }
+  pipeForgeEdit(id: string): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_edit", { id }).catch((e: unknown) => { console.error("pipe_forge_edit failed", e); throw e; });
+  }
+  pipeForgeBeginBranch(nodeId: number, diameterCm: number): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_begin_branch", { nodeId, diameterCm }).catch((e: unknown) => { console.error("pipe_forge_begin_branch failed", e); throw e; });
+  }
+  pipeForgeEndBranch(): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_end_branch").catch((e: unknown) => { console.error("pipe_forge_end_branch failed", e); throw e; });
+  }
+  pipeForgeMoveHandle(nodeId: number, x: number, y: number, z: number): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_move_handle", { nodeId, x, y, z }).catch((e: unknown) => { console.error("pipe_forge_move_handle failed", e); throw e; });
+  }
+  pipeForgeRemoveHandle(nodeId: number): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_remove_handle", { nodeId }).catch((e: unknown) => { console.error("pipe_forge_remove_handle failed", e); throw e; });
+  }
+  pipeForgePlaceFitting(nodeId: number, kind: PipeFittingKind, catalogId?: string): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_place_fitting", { nodeId, kind, catalogId: catalogId ?? null }).catch((e: unknown) => { console.error("pipe_forge_place_fitting failed", e); throw e; });
+  }
+  pipeForgeRemoveFitting(fittingId: number): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_remove_fitting", { fittingId }).catch((e: unknown) => { console.error("pipe_forge_remove_fitting failed", e); throw e; });
+  }
+  pipeForgeUpsertCatalog(entry: UserFittingCatalogEntry): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_upsert_catalog", { entry }).catch((e: unknown) => { console.error("pipe_forge_upsert_catalog failed", e); throw e; });
+  }
+  pipeForgeRemoveCatalog(id: string): Promise<PipeForgeStatus> {
+    return this.core.invoke<PipeForgeStatus>("pipe_forge_remove_catalog", { id }).catch((e: unknown) => { console.error("pipe_forge_remove_catalog failed", e); throw e; });
+  }
+  assetLabAudit(id: string): Promise<AssetLabResponse> {
+    return this.core.invoke<AssetLabResponse>("asset_lab_audit", { id }).catch((e: unknown) => { console.error("asset_lab_audit failed", e); throw e; });
+  }
+  assetLabProcess(id: string, request: AssetLabProcessRequest): Promise<AssetLabResponse> {
+    return this.core.invoke<AssetLabResponse>("asset_lab_process", { id, request }).catch((e: unknown) => { console.error("asset_lab_process failed", e); throw e; });
+  }
+  assetLabExport(id: string, path?: string): Promise<AssetLabResponse> {
+    return this.core.invoke<AssetLabResponse>("asset_lab_export", { id, path: path ?? null }).catch((e: unknown) => { console.error("asset_lab_export failed", e); throw e; });
+  }
+  sceneExport(format: "glb" | "usda", path?: string): Promise<SceneExportResponse> {
+    return this.core.invoke<SceneExportResponse>("scene_export", { format, path: path ?? null }).catch((e: unknown) => { console.error("scene_export failed", e); throw e; });
   }
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null> {
     return this.core.invoke<string | null>("add_light", { kind, x, y, z, r, g, b, intensity }).catch((e: unknown) => { console.error("add_light failed", e); throw e; });
@@ -578,6 +865,18 @@ export class TauriClient implements EditorClient {
   }
   cameraDebug(): Promise<number[]> {
     return this.core.invoke<number[]>("camera_debug").catch((e: unknown) => { console.error("camera_debug failed", e); throw e; });
+  }
+  setRenderProfile(profile: ViewportRenderProfile): Promise<ViewportRenderProfile> {
+    return this.core.invoke<ViewportRenderProfile>("set_render_profile", { profile }).catch((e: unknown) => {
+      console.error("set_render_profile failed", e);
+      throw e;
+    });
+  }
+  renderProfileDebug(): Promise<ViewportRenderProfile> {
+    return this.core.invoke<ViewportRenderProfile>("render_profile_debug").catch((e: unknown) => {
+      console.error("render_profile_debug failed", e);
+      throw e;
+    });
   }
 
   viewportPick(x: number, y: number): Promise<string | null> {
@@ -715,6 +1014,50 @@ export class TauriClient implements EditorClient {
   ruleScrub(frame: number, selected: string | null): Promise<RuleDebugInfo> {
     return this.core.invoke<RuleDebugInfo>("rule_scrub", { frame, selected }).catch((e: unknown) => { console.error("rule_scrub failed", e); throw e; });
   }
+
+  // ── the authored match (ADR-097) ─────────────────────────────────────────────────────────────────────
+  matchValidate(): Promise<MatchValidation> {
+    return this.core.invoke<MatchValidation>("moba_validate");
+  }
+  matchAuthorStarter(): Promise<AuthoredMatch> {
+    return this.core.invoke<AuthoredMatch>("moba_author_starter");
+  }
+  // Deliberately NOT swallowed into a console.error like the older commands: the rejection carries the
+  // cook's diagnostics, and the panel needs them to tell the author which object to fix.
+  matchStart(): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_start");
+  }
+  matchStep(ticks: number): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_step", { ticks });
+  }
+  matchOrderMove(xMm: number, yMm: number): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_order_move", { xMm, yMm });
+  }
+  // ── GP-08: the standing orders. One order, then the hero fights on its own. ──────────────────────
+  matchAttackMove(xMm: number, yMm: number): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_attack_move", { xMm, yMm });
+  }
+  matchAttackTarget(target: number): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_attack_target", { target });
+  }
+  matchHold(): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_hold");
+  }
+  matchHalt(): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_halt");
+  }
+  matchStun(ticks: number): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_stun", { ticks });
+  }
+  matchStatus(): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_status");
+  }
+  matchCooked(): Promise<CookedMatch | null> {
+    return this.core.invoke<CookedMatch | null>("moba_cooked");
+  }
+  matchStop(): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_stop");
+  }
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
@@ -768,6 +1111,26 @@ export function buildWorld(n: number): EntityProjection[] {
   return out;
 }
 
+const MOCK_ANIMATION_GRAPH_ADMISSION_CODES = new Set([
+  "unsupported_schema",
+  "duplicate_node_id",
+  "duplicate_edge_id",
+  "duplicate_parameter_id",
+  "duplicate_sample_id",
+  "duplicate_sample_edge",
+  "trigger_default_true",
+  "legacy_positional_contract_in_v2",
+  "unsupported_edge_weight_contract",
+  "invalid_edge_weight",
+]);
+
+interface MockAnimationClipInstance {
+  instanceId: string;
+  targetId: string;
+  clipId: string;
+  targetMappings: AnimationClipTargetMapping[];
+}
+
 /** The dev/test client: a framed `DeltaClient` for edits + minimal store-derived query mocks so
  *  `npm run dev` still renders the reveal/describe surfaces without a live core. (Vitest tests inject
  *  their own stubbed `EditorClient`; the real reveal/describe come from the shell commands under Tauri.) */
@@ -777,11 +1140,47 @@ class MockClient implements EditorClient {
   private playInfo: PlayInfo = { playing: false, paused: false };
   private placeSeq = 0;
   private saveSeq = 0;
+  private pipeStatus: PipeForgeStatus = {
+    active: false,
+    points: 0,
+    lengthM: 0,
+    previewTriangles: 0,
+    canBake: false,
+    message: "Pipe Forge is ready",
+    handles: [],
+    edges: [],
+    fittings: [],
+    fittingCatalog: [],
+    branchFrom: null,
+    editingEntity: null,
+  };
   // M12.2 (dev MockCore): authored machines are kept in-memory so the state-graph actually RENDERS in
   // `npm run dev` (a graph needs data — unlike the inert rules mock). The real validation/no-dangling +
   // undo + reload are the live `.exe` path; this dev mock stores + returns, it does not validate.
   private machines: StateMachineInfo[] = [];
   private smSeq = 0;
+  // Browser/dev animation model. The packaged editor routes the same contract to the deterministic Rust
+  // service; this small mirror keeps the Animation workspace useful in Vite and component tests.
+  private animationTracks: AnimationTrackInfo[] = [];
+  private animationMarkers: AnimationWorkspaceInfo["markers"] = [];
+  private animationEvents: AnimationWorkspaceInfo["events"] = [];
+  private animationRevision = 0;
+  private animationTick = 0;
+  private animationPlaying = false;
+  private animationLoop: AnimationLoopPolicy = "once";
+  private animationGraphStates = new Map<string, AnimationGraphStateInfo>();
+  private animationGraphRevision = 0;
+  private animationGraphPreview = new Map<string, Readonly<Record<string, AnimationGraphValue>>>();
+  private animationClipInstances = new Map<string, MockAnimationClipInstance>();
+  private animationClipInstanceRevision = 0;
+  private animationClipPreview: {
+    requestId: string;
+    targetId: string;
+    instanceId: string;
+    clipId: string;
+    durationTick: number;
+    evaluatedTracks: number;
+  } | null = null;
   // M12.5 (dev MockCore): a tiny deterministic Rules-in-Play stub so the truth-state debugger RENDERS in
   // `npm run dev` (the panel needs a running model). `ruleKills` = EnemyDied events fired so far (the live
   // head); the canonical sword ignites at 4. This dev stub stores + projects; the real runtime + determinism
@@ -896,6 +1295,9 @@ class MockClient implements EditorClient {
     /* the dev MockCore has no undo stack — a no-op; resolves false so the UI says "nothing to undo" honestly */
     return Promise.resolve(false);
   }
+  redo(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
   entityActions(id: string): Promise<ActionItem[]> {
     const e = projectionStore.getState().displayed[id];
     const canBind = !!e?.components.HealthBar; // a requirer (HealthBar) has an unmet requirement to bind
@@ -935,6 +1337,570 @@ class MockClient implements EditorClient {
   jointInfo(): Promise<JointInfo | null> {
     return Promise.resolve(null);
   }
+  private buildAnimationState(id: string | null): AnimationWorkspaceInfo {
+    const entity = id ? projectionStore.getState().displayed[id] : undefined;
+    const entityContext = entity?.components.UiStyle || entity?.components.HealthBar
+      ? "ui" as const
+      : entity?.components.Sprite
+        ? "2d" as const
+        : "3d" as const;
+    const bindingMeta = (component: string, property: string, value: Json) => {
+      const context = component === "Sprite" ? "2d" as const : ["UiStyle", "HealthBar"].includes(component) ? "ui" as const : entityContext;
+      const transformSink = component === "Transform" && ["x", "y", "z", "px", "py", "pz", "qx", "qy", "qz", "qw", "scale"].includes(property) && typeof value === "number";
+      const jointSink = ["KinematicJoint", "Joint"].includes(component) && property === "value" && typeof value === "number";
+      const workspaceSink = context !== "3d" && (typeof value === "number" || typeof value === "boolean");
+      const ready = transformSink || jointSink;
+      return {
+        context,
+        editorKind: typeof value === "boolean" ? "toggle" as const : property.toLowerCase().includes("color") || ["r", "g", "b", "a"].includes(property) ? "color" as const : property.toLowerCase().includes("frame") ? "sprite_frame" as const : "scalar" as const,
+        bindingState: ready ? "ready" as const : workspaceSink ? "preview_only" as const : "unsupported" as const,
+        bindingReason: ready ? "A verified native runtime adapter consumes this property." : workspaceSink ? "The shared editor preview adapter consumes this property; packaged game rendering is not claimed yet." : "No verified animation adapter consumes this property.",
+        runtimeSink: ready ? (jointSink ? "kinematic-joint" : "viewport-transform") : workspaceSink ? `workspace-${context}` : null,
+      };
+    };
+    const protectedField = (component: string, property: string, value: Json): string | null => {
+      const token = `${component}.${property}`.toLowerCase();
+      if (["mesh", "material", "source", "handle", "parent", "bodya", "bodyb", "controller"].some((part) => token.includes(part))) {
+        return "This field identifies authored data or another asset; key a numeric presentation property instead.";
+      }
+      if (typeof value !== "number" && typeof value !== "boolean") {
+        return "Structured and reference fields stay authoritative.";
+      }
+      const meta = bindingMeta(component, property, value);
+      return meta.bindingState === "ready" || meta.bindingState === "preview_only" ? null : "This typed field has no animation consumer yet, so keying remains disabled rather than failing silently.";
+    };
+    const properties = entity
+      ? Object.entries(entity.components).flatMap(([component, fields]) =>
+          Object.entries(fields).map(([property, value]) => {
+            const reason = protectedField(component, property, value);
+            return {
+              component,
+              property,
+              label: `${component} / ${property}`,
+              valueKind: typeof value === "boolean" ? "bool" : typeof value === "number" ? "number" : "unsupported",
+              value,
+              animatable: reason === null,
+              reason,
+              ...bindingMeta(component, property, value),
+            };
+          }),
+        )
+      : [];
+    const tracks = this.animationTracks.filter((track) => !id || track.targetId === id);
+    const hasMesh = Boolean(entity?.components.MeshRenderer);
+    const hasJoint = Boolean(entity?.components.KinematicJoint ?? entity?.components.Joint);
+    const durationTick = this.animationRuntimeDuration();
+    const clipInstances = [...this.animationClipInstances.values()].filter((instance) => instance.targetId === id);
+    const rigidInstance = clipInstances.filter((instance) => instance.clipId === "rigid-demo").at(-1) ?? null;
+    const multiInstance = clipInstances.filter((instance) => instance.clipId === "multi-node-demo").at(-1) ?? null;
+    const instanceNeedsRepair = (instance: MockAnimationClipInstance | null) =>
+      Boolean(instance?.targetMappings.some((mapping) => {
+        const target = projectionStore.getState().displayed[mapping.targetId];
+        return !target?.components.Transform;
+      }));
+    const rigidNeedsRepair = instanceNeedsRepair(rigidInstance);
+    const multiNeedsRepair = instanceNeedsRepair(multiInstance);
+    return {
+      revision: `mock-${this.animationRevision}`,
+      sequenceId: "main",
+      sequenceName: "Main sequence",
+      ticksPerSecond: 60_000,
+      durationTick,
+      currentTick: this.animationTick,
+      playing: this.animationPlaying,
+      loopPolicy: this.animationLoop,
+      selectedId: id,
+      selectedName: entity?.name ?? null,
+      properties,
+      tracks,
+      markers: this.animationMarkers,
+      events: this.animationEvents,
+      contexts: (["2d", "3d", "ui"] as const).map((context) => {
+        const contextProperties = properties.filter((property) => property.context === context);
+        const contextTracks = tracks.filter((track) => track.context === context);
+        const state = contextProperties.some((property) => property.bindingState === "ready") ? "ready" as const : contextProperties.some((property) => property.bindingState === "preview_only") ? "preview_only" as const : "unsupported" as const;
+        return { context, state, properties: contextProperties.length, tracks: contextTracks.length, reason: contextProperties.length ? "Shared sequence channels are available in this context." : "Select an asset with properties for this context.", action: null };
+      }),
+      asset: entity
+        ? {
+            displayName: entity.name,
+            source: entity.components.CadPart ? "CAD import" : hasMesh ? "mesh asset" : "authored entity",
+            provenance: entity.components.CadPart ? "source-linked" : "project-authored",
+            qualityGrade: hasMesh ? "B · rigid-ready" : "B · native-sink measured",
+            logicalId: hasMesh ? "mock-rigid-asset" : null,
+            revisionId: hasMesh ? "mock-rigid-revision-1" : null,
+            importState: hasMesh ? "ready" : null,
+            dependencyCount: 0,
+            sourceLocation: null,
+            watchesSource: false,
+            reimportDiagnostics: 0,
+            skeletonJoints: 0,
+            clipCount: hasMesh ? 2 : 0,
+            morphTargets: 0,
+            rootMotion: "not classified (unsupported in this tier)",
+            reimportBinding: entity.components.CadPart ? "stable source identity retained" : "project entity identity",
+            clipInstanceRevision: `mock-clip-instances-${this.animationClipInstanceRevision}`,
+            clips: hasMesh ? [
+              {
+                clipId: "rigid-demo",
+                sequenceId: "rigid-demo-source",
+                name: "Rigid showcase",
+                durationTick: 120_000,
+                sourceBindingHash: "mock-rigid-bindings-v1",
+                sourceTargets: ["Fixture root (FixtureRoot#0)"],
+                sourceTargetIds: ["gltf-target:fixture-root"],
+                sourceBindings: [
+                  { sourceTargetId: "gltf-target:fixture-root", sourceTargetLabel: "Fixture root (FixtureRoot#0)", component: "Transform", property: "translation", valueKind: "vec3" },
+                  { sourceTargetId: "gltf-target:fixture-root", sourceTargetLabel: "Fixture root (FixtureRoot#0)", component: "Transform", property: "rotation", valueKind: "quaternion" },
+                  { sourceTargetId: "gltf-target:fixture-root", sourceTargetLabel: "Fixture root (FixtureRoot#0)", component: "Transform", property: "scale", valueKind: "vec3" },
+                ],
+                channels: ["translation (vec3)", "rotation (quaternion)", "scale (vec3)"],
+                readiness: rigidInstance ? (rigidNeedsRepair ? "repair_required" as const : "ready" as const) : "setup_available" as const,
+                reason: rigidInstance
+                  ? rigidNeedsRepair
+                    ? "This persisted instance references a target that is no longer a live Transform. Repair its mapping without changing its identity."
+                    : "This revision-pinned instance is explicitly mapped and ready for native graph playback."
+                  : "One rigid source node can be explicitly mapped to this selected entity.",
+                action: rigidInstance ? (rigidNeedsRepair ? "Repair the stale target mapping." : "Add this instance in Graph or set up another instance.") : "Review and set up this clip.",
+                instanceId: rigidInstance?.instanceId ?? null,
+                targetMappings: rigidInstance?.targetMappings.map((mapping) => ({ ...mapping })),
+              },
+              {
+                clipId: "multi-node-demo",
+                sequenceId: "multi-node-demo-source",
+                name: "Two-part assembly",
+                durationTick: 90_000,
+                sourceBindingHash: "mock-multi-bindings-v1",
+                sourceTargets: ["Fixture root (FixtureRoot#0)", "Fixture child (FixtureRoot#0/FixtureChild#0)"],
+                sourceTargetIds: ["gltf-target:fixture-root", "gltf-target:fixture-child"],
+                sourceBindings: [
+                  { sourceTargetId: "gltf-target:fixture-root", sourceTargetLabel: "Fixture root (FixtureRoot#0)", component: "Transform", property: "translation", valueKind: "vec3" },
+                  { sourceTargetId: "gltf-target:fixture-child", sourceTargetLabel: "Fixture child (FixtureRoot#0/FixtureChild#0)", component: "Transform", property: "rotation", valueKind: "quaternion" },
+                ],
+                channels: ["translation (vec3)", "rotation (quaternion)"],
+                readiness: multiInstance ? (multiNeedsRepair ? "repair_required" as const : "ready" as const) : "explicit_mapping_required" as const,
+                reason: multiInstance
+                  ? multiNeedsRepair
+                    ? "A persisted target is no longer a live Transform. Repair the affected row while preserving this instance identity."
+                    : "Every source node has a distinct explicit live target."
+                  : "This clip animates 2 distinct source nodes. Unsafe one-entity auto-map is disabled.",
+                action: multiInstance ? (multiNeedsRepair ? "Repair the stale target mapping." : "Add this instance in Graph or set up another instance.") : "Map every source node to a distinct scene entity.",
+                instanceId: multiInstance?.instanceId ?? null,
+                targetMappings: multiInstance?.targetMappings.map((mapping) => ({ ...mapping })),
+              },
+            ] : [],
+            capabilities: [
+              { capability: "Native property playback", state: properties.some((property) => property.animatable) ? "available" : "missing", reason: "Only Transform fields and validated kinematic-joint values expose a native sink.", action: null },
+              { capability: "CAD mechanism", state: hasJoint ? "available" : "missing", reason: hasJoint ? "A kinematic joint is present." : "No kinematic joint is authored on this entity.", action: hasJoint ? null : "Author a joint only when the part has a mechanical degree of freedom." },
+              { capability: "GPU skeletal deformation", state: "unsupported", reason: "No verified joint/weight stream is exposed by the dev projection.", action: "Import a skinned glTF and inspect its rig diagnostics in the packaged editor." },
+              { capability: "Root-motion authority", state: "unsupported", reason: "Root trajectories are not classified or extracted in this runtime tier.", action: "Keep movement entity-driven." },
+            ],
+            suggestions: hasMesh ? ["Key Transform properties for a rigid preview."] : ["Choose a numeric property and add the first key."],
+          }
+        : null,
+      issues: [],
+    };
+  }
+  animationState(id: string | null): Promise<AnimationWorkspaceInfo> {
+    return Promise.resolve(this.buildAnimationState(id));
+  }
+  private animationClipDraftError(request: AnimationClipInstanceSaveRequest): string | null {
+    const currentRevision = `mock-clip-instances-${this.animationClipInstanceRevision}`;
+    if (request.expectedRevision !== currentRevision) return "Clip instances changed elsewhere. Review the latest setup before continuing.";
+    if (request.logicalAssetId !== "mock-rigid-asset" || request.expectedAssetRevision !== "mock-rigid-revision-1") return "The imported asset revision changed while setup was open.";
+    const sourceTargetIds = request.clipId === "rigid-demo"
+      ? ["gltf-target:fixture-root"]
+      : request.clipId === "multi-node-demo"
+        ? ["gltf-target:fixture-root", "gltf-target:fixture-child"]
+        : null;
+    const expectedHash = request.clipId === "rigid-demo"
+      ? "mock-rigid-bindings-v1"
+      : request.clipId === "multi-node-demo"
+        ? "mock-multi-bindings-v1"
+        : null;
+    if (!sourceTargetIds || request.expectedSourceBindingHash !== expectedHash) return "The clip source signature is stale or unsupported.";
+    const mappings = request.targetMappings?.length
+      ? request.targetMappings
+      : sourceTargetIds.length === 1
+        ? [{ sourceTargetId: sourceTargetIds[0], targetId: request.targetId }]
+        : [];
+    if (mappings.length === 0) return `This clip animates ${sourceTargetIds.length} source nodes. Map every source node to a distinct live Transform entity.`;
+    const expectedSources = new Set(sourceTargetIds);
+    const mappedSources = new Set<string>();
+    const mappedTargets = new Set<string>();
+    for (const mapping of mappings) {
+      if (!expectedSources.has(mapping.sourceTargetId)) return `Source mapping '${mapping.sourceTargetId}' is stale. Reopen setup.`;
+      if (mappedSources.has(mapping.sourceTargetId)) return `Source node '${mapping.sourceTargetId}' is mapped more than once.`;
+      if (mappedTargets.has(mapping.targetId)) return "Each source node needs a distinct scene target; many-to-one mapping is refused.";
+      mappedSources.add(mapping.sourceTargetId);
+      mappedTargets.add(mapping.targetId);
+      const entity = projectionStore.getState().displayed[mapping.targetId];
+      if (!entity?.components.Transform) return `Mapped target '${mapping.targetId}' is missing or no longer has a Transform component.`;
+    }
+    const missing = sourceTargetIds.filter((sourceTargetId) => !mappedSources.has(sourceTargetId));
+    if (missing.length > 0) return `${missing.length} source node mapping(s) are missing.`;
+    return null;
+  }
+  animationClipInstanceSave(request: AnimationClipInstanceSaveRequest): Promise<AnimationClipInstanceSaveResult> {
+    const error = this.animationClipDraftError(request);
+    if (error) return Promise.resolve({ ok: false, message: error, instanceId: null, state: this.buildAnimationState(request.targetId) });
+    const sourceTargetId = request.clipId === "multi-node-demo" ? null : "gltf-target:fixture-root";
+    const targetMappings = request.targetMappings?.length
+      ? request.targetMappings.map((mapping) => ({ ...mapping }))
+      : sourceTargetId
+        ? [{ sourceTargetId, targetId: request.targetId }]
+        : [];
+    this.animationClipInstances.set(request.instanceId, {
+      instanceId: request.instanceId,
+      targetId: request.targetId,
+      clipId: request.clipId,
+      targetMappings,
+    });
+    this.animationClipInstanceRevision += 1;
+    this.animationClipPreview = null;
+    this.animationPlaying = false;
+    this.animationTick = 0;
+    this.animationGraphStates.clear();
+    return Promise.resolve({
+      ok: true,
+      message: `Clip '${request.name}' is explicitly mapped and ready in the Graph source palette.`,
+      instanceId: request.instanceId,
+      state: this.buildAnimationState(request.targetId),
+    });
+  }
+  animationClipInstanceDelete(instanceId: string, expectedRevision: string, selectedId: string | null): Promise<AnimationClipInstanceSaveResult> {
+    if (expectedRevision !== `clip-instances-${this.animationClipInstanceRevision}`) {
+      return Promise.resolve({
+        ok: false,
+        message: "Clip instances changed elsewhere. Refresh before discarding.",
+        instanceId: null,
+        state: this.buildAnimationState(selectedId),
+      });
+    }
+    if (!this.animationClipInstances.delete(instanceId)) {
+      return Promise.resolve({
+        ok: false,
+        message: `Clip instance '${instanceId}' no longer exists.`,
+        instanceId: null,
+        state: this.buildAnimationState(selectedId),
+      });
+    }
+    this.animationClipInstanceRevision += 1;
+    this.animationClipPreview = null;
+    this.animationPlaying = false;
+    this.animationTick = 0;
+    this.animationGraphStates.clear();
+    return Promise.resolve({
+      ok: true,
+      message: `Clip instance '${instanceId}' was discarded.`,
+      instanceId,
+      state: this.buildAnimationState(selectedId),
+    });
+  }
+  animationClipInstancePreview(request: AnimationClipInstanceSaveRequest): Promise<AnimationPlaybackInfo> {
+    const error = this.animationClipDraftError(request);
+    if (error) return Promise.resolve({ ok: false, message: error, currentTick: this.animationTick, durationTick: this.animationRuntimeDuration(), playing: this.animationPlaying, loopPolicy: this.animationLoop, evaluatedTracks: 0, crossedEvents: [], eventsTruncated: false });
+    const durationTick = request.clipId === "multi-node-demo" ? 90_000 : 120_000;
+    const evaluatedTracks = request.clipId === "multi-node-demo" ? 2 : 3;
+    this.animationClipPreview = {
+      requestId: request.requestId,
+      targetId: request.targetId,
+      instanceId: request.instanceId,
+      clipId: request.clipId,
+      durationTick,
+      evaluatedTracks,
+    };
+    this.animationTick = 0;
+    this.animationPlaying = true;
+    this.animationLoop = "once";
+    return Promise.resolve({ ok: true, message: "Previewing the unsaved mapped clip. Stop preview restores authored transforms.", currentTick: 0, durationTick, playing: true, loopPolicy: "once", evaluatedTracks, crossedEvents: [], eventsTruncated: false });
+  }
+  animationClipInstancePreviewStop(expectedRequestId?: string): Promise<AnimationPlaybackInfo> {
+    if (
+      expectedRequestId
+      && this.animationClipPreview
+      && this.animationClipPreview.requestId !== expectedRequestId
+    ) {
+      return Promise.resolve({
+        ok: true,
+        message: "A newer imported clip preview remains active.",
+        currentTick: this.animationTick,
+        durationTick: this.animationRuntimeDuration(),
+        playing: this.animationPlaying,
+        loopPolicy: this.animationLoop,
+        evaluatedTracks: this.animationClipPreview.evaluatedTracks,
+        crossedEvents: [],
+        eventsTruncated: false,
+      });
+    }
+    this.animationClipPreview = null;
+    this.animationPlaying = false;
+    this.animationTick = 0;
+    return Promise.resolve({ ok: true, message: "Imported clip preview stopped; authored transforms restored.", currentTick: 0, durationTick: this.animationRuntimeDuration(), playing: false, loopPolicy: this.animationLoop, evaluatedTracks: this.animationTracks.length, crossedEvents: [], eventsTruncated: false });
+  }
+  animationKey(id: string, component: string, property: string, tick: number, interpolation: AnimationInterpolation): Promise<AnimationEditResult> {
+    const value = projectionStore.getState().displayed[id]?.components[component]?.[property];
+    const entity = projectionStore.getState().displayed[id];
+    const context = component === "Sprite" ? "2d" as const : ["UiStyle", "HealthBar"].includes(component) ? "ui" as const : entity?.components.UiStyle || entity?.components.HealthBar ? "ui" as const : entity?.components.Sprite ? "2d" as const : "3d" as const;
+    const hasNativeSink = typeof value === "number" && ((component === "Transform" && ["x", "y", "z", "px", "py", "pz", "qx", "qy", "qz", "qw", "scale"].includes(property)) || (["KinematicJoint", "Joint"].includes(component) && property === "value"));
+    const hasWorkspaceSink = context !== "3d" && (typeof value === "number" || typeof value === "boolean");
+    if ((!Number.isInteger(tick) || tick < 0) || (typeof value !== "number" && typeof value !== "boolean") || (!hasNativeSink && !hasWorkspaceSink) || (typeof value === "number" && !Number.isFinite(value))) {
+      return Promise.resolve({ ok: false, message: "The key needs a verified native property sink, a finite current value, and a non-negative whole tick.", trackId: null, keyId: null, state: this.buildAnimationState(id) });
+    }
+    const trackId = `${id}:${component}:${property}`;
+    let track = this.animationTracks.find((item) => item.id === trackId);
+    if (!track) {
+      track = { id: trackId, name: `${component}.${property}`, targetId: id, targetName: projectionStore.getState().displayed[id]?.name ?? id, component, property, valueKind: typeof value === "boolean" ? "bool" : "number", interpolation, enabled: true, locked: false, context, editorKind: typeof value === "boolean" ? "toggle" : property.toLowerCase().includes("frame") ? "sprite_frame" : "scalar", bindingState: hasNativeSink ? "ready" : "preview_only", bindingReason: hasNativeSink ? "Verified native adapter." : "Shared workspace preview adapter.", runtimeSink: hasNativeSink ? "viewport-transform" : `workspace-${context}`, keys: [] };
+      this.animationTracks.push(track);
+    }
+    const keyId = `${trackId}:${tick}`;
+    track.interpolation = interpolation;
+    track.keys = [...track.keys.filter((key) => key.tick !== tick), { id: keyId, tick, seconds: tick / 60_000, value, inTangent: null, outTangent: null }].sort((a, b) => a.tick - b.tick || a.id.localeCompare(b.id));
+    this.animationRevision += 1;
+    return Promise.resolve({ ok: true, message: `Key added at tick ${tick}. Ctrl-Z removes it in the packaged editor.`, trackId, keyId, state: this.buildAnimationState(id) });
+  }
+  animationDeleteKey(id: string, trackId: string, keyId: string): Promise<AnimationEditResult> {
+    const track = this.animationTracks.find((item) => item.id === trackId && item.targetId === id);
+    if (!track || !track.keys.some((key) => key.id === keyId)) {
+      return Promise.resolve({ ok: false, message: "That key no longer exists; the timeline was refreshed.", trackId, keyId, state: this.buildAnimationState(id) });
+    }
+    track.keys = track.keys.filter((key) => key.id !== keyId);
+    this.animationRevision += 1;
+    return Promise.resolve({ ok: true, message: "Key removed.", trackId, keyId, state: this.buildAnimationState(id) });
+  }
+  animationDeleteKeys(id: string | null, deletes: AnimationKeyDeleteInfo[]): Promise<AnimationEditResult> {
+    if (deletes.length === 0) return Promise.resolve({ ok: true, message: "No keys selected.", trackId: null, keyId: null, state: this.buildAnimationState(id) });
+    const unique = [...new Map(deletes.map((item) => [JSON.stringify([item.targetId, item.trackId, item.keyId]), item])).values()];
+    const requested = new Set(unique.map((item) => JSON.stringify([item.targetId, item.trackId, item.keyId])));
+    for (const item of unique) {
+      const track = this.animationTracks.find((candidate) => candidate.id === item.trackId && candidate.targetId === item.targetId);
+      if (!track || track.locked || !track.keys.some((key) => key.id === item.keyId)) {
+        return Promise.resolve({ ok: false, message: track?.locked ? "Unlock every selected track before deleting its keys." : "A selected key no longer exists; nothing was removed.", trackId: item.trackId, keyId: item.keyId, state: this.buildAnimationState(id) });
+      }
+    }
+    for (const track of this.animationTracks) {
+      track.keys = track.keys.filter((key) => !requested.has(JSON.stringify([track.targetId, track.id, key.id])));
+    }
+    this.animationRevision += 1;
+    return Promise.resolve({ ok: true, message: `${unique.length} key${unique.length === 1 ? "" : "s"} removed as one edit.`, trackId: unique[0]?.trackId ?? null, keyId: unique[0]?.keyId ?? null, state: this.buildAnimationState(id) });
+  }
+  animationSetInterpolation(id: string, trackId: string, interpolation: AnimationInterpolation): Promise<AnimationEditResult> {
+    const track = this.animationTracks.find((item) => item.id === trackId && item.targetId === id);
+    if (!track) return Promise.resolve({ ok: false, message: "That track no longer exists.", trackId, keyId: null, state: this.buildAnimationState(id) });
+    track.interpolation = interpolation;
+    this.animationRevision += 1;
+    return Promise.resolve({ ok: true, message: `Interpolation changed to ${interpolation}.`, trackId, keyId: null, state: this.buildAnimationState(id) });
+  }
+  animationSetTrackEnabled(id: string, trackId: string, enabled: boolean): Promise<AnimationEditResult> {
+    const track = this.animationTracks.find((item) => item.id === trackId && item.targetId === id);
+    if (!track || track.locked) return Promise.resolve({ ok: false, message: track?.locked ? "Unlock the track before muting it." : "That track no longer exists.", trackId, keyId: null, state: this.buildAnimationState(id) });
+    track.enabled = enabled;
+    this.animationRevision += 1;
+    return Promise.resolve({ ok: true, message: enabled ? "Track unmuted." : "Track muted; keys were preserved.", trackId, keyId: null, state: this.buildAnimationState(id) });
+  }
+  animationSetTrackLocked(id: string, trackId: string, locked: boolean): Promise<AnimationEditResult> {
+    const track = this.animationTracks.find((item) => item.id === trackId && item.targetId === id);
+    if (!track) return Promise.resolve({ ok: false, message: "That track no longer exists.", trackId, keyId: null, state: this.buildAnimationState(id) });
+    track.locked = locked;
+    this.animationRevision += 1;
+    return Promise.resolve({ ok: true, message: locked ? "Track locked." : "Track unlocked.", trackId, keyId: null, state: this.buildAnimationState(id) });
+  }
+  animationUpdateKeys(id: string, trackId: string, updates: AnimationKeyUpdateInfo[]): Promise<AnimationEditResult> {
+    const track = this.animationTracks.find((item) => item.id === trackId && item.targetId === id);
+    if (!track || track.locked) return Promise.resolve({ ok: false, message: track?.locked ? "Unlock the track before editing keys." : "That track no longer exists.", trackId, keyId: null, state: this.buildAnimationState(id) });
+    for (const update of updates) {
+      const key = track.keys.find((item) => item.id === update.keyId);
+      if (!key || (update.tick !== undefined && (!Number.isInteger(update.tick) || update.tick < 0))) return Promise.resolve({ ok: false, message: "A key update was stale or invalid.", trackId, keyId: update.keyId, state: this.buildAnimationState(id) });
+      if (update.tick !== undefined) { key.tick = update.tick; key.seconds = update.tick / 60_000; }
+      if (update.value !== undefined) key.value = update.value;
+      if ("inTangent" in update) key.inTangent = update.inTangent ?? null;
+      if ("outTangent" in update) key.outTangent = update.outTangent ?? null;
+    }
+    track.keys.sort((a, b) => a.tick - b.tick || a.id.localeCompare(b.id));
+    this.animationRevision += 1;
+    return Promise.resolve({ ok: true, message: `${updates.length} key update(s) committed as one edit.`, trackId, keyId: updates[0]?.keyId ?? null, state: this.buildAnimationState(id) });
+  }
+  animationAddMarker(id: string, name: string, tick: number): Promise<AnimationEditResult> {
+    if (!Number.isInteger(tick) || tick < 0) return Promise.resolve({ ok: false, message: "Marker time must be a non-negative whole tick.", trackId: null, keyId: null, state: this.buildAnimationState(id) });
+    this.animationRevision += 1;
+    this.animationMarkers.push({ id: `marker-${this.animationRevision}`, ownerId: id, name: name.trim() || "Marker", tick, seconds: tick / 60_000, color: [89, 192, 255, 255] });
+    return Promise.resolve({ ok: true, message: "Marker added.", trackId: null, keyId: null, state: this.buildAnimationState(id) });
+  }
+  animationDeleteMarker(ownerId: string, markerId: string): Promise<AnimationEditResult> {
+    const before = this.animationMarkers.length;
+    this.animationMarkers = this.animationMarkers.filter((marker) => marker.id !== markerId || marker.ownerId !== ownerId);
+    if (before === this.animationMarkers.length) return Promise.resolve({ ok: false, message: "That marker no longer exists.", trackId: null, keyId: null, state: this.buildAnimationState(ownerId) });
+    this.animationRevision += 1;
+    return Promise.resolve({ ok: true, message: "Marker removed.", trackId: null, keyId: null, state: this.buildAnimationState(ownerId) });
+  }
+  animationAddEvent(id: string, name: string, tick: number, payload?: Json): Promise<AnimationEditResult> {
+    if (!Number.isInteger(tick) || tick < 0) return Promise.resolve({ ok: false, message: "Event time must be a non-negative whole tick.", trackId: null, keyId: null, state: this.buildAnimationState(id) });
+    this.animationRevision += 1;
+    this.animationEvents.push({ id: `event-${this.animationRevision}`, ownerId: id, name: name.trim() || "Event", tick, seconds: tick / 60_000, payload: payload ?? null });
+    return Promise.resolve({ ok: true, message: "Event added.", trackId: null, keyId: null, state: this.buildAnimationState(id) });
+  }
+  animationDeleteEvent(ownerId: string, eventId: string): Promise<AnimationEditResult> {
+    const before = this.animationEvents.length;
+    this.animationEvents = this.animationEvents.filter((event) => event.id !== eventId || event.ownerId !== ownerId);
+    if (before === this.animationEvents.length) return Promise.resolve({ ok: false, message: "That event no longer exists.", trackId: null, keyId: null, state: this.buildAnimationState(ownerId) });
+    this.animationRevision += 1;
+    return Promise.resolve({ ok: true, message: "Event removed.", trackId: null, keyId: null, state: this.buildAnimationState(ownerId) });
+  }
+  private animationRuntimeDuration(): number {
+    const authoredDuration = Math.max(
+      60_000,
+      ...this.animationTracks.flatMap((track) => track.keys.map((key) => key.tick)),
+    );
+    const readyInstances = new Set([...this.animationClipInstances.values()].map((instance) => instance.instanceId));
+    const graphUsesReadyInstance = [...this.animationGraphStates.values()].some((state) =>
+      state.compile.state === "ready"
+      && state.graph?.nodes.some((node) => node.kind === "sequence" && node.sourceId != null && readyInstances.has(node.sourceId)),
+    );
+    return this.animationClipPreview || graphUsesReadyInstance
+      ? Math.max(this.animationClipPreview?.durationTick ?? 120_000, authoredDuration)
+      : authoredDuration;
+  }
+  animationTransport(action: "play" | "pause" | "stop" | "scrub", tick?: number, loopPolicy?: AnimationLoopPolicy): Promise<AnimationPlaybackInfo> {
+    if (loopPolicy) this.animationLoop = loopPolicy;
+    if (action === "play") this.animationPlaying = true;
+    if (action === "pause") this.animationPlaying = false;
+    if (action === "stop") { this.animationClipPreview = null; this.animationPlaying = false; this.animationTick = 0; }
+    if (action === "scrub" && Number.isFinite(tick) && Number.isInteger(tick) && (tick ?? -1) >= 0) { this.animationPlaying = false; this.animationTick = tick ?? 0; }
+    const durationTick = this.animationRuntimeDuration();
+    return Promise.resolve({ ok: true, message: action === "scrub" ? `Previewing tick ${this.animationTick}.` : `Animation ${action}.`, currentTick: this.animationTick, durationTick, playing: this.animationPlaying, loopPolicy: this.animationLoop, evaluatedTracks: this.animationTracks.length, crossedEvents: [], eventsTruncated: false });
+  }
+  animationPlaybackState(): Promise<AnimationPlaybackInfo> {
+    const durationTick = this.animationRuntimeDuration();
+    return Promise.resolve({ ok: true, message: "Animation clock synchronized.", currentTick: this.animationTick, durationTick, playing: this.animationPlaying, loopPolicy: this.animationLoop, evaluatedTracks: this.animationTracks.length, crossedEvents: [], eventsTruncated: false });
+  }
+  private buildAnimationGraphState(sequenceId: string): AnimationGraphStateInfo {
+    const existing = this.animationGraphStates.get(sequenceId);
+    if (existing) return existing;
+    const state: AnimationGraphStateInfo = {
+      schemaVersion: ANIMATION_GRAPH_SCHEMA_VERSION,
+      sequenceId,
+      revision: "mock-graph-0",
+      graph: null,
+      nodePresentation: [],
+      sources: [
+        { id: sequenceId, name: "Main authored sequence", kind: "authored_sequence", logicalAssetId: null, revisionId: `mock-${this.animationRevision}`, durationTick: 60_000, readiness: "ready", reason: "Authored tracks can be evaluated by the graph runtime.", action: null },
+        { id: "reference-pose", name: "Reference pose", kind: "reference_pose", logicalAssetId: null, revisionId: null, durationTick: 0, readiness: "ready", reason: "The entity's typed authored values define its reference pose.", action: null },
+        { id: "imported:mock-rigid-asset:rigid-demo-source", name: "Rigid showcase (source)", kind: "imported_clip", logicalAssetId: "mock-rigid-asset", revisionId: "mock-rigid-revision-1", durationTick: 120_000, readiness: "blocked", reason: "Immutable source provenance is not a live scene address.", action: "Select its entity in Animation and choose Set up clip." },
+        { id: "imported:mock-rigid-asset:multi-node-demo-source", name: "Two-part assembly (source)", kind: "imported_clip", logicalAssetId: "mock-rigid-asset", revisionId: "mock-rigid-revision-1", durationTick: 90_000, readiness: "blocked", reason: "This multi-node source requires a distinct explicit mapping for every node.", action: "Use the advanced mapper; unsafe one-entity auto-map is disabled." },
+        ...[...this.animationClipInstances.values()].map((instance) => ({
+          id: instance.instanceId,
+          name: instance.clipId === "multi-node-demo" ? "Two-part assembly instance" : "Rigid showcase instance",
+          kind: "clip_instance" as const,
+          logicalAssetId: "mock-rigid-asset",
+          revisionId: "mock-rigid-instance-v1",
+          durationTick: instance.clipId === "multi-node-demo" ? 90_000 : 120_000,
+          readiness: instance.targetMappings.every((mapping) => projectionStore.getState().displayed[mapping.targetId]?.components.Transform)
+            ? "ready" as const
+            : "blocked" as const,
+          reason: instance.targetMappings.every((mapping) => projectionStore.getState().displayed[mapping.targetId]?.components.Transform)
+            ? "Revision-pinned source and explicit live target mapping validated."
+            : "A persisted target is missing or no longer has a Transform; repair this instance in Animation.",
+          action: instance.targetMappings.every((mapping) => projectionStore.getState().displayed[mapping.targetId]?.components.Transform)
+            ? null
+            : "Repair mapping in the imported clip inspector.",
+        })),
+      ],
+      compile: { state: "missing", authoredRevision: "mock-graph-0", compiledRevision: null, compiledHash: null, lastGoodRevision: null, lastGoodHash: null, message: "Create or apply a graph to compile it." },
+      diagnostics: [],
+    };
+    this.animationGraphStates.set(sequenceId, state);
+    return state;
+  }
+  animationGraphState(sequenceId: string): Promise<AnimationGraphStateInfo> {
+    return Promise.resolve(this.buildAnimationGraphState(sequenceId));
+  }
+  async animationGraphSave(sequenceId: string, request: AnimationGraphSaveRequest): Promise<AnimationGraphSaveResult> {
+    // The browser graph validator is only needed when a dev/mock graph is explicitly applied. Keep the
+    // complete authoring model out of the viewport shell's startup graph; the desktop path stays native.
+    const {
+      animationGraphPreflight,
+      animationGraphReadableSchemaVersion,
+      canonicalizeAnimationGraphDocument,
+      cloneAnimationGraph,
+    } = await import("../graph/animation-graph-model");
+    const current = this.buildAnimationGraphState(sequenceId);
+    const requestVersion = animationGraphReadableSchemaVersion(request);
+    const graphVersion = animationGraphReadableSchemaVersion(request.graph);
+    if (requestVersion === null || graphVersion === null || requestVersion !== graphVersion) {
+      return { ok: false, message: "This graph uses an unsupported schema version.", state: current };
+    }
+    if (request.expectedRevision !== current.revision) {
+      return { ok: false, message: "The graph changed elsewhere. Your draft was preserved; review the latest revision before applying again.", state: current };
+    }
+    const graph = canonicalizeAnimationGraphDocument(request.graph);
+    if (graph.sequenceId !== sequenceId) {
+      return { ok: false, message: "The graph belongs to a different sequence.", state: current };
+    }
+    const diagnostics = animationGraphPreflight(graph);
+    if (diagnostics.some((diagnostic) => diagnostic.severity === "error" && MOCK_ANIMATION_GRAPH_ADMISSION_CODES.has(diagnostic.code))) {
+      return {
+        ok: false,
+        message: "The draft contains an unsafe storage contract and was not persisted.",
+        state: { ...current, diagnostics },
+      };
+    }
+    this.animationGraphRevision += 1;
+    const revision = `mock-graph-${this.animationGraphRevision}`;
+    const persistedGraph = cloneAnimationGraph(graph);
+    const semanticInvalid = diagnostics.some((diagnostic) => diagnostic.severity === "error");
+    const compiledHash = semanticInvalid ? current.compile.compiledHash : `mock-compiled-${this.animationGraphRevision}`;
+    const state: AnimationGraphStateInfo = {
+      ...current,
+      revision,
+      graph: persistedGraph,
+      nodePresentation: persistedGraph.nodes.map((node) => ({ nodeId: node.id, ports: [], readiness: semanticInvalid ? "blocked" : "ready", readinessReason: semanticInvalid ? "The authored draft is retained, but semantic diagnostics prevent compilation." : "Mock compilation accepted this schema-v2 node." })),
+      compile: semanticInvalid
+        ? { ...current.compile, state: "invalid", authoredRevision: revision, message: "Draft saved; previewing the last good compiled revision while semantic diagnostics remain." }
+        : { state: "ready", authoredRevision: revision, compiledRevision: revision, compiledHash, lastGoodRevision: revision, lastGoodHash: compiledHash, message: "Graph compiled and installed." },
+      diagnostics,
+    };
+    this.animationGraphStates.set(sequenceId, state);
+    return { ok: true, message: semanticInvalid ? "Graph draft saved; fix blocking diagnostics while the last-good preview remains active." : "Graph applied as one undoable edit in the packaged editor.", state };
+  }
+  animationGraphDelete(sequenceId: string, graphId: string, expectedRevision: string, _requestId: string): Promise<AnimationGraphDeleteResult> {
+    const current = this.buildAnimationGraphState(sequenceId);
+    if (current.revision !== expectedRevision || current.graph?.id !== graphId) {
+      return Promise.resolve({ ok: false, message: "The graph changed or no longer exists; nothing was deleted.", state: current });
+    }
+    this.animationGraphRevision += 1;
+    const revision = `mock-graph-${this.animationGraphRevision}`;
+    const state: AnimationGraphStateInfo = { ...current, revision, graph: null, nodePresentation: [], diagnostics: [], compile: { state: "missing", authoredRevision: revision, compiledRevision: null, compiledHash: null, lastGoodRevision: current.compile.lastGoodRevision, lastGoodHash: current.compile.lastGoodHash, message: "No graph is authored for this sequence." } };
+    this.animationGraphStates.set(sequenceId, state);
+    this.animationGraphPreview.delete(graphId);
+    return Promise.resolve({ ok: true, message: "Animation graph deleted.", state });
+  }
+  animationGraphDebug(graphId: string, instanceId: string | null, watches: readonly string[]): Promise<AnimationGraphDebugInfo> {
+    const state = [...this.animationGraphStates.values()].find((candidate) => candidate.graph?.id === graphId);
+    const graph = state?.graph;
+    const preview = this.animationGraphPreview.get(graphId) ?? {};
+    // The browser mock has no graph evaluator, so it reports no activity instead of inventing node or
+    // edge weights. `truncated` makes the missing runtime trace explicit to the UI.
+    return Promise.resolve({ graphId, graphRevision: state?.compile.compiledRevision ?? state?.revision ?? "missing", compiledHash: state?.compile.compiledHash ?? "missing", instanceId: instanceId ?? "mock-instance", rawTick: this.animationTick, localTick: this.animationTick, activeNodes: [], activeEdges: [], transition: null, parameterValues: preview, watches: watches.slice(0, 32).map((id) => { const value = preview[id]; return { id, value: (Array.isArray(value) ? [...value] : value ?? null) as Json, source: value === undefined ? "unavailable in browser mock" : "preview parameter" }; }), eventsTruncated: false, evaluationCostMicros: null, truncated: Boolean(graph) || watches.length > 32 });
+  }
+  animationGraphSetPreviewParameters(graphId: string, values: Readonly<Record<string, AnimationGraphValue>>): Promise<AnimationGraphPreviewResult> {
+    const state = [...this.animationGraphStates.values()].find((candidate) => candidate.graph?.id === graphId);
+    if (!state?.graph) return Promise.resolve({ ok: false, message: "That graph is not the active browser preview graph.", accepted: {} });
+    const parameters = new Map(state.graph.parameters.map((parameter) => [parameter.id, parameter]));
+    const accepted: Record<string, AnimationGraphValue> = {};
+    const replayable: Record<string, AnimationGraphValue> = { ...(this.animationGraphPreview.get(graphId) ?? {}) };
+    for (const [id, value] of Object.entries(values)) {
+      const parameter = parameters.get(id);
+      if (!parameter) continue;
+      accepted[id] = Array.isArray(value) ? [value[0], value[1]] : value;
+      if (parameter.kind !== "trigger") replayable[id] = accepted[id];
+    }
+    this.animationGraphPreview.set(graphId, replayable);
+    return Promise.resolve({ ok: Object.keys(accepted).length === Object.keys(values).length, message: "Transient graph parameters updated; the document remains clean.", accepted });
+  }
+  animationGraphClearPreviewParameters(graphId: string): Promise<AnimationGraphPreviewResult> {
+    this.animationGraphPreview.delete(graphId);
+    return Promise.resolve({ ok: true, message: "Transient graph parameters reset.", accepted: {} });
+  }
   cadReport(): Promise<CadReport> {
     // Dev stand-in: derive the report from the projection's persisted CadPart components (empty until a
     // CAD file is imported, which only happens under the real Tauri core — so this is normally all zeros).
@@ -967,10 +1933,241 @@ class MockClient implements EditorClient {
   makeDynamic(_id: string): Promise<boolean> {
     return Promise.resolve(true);
   }
+  makeStatic(_id: string): Promise<boolean> {
+    return Promise.resolve(true);
+  }
   // ── M10.6 scene-authoring verbs — the real undoable commits run under Tauri (proven by the .exe gate);
   // the dev MockCore stubs are inert+deterministic so the menu/hierarchy render without a live core. ──
   createEntity(): Promise<string | null> {
     return Promise.resolve(null);
+  }
+  pipeForgeStart(options: PipeForgeOptions): Promise<PipeForgeStatus> {
+    this.pipeStatus = {
+      active: true,
+      kit: options.kit,
+      diameterCm: options.diameterCm,
+      quality: options.quality,
+      autoFittings: options.autoFittings,
+      points: 0,
+      lengthM: 0,
+      previewTriangles: 0,
+      canBake: false,
+      message: "Click in the viewport to place the first point",
+      handles: [],
+      edges: [],
+      fittings: [],
+      fittingCatalog: [],
+      branchFrom: null,
+      editingEntity: null,
+    };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgePoint(x = 0, y = 0): Promise<PipeForgeStatus> {
+    if (!this.pipeStatus.active) return Promise.resolve({ ...this.pipeStatus, message: "Start Pipe Forge first" });
+    const handles = [...this.pipeStatus.handles];
+    const edges = [...this.pipeStatus.edges];
+    const nextNodeId = handles.reduce((max, handle) => Math.max(max, handle.nodeId), 0) + 1;
+    const from = this.pipeStatus.branchFrom ?? handles.at(-1)?.nodeId ?? null;
+    handles.push({
+      nodeId: nextNodeId,
+      position: [Number((x * 10).toFixed(2)), 0, Number((y * 10).toFixed(2))],
+      connectedEdges: from == null ? [] : [edges.length + 1],
+      fittingIds: [],
+    });
+    if (from != null) {
+      const edgeId = edges.length + 1;
+      edges.push({ id: edgeId, from, to: nextNodeId, diameterM: (this.pipeStatus.diameterCm ?? 5) / 100 });
+      const parent = handles.find((handle) => handle.nodeId === from);
+      if (parent && !parent.connectedEdges.includes(edgeId)) parent.connectedEdges = [...parent.connectedEdges, edgeId];
+    }
+    const points = handles.length;
+    this.pipeStatus = {
+      ...this.pipeStatus,
+      points,
+      lengthM: Math.max(0, points - 1),
+      previewTriangles: Math.max(0, points - 1) * 576,
+      canBake: points >= 2,
+      handles,
+      edges,
+      branchFrom: this.pipeStatus.branchFrom == null ? null : nextNodeId,
+      message: points === 1 ? "First point placed — click to extend the run" : "Run updated — keep drawing or bake the asset",
+    };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeUndo(): Promise<PipeForgeStatus> {
+    const handles = this.pipeStatus.handles.slice(0, -1);
+    const removed = this.pipeStatus.handles.at(-1);
+    const edges = removed
+      ? this.pipeStatus.edges.filter((edge) => edge.from !== removed.nodeId && edge.to !== removed.nodeId)
+      : this.pipeStatus.edges;
+    const points = handles.length;
+    this.pipeStatus = {
+      ...this.pipeStatus,
+      points,
+      lengthM: Math.max(0, points - 1),
+      previewTriangles: Math.max(0, points - 1) * 576,
+      canBake: points >= 2,
+      handles: handles.map((handle) => ({
+        ...handle,
+        connectedEdges: handle.connectedEdges.filter((id) => edges.some((edge) => edge.id === id)),
+      })),
+      edges,
+      fittings: removed ? this.pipeStatus.fittings.filter((fitting) => fitting.nodeId !== removed.nodeId) : this.pipeStatus.fittings,
+      branchFrom: this.pipeStatus.branchFrom === removed?.nodeId ? null : this.pipeStatus.branchFrom,
+      message: this.pipeStatus.points > 0 ? "Last point removed" : "No points to undo",
+    };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeBake(): Promise<PipeBakeReport> {
+    if (!this.pipeStatus.canBake) {
+      return Promise.resolve({ entityId: null, handle: null, vertices: 0, triangles: 0, lodTriangles: [], textureResolution: 0, collisionHulls: 0, collisionKind: "none", collisionTriangles: 0, watertight: false, warnings: ["Place at least two points"], message: "Place at least two points before baking" });
+    }
+    const id = this.place("Galvanized steel pipe", {
+      Transform: { x: 0, y: 0, z: 0, scale: 1 },
+      MeshRenderer: { mesh: "mtkasset:mock-pipe" },
+      PipeRecipe: { version: 1, kit: "Galvanized steel" },
+      RigidBody: { kind: "fixed" },
+      Collider: { shape: "trimesh" },
+    });
+    const triangles = this.pipeStatus.previewTriangles;
+    this.pipeStatus = { active: false, points: 0, lengthM: 0, previewTriangles: 0, canBake: false, message: "Pipe asset baked", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null };
+    return Promise.resolve({ entityId: id, handle: "mtkasset:mock-pipe", vertices: Math.ceil(triangles / 2), triangles, lodTriangles: [triangles, Math.floor(triangles / 2)], textureResolution: 256, collisionHulls: 0, collisionKind: "triangle mesh", collisionTriangles: triangles, watertight: true, warnings: [], message: "Pipe asset baked" });
+  }
+  pipeForgeCancel(): Promise<PipeForgeStatus> {
+    this.pipeStatus = { active: false, points: 0, lengthM: 0, previewTriangles: 0, canBake: false, message: "Pipe drawing cancelled — the scene was not changed", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeStatus(): Promise<PipeForgeStatus> {
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeEdit(id: string): Promise<PipeForgeStatus> {
+    const handles = [
+      { nodeId: 1, position: [0, 0, 0] as [number, number, number], connectedEdges: [1], fittingIds: [] },
+      { nodeId: 2, position: [1, 0, 0] as [number, number, number], connectedEdges: [1], fittingIds: [] },
+    ];
+    this.pipeStatus = {
+      ...this.pipeStatus,
+      active: true,
+      points: handles.length,
+      lengthM: 1,
+      previewTriangles: 576,
+      canBake: true,
+      message: "Editable route restored — select a handle or click Rebake",
+      handles,
+      edges: [{ id: 1, from: 1, to: 2, diameterM: (this.pipeStatus.diameterCm ?? 5) / 100 }],
+      fittings: [],
+      branchFrom: null,
+      editingEntity: id,
+    };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeBeginBranch(nodeId: number, diameterCm: number): Promise<PipeForgeStatus> {
+    this.pipeStatus = {
+      ...this.pipeStatus,
+      branchFrom: nodeId,
+      diameterCm,
+      message: `Branch started at handle ${nodeId} — click the viewport to extend it`,
+    };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeEndBranch(): Promise<PipeForgeStatus> {
+    this.pipeStatus = { ...this.pipeStatus, branchFrom: null, message: "Branch complete — route handles remain editable" };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeMoveHandle(nodeId: number, x: number, y: number, z: number): Promise<PipeForgeStatus> {
+    this.pipeStatus = {
+      ...this.pipeStatus,
+      handles: this.pipeStatus.handles.map((handle) => handle.nodeId === nodeId ? { ...handle, position: [x, y, z] } : handle),
+      message: `Handle ${nodeId} moved`,
+    };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeRemoveHandle(nodeId: number): Promise<PipeForgeStatus> {
+    const edgeIds = new Set(this.pipeStatus.edges.filter((edge) => edge.from === nodeId || edge.to === nodeId).map((edge) => edge.id));
+    const handles = this.pipeStatus.handles
+      .filter((handle) => handle.nodeId !== nodeId)
+      .map((handle) => ({ ...handle, connectedEdges: handle.connectedEdges.filter((id) => !edgeIds.has(id)) }));
+    this.pipeStatus = {
+      ...this.pipeStatus,
+      handles,
+      edges: this.pipeStatus.edges.filter((edge) => !edgeIds.has(edge.id)),
+      fittings: this.pipeStatus.fittings.filter((fitting) => fitting.nodeId !== nodeId),
+      points: handles.length,
+      canBake: handles.length >= 2,
+      branchFrom: this.pipeStatus.branchFrom === nodeId ? null : this.pipeStatus.branchFrom,
+      message: `Leaf handle ${nodeId} removed`,
+    };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgePlaceFitting(nodeId: number, kind: PipeFittingKind, catalogId?: string): Promise<PipeForgeStatus> {
+    const id = this.pipeStatus.fittings.reduce((max, fitting) => Math.max(max, fitting.id), 0) + 1;
+    const fittings = [...this.pipeStatus.fittings, { id, nodeId, kind, catalogId: catalogId ?? null, automatic: false }];
+    this.pipeStatus = {
+      ...this.pipeStatus,
+      fittings,
+      handles: this.pipeStatus.handles.map((handle) => handle.nodeId === nodeId ? { ...handle, fittingIds: [...handle.fittingIds, id] } : handle),
+      message: `${kind} placed at handle ${nodeId}`,
+    };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeRemoveFitting(fittingId: number): Promise<PipeForgeStatus> {
+    this.pipeStatus = {
+      ...this.pipeStatus,
+      fittings: this.pipeStatus.fittings.filter((fitting) => fitting.id !== fittingId),
+      handles: this.pipeStatus.handles.map((handle) => ({ ...handle, fittingIds: handle.fittingIds.filter((id) => id !== fittingId) })),
+      message: `Fitting ${fittingId} removed`,
+    };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeUpsertCatalog(entry: UserFittingCatalogEntry): Promise<PipeForgeStatus> {
+    const fittingCatalog = this.pipeStatus.fittingCatalog.filter((item) => item.id !== entry.id);
+    fittingCatalog.push(entry);
+    fittingCatalog.sort((left, right) => left.label.localeCompare(right.label));
+    this.pipeStatus = { ...this.pipeStatus, fittingCatalog, message: `${entry.label} saved to this route's fitting catalog` };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  pipeForgeRemoveCatalog(id: string): Promise<PipeForgeStatus> {
+    this.pipeStatus = {
+      ...this.pipeStatus,
+      fittingCatalog: this.pipeStatus.fittingCatalog.filter((entry) => entry.id !== id),
+      fittings: this.pipeStatus.fittings.filter((fitting) => fitting.catalogId !== id),
+      message: "Catalog fitting removed",
+    };
+    return Promise.resolve({ ...this.pipeStatus });
+  }
+  assetLabAudit(id: string): Promise<AssetLabResponse> {
+    return Promise.resolve({
+      ok: false,
+      message: "Asset Lab mesh analysis is available in the packaged desktop editor.",
+      sourceEntity: id,
+      sourceHandle: null,
+      createdEntity: null,
+      createdHandle: null,
+      audit: null,
+      change: null,
+      warnings: [],
+      exportedPath: null,
+      bakeEvidence: null,
+    });
+  }
+  assetLabProcess(id: string): Promise<AssetLabResponse> {
+    return this.assetLabAudit(id);
+  }
+  assetLabExport(id: string): Promise<AssetLabResponse> {
+    return this.assetLabAudit(id);
+  }
+  sceneExport(format: "glb" | "usda"): Promise<SceneExportResponse> {
+    return Promise.resolve({
+      ok: false,
+      message: "Complete-scene export is available in the packaged desktop editor.",
+      format,
+      exportedPath: null,
+      nodes: 0,
+      meshes: 0,
+      skins: 0,
+      animations: 0,
+      fidelity: [],
+    });
   }
   addLight(): Promise<string | null> {
     return Promise.resolve(null);
@@ -1077,6 +2274,12 @@ class MockClient implements EditorClient {
   viewPreset(): void {}
   cameraDebug(): Promise<number[]> {
     return Promise.resolve([0.785, 0.5, 60, 0, 0, 0]);
+  }
+  setRenderProfile(profile: ViewportRenderProfile): Promise<ViewportRenderProfile> {
+    return Promise.resolve(profile);
+  }
+  renderProfileDebug(): Promise<ViewportRenderProfile> {
+    return Promise.resolve("cinematic");
   }
   // The dev MockCore has no native viewport — these are inert (the real wgpu input is Tauri-only).
   viewportPick(_x: number, _y: number): Promise<string | null> {
@@ -1279,6 +2482,110 @@ class MockClient implements EditorClient {
   ruleScrub(frame: number, selected: string | null): Promise<RuleDebugInfo> {
     return Promise.resolve(this.ruleDebugAt(Math.min(frame, this.ruleKills), selected));
   }
+
+  // ── the authored match: a dev stand-in so `npm run dev` renders the panel without the native kernel.
+  // It models only what the panel needs — authored-or-not, and a match that ticks — and is honest about
+  // being a stand-in: the digest is a fixed dev value, never a real cook.
+  private matchAuthored: AuthoredMatch | null = null;
+  private matchTick = 0;
+  private matchRunning = false;
+  private matchStunTicks = 0;
+  private matchOrder: string | null = null;
+  private devStatus(): MatchStatus {
+    const stunned = this.matchStunTicks > 0;
+    const actors: MatchActor[] = this.matchAuthored
+      ? [
+          { id: 1, team: 0, kind: "Structure", x_mm: 0, y_mm: 0, health: 2000, max_health: 2000, alive: true, owned: false, controls: [], speed: 0, attack_order: null, source: this.matchAuthored.actors[0] },
+          { id: 2, team: 1, kind: "Structure", x_mm: 12000, y_mm: 0, health: 2000, max_health: 2000, alive: true, owned: false, controls: [], speed: 0, attack_order: null, source: this.matchAuthored.actors[1] },
+          { id: 3, team: 0, kind: "Hero", x_mm: 1500 + this.matchTick * 10, y_mm: 0, health: 1400, max_health: 1400, alive: true, owned: true, controls: stunned ? ["Stun"] : [], speed: stunned ? 130 : 260, attack_order: this.matchOrder, source: this.matchAuthored.actors[2] },
+        ]
+      : [];
+    return {
+      running: this.matchRunning,
+      tick: this.matchTick,
+      phase: this.matchRunning ? "Active" : "Idle",
+      world_digest: this.matchRunning ? "devworlddigest00" : "",
+      lane_digest: this.matchRunning ? "devlanedigest000" : "",
+      cook_digest: this.matchRunning ? "devcookdigest000" : "",
+      cook_schema_version: 1,
+      actor_count: actors.length,
+      live_actors: actors.length,
+      actors,
+      events: [],
+      last_rejection: null,
+    };
+  }
+  matchValidate(): Promise<MatchValidation> {
+    if (!this.matchAuthored) {
+      return Promise.resolve({
+        ok: false,
+        is_match_scene: false,
+        diagnostics: [{ severity: "error", code: "no-match-settings", message: "This scene has no match settings, so there is nothing to run. Add a Match Settings object to define the play area and match length.", entity: null, component: null, field: null }],
+        cook_digest: null,
+        actor_count: 0,
+        wave_count: 0,
+        lane_length_m: 0,
+      });
+    }
+    return Promise.resolve({ ok: true, is_match_scene: true, diagnostics: [], cook_digest: "devcookdigest000", actor_count: 3, wave_count: 1, lane_length_m: 12 });
+  }
+  matchAuthorStarter(): Promise<AuthoredMatch> {
+    this.matchAuthored = { settings: "dev_settings", lane: "dev_lane", waypoints: ["dev_wp0", "dev_wp1"], actors: ["dev_blue", "dev_red", "dev_hero"], waves: ["dev_wave"] };
+    return Promise.resolve(this.matchAuthored);
+  }
+  matchStart(): Promise<MatchStatus> {
+    if (!this.matchAuthored) {
+      return Promise.reject({ message: "This scene cannot run a match yet — one problem needs fixing.", diagnostics: [{ severity: "error", code: "no-match-settings", message: "This scene has no match settings, so there is nothing to run. Add a Match Settings object to define the play area and match length.", entity: null, component: null, field: null }] });
+    }
+    this.matchRunning = true;
+    this.matchTick = 0;
+    this.matchStunTicks = 0;
+    return Promise.resolve(this.devStatus());
+  }
+  matchStep(ticks: number): Promise<MatchStatus> {
+    if (this.matchRunning) {
+      this.matchTick += ticks;
+      this.matchStunTicks = Math.max(0, this.matchStunTicks - ticks);
+    }
+    return Promise.resolve(this.devStatus());
+  }
+  matchOrderMove(): Promise<MatchStatus> {
+    this.matchOrder = null;
+    return Promise.resolve(this.devStatus());
+  }
+  matchAttackMove(xMm: number, yMm: number): Promise<MatchStatus> {
+    this.matchOrder = `attack-move to ${(xMm / 1000).toFixed(1)}, ${(yMm / 1000).toFixed(1)}`;
+    return Promise.resolve(this.devStatus());
+  }
+  matchAttackTarget(target: number): Promise<MatchStatus> {
+    this.matchOrder = `attacking #${target}`;
+    return Promise.resolve(this.devStatus());
+  }
+  matchHold(): Promise<MatchStatus> {
+    this.matchOrder = "hold position";
+    return Promise.resolve(this.devStatus());
+  }
+  matchHalt(): Promise<MatchStatus> {
+    this.matchOrder = null;
+    return Promise.resolve(this.devStatus());
+  }
+  matchStun(ticks: number): Promise<MatchStatus> {
+    this.matchStunTicks = ticks;
+    return Promise.resolve(this.devStatus());
+  }
+  matchStatus(): Promise<MatchStatus> {
+    return Promise.resolve(this.devStatus());
+  }
+  matchCooked(): Promise<CookedMatch | null> {
+    return Promise.resolve(null);
+  }
+  matchStop(): Promise<MatchStatus> {
+    this.matchRunning = false;
+    this.matchTick = 0;
+    this.matchStunTicks = 0;
+    this.matchOrder = null;
+    return Promise.resolve(this.devStatus());
+  }
   /** Build the dev truth-state at `frame` kills (the head is `this.ruleKills`). */
   private ruleDebugAt(frame: number, selected: string | null): RuleDebugInfo {
     const lit = frame >= 4;
@@ -1312,7 +2619,7 @@ class MockClient implements EditorClient {
   }
 }
 
-function mockSession(): EditorClient {
+export function createMockSession(): EditorClient {
   const [uiT, coreT] = inProcessPair();
   // The dev/test first-run = the small NAMED sample scene (C10), not the 5k perf fixture. `buildWorld`
   // stays exported for the perf / selective-re-render tests that seed it explicitly.
@@ -1325,5 +2632,5 @@ function mockSession(): EditorClient {
 /** Build the editor session: the real Tauri shell transport inside the WebView, else the dev MockCore. */
 export function createSession(): EditorClient {
   const core = tauriCore();
-  return core ? new TauriClient(core) : mockSession();
+  return core ? new TauriClient(core) : createMockSession();
 }

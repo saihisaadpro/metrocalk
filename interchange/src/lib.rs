@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod analytic;
 mod cad_import;
+mod recognition;
 mod reimport_identity;
 pub(crate) mod step;
 mod urdf;
@@ -44,6 +45,7 @@ pub use cad_import::{
     translation_of, CadError, CadImport, CadMesh, CadReader, FidelityCounts, GroupNode,
     ImportStrategy, KernelProbe, PartChange, PartDiff, PartFidelity, PartReport, PartSource,
     RawPart, StepAssemblyReader, IDENTITY_4X4, KERNEL_DIR_ENV, MAX_ASSEMBLY_DEPTH,
+    MAX_STEP_ASSEMBLY_BYTES,
 };
 // M15.10 (ADR-080) — persistent re-import identity: match an edited re-import's parts to the previous
 // import from a rotation/translation-invariant geometric fingerprint (prefer-miss-over-wrong), so the engine
@@ -52,6 +54,15 @@ pub use cad_import::{
 pub use reimport_identity::{
     fingerprint, identities, match_identities, match_reimport, MatchKind, PartFingerprint,
     PartIdentity, PartMatch, ReimportPlan,
+};
+// M15.11 (ADR-081) — the AI semantic pass: AAG symbolic feature recognition on ALREADY-DECODED geometry
+// (never near the decode path — CI grep-gated), part classification, instance clustering, and the
+// tessellation-only mesh→primitive recovery tier. Every recognition is confidence-scored + explainable and
+// kernel-verifiable (`verify_feature` re-derives the claim from the geometry — validated-AI).
+pub use recognition::{
+    classify_part, cluster_instances, recover_primitives, verify_feature, AagRecognizer,
+    FeatureKind, FeatureRecognizer, InstanceGroup, LearnedRecognizerSeam, PartClass,
+    PartClassification, RecognizedFeature, RecoveredPrimitive,
 };
 pub use urdf::UrdfInterchange;
 pub use usd::UsdInterchange;

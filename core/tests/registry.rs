@@ -17,7 +17,8 @@ fn registry_with_stdlib() -> Registry<FlecsWorld> {
 #[test]
 fn capability_queries_through_wrapper() {
     let reg = registry_with_stdlib();
-    assert_eq!(reg.len(), 17); // 13 base kinds + the 4 M12.1 rule-target primitives (ADR-045)
+    // 13 base kinds + the 4 M12.1 rule-target primitives (ADR-045) + `UiStyle` and `PipeRecipe`.
+    assert_eq!(reg.len(), 19);
 
     // "what provides Health?" — single provider.
     assert_eq!(reg.providers_of("Health"), vec!["Health"]);

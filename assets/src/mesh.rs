@@ -58,6 +58,68 @@ impl Bounds {
     }
 }
 
+/// Explicit asset-local to viewport-display transform. Imported files are commonly authored far from
+/// the origin or in centimetres; keeping the translation as well as the uniform scale prevents derived
+/// assets, colliders and high-to-low bakes from disagreeing with the pixels shown in the viewport.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AssetAffine {
+    /// Uniform local-to-display scale.
+    pub scale: f32,
+    /// Display-space translation applied after scaling.
+    pub translation: [f32; 3],
+}
+
+impl AssetAffine {
+    /// Identity for procedural engineering assets already authored in metres.
+    pub const IDENTITY: Self = Self {
+        scale: 1.0,
+        translation: [0.0; 3],
+    };
+
+    /// Centre an asset at the origin and give its largest extent one display unit.
+    #[must_use]
+    pub fn unit_from_bounds(bounds: Bounds) -> Self {
+        let extent = bounds.max_extent();
+        if !extent.is_finite() || extent <= 0.0 {
+            return Self::IDENTITY;
+        }
+        let scale = 1.0 / extent;
+        let center = bounds.center();
+        Self {
+            scale,
+            translation: center.map(|value| -value * scale),
+        }
+    }
+
+    /// Apply the affine to one point.
+    #[must_use]
+    pub fn transform_point(self, point: [f32; 3]) -> [f32; 3] {
+        [
+            point[0] * self.scale + self.translation[0],
+            point[1] * self.scale + self.translation[1],
+            point[2] * self.scale + self.translation[2],
+        ]
+    }
+
+    /// Validate persisted/untrusted affine metadata before it affects geometry.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.scale.is_finite()
+            && self.scale > 0.0
+            && self.scale <= 1.0e6
+            && self
+                .translation
+                .iter()
+                .all(|value| value.is_finite() && value.abs() <= 1.0e9)
+    }
+}
+
+impl Default for AssetAffine {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
 /// One material's appearance — a metallic-roughness PBR factor set (M11.2, ADR-041) + an optional
 /// base-color texture (an index into [`MeshAsset::textures`]). The render bakes these per-vertex and the
 /// shader evaluates a Cook-Torrance BRDF over the scene's directional light. `metallic`/`roughness` are
@@ -78,6 +140,11 @@ pub struct Material {
     pub metallic_roughness_texture: Option<usize>,
     /// Index into [`MeshAsset::textures`] of the tangent-space normal map, if any.
     pub normal_texture: Option<usize>,
+    /// Index into [`MeshAsset::textures`] of a linear ambient-occlusion map (red channel), if any.
+    pub occlusion_texture: Option<usize>,
+    /// Project-authored signed-curvature map. Curvature is not a core glTF PBR slot; the GLB exporter
+    /// retains it in a namespaced material extra while USD/texture-bundle export writes it explicitly.
+    pub curvature_texture: Option<usize>,
 }
 
 impl Default for Material {
@@ -91,6 +158,8 @@ impl Default for Material {
             base_color_texture: None,
             metallic_roughness_texture: None,
             normal_texture: None,
+            occlusion_texture: None,
+            curvature_texture: None,
         }
     }
 }
@@ -120,6 +189,10 @@ pub struct Primitive {
     pub normals: Vec<[f32; 3]>,
     /// Per-vertex texcoord 0 (empty ⇒ packer fills `[0,0]`).
     pub uvs: Vec<[f32; 2]>,
+    /// Per-vertex MikkTSpace tangent `(xyz, handedness)`. Empty means the stream has not been baked yet;
+    /// a normal-mapped production derivative should generate this after its final UV unwrap. The sign is
+    /// used to reconstruct the bitangent as `cross(normal, tangent.xyz) * tangent.w`.
+    pub tangents: Vec<[f32; 4]>,
     /// Triangle-list indices into the vertex arrays.
     pub indices: Vec<u32>,
     /// Index into [`MeshAsset::materials`].

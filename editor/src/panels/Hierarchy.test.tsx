@@ -38,3 +38,33 @@ test("clicking a row selects it (cross-panel coherence: the engine selection fol
   fireEvent.click(screen.getByTestId("hrow"));
   expect(projectionStore.getState().selectedId).toBe("e1");
 });
+
+test("exposes a searchable semantic tree with result and no-result states", () => {
+  projectionStore.getState().bulkLoad([
+    { id: "valve-01", name: "Intake Valve", parentId: null, components: { MeshRenderer: { mesh: "valve" } } },
+    { id: "lamp-01", name: "Work Lamp", parentId: null, components: { Light: { intensity: 1 } } },
+  ]);
+  render(<Hierarchy client={fakeClient()} />);
+
+  const tree = screen.getByRole("tree", { name: "Scene objects" });
+  expect(tree.getAttribute("aria-multiselectable")).toBe("true");
+  expect(screen.getAllByRole("treeitem")).toHaveLength(2);
+  expect(screen.getAllByRole("treeitem")[0].getAttribute("aria-level")).toBe("1");
+
+  fireEvent.change(screen.getByRole("searchbox", { name: "Search scene objects" }), { target: { value: "lamp" } });
+  expect(screen.getAllByRole("treeitem")).toHaveLength(1);
+  expect(screen.getByRole("treeitem").textContent).toContain("Work Lamp");
+  expect(document.getElementById("count")?.textContent).toContain("1 of 2");
+
+  fireEvent.change(screen.getByRole("searchbox", { name: "Search scene objects" }), { target: { value: "missing" } });
+  expect(screen.queryByRole("tree")).toBeNull();
+  expect(screen.getByText("No matching objects")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+  expect(screen.getAllByRole("treeitem")).toHaveLength(2);
+});
+
+test("empty hierarchy explains how to add the first object", () => {
+  render(<Hierarchy client={fakeClient()} />);
+  expect(screen.getByText("No objects in this scene")).toBeTruthy();
+  expect(screen.getByText(/create an entity above/i)).toBeTruthy();
+});

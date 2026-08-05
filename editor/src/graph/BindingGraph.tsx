@@ -7,11 +7,13 @@ import { Background, ReactFlow, type Edge as RfEdge, type Node as RfNode } from 
 import "@xyflow/react/dist/style.css";
 import { useStore } from "zustand";
 import { projectionStore, useEdges, useSelectedId } from "../store/projection";
+import { graphEdgeStyle, graphNodeStyle, graphTheme } from "../theme/graph";
+import { EmptyPanelState } from "../theme/workspace";
 
 const STATUS_STYLE: Record<string, React.CSSProperties> = {
-  confirmed: { stroke: "#4ade80" },
-  pending: { stroke: "#fbbf24", strokeDasharray: "4 3" },
-  rejected: { stroke: "#f87171" },
+  confirmed: graphEdgeStyle("confirmed"),
+  pending: graphEdgeStyle("pending"),
+  rejected: graphEdgeStyle("rejected"),
 };
 
 export function BindingGraph() {
@@ -32,14 +34,7 @@ export function BindingGraph() {
       id,
       position: id === selected ? { x: 240, y: 200 } : { x: (i % 6) * 150, y: i < 6 ? 40 : 360 },
       data: { label: summaries[id]?.name ?? id },
-      style: {
-        padding: 6,
-        borderRadius: 6,
-        fontSize: 12,
-        border: id === selected ? "2px solid #60a5fa" : "1px solid #555",
-        background: "#1a1c22",
-        color: "#e8e8e8",
-      },
+      style: graphNodeStyle(id === selected ? "selected" : "default"),
     }));
     const rfEdges: RfEdge[] = related.slice(0, 200).map((e) => ({
       id: e.id,
@@ -53,12 +48,19 @@ export function BindingGraph() {
   }, [selected, edges, summaries]);
 
   if (!selected) {
-    return <div style={{ padding: 12, color: "#888" }}>Select an entity to see its binding neighborhood.</div>;
+    return (
+      <EmptyPanelState
+        compact
+        icon="⌘"
+        title="Select an object to inspect relationships"
+        description="Its binding neighbourhood and typed connections will appear here."
+      />
+    );
   }
   return (
-    <div style={{ height: "100%", minHeight: 240 }}>
+    <div className="mtk-graph-surface" style={{ height: "100%", minHeight: 240 }}>
       <ReactFlow nodes={nodes} edges={rfEdges} fitView proOptions={{ hideAttribution: true }}>
-        <Background color="#222" />
+        <Background color={graphTheme.grid} />
       </ReactFlow>
     </div>
   );

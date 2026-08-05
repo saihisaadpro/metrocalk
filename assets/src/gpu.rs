@@ -21,7 +21,7 @@
     clippy::float_cmp
 )]
 
-use crate::mesh::MeshAsset;
+use crate::mesh::{AssetAffine, Bounds, MeshAsset};
 use std::collections::BTreeMap;
 
 /// One packed vertex — position, normal (for lighting), a baked RGB base color, the baked
@@ -44,6 +44,9 @@ pub struct MeshVertex {
     /// Texture coordinate (0 when the source ships none → samples the renderer's 1×1 white dummy = the
     /// baked factor renders unchanged, so an untextured mesh looks exactly as before).
     pub uv: [f32; 2],
+    /// Object-space MikkTSpace tangent and bitangent handedness. A zero xyz marks a legacy asset whose
+    /// shader must use the derivative cotangent fallback until the conditioning compiler upgrades it.
+    pub tangent: [f32; 4],
 }
 
 /// One drawable **submesh** — a contiguous index range with its own material's textures. M11.2 follow-up:
@@ -63,6 +66,10 @@ pub struct SubMesh {
     pub metallic_roughness_texture: Option<crate::mesh::Texture>,
     /// Tangent-space normal map (RGBA8 LINEAR), if any.
     pub normal_texture: Option<crate::mesh::Texture>,
+    /// Ambient-occlusion map (RGBA8 LINEAR; red channel), if any.
+    pub occlusion_texture: Option<crate::mesh::Texture>,
+    /// Signed curvature preview/export data (RGBA8 LINEAR), if any.
+    pub curvature_texture: Option<crate::mesh::Texture>,
 }
 
 /// A mesh ready to upload: one interleaved vertex buffer + one `u32` index buffer, partitioned into
@@ -137,6 +144,11 @@ impl MeshGpu {
                     None => prim.uvs.get(i).copied(),
                 }
                 .unwrap_or([0.0, 0.0]);
+                let tangent = match &uv_src {
+                    Some(src) => src.get(i).and_then(|&s| prim.tangents.get(s)).copied(),
+                    None => prim.tangents.get(i).copied(),
+                }
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]);
                 vertices.push(MeshVertex {
                     position,
                     normal: prim_nrm.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
@@ -144,6 +156,7 @@ impl MeshGpu {
                     metallic,
                     roughness,
                     uv,
+                    tangent,
                 });
             }
             // Re-base this primitive's (possibly remapped) indices into the merged vertex buffer; drop any
@@ -166,6 +179,8 @@ impl MeshGpu {
                     base_color_texture: tex(mat, |m| m.base_color_texture),
                     metallic_roughness_texture: tex(mat, |m| m.metallic_roughness_texture),
                     normal_texture: tex(mat, |m| m.normal_texture),
+                    occlusion_texture: tex(mat, |m| m.occlusion_texture),
+                    curvature_texture: tex(mat, |m| m.curvature_texture),
                 });
             }
         }
@@ -200,28 +215,22 @@ impl MeshGpu {
         if self.vertices.is_empty() {
             return;
         }
-        let mut lo = [f32::INFINITY; 3];
-        let mut hi = [f32::NEG_INFINITY; 3];
+        let mut bounds = Bounds::empty();
         for v in &self.vertices {
-            for k in 0..3 {
-                lo[k] = lo[k].min(v.position[k]);
-                hi[k] = hi[k].max(v.position[k]);
-            }
+            bounds.expand(v.position);
         }
-        let ext = (0..3).map(|k| hi[k] - lo[k]).fold(0.0_f32, f32::max);
-        // Positive guard (NaN- and zero-extent-safe): only normalize a real, non-degenerate mesh.
-        if ext > 0.0 {
-            let center = [
-                (lo[0] + hi[0]) * 0.5,
-                (lo[1] + hi[1]) * 0.5,
-                (lo[2] + hi[2]) * 0.5,
-            ];
-            let inv = 1.0 / ext;
-            for v in &mut self.vertices {
-                for k in 0..3 {
-                    v.position[k] = (v.position[k] - center[k]) * inv;
-                }
-            }
+        self.apply_affine(AssetAffine::unit_from_bounds(bounds));
+    }
+
+    /// Apply a validated asset-local to display affine to packed positions. The same affine is stored
+    /// beside the canonical mesh and supplied to conditioning jobs, so renderer, collider and baker share
+    /// one coordinate contract.
+    pub fn apply_affine(&mut self, affine: AssetAffine) {
+        if !affine.is_valid() {
+            return;
+        }
+        for vertex in &mut self.vertices {
+            vertex.position = affine.transform_point(vertex.position);
         }
     }
 
@@ -240,11 +249,20 @@ impl MeshGpu {
         let base = primary.and_then(|s| s.base_color_texture.clone());
         let mr = primary.and_then(|s| s.metallic_roughness_texture.clone());
         let normal = primary.and_then(|s| s.normal_texture.clone());
+        let occlusion = primary.and_then(|s| s.occlusion_texture.clone());
+        let curvature = primary.and_then(|s| s.curvature_texture.clone());
         let mut out = Vec::with_capacity(levels as usize);
         for level in 1..=levels {
             // The normalized mesh spans ~1 unit; base cell 0.06, doubling per level → coarser + cheaper.
             let cell = 0.06_f32 * 2.0_f32.powi(i32::from(level) - 1);
-            let g = self.clustered(cell, base.clone(), mr.clone(), normal.clone());
+            let g = self.clustered(
+                cell,
+                base.clone(),
+                mr.clone(),
+                normal.clone(),
+                occlusion.clone(),
+                curvature.clone(),
+            );
             if !g.indices.is_empty() && g.vertices.len() < self.vertices.len() {
                 out.push(g);
             }
@@ -259,6 +277,8 @@ impl MeshGpu {
         base: Option<crate::mesh::Texture>,
         mr: Option<crate::mesh::Texture>,
         normal: Option<crate::mesh::Texture>,
+        occlusion: Option<crate::mesh::Texture>,
+        curvature: Option<crate::mesh::Texture>,
     ) -> MeshGpu {
         use std::collections::HashMap;
         let key = |p: [f32; 3]| -> (i32, i32, i32) {
@@ -289,6 +309,16 @@ impl MeshGpu {
             }
             verts[i].uv[0] = (verts[i].uv[0] * n + v.uv[0]) / nn;
             verts[i].uv[1] = (verts[i].uv[1] * n + v.uv[1]) / nn;
+            for c in 0..3 {
+                verts[i].tangent[c] = (verts[i].tangent[c] * n + v.tangent[c]) / nn;
+            }
+            // Handedness is categorical. Keep the first sign unless a clear weighted majority flips it.
+            let handed = if v.tangent[3] < 0.0 { -1.0 } else { 1.0 };
+            verts[i].tangent[3] = if verts[i].tangent[3] * n + handed < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
             verts[i].metallic = (verts[i].metallic * n + v.metallic) / nn;
             verts[i].roughness = (verts[i].roughness * n + v.roughness) / nn;
             counts[i] = nn;
@@ -314,6 +344,8 @@ impl MeshGpu {
                 base_color_texture: base,
                 metallic_roughness_texture: mr,
                 normal_texture: normal,
+                occlusion_texture: occlusion,
+                curvature_texture: curvature,
             }]
         };
         MeshGpu {
@@ -601,6 +633,7 @@ mod tests {
             metallic: 0.0,
             roughness: 0.7,
             uv: [0.0, 0.0],
+            tangent: [0.0, 0.0, 0.0, 1.0],
         }
     }
 
@@ -651,6 +684,7 @@ mod tests {
             positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             normals: Vec::new(),
             uvs: Vec::new(),
+            tangents: Vec::new(),
             indices: vec![0, 1, 2],
             material: 0,
             joints: Vec::new(),
@@ -667,6 +701,8 @@ mod tests {
                 base_color_texture: None,
                 metallic_roughness_texture: None,
                 normal_texture: None,
+                occlusion_texture: None,
+                curvature_texture: None,
             }],
             textures: Vec::new(),
             skeleton: None,
@@ -689,6 +725,7 @@ mod tests {
                 positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
                 normals: Vec::new(),
                 uvs: Vec::new(),
+                tangents: Vec::new(),
                 indices: vec![0, 1, 2],
                 material: 0,
                 joints: Vec::new(),
@@ -717,6 +754,7 @@ mod tests {
                 positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
                 normals: Vec::new(),
                 uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                tangents: vec![[1.0, 0.0, 0.0, 1.0]; 3],
                 indices: vec![0, 1, 2],
                 material: 0,
                 joints: Vec::new(),
@@ -729,6 +767,8 @@ mod tests {
                 base_color_texture: Some(0),
                 metallic_roughness_texture: Some(1),
                 normal_texture: Some(2),
+                occlusion_texture: None,
+                curvature_texture: None,
             }],
             // Distinct sizes so we can assert each slot maps to the right texture.
             textures: vec![tex(2, 2), tex(4, 1), tex(1, 4)],
@@ -766,6 +806,7 @@ mod tests {
             positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             normals: Vec::new(),
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            tangents: Vec::new(),
             indices: vec![0, 1, 2],
             material: mat,
             joints: Vec::new(),
@@ -778,6 +819,8 @@ mod tests {
             base_color_texture: Some(slot),
             metallic_roughness_texture: None,
             normal_texture: None,
+            occlusion_texture: None,
+            curvature_texture: None,
         };
         let asset = MeshAsset {
             name: "multi".into(),
@@ -822,6 +865,7 @@ mod tests {
                     metallic: 0.0,
                     roughness: 0.7,
                     uv: [0.0, 0.0],
+                    tangent: [1.0, 0.0, 0.0, 1.0],
                 });
             }
         }

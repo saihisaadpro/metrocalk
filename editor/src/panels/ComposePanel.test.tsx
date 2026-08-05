@@ -5,7 +5,7 @@
 //! (close the loop · every "no" explained — the AI is a guest, not a raw mutation).
 
 import { afterEach, expect, test, vi } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ComposePanel } from "./ComposePanel";
 import { fakeClient } from "../transport/test-client";
 import { projectionStore } from "../store/projection";
@@ -30,8 +30,20 @@ const COMPOSITION: Composition = {
 };
 
 afterEach(() => {
+  cleanup();
   projectionStore.getState().reset();
   toastStore.getState().reset();
+});
+
+test("the composer has a visible request label, contextual guidance, and a guarded primary action", () => {
+  render(<ComposePanel client={fakeClient()} />);
+
+  expect(screen.getByRole("region", { name: "Scene composition controls" })).toBeTruthy();
+  expect(screen.getByLabelText("What should happen?")).toBe(screen.getByTestId("compose-sentence"));
+  expect(screen.getByTestId("compose-propose").hasAttribute("disabled")).toBe(true);
+  expect(screen.getByText(/Nothing changes until you approve the preview/)).toBeTruthy();
+  expect(screen.getByText(/No entity is selected/)).toBeTruthy();
+  expect(screen.queryByText(/AI Compose/)).toBeNull();
 });
 
 test("Propose surfaces the proposed patches for review — nothing is applied yet", async () => {

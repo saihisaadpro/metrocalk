@@ -1,11 +1,11 @@
 use crate::{
     AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId,
-    ActorIntent, ActorKind, ActorProvenance, ActorSpawn, BasicAttackSpec, Bounty, CastTarget,
-    CombatStats, CommandKind, CommandRejectReason, ContentId, ControlKind, DamageCause,
-    DamageSchool, DeathRule, DynamicActorProvenance, DynamicActorSpawn, ImpactShape, MatchConfig,
-    MatchEndReason, MatchEvent, MatchOutcome, MatchPhase, MatchRuntime, ModifierOp, PlayerCommand,
-    PlayerId, RuntimeError, Scenario, ScenarioFinish, ScenarioSubmission, StatGrowth, StatKind,
-    TeamId, Vec2Mm, BASIS_POINTS,
+    ActorIntent, ActorKind, ActorProvenance, ActorSpawn, AttackOrder, BasicAttackSpec, Bounty,
+    CastTarget, CombatStats, CommandKind, CommandReceipt, CommandRejectReason, ContentId,
+    ControlKind, DamageCause, DamageSchool, DeathRule, DynamicActorProvenance, DynamicActorSpawn,
+    ImpactShape, MatchConfig, MatchEndReason, MatchEvent, MatchOutcome, MatchPhase, MatchRuntime,
+    ModifierOp, PlayerCommand, PlayerId, RuntimeError, Scenario, ScenarioFinish,
+    ScenarioSubmission, StatGrowth, StatKind, TeamId, Vec2Mm, BASIS_POINTS,
 };
 
 const PLAYER_ONE: PlayerId = PlayerId(1);
@@ -2280,6 +2280,7 @@ fn replay_orders_completion_among_same_tick_submissions() {
 fn basic_attack_revalidates_range_after_windup() {
     let attack = BasicAttackSpec {
         range_mm: 550,
+        acquisition_range_mm: 0,
         damage: 50,
         school: DamageSchool::Physical,
         windup_ticks: 1,
@@ -2365,6 +2366,7 @@ fn basic_attack_and_ability_share_one_same_tick_settlement() {
     );
     attacker.basic_attack = Some(BasicAttackSpec {
         range_mm: 1_000,
+        acquisition_range_mm: 0,
         damage: 600,
         school: DamageSchool::True,
         windup_ticks: 1,
@@ -2675,6 +2677,7 @@ fn internal_bot_intents_are_canonical_and_do_not_require_players() {
     fn run(intents: &[ActorIntent]) -> (crate::ServerFrame, crate::ServerFrame) {
         let attack = BasicAttackSpec {
             range_mm: 1_000,
+            acquisition_range_mm: 0,
             damage: 100,
             school: DamageSchool::True,
             windup_ticks: 1,
@@ -5180,6 +5183,7 @@ fn duel(attacker: CombatStats, defender: CombatStats, attack_damage: u32) -> Mat
             abilities: vec![CLEAVE],
             basic_attack: Some(BasicAttackSpec {
                 range_mm: 50_000,
+                acquisition_range_mm: 0,
                 damage: attack_damage,
                 school: DamageSchool::Physical,
                 windup_ticks: 0,
@@ -5636,6 +5640,7 @@ fn the_same_seed_criticals_identically_and_a_different_seed_does_not() {
                 abilities: vec![CLEAVE],
                 basic_attack: Some(BasicAttackSpec {
                     range_mm: 50_000,
+                    acquisition_range_mm: 0,
                     damage: 100,
                     school: DamageSchool::Physical,
                     windup_ticks: 0,
@@ -5764,5 +5769,573 @@ fn a_forged_crit_counter_is_rejected_on_restore() {
     let mut forged = runtime;
     let index = forged.actors.iter().position(|a| a.id == DUELLIST).unwrap();
     forged.actors[index].crit_attempts = crate::BASIS_POINTS + 1;
+    assert!(forged.check_invariants().is_err());
+}
+
+// --- GP-08: the standing attack order ---------------------------------------------------------------
+//
+// The property under test in this whole section is one sentence: ONE order produces MANY swings. Every
+// test below either proves that, or proves that the order does not silently do something the player did
+// not ask for. A suite that only checked "an auto-attack deals damage" would pass against a kernel that
+// re-acquires a target the player deliberately named, chases under a hold, or out-swings a disarm.
+
+const SOLDIER: ActorId = ActorId(801);
+const CREEP_NEAR: ActorId = ActorId(901);
+const CREEP_FAR: ActorId = ActorId(902);
+const ALLY: ActorId = ActorId(803);
+
+const REACH_MM: u32 = 1_000;
+const NOTICE_MM: u32 = 5_000;
+const SWING_COOLDOWN: u32 = 3;
+
+fn soldier_spawn(position: Vec2Mm, speed: u32, attack: Option<BasicAttackSpec>) -> ActorSpawn {
+    ActorSpawn {
+        id: SOLDIER,
+        owner: Some(PLAYER_ONE),
+        team: TeamId(0),
+        kind: ActorKind::Hero,
+        position,
+        stats: stats(10_000, 0, speed),
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
+        abilities: vec![],
+        basic_attack: attack,
+        death_rule: DeathRule::StayDead,
+    }
+}
+
+const fn weapon() -> BasicAttackSpec {
+    BasicAttackSpec {
+        range_mm: REACH_MM,
+        // Deliberately WIDER than reach. If acquisition and reach were the same number, the tests below
+        // could not tell "noticed" from "can hit", and the chase/hold distinction would be untestable.
+        acquisition_range_mm: NOTICE_MM,
+        damage: 100,
+        school: DamageSchool::Physical,
+        windup_ticks: 0,
+        cooldown_ticks: SWING_COOLDOWN,
+    }
+}
+
+fn creep(id: ActorId, team: TeamId, position: Vec2Mm, health: u32) -> ActorSpawn {
+    ActorSpawn {
+        id,
+        owner: None,
+        team,
+        kind: ActorKind::Minion,
+        position,
+        stats: stats(health, 0, 0),
+        growth: StatGrowth::NONE,
+        bounty: Bounty::NONE,
+        abilities: vec![],
+        basic_attack: None,
+        death_rule: DeathRule::StayDead,
+    }
+}
+
+/// One mobile soldier plus whatever hostiles a test needs, started and ready to take an order.
+fn standoff(speed: u32, hostiles: &[(ActorId, Vec2Mm, u32)]) -> MatchRuntime {
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x_0A77_ACC0).unwrap();
+    runtime
+        .spawn_actor(&soldier_spawn(Vec2Mm::new(0, 0), speed, Some(weapon())))
+        .unwrap();
+    for &(id, position, health) in hostiles {
+        runtime
+            .spawn_actor(&creep(id, TeamId(1), position, health))
+            .unwrap();
+    }
+    runtime.start().unwrap();
+    runtime
+}
+
+fn order(runtime: &mut MatchRuntime, sequence: u32, kind: CommandKind) -> CommandReceipt {
+    let at = runtime.tick() + 1;
+    runtime
+        .submit(command(PLAYER_ONE, sequence, at, SOLDIER, kind))
+        .expect("a legal standing order")
+}
+
+fn refuse_order(
+    runtime: &mut MatchRuntime,
+    sequence: u32,
+    kind: CommandKind,
+) -> CommandRejectReason {
+    let at = runtime.tick() + 1;
+    runtime
+        .submit(command(PLAYER_ONE, sequence, at, SOLDIER, kind))
+        .expect_err("an illegal standing order")
+        .reason
+}
+
+/// Total damage this actor took across a run of frames.
+fn damage_taken(frames: &[crate::ServerFrame], victim: ActorId) -> u32 {
+    frames
+        .iter()
+        .flat_map(|frame| frame.events.iter())
+        .filter_map(|event| match event {
+            MatchEvent::DamageApplied { target, amount, .. } if *target == victim => Some(*amount),
+            _ => None,
+        })
+        .sum()
+}
+
+fn run(runtime: &mut MatchRuntime, ticks: u32) -> Vec<crate::ServerFrame> {
+    (0..ticks).map(|_| runtime.step().unwrap()).collect()
+}
+
+fn position_of(runtime: &MatchRuntime, actor: ActorId) -> Vec2Mm {
+    runtime.actor(actor).unwrap().position
+}
+
+#[test]
+fn one_standing_order_produces_many_swings_where_a_command_would_be_needed_for_each() {
+    // This is the row itself. A hostile is already in reach, so the ONLY variable is whether the kernel
+    // keeps swinging on its own.
+    let mut runtime = standoff(0, &[(CREEP_NEAR, Vec2Mm::new(900, 0), 100_000)]);
+    order(&mut runtime, 1, CommandKind::HoldPosition);
+    let frames = run(&mut runtime, 24);
+
+    let swings = frames
+        .iter()
+        .flat_map(|frame| frame.events.iter())
+        .filter(|event| matches!(event, MatchEvent::DamageApplied { target, .. } if *target == CREEP_NEAR))
+        .count();
+    // 24 ticks at one swing every `cooldown` ticks - the swing at tick T sets `ready_at = T + cooldown`
+    // and legality is judged against the CURRENT tick, so the period is the cooldown itself. The exact
+    // count is asserted, not a floor, because a ">= 2" bound would also pass against a kernel that swung
+    // twice and then stalled.
+    let expected = 24 / u64::from(SWING_COOLDOWN);
+    assert_eq!(
+        u64::try_from(swings).unwrap(),
+        expected,
+        "one order must produce a sustained swing cadence, not a single hit"
+    );
+    // And the order is still standing: it was never consumed.
+    assert_eq!(
+        runtime.actor(SOLDIER).unwrap().attack_order,
+        Some(AttackOrder::Hold)
+    );
+}
+
+#[test]
+fn every_self_aimed_swing_is_reported_as_acquired_so_a_client_can_tell_it_from_a_commanded_one() {
+    let mut runtime = standoff(0, &[(CREEP_NEAR, Vec2Mm::new(900, 0), 100_000)]);
+    order(&mut runtime, 1, CommandKind::HoldPosition);
+    let frames = run(&mut runtime, 12);
+
+    let acquisitions = frames
+        .iter()
+        .flat_map(|frame| frame.events.iter())
+        .filter(
+            |event| matches!(event, MatchEvent::TargetAcquired { actor, target } if *actor == SOLDIER && *target == CREEP_NEAR),
+        )
+        .count();
+    let starts = frames
+        .iter()
+        .flat_map(|frame| frame.events.iter())
+        .filter(|event| matches!(event, MatchEvent::BasicAttackStarted { source, .. } if *source == SOLDIER))
+        .count();
+    assert!(acquisitions > 0);
+    assert_eq!(
+        acquisitions, starts,
+        "a self-aimed swing must be labelled as such, one for one"
+    );
+}
+
+#[test]
+fn a_hold_engages_what_comes_into_reach_but_never_walks_to_find_it() {
+    // The creep is NOTICED (inside acquisition) but out of reach. A hold that chased would be an
+    // attack-move, and a player who pressed hold would have lost their position.
+    let mut runtime = standoff(300, &[(CREEP_FAR, Vec2Mm::new(4_000, 0), 100_000)]);
+    order(&mut runtime, 1, CommandKind::HoldPosition);
+    let frames = run(&mut runtime, 30);
+
+    assert_eq!(
+        position_of(&runtime, SOLDIER),
+        Vec2Mm::new(0, 0),
+        "hold must hold"
+    );
+    assert_eq!(damage_taken(&frames, CREEP_FAR), 0);
+}
+
+#[test]
+fn an_attack_move_closes_on_what_it_noticed_rather_than_walking_past_it() {
+    // The order points along +x; the target sits along +y. A kernel that ignored acquisition would march
+    // off down the x axis and never fight, which is exactly the failure this geometry exposes.
+    let mut runtime = standoff(300, &[(CREEP_FAR, Vec2Mm::new(0, 3_000), 100_000)]);
+    order(
+        &mut runtime,
+        1,
+        CommandKind::AttackMove {
+            destination: Vec2Mm::new(100_000, 0),
+        },
+    );
+    let frames = run(&mut runtime, 30);
+
+    let ended = position_of(&runtime, SOLDIER);
+    assert!(
+        ended.y > 1_500 && ended.x == 0,
+        "the soldier must have closed on the target it noticed, not on the order's destination; ended at {ended:?}"
+    );
+    assert!(damage_taken(&frames, CREEP_FAR) > 0);
+}
+
+#[test]
+fn an_attack_move_advances_when_nothing_is_in_range_and_stops_dead_when_something_is() {
+    let mut runtime = standoff(300, &[(CREEP_NEAR, Vec2Mm::new(10_000, 0), 100_000)]);
+    order(
+        &mut runtime,
+        1,
+        CommandKind::AttackMove {
+            destination: Vec2Mm::new(100_000, 0),
+        },
+    );
+    // Long enough to cross the 10 m gap at 300 mm/tick and then keep going if nothing stopped it.
+    let frames = run(&mut runtime, 60);
+
+    let ended = position_of(&runtime, SOLDIER);
+    assert!(
+        ended.x >= 9_000 && ended.x <= 10_000,
+        "the advance must halt at weapon reach of the creep, not walk through it; ended at {ended:?}"
+    );
+    assert!(damage_taken(&frames, CREEP_NEAR) > 0);
+    assert!(
+        frames
+            .iter()
+            .flat_map(|frame| frame.events.iter())
+            .any(|event| matches!(event, MatchEvent::MoveStopped { actor } if *actor == SOLDIER)),
+        "stopping to fight must be visible as a stop"
+    );
+}
+
+#[test]
+fn a_named_target_is_never_traded_for_a_closer_one() {
+    // Both are hostile and BOTH are in reach. Only the player's naming distinguishes them.
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x_0A77_ACC1).unwrap();
+    runtime
+        .spawn_actor(&soldier_spawn(Vec2Mm::new(0, 0), 0, Some(weapon())))
+        .unwrap();
+    runtime
+        .spawn_actor(&creep(CREEP_NEAR, TeamId(1), Vec2Mm::new(200, 0), 100_000))
+        .unwrap();
+    runtime
+        .spawn_actor(&creep(CREEP_FAR, TeamId(1), Vec2Mm::new(900, 0), 100_000))
+        .unwrap();
+    runtime.start().unwrap();
+
+    order(
+        &mut runtime,
+        1,
+        CommandKind::AttackTarget { target: CREEP_FAR },
+    );
+    let frames = run(&mut runtime, 24);
+
+    assert!(damage_taken(&frames, CREEP_FAR) > 0);
+    assert_eq!(
+        damage_taken(&frames, CREEP_NEAR),
+        0,
+        "naming a target is an instruction, not a hint"
+    );
+}
+
+#[test]
+fn a_named_target_that_dies_ends_the_order_instead_of_quietly_becoming_a_hold() {
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x_0A77_ACC2).unwrap();
+    runtime
+        .spawn_actor(&soldier_spawn(Vec2Mm::new(0, 0), 0, Some(weapon())))
+        .unwrap();
+    // Dies to the second swing.
+    runtime
+        .spawn_actor(&creep(CREEP_FAR, TeamId(1), Vec2Mm::new(900, 0), 150))
+        .unwrap();
+    runtime
+        .spawn_actor(&creep(CREEP_NEAR, TeamId(1), Vec2Mm::new(300, 0), 100_000))
+        .unwrap();
+    runtime.start().unwrap();
+
+    order(
+        &mut runtime,
+        1,
+        CommandKind::AttackTarget { target: CREEP_FAR },
+    );
+    let frames = run(&mut runtime, 30);
+
+    assert!(!runtime.actor(CREEP_FAR).unwrap().alive);
+    assert_eq!(
+        runtime.actor(SOLDIER).unwrap().attack_order,
+        None,
+        "the order must end with its target"
+    );
+    assert_eq!(
+        damage_taken(&frames, CREEP_NEAR),
+        0,
+        "an expired named order must not roll over onto a bystander"
+    );
+    assert!(frames.iter().flat_map(|frame| frame.events.iter()).any(
+        |event| matches!(event, MatchEvent::AttackOrderChanged { actor, order: None } if *actor == SOLDIER)
+    ));
+}
+
+#[test]
+fn stop_clears_the_standing_order_so_a_stopped_actor_actually_stops() {
+    let mut runtime = standoff(0, &[(CREEP_NEAR, Vec2Mm::new(900, 0), 100_000)]);
+    order(&mut runtime, 1, CommandKind::HoldPosition);
+    run(&mut runtime, 12);
+    order(&mut runtime, 2, CommandKind::Stop);
+    let after = run(&mut runtime, 24);
+
+    assert_eq!(runtime.actor(SOLDIER).unwrap().attack_order, None);
+    assert_eq!(
+        damage_taken(&after, CREEP_NEAR),
+        0,
+        "stop must mean stop, not stop-walking-but-keep-swinging"
+    );
+}
+
+#[test]
+fn a_disarm_gates_an_automatic_swing_exactly_as_it_gates_a_commanded_one() {
+    // The whole reason the driver reuses `validate_actor_intent` rather than swinging directly. A second
+    // path into combat would let a standing order out-swing crowd control.
+    let mut runtime = standoff(0, &[(CREEP_NEAR, Vec2Mm::new(900, 0), 100_000)]);
+    order(&mut runtime, 1, CommandKind::HoldPosition);
+    runtime
+        .apply_status_effect(SOLDIER, 20, &[ControlKind::Disarm], &[])
+        .unwrap();
+
+    let disarmed = run(&mut runtime, 20);
+    assert_eq!(
+        damage_taken(&disarmed, CREEP_NEAR),
+        0,
+        "a disarmed actor must not swing, standing order or not"
+    );
+    let freed = run(&mut runtime, 20);
+    assert!(
+        damage_taken(&freed, CREEP_NEAR) > 0,
+        "and it must resume once the disarm expires, without a new command"
+    );
+}
+
+#[test]
+fn acquisition_takes_the_nearest_and_breaks_ties_by_id_not_by_iteration_order() {
+    let build = |near: Vec2Mm, far: Vec2Mm| {
+        let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x_0A77_ACC3).unwrap();
+        runtime
+            .spawn_actor(&soldier_spawn(Vec2Mm::new(0, 0), 0, Some(weapon())))
+            .unwrap();
+        // Spawned high-id-first on purpose, so "first seen" and "lowest id" disagree.
+        runtime
+            .spawn_actor(&creep(CREEP_FAR, TeamId(1), far, 100_000))
+            .unwrap();
+        runtime
+            .spawn_actor(&creep(CREEP_NEAR, TeamId(1), near, 100_000))
+            .unwrap();
+        runtime.start().unwrap();
+        runtime
+    };
+
+    // Distance decides first.
+    let mut nearest = build(Vec2Mm::new(900, 0), Vec2Mm::new(300, 0));
+    order(&mut nearest, 1, CommandKind::HoldPosition);
+    let frames = run(&mut nearest, 12);
+    assert!(damage_taken(&frames, CREEP_FAR) > 0);
+    assert_eq!(damage_taken(&frames, CREEP_NEAR), 0);
+
+    // Equidistant. CREEP_NEAR holds the LOWER id but was spawned SECOND, so "first seen" and "lowest id"
+    // give different answers here and only the id rule produces this one.
+    let mut tied = build(Vec2Mm::new(0, 500), Vec2Mm::new(500, 0));
+    order(&mut tied, 1, CommandKind::HoldPosition);
+    let frames = run(&mut tied, 12);
+    assert!(damage_taken(&frames, CREEP_NEAR) > 0);
+    assert_eq!(damage_taken(&frames, CREEP_FAR), 0);
+}
+
+#[test]
+fn a_standing_order_is_refused_for_an_actor_with_nothing_to_swing() {
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x_0A77_ACC4).unwrap();
+    runtime
+        .spawn_actor(&soldier_spawn(Vec2Mm::new(0, 0), 0, None))
+        .unwrap();
+    runtime
+        .spawn_actor(&creep(CREEP_NEAR, TeamId(1), Vec2Mm::new(900, 0), 100_000))
+        .unwrap();
+    runtime.start().unwrap();
+
+    for (sequence, kind) in [
+        CommandKind::HoldPosition,
+        CommandKind::AttackMove {
+            destination: Vec2Mm::new(1_000, 0),
+        },
+        CommandKind::AttackTarget { target: CREEP_NEAR },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            refuse_order(&mut runtime, u32::try_from(sequence).unwrap() + 1, kind),
+            CommandRejectReason::BasicAttackUnavailable
+        );
+    }
+}
+
+#[test]
+fn a_standing_order_is_refused_for_a_destination_or_a_relation_it_cannot_honour() {
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x_0A77_ACC5).unwrap();
+    runtime
+        .spawn_actor(&soldier_spawn(Vec2Mm::new(0, 0), 0, Some(weapon())))
+        .unwrap();
+    runtime
+        .spawn_actor(&creep(ALLY, TeamId(0), Vec2Mm::new(500, 0), 100_000))
+        .unwrap();
+    runtime
+        .spawn_actor(&creep(CREEP_NEAR, TeamId(1), Vec2Mm::new(900, 0), 1))
+        .unwrap();
+    runtime.start().unwrap();
+
+    assert_eq!(
+        refuse_order(
+            &mut runtime,
+            1,
+            CommandKind::AttackMove {
+                destination: Vec2Mm::new(9_000_000, 0),
+            }
+        ),
+        CommandRejectReason::DestinationOutOfBounds
+    );
+    assert_eq!(
+        refuse_order(&mut runtime, 2, CommandKind::AttackTarget { target: ALLY }),
+        CommandRejectReason::TargetRelationMismatch
+    );
+    assert_eq!(
+        refuse_order(
+            &mut runtime,
+            3,
+            CommandKind::AttackTarget { target: SOLDIER }
+        ),
+        CommandRejectReason::TargetRelationMismatch
+    );
+    assert_eq!(
+        refuse_order(
+            &mut runtime,
+            4,
+            CommandKind::AttackTarget {
+                target: ActorId(4_242)
+            }
+        ),
+        CommandRejectReason::TargetNotFound
+    );
+}
+
+#[test]
+fn an_out_of_range_named_target_is_accepted_because_closing_the_distance_is_the_point() {
+    // The one refusal that would be WRONG: range. A standing order the player can only give when already
+    // in range would be useless at the exact moment they want to give it.
+    let mut runtime = standoff(300, &[(CREEP_FAR, Vec2Mm::new(400_000, 0), 100_000)]);
+    order(
+        &mut runtime,
+        1,
+        CommandKind::AttackTarget { target: CREEP_FAR },
+    );
+    run(&mut runtime, 10);
+    assert!(position_of(&runtime, SOLDIER).x > 0, "it must set off");
+}
+
+#[test]
+fn an_acquisition_range_shorter_than_the_weapon_reach_is_refused_at_spawn() {
+    let mut runtime = MatchRuntime::new(MatchConfig::default(), 0x_0A77_ACC6).unwrap();
+    let spec = BasicAttackSpec {
+        acquisition_range_mm: REACH_MM - 1,
+        ..weapon()
+    };
+    assert!(runtime
+        .spawn_actor(&soldier_spawn(Vec2Mm::new(0, 0), 0, Some(spec)))
+        .is_err());
+    // Zero is the sanctioned way to say "the same as reach", and must still be accepted.
+    let same = BasicAttackSpec {
+        acquisition_range_mm: 0,
+        ..weapon()
+    };
+    assert!(runtime
+        .spawn_actor(&soldier_spawn(Vec2Mm::new(0, 0), 0, Some(same)))
+        .is_ok());
+}
+
+#[test]
+fn a_standing_order_is_part_of_the_world_and_survives_a_checkpoint_bit_for_bit() {
+    let content = ContentId::new([0x08; 32]);
+    let build = || {
+        let mut runtime = standoff(200, &[(CREEP_FAR, Vec2Mm::new(0, 3_000), 100_000)]);
+        let at = runtime.tick() + 1;
+        runtime
+            .submit(command(
+                PLAYER_ONE,
+                1,
+                at,
+                SOLDIER,
+                CommandKind::AttackMove {
+                    destination: Vec2Mm::new(100_000, 0),
+                },
+            ))
+            .unwrap();
+        run(&mut runtime, 8);
+        runtime
+    };
+
+    let mut uninterrupted = build();
+    let checkpointed = build();
+    assert_eq!(
+        checkpointed.actor(SOLDIER).unwrap().attack_order,
+        Some(AttackOrder::Move(Vec2Mm::new(100_000, 0))),
+        "the fixture must actually carry a live order, or this test proves nothing"
+    );
+    let checkpoint = checkpointed.capture_checkpoint(content).unwrap();
+    let mut restored = MatchRuntime::restore_checkpoint(&checkpoint, content).unwrap();
+    assert_eq!(restored.world_digest(), checkpointed.world_digest());
+
+    for _ in 0..20 {
+        let expected = uninterrupted.step().unwrap();
+        let actual = restored.step().unwrap();
+        assert_eq!(
+            actual.frame_digest, expected.frame_digest,
+            "a restored standing order must keep fighting identically"
+        );
+    }
+}
+
+#[test]
+fn a_standing_order_is_visible_in_the_world_digest() {
+    // If the order were not hashed, two worlds that fight differently from the next tick onward would
+    // claim to be the same world.
+    let plain = standoff(0, &[(CREEP_NEAR, Vec2Mm::new(900, 0), 100_000)]);
+    let mut ordered = standoff(0, &[(CREEP_NEAR, Vec2Mm::new(900, 0), 100_000)]);
+    assert_eq!(plain.world_digest(), ordered.world_digest());
+    order(&mut ordered, 1, CommandKind::HoldPosition);
+    ordered.step().unwrap();
+    assert_ne!(plain.world_digest(), ordered.world_digest());
+}
+
+#[test]
+fn a_dead_actor_cannot_retain_a_standing_order() {
+    let mut runtime = standoff(0, &[(CREEP_NEAR, Vec2Mm::new(900, 0), 100_000)]);
+    order(&mut runtime, 1, CommandKind::HoldPosition);
+    runtime.step().unwrap();
+
+    let mut forged = runtime;
+    let index = forged.actors.iter().position(|a| a.id == SOLDIER).unwrap();
+    forged.actors[index].health = 0;
+    assert!(
+        forged.check_invariants().is_err(),
+        "the audit must refuse a corpse that is still under orders"
+    );
+}
+
+#[test]
+fn a_standing_order_on_an_actor_with_no_weapon_is_refused_by_the_audit() {
+    let mut runtime = standoff(0, &[(CREEP_NEAR, Vec2Mm::new(900, 0), 100_000)]);
+    order(&mut runtime, 1, CommandKind::HoldPosition);
+    runtime.step().unwrap();
+
+    let mut forged = runtime;
+    let index = forged.actors.iter().position(|a| a.id == SOLDIER).unwrap();
+    forged.actors[index].basic_attack = None;
     assert!(forged.check_invariants().is_err());
 }

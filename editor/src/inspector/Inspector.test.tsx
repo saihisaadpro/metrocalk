@@ -4,12 +4,15 @@
 //! (Whether the LIVE core populates real properties is the `.exe`-owed half of C6.)
 
 import { afterEach, expect, test } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { Inspector } from "./Inspector";
 import { projectionStore } from "../store/projection";
 import { fakeClient } from "../transport/test-client";
 
-afterEach(() => projectionStore.getState().reset());
+afterEach(() => {
+  projectionStore.getState().reset();
+  window.localStorage.clear();
+});
 
 test("an entity with editable components renders editable property INPUTS (data-driven, real properties)", () => {
   projectionStore.getState().bulkLoad([
@@ -32,4 +35,47 @@ test("an entity with NO editable properties shows a real empty-state, not a blan
   render(<Inspector client={fakeClient()} />);
   expect(screen.getByText("Marker")).toBeTruthy(); // still names the entity
   expect(screen.getByTestId("inspectorEmpty").textContent).toMatch(/no editable properties yet/i);
+});
+
+test("component groups use remembered shared disclosures: Transform opens first and other content stays mounted", () => {
+  projectionStore.getState().bulkLoad([
+    {
+      id: "e1",
+      name: "Lamp",
+      parentId: null,
+      components: {
+        Transform: { x: 1, y: 2, z: 3 },
+        HealthBar: { width: 1 },
+      },
+    },
+  ]);
+  projectionStore.getState().select("e1");
+
+  const { unmount } = render(<Inspector client={fakeClient()} />);
+  const groups = screen.getAllByTestId("inspectorGroup");
+  const transform = groups.find((group) => group.getAttribute("data-group") === "Transform");
+  const health = groups.find((group) => group.getAttribute("data-group") === "HealthBar");
+  expect(transform).toBeTruthy();
+  expect(health).toBeTruthy();
+
+  const transformToggle = within(transform!).getByRole("button", { name: "Transform" });
+  const healthToggle = within(health!).getByRole("button", { name: "HealthBar" });
+  expect(transform!.className).toContain("mtk-disclosure--card");
+  expect(transformToggle.getAttribute("aria-expanded")).toBe("true");
+  expect(healthToggle.getAttribute("aria-expanded")).toBe("false");
+
+  const healthRegion = health!.querySelector<HTMLElement>(".mtk-disclosure__region");
+  expect(healthRegion).toBeTruthy();
+  expect(healthRegion!.getAttribute("role")).toBeNull();
+  expect(healthRegion!.getAttribute("aria-hidden")).toBe("true");
+  expect(healthRegion!.inert).toBe(true);
+  expect(healthRegion!.querySelector("input")).toBeTruthy();
+
+  fireEvent.click(healthToggle);
+  expect(healthToggle.getAttribute("aria-expanded")).toBe("true");
+  expect(window.localStorage.getItem("metrocalk:disclosure:inspector-component:HealthBar")).toBe("open");
+
+  unmount();
+  render(<Inspector client={fakeClient()} />);
+  expect(screen.getByRole("button", { name: "HealthBar" }).getAttribute("aria-expanded")).toBe("true");
 });

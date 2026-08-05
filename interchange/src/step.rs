@@ -25,6 +25,7 @@
 use crate::{Units, UnsupportedNote};
 use metrocalk_csg::TriMesh;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Reject a STEP text larger than this before parsing (the M10.2 size cap; mirrors `assets::MAX_IMPORT_BYTES`).
 pub const MAX_STEP_BYTES: usize = 64 * 1024 * 1024;
@@ -63,15 +64,28 @@ pub struct CadFace {
     pub kind: FaceKind,
     /// The outer-boundary polygon, ordered (world coordinates).
     pub outer: Vec<[f64; 3]>,
-    /// The face's referenceable edges.
+    /// The INNER boundary polygons (hole rims / trim islands — the non-outer `FACE_BOUND` loops), ordered.
+    /// Tessellation still trims by `outer` only (the declared subset); recognition (M15.11) reads these.
+    pub inner: Vec<Vec<[f64; 3]>>,
+    /// The face's referenceable edges — from **every** bound (outer + inner), so shared `EDGE_CURVE` ids
+    /// give full face adjacency (a bore rim on a plate's inner loop links the bore to the plate).
     pub edges: Vec<CadEdge>,
     /// M15.8 (ADR-078) — the recognized **analytic** surface under a `Curved` face (cylinder / cone /
     /// sphere / torus), tessellated closed-form + deterministic by this crate. `None` for planar faces and
     /// for NURBS/freeform (which stay the licensed-kernel/OCCT seam — never hand-rolled).
     pub surface: Option<crate::analytic::AnalyticSurface>,
+    /// M15.11 (ADR-081) — the recognized analytic surface **before** the tessellation-subset gate: a face
+    /// whose trim is beyond the declared tessellation subset still KNOWS it is a cylinder of radius r (the
+    /// semantic pass reads this; `surface` stays the tessellation-grade field). Equal to `surface` when
+    /// the face tessellates; `Some` where `surface` was downgraded; `None` for planes and NURBS.
+    pub recognized: Option<crate::analytic::AnalyticSurface>,
     /// The `ADVANCED_FACE` `same_sense` flag — whether the face's outward side agrees with the surface's
     /// positive normal (a bore's cylinder wall faces INWARD → `.F.`). Drives exact analytic orientation.
     pub same_sense: bool,
+    /// The `FACE_OUTER_BOUND` orientation flag — whether the outer loop runs counter-clockwise around the
+    /// surface normal as written (`.T.`) or reversed (`.F.`). With `same_sense` this orients a PLANAR
+    /// face's Newell normal outward (the analytic kinds carry their own exact normals).
+    pub outer_sense: bool,
 }
 
 /// One solid body (a `CLOSED_SHELL` / `MANIFOLD_SOLID_BREP`).
@@ -410,88 +424,176 @@ impl Value {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Entity {
-    name: String,
+    id: u64,
+    name: EntityName,
     args: Vec<Value>,
 }
 
-/// Strip Part-21 `/* … */` comments (outside strings).
-fn strip_comments(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    let mut in_str = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_str {
-            out.push(c as char);
-            if c == b'\'' {
-                in_str = false;
-            }
-            i += 1;
-        } else if c == b'\'' {
-            in_str = true;
-            out.push(c as char);
-            i += 1;
-        } else if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i += 2;
-        } else {
-            out.push(c as char);
-            i += 1;
-        }
-    }
-    out
+#[derive(Debug, Default)]
+pub(crate) struct EntityTable {
+    slots: Vec<Option<Entity>>,
+    len: usize,
 }
 
-/// Split the DATA section into `#id = NAME(...)` statements on top-level `;` (not inside strings/parens).
-fn split_statements(data: &str) -> Vec<String> {
+impl EntityTable {
+    fn insert(&mut self, id: u64, entity: Entity) {
+        let Ok(index) = usize::try_from(id) else {
+            return;
+        };
+        if index >= self.slots.len() {
+            self.slots.resize_with(index + 1, || None);
+        }
+        if self.slots[index].replace(entity).is_none() {
+            self.len += 1;
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<&Entity> {
+        usize::try_from(id)
+            .ok()
+            .and_then(|index| self.slots.get(index))
+            .and_then(Option::as_ref)
+    }
+
+    fn contains_key(&self, id: u64) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&u64, &Entity)> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(|entity| (&entity.id, entity)))
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Entity> {
+        self.slots.iter().filter_map(Option::as_ref)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EntityName(Arc<str>);
+
+impl std::ops::Deref for EntityName {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl AsRef<str> for EntityName {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl PartialEq<&str> for EntityName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.as_ref() == *other
+    }
+}
+
+impl std::fmt::Display for EntityName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0.as_ref())
+    }
+}
+
+/// Parse the DATA section one statement at a time. Keeping a second comment-stripped copy plus a
+/// `Vec<String>` containing every statement briefly tripled the live text for multi-gigabyte assembly
+/// graphs. This scanner retains only the current statement and the decoded entity table.
+fn parse_data_statements(data: &str) -> Result<EntityTable, StepError> {
+    const RETAIN_STATEMENT_CAPACITY: usize = 1024 * 1024;
     let bytes = data.as_bytes();
-    let mut out = Vec::new();
-    let mut cur = String::new();
+    let mut entities = EntityTable::default();
+    let mut names: BTreeMap<String, Arc<str>> = BTreeMap::new();
+    let mut statement = String::with_capacity(256);
     let mut depth = 0i32;
-    let mut in_str = false;
-    let mut i = 0;
+    let mut in_string = false;
+    let mut in_comment = false;
+    let mut i = 0usize;
+
     while i < bytes.len() {
-        let c = bytes[i];
-        if in_str {
-            cur.push(c as char);
-            if c == b'\'' {
-                in_str = false;
+        let byte = bytes[i];
+        if in_comment {
+            if byte == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                in_comment = false;
+                i += 2;
+            } else {
+                i += 1;
             }
-        } else {
-            match c {
-                b'\'' => {
-                    in_str = true;
-                    cur.push('\'');
+            continue;
+        }
+        if in_string {
+            statement.push(byte as char);
+            if byte == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    statement.push('\'');
+                    i += 2;
+                    continue;
                 }
-                b'(' => {
-                    depth += 1;
-                    cur.push('(');
-                }
-                b')' => {
-                    depth -= 1;
-                    cur.push(')');
-                }
-                b';' if depth == 0 => {
-                    let s = cur.trim().to_string();
-                    if !s.is_empty() {
-                        out.push(s);
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            in_comment = true;
+            i += 2;
+            continue;
+        }
+
+        match byte {
+            b'\'' => {
+                in_string = true;
+                statement.push('\'');
+            }
+            b'(' => {
+                depth += 1;
+                statement.push('(');
+            }
+            b')' => {
+                depth -= 1;
+                statement.push(')');
+            }
+            b';' if depth == 0 => {
+                let trimmed = statement.trim();
+                if trimmed.starts_with('#') {
+                    if entities.len() >= MAX_ENTITIES {
+                        return Err(StepError::TooManyEntities {
+                            count: entities.len() + 1,
+                            limit: MAX_ENTITIES,
+                        });
                     }
-                    cur.clear();
+                    let (id, entity) = parse_statement(trimmed, &mut names)?;
+                    entities.insert(id, entity);
                 }
-                _ => cur.push(c as char),
+                if statement.capacity() > RETAIN_STATEMENT_CAPACITY {
+                    statement = String::with_capacity(256);
+                } else {
+                    statement.clear();
+                }
             }
+            _ => statement.push(byte as char),
         }
         i += 1;
     }
-    out
+    Ok(entities)
 }
 
 /// Parse one `#id = NAME(args)` statement.
-fn parse_statement(stmt: &str) -> Result<(u64, Entity), StepError> {
+fn parse_statement(
+    stmt: &str,
+    names: &mut BTreeMap<String, Arc<str>>,
+) -> Result<(u64, Entity), StepError> {
     let rest = stmt.strip_prefix('#').ok_or_else(|| {
         StepError::Malformed(format!("statement does not start with '#': {stmt:.40}"))
     })?;
@@ -514,7 +616,8 @@ fn parse_statement(stmt: &str) -> Result<(u64, Entity), StepError> {
         return Ok((
             id,
             Entity {
-                name: COMPLEX_INSTANCE.to_string(),
+                id,
+                name: intern_entity_name(COMPLEX_INSTANCE, names),
                 args: list,
             },
         ));
@@ -522,14 +625,30 @@ fn parse_statement(stmt: &str) -> Result<(u64, Entity), StepError> {
     let paren = body
         .find('(')
         .ok_or_else(|| StepError::Malformed(format!("no '(' after entity name in #{id}")))?;
-    let name = body[..paren].trim().to_string();
+    let name = body[..paren].trim();
     if name.is_empty() {
         return Err(StepError::Malformed(format!("empty entity name in #{id}")));
     }
     let args_src = &body[paren..];
     let mut cur = Cursor::new(args_src);
     let args = cur.parse_paren_list()?;
-    Ok((id, Entity { name, args }))
+    Ok((
+        id,
+        Entity {
+            id,
+            name: intern_entity_name(name, names),
+            args,
+        },
+    ))
+}
+
+fn intern_entity_name(name: &str, names: &mut BTreeMap<String, Arc<str>>) -> EntityName {
+    if let Some(name) = names.get(name) {
+        return EntityName(Arc::clone(name));
+    }
+    let interned: Arc<str> = Arc::from(name);
+    names.insert(name.to_owned(), Arc::clone(&interned));
+    EntityName(interned)
 }
 
 /// The synthetic entity name for a parsed complex (AND-combined) instance (its args are the sub-records).
@@ -736,41 +855,22 @@ impl<'a> Cursor<'a> {
 /// Tokenize the whole Part-21 file text into the entity graph (`#id → Entity`). Reused by both the planar
 /// B-rep interpreter and the M15.7 tessellated-assembly reader. Bounds-checked (the decode-bomb guard);
 /// malformed → an explained [`StepError`], never a panic.
-pub(crate) fn parse_entities(text: &str) -> Result<BTreeMap<u64, Entity>, StepError> {
+pub(crate) fn parse_entities(text: &str) -> Result<EntityTable, StepError> {
     if !text.contains("ISO-10303-21") || !text.contains("END-ISO-10303-21") {
         return Err(StepError::Malformed(
             "missing ISO-10303-21 / END-ISO-10303-21 wrapper".into(),
         ));
     }
-    let clean = strip_comments(text);
-    let data_start = clean
+    let data_start = text
         .find("DATA;")
         .ok_or_else(|| StepError::Malformed("no DATA; section".into()))?
         + "DATA;".len();
     // The DATA section ends at its ENDSEC; (the last ENDSEC before END-ISO).
-    let data_end = clean[data_start..]
+    let data_end = text[data_start..]
         .find("ENDSEC")
         .ok_or_else(|| StepError::Malformed("DATA section not closed with ENDSEC".into()))?
         + data_start;
-    let data = &clean[data_start..data_end];
-
-    let statements = split_statements(data);
-    if statements.len() > MAX_ENTITIES {
-        return Err(StepError::TooManyEntities {
-            count: statements.len(),
-            limit: MAX_ENTITIES,
-        });
-    }
-
-    let mut entities: BTreeMap<u64, Entity> = BTreeMap::new();
-    for stmt in &statements {
-        // Skip a leading schema/complex line that isn't `#id = ...` gracefully.
-        if !stmt.starts_with('#') {
-            continue;
-        }
-        let (id, ent) = parse_statement(stmt)?;
-        entities.insert(id, ent);
-    }
+    let entities = parse_data_statements(&text[data_start..data_end])?;
     if entities.is_empty() {
         return Err(StepError::Empty("no entity instances in DATA".into()));
     }
@@ -783,8 +883,8 @@ fn parse_and_interpret(text: &str) -> Result<CadScene, StepError> {
 }
 
 /// Look up an entity, or a dangling-ref error.
-fn ent(entities: &BTreeMap<u64, Entity>, id: u64) -> Result<&Entity, StepError> {
-    entities.get(&id).ok_or(StepError::DanglingRef(id))
+fn ent(entities: &EntityTable, id: u64) -> Result<&Entity, StepError> {
+    entities.get(id).ok_or(StepError::DanglingRef(id))
 }
 
 /// Exact point equality by bit pattern (dedup of a repeated loop vertex — never a fuzzy float compare).
@@ -793,7 +893,7 @@ fn pt_eq(a: &[f64; 3], b: &[f64; 3]) -> bool {
 }
 
 /// A CARTESIAN_POINT → [f64;3].
-fn point_of(entities: &BTreeMap<u64, Entity>, id: u64) -> Result<[f64; 3], StepError> {
+fn point_of(entities: &EntityTable, id: u64) -> Result<[f64; 3], StepError> {
     let e = ent(entities, id)?;
     if e.name != "CARTESIAN_POINT" {
         return Err(StepError::Malformed(format!(
@@ -816,7 +916,7 @@ fn point_of(entities: &BTreeMap<u64, Entity>, id: u64) -> Result<[f64; 3], StepE
 }
 
 /// A VERTEX_POINT → its CARTESIAN_POINT coords.
-fn vertex_point(entities: &BTreeMap<u64, Entity>, id: u64) -> Result<[f64; 3], StepError> {
+fn vertex_point(entities: &EntityTable, id: u64) -> Result<[f64; 3], StepError> {
     let e = ent(entities, id)?;
     if e.name != "VERTEX_POINT" {
         // Some files reference the CARTESIAN_POINT directly.
@@ -837,13 +937,13 @@ fn vertex_point(entities: &BTreeMap<u64, Entity>, id: u64) -> Result<[f64; 3], S
 }
 
 /// Build the CadScene from the entity graph — the planar B-rep + faceted interpreter.
-pub(crate) fn interpret(entities: &BTreeMap<u64, Entity>) -> Result<CadScene, StepError> {
+pub(crate) fn interpret(entities: &EntityTable) -> Result<CadScene, StepError> {
     let mut notes: Vec<UnsupportedNote> = Vec::new();
 
     // Find the shells: every CLOSED_SHELL / OPEN_SHELL (directly, or referenced by a MANIFOLD_SOLID_BREP /
     // FACETED_BREP / *_BREP). Collect shell ids so a solid maps 1:1 to a shell.
     let mut shell_ids: Vec<u64> = Vec::new();
-    for (id, e) in entities {
+    for (id, e) in entities.iter() {
         if e.name == "CLOSED_SHELL" || e.name == "OPEN_SHELL" {
             shell_ids.push(*id);
         }
@@ -903,7 +1003,7 @@ pub(crate) fn interpret(entities: &BTreeMap<u64, Entity>) -> Result<CadScene, St
 
 /// Interpret an ADVANCED_FACE / FACE_SURFACE / FACE into a referenceable CadFace + its boundary polygon.
 fn interpret_face(
-    entities: &BTreeMap<u64, Entity>,
+    entities: &EntityTable,
     fid: u64,
     notes: &mut Vec<UnsupportedNote>,
 ) -> Result<CadFace, StepError> {
@@ -921,7 +1021,7 @@ fn interpret_face(
     // ANALYTIC curved surface (cylinder/cone/sphere/torus — M15.8/ADR-078) → recognized + tessellated
     // closed-form; NURBS/freeform → referenced but the licensed-kernel/OCCT seam (never hand-rolled).
     let mut surface = None;
-    let kind = match surface_id.and_then(|sid| entities.get(&sid)) {
+    let kind = match surface_id.and_then(|sid| entities.get(sid)) {
         Some(s) if s.name == "PLANE" => FaceKind::Planar,
         Some(s) => {
             surface = analytic_surface_of(entities, s);
@@ -940,32 +1040,46 @@ fn interpret_face(
         None => FaceKind::Planar,
     };
 
-    // The outer boundary: first FACE_OUTER_BOUND (fallback: first FACE_BOUND) → loop → ordered vertices.
+    // Every bound is read: the first FACE_OUTER_BOUND is the outer polygon (fallback: the first bound),
+    // the rest are INNER loops (hole rims), and ALL loops' edges are kept — inner-loop `EDGE_CURVE` ids
+    // are exactly the adjacency between a bore and the face it pierces (M15.11 recognition needs them;
+    // tessellation still trims by `outer` only, unchanged).
     let mut outer: Vec<[f64; 3]> = Vec::new();
+    let mut inner: Vec<Vec<[f64; 3]>> = Vec::new();
     let mut edges: Vec<CadEdge> = Vec::new();
+    let mut outer_sense = true;
     let mut got_outer = false;
     for br in bounds {
         let Some(bid) = br.as_ref_id() else { continue };
         let b = ent(entities, bid)?;
         let is_outer = b.name == "FACE_OUTER_BOUND";
-        if got_outer && is_outer {
-            continue;
-        }
         let loop_id = b
             .args
             .get(1)
             .and_then(Value::as_ref_id)
             .ok_or_else(|| StepError::Malformed(format!("bound #{bid} has no loop")))?;
+        let sense = !matches!(b.args.get(2), Some(Value::Enum(e)) if e == "F");
         let (poly, es) = interpret_loop(entities, loop_id)?;
-        if is_outer || !got_outer {
-            outer = poly;
-            edges = es;
-            got_outer = is_outer || got_outer;
-            if is_outer {
-                got_outer = true;
+        edges.extend(es);
+        if is_outer && !got_outer {
+            // A tentative fallback outer taken earlier was really an inner loop.
+            if !outer.is_empty() {
+                inner.push(std::mem::take(&mut outer));
             }
+            outer = poly;
+            outer_sense = sense;
+            got_outer = true;
+        } else if outer.is_empty() && !got_outer {
+            outer = poly;
+            outer_sense = sense;
+        } else {
+            inner.push(poly);
         }
     }
+
+    // The semantic pass keeps the PRE-gate recognition: a beyond-subset trim can't be tessellated here,
+    // but the face still IS a cylinder of radius r — that knowledge must not be lost to the gate below.
+    let recognized = surface;
 
     // The declared-subset gate runs at parse time (where the notes live): a recognized analytic face whose
     // boundary can't be tessellated (off-surface bounds / a non-rectangular trim / a degenerate patch)
@@ -982,9 +1096,12 @@ fn interpret_face(
         id: fid,
         kind,
         outer,
+        inner,
         edges,
         surface,
+        recognized,
         same_sense,
+        outer_sense,
     })
 }
 
@@ -993,7 +1110,7 @@ fn interpret_face(
 /// `CYLINDRICAL_SURFACE('', #placement, radius)` · `CONICAL_SURFACE('', #placement, radius, semi_angle)` ·
 /// `SPHERICAL_SURFACE('', #placement, radius)` · `TOROIDAL_SURFACE('', #placement, major, minor)`.
 fn analytic_surface_of(
-    entities: &BTreeMap<u64, Entity>,
+    entities: &EntityTable,
     s: &Entity,
 ) -> Option<crate::analytic::AnalyticSurface> {
     use crate::analytic::AnalyticSurface as A;
@@ -1004,7 +1121,7 @@ fn analytic_surface_of(
         .map(|p| axis_placement_matrix(entities, p))?;
     let real = |i: usize| s.args.get(i).and_then(Value::as_real);
     let positive = |x: f64| (x.is_finite() && x > 0.0).then_some(x);
-    match s.name.as_str() {
+    match s.name.as_ref() {
         "CYLINDRICAL_SURFACE" => Some(A::Cylinder {
             frame,
             radius: positive(real(2)?)?,
@@ -1036,11 +1153,11 @@ fn analytic_surface_of(
 
 /// Interpret an EDGE_LOOP (advanced b-rep) or POLY_LOOP (faceted) into an ordered vertex polygon + edges.
 fn interpret_loop(
-    entities: &BTreeMap<u64, Entity>,
+    entities: &EntityTable,
     loop_id: u64,
 ) -> Result<(Vec<[f64; 3]>, Vec<CadEdge>), StepError> {
     let l = ent(entities, loop_id)?;
-    match l.name.as_str() {
+    match l.name.as_ref() {
         "POLY_LOOP" => {
             // POLY_LOOP('', (#cartesian_point...)) — a direct polygon (faceted b-rep).
             let pts = l.args.get(1).and_then(Value::as_list).ok_or_else(|| {
@@ -1114,7 +1231,7 @@ fn interpret_loop(
 }
 
 /// Best-effort file name from FILE_NAME's first string arg.
-pub(crate) fn file_name(entities: &BTreeMap<u64, Entity>) -> Option<String> {
+pub(crate) fn file_name(entities: &EntityTable) -> Option<String> {
     for e in entities.values() {
         if e.name == "PRODUCT" {
             if let Some(Value::Str(s)) = e.args.first() {
@@ -1140,16 +1257,23 @@ pub(crate) fn file_name(entities: &BTreeMap<u64, Entity>) -> Option<String> {
 
 /// One placed tessellated part from a STEP assembly.
 pub(crate) struct TessPart {
+    /// Stable per-occurrence identity derived from the source traversal path.
+    pub id: u64,
     pub name: String,
     /// The product-definition `#id` (the dedup / re-import key).
     pub reference: String,
     /// Column-major world transform (composed down the assembly tree).
     pub transform: [f64; 16],
     /// The welded triangulated mesh (from the embedded tessellation).
-    pub mesh: TriMesh,
+    pub mesh: Arc<TriMesh>,
     /// The authored display colour (linear RGB) resolved from the STEP `STYLED_ITEM` chain, if any — so the
     /// part renders in its real colour instead of a uniform default.
     pub color: Option<[f32; 3]>,
+    /// `true` when the decoded B-rep is retained and this is its render tessellation; `false` for an
+    /// embedded AP242 visualization tessellation.
+    pub exact_brep: bool,
+    /// The containing source assembly occurrence, when available.
+    pub parent: Option<u64>,
 }
 
 /// Read a STEP file's embedded tessellation into placed [`TessPart`]s. Returns an empty Vec if the file
@@ -1164,7 +1288,7 @@ pub(crate) struct TessPart {
 /// `TESSELLATED_SOLID`/`TESSELLATED_SHELL`s. Each leaf becomes one placed part; its world transform is the
 /// composition of every ancestor node's reposition axis. This captures the curved surfaces (cylinders / cones
 /// / B-splines) the planar B-rep reader can only proxy — the tessellation triangulates every surface.
-pub(crate) fn parse_tessellated_assembly(entities: &BTreeMap<u64, Entity>) -> Vec<TessPart> {
+pub(crate) fn parse_tessellated_assembly(entities: &EntityTable) -> Vec<TessPart> {
     // A quick check: any tessellation at all?
     if !entities.values().any(is_tess_node) {
         return Vec::new();
@@ -1189,22 +1313,123 @@ pub(crate) fn parse_tessellated_assembly(entities: &BTreeMap<u64, Entity>) -> Ve
     // Per-geometry authored colours (from the STEP `STYLED_ITEM` chain) so each part renders in its real
     // colour, keyed by the styled item id (the tessellated solid / geometric-set node).
     let colors = styled_colors(entities);
+    let owners = tessellated_item_owners(entities);
 
     let mut out: Vec<TessPart> = Vec::new();
     let mut on_path: BTreeSet<u64> = BTreeSet::new();
     for root in roots {
         on_path.clear();
         walk_tess(
-            entities,
+            &TessWalk {
+                entities,
+                colors: &colors,
+                owners: &owners,
+            },
             root,
             crate::cad_import::IDENTITY_4X4,
             0,
-            &colors,
+            step_path_hash(STEP_TESS_PATH_SEED, root),
             &mut on_path,
             &mut out,
         );
     }
     out
+}
+
+const STEP_TESS_PATH_SEED: u64 = 0x7465_7373_2d72_6f6f;
+const STEP_BREP_PATH_SEED: u64 = 0x6272_6570_2d72_6f6f;
+const STEP_GROUP_SALT: u64 = 0x6772_6f75_702d_6964;
+
+fn step_path_hash(seed: u64, value: u64) -> u64 {
+    let mut hash = seed;
+    for byte in value.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// A tessellated body can be named reliably even though its own `REPRESENTATION_ITEM` name is blank: AP242
+/// connects its `TESSELLATED_SHAPE_REPRESENTATION` to the product's ordinary shape representation with a
+/// `SHAPE_REPRESENTATION_RELATIONSHIP`. Resolve that link once and label every leaf body with the owning
+/// product definition + product name.
+fn tessellated_item_owners(entities: &EntityTable) -> BTreeMap<u64, (u64, String)> {
+    let pd_to_sr = collect_pd_shape_reps(entities);
+    let mut sr_owner = BTreeMap::new();
+    for (pd, reps) in &pd_to_sr {
+        for rep in reps {
+            sr_owner.insert(*rep, *pd);
+        }
+    }
+
+    let mut tess_rep_owner = BTreeMap::new();
+    for (rep, pd) in &sr_owner {
+        if entities
+            .get(*rep)
+            .is_some_and(|entity| entity.name == "TESSELLATED_SHAPE_REPRESENTATION")
+        {
+            tess_rep_owner.insert(*rep, *pd);
+        }
+    }
+    for entity in entities.values() {
+        if entity.name != "SHAPE_REPRESENTATION_RELATIONSHIP" {
+            continue;
+        }
+        let refs: Vec<u64> = entity.args.iter().filter_map(Value::as_ref_id).collect();
+        let (Some(&left), Some(&right)) = (refs.first(), refs.get(1)) else {
+            continue;
+        };
+        for (base, tess) in [(left, right), (right, left)] {
+            if let Some(&pd) = sr_owner.get(&base) {
+                if entities
+                    .get(tess)
+                    .is_some_and(|candidate| candidate.name == "TESSELLATED_SHAPE_REPRESENTATION")
+                {
+                    tess_rep_owner.entry(tess).or_insert(pd);
+                }
+            }
+        }
+    }
+
+    let mut owners = BTreeMap::new();
+    for (rep, pd) in tess_rep_owner {
+        let Some(entity) = entities.get(rep) else {
+            continue;
+        };
+        let name = product_name(entities, pd).unwrap_or_else(|| format!("product #{pd}"));
+        let mut visited = BTreeSet::new();
+        for item in refs_in(&entity.args) {
+            assign_tess_owner(entities, item, pd, &name, &mut visited, &mut owners);
+        }
+    }
+    owners
+}
+
+fn assign_tess_owner(
+    entities: &EntityTable,
+    id: u64,
+    pd: u64,
+    name: &str,
+    visited: &mut BTreeSet<u64>,
+    owners: &mut BTreeMap<u64, (u64, String)>,
+) {
+    if !visited.insert(id) {
+        return;
+    }
+    let Some(entity) = entities.get(id) else {
+        return;
+    };
+    if matches!(
+        entity.name.as_ref(),
+        "TESSELLATED_SOLID" | "TESSELLATED_SHELL"
+    ) {
+        owners.entry(id).or_insert_with(|| (pd, name.to_string()));
+        return;
+    }
+    let (_, children) = tess_container(entities, entity);
+    for child in children {
+        assign_tess_owner(entities, child, pd, name, visited, owners);
+    }
 }
 
 /// Map a styled geometry item id → its authored display colour (linear RGB), from the STEP presentation model:
@@ -1213,7 +1438,7 @@ pub(crate) fn parse_tessellated_assembly(entities: &BTreeMap<u64, Entity>) -> Ve
 /// SURFACE_SIDE_STYLE → SURFACE_STYLE_FILL_AREA → FILL_AREA_STYLE → FILL_AREA_STYLE_COLOUR` (or
 /// `SURFACE_STYLE_RENDERING`) chain. Structure-agnostic: rather than hard-code every leg, it walks refs to the
 /// first colour (bounded depth). The colour is keyed on the `STYLED_ITEM.item` (commonly the `TESSELLATED_SOLID`).
-fn styled_colors(entities: &BTreeMap<u64, Entity>) -> BTreeMap<u64, [f32; 3]> {
+fn styled_colors(entities: &EntityTable) -> BTreeMap<u64, [f32; 3]> {
     let mut out: BTreeMap<u64, [f32; 3]> = BTreeMap::new();
     for e in entities.values() {
         if e.name != "STYLED_ITEM" {
@@ -1241,11 +1466,11 @@ fn styled_colors(entities: &BTreeMap<u64, Entity>) -> BTreeMap<u64, [f32; 3]> {
 /// Follow refs from a style entity to the first `COLOUR_RGB` (linear RGB) or a named pre-defined colour,
 /// bounded in depth (the presentation graph is shallow). Structure-agnostic so it tolerates the AP242 style
 /// variants (`SURFACE_STYLE_RENDERING` vs `FILL_AREA_STYLE`).
-fn resolve_colour(entities: &BTreeMap<u64, Entity>, id: u64, depth: u32) -> Option<[f32; 3]> {
+fn resolve_colour(entities: &EntityTable, id: u64, depth: u32) -> Option<[f32; 3]> {
     if depth > 8 {
         return None;
     }
-    let e = entities.get(&id)?;
+    let e = entities.get(id)?;
     if e.name == "COLOUR_RGB" {
         // COLOUR_RGB(name, r, g, b) — the three reals are already 0..1 linear.
         let vals: Vec<f64> = e.args.iter().filter_map(Value::as_real).collect();
@@ -1307,7 +1532,7 @@ fn predefined_colour(name: &str) -> Option<[f32; 3]> {
 /// combines those)?
 fn is_tess_node(e: &Entity) -> bool {
     matches!(
-        e.name.as_str(),
+        e.name.as_ref(),
         "TESSELLATED_SOLID"
             | "TESSELLATED_SHELL"
             | "TESSELLATED_GEOMETRIC_SET"
@@ -1320,7 +1545,7 @@ fn is_tess_node(e: &Entity) -> bool {
 
 /// A container node's `(reposition axis, child ids)`. A leaf `TESSELLATED_SOLID`/`SHELL` (or a non-tess entity)
 /// returns `(None, [])` — its geometry is read by [`mesh_of_tessellated_solid`], not recursed into.
-fn tess_container(entities: &BTreeMap<u64, Entity>, e: &Entity) -> (Option<u64>, Vec<u64>) {
+fn tess_container(entities: &EntityTable, e: &Entity) -> (Option<u64>, Vec<u64>) {
     if e.name == COMPLEX_INSTANCE {
         // The complex node combines REPOSITIONED_TESSELLATED_ITEM(#axis) + TESSELLATED_GEOMETRIC_SET((#kids)).
         let axis = e.args.iter().find_map(|a| match a {
@@ -1346,7 +1571,7 @@ fn tess_container(entities: &BTreeMap<u64, Entity>, e: &Entity) -> (Option<u64>,
         let refs: Vec<u64> = e.args.iter().filter_map(Value::as_ref_id).collect();
         let axis = refs.iter().copied().find(|r| {
             entities
-                .get(r)
+                .get(*r)
                 .is_some_and(|x| x.name == "AXIS2_PLACEMENT_3D")
         });
         let children = refs.into_iter().filter(|r| Some(*r) != axis).collect();
@@ -1371,22 +1596,31 @@ fn refs_in(values: &[Value]) -> Vec<u64> {
 
 /// Walk one tessellation node: emit a placed part for a leaf solid/shell, else compose this container's
 /// reposition axis onto `world` and recurse into its children.
+/// The parts of a tessellation walk that are FIXED for the whole traversal, grouped so the recursive
+/// step carries only what actually varies per node (id, transform, depth, path hash).
+pub(crate) struct TessWalk<'a> {
+    pub entities: &'a EntityTable,
+    pub colors: &'a BTreeMap<u64, [f32; 3]>,
+    pub owners: &'a BTreeMap<u64, (u64, String)>,
+}
+
 fn walk_tess(
-    entities: &BTreeMap<u64, Entity>,
+    walk: &TessWalk<'_>,
     id: u64,
     world: [f64; 16],
     depth: u32,
-    colors: &BTreeMap<u64, [f32; 3]>,
+    path_hash: u64,
     on_path: &mut BTreeSet<u64>,
     out: &mut Vec<TessPart>,
 ) {
+    let (entities, colors, owners) = (walk.entities, walk.colors, walk.owners);
     if depth > crate::cad_import::MAX_ASSEMBLY_DEPTH
         || out.len() >= 4_000_000
         || on_path.contains(&id)
     {
         return;
     }
-    let Some(e) = entities.get(&id) else { return };
+    let Some(e) = entities.get(id) else { return };
     if e.name == "TESSELLATED_SOLID" || e.name == "TESSELLATED_SHELL" {
         // Never-silent on the tessellation path: EVERY reachable leaf becomes a placed part. A leaf that
         // decodes to real triangles is `TessellationOnly`; one that yields NO usable mesh (unreadable faces /
@@ -1394,12 +1628,19 @@ fn walk_tess(
         // at its real transform — classified + placed, never dropped without a report entry.
         let mesh = mesh_of_tessellated_solid(entities, id)
             .unwrap_or_else(|| TriMesh::new(Vec::new(), Vec::new()));
+        let (reference, name) = owners.get(&id).map_or_else(
+            || (id.to_string(), format!("part #{id}")),
+            |(pd, name)| (format!("{pd}:tess:{id}"), name.clone()),
+        );
         out.push(TessPart {
-            name: format!("part #{id}"),
-            reference: id.to_string(),
+            id: step_path_hash(path_hash, id),
+            name,
+            reference,
             transform: world,
-            mesh,
+            mesh: Arc::new(mesh),
             color: colors.get(&id).copied(),
+            exact_brep: false,
+            parent: None,
         });
         return;
     }
@@ -1409,8 +1650,9 @@ fn walk_tess(
     });
     let child_world = crate::cad_import::mat4_mul(&world, &local);
     on_path.insert(id);
-    for c in children {
-        walk_tess(entities, c, child_world, depth + 1, colors, on_path, out);
+    for (ordinal, c) in children.into_iter().enumerate() {
+        let child_path = step_path_hash(step_path_hash(path_hash, c), ordinal as u64);
+        walk_tess(walk, c, child_world, depth + 1, child_path, on_path, out);
     }
     on_path.remove(&id);
 }
@@ -1418,8 +1660,8 @@ fn walk_tess(
 /// A `TESSELLATED_SOLID`/`SHELL` → its welded [`TriMesh`]. The faces of a solid typically SHARE one
 /// `COORDINATES_LIST`, so we intern each coords list ONCE per solid (base offset) and rebase every face's
 /// triangle indices into that shared vertex buffer — avoiding the O(faces × coords) vertex blow-up.
-fn mesh_of_tessellated_solid(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<TriMesh> {
-    let e = entities.get(&id)?;
+fn mesh_of_tessellated_solid(entities: &EntityTable, id: u64) -> Option<TriMesh> {
+    let e = entities.get(id)?;
     // TESSELLATED_SOLID/SHELL(name, (#face_refs), …) — the faces are the first list-of-refs arg.
     let faces = refs_in(&e.args);
     if faces.is_empty() {
@@ -1468,8 +1710,10 @@ fn mesh_of_tessellated_solid(entities: &BTreeMap<u64, Entity>, id: u64) -> Optio
 const MAX_BREP_PARTS: usize = 2_000_000;
 
 /// A product's tessellated B-rep, cached by product-definition id so an instanced part is triangulated
-/// once and cloned per occurrence: `(local welded mesh, authored colour, display name)`.
-type BrepMesh = (TriMesh, Option<[f32; 3]>, String);
+/// once and cloned per occurrence: `(local welded mesh, authored colour, display name, decoded faces)`.
+/// The faces are kept (M15.11) so the semantic pass can recognize features per UNIQUE geometry — once per
+/// product, never per occurrence.
+type BrepMesh = (Arc<TriMesh>, Option<[f32; 3]>, String, Vec<CadFace>);
 
 /// A single B-rep solid whose local geometry spans more than this in any axis is a **construction /
 /// reference artifact** (an unbounded plane exported as a giant plate, a symmetry body), not a real part —
@@ -1482,7 +1726,7 @@ const MAX_PART_EXTENT_MM: f64 = 120_000.0;
 /// the B-rep **assembly** union leg applies. A single-product file with no assembly graph must instead
 /// take the exact planar-B-rep leg (exact fidelity + PMI + interpret()'s notes), not be hijacked into a
 /// "tessellation-only" diagnosis by the mere presence of its standard PRODUCT_DEFINITION/SDR structure.
-pub(crate) fn has_nauo(entities: &BTreeMap<u64, Entity>) -> bool {
+pub(crate) fn has_nauo(entities: &EntityTable) -> bool {
     entities
         .values()
         .any(|e| e.name == "NEXT_ASSEMBLY_USAGE_OCCURRENCE")
@@ -1493,14 +1737,21 @@ pub(crate) fn has_nauo(entities: &BTreeMap<u64, Entity>) -> bool {
 /// the caller still has the tessellated-assembly parts and the planar single-file fallback) plus the
 /// **never-silent** notes: every curved-only product proxied, every construction-artifact solid filtered,
 /// and every per-face curved-surface approximation is named, never dropped without a word.
-pub(crate) fn parse_brep_assembly(
-    entities: &BTreeMap<u64, Entity>,
-) -> (Vec<TessPart>, Vec<UnsupportedNote>) {
+/// What one B-rep assembly parse yields. A named alias rather than a bare four-tuple, so the call sites
+/// read as something other than `.0`/`.1`/`.2`/`.3`.
+pub(crate) type BrepAssembly = (
+    Vec<TessPart>,
+    Vec<UnsupportedNote>,
+    BTreeMap<String, Vec<CadFace>>,
+    Vec<crate::cad_import::GroupNode>,
+);
+
+pub(crate) fn parse_brep_assembly(entities: &EntityTable) -> BrepAssembly {
     let mut notes: Vec<UnsupportedNote> = Vec::new();
     // (1) product_definition → ALL its SHAPE_REPRESENTATIONs.
     let pd_to_sr = collect_pd_shape_reps(entities);
     if pd_to_sr.is_empty() {
-        return (Vec::new(), notes);
+        return (Vec::new(), notes, BTreeMap::new(), Vec::new());
     }
 
     // (2) Each NAUO occurrence's placement transform.
@@ -1511,7 +1762,7 @@ pub(crate) fn parse_brep_assembly(
     let mut children: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
     let mut is_child: BTreeSet<u64> = BTreeSet::new();
     let mut all_pd: BTreeSet<u64> = BTreeSet::new();
-    for (id, e) in entities {
+    for (id, e) in entities.iter() {
         if e.name != "NEXT_ASSEMBLY_USAGE_OCCURRENCE" {
             continue;
         }
@@ -1542,6 +1793,7 @@ pub(crate) fn parse_brep_assembly(
     let colors = styled_colors(entities);
     let mut mesh_cache: BTreeMap<u64, Option<BrepMesh>> = BTreeMap::new();
     let mut out: Vec<TessPart> = Vec::new();
+    let mut groups: Vec<crate::cad_import::GroupNode> = Vec::new();
     let mut on_path: BTreeSet<u64> = BTreeSet::new();
     let mut reached: BTreeSet<u64> = BTreeSet::new();
     for root in roots {
@@ -1550,6 +1802,8 @@ pub(crate) fn parse_brep_assembly(
             root,
             crate::cad_import::IDENTITY_4X4,
             0,
+            step_path_hash(STEP_BREP_PATH_SEED, root),
+            None,
             &pd_to_sr,
             &children,
             &nauo_xform,
@@ -1559,6 +1813,7 @@ pub(crate) fn parse_brep_assembly(
             &mut reached,
             &mut notes,
             &mut out,
+            &mut groups,
         );
     }
     // (5) NEVER-SILENT: a product with geometry that is OUTSIDE the NAUO graph (a loose reference part, a
@@ -1575,6 +1830,8 @@ pub(crate) fn parse_brep_assembly(
             pd,
             crate::cad_import::IDENTITY_4X4,
             0,
+            step_path_hash(STEP_BREP_PATH_SEED, pd),
+            None,
             &pd_to_sr,
             &children,
             &nauo_xform,
@@ -1584,21 +1841,34 @@ pub(crate) fn parse_brep_assembly(
             &mut reached,
             &mut notes,
             &mut out,
+            &mut groups,
         );
     }
-    (out, notes)
+    // The per-unique-geometry decoded faces (M15.11): keyed by the product-definition `#id` — the same
+    // `reference` every occurrence of that product carries, so the semantic pass recognizes each unique
+    // geometry ONCE regardless of instance count. Faces are in the product's LOCAL frame (the occurrence
+    // transform places them), which is exactly the frame feature params should live in.
+    let breps: BTreeMap<String, Vec<CadFace>> = mesh_cache
+        .into_iter()
+        .filter_map(|(pd, entry)| {
+            entry.and_then(|(_m, _c, _n, faces)| {
+                (!faces.is_empty()).then(|| (pd.to_string(), faces))
+            })
+        })
+        .collect();
+    (out, notes, breps, groups)
 }
 
 /// Each `NEXT_ASSEMBLY_USAGE_OCCURRENCE` → its placement transform. A PRODUCT_DEFINITION_SHAPE whose
 /// definition is a NAUO is that occurrence's shape → find the
 /// `CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(rep_rel, pds)` that carries its ITEM_DEFINED_TRANSFORMATION.
-fn collect_nauo_transforms(entities: &BTreeMap<u64, Entity>) -> BTreeMap<u64, [f64; 16]> {
+fn collect_nauo_transforms(entities: &EntityTable) -> BTreeMap<u64, [f64; 16]> {
     let mut pds_to_nauo: BTreeMap<u64, u64> = BTreeMap::new();
-    for (id, e) in entities {
+    for (id, e) in entities.iter() {
         if e.name == "PRODUCT_DEFINITION_SHAPE" {
             if let Some(def) = e.args.iter().filter_map(Value::as_ref_id).next_back() {
                 if entities
-                    .get(&def)
+                    .get(def)
                     .is_some_and(|x| x.name == "NEXT_ASSEMBLY_USAGE_OCCURRENCE")
                 {
                     pds_to_nauo.insert(*id, def);
@@ -1629,7 +1899,7 @@ fn collect_nauo_transforms(entities: &BTreeMap<u64, Entity>) -> BTreeMap<u64, [f
 /// A multimap: AP242 exporters routinely attach several shape reps to one PRODUCT_DEFINITION (a
 /// geometry-bearing brep rep + a placement-only rep) — keeping only one would silently drop whichever rep
 /// lost the insert order.
-fn collect_pd_shape_reps(entities: &BTreeMap<u64, Entity>) -> BTreeMap<u64, Vec<u64>> {
+fn collect_pd_shape_reps(entities: &EntityTable) -> BTreeMap<u64, Vec<u64>> {
     let mut pd_to_sr: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for e in entities.values() {
         if e.name != "SHAPE_DEFINITION_REPRESENTATION" {
@@ -1641,7 +1911,7 @@ fn collect_pd_shape_reps(entities: &BTreeMap<u64, Entity>) -> BTreeMap<u64, Vec<
         };
         if let Some(pd) = pds_definition(entities, pds) {
             if entities
-                .get(&pd)
+                .get(pd)
                 .is_some_and(|x| x.name == "PRODUCT_DEFINITION")
             {
                 pd_to_sr.entry(pd).or_default().push(sr);
@@ -1651,24 +1921,52 @@ fn collect_pd_shape_reps(entities: &BTreeMap<u64, Entity>) -> BTreeMap<u64, Vec<
     pd_to_sr
 }
 
+/// Resolve a `PRODUCT_DEFINITION` to the user-authored `PRODUCT` name through its formation. Exporters leave
+/// many representation-item names blank, so this product-structure name is the authoritative asset-browser
+/// label for both exact and tessellated bodies.
+fn product_name(entities: &EntityTable, pd: u64) -> Option<String> {
+    let mut frontier = vec![(pd, 0u8)];
+    let mut visited = BTreeSet::new();
+    while let Some((id, depth)) = frontier.pop() {
+        if depth > 4 || !visited.insert(id) {
+            continue;
+        }
+        let Some(entity) = entities.get(id) else {
+            continue;
+        };
+        if entity.name == "PRODUCT" {
+            return entity.args.iter().find_map(|arg| match arg {
+                Value::Str(value) if !value.trim().is_empty() => Some(value.clone()),
+                _ => None,
+            });
+        }
+        for argument in &entity.args {
+            let mut refs = Vec::new();
+            collect_refs(argument, &mut refs);
+            frontier.extend(refs.into_iter().map(|reference| (reference, depth + 1)));
+        }
+    }
+    None
+}
+
 /// A `PRODUCT_DEFINITION_SHAPE` / `..._SHAPE_ASPECT` → the definition ref it characterises (a
 /// `PRODUCT_DEFINITION` for a part shape, or a `NEXT_ASSEMBLY_USAGE_OCCURRENCE` for an occurrence shape).
-fn pds_definition(entities: &BTreeMap<u64, Entity>, pds: u64) -> Option<u64> {
-    let e = entities.get(&pds)?;
+fn pds_definition(entities: &EntityTable, pds: u64) -> Option<u64> {
+    let e = entities.get(pds)?;
     // PRODUCT_DEFINITION_SHAPE(name, desc, #definition) — the definition is the last ref.
     e.args
         .iter()
         .filter_map(Value::as_ref_id)
         .next_back()
-        .filter(|d| entities.contains_key(d))
+        .filter(|d| entities.contains_key(*d))
 }
 
 /// The relative placement transform an occurrence's representation-relationship carries: follow the
 /// `rep_rel` (a complex `REPRESENTATION_RELATIONSHIP + REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION +
 /// SHAPE_REPRESENTATION_RELATIONSHIP`) to its `ITEM_DEFINED_TRANSFORMATION(item1, item2)` and compose
 /// `M(item2) · M(item1)⁻¹` (item1 is the local origin frame, item2 the placement in the parent).
-fn occurrence_transform(entities: &BTreeMap<u64, Entity>, rep_rel: u64) -> Option<[f64; 16]> {
-    let e = entities.get(&rep_rel)?;
+fn occurrence_transform(entities: &EntityTable, rep_rel: u64) -> Option<[f64; 16]> {
+    let e = entities.get(rep_rel)?;
     // The IDT is reachable from the (complex) rep-relationship — collect its refs and take the first
     // that resolves to an ITEM_DEFINED_TRANSFORMATION.
     let mut refs = Vec::new();
@@ -1677,10 +1975,10 @@ fn occurrence_transform(entities: &BTreeMap<u64, Entity>, rep_rel: u64) -> Optio
     }
     let idt = refs.into_iter().find(|r| {
         entities
-            .get(r)
+            .get(*r)
             .is_some_and(|x| x.name == "ITEM_DEFINED_TRANSFORMATION")
     })?;
-    let ie = entities.get(&idt)?;
+    let ie = entities.get(idt)?;
     let axes: Vec<u64> = ie.args.iter().filter_map(Value::as_ref_id).collect();
     let (Some(&a1), Some(&a2)) = (axes.first(), axes.get(1)) else {
         return None;
@@ -1719,10 +2017,12 @@ fn rigid_inverse(m: &[f64; 16]) -> [f64; 16] {
 /// current-path cycle guard (a malformed self-referential assembly is bounded, never a hang).
 #[allow(clippy::too_many_arguments)]
 fn walk_brep(
-    entities: &BTreeMap<u64, Entity>,
+    entities: &EntityTable,
     pd: u64,
     world: [f64; 16],
     depth: u32,
+    path_hash: u64,
+    parent_group: Option<u64>,
     pd_to_sr: &BTreeMap<u64, Vec<u64>>,
     children: &BTreeMap<u64, Vec<(u64, u64)>>,
     nauo_xform: &BTreeMap<u64, [f64; 16]>,
@@ -1732,6 +2032,7 @@ fn walk_brep(
     reached: &mut BTreeSet<u64>,
     notes: &mut Vec<UnsupportedNote>,
     out: &mut Vec<TessPart>,
+    groups: &mut Vec<crate::cad_import::GroupNode>,
 ) {
     if depth > crate::cad_import::MAX_ASSEMBLY_DEPTH
         || out.len() >= MAX_BREP_PARTS
@@ -1740,6 +2041,18 @@ fn walk_brep(
         return;
     }
     reached.insert(pd);
+    let has_children = children.get(&pd).is_some_and(|items| !items.is_empty());
+    let group_for_children = if has_children {
+        let group_id = step_path_hash(path_hash, STEP_GROUP_SALT);
+        groups.push(crate::cad_import::GroupNode {
+            id: group_id,
+            name: product_name(entities, pd).unwrap_or_else(|| format!("assembly #{pd}")),
+            parent: parent_group,
+        });
+        Some(group_id)
+    } else {
+        parent_group
+    };
     // This product's own geometry (if any), tessellated once + cached (the product-level notes are pushed
     // exactly once, at cache-fill).
     if let Some(srs) = pd_to_sr.get(&pd) {
@@ -1747,13 +2060,17 @@ fn walk_brep(
             .entry(pd)
             .or_insert_with(|| tessellate_product_brep(entities, srs, colors, notes))
             .clone();
-        if let Some((mesh, color, name)) = entry {
+        if let Some((mesh, color, cached_name, _faces)) = entry {
+            let name = product_name(entities, pd).unwrap_or(cached_name);
             out.push(TessPart {
+                id: step_path_hash(path_hash, pd),
                 name,
                 reference: pd.to_string(),
                 transform: world,
                 mesh,
                 color,
+                exact_brep: true,
+                parent: group_for_children,
             });
         }
     }
@@ -1768,11 +2085,14 @@ fn walk_brep(
                 .copied()
                 .unwrap_or(crate::cad_import::IDENTITY_4X4);
             let child_world = crate::cad_import::mat4_mul(&world, &t);
+            let child_path = step_path_hash(path_hash, nauo);
             walk_brep(
                 entities,
                 child,
                 child_world,
                 depth + 1,
+                child_path,
+                group_for_children,
                 pd_to_sr,
                 children,
                 nauo_xform,
@@ -1782,6 +2102,7 @@ fn walk_brep(
                 reached,
                 notes,
                 out,
+                groups,
             );
         }
     }
@@ -1795,7 +2116,7 @@ fn walk_brep(
 /// diagnoses + proxies it downstream — and the per-face approximation notes + the construction-artifact
 /// filter each land in `notes`, so no real part vanishes without a word.
 fn tessellate_product_brep(
-    entities: &BTreeMap<u64, Entity>,
+    entities: &EntityTable,
     srs: &[u64],
     colors: &BTreeMap<u64, [f32; 3]>,
     notes: &mut Vec<UnsupportedNote>,
@@ -1806,7 +2127,7 @@ fn tessellate_product_brep(
     let mut sink: Vec<UnsupportedNote> = Vec::new();
     let mut first_sr = 0u64;
     for &sr in srs {
-        let Some(e) = entities.get(&sr) else {
+        let Some(e) = entities.get(sr) else {
             continue;
         };
         if first_sr == 0 {
@@ -1827,7 +2148,7 @@ fn tessellate_product_brep(
             }
             color = color.or_else(|| colors.get(&item).copied());
             for shell in shells {
-                let Some(sh) = entities.get(&shell) else {
+                let Some(sh) = entities.get(shell) else {
                     continue;
                 };
                 let Some(face_refs) = sh.args.get(1).and_then(Value::as_list) else {
@@ -1878,6 +2199,10 @@ fn tessellate_product_brep(
     // Assembly bakes tessellate at PREVIEW grade (quality by context): a 13k-occurrence cell at exact
     // viewer grade measured minutes of registration/persist for invisible gain at factory scale.
     let mesh = scene.tessellate_with(crate::analytic::PREVIEW_DEFLECTION);
+    let faces = match scene.solids.into_iter().next() {
+        Some(s) => s.faces,
+        None => Vec::new(),
+    };
     let extent = mesh_axis_extent(&mesh);
     if mesh.triangle_count() > 0 && extent > MAX_PART_EXTENT_MM {
         // The construction-artifact filter (an unbounded reference plane exported as a giant plate) —
@@ -1893,8 +2218,8 @@ fn tessellate_product_brep(
         return None;
     }
     // A curved-only product tessellates to 0 triangles — return it EMPTY so the pipeline places a
-    // diagnosed proxy (never a silently-vanished part).
-    Some((mesh, color, name))
+    // diagnosed proxy (never a silently-vanished part). The decoded faces ride along for the semantic pass.
+    Some((Arc::new(mesh), color, name, faces))
 }
 
 /// The largest per-axis extent of a mesh's local bounding box (the construction-artifact filter — a
@@ -1914,8 +2239,8 @@ fn mesh_axis_extent(mesh: &TriMesh) -> f64 {
 /// The `CLOSED_SHELL` / `OPEN_SHELL` ids a geometry item resolves to — handles `MANIFOLD_SOLID_BREP`,
 /// `BREP_WITH_VOIDS`, `FACETED_BREP`, and `SHELL_BASED_SURFACE_MODEL` uniformly by collecting every
 /// shell reachable in the item's args (a non-geometry item — an `AXIS2_PLACEMENT_3D` — yields none).
-fn brep_item_shells(entities: &BTreeMap<u64, Entity>, item: u64) -> Vec<u64> {
-    let Some(e) = entities.get(&item) else {
+fn brep_item_shells(entities: &EntityTable, item: u64) -> Vec<u64> {
+    let Some(e) = entities.get(item) else {
         return Vec::new();
     };
     let mut refs = Vec::new();
@@ -1925,7 +2250,7 @@ fn brep_item_shells(entities: &BTreeMap<u64, Entity>, item: u64) -> Vec<u64> {
     refs.into_iter()
         .filter(|r| {
             entities
-                .get(r)
+                .get(*r)
                 .is_some_and(|x| x.name == "CLOSED_SHELL" || x.name == "OPEN_SHELL")
         })
         .collect()
@@ -1939,15 +2264,15 @@ fn brep_item_shells(entities: &BTreeMap<u64, Entity>, item: u64) -> Vec<u64> {
 /// 1-based and remapped through `pnindex` → the (0-based) coordinates list; the caller rebases them into the
 /// solid's shared vertex buffer and bounds-checks against the coordinate count.
 #[allow(clippy::cast_possible_truncation)]
-fn face_triangles(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<(u64, Vec<[u32; 3]>)> {
-    let e = entities.get(&id)?;
+fn face_triangles(entities: &EntityTable, id: u64) -> Option<(u64, Vec<[u32; 3]>)> {
+    let e = entities.get(id)?;
     if !e.name.contains("TRIANGULATED") {
         return None;
     }
     let coords_id = e.args.iter().find_map(|a| {
         a.as_ref_id().filter(|r| {
             entities
-                .get(r)
+                .get(*r)
                 .is_some_and(|c| c.name == "COORDINATES_LIST")
         })
     })?;
@@ -2054,8 +2379,8 @@ fn face_triangles(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<(u64, Vec
 }
 
 /// A COORDINATES_LIST → its vertices.
-fn coordinates_list(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<Vec<[f64; 3]>> {
-    let e = entities.get(&id)?;
+fn coordinates_list(entities: &EntityTable, id: u64) -> Option<Vec<[f64; 3]>> {
+    let e = entities.get(id)?;
     if e.name != "COORDINATES_LIST" {
         return None;
     }
@@ -2075,8 +2400,8 @@ fn coordinates_list(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<Vec<[f6
 
 /// An AXIS2_PLACEMENT_3D → a column-major rigid 4×4 (orthonormal frame from the z + x-ref directions + the
 /// origin point). Missing axis/ref default to +Z / +X.
-fn axis_placement_matrix(entities: &BTreeMap<u64, Entity>, id: u64) -> [f64; 16] {
-    let Some(e) = entities.get(&id) else {
+fn axis_placement_matrix(entities: &EntityTable, id: u64) -> [f64; 16] {
+    let Some(e) = entities.get(id) else {
         return crate::cad_import::IDENTITY_4X4;
     };
     // AXIS2_PLACEMENT_3D(name, #location, #axis(z), #ref_direction(x))
@@ -2110,8 +2435,8 @@ fn axis_placement_matrix(entities: &BTreeMap<u64, Entity>, id: u64) -> [f64; 16]
 }
 
 /// A DIRECTION → its unit-ish vector.
-fn direction_of(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<[f64; 3]> {
-    let e = entities.get(&id)?;
+fn direction_of(entities: &EntityTable, id: u64) -> Option<[f64; 3]> {
+    let e = entities.get(id)?;
     if e.name != "DIRECTION" {
         return None;
     }
@@ -2373,8 +2698,8 @@ pub fn gdt_token(entity_name: &str) -> Option<&'static str> {
 }
 
 /// Resolve a `LENGTH_MEASURE_WITH_UNIT` (or a bare `LENGTH_MEASURE`) `#id` → its millimetre value.
-fn measure_value(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<f64> {
-    let e = entities.get(&id)?;
+fn measure_value(entities: &EntityTable, id: u64) -> Option<f64> {
+    let e = entities.get(id)?;
     // LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(<v>), #unit) — arg 0 is the typed measure.
     match e.args.first() {
         Some(Value::Typed(_, inner)) => inner.first().and_then(Value::as_real),
@@ -2384,8 +2709,8 @@ fn measure_value(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<f64> {
 }
 
 /// Resolve a `SHAPE_ASPECT` `#id` → the referenceable face `#id` it is bound to (the arg that is a `#ref`).
-fn shape_aspect_face(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<u64> {
-    let e = entities.get(&id)?;
+fn shape_aspect_face(entities: &EntityTable, id: u64) -> Option<u64> {
+    let e = entities.get(id)?;
     if e.name != "SHAPE_ASPECT" {
         return None;
     }
@@ -2394,8 +2719,8 @@ fn shape_aspect_face(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<u64> {
 }
 
 /// Resolve a `DATUM` `#id` → its datum face `#id` (via its `SHAPE_ASPECT`).
-fn datum_face(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<u64> {
-    let e = entities.get(&id)?;
+fn datum_face(entities: &EntityTable, id: u64) -> Option<u64> {
+    let e = entities.get(id)?;
     if e.name != "DATUM" {
         return None;
     }
@@ -2408,7 +2733,7 @@ fn datum_face(entities: &BTreeMap<u64, Entity>, id: u64) -> Option<u64> {
 /// #toleranced_shape_aspect)` + an optional datum ref. `face_ids` gates the face reference to a real
 /// resolved face (never a dangle).
 fn pmi_from_gt(
-    entities: &BTreeMap<u64, Entity>,
+    entities: &EntityTable,
     gt_args: &[Value],
     characteristic: &str,
     datum_ref: Option<u64>,
@@ -2446,13 +2771,13 @@ fn pmi_from_gt(
 /// honest downgrade: a graphic is not machine-readable; the semantic path is what round-trips). Deterministic
 /// order (the entity map is a `BTreeMap`).
 fn parse_pmi(
-    entities: &BTreeMap<u64, Entity>,
+    entities: &EntityTable,
     face_ids: &std::collections::BTreeSet<u64>,
     notes: &mut Vec<UnsupportedNote>,
 ) -> Vec<CadPmi> {
     let mut pmi = Vec::new();
     let mut graphical = 0usize;
-    for (id, e) in entities {
+    for (id, e) in entities.iter() {
         // A simple-instance form tolerance: `FLATNESS_TOLERANCE(name, description, #mag, #tsa)`.
         if let Some(token) = gdt_token(&e.name) {
             if let Some(p) = pmi_from_gt(entities, &e.args, token, None, face_ids) {

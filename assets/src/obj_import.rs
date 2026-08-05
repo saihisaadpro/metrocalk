@@ -125,6 +125,7 @@ impl MeshSource for ObjImporter {
                 positions,
                 normals,
                 uvs,
+                tangents: Vec::new(),
                 indices: m.indices.clone(),
                 material: 0,
                 joints: Vec::new(),

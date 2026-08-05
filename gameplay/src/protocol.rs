@@ -1,7 +1,7 @@
 use crate::model::{
-    AbilityId, ActorId, ActorKind, ActorProvenance, ControlMask, DamageSchool, GoldReason,
-    MatchEndReason, MatchOutcome, MatchPhase, PlayerId, ProjectileId, ScoreView, StatusEffectId,
-    TeamId, Tick, Vec2Mm,
+    AbilityId, ActorId, ActorKind, ActorProvenance, AttackOrder, ControlMask, DamageSchool,
+    GoldReason, MatchEndReason, MatchOutcome, MatchPhase, PlayerId, ProjectileId, ScoreView,
+    StatusEffectId, TeamId, Tick, Vec2Mm,
 };
 
 /// Deterministic equality key for authoritative gameplay simulation state.
@@ -44,6 +44,19 @@ pub enum CommandKind {
     BasicAttack {
         target: ActorId,
     },
+    /// Advance toward a point, engaging anything hostile that comes into acquisition range.
+    ///
+    /// The order PERSISTS: the runtime keeps swinging and re-acquiring under it, which is what makes this
+    /// an auto-attack rather than the one-shot `BasicAttack` above.
+    AttackMove {
+        destination: Vec2Mm,
+    },
+    /// Attack one named target until it is gone. Never re-acquires — the player named this target.
+    AttackTarget {
+        target: ActorId,
+    },
+    /// Hold position and engage anything hostile that comes into acquisition range.
+    HoldPosition,
     /// Spend one unspent ability point to raise one equipped ability by a rank.
     ///
     /// A player command rather than a server-owned mutator because choosing *which* ability to raise is
@@ -206,6 +219,9 @@ pub struct ActorView {
     pub basic_attack_ready_at: Option<Tick>,
     pub basic_attack_range_mm: Option<u32>,
     pub respawn_at: Option<Tick>,
+    /// The standing attack order, if any. A client needs it to show whether a unit is holding, advancing,
+    /// or locked onto something.
+    pub attack_order: Option<AttackOrder>,
     /// Progression. `level` is DERIVED from `experience` and is projected rather than stored, so a client
     /// and the server can never disagree about which one is authoritative.
     pub level: u8,
@@ -387,6 +403,19 @@ pub enum MatchEvent {
         effect: StatusEffectId,
         amount: u32,
         remaining: u32,
+    },
+    /// A standing order acquired a target on its own, rather than being handed one.
+    ///
+    /// Distinct from `BasicAttackStarted` so a client can tell "the player told it to hit that" from
+    /// "it noticed that by itself" - which is exactly the information a player needs to trust their army.
+    TargetAcquired {
+        actor: ActorId,
+        target: ActorId,
+    },
+    /// A standing order was set, replaced, or cleared.
+    AttackOrderChanged {
+        actor: ActorId,
+        order: Option<AttackOrder>,
     },
     /// An attacker healed from damage it dealt.
     LifestealApplied {

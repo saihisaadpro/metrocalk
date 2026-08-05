@@ -35,16 +35,62 @@ test("opening the menu refreshes project state and shows the actions", async () 
   const projectState = vi.fn(() => Promise.resolve(info({ path: "a.mtk" })));
   render(<FileMenu client={fakeClient({ projectState })} />);
 
-  fireEvent.click(screen.getByTestId("fileMenu"));
+  const trigger = screen.getByTestId("fileMenu");
+  expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
+  expect(trigger.getAttribute("aria-expanded")).toBe("false");
+  fireEvent.click(trigger);
   await waitFor(() => expect(projectState).toHaveBeenCalled());
+  expect(trigger.getAttribute("aria-expanded")).toBe("true");
+  expect(screen.getByRole("menu", { name: /File/ })).toBeTruthy();
+  expect(screen.getByTestId("fileMenuPanel").className).toContain("mtk-popup-menu");
+  expect(screen.getByText("Project")).toBeTruthy();
+  expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "New project" }));
   expect(screen.getByTestId("fileNew")).toBeTruthy();
   expect(screen.getByTestId("fileOpen")).toBeTruthy();
   expect(screen.getByTestId("fileSave")).toBeTruthy();
   expect(screen.getByTestId("fileSaveAs")).toBeTruthy();
+  expect(screen.getByTestId("fileExportGlb")).toBeTruthy();
+  expect(screen.getByTestId("fileExportUsda")).toBeTruthy();
+});
+
+test("File menu follows desktop keyboard navigation and returns focus on Escape", () => {
+  render(<FileMenu client={fakeClient()} />);
+  const trigger = screen.getByTestId("fileMenu");
+  fireEvent.click(trigger);
+  const menu = screen.getByRole("menu", { name: /File/ });
+  expect(document.activeElement).toBe(screen.getByTestId("fileNew"));
+  fireEvent.keyDown(menu, { key: "ArrowDown" });
+  expect(document.activeElement).toBe(screen.getByTestId("fileOpen"));
+  fireEvent.keyDown(menu, { key: "End" });
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByRole("menu", { name: /File/ })).toBeNull();
+  expect(document.activeElement).toBe(trigger);
+});
+
+test("complete-scene export is reachable without an Asset Lab selection", async () => {
+  const sceneExport = vi.fn(() => Promise.resolve({
+    ok: true,
+    message: "Exported 12 nodes",
+    format: "glb",
+    exportedPath: "scene.glb",
+    nodes: 12,
+    meshes: 4,
+    skins: 1,
+    animations: 1,
+    fidelity: [{ status: "converted" as const, feature: "authored_visibility", count: 1, detail: "Stored in node extras" }],
+  }));
+  render(<FileMenu client={fakeClient({ sceneExport })} />);
+
+  fireEvent.click(screen.getByTestId("fileMenu"));
+  await waitFor(() => expect(screen.getByTestId("fileExportGlb")).toBeTruthy());
+  fireEvent.click(screen.getByTestId("fileExportGlb"));
+
+  await waitFor(() => expect(sceneExport).toHaveBeenCalledWith("glb"));
 });
 
 test("New on a clean project runs immediately (no guard)", async () => {
   const newProject = vi.fn(() => Promise.resolve(info()));
+  const previousSession = projectStore.getState().sessionId;
   render(<FileMenu client={fakeClient({ projectState: () => Promise.resolve(info({ dirty: false })), newProject })} />);
 
   fireEvent.click(screen.getByTestId("fileMenu"));
@@ -52,6 +98,7 @@ test("New on a clean project runs immediately (no guard)", async () => {
   fireEvent.click(screen.getByTestId("fileNew"));
 
   await waitFor(() => expect(newProject).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(projectStore.getState().sessionId).not.toBe(previousSession));
   expect(screen.queryByTestId("unsavedGuard")).toBeNull();
 });
 
@@ -67,7 +114,7 @@ test("New on a DIRTY project guards: Cancel aborts, Discard proceeds", async () 
 
   // New → the guard appears; New is NOT yet called.
   fireEvent.click(screen.getByTestId("fileNew"));
-  expect(screen.getByTestId("unsavedGuard")).toBeTruthy();
+  expect(screen.getByRole("dialog", { name: /Discard unsaved changes/ })).toBeTruthy();
   expect(newProject).not.toHaveBeenCalled();
 
   // Cancel → aborts, nothing happens.

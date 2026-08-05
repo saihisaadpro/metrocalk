@@ -14,6 +14,8 @@ export function deriveKind(components: Record<string, Record<string, Json>>): st
   if ("AudioSource" in components) return "audio";
   if ("HealthBar" in components) return "requirer";
   if ("MeshRenderer" in components) return "mesh";
+  // A thing with hit points is a character. Mirrors the authoritative `classify_kind` in bridge.rs.
+  if ("Health" in components) return "character";
   return "default";
 }
 

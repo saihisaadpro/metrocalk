@@ -62,7 +62,7 @@ pub const MATCH_ACTOR: &str = "MatchActor";
 pub const MATCH_WAVE: &str = "MatchWave";
 
 /// The cooked-artifact schema version. Bump on any change to [`CookedMatch`]'s shape or meaning.
-pub const MATCH_COOK_SCHEMA_VERSION: u32 = 2;
+pub const MATCH_COOK_SCHEMA_VERSION: u32 = 3;
 
 /// The single lane the MOB-2 one-route profile permits.
 const LANE: LaneId = LaneId(0);
@@ -209,6 +209,10 @@ pub struct CookedActor {
 #[serde(rename_all = "camelCase")]
 pub struct CookedAttack {
     pub range_mm: u32,
+    /// How far this unit notices a target it was not handed. Defaults to twice its reach when unauthored,
+    /// because an acquisition equal to reach makes a standing order look broken: the unit would only ever
+    /// engage what has already walked into its face.
+    pub acquisition_range_mm: u32,
     pub damage: u32,
     pub windup_ticks: u16,
     pub cooldown_ticks: u32,
@@ -414,6 +418,7 @@ fn kernel_wave(wave: &CookedWave) -> WaveSpec {
 fn kernel_attack(attack: CookedAttack) -> BasicAttackSpec {
     BasicAttackSpec {
         range_mm: attack.range_mm,
+        acquisition_range_mm: attack.acquisition_range_mm,
         damage: attack.damage,
         school: DamageSchool::Physical,
         windup_ticks: attack.windup_ticks,
@@ -651,6 +656,21 @@ impl Cook {
         self.mm_from(value, entity, component, field)
     }
 
+    /// Read an optional distance in metres. Absent is not an error.
+    ///
+    /// Distinct from [`Self::metres_mm`] because a field introduced after scenes were authored must not
+    /// make every one of those scenes stop cooking. Present-but-broken is still reported.
+    fn optional_metres_mm(
+        &mut self,
+        comps: &Components,
+        entity: EntityId,
+        component: &str,
+        field: &str,
+    ) -> Option<i32> {
+        let value = number(comps, component, field)?;
+        Some(self.mm_from(value, entity, component, field))
+    }
+
     fn mm_from(&mut self, metres: f64, entity: EntityId, component: &str, field: &str) -> i32 {
         if !metres.is_finite() {
             self.error(
@@ -866,6 +886,29 @@ impl Cook {
             }
             Ok(positive) => positive,
         };
+        // Authored in metres like every other distance. Zero (or absent) means "twice reach"; the kernel
+        // refuses anything below reach, so that refusal is pre-empted here with a diagnostic that names
+        // the field rather than surfacing a runtime error at start.
+        let acquisition_field = format!("{prefix}AcquisitionRange");
+        let acquisition_mm = self
+            .optional_metres_mm(comps, entity, component, &acquisition_field)
+            .unwrap_or(0);
+        let acquisition_range_mm = match u32::try_from(acquisition_mm) {
+            Ok(0) | Err(_) => range_mm.saturating_mul(2),
+            Ok(authored) if authored < range_mm => {
+                self.error(
+                    "out-of-range",
+                    entity,
+                    component,
+                    Some(&acquisition_field),
+                    format!(
+                        "`{acquisition_field}` is shorter than `{range_field}`; a unit cannot notice                          less far than it can reach. Leave it at 0 to use twice the attack range."
+                    ),
+                );
+                range_mm.saturating_mul(2)
+            }
+            Ok(authored) => authored,
+        };
         let windup = self
             .optional_u32(comps, entity, component, &format!("{prefix}WindupTicks"))
             .unwrap_or(1);
@@ -876,6 +919,7 @@ impl Cook {
             .max(1);
         Some(CookedAttack {
             range_mm,
+            acquisition_range_mm,
             damage,
             windup_ticks: windup,
             cooldown_ticks: cooldown,

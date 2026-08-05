@@ -174,6 +174,7 @@ fn cluster_decimate(prim: &Primitive, cell: f32) -> Primitive {
         positions,
         normals: Vec::new(), // re-derived by the packer (flat normals), like a normal-less import
         uvs: Vec::new(),
+        tangents: Vec::new(),
         indices,
         material: prim.material,
         joints: Vec::new(),
@@ -213,6 +214,7 @@ mod tests {
                 positions,
                 normals: Vec::new(),
                 uvs: Vec::new(),
+                tangents: Vec::new(),
                 indices,
                 material: 0,
                 joints: Vec::new(),

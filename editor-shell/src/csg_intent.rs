@@ -132,6 +132,7 @@ pub fn trimesh_to_mesh_asset_colored(
             positions,
             normals: Vec::new(),
             uvs: Vec::new(),
+            tangents: Vec::new(),
             indices,
             material: 0,
             joints: Vec::new(),

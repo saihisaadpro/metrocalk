@@ -11,30 +11,53 @@ export interface PanelLayout {
   right: number;
   /** Below the breakpoint the side panels collapse to icon rails so the stage keeps the space. */
   collapsed: boolean;
+  /** On phone-width windows even the rails yield; the header opens both docks as focus-managed overlays. */
+  overlay: boolean;
   /** The CSS `grid-template-columns` — the MIDDLE (stage) is always the flex `1fr` with a min-width. */
   gridColumns: string;
 }
 
 /** The stage's protected minimum width (px) — it never shrinks below this; the panels yield first. */
-export const STAGE_MIN = 360;
+export const STAGE_MIN = 320;
 /** Below this width the side panels collapse to icon rails (desktop windowed / split-screen use). */
-export const COLLAPSE_BELOW = 900;
+export const COLLAPSE_BELOW = 980;
+/** Below this width the shell becomes a one-column stage with modal dock drawers. */
+export const OVERLAY_BELOW = 620;
 /** Below this width the open panels shrink to their compact widths (still open). */
 export const COMPACT_BELOW = 1200;
 /** The collapsed icon-rail width (px). */
 export const RAIL_W = 44;
 
 export function panelLayout(width: number): PanelLayout {
+  if (width < OVERLAY_BELOW) {
+    return {
+      left: 0,
+      right: 0,
+      collapsed: true,
+      overlay: true,
+      gridColumns: "minmax(0, 1fr)",
+    };
+  }
   if (width < COLLAPSE_BELOW) {
     return {
       left: RAIL_W,
       right: RAIL_W,
       collapsed: true,
+      overlay: false,
       gridColumns: `${RAIL_W}px minmax(${STAGE_MIN}px, 1fr) ${RAIL_W}px`,
     };
   }
   if (width < COMPACT_BELOW) {
-    return { left: 220, right: 260, collapsed: false, gridColumns: `220px minmax(${STAGE_MIN}px, 1fr) 260px` };
+    return { left: 240, right: 300, collapsed: false, overlay: false, gridColumns: `240px minmax(${STAGE_MIN}px, 1fr) 300px` };
   }
-  return { left: 260, right: 320, collapsed: false, gridColumns: `260px minmax(${STAGE_MIN}px, 1fr) 320px` };
+  return { left: 280, right: 340, collapsed: false, overlay: false, gridColumns: `280px minmax(${STAGE_MIN}px, 1fr) 340px` };
+}
+
+/** Compose the realized grid after user-controlled dock collapse. Responsive rails still win below their
+ * breakpoint; at larger sizes each dock can independently yield without changing the workspace context. */
+export function dockGridColumns(layout: PanelLayout, leftCollapsed: boolean, rightCollapsed: boolean): string {
+  if (layout.overlay) return "minmax(0, 1fr)";
+  const left = layout.collapsed || leftCollapsed ? RAIL_W : layout.left;
+  const right = layout.collapsed || rightCollapsed ? RAIL_W : layout.right;
+  return `${left}px minmax(${STAGE_MIN}px, 1fr) ${right}px`;
 }

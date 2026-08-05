@@ -14,15 +14,32 @@
 //! transaction (north-star test #1).
 
 mod ibl;
+mod moba;
 mod render;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
+use metrocalk_animation::{
+    AnimValue, AnimationAssetId, AnimationBindingContext, AnimationDomain,
+    AnimationEditorKind as BindingEditorKind, AnimationGraphRuntimeInstance, AnimationRuntimeSink,
+    Binding as AnimationBinding, BindingRebind as AnimationBindingRebind,
+    BindingSignature as AnimationBindingSignature, ClipId as AnimationClipId,
+    ClipInstantiationRequest, CompiledAnimationGraph, CompiledClipInstance, CompiledSequence,
+    GraphParameterId, GraphParameterValue, Interpolation as AnimationInterpolation,
+    LoopPolicy as AnimationLoopPolicy, PropertyPath as AnimationPropertyPath,
+    Severity as AnimationSeverity, TargetRebind as AnimationTargetRebind, Tick as AnimationTick,
+    TimeBase as AnimationTimeBase, ValueKind as AnimationValueKind,
+};
 use metrocalk_assets::{
-    detect, AssetId, AssetStore, Detected, FbxImporter, GltfImporter, ImageImporter, KtxImporter,
-    MeshGpu, MeshSource, ObjImporter,
+    detect, export_glb, export_scene_glb, export_usda, AssetAffine, AssetId, AssetStore, Detected,
+    FbxImporter, FidelityStatus, GltfImporter, ImageImporter, KtxImporter, Material, MeshAsset,
+    MeshGpu, MeshSource, ObjImporter, MAX_GLB_EXPORT_BYTES,
+};
+use metrocalk_conditioning::uv::XatlasUvUnwrapper;
+use metrocalk_conditioning::{
+    BakeConfig, BakeError, BakeSource, BakeTransform, ChartUvConfig, CpuTextureBaker, UvUnwrapper,
 };
 use metrocalk_core::catalog::{CatalogItem, CatalogSearch};
 use metrocalk_core::marketplace::{LocalCatalog, MarketplaceIndex};
@@ -38,10 +55,15 @@ use metrocalk_editor_shell::transform_solver::{
     Constraint, ConstraintIntent, SnapKind, SnapTarget,
 };
 use metrocalk_editor_shell::{
-    actions_for, ai_edit_material, apply_ai_patch, apply_edit, buy_marketplace, capscene,
-    enrich_relational, project_entity, project_full, transform_solver, ActionItem, AiPatch,
-    CapScene, EditIntent, EditTx, Log, MeshCatalog, Outcome, PatchOp, ProjectionDelta,
-    ProjectionOp, Record, Wallet,
+    actions_for, ai_edit_material, apply_ai_patch, apply_edit, audit_asset, bake_pipe,
+    buy_marketplace, capscene, capture_scene, cleanup_asset, decode_pipe_artifact,
+    enrich_relational, land_pipe_asset, optimize_asset, project_entity, project_full,
+    rebake_pipe_in_place, replace_pipe_asset, transform_solver, ActionItem, AiPatch,
+    AssetAuditReport, AssetChangeReport, AuditOptions, CapScene, CapturedMesh, CleanupConfig,
+    EditIntent, EditTx, Log, MeshCatalog, NormalRepairMode, OptimizationConfig, OptimizationPreset,
+    Outcome, PatchOp, PipeBakeReport, PipeBuild, PipeFittingKind, PipeForgeOptions,
+    PipeForgeStatus, PipeRecipe, PipeToolSession, ProjectionDelta, ProjectionOp, Record,
+    UserFittingCatalogEntry, UvGenerationMode, Wallet,
 };
 use metrocalk_gizmo::{
     Gizmo, GizmoMode, GizmoPivot, GizmoSpace, Handle, Ray, Transform as GizmoTransform,
@@ -84,6 +106,35 @@ macro_rules! send_proj {
 fn proj_full(engine: &Engine<FlecsWorld>, scene: &CapScene) -> ProjectionDelta {
     let mut d = project_full(engine);
     enrich_relational(&mut d, engine, scene.rels, &scene.cap_name);
+    // Graph controllers are project infrastructure, not user scene objects. They remain authoritative ECS
+    // entities so undo/merge/persistence work normally, but must never become hierarchy rows or viewport
+    // placeholders. Filter their complete projection (including any future relationship endpoint) here.
+    let hidden: HashSet<String> = engine
+        .entity_ids()
+        .into_iter()
+        .filter(|id| {
+            matches!(
+                engine.components_of(*id).get("__meta__").and_then(|fields| fields.get("kind")),
+                Some(FieldValue::Str(kind))
+                    if matches!(
+                        kind.as_str(),
+                        "animation_graph_controller" | "animation_clip_instance"
+                    )
+            )
+        })
+        .map(|id| id.to_loro_key())
+        .collect();
+    if !hidden.is_empty() {
+        d.ops.retain(|op| match op {
+            ProjectionOp::Upsert { id, .. }
+            | ProjectionOp::Remove { id }
+            | ProjectionOp::SetField { id, .. }
+            | ProjectionOp::RemoveField { id, .. } => !hidden.contains(id),
+            ProjectionOp::AddEdge { from, to, .. } | ProjectionOp::RemoveEdge { from, to, .. } => {
+                !hidden.contains(from) && !hidden.contains(to)
+            }
+        });
+    }
     d
 }
 
@@ -93,6 +144,13 @@ const HEALTHBAR_GLB: &[u8] = include_bytes!("../../assets/healthbar.glb");
 const PROP_GLB: &[u8] = include_bytes!("../../assets/prop.glb");
 /// The M8.2 physics test mesh — a ball; a spawned RigidBody renders as this (see `spawn_physics_body`).
 const SPHERE_GLB: &[u8] = include_bytes!("../../assets/sphere.glb");
+/// The three MOBA character/structure meshes. Real downloaded models, not primitives: a match drawn with
+/// spheres and boxes cannot be judged as a game, only as a diagram. Their embedded textures are stripped
+/// (see `ATTRIBUTION.md`) because the projection tints every actor by TEAM — a baked albedo would fight
+/// the one colour on screen that carries gameplay meaning.
+const MOBA_HERO_GLB: &[u8] = include_bytes!("../../assets/moba_hero.glb");
+const MOBA_MINION_GLB: &[u8] = include_bytes!("../../assets/moba_minion.glb");
+const MOBA_TOWER_GLB: &[u8] = include_bytes!("../../assets/moba_tower.glb");
 /// The spawned ball's collider radius (world meters). The render mesh is normalized separately.
 const BALL_RADIUS: f32 = 0.45;
 
@@ -102,12 +160,19 @@ const BALL_RADIUS: f32 = 0.45;
 /// render slot + a normalized scale; `meshes` is the slot-indexed packed geometry handed to the
 /// viewport. The asset *store* itself is dropped after packing — nothing here borrows from it.
 struct AssetsRuntime {
+    /// Canonical editable meshes retained beside their prepared GPU copies. Keeping this store alive is
+    /// the asset-authoring seam: procedural rebuilds/CSG/conditioning no longer lose source geometry after
+    /// the initial upload.
+    store: AssetStore,
     catalog: MeshCatalog,
     /// Logical asset name (a marketplace entry's `asset` field, e.g. `"prop"`) → content-addressed
     /// handle — how a marketplace entry's mesh is resolved at apply time.
     asset_by_name: HashMap<String, String>,
     handle_to_slot: HashMap<String, usize>,
     scales: Vec<f32>,
+    /// Asset-local to the exact display coordinates baked into `meshes[slot]`. Conditioning uses the
+    /// same affine for high/low common-space projection and derivative registration.
+    display_affines: Vec<AssetAffine>,
     meshes: Vec<MeshGpu>,
     /// The ball mesh handle (M8.2) — a spawned physics body renders as this.
     sphere: String,
@@ -115,6 +180,27 @@ struct AssetsRuntime {
     /// rebuilding it). Populated for IMPORTED assets (built-in catalog meshes have none). Carries the
     /// identity record + the perceptual hash used for near-duplicate hints.
     provenance: HashMap<String, metrocalk_assets::Provenance>,
+    /// Animation is a separate asset facet: clip data and its self-aware manifest share the source content
+    /// identity without bloating or changing `MeshAsset` consumers.
+    animation_assets: HashMap<String, metrocalk_assets::AnimationAsset>,
+    /// Editable sources recovered from `MTKPIPE1` artifacts, keyed by the same handle the scene carries.
+    pipe_recipes: HashMap<String, PipeRecipe>,
+}
+
+/// Replace any older loaded revision of one logical animation asset. Runtime lookup is deliberately
+/// one-to-one: persisted content aliases remain on disk, but only the index-designated current revision
+/// may participate in mapping, preview, or graph compilation.
+fn install_current_animation_asset_revision(
+    animation_assets: &mut HashMap<String, metrocalk_assets::AnimationAsset>,
+    content_handle: String,
+    animation: metrocalk_assets::AnimationAsset,
+) {
+    let logical_id = animation.record.effective_logical_id().as_str().to_owned();
+    animation_assets.retain(|existing_handle, existing| {
+        existing_handle == &content_handle
+            || existing.record.effective_logical_id().as_str() != logical_id
+    });
+    animation_assets.insert(content_handle, animation);
 }
 
 /// Re-import ONE persisted asset blob into the store on boot, routed by MAGIC — mirrors `import_any`'s
@@ -138,6 +224,95 @@ fn reimport_persisted_blob(store: &mut AssetStore, gltf: &GltfImporter, bytes: &
     stored.is_ok()
 }
 
+/// Asset Lab variants keep the source asset's viewport scale policy across close/reopen. Imported assets
+/// are normally normalized while procedural engineering assets remain in metres, so a plain GLB sidecar
+/// is insufficient: this tiny deterministic envelope carries the authored display scale beside the GLB.
+const ASSET_LAB_ARTIFACT_MAGIC: &[u8; 8] = b"MTKLAB2\0";
+const ASSET_LAB_ARTIFACT_V1_MAGIC: &[u8; 8] = b"MTKLAB1\0";
+const ASSET_LAB_ARTIFACT_HEADER: usize = 8 + 4 + 12 + 8;
+const ASSET_LAB_ARTIFACT_V1_HEADER: usize = 8 + 4 + 8;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AssetLabDisplay {
+    Affine(AssetAffine),
+    LegacyScale(f32),
+}
+
+fn encode_asset_lab_artifact(display: AssetAffine, glb: &[u8]) -> Result<Vec<u8>, String> {
+    if !display.is_valid() {
+        return Err("the source asset has an invalid viewport affine".into());
+    }
+    if glb.len() > MAX_GLB_EXPORT_BYTES {
+        return Err("the exported GLB exceeds the Asset Lab size limit".into());
+    }
+    let len = u64::try_from(glb.len()).map_err(|_| "the exported GLB is too large")?;
+    let mut bytes = Vec::with_capacity(ASSET_LAB_ARTIFACT_HEADER + glb.len());
+    bytes.extend_from_slice(ASSET_LAB_ARTIFACT_MAGIC);
+    bytes.extend_from_slice(&display.scale.to_le_bytes());
+    for value in display.translation {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(glb);
+    Ok(bytes)
+}
+
+fn decode_asset_lab_artifact(bytes: &[u8]) -> Result<Option<(AssetLabDisplay, &[u8])>, String> {
+    let v2 = bytes.starts_with(ASSET_LAB_ARTIFACT_MAGIC);
+    let v1 = bytes.starts_with(ASSET_LAB_ARTIFACT_V1_MAGIC);
+    if !v2 && !v1 {
+        return Ok(None);
+    }
+    let header = if v2 {
+        ASSET_LAB_ARTIFACT_HEADER
+    } else {
+        ASSET_LAB_ARTIFACT_V1_HEADER
+    };
+    if bytes.len() < header {
+        return Err("truncated Asset Lab artifact header".into());
+    }
+    let display_scale = f32::from_le_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|_| "invalid Asset Lab scale field")?,
+    );
+    if !display_scale.is_finite() || display_scale <= 0.0 || display_scale > 1.0e6 {
+        return Err("invalid Asset Lab viewport scale".into());
+    }
+    let display = if v2 {
+        let mut translation = [0.0; 3];
+        for (axis, value) in translation.iter_mut().enumerate() {
+            let start = 12 + axis * 4;
+            *value = f32::from_le_bytes(
+                bytes[start..start + 4]
+                    .try_into()
+                    .map_err(|_| "invalid Asset Lab translation field")?,
+            );
+        }
+        let affine = AssetAffine {
+            scale: display_scale,
+            translation,
+        };
+        if !affine.is_valid() {
+            return Err("invalid Asset Lab viewport affine".into());
+        }
+        AssetLabDisplay::Affine(affine)
+    } else {
+        AssetLabDisplay::LegacyScale(display_scale)
+    };
+    let length_start = if v2 { 24 } else { 12 };
+    let glb_len = u64::from_le_bytes(
+        bytes[length_start..length_start + 8]
+            .try_into()
+            .map_err(|_| "invalid Asset Lab length field")?,
+    );
+    let glb_len = usize::try_from(glb_len).map_err(|_| "Asset Lab artifact is too large")?;
+    if glb_len > MAX_GLB_EXPORT_BYTES || header.checked_add(glb_len) != Some(bytes.len()) {
+        return Err("Asset Lab artifact length does not match its payload".into());
+    }
+    Ok(Some((display, &bytes[header..])))
+}
+
 /// Import the embedded fixtures into a content-addressed store, build the kind→handle catalog, and pack
 /// each asset to GPU-ready geometry + a normalized render scale. Import is the one-shot heavy op
 /// (measured here, never frame-budget-gated). Slot order is per-run (the handle in the doc is the
@@ -153,6 +328,15 @@ fn load_assets() -> AssetsRuntime {
     let sphere = store
         .import(&importer, SPHERE_GLB)
         .expect("import sphere.glb");
+    let moba_hero = store
+        .import(&importer, MOBA_HERO_GLB)
+        .expect("import moba_hero.glb");
+    let moba_minion = store
+        .import(&importer, MOBA_MINION_GLB)
+        .expect("import moba_minion.glb");
+    let moba_tower = store
+        .import(&importer, MOBA_TOWER_GLB)
+        .expect("import moba_tower.glb");
 
     // M11.1 — re-import any PERSISTED asset bytes (generated meshes / user File→Import) from the
     // content-addressed sidecar dir, so a handle saved in the `.mtk` doc re-resolves after reload (closes
@@ -161,9 +345,62 @@ fn load_assets() -> AssetsRuntime {
     // A corrupt blob is skipped by `load_all` (content/name mismatch), never trusted.
     let blob_dir = sidecar("metrocalk-assets");
     let mut blobs_loaded = 0usize;
-    for (_id, bytes) in metrocalk_editor_shell::blobstore::load_all(&blob_dir) {
-        if reimport_persisted_blob(&mut store, &importer, &bytes) {
-            blobs_loaded += 1;
+    let mut pipe_recipes = HashMap::new();
+    let mut authored_affines: HashMap<String, AssetAffine> = HashMap::new();
+    let mut animation_assets: HashMap<String, metrocalk_assets::AnimationAsset> = HashMap::new();
+    for (id, bytes) in metrocalk_editor_shell::blobstore::load_all(&blob_dir) {
+        if matches!(detect(&bytes), Some(Detected::Gltf)) {
+            if let Ok(Some(animation)) = import_repository_animation(
+                &importer,
+                &bytes,
+                id.as_str(),
+                &format!("project://{}", id.as_str()),
+            ) {
+                install_current_animation_asset_revision(
+                    &mut animation_assets,
+                    id.as_str().to_owned(),
+                    animation,
+                );
+            }
+        }
+        match decode_asset_lab_artifact(&bytes) {
+            Ok(Some((display, glb))) => match importer.import_internal(glb) {
+                Ok(asset) => {
+                    let affine = match display {
+                        AssetLabDisplay::Affine(affine) => affine,
+                        AssetLabDisplay::LegacyScale(scale) => {
+                            let center = asset.bounds().center();
+                            AssetAffine {
+                                scale,
+                                translation: center.map(|value| -value * scale),
+                            }
+                        }
+                    };
+                    authored_affines.insert(id.as_str().to_string(), affine);
+                    store.insert(id, asset);
+                    blobs_loaded += 1;
+                }
+                Err(e) => eprintln!(
+                    "[shell] Asset Lab artifact {} contains an invalid GLB: {e}",
+                    id.as_str()
+                ),
+            },
+            Err(e) => {
+                eprintln!("[shell] Asset Lab artifact {} rejected: {e}", id.as_str());
+            }
+            Ok(None) => match decode_pipe_artifact(&bytes) {
+                Ok(Some((recipe, asset, _report))) => {
+                    pipe_recipes.insert(id.as_str().to_string(), recipe);
+                    store.insert(id, asset);
+                    blobs_loaded += 1;
+                }
+                Ok(None) => {
+                    if reimport_persisted_blob(&mut store, &importer, &bytes) {
+                        blobs_loaded += 1;
+                    }
+                }
+                Err(e) => eprintln!("[shell] pipe artifact {} rejected — {e}", id.as_str()),
+            },
         }
     }
     let import_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -182,11 +419,16 @@ fn load_assets() -> AssetsRuntime {
     .collect();
 
     // Logical asset name → handle, for marketplace entries (their `asset` field is a logical name).
-    let asset_by_name: HashMap<String, String> =
-        [("healthbar", healthbar.as_str()), ("prop", prop.as_str())]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+    let asset_by_name: HashMap<String, String> = [
+        ("healthbar", healthbar.as_str()),
+        ("prop", prop.as_str()),
+        ("moba_hero", moba_hero.as_str()),
+        ("moba_minion", moba_minion.as_str()),
+        ("moba_tower", moba_tower.as_str()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
 
     // M11.5 (ADR-044) — label the three built-in fixtures so a boot-time provenance record reads honestly;
     // anything else in the store is a user import restored from the content-addressed sidecar (its original
@@ -195,6 +437,9 @@ fn load_assets() -> AssetsRuntime {
         (healthbar.as_str(), "healthbar.glb (built-in)"),
         (prop.as_str(), "prop.glb (built-in)"),
         (sphere.as_str(), "sphere.glb (built-in)"),
+        (moba_hero.as_str(), "moba_hero.glb (RiggedFigure, CC-BY-4.0)"),
+        (moba_minion.as_str(), "moba_minion.glb (Fox, CC-BY-4.0)"),
+        (moba_tower.as_str(), "moba_tower.glb (Lantern, CC0-1.0)"),
     ]
     .into_iter()
     .collect();
@@ -202,12 +447,23 @@ fn load_assets() -> AssetsRuntime {
     let mut meshes = Vec::new();
     let mut handle_to_slot = HashMap::new();
     let mut scales = Vec::new();
+    let mut display_affines = Vec::new();
     let mut provenance: HashMap<String, metrocalk_assets::Provenance> = HashMap::new();
     for (id, asset) in store.iter() {
         let slot = meshes.len();
-        meshes.push(MeshGpu::from_asset(asset));
-        let ext = asset.bounds().max_extent();
-        scales.push(if ext > 0.0 { 0.9 / ext } else { 1.0 });
+        let affine = if pipe_recipes.contains_key(id.as_str()) {
+            AssetAffine::IDENTITY
+        } else {
+            authored_affines
+                .get(id.as_str())
+                .copied()
+                .unwrap_or_else(|| AssetAffine::unit_from_bounds(asset.bounds()))
+        };
+        let mut gpu = MeshGpu::from_asset(asset);
+        gpu.apply_affine(affine);
+        meshes.push(gpu);
+        scales.push(1.0);
+        display_affines.push(affine);
         handle_to_slot.insert(id.as_str().to_string(), slot);
         // Record provenance for every boot-loaded asset (recomputing the perceptual hash from its primary
         // texture) so near-duplicate hints + the inspector field survive a reload, not just in-session imports.
@@ -224,38 +480,690 @@ fn load_assets() -> AssetsRuntime {
             metrocalk_assets::Provenance::imported(source, id.as_str().to_string(), phash),
         );
     }
-    // M15.7 (ADR-077) — restore the DERIVED CAD render meshes (the `mtkcad:` handles a saved doc's
-    // MeshRenderer fields carry) from the cad-mesh sidecar, so a reopened project renders its imported
-    // CAD parts instead of silently degrading them to placeholder cubes. Boot cost is deserialize + GPU
-    // pack of the ~dozens of UNIQUE meshes — never a re-parse of the multi-hundred-MB source container.
-    let cad_restored =
-        metrocalk_editor_shell::load_persisted_cad_meshes(&sidecar("metrocalk-cad-meshes"));
-    if !cad_restored.is_empty() {
-        eprintln!(
-            "[shell] restored {} persisted CAD mesh(es) from the cad-mesh sidecar",
-            cad_restored.len()
-        );
-    }
-    for (handle, asset) in cad_restored {
-        let slot = meshes.len();
-        meshes.push(MeshGpu::from_asset(&asset));
-        scales.push(1.0);
-        handle_to_slot.insert(handle, slot);
-    }
     eprintln!(
         "[shell] imported {} mesh assets ({} verts total) in {import_ms:.3} ms (one-shot)",
         meshes.len(),
         meshes.iter().map(MeshGpu::vertex_count).sum::<usize>()
     );
     AssetsRuntime {
+        store,
         catalog,
         asset_by_name,
         handle_to_slot,
         scales,
+        display_affines,
         meshes,
         sphere: sphere.as_str().to_string(),
         provenance,
+        animation_assets,
+        pipe_recipes,
     }
+}
+
+/// Make a compiled Pipe Forge artifact durable and available to every runtime projection (asset store,
+/// renderer and editable-source lookup) as one checked operation. Keeping this path shared by a live bake
+/// and project recovery prevents the two lifecycle paths from drifting.
+fn persist_and_register_pipe(
+    assets: &mut AssetsRuntime,
+    shared: &Shared,
+    built: &PipeBuild,
+) -> Result<(), String> {
+    let persisted =
+        metrocalk_editor_shell::blobstore::put(&sidecar("metrocalk-assets"), &built.artifact_bytes)
+            .map_err(|e| format!("could not save the baked asset: {e}"))?;
+    if persisted.as_str() != built.handle {
+        return Err("pipe artifact identity changed while persisting".into());
+    }
+
+    if !assets.handle_to_slot.contains_key(&built.handle) {
+        // Pipe recipes are authored in metres and deliberately keep their real scale. Imported assets use
+        // normalization; procedural engineering geometry must not.
+        let gpu = MeshGpu::from_asset(&built.asset);
+        let slot = assets.meshes.len();
+        assets.meshes.push(gpu.clone());
+        assets.scales.push(1.0);
+        assets.display_affines.push(AssetAffine::IDENTITY);
+        assets.handle_to_slot.insert(built.handle.clone(), slot);
+        let mut st = shared.lock().unwrap();
+        st.meshes.push(gpu);
+        st.meshes_revision = st.meshes_revision.wrapping_add(1);
+    }
+    assets.store.insert(persisted, built.asset.clone());
+    assets
+        .pipe_recipes
+        .insert(built.handle.clone(), built.recipe.clone());
+    Ok(())
+}
+
+fn rebuild_document_pipe(expected: &str, source: &str) -> Result<PipeBuild, String> {
+    let recipe = serde_json::from_str::<PipeRecipe>(source)
+        .map_err(|_| "the editable recipe is corrupt".to_string())?;
+    let built = bake_pipe(&recipe).map_err(|e| e.to_string())?;
+    if built.handle != expected {
+        return Err("the editable recipe does not match the saved asset identity".into());
+    }
+    Ok(built)
+}
+
+/// Reconstruct missing Pipe Forge artifacts from the editable recipes carried by the scene document.
+/// This is what makes a moved/shared `.mtk` project self-healing for procedural assets: the content hash
+/// is verified before registration, and an invalid/mismatched recipe remains an explained placeholder
+/// instead of silently resolving to different geometry.
+fn restore_document_pipe_assets(
+    engine: &Engine<FlecsWorld>,
+    assets: &mut AssetsRuntime,
+    shared: &Shared,
+) -> (usize, Vec<String>) {
+    let candidates: Vec<(String, String, String)> = engine
+        .entity_ids()
+        .into_iter()
+        .filter_map(|id| {
+            let comps = engine.components_of(id);
+            let FieldValue::Str(handle) = comps
+                .get("MeshRenderer")
+                .and_then(|m| m.get(capscene::MESH_FIELD))?
+            else {
+                return None;
+            };
+            if assets.handle_to_slot.contains_key(handle) {
+                return None;
+            }
+            let FieldValue::Str(source) = comps.get("PipeRecipe").and_then(|m| m.get("source"))?
+            else {
+                return None;
+            };
+            Some((id.to_loro_key(), handle.clone(), source.clone()))
+        })
+        .collect();
+
+    let mut restored = 0usize;
+    let mut errors = Vec::new();
+    for (entity, expected, source) in candidates {
+        if assets.handle_to_slot.contains_key(&expected) {
+            continue; // another entity already restored this shared content-addressed asset
+        }
+        let result = rebuild_document_pipe(&expected, &source)
+            .and_then(|built| persist_and_register_pipe(assets, shared, &built));
+        match result {
+            Ok(()) => restored += 1,
+            Err(reason) => errors.push(format!("{entity}: {reason}")),
+        }
+    }
+    (restored, errors)
+}
+
+/// Queue only the persisted CAD meshes referenced by the active document. Deserializing and preparing
+/// hundreds of historical cache entries before the command loop used to make the editor look ready while
+/// authoring commands sat unanswered for nearly a minute. Direct, content-derived lookup runs off-thread;
+/// the single engine owner later registers the prepared results atomically through [`EngineCmd::CadAssetsReady`].
+fn queue_document_cad_assets(
+    engine: &Engine<FlecsWorld>,
+    assets: &AssetsRuntime,
+    self_tx: &Sender<EngineCmd>,
+) -> usize {
+    let handles: BTreeSet<String> = engine
+        .entity_ids()
+        .into_iter()
+        .filter_map(|entity| {
+            let components = engine.components_of(entity);
+            let FieldValue::Str(handle) = components
+                .get("MeshRenderer")
+                .and_then(|fields| fields.get(capscene::MESH_FIELD))?
+            else {
+                return None;
+            };
+            (handle.starts_with("mtkcad:") && !assets.handle_to_slot.contains_key(handle))
+                .then(|| handle.clone())
+        })
+        .collect();
+    let expected = handles.len();
+    if expected == 0 {
+        return 0;
+    }
+
+    let directory = sidecar("metrocalk-cad-meshes");
+    let tx = self_tx.clone();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let prepared = metrocalk_editor_shell::load_persisted_cad_meshes_for(&directory, &handles)
+            .into_iter()
+            .map(|(handle, asset)| {
+                let gpu = MeshGpu::from_asset(&asset);
+                (handle, asset, gpu)
+            })
+            .collect();
+        if tx
+            .send(EngineCmd::CadAssetsReady {
+                expected,
+                prepared,
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            })
+            .is_err()
+        {
+            eprintln!("[shell] CAD asset restore finished after the engine closed");
+        }
+    });
+    expected
+}
+
+fn asset_lab_source<'a>(
+    engine: &Engine<FlecsWorld>,
+    assets: &'a AssetsRuntime,
+    id: &str,
+) -> Result<(EntityId, String, &'a MeshAsset, AssetAffine), String> {
+    let entity = EntityId::from_loro_key(id)
+        .ok_or_else(|| "the selected entity id is invalid".to_string())?;
+    if !engine.entity_exists(entity) {
+        return Err("the selected entity no longer exists".into());
+    }
+    let components = engine.resolved_components(entity);
+    let handle = components
+        .get("MeshRenderer")
+        .and_then(|fields| fields.get(capscene::MESH_FIELD))
+        .and_then(|value| match value {
+            FieldValue::Str(value) if !value.is_empty() => Some(value.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "select a rendered mesh to use Asset Lab".to_string())?;
+    let asset = assets.store.get_str(&handle).ok_or_else(|| {
+        "this mesh source is unresolved; re-import or restore it before processing".to_string()
+    })?;
+    let slot = assets
+        .handle_to_slot
+        .get(&handle)
+        .copied()
+        .ok_or_else(|| "this mesh is not registered with the viewport".to_string())?;
+    let display = assets
+        .display_affines
+        .get(slot)
+        .copied()
+        .unwrap_or(AssetAffine::IDENTITY);
+    Ok((entity, handle, asset, display))
+}
+
+#[derive(Clone)]
+struct AssetLabBakeSource {
+    asset: MeshAsset,
+    transform: BakeTransform,
+    auto_aligned: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssetLabAlignmentPolicy {
+    AutoRelated,
+    WorldSpace,
+}
+
+impl AssetLabAlignmentPolicy {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("autoRelated").to_ascii_lowercase().as_str() {
+            "autorelated" | "auto-related" | "auto" => Ok(Self::AutoRelated),
+            "worldspace" | "world-space" | "world" => Ok(Self::WorldSpace),
+            other => Err(format!("unknown bake source alignment policy '{other}'")),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AutoRelated => "autoRelated",
+            Self::WorldSpace => "worldSpace",
+        }
+    }
+}
+
+/// Resolve the stable local-coordinate lineage carried by Asset Lab derivatives. Ordinary scene assets
+/// are their own root; descendants keep their original root even though review copies are placed beside
+/// one another in the viewport.
+fn asset_lab_lineage_root(engine: &Engine<FlecsWorld>, entity: EntityId) -> String {
+    engine
+        .resolved_components(entity)
+        .get(capscene::ASSET_LAB_COMPONENT)
+        .and_then(|fields| fields.get(capscene::ASSET_LAB_ROOT_FIELD))
+        .and_then(|value| match value {
+            FieldValue::Str(root) if !root.is_empty() => Some(root.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| entity.to_loro_key())
+}
+
+fn asset_lab_aligned_source_transform(
+    policy: AssetLabAlignmentPolicy,
+    target_root: &str,
+    source_root: &str,
+    target_transform: BakeTransform,
+    source_world_transform: BakeTransform,
+) -> (BakeTransform, bool) {
+    let auto_aligned = policy == AssetLabAlignmentPolicy::AutoRelated && source_root == target_root;
+    if auto_aligned {
+        (target_transform, true)
+    } else {
+        (source_world_transform, false)
+    }
+}
+
+/// Compose the canonical asset-local display affine with the entity's exact world TRS. Gizmo matrices are
+/// column-major; the conditioning boundary is explicitly row-major, so the transpose here is intentional.
+fn asset_lab_bake_transform(world: GizmoTransform, display: AssetAffine) -> BakeTransform {
+    let display_matrix = [
+        [display.scale, 0.0, 0.0, 0.0],
+        [0.0, display.scale, 0.0, 0.0],
+        [0.0, 0.0, display.scale, 0.0],
+        [
+            display.translation[0],
+            display.translation[1],
+            display.translation[2],
+            1.0,
+        ],
+    ];
+    let columns = metrocalk_gizmo::mat_mul(world.to_matrix(), display_matrix);
+    let mut rows = [[0.0_f32; 4]; 4];
+    for row in 0..4 {
+        for column in 0..4 {
+            rows[row][column] = columns[column][row];
+        }
+    }
+    BakeTransform { matrix: rows }
+}
+
+fn optimization_preset(value: Option<&str>) -> Result<OptimizationPreset, String> {
+    match value.unwrap_or("balanced").to_ascii_lowercase().as_str() {
+        "draft" => Ok(OptimizationPreset::Draft),
+        "balanced" => Ok(OptimizationPreset::Balanced),
+        "highquality" | "high-quality" | "high_quality" => Ok(OptimizationPreset::HighQuality),
+        "mobile" => Ok(OptimizationPreset::Mobile),
+        "web" => Ok(OptimizationPreset::Web),
+        "desktop" => Ok(OptimizationPreset::Desktop),
+        "cinematic" => Ok(OptimizationPreset::Cinematic),
+        other => Err(format!("unknown optimization preset '{other}'")),
+    }
+}
+
+fn normal_repair_mode(value: Option<&str>) -> Result<NormalRepairMode, String> {
+    match value
+        .unwrap_or("missingOrInvalid")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "preserve" => Ok(NormalRepairMode::Preserve),
+        "missingorinvalid" | "missing-or-invalid" => Ok(NormalRepairMode::MissingOrInvalid),
+        "recomputeareaweightedsmooth" | "recompute-area-weighted-smooth" => {
+            Ok(NormalRepairMode::RecomputeAreaWeightedSmooth)
+        }
+        other => Err(format!("unknown normal repair mode '{other}'")),
+    }
+}
+
+fn apply_material_preset(asset: &mut MeshAsset, preset: Option<&str>) -> Result<String, String> {
+    let (label, base_color, metallic, roughness) = match preset
+        .unwrap_or("studio-paint")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "studio-paint" | "paint" => ("Studio Paint", [0.035, 0.18, 0.62, 1.0], 0.0, 0.24),
+        "brushed-metal" | "metal" => ("Brushed Metal", [0.42, 0.48, 0.56, 1.0], 1.0, 0.34),
+        "matte-clay" | "clay" => ("Matte Clay", [0.52, 0.21, 0.08, 1.0], 0.0, 0.82),
+        "technical-plastic" | "plastic" => {
+            ("Technical Plastic", [0.045, 0.055, 0.07, 1.0], 0.0, 0.48)
+        }
+        other => return Err(format!("unknown material preset '{other}'")),
+    };
+    if asset.materials.is_empty() {
+        asset.materials.push(Material::default());
+    }
+    for primitive in &mut asset.primitives {
+        if primitive.material >= asset.materials.len() {
+            primitive.material = 0;
+        }
+    }
+    for material in &mut asset.materials {
+        material.base_color = base_color;
+        material.metallic = metallic;
+        material.roughness = roughness;
+    }
+    Ok(label.into())
+}
+
+fn build_asset_lab_variant(
+    source: &MeshAsset,
+    display: AssetAffine,
+    target_transform: BakeTransform,
+    bake_sources: &[AssetLabBakeSource],
+    request: &AssetLabProcessRequest,
+) -> Result<AssetLabBuilt, AssetLabBuildError> {
+    let source_name = if source.name.trim().is_empty() {
+        "Asset"
+    } else {
+        source.name.trim()
+    };
+    let (asset, report, operation_label, bake_evidence) = match request
+        .operation
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "repair" => {
+            let defaults = CleanupConfig::default();
+            let result = cleanup_asset(
+                source,
+                &CleanupConfig {
+                    weld_threshold: request.weld_threshold.unwrap_or(defaults.weld_threshold),
+                    preserve_attribute_seams: request.preserve_attribute_seams,
+                    remove_degenerate_triangles: request
+                        .remove_degenerate_triangles
+                        .unwrap_or(defaults.remove_degenerate_triangles),
+                    remove_duplicate_triangles: request
+                        .remove_duplicate_triangles
+                        .unwrap_or(defaults.remove_duplicate_triangles),
+                    remove_isolated_vertices: request
+                        .remove_isolated_vertices
+                        .unwrap_or(defaults.remove_isolated_vertices),
+                    remove_components_smaller_than_triangles: request
+                        .remove_components_smaller_than_triangles
+                        .unwrap_or(defaults.remove_components_smaller_than_triangles),
+                    repair_winding: request.repair_winding.unwrap_or(defaults.repair_winding),
+                    normal_repair: normal_repair_mode(request.normal_repair.as_deref())?,
+                    ..defaults
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            if result.asset == *source {
+                return Err("the audit found no safe repair changes to apply".into());
+            }
+            (result.asset, result.report, "Repaired".to_string(), None)
+        }
+        "uv" | "generate-uv" => {
+            let mode = request
+                .preset
+                .as_deref()
+                .unwrap_or("chart")
+                .to_ascii_lowercase();
+            if mode == "chart" || mode == "xatlas" || mode == "chartunwrap" {
+                let before =
+                    audit_asset(source, &AuditOptions::default()).map_err(|e| e.to_string())?;
+                let prepared = cleanup_asset(
+                    source,
+                    &CleanupConfig {
+                        preserve_attribute_seams: true,
+                        normal_repair: NormalRepairMode::MissingOrInvalid,
+                        ..CleanupConfig::default()
+                    },
+                )
+                .map_err(|e| e.to_string())?
+                .asset;
+                let charted = XatlasUvUnwrapper
+                    .unwrap(
+                        &prepared,
+                        &ChartUvConfig {
+                            resolution: request.resolution.unwrap_or(2_048),
+                            padding: request.padding_px.unwrap_or(8),
+                            texels_per_unit: request.texels_per_unit,
+                            max_iterations: 4,
+                            block_align: true,
+                            brute_force: true,
+                            replace_textured_uv0: request.replace_textured_uv0,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                let after = audit_asset(&charted.asset, &AuditOptions::default())
+                    .map_err(|e| e.to_string())?;
+                let report = AssetChangeReport {
+                    before,
+                    after,
+                    changes: vec![format!(
+                        "packed {} charts into {}x{} with {:.1}% utilization and {:.1} px/unit mean density; {} chart/tangent seam vertices added",
+                        charted.report.charts,
+                        charted.report.atlas_width,
+                        charted.report.atlas_height,
+                        charted.report.utilization * 100.0,
+                        charted.report.mean_texel_density,
+                        charted.report.chart_split_vertices + charted.report.tangent_split_vertices,
+                    )],
+                    warnings: vec![charted.report.determinism],
+                };
+                (
+                    charted.asset,
+                    report,
+                    "Chart UV + MikkTSpace".to_string(),
+                    None,
+                )
+            } else {
+                let uv_generation = match mode.as_str() {
+                    "planarwhenabsent" | "planar-when-absent" => UvGenerationMode::PlanarWhenAbsent,
+                    "replaceincompletewithplanar" | "replace-incomplete-with-planar" => {
+                        UvGenerationMode::ReplaceIncompleteWithPlanar
+                    }
+                    other => return Err(format!("unknown UV preparation mode '{other}'").into()),
+                };
+                let result = cleanup_asset(
+                    source,
+                    &CleanupConfig {
+                        preserve_attribute_seams: request.preserve_attribute_seams,
+                        normal_repair: NormalRepairMode::MissingOrInvalid,
+                        uv_generation,
+                        ..CleanupConfig::default()
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                if result.asset == *source {
+                    return Err("this asset already has a complete UV0 stream".into());
+                }
+                (
+                    result.asset,
+                    result.report,
+                    "Planar UV Prepared".to_string(),
+                    None,
+                )
+            }
+        }
+        "optimize" => {
+            let result = optimize_asset(
+                source,
+                &OptimizationConfig {
+                    preset: optimization_preset(request.preset.as_deref())?,
+                    target_ratio: request.target_ratio,
+                    candidate_levels: request.candidate_levels.unwrap_or(10),
+                    base_fraction: request.base_fraction.unwrap_or(0.003),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            (result.asset, result.report, "Optimized".to_string(), None)
+        }
+        "bake" | "bake-textures" => {
+            if bake_sources.is_empty() {
+                return Err("choose at least one high-detail source mesh for the bake".into());
+            }
+            let requested_maps: BTreeSet<String> = request
+                .maps
+                .iter()
+                .map(|map| map.to_ascii_lowercase())
+                .collect();
+            if requested_maps.is_empty() {
+                return Err("choose at least one bake map".into());
+            }
+            let unsupported: Vec<_> = requested_maps
+                .iter()
+                .filter(|map| {
+                    !matches!(
+                        map.as_str(),
+                        "normal" | "ambientocclusion" | "ambient-occlusion" | "ao" | "curvature"
+                    )
+                })
+                .cloned()
+                .collect();
+            if !unsupported.is_empty() {
+                return Err(format!(
+                    "unsupported projection map(s): {}; this baker emits normal, ambient occlusion and signed curvature",
+                    unsupported.join(", ")
+                )
+                .into());
+            }
+            let bake_normal = requested_maps.contains("normal");
+            let bake_ao = requested_maps.contains("ambientocclusion")
+                || requested_maps.contains("ambient-occlusion")
+                || requested_maps.contains("ao");
+            let bake_curvature = requested_maps.contains("curvature");
+            let resolution = request.resolution.unwrap_or(1_024);
+            let ao_samples = request.ao_samples.unwrap_or(16);
+            let required_hit_ratio = request.min_projection_hit_ratio.unwrap_or(0.9);
+            let alignment_policy =
+                AssetLabAlignmentPolicy::parse(request.alignment_policy.as_deref())?;
+            let auto_aligned_sources = bake_sources
+                .iter()
+                .filter(|source| source.auto_aligned)
+                .count();
+            let world_space_sources = bake_sources.len().saturating_sub(auto_aligned_sources);
+            let requested_maps: Vec<String> = requested_maps.iter().cloned().collect();
+            let estimated_rays = u64::from(resolution)
+                .saturating_mul(u64::from(resolution))
+                .saturating_mul(2 + if bake_ao { u64::from(ao_samples) } else { 0 });
+            let sources: Vec<BakeSource<'_>> = bake_sources
+                .iter()
+                .map(|source| BakeSource {
+                    asset: &source.asset,
+                    transform: source.transform,
+                })
+                .collect();
+            let result = CpuTextureBaker.bake_unobserved(
+                source,
+                target_transform,
+                &sources,
+                &BakeConfig {
+                    resolution,
+                    padding: request.padding_px.unwrap_or(16),
+                    cage_distance: request.cage_distance.unwrap_or(0.1),
+                    ray_bias: 1.0e-4,
+                    ao_distance: request.ao_distance.unwrap_or(0.25),
+                    ao_samples,
+                    curvature_scale: request.curvature_scale.unwrap_or(0.05),
+                    bake_normal,
+                    bake_ao,
+                    bake_curvature,
+                    match_normal_orientation: true,
+                    min_projection_hit_ratio: required_hit_ratio,
+                    max_source_triangles: 5_000_000,
+                    max_output_bytes: 512 * 1_024 * 1_024,
+                    max_rays: estimated_rays.saturating_add(1),
+                },
+            );
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    let bake_evidence = match error {
+                        BakeError::InsufficientProjection {
+                            covered_texels,
+                            projected_texels,
+                            minimum_hit_ratio_millionths,
+                        } => {
+                            let atlas_texels = resolution as usize * resolution as usize;
+                            Some(AssetLabBakeEvidence {
+                                resolution,
+                                requested_maps,
+                                source_count: bake_sources.len(),
+                                source_triangles: bake_sources
+                                    .iter()
+                                    .map(|source| source.asset.triangle_count())
+                                    .sum(),
+                                charts: 0,
+                                atlas_texels,
+                                covered_texels,
+                                projected_texels,
+                                projection_misses: covered_texels.saturating_sub(projected_texels),
+                                dilated_texels: 0,
+                                coverage_ratio: covered_texels as f32 / atlas_texels as f32,
+                                projection_hit_ratio: if covered_texels == 0 {
+                                    0.0
+                                } else {
+                                    projected_texels as f32 / covered_texels as f32
+                                },
+                                required_hit_ratio: minimum_hit_ratio_millionths as f32
+                                    / 1_000_000.0,
+                                alignment_policy: alignment_policy.label().into(),
+                                auto_aligned_sources,
+                                world_space_sources,
+                            })
+                        }
+                        _ => None,
+                    };
+                    return Err(AssetLabBuildError {
+                        message: error.to_string(),
+                        bake_evidence: bake_evidence.map(Box::new),
+                    });
+                }
+            };
+            let asset = result
+                .maps
+                .attach_to(&result.conditioned_target)
+                .map_err(|error| error.to_string())?;
+            let before =
+                audit_asset(source, &AuditOptions::default()).map_err(|e| e.to_string())?;
+            let after = audit_asset(&asset, &AuditOptions::default()).map_err(|e| e.to_string())?;
+            let report = AssetChangeReport {
+                before,
+                after,
+                changes: vec![format!(
+                    "baked {}x{} maps from {} high-detail source(s): {}/{} texels projected, {} AO rays occluded, curvature [{:.5}, {:.5}]",
+                    resolution,
+                    resolution,
+                    bake_sources.len(),
+                    result.report.projected_texels,
+                    result.report.covered_texels,
+                    result.report.occluded_rays,
+                    result.report.min_curvature,
+                    result.report.max_curvature,
+                )],
+                warnings: vec![result.report.determinism],
+            };
+            let bake_evidence = AssetLabBakeEvidence {
+                resolution,
+                requested_maps,
+                source_count: bake_sources.len(),
+                source_triangles: result.report.source_triangles,
+                charts: result.report.charts,
+                atlas_texels: resolution as usize * resolution as usize,
+                covered_texels: result.report.covered_texels,
+                projected_texels: result.report.projected_texels,
+                projection_misses: result.report.projection_misses,
+                dilated_texels: result.report.dilated_texels,
+                coverage_ratio: result.report.coverage_ratio,
+                projection_hit_ratio: result.report.projection_hit_ratio,
+                required_hit_ratio,
+                alignment_policy: alignment_policy.label().into(),
+                auto_aligned_sources,
+                world_space_sources,
+            };
+            (asset, report, "Baked Maps".to_string(), Some(bake_evidence))
+        }
+        "material" => {
+            let before =
+                audit_asset(source, &AuditOptions::default()).map_err(|e| e.to_string())?;
+            let mut asset = source.clone();
+            let preset = apply_material_preset(&mut asset, request.preset.as_deref())?;
+            let after = audit_asset(&asset, &AuditOptions::default()).map_err(|e| e.to_string())?;
+            let report = AssetChangeReport {
+                before,
+                after,
+                changes: vec![format!("applied the {preset} PBR factor preset")],
+                warnings: if asset.textures.is_empty() {
+                    Vec::new()
+                } else {
+                    vec!["the preset multiplies existing texture maps; texture pixels were preserved".into()]
+                },
+            };
+            (asset, report, preset, None)
+        }
+        other => return Err(format!("unknown Asset Lab operation '{other}'").into()),
+    };
+
+    let glb =
+        export_glb(&asset).map_err(|e| format!("could not package the result as GLB: {e}"))?;
+    let artifact = encode_asset_lab_artifact(display, &glb)?;
+    Ok(AssetLabBuilt {
+        asset,
+        artifact,
+        report,
+        variant_name: format!("{source_name} — {operation_label}"),
+        operation_label,
+        bake_evidence,
+    })
 }
 
 /// A ranked compatible target the selection can bind to (north-star test #1).
@@ -310,6 +1218,468 @@ struct JointInfoResp {
     keys: usize,
 }
 
+/// Animation workspace read model. Every value here is derived from the authoritative component document,
+/// the compiled kernel plan, or measured asset streams; it is never a second authored scene model.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationPropertyInfo {
+    component: String,
+    property: String,
+    label: String,
+    value_kind: String,
+    value: serde_json::Value,
+    animatable: bool,
+    reason: Option<String>,
+    context: String,
+    editor_kind: String,
+    binding_state: String,
+    binding_reason: String,
+    runtime_sink: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationKeyInfo {
+    id: String,
+    tick: i64,
+    seconds: f64,
+    value: serde_json::Value,
+    in_tangent: Option<serde_json::Value>,
+    out_tangent: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationTrackInfo {
+    id: String,
+    name: String,
+    target_id: String,
+    target_name: String,
+    component: String,
+    property: String,
+    value_kind: String,
+    interpolation: String,
+    enabled: bool,
+    locked: bool,
+    context: String,
+    editor_kind: String,
+    binding_state: String,
+    binding_reason: String,
+    runtime_sink: Option<String>,
+    keys: Vec<AnimationKeyInfo>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationMarkerInfo {
+    id: String,
+    owner_id: String,
+    name: String,
+    tick: i64,
+    seconds: f64,
+    color: Option<[u8; 4]>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationEventInfo {
+    id: String,
+    owner_id: String,
+    name: String,
+    tick: i64,
+    seconds: f64,
+    payload: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationContextReadiness {
+    context: String,
+    state: String,
+    properties: usize,
+    tracks: usize,
+    reason: String,
+    action: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationCapabilityFact {
+    capability: String,
+    state: String,
+    reason: String,
+    action: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationAssetProfile {
+    display_name: String,
+    source: String,
+    provenance: String,
+    quality_grade: String,
+    logical_id: Option<String>,
+    revision_id: Option<String>,
+    import_state: Option<String>,
+    dependency_count: usize,
+    source_location: Option<String>,
+    watches_source: bool,
+    reimport_diagnostics: usize,
+    skeleton_joints: usize,
+    clip_count: usize,
+    morph_targets: usize,
+    root_motion: String,
+    reimport_binding: String,
+    clip_instance_revision: String,
+    clips: Vec<AnimationImportedClipInfo>,
+    capabilities: Vec<AnimationCapabilityFact>,
+    suggestions: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationImportedClipInfo {
+    clip_id: String,
+    sequence_id: String,
+    name: String,
+    duration_tick: i64,
+    source_binding_hash: String,
+    source_targets: Vec<String>,
+    source_target_ids: Vec<String>,
+    source_bindings: Vec<AnimationImportedSourceBindingInfo>,
+    channels: Vec<String>,
+    readiness: String,
+    reason: String,
+    action: Option<String>,
+    instance_id: Option<String>,
+    target_mappings: Vec<AnimationClipTargetMappingRequest>,
+    repair_changes: Vec<String>,
+    instances: Vec<AnimationImportedClipInstanceInfo>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationImportedClipInstanceInfo {
+    instance_id: String,
+    name: String,
+    readiness: String,
+    reason: String,
+    target_mappings: Vec<AnimationClipTargetMappingRequest>,
+    repair_changes: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationImportedSourceBindingInfo {
+    source_target_id: String,
+    source_target_label: String,
+    component: String,
+    property: String,
+    value_kind: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationIssueInfo {
+    severity: String,
+    code: String,
+    message: String,
+    fix: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationWorkspaceInfo {
+    revision: String,
+    sequence_id: String,
+    sequence_name: String,
+    ticks_per_second: u32,
+    duration_tick: i64,
+    current_tick: i64,
+    playing: bool,
+    loop_policy: String,
+    selected_id: Option<String>,
+    selected_name: Option<String>,
+    properties: Vec<AnimationPropertyInfo>,
+    tracks: Vec<AnimationTrackInfo>,
+    markers: Vec<AnimationMarkerInfo>,
+    events: Vec<AnimationEventInfo>,
+    contexts: Vec<AnimationContextReadiness>,
+    asset: Option<AnimationAssetProfile>,
+    issues: Vec<AnimationIssueInfo>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationEditResult {
+    ok: bool,
+    message: String,
+    track_id: Option<String>,
+    key_id: Option<String>,
+    state: AnimationWorkspaceInfo,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationClipInstanceSaveRequest {
+    expected_revision: String,
+    request_id: String,
+    instance_id: String,
+    name: String,
+    logical_asset_id: String,
+    expected_asset_revision: String,
+    clip_id: String,
+    expected_source_binding_hash: String,
+    #[serde(default)]
+    target_mappings: Vec<AnimationClipTargetMappingRequest>,
+    target_id: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AnimationClipTargetMappingRequest {
+    source_target_id: String,
+    target_id: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationClipInstanceSaveResult {
+    ok: bool,
+    message: String,
+    instance_id: Option<String>,
+    state: AnimationWorkspaceInfo,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationPlaybackInfo {
+    ok: bool,
+    message: String,
+    current_tick: i64,
+    duration_tick: i64,
+    playing: bool,
+    imported_clip_preview_active: bool,
+    loop_policy: String,
+    evaluated_tracks: usize,
+    crossed_events: Vec<AnimationEventInfo>,
+    events_truncated: bool,
+}
+
+// Animation-graph IPC deliberately uses JSON for the authored document/value leaves at this outermost
+// Tauri seam. The authoritative typed schema lives in `editor-shell::animation_graph_intent`; keeping the
+// transport envelope independent lets the engine return a precise validation response even when a newer
+// or malformed document cannot be deserialized as the current schema.
+const ANIMATION_GRAPH_SCHEMA_VERSION: u32 = 2;
+const MAX_ANIMATION_GRAPH_DEBUG_NODES: usize = 64;
+const MAX_ANIMATION_GRAPH_DEBUG_EDGES: usize = 128;
+const MAX_ANIMATION_GRAPH_DEBUG_WATCHES: usize = 32;
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphSaveRequest {
+    schema_version: u32,
+    expected_revision: String,
+    request_id: String,
+    graph: serde_json::Value,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphPortInfo {
+    id: String,
+    label: String,
+    direction: String,
+    kind: String,
+    required: bool,
+    multiple: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphNodePresentation {
+    node_id: String,
+    ports: Vec<AnimationGraphPortInfo>,
+    readiness: String,
+    readiness_reason: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphSourceInfo {
+    id: String,
+    name: String,
+    kind: String,
+    logical_asset_id: Option<String>,
+    revision_id: Option<String>,
+    duration_tick: i64,
+    readiness: String,
+    reason: String,
+    action: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphDiagnosticInfo {
+    id: String,
+    severity: String,
+    code: String,
+    message: String,
+    fix: Option<String>,
+    node_id: Option<String>,
+    edge_id: Option<String>,
+    port_id: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphCompileInfo {
+    state: String,
+    authored_revision: String,
+    compiled_revision: Option<String>,
+    compiled_hash: Option<String>,
+    last_good_revision: Option<String>,
+    last_good_hash: Option<String>,
+    message: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphStateInfo {
+    schema_version: u32,
+    sequence_id: String,
+    revision: String,
+    graph: Option<serde_json::Value>,
+    node_presentation: Vec<AnimationGraphNodePresentation>,
+    sources: Vec<AnimationGraphSourceInfo>,
+    compile: AnimationGraphCompileInfo,
+    diagnostics: Vec<AnimationGraphDiagnosticInfo>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphSaveResult {
+    ok: bool,
+    message: String,
+    state: AnimationGraphStateInfo,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphDeleteResult {
+    ok: bool,
+    message: String,
+    state: AnimationGraphStateInfo,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphActiveNode {
+    node_id: String,
+    weight: f64,
+    local_tick: i64,
+    state_id: Option<String>,
+    cost_micros: Option<u64>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphActiveEdge {
+    edge_id: String,
+    weight: f64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphTransitionDebug {
+    transition_id: String,
+    from_state_id: String,
+    to_state_id: String,
+    elapsed_tick: i64,
+    duration_tick: i64,
+    progress: f64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphWatchValue {
+    id: String,
+    value: serde_json::Value,
+    source: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphDebugInfo {
+    graph_id: String,
+    graph_revision: String,
+    compiled_hash: String,
+    instance_id: String,
+    raw_tick: i64,
+    local_tick: i64,
+    active_nodes: Vec<AnimationGraphActiveNode>,
+    active_edges: Vec<AnimationGraphActiveEdge>,
+    transition: Option<AnimationGraphTransitionDebug>,
+    parameter_values: BTreeMap<String, serde_json::Value>,
+    watches: Vec<AnimationGraphWatchValue>,
+    events_truncated: bool,
+    evaluation_cost_micros: Option<u64>,
+    truncated: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationGraphPreviewResult {
+    ok: bool,
+    message: String,
+    accepted: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationKeyUpdateRequest {
+    key_id: String,
+    tick: Option<i64>,
+    value: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_animation_value_patch")]
+    in_tangent: AnimationValuePatch,
+    #[serde(default, deserialize_with = "deserialize_animation_value_patch")]
+    out_tangent: AnimationValuePatch,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnimationKeyDeleteRequest {
+    target_id: String,
+    track_id: String,
+    key_id: String,
+}
+
+/// Three-state patch semantics are required here: an omitted tangent leaves authored data untouched,
+/// an explicit JSON `null` clears it, and a value replaces it. `Option<Value>` collapses the first two
+/// states during Serde deserialization and made the curve editor unable to remove tangents.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum AnimationValuePatch {
+    #[default]
+    Unchanged,
+    Clear,
+    Set(serde_json::Value),
+}
+
+fn deserialize_animation_value_patch<'de, D>(
+    deserializer: D,
+) -> Result<AnimationValuePatch, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(value) => AnimationValuePatch::Set(value),
+            None => AnimationValuePatch::Clear,
+        },
+    )
+}
+
 /// One row of the M15.7 (ADR-077) import report — a CAD part entity + its honesty class. The `fidelity`
 /// token is read straight off the persisted `CadPart` component (survives reload), so this is the
 /// ECS-native "explain every no" surface ("show tessellation-only parts"), not a side copy.
@@ -319,6 +1689,11 @@ struct CadReportPart {
     id: String,
     name: String,
     fidelity: String,
+    reference: Option<String>,
+    strategy: Option<String>,
+    reason: Option<String>,
+    fix: Option<String>,
+    source_format: Option<String>,
 }
 
 /// The per-part import report aggregated from the ECS: the fidelity breakdown (the header line) + a capped
@@ -444,6 +1819,165 @@ struct ProjectInfoResp {
     error: Option<String>,
 }
 
+/// One progressive Asset Lab operation. Presets are strings at the IPC boundary so older UI builds can
+/// receive an explained error instead of failing deserialization when a new preset is introduced.
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct AssetLabProcessRequest {
+    operation: String,
+    #[serde(default)]
+    preset: Option<String>,
+    #[serde(default)]
+    target_ratio: Option<f32>,
+    #[serde(default)]
+    candidate_levels: Option<u8>,
+    #[serde(default)]
+    base_fraction: Option<f32>,
+    #[serde(default)]
+    weld_threshold: Option<f32>,
+    #[serde(default)]
+    remove_degenerate_triangles: Option<bool>,
+    #[serde(default)]
+    remove_duplicate_triangles: Option<bool>,
+    #[serde(default)]
+    remove_isolated_vertices: Option<bool>,
+    #[serde(default)]
+    remove_components_smaller_than_triangles: Option<usize>,
+    #[serde(default)]
+    repair_winding: Option<bool>,
+    #[serde(default)]
+    normal_repair: Option<String>,
+    #[serde(default = "default_true")]
+    preserve_attribute_seams: bool,
+    #[serde(default)]
+    resolution: Option<u32>,
+    #[serde(default)]
+    padding_px: Option<u32>,
+    #[serde(default)]
+    texels_per_unit: Option<f32>,
+    #[serde(default)]
+    replace_textured_uv0: bool,
+    #[serde(default)]
+    high_source_ids: Vec<String>,
+    #[serde(default)]
+    maps: Vec<String>,
+    #[serde(default)]
+    cage_distance: Option<f32>,
+    #[serde(default)]
+    ao_distance: Option<f32>,
+    #[serde(default)]
+    ao_samples: Option<u32>,
+    #[serde(default)]
+    curvature_scale: Option<f32>,
+    /// `autoRelated` removes only Asset Lab comparison offsets for sources in the target's lineage;
+    /// `worldSpace` preserves every authored transform for already-registered scan/source workflows.
+    #[serde(default)]
+    alignment_policy: Option<String>,
+    /// Quality floor applied by the bake kernel before a derivative can be published.
+    #[serde(default)]
+    min_projection_hit_ratio: Option<f32>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Machine-readable proof that a texture payload contains actual high-to-low projection work rather
+/// than merely having the requested dimensions.
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct AssetLabBakeEvidence {
+    resolution: u32,
+    requested_maps: Vec<String>,
+    source_count: usize,
+    source_triangles: usize,
+    charts: usize,
+    atlas_texels: usize,
+    covered_texels: usize,
+    projected_texels: usize,
+    projection_misses: usize,
+    dilated_texels: usize,
+    coverage_ratio: f32,
+    projection_hit_ratio: f32,
+    required_hit_ratio: f32,
+    alignment_policy: String,
+    auto_aligned_sources: usize,
+    world_space_sources: usize,
+}
+
+/// Evidence returned to the editor after inspect/process/export. `change` always contains the exact
+/// measured before/after reports for a derived variant; unsupported work is `ok=false` with a reason.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct AssetLabResponse {
+    ok: bool,
+    message: String,
+    source_entity: Option<String>,
+    source_handle: Option<String>,
+    created_entity: Option<String>,
+    created_handle: Option<String>,
+    audit: Option<AssetAuditReport>,
+    change: Option<AssetChangeReport>,
+    warnings: Vec<String>,
+    exported_path: Option<String>,
+    bake_evidence: Option<AssetLabBakeEvidence>,
+}
+
+/// One machine-readable complete-scene export fidelity fact.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SceneExportFidelityResp {
+    status: String,
+    feature: String,
+    count: usize,
+    detail: String,
+}
+
+/// Complete-scene export result surfaced by the Export stage and automation evidence.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SceneExportResponse {
+    ok: bool,
+    message: String,
+    format: String,
+    exported_path: Option<String>,
+    nodes: usize,
+    meshes: usize,
+    skins: usize,
+    animations: usize,
+    fidelity: Vec<SceneExportFidelityResp>,
+}
+
+struct AssetLabBuilt {
+    asset: MeshAsset,
+    artifact: Vec<u8>,
+    report: AssetChangeReport,
+    variant_name: String,
+    operation_label: String,
+    bake_evidence: Option<AssetLabBakeEvidence>,
+}
+
+#[derive(Debug)]
+struct AssetLabBuildError {
+    message: String,
+    bake_evidence: Option<Box<AssetLabBakeEvidence>>,
+}
+
+impl From<String> for AssetLabBuildError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            bake_evidence: None,
+        }
+    }
+}
+
+impl From<&str> for AssetLabBuildError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
 /// M10.4 (ADR-034) — Play-mode state for the editor's runtime controls: `playing` = the scene is
 /// running (Play entered, not yet Stopped); `paused` = running but the sim is frozen. Both false ⇒
 /// Stopped (authoring). Mirrors the React `PlayInfo`.
@@ -457,10 +1991,21 @@ struct PlayInfo {
 /// Commands to the engine thread (which owns the `!Send` Engine).
 enum EngineCmd {
     Connect(Channel<ProjectionDelta>),
+    /// Background restore of only the derived CAD meshes referenced by the active document. CPU decode +
+    /// mesh preparation happen off-thread; registration and render publication return to this single owner.
+    CadAssetsReady {
+        expected: usize,
+        prepared: Vec<(String, MeshAsset, MeshGpu)>,
+        elapsed_ms: f64,
+    },
     Edit(EditTx),
     /// Undo the last transaction; reply whether anything was actually reverted (so the UI can be honest —
     /// "undo" vs "nothing to undo" — instead of always claiming a revert on an empty history).
     Undo {
+        reply: mpsc::Sender<bool>,
+    },
+    /// Redo the last undone transaction; mirrors Undo's projection/physics refresh and honest result.
+    Redo {
         reply: mpsc::Sender<bool>,
     },
     /// Compute the reveal for a selected entity and reply (request/response — a read).
@@ -486,6 +2031,20 @@ enum EngineCmd {
     /// Remove an entity + its edges (M3.3) — one undoable transaction.
     Remove {
         id: String,
+    },
+    /// Cook the authored scene into runnable match definitions (a read). The document lives on this
+    /// thread, so the cook runs here and only plain data crosses back to the viewport session.
+    MatchPlan {
+        reply: Sender<Result<moba::MatchPlan, moba::MobaStartError>>,
+    },
+    /// Validate the authored scene without starting anything (a read) — the continuous authoring
+    /// feedback the match panel shows while the user edits.
+    MatchValidate {
+        reply: Sender<moba::MobaValidation>,
+    },
+    /// Author a complete, playable starter match as ONE undoable transaction (invariant 3).
+    MatchAuthorStarter {
+        reply: Sender<Result<metrocalk_editor_shell::match_cook::AuthoredMatch, String>>,
     },
     /// Duplicate an entity (M3.3) — one undoable transaction; replies the new id.
     Duplicate {
@@ -547,10 +2106,195 @@ enum EngineCmd {
         id: String,
         reply: Sender<Option<JointInfoResp>>,
     },
+    /// Read the selected entity's keyable properties, universal tracks and measured asset readiness.
+    AnimationState {
+        id: Option<String>,
+        reply: Sender<AnimationWorkspaceInfo>,
+    },
+    /// Persist and compile one explicit single-rigid-target imported clip instance. The native side
+    /// revalidates asset revision, source signature, live target and every typed channel before commit.
+    AnimationClipInstanceSave {
+        request: AnimationClipInstanceSaveRequest,
+        reply: Sender<AnimationClipInstanceSaveResult>,
+    },
+    /// Revision-fenced tombstone for one explicitly chosen persisted clip instance.
+    AnimationClipInstanceDelete {
+        instance_id: String,
+        expected_revision: String,
+        selected_id: Option<String>,
+        reply: Sender<AnimationClipInstanceSaveResult>,
+    },
+    /// Compile and play the exact draft mapping without authoring it into the document.
+    AnimationClipInstancePreview {
+        request: AnimationClipInstanceSaveRequest,
+        reply: Sender<AnimationPlaybackInfo>,
+    },
+    /// Tear down an unsaved clip audition and restore the authored sequence/graph projection.
+    AnimationClipInstancePreviewStop {
+        expected_request_id: Option<String>,
+        reply: Sender<AnimationPlaybackInfo>,
+    },
+    /// Add or replace one stable property key in one undoable granular transaction.
+    AnimationKey {
+        id: String,
+        component: String,
+        property: String,
+        tick: i64,
+        interpolation: String,
+        reply: Sender<AnimationEditResult>,
+    },
+    AnimationDeleteKey {
+        id: String,
+        track_id: String,
+        key_id: String,
+        reply: Sender<AnimationEditResult>,
+    },
+    /// Validate and tombstone a cross-track selection in one authoritative undo transaction.
+    AnimationDeleteKeys {
+        selected_id: Option<String>,
+        deletes: Vec<AnimationKeyDeleteRequest>,
+        reply: Sender<AnimationEditResult>,
+    },
+    AnimationSetInterpolation {
+        id: String,
+        track_id: String,
+        interpolation: String,
+        reply: Sender<AnimationEditResult>,
+    },
+    AnimationSetTrackEnabled {
+        id: String,
+        track_id: String,
+        enabled: bool,
+        reply: Sender<AnimationEditResult>,
+    },
+    AnimationSetTrackLocked {
+        id: String,
+        track_id: String,
+        locked: bool,
+        reply: Sender<AnimationEditResult>,
+    },
+    AnimationUpdateKeys {
+        id: String,
+        track_id: String,
+        updates: Vec<AnimationKeyUpdateRequest>,
+        reply: Sender<AnimationEditResult>,
+    },
+    AnimationAddMarker {
+        id: String,
+        name: String,
+        tick: i64,
+        reply: Sender<AnimationEditResult>,
+    },
+    AnimationDeleteMarker {
+        owner_id: String,
+        marker_id: String,
+        reply: Sender<AnimationEditResult>,
+    },
+    AnimationAddEvent {
+        id: String,
+        name: String,
+        tick: i64,
+        payload: Option<serde_json::Value>,
+        reply: Sender<AnimationEditResult>,
+    },
+    AnimationDeleteEvent {
+        owner_id: String,
+        event_id: String,
+        reply: Sender<AnimationEditResult>,
+    },
+    /// Native fixed-tick preview transport. Scrub/play evaluate a render projection and never commit values.
+    AnimationTransport {
+        action: String,
+        tick: Option<i64>,
+        loop_policy: Option<String>,
+        reply: Sender<AnimationPlaybackInfo>,
+    },
+    /// Sequence-global graph authoring/readback. The selected entity is intentionally absent: changing
+    /// selection must never swap the animation graph under the author.
+    AnimationGraphState {
+        sequence_id: String,
+        reply: Sender<AnimationGraphStateInfo>,
+    },
+    AnimationGraphSave {
+        sequence_id: String,
+        request: AnimationGraphSaveRequest,
+        reply: Sender<AnimationGraphSaveResult>,
+    },
+    AnimationGraphDelete {
+        sequence_id: String,
+        graph_id: String,
+        expected_revision: String,
+        request_id: String,
+        reply: Sender<AnimationGraphDeleteResult>,
+    },
+    /// Bounded runtime facts only; poses never cross IPC.
+    AnimationGraphDebug {
+        graph_id: String,
+        instance_id: Option<String>,
+        watches: Vec<String>,
+        reply: Sender<AnimationGraphDebugInfo>,
+    },
+    /// Per-instance preview controls are transient native state and never dirty the project document.
+    AnimationGraphSetPreviewParameters {
+        graph_id: String,
+        values: BTreeMap<String, serde_json::Value>,
+        reply: Sender<AnimationGraphPreviewResult>,
+    },
+    AnimationGraphClearPreviewParameters {
+        graph_id: String,
+        reply: Sender<AnimationGraphPreviewResult>,
+    },
+    /// Worker completion is revision-fenced on the engine owner before it can replace the last-good plan.
+    AnimationGraphCompileReady {
+        sequence_id: String,
+        authored_revision: String,
+        source_hash: String,
+        source_duration: AnimationTick,
+        parameter_routes:
+            Vec<metrocalk_editor_shell::animation_graph_intent::AnimationGraphParameterRoute>,
+        edge_provenance:
+            Vec<metrocalk_editor_shell::animation_graph_intent::AnimationGraphEdgeProvenance>,
+        adapter_diagnostics: Vec<metrocalk_editor_shell::AnimationGraphDiagnostic>,
+        result:
+            Box<Result<CompiledAnimationGraph, metrocalk_animation::AnimationGraphCompileError>>,
+    },
     /// M11.5 (ADR-044) — the selected entity's asset provenance (identity/AI-flag/near-dup) — a read.
     AssetProvenance {
         id: String,
         reply: Sender<Option<ProvenanceInfo>>,
+    },
+    /// Inspect the canonical mesh behind one scene entity without mutating it.
+    AssetLabAudit {
+        id: String,
+        reply: Sender<AssetLabResponse>,
+    },
+    /// Start a source-preserving conditioning operation. Heavy geometry work runs off the engine thread.
+    AssetLabProcess {
+        id: String,
+        request: AssetLabProcessRequest,
+        reply: Sender<AssetLabResponse>,
+    },
+    /// Worker completion returns to the single owner so store registration + document landing are atomic.
+    AssetLabReady {
+        source_entity: String,
+        root_entity: String,
+        source_handle: String,
+        display: AssetAffine,
+        transform: GizmoTransform,
+        result: Box<Result<AssetLabBuilt, AssetLabBuildError>>,
+        reply: Sender<AssetLabResponse>,
+    },
+    /// Export the selected canonical asset as a standards-based GLB without touching the document.
+    AssetLabExport {
+        id: String,
+        path: String,
+        reply: Sender<AssetLabResponse>,
+    },
+    /// Snapshot the authoritative hierarchy/assets/tracks, then encode a complete scene off-thread.
+    SceneExport {
+        format: String,
+        path: String,
+        reply: Sender<SceneExportResponse>,
     },
     /// M12.1 (ADR-045) — list all authored rules (the editor Rule list) — a read.
     ListRules {
@@ -645,6 +2389,79 @@ enum EngineCmd {
         z: f32,
         name: String,
         reply: Sender<Option<String>>,
+    },
+    /// Pipe Forge — begin a render-only editable procedural run.
+    PipeStart {
+        options: PipeForgeOptions,
+        reply: Sender<PipeForgeStatus>,
+    },
+    /// Restore an existing baked procedural entity into the render-only editing session.
+    PipeEdit {
+        entity: String,
+        reply: Sender<PipeForgeStatus>,
+    },
+    /// Add one already-unprojected world point to the active run.
+    PipePoint {
+        point: [f32; 3],
+        reply: Sender<PipeForgeStatus>,
+    },
+    /// Remove the active run's last point without touching scene undo history.
+    PipeUndo {
+        reply: Sender<PipeForgeStatus>,
+    },
+    PipeBeginBranch {
+        node_id: u32,
+        diameter_cm: f32,
+        reply: Sender<PipeForgeStatus>,
+    },
+    PipeEndBranch {
+        reply: Sender<PipeForgeStatus>,
+    },
+    PipeMoveHandle {
+        node_id: u32,
+        point: [f32; 3],
+        reply: Sender<PipeForgeStatus>,
+    },
+    PipeRemoveHandle {
+        node_id: u32,
+        reply: Sender<PipeForgeStatus>,
+    },
+    PipePlaceFitting {
+        node_id: u32,
+        kind: PipeFittingKind,
+        catalog_id: Option<String>,
+        reply: Sender<PipeForgeStatus>,
+    },
+    PipeRemoveFitting {
+        fitting_id: u32,
+        reply: Sender<PipeForgeStatus>,
+    },
+    PipeUpsertCatalog {
+        entry: UserFittingCatalogEntry,
+        reply: Sender<PipeForgeStatus>,
+    },
+    PipeRemoveCatalog {
+        id: String,
+        reply: Sender<PipeForgeStatus>,
+    },
+    /// Compile in a worker; completion is revision-fenced so Cancel/new edits cannot land stale geometry.
+    PipeBake {
+        reply: Sender<PipeBakeReport>,
+    },
+    PipeBuildComplete {
+        revision: u64,
+        source: PipeRecipe,
+        editing_entity: Option<String>,
+        world_anchor: [f32; 3],
+        result: Box<Result<PipeBuild, String>>,
+        reply: Sender<PipeBakeReport>,
+    },
+    /// Cancel the preview; the authored document remains byte-identical.
+    PipeCancel {
+        reply: Sender<PipeForgeStatus>,
+    },
+    PipeStatus {
+        reply: Sender<PipeForgeStatus>,
     },
     /// M11.3 — author a Light entity (Directional/Point/Spot), one undoable commit. Replies its id.
     AddLight {
@@ -1273,9 +3090,3284 @@ struct RuleDebugInfo {
     flagged: Vec<metrocalk_core::FlaggedRule>,
 }
 
+struct AnimationPreviewState {
+    current_tick: AnimationTick,
+    playing: bool,
+    loop_policy: AnimationLoopPolicy,
+    plan: Option<CompiledSequence>,
+    last_error: Option<String>,
+    crossed_events: Vec<AnimationEventInfo>,
+    event_overflowed: bool,
+    clip_instances: BTreeMap<String, NativeClipInstance>,
+    clip_instance_revision: String,
+    clip_instance_refresh_fence: Option<String>,
+    clip_instance_issues: Vec<AnimationIssueInfo>,
+    /// One unsaved, explicitly mapped imported clip audition. It uses the exact compiled draft that
+    /// Save would persist, but remains render-only and is torn down on stop or any source/target fence change.
+    transient_clip: Option<NativeClipInstance>,
+    transient_clip_fence: Option<String>,
+    /// The setup draft that owns `transient_clip`. A delayed Stop from an older dialog must not tear
+    /// down a newer audition that won the race.
+    transient_clip_request_id: Option<String>,
+    /// Auditions temporarily force Once playback, but teardown restores the user's authored transport
+    /// policy instead of leaking preview-only state into normal graph playback.
+    transient_previous_loop_policy: Option<AnimationLoopPolicy>,
+    /// Independent wall-clock lease. Completion normally restores sooner, while this deadline still
+    /// guarantees teardown if playback is paused, scrubbed, or a malformed source has an extreme duration.
+    transient_clip_deadline: Option<std::time::Instant>,
+    /// Token-fenced Stop can race ahead of its async Preview invoke. Bounded tombstones make that ordering
+    /// deterministic: the later Preview consumes its exact cancellation and never installs a hidden pose.
+    cancelled_transient_clip_request_ids: VecDeque<String>,
+    graph: NativeAnimationGraphState,
+}
+
+#[derive(Clone)]
+struct NativeClipInstance {
+    document: metrocalk_editor_shell::AnimationClipInstanceDocument,
+    compiled: CompiledClipInstance,
+    sequence: metrocalk_animation::Sequence,
+}
+
+const MAX_PENDING_ANIMATION_EVENTS: usize = 256;
+const MAX_CANCELLED_TRANSIENT_CLIP_REQUESTS: usize = 64;
+const TRANSIENT_CLIP_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+const ANIMATION_RUNTIME_TIME_BASE: AnimationTimeBase =
+    AnimationTimeBase::new(metrocalk_editor_shell::DEFAULT_TICKS_PER_SECOND);
+
+impl Default for AnimationPreviewState {
+    fn default() -> Self {
+        Self {
+            current_tick: AnimationTick::ZERO,
+            playing: false,
+            loop_policy: AnimationLoopPolicy::Once,
+            plan: None,
+            last_error: None,
+            crossed_events: Vec::new(),
+            event_overflowed: false,
+            clip_instances: BTreeMap::new(),
+            clip_instance_revision: "animation-clip-instances:unloaded".into(),
+            clip_instance_refresh_fence: None,
+            clip_instance_issues: Vec::new(),
+            transient_clip: None,
+            transient_clip_fence: None,
+            transient_clip_request_id: None,
+            transient_previous_loop_policy: None,
+            transient_clip_deadline: None,
+            cancelled_transient_clip_request_ids: VecDeque::new(),
+            graph: NativeAnimationGraphState::default(),
+        }
+    }
+}
+
+/// Native, per-preview-instance graph state. Authored JSON is only a cached read projection of the ECS
+/// document; compilation/runtime state and parameter overrides are deliberately transient. A failed or
+/// pending compile never replaces `last_good_*`, which is the revision currently driving the viewport.
+struct NativeAnimationGraphState {
+    sequence_id: String,
+    revision: String,
+    graph: Option<serde_json::Value>,
+    node_presentation: Vec<AnimationGraphNodePresentation>,
+    diagnostics: Vec<AnimationGraphDiagnosticInfo>,
+    compile: AnimationGraphCompileInfo,
+    preview_parameters: BTreeMap<String, serde_json::Value>,
+    active_nodes: Vec<AnimationGraphActiveNode>,
+    active_edges: Vec<AnimationGraphActiveEdge>,
+    transition: Option<AnimationGraphTransitionDebug>,
+    events_truncated: bool,
+    debug_trace_incomplete: bool,
+    evaluation_cost_micros: Option<u64>,
+    runtime: Option<AnimationGraphRuntimeInstance>,
+    parameter_routes:
+        Vec<metrocalk_editor_shell::animation_graph_intent::AnimationGraphParameterRoute>,
+    edge_provenance:
+        Vec<metrocalk_editor_shell::animation_graph_intent::AnimationGraphEdgeProvenance>,
+    compiled_source_hash: Option<String>,
+    source_duration: Option<AnimationTick>,
+    pending_compile_key: Option<(String, String)>,
+    compile_tx: Option<Sender<EngineCmd>>,
+}
+
+impl Default for NativeAnimationGraphState {
+    fn default() -> Self {
+        let revision = "animation-graph:missing".to_owned();
+        Self {
+            sequence_id: metrocalk_editor_shell::MAIN_SEQUENCE_ID.into(),
+            revision: revision.clone(),
+            graph: None,
+            node_presentation: Vec::new(),
+            diagnostics: Vec::new(),
+            compile: AnimationGraphCompileInfo {
+                state: "missing".into(),
+                authored_revision: revision,
+                compiled_revision: None,
+                compiled_hash: None,
+                last_good_revision: None,
+                last_good_hash: None,
+                message: "No graph is authored for this sequence; the timeline plays through the implicit flat graph.".into(),
+            },
+            preview_parameters: BTreeMap::new(),
+            active_nodes: Vec::new(),
+            active_edges: Vec::new(),
+            transition: None,
+            events_truncated: false,
+            debug_trace_incomplete: false,
+            evaluation_cost_micros: None,
+            runtime: None,
+            parameter_routes: Vec::new(),
+            edge_provenance: Vec::new(),
+            compiled_source_hash: None,
+            source_duration: None,
+            pending_compile_key: None,
+            compile_tx: None,
+        }
+    }
+}
+
+fn animation_asset_by_logical_id<'a>(
+    assets: &'a AssetsRuntime,
+    logical_asset_id: &str,
+) -> Result<&'a metrocalk_assets::AnimationAsset, String> {
+    let mut matches = assets
+        .animation_assets
+        .values()
+        .filter(|asset| asset.record.effective_logical_id().as_str() == logical_asset_id);
+    let Some(asset) = matches.next() else {
+        return Err(format!(
+            "Animation asset '{logical_asset_id}' is not loaded. Reimport it before using this clip instance."
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "Animation asset identity '{logical_asset_id}' resolves to multiple loaded assets; playback is blocked until the duplicate identity is repaired."
+        ));
+    }
+    Ok(asset)
+}
+
+fn animation_clip_source_locator(clip_id: &str) -> String {
+    clip_id
+        .strip_prefix("gltf-clip:")
+        .and_then(|qualified| qualified.rsplit_once(':'))
+        .and_then(|(content_hash, animation_index)| {
+            (!content_hash.is_empty())
+                .then(|| animation_index.parse::<u32>().ok())
+                .flatten()
+        })
+        .map_or_else(
+            || format!("clip-id:{clip_id}"),
+            |animation_index| format!("gltf-animation-index:{animation_index}"),
+        )
+}
+
+fn persisted_animation_clip_locator(
+    document: &metrocalk_editor_shell::AnimationClipInstanceDocument,
+) -> String {
+    if document.clip_locator.trim().is_empty() || document.clip_locator == document.clip_id {
+        animation_clip_source_locator(&document.clip_id)
+    } else {
+        document.clip_locator.clone()
+    }
+}
+
+fn persisted_clip_corresponds_to_current(
+    document: &metrocalk_editor_shell::AnimationClipInstanceDocument,
+    current_clip_id: &AnimationClipId,
+) -> bool {
+    document.clip_id == current_clip_id.as_str()
+        || persisted_animation_clip_locator(document)
+            == animation_clip_source_locator(current_clip_id.as_str())
+}
+
+fn animation_clip_repair_changes(
+    previous: &[AnimationBinding],
+    current: &AnimationBindingSignature,
+) -> Vec<String> {
+    if previous.is_empty() {
+        return vec![
+            "This instance predates typed re-import evidence. Review every current channel before saving."
+                .into(),
+        ];
+    }
+    let previous_by_path: BTreeMap<_, _> = previous
+        .iter()
+        .map(|binding| (binding.path.clone(), binding.value_kind))
+        .collect();
+    let current_by_path: BTreeMap<_, _> = current
+        .bindings
+        .iter()
+        .map(|binding| (binding.path.clone(), binding.value_kind))
+        .collect();
+    let mut changes = Vec::new();
+    for (path, previous_kind) in &previous_by_path {
+        match current_by_path.get(path) {
+            None => changes.push(format!(
+                "Removed · {} · {}",
+                path.display_path(),
+                animation_value_kind(*previous_kind)
+            )),
+            Some(current_kind) if current_kind != previous_kind => changes.push(format!(
+                "Type changed · {} · {} → {}",
+                path.display_path(),
+                animation_value_kind(*previous_kind),
+                animation_value_kind(*current_kind)
+            )),
+            Some(_) => {}
+        }
+    }
+    for (path, current_kind) in &current_by_path {
+        if !previous_by_path.contains_key(path) {
+            changes.push(format!(
+                "Added · {} · {}",
+                path.display_path(),
+                animation_value_kind(*current_kind)
+            ));
+        }
+    }
+    if changes.is_empty() {
+        changes.push(
+            "No typed channel additions, removals, or type changes; the cooked content or timing changed."
+                .into(),
+        );
+    } else if changes.len() > 12 {
+        let remaining = changes.len() - 12;
+        changes.truncate(12);
+        changes.push(format!("…and {remaining} more channel change(s)."));
+    }
+    changes
+}
+
+fn animation_clip_sequence<'a>(
+    asset: &'a metrocalk_assets::AnimationAsset,
+    clip_id: &AnimationClipId,
+) -> Result<&'a metrocalk_animation::Sequence, String> {
+    let mut summaries = asset
+        .manifest
+        .facets
+        .iter()
+        .flat_map(|facet| facet.clips.iter())
+        .filter(|summary| &summary.clip_id == clip_id);
+    let Some(summary) = summaries.next() else {
+        return Err(format!(
+            "Clip '{clip_id}' no longer exists in the loaded asset."
+        ));
+    };
+    if summaries.next().is_some() {
+        return Err(format!(
+            "Clip identity '{clip_id}' is ambiguous in the loaded asset."
+        ));
+    }
+    let mut sequences = asset
+        .sequences
+        .iter()
+        .filter(|sequence| sequence.id == summary.sequence_id);
+    let Some(sequence) = sequences.next() else {
+        return Err(format!(
+            "Clip '{clip_id}' points to a missing source sequence '{}'.",
+            summary.sequence_id
+        ));
+    };
+    if sequences.next().is_some() {
+        return Err(format!(
+            "Clip '{clip_id}' points to an ambiguous source sequence '{}'.",
+            summary.sequence_id
+        ));
+    }
+    Ok(sequence)
+}
+
+fn imported_uniform_scale_track_is_safe(track: &metrocalk_animation::Track) -> bool {
+    // Positive uniform endpoints remain positive and uniform under Step/Linear interpolation. Cubic
+    // tangents can overshoot between keys, so this tier blocks them rather than relying on sparse samples.
+    track.interpolation != AnimationInterpolation::Cubic
+        && track.keyframes.iter().all(|key| {
+            matches!(
+                &key.value,
+                AnimValue::Vec3(value)
+                    if value.iter().all(|part| part.is_finite())
+                        && value[0] > 0.0
+                        && (value[0] - value[1]).abs() < 1.0e-9
+                        && (value[1] - value[2]).abs() < 1.0e-9
+            )
+        })
+}
+
+fn rigid_clip_admission(
+    asset: &metrocalk_assets::AnimationAsset,
+    clip_id: &AnimationClipId,
+) -> Result<
+    (
+        AnimationBindingSignature,
+        Vec<String>,
+        Vec<String>,
+        metrocalk_animation::SequenceId,
+    ),
+    String,
+> {
+    let signature = asset
+        .clip_binding_signature(clip_id)
+        .map_err(|error| format!("{error}: {}", error.issues[0].message))?;
+    let sequence = animation_clip_sequence(asset, clip_id)?;
+    let mut targets = BTreeSet::new();
+    let mut channels = BTreeSet::new();
+    for binding in &signature.bindings {
+        targets.insert(binding.path.target.clone());
+        let supported = match (
+            binding.path.component.as_str(),
+            binding.path.property.as_str(),
+            binding.value_kind,
+            binding.path.subpath.is_empty(),
+        ) {
+            ("Transform", "translation", AnimationValueKind::Vec3, true)
+            | ("Transform", "rotation", AnimationValueKind::Quaternion, true) => true,
+            ("Transform", "scale", AnimationValueKind::Vec3, true) => sequence
+                .tracks
+                .iter()
+                .filter(|track| track.binding == *binding && track.enabled)
+                .all(imported_uniform_scale_track_is_safe),
+            _ => false,
+        };
+        if !supported {
+            return Err(format!(
+                "Channel '{}' is not a safe rigid viewport channel. Skeletal, morph, arbitrary-property, structured, non-uniform, or cubic scale playback needs its dedicated target adapter.",
+                binding.path.display_path()
+            ));
+        }
+        channels.insert(format!(
+            "{} ({})",
+            binding.path.property,
+            animation_value_kind(binding.value_kind)
+        ));
+    }
+    if targets.is_empty() {
+        return Err("The clip has no enabled binding-bearing channels.".into());
+    }
+    Ok((
+        signature,
+        targets.into_iter().collect(),
+        channels.into_iter().collect(),
+        sequence.id.clone(),
+    ))
+}
+
+fn mapped_rigid_binding(
+    document: &metrocalk_editor_shell::AnimationClipInstanceDocument,
+    source: &AnimationBinding,
+) -> Option<AnimationBinding> {
+    if let Some(mapping) = document
+        .binding_rebinds
+        .iter()
+        .find(|mapping| mapping.source == *source)
+    {
+        return Some(mapping.target.clone());
+    }
+    let target = document
+        .target_rebinds
+        .iter()
+        .find(|mapping| mapping.source_target == source.path.target)?
+        .target_target
+        .clone();
+    Some(AnimationBinding {
+        path: AnimationPropertyPath {
+            target,
+            component: source.path.component.clone(),
+            property: source.path.property.clone(),
+            subpath: source.path.subpath.clone(),
+        },
+        value_kind: source.value_kind,
+    })
+}
+
+fn compile_persisted_clip_instance(
+    engine: &Engine<FlecsWorld>,
+    assets: &AssetsRuntime,
+    document: &metrocalk_editor_shell::AnimationClipInstanceDocument,
+) -> Result<NativeClipInstance, String> {
+    let asset = animation_asset_by_logical_id(assets, &document.logical_asset_id)?;
+    if asset.record.effective_revision_id().as_str() != document.revision_id {
+        return Err(format!(
+            "Clip instance '{}' pins asset revision '{}', but '{}' is loaded. Reopen setup and review the reimported channels.",
+            document.name,
+            document.revision_id,
+            asset.record.effective_revision_id().as_str()
+        ));
+    }
+    if asset.manifest.content.content_hash != document.content_hash {
+        return Err(format!(
+            "Clip instance '{}' pins different cooked content. Reopen setup instead of silently rebinding changed animation.",
+            document.name
+        ));
+    }
+    let clip_id = AnimationClipId::new(document.clip_id.clone());
+    let (source_signature, _, _, source_sequence_id) = rigid_clip_admission(asset, &clip_id)?;
+    if source_signature.signature_hash != document.expected_source_binding_hash {
+        return Err(format!(
+            "Clip instance '{}' has a stale source binding signature. Reopen setup and review every changed channel.",
+            document.name
+        ));
+    }
+    if source_sequence_id.as_str() != document.source_sequence_id {
+        return Err(format!(
+            "Clip instance '{}' points to a different source sequence after reimport.",
+            document.name
+        ));
+    }
+    let mapped: Vec<_> = source_signature
+        .bindings
+        .iter()
+        .map(|source| {
+            mapped_rigid_binding(document, source).ok_or_else(|| {
+                format!(
+                    "Source '{}' has no explicit target mapping.",
+                    source.path.display_path()
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    for binding in &mapped {
+        let Some(target) = EntityId::from_loro_key(&binding.path.target) else {
+            return Err(format!(
+                "Mapped target '{}' is not a live scene entity identity.",
+                binding.path.target
+            ));
+        };
+        if !engine.is_active(target) {
+            return Err(format!(
+                "Mapped target '{}' is deactivated. Reactivate it or repair this instance onto an active scene entity.",
+                binding.path.target
+            ));
+        }
+        if !engine.components_of(target).contains_key("Transform") {
+            return Err(format!(
+                "Mapped target '{}' no longer has a Transform component.",
+                binding.path.target
+            ));
+        }
+        if !animation_binding_is_native_projectable(binding) {
+            return Err(format!(
+                "Mapped binding '{}' has no exact typed native viewport sink.",
+                binding.path.display_path()
+            ));
+        }
+    }
+    let mut request = ClipInstantiationRequest::new(
+        document.id.clone(),
+        clip_id,
+        AnimationBindingSignature::new(mapped),
+    );
+    request.expected_source_binding_hash = Some(document.expected_source_binding_hash.clone());
+    request.target_rebinds = document.target_rebinds.clone();
+    request.binding_rebinds = document.binding_rebinds.clone();
+    request.require_rest_pose_match = document.require_rest_pose_match;
+    let runtime_time_base = ANIMATION_RUNTIME_TIME_BASE;
+    request.runtime_time_base = Some(runtime_time_base);
+    let compiled = asset.instantiate_clip(&request).map_err(|error| {
+        let details = error
+            .issues
+            .iter()
+            .map(|issue| format!("{}: {}", issue.location, issue.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("Clip instance '{}' is blocked: {details}", document.name)
+    })?;
+    if compiled.source.logical_asset_id.as_str() != document.logical_asset_id
+        || compiled.source.revision_id.as_str() != document.revision_id
+        || compiled.source.content_hash != document.content_hash
+        || compiled.source.sequence_id.as_str() != document.source_sequence_id
+    {
+        return Err(format!(
+            "Clip instance '{}' compiled from provenance that does not match its authored pin.",
+            document.name
+        ));
+    }
+    let mut sequence = animation_clip_sequence(asset, &compiled.source.clip_id)?.clone();
+    sequence.id = metrocalk_animation::SequenceId::new(document.id.clone());
+    // Core compilation deliberately retains only enabled, non-empty tracks. Mirror that exact set for
+    // graph reference-pose adaptation so disabled provenance paths neither block instancing nor leak into
+    // the live target catalog.
+    sequence
+        .tracks
+        .retain(|track| track.enabled && !track.keyframes.is_empty());
+    for track in &mut sequence.tracks {
+        let Some(mapping) = compiled
+            .rebindings
+            .iter()
+            .find(|mapping| mapping.source == track.binding)
+        else {
+            return Err(format!(
+                "Clip instance '{}' has no compiled mapping for '{}'.",
+                document.name,
+                track.binding.path.display_path()
+            ));
+        };
+        track.binding = mapping.target.clone();
+    }
+    sequence = sequence.retimed(runtime_time_base).map_err(|error| {
+        format!(
+            "Clip instance '{}' could not normalize source clock {} to runtime clock {}: {error}",
+            document.name, sequence.time_base.ticks_per_second, runtime_time_base.ticks_per_second
+        )
+    })?;
+    if sequence.time_base != compiled.plan.time_base || sequence.duration != compiled.plan.duration
+    {
+        return Err(format!(
+            "Clip instance '{}' produced inconsistent runtime clocks between graph adaptation and compiled playback.",
+            document.name
+        ));
+    }
+    Ok(NativeClipInstance {
+        document: document.clone(),
+        compiled,
+        sequence,
+    })
+}
+
+fn refresh_animation_clip_instances(
+    engine: &Engine<FlecsWorld>,
+    assets: &AssetsRuntime,
+    preview: &mut AnimationPreviewState,
+) -> bool {
+    let transient_invalidated = preview.transient_clip.as_ref().is_some_and(|instance| {
+        preview.transient_clip_fence.as_deref()
+            != Some(transient_animation_clip_live_fence(engine, assets, instance).as_str())
+    });
+    if transient_invalidated {
+        clear_transient_animation_clip_preserving_events_with_reason(
+            preview,
+            Some(
+                "The imported clip audition stopped because its source revision, target, or authored transform changed. Review the mapping before previewing again."
+                    .into(),
+            ),
+        );
+    }
+    let loaded = metrocalk_editor_shell::load_animation_clip_instances(engine);
+    let refresh_fence = animation_clip_instance_live_fence(engine, assets, &loaded);
+    if preview.clip_instance_refresh_fence.as_deref() == Some(refresh_fence.as_str()) {
+        return transient_invalidated;
+    }
+    let previous_source_hash = current_animation_graph_source_hash(preview);
+    let mut issues: Vec<_> = loaded
+        .issues
+        .into_iter()
+        .map(|issue| AnimationIssueInfo {
+            severity: match issue.severity {
+                metrocalk_editor_shell::AnimationClipInstanceIssueSeverity::Warning => "warning",
+                metrocalk_editor_shell::AnimationClipInstanceIssueSeverity::Error => "error",
+            }
+            .into(),
+            code: issue.code,
+            message: issue.message,
+            fix: Some(issue.fix),
+        })
+        .collect();
+    let mut instances = BTreeMap::new();
+    for document in loaded.documents {
+        match compile_persisted_clip_instance(engine, assets, &document) {
+            Ok(instance) => {
+                instances.insert(document.id.clone(), instance);
+            }
+            Err(message) => issues.push(AnimationIssueInfo {
+                severity: "error".into(),
+                code: "clip_instance_not_ready".into(),
+                message,
+                fix: Some(
+                    "Open the imported clip setup, review the changed source/target, and save a new explicit mapping."
+                        .into(),
+                ),
+            }),
+        }
+    }
+    preview.clip_instances = instances;
+    preview.clip_instance_revision = loaded.revision;
+    preview.clip_instance_refresh_fence = Some(refresh_fence);
+    preview.clip_instance_issues = issues;
+    let current_source_hash = current_animation_graph_source_hash(preview);
+    if previous_source_hash != current_source_hash && preview.graph.graph.is_some() {
+        // A rebound/deleted/stale target is an authority change, not a cosmetic source edit. Never let
+        // a last-good runtime continue writing the old mapping while replacement compilation is pending.
+        preview.graph.runtime = None;
+        preview.graph.compiled_source_hash = None;
+        preview.graph.source_duration = None;
+        preview.graph.pending_compile_key = None;
+        preview.graph.active_nodes.clear();
+        preview.graph.active_edges.clear();
+        preview.graph.transition = None;
+        preview.graph.compile.state = if current_source_hash.is_some() {
+            "compiling"
+        } else {
+            "invalid"
+        }
+        .into();
+        preview.graph.compile.compiled_revision = None;
+        preview.graph.compile.compiled_hash = None;
+        preview.graph.compile.message = if current_source_hash.is_some() {
+            "A clip-instance mapping changed; the previous runtime was invalidated and the graph is recompiling."
+                .into()
+        } else {
+            "A referenced clip instance is missing or stale; playback is blocked until its explicit mapping is repaired."
+                .into()
+        };
+    }
+    transient_invalidated
+}
+
+fn animation_clip_instance_live_fence(
+    engine: &Engine<FlecsWorld>,
+    assets: &AssetsRuntime,
+    loaded: &metrocalk_editor_shell::AnimationClipInstanceLoad,
+) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut frame = |bytes: &[u8]| {
+        hash ^= u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    frame(b"metrocalk-animation-clip-instance-live-fence-v1");
+    frame(loaded.revision.as_bytes());
+    for document in &loaded.documents {
+        frame(document.id.as_bytes());
+        match animation_asset_by_logical_id(assets, &document.logical_asset_id) {
+            Ok(asset) => {
+                frame(asset.record.effective_revision_id().as_str().as_bytes());
+                frame(asset.manifest.content.content_hash.as_bytes());
+                frame(&[u8::from(asset.is_ready_for_playback())]);
+            }
+            Err(error) => frame(error.as_bytes()),
+        }
+        let targets = document
+            .target_rebinds
+            .iter()
+            .map(|mapping| mapping.target_target.as_str())
+            .chain(
+                document
+                    .binding_rebinds
+                    .iter()
+                    .map(|mapping| mapping.target.path.target.as_str()),
+            );
+        for target in targets {
+            frame(target.as_bytes());
+            let entity = EntityId::from_loro_key(target);
+            let ready = entity.is_some_and(|entity| {
+                engine.is_active(entity) && engine.components_of(entity).contains_key("Transform")
+            });
+            frame(&[u8::from(ready)]);
+            if let Some(entity) = entity.filter(|_| ready) {
+                let local = capscene::local_transform(engine, entity);
+                for value in local
+                    .translation
+                    .into_iter()
+                    .chain(local.rotation)
+                    .chain(local.scale)
+                {
+                    frame(&value.to_bits().to_le_bytes());
+                }
+            }
+        }
+    }
+    format!("animation-clip-instance-live:{hash:016x}")
+}
+
+fn transient_animation_clip_live_fence(
+    engine: &Engine<FlecsWorld>,
+    assets: &AssetsRuntime,
+    instance: &NativeClipInstance,
+) -> String {
+    animation_clip_instance_live_fence(
+        engine,
+        assets,
+        &metrocalk_editor_shell::AnimationClipInstanceLoad {
+            documents: vec![instance.document.clone()],
+            revision: format!("transient:{}", instance.compiled.stable_hash),
+            issues: Vec::new(),
+        },
+    )
+}
+
+fn clear_transient_animation_clip(preview: &mut AnimationPreviewState, reason: Option<String>) {
+    preview.transient_clip = None;
+    preview.transient_clip_fence = None;
+    preview.transient_clip_request_id = None;
+    preview.transient_clip_deadline = None;
+    if let Some(previous_loop_policy) = preview.transient_previous_loop_policy.take() {
+        preview.loop_policy = previous_loop_policy;
+    }
+    preview.plan = None;
+    preview.playing = false;
+    preview.current_tick = AnimationTick::ZERO;
+    preview.crossed_events.clear();
+    preview.event_overflowed = false;
+    preview.graph.runtime = None;
+    preview.graph.active_nodes.clear();
+    preview.graph.active_edges.clear();
+    preview.graph.transition = None;
+    preview.last_error = reason;
+}
+
+fn remember_cancelled_transient_clip_request(
+    preview: &mut AnimationPreviewState,
+    request_id: Option<&str>,
+) {
+    let Some(request_id) = request_id
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty())
+    else {
+        return;
+    };
+    preview
+        .cancelled_transient_clip_request_ids
+        .retain(|cancelled| cancelled != request_id);
+    preview
+        .cancelled_transient_clip_request_ids
+        .push_back(request_id.to_owned());
+    while preview.cancelled_transient_clip_request_ids.len() > MAX_CANCELLED_TRANSIENT_CLIP_REQUESTS
+    {
+        preview.cancelled_transient_clip_request_ids.pop_front();
+    }
+}
+
+fn take_cancelled_transient_clip_request(
+    preview: &mut AnimationPreviewState,
+    request_id: &str,
+) -> bool {
+    let Some(index) = preview
+        .cancelled_transient_clip_request_ids
+        .iter()
+        .position(|cancelled| cancelled == request_id)
+    else {
+        return false;
+    };
+    preview.cancelled_transient_clip_request_ids.remove(index);
+    true
+}
+
+fn clear_transient_animation_clip_preserving_events_with_reason(
+    preview: &mut AnimationPreviewState,
+    reason: Option<String>,
+) -> bool {
+    if preview.transient_clip.is_none() {
+        return false;
+    }
+    let crossed_events = std::mem::take(&mut preview.crossed_events);
+    let event_overflowed = preview.event_overflowed;
+    clear_transient_animation_clip(preview, reason);
+    preview.crossed_events = crossed_events;
+    preview.event_overflowed = event_overflowed;
+    true
+}
+
+fn clear_transient_animation_clip_preserving_events(preview: &mut AnimationPreviewState) -> bool {
+    clear_transient_animation_clip_preserving_events_with_reason(preview, None)
+}
+
+/// An unsaved imported-clip audition owns a render-only projection and must never leave that
+/// projection stranded after its one-shot clock reaches the end. Preserve bounded event delivery
+/// while releasing the transient plan; the caller immediately rebuilds the authored projection.
+fn clear_completed_transient_animation_clip(preview: &mut AnimationPreviewState) -> bool {
+    if preview.transient_clip.is_none()
+        || preview.loop_policy != AnimationLoopPolicy::Once
+        || preview.current_tick < animation_transport_duration(preview)
+    {
+        return false;
+    }
+    clear_transient_animation_clip_preserving_events(preview)
+}
+
+fn clear_expired_transient_animation_clip(
+    preview: &mut AnimationPreviewState,
+    now: std::time::Instant,
+) -> bool {
+    if preview.transient_clip.is_none()
+        || !preview
+            .transient_clip_deadline
+            .is_some_and(|deadline| now >= deadline)
+    {
+        return false;
+    }
+    clear_transient_animation_clip_preserving_events(preview)
+}
+
+fn animation_clip_preview_stop_is_stale(
+    preview: &AnimationPreviewState,
+    expected_request_id: Option<&str>,
+) -> bool {
+    preview.transient_clip.is_some()
+        && expected_request_id
+            .is_some_and(|expected| preview.transient_clip_request_id.as_deref() != Some(expected))
+}
+
+fn build_single_rigid_clip_instance_document(
+    engine: &Engine<FlecsWorld>,
+    assets: &AssetsRuntime,
+    request: &AnimationClipInstanceSaveRequest,
+) -> Result<metrocalk_editor_shell::AnimationClipInstanceDocument, String> {
+    if request.request_id.trim().is_empty() {
+        return Err("The setup request has no stable request identity.".into());
+    }
+    let current_clip_instances_revision =
+        metrocalk_editor_shell::load_animation_clip_instances(engine).revision;
+    if request.expected_revision != current_clip_instances_revision {
+        return Err(
+            "Clip instances changed elsewhere while setup was open. Reopen the mapper before previewing or saving."
+                .into(),
+        );
+    }
+    let asset = animation_asset_by_logical_id(assets, &request.logical_asset_id)?;
+    let effective_revision = asset.record.effective_revision_id();
+    let current_revision = effective_revision.as_str();
+    if current_revision != request.expected_asset_revision {
+        return Err(format!(
+            "The imported asset changed from revision '{}' to '{current_revision}' while setup was open. Review the new channels before saving.",
+            request.expected_asset_revision
+        ));
+    }
+    if !asset.is_ready_for_playback() {
+        return Err(
+            "The imported animation asset is not in a validated playable state. Repair its import diagnostics first."
+                .into(),
+        );
+    }
+    let clip_id = AnimationClipId::new(request.clip_id.clone());
+    let (signature, source_targets, _, sequence_id) = rigid_clip_admission(asset, &clip_id)?;
+    if signature.signature_hash != request.expected_source_binding_hash {
+        return Err(
+            "The clip channel signature changed while setup was open. Review the source again before binding."
+                .into(),
+        );
+    }
+    if source_targets.is_empty() {
+        return Err("This clip has no rigid source target to bind.".into());
+    }
+    let requested_mappings = if request.target_mappings.is_empty() {
+        let [source_target] = source_targets.as_slice() else {
+            return Err(format!(
+                "This clip animates {} source nodes. Provide one explicit, distinct live scene target for every source node.",
+                source_targets.len()
+            ));
+        };
+        vec![AnimationClipTargetMappingRequest {
+            source_target_id: source_target.clone(),
+            target_id: request.target_id.clone(),
+        }]
+    } else {
+        request.target_mappings.clone()
+    };
+    let expected_sources: BTreeSet<_> = source_targets.iter().cloned().collect();
+    let mut source_to_target = BTreeMap::new();
+    let mut used_targets = BTreeSet::new();
+    for mapping in requested_mappings {
+        if !expected_sources.contains(&mapping.source_target_id) {
+            return Err(format!(
+                "Source mapping '{}' is not part of the current clip signature. Reopen setup instead of binding stale source evidence.",
+                mapping.source_target_id
+            ));
+        }
+        if source_to_target
+            .insert(mapping.source_target_id.clone(), mapping.target_id.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "Source node '{}' is mapped more than once.",
+                mapping.source_target_id
+            ));
+        }
+        if !used_targets.insert(mapping.target_id.clone()) {
+            return Err(format!(
+                "Scene target '{}' is assigned to more than one source node. Many-to-one rigid mapping is refused.",
+                mapping.target_id
+            ));
+        }
+        let target = EntityId::from_loro_key(&mapping.target_id).ok_or_else(|| {
+            format!(
+                "Mapped scene target '{}' is missing or is not a live entity identity.",
+                mapping.target_id
+            )
+        })?;
+        if !engine.is_active(target) {
+            return Err(format!(
+                "Mapped scene target '{}' is deactivated. Reactivate it or choose an active scene entity.",
+                mapping.target_id
+            ));
+        }
+        if !engine.components_of(target).contains_key("Transform") {
+            return Err(format!(
+                "Mapped scene target '{}' has no Transform component for rigid playback.",
+                mapping.target_id
+            ));
+        }
+    }
+    let missing: Vec<_> = source_targets
+        .iter()
+        .filter(|source| !source_to_target.contains_key(*source))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{} source node mapping(s) are missing: {}.",
+            missing.len(),
+            missing.join(", ")
+        ));
+    }
+    let target_rebinds = source_targets
+        .iter()
+        .map(|source| {
+            AnimationTargetRebind::new(
+                source.clone(),
+                source_to_target
+                    .get(source)
+                    .expect("all source mappings were checked")
+                    .clone(),
+            )
+        })
+        .collect();
+    let binding_rebinds = signature
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding.path.component == "Transform"
+                && binding.path.property == "scale"
+                && binding.value_kind == AnimationValueKind::Vec3
+        })
+        .map(|source| {
+            let target_id = source_to_target
+                .get(&source.path.target)
+                .expect("every scale source has a checked target");
+            AnimationBindingRebind::new(
+                source.clone(),
+                AnimationBinding {
+                    path: AnimationPropertyPath::new(target_id.clone(), "Transform", "scale3"),
+                    value_kind: AnimationValueKind::Vec3,
+                },
+            )
+        })
+        .collect();
+    Ok(metrocalk_editor_shell::AnimationClipInstanceDocument {
+        schema_version: metrocalk_editor_shell::ANIMATION_CLIP_INSTANCE_SCHEMA_VERSION,
+        id: request.instance_id.clone(),
+        name: request.name.clone(),
+        logical_asset_id: request.logical_asset_id.clone(),
+        revision_id: current_revision.to_owned(),
+        content_hash: asset.manifest.content.content_hash.clone(),
+        clip_id: request.clip_id.clone(),
+        clip_locator: animation_clip_source_locator(&request.clip_id),
+        source_sequence_id: sequence_id.as_str().to_owned(),
+        expected_source_binding_hash: signature.signature_hash,
+        source_bindings: signature.bindings,
+        target_rebinds,
+        binding_rebinds,
+        require_rest_pose_match: true,
+    })
+}
+
+fn animation_graph_port(
+    id: &str,
+    label: &str,
+    direction: &str,
+    kind: &str,
+    required: bool,
+    multiple: bool,
+) -> AnimationGraphPortInfo {
+    AnimationGraphPortInfo {
+        id: id.into(),
+        label: label.into(),
+        direction: direction.into(),
+        kind: kind.into(),
+        required,
+        multiple,
+    }
+}
+
+fn animation_graph_node_presentations(
+    graph: &serde_json::Value,
+) -> Vec<AnimationGraphNodePresentation> {
+    animation_graph_node_presentations_with_sources(graph, &BTreeSet::new())
+}
+
+fn animation_graph_node_presentations_with_sources(
+    graph: &serde_json::Value,
+    ready_sources: &BTreeSet<String>,
+) -> Vec<AnimationGraphNodePresentation> {
+    let nodes = graph
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let edges = graph
+        .get("edges")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let node_id = node.get("id")?.as_str()?.to_owned();
+            let kind = node.get("kind")?.as_str()?;
+            let pose_out = || animation_graph_port("pose", "Pose", "output", "pose", false, true);
+            let ports = match kind {
+                "reference_pose" | "sequence" => vec![pose_out()],
+                "blend_normalized" | "blend_direct" | "blend_1d" | "blend_2d_cartesian" => vec![
+                    animation_graph_port("poses", "Pose inputs", "input", "pose", true, true),
+                    pose_out(),
+                ],
+                "layer_override" | "layer_additive" => vec![
+                    animation_graph_port("base", "Base pose", "input", "pose", true, false),
+                    animation_graph_port("layer", "Layer pose", "input", "pose", true, false),
+                    pose_out(),
+                ],
+                "state_machine" => vec![
+                    animation_graph_port("states", "State poses", "input", "pose", true, true),
+                    pose_out(),
+                ],
+                "output" => vec![
+                    animation_graph_port("pose", "Final pose", "input", "pose", true, false),
+                    animation_graph_port("output", "Output", "output", "output", false, false),
+                ],
+                _ => Vec::new(),
+            };
+            let enabled = node
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let incoming = edges
+                .iter()
+                .filter(|edge| {
+                    edge.get("enabled")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true)
+                        && edge.get("toNodeId").and_then(serde_json::Value::as_str)
+                            == Some(node_id.as_str())
+                })
+                .count();
+            let (readiness, readiness_reason) = if !enabled {
+                (
+                    "warning",
+                    "This node is disabled and is excluded from native compilation.".to_owned(),
+                )
+            } else if ports.is_empty() {
+                (
+                    "blocked",
+                    format!(
+                        "Node kind '{kind}' is not supported by the schema-v{ANIMATION_GRAPH_SCHEMA_VERSION} native adapter."
+                    ),
+                )
+            } else if kind == "output" && incoming != 1 {
+                (
+                    "blocked",
+                    format!("Output requires exactly one enabled pose input; found {incoming}."),
+                )
+            } else if kind == "sequence"
+                && node
+                    .get("sourceId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|source_id| {
+                        source_id != metrocalk_editor_shell::MAIN_SEQUENCE_ID
+                            && !ready_sources.contains(source_id)
+                    })
+            {
+                (
+                    "blocked",
+                    "This source is missing, stale, or has no validated explicit clip instance."
+                        .to_owned(),
+                )
+            } else if matches!(kind, "layer_override" | "layer_additive")
+                && node
+                    .get("maskBindings")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty)
+            {
+                (
+                    "warning",
+                    "The empty mask intentionally affects the complete animation bundle."
+                        .to_owned(),
+                )
+            } else {
+                (
+                    "ready",
+                    format!(
+                        "This node has a supported schema-v{ANIMATION_GRAPH_SCHEMA_VERSION} native projection."
+                    ),
+                )
+            };
+            Some(AnimationGraphNodePresentation {
+                node_id,
+                ports,
+                readiness: readiness.into(),
+                readiness_reason,
+            })
+        })
+        .collect()
+}
+
+fn animation_graph_sources(
+    assets: &AssetsRuntime,
+    plan: Option<&CompiledSequence>,
+    graph: Option<&serde_json::Value>,
+) -> Vec<AnimationGraphSourceInfo> {
+    animation_graph_sources_with_instances(assets, plan, graph, &BTreeMap::new())
+}
+
+fn animation_graph_sources_with_instances(
+    assets: &AssetsRuntime,
+    plan: Option<&CompiledSequence>,
+    graph: Option<&serde_json::Value>,
+    clip_instances: &BTreeMap<String, NativeClipInstance>,
+) -> Vec<AnimationGraphSourceInfo> {
+    let (main_readiness, main_reason, main_action) = match plan {
+        None => (
+            "blocked",
+            "The authored sequence has blocking timeline diagnostics and has no immutable native plan.",
+            Some("Repair the timeline diagnostics before using this graph source."),
+        ),
+        Some(plan) if plan.tracks_len() == 0 => (
+            "blocked",
+            "The compiled sequence has no enabled tracks with keyframes; events and markers do not provide a pose/property binding signature.",
+            Some("Key at least one supported Transform or KinematicJoint property before using Main as a graph source."),
+        ),
+        Some(plan)
+            if !plan
+                .evaluate(AnimationTick::ZERO)
+                .bindings
+                .iter()
+                .any(|evaluated| animation_binding_is_native_projectable(&evaluated.binding)) =>
+        {
+            (
+                "blocked",
+                "The compiled sequence has tracks, but none target a native viewport sink (Transform or KinematicJoint without a structured subpath).",
+                Some("Rebind at least one track to a supported live viewport property before using Main as a graph source."),
+            )
+        }
+        Some(_) => (
+            "ready",
+            "Authored tracks compile into an immutable native sequence source with at least one live viewport binding.",
+            None,
+        ),
+    };
+    let main_ready = main_readiness == "ready";
+    let mut binding_bearing_sources: BTreeSet<&str> = clip_instances
+        .iter()
+        .filter(|(_, instance)| {
+            !instance
+                .compiled
+                .mapped_binding_signature
+                .bindings
+                .is_empty()
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if main_ready {
+        binding_bearing_sources.insert(metrocalk_editor_shell::MAIN_SEQUENCE_ID);
+    }
+    let reference_pose_ready = graph
+        .and_then(|graph| graph.get("nodes"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                node.get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true)
+                    && node.get("kind").and_then(serde_json::Value::as_str) == Some("sequence")
+                    && node
+                        .get("sourceId")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|source| binding_bearing_sources.contains(source))
+            })
+        });
+    let mut sources = vec![
+        AnimationGraphSourceInfo {
+            id: metrocalk_editor_shell::MAIN_SEQUENCE_ID.into(),
+            name: "Main authored sequence".into(),
+            kind: "authored_sequence".into(),
+            logical_asset_id: None,
+            revision_id: plan.map(|plan| plan.stable_hash.clone()),
+            duration_tick: plan.map_or(0, |plan| plan.duration.0),
+            readiness: main_readiness.into(),
+            reason: main_reason.into(),
+            action: main_action.map(str::to_owned),
+        },
+        AnimationGraphSourceInfo {
+            id: "reference-pose".into(),
+            name: "Reference pose".into(),
+            kind: "reference_pose".into(),
+            logical_asset_id: None,
+            revision_id: None,
+            duration_tick: 0,
+            readiness: if reference_pose_ready {
+                "ready"
+            } else {
+                "blocked"
+            }
+            .into(),
+            reason: if reference_pose_ready {
+                "The graph compiler can capture an explicit typed baseline for every binding emitted by a referenced ready sequence or clip instance."
+            } else {
+                "Reference Pose has no independent binding signature in this tier; it can only snapshot bindings supplied by a referenced ready, binding-bearing sequence or clip instance."
+            }
+            .into(),
+            action: (!reference_pose_ready).then(|| {
+                "Add a ready sequence or validated clip-instance node with at least one supported live ECS binding before using Reference Pose."
+                    .into()
+            }),
+        },
+    ];
+    let mut imported: Vec<_> = assets.animation_assets.values().collect();
+    imported.sort_by(|left, right| {
+        left.record
+            .effective_logical_id()
+            .as_str()
+            .cmp(right.record.effective_logical_id().as_str())
+    });
+    for asset in imported {
+        let logical = asset.record.effective_logical_id().as_str().to_owned();
+        let revision = asset.record.effective_revision_id().as_str().to_owned();
+        for sequence in &asset.sequences {
+            sources.push(AnimationGraphSourceInfo {
+                id: format!("imported:{logical}:{}", sequence.id.as_str()),
+                name: format!("{} - {}", asset.manifest.display_name, sequence.name),
+                kind: "imported_clip".into(),
+                logical_asset_id: Some(logical.clone()),
+                revision_id: Some(revision.clone()),
+                duration_tick: sequence
+                    .time_base
+                    .convert_tick(sequence.duration, ANIMATION_RUNTIME_TIME_BASE)
+                    .map_or(0, |tick| tick.0),
+                readiness: "blocked".into(),
+                reason: "This is immutable source provenance, not a live scene address. Create and validate an explicit clip instance before adding it to the graph.".into(),
+                action: Some("Select an entity using this asset in Animation, then choose Set up clip.".into()),
+            });
+        }
+    }
+    for instance in clip_instances.values() {
+        sources.push(AnimationGraphSourceInfo {
+            id: instance.document.id.clone(),
+            name: instance.document.name.clone(),
+            kind: "clip_instance".into(),
+            logical_asset_id: Some(instance.document.logical_asset_id.clone()),
+            revision_id: Some(instance.compiled.stable_hash.clone()),
+            duration_tick: instance.compiled.plan.duration.0,
+            readiness: "ready".into(),
+            reason: format!(
+                "Validated explicit mapping from revision '{}' onto {} typed live binding(s).",
+                instance.document.revision_id,
+                instance.compiled.mapped_binding_signature.bindings.len()
+            ),
+            action: None,
+        });
+    }
+    sources.sort_by(|left, right| {
+        (left.kind.as_str(), left.name.as_str(), left.id.as_str()).cmp(&(
+            right.kind.as_str(),
+            right.name.as_str(),
+            right.id.as_str(),
+        ))
+    });
+    sources
+}
+
+fn animation_graph_state_info(
+    assets: &AssetsRuntime,
+    preview: &AnimationPreviewState,
+    sequence_id: &str,
+) -> AnimationGraphStateInfo {
+    if sequence_id != preview.graph.sequence_id {
+        let revision = format!("animation-graph:missing:{sequence_id}");
+        return AnimationGraphStateInfo {
+            schema_version: ANIMATION_GRAPH_SCHEMA_VERSION,
+            sequence_id: sequence_id.into(),
+            revision: revision.clone(),
+            graph: None,
+            node_presentation: Vec::new(),
+            sources: animation_graph_sources_with_instances(
+                assets,
+                preview.plan.as_ref(),
+                None,
+                &preview.clip_instances,
+            ),
+            compile: AnimationGraphCompileInfo {
+                state: "missing".into(),
+                authored_revision: revision,
+                compiled_revision: None,
+                compiled_hash: None,
+                last_good_revision: None,
+                last_good_hash: None,
+                message: "No graph is authored for this sequence.".into(),
+            },
+            diagnostics: Vec::new(),
+        };
+    }
+    let ready_sources: BTreeSet<_> = preview.clip_instances.keys().cloned().collect();
+    AnimationGraphStateInfo {
+        schema_version: ANIMATION_GRAPH_SCHEMA_VERSION,
+        sequence_id: sequence_id.into(),
+        revision: preview.graph.revision.clone(),
+        graph: preview.graph.graph.clone(),
+        node_presentation: preview.graph.graph.as_ref().map_or_else(Vec::new, |graph| {
+            animation_graph_node_presentations_with_sources(graph, &ready_sources)
+        }),
+        sources: animation_graph_sources_with_instances(
+            assets,
+            preview.plan.as_ref(),
+            preview.graph.graph.as_ref(),
+            &preview.clip_instances,
+        ),
+        compile: preview.graph.compile.clone(),
+        diagnostics: preview.graph.diagnostics.clone(),
+    }
+}
+
+fn animation_graph_json_id(graph: Option<&serde_json::Value>) -> Option<&str> {
+    graph?.get("id")?.as_str()
+}
+
+fn animation_graph_save_schema_matches(request: &AnimationGraphSaveRequest) -> bool {
+    request.schema_version == ANIMATION_GRAPH_SCHEMA_VERSION
+        && request
+            .graph
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(ANIMATION_GRAPH_SCHEMA_VERSION))
+}
+
+fn animation_graph_preview_values(
+    graph: &serde_json::Value,
+    requested: BTreeMap<String, serde_json::Value>,
+) -> (BTreeMap<String, serde_json::Value>, Vec<String>) {
+    let parameters = graph
+        .get("parameters")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let by_id: BTreeMap<_, _> = parameters
+        .iter()
+        .filter_map(|parameter| Some((parameter.get("id")?.as_str()?, parameter)))
+        .collect();
+    let mut accepted = BTreeMap::new();
+    let mut rejected = Vec::new();
+    for (id, mut value) in requested {
+        let Some(parameter) = by_id.get(id.as_str()) else {
+            rejected.push(format!("'{id}' is not a parameter in the active graph"));
+            continue;
+        };
+        let kind = parameter
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let valid = match kind {
+            "float" | "integer" => value.as_f64().is_some_and(f64::is_finite),
+            "boolean" | "trigger" => value.is_boolean(),
+            "vec2" => value.as_array().is_some_and(|values| {
+                values.len() == 2
+                    && values
+                        .iter()
+                        .all(|value| value.as_f64().is_some_and(f64::is_finite))
+            }),
+            _ => false,
+        };
+        if !valid {
+            rejected.push(format!("'{id}' does not match its declared {kind} type"));
+            continue;
+        }
+        if matches!(kind, "float" | "integer") {
+            let mut number = value.as_f64().unwrap_or_default();
+            if let Some(minimum) = parameter.get("min").and_then(serde_json::Value::as_f64) {
+                number = number.max(minimum);
+            }
+            if let Some(maximum) = parameter.get("max").and_then(serde_json::Value::as_f64) {
+                number = number.min(maximum);
+            }
+            value = if kind == "integer" {
+                serde_json::json!(number.round() as i64)
+            } else {
+                serde_json::json!(number)
+            };
+        }
+        accepted.insert(id, value);
+    }
+    (accepted, rejected)
+}
+
+fn replayable_animation_graph_preview_values(
+    graph: &serde_json::Value,
+    accepted: &BTreeMap<String, serde_json::Value>,
+) -> BTreeMap<String, serde_json::Value> {
+    let parameter_kinds: BTreeMap<_, _> = graph
+        .get("parameters")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|parameter| {
+            Some((
+                parameter.get("id")?.as_str()?,
+                parameter.get("kind")?.as_str()?,
+            ))
+        })
+        .collect();
+    accepted
+        .iter()
+        .filter(|(id, _)| parameter_kinds.get(id.as_str()).copied() != Some("trigger"))
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect()
+}
+
+fn apply_native_animation_graph_parameters(
+    graph: &mut NativeAnimationGraphState,
+    values: &BTreeMap<String, serde_json::Value>,
+) -> Vec<String> {
+    let started = std::time::Instant::now();
+    let Some(runtime) = graph.runtime.as_mut() else {
+        return Vec::new();
+    };
+    let routes = graph.parameter_routes.clone();
+    let mut errors = Vec::new();
+    let mut mutated = false;
+    for (editor_id, value) in values {
+        let Some(route) = routes
+            .iter()
+            .find(|route| route.editor_parameter_id == *editor_id)
+        else {
+            // A valid authored parameter can be pending in a newer draft while last-good playback remains
+            // installed. Keep the value transiently; it will be applied when that revision compiles.
+            continue;
+        };
+        let result = match route.kind {
+            metrocalk_editor_shell::AnimationGraphParameterKind::Float => value
+                .as_f64()
+                .ok_or_else(|| "expected a finite float".to_owned())
+                .and_then(|number| {
+                    runtime
+                        .set_parameter(
+                            &GraphParameterId::new(route.runtime_parameter_ids[0].clone()),
+                            GraphParameterValue::Number(number),
+                        )
+                        .map_err(|error| error.to_string())
+                }),
+            metrocalk_editor_shell::AnimationGraphParameterKind::Integer => value
+                .as_i64()
+                .ok_or_else(|| "expected a whole integer".to_owned())
+                .and_then(|number| {
+                    runtime
+                        .set_parameter(
+                            &GraphParameterId::new(route.runtime_parameter_ids[0].clone()),
+                            GraphParameterValue::Integer(number),
+                        )
+                        .map_err(|error| error.to_string())
+                }),
+            metrocalk_editor_shell::AnimationGraphParameterKind::Boolean => value
+                .as_bool()
+                .ok_or_else(|| "expected a boolean".to_owned())
+                .and_then(|boolean| {
+                    runtime
+                        .set_parameter(
+                            &GraphParameterId::new(route.runtime_parameter_ids[0].clone()),
+                            GraphParameterValue::Boolean(boolean),
+                        )
+                        .map_err(|error| error.to_string())
+                }),
+            metrocalk_editor_shell::AnimationGraphParameterKind::Trigger => value
+                .as_bool()
+                .ok_or_else(|| "expected a trigger boolean".to_owned())
+                .and_then(|triggered| {
+                    if !triggered {
+                        return Ok(());
+                    }
+                    runtime
+                        .fire_trigger(&GraphParameterId::new(
+                            route.runtime_parameter_ids[0].clone(),
+                        ))
+                        .map_err(|error| error.to_string())
+                }),
+            metrocalk_editor_shell::AnimationGraphParameterKind::Vec2 => value
+                .as_array()
+                .filter(|parts| parts.len() == 2)
+                .ok_or_else(|| "expected a two-number vector".to_owned())
+                .and_then(|parts| {
+                    for (index, part) in parts.iter().enumerate() {
+                        let number = part
+                            .as_f64()
+                            .ok_or_else(|| "expected a finite two-number vector".to_owned())?;
+                        runtime
+                            .set_parameter(
+                                &GraphParameterId::new(route.runtime_parameter_ids[index].clone()),
+                                GraphParameterValue::Number(number),
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(())
+                }),
+        };
+        match result {
+            Ok(()) => mutated = true,
+            Err(error) => errors.push(format!("{editor_id}: {error}")),
+        }
+    }
+    if mutated {
+        // Re-sample blend inputs and resolve conditions exactly once at the current exact tick. Core only
+        // consumes triggers used by the winning transition; unused triggers remain armed in this runtime.
+        runtime.advance(AnimationTick::ZERO);
+        graph.evaluation_cost_micros =
+            Some(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    }
+    errors
+}
+
+fn animation_graph_diagnostic_info(
+    diagnostic: &metrocalk_editor_shell::AnimationGraphDiagnostic,
+) -> AnimationGraphDiagnosticInfo {
+    let severity = match diagnostic.severity {
+        metrocalk_editor_shell::AnimationGraphDiagnosticSeverity::Info => "info",
+        metrocalk_editor_shell::AnimationGraphDiagnosticSeverity::Warning => "warning",
+        metrocalk_editor_shell::AnimationGraphDiagnosticSeverity::Error => "error",
+    };
+    AnimationGraphDiagnosticInfo {
+        id: diagnostic.id.clone(),
+        severity: severity.into(),
+        code: diagnostic.code.clone(),
+        message: diagnostic.message.clone(),
+        fix: diagnostic.fix.clone(),
+        node_id: diagnostic.node_id.clone(),
+        edge_id: diagnostic.edge_id.clone(),
+        port_id: diagnostic.port_id.clone(),
+    }
+}
+
+fn core_animation_graph_diagnostic_info(
+    diagnostic: &metrocalk_animation::AnimationGraphDiagnostic,
+    index: usize,
+    edge_provenance: &[metrocalk_editor_shell::animation_graph_intent::AnimationGraphEdgeProvenance],
+) -> AnimationGraphDiagnosticInfo {
+    let severity = match diagnostic.severity {
+        AnimationSeverity::Info => "info",
+        AnimationSeverity::Warning => "warning",
+        AnimationSeverity::Error => "error",
+    };
+    let code = serde_json::to_value(diagnostic.code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "graph_compile".into());
+    let node_id = diagnostic.node_id.as_ref().map(ToString::to_string);
+    let edge_id = node_id.as_deref().and_then(|node_id| {
+        edge_provenance
+            .iter()
+            .find(|edge| {
+                edge.to_node_id == node_id
+                    && diagnostic
+                        .port
+                        .as_deref()
+                        .is_none_or(|port| edge.to_port_id == port)
+            })
+            .or_else(|| {
+                edge_provenance
+                    .iter()
+                    .find(|edge| edge.to_node_id == node_id)
+            })
+            .map(|edge| edge.edge_id.clone())
+    });
+    AnimationGraphDiagnosticInfo {
+        id: format!("core-{code}-{}-{index}", diagnostic.location),
+        severity: severity.into(),
+        code,
+        message: diagnostic.message.clone(),
+        fix: Some(diagnostic.recovery.clone()),
+        node_id,
+        edge_id,
+        port_id: diagnostic.port.clone(),
+    }
+}
+
+fn install_animation_graph_load(
+    preview: &mut AnimationPreviewState,
+    load: metrocalk_editor_shell::AnimationGraphLoad,
+) {
+    let previous = preview.graph.compile.clone();
+    let had_last_good = previous.last_good_hash.is_some();
+    let graph_json = load
+        .document
+        .as_ref()
+        .and_then(|document| serde_json::to_value(document).ok());
+    let has_errors = load.diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity == metrocalk_editor_shell::AnimationGraphDiagnosticSeverity::Error
+    });
+    preview.graph.sequence_id = load.document.as_ref().map_or_else(
+        || metrocalk_editor_shell::MAIN_SEQUENCE_ID.to_owned(),
+        |document| document.sequence_id.clone(),
+    );
+    preview.graph.revision = load.revision.clone();
+    preview.graph.node_presentation = graph_json
+        .as_ref()
+        .map_or_else(Vec::new, animation_graph_node_presentations);
+    preview.graph.graph = graph_json;
+    preview.graph.diagnostics = load
+        .diagnostics
+        .iter()
+        .map(animation_graph_diagnostic_info)
+        .collect();
+    preview.graph.preview_parameters.clear();
+    preview.graph.active_nodes.clear();
+    preview.graph.active_edges.clear();
+    preview.graph.transition = None;
+    preview.graph.events_truncated = false;
+    preview.graph.debug_trace_incomplete = false;
+    preview.graph.evaluation_cost_micros = None;
+    preview.graph.pending_compile_key = None;
+    if load.document.is_none() {
+        preview.graph.runtime = None;
+        preview.graph.parameter_routes.clear();
+        preview.graph.edge_provenance.clear();
+        preview.graph.compiled_source_hash = None;
+        preview.graph.source_duration = None;
+    }
+    preview.graph.compile = if load.document.is_none() {
+        AnimationGraphCompileInfo {
+            state: "missing".into(),
+            authored_revision: load.revision,
+            compiled_revision: None,
+            compiled_hash: None,
+            last_good_revision: previous.last_good_revision,
+            last_good_hash: previous.last_good_hash,
+            message: "No graph is authored; the timeline plays through the implicit flat graph."
+                .into(),
+        }
+    } else if has_errors {
+        AnimationGraphCompileInfo {
+            state: "invalid".into(),
+            authored_revision: load.revision,
+            compiled_revision: previous.compiled_revision,
+            compiled_hash: previous.compiled_hash,
+            last_good_revision: previous.last_good_revision,
+            last_good_hash: previous.last_good_hash,
+            message: if had_last_good {
+                "The authored graph is invalid; the last good compiled revision remains in preview."
+                    .into()
+            } else {
+                "The authored graph is invalid; the implicit flat graph remains in preview.".into()
+            },
+        }
+    } else {
+        AnimationGraphCompileInfo {
+            state: "compiling".into(),
+            authored_revision: load.revision,
+            compiled_revision: previous.compiled_revision,
+            compiled_hash: previous.compiled_hash,
+            last_good_revision: previous.last_good_revision,
+            last_good_hash: previous.last_good_hash,
+            message: "The graph is queued for deterministic native compilation.".into(),
+        }
+    };
+}
+
+fn schedule_animation_graph_compile(
+    engine: &Engine<FlecsWorld>,
+    preview: &mut AnimationPreviewState,
+) {
+    if preview.transient_clip.is_some() {
+        preview.graph.compile.state = "stale".into();
+        preview.graph.compile.message =
+            "Graph installation is paused while an unsaved imported clip is being previewed. Stop preview to restore graph authority."
+                .into();
+        return;
+    }
+    let Some(graph_json) = preview.graph.graph.clone() else {
+        return;
+    };
+    if preview
+        .graph
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == "error")
+    {
+        return;
+    }
+    let document = match serde_json::from_value::<metrocalk_editor_shell::AnimationGraphDocument>(
+        graph_json,
+    ) {
+        Ok(document) => document,
+        Err(error) => {
+            preview.graph.compile.state = "invalid".into();
+            preview.graph.compile.message = format!(
+                "The stored graph could not be decoded for compilation: {error}. The last good preview remains active."
+            );
+            return;
+        }
+    };
+    let referenced_sources: BTreeSet<_> = document
+        .nodes
+        .iter()
+        .filter(|node| node.enabled)
+        .filter_map(|node| {
+            (node.kind == metrocalk_editor_shell::AnimationGraphNodeKind::Sequence)
+                .then(|| node.source_id.clone())
+                .flatten()
+        })
+        .collect();
+    let sequence_document = metrocalk_editor_shell::load_animation_document(engine);
+    let mut authored_sequences = BTreeMap::new();
+    let mut catalog = BTreeMap::new();
+    let mut source_fences = BTreeMap::new();
+    for source_id in &referenced_sources {
+        if source_id == metrocalk_editor_shell::MAIN_SEQUENCE_ID {
+            let Some(source_plan) = preview.plan.clone() else {
+                preview.graph.compile.state = "invalid".into();
+                preview.graph.compile.message =
+                    "The graph references Main, but the authored sequence did not compile; the last good graph remains active."
+                        .into();
+                return;
+            };
+            authored_sequences.insert(
+                sequence_document.sequence.id.clone(),
+                sequence_document.sequence.clone(),
+            );
+            source_fences.insert(source_id.clone(), source_plan.stable_hash.clone());
+            catalog.insert(source_plan.id.clone(), source_plan);
+        } else {
+            let Some(instance) = preview.clip_instances.get(source_id) else {
+                preview.graph.compile.state = "invalid".into();
+                preview.graph.compile.message = format!(
+                    "Graph source '{source_id}' has no current validated clip instance. Repair or recreate its explicit mapping."
+                );
+                return;
+            };
+            authored_sequences.insert(instance.sequence.id.clone(), instance.sequence.clone());
+            source_fences.insert(source_id.clone(), instance.compiled.stable_hash.clone());
+            catalog.insert(
+                instance.compiled.plan.id.clone(),
+                instance.compiled.plan.clone(),
+            );
+        }
+    }
+    let source_hash = animation_graph_source_set_hash(&source_fences);
+    if let Some((source_id, plan)) = catalog
+        .iter()
+        .find(|(_, plan)| plan.time_base != ANIMATION_RUNTIME_TIME_BASE)
+    {
+        preview.graph.compile.state = "invalid".into();
+        preview.graph.compile.message = format!(
+            "Graph source '{}' uses {} ticks/second, but the shared runtime playhead requires {}. Re-instance or migrate this source before playback.",
+            source_id.as_str(),
+            plan.time_base.ticks_per_second,
+            ANIMATION_RUNTIME_TIME_BASE.ticks_per_second
+        );
+        preview.graph.runtime = None;
+        preview.graph.pending_compile_key = None;
+        return;
+    }
+    // A graph-wide transport has one visible playhead. Until per-state duration policy is authored, the
+    // deterministic policy is the maximum referenced source duration so no longer clip is truncated.
+    let source_duration = catalog
+        .values()
+        .map(|plan| plan.duration)
+        .max()
+        .unwrap_or(AnimationTick::ZERO);
+    let authored_revision = preview.graph.revision.clone();
+    if preview.graph.compiled_source_hash.as_deref() == Some(source_hash.as_str())
+        && preview.graph.compile.compiled_revision.as_deref() == Some(authored_revision.as_str())
+        && preview.graph.runtime.is_some()
+    {
+        preview.graph.compile.state = "ready".into();
+        return;
+    }
+    let key = (authored_revision.clone(), source_hash.clone());
+    if preview.graph.pending_compile_key.as_ref() == Some(&key) {
+        return;
+    }
+    let mut adapted = match metrocalk_editor_shell::adapt_animation_graph_document(
+        engine,
+        &document,
+        &authored_sequences,
+    ) {
+        Ok(adapted) => adapted,
+        Err(diagnostics) => {
+            preview
+                .graph
+                .diagnostics
+                .extend(diagnostics.iter().map(animation_graph_diagnostic_info));
+            preview.graph.compile.state = "invalid".into();
+            preview.graph.compile.message = if preview.graph.runtime.is_some() {
+                "Graph adaptation failed; the last good compiled revision remains active.".into()
+            } else {
+                "Graph adaptation failed; the implicit flat graph remains active.".into()
+            };
+            return;
+        }
+    };
+    adapted
+        .diagnostics
+        .push(metrocalk_editor_shell::AnimationGraphDiagnostic {
+            id: "runtime-derived-reference-pose".into(),
+            severity: metrocalk_editor_shell::AnimationGraphDiagnosticSeverity::Info,
+            code: "derived_reference_pose".into(),
+            message: "The runtime reference pose is an explicit typed snapshot of live resolved ECS properties at compilation time.".into(),
+            fix: None,
+            node_id: None,
+            edge_id: None,
+            port_id: Some("reference_pose".into()),
+        });
+    let Some(sender) = preview.graph.compile_tx.clone() else {
+        preview.graph.compile.state = "invalid".into();
+        preview.graph.compile.message =
+            "The graph compiler worker is unavailable; the last good preview remains active."
+                .into();
+        return;
+    };
+    preview.graph.pending_compile_key = Some(key);
+    preview.graph.compile.state = if preview.graph.runtime.is_some() {
+        "stale"
+    } else {
+        "compiling"
+    }
+    .into();
+    preview.graph.compile.message = if preview.graph.runtime.is_some() {
+        "Source or graph changes are compiling; the last good revision remains active.".into()
+    } else {
+        "The graph is compiling on a native worker.".into()
+    };
+    std::thread::spawn(move || {
+        let result = CompiledAnimationGraph::compile(&adapted.graph, &catalog);
+        if sender
+            .send(EngineCmd::AnimationGraphCompileReady {
+                sequence_id: document.sequence_id,
+                authored_revision,
+                source_hash,
+                source_duration,
+                parameter_routes: adapted.parameter_routes,
+                edge_provenance: adapted.edge_provenance,
+                adapter_diagnostics: adapted.diagnostics,
+                result: Box::new(result),
+            })
+            .is_err()
+        {
+            eprintln!("[animation-graph] compile result dropped because the engine thread stopped");
+        }
+    });
+}
+
+fn animation_graph_source_set_hash(source_fences: &BTreeMap<String, String>) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut frame = |bytes: &[u8]| {
+        hash ^= u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    frame(b"metrocalk-animation-graph-source-set-v1");
+    for (source_id, stable_hash) in source_fences {
+        frame(source_id.as_bytes());
+        frame(stable_hash.as_bytes());
+    }
+    format!("animation-graph-sources:{hash:016x}")
+}
+
+fn current_animation_graph_source_hash(preview: &AnimationPreviewState) -> Option<String> {
+    let graph = preview.graph.graph.as_ref()?;
+    let source_ids: BTreeSet<_> = graph
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|node| {
+            node.get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true)
+                && node.get("kind").and_then(serde_json::Value::as_str) == Some("sequence")
+        })
+        .filter_map(|node| {
+            node.get("sourceId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    let mut fences = BTreeMap::new();
+    for source_id in source_ids {
+        let hash = if source_id == metrocalk_editor_shell::MAIN_SEQUENCE_ID {
+            preview.plan.as_ref()?.stable_hash.clone()
+        } else {
+            preview
+                .clip_instances
+                .get(&source_id)?
+                .compiled
+                .stable_hash
+                .clone()
+        };
+        fences.insert(source_id, hash);
+    }
+    Some(animation_graph_source_set_hash(&fences))
+}
+
+fn animation_interpolation(value: &str) -> Option<AnimationInterpolation> {
+    match value {
+        "step" => Some(AnimationInterpolation::Step),
+        "linear" => Some(AnimationInterpolation::Linear),
+        "cubic" => Some(AnimationInterpolation::Cubic),
+        _ => None,
+    }
+}
+
+fn animation_interpolation_name(value: AnimationInterpolation) -> &'static str {
+    match value {
+        AnimationInterpolation::Step => "step",
+        AnimationInterpolation::Linear => "linear",
+        AnimationInterpolation::Cubic => "cubic",
+    }
+}
+
+fn animation_loop_policy(value: &str) -> Option<AnimationLoopPolicy> {
+    match value {
+        "once" => Some(AnimationLoopPolicy::Once),
+        "loop" => Some(AnimationLoopPolicy::Loop),
+        "ping_pong" => Some(AnimationLoopPolicy::PingPong),
+        _ => None,
+    }
+}
+
+fn animation_loop_name(value: AnimationLoopPolicy) -> &'static str {
+    match value {
+        AnimationLoopPolicy::Once => "once",
+        AnimationLoopPolicy::Loop => "loop",
+        AnimationLoopPolicy::PingPong => "ping_pong",
+    }
+}
+
+fn animation_value_kind(value: AnimationValueKind) -> &'static str {
+    match value {
+        AnimationValueKind::Number => "number",
+        AnimationValueKind::Integer => "integer",
+        AnimationValueKind::Boolean => "bool",
+        AnimationValueKind::String => "string",
+        AnimationValueKind::Vec3 => "vec3",
+        AnimationValueKind::Vec4 => "vec4",
+        AnimationValueKind::Quaternion => "quaternion",
+        AnimationValueKind::Weights => "weights",
+    }
+}
+
+fn animation_value_json(value: &AnimValue) -> serde_json::Value {
+    match value {
+        AnimValue::Number(value) => serde_json::json!(value),
+        AnimValue::Integer(value) => serde_json::json!(value),
+        AnimValue::Boolean(value) => serde_json::json!(value),
+        AnimValue::String(value) => serde_json::json!(value),
+        AnimValue::Vec3(value) => serde_json::json!(value),
+        AnimValue::Vec4(value) | AnimValue::Quaternion(value) => serde_json::json!(value),
+        AnimValue::Weights(value) => serde_json::json!(value),
+    }
+}
+
+fn animation_value_from_json(
+    kind: AnimationValueKind,
+    value: &serde_json::Value,
+) -> Option<AnimValue> {
+    match kind {
+        AnimationValueKind::Number => value.as_f64().map(AnimValue::Number),
+        AnimationValueKind::Integer => value.as_i64().map(AnimValue::Integer),
+        AnimationValueKind::Boolean => value.as_bool().map(AnimValue::Boolean),
+        AnimationValueKind::String => value.as_str().map(|value| AnimValue::String(value.into())),
+        AnimationValueKind::Vec3 => json_number_array::<3>(value).map(AnimValue::Vec3),
+        AnimationValueKind::Vec4 => json_number_array::<4>(value).map(AnimValue::Vec4),
+        AnimationValueKind::Quaternion => json_number_array::<4>(value).map(AnimValue::Quaternion),
+        AnimationValueKind::Weights => value.as_array().and_then(|values| {
+            values
+                .iter()
+                .map(serde_json::Value::as_f64)
+                .collect::<Option<Vec<_>>>()
+                .map(AnimValue::Weights)
+        }),
+    }
+}
+
+fn json_number_array<const N: usize>(value: &serde_json::Value) -> Option<[f64; N]> {
+    let values = value.as_array()?;
+    if values.len() != N {
+        return None;
+    }
+    let mut out = [0.0; N];
+    for (index, value) in values.iter().enumerate() {
+        out[index] = value.as_f64()?;
+    }
+    Some(out)
+}
+
+fn animation_payload_from_json(value: &serde_json::Value) -> Option<AnimValue> {
+    if let Some(value) = value.as_bool() {
+        Some(AnimValue::Boolean(value))
+    } else if let Some(value) = value.as_i64() {
+        Some(AnimValue::Integer(value))
+    } else if let Some(value) = value.as_f64() {
+        Some(AnimValue::Number(value))
+    } else if let Some(value) = value.as_str() {
+        Some(AnimValue::String(value.into()))
+    } else if value.as_array().is_some_and(|values| values.len() == 3) {
+        json_number_array::<3>(value).map(AnimValue::Vec3)
+    } else if value.as_array().is_some_and(|values| values.len() == 4) {
+        json_number_array::<4>(value).map(AnimValue::Vec4)
+    } else {
+        None
+    }
+}
+
+fn field_value_json(value: &FieldValue) -> serde_json::Value {
+    match value {
+        FieldValue::Integer(value) => serde_json::json!(value),
+        FieldValue::Number(value) => serde_json::json!(value),
+        FieldValue::Bool(value) => serde_json::json!(value),
+        FieldValue::Str(value) => serde_json::json!(value),
+    }
+}
+
+fn entity_display_name(engine: &Engine<FlecsWorld>, id: EntityId) -> String {
+    engine
+        .components_of(id)
+        .get(metrocalk_core::variant::INSTANCE_META)
+        .and_then(|meta| meta.get("name"))
+        .and_then(|value| match value {
+            FieldValue::Str(value) => Some(value.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| id.to_loro_key())
+}
+
+fn refresh_animation_plan(engine: &Engine<FlecsWorld>, preview: &mut AnimationPreviewState) {
+    if let Some(transient) = preview.transient_clip.as_ref() {
+        // Audition is an isolated render projection. Keep the exact compiled draft active and do not
+        // install/schedule the authored graph until explicit teardown restores normal preview authority.
+        preview.plan = Some(transient.compiled.plan.clone());
+        preview.graph.runtime = None;
+        return;
+    }
+    let mut document = metrocalk_editor_shell::load_animation_document(engine);
+    document.sequence.loop_policy = preview.loop_policy;
+    match document.compile() {
+        Ok(plan) => {
+            preview.plan = Some(plan);
+            preview.last_error = None;
+        }
+        Err(error) => {
+            preview.plan = None;
+            if preview.graph.runtime.is_none() {
+                preview.playing = false;
+            }
+            preview.last_error = Some(error.to_string());
+        }
+    }
+    schedule_animation_graph_compile(engine, preview);
+}
+
+fn restore_authored_animation_projection(
+    engine: &Engine<FlecsWorld>,
+    shared: &Shared,
+    positions: &mut HashMap<Entity, [f32; 3]>,
+    assets: &AssetsRuntime,
+    preview: &mut AnimationPreviewState,
+) {
+    refresh_animation_plan(engine, preview);
+    ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+    rebuild(engine, shared, positions, assets);
+}
+
+fn animation_display_tick(preview: &AnimationPreviewState) -> AnimationTick {
+    if preview.graph.runtime.is_some() {
+        let duration = animation_transport_duration(preview);
+        if duration <= AnimationTick::ZERO {
+            return AnimationTick::ZERO;
+        }
+        return if preview.loop_policy == AnimationLoopPolicy::Once {
+            AnimationTick(preview.current_tick.0.min(duration.0))
+        } else {
+            AnimationTick(preview.current_tick.0.rem_euclid(duration.0))
+        };
+    }
+    preview.plan.as_ref().map_or(preview.current_tick, |plan| {
+        if preview.playing || preview.current_tick > plan.duration {
+            plan.evaluate(preview.current_tick).local_tick
+        } else {
+            preview.current_tick
+        }
+    })
+}
+
+fn animation_transport_duration(preview: &AnimationPreviewState) -> AnimationTick {
+    if preview.graph.runtime.is_some() {
+        preview.graph.source_duration.unwrap_or(AnimationTick::ZERO)
+    } else {
+        preview
+            .plan
+            .as_ref()
+            .map_or(AnimationTick::ZERO, |plan| plan.duration)
+    }
+}
+
+fn animation_preview_has_transport_content(preview: &AnimationPreviewState) -> bool {
+    preview.graph.runtime.is_some()
+        || preview
+            .plan
+            .as_ref()
+            .is_some_and(animation_plan_has_transport_content)
+}
+
+fn seek_animation_preview(preview: &mut AnimationPreviewState, tick: AnimationTick) {
+    preview.current_tick = tick;
+    if let Some(runtime) = preview.graph.runtime.as_mut() {
+        let started = std::time::Instant::now();
+        runtime.seek(tick);
+        preview.graph.evaluation_cost_micros =
+            Some(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    }
+}
+
+fn advance_animation_preview(preview: &mut AnimationPreviewState, delta: AnimationTick) {
+    preview.current_tick = preview.current_tick.saturating_add(delta);
+    if let Some(runtime) = preview.graph.runtime.as_mut() {
+        let started = std::time::Instant::now();
+        runtime.advance(delta);
+        preview.graph.evaluation_cost_micros =
+            Some(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    }
+}
+
+fn animation_preview_step_delta(
+    loop_policy: AnimationLoopPolicy,
+    current: AnimationTick,
+    duration: AnimationTick,
+    requested: AnimationTick,
+) -> AnimationTick {
+    if loop_policy == AnimationLoopPolicy::Once {
+        AnimationTick(requested.0.min(duration.0.saturating_sub(current.0).max(0)))
+    } else {
+        requested
+    }
+}
+
+fn animation_plan_has_transport_content(plan: &CompiledSequence) -> bool {
+    plan.tracks_len() > 0 || !plan.events().is_empty()
+}
+
+fn take_pending_animation_events(
+    preview: &mut AnimationPreviewState,
+) -> (Vec<AnimationEventInfo>, bool) {
+    let mut events = std::mem::take(&mut preview.crossed_events);
+    let truncated = preview.event_overflowed || events.len() > MAX_PENDING_ANIMATION_EVENTS;
+    events.truncate(MAX_PENDING_ANIMATION_EVENTS);
+    preview.event_overflowed = false;
+    (events, truncated)
+}
+
+fn animation_playback_response(
+    preview: &mut AnimationPreviewState,
+    ok: bool,
+    message: String,
+) -> AnimationPlaybackInfo {
+    let duration_tick = animation_transport_duration(preview).0;
+    let evaluated_tracks = preview.graph.runtime.as_ref().map_or_else(
+        || {
+            preview
+                .plan
+                .as_ref()
+                .map_or(0, CompiledSequence::tracks_len)
+        },
+        |runtime| runtime.frame().values.len(),
+    );
+    let (crossed_events, events_truncated) = take_pending_animation_events(preview);
+    AnimationPlaybackInfo {
+        ok,
+        message,
+        current_tick: animation_display_tick(preview).0,
+        duration_tick,
+        playing: preview.playing,
+        imported_clip_preview_active: preview.transient_clip.is_some(),
+        loop_policy: animation_loop_name(preview.loop_policy).into(),
+        evaluated_tracks,
+        crossed_events,
+        events_truncated,
+    }
+}
+
+/// A stale request may inspect transport truth but must not consume crossings owned by the current
+/// preview. This bounded snapshot mirrors the normal response without draining the event handoff.
+fn animation_playback_snapshot(
+    preview: &AnimationPreviewState,
+    ok: bool,
+    message: String,
+) -> AnimationPlaybackInfo {
+    let duration_tick = animation_transport_duration(preview).0;
+    let evaluated_tracks = preview.graph.runtime.as_ref().map_or_else(
+        || {
+            preview
+                .plan
+                .as_ref()
+                .map_or(0, CompiledSequence::tracks_len)
+        },
+        |runtime| runtime.frame().values.len(),
+    );
+    AnimationPlaybackInfo {
+        ok,
+        message,
+        current_tick: animation_display_tick(preview).0,
+        duration_tick,
+        playing: preview.playing,
+        imported_clip_preview_active: preview.transient_clip.is_some(),
+        loop_policy: animation_loop_name(preview.loop_policy).into(),
+        evaluated_tracks,
+        crossed_events: preview
+            .crossed_events
+            .iter()
+            .take(MAX_PENDING_ANIMATION_EVENTS)
+            .cloned()
+            .collect(),
+        events_truncated: preview.event_overflowed
+            || preview.crossed_events.len() > MAX_PENDING_ANIMATION_EVENTS,
+    }
+}
+
+struct AnimationBindingPresentation {
+    context: &'static str,
+    editor_kind: &'static str,
+    state: &'static str,
+    reason: String,
+    runtime_sink: Option<String>,
+}
+
+fn animation_binding_presentation(
+    engine: &Engine<FlecsWorld>,
+    entity: EntityId,
+    binding: &AnimationBindingContext,
+    animatable: bool,
+    unavailable_reason: Option<&str>,
+) -> AnimationBindingPresentation {
+    let components = engine.components_of(entity);
+    let component = binding.path.component.as_str();
+    let context = if binding.domains.contains(&AnimationDomain::Ui)
+        || (component == "Transform"
+            && (components.contains_key("UiStyle") || components.contains_key("HealthBar")))
+    {
+        "ui"
+    } else if component == "Sprite"
+        || (component == "Transform" && components.contains_key("Sprite"))
+    {
+        "2d"
+    } else {
+        "3d"
+    };
+    let editor_kind = match binding.editor_kind {
+        BindingEditorKind::Scalar | BindingEditorKind::Integer => "scalar",
+        BindingEditorKind::Toggle | BindingEditorKind::Visibility => "toggle",
+        BindingEditorKind::Text | BindingEditorKind::ReadOnly => "text",
+        BindingEditorKind::Vector3 => "vector",
+        BindingEditorKind::Quaternion => "quaternion",
+        BindingEditorKind::Color => "color",
+        BindingEditorKind::Opacity => "scalar",
+        BindingEditorKind::SpriteFrame => "sprite_frame",
+    };
+    let runtime_sink: Option<String> = match binding.runtime_sink {
+        Some(AnimationRuntimeSink::TransformProjection) => Some("viewport-transform".into()),
+        Some(AnimationRuntimeSink::KinematicJointProjection) => Some("kinematic-joint".into()),
+        Some(AnimationRuntimeSink::EditorTwoDProjection) => Some("workspace-2d".into()),
+        Some(AnimationRuntimeSink::EditorUiProjection) => Some("workspace-ui".into()),
+        None => None,
+    };
+    let editor_preview_only = runtime_sink
+        .as_deref()
+        .is_some_and(|sink| sink.starts_with("workspace-"));
+    let state = if !animatable {
+        "unsupported"
+    } else if editor_preview_only {
+        "preview_only"
+    } else {
+        "ready"
+    };
+    AnimationBindingPresentation {
+        context,
+        editor_kind,
+        state,
+        reason: if !animatable {
+            unavailable_reason
+                .unwrap_or("No verified animation adapter consumes this channel.")
+                .to_owned()
+        } else if editor_preview_only {
+            "An editor preview adapter consumes this channel; a deployment runtime adapter is still required."
+                .into()
+        } else {
+            "A verified native animation adapter consumes this channel.".into()
+        },
+        runtime_sink,
+    }
+}
+
+fn animation_workspace_info(
+    engine: &Engine<FlecsWorld>,
+    assets: &AssetsRuntime,
+    preview: &AnimationPreviewState,
+    selected: Option<&str>,
+) -> AnimationWorkspaceInfo {
+    let document = metrocalk_editor_shell::load_animation_document(engine);
+    let transport_duration = animation_transport_duration(preview);
+    let selected_entity = selected.and_then(EntityId::from_loro_key);
+    let selected_key = selected_entity.map(|id| id.to_loro_key());
+    let selected_name = selected_entity.map(|id| entity_display_name(engine, id));
+    let properties: Vec<AnimationPropertyInfo> = selected_entity
+        .map(|id| {
+            metrocalk_editor_shell::animation_property_catalog(engine, id)
+                .into_iter()
+                .map(|property| {
+                    let binding = animation_binding_presentation(
+                        engine,
+                        id,
+                        &property.binding,
+                        property.animatable,
+                        property.reason.as_deref(),
+                    );
+                    AnimationPropertyInfo {
+                        component: property.component,
+                        property: property.property,
+                        label: property.label,
+                        value_kind: property.value_kind.map_or_else(
+                            || "unsupported".into(),
+                            |kind| animation_value_kind(kind).into(),
+                        ),
+                        value: field_value_json(&property.value),
+                        animatable: property.animatable,
+                        reason: property.reason,
+                        context: binding.context.into(),
+                        editor_kind: binding.editor_kind.into(),
+                        binding_state: binding.state.into(),
+                        binding_reason: binding.reason,
+                        runtime_sink: binding.runtime_sink,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let time_base = document.sequence.time_base;
+    let binding_registry = metrocalk_editor_shell::standard_animation_binding_registry();
+    let tracks: Vec<_> = document
+        .sequence
+        .tracks
+        .iter()
+        .filter(|track| {
+            selected_key
+                .as_ref()
+                .is_none_or(|target| &track.binding.path.target == target)
+        })
+        .map(|track| {
+            let target_id = track.binding.path.target.clone();
+            let target_name = EntityId::from_loro_key(&target_id)
+                .map(|id| entity_display_name(engine, id))
+                .unwrap_or_else(|| target_id.clone());
+            let target_entity = EntityId::from_loro_key(&target_id);
+            let binding_context = binding_registry.resolve(&track.binding.path);
+            let target_animatable = target_entity.is_some_and(|entity| {
+                let catalog = metrocalk_editor_shell::animation_property_catalog(engine, entity);
+                catalog.iter().any(|property| {
+                    property.component == track.binding.path.component
+                        && property.property == track.binding.path.property
+                        && property.animatable
+                })
+            });
+            let mut binding = target_entity.map_or(
+                AnimationBindingPresentation {
+                    context: "3d",
+                    editor_kind: "scalar",
+                    state: "invalid",
+                    reason: "The animation target no longer exists.".into(),
+                    runtime_sink: None,
+                },
+                |entity| {
+                    animation_binding_presentation(
+                        engine,
+                        entity,
+                        &binding_context,
+                        target_animatable,
+                        None,
+                    )
+                },
+            );
+            let legacy_joint_track = track.id.as_str().starts_with("legacy-");
+            if legacy_joint_track {
+                binding.state = "read_only";
+                binding.reason = "This read-only row adapts legacy JointTrack keys. Edit it with the Joint tool, or key the same property in Animation to migrate authoring to a universal track."
+                    .into();
+            }
+            AnimationTrackInfo {
+                id: track.id.as_str().to_owned(),
+                name: track.name.clone(),
+                target_id,
+                target_name,
+                component: track.binding.path.component.clone(),
+                property: track.binding.path.property.clone(),
+                value_kind: animation_value_kind(track.binding.value_kind).into(),
+                interpolation: animation_interpolation_name(track.interpolation).into(),
+                enabled: track.enabled,
+                locked: legacy_joint_track || document.locked_tracks.contains(&track.id),
+                context: binding.context.into(),
+                editor_kind: binding.editor_kind.into(),
+                binding_state: binding.state.into(),
+                binding_reason: binding.reason,
+                runtime_sink: binding.runtime_sink,
+                keys: track
+                    .keyframes
+                    .iter()
+                    .map(|key| AnimationKeyInfo {
+                        id: key.id.as_str().to_owned(),
+                        tick: key.tick.0,
+                        seconds: time_base.to_seconds(key.tick).unwrap_or(0.0),
+                        value: animation_value_json(&key.value),
+                        in_tangent: key.in_tangent.as_ref().map(animation_value_json),
+                        out_tangent: key.out_tangent.as_ref().map(animation_value_json),
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    let markers: Vec<_> = document
+        .sequence
+        .markers
+        .iter()
+        .map(|marker| AnimationMarkerInfo {
+            id: marker.id.as_str().to_owned(),
+            owner_id: document
+                .marker_owners
+                .get(&marker.id)
+                .map_or_else(String::new, EntityId::to_loro_key),
+            name: marker.name.clone(),
+            tick: marker.tick.0,
+            seconds: time_base.to_seconds(marker.tick).unwrap_or(0.0),
+            color: marker.color,
+        })
+        .collect();
+    let events: Vec<_> = document
+        .sequence
+        .events
+        .iter()
+        .map(|event| AnimationEventInfo {
+            id: event.id.as_str().to_owned(),
+            owner_id: document
+                .event_owners
+                .get(&event.id)
+                .map_or_else(String::new, EntityId::to_loro_key),
+            name: event.name.clone(),
+            tick: event.tick.0,
+            seconds: time_base.to_seconds(event.tick).unwrap_or(0.0),
+            payload: event.payload.as_ref().map(animation_value_json),
+        })
+        .collect();
+    let mut issues: Vec<_> = document
+        .storage_issues
+        .iter()
+        .map(|issue| AnimationIssueInfo {
+            severity: issue.severity.into(),
+            code: issue.code.into(),
+            message: issue.message.clone(),
+            fix: issue.remediation.clone(),
+        })
+        .collect();
+    issues.extend(document.sequence.validate().into_iter().map(|issue| {
+        AnimationIssueInfo {
+            severity: match issue.severity {
+                AnimationSeverity::Info => "info",
+                AnimationSeverity::Warning => "warning",
+                AnimationSeverity::Error => "error",
+            }
+            .into(),
+            code: format!("{:?}", issue.code),
+            message: format!("{}: {}", issue.location, issue.message),
+            fix: Some(issue.remediation),
+        }
+    }));
+    if let Some(error) = &preview.last_error {
+        issues.push(AnimationIssueInfo {
+            severity: "error".into(),
+            code: "preview_compile_failed".into(),
+            message: error.clone(),
+            fix: Some("Repair the reported track before previewing it.".into()),
+        });
+    }
+    issues.extend(preview.clip_instance_issues.clone());
+    let asset = selected_entity
+        .map(|id| animation_asset_profile(engine, assets, preview, id, tracks.len()));
+    let contexts = ["2d", "3d", "ui"]
+        .into_iter()
+        .map(|context| {
+            let context_properties: Vec<_> = properties
+                .iter()
+                .filter(|property| property.context == context)
+                .collect();
+            let context_tracks = tracks.iter().filter(|track| track.context == context).count();
+            let state = if context_properties.iter().any(|property| property.binding_state == "ready") {
+                "ready"
+            } else if context_properties
+                .iter()
+                .any(|property| property.binding_state == "preview_only")
+            {
+                "preview_only"
+            } else {
+                "unsupported"
+            };
+            AnimationContextReadiness {
+                context: context.into(),
+                state: state.into(),
+                properties: context_properties.len(),
+                tracks: context_tracks,
+                reason: if context_properties.is_empty() {
+                    format!("The selection has no {context} animation channels.")
+                } else if state == "preview_only" {
+                    "Channels are editable through the shared preview adapter; runtime coverage remains explicit."
+                        .into()
+                } else {
+                    "The shared sequence has verified channels for this context.".into()
+                },
+                action: None,
+            }
+        })
+        .collect();
+    let revision = metrocalk_editor_shell::authored_animation_revision(engine);
+    AnimationWorkspaceInfo {
+        revision,
+        sequence_id: document.sequence.id.as_str().to_owned(),
+        sequence_name: document.sequence.name,
+        ticks_per_second: time_base.ticks_per_second,
+        duration_tick: if transport_duration > AnimationTick::ZERO {
+            transport_duration.0
+        } else {
+            document.sequence.duration.0
+        },
+        current_tick: animation_display_tick(preview).0,
+        playing: preview.playing,
+        loop_policy: animation_loop_name(preview.loop_policy).into(),
+        selected_id: selected.map(str::to_owned),
+        selected_name,
+        properties,
+        tracks,
+        markers,
+        events,
+        contexts,
+        asset,
+        issues,
+    }
+}
+
+const fn animation_import_state_name(
+    state: metrocalk_assets::AnimationImportState,
+) -> &'static str {
+    match state {
+        metrocalk_assets::AnimationImportState::Unknown => "unknown",
+        metrocalk_assets::AnimationImportState::Pending => "pending",
+        metrocalk_assets::AnimationImportState::Importing => "importing",
+        metrocalk_assets::AnimationImportState::Ready => "ready",
+        metrocalk_assets::AnimationImportState::ReadyWithWarnings => "ready_with_warnings",
+        metrocalk_assets::AnimationImportState::Stale => "stale",
+        metrocalk_assets::AnimationImportState::FailedRetainingPrevious => {
+            "failed_retaining_previous"
+        }
+        metrocalk_assets::AnimationImportState::Failed => "failed",
+    }
+}
+
+const fn animation_source_location_name(
+    location: metrocalk_animation::AnimationSourceLocation,
+) -> &'static str {
+    match location {
+        metrocalk_animation::AnimationSourceLocation::Unknown => "unknown",
+        metrocalk_animation::AnimationSourceLocation::Embedded => "embedded",
+        metrocalk_animation::AnimationSourceLocation::ProjectRelative => "project_relative",
+        metrocalk_animation::AnimationSourceLocation::ExternalFile => "external_file",
+        metrocalk_animation::AnimationSourceLocation::Generated => "generated",
+        metrocalk_animation::AnimationSourceLocation::Remote => "remote",
+    }
+}
+
+fn persisted_clip_target_mappings(
+    document: &metrocalk_editor_shell::AnimationClipInstanceDocument,
+) -> Vec<AnimationClipTargetMappingRequest> {
+    // Modern rigid instances persist one target rebind per source node. Retain a conservative fallback
+    // for binding-only schema-v1 documents so their last explicit user intent can still seed Repair.
+    let mut mappings = document
+        .target_rebinds
+        .iter()
+        .map(|mapping| (mapping.source_target.clone(), mapping.target_target.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for mapping in &document.binding_rebinds {
+        mappings
+            .entry(mapping.source.path.target.clone())
+            .or_insert_with(|| mapping.target.path.target.clone());
+    }
+    mappings
+        .into_iter()
+        .map(
+            |(source_target_id, target_id)| AnimationClipTargetMappingRequest {
+                source_target_id,
+                target_id,
+            },
+        )
+        .collect()
+}
+
+fn animation_imported_clip_infos(
+    engine: &Engine<FlecsWorld>,
+    asset: &metrocalk_assets::AnimationAsset,
+    preview: &AnimationPreviewState,
+    target: EntityId,
+) -> Vec<AnimationImportedClipInfo> {
+    let target_key = target.to_loro_key();
+    let target_is_active = engine.is_active(target);
+    let target_has_transform = engine.components_of(target).contains_key("Transform");
+    let logical_asset_id = asset.record.effective_logical_id().as_str();
+    let persisted_instances = metrocalk_editor_shell::load_animation_clip_instances(engine);
+    let source_target_labels = asset
+        .targets
+        .iter()
+        .map(|source_target| {
+            let label = if source_target.canonical_path.is_empty()
+                || source_target.canonical_path == source_target.display_name
+            {
+                source_target.display_name.clone()
+            } else {
+                format!(
+                    "{} ({})",
+                    source_target.display_name, source_target.canonical_path
+                )
+            };
+            (source_target.id.clone(), label)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut summaries = BTreeMap::new();
+    for summary in asset
+        .manifest
+        .facets
+        .iter()
+        .flat_map(|facet| facet.clips.iter())
+    {
+        summaries
+            .entry(summary.clip_id.as_str().to_owned())
+            .or_insert_with(|| summary.clone());
+    }
+    summaries
+        .into_values()
+        .map(|summary| {
+            let (runtime_duration_tick, runtime_duration_error) =
+                match summary.time_base.convert_tick(
+                    summary.duration,
+                    ANIMATION_RUNTIME_TIME_BASE,
+                ) {
+                    Ok(tick) if tick > AnimationTick::ZERO => (tick.0, None),
+                    Ok(_) => (
+                        0,
+                        Some(format!(
+                            "Source duration cannot be represented by the shared {} ticks/second runtime clock without collapsing to zero.",
+                            ANIMATION_RUNTIME_TIME_BASE.ticks_per_second
+                        )),
+                    ),
+                    Err(error) => (
+                        0,
+                        Some(format!(
+                            "Source clock {} cannot be normalized to the shared {} ticks/second runtime clock: {error}",
+                            summary.time_base.ticks_per_second,
+                            ANIMATION_RUNTIME_TIME_BASE.ticks_per_second
+                        )),
+                    ),
+                };
+            let candidates = preview
+                .clip_instances
+                .values()
+                .filter(|instance| {
+                    instance.document.logical_asset_id == logical_asset_id
+                        && instance.document.clip_id == summary.clip_id.as_str()
+                })
+                .collect::<Vec<_>>();
+            let selected_candidates = candidates
+                .iter()
+                .copied()
+                .filter(|instance| {
+                    instance
+                        .document
+                        .target_rebinds
+                        .iter()
+                        .any(|mapping| mapping.target_target == target_key)
+                })
+                .collect::<Vec<_>>();
+            let existing = if selected_candidates.len() == 1 {
+                selected_candidates.first().copied()
+            } else if candidates.len() == 1 {
+                candidates.first().copied()
+            } else {
+                None
+            };
+            let existing_contains_selected = existing.is_some_and(|instance| {
+                instance
+                    .document
+                    .target_rebinds
+                    .iter()
+                    .any(|mapping| mapping.target_target == target_key)
+            });
+            let repair_candidates = persisted_instances
+                .documents
+                .iter()
+                .filter(|document| {
+                    document.logical_asset_id == logical_asset_id
+                        && persisted_clip_corresponds_to_current(document, &summary.clip_id)
+                        && !preview.clip_instances.contains_key(&document.id)
+                })
+                .collect::<Vec<_>>();
+            let selected_repair_candidates = repair_candidates
+                .iter()
+                .copied()
+                .filter(|document| {
+                    document
+                        .target_rebinds
+                        .iter()
+                        .any(|mapping| mapping.target_target == target_key)
+                        || document.binding_rebinds.iter().any(|mapping| {
+                            mapping.target.path.target == target_key
+                        })
+                })
+                .collect::<Vec<_>>();
+            let repair = if selected_repair_candidates.len() == 1 {
+                selected_repair_candidates.first().copied()
+            } else if repair_candidates.len() == 1 {
+                repair_candidates.first().copied()
+            } else {
+                None
+            };
+            let current_repair_signature = asset.clip_binding_signature(&summary.clip_id).ok();
+            let instances = persisted_instances
+                .documents
+                .iter()
+                .filter(|document| {
+                    document.logical_asset_id == logical_asset_id
+                        && persisted_clip_corresponds_to_current(document, &summary.clip_id)
+                })
+                .map(|document| {
+                    let ready = preview.clip_instances.contains_key(&document.id);
+                    AnimationImportedClipInstanceInfo {
+                        instance_id: document.id.clone(),
+                        name: document.name.clone(),
+                        readiness: if ready { "ready" } else { "repair_required" }.into(),
+                        reason: if ready {
+                            "Revision-pinned mappings compile against live scene targets.".into()
+                        } else {
+                            "The source revision or at least one mapped scene target changed; review this instance explicitly."
+                                .into()
+                        },
+                        target_mappings: persisted_clip_target_mappings(document),
+                        repair_changes: if ready {
+                            Vec::new()
+                        } else {
+                            current_repair_signature.as_ref().map_or_else(
+                                || {
+                                    vec![
+                                        "Current source channels are unavailable; repair import diagnostics before resaving."
+                                            .into(),
+                                    ]
+                                },
+                                |signature| {
+                                    animation_clip_repair_changes(
+                                        &document.source_bindings,
+                                        signature,
+                                    )
+                                },
+                            )
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            let has_ready_instances = !candidates.is_empty();
+            let has_repair_instances = !repair_candidates.is_empty();
+            let admission = rigid_clip_admission(asset, &summary.clip_id);
+            let (
+                source_binding_hash,
+                source_targets,
+                source_bindings,
+                channels,
+                admission_error,
+                repair_changes,
+            ) = match admission {
+                Ok((signature, targets, channels, _)) => {
+                    let bindings = signature
+                        .bindings
+                        .iter()
+                        .map(|binding| AnimationImportedSourceBindingInfo {
+                            source_target_id: binding.path.target.clone(),
+                            source_target_label: source_target_labels
+                                .get(&binding.path.target)
+                                .cloned()
+                                .unwrap_or_else(|| binding.path.target.clone()),
+                            component: binding.path.component.clone(),
+                            property: binding.path.property.clone(),
+                            value_kind: animation_value_kind(binding.value_kind).into(),
+                        })
+                        .collect();
+                    let repair_changes = repair.map_or_else(Vec::new, |document| {
+                        animation_clip_repair_changes(&document.source_bindings, &signature)
+                    });
+                    (
+                        signature.signature_hash,
+                        targets,
+                        bindings,
+                        channels,
+                        None,
+                        repair_changes,
+                    )
+                }
+                Err(error) => (
+                    asset
+                        .clip_binding_signature(&summary.clip_id)
+                        .map_or_else(|_| String::new(), |signature| signature.signature_hash),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Some(error),
+                    Vec::new(),
+                ),
+            };
+            let admission_error = admission_error.or(runtime_duration_error);
+            let (readiness, reason, action) = if let Some(instance) = existing {
+                (
+                    "ready",
+                    if existing_contains_selected {
+                        format!(
+                            "Instance '{}' is revision-pinned, explicitly mapped to this entity, and compiled for native playback.",
+                            instance.document.name
+                        )
+                    } else {
+                        format!(
+                            "Instance '{}' is the unique revision-pinned mapping for this imported clip and is compiled for native playback.",
+                            instance.document.name
+                        )
+                    },
+                    Some("Add this ready instance from the Animation Graph source palette.".into()),
+                )
+            } else if has_ready_instances {
+                (
+                    "ready",
+                    format!(
+                        "{} ready instances are available. Choose one by stable identity below.",
+                        candidates.len()
+                    ),
+                    Some("Use a ready instance in Graph or set up another independent mapping.".into()),
+                )
+            } else if !asset.is_ready_for_playback() {
+                (
+                    "blocked",
+                    "The imported asset is not in a validated playable state.".into(),
+                    Some("Repair the import diagnostics before setting up this clip.".into()),
+                )
+            } else if let Some(error) = admission_error {
+                (
+                    "blocked",
+                    error,
+                    Some(
+                        "Use a clip containing only supported rigid TRS channels, or enable the dedicated skeletal/morph adapter."
+                            .into(),
+                    ),
+                )
+            } else if let Some(document) = repair {
+                (
+                    "repair_required",
+                    format!(
+                        "Persisted instance '{}' is no longer in the ready catalog because its source revision or mapped scene target changed.",
+                        document.name
+                    ),
+                    Some(
+                        "Review its last explicit mappings, replace any stale target, and save the repaired instance."
+                            .into(),
+                    ),
+                )
+            } else if has_repair_instances {
+                (
+                    "repair_required",
+                    format!(
+                        "{} persisted instances need individual review; no ambiguous instance was selected automatically.",
+                        repair_candidates.len()
+                    ),
+                    Some("Choose a stable instance below to repair or discard.".into()),
+                )
+            } else if source_targets.len() > 1 {
+                (
+                    "explicit_mapping_required",
+                    format!(
+                        "This clip animates {} distinct source nodes. Unsafe one-entity auto-map is disabled.",
+                        source_targets.len()
+                    ),
+                    Some(
+                        "Use the advanced mapper and choose a distinct live scene entity for every source node."
+                            .into(),
+                    ),
+                )
+            } else if !target_is_active {
+                (
+                    "blocked",
+                    "The selected entity is deactivated and cannot receive rigid playback.".into(),
+                    Some("Reactivate it or select an active entity with a Transform component.".into()),
+                )
+            } else if !target_has_transform {
+                (
+                    "blocked",
+                    "The selected entity has no Transform component for rigid playback.".into(),
+                    Some("Select a renderable entity with a Transform component.".into()),
+                )
+            } else {
+                (
+                    "setup_available",
+                    "One rigid source node can be explicitly mapped to the selected entity. Nothing is applied until you confirm."
+                        .into(),
+                    Some("Review the source channels and choose Set up clip.".into()),
+                )
+            };
+            AnimationImportedClipInfo {
+                clip_id: summary.clip_id.as_str().to_owned(),
+                sequence_id: summary.sequence_id.as_str().to_owned(),
+                name: summary.name,
+                duration_tick: runtime_duration_tick,
+                source_binding_hash,
+                source_target_ids: source_targets.clone(),
+                source_targets: source_targets
+                    .into_iter()
+                    .map(|source_target| {
+                        source_target_labels
+                            .get(&source_target)
+                            .cloned()
+                            .unwrap_or(source_target)
+                    })
+                    .collect(),
+                source_bindings,
+                channels,
+                readiness: readiness.into(),
+                reason,
+                action,
+                instance_id: existing
+                    .map(|instance| instance.document.id.clone())
+                    .or_else(|| repair.map(|document| document.id.clone())),
+                target_mappings: existing
+                    .map(|instance| persisted_clip_target_mappings(&instance.document))
+                    .or_else(|| repair.map(persisted_clip_target_mappings))
+                    .unwrap_or_default(),
+                repair_changes,
+                instances,
+            }
+        })
+        .collect()
+}
+
+fn animation_asset_profile(
+    engine: &Engine<FlecsWorld>,
+    assets: &AssetsRuntime,
+    preview: &AnimationPreviewState,
+    id: EntityId,
+    authored_tracks: usize,
+) -> AnimationAssetProfile {
+    let components = engine.components_of(id);
+    let handle = components
+        .get("MeshRenderer")
+        .and_then(|component| component.get(capscene::MESH_FIELD))
+        .and_then(|value| match value {
+            FieldValue::Str(value) => Some(value.clone()),
+            _ => None,
+        });
+    let mesh = handle
+        .as_deref()
+        .and_then(|handle| assets.store.get_str(handle));
+    let animation_asset = handle
+        .as_deref()
+        .and_then(|handle| assets.animation_assets.get(handle));
+    let animation_record = animation_asset.map(|asset| &asset.record);
+    let skeleton_joints = mesh.and_then(|asset| asset.skeleton.as_ref()).map_or_else(
+        || {
+            animation_asset
+                .and_then(|asset| {
+                    asset
+                        .manifest
+                        .facets
+                        .iter()
+                        .filter_map(|facet| facet.skeleton_signature.as_ref())
+                        .map(|signature| signature.joint_names.len())
+                        .max()
+                })
+                .unwrap_or(0)
+        },
+        |skeleton| skeleton.joints.len(),
+    );
+    let has_skin_stream = mesh.is_some_and(|asset| {
+        asset.primitives.iter().any(|primitive| {
+            !primitive.joints.is_empty()
+                && primitive.joints.len() == primitive.positions.len()
+                && primitive.weights.len() == primitive.positions.len()
+        })
+    });
+    let is_cad = components.contains_key("CadPart");
+    let has_joint = metrocalk_editor_shell::joint_of(engine, id).is_some();
+    let has_transform = components.contains_key("Transform");
+    let provenance = handle.as_ref().map_or_else(
+        || "project-authored".into(),
+        |handle| {
+            if assets.provenance.contains_key(handle) {
+                "content-addressed source provenance recorded".into()
+            } else {
+                "content-addressed project asset".into()
+            }
+        },
+    );
+    let mut capabilities = vec![AnimationCapabilityFact {
+        capability: "Native property playback".into(),
+        state: if has_transform || has_joint {
+            "available"
+        } else {
+            "missing"
+        }
+        .into(),
+        reason: if has_transform || has_joint {
+            "Validated Transform fields and kinematic-joint values have native viewport consumers; unsupported typed fields remain visibly disabled."
+                .into()
+        } else {
+            "No property with a verified native animation consumer exists on this entity.".into()
+        },
+        action: None,
+    }];
+    capabilities.push(AnimationCapabilityFact {
+        capability: "Rigid transform playback".into(),
+        state: if has_transform {
+            "available"
+        } else {
+            "missing"
+        }
+        .into(),
+        reason: if has_transform {
+            "Transform tracks project directly into the native viewport.".into()
+        } else {
+            "This entity has no Transform component.".into()
+        },
+        action: (!has_transform)
+            .then(|| "Add or select a renderable entity with Transform data.".into()),
+    });
+    let imported_clips = animation_asset.map_or(0, |asset| asset.sequences.len());
+    let clips = animation_asset.map_or_else(Vec::new, |asset| {
+        animation_imported_clip_infos(engine, asset, preview, id)
+    });
+    let ready_imported_clips = clips
+        .iter()
+        .filter(|clip| clip.readiness == "ready")
+        .count();
+    capabilities.push(AnimationCapabilityFact {
+        capability: "Imported animation clips".into(),
+        state: if ready_imported_clips > 0 {
+            "available"
+        } else if imported_clips > 0 {
+            "decoded_only"
+        } else {
+            "missing"
+        }
+        .into(),
+        reason: if ready_imported_clips > 0 {
+            format!(
+                "{ready_imported_clips} of {imported_clips} imported clip(s) have revision-pinned source mappings and are ready for native graph playback."
+            )
+        } else if imported_clips > 0 {
+            format!(
+                "{imported_clips} glTF clip(s) were decoded and validated, but none has a current source-node to scene-entity mapping yet."
+            )
+        } else {
+            "No core glTF animation clips were measured for this asset.".into()
+        },
+        action: if ready_imported_clips > 0 {
+            Some("Add a ready clip instance from the Animation Graph source palette.".into())
+        } else if imported_clips > 0 {
+            Some("Create an explicit clip instance and map its glTF source nodes to project entities before playback.".into())
+        } else {
+            animation_asset
+                .is_some_and(|asset| asset.has_errors())
+                .then(|| "Open the import facts and repair malformed or unsupported channels before instancing the clip.".into())
+        },
+    });
+    let has_animation_pointer = animation_asset.is_some_and(|asset| {
+        asset.manifest.facets.iter().any(|facet| {
+            facet
+                .extensions
+                .iter()
+                .any(|extension| extension.namespace == "KHR_animation_pointer")
+        })
+    });
+    capabilities.push(AnimationCapabilityFact {
+        capability: "KHR_animation_pointer".into(),
+        state: if has_animation_pointer {
+            "unsupported"
+        } else {
+            "not_present"
+        }
+        .into(),
+        reason: if has_animation_pointer {
+            "The extension declaration is retained for diagnostics, but pointer channels are not decoded into typed property paths in this runtime tier."
+                .into()
+        } else {
+            "No arbitrary-property glTF animation extension was declared by this source.".into()
+        },
+        action: has_animation_pointer.then(|| {
+            "Convert the source to core TRS/morph channels, or wait for the typed pointer decoder."
+                .into()
+        }),
+    });
+    capabilities.push(AnimationCapabilityFact {
+        capability: "CAD mechanism".into(),
+        state: if has_joint { "available" } else { "missing" }.into(),
+        reason: if has_joint {
+            "A validated kinematic degree of freedom is present and legacy tracks are adapted."
+                .into()
+        } else {
+            "No kinematic joint is authored on this part.".into()
+        },
+        action: (!has_joint && is_cad)
+            .then(|| "Author a joint axis, pivot and limits for the moving CAD part.".into()),
+    });
+    capabilities.push(AnimationCapabilityFact {
+        capability: "GPU skeletal deformation".into(),
+        state: if skeleton_joints > 0 { "unsupported" } else { "missing" }.into(),
+        reason: if skeleton_joints > 0 && has_skin_stream {
+            "The rig and weight streams are preserved, but the viewport GPU palette path is not enabled yet. Rigid tracks remain available.".into()
+        } else if skeleton_joints > 0 {
+            "A skeleton exists but complete joint/weight streams were not measured.".into()
+        } else {
+            "This asset has no measured skeleton.".into()
+        },
+        action: (skeleton_joints > 0).then(|| "Use rigid preview now; enable the verified skin-palette renderer before claiming skeletal playback.".into()),
+    });
+    capabilities.push(AnimationCapabilityFact {
+        capability: "Root-motion authority".into(),
+        state: "unsupported".into(),
+        reason: "Root trajectories are not classified or extracted yet, so pose and movement authority cannot be selected safely."
+            .into(),
+        action: Some(
+            "Keep locomotion entity-driven until root-motion extraction and single-authority controls are verified."
+                .into(),
+        ),
+    });
+    AnimationAssetProfile {
+        display_name: entity_display_name(engine, id),
+        source: if is_cad {
+            "CAD import".into()
+        } else if handle.is_some() {
+            "mesh asset".into()
+        } else {
+            "authored entity".into()
+        },
+        provenance,
+        quality_grade: if animation_asset.is_some_and(|asset| asset.has_errors()) {
+            "D · animation import needs repair".into()
+        } else if skeleton_joints > 0 {
+            "C · rig preserved, skin projection pending".into()
+        } else if has_transform {
+            "A · property and rigid ready".into()
+        } else {
+            "B · no native playback sink".into()
+        },
+        logical_id: animation_record
+            .map(|record| record.effective_logical_id().as_str().to_owned()),
+        revision_id: animation_record
+            .map(|record| record.effective_revision_id().as_str().to_owned()),
+        import_state: animation_record
+            .map(|record| animation_import_state_name(record.import_status.state).to_owned()),
+        dependency_count: animation_record.map_or(0, |record| record.dependencies.len()),
+        source_location: animation_record
+            .map(|record| animation_source_location_name(record.source.location).to_owned()),
+        watches_source: animation_record.is_some_and(|record| record.source.watch_for_changes),
+        reimport_diagnostics: animation_record
+            .map_or(0, |record| record.reimport_diagnostics.len()),
+        skeleton_joints,
+        clip_count: imported_clips,
+        morph_targets: animation_asset
+            .and_then(|asset| {
+                asset
+                    .manifest
+                    .facets
+                    .iter()
+                    .filter_map(|facet| facet.morphs.as_ref())
+                    .map(|morphs| morphs.target_count as usize)
+                    .max()
+            })
+            .unwrap_or(0),
+        root_motion: if animation_asset.is_some_and(|asset| {
+            asset
+                .manifest
+                .facets
+                .iter()
+                .any(|facet| facet.root_motion.present)
+        }) {
+            "source metadata present; runtime authority unsupported".into()
+        } else {
+            "not classified (unsupported in this tier)".into()
+        },
+        reimport_binding: if animation_asset.is_some_and(|asset| {
+            asset
+                .manifest
+                .facets
+                .iter()
+                .all(|facet| facet.reimport.preserves_authored_overrides)
+        }) {
+            "canonical hierarchy-path channel identities preserve authored mappings across safe source reordering".into()
+        } else if is_cad {
+            "animation fields follow the matched entity on re-import".into()
+        } else if animation_asset.is_some() {
+            "mapping identity could not be proven current; review clip mappings after re-import"
+                .into()
+        } else {
+            "stable project entity identity".into()
+        },
+        clip_instance_revision: preview.clip_instance_revision.clone(),
+        clips,
+        capabilities,
+        suggestions: if let Some(asset) = animation_asset {
+            let suggestions: Vec<_> = asset
+                .facts
+                .iter()
+                .filter(|fact| fact.severity != AnimationSeverity::Info)
+                .take(4)
+                .map(|fact| format!("{}: {}", fact.message, fact.remediation))
+                .collect();
+            if suggestions.is_empty() {
+                if ready_imported_clips > 0 {
+                    vec![format!(
+                        "{ready_imported_clips} imported clip instance(s) are ready. Add one from the Animation Graph source palette."
+                    )]
+                } else {
+                    vec!["Set up an imported clip by reviewing its canonical source nodes and explicitly mapping them to scene entities.".into()]
+                }
+            } else {
+                suggestions
+            }
+        } else if authored_tracks == 0 {
+            vec!["Choose a safe property, add a key, move the playhead, change the value and key again.".into()]
+        } else if skeleton_joints > 0 {
+            vec!["The rig is preserved; inspect the skeletal capability reason before production playback.".into()]
+        } else {
+            vec!["Preview the sequence and use Step only for boolean or text properties.".into()]
+        },
+    }
+}
+
 struct AppState {
     tx: Sender<EngineCmd>,
     shared: Shared,
+    /// The live MOB match, if one is running. Render-side transient state exactly like the other viewport
+    /// tools: it never touches the ECS/Loro document, so it needs no engine-thread round trip.
+    moba: Mutex<Option<moba::MobaSession>>,
+}
+
+fn inactive_pipe_status(message: impl Into<String>) -> PipeForgeStatus {
+    PipeForgeStatus {
+        active: false,
+        message: message.into(),
+        ..PipeForgeStatus::default()
+    }
+}
+
+/// Publish only the cheap editable route to the native viewport. This is tool projection state, not ECS.
+fn publish_pipe_preview(shared: &Shared, session: Option<&PipeToolSession>) {
+    let mut state = shared.lock().unwrap();
+    if let Some(session) = session {
+        state.pipe_points = session.preview_points();
+        state.pipe_edges = session.preview_edges();
+        state.pipe_handles = session.preview_handles();
+    } else {
+        state.pipe_points.clear();
+        state.pipe_edges.clear();
+        state.pipe_handles.clear();
+    }
 }
 
 // ── engine thread: owns the real Engine + the capability scene + the bridge ─────
@@ -1300,6 +6392,309 @@ fn sidecar(name: &str) -> std::path::PathBuf {
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(name)
+}
+
+const ANIMATION_ASSET_IDENTITY_SCHEMA: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct AnimationAssetIdentityRecord {
+    logical_id: String,
+    source_uri: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AnimationAssetIdentityIndex {
+    schema_version: u32,
+    by_content_handle: BTreeMap<String, AnimationAssetIdentityRecord>,
+    #[serde(default)]
+    by_source_key: BTreeMap<String, String>,
+    /// The only content revision allowed into the runtime for each logical asset. Older aliases remain
+    /// content-addressable for provenance and rollback, but cannot create ambiguous live lookup.
+    #[serde(default)]
+    current_content_by_logical_id: BTreeMap<String, String>,
+}
+
+fn animation_asset_identity_path() -> std::path::PathBuf {
+    sidecar("metrocalk-animation-asset-identities.json")
+}
+
+fn load_animation_asset_identity_index(
+    path: &std::path::Path,
+) -> Result<AnimationAssetIdentityIndex, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let index: AnimationAssetIdentityIndex = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid animation asset identity index: {error}"))?;
+            if index.schema_version != ANIMATION_ASSET_IDENTITY_SCHEMA {
+                return Err(format!(
+                    "unsupported animation asset identity schema {}",
+                    index.schema_version
+                ));
+            }
+            for (logical_id, content_handle) in &index.current_content_by_logical_id {
+                let Some(record) = index.by_content_handle.get(content_handle) else {
+                    return Err(format!(
+                        "animation asset identity '{logical_id}' selects missing content record '{content_handle}'"
+                    ));
+                };
+                if &record.logical_id != logical_id {
+                    return Err(format!(
+                        "animation asset identity '{logical_id}' selects content owned by '{}'",
+                        record.logical_id
+                    ));
+                }
+            }
+            Ok(index)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(AnimationAssetIdentityIndex {
+                schema_version: ANIMATION_ASSET_IDENTITY_SCHEMA,
+                by_content_handle: BTreeMap::new(),
+                by_source_key: BTreeMap::new(),
+                current_content_by_logical_id: BTreeMap::new(),
+            })
+        }
+        Err(error) => Err(format!(
+            "could not read animation asset identities: {error}"
+        )),
+    }
+}
+
+fn save_animation_asset_identity_index(
+    path: &std::path::Path,
+    index: &AnimationAssetIdentityIndex,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(index)
+        .map_err(|error| format!("could not encode animation asset identities: {error}"))?;
+    if std::fs::read(path).ok().as_deref() == Some(bytes.as_slice()) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create animation identity directory: {error}"))?;
+    }
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("could not create animation identity transaction: {error}"))?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|()| temporary.as_file_mut().sync_all())
+        .map_err(|error| format!("could not sync animation asset identities: {error}"))?;
+    temporary.persist(path).map_err(|error| {
+        format!("could not atomically replace animation asset identities: {error}")
+    })?;
+    // Directory sync is supported on Unix and may be rejected for directory handles on Windows. The
+    // replacement itself is already complete; sync where the platform exposes it.
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+fn new_repository_animation_asset_id(existing: &AnimationAssetIdentityIndex) -> AnimationAssetId {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    loop {
+        let nonce = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let candidate = format!(
+            "project-animation:{now:032x}-{:08x}-{nonce:016x}",
+            std::process::id()
+        );
+        if existing
+            .by_content_handle
+            .values()
+            .all(|record| record.logical_id != candidate)
+        {
+            return AnimationAssetId::new(candidate);
+        }
+    }
+}
+
+fn repository_animation_source_key(source_uri: &str) -> Option<String> {
+    let trimmed = source_uri.trim();
+    let path_text = if let Some(path) = trimmed.strip_prefix("file://") {
+        path
+    } else if trimmed.contains("://") {
+        // Generated/project/memory URIs are provenance evidence, not durable source records. In
+        // particular, every generated result must not collapse into one logical asset merely because
+        // its evidence URI is the same.
+        return None;
+    } else {
+        trimmed
+    };
+    if path_text.is_empty() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(path_text);
+    let normalized = std::fs::canonicalize(&path).unwrap_or(path);
+    let mut key = normalized.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        key.make_ascii_lowercase();
+    }
+    Some(format!("file:{key}"))
+}
+
+fn resolve_animation_asset_identity_at(
+    path: &std::path::Path,
+    content_handle: &str,
+    source_uri: &str,
+) -> Result<AnimationAssetIdentityRecord, String> {
+    if content_handle.trim().is_empty() || source_uri.trim().is_empty() {
+        return Err("animation asset identity requires a content record and source URI".into());
+    }
+    let index = load_animation_asset_identity_index(path)?;
+    let source_key = repository_animation_source_key(source_uri);
+    if let Some(logical_id) = source_key
+        .as_ref()
+        .and_then(|key| index.by_source_key.get(key))
+        .cloned()
+    {
+        let record = index
+            .by_content_handle
+            .values()
+            .find(|record| record.logical_id == logical_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "animation source identity '{logical_id}' has no content alias; repair the identity index before reimport"
+                )
+            })?;
+        if let Some(conflict) = index.by_content_handle.get(content_handle) {
+            if conflict.logical_id != logical_id {
+                return Err(format!(
+                    "animation content record '{content_handle}' is already owned by a different logical asset"
+                ));
+            }
+        }
+        return Ok(record);
+    }
+    if let Some(record) = index.by_content_handle.get(content_handle) {
+        return Ok(record.clone());
+    }
+    let logical_id = new_repository_animation_asset_id(&index);
+    let record = AnimationAssetIdentityRecord {
+        logical_id: logical_id.as_str().to_owned(),
+        source_uri: source_uri.to_owned(),
+    };
+    Ok(record)
+}
+
+fn commit_current_animation_asset_identity_at(
+    path: &std::path::Path,
+    content_handle: &str,
+    source_uri: &str,
+    resolved: &AnimationAssetIdentityRecord,
+) -> Result<AnimationAssetIdentityRecord, String> {
+    let mut index = load_animation_asset_identity_index(path)?;
+    let source_key = repository_animation_source_key(source_uri);
+    if let Some(owner) = index.by_content_handle.get(content_handle) {
+        if owner.logical_id != resolved.logical_id {
+            return Err(format!(
+                "animation content record '{content_handle}' became owned by a different logical asset"
+            ));
+        }
+    }
+    if let Some(logical_id) = source_key
+        .as_ref()
+        .and_then(|key| index.by_source_key.get(key))
+    {
+        if logical_id != &resolved.logical_id {
+            return Err(format!(
+                "animation repository source changed identity while its candidate revision was importing"
+            ));
+        }
+    }
+    let canonical = index
+        .by_content_handle
+        .values()
+        .find(|record| record.logical_id == resolved.logical_id)
+        .cloned()
+        .unwrap_or_else(|| resolved.clone());
+    index
+        .by_content_handle
+        .insert(content_handle.to_owned(), canonical.clone());
+    if let Some(source_key) = source_key {
+        index
+            .by_source_key
+            .insert(source_key, canonical.logical_id.clone());
+    }
+    index
+        .current_content_by_logical_id
+        .insert(canonical.logical_id.clone(), content_handle.to_owned());
+    save_animation_asset_identity_index(path, &index)?;
+    Ok(canonical)
+}
+
+#[cfg(test)]
+fn animation_content_revision_is_current_at(
+    path: &std::path::Path,
+    logical_asset_id: &str,
+    content_handle: &str,
+) -> Result<bool, String> {
+    let index = load_animation_asset_identity_index(path)?;
+    let current = index
+        .current_content_by_logical_id
+        .get(logical_asset_id)
+        .ok_or_else(|| {
+            format!(
+                "animation asset '{logical_asset_id}' has no unambiguous current revision; explicitly re-import its repository source"
+            )
+        })?;
+    Ok(current == content_handle)
+}
+
+fn import_repository_animation(
+    importer: &GltfImporter,
+    bytes: &[u8],
+    content_handle: &str,
+    fallback_source_uri: &str,
+) -> Result<Option<metrocalk_assets::AnimationAsset>, String> {
+    let identity_path = animation_asset_identity_path();
+    let identity =
+        resolve_animation_asset_identity_at(&identity_path, content_handle, fallback_source_uri)?;
+    let explicit_repository_reimport =
+        repository_animation_source_key(fallback_source_uri).is_some();
+    if !explicit_repository_reimport {
+        let index = load_animation_asset_identity_index(&identity_path)?;
+        if let Some(current) = index
+            .current_content_by_logical_id
+            .get(&identity.logical_id)
+        {
+            if current != content_handle {
+                return Ok(None);
+            }
+        } else {
+            let alias_count = index
+                .by_content_handle
+                .values()
+                .filter(|record| record.logical_id == identity.logical_id)
+                .count();
+            if alias_count > 1 {
+                return Err(format!(
+                    "animation asset '{}' has multiple legacy revisions and no current selection; explicitly re-import its repository source",
+                    identity.logical_id
+                ));
+            }
+        }
+    }
+    let animation = importer
+        .import_animations_with_logical_id(
+            bytes,
+            &identity.source_uri,
+            AnimationAssetId::new(identity.logical_id.clone()),
+        )
+        .map_err(|error| error.to_string())?;
+    commit_current_animation_asset_identity_at(
+        &identity_path,
+        content_handle,
+        fallback_source_uri,
+        &identity,
+    )?;
+    Ok(Some(animation))
 }
 
 /// Persisted window geometry, so the editor reopens where it was left ("open where the last instance
@@ -1451,6 +6846,7 @@ fn quat_of_transform(m: &[f64; 16]) -> [f32; 4] {
 /// Proxies get a scene-visible size; real geometry the metric unit scale. Returns the first entity id, or
 /// None + an explained log line on a container error (never a panic).
 fn land_cad(
+    source_path: &std::path::Path,
     bytes: &[u8],
     engine: &mut Engine<FlecsWorld>,
     scene: &CapScene,
@@ -1472,8 +6868,9 @@ fn land_cad(
         eprintln!("[shell] {m}");
     };
     log(&format!("CAD import start: {} bytes", bytes.len()));
+    let t_total = std::time::Instant::now();
     let t_read = std::time::Instant::now();
-    let report = match metrocalk_editor_shell::read_cad(bytes) {
+    let report = match metrocalk_editor_shell::read_cad_with_companion(source_path, bytes) {
         Ok(r) => r,
         Err(e) => {
             log(&format!("CAD import FAILED (read): {e}"));
@@ -1484,6 +6881,51 @@ fn land_cad(
         "CAD import read OK in {:.1}s: {}",
         t_read.elapsed().as_secs_f64(),
         report.summary()
+    ));
+    let fidelity = report.fidelity_counts();
+    let real_meshes: Vec<_> = report.meshes.iter().filter(|mesh| !mesh.is_proxy).collect();
+    let vertices: usize = real_meshes
+        .iter()
+        .map(|mesh| mesh.tris.positions.len())
+        .sum();
+    let triangles: usize = real_meshes
+        .iter()
+        .map(|mesh| mesh.tris.triangle_count())
+        .sum();
+    let authored_colors: std::collections::BTreeSet<[u32; 3]> = report
+        .parts
+        .iter()
+        .filter_map(|part| part.color)
+        .map(|color| color.map(f32::to_bits))
+        .collect();
+    let invalid_transforms = report
+        .parts
+        .iter()
+        .filter(|part| part.transform.iter().any(|value| !value.is_finite()))
+        .count();
+    log(&format!(
+        "CAD_IMPORT_METRICS {}",
+        serde_json::json!({
+            "source": source_path.display().to_string(),
+            "format": &report.source_format,
+            "sourceBytes": bytes.len(),
+            "metersPerUnit": report.units.meters_per_unit,
+            "assemblyGroups": report.groups.len(),
+            "partPlacements": report.parts.len(),
+            "sourceOccurrences": report.total_occurrences,
+            "uniqueMeshes": real_meshes.len(),
+            "vertices": vertices,
+            "triangles": triangles,
+            "authoredColors": authored_colors.len(),
+            "exactBrep": fidelity.exact_brep,
+            "tessellationOnly": fidelity.tessellation_only,
+            "proxy": fidelity.proxy,
+            "failed": fidelity.failed,
+            "invalidTransforms": invalid_transforms,
+            "diagnosticNotes": report.notes.len(),
+            "embeddedTessellationSettings": "source-authored (not retessellatable)",
+            "brepPreviewChordToleranceMm": metrocalk_interchange::PREVIEW_DEFLECTION,
+        })
     ));
     let t_register = std::time::Instant::now();
     // The derived-mesh persistence jobs run on a DETACHED writer thread after the commit (off the
@@ -1564,22 +7006,29 @@ fn land_cad(
     // instancing) while a mirrored or recoloured twin keys its own.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let handle_for = |p: &metrocalk_interchange::PartReport| -> Option<String> {
+        // An unresolved proprietary/missing body remains a selectable, fully diagnosed outliner item, but
+        // it is not fake scene geometry. The old path registered the shared unit cube and produced the
+        // unusable white-block cloud seen in the failure screenshots.
+        if !p.is_real_geometry() {
+            return None;
+        }
         let m = &report.meshes[p.mesh?];
-        let rigid = metrocalk_editor_shell::basis_is_rigid(&p.transform);
+        let editor_transform = metrocalk_editor_shell::cad_z_up_to_editor_transform(&p.transform);
+        let rigid = metrocalk_editor_shell::basis_is_rigid(&editor_transform);
         let basis_tag = if rigid || !p.fidelity.is_real_geometry() {
             String::new()
         } else {
-            format!(":b{:016x}", basis_bits_hash(&p.transform))
+            format!(":b{:016x}", basis_bits_hash(&editor_transform))
         };
         Some(match p.color {
             Some(c) => format!(
-                "mtkcad:{:016x}{basis_tag}:{:02x}{:02x}{:02x}",
+                "mtkcad:{:016x}:yup1{basis_tag}:{:02x}{:02x}{:02x}",
                 m.hash,
                 (c[0] * 255.0).round().clamp(0.0, 255.0) as u8,
                 (c[1] * 255.0).round().clamp(0.0, 255.0) as u8,
                 (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
             ),
-            None => format!("mtkcad:{:016x}{basis_tag}", m.hash),
+            None => format!("mtkcad:{:016x}:yup1{basis_tag}", m.hash),
         })
     };
 
@@ -1621,13 +7070,19 @@ fn land_cad(
                         break;
                     };
                     let m = &report.meshes[p.mesh.expect("reg_work parts have meshes")];
-                    let rigid = metrocalk_editor_shell::basis_is_rigid(&p.transform);
+                    let editor_transform =
+                        metrocalk_editor_shell::cad_z_up_to_editor_transform(&p.transform);
+                    let editor_mesh = metrocalk_editor_shell::cad_z_up_to_editor_mesh(&m.tris);
+                    let rigid = metrocalk_editor_shell::basis_is_rigid(&editor_transform);
                     // A non-rigid instance basis (mirror/scale) is baked into a per-instance mesh — a
                     // mirrored bracket is genuinely different geometry from its twin.
                     let tris = if rigid || !p.fidelity.is_real_geometry() {
-                        m.tris.clone()
+                        editor_mesh
                     } else {
-                        metrocalk_editor_shell::bake_basis_into_mesh(&p.transform, &m.tris)
+                        metrocalk_editor_shell::bake_basis_into_mesh(
+                            &editor_transform,
+                            &editor_mesh,
+                        )
                     };
                     let asset = metrocalk_editor_shell::csg_intent::trimesh_to_mesh_asset_colored(
                         &tris, "cad", p.color,
@@ -1644,6 +7099,7 @@ fn land_cad(
             let slot = assets.meshes.len();
             assets.meshes.push(gpu.clone());
             assets.scales.push(1.0);
+            assets.display_affines.push(AssetAffine::IDENTITY);
             assets.handle_to_slot.insert(handle.clone(), slot);
             st.meshes.push(gpu);
             // Persist the DERIVED mesh so the saved doc's `mtkcad:` handle re-resolves after restart +
@@ -1716,7 +7172,8 @@ fn land_cad(
         }
         let parent = p.parent.and_then(|pid| src_to_entity.get(&pid).copied());
         ops.push(metrocalk_core::Op::CreateEntity { id: e, parent });
-        let t = metrocalk_interchange::translation_of(&p.transform);
+        let editor_transform = metrocalk_editor_shell::cad_z_up_to_editor_transform(&p.transform);
+        let t = metrocalk_interchange::translation_of(&editor_transform);
         let scale = if p.fidelity.is_real_geometry() {
             m_per_unit
         } else {
@@ -1726,9 +7183,9 @@ fn land_cad(
         // orientation-free, so only real tessellation writes the quaternion. A quaternion represents ONLY a
         // proper rigid rotation — a CATIA mirror/scaled instance basis (det<0, symmetry instances) is instead
         // BAKED into a per-instance mesh below, and the entity carries just the translation.
-        let rigid = metrocalk_editor_shell::basis_is_rigid(&p.transform);
+        let rigid = metrocalk_editor_shell::basis_is_rigid(&editor_transform);
         let q = if p.fidelity.is_real_geometry() && rigid {
-            quat_of_transform(&p.transform)
+            quat_of_transform(&editor_transform)
         } else {
             [0.0, 0.0, 0.0, 1.0]
         };
@@ -1761,12 +7218,24 @@ fn land_cad(
         for (field, value) in [
             ("fidelity", p.fidelity.token().to_string()),
             ("name", p.name.clone()),
+            ("reference", p.reference.clone()),
+            ("strategy", p.strategy.token().to_string()),
+            ("reason", p.reason.clone()),
+            ("sourceFormat", report.source_format.clone()),
         ] {
             ops.push(metrocalk_core::Op::SetField {
                 entity: e,
                 component: metrocalk_editor_shell::CAD_PART.into(),
                 field: field.into(),
                 value: FieldValue::Str(value),
+            });
+        }
+        if let Some(fix) = &p.fix {
+            ops.push(metrocalk_core::Op::SetField {
+                entity: e,
+                component: metrocalk_editor_shell::CAD_PART.into(),
+                field: "fix".into(),
+                value: FieldValue::Str(fix.clone()),
             });
         }
         // The user-facing OUTLINER name (`__meta__.name`) — the real source part name (CATIA `V_Name` / STEP
@@ -1777,6 +7246,14 @@ fn land_cad(
                 component: metrocalk_core::variant::INSTANCE_META.into(),
                 field: "name".into(),
                 value: FieldValue::Str(p.name.clone()),
+            });
+        }
+        if !p.is_real_geometry() {
+            ops.push(metrocalk_core::Op::SetField {
+                entity: e,
+                component: metrocalk_core::variant::INSTANCE_META.into(),
+                field: "kind".into(),
+                value: FieldValue::Str("cad-unresolved".into()),
             });
         }
         if let Some(c) = renderable {
@@ -1839,7 +7316,10 @@ fn land_cad(
         log(&format!("CAD import commit REJECTED: {err:?}"));
         return None;
     }
-    log("CAD import commit OK");
+    log(&format!(
+        "CAD import commit OK in {:.1}s total",
+        t_total.elapsed().as_secs_f64()
+    ));
     // Sidecar persistence runs DETACHED so the land path replies "on screen" without waiting on disk.
     if !persist_jobs.is_empty() {
         let n = persist_jobs.len();
@@ -1885,6 +7365,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     {
         let mut st = shared.lock().unwrap();
         st.meshes = assets.meshes.clone();
+        let meshes = moba_slots(&assets);
+        st.moba_hero_slot = meshes.hero;
+        st.moba_minion_slot = meshes.minion;
+        st.moba_structure_slot = meshes.structure;
         st.meshes_revision = st.meshes_revision.wrapping_add(1);
     }
 
@@ -1998,6 +7482,25 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             }
         }
     }
+    // A `.mtk` carries the editable PipeRecipe in its document. If this project was moved to another
+    // machine (or the local cache was cleaned), deterministically rebuild the exact content-addressed
+    // artifact before the first viewport projection.
+    let (pipe_assets_restored, pipe_restore_errors) =
+        restore_document_pipe_assets(&engine, &mut assets, &shared);
+    if pipe_assets_restored > 0 {
+        eprintln!(
+            "[shell] reconstructed {pipe_assets_restored} procedural asset(s) from project recipes"
+        );
+    }
+    for error in &pipe_restore_errors {
+        eprintln!("[shell] procedural asset recovery skipped {error}");
+    }
+    let cad_assets_queued = queue_document_cad_assets(&engine, &assets, &self_tx);
+    if cad_assets_queued > 0 {
+        eprintln!(
+            "[shell] restoring {cad_assets_queued} CAD mesh(es) referenced by the active document in the background"
+        );
+    }
     // The Loro version vector at the last save/open/new (captured AFTER any open/seed, so a fresh session
     // starts "clean"): `dirty = current vv != saved_vv` needs no per-command instrumentation.
     let mut saved_vv: Vec<u8> = engine.version_vector();
@@ -2005,6 +7508,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     let mut positions: HashMap<Entity, [f32; 3]> = HashMap::new();
     rebuild(&engine, &shared, &mut positions, &assets);
     let mut channel: Option<Channel<ProjectionDelta>> = None;
+    // Pipe Forge's source/preview is deliberately outside Loro until a persisted bake succeeds. Any edit,
+    // Cancel or new session increments this fence so a worker can never land stale geometry afterward.
+    let mut pipe_tool: Option<PipeToolSession> = None;
+    let mut pipe_revision: u64 = 0;
     // Last-touched sequence per entity (higher = more recent) — the reveal's recency ranking signal,
     // bumped on every committed edit/bind so it's live, not inert.
     let mut recency: HashMap<Entity, u64> = HashMap::new();
@@ -2073,13 +7580,27 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     let mut rule_session: Option<metrocalk_core::RuleReplay> = None;
     let mut rule_flagged: Vec<metrocalk_core::FlaggedRule> = Vec::new();
     let mut rule_head: u64 = 0;
+    // Animation is its own deterministic engine service. The compiled plan is immutable between authored
+    // timeline edits; the playhead and sampled poses are transient render state, independent of physics.
+    let mut animation_preview = AnimationPreviewState::default();
+    animation_preview.graph.compile_tx = Some(self_tx.clone());
+    install_animation_graph_load(
+        &mut animation_preview,
+        metrocalk_editor_shell::load_animation_graph(
+            &engine,
+            metrocalk_editor_shell::MAIN_SEQUENCE_ID,
+        ),
+    );
+    refresh_animation_clip_instances(&engine, &assets, &mut animation_preview);
+    refresh_animation_plan(&engine, &mut animation_preview);
     // A fixed-cadence heartbeat (~60/s) on its own thread enqueues `Tick` via the engine's own sender, so
     // the sim advances ON the engine thread (off the JS hot path, invariant 4) without blocking the
     // command loop. A `Tick` is a no-op until the sim is running with at least one body.
     {
         let ticker = self_tx.clone();
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(16));
+            // One fixed 60 Hz step. `16 ms` is 62.5 Hz and made animation/physics run 4.17% fast.
+            std::thread::sleep(std::time::Duration::from_nanos(16_666_667));
             if ticker.send(EngineCmd::Tick).is_err() {
                 // The engine thread is gone (exited or panicked) — say so once (audit F6) instead of the
                 // ticker just silently stopping while the viewport appears frozen.
@@ -2094,6 +7615,44 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             EngineCmd::Connect(ch) => {
                 send_proj!(ch, proj_full(&engine, &scene)); // initial full-scene load
                 channel = Some(ch);
+            }
+            EngineCmd::CadAssetsReady {
+                expected,
+                prepared,
+                elapsed_ms,
+            } => {
+                let restored = prepared.len();
+                let mut added = 0usize;
+                {
+                    let mut state = shared.lock().unwrap();
+                    for (handle, asset, gpu) in prepared {
+                        if !assets.handle_to_slot.contains_key(&handle) {
+                            let slot = assets.meshes.len();
+                            assets.meshes.push(gpu.clone());
+                            assets.scales.push(1.0);
+                            assets.display_affines.push(AssetAffine::IDENTITY);
+                            assets.handle_to_slot.insert(handle.clone(), slot);
+                            state.meshes.push(gpu);
+                            added += 1;
+                        }
+                        assets.store.insert(AssetId::from_handle(handle), asset);
+                    }
+                    if added > 0 {
+                        state.meshes_revision = state.meshes_revision.wrapping_add(1);
+                    }
+                }
+                if added > 0 {
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                if restored == expected {
+                    eprintln!(
+                        "[shell] restored {restored} active-document CAD mesh(es) in {elapsed_ms:.1} ms"
+                    );
+                } else {
+                    eprintln!(
+                        "[shell] restored {restored}/{expected} active-document CAD mesh(es) in {elapsed_ms:.1} ms — unresolved parts remain explicit placeholders"
+                    );
+                }
             }
             EngineCmd::Edit(tx) => {
                 // M10.4 (ADR-034): edits are DISABLED during Play — the authored scene must not change
@@ -2152,12 +7711,62 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     if let Some(ch) = &channel {
                         send_proj!(ch, proj_full(&engine, &scene)); // simplest correct post-undo sync
                     }
+                    ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+                    install_animation_graph_load(
+                        &mut animation_preview,
+                        metrocalk_editor_shell::load_animation_graph(
+                            &engine,
+                            metrocalk_editor_shell::MAIN_SEQUENCE_ID,
+                        ),
+                    );
+                    refresh_animation_plan(&engine, &mut animation_preview);
                     rebuild(&engine, &shared, &mut positions, &assets);
+                    let _ = apply_animation_preview_state(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
                     // The ECS is the single authority over which bodies EXIST — restart the run from the
                     // post-undo ECS. This covers BOTH undo of a spawn (the entity is gone → its body
                     // drops out) AND undo of make-dynamic (the entity REMAINS but lost its RigidBody/
                     // Collider → it's no longer a body). Surviving bodies keep their current simulated
                     // state (restart_run captures it), so undo doesn't snap the rest of the scene back.
+                    (recording, rec_entities, sim, body_of) =
+                        restart_run(&engine, &assets, &sim, &body_of);
+                    frame = 0;
+                    max_frame = 0;
+                    if body_of.is_empty() {
+                        sim_running = false;
+                    }
+                }
+                let _ = reply.send(did);
+            }
+            EngineCmd::Redo { reply } => {
+                let did = engine.redo();
+                if did {
+                    log.append(&Record::Redo);
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, proj_full(&engine, &scene));
+                    }
+                    ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+                    install_animation_graph_load(
+                        &mut animation_preview,
+                        metrocalk_editor_shell::load_animation_graph(
+                            &engine,
+                            metrocalk_editor_shell::MAIN_SEQUENCE_ID,
+                        ),
+                    );
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                    let _ = apply_animation_preview_state(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
                     (recording, rec_entities, sim, body_of) =
                         restart_run(&engine, &assets, &sim, &body_of);
                     frame = 0;
@@ -2352,6 +7961,25 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     }
                 }
             }
+            EngineCmd::MatchPlan { reply } => {
+                let _ = reply.send(moba::plan(&engine));
+            }
+            EngineCmd::MatchValidate { reply } => {
+                let _ = reply.send(moba::validate(&engine));
+            }
+            EngineCmd::MatchAuthorStarter { reply } => {
+                let authored = metrocalk_editor_shell::match_cook::author_starter_match(&mut engine)
+                    .map_err(|error| format!("{error:?}"));
+                if authored.is_ok() {
+                    // A new match's objects must appear in the outliner and the viewport immediately —
+                    // this is an ordinary authored transaction, so it re-projects like any other.
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, proj_full(&engine, &scene));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(authored);
+            }
             EngineCmd::Duplicate { id, reply } => {
                 let new = EntityId::from_loro_key(&id)
                     .and_then(|e| capscene::duplicate_entity(&mut engine, &scene, e).ok());
@@ -2388,6 +8016,391 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
                 let _ = reply.send(new.map(|n| n.to_loro_key()));
+            }
+            EngineCmd::PipeStart { options, reply } => {
+                if play_mode {
+                    let _ = reply.send(inactive_pipe_status(
+                        "Stop Play mode before drawing a procedural asset",
+                    ));
+                    continue;
+                }
+                pipe_revision = pipe_revision.wrapping_add(1);
+                pipe_tool = Some(PipeToolSession::new(&options));
+                publish_pipe_preview(&shared, pipe_tool.as_ref());
+                let _ = reply.send(pipe_tool.as_ref().unwrap().status());
+            }
+            EngineCmd::PipeEdit { entity, reply } => {
+                if play_mode {
+                    let _ = reply.send(inactive_pipe_status(
+                        "Stop Play mode before editing a procedural asset",
+                    ));
+                    continue;
+                }
+                let restored = (|| -> Result<PipeToolSession, String> {
+                    let id = EntityId::from_loro_key(&entity)
+                        .filter(|id| engine.entity_exists(*id))
+                        .ok_or_else(|| "That scene entity no longer exists".to_string())?;
+                    let components = engine.components_of(id);
+                    let handle = match components
+                        .get("MeshRenderer")
+                        .and_then(|fields| fields.get(capscene::MESH_FIELD))
+                    {
+                        Some(FieldValue::Str(handle)) => handle,
+                        _ => return Err("That entity is not a baked Pipe Forge asset".into()),
+                    };
+                    let recipe = assets
+                        .pipe_recipes
+                        .get(handle)
+                        .cloned()
+                        .ok_or_else(|| {
+                            "The editable pipe source is unavailable; reopen the project to reconstruct it"
+                                .to_string()
+                        })?;
+                    let transform = components.get("Transform");
+                    let number = |field: &str, fallback: f32| {
+                        transform
+                            .and_then(|fields| fields.get(field))
+                            .and_then(|value| match value {
+                                FieldValue::Number(value) if value.is_finite() => {
+                                    Some(*value as f32)
+                                }
+                                FieldValue::Integer(value) => Some(*value as f32),
+                                _ => None,
+                            })
+                            .unwrap_or(fallback)
+                    };
+                    let scale = number("scale", 1.0);
+                    let rotation = [
+                        number("qx", 0.0),
+                        number("qy", 0.0),
+                        number("qz", 0.0),
+                        number("qw", 1.0),
+                    ];
+                    if (scale - 1.0).abs() > 1.0e-4
+                        || rotation[0].abs() > 1.0e-4
+                        || rotation[1].abs() > 1.0e-4
+                        || rotation[2].abs() > 1.0e-4
+                        || (rotation[3].abs() - 1.0).abs() > 1.0e-4
+                    {
+                        return Err(
+                            "Route handles require an unscaled, unrotated pipe entity; preserve its translation and reset rotation/scale first"
+                                .into(),
+                        );
+                    }
+                    PipeToolSession::edit(
+                        &recipe,
+                        entity.clone(),
+                        [number("x", 0.0), number("y", 0.0), number("z", 0.0)],
+                    )
+                    .map_err(|error| error.to_string())
+                })();
+                match restored {
+                    Ok(session) => {
+                        pipe_revision = pipe_revision.wrapping_add(1);
+                        pipe_tool = Some(session);
+                        publish_pipe_preview(&shared, pipe_tool.as_ref());
+                        let _ = reply.send(pipe_tool.as_ref().expect("just restored").status());
+                    }
+                    Err(reason) => {
+                        let _ = reply.send(inactive_pipe_status(reason));
+                    }
+                }
+            }
+            EngineCmd::PipePoint { point, reply } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                let status = if let Some(tool) = &mut pipe_tool {
+                    tool.point(point)
+                } else {
+                    inactive_pipe_status("Start Pipe Forge before placing points")
+                };
+                publish_pipe_preview(&shared, pipe_tool.as_ref());
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipeUndo { reply } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                let status = if let Some(tool) = &mut pipe_tool {
+                    tool.undo_point()
+                } else {
+                    inactive_pipe_status("There is no active pipe run to undo")
+                };
+                publish_pipe_preview(&shared, pipe_tool.as_ref());
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipeBeginBranch {
+                node_id,
+                diameter_cm,
+                reply,
+            } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                let status = pipe_tool.as_mut().map_or_else(
+                    || inactive_pipe_status("Start or edit a pipe before adding a branch"),
+                    |tool| tool.begin_branch(node_id, diameter_cm),
+                );
+                publish_pipe_preview(&shared, pipe_tool.as_ref());
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipeEndBranch { reply } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                let status = pipe_tool.as_mut().map_or_else(
+                    || inactive_pipe_status("There is no active branch"),
+                    PipeToolSession::end_branch,
+                );
+                publish_pipe_preview(&shared, pipe_tool.as_ref());
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipeMoveHandle {
+                node_id,
+                point,
+                reply,
+            } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                let status = pipe_tool.as_mut().map_or_else(
+                    || inactive_pipe_status("Start or edit a pipe before moving handles"),
+                    |tool| tool.move_handle(node_id, point),
+                );
+                publish_pipe_preview(&shared, pipe_tool.as_ref());
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipeRemoveHandle { node_id, reply } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                let status = pipe_tool.as_mut().map_or_else(
+                    || inactive_pipe_status("Start or edit a pipe before removing handles"),
+                    |tool| tool.remove_handle(node_id),
+                );
+                publish_pipe_preview(&shared, pipe_tool.as_ref());
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipePlaceFitting {
+                node_id,
+                kind,
+                catalog_id,
+                reply,
+            } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                let status = pipe_tool.as_mut().map_or_else(
+                    || inactive_pipe_status("Start or edit a pipe before placing fittings"),
+                    |tool| tool.place_fitting(node_id, kind, catalog_id),
+                );
+                publish_pipe_preview(&shared, pipe_tool.as_ref());
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipeRemoveFitting { fitting_id, reply } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                let status = pipe_tool.as_mut().map_or_else(
+                    || inactive_pipe_status("Start or edit a pipe before removing fittings"),
+                    |tool| tool.remove_fitting(fitting_id),
+                );
+                publish_pipe_preview(&shared, pipe_tool.as_ref());
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipeUpsertCatalog { entry, reply } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                let status = pipe_tool.as_mut().map_or_else(
+                    || inactive_pipe_status("Start or edit a pipe before changing its catalog"),
+                    |tool| tool.upsert_catalog(entry),
+                );
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipeRemoveCatalog { id, reply } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                let status = pipe_tool.as_mut().map_or_else(
+                    || inactive_pipe_status("Start or edit a pipe before changing its catalog"),
+                    |tool| tool.remove_catalog(&id),
+                );
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipeCancel { reply } => {
+                pipe_revision = pipe_revision.wrapping_add(1);
+                pipe_tool = None;
+                publish_pipe_preview(&shared, None);
+                let _ = reply.send(inactive_pipe_status(
+                    "Pipe drawing cancelled — the scene was not changed",
+                ));
+            }
+            EngineCmd::PipeStatus { reply } => {
+                let status = pipe_tool.as_ref().map_or_else(
+                    || inactive_pipe_status("Pipe Forge is ready"),
+                    PipeToolSession::status,
+                );
+                let _ = reply.send(status);
+            }
+            EngineCmd::PipeBake { reply } => {
+                let Some(tool) = &mut pipe_tool else {
+                    let _ = reply.send(PipeBakeReport {
+                        message: "Start Pipe Forge before baking".into(),
+                        warnings: vec!["No active procedural source".into()],
+                        ..PipeBakeReport::default()
+                    });
+                    continue;
+                };
+                if let Err(e) = tool.recipe.validate(true) {
+                    tool.message = e.to_string();
+                    let _ = reply.send(PipeBakeReport {
+                        message: e.to_string(),
+                        warnings: vec![e.to_string()],
+                        ..PipeBakeReport::default()
+                    });
+                    continue;
+                }
+                tool.message = "Baking geometry, PBR textures and runtime levels…".into();
+                let source = tool.recipe.clone();
+                let editing_entity = tool.editing_entity.clone();
+                let world_anchor = tool.anchor;
+                let revision = pipe_revision;
+                let done = self_tx.clone();
+                std::thread::spawn(move || {
+                    let result = if editing_entity.is_some() {
+                        rebake_pipe_in_place(&source)
+                    } else {
+                        bake_pipe(&source)
+                    }
+                    .map_err(|e| e.to_string());
+                    let _ = done.send(EngineCmd::PipeBuildComplete {
+                        revision,
+                        source,
+                        editing_entity,
+                        world_anchor,
+                        result: Box::new(result),
+                        reply,
+                    });
+                });
+            }
+            EngineCmd::PipeBuildComplete {
+                revision,
+                source,
+                editing_entity,
+                world_anchor,
+                result,
+                reply,
+            } => {
+                let current = pipe_tool.as_ref().is_some_and(|tool| {
+                    revision == pipe_revision
+                        && tool.recipe == source
+                        && tool.editing_entity == editing_entity
+                        && tool.anchor == world_anchor
+                });
+                if !current {
+                    let _ = reply.send(PipeBakeReport {
+                        message: "That bake was superseded by a newer edit".into(),
+                        warnings: vec![
+                            "Stale build discarded; the current route is unchanged".into()
+                        ],
+                        ..PipeBakeReport::default()
+                    });
+                    continue;
+                }
+                let mut built = match *result {
+                    Ok(build) => build,
+                    Err(reason) => {
+                        if let Some(tool) = &mut pipe_tool {
+                            tool.message = reason.clone();
+                        }
+                        let _ = reply.send(PipeBakeReport {
+                            message: reason.clone(),
+                            warnings: vec![reason],
+                            ..PipeBakeReport::default()
+                        });
+                        continue;
+                    }
+                };
+                // Durability is a prerequisite, not a best-effort follow-up: only a persisted content
+                // address may enter the scene document.
+                if let Err(reason) = persist_and_register_pipe(&mut assets, &shared, &built) {
+                    if let Some(tool) = &mut pipe_tool {
+                        tool.message = reason.clone();
+                    }
+                    let _ = reply.send(PipeBakeReport {
+                        message: reason.clone(),
+                        warnings: vec![reason],
+                        ..PipeBakeReport::default()
+                    });
+                    continue;
+                }
+
+                let landing = if let Some(entity) = editing_entity.as_deref() {
+                    EntityId::from_loro_key(entity)
+                        .filter(|id| engine.entity_exists(*id))
+                        .ok_or_else(|| "the edited pipe entity no longer exists".to_string())
+                        .and_then(|id| {
+                            replace_pipe_asset(
+                                &mut engine,
+                                id,
+                                &built.recipe,
+                                &built.handle,
+                                &built.report,
+                            )
+                            .map_err(|error| error.to_string())
+                            .map(|()| id)
+                        })
+                } else {
+                    land_pipe_asset(
+                        &mut engine,
+                        &scene,
+                        &built.recipe,
+                        &built.handle,
+                        built.anchor,
+                        &built.report,
+                    )
+                    .map_err(|error| error.to_string())
+                };
+                match landing {
+                    Ok(id) => {
+                        built.report.entity_id = Some(id.to_loro_key());
+                        built.report.message = if editing_entity.is_some() {
+                            format!(
+                                "Rebaked {} triangles into the same scene entity; the world anchor and editable source were preserved",
+                                built.report.triangles
+                            )
+                        } else {
+                            format!(
+                                "Baked {} triangles, {} PBR maps and {} runtime levels",
+                                built.report.triangles,
+                                3,
+                                built.report.lod_triangles.len()
+                            )
+                        };
+                        if editing_entity.is_none() {
+                            // The replay record intentionally keeps the original world-space authoring
+                            // source. The document itself carries the canonical local recipe.
+                            log.append(&Record::PipeAsset {
+                                recipe: source,
+                                asset: built.handle.clone(),
+                            });
+                        }
+                        pipe_tool = None;
+                        pipe_revision = pipe_revision.wrapping_add(1);
+                        publish_pipe_preview(&shared, None);
+                        echo_created(
+                            &mut engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &channel,
+                            &mut recency,
+                            &mut touch,
+                            id,
+                        );
+                        // The baked collider is part of the same user-visible completion: rebuild the
+                        // deterministic physics recording now, so the new pipe participates in contacts
+                        // immediately rather than only after Play/restart or another physics edit.
+                        (recording, rec_entities, sim, body_of) =
+                            restart_run(&engine, &assets, &sim, &body_of);
+                        frame = 0;
+                        max_frame = 0;
+                        sim_running = !body_of.is_empty();
+                        prev_centers = sync_out(&sim, &body_of, &shared);
+                        let _ = reply.send(built.report);
+                    }
+                    Err(e) => {
+                        let reason = format!("The asset baked, but could not be placed: {e}");
+                        if let Some(tool) = &mut pipe_tool {
+                            tool.message = reason.clone();
+                        }
+                        built.report.message = reason.clone();
+                        built.report.warnings.push(reason);
+                        let _ = reply.send(built.report);
+                    }
+                }
             }
             EngineCmd::AddLight {
                 kind,
@@ -2607,9 +8620,14 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         // M15.7 (ADR-077) — a CAD container (CATIA 3DXML / STEP AP242): the never-empty,
                         // never-silent pipeline lands each part as a renderable entity in one undoable commit
                         // (proxies for proprietary geometry the licensed kernel would decode, at real transforms).
-                        if let Some(root) =
-                            land_cad(&bytes, &mut engine, &scene, &mut assets, &shared)
-                        {
+                        if let Some(root) = land_cad(
+                            std::path::Path::new(&path),
+                            &bytes,
+                            &mut engine,
+                            &scene,
+                            &mut assets,
+                            &shared,
+                        ) {
                             rebuild(&engine, &shared, &mut positions, &assets);
                             if let Some(ch) = &channel {
                                 send_proj!(ch, proj_full(&engine, &scene));
@@ -2620,17 +8638,24 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         metrocalk_assets::import_any(&bytes)
                     {
                         let handle = AssetId::of_bytes(&bytes).as_str().to_string();
+                        // Retain canonical editable geometry beside the GPU packing; live asset tools can
+                        // now condition/bake this mesh instead of losing it after upload.
+                        assets
+                            .store
+                            .insert(AssetId::from_handle(handle.clone()), asset.clone());
                         if !assets.handle_to_slot.contains_key(&handle) {
                             // Normalise the imported geometry to ~1 unit, centred (FBX/glTF are often authored
                             // in cm, hundreds of units across). The renderer applies `Transform.scale`
                             // directly to these verts, so this makes `scale` an intuitive world-size
                             // multiplier (1.0 ≈ one unit) instead of `0.9/extent`-tiny; the collider reads
                             // the SAME verts (`mesh_geometry`) so it stays matched + centred on the entity.
+                            let affine = AssetAffine::unit_from_bounds(asset.bounds());
                             let mut gpu = MeshGpu::from_asset(&asset);
-                            gpu.normalize_to_unit();
+                            gpu.apply_affine(affine);
                             let slot = assets.meshes.len();
                             assets.meshes.push(gpu.clone());
                             assets.scales.push(1.0);
+                            assets.display_affines.push(affine);
                             assets.handle_to_slot.insert(handle.clone(), slot);
                             let mut st = shared.lock().unwrap();
                             st.meshes.push(gpu);
@@ -2676,33 +8701,60 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         // Persist the bytes content-addressed so the handle re-resolves on reload (audit F3):
                         // log a write failure rather than swallow it — else the imported mesh silently
                         // vanishes after restart (the saved handle dangles).
-                        if let Err(e) = metrocalk_editor_shell::blobstore::put(
+                        let persisted = match metrocalk_editor_shell::blobstore::put(
                             &sidecar("metrocalk-assets"),
                             &bytes,
                         ) {
-                            eprintln!(
-                                "[shell] import: failed to persist asset bytes — it may not survive reload: {e}"
-                            );
-                        }
+                            Ok(_) => true,
+                            Err(e) => {
+                                eprintln!(
+                                    "[shell] import persistence failed; scene placement was refused so no dangling authored handle can survive reload: {e}"
+                                );
+                                false
+                            }
+                        };
                         // M11.1 — lay successive imports out on a grid so they don't stack on the same spot
                         // (the persisted record keeps the chosen pos, so reload restores the same layout).
-                        let pos = next_import_pos(&engine);
-                        if let Ok(id) = capscene::place_mesh(&mut engine, &scene, &handle, pos) {
-                            log.append(&Record::PlaceMesh {
-                                asset: handle.clone(),
-                                pos,
-                            });
-                            echo_created(
-                                &mut engine,
-                                &shared,
-                                &mut positions,
-                                &assets,
-                                &channel,
-                                &mut recency,
-                                &mut touch,
-                                id,
-                            );
-                            result = Some(id.to_loro_key());
+                        if persisted {
+                            if matches!(detect(&bytes), Some(Detected::Gltf)) {
+                                match import_repository_animation(
+                                    &GltfImporter::new(),
+                                    &bytes,
+                                    &handle,
+                                    &path,
+                                ) {
+                                    Ok(Some(animation)) => {
+                                        install_current_animation_asset_revision(
+                                            &mut assets.animation_assets,
+                                            handle.clone(),
+                                            animation,
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => eprintln!(
+                                        "[shell] animation facet inspection failed for '{path}': {error}"
+                                    ),
+                                }
+                            }
+                            let pos = next_import_pos(&engine);
+                            if let Ok(id) = capscene::place_mesh(&mut engine, &scene, &handle, pos)
+                            {
+                                log.append(&Record::PlaceMesh {
+                                    asset: handle.clone(),
+                                    pos,
+                                });
+                                echo_created(
+                                    &mut engine,
+                                    &shared,
+                                    &mut positions,
+                                    &assets,
+                                    &channel,
+                                    &mut recency,
+                                    &mut touch,
+                                    id,
+                                );
+                                result = Some(id.to_loro_key());
+                            }
                         }
                     }
                 }
@@ -2774,10 +8826,15 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // one undoable commit; the honesty label ("manual"/"inferred"/"urdf") rides the component.
                 let mut ok = false;
                 if let Some(eid) = EntityId::from_loro_key(&id) {
-                    let ops = metrocalk_editor_shell::set_joint_ops(
+                    ok = metrocalk_editor_shell::try_set_joint_ops(
                         eid, revolute, axis, pivot, limits, &source,
-                    );
-                    ok = engine.commit("set-joint", ops).is_ok();
+                    )
+                    .and_then(|ops| {
+                        engine
+                            .commit("set-joint", ops)
+                            .map_err(|_| "the joint transaction was rejected")
+                    })
+                    .is_ok();
                     if ok {
                         if let Some(ch) = &channel {
                             send_proj!(ch, project_entity(&engine, eid));
@@ -2790,7 +8847,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // Key the CURRENT DOF value at time t (append/replace in the sorted track) — one undoable
                 // commit; the track is doc state (survives reload, merges).
                 let mut ok = false;
-                if let Some(eid) = EntityId::from_loro_key(&id) {
+                if let Some(eid) = EntityId::from_loro_key(&id)
+                    .filter(|_| metrocalk_editor_shell::validate_joint_time(t).is_ok())
+                {
                     if let Some(joint) = metrocalk_editor_shell::joint_of(&engine, eid) {
                         let comps = engine.components_of(eid);
                         let existing = comps
@@ -2818,6 +8877,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             .is_ok();
                     }
                 }
+                if ok {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                }
                 let _ = reply.send(ok);
             }
             EngineCmd::JointValue {
@@ -2827,8 +8889,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 reply,
             } => {
                 let mut ok = false;
-                if let Some(eid) = EntityId::from_loro_key(&id) {
-                    if let Some(joint) = metrocalk_editor_shell::joint_of(&engine, eid) {
+                if let Some(eid) = EntityId::from_loro_key(&id)
+                    .filter(|_| metrocalk_editor_shell::validate_joint_value(value).is_ok())
+                {
+                    if let Some((joint, joint_component)) =
+                        metrocalk_editor_shell::joint_of_with_component(&engine, eid)
+                    {
                         let comps = engine.components_of(eid);
                         let t = comps.get("Transform");
                         let num = |f: &str| -> f64 {
@@ -2877,7 +8943,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             }
                             ops.push(metrocalk_core::Op::SetField {
                                 entity: eid,
-                                component: metrocalk_editor_shell::JOINT.into(),
+                                component: joint_component.into(),
                                 field: "value".into(),
                                 value: FieldValue::Number(value.clamp(joint.min, joint.max)),
                             });
@@ -2902,63 +8968,36 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let _ = reply.send(ok);
             }
             EngineCmd::JointScrub { t, reply } => {
-                // Scrub the whole mechanism to time t: every entity with a Joint + a track poses via the
-                // closed-form kinematic solve (deterministic — same t, same pose bits). Render-only.
-                let mut posed = 0usize;
+                // Compatibility entry point for the original mechanism panel. Route it through the same
+                // immutable animation plan as the universal timeline so parent/child assemblies, granular
+                // tracks and legacy JointTrack data all share one deterministic render-only projection.
                 JOINT_POSES.with(|jp| jp.borrow_mut().clear());
-                if t >= 0.0 {
-                    for eid in engine.entity_ids() {
-                        let Some(joint) = metrocalk_editor_shell::joint_of(&engine, eid) else {
-                            continue;
-                        };
-                        let comps = engine.components_of(eid);
-                        let Some(keys) = comps
-                            .get(metrocalk_editor_shell::JOINT_TRACK)
-                            .and_then(|m| m.get("keys"))
-                            .and_then(|v| match v {
-                                FieldValue::Str(s) => Some(s.clone()),
-                                _ => None,
-                            })
-                        else {
-                            continue;
-                        };
-                        let track = metrocalk_editor_shell::parse_track(&keys);
-                        if track.is_empty() {
-                            continue;
-                        }
-                        let value = metrocalk_editor_shell::track_value(&track, t);
-                        let tf = comps.get("Transform");
-                        let num = |f: &str| -> f64 {
-                            tf.and_then(|m| m.get(f)).map_or(0.0, |v| match v {
-                                FieldValue::Number(n) => *n,
-                                #[allow(clippy::cast_precision_loss)]
-                                FieldValue::Integer(i) => *i as f64,
-                                _ => 0.0,
-                            })
-                        };
-                        let base_pos = [num("x"), num("y"), num("z")];
-                        let bq = [num("qx"), num("qy"), num("qz"), num("qw")];
-                        let base_quat = if bq == [0.0; 4] {
-                            [0.0, 0.0, 0.0, 1.0]
-                        } else {
-                            bq
-                        };
-                        // The base is the pose at the joint's committed value — solve relative to zero.
-                        let (zero_pos, zero_quat) = metrocalk_editor_shell::joint_pose(
-                            &joint,
-                            base_pos,
-                            base_quat,
-                            -joint.value,
-                        );
-                        let pose =
-                            metrocalk_editor_shell::joint_pose(&joint, zero_pos, zero_quat, value);
-                        JOINT_POSES.with(|jp| {
-                            jp.borrow_mut().insert(eid, pose);
-                        });
-                        posed += 1;
-                    }
-                }
+                ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+                animation_preview.playing = false;
                 rebuild(&engine, &shared, &mut positions, &assets);
+                let posed = if t.is_finite() && t >= 0.0 {
+                    let document = metrocalk_editor_shell::load_animation_document(&engine);
+                    if let Ok(tick) = document.sequence.time_base.from_seconds(t) {
+                        seek_animation_preview(&mut animation_preview, tick);
+                        refresh_animation_plan(&engine, &mut animation_preview);
+                        let _ = apply_animation_preview_state(
+                            &engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &mut animation_preview,
+                        );
+                        ANIMATION_POSES.with(|poses| poses.borrow().len())
+                    } else {
+                        0
+                    }
+                } else {
+                    seek_animation_preview(&mut animation_preview, AnimationTick::ZERO);
+                    0
+                };
+                if posed == 0 {
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
                 let _ = reply.send(posed);
             }
             EngineCmd::JointInfo { id, reply } => {
@@ -2993,10 +9032,1884 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 });
                 let _ = reply.send(info);
             }
+            EngineCmd::AnimationState { id, reply } => {
+                if refresh_animation_clip_instances(&engine, &assets, &mut animation_preview) {
+                    restore_authored_animation_projection(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                }
+                let info =
+                    animation_workspace_info(&engine, &assets, &animation_preview, id.as_deref());
+                let _ = reply.send(info);
+            }
+            EngineCmd::AnimationClipInstanceSave { request, reply } => {
+                let selected_id = request.target_id.clone();
+                let result = build_single_rigid_clip_instance_document(&engine, &assets, &request)
+                    .and_then(|document| {
+                        // Compile before committing so a successful response always means the saved
+                        // instance is immediately usable, never merely well-shaped storage.
+                        compile_persisted_clip_instance(&engine, &assets, &document)?;
+                        metrocalk_editor_shell::save_animation_clip_instance(
+                            &mut engine,
+                            &request.expected_revision,
+                            &document,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(document)
+                    });
+                let (ok, message, instance_id) = match result {
+                    Ok(document) => {
+                        let stopped_audition = animation_preview.transient_clip.is_some();
+                        if stopped_audition {
+                            clear_transient_animation_clip_preserving_events(
+                                &mut animation_preview,
+                            );
+                        }
+                        refresh_animation_clip_instances(&engine, &assets, &mut animation_preview);
+                        if stopped_audition {
+                            restore_authored_animation_projection(
+                                &engine,
+                                &shared,
+                                &mut positions,
+                                &assets,
+                                &mut animation_preview,
+                            );
+                        } else {
+                            schedule_animation_graph_compile(&engine, &mut animation_preview);
+                        }
+                        (
+                            true,
+                            format!(
+                                "Clip '{}' is explicitly mapped, revision-pinned, and ready in the Animation Graph source palette.",
+                                document.name
+                            ),
+                            Some(document.id),
+                        )
+                    }
+                    Err(message) => {
+                        if refresh_animation_clip_instances(
+                            &engine,
+                            &assets,
+                            &mut animation_preview,
+                        ) {
+                            restore_authored_animation_projection(
+                                &engine,
+                                &shared,
+                                &mut positions,
+                                &assets,
+                                &mut animation_preview,
+                            );
+                        }
+                        (false, message, None)
+                    }
+                };
+                let state = animation_workspace_info(
+                    &engine,
+                    &assets,
+                    &animation_preview,
+                    Some(&selected_id),
+                );
+                let _ = reply.send(AnimationClipInstanceSaveResult {
+                    ok,
+                    message,
+                    instance_id,
+                    state,
+                });
+            }
+            EngineCmd::AnimationClipInstanceDelete {
+                instance_id,
+                expected_revision,
+                selected_id,
+                reply,
+            } => {
+                let result = metrocalk_editor_shell::delete_animation_clip_instance(
+                    &mut engine,
+                    &instance_id,
+                    &expected_revision,
+                )
+                .map_err(|error| error.to_string());
+                let (ok, message) = match result {
+                    Ok(_) => {
+                        if animation_preview
+                            .transient_clip
+                            .as_ref()
+                            .is_some_and(|clip| clip.document.id == instance_id)
+                        {
+                            clear_transient_animation_clip_preserving_events(
+                                &mut animation_preview,
+                            );
+                        }
+                        refresh_animation_clip_instances(&engine, &assets, &mut animation_preview);
+                        restore_authored_animation_projection(
+                            &engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &mut animation_preview,
+                        );
+                        schedule_animation_graph_compile(&engine, &mut animation_preview);
+                        (
+                            true,
+                            format!(
+                                "Clip instance '{instance_id}' was discarded. Any graph reference now fails closed until rewired."
+                            ),
+                        )
+                    }
+                    Err(message) => {
+                        refresh_animation_clip_instances(&engine, &assets, &mut animation_preview);
+                        (false, message)
+                    }
+                };
+                let state = animation_workspace_info(
+                    &engine,
+                    &assets,
+                    &animation_preview,
+                    selected_id.as_deref(),
+                );
+                let _ = reply.send(AnimationClipInstanceSaveResult {
+                    ok,
+                    message,
+                    instance_id: ok.then_some(instance_id),
+                    state,
+                });
+            }
+            EngineCmd::AnimationClipInstancePreview { request, reply } => {
+                if take_cancelled_transient_clip_request(
+                    &mut animation_preview,
+                    &request.request_id,
+                ) {
+                    let response = animation_playback_snapshot(
+                        &animation_preview,
+                        false,
+                        "This imported clip preview was cancelled before native installation; no transient pose was applied."
+                            .into(),
+                    );
+                    let _ = reply.send(response);
+                    continue;
+                }
+                if refresh_animation_clip_instances(&engine, &assets, &mut animation_preview) {
+                    restore_authored_animation_projection(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                }
+                let result = build_single_rigid_clip_instance_document(&engine, &assets, &request)
+                    .and_then(|document| {
+                        // The same constructor and compiler used by Save establish exact draft parity.
+                        // No persistence API is called in this branch.
+                        compile_persisted_clip_instance(&engine, &assets, &document)
+                    });
+                let response = match result {
+                    Ok(instance) => {
+                        let fence =
+                            transient_animation_clip_live_fence(&engine, &assets, &instance);
+                        // Start every audition from the authoritative ECS render projection. A prior graph
+                        // may have posed entities outside this draft's target set; clearing only its runtime
+                        // would leave those unrelated GPU instance transforms visually stranded.
+                        ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                        animation_preview.graph.runtime = None;
+                        animation_preview.graph.pending_compile_key = None;
+                        animation_preview.graph.active_nodes.clear();
+                        animation_preview.graph.active_edges.clear();
+                        animation_preview.graph.transition = None;
+                        animation_preview.plan = Some(instance.compiled.plan.clone());
+                        animation_preview.current_tick = AnimationTick::ZERO;
+                        if animation_preview.transient_previous_loop_policy.is_none() {
+                            animation_preview.transient_previous_loop_policy =
+                                Some(animation_preview.loop_policy);
+                        }
+                        animation_preview.loop_policy = AnimationLoopPolicy::Once;
+                        // Install auditions paused at their authoritative first frame. Short imported clips
+                        // can otherwise complete before the mapper's controls render, leaving users unable
+                        // to inspect or scrub them. Resume remains an explicit render-only transport action.
+                        animation_preview.playing = false;
+                        animation_preview.last_error = None;
+                        animation_preview.transient_clip_fence = Some(fence);
+                        animation_preview.transient_clip_request_id =
+                            Some(request.request_id.clone());
+                        animation_preview.transient_clip = Some(instance);
+                        animation_preview.transient_clip_deadline =
+                            std::time::Instant::now().checked_add(TRANSIENT_CLIP_LEASE_DURATION);
+                        let report = apply_animation_preview_state(
+                            &engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &mut animation_preview,
+                        );
+                        animation_playback_response(
+                            &mut animation_preview,
+                            true,
+                            format!(
+                                "Loaded the unsaved mapped clip at frame zero across {} native channel(s). Resume audition or scrub to inspect it; Stop preview restores authored transforms.",
+                                report.applied
+                            ),
+                        )
+                    }
+                    Err(message) => {
+                        animation_playback_response(&mut animation_preview, false, message)
+                    }
+                };
+                let _ = reply.send(response);
+            }
+            EngineCmd::AnimationClipInstancePreviewStop {
+                expected_request_id,
+                reply,
+            } => {
+                let stale_stop = animation_clip_preview_stop_is_stale(
+                    &animation_preview,
+                    expected_request_id.as_deref(),
+                );
+                if stale_stop {
+                    // Stop(A) may overtake a delayed Preview(A) while Preview(B) is already active.
+                    // Keep B installed, but tombstone A so it cannot arrive later and replace B.
+                    remember_cancelled_transient_clip_request(
+                        &mut animation_preview,
+                        expected_request_id.as_deref(),
+                    );
+                    let response = animation_playback_snapshot(
+                        &animation_preview,
+                        true,
+                        "A newer imported clip preview remains active; this stale stop request was ignored."
+                            .into(),
+                    );
+                    let _ = reply.send(response);
+                    continue;
+                }
+                let had_audition = animation_preview.transient_clip.is_some();
+                if had_audition {
+                    clear_transient_animation_clip_preserving_events(&mut animation_preview);
+                } else {
+                    remember_cancelled_transient_clip_request(
+                        &mut animation_preview,
+                        expected_request_id.as_deref(),
+                    );
+                }
+                restore_authored_animation_projection(
+                    &engine,
+                    &shared,
+                    &mut positions,
+                    &assets,
+                    &mut animation_preview,
+                );
+                let message = if had_audition {
+                    "Imported clip preview stopped; authored transforms and normal graph authority were restored."
+                } else {
+                    "No imported clip preview was active; authored animation remains restored."
+                };
+                let response =
+                    animation_playback_response(&mut animation_preview, true, message.into());
+                let _ = reply.send(response);
+            }
+            EngineCmd::AnimationKey {
+                id,
+                component,
+                property,
+                tick,
+                interpolation,
+                reply,
+            } => {
+                let parsed_interpolation = animation_interpolation(&interpolation);
+                let edit = EntityId::from_loro_key(&id)
+                    .ok_or_else(|| "the selected entity no longer exists".to_owned())
+                    .and_then(|entity| {
+                        let interpolation = parsed_interpolation
+                            .ok_or_else(|| format!("unknown interpolation '{interpolation}'"))?;
+                        metrocalk_editor_shell::key_animation_property(
+                            &mut engine,
+                            entity,
+                            &component,
+                            &property,
+                            AnimationTick(tick),
+                            interpolation,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let (ok, message, track_id, key_id) = match edit {
+                    Ok(receipt) => {
+                        refresh_animation_plan(&engine, &mut animation_preview);
+                        restore_and_apply_animation_preview(
+                            &engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &mut animation_preview,
+                        );
+                        if let Some(ch) = &channel {
+                            if let Some(entity) = EntityId::from_loro_key(&id) {
+                                send_proj!(ch, project_entity(&engine, entity));
+                            }
+                        }
+                        (
+                            true,
+                            format!("Key added at tick {tick}; Ctrl-Z removes this animation edit"),
+                            Some(receipt.track_id),
+                            Some(receipt.key_id),
+                        )
+                    }
+                    Err(error) => (false, error, None, None),
+                };
+                let state =
+                    animation_workspace_info(&engine, &assets, &animation_preview, Some(&id));
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id,
+                    key_id,
+                    state,
+                });
+            }
+            EngineCmd::AnimationDeleteKey {
+                id,
+                track_id,
+                key_id,
+                reply,
+            } => {
+                let edit = EntityId::from_loro_key(&id)
+                    .ok_or_else(|| "the selected entity no longer exists".to_owned())
+                    .and_then(|entity| {
+                        metrocalk_editor_shell::delete_animation_key(
+                            &mut engine,
+                            entity,
+                            &track_id,
+                            &key_id,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let ok = edit.is_ok();
+                let message = edit
+                    .err()
+                    .unwrap_or_else(|| "Key removed; Ctrl-Z restores it".into());
+                if ok {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                    restore_and_apply_animation_preview(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                    if let (Some(ch), Some(entity)) = (&channel, EntityId::from_loro_key(&id)) {
+                        send_proj!(ch, project_entity(&engine, entity));
+                    }
+                }
+                let state =
+                    animation_workspace_info(&engine, &assets, &animation_preview, Some(&id));
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id: Some(track_id),
+                    key_id: Some(key_id),
+                    state,
+                });
+            }
+            EngineCmd::AnimationDeleteKeys {
+                selected_id,
+                deletes,
+                reply,
+            } => {
+                let parsed = deletes
+                    .iter()
+                    .map(|delete| {
+                        EntityId::from_loro_key(&delete.target_id)
+                            .ok_or_else(|| {
+                                format!("animation target {} no longer exists", delete.target_id)
+                            })
+                            .map(|entity| metrocalk_editor_shell::AnimationKeyDelete {
+                                entity,
+                                track_id: delete.track_id.clone(),
+                                key_id: delete.key_id.clone(),
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                let targets: BTreeSet<_> = parsed
+                    .as_ref()
+                    .map(|deletes| deletes.iter().map(|delete| delete.entity).collect())
+                    .unwrap_or_default();
+                let edit = parsed.and_then(|deletes| {
+                    metrocalk_editor_shell::delete_animation_keys(&mut engine, &deletes)
+                        .map_err(|error| error.to_string())
+                });
+                let (ok, message) = match edit {
+                    Ok(0) => (
+                        true,
+                        "No keys selected; authored animation is unchanged".into(),
+                    ),
+                    Ok(count) => (
+                        true,
+                        format!(
+                            "{count} key{} removed as one edit; Ctrl-Z restores the selection",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                    ),
+                    Err(error) => (false, error),
+                };
+                if ok && !deletes.is_empty() {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                    restore_and_apply_animation_preview(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                    if let Some(ch) = &channel {
+                        for entity in targets {
+                            send_proj!(ch, project_entity(&engine, entity));
+                        }
+                    }
+                }
+                let state = animation_workspace_info(
+                    &engine,
+                    &assets,
+                    &animation_preview,
+                    selected_id.as_deref(),
+                );
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id: deletes.first().map(|delete| delete.track_id.clone()),
+                    key_id: deletes.first().map(|delete| delete.key_id.clone()),
+                    state,
+                });
+            }
+            EngineCmd::AnimationSetInterpolation {
+                id,
+                track_id,
+                interpolation,
+                reply,
+            } => {
+                let edit = EntityId::from_loro_key(&id)
+                    .ok_or_else(|| "the selected entity no longer exists".to_owned())
+                    .and_then(|entity| {
+                        let interpolation = animation_interpolation(&interpolation)
+                            .ok_or_else(|| format!("unknown interpolation '{interpolation}'"))?;
+                        metrocalk_editor_shell::set_animation_interpolation(
+                            &mut engine,
+                            entity,
+                            &track_id,
+                            interpolation,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let ok = edit.is_ok();
+                let message = edit.err().unwrap_or_else(|| {
+                    format!("Interpolation changed to {interpolation}; Ctrl-Z restores it")
+                });
+                if ok {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                    restore_and_apply_animation_preview(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                    if let (Some(ch), Some(entity)) = (&channel, EntityId::from_loro_key(&id)) {
+                        send_proj!(ch, project_entity(&engine, entity));
+                    }
+                }
+                let state =
+                    animation_workspace_info(&engine, &assets, &animation_preview, Some(&id));
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id: Some(track_id),
+                    key_id: None,
+                    state,
+                });
+            }
+            EngineCmd::AnimationSetTrackEnabled {
+                id,
+                track_id,
+                enabled,
+                reply,
+            } => {
+                let edit = EntityId::from_loro_key(&id)
+                    .ok_or_else(|| "the selected entity no longer exists".to_owned())
+                    .and_then(|entity| {
+                        metrocalk_editor_shell::animation_intent::set_track_enabled(
+                            &mut engine,
+                            entity,
+                            &track_id,
+                            enabled,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let ok = edit.is_ok();
+                let message = edit.err().unwrap_or_else(|| {
+                    if enabled {
+                        "Track unmuted; its keys are active again".into()
+                    } else {
+                        "Track muted; authored keys were preserved".into()
+                    }
+                });
+                if ok {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                    restore_and_apply_animation_preview(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                }
+                let state =
+                    animation_workspace_info(&engine, &assets, &animation_preview, Some(&id));
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id: Some(track_id),
+                    key_id: None,
+                    state,
+                });
+            }
+            EngineCmd::AnimationSetTrackLocked {
+                id,
+                track_id,
+                locked,
+                reply,
+            } => {
+                let edit = EntityId::from_loro_key(&id)
+                    .ok_or_else(|| "the selected entity no longer exists".to_owned())
+                    .and_then(|entity| {
+                        metrocalk_editor_shell::animation_intent::set_track_locked(
+                            &mut engine,
+                            entity,
+                            &track_id,
+                            locked,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let ok = edit.is_ok();
+                let message = edit.err().unwrap_or_else(|| {
+                    if locked {
+                        "Track locked".into()
+                    } else {
+                        "Track unlocked".into()
+                    }
+                });
+                let state =
+                    animation_workspace_info(&engine, &assets, &animation_preview, Some(&id));
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id: Some(track_id),
+                    key_id: None,
+                    state,
+                });
+            }
+            EngineCmd::AnimationUpdateKeys {
+                id,
+                track_id,
+                updates,
+                reply,
+            } => {
+                let edit = EntityId::from_loro_key(&id)
+                    .ok_or_else(|| "the selected entity no longer exists".to_owned())
+                    .and_then(|entity| {
+                        let document = metrocalk_editor_shell::load_animation_document(&engine);
+                        let track = document
+                            .sequence
+                            .tracks
+                            .iter()
+                            .find(|track| track.id.as_str() == track_id)
+                            .ok_or_else(|| "the animation track no longer exists".to_owned())?;
+                        let mut parsed = Vec::with_capacity(updates.len());
+                        for update in updates {
+                            let key = track
+                                .keyframes
+                                .iter()
+                                .find(|key| key.id.as_str() == update.key_id)
+                                .ok_or_else(|| format!("key {} no longer exists", update.key_id))?;
+                            let value = match update.value.as_ref() {
+                                Some(value) => Some(
+                                    animation_value_from_json(track.binding.value_kind, value)
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "key {} has a value of the wrong type",
+                                                update.key_id
+                                            )
+                                        })?,
+                                ),
+                                None => None,
+                            };
+                            let in_tangent = match &update.in_tangent {
+                                AnimationValuePatch::Set(value) => Some(Some(
+                                    animation_value_from_json(track.binding.value_kind, value)
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "key {} has an invalid in tangent",
+                                                update.key_id
+                                            )
+                                        })?,
+                                )),
+                                AnimationValuePatch::Clear => Some(None),
+                                AnimationValuePatch::Unchanged => None,
+                            };
+                            let out_tangent = match &update.out_tangent {
+                                AnimationValuePatch::Set(value) => Some(Some(
+                                    animation_value_from_json(track.binding.value_kind, value)
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "key {} has an invalid out tangent",
+                                                update.key_id
+                                            )
+                                        })?,
+                                )),
+                                AnimationValuePatch::Clear => Some(None),
+                                AnimationValuePatch::Unchanged => None,
+                            };
+                            parsed.push(
+                                metrocalk_editor_shell::animation_intent::AnimationKeyUpdate {
+                                    key_id: update.key_id,
+                                    tick: AnimationTick(update.tick.unwrap_or(key.tick.0)),
+                                    value,
+                                    in_tangent,
+                                    out_tangent,
+                                },
+                            );
+                        }
+                        metrocalk_editor_shell::animation_intent::update_keys(
+                            &mut engine,
+                            entity,
+                            &track_id,
+                            &parsed,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let ok = edit.is_ok();
+                let message = edit
+                    .err()
+                    .unwrap_or_else(|| "Key edits committed as one undoable change".into());
+                if ok {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                    restore_and_apply_animation_preview(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                }
+                let state =
+                    animation_workspace_info(&engine, &assets, &animation_preview, Some(&id));
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id: Some(track_id),
+                    key_id: None,
+                    state,
+                });
+            }
+            EngineCmd::AnimationAddMarker {
+                id,
+                name,
+                tick,
+                reply,
+            } => {
+                let edit = EntityId::from_loro_key(&id)
+                    .ok_or_else(|| "the selected entity no longer exists".to_owned())
+                    .and_then(|entity| {
+                        metrocalk_editor_shell::animation_intent::add_marker(
+                            &mut engine,
+                            entity,
+                            &name,
+                            AnimationTick(tick),
+                            Some([89, 192, 255, 255]),
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let (ok, message, key_id) = match edit {
+                    Ok(marker_id) => (
+                        true,
+                        "Marker added; Ctrl-Z removes it".into(),
+                        Some(marker_id),
+                    ),
+                    Err(error) => (false, error, None),
+                };
+                if ok {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                }
+                let state =
+                    animation_workspace_info(&engine, &assets, &animation_preview, Some(&id));
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id: None,
+                    key_id,
+                    state,
+                });
+            }
+            EngineCmd::AnimationDeleteMarker {
+                owner_id,
+                marker_id,
+                reply,
+            } => {
+                let edit = EntityId::from_loro_key(&owner_id)
+                    .ok_or_else(|| "the marker owner no longer exists".to_owned())
+                    .and_then(|entity| {
+                        metrocalk_editor_shell::animation_intent::delete_marker(
+                            &mut engine,
+                            entity,
+                            &marker_id,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let ok = edit.is_ok();
+                let message = edit
+                    .err()
+                    .unwrap_or_else(|| "Marker removed; Ctrl-Z restores it".into());
+                if ok {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                }
+                let state =
+                    animation_workspace_info(&engine, &assets, &animation_preview, Some(&owner_id));
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id: None,
+                    key_id: Some(marker_id),
+                    state,
+                });
+            }
+            EngineCmd::AnimationAddEvent {
+                id,
+                name,
+                tick,
+                payload,
+                reply,
+            } => {
+                let parsed_payload = match payload.as_ref() {
+                    Some(payload) => {
+                        animation_payload_from_json(payload)
+                            .map(Some)
+                            .ok_or_else(|| {
+                                "event payload must be a scalar or numeric vector".to_owned()
+                            })
+                    }
+                    None => Ok(None),
+                };
+                let edit = parsed_payload.and_then(|payload| {
+                    EntityId::from_loro_key(&id)
+                        .ok_or_else(|| "the selected entity no longer exists".to_owned())
+                        .and_then(|entity| {
+                            metrocalk_editor_shell::animation_intent::add_event(
+                                &mut engine,
+                                entity,
+                                &name,
+                                AnimationTick(tick),
+                                payload,
+                            )
+                            .map_err(|error| error.to_string())
+                        })
+                });
+                let (ok, message, key_id) = match edit {
+                    Ok(event_id) => (
+                        true,
+                        "Event added; playback dispatches it on interval crossing".into(),
+                        Some(event_id),
+                    ),
+                    Err(error) => (false, error, None),
+                };
+                if ok {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                }
+                let state =
+                    animation_workspace_info(&engine, &assets, &animation_preview, Some(&id));
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id: None,
+                    key_id,
+                    state,
+                });
+            }
+            EngineCmd::AnimationDeleteEvent {
+                owner_id,
+                event_id,
+                reply,
+            } => {
+                let edit = EntityId::from_loro_key(&owner_id)
+                    .ok_or_else(|| "the event owner no longer exists".to_owned())
+                    .and_then(|entity| {
+                        metrocalk_editor_shell::animation_intent::delete_event(
+                            &mut engine,
+                            entity,
+                            &event_id,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let ok = edit.is_ok();
+                let message = edit
+                    .err()
+                    .unwrap_or_else(|| "Event removed; Ctrl-Z restores it".into());
+                if ok {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                }
+                let state =
+                    animation_workspace_info(&engine, &assets, &animation_preview, Some(&owner_id));
+                let _ = reply.send(AnimationEditResult {
+                    ok,
+                    message,
+                    track_id: None,
+                    key_id: Some(event_id),
+                    state,
+                });
+            }
+            EngineCmd::AnimationTransport {
+                action,
+                tick,
+                loop_policy,
+                reply,
+            } => {
+                if refresh_animation_clip_instances(&engine, &assets, &mut animation_preview) {
+                    restore_authored_animation_projection(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                }
+                let mut ok = true;
+                let mut message = String::new();
+                if let Some(policy) = loop_policy {
+                    if let Some(policy) = animation_loop_policy(&policy) {
+                        if animation_preview.transient_clip.is_some()
+                            && policy != AnimationLoopPolicy::Once
+                        {
+                            ok = false;
+                            message = "Unsaved imported-clip auditions use a bounded one-shot lease. Stop the audition before changing the authored loop policy."
+                                .into();
+                        } else if animation_preview.transient_clip.is_none() {
+                            animation_preview.loop_policy = policy;
+                            refresh_animation_plan(&engine, &mut animation_preview);
+                        }
+                    } else {
+                        ok = false;
+                        message = "Unknown animation loop policy".into();
+                    }
+                }
+                if animation_preview.plan.is_none() {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                }
+                if ok {
+                    match action.as_str() {
+                        "play" => {
+                            if animation_preview_has_transport_content(&animation_preview) {
+                                if animation_preview.loop_policy == AnimationLoopPolicy::Once
+                                    && animation_preview.current_tick
+                                        >= animation_transport_duration(&animation_preview)
+                                {
+                                    seek_animation_preview(
+                                        &mut animation_preview,
+                                        AnimationTick::ZERO,
+                                    );
+                                }
+                                animation_preview.playing = true;
+                                message = "Animation preview is playing natively".into();
+                            } else {
+                                ok = false;
+                                message =
+                                    "Add at least one valid key or timeline event before playing"
+                                        .into();
+                            }
+                        }
+                        "pause" => {
+                            animation_preview.playing = false;
+                            message = "Animation preview paused at the current tick".into();
+                        }
+                        "stop" => {
+                            let stopped_imported_preview =
+                                animation_preview.transient_clip.is_some();
+                            if stopped_imported_preview {
+                                clear_transient_animation_clip_preserving_events(
+                                    &mut animation_preview,
+                                );
+                                restore_authored_animation_projection(
+                                    &engine,
+                                    &shared,
+                                    &mut positions,
+                                    &assets,
+                                    &mut animation_preview,
+                                );
+                            } else {
+                                animation_preview.playing = false;
+                                seek_animation_preview(&mut animation_preview, AnimationTick::ZERO);
+                                ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+                                rebuild(&engine, &shared, &mut positions, &assets);
+                            }
+                            message = if stopped_imported_preview {
+                                "Imported clip preview stopped; authored transforms and graph authority restored"
+                            } else {
+                                "Animation preview stopped; authored transforms restored"
+                            }
+                            .into();
+                        }
+                        "scrub" => match tick {
+                            Some(tick) if tick >= 0 => {
+                                animation_preview.playing = false;
+                                seek_animation_preview(&mut animation_preview, AnimationTick(tick));
+                                let report = apply_animation_preview_state(
+                                    &engine,
+                                    &shared,
+                                    &mut positions,
+                                    &assets,
+                                    &mut animation_preview,
+                                );
+                                message = if report.applied == report.evaluated {
+                                    format!(
+                                        "Previewing tick {tick} across {} track(s)",
+                                        report.applied
+                                    )
+                                } else {
+                                    format!(
+                                        "Previewing tick {tick}: applied {} of {} evaluated track(s); unsupported bindings were left unchanged",
+                                        report.applied, report.evaluated
+                                    )
+                                };
+                            }
+                            _ => {
+                                ok = false;
+                                message = "Scrub time must be a non-negative integer tick".into();
+                            }
+                        },
+                        "status" => {
+                            message = "Animation clock synchronized".into();
+                        }
+                        _ => {
+                            ok = false;
+                            message = format!("Unknown animation transport action '{action}'");
+                        }
+                    }
+                }
+                if ok && action == "play" {
+                    let _ = apply_animation_preview_state(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                }
+                let duration = animation_transport_duration(&animation_preview).0;
+                let evaluated_tracks = animation_preview.graph.runtime.as_ref().map_or_else(
+                    || {
+                        animation_preview
+                            .plan
+                            .as_ref()
+                            .map_or(0, CompiledSequence::tracks_len)
+                    },
+                    |runtime| runtime.frame().values.len(),
+                );
+                let (crossed_events, events_truncated) =
+                    take_pending_animation_events(&mut animation_preview);
+                let _ = reply.send(AnimationPlaybackInfo {
+                    ok,
+                    message,
+                    current_tick: animation_display_tick(&animation_preview).0,
+                    duration_tick: duration,
+                    playing: animation_preview.playing,
+                    imported_clip_preview_active: animation_preview.transient_clip.is_some(),
+                    loop_policy: animation_loop_name(animation_preview.loop_policy).into(),
+                    evaluated_tracks,
+                    crossed_events,
+                    events_truncated,
+                });
+            }
+            EngineCmd::AnimationGraphState { sequence_id, reply } => {
+                if refresh_animation_clip_instances(&engine, &assets, &mut animation_preview) {
+                    restore_authored_animation_projection(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                }
+                schedule_animation_graph_compile(&engine, &mut animation_preview);
+                let _ = reply.send(animation_graph_state_info(
+                    &assets,
+                    &animation_preview,
+                    &sequence_id,
+                ));
+            }
+            EngineCmd::AnimationGraphSave {
+                sequence_id,
+                request,
+                reply,
+            } => {
+                let schema_matches = animation_graph_save_schema_matches(&request);
+                let parsed = if schema_matches {
+                    serde_json::from_value::<metrocalk_editor_shell::AnimationGraphDocument>(
+                        request.graph,
+                    )
+                    .map_err(|error| format!("The graph document is malformed: {error}"))
+                } else {
+                    Err(format!(
+                        "Graph schema {} is unsupported; expected schema {ANIMATION_GRAPH_SCHEMA_VERSION}.",
+                        request.schema_version
+                    ))
+                };
+                let result = parsed.and_then(|document| {
+                    if document.sequence_id != sequence_id {
+                        return Err("The draft belongs to a different animation sequence.".into());
+                    }
+                    metrocalk_editor_shell::save_animation_graph(
+                        &mut engine,
+                        &request.expected_revision,
+                        &document,
+                    )
+                    .map_err(|error| error.to_string())
+                });
+                match result {
+                    Ok(load) => {
+                        install_animation_graph_load(&mut animation_preview, load);
+                        refresh_animation_plan(&engine, &mut animation_preview);
+                        let state =
+                            animation_graph_state_info(&assets, &animation_preview, &sequence_id);
+                        let request_suffix = if request.request_id.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", request.request_id)
+                        };
+                        let message = if state.compile.state == "invalid" {
+                            format!(
+                                "Graph draft saved as one undoable edit{request_suffix}; fix the blocking diagnostics while the last good preview remains active."
+                            )
+                        } else {
+                            format!(
+                                "Graph saved as one undoable edit{request_suffix} and queued for native compilation."
+                            )
+                        };
+                        let _ = reply.send(AnimationGraphSaveResult {
+                            ok: true,
+                            message,
+                            state,
+                        });
+                    }
+                    Err(message) => {
+                        let load =
+                            metrocalk_editor_shell::load_animation_graph(&engine, &sequence_id);
+                        if load.revision != animation_preview.graph.revision {
+                            install_animation_graph_load(&mut animation_preview, load);
+                            refresh_animation_plan(&engine, &mut animation_preview);
+                        }
+                        let state =
+                            animation_graph_state_info(&assets, &animation_preview, &sequence_id);
+                        let _ = reply.send(AnimationGraphSaveResult {
+                            ok: false,
+                            message,
+                            state,
+                        });
+                    }
+                }
+            }
+            EngineCmd::AnimationGraphDelete {
+                sequence_id,
+                graph_id,
+                expected_revision,
+                request_id,
+                reply,
+            } => {
+                match metrocalk_editor_shell::delete_animation_graph(
+                    &mut engine,
+                    &sequence_id,
+                    &graph_id,
+                    &expected_revision,
+                ) {
+                    Ok(load) => {
+                        install_animation_graph_load(&mut animation_preview, load);
+                        refresh_animation_plan(&engine, &mut animation_preview);
+                        let state =
+                            animation_graph_state_info(&assets, &animation_preview, &sequence_id);
+                        let suffix = if request_id.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({request_id})")
+                        };
+                        let _ = reply.send(AnimationGraphDeleteResult {
+                            ok: true,
+                            message: format!(
+                                "Animation graph deleted as one undoable edit{suffix}; preview returned to the implicit flat graph."
+                            ),
+                            state,
+                        });
+                    }
+                    Err(error) => {
+                        let load =
+                            metrocalk_editor_shell::load_animation_graph(&engine, &sequence_id);
+                        if load.revision != animation_preview.graph.revision {
+                            install_animation_graph_load(&mut animation_preview, load);
+                            refresh_animation_plan(&engine, &mut animation_preview);
+                        }
+                        let state =
+                            animation_graph_state_info(&assets, &animation_preview, &sequence_id);
+                        let _ = reply.send(AnimationGraphDeleteResult {
+                            ok: false,
+                            message: error.to_string(),
+                            state,
+                        });
+                    }
+                }
+            }
+            EngineCmd::AnimationGraphDebug {
+                graph_id,
+                instance_id,
+                watches,
+                reply,
+            } => {
+                let graph_matches = animation_graph_json_id(animation_preview.graph.graph.as_ref())
+                    == Some(graph_id.as_str());
+                if !graph_matches {
+                    let _ = reply.send(AnimationGraphDebugInfo {
+                        graph_id,
+                        graph_revision: "missing".into(),
+                        compiled_hash: "missing".into(),
+                        instance_id: instance_id.unwrap_or_else(|| "native-preview".into()),
+                        raw_tick: animation_preview.current_tick.0,
+                        local_tick: animation_display_tick(&animation_preview).0,
+                        active_nodes: Vec::new(),
+                        active_edges: Vec::new(),
+                        transition: None,
+                        parameter_values: BTreeMap::new(),
+                        watches: Vec::new(),
+                        events_truncated: false,
+                        evaluation_cost_micros: None,
+                        truncated: watches.len() > MAX_ANIMATION_GRAPH_DEBUG_WATCHES,
+                    });
+                    continue;
+                }
+                let parameter_values =
+                    runtime_animation_graph_parameter_values(&animation_preview.graph)
+                        .unwrap_or_else(|| {
+                            let mut values = authored_animation_graph_parameter_values(
+                                animation_preview.graph.graph.as_ref(),
+                            );
+                            values.extend(animation_preview.graph.preview_parameters.clone());
+                            values
+                        });
+                let bounded_watches: Vec<_> = watches
+                    .iter()
+                    .take(MAX_ANIMATION_GRAPH_DEBUG_WATCHES)
+                    .map(|id| AnimationGraphWatchValue {
+                        id: id.clone(),
+                        value: parameter_values
+                            .get(id)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        source: if animation_preview.graph.runtime.is_some()
+                            && parameter_values.contains_key(id)
+                        {
+                            "runtime parameter"
+                        } else if animation_preview.graph.preview_parameters.contains_key(id) {
+                            "preview parameter"
+                        } else if parameter_values.contains_key(id) {
+                            "authored default"
+                        } else {
+                            "unavailable"
+                        }
+                        .into(),
+                    })
+                    .collect();
+                let nodes_len = animation_preview.graph.active_nodes.len();
+                let edges_len = animation_preview.graph.active_edges.len();
+                let _ = reply.send(AnimationGraphDebugInfo {
+                    graph_id,
+                    graph_revision: animation_preview
+                        .graph
+                        .compile
+                        .compiled_revision
+                        .clone()
+                        .unwrap_or_else(|| animation_preview.graph.revision.clone()),
+                    compiled_hash: animation_preview
+                        .graph
+                        .compile
+                        .compiled_hash
+                        .clone()
+                        .unwrap_or_else(|| "missing".into()),
+                    instance_id: instance_id.unwrap_or_else(|| "native-preview".into()),
+                    raw_tick: animation_preview.current_tick.0,
+                    local_tick: animation_display_tick(&animation_preview).0,
+                    active_nodes: animation_preview
+                        .graph
+                        .active_nodes
+                        .iter()
+                        .take(MAX_ANIMATION_GRAPH_DEBUG_NODES)
+                        .cloned()
+                        .collect(),
+                    active_edges: animation_preview
+                        .graph
+                        .active_edges
+                        .iter()
+                        .take(MAX_ANIMATION_GRAPH_DEBUG_EDGES)
+                        .cloned()
+                        .collect(),
+                    transition: animation_preview.graph.transition.clone(),
+                    parameter_values,
+                    watches: bounded_watches,
+                    events_truncated: animation_preview.graph.events_truncated,
+                    evaluation_cost_micros: animation_preview.graph.evaluation_cost_micros,
+                    truncated: nodes_len > MAX_ANIMATION_GRAPH_DEBUG_NODES
+                        || edges_len > MAX_ANIMATION_GRAPH_DEBUG_EDGES
+                        || watches.len() > MAX_ANIMATION_GRAPH_DEBUG_WATCHES
+                        || animation_preview.graph.debug_trace_incomplete,
+                });
+            }
+            EngineCmd::AnimationGraphSetPreviewParameters {
+                graph_id,
+                values,
+                reply,
+            } => {
+                let Some(graph) = animation_preview.graph.graph.as_ref().filter(|graph| {
+                    animation_graph_json_id(Some(graph)) == Some(graph_id.as_str())
+                }) else {
+                    let _ = reply.send(AnimationGraphPreviewResult {
+                        ok: false,
+                        message: "That graph is not the active native preview graph.".into(),
+                        accepted: BTreeMap::new(),
+                    });
+                    continue;
+                };
+                let (mut accepted, mut rejected) = animation_graph_preview_values(graph, values);
+                // Level parameters survive a hot compile so the preview remains stable. Triggers are
+                // commands, not state: return them to the caller, but never replay them into a new plan.
+                let mut replayable = replayable_animation_graph_preview_values(graph, &accepted);
+                let runtime_errors = apply_native_animation_graph_parameters(
+                    &mut animation_preview.graph,
+                    &accepted,
+                );
+                for error in runtime_errors {
+                    if let Some((id, _)) = error.split_once(": ") {
+                        accepted.remove(id);
+                        replayable.remove(id);
+                    }
+                    rejected.push(error);
+                }
+                animation_preview
+                    .graph
+                    .preview_parameters
+                    .extend(replayable);
+                if animation_preview.graph.runtime.is_some() {
+                    let _ = apply_animation_preview_state(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                }
+                let _ = reply.send(AnimationGraphPreviewResult {
+                    ok: rejected.is_empty(),
+                    message: if rejected.is_empty() {
+                        "Transient graph parameters updated; the project document remains clean."
+                            .into()
+                    } else {
+                        format!(
+                            "Accepted {} parameter(s); rejected {}.",
+                            accepted.len(),
+                            rejected.join("; ")
+                        )
+                    },
+                    accepted,
+                });
+            }
+            EngineCmd::AnimationGraphClearPreviewParameters { graph_id, reply } => {
+                let matches = animation_graph_json_id(animation_preview.graph.graph.as_ref())
+                    == Some(graph_id.as_str());
+                if matches {
+                    let defaults = authored_animation_graph_parameter_values(
+                        animation_preview.graph.graph.as_ref(),
+                    );
+                    let errors = apply_native_animation_graph_parameters(
+                        &mut animation_preview.graph,
+                        &defaults,
+                    );
+                    animation_preview.graph.preview_parameters.clear();
+                    if errors.is_empty() && animation_preview.graph.runtime.is_some() {
+                        let _ = apply_animation_preview_state(
+                            &engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &mut animation_preview,
+                        );
+                    }
+                }
+                let _ = reply.send(AnimationGraphPreviewResult {
+                    ok: matches,
+                    message: if matches {
+                        "Transient graph parameters reset to authored defaults.".into()
+                    } else {
+                        "That graph is not the active native preview graph.".into()
+                    },
+                    accepted: BTreeMap::new(),
+                });
+            }
+            EngineCmd::AnimationGraphCompileReady {
+                sequence_id,
+                authored_revision,
+                source_hash,
+                source_duration,
+                parameter_routes,
+                edge_provenance,
+                adapter_diagnostics,
+                result,
+            } => {
+                if animation_preview.transient_clip.is_some() {
+                    // The unsaved audition owns the render projection. Never let an in-flight worker
+                    // install a graph underneath it; Stop preview queues a fresh fenced compile.
+                    animation_preview.graph.pending_compile_key = None;
+                    animation_preview.graph.compile.state = "stale".into();
+                    animation_preview.graph.compile.message =
+                        "Graph compilation finished during clip preview and was not installed. Stop preview to recompile against current sources."
+                            .into();
+                    continue;
+                }
+                // A compile can finish after another save/open/undo. Only the exact authored revision that
+                // requested it may install; stale workers are harmlessly discarded.
+                if sequence_id != animation_preview.graph.sequence_id
+                    || authored_revision != animation_preview.graph.revision
+                    || animation_preview.graph.graph.is_none()
+                    || current_animation_graph_source_hash(&animation_preview).as_deref()
+                        != Some(source_hash.as_str())
+                    || animation_preview.graph.pending_compile_key.as_ref()
+                        != Some(&(authored_revision.clone(), source_hash.clone()))
+                {
+                    continue;
+                }
+                animation_preview.graph.pending_compile_key = None;
+                animation_preview.graph.diagnostics.extend(
+                    adapter_diagnostics
+                        .iter()
+                        .map(animation_graph_diagnostic_info),
+                );
+                match *result {
+                    Ok(plan) => {
+                        let hash = plan.stable_hash.clone();
+                        let core_diagnostics: Vec<_> = plan
+                            .diagnostics
+                            .iter()
+                            .enumerate()
+                            .map(|(index, diagnostic)| {
+                                core_animation_graph_diagnostic_info(
+                                    diagnostic,
+                                    index,
+                                    &edge_provenance,
+                                )
+                            })
+                            .collect();
+                        if let Some(runtime) = animation_preview.graph.runtime.as_mut() {
+                            runtime.rebind_plan(
+                                plan,
+                                metrocalk_animation::AnimationGraphRebindPolicy::PreserveState,
+                            );
+                        } else {
+                            let mut runtime = AnimationGraphRuntimeInstance::new(plan);
+                            runtime.seek(animation_preview.current_tick);
+                            animation_preview.graph.runtime = Some(runtime);
+                        }
+                        animation_preview.graph.parameter_routes = parameter_routes;
+                        animation_preview.graph.edge_provenance = edge_provenance;
+                        animation_preview.graph.compiled_source_hash = Some(source_hash);
+                        animation_preview.graph.source_duration = Some(source_duration);
+                        animation_preview.graph.diagnostics.extend(core_diagnostics);
+                        animation_preview.graph.compile = AnimationGraphCompileInfo {
+                            state: "ready".into(),
+                            authored_revision: authored_revision.clone(),
+                            compiled_revision: Some(authored_revision.clone()),
+                            compiled_hash: Some(hash.clone()),
+                            last_good_revision: Some(authored_revision),
+                            last_good_hash: Some(hash),
+                            message: "Graph compiled and installed; the native viewport is evaluating the mixed output.".into(),
+                        };
+                        let preview_values = animation_preview.graph.preview_parameters.clone();
+                        let parameter_errors = apply_native_animation_graph_parameters(
+                            &mut animation_preview.graph,
+                            &preview_values,
+                        );
+                        if !parameter_errors.is_empty() {
+                            animation_preview.graph.diagnostics.extend(
+                                parameter_errors.into_iter().enumerate().map(|(index, message)| {
+                                    AnimationGraphDiagnosticInfo {
+                                        id: format!("preview-parameter-{index}"),
+                                        severity: "warning".into(),
+                                        code: "preview_parameter_rejected".into(),
+                                        message,
+                                        fix: Some("Reset the transient parameter or repair its graph use.".into()),
+                                        node_id: None,
+                                        edge_id: None,
+                                        port_id: None,
+                                    }
+                                }),
+                            );
+                        }
+                        let _ = apply_animation_preview_state(
+                            &engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &mut animation_preview,
+                        );
+                    }
+                    Err(error) => {
+                        animation_preview.graph.diagnostics.extend(
+                            error
+                                .diagnostics
+                                .iter()
+                                .enumerate()
+                                .map(|(index, diagnostic)| {
+                                    core_animation_graph_diagnostic_info(
+                                        diagnostic,
+                                        index,
+                                        &edge_provenance,
+                                    )
+                                }),
+                        );
+                        animation_preview.graph.compile.state = "invalid".into();
+                        animation_preview.graph.compile.message = if animation_preview
+                            .graph
+                            .runtime
+                            .is_some()
+                        {
+                            "Compilation failed; the last good compiled revision remains active."
+                                .into()
+                        } else {
+                            "Compilation failed; the implicit flat graph remains active.".into()
+                        };
+                    }
+                }
+                let mut seen = BTreeSet::new();
+                animation_preview.graph.diagnostics.retain(|diagnostic| {
+                    seen.insert((
+                        diagnostic.id.clone(),
+                        diagnostic.code.clone(),
+                        diagnostic.node_id.clone(),
+                        diagnostic.edge_id.clone(),
+                    ))
+                });
+            }
             EngineCmd::AssetProvenance { id, reply } => {
                 let info = EntityId::from_loro_key(&id)
                     .and_then(|e| asset_provenance_of(&assets, &engine, e));
                 let _ = reply.send(info);
+            }
+            EngineCmd::AssetLabAudit { id, reply } => {
+                match asset_lab_source(&engine, &assets, &id) {
+                    Ok((_entity, handle, asset, _display_scale)) => {
+                        let asset = asset.clone();
+                        std::thread::spawn(move || {
+                            let response = match audit_asset(&asset, &AuditOptions::default()) {
+                                Ok(audit) => AssetLabResponse {
+                                    ok: true,
+                                    message: format!(
+                                        "Inspected {} triangles, {} vertices and {} material slots",
+                                        audit.triangles, audit.vertices, audit.materials.slots
+                                    ),
+                                    source_entity: Some(id),
+                                    source_handle: Some(handle),
+                                    warnings: audit.warnings.clone(),
+                                    audit: Some(audit),
+                                    ..AssetLabResponse::default()
+                                },
+                                Err(error) => AssetLabResponse {
+                                    message: error.to_string(),
+                                    source_entity: Some(id),
+                                    source_handle: Some(handle),
+                                    ..AssetLabResponse::default()
+                                },
+                            };
+                            let _ = reply.send(response);
+                        });
+                    }
+                    Err(message) => {
+                        let _ = reply.send(AssetLabResponse {
+                            message,
+                            source_entity: Some(id),
+                            ..AssetLabResponse::default()
+                        });
+                    }
+                }
+            }
+            EngineCmd::AssetLabProcess { id, request, reply } => {
+                match asset_lab_source(&engine, &assets, &id) {
+                    Ok((entity, handle, asset, display)) => {
+                        let source_world = capscene::global_transform(&engine, entity);
+                        let target_bake_transform = asset_lab_bake_transform(source_world, display);
+                        let root_entity = asset_lab_lineage_root(&engine, entity);
+                        let asset = asset.clone();
+                        let mut bake_sources = Vec::new();
+                        let mut source_error = None;
+                        let is_bake = request.operation.eq_ignore_ascii_case("bake")
+                            || request.operation.eq_ignore_ascii_case("bake-textures");
+                        let alignment_policy = if is_bake {
+                            match AssetLabAlignmentPolicy::parse(
+                                request.alignment_policy.as_deref(),
+                            ) {
+                                Ok(policy) => policy,
+                                Err(message) => {
+                                    let _ = reply.send(AssetLabResponse {
+                                        message,
+                                        source_entity: Some(id),
+                                        source_handle: Some(handle),
+                                        ..AssetLabResponse::default()
+                                    });
+                                    continue;
+                                }
+                            }
+                        } else {
+                            AssetLabAlignmentPolicy::AutoRelated
+                        };
+                        if is_bake {
+                            let mut unique = BTreeSet::new();
+                            for source_id in &request.high_source_ids {
+                                if !unique.insert(source_id.clone()) {
+                                    continue;
+                                }
+                                match asset_lab_source(&engine, &assets, source_id) {
+                                    Ok((source_entity, _, source_asset, source_display)) => {
+                                        let source_root =
+                                            asset_lab_lineage_root(&engine, source_entity);
+                                        let source_world_transform = asset_lab_bake_transform(
+                                            capscene::global_transform(&engine, source_entity),
+                                            source_display,
+                                        );
+                                        let (source_transform, auto_aligned) =
+                                            asset_lab_aligned_source_transform(
+                                                alignment_policy,
+                                                &root_entity,
+                                                &source_root,
+                                                target_bake_transform,
+                                                source_world_transform,
+                                            );
+                                        bake_sources.push(AssetLabBakeSource {
+                                            asset: source_asset.clone(),
+                                            transform: source_transform,
+                                            auto_aligned,
+                                        });
+                                    }
+                                    Err(message) => {
+                                        source_error = Some(format!(
+                                            "high-detail source {source_id} is unavailable: {message}"
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(message) = source_error {
+                            let _ = reply.send(AssetLabResponse {
+                                message,
+                                source_entity: Some(id),
+                                source_handle: Some(handle),
+                                ..AssetLabResponse::default()
+                            });
+                            continue;
+                        }
+                        let mut transform = source_world;
+                        let source_extent = asset.bounds().max_extent();
+                        let entity_scale = transform.scale[0].abs().max(0.001);
+                        transform.translation[0] +=
+                            (source_extent * display.scale * entity_scale).max(0.5) + 0.5;
+                        let tx = self_tx.clone();
+                        std::thread::spawn(move || {
+                            let result = build_asset_lab_variant(
+                                &asset,
+                                display,
+                                target_bake_transform,
+                                &bake_sources,
+                                &request,
+                            );
+                            if tx
+                                .send(EngineCmd::AssetLabReady {
+                                    source_entity: id,
+                                    root_entity,
+                                    source_handle: handle,
+                                    display,
+                                    transform,
+                                    result: Box::new(result),
+                                    reply,
+                                })
+                                .is_err()
+                            {
+                                eprintln!("[shell] Asset Lab completion dropped because the engine closed");
+                            }
+                        });
+                    }
+                    Err(message) => {
+                        let _ = reply.send(AssetLabResponse {
+                            message,
+                            source_entity: Some(id),
+                            ..AssetLabResponse::default()
+                        });
+                    }
+                }
+            }
+            EngineCmd::AssetLabReady {
+                source_entity,
+                root_entity,
+                source_handle,
+                display,
+                transform,
+                result,
+                reply,
+            } => {
+                let source_is_current = asset_lab_source(&engine, &assets, &source_entity)
+                    .is_ok_and(|(_, handle, _, _)| handle == source_handle);
+                if !source_is_current {
+                    let _ = reply.send(AssetLabResponse {
+                        message:
+                            "The source changed while processing; the stale result was discarded"
+                                .into(),
+                        source_entity: Some(source_entity),
+                        source_handle: Some(source_handle),
+                        ..AssetLabResponse::default()
+                    });
+                    continue;
+                }
+                let built = match *result {
+                    Ok(built) => built,
+                    Err(error) => {
+                        let _ = reply.send(AssetLabResponse {
+                            message: error.message,
+                            source_entity: Some(source_entity),
+                            source_handle: Some(source_handle),
+                            bake_evidence: error.bake_evidence.map(|evidence| *evidence),
+                            ..AssetLabResponse::default()
+                        });
+                        continue;
+                    }
+                };
+                let persisted = match metrocalk_editor_shell::blobstore::put(
+                    &sidecar("metrocalk-assets"),
+                    &built.artifact,
+                ) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        let _ = reply.send(AssetLabResponse {
+                            message: format!("The result could not be saved: {error}"),
+                            source_entity: Some(source_entity),
+                            source_handle: Some(source_handle),
+                            ..AssetLabResponse::default()
+                        });
+                        continue;
+                    }
+                };
+                let handle = persisted.as_str().to_string();
+                if !assets.handle_to_slot.contains_key(&handle) {
+                    let mut gpu = MeshGpu::from_asset(&built.asset);
+                    gpu.apply_affine(display);
+                    let slot = assets.meshes.len();
+                    assets.meshes.push(gpu.clone());
+                    assets.scales.push(1.0);
+                    assets.display_affines.push(display);
+                    assets.handle_to_slot.insert(handle.clone(), slot);
+                    let mut state = shared.lock().unwrap();
+                    state.meshes.push(gpu);
+                    state.meshes_revision = state.meshes_revision.wrapping_add(1);
+                }
+                assets.store.insert(persisted, built.asset);
+                match capscene::place_mesh_variant(
+                    &mut engine,
+                    &scene,
+                    &handle,
+                    transform,
+                    &built.variant_name,
+                    Some(&source_entity),
+                    Some(&root_entity),
+                ) {
+                    Ok(created) => {
+                        log.append(&Record::AssetLabVariant {
+                            asset: handle.clone(),
+                            pos: transform.translation,
+                            rotation: transform.rotation,
+                            scale: transform.scale[0],
+                            name: built.variant_name,
+                            source_entity: Some(source_entity.clone()),
+                            root_entity: Some(root_entity),
+                        });
+                        echo_created(
+                            &mut engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &channel,
+                            &mut recency,
+                            &mut touch,
+                            created,
+                        );
+                        let warnings = built.report.warnings.clone();
+                        let audit = built.report.after.clone();
+                        let _ = reply.send(AssetLabResponse {
+                            ok: true,
+                            message: format!(
+                                "{} variant created beside the source — Ctrl/Cmd+Z to undo",
+                                built.operation_label
+                            ),
+                            source_entity: Some(source_entity),
+                            source_handle: Some(source_handle),
+                            created_entity: Some(created.to_loro_key()),
+                            created_handle: Some(handle),
+                            audit: Some(audit),
+                            change: Some(built.report),
+                            warnings,
+                            exported_path: None,
+                            bake_evidence: built.bake_evidence,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = reply.send(AssetLabResponse {
+                            message: format!(
+                                "The result was saved but could not be placed: {error}"
+                            ),
+                            source_entity: Some(source_entity),
+                            source_handle: Some(source_handle),
+                            created_handle: Some(handle),
+                            ..AssetLabResponse::default()
+                        });
+                    }
+                }
+            }
+            EngineCmd::AssetLabExport { id, path, reply } => {
+                match asset_lab_source(&engine, &assets, &id) {
+                    Ok((_entity, handle, asset, _display_scale)) => {
+                        let asset = asset.clone();
+                        std::thread::spawn(move || {
+                            let exported = export_glb(&asset)
+                                .map_err(|error| error.to_string())
+                                .and_then(|bytes| {
+                                    mtk_project::atomic_write(std::path::Path::new(&path), &bytes)
+                                        .map_err(|error| error.to_string())
+                                });
+                            let response = match exported {
+                                Ok(()) => AssetLabResponse {
+                                    ok: true,
+                                    message: format!("Exported GLB to {path}"),
+                                    source_entity: Some(id),
+                                    source_handle: Some(handle),
+                                    exported_path: Some(path),
+                                    ..AssetLabResponse::default()
+                                },
+                                Err(message) => AssetLabResponse {
+                                    message: format!("Export failed: {message}"),
+                                    source_entity: Some(id),
+                                    source_handle: Some(handle),
+                                    ..AssetLabResponse::default()
+                                },
+                            };
+                            let _ = reply.send(response);
+                        });
+                    }
+                    Err(message) => {
+                        let _ = reply.send(AssetLabResponse {
+                            message,
+                            source_entity: Some(id),
+                            ..AssetLabResponse::default()
+                        });
+                    }
+                }
+            }
+            EngineCmd::SceneExport {
+                format,
+                path,
+                reply,
+            } => {
+                let normalized = format.to_ascii_lowercase();
+                if !matches!(normalized.as_str(), "glb" | "usda" | "usd") {
+                    let _ = reply.send(SceneExportResponse {
+                        message: format!(
+                            "Unsupported scene format '{format}'; choose GLB or ASCII USDA"
+                        ),
+                        format,
+                        ..SceneExportResponse::default()
+                    });
+                    continue;
+                }
+                let captured = capture_scene(&engine, "MetroCalkScene", |handle| {
+                    let asset = assets.store.get_str(handle)?.clone();
+                    let slot = assets.handle_to_slot.get(handle).copied()?;
+                    let display = assets.display_affines.get(slot).copied()?;
+                    Some(CapturedMesh { asset, display })
+                });
+                match captured {
+                    Ok(scene) => {
+                        let nodes = scene.nodes.len();
+                        let meshes = scene.meshes.len();
+                        let skins = scene.skins.len();
+                        let animations = scene.animations.len();
+                        std::thread::spawn(move || {
+                            let encoded = match normalized.as_str() {
+                                "glb" => export_scene_glb(&scene)
+                                    .map(|export| (export.bytes, export.report))
+                                    .map_err(|error| error.to_string()),
+                                "usda" | "usd" => export_usda(&scene)
+                                    .map(|export| (export.text.into_bytes(), export.report))
+                                    .map_err(|error| error.to_string()),
+                                _ => unreachable!("format was preflighted"),
+                            };
+                            let response = encoded.and_then(|(bytes, report)| {
+                                mtk_project::atomic_write(std::path::Path::new(&path), &bytes)
+                                    .map_err(|error| error.to_string())?;
+                                Ok((report, bytes.len()))
+                            });
+                            let response = match response {
+                                Ok((report, bytes)) => SceneExportResponse {
+                                    ok: true,
+                                    message: format!(
+                                        "Exported {nodes} nodes, {meshes} reusable meshes and {animations} animation clip(s) to {path} ({bytes} bytes)"
+                                    ),
+                                    format: normalized,
+                                    exported_path: Some(path),
+                                    nodes,
+                                    meshes,
+                                    skins,
+                                    animations,
+                                    fidelity: report
+                                        .entries
+                                        .into_iter()
+                                        .map(|entry| SceneExportFidelityResp {
+                                            status: match entry.status {
+                                                FidelityStatus::Preserved => "preserved",
+                                                FidelityStatus::Converted => "converted",
+                                                FidelityStatus::Omitted => "omitted",
+                                            }
+                                            .into(),
+                                            feature: entry.feature,
+                                            count: entry.count,
+                                            detail: entry.detail,
+                                        })
+                                        .collect(),
+                                },
+                                Err(error) => SceneExportResponse {
+                                    message: format!("Complete-scene export failed: {error}"),
+                                    format: normalized,
+                                    nodes,
+                                    meshes,
+                                    skins,
+                                    animations,
+                                    ..SceneExportResponse::default()
+                                },
+                            };
+                            let _ = reply.send(response);
+                        });
+                    }
+                    Err(error) => {
+                        let _ = reply.send(SceneExportResponse {
+                            message: format!("Complete-scene preflight failed: {error}"),
+                            format: normalized,
+                            ..SceneExportResponse::default()
+                        });
+                    }
+                }
             }
             EngineCmd::ListRules { reply } => {
                 let out = engine
@@ -3442,13 +11355,31 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 &bytes,
                             ) {
                                 Ok(_) => {
+                                    assets.store.insert(
+                                        AssetId::from_handle(handle.clone()),
+                                        asset.clone(),
+                                    );
+                                    if let Ok(Some(animation)) = import_repository_animation(
+                                        &GltfImporter::new(),
+                                        &bytes,
+                                        &handle,
+                                        "generation://result",
+                                    ) {
+                                        install_current_animation_asset_revision(
+                                            &mut assets.animation_assets,
+                                            handle.clone(),
+                                            animation,
+                                        );
+                                    }
                                     // Normalise to ~1 unit, centred (see the import path) so the generated
                                     // mesh's `scale` is an intuitive world-size multiplier + collider matched.
+                                    let affine = AssetAffine::unit_from_bounds(asset.bounds());
                                     let mut gpu = MeshGpu::from_asset(&asset);
-                                    gpu.normalize_to_unit();
+                                    gpu.apply_affine(affine);
                                     let slot = assets.meshes.len();
                                     assets.meshes.push(gpu.clone());
                                     assets.scales.push(1.0);
+                                    assets.display_affines.push(affine);
                                     assets.handle_to_slot.insert(handle.clone(), slot);
                                     let mut st = shared.lock().unwrap();
                                     st.meshes.push(gpu);
@@ -3851,6 +11782,21 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 current_path = None;
                 saved_vv = engine.version_vector();
                 log.clear(); // the session replay log resets for the new project
+                pipe_tool = None;
+                pipe_revision = pipe_revision.wrapping_add(1);
+                publish_pipe_preview(&shared, None);
+                animation_preview = AnimationPreviewState::default();
+                animation_preview.graph.compile_tx = Some(self_tx.clone());
+                install_animation_graph_load(
+                    &mut animation_preview,
+                    metrocalk_editor_shell::load_animation_graph(
+                        &engine,
+                        metrocalk_editor_shell::MAIN_SEQUENCE_ID,
+                    ),
+                );
+                refresh_animation_plan(&engine, &mut animation_preview);
+                ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+                JOINT_POSES.with(|poses| poses.borrow_mut().clear());
                 recency.clear();
                 touch = 0;
                 rebuild(&engine, &shared, &mut positions, &assets);
@@ -3896,8 +11842,36 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         current_path = Some(p.clone());
                         saved_vv = engine.version_vector();
                         log.clear(); // the opened document IS the state; reset the session log
+                        pipe_tool = None;
+                        pipe_revision = pipe_revision.wrapping_add(1);
+                        publish_pipe_preview(&shared, None);
+                        animation_preview = AnimationPreviewState::default();
+                        animation_preview.graph.compile_tx = Some(self_tx.clone());
+                        install_animation_graph_load(
+                            &mut animation_preview,
+                            metrocalk_editor_shell::load_animation_graph(
+                                &engine,
+                                metrocalk_editor_shell::MAIN_SEQUENCE_ID,
+                            ),
+                        );
+                        refresh_animation_plan(&engine, &mut animation_preview);
+                        ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+                        JOINT_POSES.with(|poses| poses.borrow_mut().clear());
                         recency.clear();
                         touch = 0;
+                        let (restored, restore_errors) =
+                            restore_document_pipe_assets(&engine, &mut assets, &shared);
+                        if restored > 0 {
+                            eprintln!(
+                                "[shell] reconstructed {restored} procedural asset(s) from project recipes"
+                            );
+                        }
+                        let cad_queued = queue_document_cad_assets(&engine, &assets, &self_tx);
+                        if cad_queued > 0 {
+                            eprintln!(
+                                "[shell] restoring {cad_queued} CAD mesh(es) referenced by the opened project in the background"
+                            );
+                        }
                         rebuild(&engine, &shared, &mut positions, &assets);
                         if let Some(ch) = &channel {
                             send_proj!(ch, proj_full(&engine, &scene));
@@ -3916,7 +11890,14 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             &p.display().to_string(),
                             mtk_project::RECENTS_CAP,
                         );
-                        project_info(Some(&p), false, &recents_path, None)
+                        let restore_warning = (!restore_errors.is_empty()).then(|| {
+                            format!(
+                                "project opened, but {} procedural asset(s) could not be reconstructed: {}",
+                                restore_errors.len(),
+                                restore_errors.join("; ")
+                            )
+                        });
+                        project_info(Some(&p), false, &recents_path, restore_warning)
                     }
                     Err(err) => project_info(
                         current_path.as_deref(),
@@ -3931,10 +11912,33 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 sim_running = run;
             }
             EngineCmd::Play { reply } => {
+                if refresh_animation_clip_instances(&engine, &assets, &mut animation_preview) {
+                    restore_authored_animation_projection(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                }
+                if animation_preview.transient_clip.is_some() {
+                    clear_transient_animation_clip_preserving_events(&mut animation_preview);
+                    restore_authored_animation_projection(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                }
+                schedule_animation_graph_compile(&engine, &mut animation_preview);
                 // Enter play mode: snapshot the edit state (so Stop restores it bit-exactly), then run
                 // the deterministic sim from the current scene. The sim projects per-tick transforms to
                 // the render only (ADR-021), so the authored ECS/Loro is never mutated by running.
                 if !play_mode {
+                    pipe_tool = None;
+                    pipe_revision = pipe_revision.wrapping_add(1);
+                    publish_pipe_preview(&shared, None);
                     play_snapshot = Some(engine.snapshot());
                     play_mode = true;
                     // M11.4 (ADR-043) — render through the active scene camera while playing. Save the
@@ -3968,6 +11972,19 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rule_flagged = session.flagged;
                     rule_session = Some(metrocalk_core::RuleReplay::new(session.recording));
                     rule_head = 0;
+                    seek_animation_preview(&mut animation_preview, AnimationTick::ZERO);
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                    animation_preview.playing =
+                        animation_preview_has_transport_content(&animation_preview);
+                    if animation_preview.playing {
+                        let _ = apply_animation_preview_state(
+                            &engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &mut animation_preview,
+                        );
+                    }
                 }
                 let _ = reply.send(PlayInfo {
                     playing: play_mode,
@@ -3978,6 +11995,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // Freeze / unfreeze the running sim while staying in play mode (no effect when Stopped).
                 if play_mode {
                     sim_running = !sim_running;
+                    animation_preview.playing =
+                        sim_running && animation_preview_has_transport_content(&animation_preview);
                 }
                 let _ = reply.send(PlayInfo {
                     playing: play_mode,
@@ -4015,6 +12034,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rule_session = None;
                     rule_flagged.clear();
                     rule_head = 0;
+                    animation_preview.playing = false;
+                    seek_animation_preview(&mut animation_preview, AnimationTick::ZERO);
+                    animation_preview.plan = None;
+                    ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
                     // M11.4 — leave look-through: restore the pre-Play editor view (fly-cam or manual).
                     shared.lock().unwrap().cam_override = pre_play_cam.take();
                     recency.clear(); // ECS handles changed on the restore swap — drop stale ranking state
@@ -4056,6 +12079,127 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         push_overlay(&sim, &body_of, &prev_centers, &shared);
                     }
                     prev_centers = centers;
+                }
+                // Animation advances on the same native heartbeat but is independent of physics. A scene
+                // with zero rigid bodies still animates, and integer ticks keep playback deterministic.
+                if animation_preview.playing {
+                    const PREVIEW_STEP: i64 =
+                        metrocalk_editor_shell::DEFAULT_TICKS_PER_SECOND as i64 / 60;
+                    let animation_document =
+                        metrocalk_editor_shell::load_animation_document(&engine);
+                    let duration = animation_transport_duration(&animation_preview);
+                    let previous_tick = animation_preview.current_tick;
+                    let step = animation_preview_step_delta(
+                        animation_preview.loop_policy,
+                        animation_preview.current_tick,
+                        duration,
+                        AnimationTick(PREVIEW_STEP),
+                    );
+                    advance_animation_preview(&mut animation_preview, step);
+                    if animation_preview.loop_policy == AnimationLoopPolicy::Once
+                        && animation_preview.current_tick >= duration
+                    {
+                        animation_preview.playing = false;
+                    }
+                    if let Some(runtime) = animation_preview.graph.runtime.as_ref() {
+                        let remaining = MAX_PENDING_ANIMATION_EVENTS
+                            .saturating_sub(animation_preview.crossed_events.len());
+                        let events = runtime.events();
+                        let truncated = runtime.events_truncated() || events.len() > remaining;
+                        animation_preview
+                            .crossed_events
+                            .extend(events.iter().take(remaining).map(|occurrence| {
+                                AnimationEventInfo {
+                                    id: occurrence.event.id.as_str().to_owned(),
+                                    owner_id: animation_document
+                                        .event_owners
+                                        .get(&occurrence.event.id)
+                                        .map_or_else(String::new, EntityId::to_loro_key),
+                                    name: occurrence.event.name.clone(),
+                                    tick: occurrence.source_local_tick.0,
+                                    seconds: animation_preview
+                                        .plan
+                                        .as_ref()
+                                        .and_then(|plan| {
+                                            plan.time_base
+                                                .to_seconds(occurrence.source_local_tick)
+                                                .ok()
+                                        })
+                                        .unwrap_or(0.0),
+                                    payload: occurrence
+                                        .event
+                                        .payload
+                                        .as_ref()
+                                        .map(animation_value_json),
+                                }
+                            }));
+                        animation_preview.event_overflowed |= truncated;
+                    } else if let Some(plan) = animation_preview.plan.as_ref() {
+                        let remaining = MAX_PENDING_ANIMATION_EVENTS
+                            .saturating_sub(animation_preview.crossed_events.len());
+                        let crossed = plan.events_crossed_limited(
+                            previous_tick,
+                            animation_preview.current_tick,
+                            remaining,
+                        );
+                        animation_preview.crossed_events.extend(
+                            crossed
+                                .occurrences
+                                .into_iter()
+                                .map(|occurrence| AnimationEventInfo {
+                                    id: occurrence.event.id.as_str().to_owned(),
+                                    owner_id: animation_document
+                                        .event_owners
+                                        .get(&occurrence.event.id)
+                                        .map_or_else(String::new, EntityId::to_loro_key),
+                                    name: occurrence.event.name,
+                                    tick: occurrence.local_tick.0,
+                                    seconds: plan
+                                        .time_base
+                                        .to_seconds(occurrence.local_tick)
+                                        .unwrap_or(0.0),
+                                    payload: occurrence
+                                        .event
+                                        .payload
+                                        .as_ref()
+                                        .map(animation_value_json),
+                                }),
+                        );
+                        if crossed.truncated && !animation_preview.event_overflowed {
+                            eprintln!(
+                                "[animation] pending event transport capped at {MAX_PENDING_ANIMATION_EVENTS} occurrences"
+                            );
+                        }
+                        animation_preview.event_overflowed |= crossed.truncated;
+                    }
+                    let _ = apply_animation_preview_state(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
+                    if clear_completed_transient_animation_clip(&mut animation_preview) {
+                        restore_authored_animation_projection(
+                            &engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &mut animation_preview,
+                        );
+                    }
+                }
+                if clear_expired_transient_animation_clip(
+                    &mut animation_preview,
+                    std::time::Instant::now(),
+                ) {
+                    restore_authored_animation_projection(
+                        &engine,
+                        &shared,
+                        &mut positions,
+                        &assets,
+                        &mut animation_preview,
+                    );
                 }
             }
             EngineCmd::SimScrub {
@@ -4840,14 +12984,30 @@ fn mesh_geometry(
     };
     let slot = *assets.handle_to_slot.get(handle)?;
     let gpu = assets.meshes.get(slot)?;
+    // Keep collision geometry at the exact displayed size. Imported assets use their normalization
+    // scale until the user authors one; procedural assets use 1.0. Child bodies also inherit parent
+    // scale, matching the viewport's global-transform path.
+    let asset_scale = assets.scales.get(slot).copied().unwrap_or(1.0);
+    let authored_scale = comps
+        .get("Transform")
+        .and_then(|m| m.get("scale"))
+        .and_then(|value| match value {
+            FieldValue::Number(n) if *n > 0.0 => Some(*n as f32),
+            FieldValue::Integer(n) if *n > 0 => Some(*n as f32),
+            _ => None,
+        });
+    let mut display_scale = authored_scale.unwrap_or(asset_scale);
+    if engine.parent_of(id).is_some() {
+        display_scale *= ancestor_scale_product(engine, id);
+    }
     let verts = gpu
         .vertices
         .iter()
         .map(|v| {
             [
-                f64::from(v.position[0]),
-                f64::from(v.position[1]),
-                f64::from(v.position[2]),
+                f64::from(v.position[0] * display_scale),
+                f64::from(v.position[1] * display_scale),
+                f64::from(v.position[2] * display_scale),
             ]
         })
         .collect();
@@ -4902,6 +13062,14 @@ fn collider_shape_for(
         })
     };
     match shape {
+        Some("trimesh") => {
+            if let Some((vertices, indices)) = mesh_geometry(assets, engine, id) {
+                return ColliderShape::TriMesh { vertices, indices };
+            }
+            ColliderShape::Ball {
+                radius: num("radius", f64::from(BALL_RADIUS)),
+            }
+        }
         Some("convexHull") => {
             if let Some((verts, idx)) = mesh_geometry(assets, engine, id) {
                 if let Ok(d) = metrocalk_physics::derive_collider(&verts, &idx) {
@@ -5271,10 +13439,22 @@ fn build_cad_report(engine: &Engine<FlecsWorld>) -> CadReportResp {
                 id: id.to_loro_key(),
                 name,
                 fidelity: fidelity.clone(),
+                reference: cad.get("reference").and_then(nonempty_field_string),
+                strategy: cad.get("strategy").and_then(nonempty_field_string),
+                reason: cad.get("reason").and_then(nonempty_field_string),
+                fix: cad.get("fix").and_then(nonempty_field_string),
+                source_format: cad.get("sourceFormat").and_then(nonempty_field_string),
             });
         }
     }
     r
+}
+
+fn nonempty_field_string(value: &FieldValue) -> Option<String> {
+    match value {
+        FieldValue::Str(value) if !value.trim().is_empty() => Some(value.clone()),
+        _ => None,
+    }
 }
 
 /// their display names · the entities it's bound to). `None` if the id isn't a live entity.
@@ -5740,12 +13920,24 @@ fn camera_glyph(p: [f32; 3]) -> Vec<Instance> {
 /// A posed `(position, quaternion)` kinematic override (see [`JOINT_POSES`]).
 type JointPose = ([f64; 3], [f64; 4]);
 
+#[derive(Clone, Copy)]
+struct AnimationPose {
+    position: [f32; 3],
+    rotation: [f32; 4],
+    render_scale: f32,
+}
+
 thread_local! {
     /// M15.9 (ADR-079) — render-only kinematic pose overrides (entity → posed `(position, quat)`), applied
     /// by `rebuild` ON TOP of the authored ECS transforms during a timeline scrub / joint-drag preview.
     /// NEVER written to the doc (the M8.4 sim-scrub discipline: playback is a projection); cleared when the
     /// scrub ends. Engine-thread-local — `rebuild` only runs there.
     static JOINT_POSES: std::cell::RefCell<HashMap<EntityId, JointPose>> =
+        std::cell::RefCell::new(HashMap::new());
+
+    /// Complete hierarchy-aware global poses for the animation engine. Unlike `JOINT_POSES`, this map
+    /// includes affected descendants, so a keyed assembly or mechanism parent carries its children.
+    static ANIMATION_POSES: std::cell::RefCell<HashMap<EntityId, AnimationPose>> =
         std::cell::RefCell::new(HashMap::new());
 
     /// M15.10 (ADR-080) — the last CAD import's re-import diff (the never-silent report the UI renders) + the
@@ -5836,6 +14028,645 @@ fn clear_reimport_session() {
     LAST_REIMPORT.with(|s| *s.borrow_mut() = StoredReimport::default());
 }
 
+fn animation_number(value: &AnimValue) -> Option<f64> {
+    match value {
+        AnimValue::Number(value) => Some(*value),
+        #[allow(clippy::cast_precision_loss)]
+        AnimValue::Integer(value) => Some(*value as f64),
+        _ => None,
+    }
+}
+
+fn apply_animation_local_values(
+    local: &mut GizmoTransform,
+    values: Option<&BTreeMap<(String, String), AnimValue>>,
+) {
+    let Some(values) = values else { return };
+    for ((component, property), value) in values {
+        if component != "Transform" {
+            continue;
+        }
+        match (property.as_str(), value) {
+            ("translation", AnimValue::Vec3(value)) => {
+                local.translation = value.map(|part| part as f32);
+            }
+            ("rotation", AnimValue::Quaternion(value) | AnimValue::Vec4(value)) => {
+                local.rotation = value.map(|part| part as f32);
+            }
+            ("scale3", AnimValue::Vec3(value))
+                if (value[0] - value[1]).abs() < 1.0e-9
+                    && (value[1] - value[2]).abs() < 1.0e-9
+                    && value.iter().all(|part| part.is_finite())
+                    && value[0] > 0.0 =>
+            {
+                local.scale = [value[0] as f32; 3];
+            }
+            (field, value) => {
+                let Some(value) = animation_number(value).map(|value| value as f32) else {
+                    continue;
+                };
+                match field {
+                    "x" | "px" => local.translation[0] = value,
+                    "y" | "py" => local.translation[1] = value,
+                    "z" | "pz" => local.translation[2] = value,
+                    "qx" => local.rotation[0] = value,
+                    "qy" => local.rotation[1] = value,
+                    "qz" => local.rotation[2] = value,
+                    "qw" => local.rotation[3] = value,
+                    "scale" if value > 0.0 => local.scale = [value; 3],
+                    _ => {}
+                }
+            }
+        }
+    }
+    let length_squared = local.rotation.iter().map(|part| part * part).sum::<f32>();
+    if length_squared.is_finite() && length_squared > 1.0e-12 {
+        let inverse_length = length_squared.sqrt().recip();
+        local.rotation = local.rotation.map(|part| part * inverse_length);
+    } else {
+        local.rotation = [0.0, 0.0, 0.0, 1.0];
+    }
+}
+
+fn projected_animation_global(
+    engine: &Engine<FlecsWorld>,
+    id: EntityId,
+    values: &HashMap<EntityId, BTreeMap<(String, String), AnimValue>>,
+    memo: &mut HashMap<EntityId, GizmoTransform>,
+) -> GizmoTransform {
+    if let Some(transform) = memo.get(&id) {
+        return *transform;
+    }
+    let mut local = capscene::local_transform(engine, id);
+    apply_animation_local_values(&mut local, values.get(&id));
+    let mut global = engine.parent_of(id).map_or(local, |parent| {
+        let parent = projected_animation_global(engine, parent, values, memo);
+        GizmoTransform::from_matrix(metrocalk_gizmo::mat_mul(
+            parent.to_matrix(),
+            local.to_matrix(),
+        ))
+    });
+    let joint_value = values.get(&id).and_then(|bindings| {
+        bindings
+            .iter()
+            .rev()
+            .find_map(|((component, property), value)| {
+                (property == "value" && matches!(component.as_str(), "KinematicJoint" | "Joint"))
+                    .then(|| animation_number(value))
+                    .flatten()
+            })
+    });
+    if let (Some(joint), Some(value)) = (metrocalk_editor_shell::joint_of(engine, id), joint_value)
+    {
+        let base_position = global.translation.map(f64::from);
+        let base_rotation = global.rotation.map(f64::from);
+        let (zero_position, zero_rotation) =
+            metrocalk_editor_shell::joint_pose(&joint, base_position, base_rotation, -joint.value);
+        let (position, rotation) =
+            metrocalk_editor_shell::joint_pose(&joint, zero_position, zero_rotation, value);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            global.translation = position.map(|part| part as f32);
+            global.rotation = rotation.map(|part| part as f32);
+        }
+    }
+    memo.insert(id, global);
+    global
+}
+
+fn base_render_scale(engine: &Engine<FlecsWorld>, assets: &AssetsRuntime, id: EntityId) -> f32 {
+    let components = engine.components_of(id);
+    let transform = components.get("Transform");
+    let slot = components
+        .get("MeshRenderer")
+        .and_then(|component| component.get(capscene::MESH_FIELD))
+        .and_then(|value| match value {
+            FieldValue::Str(handle) => assets.handle_to_slot.get(handle).copied(),
+            _ => None,
+        });
+    let asset_scale = slot.map_or(0.45, |slot| {
+        assets.scales.get(slot).copied().unwrap_or(0.45)
+    });
+    let authored = transform
+        .and_then(|transform| transform.get("scale"))
+        .and_then(|value| match value {
+            FieldValue::Number(value) if *value > 0.0 => Some(*value as f32),
+            FieldValue::Integer(value) if *value > 0 => Some(*value as f32),
+            _ => None,
+        });
+    if engine.parent_of(id).is_some() {
+        authored.unwrap_or(asset_scale) * ancestor_scale_product(engine, id)
+    } else {
+        authored.unwrap_or(asset_scale)
+    }
+}
+
+/// Evaluate the immutable plan and publish only affected instance transforms. This updates native shared
+/// render memory directly; no per-frame IPC and no document writes. Descendants are included so hierarchy
+/// motion is coherent, while unrelated physics instances retain their live simulation projection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AnimationApplyReport {
+    evaluated: usize,
+    applied: usize,
+}
+
+fn animation_binding_has_native_sink(component: &str, property: &str) -> bool {
+    metrocalk_editor_shell::standard_animation_binding_registry()
+        .descriptor(component, property)
+        .and_then(|descriptor| descriptor.runtime_sink)
+        .is_some_and(|sink| {
+            matches!(
+                sink,
+                AnimationRuntimeSink::TransformProjection
+                    | AnimationRuntimeSink::KinematicJointProjection
+            )
+        })
+}
+
+fn animation_binding_is_native_projectable(binding: &metrocalk_animation::Binding) -> bool {
+    let descriptor = metrocalk_editor_shell::standard_animation_binding_registry()
+        .descriptor(&binding.path.component, &binding.path.property);
+    binding.path.subpath.is_empty()
+        && descriptor.is_some_and(|descriptor| {
+            descriptor.value_kind == binding.value_kind
+                && descriptor.runtime_sink.is_some_and(|sink| {
+                    matches!(
+                        sink,
+                        AnimationRuntimeSink::TransformProjection
+                            | AnimationRuntimeSink::KinematicJointProjection
+                    )
+                })
+        })
+}
+
+fn animation_binding_value_is_native_applicable(
+    engine: &Engine<FlecsWorld>,
+    binding: &metrocalk_animation::Binding,
+    value: &AnimValue,
+) -> Option<EntityId> {
+    if !animation_binding_is_native_projectable(binding) || value.kind() != binding.value_kind {
+        return None;
+    }
+    let id = EntityId::from_loro_key(&binding.path.target)?;
+    let components = engine.components_of(id);
+    match binding.path.component.as_str() {
+        "Transform" if components.contains_key("Transform") => {
+            let valid = match (binding.path.property.as_str(), value) {
+                ("translation", AnimValue::Vec3(value)) => {
+                    value.iter().all(|part| part.is_finite())
+                }
+                ("rotation", AnimValue::Quaternion(value)) => {
+                    let length_squared = value.iter().map(|part| part * part).sum::<f64>();
+                    value.iter().all(|part| part.is_finite())
+                        && length_squared.is_finite()
+                        && length_squared > 1.0e-24
+                }
+                ("scale3", AnimValue::Vec3(value)) => {
+                    value.iter().all(|part| part.is_finite())
+                        && value[0] > 0.0
+                        && (value[0] - value[1]).abs() < 1.0e-9
+                        && (value[1] - value[2]).abs() < 1.0e-9
+                }
+                ("scale", value) => {
+                    animation_number(value).is_some_and(|number| number.is_finite() && number > 0.0)
+                }
+                ("x" | "y" | "z" | "px" | "py" | "pz" | "qx" | "qy" | "qz" | "qw", value) => {
+                    animation_number(value).is_some_and(f64::is_finite)
+                }
+                _ => false,
+            };
+            valid.then_some(id)
+        }
+        "KinematicJoint" | "Joint"
+            if metrocalk_editor_shell::joint_of(engine, id).is_some()
+                && binding.path.property == "value"
+                && animation_number(value).is_some_and(f64::is_finite) =>
+        {
+            Some(id)
+        }
+        _ => None,
+    }
+}
+
+fn restore_and_apply_animation_preview(
+    engine: &Engine<FlecsWorld>,
+    shared: &Shared,
+    positions: &mut HashMap<Entity, [f32; 3]>,
+    assets: &AssetsRuntime,
+    preview: &mut AnimationPreviewState,
+) {
+    ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+    rebuild(engine, shared, positions, assets);
+    let _ = apply_animation_preview_state(engine, shared, positions, assets, preview);
+}
+
+fn authored_animation_graph_parameter_values(
+    graph: Option<&serde_json::Value>,
+) -> BTreeMap<String, serde_json::Value> {
+    graph
+        .and_then(|graph| graph.get("parameters"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|parameter| {
+            Some((
+                parameter.get("id")?.as_str()?.to_owned(),
+                parameter.get("defaultValue")?.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn graph_parameter_value_json(value: &GraphParameterValue) -> serde_json::Value {
+    match value {
+        GraphParameterValue::Number(value) => serde_json::json!(value),
+        GraphParameterValue::Integer(value) => serde_json::json!(value),
+        GraphParameterValue::Boolean(value) | GraphParameterValue::Trigger(value) => {
+            serde_json::json!(value)
+        }
+    }
+}
+
+fn runtime_animation_graph_parameter_values(
+    graph: &NativeAnimationGraphState,
+) -> Option<BTreeMap<String, serde_json::Value>> {
+    let runtime = graph.runtime.as_ref()?;
+    let snapshots: BTreeMap<_, _> = runtime
+        .parameters()
+        .into_iter()
+        .map(|snapshot| (snapshot.id.to_string(), snapshot.value))
+        .collect();
+    let mut values = BTreeMap::new();
+    for route in &graph.parameter_routes {
+        let value = if route.kind == metrocalk_editor_shell::AnimationGraphParameterKind::Vec2 {
+            let x = route
+                .runtime_parameter_ids
+                .first()
+                .and_then(|id| snapshots.get(id))
+                .and_then(|value| match value {
+                    GraphParameterValue::Number(value) => Some(*value),
+                    _ => None,
+                });
+            let y = route
+                .runtime_parameter_ids
+                .get(1)
+                .and_then(|id| snapshots.get(id))
+                .and_then(|value| match value {
+                    GraphParameterValue::Number(value) => Some(*value),
+                    _ => None,
+                });
+            match (x, y) {
+                (Some(x), Some(y)) => serde_json::json!([x, y]),
+                _ => continue,
+            }
+        } else {
+            let Some(value) = route
+                .runtime_parameter_ids
+                .first()
+                .and_then(|id| snapshots.get(id))
+            else {
+                continue;
+            };
+            graph_parameter_value_json(value)
+        };
+        values.insert(route.editor_parameter_id.clone(), value);
+    }
+    Some(values)
+}
+
+fn exact_animation_graph_active_nodes(
+    node_trace: &[metrocalk_animation::GraphNodeTrace],
+    fallback_tick: AnimationTick,
+    current_state: Option<&str>,
+) -> (Vec<AnimationGraphActiveNode>, bool) {
+    let mut incomplete = false;
+    let mut active = Vec::new();
+    for trace in node_trace.iter().filter(|trace| trace.evaluated) {
+        if !trace.contribution_weight.is_finite() || trace.contribution_weight < 0.0 {
+            incomplete = true;
+            continue;
+        }
+        if trace.contribution_weight == 0.0 {
+            continue;
+        }
+        active.push(AnimationGraphActiveNode {
+            node_id: trace.node_id.to_string(),
+            weight: trace.contribution_weight,
+            local_tick: trace.local_tick.unwrap_or(fallback_tick).0,
+            state_id: current_state.map(str::to_owned),
+            cost_micros: None,
+        });
+    }
+    (active, incomplete)
+}
+
+fn exact_animation_graph_active_edges(
+    input_trace: &[metrocalk_animation::GraphInputTrace],
+    core_trace_truncated: bool,
+    provenance: &[metrocalk_editor_shell::animation_graph_intent::AnimationGraphEdgeProvenance],
+) -> (Vec<AnimationGraphActiveEdge>, bool) {
+    let mut by_pair: BTreeMap<(String, String), (String, usize)> = BTreeMap::new();
+    for edge in provenance {
+        let key = (edge.from_node_id.clone(), edge.to_node_id.clone());
+        by_pair
+            .entry(key)
+            .and_modify(|(_, count)| *count += 1)
+            .or_insert_with(|| (edge.edge_id.clone(), 1));
+    }
+
+    let mut incomplete = core_trace_truncated;
+    let mut active = Vec::new();
+    for trace in input_trace {
+        if !trace.contribution_weight.is_finite() || trace.contribution_weight < 0.0 {
+            incomplete = true;
+            continue;
+        }
+        if trace.contribution_weight == 0.0 {
+            continue;
+        }
+        let key = (trace.from.to_string(), trace.to.to_string());
+        let Some((edge_id, count)) = by_pair.get(&key) else {
+            incomplete = true;
+            continue;
+        };
+        if *count != 1 {
+            incomplete = true;
+            continue;
+        }
+        active.push(AnimationGraphActiveEdge {
+            edge_id: edge_id.clone(),
+            weight: trace.contribution_weight,
+        });
+    }
+    active.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+    (active, incomplete)
+}
+
+fn animation_graph_has_unrepresented_active_edges(
+    input_trace: &[metrocalk_animation::GraphInputTrace],
+    provenance: &[metrocalk_editor_shell::animation_graph_intent::AnimationGraphEdgeProvenance],
+    active_nodes: &[AnimationGraphActiveNode],
+) -> bool {
+    let active_ids: BTreeSet<_> = active_nodes
+        .iter()
+        .map(|node| node.node_id.as_str())
+        .collect();
+    let represented_pairs: BTreeSet<_> = input_trace
+        .iter()
+        .filter(|trace| trace.contribution_weight.is_finite() && trace.contribution_weight > 0.0)
+        .map(|trace| (trace.from.to_string(), trace.to.to_string()))
+        .collect();
+    provenance.iter().any(|edge| {
+        active_ids.contains(edge.from_node_id.as_str())
+            && active_ids.contains(edge.to_node_id.as_str())
+            && !represented_pairs.contains(&(edge.from_node_id.clone(), edge.to_node_id.clone()))
+    })
+}
+
+const fn animation_graph_debug_trace_is_incomplete(
+    node_trace_incomplete: bool,
+    input_trace_incomplete: bool,
+    unrepresented_active_edges: bool,
+    transition_limit_reached: bool,
+) -> bool {
+    node_trace_incomplete
+        || input_trace_incomplete
+        || unrepresented_active_edges
+        || transition_limit_reached
+}
+
+fn refresh_native_animation_graph_trace(preview: &mut AnimationPreviewState) {
+    let Some(runtime) = preview.graph.runtime.as_ref() else {
+        preview.graph.active_nodes.clear();
+        preview.graph.active_edges.clear();
+        preview.graph.transition = None;
+        preview.graph.debug_trace_incomplete = false;
+        return;
+    };
+    let state_trace = runtime.state_trace();
+    let current_state = state_trace.current_state.as_ref().map(ToString::to_string);
+    let (active_nodes, node_trace_incomplete) = exact_animation_graph_active_nodes(
+        runtime.node_trace(),
+        runtime.raw_tick(),
+        current_state.as_deref(),
+    );
+    preview.graph.active_nodes = active_nodes;
+    // Output/state-machine nodes are authoring facades around the pure runtime DAG. Keep them visible in
+    // live debugging without pretending they are separately evaluated pose buffers.
+    if let Some(nodes) = preview
+        .graph
+        .graph
+        .as_ref()
+        .and_then(|graph| graph.get("nodes"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for node in nodes {
+            let Some(id) = node.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if matches!(
+                node.get("kind").and_then(serde_json::Value::as_str),
+                Some("state_machine" | "output")
+            ) {
+                preview.graph.active_nodes.push(AnimationGraphActiveNode {
+                    node_id: id.to_owned(),
+                    weight: 1.0,
+                    local_tick: runtime.raw_tick().0,
+                    state_id: current_state.clone(),
+                    cost_micros: None,
+                });
+            }
+        }
+    }
+    let (active_edges, input_trace_incomplete) = exact_animation_graph_active_edges(
+        runtime.input_trace(),
+        runtime.input_trace_truncated(),
+        &preview.graph.edge_provenance,
+    );
+    preview.graph.active_edges = active_edges;
+    let unrepresented_active_edges = animation_graph_has_unrepresented_active_edges(
+        runtime.input_trace(),
+        &preview.graph.edge_provenance,
+        &preview.graph.active_nodes,
+    );
+    preview.graph.debug_trace_incomplete = animation_graph_debug_trace_is_incomplete(
+        node_trace_incomplete,
+        input_trace_incomplete,
+        unrepresented_active_edges,
+        state_trace.transition_limit_reached,
+    );
+    preview.graph.transition =
+        state_trace
+            .transition
+            .as_ref()
+            .map(|transition| AnimationGraphTransitionDebug {
+                transition_id: transition.id.to_string(),
+                from_state_id: transition.from.to_string(),
+                to_state_id: transition.to.to_string(),
+                elapsed_tick: transition.elapsed.0,
+                duration_tick: transition.duration.0,
+                progress: transition.curved_progress,
+            });
+    preview.graph.events_truncated = runtime.events_truncated();
+}
+
+fn apply_animation_preview_state(
+    engine: &Engine<FlecsWorld>,
+    shared: &Shared,
+    positions: &mut HashMap<Entity, [f32; 3]>,
+    assets: &AssetsRuntime,
+    preview: &mut AnimationPreviewState,
+) -> AnimationApplyReport {
+    if preview.graph.runtime.is_some() {
+        let report = {
+            let runtime = preview.graph.runtime.as_ref().expect("checked above");
+            let frame = runtime.frame();
+            apply_animation_binding_values(
+                engine,
+                shared,
+                positions,
+                assets,
+                frame.values.len(),
+                frame
+                    .values
+                    .iter()
+                    .map(|value| (&value.binding, &value.value)),
+            )
+        };
+        refresh_native_animation_graph_trace(preview);
+        report
+    } else {
+        apply_animation_preview(
+            engine,
+            shared,
+            positions,
+            assets,
+            preview.plan.as_ref(),
+            preview.current_tick,
+        )
+    }
+}
+
+fn apply_animation_preview(
+    engine: &Engine<FlecsWorld>,
+    shared: &Shared,
+    positions: &mut HashMap<Entity, [f32; 3]>,
+    assets: &AssetsRuntime,
+    plan: Option<&CompiledSequence>,
+    tick: AnimationTick,
+) -> AnimationApplyReport {
+    let Some(plan) = plan else {
+        ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+        return AnimationApplyReport::default();
+    };
+    let evaluation = plan.evaluate(tick);
+    apply_animation_binding_values(
+        engine,
+        shared,
+        positions,
+        assets,
+        evaluation.bindings.len(),
+        evaluation
+            .bindings
+            .iter()
+            .map(|evaluated| (&evaluated.binding, &evaluated.value)),
+    )
+}
+
+/// Project one final, already-mixed property bundle. Both the implicit flat sequence and the authored
+/// graph runtime converge here, so hierarchy propagation, sink admission and unsupported-subpath behavior
+/// cannot drift between the two playback modes.
+fn apply_animation_binding_values<'a>(
+    engine: &Engine<FlecsWorld>,
+    shared: &Shared,
+    positions: &mut HashMap<Entity, [f32; 3]>,
+    assets: &AssetsRuntime,
+    evaluated: usize,
+    bindings: impl IntoIterator<Item = (&'a metrocalk_animation::Binding, &'a AnimValue)>,
+) -> AnimationApplyReport {
+    let mut report = AnimationApplyReport {
+        evaluated,
+        applied: 0,
+    };
+    let mut values: HashMap<EntityId, BTreeMap<(String, String), AnimValue>> = HashMap::new();
+    let mut animated_targets = BTreeSet::new();
+    for (binding, value) in bindings {
+        // The native viewport currently projects whole ECS properties. Silently flattening a structured
+        // path such as `material/base_color/r` onto `material/base_color` would animate the wrong value.
+        // Keep the binding in `evaluated` (so transport reports an honest applied/evaluated mismatch), but
+        // fail closed until a sink explicitly declares support for that exact subpath.
+        let Some(id) = animation_binding_value_is_native_applicable(engine, binding, value) else {
+            continue;
+        };
+        values.entry(id).or_default().insert(
+            (
+                binding.path.component.clone(),
+                binding.path.property.clone(),
+            ),
+            value.clone(),
+        );
+        animated_targets.insert(id);
+        report.applied += 1;
+    }
+    let mut affected = BTreeSet::new();
+    for candidate in engine.entity_ids() {
+        let mut cursor = Some(candidate);
+        while let Some(id) = cursor {
+            if animated_targets.contains(&id) {
+                affected.insert(candidate);
+                break;
+            }
+            cursor = engine.parent_of(id);
+        }
+    }
+    let mut memo = HashMap::new();
+    let mut poses = HashMap::new();
+    for id in affected {
+        let projected = projected_animation_global(engine, id, &values, &mut memo);
+        let base = capscene::global_transform(engine, id);
+        let scale_ratio = if base.scale[0].abs() > 1.0e-9 {
+            projected.scale[0] / base.scale[0]
+        } else {
+            1.0
+        };
+        let pose = AnimationPose {
+            position: projected.translation,
+            rotation: projected.rotation,
+            render_scale: (base_render_scale(engine, assets, id) * scale_ratio).max(1.0e-6),
+        };
+        if let Some(entity) = engine.ecs_entity(id) {
+            positions.insert(entity, pose.position);
+        }
+        poses.insert(id, pose);
+    }
+    ANIMATION_POSES.with(|stored| *stored.borrow_mut() = poses.clone());
+    if !poses.is_empty() {
+        let by_key: HashMap<_, _> = poses
+            .into_iter()
+            .map(|(id, pose)| (id.to_loro_key(), pose))
+            .collect();
+        let mut state = shared.lock().unwrap();
+        let ids = state.ids.clone();
+        let mut changed = false;
+        for (index, key) in ids.iter().enumerate() {
+            let Some(pose) = by_key.get(key) else {
+                continue;
+            };
+            let Some(instance) = state.instances.get_mut(index) else {
+                continue;
+            };
+            instance.center = pose.position;
+            instance.rotation = pose.rotation;
+            instance.scale = pose.render_scale;
+            changed = true;
+        }
+        if changed {
+            state.revision = state.revision.wrapping_add(1);
+        }
+    }
+    report
+}
+
 fn rebuild(
     engine: &Engine<FlecsWorld>,
     shared: &Shared,
@@ -5863,6 +14694,12 @@ fn rebuild(
             continue;
         }
         let comps = engine.components_of(id);
+        if matches!(
+            comps.get("__meta__").and_then(|fields| fields.get("kind")),
+            Some(FieldValue::Str(kind)) if kind == "animation_graph_controller"
+        ) {
+            continue;
+        }
         let t = comps.get("Transform");
         let get = |f: &str| -> f32 {
             t.and_then(|m| m.get(f)).map_or(0.0, |v| match v {
@@ -5890,13 +14727,16 @@ fn rebuild(
         // with no `MeshRenderer`): a pure hierarchy node — the outliner shows it (the source's exact assembly
         // tree / grouping) and its parts parent under it, but it is NEVER scene geometry → render nothing (no
         // placeholder cube, no glyph). Same pattern as the light/camera marker skip above.
-        if !comps.contains_key("MeshRenderer")
-            && comps
+        if !comps.contains_key("MeshRenderer") {
+            let non_geometry_kind = comps
                 .get(metrocalk_core::variant::INSTANCE_META)
-                .and_then(|m| m.get("kind"))
-                == Some(&FieldValue::Str("group".into()))
-        {
-            continue;
+                .and_then(|m| m.get("kind"));
+            if matches!(
+                non_geometry_kind,
+                Some(FieldValue::Str(kind)) if matches!(kind.as_str(), "group" | "cad-unresolved")
+            ) {
+                continue;
+            }
         }
         // Resolve the entity's mesh handle (if any) to a render slot + normalized scale.
         let slot = comps
@@ -5963,6 +14803,11 @@ fn rebuild(
                     [op[0] as f32, op[1] as f32, op[2] as f32],
                     [oq[0] as f32, oq[1] as f32, oq[2] as f32, oq[3] as f32],
                 )
+            })
+        });
+        let (p, rot, scale) = ANIMATION_POSES.with(|poses| {
+            poses.borrow().get(&id).map_or((p, rot, scale), |pose| {
+                (pose.position, pose.rotation, pose.render_scale)
             })
         });
         if let Some(e) = engine.ecs_entity(id) {
@@ -6159,6 +15004,16 @@ fn undo(state: State<AppState>) -> bool {
         return false;
     }
     recv_reply(&rx).unwrap_or(false) // true iff a transaction was actually reverted (honest "undo" vs "nothing to undo")
+}
+
+#[tauri::command(async)]
+fn redo(state: State<AppState>) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Redo { reply }).is_err() {
+        return false;
+    }
+    recv_reply(&rx).unwrap_or(false)
 }
 
 /// Reveal bindable targets for a selected entity (north-star test #1). Blocks briefly on the engine
@@ -6390,6 +15245,241 @@ fn frame_all(state: State<AppState>) {
 
 /// M10.7 — snap the camera to a canonical view (`top`/`front`/`side`/`persp`) — the orientation cube /
 /// view-preset buttons. A pure camera op.
+
+// ---------------------------------------------------------------------------------------------
+// MOB — run the deterministic match kernel in the live viewport (ADR-091/092/093/094/095)
+// ---------------------------------------------------------------------------------------------
+
+/// Resolve the real imported meshes the match draws with, one per actor role.
+///
+/// Falls back down the chain rather than inventing geometry, so the viewport always shows a real asset or
+/// nothing. Three roles rather than two because a hero and a minion reading as the same silhouette is the
+/// single biggest reason a MOBA viewport is unreadable.
+fn moba_slots(assets: &AssetsRuntime) -> moba::MobaMeshes {
+    let slot_for = |name: &str| -> i32 {
+        assets
+            .asset_by_name
+            .get(name)
+            .and_then(|handle| assets.handle_to_slot.get(handle))
+            .and_then(|slot| i32::try_from(*slot).ok())
+            .unwrap_or(-1)
+    };
+    let fallback = slot_for("prop");
+    let pick = |name: &str| {
+        let slot = slot_for(name);
+        if slot >= 0 {
+            slot
+        } else {
+            fallback
+        }
+    };
+    moba::MobaMeshes {
+        hero: pick("moba_hero"),
+        minion: pick("moba_minion"),
+        structure: pick("moba_tower"),
+    }
+}
+
+/// Validate the authored scene continuously — what the match panel shows while the user is editing.
+/// A read: it never starts anything and never touches the document.
+#[tauri::command]
+fn moba_validate(state: State<AppState>) -> moba::MobaValidation {
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::MatchValidate { reply }).is_err() {
+        return moba::MobaValidation {
+            ok: false,
+            is_match_scene: false,
+            diagnostics: Vec::new(),
+            cook_digest: None,
+            actor_count: 0,
+            wave_count: 0,
+            lane_length_m: 0.0,
+        };
+    }
+    recv_reply(&rx).unwrap_or(moba::MobaValidation {
+        ok: false,
+        is_match_scene: false,
+        diagnostics: Vec::new(),
+        cook_digest: None,
+        actor_count: 0,
+        wave_count: 0,
+        lane_length_m: 0.0,
+    })
+}
+
+/// Author a complete, playable starter match into the current scene as ONE undoable transaction.
+/// This is the discoverable entry point: a first-time author gets a scene that runs, then edits it.
+#[tauri::command]
+fn moba_author_starter(state: State<AppState>) -> Result<serde_json::Value, String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    state
+        .tx
+        .send(EngineCmd::MatchAuthorStarter { reply })
+        .map_err(|_| "the editor's document thread is not available".to_owned())?;
+    let authored = recv_reply(&rx)
+        .map_err(|_| "authoring the starter match timed out".to_owned())??;
+    serde_json::to_value(authored).map_err(|error| error.to_string())
+}
+
+/// Start a match and hand the viewport to it. The pre-match scene is saved and restored on stop.
+///
+/// The definitions are cooked from the authored document on the engine thread; nothing here is
+/// hand-written. A scene that cannot cook refuses to start and returns the reasons.
+#[tauri::command]
+fn moba_start(state: State<AppState>) -> Result<moba::MobaStatus, moba::MobaStartError> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    let unavailable = || moba::MobaStartError {
+        message: "The editor's document thread is not available, so the scene could not be read."
+            .to_owned(),
+        diagnostics: Vec::new(),
+    };
+    state
+        .tx
+        .send(EngineCmd::MatchPlan { reply })
+        .map_err(|_| unavailable())?;
+    let plan = recv_reply(&rx).map_err(|_| moba::MobaStartError {
+        message: "Reading the scene timed out, so the match was not started.".to_owned(),
+        diagnostics: Vec::new(),
+    })??;
+
+    let mut scene = state.shared.lock().unwrap();
+    let meshes = moba::MobaMeshes {
+        hero: scene.moba_hero_slot,
+        minion: scene.moba_minion_slot,
+        structure: scene.moba_structure_slot,
+    };
+    let session = moba::MobaSession::start(&mut scene, plan, meshes)?;
+    let status = session.status();
+    *state.moba.lock().unwrap() = Some(session);
+    Ok(status)
+}
+
+/// Advance the authoritative match by `ticks` and redraw from its state.
+#[tauri::command]
+fn moba_step(state: State<AppState>, ticks: u32) -> moba::MobaStatus {
+    ipc();
+    let mut guard = state.moba.lock().unwrap();
+    let Some(session) = guard.as_mut() else {
+        return moba::idle_status();
+    };
+    let mut scene = state.shared.lock().unwrap();
+    session.step(&mut scene, ticks)
+}
+
+/// Order the player's hero to a lane position, exactly as a game client would.
+#[tauri::command]
+fn moba_order_move(state: State<AppState>, x_mm: i32, y_mm: i32) -> moba::MobaStatus {
+    ipc();
+    let mut guard = state.moba.lock().unwrap();
+    let Some(session) = guard.as_mut() else {
+        return moba::idle_status();
+    };
+    let mut scene = state.shared.lock().unwrap();
+    session.order_move(&mut scene, x_mm, y_mm)
+}
+
+/// Attack-move the hero: advance and engage anything hostile noticed on the way.
+///
+/// The three orders below are the GP-08 surface. They are separate commands rather than one command with
+/// a mode string so an unknown verb fails at the IPC boundary instead of being silently dropped inside a
+/// match arm.
+#[tauri::command]
+fn moba_attack_move(state: State<AppState>, x_mm: i32, y_mm: i32) -> moba::MobaStatus {
+    ipc();
+    let mut guard = state.moba.lock().unwrap();
+    let Some(session) = guard.as_mut() else {
+        return moba::idle_status();
+    };
+    let mut scene = state.shared.lock().unwrap();
+    session.order_attack_move(&mut scene, x_mm, y_mm)
+}
+
+/// Lock the hero onto one named target until it is gone.
+#[tauri::command]
+fn moba_attack_target(state: State<AppState>, target: u64) -> moba::MobaStatus {
+    ipc();
+    let mut guard = state.moba.lock().unwrap();
+    let Some(session) = guard.as_mut() else {
+        return moba::idle_status();
+    };
+    let mut scene = state.shared.lock().unwrap();
+    session.order_attack_target(&mut scene, target)
+}
+
+/// Hold position and engage whatever comes into range.
+#[tauri::command]
+fn moba_hold(state: State<AppState>) -> moba::MobaStatus {
+    ipc();
+    let mut guard = state.moba.lock().unwrap();
+    let Some(session) = guard.as_mut() else {
+        return moba::idle_status();
+    };
+    let mut scene = state.shared.lock().unwrap();
+    session.order_hold(&mut scene)
+}
+
+/// Cancel movement and any standing order.
+#[tauri::command]
+fn moba_halt(state: State<AppState>) -> moba::MobaStatus {
+    ipc();
+    let mut guard = state.moba.lock().unwrap();
+    let Some(session) = guard.as_mut() else {
+        return moba::idle_status();
+    };
+    let mut scene = state.shared.lock().unwrap();
+    session.order_stop(&mut scene)
+}
+
+/// Stun the hero — the visible proof GP-02 crowd control runs in the live viewport.
+#[tauri::command]
+fn moba_stun(state: State<AppState>, ticks: u32) -> moba::MobaStatus {
+    ipc();
+    let mut guard = state.moba.lock().unwrap();
+    let Some(session) = guard.as_mut() else {
+        return moba::idle_status();
+    };
+    let mut scene = state.shared.lock().unwrap();
+    session.stun_hero(&mut scene, ticks)
+}
+
+/// The cooked artifact the running match was built from — the inspectable middle of the evidence chain.
+///
+/// Without this, a viewer can see the authored scene and the running match but has to take on faith that
+/// one produced the other. This returns the exact definitions the kernel was handed, digest included.
+#[tauri::command]
+fn moba_cooked(state: State<AppState>) -> Option<serde_json::Value> {
+    state
+        .moba
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|session| serde_json::to_value(session.cooked()).ok())
+}
+
+/// Read the match state without mutating it — the E2E's observable window on the kernel.
+#[tauri::command]
+fn moba_status(state: State<AppState>) -> moba::MobaStatus {
+    state
+        .moba
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or_else(moba::idle_status, moba::MobaSession::status)
+}
+
+/// End the match and restore the editor scene verbatim.
+#[tauri::command]
+fn moba_stop(state: State<AppState>) -> moba::MobaStatus {
+    ipc();
+    if let Some(session) = state.moba.lock().unwrap().take() {
+        let mut scene = state.shared.lock().unwrap();
+        session.stop(&mut scene);
+    }
+    moba::idle_status()
+}
+
 #[tauri::command]
 fn view_preset(state: State<AppState>, preset: String) {
     ipc();
@@ -6999,6 +16089,475 @@ fn create_entity(state: State<AppState>, x: f32, y: f32, z: f32, name: String) -
     recv_reply(&rx).unwrap_or(None)
 }
 
+fn ray_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn ray_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn ray_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn rotate_by_quaternion(vector: [f32; 3], quaternion: [f32; 4]) -> [f32; 3] {
+    let norm = quaternion
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if norm <= 1.0e-8 {
+        return vector;
+    }
+    let q = quaternion.map(|value| value / norm);
+    let u = [q[0], q[1], q[2]];
+    let uv = ray_cross(u, vector);
+    let uuv = ray_cross(u, uv);
+    [
+        vector[0] + 2.0 * (q[3] * uv[0] + uuv[0]),
+        vector[1] + 2.0 * (q[3] * uv[1] + uuv[1]),
+        vector[2] + 2.0 * (q[3] * uv[2] + uuv[2]),
+    ]
+}
+
+fn ray_sphere_hit(
+    origin: [f32; 3],
+    direction: [f32; 3],
+    center: [f32; 3],
+    radius: f32,
+) -> Option<f32> {
+    let oc = ray_sub(origin, center);
+    let b = ray_dot(oc, direction);
+    let c = ray_dot(oc, oc) - radius * radius;
+    let discriminant = b * b - c;
+    if discriminant < 0.0 {
+        return None;
+    }
+    let root = discriminant.sqrt();
+    let near = -b - root;
+    let far = -b + root;
+    (near > 0.01)
+        .then_some(near)
+        .or_else(|| (far > 0.01).then_some(far))
+}
+
+fn ray_triangle_hit(
+    origin: [f32; 3],
+    direction: [f32; 3],
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+) -> Option<f32> {
+    let e1 = ray_sub(b, a);
+    let e2 = ray_sub(c, a);
+    let p = ray_cross(direction, e2);
+    let determinant = ray_dot(e1, p);
+    if determinant.abs() <= 1.0e-8 {
+        return None;
+    }
+    let inverse = determinant.recip();
+    let tvec = ray_sub(origin, a);
+    let u = ray_dot(tvec, p) * inverse;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = ray_cross(tvec, e1);
+    let v = ray_dot(direction, q) * inverse;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let distance = ray_dot(e2, q) * inverse;
+    (distance > 0.01).then_some(distance)
+}
+
+fn pipe_world_point_scene(
+    origin: [f32; 3],
+    direction: [f32; 3],
+    instances: &[Instance],
+    mesh_slots: &[i32],
+    meshes: &[MeshGpu],
+    plane_y: f32,
+) -> Option<[f32; 3]> {
+    let mut best_t = f32::INFINITY;
+    let mut bounds = HashMap::<usize, f32>::new();
+    for (instance_index, inst) in instances.iter().enumerate() {
+        let slot = mesh_slots
+            .get(instance_index)
+            .and_then(|slot| usize::try_from(*slot).ok())
+            .filter(|slot| *slot < meshes.len());
+        let Some(slot) = slot else {
+            // Geometry-free/unknown entities retain the same conservative selectable surface as the
+            // placeholder renderer, rather than becoming impossible to target.
+            if let Some(distance) = ray_sphere_hit(
+                origin,
+                direction,
+                inst.center,
+                (inst.scale.abs() * 0.55).max(0.2),
+            ) {
+                best_t = best_t.min(distance);
+            }
+            continue;
+        };
+        let mesh = &meshes[slot];
+        let local_radius = *bounds.entry(slot).or_insert_with(|| {
+            mesh.vertices
+                .iter()
+                .map(|vertex| ray_dot(vertex.position, vertex.position).sqrt())
+                .fold(0.0_f32, f32::max)
+                .max(0.001)
+        });
+        if ray_sphere_hit(
+            origin,
+            direction,
+            inst.center,
+            local_radius * inst.scale.abs().max(0.001),
+        )
+        .is_none()
+        {
+            continue;
+        }
+        let to_world = |position: [f32; 3]| {
+            let rotated =
+                rotate_by_quaternion(position.map(|value| value * inst.scale), inst.rotation);
+            [
+                rotated[0] + inst.center[0],
+                rotated[1] + inst.center[1],
+                rotated[2] + inst.center[2],
+            ]
+        };
+        for triangle in mesh.indices.chunks_exact(3) {
+            let [a, b, c] = [
+                triangle[0] as usize,
+                triangle[1] as usize,
+                triangle[2] as usize,
+            ];
+            let (Some(a), Some(b), Some(c)) = (
+                mesh.vertices.get(a),
+                mesh.vertices.get(b),
+                mesh.vertices.get(c),
+            ) else {
+                continue;
+            };
+            if let Some(distance) = ray_triangle_hit(
+                origin,
+                direction,
+                to_world(a.position),
+                to_world(b.position),
+                to_world(c.position),
+            ) {
+                best_t = best_t.min(distance);
+            }
+        }
+    }
+    if best_t.is_finite() {
+        return Some([
+            origin[0] + direction[0] * best_t,
+            origin[1] + direction[1] * best_t,
+            origin[2] + direction[2] * best_t,
+        ]);
+    }
+    if direction[1].abs() < 1.0e-5 {
+        return None;
+    }
+    let t = (plane_y - origin[1]) / direction[1];
+    (t > 0.01).then(|| {
+        [
+            origin[0] + direction[0] * t,
+            plane_y,
+            origin[2] + direction[2] * t,
+        ]
+    })
+}
+
+/// Raycast Pipe Forge clicks against the exact transformed scene meshes, falling back to the active
+/// horizontal construction plane. Unlike `viewport_pick`, empty space remains meaningful and the result
+/// is a world position rather than an entity centre.
+#[cfg(test)]
+fn pipe_world_point(
+    origin: [f32; 3],
+    direction: [f32; 3],
+    instances: &[Instance],
+    plane_y: f32,
+) -> Option<[f32; 3]> {
+    pipe_world_point_scene(origin, direction, instances, &[], &[], plane_y)
+}
+
+#[tauri::command(async)]
+fn pipe_forge_start(state: State<AppState>, options: PipeForgeOptions) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PipeStart { options, reply })
+        .is_err()
+    {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_edit(state: State<AppState>, id: String) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PipeEdit { entity: id, reply })
+        .is_err()
+    {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_point(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    x: f32,
+    y: f32,
+) -> PipeForgeStatus {
+    ipc();
+    let aspect = window.inner_size().map_or(16.0 / 9.0, |s| {
+        s.width.max(1) as f32 / s.height.max(1) as f32
+    });
+    let point = {
+        let st = state.shared.lock().unwrap();
+        let (distance, elevation) = if st.distance == 0.0 {
+            (60.0, 0.4)
+        } else {
+            (st.distance, st.elevation)
+        };
+        let (origin, direction) = render::cursor_ray(
+            (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)),
+            st.orbit,
+            elevation,
+            distance,
+            aspect,
+            st.cam_target,
+        );
+        let plane_y = st.pipe_points.first().map_or(0.0, |p| p[1]);
+        pipe_world_point_scene(
+            origin,
+            direction,
+            &st.instances,
+            &st.mesh_slots,
+            &st.meshes,
+            plane_y,
+        )
+    };
+    let Some(point) = point else {
+        let (reply, rx) = mpsc::channel();
+        let _ = state.tx.send(EngineCmd::PipeStatus { reply });
+        let mut status = recv_reply(&rx)
+            .unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"));
+        status.message =
+            "That click does not reach the active work plane — orbit and try again".into();
+        return status;
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PipePoint { point, reply })
+        .is_err()
+    {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_undo(state: State<AppState>) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PipeUndo { reply }).is_err() {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_begin_branch(
+    state: State<AppState>,
+    node_id: u32,
+    diameter_cm: f32,
+) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PipeBeginBranch {
+            node_id,
+            diameter_cm,
+            reply,
+        })
+        .is_err()
+    {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_end_branch(state: State<AppState>) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PipeEndBranch { reply }).is_err() {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_move_handle(
+    state: State<AppState>,
+    node_id: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PipeMoveHandle {
+            node_id,
+            point: [x, y, z],
+            reply,
+        })
+        .is_err()
+    {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_remove_handle(state: State<AppState>, node_id: u32) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PipeRemoveHandle { node_id, reply })
+        .is_err()
+    {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_place_fitting(
+    state: State<AppState>,
+    node_id: u32,
+    kind: PipeFittingKind,
+    catalog_id: Option<String>,
+) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PipePlaceFitting {
+            node_id,
+            kind,
+            catalog_id,
+            reply,
+        })
+        .is_err()
+    {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_remove_fitting(state: State<AppState>, fitting_id: u32) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PipeRemoveFitting { fitting_id, reply })
+        .is_err()
+    {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_upsert_catalog(
+    state: State<AppState>,
+    entry: UserFittingCatalogEntry,
+) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PipeUpsertCatalog { entry, reply })
+        .is_err()
+    {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_remove_catalog(state: State<AppState>, id: String) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::PipeRemoveCatalog { id, reply })
+        .is_err()
+    {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_cancel(state: State<AppState>) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PipeCancel { reply }).is_err() {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_status(state: State<AppState>) -> PipeForgeStatus {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PipeStatus { reply }).is_err() {
+        return inactive_pipe_status("The asset engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| inactive_pipe_status("The asset engine did not respond"))
+}
+
+#[tauri::command(async)]
+fn pipe_forge_bake(state: State<AppState>) -> PipeBakeReport {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::PipeBake { reply }).is_err() {
+        return PipeBakeReport {
+            message: "The asset engine is unavailable".into(),
+            warnings: vec!["Bake did not start".into()],
+            ..PipeBakeReport::default()
+        };
+    }
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).unwrap_or_else(|_| PipeBakeReport {
+        message: "The asset bake did not finish in time".into(),
+        warnings: vec!["The editable route is still available; try Bake again".into()],
+        ..PipeBakeReport::default()
+    })
+}
+
 /// M11.3 (ADR-042) — author a Light entity (kind = directional|point|spot) at a position with a linear RGB
 /// colour + intensity; one undoable commit, persists. Reply its id (the UI selects it). Lighting is a render
 /// projection — only the light ENTITY enters Loro/undo, never the per-frame lit result.
@@ -7435,6 +16994,32 @@ fn set_exposure(state: State<AppState>, exposure: f32) -> f32 {
     e
 }
 
+/// Switch the viewport's color/inspection presentation without changing authored lights or materials.
+/// `cinematic` uses the filmic game look; `cad` uses Khronos PBR Neutral plus restrained technical edge
+/// emphasis. Render-only, so changing how the scene is inspected never dirties or enters scene history.
+#[tauri::command]
+fn set_render_profile(state: State<AppState>, profile: String) -> String {
+    ipc();
+    let (value, label) = if profile.eq_ignore_ascii_case("cad") {
+        (1.0, "cad")
+    } else {
+        (0.0, "cinematic")
+    };
+    state.shared.lock().unwrap().render_profile = value;
+    label.to_string()
+}
+
+/// Authoritative render-profile read for the viewport toolbar and visual-quality automation.
+#[tauri::command]
+fn render_profile_debug(state: State<AppState>) -> String {
+    ipc();
+    if state.shared.lock().unwrap().render_profile > 0.5 {
+        "cad".to_string()
+    } else {
+        "cinematic".to_string()
+    }
+}
+
 /// M9.4 — the current snap **ghost** position during a drag (the nearest target the dragged entity will
 /// snap to), or `None` (no candidate in range / not dragging). The HUD + E2E read it.
 #[tauri::command]
@@ -7634,8 +17219,812 @@ fn joint_info(state: State<AppState>, id: String) -> Option<JointInfoResp> {
     recv_reply(&rx).unwrap_or_default()
 }
 
+fn unavailable_animation_workspace(
+    id: Option<String>,
+    message: impl Into<String>,
+) -> AnimationWorkspaceInfo {
+    let message = message.into();
+    AnimationWorkspaceInfo {
+        revision: "unavailable".into(),
+        sequence_id: metrocalk_editor_shell::MAIN_SEQUENCE_ID.into(),
+        sequence_name: "Main sequence".into(),
+        ticks_per_second: metrocalk_editor_shell::DEFAULT_TICKS_PER_SECOND,
+        duration_tick: i64::from(metrocalk_editor_shell::DEFAULT_TICKS_PER_SECOND),
+        current_tick: 0,
+        playing: false,
+        loop_policy: "once".into(),
+        selected_id: id,
+        selected_name: None,
+        properties: Vec::new(),
+        tracks: Vec::new(),
+        markers: Vec::new(),
+        events: Vec::new(),
+        contexts: ["2d", "3d", "ui"]
+            .into_iter()
+            .map(|context| AnimationContextReadiness {
+                context: context.into(),
+                state: "invalid".into(),
+                properties: 0,
+                tracks: 0,
+                reason: message.clone(),
+                action: Some("Restart the editor and reopen the project.".into()),
+            })
+            .collect(),
+        asset: None,
+        issues: vec![AnimationIssueInfo {
+            severity: "error".into(),
+            code: "animation_service_unavailable".into(),
+            message,
+            fix: Some(
+                "Restart the editor and reopen the project; authored keys remain in the document."
+                    .into(),
+            ),
+        }],
+    }
+}
+
+#[tauri::command(async)]
+fn animation_state(state: State<AppState>, id: Option<String>) -> AnimationWorkspaceInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationState {
+            id: id.clone(),
+            reply,
+        })
+        .is_err()
+    {
+        return unavailable_animation_workspace(id, "The native animation engine stopped.");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        unavailable_animation_workspace(id, "The native animation engine did not answer.")
+    })
+}
+
+#[tauri::command(async)]
+fn animation_clip_instance_save(
+    state: State<AppState>,
+    request: AnimationClipInstanceSaveRequest,
+) -> AnimationClipInstanceSaveResult {
+    ipc();
+    let selected_id = request.target_id.clone();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationClipInstanceSave { request, reply })
+        .is_err()
+    {
+        return AnimationClipInstanceSaveResult {
+            ok: false,
+            message: "The native animation engine stopped; no clip-instance mapping was committed."
+                .into(),
+            instance_id: None,
+            state: unavailable_animation_workspace(
+                Some(selected_id),
+                "Imported clip setup is unavailable.",
+            ),
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| AnimationClipInstanceSaveResult {
+        ok: false,
+        message: "The clip setup request did not complete; no result was claimed.".into(),
+        instance_id: None,
+        state: unavailable_animation_workspace(
+            Some(selected_id),
+            "Imported clip setup did not answer.",
+        ),
+    })
+}
+
+#[tauri::command(async)]
+fn animation_clip_instance_delete(
+    state: State<AppState>,
+    instance_id: String,
+    expected_revision: String,
+    selected_id: Option<String>,
+) -> AnimationClipInstanceSaveResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationClipInstanceDelete {
+            instance_id,
+            expected_revision,
+            selected_id: selected_id.clone(),
+            reply,
+        })
+        .is_err()
+    {
+        return AnimationClipInstanceSaveResult {
+            ok: false,
+            message: "The native animation engine stopped; the clip instance was not discarded."
+                .into(),
+            instance_id: None,
+            state: unavailable_animation_workspace(
+                selected_id,
+                "Imported clip instance management is unavailable.",
+            ),
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| AnimationClipInstanceSaveResult {
+        ok: false,
+        message: "The discard request did not complete; no deletion was claimed.".into(),
+        instance_id: None,
+        state: unavailable_animation_workspace(
+            selected_id,
+            "Imported clip instance management did not answer.",
+        ),
+    })
+}
+
+fn unavailable_animation_playback(message: impl Into<String>) -> AnimationPlaybackInfo {
+    AnimationPlaybackInfo {
+        ok: false,
+        message: message.into(),
+        current_tick: 0,
+        duration_tick: i64::from(metrocalk_editor_shell::DEFAULT_TICKS_PER_SECOND),
+        playing: false,
+        imported_clip_preview_active: false,
+        loop_policy: "once".into(),
+        evaluated_tracks: 0,
+        crossed_events: Vec::new(),
+        events_truncated: false,
+    }
+}
+
+#[tauri::command(async)]
+fn animation_clip_instance_preview(
+    state: State<AppState>,
+    request: AnimationClipInstanceSaveRequest,
+) -> AnimationPlaybackInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationClipInstancePreview { request, reply })
+        .is_err()
+    {
+        return unavailable_animation_playback(
+            "The native animation engine stopped; the imported clip was not previewed.",
+        );
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        unavailable_animation_playback(
+            "The imported clip preview did not answer; no playback result was claimed.",
+        )
+    })
+}
+
+#[tauri::command(async)]
+fn animation_clip_instance_preview_stop(
+    state: State<AppState>,
+    expected_request_id: Option<String>,
+) -> AnimationPlaybackInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationClipInstancePreviewStop {
+            expected_request_id,
+            reply,
+        })
+        .is_err()
+    {
+        return unavailable_animation_playback(
+            "The native animation engine stopped while restoring authored transforms.",
+        );
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        unavailable_animation_playback(
+            "Stop preview did not answer; authored state restoration could not be confirmed.",
+        )
+    })
+}
+
+#[tauri::command(async)]
+fn animation_key(
+    state: State<AppState>,
+    id: String,
+    component: String,
+    property: String,
+    tick: i64,
+    interpolation: String,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationKey {
+            id: id.clone(),
+            component,
+            property,
+            tick,
+            interpolation,
+            reply,
+        })
+        .is_err()
+    {
+        return AnimationEditResult {
+            ok: false,
+            message: "The native animation engine stopped; no key was written.".into(),
+            track_id: None,
+            key_id: None,
+            state: unavailable_animation_workspace(Some(id), "Animation keying is unavailable."),
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| AnimationEditResult {
+        ok: false,
+        message: "The animation key request did not complete; no result was claimed.".into(),
+        track_id: None,
+        key_id: None,
+        state: unavailable_animation_workspace(Some(id), "Animation keying did not answer."),
+    })
+}
+
+#[tauri::command(async)]
+fn animation_delete_key(
+    state: State<AppState>,
+    id: String,
+    track_id: String,
+    key_id: String,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationDeleteKey {
+            id: id.clone(),
+            track_id,
+            key_id,
+            reply,
+        })
+        .is_err()
+    {
+        return AnimationEditResult {
+            ok: false,
+            message: "The native animation engine stopped; the key was not removed.".into(),
+            track_id: None,
+            key_id: None,
+            state: unavailable_animation_workspace(Some(id), "Animation editing is unavailable."),
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| AnimationEditResult {
+        ok: false,
+        message: "The key removal did not complete.".into(),
+        track_id: None,
+        key_id: None,
+        state: unavailable_animation_workspace(Some(id), "Animation editing did not answer."),
+    })
+}
+
+#[tauri::command(async)]
+fn animation_delete_keys(
+    state: State<AppState>,
+    id: Option<String>,
+    deletes: Vec<AnimationKeyDeleteRequest>,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationDeleteKeys {
+            selected_id: id.clone(),
+            deletes,
+            reply,
+        })
+        .is_err()
+    {
+        return AnimationEditResult {
+            ok: false,
+            message: "The native animation engine stopped; no selected keys were removed.".into(),
+            track_id: None,
+            key_id: None,
+            state: unavailable_animation_workspace(id, "Animation editing is unavailable."),
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| AnimationEditResult {
+        ok: false,
+        message: "The multi-key removal did not complete; no partial result was claimed.".into(),
+        track_id: None,
+        key_id: None,
+        state: unavailable_animation_workspace(id, "Animation editing did not answer."),
+    })
+}
+
+#[tauri::command(async)]
+fn animation_set_interpolation(
+    state: State<AppState>,
+    id: String,
+    track_id: String,
+    interpolation: String,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationSetInterpolation {
+            id: id.clone(),
+            track_id,
+            interpolation,
+            reply,
+        })
+        .is_err()
+    {
+        return AnimationEditResult {
+            ok: false,
+            message: "The native animation engine stopped; interpolation was not changed.".into(),
+            track_id: None,
+            key_id: None,
+            state: unavailable_animation_workspace(Some(id), "Animation editing is unavailable."),
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| AnimationEditResult {
+        ok: false,
+        message: "The interpolation change did not complete.".into(),
+        track_id: None,
+        key_id: None,
+        state: unavailable_animation_workspace(Some(id), "Animation editing did not answer."),
+    })
+}
+
+fn unavailable_animation_edit(id: String, message: impl Into<String>) -> AnimationEditResult {
+    AnimationEditResult {
+        ok: false,
+        message: message.into(),
+        track_id: None,
+        key_id: None,
+        state: unavailable_animation_workspace(Some(id), "Animation editing is unavailable."),
+    }
+}
+
+#[tauri::command(async)]
+fn animation_set_track_enabled(
+    state: State<AppState>,
+    id: String,
+    track_id: String,
+    enabled: bool,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationSetTrackEnabled {
+            id: id.clone(),
+            track_id,
+            enabled,
+            reply,
+        })
+        .is_err()
+    {
+        return unavailable_animation_edit(
+            id,
+            "The animation track mute request could not be sent.",
+        );
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        unavailable_animation_edit(id, "The animation track mute request did not complete.")
+    })
+}
+
+#[tauri::command(async)]
+fn animation_set_track_locked(
+    state: State<AppState>,
+    id: String,
+    track_id: String,
+    locked: bool,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationSetTrackLocked {
+            id: id.clone(),
+            track_id,
+            locked,
+            reply,
+        })
+        .is_err()
+    {
+        return unavailable_animation_edit(
+            id,
+            "The animation track lock request could not be sent.",
+        );
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        unavailable_animation_edit(id, "The animation track lock request did not complete.")
+    })
+}
+
+#[tauri::command(async)]
+fn animation_update_keys(
+    state: State<AppState>,
+    id: String,
+    track_id: String,
+    updates: Vec<AnimationKeyUpdateRequest>,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationUpdateKeys {
+            id: id.clone(),
+            track_id,
+            updates,
+            reply,
+        })
+        .is_err()
+    {
+        return unavailable_animation_edit(id, "The animation key update could not be sent.");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        unavailable_animation_edit(id, "The animation key update did not complete.")
+    })
+}
+
+#[tauri::command(async)]
+fn animation_add_marker(
+    state: State<AppState>,
+    id: String,
+    name: String,
+    tick: i64,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationAddMarker {
+            id: id.clone(),
+            name,
+            tick,
+            reply,
+        })
+        .is_err()
+    {
+        return unavailable_animation_edit(id, "The marker request could not be sent.");
+    }
+    recv_reply(&rx)
+        .unwrap_or_else(|_| unavailable_animation_edit(id, "The marker request did not complete."))
+}
+
+#[tauri::command(async)]
+fn animation_delete_marker(
+    state: State<AppState>,
+    owner_id: String,
+    marker_id: String,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationDeleteMarker {
+            owner_id: owner_id.clone(),
+            marker_id,
+            reply,
+        })
+        .is_err()
+    {
+        return unavailable_animation_edit(owner_id, "The marker removal could not be sent.");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        unavailable_animation_edit(owner_id, "The marker removal did not complete.")
+    })
+}
+
+#[tauri::command(async)]
+fn animation_add_event(
+    state: State<AppState>,
+    id: String,
+    name: String,
+    tick: i64,
+    payload: Option<serde_json::Value>,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationAddEvent {
+            id: id.clone(),
+            name,
+            tick,
+            payload,
+            reply,
+        })
+        .is_err()
+    {
+        return unavailable_animation_edit(id, "The event request could not be sent.");
+    }
+    recv_reply(&rx)
+        .unwrap_or_else(|_| unavailable_animation_edit(id, "The event request did not complete."))
+}
+
+#[tauri::command(async)]
+fn animation_delete_event(
+    state: State<AppState>,
+    owner_id: String,
+    event_id: String,
+) -> AnimationEditResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationDeleteEvent {
+            owner_id: owner_id.clone(),
+            event_id,
+            reply,
+        })
+        .is_err()
+    {
+        return unavailable_animation_edit(owner_id, "The event removal could not be sent.");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        unavailable_animation_edit(owner_id, "The event removal did not complete.")
+    })
+}
+
+#[tauri::command(async)]
+fn animation_transport(
+    state: State<AppState>,
+    action: String,
+    tick: Option<i64>,
+    loop_policy: Option<String>,
+) -> AnimationPlaybackInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationTransport {
+            action,
+            tick,
+            loop_policy,
+            reply,
+        })
+        .is_err()
+    {
+        return AnimationPlaybackInfo {
+            ok: false,
+            message: "The native animation engine stopped; preview is unavailable.".into(),
+            current_tick: 0,
+            duration_tick: i64::from(metrocalk_editor_shell::DEFAULT_TICKS_PER_SECOND),
+            playing: false,
+            imported_clip_preview_active: false,
+            loop_policy: "once".into(),
+            evaluated_tracks: 0,
+            crossed_events: Vec::new(),
+            events_truncated: false,
+        };
+    }
+    recv_reply(&rx).unwrap_or(AnimationPlaybackInfo {
+        ok: false,
+        message: "The animation transport did not answer.".into(),
+        current_tick: 0,
+        duration_tick: i64::from(metrocalk_editor_shell::DEFAULT_TICKS_PER_SECOND),
+        playing: false,
+        imported_clip_preview_active: false,
+        loop_policy: "once".into(),
+        evaluated_tracks: 0,
+        crossed_events: Vec::new(),
+        events_truncated: false,
+    })
+}
+
 /// M11.5 (ADR-044) — the selected entity's asset provenance for the inspector identity surface (where it
 /// came from, AI-generated?, a near-duplicate hint). Fetched on selection change, not per frame.
+fn unavailable_animation_graph_state(
+    sequence_id: String,
+    message: impl Into<String>,
+) -> AnimationGraphStateInfo {
+    let revision = format!("animation-graph:unavailable:{sequence_id}");
+    AnimationGraphStateInfo {
+        schema_version: ANIMATION_GRAPH_SCHEMA_VERSION,
+        sequence_id,
+        revision: revision.clone(),
+        graph: None,
+        node_presentation: Vec::new(),
+        sources: Vec::new(),
+        compile: AnimationGraphCompileInfo {
+            state: "invalid".into(),
+            authored_revision: revision,
+            compiled_revision: None,
+            compiled_hash: None,
+            last_good_revision: None,
+            last_good_hash: None,
+            message: message.into(),
+        },
+        diagnostics: Vec::new(),
+    }
+}
+
+#[tauri::command(async)]
+fn animation_graph_state(state: State<AppState>, sequence_id: String) -> AnimationGraphStateInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationGraphState {
+            sequence_id: sequence_id.clone(),
+            reply,
+        })
+        .is_err()
+    {
+        return unavailable_animation_graph_state(
+            sequence_id,
+            "The native graph engine stopped; graph state is unavailable.",
+        );
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        unavailable_animation_graph_state(sequence_id, "The graph engine did not answer.")
+    })
+}
+
+#[tauri::command(async)]
+fn animation_graph_save(
+    state: State<AppState>,
+    sequence_id: String,
+    request: AnimationGraphSaveRequest,
+) -> AnimationGraphSaveResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationGraphSave {
+            sequence_id: sequence_id.clone(),
+            request,
+            reply,
+        })
+        .is_err()
+    {
+        return AnimationGraphSaveResult {
+            ok: false,
+            message: "The native graph engine stopped; the draft was not saved.".into(),
+            state: unavailable_animation_graph_state(
+                sequence_id,
+                "Graph authoring is unavailable.",
+            ),
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| AnimationGraphSaveResult {
+        ok: false,
+        message: "The graph save did not complete; the draft remains in the editor.".into(),
+        state: unavailable_animation_graph_state(sequence_id, "Graph authoring did not answer."),
+    })
+}
+
+#[tauri::command(async)]
+fn animation_graph_delete(
+    state: State<AppState>,
+    sequence_id: String,
+    graph_id: String,
+    expected_revision: String,
+    request_id: String,
+) -> AnimationGraphDeleteResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationGraphDelete {
+            sequence_id: sequence_id.clone(),
+            graph_id,
+            expected_revision,
+            request_id,
+            reply,
+        })
+        .is_err()
+    {
+        return AnimationGraphDeleteResult {
+            ok: false,
+            message: "The native graph engine stopped; nothing was deleted.".into(),
+            state: unavailable_animation_graph_state(
+                sequence_id,
+                "Graph authoring is unavailable.",
+            ),
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| AnimationGraphDeleteResult {
+        ok: false,
+        message: "The graph delete did not complete; nothing was removed.".into(),
+        state: unavailable_animation_graph_state(sequence_id, "Graph authoring did not answer."),
+    })
+}
+
+#[tauri::command(async)]
+fn animation_graph_debug(
+    state: State<AppState>,
+    graph_id: String,
+    instance_id: Option<String>,
+    watches: Vec<String>,
+) -> AnimationGraphDebugInfo {
+    ipc();
+    let fallback_graph_id = graph_id.clone();
+    let fallback_instance_id = instance_id.clone().unwrap_or_else(|| "preview".into());
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationGraphDebug {
+            graph_id,
+            instance_id,
+            watches,
+            reply,
+        })
+        .is_ok()
+    {
+        if let Ok(info) = recv_reply(&rx) {
+            return info;
+        }
+    }
+    AnimationGraphDebugInfo {
+        graph_id: fallback_graph_id,
+        graph_revision: "unavailable".into(),
+        compiled_hash: "unavailable".into(),
+        instance_id: fallback_instance_id,
+        raw_tick: 0,
+        local_tick: 0,
+        active_nodes: Vec::new(),
+        active_edges: Vec::new(),
+        transition: None,
+        parameter_values: BTreeMap::new(),
+        watches: Vec::new(),
+        events_truncated: false,
+        evaluation_cost_micros: None,
+        truncated: false,
+    }
+}
+
+#[tauri::command(async)]
+fn animation_graph_set_preview_parameters(
+    state: State<AppState>,
+    graph_id: String,
+    values: BTreeMap<String, serde_json::Value>,
+) -> AnimationGraphPreviewResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationGraphSetPreviewParameters {
+            graph_id,
+            values,
+            reply,
+        })
+        .is_err()
+    {
+        return AnimationGraphPreviewResult {
+            ok: false,
+            message: "The native graph engine stopped; parameters were not changed.".into(),
+            accepted: BTreeMap::new(),
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| AnimationGraphPreviewResult {
+        ok: false,
+        message: "The graph parameter update did not complete.".into(),
+        accepted: BTreeMap::new(),
+    })
+}
+
+#[tauri::command(async)]
+fn animation_graph_clear_preview_parameters(
+    state: State<AppState>,
+    graph_id: String,
+) -> AnimationGraphPreviewResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AnimationGraphClearPreviewParameters { graph_id, reply })
+        .is_err()
+    {
+        return AnimationGraphPreviewResult {
+            ok: false,
+            message: "The native graph engine stopped; parameters were not reset.".into(),
+            accepted: BTreeMap::new(),
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| AnimationGraphPreviewResult {
+        ok: false,
+        message: "The graph parameter reset did not complete.".into(),
+        accepted: BTreeMap::new(),
+    })
+}
+
 #[tauri::command(async)]
 fn asset_provenance(state: State<AppState>, id: String) -> Option<ProvenanceInfo> {
     ipc();
@@ -7648,6 +18037,152 @@ fn asset_provenance(state: State<AppState>, id: String) -> Option<ProvenanceInfo
         return None;
     }
     recv_reply(&rx).unwrap_or_default()
+}
+
+/// Inspect one selected mesh and return measured topology, UV, material, texture and capability facts.
+#[tauri::command(async)]
+fn asset_lab_audit(state: State<AppState>, id: String) -> AssetLabResponse {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AssetLabAudit { id, reply })
+        .is_err()
+    {
+        return AssetLabResponse {
+            message: "Asset Lab is unavailable because the engine stopped".into(),
+            ..AssetLabResponse::default()
+        };
+    }
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).unwrap_or_else(|_| AssetLabResponse {
+        message: "Asset inspection timed out".into(),
+        ..AssetLabResponse::default()
+    })
+}
+
+/// Build a measured, immutable variant off-thread, then register and place it through one document commit.
+#[tauri::command(async)]
+fn asset_lab_process(
+    state: State<AppState>,
+    id: String,
+    request: AssetLabProcessRequest,
+) -> AssetLabResponse {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AssetLabProcess { id, request, reply })
+        .is_err()
+    {
+        return AssetLabResponse {
+            message: "Asset Lab is unavailable because the engine stopped".into(),
+            ..AssetLabResponse::default()
+        };
+    }
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).unwrap_or_else(|_| AssetLabResponse {
+        message: "Asset processing timed out; no result was placed".into(),
+        ..AssetLabResponse::default()
+    })
+}
+
+fn pick_asset_export_path(app: &tauri::AppHandle) -> Option<String> {
+    app.dialog()
+        .file()
+        .add_filter("glTF binary asset", &["glb"])
+        .set_file_name("asset.glb")
+        .blocking_save_file()
+        .and_then(|file| file.into_path().ok())
+        .map(|path| path.display().to_string())
+}
+
+/// Export the selected canonical mesh to a deterministic, embedded-texture GLB. An explicit path is used
+/// by automation; normal editor use opens the native Save dialog.
+#[tauri::command]
+fn asset_lab_export(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    id: String,
+    path: Option<String>,
+) -> AssetLabResponse {
+    ipc();
+    let Some(path) = path.or_else(|| pick_asset_export_path(&app)) else {
+        return AssetLabResponse {
+            message: "Export canceled".into(),
+            source_entity: Some(id),
+            ..AssetLabResponse::default()
+        };
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AssetLabExport { id, path, reply })
+        .is_err()
+    {
+        return AssetLabResponse {
+            message: "Export is unavailable because the engine stopped".into(),
+            ..AssetLabResponse::default()
+        };
+    }
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).unwrap_or_else(|_| AssetLabResponse {
+        message: "GLB export timed out".into(),
+        ..AssetLabResponse::default()
+    })
+}
+
+fn pick_scene_export_path(app: &tauri::AppHandle, format: &str) -> Option<String> {
+    let (label, extension, file_name) = if format.eq_ignore_ascii_case("glb") {
+        ("Complete glTF scene", "glb", "scene.glb")
+    } else {
+        ("OpenUSD ASCII scene", "usda", "scene.usda")
+    };
+    app.dialog()
+        .file()
+        .add_filter(label, &[extension])
+        .set_file_name(file_name)
+        .blocking_save_file()
+        .and_then(|file| file.into_path().ok())
+        .map(|path| path.display().to_string())
+}
+
+/// Export the authoritative hierarchy, reusable assets, imported skins and viewport-authored keyframe
+/// tracks. GLB is self-contained; USDA is deterministic ASCII and reports texture omission explicitly.
+#[tauri::command]
+fn scene_export(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    format: String,
+    path: Option<String>,
+) -> SceneExportResponse {
+    ipc();
+    let normalized = format.to_ascii_lowercase();
+    let Some(path) = path.or_else(|| pick_scene_export_path(&app, &normalized)) else {
+        return SceneExportResponse {
+            message: "Scene export canceled".into(),
+            format: normalized,
+            ..SceneExportResponse::default()
+        };
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SceneExport {
+            format: normalized.clone(),
+            path,
+            reply,
+        })
+        .is_err()
+    {
+        return SceneExportResponse {
+            message: "Scene export is unavailable because the engine stopped".into(),
+            format: normalized,
+            ..SceneExportResponse::default()
+        };
+    }
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).unwrap_or_else(|_| SceneExportResponse {
+        message: "Complete-scene export timed out; no partial file was published".into(),
+        format: normalized,
+        ..SceneExportResponse::default()
+    })
 }
 
 /// M12.1 (ADR-045) — the registry-fed Rules vocabulary the builder is assembled from (events · actions ·
@@ -8194,6 +18729,7 @@ fn main() {
     let app_state = AppState {
         tx,
         shared: shared.clone(),
+        moba: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -8228,6 +18764,7 @@ fn main() {
             connect,
             submit_edit,
             undo,
+            redo,
             reveal_targets,
             bind_target,
             describe,
@@ -8242,6 +18779,19 @@ fn main() {
             focus_debug,
             frame_all,
             view_preset,
+            moba_validate,
+            moba_author_starter,
+            moba_start,
+            moba_step,
+            moba_order_move,
+            moba_attack_move,
+            moba_attack_target,
+            moba_hold,
+            moba_halt,
+            moba_stun,
+            moba_status,
+            moba_cooked,
+            moba_stop,
             camera_debug,
             entity_actions,
             remove_entity,
@@ -8255,7 +18805,34 @@ fn main() {
             joint_value,
             joint_scrub,
             joint_info,
+            animation_state,
+            animation_clip_instance_save,
+            animation_clip_instance_delete,
+            animation_clip_instance_preview,
+            animation_clip_instance_preview_stop,
+            animation_key,
+            animation_delete_key,
+            animation_delete_keys,
+            animation_set_interpolation,
+            animation_set_track_enabled,
+            animation_set_track_locked,
+            animation_update_keys,
+            animation_add_marker,
+            animation_delete_marker,
+            animation_add_event,
+            animation_delete_event,
+            animation_transport,
+            animation_graph_state,
+            animation_graph_save,
+            animation_graph_delete,
+            animation_graph_debug,
+            animation_graph_set_preview_parameters,
+            animation_graph_clear_preview_parameters,
             asset_provenance,
+            asset_lab_audit,
+            asset_lab_process,
+            asset_lab_export,
+            scene_export,
             rule_registry,
             list_rules,
             author_rule,
@@ -8300,6 +18877,21 @@ fn main() {
             read_transform,
             reparent_part,
             create_entity,
+            pipe_forge_start,
+            pipe_forge_edit,
+            pipe_forge_point,
+            pipe_forge_undo,
+            pipe_forge_begin_branch,
+            pipe_forge_end_branch,
+            pipe_forge_move_handle,
+            pipe_forge_remove_handle,
+            pipe_forge_place_fitting,
+            pipe_forge_remove_fitting,
+            pipe_forge_upsert_catalog,
+            pipe_forge_remove_catalog,
+            pipe_forge_bake,
+            pipe_forge_cancel,
+            pipe_forge_status,
             add_light,
             lighting_debug,
             add_camera,
@@ -8327,6 +18919,8 @@ fn main() {
             placement_sentence,
             set_snap,
             set_exposure,
+            set_render_profile,
+            render_profile_debug,
             snap_ghost,
             gizmo_debug,
             project_state,
@@ -8345,6 +18939,198 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("run editor shell");
+}
+
+#[cfg(test)]
+mod asset_lab_native_tests {
+    use super::{
+        asset_lab_aligned_source_transform, build_asset_lab_variant, decode_asset_lab_artifact,
+        encode_asset_lab_artifact, AssetLabAlignmentPolicy, AssetLabBakeSource, AssetLabDisplay,
+        AssetLabProcessRequest, BakeTransform,
+    };
+    use metrocalk_assets::{AssetAffine, GltfImporter, Material, MeshAsset, MeshSource, Primitive};
+
+    fn triangle() -> MeshAsset {
+        MeshAsset {
+            name: "inspection fixture".into(),
+            primitives: vec![Primitive {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                indices: vec![0, 1, 2],
+                material: 0,
+                ..Primitive::default()
+            }],
+            materials: vec![Material::default()],
+            ..MeshAsset::default()
+        }
+    }
+
+    #[test]
+    fn related_alignment_removes_review_offset_but_world_policy_and_unrelated_sources_do_not() {
+        let target = BakeTransform::IDENTITY;
+        let separated = BakeTransform {
+            matrix: [
+                [1.0, 0.0, 0.0, 8.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        assert_eq!(
+            asset_lab_aligned_source_transform(
+                AssetLabAlignmentPolicy::AutoRelated,
+                "root",
+                "root",
+                target,
+                separated,
+            ),
+            (target, true),
+        );
+        assert_eq!(
+            asset_lab_aligned_source_transform(
+                AssetLabAlignmentPolicy::WorldSpace,
+                "root",
+                "root",
+                target,
+                separated,
+            ),
+            (separated, false),
+        );
+        assert_eq!(
+            asset_lab_aligned_source_transform(
+                AssetLabAlignmentPolicy::AutoRelated,
+                "target-root",
+                "other-root",
+                target,
+                separated,
+            ),
+            (separated, false),
+        );
+    }
+
+    #[test]
+    fn asset_lab_envelope_preserves_scale_and_rejects_trailing_bytes() {
+        let glb = b"glTF fixture";
+        let affine = AssetAffine {
+            scale: 0.125,
+            translation: [-2.0, 3.0, 0.5],
+        };
+        let mut artifact = encode_asset_lab_artifact(affine, glb).expect("encode");
+        let (display, payload) = decode_asset_lab_artifact(&artifact)
+            .expect("decode")
+            .expect("recognized");
+        assert_eq!(display, AssetLabDisplay::Affine(affine));
+        assert_eq!(payload, glb);
+        artifact.push(0);
+        assert!(decode_asset_lab_artifact(&artifact).is_err());
+        assert!(decode_asset_lab_artifact(b"ordinary glb")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn material_variant_is_measured_and_exports_as_reimportable_glb() {
+        let request = AssetLabProcessRequest {
+            operation: "material".into(),
+            preset: Some("brushed-metal".into()),
+            target_ratio: None,
+            candidate_levels: None,
+            base_fraction: None,
+            weld_threshold: None,
+            remove_degenerate_triangles: None,
+            remove_duplicate_triangles: None,
+            remove_isolated_vertices: None,
+            remove_components_smaller_than_triangles: None,
+            repair_winding: None,
+            normal_repair: None,
+            preserve_attribute_seams: true,
+            ..AssetLabProcessRequest::default()
+        };
+        let affine = AssetAffine {
+            scale: 0.9,
+            translation: [-0.45, -0.45, 0.0],
+        };
+        let built =
+            build_asset_lab_variant(&triangle(), affine, BakeTransform::IDENTITY, &[], &request)
+                .expect("build variant");
+        assert_eq!(built.report.before.triangles, 1);
+        assert_eq!(built.report.after.triangles, 1);
+        assert_eq!(built.asset.materials[0].metallic, 1.0);
+        let (display, glb) = decode_asset_lab_artifact(&built.artifact)
+            .expect("decode")
+            .expect("lab artifact");
+        assert_eq!(display, AssetLabDisplay::Affine(affine));
+        let round_trip = GltfImporter::new().import(glb).expect("re-import GLB");
+        assert_eq!(round_trip.triangle_count(), 1);
+        assert_eq!(round_trip.materials[0].metallic, 1.0);
+    }
+
+    #[test]
+    fn multi_channel_bake_packages_maps_and_reopens_every_material_binding() {
+        let low = triangle();
+        let high = AssetLabBakeSource {
+            asset: triangle(),
+            transform: BakeTransform::IDENTITY,
+            auto_aligned: true,
+        };
+        let request = AssetLabProcessRequest {
+            operation: "bake".into(),
+            resolution: Some(16),
+            padding_px: Some(2),
+            maps: vec![
+                "normal".into(),
+                "ambientOcclusion".into(),
+                "curvature".into(),
+            ],
+            cage_distance: Some(0.2),
+            ao_distance: Some(0.2),
+            ao_samples: Some(8),
+            curvature_scale: Some(0.05),
+            ..AssetLabProcessRequest::default()
+        };
+
+        let built = build_asset_lab_variant(
+            &low,
+            AssetAffine::IDENTITY,
+            BakeTransform::IDENTITY,
+            &[high],
+            &request,
+        )
+        .expect("bake variant");
+        let material = &built.asset.materials[0];
+        assert!(material.normal_texture.is_some());
+        assert!(material.occlusion_texture.is_some());
+        assert!(material.curvature_texture.is_some());
+        assert_eq!(built.asset.textures.len(), 3);
+        assert!(built.asset.textures.iter().all(|texture| (
+            texture.width,
+            texture.height,
+            texture.rgba8.len()
+        ) == (16, 16, 1_024)));
+        assert!(built.report.changes[0].contains("1 high-detail source"));
+        let evidence = built
+            .bake_evidence
+            .clone()
+            .expect("structured bake evidence");
+        assert!(evidence.projected_texels > 0);
+        assert!(evidence.covered_texels >= evidence.projected_texels);
+        assert!(evidence.projection_hit_ratio >= evidence.required_hit_ratio);
+        assert_eq!(evidence.alignment_policy, "autoRelated");
+        assert_eq!(evidence.auto_aligned_sources, 1);
+
+        let (_, glb) = decode_asset_lab_artifact(&built.artifact)
+            .expect("decode")
+            .expect("lab artifact");
+        let restored = GltfImporter::new()
+            .import_internal(glb)
+            .expect("reopen baked GLB");
+        let material = &restored.materials[0];
+        assert!(material.normal_texture.is_some());
+        assert!(material.occlusion_texture.is_some());
+        assert!(material.curvature_texture.is_some());
+        assert_eq!(restored.textures.len(), 3);
+    }
 }
 
 #[cfg(test)]
@@ -8378,6 +19164,99 @@ mod material_tests {
     fn unknown_material_is_no_override() {
         assert!(material_preset("banana").is_none());
         assert!(material_preset("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod pipe_viewport_tests {
+    use super::{
+        bake_pipe, pipe_world_point, pipe_world_point_scene, rebuild_document_pipe, Instance,
+        MeshGpu, PipeForgeOptions, PipeRecipe,
+    };
+    use metrocalk_assets::MeshVertex;
+
+    #[test]
+    fn click_ray_hits_scene_surface_then_falls_back_to_workplane() {
+        let prop = Instance {
+            center: [0.0, 1.0, 0.0],
+            scale: 2.0,
+            color: [0.0; 3],
+            selected: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            material: [0.0; 4],
+        };
+        let surface =
+            pipe_world_point([0.0, 1.0, 5.0], [0.0, 0.0, -1.0], &[prop], 0.0).expect("surface hit");
+        assert!(surface[2] > 0.9 && surface[2] < 1.2);
+
+        let plane =
+            pipe_world_point([0.0, 4.0, 5.0], [0.0, -0.8, -0.6], &[], 0.0).expect("ground hit");
+        assert!((plane[1] - 0.0).abs() < 1.0e-6);
+        assert!(pipe_world_point([0.0, 2.0, 0.0], [1.0, 0.0, 0.0], &[], 0.0).is_none());
+    }
+
+    #[test]
+    fn resolved_scene_meshes_use_exact_transformed_triangle_hits() {
+        let vertex = |position| MeshVertex {
+            position,
+            normal: [0.0, 0.0, 1.0],
+            color: [1.0; 3],
+            metallic: 0.0,
+            roughness: 1.0,
+            uv: [0.0; 2],
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        };
+        let mesh = MeshGpu {
+            vertices: vec![
+                vertex([-1.0, -1.0, 0.0]),
+                vertex([1.0, -1.0, 0.0]),
+                vertex([0.0, 1.0, 0.0]),
+            ],
+            indices: vec![0, 1, 2],
+            submeshes: Vec::new(),
+        };
+        let instance = Instance {
+            center: [2.0, 0.0, 0.0],
+            scale: 2.0,
+            color: [0.0; 3],
+            selected: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            material: [0.0; 4],
+        };
+        let hit = pipe_world_point_scene(
+            [2.0, 0.0, 5.0],
+            [0.0, 0.0, -1.0],
+            &[instance],
+            &[0],
+            &[mesh],
+            -3.0,
+        )
+        .expect("triangle hit");
+        assert!((hit[0] - 2.0).abs() < 1.0e-5 && hit[1].abs() < 1.0e-5);
+        assert!(
+            hit[2].abs() < 1.0e-5,
+            "the route point lands on the actual triangle, not its conservative bounding sphere"
+        );
+    }
+
+    #[test]
+    fn project_recipe_reconstructs_only_its_exact_saved_asset() {
+        let mut recipe = PipeRecipe::from_options(&PipeForgeOptions::default());
+        recipe.add_point([4.0, 0.0, -2.0]).unwrap();
+        recipe.add_point([6.0, 0.0, -2.0]).unwrap();
+        let original = bake_pipe(&recipe).expect("compile original");
+        let source = serde_json::to_string(&recipe).unwrap();
+
+        let restored =
+            rebuild_document_pipe(&original.handle, &source).expect("reconstruct exact asset");
+        assert_eq!(restored.handle, original.handle);
+        assert_eq!(restored.artifact_bytes, original.artifact_bytes);
+        assert!(
+            rebuild_document_pipe("mtkasset:not-the-saved-content", &source)
+                .unwrap_err()
+                .contains("does not match"),
+            "a tampered handle must remain unresolved instead of receiving different geometry"
+        );
     }
 }
 
@@ -8633,5 +19512,1751 @@ mod cad_report_tests {
     fn an_empty_scene_reports_no_cad() {
         let e = Engine::new(FlecsWorld::new(), 1);
         assert_eq!(build_cad_report(&e).total, 0);
+    }
+}
+
+#[cfg(test)]
+mod animation_native_tests {
+    use super::*;
+    use metrocalk_animation::{AnimationEvent, EventId, LoopPolicy, Sequence, Tick};
+    use metrocalk_core::Op;
+
+    fn simple_graph_document() -> metrocalk_editor_shell::AnimationGraphDocument {
+        use metrocalk_editor_shell::{
+            AnimationGraphDocument, AnimationGraphEdge, AnimationGraphNode, AnimationGraphNodeKind,
+            AnimationGraphPosition,
+        };
+        AnimationGraphDocument {
+            schema_version: ANIMATION_GRAPH_SCHEMA_VERSION,
+            id: "graph-native-test".into(),
+            sequence_id: metrocalk_editor_shell::MAIN_SEQUENCE_ID.into(),
+            name: "Native test graph".into(),
+            output_node_id: "output".into(),
+            nodes: vec![
+                AnimationGraphNode {
+                    id: "main-clip".into(),
+                    kind: AnimationGraphNodeKind::Sequence,
+                    name: "Main sequence".into(),
+                    position: AnimationGraphPosition { x: 0.0, y: 0.0 },
+                    enabled: true,
+                    source_id: Some(metrocalk_editor_shell::MAIN_SEQUENCE_ID.into()),
+                    parameter_ids: Vec::new(),
+                    thresholds: Vec::new(),
+                    triangles: Vec::new(),
+                    samples: Vec::new(),
+                    mask_bindings: Vec::new(),
+                    state_machine_id: None,
+                },
+                AnimationGraphNode {
+                    id: "output".into(),
+                    kind: AnimationGraphNodeKind::Output,
+                    name: "Output".into(),
+                    position: AnimationGraphPosition { x: 240.0, y: 0.0 },
+                    enabled: true,
+                    source_id: None,
+                    parameter_ids: Vec::new(),
+                    thresholds: Vec::new(),
+                    triangles: Vec::new(),
+                    samples: Vec::new(),
+                    mask_bindings: Vec::new(),
+                    state_machine_id: None,
+                },
+            ],
+            edges: vec![AnimationGraphEdge {
+                id: "edge-main-output".into(),
+                from_node_id: "main-clip".into(),
+                from_port_id: "pose".into(),
+                to_node_id: "output".into(),
+                to_port_id: "pose".into(),
+                enabled: true,
+                weight: None,
+                weight_parameter_id: None,
+            }],
+            parameters: Vec::new(),
+            state_machines: Vec::new(),
+        }
+    }
+
+    fn transform_ops(id: EntityId, x: f64) -> Vec<Op> {
+        [
+            ("x", x),
+            ("y", 0.0),
+            ("z", 0.0),
+            ("qx", 0.0),
+            ("qy", 0.0),
+            ("qz", 0.0),
+            ("qw", 1.0),
+            ("scale", 1.0),
+        ]
+        .into_iter()
+        .map(|(field, value)| Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: field.into(),
+            value: FieldValue::Number(value),
+        })
+        .collect()
+    }
+
+    fn rigid_animation_glb(multiple_targets: bool) -> Vec<u8> {
+        fn push_f32s(bin: &mut Vec<u8>, values: &[f32]) -> (usize, usize) {
+            let offset = bin.len();
+            for value in values {
+                bin.extend_from_slice(&value.to_le_bytes());
+            }
+            (offset, bin.len() - offset)
+        }
+
+        let mut bin = Vec::new();
+        let (time_offset, time_length) = push_f32s(&mut bin, &[0.0, 1.0]);
+        let (translation_offset, translation_length) =
+            push_f32s(&mut bin, &[0.0, 0.0, 0.0, 2.0, 4.0, 6.0]);
+        let (rotation_offset, rotation_length) =
+            push_f32s(&mut bin, &[0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0]);
+        let (scale_offset, scale_length) = push_f32s(&mut bin, &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+        let nodes = if multiple_targets {
+            serde_json::json!([
+                { "name": "FixtureRoot", "children": [1] },
+                { "name": "FixtureChild" }
+            ])
+        } else {
+            serde_json::json!([{ "name": "FixtureRoot" }])
+        };
+        let mut channels = vec![
+            serde_json::json!({ "sampler": 0, "target": { "node": 0, "path": "translation" } }),
+            serde_json::json!({ "sampler": 1, "target": { "node": 0, "path": "rotation" } }),
+            serde_json::json!({ "sampler": 2, "target": { "node": 0, "path": "scale" } }),
+        ];
+        if multiple_targets {
+            channels.push(serde_json::json!({
+                "sampler": 0,
+                "target": { "node": 1, "path": "translation" }
+            }));
+        }
+        let json = serde_json::to_vec(&serde_json::json!({
+            "asset": { "version": "2.0" },
+            "buffers": [{ "byteLength": bin.len() }],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": time_offset, "byteLength": time_length },
+                { "buffer": 0, "byteOffset": translation_offset, "byteLength": translation_length },
+                { "buffer": 0, "byteOffset": rotation_offset, "byteLength": rotation_length },
+                { "buffer": 0, "byteOffset": scale_offset, "byteLength": scale_length }
+            ],
+            "accessors": [
+                {
+                    "bufferView": 0,
+                    "componentType": 5126,
+                    "count": 2,
+                    "type": "SCALAR",
+                    "min": [0.0],
+                    "max": [1.0]
+                },
+                { "bufferView": 1, "componentType": 5126, "count": 2, "type": "VEC3" },
+                { "bufferView": 2, "componentType": 5126, "count": 2, "type": "VEC4" },
+                { "bufferView": 3, "componentType": 5126, "count": 2, "type": "VEC3" }
+            ],
+            "nodes": nodes,
+            "scenes": [{ "nodes": [0] }],
+            "scene": 0,
+            "animations": [{
+                "name": if multiple_targets { "Assembly motion" } else { "Rigid motion" },
+                "samplers": [
+                    { "input": 0, "output": 1, "interpolation": "LINEAR" },
+                    { "input": 0, "output": 2, "interpolation": "LINEAR" },
+                    { "input": 0, "output": 3, "interpolation": "LINEAR" }
+                ],
+                "channels": channels
+            }]
+        }))
+        .expect("fixture JSON");
+        let mut json_chunk = json;
+        while json_chunk.len() % 4 != 0 {
+            json_chunk.push(b' ');
+        }
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        let total = 12 + 8 + json_chunk.len() + 8 + bin.len();
+        let mut glb = Vec::with_capacity(total);
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2_u32.to_le_bytes());
+        glb.extend_from_slice(&(total as u32).to_le_bytes());
+        glb.extend_from_slice(&(json_chunk.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&0x4E4F_534A_u32.to_le_bytes());
+        glb.extend_from_slice(&json_chunk);
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&0x004E_4942_u32.to_le_bytes());
+        glb.extend_from_slice(&bin);
+        glb
+    }
+
+    #[test]
+    fn animation_projection_moves_descendants_with_their_animated_parent() {
+        let mut engine = Engine::new(FlecsWorld::new(), 101);
+        let parent = engine.alloc_entity_id();
+        let child = engine.alloc_entity_id();
+        let mut ops = vec![
+            Op::CreateEntity {
+                id: parent,
+                parent: None,
+            },
+            Op::CreateEntity {
+                id: child,
+                parent: Some(parent),
+            },
+        ];
+        ops.extend(transform_ops(parent, 1.0));
+        ops.extend(transform_ops(child, 2.0));
+        engine.commit("fixture", ops).expect("fixture commit");
+
+        let mut parent_values = BTreeMap::new();
+        parent_values.insert(
+            ("Transform".to_owned(), "x".to_owned()),
+            AnimValue::Number(10.0),
+        );
+        let values = HashMap::from([(parent, parent_values)]);
+        let projected = projected_animation_global(&engine, child, &values, &mut HashMap::new());
+
+        assert!((projected.translation[0] - 12.0).abs() < f32::EPSILON);
+        assert_eq!(projected.translation[1..], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn looping_preview_reports_the_local_playhead_without_losing_raw_time() {
+        let mut sequence = Sequence::new("loop", "Loop", Tick(100));
+        sequence.loop_policy = LoopPolicy::Loop;
+        let plan = sequence.compile().expect("valid sequence");
+        let preview = AnimationPreviewState {
+            current_tick: Tick(125),
+            playing: true,
+            loop_policy: LoopPolicy::Loop,
+            plan: Some(plan),
+            last_error: None,
+            crossed_events: Vec::new(),
+            event_overflowed: false,
+            graph: NativeAnimationGraphState::default(),
+            ..AnimationPreviewState::default()
+        };
+
+        assert_eq!(animation_display_tick(&preview), Tick(25));
+        assert_eq!(preview.current_tick, Tick(125));
+    }
+
+    #[test]
+    fn an_event_only_sequence_is_valid_transport_content() {
+        let mut sequence = Sequence::new("event-only", "Event only", Tick(100));
+        sequence.events.push(AnimationEvent {
+            id: EventId::new("event-1"),
+            name: "Dispatch".into(),
+            tick: Tick(50),
+            payload: None,
+        });
+        let plan = sequence.compile().expect("event-only sequence compiles");
+
+        assert_eq!(plan.tracks_len(), 0);
+        assert!(animation_plan_has_transport_content(&plan));
+    }
+
+    #[test]
+    fn repository_animation_identity_tracks_source_revisions_and_boot_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "metrocalk-animation-identity-reimport-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("identity tempdir");
+        let index_path = root.join("identities.json");
+        let source = root.join("Hero.glb").to_string_lossy().into_owned();
+        let unrelated = root.join("Other.glb").to_string_lossy().into_owned();
+
+        let revision_a = resolve_animation_asset_identity_at(&index_path, "content-a", &source)
+            .expect("first source revision");
+        commit_current_animation_asset_identity_at(&index_path, "content-a", &source, &revision_a)
+            .expect("commit admitted first revision");
+        let revision_b = resolve_animation_asset_identity_at(&index_path, "content-b", &source)
+            .expect("changed bytes at the same source");
+        assert_eq!(
+            revision_a.logical_id, revision_b.logical_id,
+            "content revisions beneath one repository source retain logical identity"
+        );
+        assert!(
+            animation_content_revision_is_current_at(
+                &index_path,
+                &revision_a.logical_id,
+                "content-a"
+            )
+            .expect("old revision remains selected before admission"),
+            "candidate registration must not promote content before parsing succeeds"
+        );
+        commit_current_animation_asset_identity_at(&index_path, "content-b", &source, &revision_b)
+            .expect("commit admitted changed revision");
+        assert!(animation_content_revision_is_current_at(
+            &index_path,
+            &revision_a.logical_id,
+            "content-b"
+        )
+        .expect("new revision is indexed"));
+        let boot_reload =
+            resolve_animation_asset_identity_at(&index_path, "content-b", "project://content-b")
+                .expect("boot resolves persisted content alias");
+        assert_eq!(boot_reload.logical_id, revision_a.logical_id);
+        resolve_animation_asset_identity_at(&index_path, "content-a", "project://content-a")
+            .expect("loading an old boot alias is read-only");
+        assert!(
+            animation_content_revision_is_current_at(
+                &index_path,
+                &revision_a.logical_id,
+                "content-b"
+            )
+            .expect("boot preserves repository-selected revision"),
+            "boot order must never roll the current revision backward"
+        );
+        let other = resolve_animation_asset_identity_at(&index_path, "content-c", &unrelated)
+            .expect("unrelated source identity");
+        assert_ne!(other.logical_id, revision_a.logical_id);
+
+        std::fs::remove_dir_all(root).expect("clean identity tempdir");
+    }
+
+    #[test]
+    fn clip_repair_diff_reports_added_removed_and_type_changed_bindings() {
+        let previous = vec![
+            AnimationBinding {
+                path: AnimationPropertyPath::new("root", "Transform", "translation"),
+                value_kind: AnimationValueKind::Vec3,
+            },
+            AnimationBinding {
+                path: AnimationPropertyPath::new("root", "Transform", "scale"),
+                value_kind: AnimationValueKind::Vec3,
+            },
+        ];
+        let current = AnimationBindingSignature::new(vec![
+            AnimationBinding {
+                path: AnimationPropertyPath::new("root", "Transform", "translation"),
+                value_kind: AnimationValueKind::Quaternion,
+            },
+            AnimationBinding {
+                path: AnimationPropertyPath::new("child", "Transform", "rotation"),
+                value_kind: AnimationValueKind::Quaternion,
+            },
+        ]);
+
+        let changes = animation_clip_repair_changes(&previous, &current);
+        assert!(changes.iter().any(|change| change.contains("Type changed")
+            && change.contains("root/Transform/translation")
+            && change.contains("vec3 → quaternion")));
+        assert!(changes
+            .iter()
+            .any(|change| change.contains("Removed") && change.contains("root/Transform/scale")));
+        assert!(changes
+            .iter()
+            .any(|change| change.contains("Added") && change.contains("child/Transform/rotation")));
+    }
+
+    #[test]
+    fn imported_rigid_clip_survives_save_and_exact_byte_reopen_with_the_same_identity() {
+        let bytes = rigid_animation_glb(false);
+        let identity_path = std::env::temp_dir().join(format!(
+            "metrocalk-animation-identities-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&identity_path);
+        let first_identity = resolve_animation_asset_identity_at(
+            &identity_path,
+            "fixture-content-record",
+            "file:///first/rigid.glb",
+        )
+        .expect("persist repository-owned identity");
+        let importer = GltfImporter::new();
+        let first_asset = importer
+            .import_animations_with_logical_id(
+                &bytes,
+                &first_identity.source_uri,
+                AnimationAssetId::new(first_identity.logical_id.clone()),
+            )
+            .expect("first animation import");
+        commit_current_animation_asset_identity_at(
+            &identity_path,
+            "fixture-content-record",
+            "file:///first/rigid.glb",
+            &first_identity,
+        )
+        .expect("commit successfully parsed first revision");
+        assert!(first_asset.is_ready_for_playback());
+        let summary = first_asset.manifest.facets[0].clips[0].clone();
+        let signature = first_asset
+            .clip_binding_signature(&summary.clip_id)
+            .expect("source signature");
+
+        let mut engine = Engine::new(FlecsWorld::new(), 114);
+        let target = engine.alloc_entity_id();
+        let mut ops = vec![Op::CreateEntity {
+            id: target,
+            parent: None,
+        }];
+        ops.extend(transform_ops(target, 0.0));
+        engine.commit("clip target", ops).expect("clip target");
+        let mut assets = load_assets();
+        assets
+            .animation_assets
+            .insert("fixture-content-record".into(), first_asset);
+        let expected_revision =
+            metrocalk_editor_shell::load_animation_clip_instances(&engine).revision;
+        let request = AnimationClipInstanceSaveRequest {
+            expected_revision: expected_revision.clone(),
+            request_id: "request-fixture".into(),
+            instance_id: "fixture-rigid-instance".into(),
+            name: "Fixture rigid motion".into(),
+            logical_asset_id: first_identity.logical_id.clone(),
+            expected_asset_revision: assets.animation_assets["fixture-content-record"]
+                .record
+                .effective_revision_id()
+                .as_str()
+                .to_owned(),
+            clip_id: summary.clip_id.as_str().to_owned(),
+            expected_source_binding_hash: signature.signature_hash,
+            target_mappings: Vec::new(),
+            target_id: target.to_loro_key(),
+        };
+        let mut stale_request = request.clone();
+        stale_request.expected_revision = "stale-clip-instance-revision".into();
+        let stale_error =
+            build_single_rigid_clip_instance_document(&engine, &assets, &stale_request)
+                .expect_err("preview/save draft must keep the clip-instance fence from setup open");
+        assert!(stale_error.contains("changed elsewhere"));
+        assert!(stale_error.contains("Reopen"));
+        let document = build_single_rigid_clip_instance_document(&engine, &assets, &request)
+            .expect("build explicit mapping");
+        let first_compiled = compile_persisted_clip_instance(&engine, &assets, &document)
+            .expect("compile before save");
+        assert_eq!(first_compiled.compiled.plan.tracks_len(), 3);
+        assert!(first_compiled
+            .compiled
+            .mapped_binding_signature
+            .bindings
+            .iter()
+            .all(|binding| binding.path.target == target.to_loro_key()));
+        assert!(first_compiled
+            .compiled
+            .mapped_binding_signature
+            .bindings
+            .iter()
+            .any(|binding| binding.path.property == "scale3"));
+        metrocalk_editor_shell::save_animation_clip_instance(
+            &mut engine,
+            &expected_revision,
+            &document,
+        )
+        .expect("save one atomic clip intent");
+
+        let reopened_identity = resolve_animation_asset_identity_at(
+            &identity_path,
+            "fixture-content-record",
+            "project://fixture-content-record",
+        )
+        .expect("reload repository identity");
+        assert_eq!(reopened_identity, first_identity);
+        let reopened_asset = importer
+            .import_animations_with_logical_id(
+                &bytes,
+                &reopened_identity.source_uri,
+                AnimationAssetId::new(reopened_identity.logical_id.clone()),
+            )
+            .expect("reopen exact bytes");
+        assets
+            .animation_assets
+            .insert("fixture-content-record".into(), reopened_asset);
+        let loaded = metrocalk_editor_shell::load_animation_clip_instances(&engine);
+        assert_eq!(loaded.documents, vec![document.clone()]);
+        let reopened_compiled =
+            compile_persisted_clip_instance(&engine, &assets, &loaded.documents[0])
+                .expect("compile saved mapping after reopen");
+        assert_eq!(
+            reopened_compiled.compiled.stable_hash,
+            first_compiled.compiled.stable_hash
+        );
+
+        let mut preview = AnimationPreviewState::default();
+        refresh_animation_clip_instances(&engine, &assets, &mut preview);
+        let first_fence = preview
+            .clip_instance_refresh_fence
+            .clone()
+            .expect("refresh fence");
+        refresh_animation_clip_instances(&engine, &assets, &mut preview);
+        assert_eq!(
+            preview.clip_instance_refresh_fence.as_deref(),
+            Some(first_fence.as_str())
+        );
+        assert_eq!(preview.clip_instances.len(), 1);
+        assert!(preview.clip_instance_issues.is_empty());
+
+        let mut audition_document = document.clone();
+        audition_document.id = "fixture-rigid-audition".into();
+        audition_document.name = "Unsaved fixture audition".into();
+        let audition = compile_persisted_clip_instance(&engine, &assets, &audition_document)
+            .expect("compile unsaved audition through save-identical path");
+        assert_eq!(
+            audition.compiled.plan.time_base,
+            AnimationTimeBase::new(metrocalk_editor_shell::DEFAULT_TICKS_PER_SECOND)
+        );
+        let audition_midpoint = AnimationTick(audition.compiled.plan.duration.0 / 2);
+        let evaluated = audition.compiled.plan.evaluate(audition_midpoint);
+        assert_eq!(evaluated.bindings.len(), 3);
+        assert!(evaluated.bindings.iter().any(|binding| {
+            matches!(
+                &binding.value,
+                AnimValue::Vec3(value) if value[0] > 0.0
+            )
+        }));
+        let authored_revision_before =
+            metrocalk_editor_shell::load_animation_clip_instances(&engine).revision;
+        preview.plan = Some(audition.compiled.plan.clone());
+        preview.transient_clip_fence = Some(transient_animation_clip_live_fence(
+            &engine, &assets, &audition,
+        ));
+        preview.transient_clip = Some(audition);
+        preview.playing = true;
+        preview.current_tick = audition_midpoint;
+        preview.crossed_events.push(AnimationEventInfo {
+            id: "pre-invalidation-event".into(),
+            owner_id: target.to_loro_key(),
+            name: "Before invalidation".into(),
+            tick: preview.current_tick.0,
+            seconds: 0.5,
+            payload: None,
+        });
+
+        engine
+            .commit(
+                "move audition target",
+                vec![Op::SetField {
+                    entity: target,
+                    component: "Transform".into(),
+                    field: "x".into(),
+                    value: FieldValue::Number(5.0),
+                }],
+            )
+            .expect("change target fence");
+        assert!(
+            refresh_animation_clip_instances(&engine, &assets, &mut preview),
+            "target/rest-pose drift invalidates the unsaved audition"
+        );
+        assert!(preview.transient_clip.is_none());
+        assert!(preview.transient_clip_fence.is_none());
+        assert!(preview.plan.is_none());
+        assert!(!preview.playing);
+        assert_eq!(preview.current_tick, AnimationTick::ZERO);
+        assert_eq!(
+            preview.crossed_events.len(),
+            1,
+            "authority invalidation preserves event handoff until the bounded response"
+        );
+        let invalidation_message = preview
+            .last_error
+            .clone()
+            .expect("invalidation exposes its reason");
+        let invalidation_response =
+            animation_playback_response(&mut preview, false, invalidation_message);
+        assert_eq!(invalidation_response.crossed_events.len(), 1);
+        assert!(preview.crossed_events.is_empty());
+        assert_eq!(
+            metrocalk_editor_shell::load_animation_clip_instances(&engine).revision,
+            authored_revision_before,
+            "transient preview and target drift do not author clip-instance storage"
+        );
+
+        let stop_audition = compile_persisted_clip_instance(&engine, &assets, &audition_document)
+            .expect("recompile audition after target move");
+        preview.plan = Some(stop_audition.compiled.plan.clone());
+        preview.transient_clip_fence = Some(transient_animation_clip_live_fence(
+            &engine,
+            &assets,
+            &stop_audition,
+        ));
+        preview.transient_clip = Some(stop_audition);
+        preview.transient_clip_request_id = Some("newer-preview-request".into());
+        preview.playing = true;
+        preview.current_tick = AnimationTick(1);
+        preview.crossed_events.push(AnimationEventInfo {
+            id: "newer-event".into(),
+            owner_id: target.to_loro_key(),
+            name: "Newer preview event".into(),
+            tick: 1,
+            seconds: 0.0,
+            payload: None,
+        });
+        assert!(animation_clip_preview_stop_is_stale(
+            &preview,
+            Some("older-preview-request")
+        ));
+        assert!(
+            preview.transient_clip.is_some(),
+            "a stale Stop token leaves the newer audition installed"
+        );
+        remember_cancelled_transient_clip_request(&mut preview, Some("older-preview-request"));
+        let stale_snapshot =
+            animation_playback_snapshot(&preview, true, "stale stop ignored".into());
+        assert_eq!(stale_snapshot.crossed_events.len(), 1);
+        assert_eq!(
+            preview.crossed_events.len(),
+            1,
+            "a stale Stop snapshot cannot drain the newer preview's event handoff"
+        );
+        assert!(
+            take_cancelled_transient_clip_request(&mut preview, "older-preview-request"),
+            "the delayed older Preview consumes the tombstone written by its stale Stop"
+        );
+        let cancelled_preview_snapshot =
+            animation_playback_snapshot(&preview, false, "older preview cancelled".into());
+        assert!(cancelled_preview_snapshot.imported_clip_preview_active);
+        assert_eq!(
+            preview.transient_clip_request_id.as_deref(),
+            Some("newer-preview-request"),
+            "cancelled Preview(A) cannot replace the already-installed Preview(B)"
+        );
+        assert!(!animation_clip_preview_stop_is_stale(
+            &preview,
+            Some("newer-preview-request")
+        ));
+        assert!(!animation_clip_preview_stop_is_stale(&preview, None));
+        clear_transient_animation_clip(&mut preview, None);
+        assert!(preview.transient_clip.is_none());
+        assert!(preview.transient_clip_fence.is_none());
+        assert!(preview.transient_clip_request_id.is_none());
+        assert!(preview.plan.is_none());
+        assert!(!preview.playing);
+        assert_eq!(preview.current_tick, AnimationTick::ZERO);
+        assert!(preview.crossed_events.is_empty());
+
+        let completion_audition =
+            compile_persisted_clip_instance(&engine, &assets, &audition_document)
+                .expect("compile audition for automatic one-shot restoration");
+        preview.plan = Some(completion_audition.compiled.plan.clone());
+        preview.transient_clip_fence = Some(transient_animation_clip_live_fence(
+            &engine,
+            &assets,
+            &completion_audition,
+        ));
+        preview.transient_clip_request_id = Some("completion-preview".into());
+        preview.transient_clip = Some(completion_audition);
+        preview.loop_policy = AnimationLoopPolicy::Once;
+        preview.playing = true;
+        preview.current_tick = animation_transport_duration(&preview);
+        let endpoint_tick = preview.current_tick.0;
+        preview.crossed_events.push(AnimationEventInfo {
+            id: "endpoint-event".into(),
+            owner_id: target.to_loro_key(),
+            name: "Endpoint".into(),
+            tick: endpoint_tick,
+            seconds: 1.0,
+            payload: None,
+        });
+        assert!(
+            clear_completed_transient_animation_clip(&mut preview),
+            "a completed one-shot audition releases its transient render projection"
+        );
+        assert!(preview.transient_clip.is_none());
+        assert!(preview.transient_clip_request_id.is_none());
+        assert!(!preview.playing);
+        assert_eq!(preview.current_tick, AnimationTick::ZERO);
+        assert_eq!(
+            preview.crossed_events.len(),
+            1,
+            "automatic teardown preserves the endpoint event until the next bounded response"
+        );
+        assert!(
+            !clear_transient_animation_clip_preserving_events(&mut preview),
+            "a Stop arriving after automatic teardown does not clear the endpoint handoff"
+        );
+        let endpoint_response =
+            animation_playback_response(&mut preview, true, "already restored".into());
+        assert_eq!(endpoint_response.crossed_events.len(), 1);
+        assert!(preview.crossed_events.is_empty());
+        assert!(
+            !clear_completed_transient_animation_clip(&mut preview),
+            "automatic teardown is idempotent once the audition is gone"
+        );
+
+        let lease_audition = compile_persisted_clip_instance(&engine, &assets, &audition_document)
+            .expect("compile audition for independent wall-clock lease");
+        preview.plan = Some(lease_audition.compiled.plan.clone());
+        preview.transient_clip = Some(lease_audition);
+        preview.transient_previous_loop_policy = Some(AnimationLoopPolicy::Loop);
+        preview.loop_policy = AnimationLoopPolicy::Once;
+        preview.playing = false;
+        preview.transient_clip_deadline =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_millis(1));
+        assert!(
+            clear_expired_transient_animation_clip(&mut preview, std::time::Instant::now()),
+            "the wall-clock lease releases even a paused audition"
+        );
+        assert_eq!(
+            preview.loop_policy,
+            AnimationLoopPolicy::Loop,
+            "teardown restores the authored loop policy"
+        );
+
+        remember_cancelled_transient_clip_request(&mut preview, Some("stop-before-preview"));
+        assert!(take_cancelled_transient_clip_request(
+            &mut preview,
+            "stop-before-preview"
+        ));
+        assert!(
+            !take_cancelled_transient_clip_request(&mut preview, "stop-before-preview"),
+            "a cancellation tombstone is consumed by exactly one matching Preview"
+        );
+        for index in 0..=MAX_CANCELLED_TRANSIENT_CLIP_REQUESTS {
+            remember_cancelled_transient_clip_request(
+                &mut preview,
+                Some(format!("cancelled-{index}").as_str()),
+            );
+        }
+        assert_eq!(
+            preview.cancelled_transient_clip_request_ids.len(),
+            MAX_CANCELLED_TRANSIENT_CLIP_REQUESTS
+        );
+
+        let deactivation_audition =
+            compile_persisted_clip_instance(&engine, &assets, &audition_document)
+                .expect("compile audition before deactivation");
+        preview.plan = Some(deactivation_audition.compiled.plan.clone());
+        preview.transient_clip_fence = Some(transient_animation_clip_live_fence(
+            &engine,
+            &assets,
+            &deactivation_audition,
+        ));
+        preview.transient_clip_request_id = Some("deactivation-preview".into());
+        preview.transient_clip = Some(deactivation_audition);
+        engine
+            .commit(
+                "deactivate animation target",
+                vec![Op::SetActive {
+                    entity: target,
+                    active: false,
+                }],
+            )
+            .expect("deactivate target");
+        assert!(
+            refresh_animation_clip_instances(&engine, &assets, &mut preview),
+            "deactivation changes the transient live fence"
+        );
+        assert!(preview.transient_clip.is_none());
+
+        let mut deactivated_request = request.clone();
+        deactivated_request.expected_revision =
+            metrocalk_editor_shell::load_animation_clip_instances(&engine).revision;
+        let builder_error =
+            build_single_rigid_clip_instance_document(&engine, &assets, &deactivated_request)
+                .expect_err("builder must reject deactivated rigid targets");
+        assert!(builder_error.contains("deactivated"));
+        let compile_error = match compile_persisted_clip_instance(&engine, &assets, &document) {
+            Err(error) => error,
+            Ok(_) => panic!("ready catalog must reject deactivated rigid targets"),
+        };
+        assert!(compile_error.contains("deactivated"));
+
+        let mut stale_preview = AnimationPreviewState::default();
+        refresh_animation_clip_instances(&engine, &assets, &mut stale_preview);
+        assert!(stale_preview.clip_instances.is_empty());
+        let clip_info = animation_imported_clip_infos(
+            &engine,
+            &assets.animation_assets["fixture-content-record"],
+            &stale_preview,
+            target,
+        )
+        .into_iter()
+        .find(|clip| clip.clip_id == summary.clip_id.as_str())
+        .expect("stale persisted clip remains repairable");
+        assert_eq!(clip_info.readiness, "repair_required");
+        assert_eq!(clip_info.instance_id.as_deref(), Some(document.id.as_str()));
+        assert_eq!(
+            clip_info.target_mappings,
+            vec![AnimationClipTargetMappingRequest {
+                source_target_id: document.target_rebinds[0].source_target.clone(),
+                target_id: target.to_loro_key(),
+            }]
+        );
+        let _ = std::fs::remove_file(identity_path);
+    }
+
+    #[test]
+    fn changed_byte_reimport_keeps_one_current_revision_and_repairs_the_stable_instance() {
+        let first_bytes = rigid_animation_glb(false);
+        let mut changed_bytes = first_bytes.clone();
+        let name_offset = changed_bytes
+            .windows(b"Rigid motion".len())
+            .position(|window| window == b"Rigid motion")
+            .expect("fixture animation name");
+        changed_bytes[name_offset] = b'r';
+        let root = std::env::temp_dir().join(format!(
+            "metrocalk-animation-repair-reimport-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("reimport tempdir");
+        let identity_path = root.join("identities.json");
+        let source = root.join("Fixture.glb").to_string_lossy().into_owned();
+        let importer = GltfImporter::new();
+
+        let first_handle = AssetId::of_bytes(&first_bytes).as_str().to_owned();
+        let first_identity =
+            resolve_animation_asset_identity_at(&identity_path, &first_handle, &source)
+                .expect("resolve first identity");
+        let first_asset = importer
+            .import_animations_with_logical_id(
+                &first_bytes,
+                &first_identity.source_uri,
+                AnimationAssetId::new(first_identity.logical_id.clone()),
+            )
+            .expect("admit first revision");
+        commit_current_animation_asset_identity_at(
+            &identity_path,
+            &first_handle,
+            &source,
+            &first_identity,
+        )
+        .expect("commit first revision");
+        let first_summary = first_asset.manifest.facets[0].clips[0].clone();
+        let first_signature = first_asset
+            .clip_binding_signature(&first_summary.clip_id)
+            .expect("first binding signature");
+
+        let mut engine = Engine::new(FlecsWorld::new(), 116);
+        let target = engine.alloc_entity_id();
+        let mut target_ops = vec![Op::CreateEntity {
+            id: target,
+            parent: None,
+        }];
+        target_ops.extend(transform_ops(target, 0.0));
+        engine
+            .commit("reimport target", target_ops)
+            .expect("create reimport target");
+        let mut assets = load_assets();
+        install_current_animation_asset_revision(
+            &mut assets.animation_assets,
+            first_handle.clone(),
+            first_asset,
+        );
+        let initial_revision =
+            metrocalk_editor_shell::load_animation_clip_instances(&engine).revision;
+        let first_request = AnimationClipInstanceSaveRequest {
+            expected_revision: initial_revision.clone(),
+            request_id: "request-reimport-first".into(),
+            instance_id: "fixture-reimport-stable-instance".into(),
+            name: "Fixture reimport motion".into(),
+            logical_asset_id: first_identity.logical_id.clone(),
+            expected_asset_revision: assets.animation_assets[&first_handle]
+                .record
+                .effective_revision_id()
+                .as_str()
+                .to_owned(),
+            clip_id: first_summary.clip_id.as_str().to_owned(),
+            expected_source_binding_hash: first_signature.signature_hash,
+            target_mappings: Vec::new(),
+            target_id: target.to_loro_key(),
+        };
+        let first_document =
+            build_single_rigid_clip_instance_document(&engine, &assets, &first_request)
+                .expect("build first instance");
+        metrocalk_editor_shell::save_animation_clip_instance(
+            &mut engine,
+            &initial_revision,
+            &first_document,
+        )
+        .expect("save first instance");
+        let mut second_document = first_document.clone();
+        second_document.id = "fixture-reimport-second-instance".into();
+        second_document.name = "Fixture reimport second motion".into();
+        let second_revision =
+            metrocalk_editor_shell::load_animation_clip_instances(&engine).revision;
+        metrocalk_editor_shell::save_animation_clip_instance(
+            &mut engine,
+            &second_revision,
+            &second_document,
+        )
+        .expect("save independent second instance");
+
+        let changed_handle = AssetId::of_bytes(&changed_bytes).as_str().to_owned();
+        let changed_identity =
+            resolve_animation_asset_identity_at(&identity_path, &changed_handle, &source)
+                .expect("resolve changed identity");
+        assert_eq!(changed_identity.logical_id, first_identity.logical_id);
+        assert!(animation_content_revision_is_current_at(
+            &identity_path,
+            &first_identity.logical_id,
+            &first_handle,
+        )
+        .expect("first remains current before changed admission"));
+        let changed_asset = importer
+            .import_animations_with_logical_id(
+                &changed_bytes,
+                &changed_identity.source_uri,
+                AnimationAssetId::new(changed_identity.logical_id.clone()),
+            )
+            .expect("admit changed revision");
+        let changed_summary = changed_asset.manifest.facets[0].clips[0].clone();
+        let changed_signature = changed_asset
+            .clip_binding_signature(&changed_summary.clip_id)
+            .expect("changed binding signature");
+        assert_ne!(changed_summary.clip_id, first_summary.clip_id);
+        assert_eq!(
+            animation_clip_source_locator(changed_summary.clip_id.as_str()),
+            first_document.clip_locator
+        );
+        commit_current_animation_asset_identity_at(
+            &identity_path,
+            &changed_handle,
+            &source,
+            &changed_identity,
+        )
+        .expect("commit changed revision only after admission");
+        install_current_animation_asset_revision(
+            &mut assets.animation_assets,
+            changed_handle.clone(),
+            changed_asset,
+        );
+        assert_eq!(
+            assets
+                .animation_assets
+                .values()
+                .filter(|asset| {
+                    asset.record.effective_logical_id().as_str() == first_identity.logical_id
+                })
+                .count(),
+            1,
+            "runtime keeps exactly one revision per logical animation asset"
+        );
+        assert!(!assets.animation_assets.contains_key(&first_handle));
+
+        let mut stale_preview = AnimationPreviewState::default();
+        refresh_animation_clip_instances(&engine, &assets, &mut stale_preview);
+        assert!(stale_preview.clip_instances.is_empty());
+        let current_asset = &assets.animation_assets[&changed_handle];
+        let clip_info =
+            animation_imported_clip_infos(&engine, current_asset, &stale_preview, target)
+                .into_iter()
+                .find(|clip| clip.clip_id == changed_summary.clip_id.as_str())
+                .expect("current clip corresponds to persisted source locator");
+        assert_eq!(clip_info.readiness, "repair_required");
+        assert!(
+            clip_info.instance_id.is_none(),
+            "ambiguous stale instances are never silently collapsed"
+        );
+        assert_eq!(clip_info.instances.len(), 2);
+        assert_eq!(
+            clip_info
+                .instances
+                .iter()
+                .map(|instance| instance.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second_document.id.as_str(), first_document.id.as_str(),],
+            "instance summaries retain stable storage order"
+        );
+        assert!(clip_info.instances.iter().all(|instance| {
+            instance.repair_changes
+                == vec![
+                    "No typed channel additions, removals, or type changes; the cooked content or timing changed."
+                        .to_owned(),
+                ]
+        }));
+
+        let discard_revision =
+            metrocalk_editor_shell::load_animation_clip_instances(&engine).revision;
+        metrocalk_editor_shell::delete_animation_clip_instance(
+            &mut engine,
+            &second_document.id,
+            &discard_revision,
+        )
+        .expect("discard one explicitly selected stale instance");
+        refresh_animation_clip_instances(&engine, &assets, &mut stale_preview);
+        let clip_info =
+            animation_imported_clip_infos(&engine, current_asset, &stale_preview, target)
+                .into_iter()
+                .find(|clip| clip.clip_id == changed_summary.clip_id.as_str())
+                .expect("remaining stale instance remains repairable");
+        assert_eq!(
+            clip_info.instance_id.as_deref(),
+            Some(first_document.id.as_str())
+        );
+        assert_eq!(clip_info.instances.len(), 1);
+
+        let repair_revision =
+            metrocalk_editor_shell::load_animation_clip_instances(&engine).revision;
+        let repair_request = AnimationClipInstanceSaveRequest {
+            expected_revision: repair_revision.clone(),
+            request_id: "request-reimport-repair".into(),
+            instance_id: first_document.id.clone(),
+            name: first_document.name.clone(),
+            logical_asset_id: changed_identity.logical_id,
+            expected_asset_revision: current_asset
+                .record
+                .effective_revision_id()
+                .as_str()
+                .to_owned(),
+            clip_id: changed_summary.clip_id.as_str().to_owned(),
+            expected_source_binding_hash: changed_signature.signature_hash,
+            target_mappings: clip_info.target_mappings,
+            target_id: target.to_loro_key(),
+        };
+        let repaired_document =
+            build_single_rigid_clip_instance_document(&engine, &assets, &repair_request)
+                .expect("explicit repair against current evidence");
+        assert_eq!(repaired_document.id, first_document.id);
+        assert_eq!(
+            repaired_document.clip_locator, first_document.clip_locator,
+            "repair keeps stable source correspondence while updating the cooked clip ID"
+        );
+        assert_ne!(repaired_document.clip_id, first_document.clip_id);
+        assert_eq!(
+            repaired_document.source_bindings,
+            current_asset
+                .clip_binding_signature(&changed_summary.clip_id)
+                .expect("current signature")
+                .bindings
+        );
+        metrocalk_editor_shell::save_animation_clip_instance(
+            &mut engine,
+            &repair_revision,
+            &repaired_document,
+        )
+        .expect("save repaired stable instance");
+        let repaired = compile_persisted_clip_instance(&engine, &assets, &repaired_document)
+            .expect("repaired instance compiles on current revision");
+        assert_eq!(repaired.document.id, first_document.id);
+
+        std::fs::remove_dir_all(root).expect("clean reimport tempdir");
+    }
+
+    #[test]
+    fn multi_node_import_requires_complete_distinct_targets_and_compiles_when_explicit() {
+        let bytes = rigid_animation_glb(true);
+        let asset = GltfImporter::new()
+            .import_animations_with_logical_id(
+                &bytes,
+                "fixture://assembly.glb",
+                AnimationAssetId::new("fixture-assembly"),
+            )
+            .expect("multi-node animation import");
+        let summary = asset.manifest.facets[0].clips[0].clone();
+        let signature = asset
+            .clip_binding_signature(&summary.clip_id)
+            .expect("source signature");
+        let mut engine = Engine::new(FlecsWorld::new(), 115);
+        let target = engine.alloc_entity_id();
+        let second_target = engine.alloc_entity_id();
+        let mut ops = vec![
+            Op::CreateEntity {
+                id: target,
+                parent: None,
+            },
+            Op::CreateEntity {
+                id: second_target,
+                parent: None,
+            },
+        ];
+        ops.extend(transform_ops(target, 0.0));
+        ops.extend(transform_ops(second_target, 10.0));
+        engine.commit("clip target", ops).expect("clip target");
+        let mut assets = load_assets();
+        assets
+            .animation_assets
+            .insert("fixture-assembly-record".into(), asset);
+        let request = AnimationClipInstanceSaveRequest {
+            expected_revision: metrocalk_editor_shell::load_animation_clip_instances(&engine)
+                .revision,
+            request_id: "request-assembly".into(),
+            instance_id: "fixture-assembly-instance".into(),
+            name: "Fixture assembly".into(),
+            logical_asset_id: "fixture-assembly".into(),
+            expected_asset_revision: assets.animation_assets["fixture-assembly-record"]
+                .record
+                .effective_revision_id()
+                .as_str()
+                .to_owned(),
+            clip_id: summary.clip_id.as_str().to_owned(),
+            expected_source_binding_hash: signature.signature_hash,
+            target_mappings: Vec::new(),
+            target_id: target.to_loro_key(),
+        };
+        let error = build_single_rigid_clip_instance_document(&engine, &assets, &request)
+            .expect_err("single-target automap must fail closed");
+        assert!(error.contains("2 source nodes"));
+        assert!(error.contains("explicit"));
+
+        let source_targets = rigid_clip_admission(
+            &assets.animation_assets["fixture-assembly-record"],
+            &summary.clip_id,
+        )
+        .expect("rigid admission")
+        .1;
+        let mut incomplete = request.clone();
+        incomplete.target_mappings = vec![AnimationClipTargetMappingRequest {
+            source_target_id: source_targets[0].clone(),
+            target_id: target.to_loro_key(),
+        }];
+        assert!(
+            build_single_rigid_clip_instance_document(&engine, &assets, &incomplete)
+                .expect_err("incomplete mapping")
+                .contains("mapping(s) are missing")
+        );
+
+        let mut many_to_one = request.clone();
+        many_to_one.target_mappings = source_targets
+            .iter()
+            .map(|source| AnimationClipTargetMappingRequest {
+                source_target_id: source.clone(),
+                target_id: target.to_loro_key(),
+            })
+            .collect();
+        assert!(
+            build_single_rigid_clip_instance_document(&engine, &assets, &many_to_one)
+                .expect_err("many-to-one mapping")
+                .contains("Many-to-one")
+        );
+
+        let mut explicit = request;
+        explicit.target_mappings = vec![
+            AnimationClipTargetMappingRequest {
+                source_target_id: source_targets[0].clone(),
+                target_id: target.to_loro_key(),
+            },
+            AnimationClipTargetMappingRequest {
+                source_target_id: source_targets[1].clone(),
+                target_id: second_target.to_loro_key(),
+            },
+        ];
+        let document = build_single_rigid_clip_instance_document(&engine, &assets, &explicit)
+            .expect("complete explicit mapping");
+        let compiled = compile_persisted_clip_instance(&engine, &assets, &document)
+            .expect("compile two-node instance");
+        assert_eq!(compiled.compiled.plan.tracks_len(), 4);
+        assert_eq!(
+            compiled
+                .compiled
+                .mapped_binding_signature
+                .bindings
+                .iter()
+                .map(|binding| binding.path.target.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([target.to_loro_key(), second_target.to_loro_key()])
+        );
+        let evaluation = compiled
+            .compiled
+            .plan
+            .evaluate(AnimationTick(compiled.compiled.plan.duration.0 / 2));
+        assert_eq!(evaluation.bindings.len(), 4);
+    }
+
+    #[test]
+    fn once_graph_step_preserves_an_event_on_the_duration_boundary() {
+        use metrocalk_animation::{
+            AnimationGraph, AnimationGraphId, AnimationGraphRuntimeInstance, Binding,
+            CompiledAnimationGraph, GraphNode, GraphNodeId, GraphNodeKind, GraphReferenceValue,
+            Interpolation, Keyframe, PropertyPath, SequenceId, Track, TrackId, ValueKind,
+        };
+        let binding = Binding {
+            path: PropertyPath::new("target", "Transform", "x"),
+            value_kind: ValueKind::Number,
+        };
+        let mut sequence = Sequence::new("main", "Boundary", Tick(10));
+        sequence.tracks.push(Track {
+            id: TrackId::new("track"),
+            name: "X".into(),
+            binding: binding.clone(),
+            interpolation: Interpolation::Linear,
+            keyframes: vec![
+                Keyframe::new("key-0", Tick::ZERO, AnimValue::Number(0.0)),
+                Keyframe::new("key-10", Tick(10), AnimValue::Number(1.0)),
+            ],
+            enabled: true,
+        });
+        sequence.events.push(AnimationEvent {
+            id: EventId::new("at-end"),
+            name: "At end".into(),
+            tick: Tick(10),
+            payload: None,
+        });
+        let sequence_plan = sequence.compile().expect("sequence");
+        let clip = GraphNodeId::new("clip");
+        let graph = AnimationGraph::flat(
+            AnimationGraphId::new("boundary"),
+            "Boundary",
+            clip.clone(),
+            vec![GraphReferenceValue {
+                binding,
+                value: AnimValue::Number(0.0),
+            }],
+            vec![GraphNode {
+                id: clip,
+                name: "Clip".into(),
+                kind: GraphNodeKind::Clip {
+                    sequence: SequenceId::new("main"),
+                    rate: metrocalk_animation::RationalRate::ONE,
+                    start_tick: Tick::ZERO,
+                },
+            }],
+        );
+        let graph_plan = CompiledAnimationGraph::compile(
+            &graph,
+            &BTreeMap::from([(SequenceId::new("main"), sequence_plan)]),
+        )
+        .expect("graph");
+        let mut runtime = AnimationGraphRuntimeInstance::new(graph_plan);
+        runtime.seek(Tick(8));
+        let delta = animation_preview_step_delta(LoopPolicy::Once, Tick(8), Tick(10), Tick(5));
+        assert_eq!(delta, Tick(2));
+        runtime.advance(delta);
+        assert_eq!(runtime.events().len(), 1);
+        assert_eq!(runtime.events()[0].event.id.as_str(), "at-end");
+    }
+
+    #[test]
+    fn authored_graph_compiles_on_worker_with_revision_and_source_fences() {
+        let mut engine = Engine::new(FlecsWorld::new(), 111);
+        let target = engine.alloc_entity_id();
+        let mut ops = vec![Op::CreateEntity {
+            id: target,
+            parent: None,
+        }];
+        ops.extend(transform_ops(target, 2.0));
+        engine.commit("graph target", ops).expect("graph target");
+        metrocalk_editor_shell::key_animation_property(
+            &mut engine,
+            target,
+            "Transform",
+            "x",
+            Tick::ZERO,
+            metrocalk_animation::Interpolation::Linear,
+        )
+        .expect("key main sequence");
+
+        let initial = metrocalk_editor_shell::load_animation_graph(
+            &engine,
+            metrocalk_editor_shell::MAIN_SEQUENCE_ID,
+        );
+        let saved = metrocalk_editor_shell::save_animation_graph(
+            &mut engine,
+            &initial.revision,
+            &simple_graph_document(),
+        )
+        .expect("save graph");
+        let expected_revision = saved.revision.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut preview = AnimationPreviewState::default();
+        preview.graph.compile_tx = Some(tx);
+        install_animation_graph_load(&mut preview, saved);
+        refresh_animation_plan(&engine, &mut preview);
+
+        let command = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker compile result");
+        let EngineCmd::AnimationGraphCompileReady {
+            authored_revision,
+            source_hash,
+            parameter_routes,
+            edge_provenance,
+            result,
+            ..
+        } = command
+        else {
+            panic!("unexpected engine command");
+        };
+        assert_eq!(authored_revision, expected_revision);
+        assert_eq!(source_hash, preview.plan.as_ref().unwrap().stable_hash);
+        assert!(parameter_routes.is_empty());
+        assert_eq!(edge_provenance[0].edge_id, "edge-main-output");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn graph_controller_is_not_projected_as_a_scene_object() {
+        let mut world = FlecsWorld::new();
+        let scene = CapScene::intern(&mut world);
+        let mut engine = Engine::new(world, 112);
+        engine.set_capability_resolver(Box::new(capscene::CapResolver::from_scene(&scene)));
+        let visible = engine.alloc_entity_id();
+        let mut ops = vec![Op::CreateEntity {
+            id: visible,
+            parent: None,
+        }];
+        ops.extend(transform_ops(visible, 0.0));
+        engine.commit("visible", ops).expect("visible entity");
+        let initial = metrocalk_editor_shell::load_animation_graph(
+            &engine,
+            metrocalk_editor_shell::MAIN_SEQUENCE_ID,
+        );
+        let saved = metrocalk_editor_shell::save_animation_graph(
+            &mut engine,
+            &initial.revision,
+            &simple_graph_document(),
+        )
+        .expect("save graph");
+        let controller = saved.controller_id.expect("controller identity");
+        let projected = proj_full(&engine, &scene);
+        assert!(projected.ops.iter().any(|op| matches!(
+            op,
+            ProjectionOp::Upsert { id, .. } if id == &visible.to_loro_key()
+        )));
+        assert!(!projected.ops.iter().any(|op| match op {
+            ProjectionOp::Upsert { id, .. }
+            | ProjectionOp::Remove { id }
+            | ProjectionOp::SetField { id, .. }
+            | ProjectionOp::RemoveField { id, .. } => id == &controller,
+            ProjectionOp::AddEdge { from, to, .. } | ProjectionOp::RemoveEdge { from, to, .. } => {
+                from == &controller || to == &controller
+            }
+        }));
+    }
+
+    #[test]
+    fn structured_property_subpaths_fail_closed_for_native_projection() {
+        let path = metrocalk_animation::PropertyPath::new("target", "Transform", "x")
+            .with_subpath(["component"]);
+        let binding = metrocalk_animation::Binding {
+            path,
+            value_kind: metrocalk_animation::ValueKind::Number,
+        };
+        assert!(animation_binding_has_native_sink("Transform", "x"));
+        assert!(!animation_binding_is_native_projectable(&binding));
+    }
+
+    #[test]
+    fn trigger_preview_commands_are_accepted_but_never_replayed_after_recompile() {
+        let graph = serde_json::json!({
+            "parameters": [
+                { "id": "speed", "kind": "float", "defaultValue": 1.0 },
+                { "id": "grounded", "kind": "boolean", "defaultValue": true },
+                { "id": "jump", "kind": "trigger", "defaultValue": false }
+            ]
+        });
+        let requested = BTreeMap::from([
+            ("speed".to_owned(), serde_json::json!(2.5)),
+            ("grounded".to_owned(), serde_json::json!(false)),
+            ("jump".to_owned(), serde_json::json!(true)),
+        ]);
+
+        let (accepted, rejected) = animation_graph_preview_values(&graph, requested);
+        assert!(rejected.is_empty());
+        assert_eq!(accepted.get("jump"), Some(&serde_json::json!(true)));
+
+        let replayable = replayable_animation_graph_preview_values(&graph, &accepted);
+        assert_eq!(replayable.get("speed"), Some(&serde_json::json!(2.5)));
+        assert_eq!(replayable.get("grounded"), Some(&serde_json::json!(false)));
+        assert!(!replayable.contains_key("jump"));
+    }
+
+    #[test]
+    fn native_save_gate_accepts_only_canonical_schema_v2_on_both_envelopes() {
+        assert_eq!(ANIMATION_GRAPH_SCHEMA_VERSION, 2);
+        let graph = serde_json::to_value(simple_graph_document()).expect("graph JSON");
+        let current = AnimationGraphSaveRequest {
+            request_id: "current".into(),
+            schema_version: ANIMATION_GRAPH_SCHEMA_VERSION,
+            expected_revision: "revision".into(),
+            graph: graph.clone(),
+        };
+        assert!(animation_graph_save_schema_matches(&current));
+
+        let legacy_outer = AnimationGraphSaveRequest {
+            request_id: "legacy-outer".into(),
+            schema_version: 1,
+            expected_revision: "revision".into(),
+            graph: graph.clone(),
+        };
+        assert!(!animation_graph_save_schema_matches(&legacy_outer));
+
+        let mut legacy_graph = graph;
+        legacy_graph["schemaVersion"] = serde_json::json!(1);
+        let legacy_inner = AnimationGraphSaveRequest {
+            request_id: "legacy-inner".into(),
+            schema_version: ANIMATION_GRAPH_SCHEMA_VERSION,
+            expected_revision: "revision".into(),
+            graph: legacy_graph,
+        };
+        assert!(!animation_graph_save_schema_matches(&legacy_inner));
+    }
+
+    #[test]
+    fn active_edge_debug_uses_exact_unambiguous_core_input_contributions() {
+        let traces = vec![
+            metrocalk_animation::GraphInputTrace {
+                from: metrocalk_animation::GraphNodeId::new("walk"),
+                to: metrocalk_animation::GraphNodeId::new("locomotion"),
+                contribution_weight: 0.25,
+            },
+            metrocalk_animation::GraphInputTrace {
+                from: metrocalk_animation::GraphNodeId::new("run"),
+                to: metrocalk_animation::GraphNodeId::new("locomotion"),
+                contribution_weight: 0.75,
+            },
+        ];
+        let mut provenance = vec![
+            metrocalk_editor_shell::animation_graph_intent::AnimationGraphEdgeProvenance {
+                edge_id: "edge-walk".into(),
+                from_node_id: "walk".into(),
+                to_node_id: "locomotion".into(),
+                to_port_id: "poses".into(),
+            },
+            metrocalk_editor_shell::animation_graph_intent::AnimationGraphEdgeProvenance {
+                edge_id: "edge-run".into(),
+                from_node_id: "run".into(),
+                to_node_id: "locomotion".into(),
+                to_port_id: "poses".into(),
+            },
+        ];
+
+        let (active, incomplete) = exact_animation_graph_active_edges(&traces, false, &provenance);
+        assert!(!incomplete);
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].edge_id, "edge-run");
+        assert_eq!(active[0].weight, 0.75);
+        assert_eq!(active[1].edge_id, "edge-walk");
+        assert_eq!(active[1].weight, 0.25);
+
+        provenance.push(
+            metrocalk_editor_shell::animation_graph_intent::AnimationGraphEdgeProvenance {
+                edge_id: "edge-run-parallel".into(),
+                from_node_id: "run".into(),
+                to_node_id: "locomotion".into(),
+                to_port_id: "poses".into(),
+            },
+        );
+        let (active, incomplete) = exact_animation_graph_active_edges(&traces, false, &provenance);
+        assert!(
+            incomplete,
+            "an aggregate cannot be assigned to parallel edges"
+        );
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].edge_id, "edge-walk");
+        assert_eq!(active[0].weight, 0.25);
+
+        let mut facade_provenance = provenance;
+        facade_provenance.push(
+            metrocalk_editor_shell::animation_graph_intent::AnimationGraphEdgeProvenance {
+                edge_id: "edge-output".into(),
+                from_node_id: "locomotion".into(),
+                to_node_id: "output".into(),
+                to_port_id: "pose".into(),
+            },
+        );
+        let active_nodes = ["walk", "run", "locomotion", "output"]
+            .into_iter()
+            .map(|node_id| AnimationGraphActiveNode {
+                node_id: node_id.into(),
+                weight: 1.0,
+                local_tick: 0,
+                state_id: None,
+                cost_micros: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(animation_graph_has_unrepresented_active_edges(
+            &traces,
+            &facade_provenance,
+            &active_nodes,
+        ));
+    }
+
+    #[test]
+    fn active_node_debug_preserves_direct_weights_above_one_without_clamping() {
+        let traces = vec![
+            metrocalk_animation::GraphNodeTrace {
+                node_id: metrocalk_animation::GraphNodeId::new("direct-blend"),
+                evaluated: true,
+                contribution_weight: 1.75,
+                local_tick: Some(Tick(42)),
+            },
+            metrocalk_animation::GraphNodeTrace {
+                node_id: metrocalk_animation::GraphNodeId::new("invalid"),
+                evaluated: true,
+                contribution_weight: f64::INFINITY,
+                local_tick: None,
+            },
+        ];
+
+        let (active, incomplete) =
+            exact_animation_graph_active_nodes(&traces, Tick(7), Some("locomotion"));
+        assert!(
+            incomplete,
+            "non-finite runtime facts must be omitted and flagged"
+        );
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].node_id, "direct-blend");
+        assert_eq!(active[0].weight, 1.75);
+        assert_eq!(active[0].local_tick, 42);
+        assert_eq!(active[0].state_id.as_deref(), Some("locomotion"));
+    }
+
+    #[test]
+    fn transition_safety_limit_marks_the_wire_debug_snapshot_incomplete() {
+        assert!(!animation_graph_debug_trace_is_incomplete(
+            false, false, false, false,
+        ));
+        assert!(animation_graph_debug_trace_is_incomplete(
+            false, false, false, true,
+        ));
+    }
+
+    #[test]
+    fn advertised_graph_source_readiness_matches_native_adaptation_inputs() {
+        let mut engine = Engine::new(FlecsWorld::new(), 113);
+        let target = engine.alloc_entity_id();
+        let mut ops = vec![Op::CreateEntity {
+            id: target,
+            parent: None,
+        }];
+        ops.extend(transform_ops(target, 3.0));
+        engine.commit("reference target", ops).expect("target");
+        metrocalk_editor_shell::key_animation_property(
+            &mut engine,
+            target,
+            "Transform",
+            "x",
+            Tick::ZERO,
+            metrocalk_animation::Interpolation::Linear,
+        )
+        .expect("binding-bearing main sequence");
+        let sequence = metrocalk_editor_shell::load_animation_document(&engine).sequence;
+        let plan = sequence.clone().compile().expect("main sequence plan");
+        let sequences = BTreeMap::from([(sequence.id.clone(), sequence)]);
+        let graph_document = simple_graph_document();
+        let graph_json = serde_json::to_value(&graph_document).expect("graph JSON");
+        let assets = load_assets();
+
+        let missing_plan_sources = animation_graph_sources(&assets, None, Some(&graph_json));
+        assert_eq!(
+            missing_plan_sources
+                .iter()
+                .find(|source| source.id == metrocalk_editor_shell::MAIN_SEQUENCE_ID)
+                .expect("main source")
+                .readiness,
+            "blocked"
+        );
+        assert_eq!(
+            missing_plan_sources
+                .iter()
+                .find(|source| source.id == "reference-pose")
+                .expect("reference source")
+                .readiness,
+            "blocked"
+        );
+
+        let empty_plan =
+            Sequence::new(metrocalk_editor_shell::MAIN_SEQUENCE_ID, "Empty", Tick(100))
+                .compile()
+                .expect("empty sequence still compiles");
+        let empty_sources = animation_graph_sources(&assets, Some(&empty_plan), Some(&graph_json));
+        let empty_main = empty_sources
+            .iter()
+            .find(|source| source.id == metrocalk_editor_shell::MAIN_SEQUENCE_ID)
+            .expect("empty main source");
+        assert_eq!(empty_main.readiness, "blocked");
+        assert!(empty_main.reason.contains("no enabled tracks"));
+        assert!(empty_main.action.is_some());
+
+        let mut unsupported_sequence = Sequence::new(
+            metrocalk_editor_shell::MAIN_SEQUENCE_ID,
+            "Unsupported",
+            Tick(100),
+        );
+        unsupported_sequence
+            .tracks
+            .push(metrocalk_animation::Track {
+                id: metrocalk_animation::TrackId::new("health-track"),
+                name: "Health".into(),
+                binding: metrocalk_animation::Binding {
+                    path: metrocalk_animation::PropertyPath::new(
+                        target.to_loro_key(),
+                        "Health",
+                        "value",
+                    ),
+                    value_kind: metrocalk_animation::ValueKind::Number,
+                },
+                interpolation: metrocalk_animation::Interpolation::Linear,
+                keyframes: vec![metrocalk_animation::Keyframe::new(
+                    "health-key",
+                    Tick::ZERO,
+                    AnimValue::Number(100.0),
+                )],
+                enabled: true,
+            });
+        let unsupported_plan = unsupported_sequence
+            .compile()
+            .expect("unsupported sink is still a valid animation binding");
+        let unsupported_sources =
+            animation_graph_sources(&assets, Some(&unsupported_plan), Some(&graph_json));
+        let unsupported_main = unsupported_sources
+            .iter()
+            .find(|source| source.id == metrocalk_editor_shell::MAIN_SEQUENCE_ID)
+            .expect("unsupported main source");
+        assert_eq!(unsupported_main.readiness, "blocked");
+        assert!(unsupported_main
+            .reason
+            .contains("none target a native viewport sink"));
+        assert!(unsupported_main.action.is_some());
+
+        metrocalk_editor_shell::adapt_animation_graph_document(
+            &engine,
+            &graph_document,
+            &sequences,
+        )
+        .expect("advertised ready graph adapts");
+        let ready_sources = animation_graph_sources(&assets, Some(&plan), Some(&graph_json));
+        assert_eq!(
+            ready_sources
+                .iter()
+                .find(|source| source.id == metrocalk_editor_shell::MAIN_SEQUENCE_ID)
+                .expect("main source")
+                .readiness,
+            "ready"
+        );
+        assert_eq!(
+            ready_sources
+                .iter()
+                .find(|source| source.id == "reference-pose")
+                .expect("reference source")
+                .readiness,
+            "ready"
+        );
+
+        let mut reference_only = simple_graph_document();
+        reference_only.nodes[0].id = "reference".into();
+        reference_only.nodes[0].kind =
+            metrocalk_editor_shell::AnimationGraphNodeKind::ReferencePose;
+        reference_only.nodes[0].source_id = None;
+        reference_only.edges[0].from_node_id = "reference".into();
+        let adaptation_errors = metrocalk_editor_shell::adapt_animation_graph_document(
+            &engine,
+            &reference_only,
+            &sequences,
+        )
+        .expect_err("reference-only graph has no independent binding signature");
+        assert!(adaptation_errors
+            .iter()
+            .any(|diagnostic| diagnostic.code == "empty_reference_pose"));
+        let reference_only_json =
+            serde_json::to_value(reference_only).expect("reference graph JSON");
+        let reference_only_sources =
+            animation_graph_sources(&assets, Some(&plan), Some(&reference_only_json));
+        assert_eq!(
+            reference_only_sources
+                .iter()
+                .find(|source| source.id == "reference-pose")
+                .expect("reference source")
+                .readiness,
+            "blocked"
+        );
+        assert!(reference_only_sources
+            .iter()
+            .find(|source| source.id == "reference-pose")
+            .and_then(|source| source.action.as_deref())
+            .is_some());
+    }
+
+    #[test]
+    fn transport_event_response_is_bounded_and_drains_the_pending_queue() {
+        let mut preview = AnimationPreviewState {
+            crossed_events: (0..(MAX_PENDING_ANIMATION_EVENTS + 20))
+                .map(|index| AnimationEventInfo {
+                    id: format!("event-{index}"),
+                    owner_id: "owner".into(),
+                    name: "Event".into(),
+                    tick: index as i64,
+                    seconds: index as f64,
+                    payload: None,
+                })
+                .collect(),
+            ..AnimationPreviewState::default()
+        };
+
+        let (response, truncated) = take_pending_animation_events(&mut preview);
+        assert_eq!(response.len(), MAX_PENDING_ANIMATION_EVENTS);
+        assert!(truncated);
+        assert!(preview.crossed_events.is_empty());
+    }
+
+    #[test]
+    fn failed_binding_validation_takes_precedence_over_preview_only_status() {
+        let mut engine = Engine::new(FlecsWorld::new(), 102);
+        let id = engine.alloc_entity_id();
+        engine
+            .commit(
+                "sprite fixture",
+                vec![Op::CreateEntity { id, parent: None }],
+            )
+            .expect("create fixture");
+        let binding = metrocalk_editor_shell::standard_animation_binding_registry().resolve(
+            &metrocalk_animation::PropertyPath::new(id.to_loro_key(), "Sprite", "frame"),
+        );
+
+        let presentation = animation_binding_presentation(
+            &engine,
+            id,
+            &binding,
+            false,
+            Some("The channel failed target validation."),
+        );
+        assert_eq!(presentation.state, "unsupported");
+        assert_eq!(presentation.reason, "The channel failed target validation.");
+    }
+
+    #[test]
+    fn key_update_protocol_distinguishes_omitted_clear_and_replacement_tangents() {
+        let omitted: AnimationKeyUpdateRequest = serde_json::from_value(serde_json::json!({
+            "keyId": "key-1"
+        }))
+        .expect("omitted tangent patch");
+        assert_eq!(omitted.in_tangent, AnimationValuePatch::Unchanged);
+
+        let cleared: AnimationKeyUpdateRequest = serde_json::from_value(serde_json::json!({
+            "keyId": "key-1",
+            "inTangent": null
+        }))
+        .expect("clear tangent patch");
+        assert_eq!(cleared.in_tangent, AnimationValuePatch::Clear);
+
+        let replaced: AnimationKeyUpdateRequest = serde_json::from_value(serde_json::json!({
+            "keyId": "key-1",
+            "outTangent": 2.5
+        }))
+        .expect("replace tangent patch");
+        assert_eq!(
+            replaced.out_tangent,
+            AnimationValuePatch::Set(serde_json::json!(2.5))
+        );
+    }
+
+    #[test]
+    fn only_bindings_with_native_consumers_enter_the_viewport_projection() {
+        let bindings = metrocalk_editor_shell::standard_animation_binding_registry();
+        assert_eq!(
+            bindings
+                .descriptor("Sprite", "frame")
+                .and_then(|descriptor| descriptor.runtime_sink),
+            Some(AnimationRuntimeSink::EditorTwoDProjection)
+        );
+        assert_eq!(
+            bindings
+                .descriptor("UiStyle", "opacity")
+                .and_then(|descriptor| descriptor.runtime_sink),
+            Some(AnimationRuntimeSink::EditorUiProjection)
+        );
+        assert!(animation_binding_has_native_sink("Transform", "x"));
+        assert!(animation_binding_has_native_sink("Transform", "rotation"));
+        assert!(animation_binding_has_native_sink("KinematicJoint", "value"));
+        assert!(!animation_binding_has_native_sink("Health", "value"));
+        assert!(!animation_binding_has_native_sink("Sprite", "frame"));
+        assert!(!animation_binding_has_native_sink("UiStyle", "opacity"));
+        assert!(!animation_binding_has_native_sink("Light", "intensity"));
+        assert!(!animation_binding_has_native_sink("MeshRenderer", "mesh"));
     }
 }

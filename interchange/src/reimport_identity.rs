@@ -223,8 +223,12 @@ pub fn fingerprint(tris: &TriMesh, faces: Option<&[crate::step::CadFace]>) -> Pa
     if let Some(faces) = faces {
         use crate::analytic::AnalyticSurface;
         for f in faces {
-            let slot = match &f.surface {
-                None => 0, // planar
+            // The PRE-subset-gate recognition (M15.11): a cylinder whose trim was beyond the tessellation
+            // subset is still a cylinder for identity purposes. Both sides of a re-import match are
+            // computed by this same code, so the mapping choice cannot desynchronize a match; against an
+            // older all-zero stored histogram `surface_similarity` stays neutral (1.0) by construction.
+            let slot = match &f.recognized {
+                None => 0, // planar (and NURBS — the honest coarseness, counted with planes)
                 Some(AnalyticSurface::Cylinder { .. }) => 1,
                 Some(AnalyticSurface::Cone { .. }) => 2,
                 Some(AnalyticSurface::Sphere { .. }) => 3,
@@ -258,8 +262,11 @@ fn identity_of(p: &PartReport, import: &CadImport) -> PartIdentity {
     let (fp, local_centroid, mesh_hash) = match mesh {
         Some(m) if !m.is_proxy => {
             let (_v, c, _cov) = volume_centroid_covariance(&m.tris);
-            let faces = brep_faces(p);
-            (fingerprint(&m.tris, faces.as_deref()), c, Some(m.hash))
+            // The decoded faces per unique geometry (M15.11 `CadImport::breps`) — this was the M15.10
+            // `brep_faces()` stub that left in-pipeline histograms all-zero; the surface histogram is a
+            // BONUS discriminator, never the sole key — volume/area/moments carry the match.
+            let faces = import.breps.get(&p.reference).map(Vec::as_slice);
+            (fingerprint(&m.tris, faces), c, Some(m.hash))
         }
         _ => (PartFingerprint::degenerate(), [0.0; 3], None),
     };
@@ -272,14 +279,6 @@ fn identity_of(p: &PartReport, import: &CadImport) -> PartIdentity {
         name: p.name.clone(),
         parent: p.parent,
     }
-}
-
-/// The B-rep face list of a part, if it carries exact geometry (for the surface-type histogram). `PartReport`
-/// keeps only a mesh index, so the exact faces are reachable only when the report is paired with its raw
-/// source; here we conservatively return `None` (tessellation-only fingerprint) unless a caller supplies them.
-/// The surface histogram is a BONUS discriminator, never the sole key — volume/area/moments carry the match.
-fn brep_faces(_p: &PartReport) -> Option<Vec<crate::step::CadFace>> {
-    None
 }
 
 /// Match a re-imported assembly (`after`) against the previous import (`before`) — the M15.10 core. Two layers:
@@ -511,7 +510,7 @@ fn surface_similarity(a: &[u32; 5], b: &[u32; 5]) -> f64 {
 /// of a triangle mesh. Divergence-theorem decomposition into tetrahedra from the origin (Blow & Binstock 2004
 /// covariance form) — exact for a closed mesh, a graceful approximation for an open shell (volume→~0, the
 /// covariance still describes the surface's spatial spread, which is what the fingerprint needs).
-fn volume_centroid_covariance(tris: &TriMesh) -> (f64, [f64; 3], [[f64; 3]; 3]) {
+pub(crate) fn volume_centroid_covariance(tris: &TriMesh) -> (f64, [f64; 3], [[f64; 3]; 3]) {
     // Canonical unit-tetrahedron covariance (about the origin), scaled per-tet by det(A).
     const C: [[f64; 3]; 3] = [
         [1.0 / 60.0, 1.0 / 120.0, 1.0 / 120.0],
@@ -591,7 +590,7 @@ fn surface_area(tris: &TriMesh) -> f64 {
 
 /// The three eigenvalues of a symmetric 3×3 matrix, sorted ascending — the analytic trigonometric method
 /// (Smith 1961; deterministic, no iteration). Used for the rotation-invariant principal moments.
-fn sym3_eigenvalues_sorted(m: [[f64; 3]; 3]) -> [f64; 3] {
+pub(crate) fn sym3_eigenvalues_sorted(m: [[f64; 3]; 3]) -> [f64; 3] {
     let p1 = m[0][1].powi(2) + m[0][2].powi(2) + m[1][2].powi(2);
     let mut e = if p1 <= 1e-30 {
         // Already diagonal.

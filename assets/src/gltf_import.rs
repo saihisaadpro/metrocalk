@@ -19,7 +19,9 @@ use gltf::Gltf;
 use metrocalk_skeleton::{Joint, Skeleton, Transform};
 
 use crate::mesh::{Material, MeshAsset, Primitive, Texture};
-use crate::source::{ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES};
+use crate::source::{
+    ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES, MAX_INTERNAL_ASSET_BYTES,
+};
 
 /// The glTF/glb importer. Stateless — construct with [`GltfImporter::new`] and call
 /// [`MeshSource::import`].
@@ -32,21 +34,24 @@ impl GltfImporter {
     pub fn new() -> Self {
         Self
     }
-}
 
-impl MeshSource for GltfImporter {
-    fn format(&self) -> &'static str {
-        "gltf/glb"
+    /// Reopen a self-contained GLB that was produced by MetroCalk's bounded asset compiler.
+    ///
+    /// This deliberately does not change [`MeshSource::import`]'s 64 MiB hostile-file policy. The
+    /// internal path only raises the byte ceiling far enough to persist three embedded 4K bake maps;
+    /// the parser, decoded element limits, texture validation, and allocation checks remain identical.
+    pub fn import_internal(&self, bytes: &[u8]) -> Result<MeshAsset, ImportError> {
+        Self::import_with_limit(bytes, MAX_INTERNAL_ASSET_BYTES)
     }
 
     // One linear import flow (parse → materials → primitives → skin → textures); splitting it would
     // scatter the shared `doc`/`blob`/`primitives` state. M9.3's skin parsing pushed it past 100 lines.
     #[allow(clippy::too_many_lines)]
-    fn import(&self, bytes: &[u8]) -> Result<MeshAsset, ImportError> {
-        if bytes.len() > MAX_IMPORT_BYTES {
+    fn import_with_limit(bytes: &[u8], byte_limit: usize) -> Result<MeshAsset, ImportError> {
+        if bytes.len() > byte_limit {
             return Err(ImportError::TooLarge {
                 bytes: bytes.len(),
-                limit: MAX_IMPORT_BYTES,
+                limit: byte_limit,
             });
         }
         // Parse (validates the container) — flatten the decoder's error to a string, never leak its type.
@@ -74,6 +79,15 @@ impl MeshSource for GltfImporter {
                         .metallic_roughness_texture()
                         .map(|t| t.texture().source().index()),
                     normal_texture: m.normal_texture().map(|t| t.texture().source().index()),
+                    occlusion_texture: m.occlusion_texture().map(|t| t.texture().source().index()),
+                    // Core glTF has no curvature material slot. MetroCalk's writer emits a deliberately
+                    // namespaced material extra and this importer resolves its texture index back to the
+                    // source image before the common compact-texture remap below.
+                    curvature_texture: curvature_texture_index(m.extras()).and_then(|index| {
+                        doc.textures()
+                            .nth(index)
+                            .map(|texture| texture.source().index())
+                    }),
                 }
             })
             .collect();
@@ -148,11 +162,16 @@ impl MeshSource for GltfImporter {
                     .read_weights(0)
                     .map(|w| w.into_f32().collect())
                     .unwrap_or_default();
+                let tangents: Vec<[f32; 4]> = reader
+                    .read_tangents()
+                    .map(Iterator::collect)
+                    .unwrap_or_default();
 
                 primitives.push(Primitive {
                     positions,
                     normals,
                     uvs,
+                    tangents,
                     indices,
                     material,
                     joints,
@@ -212,6 +231,31 @@ impl MeshSource for GltfImporter {
             skeleton,
         })
     }
+}
+
+impl MeshSource for GltfImporter {
+    fn format(&self) -> &'static str {
+        "gltf/glb"
+    }
+
+    fn import(&self, bytes: &[u8]) -> Result<MeshAsset, ImportError> {
+        Self::import_with_limit(bytes, MAX_IMPORT_BYTES)
+    }
+}
+
+/// Parse the single integer field emitted by our own writer without accepting a more permissive custom
+/// extension grammar. Unknown/malformed extras remain interoperable and simply do not bind curvature.
+fn curvature_texture_index(extras: &gltf::json::Extras) -> Option<usize> {
+    let text = extras.as_ref()?.get();
+    let marker = "\"metrocalkCurvatureTexture\"";
+    let tail = text.get(text.find(marker)? + marker.len()..)?;
+    let (_, value) = tail.split_once(':')?;
+    let digits = value
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
 /// Map a glTF `skin` onto our [`Skeleton`] (M9.3 / G3): collect the skin's joint nodes (their bind-pose
@@ -361,6 +405,22 @@ fn decode_textures(doc: &Gltf, blob: &[u8], materials: &mut [Material]) -> Vec<T
             &mut out,
             &mut remap,
             "normal",
+        );
+        mat.occlusion_texture = resolve_slot(
+            doc,
+            blob,
+            mat.occlusion_texture,
+            &mut out,
+            &mut remap,
+            "occlusion",
+        );
+        mat.curvature_texture = resolve_slot(
+            doc,
+            blob,
+            mat.curvature_texture,
+            &mut out,
+            &mut remap,
+            "curvature",
         );
     }
     out

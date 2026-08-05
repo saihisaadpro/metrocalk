@@ -8,13 +8,16 @@
 //! draws. An entity references an asset only by lightweight handle ([`store::AssetId`]); geometry
 //! never enters the ECS or the Loro doc (invariants 1 & 2).
 //!
-//! **No foreign decoder type crosses the public surface** (invariant 5): `gltf::` / `image::` live
-//! only in [`gltf_import`], exactly as `flecs_ecs` lives only in `/ecs` (CI grep-gated). And the whole
+//! **No foreign codec type crosses the public surface** (invariant 5): `gltf::` / `image::` live
+//! only in the glTF/image import/export wrappers, exactly as `flecs_ecs` lives only in `/ecs`
+//! (CI grep-gated). And the whole
 //! crate is `wasm32-unknown-unknown`-clean — no `/core` (Flecs), no Loro, no C FFI — so import +
 //! mesh-data prep reach the browser (ADR-006). KTX2/basis-universal GPU-texture compression is a
 //! native-only normalization step (basis-universal is C++ FFI) — documented in the asset ADR, not
 //! built here.
 
+/// Format-wrapped glTF animation ingestion into the project-owned animation kernel and manifest.
+pub mod animation_import;
 pub mod audio;
 pub mod autorig;
 pub mod demo;
@@ -23,7 +26,10 @@ pub mod env_import;
 /// stays wasm32-clean. The browser funnel converts FBX server-side (the explicit wasm seam).
 #[cfg(feature = "fbx")]
 pub mod fbx_import;
+pub mod gltf_export;
 pub mod gltf_import;
+/// Deterministic complete-scene GLB writer over the versioned neutral scene IR.
+pub mod gltf_scene_export;
 pub mod gpu;
 pub mod image_import;
 pub mod import;
@@ -37,34 +43,61 @@ pub mod obj_import;
 /// M11.5 (ADR-044) — asset identity: a provenance record + perceptual-hash near-dup detection, riding the
 /// content-addressed store. Pure-Rust; the C2PA backing + offline auto-rig are seams behind it.
 pub mod provenance;
+/// Versioned neutral scene IR: stable hierarchy, exact local matrices, reusable mesh references, skins,
+/// and typed animation channels. Kept separate from `mesh` so geometry stays reusable.
+pub mod scene;
 /// M11.5 (ADR-044) — the cryptographic provenance signing backing (Ed25519, the C2PA trust model). Behind
 /// the `signing` feature so the default crate stays minimal + wasm-tripwire-clean.
 #[cfg(feature = "signing")]
 pub mod signed;
 pub mod source;
 pub mod store;
+/// Deterministic bounded ASCII USDA complete-scene writer over [`scene::SceneAsset`].
+pub mod usd_export;
 
+pub use animation_import::{
+    AnimationAsset, AnimationImportCode, AnimationImportFact, AnimationTargetIdentity,
+};
 pub use audio::{AudioAsset, AudioFormat, AudioImporter, AudioSource, AudioStore};
 pub use autorig::{bake_standard_lbs, AutoRig, AutoRigJoint, NeuralRigImporter};
 #[cfg(feature = "fbx")]
 pub use fbx_import::FbxImporter;
+pub use gltf_export::{export_glb, GlbExportError, MAX_GLB_EXPORT_BYTES};
 pub use gltf_import::GltfImporter;
+pub use gltf_scene_export::{
+    export_scene_glb, export_scene_glb_with_limits, SceneGlbExport, SceneGlbExportError,
+    SceneGlbExportLimits, MAX_SCENE_GLB_EXPORT_BYTES,
+};
 pub use gpu::{MeshGpu, MeshVertex};
 pub use image_import::{ImageImporter, MAX_TEXELS};
 pub use import::{detect, import_any, Detected, ImportedAsset};
 #[cfg(feature = "ktx2")]
 pub use ktx2_import::{transcode_to_rgba8, KtxImporter};
 pub use lod::{GridClusterLod, LodConfig, LodGenerator, MeshLod};
-pub use mesh::{Bounds, Material, MeshAsset, Primitive, Texture};
+pub use mesh::{AssetAffine, Bounds, Material, MeshAsset, Primitive, Texture};
+pub use metrocalk_animation::{
+    AnimationAssetManifest, AnimationAssetRecord, AnimationImportState, AnimationImportStatus,
+};
 pub use obj_import::ObjImporter;
 pub use provenance::{
     hamming_distance, is_near_duplicate, perceptual_hash, AssetKind, ContentAddressTrust,
     Provenance, ProvenanceVerifier, TamperError,
 };
+pub use scene::{
+    AnimationChannel, AnimationInterpolation, AnimationSample, AnimationTarget, AnimationValue,
+    AnimationValueType, Matrix4d, SceneAnimation, SceneAsset, SceneJoint, SceneMeshRef, SceneNode,
+    SceneNodeId, SceneSkin, SceneSkinRef, SceneUpAxis, SCENE_IR_VERSION,
+};
 #[cfg(feature = "signing")]
 pub use signed::SignedProvenanceTrust;
-pub use source::{ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES};
+pub use source::{
+    ImportError, MeshSource, MAX_ELEMENTS, MAX_IMPORT_BYTES, MAX_INTERNAL_ASSET_BYTES,
+};
 pub use store::{AssetId, AssetStore};
+pub use usd_export::{
+    export_usda, export_usda_with_limits, FidelityEntry, FidelityReport, FidelityStatus,
+    UsdaExport, UsdaExportError, UsdaExportLimits, MAX_USDA_EXPORT_BYTES,
+};
 
 #[cfg(test)]
 mod tests {

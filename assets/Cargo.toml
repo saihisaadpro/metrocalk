@@ -18,7 +18,7 @@ publish = false
 # (which pulls `image` + `base64` + a transitively-rayon'd decoder path that breaks wasm) and the fs
 # entry point; we read self-contained `.glb` blobs via `Gltf::from_slice` and decode textures with
 # our own pinned `image`. `utils` = the `read_*` reader helpers; `names` = `.name()` accessors.
-gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
+gltf = { version = "1.4", default-features = false, features = ["utils", "names", "extras"] }
 # PNG + JPEG decode (standalone user-image import, M10.2) + Radiance HDR decode (M11.3 inc.2 IBL env maps),
 # pure Rust, wasm32-clean (no rayon / no C codecs — `default-features = false`; `jpeg-decoder`'s rayon is an
 # opt-in feature we do NOT enable).
@@ -34,6 +34,10 @@ bytemuck = { version = "1", features = ["derive"] }
 # JOINTS_0/WEIGHTS_0) onto a `skeleton::Skeleton` INSIDE the wrapper (gltf_import.rs), so the loaded rig
 # crosses out as OUR type, no `gltf::` leak. Pure Rust (glam + the gizmo crate's plain arrays), wasm32-clean.
 metrocalk-skeleton = { path = "../skeleton" }
+# Project-owned deterministic animation domain + self-describing manifest. Pure Rust/serde only; no
+# renderer, ECS, document, or format type crosses this boundary, so the default asset crate stays wasm-clean.
+metrocalk-animation = { path = "../animation" }
+serde = { version = "1", features = ["derive"] }
 # FBX import (M11.1, ADR-040) — the `ufbx` C library wrapped via FFI (`cc`). Robust ASCII+binary+skinning,
 # but **native-only** → OFF by default behind the `fbx` feature so the crate stays wasm32-clean (the
 # wasm-tripwire builds the default). `ufbx::` stays behind `fbx_import.rs` (grep-gated, like `gltf::`).
@@ -62,9 +66,13 @@ signing = ["dep:ed25519-dalek"]
 
 [dev-dependencies]
 # Round-trip the demo glb generators back through the importer in tests.
+serde_json = "1"
 # Bake-off comparison ONLY (M11.1 crate eval, ADR-040): the pure-Rust FBX DOM parser — experimental,
 # binary-only — measured head-to-head with `ufbx` on the SAME fixture, then NOT used in production.
 fbxcel-dom = "0.0.10"
+# Parse generated ASCII stages in host tests with the same wrapped, pure-Rust OpenUSD reader already used
+# by the workspace interchange crate. Test-only: no foreign type crosses the asset API or wasm build.
+openusd = "0.5"
 
 [lints]
 workspace = true

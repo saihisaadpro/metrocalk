@@ -1,24 +1,25 @@
-//! ContextMenu (M3.3) — right-click an entity → its registry-derived actions appear, each one **explained**:
-//! an unavailable action is greyed WITH its reason ("every 'no' explained", ADR-016), so the menu teaches
-//! why an edit is blocked rather than silently hiding it. Reads `entity_actions(id)` over the `EditorClient`,
-//! dispatches the chosen verb through the contract, then closes + posts a status line. A disabled row is
-//! inert (no dispatch, no close). Mirrors the vanilla scaffold's stable `.ctxitem` / `data-action` hooks.
+//! Registry-derived entity actions. Unavailable actions stay visible with a reason ("every no explained"),
+//! and the menu follows the WAI-ARIA keyboard pattern: one tabbable item, arrow-key navigation, Home/End,
+//! native Enter/Space activation, and Escape dismissal.
 
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { pushToast, type ToastKind } from "../store/toasts";
+import { PopoverSurface } from "../theme/Popover";
+import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type { ActionItem } from "../transport/protocol";
 
-/** Soften the engine-internal phrasings of an "every-no-explained" reason into plain user words (C11).
- *  Unknown reasons pass through unchanged (the backend already explains them as a sentence). */
+/** Soften engine-internal rejection language into concise user-facing guidance. */
 function plainReason(reason: string): string {
   if (/no unmet requirement to bind/i.test(reason)) {
     return "nothing to bind yet — this object already has what it needs";
   }
   return reason;
 }
+
+type LoadState = "loading" | "ready" | "error";
 
 export function ContextMenu({
   client,
@@ -29,105 +30,227 @@ export function ContextMenu({
   client: EditorClient;
   id: string;
   onClose: () => void;
-  /** M3.3 focus: after framing the entity, hand the framed camera distance up so App raises the banner. */
+  /** After framing the entity, hand the live camera distance up so App can raise the focus banner. */
   onFocus?: (id: string, dist: number) => void;
 }) {
   const [actions, setActions] = useState<ActionItem[]>([]);
+  const [loadState, setLoadState] = useState<LoadState>("loading");
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [insideMenu, setInsideMenu] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const previousFocus = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    previousFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => {
+      if (previousFocus.current?.isConnected) previousFocus.current.focus();
+    };
+  }, []);
 
   useEffect(() => {
     let live = true;
+    setLoadState("loading");
+    setActions([]);
     client
       .entityActions(id)
-      .then((a) => {
-        if (live) setActions(a);
+      .then((nextActions) => {
+        if (!live) return;
+        setActions(nextActions);
+        setLoadState("ready");
       })
       .catch(() => {
-        if (live) setActions([]);
+        if (!live) return;
+        setActions([]);
+        setLoadState("error");
       });
     return () => {
       live = false;
     };
   }, [id, client]);
 
-  // Feedback at the gesture (C11): a transient toast next to the action AND the footer status line.
-  function feedback(msg: string, kind: ToastKind = "info") {
-    setStatus(msg);
-    pushToast(msg, kind);
+  // `Popover` already supplies the menu role in the integrated app. Render this surface as its labelled
+  // action group there, while retaining a complete standalone menu contract for direct embedding/tests.
+  useLayoutEffect(() => {
+    setInsideMenu(Boolean(menuRef.current?.parentElement?.closest('[role="menu"]')));
+  }, []);
+
+  // A context menu owns focus while open. Start on the first action (including a disabled action, whose
+  // explanation remains discoverable), then keep exactly one menu item in the document tab order.
+  useLayoutEffect(() => {
+    if (loadState !== "ready" || actions.length === 0) return;
+    setActiveIndex(0);
+    itemRefs.current[0]?.focus();
+  }, [actions, loadState]);
+
+  function feedback(message: string, kind: ToastKind = "info") {
+    setStatus(message);
+    pushToast(message, kind);
   }
 
-  function dispatch(a: ActionItem) {
-    if (!a.available) return; // a disabled row does NOTHING — no dispatch, no close
-    switch (a.action) {
+  function dispatch(action: ActionItem) {
+    if (!action.available) return;
+    switch (action.action) {
       case "remove":
         client.removeEntity(id);
         feedback("removed " + id + " · Ctrl-Z to undo", "info");
         break;
       case "duplicate":
-        // Report the REAL outcome (audit F11): the toast used to claim success unconditionally.
         void client
           .duplicateEntity(id)
           .then((newId) => feedback(newId ? "duplicated " + id : "couldn't duplicate " + id, newId ? "success" : "error"))
-          .catch((e) => {
-            console.error("duplicate failed", e);
+          .catch((error) => {
+            console.error("duplicate failed", error);
             feedback("couldn't duplicate " + id, "error");
           });
         break;
       case "focus":
         client.focusEntity(id);
-        // Read the framed camera distance back from the live engine → App shows the banner with data-dist.
         void client
           .focusDebug()
-          .then(([dist]) => onFocus?.(id, dist))
+          .then(([distance]) => onFocus?.(id, distance))
           .catch(() => onFocus?.(id, 0));
         feedback("focused " + id, "info");
         break;
       case "inspect":
         projectionStore.getState().select(id);
-        void client.gizmoSelect(id).catch((e) => console.error("gizmoSelect failed (engine selection may be out of sync)", e)); // keep the ENGINE selection in sync (TransformPanel reads it)
+        void client.gizmoSelect(id).catch((error) => console.error("gizmoSelect failed (engine selection may be out of sync)", error));
         feedback("inspecting " + id, "info");
         break;
       case "bind":
-        projectionStore.getState().select(id); // opens the reveal
-        void client.gizmoSelect(id).catch((e) => console.error("gizmoSelect failed (engine selection may be out of sync)", e)); // keep the ENGINE selection in sync
+        projectionStore.getState().select(id);
+        void client.gizmoSelect(id).catch((error) => console.error("gizmoSelect failed (engine selection may be out of sync)", error));
         feedback("binding " + id, "info");
         break;
       case "makedynamic":
-        // Report the REAL outcome (audit F11): the engine can refuse (e.g. no derivable collider).
         void client
           .makeDynamic(id)
           .then((ok) => feedback(ok ? "made " + id + " dynamic" : "couldn't make " + id + " dynamic", ok ? "success" : "error"))
-          .catch((e) => {
-            console.error("make_dynamic failed", e);
+          .catch((error) => {
+            console.error("make_dynamic failed", error);
             feedback("couldn't make " + id + " dynamic", "error");
           });
         break;
       default:
-        return; // unknown verb → don't close
+        return;
     }
     onClose();
   }
 
+  function focusItem(index: number) {
+    if (actions.length === 0) return;
+    const wrapped = (index + actions.length) % actions.length;
+    setActiveIndex(wrapped);
+    itemRefs.current[wrapped]?.focus();
+  }
+
+  function onMenuKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+      return;
+    }
+    if (actions.length === 0) return;
+
+    let next: number | null = null;
+    if (event.key === "ArrowDown") next = activeIndex + 1;
+    else if (event.key === "ArrowUp") next = activeIndex - 1;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = actions.length - 1;
+
+    if (next !== null) {
+      event.preventDefault();
+      event.stopPropagation();
+      focusItem(next);
+    }
+  }
+
   return (
-    <div id="ctxmenu" data-testid="ctxmenu" style={{ minWidth: 180, background: "#161a26", border: "1px solid #2a3550", borderRadius: 6, padding: 4, fontSize: 13 }}>
-      {actions.map((a) => (
+    <PopoverSurface
+      ref={menuRef}
+      id="ctxmenu"
+      data-testid="ctxmenu"
+      role={insideMenu ? "group" : "menu"}
+      aria-label={`Actions for ${id}`}
+      aria-busy={loadState === "loading"}
+      onKeyDown={onMenuKeyDown}
+      style={{
+        minWidth: 220,
+        maxWidth: `min(320px, calc(100vw - ${space.xxl}px))`,
+        padding: space.xs,
+        color: color.text.secondary,
+        fontFamily: font.ui,
+        fontSize: fontSize.label,
+      }}
+    >
+      {loadState === "loading" && (
         <div
-          key={a.action}
-          className={a.available ? "ctxitem" : "ctxitem disabled"}
-          data-action={a.action}
-          data-testid="ctxitem"
-          aria-disabled={!a.available}
-          onClick={() => dispatch(a)}
-          title={a.available || !a.reason ? undefined : plainReason(a.reason)}
-          style={{
-            padding: "5px 8px",
-            borderRadius: 4,
-            cursor: a.available ? "pointer" : "default",
-            color: a.available ? "#cde" : "#667",
-          }}
+          data-testid="ctxmenu-loading"
+          role="status"
+          aria-live="polite"
+          style={{ display: "flex", alignItems: "center", gap: space.sm, padding: `${space.md}px ${space.lg}px`, color: color.text.muted }}
         >
-          {a.available || !a.reason ? a.label : a.label + " — " + plainReason(a.reason)}
+          <span className="mtk-spinner" aria-hidden="true" /> Loading actions…
         </div>
-      ))}
-    </div>
+      )}
+      {loadState === "error" && (
+        <div
+          data-testid="ctxmenu-error"
+          role="alert"
+          aria-live="assertive"
+          style={{ padding: `${space.md}px ${space.lg}px`, color: color.danger.text }}
+        >
+          Actions could not be loaded. Close the menu and try again.
+        </div>
+      )}
+      {loadState === "ready" && actions.length === 0 && (
+        <div role="status" aria-live="polite" style={{ padding: `${space.md}px ${space.lg}px`, color: color.text.muted }}>
+          No actions available.
+        </div>
+      )}
+      {actions.map((action, index) => {
+        const reason = !action.available && action.reason ? plainReason(action.reason) : null;
+        const reasonId = `ctxreason-${id}-${action.action}`;
+        return (
+          <button
+            key={action.action}
+            ref={(node) => {
+              itemRefs.current[index] = node;
+            }}
+            type="button"
+            role="menuitem"
+            className={`mtk-btn mtk-btn--ghost ctxitem${action.available ? "" : " disabled"}`}
+            data-action={action.action}
+            data-testid="ctxitem"
+            aria-disabled={!action.available}
+            aria-describedby={reason ? reasonId : undefined}
+            tabIndex={index === activeIndex ? 0 : -1}
+            onFocus={() => setActiveIndex(index)}
+            onClick={() => dispatch(action)}
+            title={reason ?? undefined}
+            style={{
+              width: "100%",
+              justifyContent: "flex-start",
+              gap: space.xs,
+              padding: `${space.sm}px ${space.md}px`,
+              borderColor: "transparent",
+              borderRadius: radius.md,
+              color: action.available ? color.text.secondary : color.text.faint,
+              cursor: action.available ? "pointer" : "default",
+              textAlign: "left",
+              whiteSpace: "normal",
+            }}
+          >
+            <span>{action.label}</span>
+            {reason && (
+              <span id={reasonId} style={{ color: color.text.muted, fontSize: fontSize.meta }}>
+                — {reason}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </PopoverSurface>
   );
 }

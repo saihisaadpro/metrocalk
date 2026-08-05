@@ -7,6 +7,7 @@
 //! page-object re-greens by selector-swap, not a spec rewrite.
 
 import { useStatus } from "../store/ui";
+import { color, font, fontSize, space } from "../theme/tokens";
 
 const PLACEHOLDER = "ready";
 
@@ -19,13 +20,20 @@ export function StatusBar() {
     <div
       id="status"
       data-testid="status"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+      title={text}
       style={{
-        padding: "4px 10px",
-        fontSize: 12,
-        fontFamily: "monospace",
-        color: idle ? "#667" : "#cde",
-        background: "#0a0a0f", // opaque chrome — the .exe root is transparent (wgpu composite), so the footer paints its own bg
-        borderTop: "1px solid #222",
+        minHeight: 24,
+        boxSizing: "border-box",
+        padding: `${space.xs}px ${space.lg}px`,
+        fontSize: fontSize.meta,
+        fontFamily: font.mono,
+        lineHeight: "16px",
+        color: idle ? color.text.muted : color.text.secondary,
+        background: color.bg.inset, // opaque chrome — the .exe root is transparent (wgpu composite), so the footer paints its own bg
+        borderTop: `1px solid ${color.border.subtle}`,
         whiteSpace: "nowrap",
         overflow: "hidden",
         textOverflow: "ellipsis",

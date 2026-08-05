@@ -1,33 +1,41 @@
-//! M12.4 (ADR-048) — the **AI Compose** panel: a natural-language sentence → a **reviewable** Composition
-//! proposal → applied through the SAME validated commit pipeline a human/plugin uses. The AI is a **guest**:
-//! it only *proposes*; the engine validates + commits (one undoable transaction) or refuses with a plain-
-//! language reason (ADR-016). Close the loop: the user reads the proposed patches BEFORE applying, every "no"
-//! is explained, and the result is one Ctrl-Z away. The shipped headless live path is the `metrocalk-mcp`
-//! server (an external MCP client like Claude); this is the in-editor seam beside it.
+/**
+ * Review-first composition builder.
+ *
+ * A plain-language request produces a proposal that the user can inspect before anything reaches the scene.
+ * Apply sends the exact reviewed composition through the normal validated, undoable commit path.
+ */
 
 import { useState } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { pushToast } from "../store/toasts";
-import type { EditorClient } from "../transport/session";
+import { Badge, Button } from "../theme/primitives";
+import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { ShortcutBadge } from "../theme/workspace";
 import type { ComposeOp, ComposeProposal, Composition } from "../transport/protocol";
+import type { EditorClient } from "../transport/session";
 
-const box: React.CSSProperties = { font: "12px ui-monospace, monospace", padding: 10 };
-const ctrl: React.CSSProperties = { font: "11px ui-monospace, monospace", padding: "1px 3px" };
-
-/** A one-line, plain-language summary of a proposed op (so the user reviews WHAT will change, not raw JSON). */
+/** A concise, reviewable summary of an operation. Raw patch JSON stays out of the primary workflow. */
 function describeOp(op: ComposeOp): string {
   switch (op.op) {
     case "setField":
-      return `set ${op.component}.${op.field} on ${op.entity}`;
+      return `Set ${op.component}.${op.field} on ${op.entity}`;
     case "authorRule":
-      return `author rule "${op.rule.name}" (When ${op.rule.event})`;
+      return `author rule "${op.rule.name}" (when ${op.rule.event})`;
     case "authorStateMachine":
-      return `author state machine "${op.machine.name}"`;
+      return `Author state machine "${op.machine.name}"`;
     default:
-      return "unknown op";
+      return "Unknown operation";
   }
 }
+
+const helperText: React.CSSProperties = {
+  margin: 0,
+  color: color.text.muted,
+  font: font.ui,
+  fontSize: fontSize.meta,
+  lineHeight: 1.45,
+};
 
 export function ComposePanel({ client }: { client: EditorClient }) {
   const selectedId = useStore(projectionStore, (s) => s.selectedId);
@@ -56,7 +64,6 @@ export function ComposePanel({ client }: { client: EditorClient }) {
     try {
       const r = await client.compose(composition);
       if (r.error || !r.ok) {
-        // The proposal was pre-validated, but the scene can change between review + apply — explain, don't crash.
         setProposal({ ok: false, composition: null, ops: 0, error: r.error ?? "the composition was rejected" });
         return;
       }
@@ -71,64 +78,164 @@ export function ComposePanel({ client }: { client: EditorClient }) {
   }
 
   return (
-    <div id="compose" data-testid="compose-panel" style={{ ...box, borderTop: "1px solid #2a2d35" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-        <b>AI Compose</b>
-        <span style={{ color: "#888", fontSize: 10 }}>{selectedName ? `acts on: ${selectedName}` : "select an entity"}</span>
+    <section
+      id="compose"
+      data-testid="compose-panel"
+      className="mtk-scroll"
+      aria-label="Scene composition controls"
+      aria-busy={busy || undefined}
+      style={{ minHeight: 0, overflowY: "auto", padding: space.md, background: color.bg.panel }}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: space.sm, marginBottom: space.md }}>
+        <span style={helperText}>Preview-first scene changes</span>
+        <Badge tone={selectedName ? "accent" : "neutral"}>{selectedName ? `Target: ${selectedName}` : "Scene-wide"}</Badge>
       </div>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!busy && sentence.trim()) void propose();
+        }}
+        style={{ display: "flex", flexDirection: "column", gap: space.sm }}
+      >
+        <div>
+          <label
+            htmlFor="composeSentence"
+            style={{ display: "block", marginBottom: space.xs, color: color.text.secondary, font: font.ui, fontSize: fontSize.meta, fontWeight: 600 }}
+          >
+            What should happen?
+          </label>
+          <textarea
+            id="composeSentence"
+            data-testid="compose-sentence"
+            className="mtk-input"
+            placeholder='Example: "When an enemy dies and kills reach 4, set it on fire"'
+            aria-describedby="compose-help compose-target"
+            style={{ boxSizing: "border-box", width: "100%", minHeight: 76, resize: "vertical", lineHeight: 1.45 }}
+            value={sentence}
+            disabled={busy}
+            onChange={(e) => setSentence(e.target.value)}
+          />
+          <div id="compose-help" style={{ ...helperText, marginTop: space.xs }}>
+            Be specific about the trigger, condition, and result. Nothing changes until you approve the preview.
+          </div>
+          <div id="compose-target" style={{ ...helperText, marginTop: space.xs, color: selectedName ? color.accent.base : color.text.muted }}>
+            {selectedName
+              ? `The current selection, “${selectedName}”, will be supplied as context.`
+              : "No entity is selected. Requests that need a target will explain what to select."}
+          </div>
+        </div>
 
-      <textarea
-        data-testid="compose-sentence"
-        placeholder='e.g. "when an enemy dies and kills reach 4, set it on fire"'
-        style={{ ...ctrl, width: "100%", height: 38, resize: "vertical", boxSizing: "border-box" }}
-        value={sentence}
-        onChange={(e) => setSentence(e.target.value)}
-      />
-      <div style={{ marginTop: 6 }}>
-        <button
-          data-testid="compose-propose"
-          style={{ ...ctrl, fontWeight: 700 }}
-          disabled={busy || sentence.trim().length === 0}
-          onClick={() => void propose()}
-        >
-          {busy ? "thinking…" : "Propose"}
-        </button>
-      </div>
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: space.sm }}>
+          <Button
+            data-testid="compose-propose"
+            type="submit"
+            variant="primary"
+            disabled={busy || sentence.trim().length === 0}
+            title={sentence.trim().length === 0 ? "Enter a scene request before preparing a proposal." : "Prepare a reviewable list of scene changes."}
+          >
+            {busy ? (
+              <>
+                <span className="mtk-spinner" aria-hidden="true" /> Preparing preview…
+              </>
+            ) : (
+              "Preview changes"
+            )}
+          </Button>
+          {!busy && !proposal && <span style={helperText}>A preview never edits the scene.</span>}
+        </div>
+      </form>
+
+      {busy && (
+        <div role="status" aria-live="polite" style={{ ...helperText, marginTop: space.md }}>
+          Preparing and validating the requested changes…
+        </div>
+      )}
 
       {proposal && !proposal.ok && (
-        <div data-testid="compose-error" style={{ color: "#f88", margin: "8px 0" }}>
-          {proposal.error}
+        <div
+          data-testid="compose-error"
+          role="alert"
+          style={{
+            marginTop: space.md,
+            padding: space.md,
+            border: `1px solid ${color.danger.border}`,
+            borderRadius: radius.lg,
+            background: color.danger.bg,
+            color: color.danger.text,
+            font: font.ui,
+            fontSize: fontSize.body,
+            lineHeight: 1.45,
+          }}
+        >
+          <div style={{ marginBottom: space.xs, fontWeight: 600 }}>A preview could not be created</div>
+          <div>{proposal.error}</div>
+          <Button type="button" variant="ghost" compact style={{ marginTop: space.sm }} onClick={() => setProposal(null)}>
+            Dismiss
+          </Button>
         </div>
       )}
 
       {proposal && proposal.ok && proposal.composition && (
-        <div
+        <section
           data-testid="compose-proposal"
-          style={{ border: "1px solid #3a5", borderRadius: 4, padding: 8, marginTop: 8, background: "#0c1a0c" }}
+          aria-labelledby="compose-proposal-title"
+          style={{
+            marginTop: space.lg,
+            overflow: "hidden",
+            border: `1px solid ${color.success.border}`,
+            borderRadius: radius.lg,
+            background: color.success.bg,
+          }}
         >
-          <div style={{ marginBottom: 4 }}>
-            Proposed <b data-testid="compose-opcount">{proposal.ops}</b> patch{proposal.ops === 1 ? "" : "es"} — review before applying:
+          <div style={{ padding: space.md, borderBottom: `1px solid ${color.success.border}` }}>
+            <div id="compose-proposal-title" style={{ color: color.text.primary, font: font.ui, fontSize: fontSize.body, fontWeight: 600 }}>
+              Review proposed changes
+            </div>
+            <div style={{ ...helperText, marginTop: space.xs, color: color.success.text }}>
+              <b data-testid="compose-opcount">{proposal.ops}</b> patch{proposal.ops === 1 ? "" : "es"} ready. The scene is still unchanged.
+            </div>
           </div>
-          <ul style={{ margin: "4px 0 8px 16px", padding: 0 }}>
+
+          <ol style={{ display: "flex", flexDirection: "column", gap: space.xs, margin: 0, padding: space.md, listStylePosition: "inside" }}>
             {proposal.composition.ops.map((op, i) => (
-              <li key={i} data-testid="compose-op">
+              <li
+                key={i}
+                data-testid="compose-op"
+                style={{
+                  padding: space.sm,
+                  border: `1px solid ${color.border.subtle}`,
+                  borderRadius: radius.md,
+                  background: color.bg.raised,
+                  color: color.text.secondary,
+                  font: font.ui,
+                  fontSize: fontSize.body,
+                  lineHeight: 1.4,
+                }}
+              >
                 {describeOp(op)}
               </li>
             ))}
-          </ul>
-          <button
-            data-testid="compose-apply"
-            style={{ ...ctrl, fontWeight: 700 }}
-            disabled={busy}
-            onClick={() => proposal.composition && void apply(proposal.composition)}
-          >
-            Apply
-          </button>{" "}
-          <button data-testid="compose-discard" style={ctrl} disabled={busy} onClick={() => setProposal(null)}>
-            Discard
-          </button>
-        </div>
+          </ol>
+
+          <div style={{ display: "flex", flexWrap: "wrap", gap: space.sm, padding: space.md, borderTop: `1px solid ${color.success.border}` }}>
+            <Button
+              data-testid="compose-apply"
+              type="button"
+              variant="primary"
+              disabled={busy}
+              onClick={() => proposal.composition && void apply(proposal.composition)}
+            >
+              Apply reviewed changes
+            </Button>
+            <Button data-testid="compose-discard" type="button" disabled={busy} onClick={() => setProposal(null)}>
+              Discard preview
+            </Button>
+          </div>
+        </section>
       )}
-    </div>
+      <div style={{ ...helperText, marginTop: space.lg, paddingTop: space.md, borderTop: `1px solid ${color.border.subtle}` }}>
+        Changes use the standard commit path and can be undone with <ShortcutBadge keys={["Ctrl", "Z"]} ariaLabel="Control plus Z" />
+      </div>
+    </section>
   );
 }

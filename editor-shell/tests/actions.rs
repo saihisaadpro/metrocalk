@@ -332,3 +332,64 @@ fn remove_and_duplicate_survive_export_then_replay() {
 fn b_replay(log: &Log, engine: &mut Engine<FlecsWorld>, scene: &CapScene) -> (usize, usize) {
     log.replay(engine, scene, &HashMap::new())
 }
+
+/// Every seeded entity carries a real, role-shaped name — not its raw Loro key.
+///
+/// The outliner falls back to the entity key when `__meta__.name` is absent, so an unnamed scene renders
+/// as a column of `1_5` / `1_d` / `1_a` that tells a user nothing about what they are looking at. This is
+/// asserted over EVERY entity rather than a sample, because one unnamed row is one row a person cannot
+/// find by name, cannot search for, and cannot identify in the inspector.
+#[test]
+fn every_seeded_entity_is_named_for_what_it_actually_is() {
+    let (engine, _scene, _index) = seeded();
+    let mut roles: HashMap<String, usize> = HashMap::new();
+    let mut entities = 0usize;
+    for id in engine.entity_ids() {
+        entities += 1;
+        let name =
+            metrocalk_editor_shell::capscene::entity_name(&engine, id).unwrap_or_else(|| {
+                panic!("entity {id:?} has no name, so the outliner shows its raw key")
+            });
+        // "Health Bar 3" → the role is everything before the trailing number.
+        let (role, number) = name
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("name {name:?} is not `<role> <number>`"));
+        assert!(
+            number.parse::<usize>().is_ok(),
+            "name {name:?} does not end in a number, so two of the same role are indistinguishable"
+        );
+        *roles.entry(role.to_owned()).or_default() += 1;
+    }
+    assert_eq!(entities, N);
+    // The vocabulary is closed: an unrecognised role means a seed path added entities this test has never
+    // seen, which is exactly when a naming gap would slip back in.
+    let known = [
+        "Health Bar",
+        "Character",
+        "Prop",
+        "Physics Body",
+        "Speaker",
+        "Marker",
+        "Empty",
+    ];
+    for role in roles.keys() {
+        assert!(known.contains(&role.as_str()), "unexpected role {role:?}");
+    }
+    // The two roles the first-run scene is built around must both be present, or the demo it exists to
+    // support is not there either.
+    assert!(roles.get("Health Bar").is_some_and(|&n| n > 0));
+    assert!(roles.get("Character").is_some_and(|&n| n > 0));
+
+    // Names are deterministic: the same seed produces the same scene, so a capture or a golden that
+    // mentions "Character 4" keeps meaning the same entity. Compared BY ENTITY ID rather than by
+    // iteration position — `entity_ids()` is not order-stable, and comparing positionally would report a
+    // naming bug that is really just two engines enumerating the same scene in different orders.
+    let (again, _s, _i) = seeded();
+    let named = |e: &Engine<FlecsWorld>| -> HashMap<EntityId, Option<String>> {
+        e.entity_ids()
+            .into_iter()
+            .map(|id| (id, metrocalk_editor_shell::capscene::entity_name(e, id)))
+            .collect()
+    };
+    assert_eq!(named(&engine), named(&again));
+}

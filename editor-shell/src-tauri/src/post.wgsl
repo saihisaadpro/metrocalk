@@ -32,15 +32,21 @@ fn vs_post(@builtin(vertex_index) vid: u32) -> VsOut {
 
 // Display-space bloom runs AFTER the ACES tonemap, where values are compressed into ~[0,1], so the
 // threshold is fairly high (only genuinely bright highlights glow) and the add is strong enough to read.
-const THRESHOLD: f32 = 0.70; // luminance above which a pixel contributes to bloom
-const INTENSITY: f32 = 1.10; // bloom add strength at composite
+const THRESHOLD: f32 = 0.78;
+const SOFT_KNEE: f32 = 0.12;
+const INTENSITY: f32 = 0.68;
 
 // Bright pass: keep only the energy ABOVE the threshold (so only bright highlights glow), preserving hue.
 @fragment
 fn fs_bright(in: VsOut) -> @location(0) vec4<f32> {
     let c = textureSample(src, samp, in.uv).rgb;
-    let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let contrib = max(luma - THRESHOLD, 0.0) / max(luma, 1e-4); // fraction of c above the threshold
+    // Max-channel detection lets saturated emissive/game highlights glow without requiring high luma.
+    // A quadratic knee avoids the hard halo boundary produced by the old threshold-only extraction.
+    let peak = max(c.r, max(c.g, c.b));
+    var soft = clamp(peak - THRESHOLD + SOFT_KNEE, 0.0, 2.0 * SOFT_KNEE);
+    soft = soft * soft / (4.0 * SOFT_KNEE + 1e-4);
+    let contribution = max(peak - THRESHOLD, soft) / max(peak, 1e-4);
+    let contrib = clamp(contribution, 0.0, 1.0);
     return vec4<f32>(c * contrib, 1.0);
 }
 

@@ -22,16 +22,24 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3.27.0"
 
 # The real authoritative core + the M2.6 bridge (apply_edit / project_full — no MockCore).
 metrocalk-core = { path = "../../core" }
 metrocalk-ecs = { path = "../../ecs" }
 metrocalk-editor-shell = { path = ".." }
+metrocalk-animation = { path = "../../animation" }
+# MOB: the deterministic match kernel, so a real match can drive the live viewport (ADR-091/092).
+metrocalk-gameplay = { path = "../../gameplay" }
 # The local asset/import substrate (M4): glTF import + content-addressed store + GPU mesh packing.
 # `fbx`+`ktx2` enable the native FFI importers (M11.1, ADR-040) — the .exe imports FBX (ufbx) and KTX2/basis
 # (basis-universal). The wasm funnel never builds this crate with them (the browser converts/transcodes
 # server-side — the explicit seam).
 metrocalk-assets = { path = "../../assets", features = ["fbx", "ktx2"] }
+# Asset Lab's native bake/unwrap/optimization commands are invoked directly by
+# the desktop command loop, so the standalone Tauri workspace must link the
+# conditioning crate as well as the editor-shell bridge library.
+metrocalk-conditioning = { path = "../../conditioning", features = ["native"] }
 # The token economy (M7): the wallet/ledger types the three paid sinks meter against.
 metrocalk-economy = { path = "../../economy" }
 # The physics subsystem (M8.2): the project-owned `Physics` trait (Rapier wrapped). Only the binary

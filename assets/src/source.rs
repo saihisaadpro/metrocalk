@@ -13,6 +13,12 @@ use crate::mesh::MeshAsset;
 /// after their own size policy.
 pub const MAX_IMPORT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Maximum size of a self-contained asset produced by MetroCalk's own bounded conditioning pipeline.
+/// External imports continue to use [`MAX_IMPORT_BYTES`]; this larger ceiling exists so three embedded
+/// 4K bake maps can be reopened without weakening the hostile-file boundary. Geometry is still guarded
+/// independently by [`MAX_ELEMENTS`] and every texture allocation is validated by the decoder.
+pub const MAX_INTERNAL_ASSET_BYTES: usize = 256 * 1024 * 1024;
+
 /// The maximum vertex / index count we accept from a single asset — a second guard, against a small
 /// file that decodes to a ruinously large mesh (e.g. a crafted accessor count). 8M of each is far past
 /// any hand-placed editor asset while still refusing a decode bomb.

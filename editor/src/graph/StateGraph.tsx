@@ -9,12 +9,19 @@ import { useMemo } from "react";
 import { Background, ReactFlow, type Edge as RfEdge, type Node as RfNode } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import type { StateMachine } from "../transport/protocol";
+import {
+  graphEdgeStyle,
+  graphNodeStyle,
+  graphTheme,
+  type GraphNodeEmphasis,
+} from "../theme/graph";
+import { EmptyPanelState } from "../theme/workspace";
 
 /** Node border: green = the live current state (M12.5 seam), blue = the initial state, grey = other. */
-function nodeBorder(state: string, machine: StateMachine, current?: string | null): string {
-  if (state === current) return "2px solid #4ade80";
-  if (state === machine.initial) return "2px solid #60a5fa";
-  return "1px solid #555";
+function nodeEmphasis(state: string, machine: StateMachine, current?: string | null): GraphNodeEmphasis {
+  if (state === current) return "live";
+  if (state === machine.initial) return "initial";
+  return "default";
 }
 
 export function StateGraph({
@@ -32,14 +39,7 @@ export function StateGraph({
       id: s,
       position: { x: (i % 4) * 200, y: Math.floor(i / 4) * 150 + (i % 2) * 36 },
       data: { label: s },
-      style: {
-        padding: 6,
-        borderRadius: 6,
-        fontSize: 12,
-        border: nodeBorder(s, machine, current),
-        background: "#1a1c22",
-        color: "#e8e8e8",
-      },
+      style: graphNodeStyle(nodeEmphasis(s, machine, current)),
     }));
     // Transitions → edges, keyed by the stable transition id (a draft transition not yet committed has no
     // id yet — fall back to a positional render key so React Flow stays happy until the save stamps one).
@@ -48,22 +48,27 @@ export function StateGraph({
       source: t.from,
       target: t.to,
       label: t.rule.event,
-      style: { stroke: "#8aa" },
+      style: graphEdgeStyle(),
     }));
     return { nodes, rfEdges };
   }, [machine, current]);
 
   if (machine.states.length === 0) {
     return (
-      <div data-testid="state-graph" style={{ padding: 12, color: "#888" }}>
-        Add a state to start the graph.
+      <div data-testid="state-graph">
+        <EmptyPanelState
+          compact
+          icon="◇"
+          title="Add a state to start the graph"
+          description="States and their event-driven transitions will appear on this shared canvas."
+        />
       </div>
     );
   }
   return (
-    <div data-testid="state-graph" style={{ height: 240, minHeight: 180 }}>
+    <div className="mtk-graph-surface" data-testid="state-graph" style={{ height: 240, minHeight: 180 }}>
       <ReactFlow nodes={nodes} edges={rfEdges} fitView proOptions={{ hideAttribution: true }}>
-        <Background color="#222" />
+        <Background color={graphTheme.grid} />
       </ReactFlow>
     </div>
   );

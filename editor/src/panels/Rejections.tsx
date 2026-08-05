@@ -1,38 +1,66 @@
 //! Rejection surface — the north-star "every 'no' explained". When the core rejects an optimistic
-//! edit (e.g. an incompatible bind), the store reverts the optimistic effect and records the reason;
-//! this panel shows it so the user always sees WHY a bind failed.
+//! edit, this panel restores the authoritative state and explains why the change could not be applied.
 
 import { projectionStore, useRejections } from "../store/projection";
+import { Button } from "../theme/primitives";
+import { color, elevation, font, fontSize, radius, space, z } from "../theme/tokens";
 
 export function Rejections() {
   const rejections = useRejections();
   if (rejections.length === 0) return null;
+
   return (
-    // Stable `#reject` id — the "every 'no' explained" surface the prompt-40 E2E reads (ADR-010).
-    <div id="reject" data-testid="reject" style={{ position: "fixed", right: 12, bottom: 12, maxWidth: 360, zIndex: 20 }}>
-      {rejections.map((r) => (
+    // Stable `#reject` id — the "every 'no' explained" surface the acceptance flow reads (ADR-010).
+    <section
+      id="reject"
+      data-testid="reject"
+      aria-label="Rejected changes"
+      style={{
+        position: "fixed",
+        right: space.lg,
+        bottom: "calc(var(--mtk-status-bar-height) + var(--mtk-bottom-bar-height) + var(--mtk-space-4))",
+        width: `min(360px, calc(100vw - ${space.xxl}px))`,
+        zIndex: z.toast,
+      }}
+    >
+      {rejections.map((rejection) => (
         <div
-          key={r.clientOpId}
+          key={rejection.clientOpId}
+          role="alert"
+          aria-live="assertive"
+          aria-atomic="true"
           style={{
-            background: "rgba(120,20,20,0.92)",
-            color: "#ffe8e8",
-            border: "1px solid #f87171",
-            borderRadius: 6,
-            padding: "8px 10px",
-            marginTop: 6,
-            font: "12px ui-monospace, monospace",
+            display: "flex",
+            alignItems: "flex-start",
+            gap: space.sm,
+            marginTop: space.sm,
+            padding: `${space.md}px ${space.sm}px ${space.md}px ${space.lg}px`,
+            color: color.danger.text,
+            background: color.danger.bg,
+            border: `1px solid ${color.danger.border}`,
+            borderRadius: radius.lg,
+            boxShadow: elevation.e2,
+            fontFamily: font.ui,
+            fontSize: fontSize.body,
           }}
         >
-          {/* generic — the surface handles bind AND field-edit rejections (the reason explains which) */}
-          <strong>rejected</strong> — {r.reason}
-          <button
-            onClick={() => projectionStore.getState().dismissRejection(r.clientOpId)}
-            style={{ marginLeft: 8, background: "transparent", color: "#ffd", border: "none", cursor: "pointer" }}
+          <span style={{ flex: 1, minWidth: 0, lineHeight: 1.45, overflowWrap: "anywhere" }}>
+            <strong>Rejected:</strong> {rejection.reason}
+          </span>
+          <Button
+            type="button"
+            variant="ghost"
+            compact
+            icon
+            onClick={() => projectionStore.getState().dismissRejection(rejection.clientOpId)}
+            aria-label={`Dismiss rejection: ${rejection.reason}`}
+            title="Dismiss rejection"
+            style={{ flex: "none", color: color.danger.text }}
           >
-            ✕
-          </button>
+            <span aria-hidden="true">×</span>
+          </Button>
         </div>
       ))}
-    </div>
+    </section>
   );
 }

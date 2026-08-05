@@ -1,4 +1,5 @@
-//! Design tokens (M14.1 / ADR-057) — the typed token layer every editor surface consumes, so components
+//! Design tokens (ADR-090 light-first Engine UI/UX Architecture Constitution; extends ADR-035) — the
+//! typed token layer every editor surface consumes, so components
 //! carry **no magic hex / magic numbers** (the ADR-035 contract, made systematic). Colours reference the
 //! CSS custom properties defined in `theme/global.css` (the single source of truth — `var(--mtk-*)`), so a
 //! palette change is one edit and there's no hex duplicated across TS + CSS. The non-colour scales
@@ -14,8 +15,10 @@ export const color = {
     raised: "var(--mtk-bg-raised)",
     inset: "var(--mtk-bg-inset)",
     input: "var(--mtk-bg-input)",
+    canvas: "var(--mtk-bg-canvas)",
     hover: "var(--mtk-bg-hover)",
     active: "var(--mtk-bg-active)",
+    scrim: "var(--mtk-bg-scrim)",
   },
   border: {
     subtle: "var(--mtk-border-subtle)",
@@ -35,6 +38,10 @@ export const color = {
     border: "var(--mtk-accent-border)",
     subtle: "var(--mtk-accent-subtle)",
     ring: "var(--mtk-ring)",
+    onSolid: "var(--mtk-on-accent)",
+  },
+  overlay: {
+    scrim: "var(--mtk-overlay-scrim)",
   },
   success: { text: "var(--mtk-success)", solid: "var(--mtk-success-solid)", border: "var(--mtk-success-border)", bg: "var(--mtk-success-bg)" },
   warn: { text: "var(--mtk-warn)", solid: "var(--mtk-warn-solid)", border: "var(--mtk-warn-border)", bg: "var(--mtk-warn-bg)" },
@@ -51,16 +58,24 @@ export const font = {
 
 /** Type scale (px). */
 export const fontSize = {
-  micro: 10,
-  meta: 11,
-  body: 12,
+  micro: 11,
+  meta: 12,
+  body: 13,
   label: 13,
-  title: 14,
-  heading: 16,
-  display: 20,
+  title: 15,
+  heading: 18,
+  display: 22,
+  hero: 28,
 } as const;
 
-/** Spacing scale (px) — a 2/4 base rhythm. */
+/** Line-height roles keep dense technical data legible without making the workbench feel loose. */
+export const lineHeight = {
+  compact: 1.2,
+  body: 1.45,
+  relaxed: 1.6,
+} as const;
+
+/** Spacing scale (px) — a 2/4 base rhythm with room for calm, high-level composition. */
 export const space = {
   none: 0,
   xxs: 2,
@@ -70,30 +85,69 @@ export const space = {
   lg: 12,
   xl: 16,
   xxl: 24,
+  xxxl: 32,
+  huge: 40,
 } as const;
 
-/** Corner radii (px). */
+/** Corner radii (px). Restrained at control scale, softer for floating and feature surfaces. */
 export const radius = {
-  sm: 3,
-  md: 4,
-  lg: 6,
-  xl: 8,
+  none: 0,
+  sm: 4,
+  md: 6,
+  lg: 8,
+  xl: 12,
+  xxl: 16,
   pill: 999,
 } as const;
 
-/** Elevation (box-shadows) for raised surfaces. */
+/** Elevation for a light workbench: broad ambient shadows plus a restrained key shadow. */
 export const elevation = {
-  e1: "0 2px 8px #0006",
-  e2: "0 6px 18px #0007",
-  e3: "0 8px 24px #0009",
-  e4: "0 4px 16px #0008",
+  e0: "none",
+  e1: "0 1px 2px rgba(21, 34, 50, 0.08), 0 2px 6px rgba(21, 34, 50, 0.05)",
+  e2: "0 4px 12px rgba(21, 34, 50, 0.10), 0 1px 3px rgba(21, 34, 50, 0.08)",
+  e3: "0 12px 32px rgba(21, 34, 50, 0.14), 0 3px 8px rgba(21, 34, 50, 0.08)",
+  e4: "0 20px 56px rgba(21, 34, 50, 0.18), 0 5px 14px rgba(21, 34, 50, 0.10)",
+  inset: "inset 0 1px 2px rgba(21, 34, 50, 0.06)",
 } as const;
 
 /** Motion presets (restrained — a serious tool, not a marketing page). */
 export const motion = {
-  fast: "120ms ease",
-  base: "180ms ease",
-  slow: "240ms ease",
+  instant: "80ms cubic-bezier(0.2, 0, 0, 1)",
+  fast: "120ms cubic-bezier(0.2, 0, 0, 1)",
+  base: "180ms cubic-bezier(0.2, 0, 0, 1)",
+  slow: "240ms cubic-bezier(0.2, 0, 0, 1)",
+  duration: {
+    instant: 80,
+    fast: 120,
+    base: 180,
+    slow: 240,
+  },
+  easing: {
+    standard: "cubic-bezier(0.2, 0, 0, 1)",
+    enter: "cubic-bezier(0, 0, 0, 1)",
+    exit: "cubic-bezier(0.3, 0, 1, 1)",
+  },
+} as const;
+
+/** Shared control geometry. Coarse-pointer overrides live in `global.css`, not individual controls. */
+export const control = {
+  height: {
+    compact: 30,
+    default: 34,
+    comfortable: 40,
+    touch: 44,
+  },
+  inlinePadding: {
+    compact: 8,
+    default: 12,
+    comfortable: 16,
+  },
+  icon: {
+    sm: 14,
+    md: 16,
+    lg: 20,
+    xl: 24,
+  },
 } as const;
 
 /**
@@ -112,9 +166,9 @@ export const motion = {
  *  - `base`    0   — normal document flow.
  *  - `chrome`  5   — in-viewport chrome pinned over the stage (viewport toolbar, empty-state).
  *  - `sticky`  10  — sticky headers within a scroll region.
- *  - `menu`    100 — anchored floating menus / dropdowns / context menus / popovers (the default for `Popover`).
  *  - `overlay` 110 — a full-screen scrim/backdrop behind a drawer or modal.
  *  - `drawer`  120 — a slide-in side drawer (sits above its own scrim).
+ *  - `menu`    130 — anchored menus/popovers, including those invoked from inside a drawer.
  *  - `badge`   140 — persistent stage badges (e.g. "● PLAYING").
  *  - `toast`   150 — transient notifications (toasts) — above menus so a toast is never hidden by a menu.
  *  - `guard`   200 — blocking modal dialogs / confirmations (the top; must sit over everything, the default
@@ -124,9 +178,9 @@ export const z = {
   base: 0,
   chrome: 5,
   sticky: 10,
-  menu: 100,
   overlay: 110,
   drawer: 120,
+  menu: 130,
   badge: 140,
   toast: 150,
   guard: 200,
@@ -135,11 +189,11 @@ export const z = {
 /** Text roles — ready-to-spread `CSSProperties` for the common copy kinds (panel title · section title ·
  *  item label · metadata · value · warning · disabled). Keeps text styling consistent without re-deriving. */
 export const text = {
-  panelTitle: { font: font.ui, fontSize: fontSize.meta, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase" as const, color: color.text.secondary },
-  sectionTitle: { font: font.ui, fontSize: fontSize.meta, fontWeight: 600, color: color.text.secondary },
-  itemLabel: { font: font.ui, fontSize: fontSize.body, color: color.text.primary },
-  metadata: { font: font.mono, fontSize: fontSize.meta, color: color.text.muted },
-  value: { font: font.mono, fontSize: fontSize.body, color: color.text.primary },
-  warning: { font: font.ui, fontSize: fontSize.body, color: color.warn.text },
+  panelTitle: { font: font.ui, fontSize: fontSize.meta, fontWeight: 650, lineHeight: lineHeight.compact, letterSpacing: 0.15, color: color.text.primary },
+  sectionTitle: { font: font.ui, fontSize: fontSize.meta, fontWeight: 650, lineHeight: lineHeight.compact, color: color.text.secondary },
+  itemLabel: { font: font.ui, fontSize: fontSize.body, lineHeight: lineHeight.body, color: color.text.primary },
+  metadata: { font: font.mono, fontSize: fontSize.meta, lineHeight: lineHeight.body, color: color.text.muted },
+  value: { font: font.mono, fontSize: fontSize.body, lineHeight: lineHeight.body, color: color.text.primary },
+  warning: { font: font.ui, fontSize: fontSize.body, lineHeight: lineHeight.body, color: color.warn.text },
   disabled: { color: color.text.faint },
 } as const;

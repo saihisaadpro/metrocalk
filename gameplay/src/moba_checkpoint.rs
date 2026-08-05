@@ -996,6 +996,7 @@ mod tests {
     const fn attack() -> BasicAttackSpec {
         BasicAttackSpec {
             range_mm: 700,
+            acquisition_range_mm: 0,
             damage: 60,
             school: DamageSchool::True,
             windup_ticks: 1,

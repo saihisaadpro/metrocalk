@@ -78,6 +78,25 @@ fn mixed_import() -> CadImport {
 }
 
 #[test]
+fn cad_z_up_basis_converts_mesh_translation_and_rotation_to_editor_y_up() {
+    let mesh = metrocalk_csg::TriMesh::new(
+        vec![[1.0, 2.0, 3.0], [2.0, 2.0, 3.0], [1.0, 3.0, 3.0]],
+        vec![[0, 1, 2]],
+    );
+    let converted = cad_z_up_to_editor_mesh(&mesh);
+    assert_eq!(converted.positions[0], [1.0, 3.0, -2.0]);
+    assert_eq!(converted.triangles, mesh.triangles);
+
+    let mut transform = IDENTITY_4X4;
+    transform[12] = 10.0;
+    transform[13] = 20.0;
+    transform[14] = 30.0;
+    let converted = cad_z_up_to_editor_transform(&transform);
+    assert_eq!(translation_of(&converted), [10.0, 30.0, -20.0]);
+    assert!(basis_is_rigid(&converted));
+}
+
+#[test]
 fn a_cad_import_lands_as_one_undoable_transaction_of_queryable_deduped_entities() {
     let (mut engine, scene) = engine();
     let mut store = AssetStore::new();
@@ -118,9 +137,9 @@ fn a_cad_import_lands_as_one_undoable_transaction_of_queryable_deduped_entities(
         "1000 mm → 1.0 m (units backstop, real placement)"
     );
     assert_eq!(
-        engine.get_field(landing.entities[2], "Transform", "y"),
-        Some(FieldValue::Number(2.0)),
-        "2000 mm → 2.0 m"
+        engine.get_field(landing.entities[2], "Transform", "z"),
+        Some(FieldValue::Number(-2.0)),
+        "CAD +Y becomes editor -Z; 2000 mm → -2.0 m"
     );
     // Geometry shares that metric frame: the mm mesh is scaled by m_per_unit (0.001), so a real mesh renders
     // at true size, not 1000× oversized (the adversarial-review units fix).
@@ -255,8 +274,79 @@ fn persisted_cad_meshes_reload_under_the_same_handle() {
 }
 
 #[test]
+fn persisted_cad_mesh_restore_reads_only_active_document_handles() {
+    let dir =
+        std::env::temp_dir().join(format!("mtk-cad-mesh-targeted-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mesh = metrocalk_csg::TriMesh::new(
+        vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+        vec![[0, 1, 2]],
+    );
+    let active = "mtkcad:0000000000000001:ff0000";
+    let unrelated = "mtkcad:0000000000000002:00ff00";
+    persist_cad_mesh(&dir, active, &mesh, Some([1.0, 0.0, 0.0])).expect("persist active");
+    persist_cad_mesh(&dir, unrelated, &mesh, Some([0.0, 1.0, 0.0])).expect("persist unrelated");
+    // If the targeted loader accidentally enumerates/decodes the whole cache, this unrelated corrupt
+    // record would be observed. Direct lookup must touch only the requested content-derived path.
+    std::fs::write(dir.join("mtkcad-deadbeef.bin"), b"not bincode").expect("write corrupt decoy");
+
+    let requested = std::collections::BTreeSet::from([active.to_string()]);
+    let loaded = load_persisted_cad_meshes_for(&dir, &requested);
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].0, active);
+    assert_eq!(loaded[0].1.bounds().max_extent(), 2.0);
+
+    let invalid = std::collections::BTreeSet::from(["mtkcad:../../outside".to_string()]);
+    assert!(load_persisted_cad_meshes_for(&dir, &invalid).is_empty());
+    assert!(persist_cad_mesh(&dir, "mtkcad:../outside", &mesh, None).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn read_cad_rejects_an_unrecognized_container_explained() {
     assert!(read_cad(b"not a cad file at all").is_err());
+}
+
+#[test]
+fn companion_matching_normalizes_export_copy_suffixes_without_hardcoding_a_file() {
+    assert_eq!(
+        normalized_cad_label("Skid Weld Line A.1_(1)"),
+        normalized_cad_label("Skid Weld Line A.1")
+    );
+    assert_eq!(
+        normalized_cad_label("Pump-Station (23)"),
+        normalized_cad_label("Pump Station")
+    );
+    assert_ne!(
+        normalized_cad_label("Pump Station East"),
+        normalized_cad_label("Pump Station West")
+    );
+}
+
+#[test]
+fn companion_discovery_is_local_bounded_and_prefers_the_matching_step_stem() {
+    let dir = std::env::temp_dir().join(format!("mtk-cad-companion-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create fixture directory");
+    let source = dir.join("Assembly.3dxml");
+    std::fs::write(&source, b"fixture").expect("source");
+    std::fs::write(dir.join("Unrelated.step"), b"fixture").expect("unrelated");
+    std::fs::write(dir.join("Assembly_(2).stp"), b"fixture").expect("matching");
+    std::fs::write(dir.join("Assembly.obj"), b"fixture").expect("wrong extension");
+
+    let candidates = step_companion_candidates(&source);
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(
+        candidates[0].file_name().and_then(|name| name.to_str()),
+        Some("Assembly_(2).stp")
+    );
+    assert!(candidates.iter().all(|path| {
+        matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("stp" | "step")
+        )
+    }));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

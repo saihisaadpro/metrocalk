@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use metrocalk_core::{Engine, EntityId};
+use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_ecs::FlecsWorld;
 
 use metrocalk_editor_shell::capscene::{self, CapScene};
@@ -122,6 +122,80 @@ fn undo_in_the_log_nets_out_on_replay() {
     assert!(
         !has_binding(&e, bar, provider),
         "an undone bind does not persist (the log replays the undo too)"
+    );
+    log.clear();
+}
+
+#[test]
+fn redo_in_the_log_restores_the_undone_action_on_replay() {
+    let log = Log::open(tmp("persist-redo"), fp());
+    log.clear();
+    let (_, _, bar, provider) = make();
+    log.append(&Record::Bind {
+        from: bar.to_loro_key(),
+        to: provider.to_loro_key(),
+    });
+    log.append(&Record::Undo);
+    log.append(&Record::Redo);
+
+    let (e, applied, skipped) = relaunch(&log);
+    assert_eq!(applied, 3, "bind + undo + redo all replay");
+    assert_eq!(skipped, 0, "a valid redo record must not be skipped");
+    assert!(
+        has_binding(&e, bar, provider),
+        "a redone bind survives close and reopen"
+    );
+    log.clear();
+}
+
+#[test]
+fn asset_lab_variant_replays_with_its_name_and_comparison_transform() {
+    let log = Log::open(tmp("persist-asset-lab"), fp());
+    log.clear();
+    log.append(&Record::AssetLabVariant {
+        asset: "mtkasset:derived-fixture".into(),
+        pos: [3.0, 2.0, -1.0],
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        scale: 1.25,
+        source_entity: Some("1_2".into()),
+        root_entity: Some("1_0".into()),
+        name: "Valve — Optimized".into(),
+    });
+
+    let (engine, applied, skipped) = relaunch(&log);
+    assert_eq!((applied, skipped), (1, 0));
+    let restored = engine.entity_ids().into_iter().find(|id| {
+        engine
+            .components_of(*id)
+            .get("MeshRenderer")
+            .and_then(|fields| fields.get(capscene::MESH_FIELD))
+            == Some(&FieldValue::Str("mtkasset:derived-fixture".into()))
+    });
+    let restored = restored.expect("derived entity replayed");
+    let components = engine.components_of(restored);
+    assert_eq!(
+        components
+            .get("__meta__")
+            .and_then(|fields| fields.get(capscene::NAME_FIELD)),
+        Some(&FieldValue::Str("Valve — Optimized".into()))
+    );
+    assert_eq!(
+        components
+            .get("Transform")
+            .and_then(|fields| fields.get("scale")),
+        Some(&FieldValue::Number(1.25))
+    );
+    assert_eq!(
+        components
+            .get(capscene::ASSET_LAB_COMPONENT)
+            .and_then(|fields| fields.get(capscene::ASSET_LAB_SOURCE_FIELD)),
+        Some(&FieldValue::Str("1_2".into()))
+    );
+    assert_eq!(
+        components
+            .get(capscene::ASSET_LAB_COMPONENT)
+            .and_then(|fields| fields.get(capscene::ASSET_LAB_ROOT_FIELD)),
+        Some(&FieldValue::Str("1_0".into()))
     );
     log.clear();
 }

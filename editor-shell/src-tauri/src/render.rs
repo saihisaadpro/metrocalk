@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec3, Vec4};
 use metrocalk_assets::{MeshGpu, MeshVertex, Texture};
 use metrocalk_editor_shell::reveal::intent_order;
 use metrocalk_gizmo::{Gizmo, TransformGizmo};
@@ -65,6 +65,99 @@ pub struct LightGpu {
 /// The identity quaternion (no rotation) — the default for `Instance::rotation`.
 pub const IDENTITY_QUAT: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
+/// Authored-space bounds shared by camera framing, focus, LOD, and thumbnail portraits. Imported CAD is
+/// intentionally not normalized (millimetre vertices commonly render with a 0.001 instance scale), so any
+/// path that guesses size from `Instance::scale` alone will either clip it or park the camera far away.
+#[derive(Clone, Copy, Debug)]
+struct LocalBounds {
+    center: Vec3,
+    half_size: Vec3,
+}
+
+impl LocalBounds {
+    const UNIT_CUBE: Self = Self {
+        center: Vec3::ZERO,
+        half_size: Vec3::ONE,
+    };
+
+    fn max_extent(self) -> f32 {
+        (self.half_size * 2.0).max_element()
+    }
+}
+
+fn local_mesh_bounds(mesh: &MeshGpu) -> Option<LocalBounds> {
+    let mut lo = Vec3::splat(f32::INFINITY);
+    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+    let mut found = false;
+    for vertex in &mesh.vertices {
+        let position = Vec3::from(vertex.position);
+        if position.is_finite() {
+            lo = lo.min(position);
+            hi = hi.max(position);
+            found = true;
+        }
+    }
+    found.then(|| LocalBounds {
+        center: (lo + hi) * 0.5,
+        half_size: ((hi - lo) * 0.5).max(Vec3::splat(0.000_5)),
+    })
+}
+
+fn instance_rotation(instance: &Instance) -> Quat {
+    let rotation = Quat::from_array(instance.rotation);
+    if rotation.is_finite() && rotation.length_squared() > 1.0e-8 {
+        rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    }
+}
+
+/// Exact world AABB for an authored local AABB under this renderer's uniform scale + quaternion transform.
+fn instance_world_bounds(instance: &Instance, local: LocalBounds) -> (Vec3, Vec3) {
+    let rotation = instance_rotation(instance);
+    let translation = Vec3::from(instance.center);
+    let mut lo = Vec3::splat(f32::INFINITY);
+    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+    for x in [-1.0, 1.0] {
+        for y in [-1.0, 1.0] {
+            for z in [-1.0, 1.0] {
+                let corner = local.center + local.half_size * Vec3::new(x, y, z);
+                let world = translation + rotation * (corner * instance.scale);
+                lo = lo.min(world);
+                hi = hi.max(world);
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// Rendered world bounds using each instance's authored mesh bounds (or the placeholder unit cube).
+/// Keeping this in one place prevents camera framing and shadow fitting from quietly disagreeing on CAD
+/// assets whose vertices are authored in millimetres and displayed through a small instance scale.
+fn scene_world_bounds(
+    instances: &[Instance],
+    mesh_slots: &[i32],
+    meshes: &[MeshGpu],
+) -> Option<(Vec3, Vec3)> {
+    if instances.is_empty() {
+        return None;
+    }
+    let mesh_bounds: Vec<Option<LocalBounds>> = meshes.iter().map(local_mesh_bounds).collect();
+    let mut lo = Vec3::splat(f32::INFINITY);
+    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+    for (index, instance) in instances.iter().enumerate() {
+        let bounds = mesh_slots
+            .get(index)
+            .and_then(|slot| usize::try_from(*slot).ok())
+            .and_then(|slot| mesh_bounds.get(slot).copied().flatten())
+            .unwrap_or(LocalBounds::UNIT_CUBE);
+        let (instance_lo, instance_hi) = instance_world_bounds(instance, bounds);
+        lo = lo.min(instance_lo);
+        hi = hi.max(instance_hi);
+    }
+    Some((lo, hi))
+}
+
 /// M11.4 (ADR-043) — the active scene camera's look-through view parameters. A render PROJECTION (never
 /// Loro/undo): when `SceneState.cam_override` is `Some`, the frame renders from this scene camera instead
 /// of the editor fly-cam. Set by `look_through_camera` from the authored `Camera` entity.
@@ -97,6 +190,14 @@ pub struct SceneState {
     /// debugger is off → the overlay pass is skipped → zero per-frame cost). Updated independently from
     /// `instances`, on its own [`Self::overlay_revision`].
     pub overlay_lines: Vec<Instance>,
+    /// Pipe Forge's transient editable route. This is render-only tool state: clicks update it, Cancel/Bake
+    /// clear it, and it never dirties Loro or undo history. The render loop turns it into bright line/cross
+    /// geometry in the existing always-visible gizmo pass.
+    pub pipe_points: Vec<[f32; 3]>,
+    /// Every stable graph edge in world space. Unlike `pipe_points`, this includes secondary branches.
+    pub pipe_edges: Vec<[[f32; 3]; 2]>,
+    /// Every stable graph handle in world space, including branch-only nodes.
+    pub pipe_handles: Vec<[f32; 3]>,
     /// Bump when `overlay_lines` changes so the loop re-uploads them (decoupled from `revision`).
     pub overlay_revision: u64,
     /// M11.3 (ADR-042) — the scene's lights, built each rebuild from the authored `Light` entities (a
@@ -118,6 +219,12 @@ pub struct SceneState {
     /// Bump when `meshes` changes so the loop re-uploads the per-asset vertex/index buffers (rare —
     /// the asset set is loaded once at startup).
     pub meshes_revision: u64,
+    /// Slot indices the MOB match projection draws with, resolved once from the real imported catalog.
+    /// Published here because the asset runtime lives on the engine thread while the match projection is
+    /// render-side; -1 means the catalog had no such asset and the match draws nothing rather than a stand-in.
+    pub moba_hero_slot: i32,
+    pub moba_minion_slot: i32,
+    pub moba_structure_slot: i32,
     /// Currently-selected instance index (drives the highlight).
     pub selected: Option<usize>,
     /// Bump when `instances` changes so the loop re-uploads the buffer.
@@ -140,6 +247,10 @@ pub struct SceneState {
     /// `display_encode`). Render-only state (a projection, never Loro/undo — like the camera pose), set by
     /// `set_exposure` (0-IPC). 0 is treated as "uninitialised" → defaults to 1.0.
     pub exposure: f32,
+    /// Viewport presentation profile: `0` = cinematic/game, `1` = CAD inspection. This is render-only
+    /// state, like exposure and camera pose. The HDR/PBR core stays shared; tone mapping, selection
+    /// treatment and technical edge emphasis are the intentional presentation differences.
+    pub render_profile: f32,
     /// M11.4 — look-through: when `Some`, the frame renders from this scene camera (the editor fly-cam is
     /// bypassed). Render-only (a projection, never Loro — ADR-021); set by `look_through_camera`.
     pub cam_override: Option<CamView>,
@@ -206,28 +317,12 @@ impl SceneState {
         if self.instances.is_empty() {
             return;
         }
-        let mut lo = [f32::INFINITY; 3];
-        let mut hi = [f32::NEG_INFINITY; 3];
-        for inst in &self.instances {
-            // The per-instance radius floor is CM-SCALE (0.05), not the old 0.5: a centimetre-scale CAD
-            // part (a mm-unit import at scale 0.001) was being inflated to a half-metre sphere, so
-            // frame-all parked the camera metres away and the part rendered sub-pixel — "first-class CAD"
-            // failed for small parts (the M15.9 screenshot assessment caught it).
-            let r = inst.scale.max(0.05);
-            for k in 0..3 {
-                lo[k] = lo[k].min(inst.center[k] - r);
-                hi[k] = hi[k].max(inst.center[k] + r);
-            }
-        }
-        self.cam_target = [
-            (lo[0] + hi[0]) * 0.5,
-            (lo[1] + hi[1]) * 0.5,
-            (lo[2] + hi[2]) * 0.5,
-        ];
-        let radius = (0..3)
-            .map(|k| (hi[k] - lo[k]) * 0.5)
-            .fold(0.0_f32, f32::max)
-            .max(0.02);
+        let Some((lo, hi)) = scene_world_bounds(&self.instances, &self.mesh_slots, &self.meshes)
+        else {
+            return;
+        };
+        self.cam_target = ((lo + hi) * 0.5).to_array();
+        let radius = ((hi - lo) * 0.5).max_element().max(0.02);
         // Distance floor 0.3 (3× the 0.1 near plane), not the old metre-scale 3.0: the computed fit
         // (radius × 2.4) already frames a unit prop at ~2.4; the metre floor pushed small CAD out of
         // view. Multi-object scenes have a larger radius, so the floor only affects tiny scenes.
@@ -283,8 +378,17 @@ impl SceneState {
         }
         self.selected = Some(i);
         self.instances[i].selected = 1.0;
-        // Center: look straight at the entity.
-        self.cam_target = self.instances[i].center;
+        // Center and size come from the real authored geometry. This is essential for offset meshes and for
+        // CAD whose vertices are in millimetres while its instance scale is 0.001.
+        let local_bounds = self
+            .mesh_slots
+            .get(i)
+            .and_then(|slot| usize::try_from(*slot).ok())
+            .and_then(|slot| self.meshes.get(slot))
+            .and_then(local_mesh_bounds)
+            .unwrap_or(LocalBounds::UNIT_CUBE);
+        let (world_lo, world_hi) = instance_world_bounds(&self.instances[i], local_bounds);
+        self.cam_target = ((world_lo + world_hi) * 0.5).to_array();
         // Get nearby: save the framing once, then zoom to ~4× the entity's half-extent, clamped to the
         // orbit range so a huge or tiny entity still lands at a sensible, in-bounds distance.
         if self.pre_focus_distance.is_none() {
@@ -297,8 +401,8 @@ impl SceneState {
         // CM-SCALE floors (not the old 0.5 m / 6 m): focusing a centimetre-scale CAD part must get the
         // camera NEAR it (the old 6 m floor parked a 2 cm part sub-pixel — the same M15.9 defect family
         // as frame-all's metre floors).
-        let half_extent = self.instances[i].scale.max(0.02);
-        self.distance = (half_extent * 4.0).clamp(0.15, 40.0);
+        let half_extent = ((world_hi - world_lo) * 0.5).max_element().max(0.02);
+        self.distance = (half_extent * 4.0).clamp(0.15, 400.0);
         self.focused = Some(i);
         self.revision = self.revision.wrapping_add(1);
     }
@@ -328,6 +432,7 @@ struct GpuMesh {
     ibuf: wgpu::Buffer,
     /// Whole-mesh index count — the depth-only shadow pass draws the full mesh in one call (no textures).
     n_idx: u32,
+    local_bounds: LocalBounds,
     submeshes: Vec<GpuSubMesh>,
 }
 
@@ -339,6 +444,7 @@ struct GpuSubMesh {
     base_view: wgpu::TextureView,
     mr_view: wgpu::TextureView,
     normal_view: wgpu::TextureView,
+    ao_view: wgpu::TextureView,
 }
 
 /// A growable storage buffer of [`Instance`]s + its bind group — the per-asset instance list for one
@@ -392,14 +498,132 @@ fn new_instance_storage(device: &wgpu::Device, cap: u64) -> wgpu::Buffer {
 // WebGPU 4-group cap. An untextured mesh binds a 1×1 white dummy → `fs_mesh` always samples (white × the
 // baked factor = the factor), so it looks exactly as before.
 
-/// Upload an RGBA8 texture → a sampled view. `srgb` picks `Rgba8UnormSrgb` (base-color — linearized on
-/// sample, the BRDF works in linear space) vs `Rgba8Unorm` for **data** textures (metallic-roughness +
-/// normal maps MUST stay linear — sampling a normal map as sRGB would corrupt the decoded vectors).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextureSemantic {
+    Color,
+    Data,
+    Normal,
+}
+
+fn srgb_to_linear(byte: u8) -> f32 {
+    let value = f32::from(byte) / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(value: f32) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let encoded = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// Deterministically derive a complete mip chain. Base colour is averaged in linear light, packed
+/// material data is averaged channel-wise, and tangent-space normals are decoded/averaged/renormalized.
+/// This avoids the distant shimmer and dark halos caused by treating every PBR texture as raw colour.
+fn texture_mips(tex: &Texture, semantic: TextureSemantic) -> Vec<(u32, u32, Vec<u8>)> {
+    let mut width = tex.width.max(1);
+    let mut height = tex.height.max(1);
+    let expected = width as usize * height as usize * 4;
+    let mut pixels = if tex.rgba8.len() == expected {
+        tex.rgba8.clone()
+    } else {
+        vec![255; expected]
+    };
+    let mut levels = vec![(width, height, pixels.clone())];
+    while width > 1 || height > 1 {
+        let next_width = width.div_ceil(2);
+        let next_height = height.div_ceil(2);
+        let mut next = vec![0u8; next_width as usize * next_height as usize * 4];
+        for y in 0..next_height {
+            for x in 0..next_width {
+                let mut samples = [[0u8; 4]; 4];
+                let mut sample_count = 0usize;
+                for oy in 0..2 {
+                    for ox in 0..2 {
+                        let sx = x * 2 + ox;
+                        let sy = y * 2 + oy;
+                        if sx < width && sy < height {
+                            let source = (sy as usize * width as usize + sx as usize) * 4;
+                            samples[sample_count].copy_from_slice(&pixels[source..source + 4]);
+                            sample_count += 1;
+                        }
+                    }
+                }
+                let target = (y as usize * next_width as usize + x as usize) * 4;
+                let inv = 1.0 / sample_count as f32;
+                match semantic {
+                    TextureSemantic::Color => {
+                        for channel in 0..3 {
+                            let linear = samples[..sample_count]
+                                .iter()
+                                .map(|sample| srgb_to_linear(sample[channel]))
+                                .sum::<f32>()
+                                * inv;
+                            next[target + channel] = linear_to_srgb(linear);
+                        }
+                    }
+                    TextureSemantic::Data => {
+                        for channel in 0..3 {
+                            next[target + channel] = (samples[..sample_count]
+                                .iter()
+                                .map(|sample| f32::from(sample[channel]))
+                                .sum::<f32>()
+                                * inv)
+                                .round() as u8;
+                        }
+                    }
+                    TextureSemantic::Normal => {
+                        let mut normal = [0.0_f32; 3];
+                        for sample in &samples[..sample_count] {
+                            for channel in 0..3 {
+                                normal[channel] +=
+                                    (f32::from(sample[channel]) / 255.0 * 2.0 - 1.0) * inv;
+                            }
+                        }
+                        let length = normal.iter().map(|value| value * value).sum::<f32>().sqrt();
+                        let normal = if length > 1.0e-6 {
+                            normal.map(|value| value / length)
+                        } else {
+                            [0.0, 0.0, 1.0]
+                        };
+                        for channel in 0..3 {
+                            next[target + channel] = ((normal[channel] * 0.5 + 0.5) * 255.0)
+                                .round()
+                                .clamp(0.0, 255.0)
+                                as u8;
+                        }
+                    }
+                }
+                next[target + 3] = (samples[..sample_count]
+                    .iter()
+                    .map(|sample| f32::from(sample[3]))
+                    .sum::<f32>()
+                    * inv)
+                    .round() as u8;
+            }
+        }
+        width = next_width;
+        height = next_height;
+        pixels = next;
+        levels.push((width, height, pixels.clone()));
+    }
+    levels
+}
+
+/// Upload an RGBA8 texture → a sampled view with a full semantic-aware mip chain. Base colour uses an
+/// sRGB format (linearized on sample); metallic-roughness and normal maps stay linear.
 fn upload_tex(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     tex: &Texture,
-    srgb: bool,
+    semantic: TextureSemantic,
 ) -> wgpu::TextureView {
     let (w, h) = (tex.width.max(1), tex.height.max(1));
     let size = wgpu::Extent3d {
@@ -407,36 +631,43 @@ fn upload_tex(
         height: h,
         depth_or_array_layers: 1,
     };
-    let format = if srgb {
+    let format = if semantic == TextureSemantic::Color {
         wgpu::TextureFormat::Rgba8UnormSrgb
     } else {
         wgpu::TextureFormat::Rgba8Unorm
     };
+    let mips = texture_mips(tex, semantic);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("mesh-tex"),
         size,
-        mip_level_count: 1,
+        mip_level_count: mips.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &tex.rgba8,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(w * 4),
-            rows_per_image: Some(h),
-        },
-        size,
-    );
+    for (level, (mip_width, mip_height, rgba8)) in mips.iter().enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba8,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(mip_width * 4),
+                rows_per_image: Some(*mip_height),
+            },
+            wgpu::Extent3d {
+                width: *mip_width,
+                height: *mip_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
@@ -451,7 +682,11 @@ fn white_dummy(device: &wgpu::Device, queue: &wgpu::Queue, srgb: bool) -> wgpu::
             height: 1,
             rgba8: vec![255, 255, 255, 255],
         },
-        srgb,
+        if srgb {
+            TextureSemantic::Color
+        } else {
+            TextureSemantic::Data
+        },
     )
 }
 
@@ -466,7 +701,7 @@ fn flat_normal_dummy(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Textur
             height: 1,
             rgba8: vec![128, 128, 255, 255],
         },
-        false,
+        TextureSemantic::Normal,
     )
 }
 
@@ -480,6 +715,7 @@ fn make_mesh_main_bg(
     base: &wgpu::TextureView,
     mr: &wgpu::TextureView,
     normal: &wgpu::TextureView,
+    ao: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -505,6 +741,10 @@ fn make_mesh_main_bg(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::TextureView(normal),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(ao),
             },
         ],
     })
@@ -576,7 +816,7 @@ const CUBE_INDICES: [u16; 36] = [
     0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6, 0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4, 2, 6,
     7, 2, 7, 3,
 ];
-const GRID_VERTS: u32 = (2 * (40 + 1) * 2) as u32;
+const GRID_VERTS: u32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -599,10 +839,13 @@ struct Camera {
     /// light, or `-1.0` when nothing casts. `fs_mesh` applies the single shadow map to ONLY that light, so
     /// other directional lights (which have no map) stay unshadowed. `[1..4]` unused (pad to a vec4).
     shadow: [f32; 4],
+    /// Adaptive grid metadata: target X/Z in `.xy`, camera distance in `.z`. This keeps line density stable
+    /// in world space while sizing the grid plane to the current view.
+    grid: [f32; 4],
 }
-// The WGSL `Camera` (3×mat4 + 2×vec4) is 224 bytes; keep this struct byte-identical or wgpu rejects the
+// The WGSL `Camera` (3×mat4 + 3×vec4) is 240 bytes; keep this struct byte-identical or wgpu rejects the
 // uniform at draw. A compile-time tripwire so a future field can't silently desync the layout.
-const _: () = assert!(std::mem::size_of::<Camera>() == 224);
+const _: () = assert!(std::mem::size_of::<Camera>() == 240);
 
 /// M11.3 inc.3 — shadow-map quality profile, chosen once at startup from `MTK_SHADOW_QUALITY`
 /// (`off`|`low`|`medium`|`high`, default medium). Drives the shadow-map resolution; `Low` is the
@@ -642,6 +885,14 @@ impl ShadowQuality {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+        }
+    }
+    fn shader_level(self) -> f32 {
+        match self {
+            Self::Off => 0.0,
+            Self::Low => 1.0,
+            Self::Medium => 2.0,
+            Self::High => 3.0,
         }
     }
 }
@@ -1014,6 +1265,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         metallic: 0.0,
         roughness: 0.95,
         uv: [0.0, 0.0], // untextured (binds the white dummy)
+        tangent: [0.0, 0.0, 0.0, 1.0],
     };
     let ground_verts = [
         ground_vert(-1.0, -1.0),
@@ -1080,6 +1332,16 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     });
     let albedo_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1089,7 +1351,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         address_mode_w: wgpu::AddressMode::Repeat,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
         ..Default::default()
     });
     let dummy_view = white_dummy(&device, &queue, true); // base-color (sRGB)
@@ -1119,6 +1381,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         &dummy_view,
         &dummy_mr_view,
         &dummy_normal_view,
+        &dummy_mr_view,
         &albedo_sampler,
     );
 
@@ -1192,17 +1455,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         bind_group_layouts: &[Some(&cam_bgl)],
         immediate_size: 0,
     });
-    let grid_pipeline = make_pipeline(
+    let mut grid_depth_state = depth_state.clone();
+    grid_depth_state.depth_write_enabled = Some(false);
+    let grid_pipeline = make_grid_pipeline(
         &device,
         &shader,
         &grid_layout,
         format,
-        &depth_state,
-        "vs_grid",
-        wgpu::PrimitiveTopology::LineList,
-        None,
+        &grid_depth_state,
         samples,
-        "grid",
     );
     // Tracking lines: same layout as the cubes (cam + a storage buffer of points), LineList topology,
     // reading `vs_line`. A separate buffer holds the line endpoints (filled from the bindings). They
@@ -1293,6 +1554,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 format: wgpu::VertexFormat::Float32x2,
                 offset: 44,
                 shader_location: 5,
+            },
+            // Production normal maps use the same explicit MikkTSpace basis that the baker/exporter use.
+            // A zero tangent on a legacy asset selects the derivative fallback in the fragment shader.
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 52,
+                shader_location: 6,
             },
         ],
     };
@@ -1418,6 +1686,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let mut gpu_lods: Vec<Vec<GpuMesh>> = Vec::new();
     let mut lod_main_bg: Vec<Vec<Vec<wgpu::BindGroup>>> = Vec::new();
     let mut mesh_centroid: Vec<[f32; 3]> = Vec::new();
+    // Raw authored extent per mesh + displayed extent per instance group. Distance-only thresholds assume
+    // every asset is normalized to one metre and prematurely collapse long procedural runs; using world
+    // extent keeps LOD selection tied to projected visual size for both imports and authored geometry.
+    let mut mesh_extent: Vec<f32> = Vec::new();
+    let mut mesh_world_extent: Vec<f32> = Vec::new();
     let lod_on = !matches!(std::env::var("MTK_LOD").ok().as_deref(), Some("off" | "0"));
     let mut cur_mesh_rev = u64::MAX;
     let mut cube_scratch: Vec<Instance> = Vec::new();
@@ -1464,7 +1737,17 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
 
         // read shared state; re-upload instances on revision change (picking is NOT serviced here —
         // it's done synchronously in the viewport_pick command, decoupled from the frame cadence)
-        let (cam, cam_eye, focus_active, gizmo_verts, light_vp, caster_idx, exposure) = {
+        let (
+            cam,
+            cam_eye,
+            focus_active,
+            gizmo_verts,
+            light_vp,
+            caster_idx,
+            exposure,
+            render_profile,
+            grid_meta,
+        ) = {
             let mut st = shared.lock().unwrap();
             if st.distance == 0.0 {
                 st.distance = 60.0;
@@ -1568,12 +1851,14 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 cur_mesh_rev = st.meshes_revision;
                 gpu_meshes.clear();
                 gpu_lods.clear();
+                mesh_extent.clear();
                 // Upload one `MeshGpu` (the full mesh OR a LOD) → a `GpuMesh` with per-submesh texture views.
                 // M11.2: base-color is sRGB; metallic-roughness + normal are LINEAR.
                 let upload_mesh = |m: &MeshGpu| -> Option<GpuMesh> {
                     if m.vertices.is_empty() || m.indices.is_empty() {
                         return None;
                     }
+                    let local_bounds = local_mesh_bounds(m)?;
                     let vbuf = create_init_buffer(
                         &device,
                         "mesh-v",
@@ -1594,15 +1879,19 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                             index_count: sm.index_count,
                             base_view: sm.base_color_texture.as_ref().map_or_else(
                                 || dummy_view.clone(),
-                                |t| upload_tex(&device, &queue, t, true),
+                                |t| upload_tex(&device, &queue, t, TextureSemantic::Color),
                             ),
                             mr_view: sm.metallic_roughness_texture.as_ref().map_or_else(
                                 || dummy_mr_view.clone(),
-                                |t| upload_tex(&device, &queue, t, false),
+                                |t| upload_tex(&device, &queue, t, TextureSemantic::Data),
                             ),
                             normal_view: sm.normal_texture.as_ref().map_or_else(
                                 || dummy_normal_view.clone(),
-                                |t| upload_tex(&device, &queue, t, false),
+                                |t| upload_tex(&device, &queue, t, TextureSemantic::Normal),
+                            ),
+                            ao_view: sm.occlusion_texture.as_ref().map_or_else(
+                                || dummy_mr_view.clone(),
+                                |t| upload_tex(&device, &queue, t, TextureSemantic::Data),
                             ),
                         })
                         .collect();
@@ -1610,10 +1899,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         vbuf,
                         ibuf,
                         n_idx: m.indices.len() as u32,
+                        local_bounds,
                         submeshes,
                     })
                 };
                 for m in &st.meshes {
+                    mesh_extent.push(local_mesh_bounds(m).map_or(0.001, LocalBounds::max_extent));
                     // M11.1 — also build coarser LODs for distance selection (skipped when `MTK_LOD=off`).
                     let lods: Vec<GpuMesh> = if lod_on {
                         m.lods(2).iter().filter_map(&upload_mesh).collect()
@@ -1667,6 +1958,16 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         [s[0] / n, s[1] / n, s[2] / n]
                     });
                 }
+                mesh_world_extent.clear();
+                for (slot, group) in mesh_scratch.iter().enumerate() {
+                    let largest_instance = group
+                        .iter()
+                        .map(|instance| instance.scale.abs())
+                        .fold(0.0_f32, f32::max);
+                    mesh_world_extent.push(
+                        mesh_extent.get(slot).copied().unwrap_or(1.0) * largest_instance.max(0.001),
+                    );
+                }
                 // M11.2 follow-up — rebuild each mesh's main-pass group-1 bind groups, **one per submesh**
                 // (an instance upload may have grown → a new buffer), pairing the current instance buffer with
                 // that submesh's own textures. Few meshes/submeshes, only on scene-edit revisions (never per
@@ -1684,6 +1985,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                                     &sm.base_view,
                                     &sm.mr_view,
                                     &sm.normal_view,
+                                    &sm.ao_view,
                                     &albedo_sampler,
                                 )
                             })
@@ -1707,6 +2009,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                                         &sm.base_view,
                                         &sm.mr_view,
                                         &sm.normal_view,
+                                        &sm.ao_view,
                                         &albedo_sampler,
                                     )
                                 })
@@ -1763,7 +2066,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     .and_then(|i| st.lights.get(i))
                     .map(|l| [l.dir_range[0], l.dir_range[1], l.dir_range[2]]);
                 (
-                    shadow_view_proj(shadow_dir, &st.instances),
+                    shadow_view_proj(
+                        shadow_dir,
+                        &st.instances,
+                        &st.mesh_slots,
+                        &st.meshes,
+                        st.cam_target.into(),
+                        st.distance,
+                        shadow_quality.shadow_size(),
+                    ),
                     st.shadow_caster.map_or(-1.0, |i| i as f32),
                 )
             };
@@ -1809,6 +2120,16 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     gizmo_verts.push(mark(1.0));
                 }
             }
+            // Pipe Forge live route: connected amber segments plus a cyan 3-axis cross at each authored
+            // point. It shares the tiny gizmo line buffer (no mesh re-upload, no JS per frame) and is always
+            // depth-visible, matching the direct-manipulation preview contract.
+            if !st.pipe_handles.is_empty() {
+                gizmo_verts.extend(pipe_graph_preview_vertices(
+                    &st.pipe_edges,
+                    &st.pipe_handles,
+                    0.09,
+                ));
+            }
             // Focus dim flag (read under the same lock as the camera, so it can't lag the frame).
             (
                 cam,
@@ -1818,6 +2139,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 light_vp,
                 caster_idx,
                 st.exposure,
+                st.render_profile,
+                [st.cam_target[0], st.cam_target[2], st.distance, 0.0],
             )
         };
         queue.write_buffer(
@@ -1828,7 +2151,14 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 inv_view_proj: cam.inverse().to_cols_array_2d(),
                 light_view_proj: light_vp.to_cols_array_2d(),
                 focus: [focus_active, cam_eye[0], cam_eye[1], cam_eye[2]],
-                shadow: [caster_idx, exposure, 0.0, 0.0], // .y = M11.4 post exposure (display_encode)
+                // .y = exposure; .z = cinematic(0)/CAD(1); .w = shadow quality level.
+                shadow: [
+                    caster_idx,
+                    exposure,
+                    render_profile,
+                    shadow_quality.shader_level(),
+                ],
+                grid: grid_meta,
             }),
         );
         // M9.1: upload the gizmo handle geometry (tiny — regenerated each frame at the selection).
@@ -2030,7 +2360,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 // M11.1 — pick the LOD by the camera distance to this asset's instance centroid; level 0 =
                 // the full mesh, higher = coarser. Falls back to the full mesh if the LOD/bg isn't present.
                 let n_lods = gpu_lods.get(slot).map_or(0, |l| l.len());
-                let level = lod_level(cam_eye, mesh_centroid.get(slot).copied(), n_lods);
+                let level = lod_level(
+                    cam_eye,
+                    mesh_centroid.get(slot).copied(),
+                    n_lods,
+                    mesh_world_extent.get(slot).copied().unwrap_or(1.0),
+                );
                 let (geo, geo_bgs) = if level == 0 {
                     (mesh, bgs)
                 } else {
@@ -2212,7 +2547,15 @@ pub fn camera_matrix(orbit: f32, elevation: f32, distance: f32, aspect: f32, tar
 /// fixed-resolution shadow map lands its detail on the actual objects (not the whole ±40 grid). `None`
 /// shadow_dir ⇒ identity: `fs_mesh`'s reprojection then falls outside the unit cube, reading as fully lit
 /// (the depth pass is also skipped). wgpu NDC z ∈ [0,1] (`orthographic_rh`, matching `perspective_rh`).
-fn shadow_view_proj(shadow_dir: Option<[f32; 3]>, instances: &[Instance]) -> Mat4 {
+fn shadow_view_proj(
+    shadow_dir: Option<[f32; 3]>,
+    instances: &[Instance],
+    mesh_slots: &[i32],
+    meshes: &[MeshGpu],
+    camera_target: Vec3,
+    camera_distance: f32,
+    shadow_size: u32,
+) -> Mat4 {
     let Some(dir) = shadow_dir else {
         return Mat4::IDENTITY;
     };
@@ -2220,32 +2563,43 @@ fn shadow_view_proj(shadow_dir: Option<[f32; 3]>, instances: &[Instance]) -> Mat
     if dir.length_squared() < 1e-6 {
         return Mat4::IDENTITY;
     }
-    // Bound the instances (centre + radius); cap the radius so a sprawling scene doesn't make shadows too
-    // coarse, and floor it so a single object still gets a sane frustum. Empty scene ⇒ a small origin box.
-    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-    for inst in instances {
-        let r = inst.scale.max(0.5);
-        for k in 0..3 {
-            lo[k] = lo[k].min(inst.center[k] - r);
-            hi[k] = hi[k].max(inst.center[k] + r);
-        }
-    }
-    let (center, radius) = if lo[0].is_finite() {
-        let lo_y = lo[1].min(-0.1); // pull the box down to the ground plane (y≈0) so it receives shadows
-        let c = Vec3::new(
-            (lo[0] + hi[0]) * 0.5,
-            (lo_y + hi[1]) * 0.5,
-            (lo[2] + hi[2]) * 0.5,
-        );
-        let ext = Vec3::new(hi[0] - lo[0], hi[1] - lo_y, hi[2] - lo[2]) * 0.5;
-        (c, ext.length().clamp(2.0, 30.0))
+    // Use authored mesh extents, not just instance scale. The latter made a 1,000 mm CAD body displayed at
+    // scale 0.001 look like a millimetre-wide caster to the shadow camera. Fit one camera-centred cascade:
+    // frame-all covers the assembly, while focus mode spends the same texels on the inspected part.
+    let Some((mut lo, hi)) = scene_world_bounds(instances, mesh_slots, meshes) else {
+        return Mat4::IDENTITY;
+    };
+    lo.y = lo.y.min(0.0); // include the ground receiver without imposing a metre-scale minimum.
+    let scene_center = (lo + hi) * 0.5;
+    let scene_radius = ((hi - lo) * 0.5).length().max(0.02);
+    let radius = (camera_distance * 0.9)
+        .clamp((scene_radius * 0.02).max(0.02), scene_radius)
+        .max(0.02);
+    let mut center = if camera_target.distance(scene_center) + radius < scene_radius * 1.15 {
+        camera_target
     } else {
-        (Vec3::ZERO, 8.0)
+        scene_center
     };
     let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
-    let eye = center - dir * (radius * 2.0);
+    // Snap the light-space centre to a shadow texel. Without this, sub-texel camera motion makes the whole
+    // shadow field crawl even though the geometry and light are stationary.
+    let right = dir.cross(up).normalize();
+    let light_up = right.cross(dir).normalize();
+    let texel_world = (2.0 * radius) / shadow_size.max(1) as f32;
+    let snap = |value: f32| (value / texel_world).round() * texel_world;
+    center += right * (snap(center.dot(right)) - center.dot(right));
+    center += light_up * (snap(center.dot(light_up)) - center.dot(light_up));
+
+    let eye = center - dir * (radius * 2.5);
     let view = Mat4::look_at_rh(eye, center, up);
-    let proj = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.05, radius * 4.0);
+    let proj = Mat4::orthographic_rh(
+        -radius,
+        radius,
+        -radius,
+        radius,
+        (radius * 0.005).max(0.0001),
+        radius * 6.0,
+    );
     proj * view
 }
 
@@ -2518,6 +2872,51 @@ fn make_pipeline(
     })
 }
 
+/// The grid is an antialiased transparent plane, not opaque hardware lines, so it needs its own fragment
+/// entry point and alpha blend state. Keeping this descriptor separate prevents overlay/cube pipelines from
+/// accidentally inheriting transparency or losing depth writes.
+fn make_grid_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    depth: &wgpu::DepthStencilState,
+    samples: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("grid"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_grid"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_grid"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth.clone()),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 /// M11.4 (ADR-043) — MSAA sample count from `MTK_MSAA` (`off`/`1`/`2`/`4`/`8`, default 4), clamped to the
 /// highest count ≤ requested that the adapter supports for `format` (so a downlevel GPU still gets some AA,
 /// or falls back to 1 = off). `1` means no multisample target + no resolve — the pre-MSAA path.
@@ -2614,6 +3013,26 @@ fn make_post_tex(
 /// frame, so it never touches the per-frame orbit path (invariant 4). A presentation artifact — never in the
 /// op-stream/doc (zero determinism impact). Renders at the scene `samples` count (MSAA → resolve) so it
 /// reuses the existing scene pipelines verbatim. Returns the PNG bytes, or `None` if the readback fails.
+fn thumbnail_framing(instance: &Instance, local_bounds: LocalBounds) -> (Instance, f32) {
+    let rotation = instance_rotation(instance);
+    // Move the authored bounds centre—not merely the instance origin—to the thumbnail origin. Offset CAD
+    // bodies and exported meshes with a distant modelling origin otherwise render cropped or entirely blank.
+    let offset = rotation * (local_bounds.center * instance.scale);
+    let framed = Instance {
+        center: (-offset).to_array(),
+        scale: instance.scale,
+        color: instance.color,
+        selected: 0.0,
+        rotation: rotation.to_array(),
+        material: instance.material,
+    };
+    // A bounding sphere is orientation-independent, so a portrait remains fully contained for every asset
+    // rotation. The 18% margin keeps antialiased silhouettes away from the PNG edge at every DPR.
+    let radius = local_bounds.half_size.length() * instance.scale.abs();
+    let distance = (radius * 1.18 / (55f32.to_radians() * 0.5).tan()).clamp(0.25, 2_000.0);
+    (framed, distance)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_thumbnail(
     device: &wgpu::Device,
@@ -2634,17 +3053,12 @@ fn render_thumbnail(
     size: u32,
 ) -> Option<Vec<u8>> {
     let size = size.clamp(32, 256);
-    // Frame a COPY of the entity at the origin — a consistent "portrait" regardless of its world position.
-    let scale = instance.scale.max(0.1);
-    let framed = Instance {
-        center: [0.0, 0.0, 0.0],
-        scale,
-        color: instance.color,
-        selected: 0.0,
-        rotation: instance.rotation,
-        material: instance.material,
-    };
-    let dist = (scale * 3.2).clamp(2.0, 200.0);
+    // Frame a COPY of the entity from its real authored bounds. Do not floor the instance scale: production
+    // CAD commonly uses millimetre vertices with a 0.001 scale, and replacing it with 0.1 magnifies it 100×.
+    let (framed, dist) = thumbnail_framing(
+        instance,
+        mesh.map_or(LocalBounds::UNIT_CUBE, |geometry| geometry.local_bounds),
+    );
     let cam = camera_matrix(std::f32::consts::FRAC_PI_4, 0.5, dist, 1.0, Vec3::ZERO);
     let eye = camera_eye(std::f32::consts::FRAC_PI_4, 0.5, dist, [0.0; 3]);
     let cam_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2663,6 +3077,7 @@ fn render_thumbnail(
             light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             focus: [0.0, eye[0], eye[1], eye[2]],
             shadow: [-1.0, 1.0, 0.0, 0.0], // caster -1 = none; exposure 1.0
+            grid: [0.0, 0.0, dist, 0.0],
         }),
     );
     let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2751,6 +3166,7 @@ fn render_thumbnail(
                     &sm.base_view,
                     &sm.mr_view,
                     &sm.normal_view,
+                    &sm.ao_view,
                     albedo_sampler,
                 );
                 rp.set_bind_group(1, &bg, &[]);
@@ -2970,11 +3386,16 @@ fn make_bloom_targets(
     }
 }
 
-/// M11.1 (ADR-040) — choose a LOD level from the camera distance to an asset's instance centroid: nearer =
-/// finer. `0` = the full mesh; `1..=n_lods` = progressively coarser (the normalized meshes are ~1 unit, so
-/// the thresholds are world distances). Clamped to the LODs that actually exist; `0` if there are none or no
-/// centroid.
-fn lod_level(cam_eye: [f32; 3], centroid: Option<[f32; 3]>, n_lods: usize) -> usize {
+/// M11.1 (ADR-040) — choose a LOD level from camera distance relative to the asset's displayed world
+/// extent: nearer/larger on screen = finer. `0` is the full mesh; `1..=n_lods` are progressively coarser.
+/// Relative thresholds work for both normalized imports and real-scale procedural geometry. Clamped to the
+/// LODs that actually exist; `0` if there are none or no centroid.
+fn lod_level(
+    cam_eye: [f32; 3],
+    centroid: Option<[f32; 3]>,
+    n_lods: usize,
+    world_extent: f32,
+) -> usize {
     if n_lods == 0 {
         return 0;
     }
@@ -2982,9 +3403,12 @@ fn lod_level(cam_eye: [f32; 3], centroid: Option<[f32; 3]>, n_lods: usize) -> us
         return 0;
     };
     let d2 = (0..3).map(|k| (cam_eye[k] - c[k]).powi(2)).sum::<f32>();
-    let level = if d2 < 16.0 * 16.0 {
+    let extent = world_extent.max(0.001);
+    let near = 16.0 * extent;
+    let mid = 34.0 * extent;
+    let level = if d2 < near * near {
         0
-    } else if d2 < 34.0 * 34.0 {
+    } else if d2 < mid * mid {
         1
     } else {
         2
@@ -2992,27 +3416,187 @@ fn lod_level(cam_eye: [f32; 3], centroid: Option<[f32; 3]>, n_lods: usize) -> us
     level.min(n_lods)
 }
 
+/// Build the Pipe Forge route overlay as line-list endpoint pairs. Kept pure for interaction regression
+/// tests: N points produce N-1 route segments and three small axis marks at every control point.
+fn pipe_graph_preview_vertices(
+    edges: &[[[f32; 3]; 2]],
+    handles: &[[f32; 3]],
+    marker: f32,
+) -> Vec<Instance> {
+    const ROUTE: [f32; 3] = [1.0, 0.55, 0.12];
+    const POINT: [f32; 3] = [0.20, 0.92, 0.95];
+    let vertex = |center: [f32; 3], color: [f32; 3]| Instance {
+        center,
+        scale: 0.0,
+        color,
+        selected: 0.0,
+        rotation: IDENTITY_QUAT,
+        material: [0.0; 4],
+    };
+    let mut out = Vec::with_capacity(edges.len() * 2 + handles.len() * 6);
+    for &[from, to] in edges {
+        out.push(vertex(from, ROUTE));
+        out.push(vertex(to, ROUTE));
+    }
+    for &p in handles {
+        for axis in [[marker, 0.0, 0.0], [0.0, marker, 0.0], [0.0, 0.0, marker]] {
+            out.push(vertex(
+                [p[0] - axis[0], p[1] - axis[1], p[2] - axis[2]],
+                POINT,
+            ));
+            out.push(vertex(
+                [p[0] + axis[0], p[1] + axis[1], p[2] + axis[2]],
+                POINT,
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn cad_bounds_apply_authored_coordinates_and_instance_scale_once() {
+        let instance = Instance {
+            center: [1.0, 2.0, 3.0],
+            scale: 0.001,
+            color: [1.0; 3],
+            selected: 0.0,
+            rotation: IDENTITY_QUAT,
+            material: [0.0; 4],
+        };
+        let bounds = LocalBounds {
+            center: Vec3::new(1_000.0, 0.0, 0.0),
+            half_size: Vec3::new(500.0, 250.0, 125.0),
+        };
+        let (lo, hi) = instance_world_bounds(&instance, bounds);
+        let center = (lo + hi) * 0.5;
+        let size = hi - lo;
+        assert!((center - Vec3::new(2.0, 2.0, 3.0)).length() < 1.0e-5);
+        assert!((size - Vec3::new(1.0, 0.5, 0.25)).length() < 1.0e-5);
+    }
+
+    #[test]
+    fn thumbnail_framing_preserves_millimetre_cad_scale_and_recenters_offset_mesh() {
+        let instance = Instance {
+            center: [75.0, -20.0, 9.0], // world placement must not leak into a portrait
+            scale: 0.001,
+            color: [0.7, 0.8, 0.9],
+            selected: 1.0,
+            rotation: IDENTITY_QUAT,
+            material: [0.0; 4],
+        };
+        let bounds = LocalBounds {
+            center: Vec3::new(1_000.0, 0.0, 0.0),
+            half_size: Vec3::new(500.0, 250.0, 125.0),
+        };
+        let (framed, distance) = thumbnail_framing(&instance, bounds);
+        assert_eq!(
+            framed.scale, 0.001,
+            "never replace a CAD scale with the old 0.1 floor"
+        );
+        assert!((Vec3::from(framed.center) - Vec3::new(-1.0, 0.0, 0.0)).length() < 1.0e-6);
+        assert_eq!(
+            framed.selected, 0.0,
+            "portrait selection must not tint the source material"
+        );
+        assert!(
+            distance > 1.0 && distance < 2.0,
+            "real displayed bounds drive a tight portrait"
+        );
+    }
+
+    #[test]
     fn lod_level_picks_coarser_with_distance_and_clamps() {
         let c = Some([0.0, 0.0, 0.0]);
-        assert_eq!(lod_level([0.0, 0.0, 5.0], c, 2), 0, "near → full");
-        assert_eq!(lod_level([0.0, 0.0, 20.0], c, 2), 1, "mid → LOD-1");
-        assert_eq!(lod_level([0.0, 0.0, 50.0], c, 2), 2, "far → LOD-2");
+        assert_eq!(lod_level([0.0, 0.0, 5.0], c, 2, 1.0), 0, "near → full");
+        assert_eq!(lod_level([0.0, 0.0, 20.0], c, 2, 1.0), 1, "mid → LOD-1");
+        assert_eq!(lod_level([0.0, 0.0, 50.0], c, 2, 1.0), 2, "far → LOD-2");
         assert_eq!(
-            lod_level([0.0, 0.0, 50.0], c, 1),
+            lod_level([0.0, 0.0, 50.0], c, 1, 1.0),
             1,
             "clamped to the available LODs"
         );
-        assert_eq!(lod_level([0.0, 0.0, 50.0], c, 0), 0, "no LODs → full");
+        assert_eq!(lod_level([0.0, 0.0, 50.0], c, 0, 1.0), 0, "no LODs → full");
         assert_eq!(
-            lod_level([0.0, 0.0, 50.0], None, 2),
+            lod_level([0.0, 0.0, 50.0], None, 2, 1.0),
             0,
             "no centroid → full"
         );
+        assert_eq!(
+            lod_level([0.0, 0.0, 50.0], c, 2, 10.0),
+            0,
+            "a ten-metre authored asset stays full-detail at the same camera distance"
+        );
+    }
+
+    #[test]
+    fn pbr_texture_mips_are_complete_and_semantic_aware() {
+        let color_tex = Texture {
+            width: 2,
+            height: 1,
+            rgba8: vec![0, 0, 0, 255, 255, 255, 255, 255],
+        };
+        let color = texture_mips(&color_tex, TextureSemantic::Color);
+        let raw = texture_mips(&color_tex, TextureSemantic::Data);
+        assert_eq!(
+            color.iter().map(|(w, h, _)| (*w, *h)).collect::<Vec<_>>(),
+            vec![(2, 1), (1, 1)]
+        );
+        assert!(
+            color[1].2[0] > raw[1].2[0] + 50,
+            "linear-light colour averaging avoids the dark 128 grey produced by raw byte averaging"
+        );
+
+        let odd = Texture {
+            width: 3,
+            height: 5,
+            rgba8: vec![128; 3 * 5 * 4],
+        };
+        assert_eq!(
+            texture_mips(&odd, TextureSemantic::Data)
+                .iter()
+                .map(|(w, h, _)| (*w, *h))
+                .collect::<Vec<_>>(),
+            vec![(3, 5), (2, 3), (1, 2), (1, 1)],
+            "odd dimensions reduce with ceil-half until a complete 1x1 chain"
+        );
+
+        let normals = Texture {
+            width: 2,
+            height: 1,
+            rgba8: vec![255, 128, 128, 255, 128, 255, 128, 255],
+        };
+        let pixel = &texture_mips(&normals, TextureSemantic::Normal)[1].2;
+        let decoded = [0, 1, 2].map(|channel| f32::from(pixel[channel]) / 255.0 * 2.0 - 1.0);
+        let length = decoded
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            (length - 1.0).abs() < 0.02,
+            "normal-map mips stay normalized"
+        );
+    }
+
+    #[test]
+    fn pipe_preview_contains_route_segments_and_control_point_crosses() {
+        let handles = [[0.0; 3], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 0.0, 0.0]];
+        let edges = [
+            [handles[0], handles[1]],
+            [handles[1], handles[2]],
+            [handles[1], handles[3]],
+        ];
+        let v = pipe_graph_preview_vertices(&edges, &handles, 0.1);
+        assert_eq!(v.len(), 3 * 2 + 4 * 6);
+        assert_eq!(v[0].center, [0.0; 3]);
+        assert_eq!(v[1].center, [1.0, 0.0, 0.0]);
+        assert_eq!(v[4].center, [1.0, 0.0, 0.0]);
+        assert_eq!(v[5].center, [2.0, 0.0, 0.0]);
+        assert!(v.iter().all(|p| p.scale == 0.0));
     }
 
     /// A bare scene of `n` unit-scale cubes on a line — enough to exercise the focus state transition

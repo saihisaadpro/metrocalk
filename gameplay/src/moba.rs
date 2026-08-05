@@ -269,9 +269,23 @@ impl OneLaneMatch {
                     ..command
                 })
             }
+            // An attack-move destination is a movement destination, so it is anchored on the same terms as
+            // `MoveTo`. Passing it through unanchored would give the composed lane a hole: a player could
+            // walk off the corridor simply by choosing the verb that also swings.
+            CommandKind::AttackMove { destination } => {
+                let anchored = self.lane.point_at(self.lane.project(destination)?)?;
+                Ok(PlayerCommand {
+                    kind: CommandKind::AttackMove {
+                        destination: anchored,
+                    },
+                    ..command
+                })
+            }
             CommandKind::Stop
             | CommandKind::Cast { .. }
             | CommandKind::BasicAttack { .. }
+            | CommandKind::AttackTarget { .. }
+            | CommandKind::HoldPosition
             | CommandKind::UpgradeAbility { .. } => Ok(command),
         }
     }
@@ -1132,6 +1146,7 @@ mod tests {
         };
         let attack = BasicAttackSpec {
             range_mm: 1_000,
+            acquisition_range_mm: 0,
             damage: 100,
             school: DamageSchool::True,
             windup_ticks: 0,
@@ -1231,6 +1246,7 @@ mod tests {
         };
         let attack = BasicAttackSpec {
             range_mm: 1_000,
+            acquisition_range_mm: 0,
             damage: 100,
             school: DamageSchool::True,
             windup_ticks: 0,

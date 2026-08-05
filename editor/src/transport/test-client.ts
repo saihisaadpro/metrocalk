@@ -4,6 +4,64 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type MatchStatus } from "./protocol";
+
+function emptyAnimationState(id: string | null): AnimationWorkspaceInfo {
+  return {
+    revision: "fixture-0",
+    sequenceId: "main",
+    sequenceName: "Main sequence",
+    ticksPerSecond: 60_000,
+    durationTick: 60_000,
+    currentTick: 0,
+    playing: false,
+    loopPolicy: "once",
+    selectedId: id,
+    selectedName: null,
+    properties: [],
+    tracks: [],
+    markers: [],
+    events: [],
+    contexts: [
+      { context: "2d", state: "unsupported", properties: 0, tracks: 0, reason: "No 2D fixture.", action: null },
+      { context: "3d", state: "unsupported", properties: 0, tracks: 0, reason: "No 3D fixture.", action: null },
+      { context: "ui", state: "unsupported", properties: 0, tracks: 0, reason: "No UI fixture.", action: null },
+    ],
+    asset: null,
+    issues: [],
+  };
+}
+
+function emptyAnimationGraphState(sequenceId: string): AnimationGraphStateInfo {
+  return {
+    schemaVersion: ANIMATION_GRAPH_SCHEMA_VERSION,
+    sequenceId,
+    revision: "fixture-graph-0",
+    graph: null,
+    nodePresentation: [],
+    sources: [],
+    compile: { state: "missing", authoredRevision: "fixture-graph-0", compiledRevision: null, compiledHash: null, lastGoodRevision: null, lastGoodHash: null, message: "No graph fixture." },
+    diagnostics: [],
+  };
+}
+
+/** An idle match — nothing authored, nothing running. */
+function emptyMatchStatus(): MatchStatus {
+  return {
+    running: false,
+    tick: 0,
+    phase: "Idle",
+    world_digest: "",
+    lane_digest: "",
+    cook_digest: "",
+    cook_schema_version: 1,
+    actor_count: 0,
+    live_actors: 0,
+    actors: [],
+    events: [],
+    last_rejection: null,
+  };
+}
 
 export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
   return {
@@ -17,6 +75,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     aiEdit: () => Promise.resolve({ ok: true, balance: 198, cost: 2, message: null }),
     generate: () => Promise.resolve({ created: "gen-1", cost: 10, available: true, seam: null, balance: 90 }),
     undo: vi.fn(() => Promise.resolve(false)),
+    redo: vi.fn(() => Promise.resolve(false)),
     entityActions: () => Promise.resolve([]),
     entityDetails: () => Promise.resolve(null),
     cadReport: () =>
@@ -39,12 +98,66 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     jointValue: () => Promise.resolve(true),
     jointScrub: () => Promise.resolve(0),
     jointInfo: () => Promise.resolve(null),
+    animationState: (id) => Promise.resolve(emptyAnimationState(id)),
+    animationClipInstanceSave: (request) => Promise.resolve({
+      ok: false,
+      message: "No imported clip fixture",
+      instanceId: null,
+      state: emptyAnimationState(request.targetId),
+    }),
+    animationClipInstanceDelete: (_instanceId, _expectedRevision, selectedId) => Promise.resolve({
+      ok: false,
+      message: "No imported clip fixture",
+      instanceId: null,
+      state: emptyAnimationState(selectedId),
+    }),
+    animationClipInstancePreview: () => Promise.resolve({ ok: false, message: "No imported clip fixture", currentTick: 0, durationTick: 60_000, playing: false, loopPolicy: "once", evaluatedTracks: 0, crossedEvents: [], eventsTruncated: false }),
+    animationClipInstancePreviewStop: (_expectedRequestId?: string) => Promise.resolve({ ok: true, message: "Authored animation restored.", currentTick: 0, durationTick: 60_000, playing: false, loopPolicy: "once", evaluatedTracks: 0, crossedEvents: [], eventsTruncated: false }),
+    animationKey: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationDeleteKey: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationDeleteKeys: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationSetInterpolation: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationSetTrackEnabled: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationSetTrackLocked: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationUpdateKeys: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationAddMarker: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationDeleteMarker: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationAddEvent: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationDeleteEvent: (id) => Promise.resolve({ ok: false, message: "No animation fixture", trackId: null, keyId: null, state: emptyAnimationState(id) }),
+    animationTransport: (action, tick, loopPolicy) => Promise.resolve({ ok: true, message: `Animation ${action}.`, currentTick: tick ?? 0, durationTick: 60_000, playing: action === "play", loopPolicy: loopPolicy ?? "once", evaluatedTracks: 0, crossedEvents: [], eventsTruncated: false }),
+    animationPlaybackState: () => Promise.resolve({ ok: true, message: "Animation clock synchronized.", currentTick: 0, durationTick: 60_000, playing: false, loopPolicy: "once", evaluatedTracks: 0, crossedEvents: [], eventsTruncated: false }),
+    animationGraphState: (sequenceId) => Promise.resolve(emptyAnimationGraphState(sequenceId)),
+    animationGraphSave: (sequenceId) => Promise.resolve({ ok: false, message: "No animation graph fixture", state: emptyAnimationGraphState(sequenceId) }),
+    animationGraphDelete: (sequenceId) => Promise.resolve({ ok: false, message: "No animation graph fixture", state: emptyAnimationGraphState(sequenceId) }),
+    animationGraphDebug: (graphId, instanceId) => Promise.resolve({ graphId, graphRevision: "fixture-graph-0", compiledHash: "missing", instanceId: instanceId ?? "fixture-instance", rawTick: 0, localTick: 0, activeNodes: [], activeEdges: [], transition: null, parameterValues: {}, watches: [], eventsTruncated: false, evaluationCostMicros: 0, truncated: false }),
+    animationGraphSetPreviewParameters: (_graphId, values) => Promise.resolve({ ok: true, message: "Transient parameters updated.", accepted: values }),
+    animationGraphClearPreviewParameters: () => Promise.resolve({ ok: true, message: "Transient parameters reset.", accepted: {} }),
     removeEntity: vi.fn(),
     duplicateEntity: () => Promise.resolve(null),
     focusEntity: vi.fn(),
     makeDynamic: () => Promise.resolve(true),
+    makeStatic: () => Promise.resolve(true),
     // M10.6 scene-authoring verbs (a test overrides what it exercises).
     createEntity: () => Promise.resolve("e-created"),
+    pipeForgeStart: () => Promise.resolve({ active: true, points: 0, lengthM: 0, previewTriangles: 0, canBake: false, message: "Click the viewport to place the first point", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    pipeForgePoint: () => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "First point placed", handles: [{ nodeId: 1, position: [0, 0, 0], connectedEdges: [], fittingIds: [] }], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    pipeForgeUndo: () => Promise.resolve({ active: true, points: 0, lengthM: 0, previewTriangles: 0, canBake: false, message: "Last point removed", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    pipeForgeBake: () => Promise.resolve({ entityId: "pipe-1", handle: "mtkasset:pipe", vertices: 128, triangles: 256, lodTriangles: [256, 128], textureResolution: 256, collisionHulls: 0, collisionKind: "triangle mesh", collisionTriangles: 256, watertight: true, warnings: [], message: "Pipe asset baked" }),
+    pipeForgeCancel: () => Promise.resolve({ active: false, points: 0, lengthM: 0, previewTriangles: 0, canBake: false, message: "Pipe drawing cancelled", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    pipeForgeStatus: () => Promise.resolve({ active: false, points: 0, lengthM: 0, previewTriangles: 0, canBake: false, message: "Pipe Forge is ready", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    pipeForgeEdit: (id) => Promise.resolve({ active: true, points: 2, lengthM: 1, previewTriangles: 576, canBake: true, message: "Editable route restored", handles: [{ nodeId: 1, position: [0, 0, 0], connectedEdges: [1], fittingIds: [] }, { nodeId: 2, position: [1, 0, 0], connectedEdges: [1], fittingIds: [] }], edges: [{ id: 1, from: 1, to: 2, diameterM: 0.05 }], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: id }),
+    pipeForgeBeginBranch: (nodeId) => Promise.resolve({ active: true, points: 2, lengthM: 1, previewTriangles: 576, canBake: true, message: "Click to extend the branch", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: nodeId, editingEntity: null }),
+    pipeForgeEndBranch: () => Promise.resolve({ active: true, points: 2, lengthM: 1, previewTriangles: 576, canBake: true, message: "Branch complete", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    pipeForgeMoveHandle: (nodeId, x, y, z) => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "Handle moved", handles: [{ nodeId, position: [x, y, z], connectedEdges: [], fittingIds: [] }], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    pipeForgeRemoveHandle: () => Promise.resolve({ active: true, points: 0, lengthM: 0, previewTriangles: 0, canBake: false, message: "Handle removed", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    pipeForgePlaceFitting: (nodeId, kind, catalogId) => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "Fitting placed", handles: [], edges: [], fittings: [{ id: 1, nodeId, kind, catalogId: catalogId ?? null, automatic: false }], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    pipeForgeRemoveFitting: () => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "Fitting removed", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    pipeForgeUpsertCatalog: (entry) => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "Catalog saved", handles: [], edges: [], fittings: [], fittingCatalog: [entry], branchFrom: null, editingEntity: null }),
+    pipeForgeRemoveCatalog: () => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "Catalog removed", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    assetLabAudit: (id) => Promise.resolve({ ok: false, message: "No mesh audit fixture", sourceEntity: id, sourceHandle: null, createdEntity: null, createdHandle: null, audit: null, change: null, warnings: [], exportedPath: null, bakeEvidence: null }),
+    assetLabProcess: (id) => Promise.resolve({ ok: false, message: "No mesh process fixture", sourceEntity: id, sourceHandle: null, createdEntity: null, createdHandle: null, audit: null, change: null, warnings: [], exportedPath: null, bakeEvidence: null }),
+    assetLabExport: (id) => Promise.resolve({ ok: false, message: "No mesh export fixture", sourceEntity: id, sourceHandle: null, createdEntity: null, createdHandle: null, audit: null, change: null, warnings: [], exportedPath: null, bakeEvidence: null }),
+    sceneExport: (format) => Promise.resolve({ ok: false, message: "No scene export fixture", format, exportedPath: null, nodes: 0, meshes: 0, skins: 0, animations: 0, fidelity: [] }),
     addLight: () => Promise.resolve("light-created"),
     renameEntity: () => Promise.resolve(true),
     groupEntities: () => Promise.resolve("group-1"),
@@ -87,6 +200,8 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     frameAll: vi.fn(),
     viewPreset: vi.fn(),
     cameraDebug: () => Promise.resolve([0.785, 0.5, 60, 0, 0, 0]),
+    setRenderProfile: (profile) => Promise.resolve(profile),
+    renderProfileDebug: () => Promise.resolve("cinematic"),
     viewportPick: () => Promise.resolve(null),
     dragStart: vi.fn(),
     dragEnd: vi.fn(),
@@ -122,6 +237,25 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     fireRuleEvent: vi.fn(() => Promise.resolve({ playing: true, frame: 0, head: 0, truth: null, explanations: [], decisions: [], flagged: [] })),
     ruleDebug: vi.fn(() => Promise.resolve({ playing: false, frame: 0, head: 0, truth: null, explanations: [], decisions: [], flagged: [] })),
     ruleScrub: vi.fn(() => Promise.resolve({ playing: true, frame: 0, head: 0, truth: null, explanations: [], decisions: [], flagged: [] })),
+    // The authored match (ADR-097). The default is a scene with NO match, because that is the state every
+    // other panel's test starts in — a test that wants a match overrides `matchValidate`.
+    matchValidate: vi.fn(() =>
+      Promise.resolve({ ok: false, is_match_scene: false, diagnostics: [], cook_digest: null, actor_count: 0, wave_count: 0, lane_length_m: 0 }),
+    ),
+    matchAuthorStarter: vi.fn(() =>
+      Promise.resolve({ settings: "s", lane: "l", waypoints: ["w0", "w1"], actors: ["a0", "a1", "a2"], waves: ["v0"] }),
+    ),
+    matchStart: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    matchStep: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    matchOrderMove: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    matchAttackMove: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    matchAttackTarget: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    matchHold: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    matchHalt: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    matchStun: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    matchStatus: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    matchCooked: vi.fn(() => Promise.resolve(null)),
+    matchStop: vi.fn(() => Promise.resolve(emptyMatchStatus())),
     ...over,
   };
 }

@@ -5,10 +5,10 @@ use std::fmt::{self, Display, Formatter};
 use crate::model::{
     apportion, integer_sqrt_ceil, level_for_experience, passive_gold_owed, streak_gold, AbilityAim,
     AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting, ActorId, ActorKind,
-    ActorProvenance, ActorSpawn, BasicAttackSpec, Bounty, CombatStats, ControlKind, ControlMask,
-    DamageSchool, DeathRule, DynamicActorProvenance, DynamicActorSpawn, GoldReason, ImpactShape,
-    MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, ModifierId, ModifierOp, PlayerId,
-    ProjectileId, RectMm, RuntimeError, ScoreView, StatGrowth, StatKind, StatModifier,
+    ActorProvenance, ActorSpawn, AttackOrder, BasicAttackSpec, Bounty, CombatStats, ControlKind,
+    ControlMask, DamageSchool, DeathRule, DynamicActorProvenance, DynamicActorSpawn, GoldReason,
+    ImpactShape, MatchConfig, MatchEndReason, MatchOutcome, MatchPhase, ModifierId, ModifierOp,
+    PlayerId, ProjectileId, RectMm, RuntimeError, ScoreView, StatGrowth, StatKind, StatModifier,
     StatusEffectId, StatusEffectView, TeamId, Tick, Vec2Mm, BASIS_POINTS, EXPERIENCE_CAP,
     MAX_ABILITY_DEFINITIONS, MAX_ABILITY_RANK,
 };
@@ -238,6 +238,9 @@ pub(crate) struct ActorState {
     /// assert a level its own experience does not produce.
     pub(crate) level: u8,
     pub(crate) unspent_ability_points: u8,
+    /// The standing attack order. This is what makes an auto-attack an auto-attack: it survives the swing
+    /// that satisfied it, so the runtime re-issues without a command per swing.
+    pub(crate) attack_order: Option<AttackOrder>,
     /// Attempts since this actor's last critical strike, driving the pseudo-random distribution.
     ///
     /// This is the ONLY mutable state the RNG has. The generator itself is keyed and stateless, so the
@@ -297,6 +300,7 @@ impl ActorState {
             // Level 1 is the identity of `with_growth`, so the authored stats ARE the level-1 base stats.
             level: 1,
             unspent_ability_points: 0,
+            attack_order: None,
             crit_attempts: 0,
             damage_credits: Vec::new(),
             base_stats: spawn.stats,
@@ -389,6 +393,7 @@ impl ActorState {
             basic_attack_ready_at: self.basic_attack.map(|attack| attack.ready_at),
             basic_attack_range_mm: self.basic_attack.map(|attack| attack.spec.range_mm),
             respawn_at: self.respawn_at,
+            attack_order: self.attack_order,
             level: self.level,
             experience: self.experience,
             unspent_ability_points: self.unspent_ability_points,
@@ -1112,6 +1117,15 @@ impl MatchRuntime {
             self.actors[index].damage_credits.clear();
             self.dirty.insert(actor);
         }
+        // Standing orders die with the match. Leaving one set would let a checkpoint of a FINISHED match
+        // restore into a world whose units are still trying to fight, and the terminal-phase audit rule
+        // below would then fire on a world this runtime itself produced.
+        for index in 0..self.actors.len() {
+            if self.actors[index].attack_order.take().is_some() {
+                let id = self.actors[index].id;
+                self.dirty.insert(id);
+            }
+        }
         // In-flight projectiles are cancelled, never resolved: a match that has already produced its
         // terminal outcome must not have a missile land afterwards and rewrite health the result was
         // computed from.
@@ -1582,6 +1596,7 @@ impl MatchRuntime {
                     actor.cast.is_some()
                         || actor.attack.is_some()
                         || actor.respawn_at.is_some()
+                        || actor.attack_order.is_some()
                         || !actor.damage_credits.is_empty()
                 }))
         {
@@ -2051,12 +2066,30 @@ impl MatchRuntime {
             }
         }
         if !actor.alive()
-            && (actor.destination.is_some() || actor.cast.is_some() || actor.attack.is_some())
+            && (actor.destination.is_some()
+                || actor.cast.is_some()
+                || actor.attack.is_some()
+                || actor.attack_order.is_some())
         {
             return Err(Self::violation(
                 Some(actor.id),
-                "dead actor retains navigation or an action",
+                "dead actor retains navigation, an action, or a standing order",
             ));
+        }
+        // A standing order on an actor with no weapon can never be satisfied, so it would sit forever.
+        if actor.attack_order.is_some() && actor.basic_attack.is_none() {
+            return Err(Self::violation(
+                Some(actor.id),
+                "standing attack order on an actor with no basic attack",
+            ));
+        }
+        if let Some(AttackOrder::Move(destination)) = actor.attack_order {
+            if !self.config.map_bounds.contains(destination) {
+                return Err(Self::violation(
+                    Some(actor.id),
+                    "standing attack-move destination is outside map bounds",
+                ));
+            }
         }
         if actor.alive() && actor.respawn_at.is_some() {
             return Err(Self::violation(
@@ -2349,6 +2382,9 @@ impl MatchRuntime {
         }
 
         self.integrate_movement();
+        // Standing orders act on the positions movement just produced, and before combat resolves, so an
+        // engagement lands on the tick it was earned rather than the one after.
+        self.drive_attack_orders()?;
         self.resolve_combat()?;
         if !self.objective_claims.is_empty() {
             let outcome = if self.objective_claims.len() == 1 {
@@ -2381,7 +2417,7 @@ impl MatchRuntime {
     #[must_use]
     pub fn world_digest(&self) -> WorldDigest {
         let mut hash = StableHash::new();
-        hash.bytes(b"metrocalk-gameplay-mob2-v10");
+        hash.bytes(b"metrocalk-gameplay-mob2-v11");
         hash.u64(self.seed);
         hash.u64(self.tick);
         hash.phase(self.phase);
@@ -2605,7 +2641,54 @@ impl MatchRuntime {
                 }
                 Ok(())
             }
+            CommandKind::AttackMove { .. }
+            | CommandKind::AttackTarget { .. }
+            | CommandKind::HoldPosition => self.validate_standing_order(actor, kind),
             CommandKind::UpgradeAbility { ability } => Self::validate_upgrade(actor, ability),
+        }
+    }
+
+    /// Validate one of the three standing-order verbs.
+    ///
+    /// Split out of [`Self::validate_actor_intent`] because all three share the same precondition — an
+    /// order to fight is meaningless without something to fight WITH — and stating that once is the only
+    /// way it stays true for all three.
+    fn validate_standing_order(
+        &self,
+        actor: &ActorState,
+        kind: CommandKind,
+    ) -> Result<(), CommandRejectReason> {
+        if actor.basic_attack.is_none() {
+            return Err(CommandRejectReason::BasicAttackUnavailable);
+        }
+        match kind {
+            CommandKind::HoldPosition => Ok(()),
+            CommandKind::AttackMove { destination } => {
+                if self.config.map_bounds.contains(destination) {
+                    Ok(())
+                } else {
+                    Err(CommandRejectReason::DestinationOutOfBounds)
+                }
+            }
+            CommandKind::AttackTarget { target } => {
+                // Only the RELATION and existence are checked when the order is given. Range is NOT: the
+                // whole point of a standing order is that the actor closes the distance itself, so
+                // refusing an out-of-range target here would make the order useless at the exact moment
+                // it is most natural to give.
+                let victim = self
+                    .actor_state(target)
+                    .ok_or(CommandRejectReason::TargetNotFound)?;
+                if !victim.alive() {
+                    return Err(CommandRejectReason::TargetDead);
+                }
+                if victim.team == actor.team || victim.id == actor.id {
+                    return Err(CommandRejectReason::TargetRelationMismatch);
+                }
+                Ok(())
+            }
+            // The caller dispatches only the three order verbs here. Refusing rather than silently
+            // accepting keeps a future verb from inheriting "needs a weapon" by accident.
+            _ => Err(CommandRejectReason::InvalidTargetForm),
         }
     }
 
@@ -2784,6 +2867,9 @@ impl MatchRuntime {
                 }
             }
             CommandKind::Stop => {
+                // Stop must clear the standing order too. Cancelling only the destination would leave an
+                // actor that a player explicitly told to stop still swinging at whatever wanders past.
+                self.set_attack_order(actor_id, None);
                 let index = self.actor_index(actor_id).expect("validated actor");
                 if self.actors[index].destination.take().is_some() {
                     self.dirty.insert(actor_id);
@@ -2822,6 +2908,15 @@ impl MatchRuntime {
                     target,
                     resolves_at,
                 });
+            }
+            CommandKind::AttackMove { destination } => {
+                self.set_attack_order(actor_id, Some(AttackOrder::Move(destination)));
+            }
+            CommandKind::AttackTarget { target } => {
+                self.set_attack_order(actor_id, Some(AttackOrder::Target(target)));
+            }
+            CommandKind::HoldPosition => {
+                self.set_attack_order(actor_id, Some(AttackOrder::Hold));
             }
             CommandKind::UpgradeAbility { ability } => {
                 let index = self.actor_index(actor_id).expect("validated actor");
@@ -2872,6 +2967,148 @@ impl MatchRuntime {
             }
         }
         Ok(())
+    }
+
+    /// Set or clear a standing attack order, emitting the change so a client can show it.
+    fn set_attack_order(&mut self, actor_id: ActorId, order: Option<AttackOrder>) {
+        let Some(index) = self.actor_index(actor_id) else {
+            return;
+        };
+        if self.actors[index].attack_order == order {
+            return;
+        }
+        self.actors[index].attack_order = order;
+        self.dirty.insert(actor_id);
+        self.pending_events.push(MatchEvent::AttackOrderChanged {
+            actor: actor_id,
+            order,
+        });
+    }
+
+    /// Drive every standing attack order one tick: acquire, engage, or keep advancing.
+    ///
+    /// Placed AFTER movement and BEFORE combat resolution, which is the only placement that reads true
+    /// positions: acquiring before movement would let a unit engage a target it has not reached yet, and
+    /// acquiring after combat would delay every engagement by a tick.
+    ///
+    /// Every issued swing goes through `validate_actor_intent`, the same choke point a player command
+    /// uses, so crowd control gates an auto-attack exactly as it gates a manual one — a disarmed unit
+    /// cannot out-swing a disarm just because a standing order is driving it.
+    fn drive_attack_orders(&mut self) -> Result<(), RuntimeError> {
+        let candidates: Vec<ActorId> = self
+            .actors
+            .iter()
+            .filter(|actor| actor.attack_order.is_some() && actor.alive())
+            .filter(|actor| actor.cast.is_none() && actor.attack.is_none())
+            .map(|actor| actor.id)
+            .collect();
+
+        for actor_id in candidates {
+            let Some(index) = self.actor_index(actor_id) else {
+                continue;
+            };
+            let Some(order) = self.actors[index].attack_order else {
+                continue;
+            };
+            let Some(attack) = self.actors[index].basic_attack else {
+                // The order outlived the weapon that justified it.
+                self.set_attack_order(actor_id, None);
+                continue;
+            };
+
+            let (target, acquired) = match order {
+                AttackOrder::Target(target) => (
+                    self.actor_state(target)
+                        .filter(|victim| victim.alive())
+                        .map(|victim| victim.id),
+                    false,
+                ),
+                AttackOrder::Move(_) | AttackOrder::Hold => (
+                    self.acquire_target(index, attack.spec.acquisition_mm()),
+                    true,
+                ),
+            };
+
+            // A named target that is gone ends the order rather than silently becoming a hold.
+            if matches!(order, AttackOrder::Target(_)) && target.is_none() {
+                self.set_attack_order(actor_id, None);
+                continue;
+            }
+
+            if let Some(target) = target {
+                let victim_position = self.actor_state(target).map(|victim| victim.position);
+                let in_range = victim_position.is_some_and(|position| {
+                    self.actors[index].position.squared_distance(position)
+                        <= u128::from(attack.spec.range_mm).pow(2)
+                });
+                if in_range {
+                    // An engaged actor stops advancing FIRST, and stops whether or not the swing is
+                    // legal this tick. Halting only on a successful swing would walk a disarmed or
+                    // cooling-down actor straight through the target it is standing there to hit.
+                    self.halt_engagement(index);
+                    let allowed = self
+                        .validate_actor_intent(
+                            &self.actors[index],
+                            CommandKind::BasicAttack { target },
+                            self.tick,
+                        )
+                        .is_ok();
+                    if allowed {
+                        if acquired {
+                            self.pending_events.push(MatchEvent::TargetAcquired {
+                                actor: actor_id,
+                                target,
+                            });
+                        }
+                        self.apply_intent(actor_id, CommandKind::BasicAttack { target })?;
+                    }
+                    continue;
+                }
+                // Noticed but out of reach. A named target and an ADVANCE order both close the distance;
+                // a HOLD does not, or it would not be a hold. This is the case that only exists because
+                // acquisition can be wider than reach.
+                if !matches!(order, AttackOrder::Hold) {
+                    if let Some(destination) = victim_position {
+                        self.apply_intent(actor_id, CommandKind::MoveTo { destination })?;
+                    }
+                    continue;
+                }
+            }
+
+            // Nothing to engage: an advance order keeps advancing, a hold stays put.
+            if let AttackOrder::Move(destination) = order {
+                self.apply_intent(actor_id, CommandKind::MoveTo { destination })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop any pending navigation because this actor is now engaging something in reach.
+    ///
+    /// Emits `MoveStopped` rather than clearing silently: from a client's point of view the unit stopped
+    /// walking, and a projection that showed it still en route would be describing a different world.
+    fn halt_engagement(&mut self, index: usize) {
+        if self.actors[index].destination.take().is_some() {
+            let actor = self.actors[index].id;
+            self.dirty.insert(actor);
+            self.pending_events.push(MatchEvent::MoveStopped { actor });
+        }
+    }
+
+    /// The nearest hostile living actor within `radius_mm`, ties broken by actor id.
+    ///
+    /// Nearest-with-an-id-tiebreak rather than "first found": iteration order must never decide who a unit
+    /// engages, and two equidistant targets have to resolve the same way in every runtime.
+    fn acquire_target(&self, index: usize, radius_mm: u32) -> Option<ActorId> {
+        let origin = self.actors[index].position;
+        let team = self.actors[index].team;
+        let radius_squared = u128::from(radius_mm).pow(2);
+        self.actors
+            .iter()
+            .filter(|candidate| candidate.alive() && candidate.team != team)
+            .filter(|candidate| origin.squared_distance(candidate.position) <= radius_squared)
+            .min_by_key(|candidate| (origin.squared_distance(candidate.position), candidate.id))
+            .map(|candidate| candidate.id)
     }
 
     fn integrate_movement(&mut self) {
@@ -3459,6 +3696,7 @@ impl MatchRuntime {
             }
             if health_before > 0 && settled_health == 0 {
                 self.actors[target_index].destination = None;
+                self.actors[target_index].attack_order = None;
                 if let Some(cancelled) = self.actors[target_index].cast.take() {
                     self.pending_events.push(MatchEvent::CastCancelled {
                         source: target,
@@ -3982,12 +4220,14 @@ pub(crate) const fn event_tag(event: MatchEvent) -> u8 {
         MatchEvent::AbilityRankUp { .. } => 29,
         MatchEvent::ShieldAbsorbed { .. } => 30,
         MatchEvent::LifestealApplied { .. } => 31,
+        MatchEvent::TargetAcquired { .. } => 32,
+        MatchEvent::AttackOrderChanged { .. } => 33,
     }
 }
 
 pub(crate) fn digest_frame(frame: &ServerFrame) -> FrameDigest {
     let mut hash = StableHash::new();
-    hash.bytes(b"metrocalk-gameplay-frame-v8");
+    hash.bytes(b"metrocalk-gameplay-frame-v9");
     hash.u64(frame.tick);
     hash.phase(frame.phase);
     hash.len(frame.changed.len());
@@ -4225,6 +4465,22 @@ impl StableHash {
         self.u32(amount);
     }
 
+    #[inline]
+    fn attack_order(&mut self, order: Option<AttackOrder>) {
+        match order {
+            None => self.u8(0),
+            Some(AttackOrder::Target(actor)) => {
+                self.u8(1);
+                self.u64(actor.get());
+            }
+            Some(AttackOrder::Move(destination)) => {
+                self.u8(2);
+                self.point(destination);
+            }
+            Some(AttackOrder::Hold) => self.u8(3),
+        }
+    }
+
     fn bounty(&mut self, bounty: Bounty) {
         self.u32(bounty.gold);
         self.u32(bounty.experience);
@@ -4393,6 +4649,7 @@ impl StableHash {
             experience,
             level,
             unspent_ability_points,
+            attack_order,
             crit_attempts,
             damage_credits,
             base_stats: _,
@@ -4441,6 +4698,7 @@ impl StableHash {
         self.bounty(*bounty);
         self.u32(*experience);
         self.u8(*unspent_ability_points);
+        self.attack_order(*attack_order);
         self.u16(*crit_attempts);
         self.len(damage_credits.len());
         for credit in damage_credits {
@@ -4491,6 +4749,7 @@ impl StableHash {
             Some(attack) => {
                 self.bool(true);
                 self.u32(attack.spec.range_mm);
+                self.u32(attack.spec.acquisition_range_mm);
                 self.u32(attack.spec.damage);
                 self.damage_school(attack.spec.school);
                 self.u16(attack.spec.windup_ticks);
@@ -4603,6 +4862,7 @@ impl StableHash {
             }
             None => self.bool(false),
         }
+        self.attack_order(actor.attack_order);
         self.u8(actor.level);
         self.u32(actor.experience);
         self.u8(actor.unspent_ability_points);
@@ -4932,6 +5192,14 @@ impl StableHash {
                 self.u32(amount);
                 self.u32(health_after);
             }
+            MatchEvent::TargetAcquired { actor, target } => {
+                self.u64(actor.get());
+                self.u64(target.get());
+            }
+            MatchEvent::AttackOrderChanged { actor, order } => {
+                self.u64(actor.get());
+                self.attack_order(order);
+            }
         }
     }
 
@@ -4959,6 +5227,15 @@ impl StableHash {
                 self.u8(4);
                 self.u32(ability.get());
             }
+            CommandKind::AttackMove { destination } => {
+                self.u8(5);
+                self.point(destination);
+            }
+            CommandKind::AttackTarget { target } => {
+                self.u8(6);
+                self.u64(target.get());
+            }
+            CommandKind::HoldPosition => self.u8(7),
         }
     }
 

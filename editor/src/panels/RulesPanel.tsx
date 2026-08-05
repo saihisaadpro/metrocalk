@@ -8,6 +8,7 @@ import { useEffect, useState } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { pushToast } from "../store/toasts";
+import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type {
   CompareOp,
@@ -28,8 +29,16 @@ const OPS: { op: CompareOp; label: string }[] = [
   { op: "ge", label: "≥" },
 ];
 
-const box: React.CSSProperties = { font: "12px ui-monospace, monospace", padding: 10 };
-const ctrl: React.CSSProperties = { font: "11px ui-monospace, monospace", padding: "1px 3px" };
+const box: React.CSSProperties = { font: `${fontSize.meta}px ${font.mono}`, padding: space.lg };
+const ctrl: React.CSSProperties = {
+  minHeight: 30,
+  padding: `${space.xxs}px ${space.sm}px`,
+  border: `1px solid ${color.border.default}`,
+  borderRadius: radius.sm,
+  color: color.text.primary,
+  background: color.bg.input,
+  font: `${fontSize.micro}px ${font.mono}`,
+};
 
 function fieldTy(reg: RuleRegistryInfo, component: string, field: string): string {
   return reg.components.find((c) => c.name === component)?.fields.find((f) => f.name === field)?.ty ?? "string";
@@ -50,10 +59,21 @@ function rawValue(v: FieldValue): string {
 
 /** A value input whose KIND is dictated by the field's registry type (typo-proof: an integer field gets a
  *  number input, a boolean a true/false select) — the value can never be the wrong shape for the field. */
-function ValueInput({ ty, value, onChange }: { ty: string; value: FieldValue; onChange: (v: FieldValue) => void }) {
+function ValueInput({
+  ty,
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  ty: string;
+  value: FieldValue;
+  onChange: (v: FieldValue) => void;
+  ariaLabel: string;
+}) {
   if (ty === "boolean") {
     return (
       <select
+        aria-label={ariaLabel}
         data-testid="rule-value"
         style={ctrl}
         value={"Bool" in value ? String(value.Bool) : "false"}
@@ -67,6 +87,7 @@ function ValueInput({ ty, value, onChange }: { ty: string; value: FieldValue; on
   if (ty === "integer" || ty === "number") {
     return (
       <input
+        aria-label={ariaLabel}
         data-testid="rule-value"
         type="number"
         style={{ ...ctrl, width: 64 }}
@@ -80,6 +101,7 @@ function ValueInput({ ty, value, onChange }: { ty: string; value: FieldValue; on
   }
   return (
     <input
+      aria-label={ariaLabel}
       data-testid="rule-value"
       type="text"
       style={{ ...ctrl, width: 96 }}
@@ -96,6 +118,7 @@ function TargetPicker({
   entity,
   component,
   field,
+  contextLabel,
   onChange,
 }: {
   reg: RuleRegistryInfo;
@@ -103,12 +126,19 @@ function TargetPicker({
   entity: string;
   component: string;
   field: string;
+  contextLabel: string;
   onChange: (patch: { entity?: string; component?: string; field?: string }) => void;
 }) {
   const fields = reg.components.find((c) => c.name === component)?.fields ?? [];
   return (
     <>
-      <select data-testid="rule-entity" style={ctrl} value={entity} onChange={(e) => onChange({ entity: e.target.value })}>
+      <select
+        aria-label={`${contextLabel} entity`}
+        data-testid="rule-entity"
+        style={ctrl}
+        value={entity}
+        onChange={(e) => onChange({ entity: e.target.value })}
+      >
         <option value="">— entity —</option>
         {entityOptions.map((o) => (
           <option key={o.id} value={o.id}>
@@ -117,6 +147,7 @@ function TargetPicker({
         ))}
       </select>
       <select
+        aria-label={`${contextLabel} component`}
         data-testid="rule-component"
         style={ctrl}
         value={component}
@@ -131,7 +162,13 @@ function TargetPicker({
           </option>
         ))}
       </select>
-      <select data-testid="rule-field" style={ctrl} value={field} onChange={(e) => onChange({ field: e.target.value })}>
+      <select
+        aria-label={`${contextLabel} field`}
+        data-testid="rule-field"
+        style={ctrl}
+        value={field}
+        onChange={(e) => onChange({ field: e.target.value })}
+      >
         {fields.map((f) => (
           <option key={f.name} value={f.name}>
             {f.name}
@@ -205,8 +242,9 @@ function RuleBuilder({
   }
 
   return (
-    <div data-testid="rule-builder" style={{ border: "1px solid #2a2d35", borderRadius: 4, padding: 8, marginBottom: 8 }}>
+    <div data-testid="rule-builder" style={{ border: `1px solid ${color.border.subtle}`, borderRadius: radius.lg, padding: space.md, marginBottom: space.md, background: color.bg.panel }}>
       <input
+        aria-label="Rule name"
         data-testid="rule-name"
         type="text"
         placeholder="rule name"
@@ -216,7 +254,13 @@ function RuleBuilder({
       />
       <div style={{ marginBottom: 6 }}>
         <b>When</b>{" "}
-        <select data-testid="rule-event" style={ctrl} value={event} onChange={(e) => setEvent(e.target.value)}>
+        <select
+          aria-label="Rule trigger event"
+          data-testid="rule-event"
+          style={ctrl}
+          value={event}
+          onChange={(e) => setEvent(e.target.value)}
+        >
           {reg.events.map((ev) => (
             <option key={ev.name} value={ev.name} title={ev.description}>
               {ev.name}
@@ -238,6 +282,7 @@ function RuleBuilder({
               entity={c.entity}
               component={c.component}
               field={c.field}
+              contextLabel={`Condition ${i + 1}`}
               onChange={(p) => {
                 const next = [...conditions];
                 next[i] = { ...c, ...p };
@@ -246,6 +291,7 @@ function RuleBuilder({
               }}
             />
             <select
+              aria-label={`Condition ${i + 1} comparison operator`}
               data-testid="rule-op"
               style={ctrl}
               value={c.op}
@@ -262,6 +308,7 @@ function RuleBuilder({
               ))}
             </select>
             <ValueInput
+              ariaLabel={`Condition ${i + 1} value`}
               ty={fieldTy(reg, c.component, c.field)}
               value={c.value}
               onChange={(v) => {
@@ -270,7 +317,11 @@ function RuleBuilder({
                 setConditions(next);
               }}
             />
-            <button style={ctrl} onClick={() => setConditions(conditions.filter((_, j) => j !== i))}>
+            <button
+              aria-label={`Remove condition ${i + 1}`}
+              style={ctrl}
+              onClick={() => setConditions(conditions.filter((_, j) => j !== i))}
+            >
               ×
             </button>
           </div>
@@ -285,6 +336,7 @@ function RuleBuilder({
         {actions.map((a, i) => (
           <div key={i} style={{ display: "flex", gap: 4, flexWrap: "wrap", margin: "3px 0" }}>
             <select
+              aria-label={`Action ${i + 1} type`}
               data-testid="rule-action"
               style={ctrl}
               value={a.action}
@@ -306,6 +358,7 @@ function RuleBuilder({
               entity={a.entity}
               component={a.component}
               field={a.field}
+              contextLabel={`Action ${i + 1}`}
               onChange={(p) => {
                 const next = [...actions];
                 next[i] = { ...a, ...p };
@@ -315,6 +368,7 @@ function RuleBuilder({
             />
             <span>=</span>
             <ValueInput
+              ariaLabel={`Action ${i + 1} value`}
               ty={fieldTy(reg, a.component, a.field)}
               value={a.value}
               onChange={(v) => {
@@ -323,7 +377,11 @@ function RuleBuilder({
                 setActions(next);
               }}
             />
-            <button style={ctrl} onClick={() => setActions(actions.filter((_, j) => j !== i))}>
+            <button
+              aria-label={`Remove action ${i + 1}`}
+              style={ctrl}
+              onClick={() => setActions(actions.filter((_, j) => j !== i))}
+            >
               ×
             </button>
           </div>
@@ -331,7 +389,7 @@ function RuleBuilder({
       </div>
 
       {error && (
-        <div data-testid="rule-error" style={{ color: "#f88", margin: "4px 0" }}>
+        <div data-testid="rule-error" style={{ color: color.danger.text, margin: `${space.xs}px 0` }}>
           {error}
         </div>
       )}
@@ -373,7 +431,7 @@ export function RulesPanel({ client }: { client: EditorClient }) {
   }
 
   return (
-    <div id="rules" data-testid="rules-panel" style={{ ...box, borderTop: "1px solid #2a2d35" }}>
+    <div id="rules" data-testid="rules-panel" style={{ ...box, borderTop: `1px solid ${color.border.subtle}` }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
         <b>Rules</b>
         <button
@@ -401,7 +459,7 @@ export function RulesPanel({ client }: { client: EditorClient }) {
       {offeredMirror && (
         <div
           data-testid="mirror-offer"
-          style={{ border: "1px solid #3a5", borderRadius: 4, padding: 6, marginBottom: 8, background: "#0c1a0c" }}
+          style={{ border: `1px solid ${color.success.border}`, borderRadius: radius.lg, padding: space.md, marginBottom: space.md, background: color.success.bg }}
         >
           Also remove the effect on the way out? Add the cleanup rule{" "}
           <b>{offeredMirror.name}</b> (When {offeredMirror.event}).{" "}
@@ -415,18 +473,23 @@ export function RulesPanel({ client }: { client: EditorClient }) {
       )}
 
       {rules.length === 0 ? (
-        <div style={{ color: "#888" }}>No rules yet — author a When / If / Then rule.</div>
+        <div style={{ color: color.text.muted }}>No rules yet — author a When / If / Then rule.</div>
       ) : (
         rules.map((r) => (
           <div
             key={r.id}
             data-testid="rule-row"
-            style={{ display: "flex", justifyContent: "space-between", gap: 8, padding: "3px 0", borderBottom: "1px solid #23262d" }}
+            style={{ display: "flex", justifyContent: "space-between", gap: space.md, padding: `${space.xs}px 0`, borderBottom: `1px solid ${color.border.subtle}` }}
           >
             <span>
               <b>{r.name}</b> · When {r.event} · {r.conditionCount} if · {r.actionCount} then
             </span>
-            <button style={ctrl} onClick={() => void remove(r.id)} title="remove rule">
+            <button
+              aria-label={`Remove rule ${r.name}`}
+              style={ctrl}
+              onClick={() => void remove(r.id)}
+              title="remove rule"
+            >
               ×
             </button>
           </div>

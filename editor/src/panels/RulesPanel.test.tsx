@@ -55,6 +55,36 @@ test("the builder's dropdowns are fed by the registry (typo-proof — no free te
   expect([...action.options].map((o) => o.value)).toEqual(["SetField", "AdjustCounter"]);
 });
 
+test("repeated builder controls expose unambiguous row-context names", async () => {
+  await openBuilder();
+
+  expect(screen.getByRole("textbox", { name: "Rule name" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Rule trigger event" })).toBeTruthy();
+
+  fireEvent.click(screen.getByText("+ condition"));
+  fireEvent.click(screen.getByText("+ condition"));
+  fireEvent.click(screen.getByText("+ action"));
+
+  expect(screen.getByRole("combobox", { name: "Condition 1 entity" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Condition 1 component" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Condition 1 field" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Condition 1 comparison operator" })).toBeTruthy();
+  expect(screen.getByRole("spinbutton", { name: "Condition 1 value" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Condition 2 entity" })).toBeTruthy();
+  expect(screen.getByRole("spinbutton", { name: "Condition 2 value" })).toBeTruthy();
+
+  expect(screen.getByRole("combobox", { name: "Action 1 type" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Action 1 entity" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Action 1 component" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Action 1 field" })).toBeTruthy();
+  expect(screen.getByRole("spinbutton", { name: "Action 1 value" })).toBeTruthy();
+
+  expect(screen.getByRole("button", { name: "Remove condition 1" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Remove condition 2" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Remove action 1" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "×" })).toBeNull();
+});
+
 test("Create submits a structured RuleData assembled from registry clicks", async () => {
   const authorRule = vi.fn((_rule: RuleData) => Promise.resolve({ id: "r1", error: null, mirror: null }));
   await openBuilder(fakeClient({ ruleRegistry: () => Promise.resolve(REGISTRY), authorRule }));
@@ -122,6 +152,7 @@ test("the Rule list renders authored rules and deletes one", async () => {
   const row = await screen.findByTestId("rule-row");
   expect(row.textContent).toMatch(/ignite/);
   expect(row.textContent).toMatch(/When EnemyDied/);
-  fireEvent.click(screen.getByTitle("remove rule"));
+  expect(screen.queryByRole("button", { name: "×" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Remove rule ignite" }));
   await waitFor(() => expect(deleteRule).toHaveBeenCalledWith("r1"));
 });

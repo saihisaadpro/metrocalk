@@ -182,6 +182,7 @@ pub fn bake_standard_lbs(
             positions,
             normals: Vec::new(),
             uvs: Vec::new(),
+            tangents: Vec::new(),
             indices,
             material: 0,
             joints,

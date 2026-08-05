@@ -4,15 +4,18 @@
 // `inv_view_proj` (M11.3 inc.2) lets the skybox turn a screen pixel into a world ray; `light_view_proj`
 // (M11.3 inc.3) is the shadow-casting light's ortho view-proj, for both the depth pass and fs_mesh's shadow
 // lookup. The cube/grid/line shaders ignore the trailing fields. Field order matches render.rs's `Camera`
-// (view_proj · inv_view_proj · light_view_proj · focus) — 208 bytes, std140-clean.
+// (view_proj · inv_view_proj · light_view_proj · focus · shadow · grid) — 240 bytes, std140-clean.
 struct Camera {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     light_view_proj: mat4x4<f32>,
     focus: vec4<f32>,
     // M11.3 inc.3 — `shadow.x` = index of the shadow-casting directional light (-1 = none); the single
-    // shadow map applies to ONLY that light, so other directionals (no map) stay unshadowed.
+    // shadow map applies to ONLY that light, so other directionals (no map) stay unshadowed. `.y` is
+    // exposure, `.z` is the cinematic(0)/CAD(1) presentation profile, `.w` is shadow quality 0..3.
     shadow: vec4<f32>,
+    // Adaptive grid: target X/Z in `.xy`, camera distance in `.z`.
+    grid: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 
@@ -25,7 +28,7 @@ struct Camera {
 @group(3) @binding(5) var shadow_samp: sampler_comparison;
 
 // Fraction of the directional light reaching `world_pos` (1 = fully lit, 0 = fully shadowed). Projects into
-// the light's clip space, does a 3×3 PCF compare with a slope-scaled depth bias. Anything outside the
+// the light's clip space, does quality-scaled tent PCF with receiver/slope bias. Anything outside the
 // shadow frustum is treated as lit (the map only covers the scene's fitted bounds).
 fn shadow_factor(world_pos: vec3<f32>, n_dot_l: f32) -> f32 {
     let lc = cam.light_view_proj * vec4<f32>(world_pos, 1.0);
@@ -36,18 +39,37 @@ fn shadow_factor(world_pos: vec3<f32>, n_dot_l: f32) -> f32 {
     }
     // Slope-scaled bias: steeper grazing angles need more, to avoid shadow acne; clamped so flat faces
     // don't peter-pan (detach their contact shadow).
-    let bias = clamp(0.0016 * tan(acos(clamp(n_dot_l, 0.0, 1.0))), 0.0006, 0.004);
+    let slope_bias = 0.0012 * tan(acos(clamp(n_dot_l, 0.0, 1.0)));
+    // Receiver-plane depth gradient catches the cases where normal-only bias underestimates a large
+    // projected slope. It materially reduces crawling acne without globally detaching contact shadows.
+    let receiver_bias = max(abs(dpdx(ndc.z)), abs(dpdy(ndc.z))) * 1.5;
+    let bias = clamp(max(slope_bias, receiver_bias), 0.00035, 0.0035);
     let ref_depth = ndc.z - bias;
     let dim = vec2<f32>(textureDimensions(shadow_map));
     let texel = 1.0 / dim;
+    let quality = cam.shadow.w;
+    if (quality < 1.5) {
+        return textureSampleCompareLevel(shadow_map, shadow_samp, uv, ref_depth);
+    }
+    let radius = select(1, 2, quality > 2.5);
     var sum = 0.0;
-    for (var dy = -1; dy <= 1; dy = dy + 1) {
-        for (var dx = -1; dx <= 1; dx = dx + 1) {
+    var weight_sum = 0.0;
+    for (var dy = -2; dy <= 2; dy = dy + 1) {
+        for (var dx = -2; dx <= 2; dx = dx + 1) {
+            if (abs(dx) > radius || abs(dy) > radius) {
+                continue;
+            }
             let o = vec2<f32>(f32(dx), f32(dy)) * texel;
-            sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + o, ref_depth);
+            // 3×3 [1 2 1] or 5×5 [1 2 3 2 1] separable tent. Hardware comparison filtering expands
+            // this into a soft, stable kernel without the box-PCF stepping visible during orbit.
+            let wx = f32(radius + 1 - abs(dx));
+            let wy = f32(radius + 1 - abs(dy));
+            let weight = wx * wy;
+            sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + o, ref_depth) * weight;
+            weight_sum = weight_sum + weight;
         }
     }
-    return sum / 9.0;
+    return sum / weight_sum;
 }
 
 // Focus mode (M3.3): when `cam.focus_active > 0.5`, every entity that isn't the focused/selected one
@@ -78,6 +100,7 @@ struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, selected: f32
 // the sampler. Untextured slots bind dummies (white → factor unchanged; flat-normal [128,128,255] → +Z).
 @group(1) @binding(3) var mr_tex: texture_2d<f32>;
 @group(1) @binding(4) var normal_tex: texture_2d<f32>;
+@group(1) @binding(5) var ao_tex: texture_2d<f32>;
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
 
@@ -112,31 +135,52 @@ fn vs_cube(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     return out;
 }
 
-const GRID_N: u32 = 40u;
-const GRID_HALF: f32 = 40.0;
+// Derivative-antialiased adaptive grid. The prior 82 hardware lines were always two metres apart and all
+// survived into the distance; at CAD frame-all distances they collapsed into alternating pixel rows (moiré).
+// This is one transparent plane whose world-stable spacing follows powers of ten and whose `fwidth` coverage
+// integrates sub-pixel lines instead of flickering. Its extent follows the camera target and distance.
+struct GridOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) world_xz: vec2<f32>,
+    @location(1) local_xz: vec2<f32>,
+};
 
 @vertex
-fn vs_grid(@builtin(vertex_index) vi: u32) -> VsOut {
-    let line = vi / 2u;
-    let endp = vi % 2u;
-    let lines_per_dir = GRID_N + 1u;
-    let span = GRID_HALF * 2.0;
-    var world: vec3<f32>;
-    if (line < lines_per_dir) {
-        let f = f32(line) / f32(GRID_N);
-        let x = -GRID_HALF + f * span;
-        let z = select(-GRID_HALF, GRID_HALF, endp == 1u);
-        world = vec3<f32>(x, 0.0, z);
-    } else {
-        let f = f32(line - lines_per_dir) / f32(GRID_N);
-        let z = -GRID_HALF + f * span;
-        let x = select(-GRID_HALF, GRID_HALF, endp == 1u);
-        world = vec3<f32>(x, 0.0, z);
-    }
-    var out: VsOut;
-    out.pos = cam.view_proj * vec4<f32>(world, 1.0);
-    out.color = vec3<f32>(0.18, 0.20, 0.26);
+fn vs_grid(@builtin(vertex_index) vi: u32) -> GridOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0),
+    );
+    let half_size = max(40.0, cam.grid.z * 2.2);
+    let local = corners[vi] * half_size;
+    let world_xz = cam.grid.xy + local;
+    var out: GridOut;
+    out.pos = cam.view_proj * vec4<f32>(world_xz.x, 0.0, world_xz.y, 1.0);
+    out.world_xz = world_xz;
+    out.local_xz = local / half_size;
     return out;
+}
+
+fn grid_line_coverage(world_xz: vec2<f32>, spacing: f32) -> f32 {
+    let coordinate = world_xz / spacing;
+    let width = max(fwidth(coordinate), vec2<f32>(0.00001));
+    let distance_to_line = abs(fract(coordinate - 0.5) - 0.5) / width;
+    return 1.0 - min(min(distance_to_line.x, distance_to_line.y), 1.0);
+}
+
+@fragment
+fn fs_grid(in: GridOut) -> @location(0) vec4<f32> {
+    let view_distance = max(cam.grid.z, 0.1);
+    let decade = floor(log2(view_distance / 12.0) / log2(10.0));
+    let spacing = clamp(pow(10.0, decade), 0.01, 100.0);
+    let minor = grid_line_coverage(in.world_xz, spacing);
+    let major = grid_line_coverage(in.world_xz, spacing * 10.0);
+    let edge_fade = 1.0 - smoothstep(0.72, 1.0, length(in.local_xz));
+    let alpha = max(minor * 0.20, major * 0.36) * edge_fade;
+    if (alpha < 0.004) {
+        discard;
+    }
+    return vec4<f32>(0.10, 0.12, 0.17, alpha);
 }
 
 // Tracking lines (binding-by-intent edges, drawn between bound entity centres). Reuses the `instances`
@@ -176,6 +220,7 @@ struct MeshIn {
     @location(3) metallic: f32,
     @location(4) roughness: f32,
     @location(5) uv: vec2<f32>,
+    @location(6) tangent: vec4<f32>,
 };
 
 struct MeshVsOut {
@@ -186,6 +231,7 @@ struct MeshVsOut {
     @location(3) mr: vec2<f32>,       // metallic, roughness
     @location(4) selected: f32,
     @location(5) uv: vec2<f32>,
+    @location(6) world_tangent: vec4<f32>,
 };
 
 @vertex
@@ -203,6 +249,7 @@ fn vs_mesh(v: MeshIn, @builtin(instance_index) ii: u32) -> MeshVsOut {
     out.base_color = select(v.color, inst.color, has_override);
     out.mr = select(vec2<f32>(v.metallic, v.roughness), inst.material.xy, has_override);
     out.uv = v.uv;
+    out.world_tangent = vec4<f32>(quat_rotate(inst.rotation, v.tangent.xyz), v.tangent.w);
     return out;
 }
 
@@ -240,20 +287,41 @@ fn fresnel_schlick_roughness(cos_theta: f32, f0: vec3<f32>, roughness: f32) -> v
     return f0 + (max(inv_rough, f0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
-// M11.3 inc.2 — the lit/IBL paths work in LINEAR HDR (the sun + bright reflections exceed 1.0), but the
-// swapchain is a NON-sRGB (linear-store) format, so the shader must both compress the highlights and
-// encode to sRGB itself. ACES filmic (Narkowicz fit) + a 2.2 gamma — applied to the mesh + sky outputs.
+// The lit/IBL paths work in linear HDR. Cinematic mode uses an ACES filmic fit; CAD mode uses the Khronos
+// PBR Neutral reference curve, which preserves material hue/saturation under neutral lighting. Both use
+// the exact sRGB OETF rather than a 2.2 approximation so dark gradients and brand colors remain stable.
 fn tonemap_aces(x: vec3<f32>) -> vec3<f32> {
     let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
+fn tonemap_pbr_neutral(input_color: vec3<f32>) -> vec3<f32> {
+    let start_compression = 0.8 - 0.04;
+    let desaturation = 0.15;
+    let x = min(input_color.r, min(input_color.g, input_color.b));
+    let offset = select(0.04, x - 6.25 * x * x, x < 0.08);
+    let color = input_color - vec3<f32>(offset);
+    let peak = max(color.r, max(color.g, color.b));
+    if (peak < start_compression) {
+        return color;
+    }
+    let new_peak = 1.0 - (1.0 - start_compression) * (1.0 - start_compression)
+        / (peak + 1.0 - 2.0 * start_compression);
+    let compressed = color * (new_peak / peak);
+    let g = 1.0 / (desaturation * (peak - new_peak) + 1.0);
+    return mix(vec3<f32>(new_peak), compressed, g);
+}
 fn to_srgb(x: vec3<f32>) -> vec3<f32> {
-    return pow(x, vec3<f32>(1.0 / 2.2));
+    let safe = max(x, vec3<f32>(0.0));
+    let low = safe * 12.92;
+    let high = 1.055 * pow(safe, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    return select(high, low, safe <= vec3<f32>(0.0031308));
 }
 fn display_encode(hdr: vec3<f32>) -> vec3<f32> {
-    // M11.4 — apply post EXPOSURE (cam.shadow.y, a linear multiplier set by `set_exposure`) before the ACES
-    // tonemap, so a too-bright/too-dark HDR scene can be balanced without touching lights.
-    return to_srgb(tonemap_aces(hdr * cam.shadow.y));
+    let exposed = max(hdr * cam.shadow.y, vec3<f32>(0.0));
+    if (cam.shadow.z > 0.5) {
+        return to_srgb(tonemap_pbr_neutral(exposed));
+    }
+    return to_srgb(tonemap_aces(exposed));
 }
 
 // GGX/Trowbridge-Reitz normal distribution.
@@ -278,11 +346,30 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+// Geometric/specular AA: turn screen-space normal variance into additional microfacet roughness. This
+// suppresses the sub-pixel fireflies and crawling highlights that MSAA cannot touch, while retaining broad
+// reflection shape. CAD uses a slightly tighter filter to preserve inspection detail.
+fn specular_aa_roughness(perceptual_roughness: f32, n: vec3<f32>) -> f32 {
+    let dn_dx = dpdx(n);
+    let dn_dy = dpdy(n);
+    let cad = clamp(cam.shadow.z, 0.0, 1.0);
+    let variance_scale = mix(0.15, 0.10, cad);
+    let threshold = mix(0.18, 0.12, cad);
+    let variance = variance_scale * (dot(dn_dx, dn_dx) + dot(dn_dy, dn_dy));
+    let kernel_roughness2 = min(2.0 * variance, threshold);
+    return clamp(sqrt(perceptual_roughness * perceptual_roughness + kernel_roughness2), 0.045, 1.0);
+}
+
+fn specular_ambient_occlusion(n_dot_v: f32, ao: f32, roughness: f32) -> f32 {
+    let exponent = exp2(-16.0 * roughness - 1.0);
+    return clamp(pow(n_dot_v + ao, exponent) - 1.0 + ao, 0.0, 1.0);
+}
+
 // One light's Cook-Torrance contribution. `l` = unit direction TO the light; `radiance` = colour·intensity
 // (already attenuated). Energy-conserving Lambert diffuse + GGX/Smith/Fresnel specular; metals have no diffuse.
 fn light_contrib(
     n: vec3<f32>, v: vec3<f32>, base: vec3<f32>, metallic: f32, roughness: f32, f0: vec3<f32>,
-    l: vec3<f32>, radiance: vec3<f32>,
+    energy_compensation: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>,
 ) -> vec3<f32> {
     let h = normalize(v + l);
     let n_dot_l = max(dot(n, l), 0.0);
@@ -292,7 +379,7 @@ fn light_contrib(
     let f = fresnel_schlick(v_dot_h, f0);
     let ndf = distribution_ggx(n_dot_h, roughness);
     let g = geometry_smith(n_dot_v, n_dot_l, roughness);
-    let specular = (ndf * g * f) / max(4.0 * n_dot_v * n_dot_l, 1e-4);
+    let specular = ((ndf * g * f) / max(4.0 * n_dot_v * n_dot_l, 1e-4)) * energy_compensation;
     let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
     let diffuse = kd * base / PI;
     return (diffuse + specular) * radiance * n_dot_l;
@@ -302,7 +389,15 @@ fn light_contrib(
 // build the TBN from screen-space derivatives of world position + UV, then rotate the sampled normal into
 // world space. Degenerate UV (untextured meshes have a constant UV → zero gradient) falls back to the
 // geometric normal, avoiding a NaN from inverseSqrt(0).
-fn perturb_normal(n: vec3<f32>, world_pos: vec3<f32>, uv: vec2<f32>, map: vec3<f32>) -> vec3<f32> {
+fn perturb_normal(n: vec3<f32>, tangent: vec4<f32>, world_pos: vec3<f32>, uv: vec2<f32>, map: vec3<f32>) -> vec3<f32> {
+    if (dot(tangent.xyz, tangent.xyz) > 0.25) {
+        // Gram-Schmidt removes interpolation drift. The sign is the MikkTSpace handedness emitted by
+        // the same compiler that produced the baked normal map.
+        let t = normalize(tangent.xyz - n * dot(n, tangent.xyz));
+        let sign = select(-1.0, 1.0, tangent.w >= 0.0);
+        let b = cross(n, t) * sign;
+        return normalize(mat3x3<f32>(t, b, n) * map);
+    }
     let dp1 = dpdx(world_pos);
     let dp2 = dpdy(world_pos);
     let duv1 = dpdx(uv);
@@ -329,16 +424,26 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
     // roughness=G, metalness=B); an untextured mesh binds a white dummy (×1 → unchanged).
     let mr_s = textureSample(mr_tex, base_color_samp, in.uv);
     let metallic = clamp(in.mr.x * mr_s.b, 0.0, 1.0);
-    let roughness = clamp(in.mr.y * mr_s.g, 0.04, 1.0); // floor avoids a singular mirror highlight
+    var roughness = clamp(in.mr.y * mr_s.g, 0.04, 1.0); // floor avoids a singular mirror highlight
 
     // M11.2 follow-up — perturb the geometric normal by the tangent-space normal map (flat dummy → no-op).
     let geo_n = normalize(in.world_normal);
     let nmap = textureSample(normal_tex, base_color_samp, in.uv).rgb * 2.0 - 1.0;
-    let n = perturb_normal(geo_n, in.world_pos, in.uv, nmap);
+    let n = perturb_normal(geo_n, in.world_tangent, in.world_pos, in.uv, nmap);
+    roughness = specular_aa_roughness(roughness, n);
     let cam_eye = cam.focus.yzw; // packed in the Camera uniform's spare slot
     let v = normalize(cam_eye - in.world_pos);
     // F0: dielectric 0.04, lerped toward the base color as the surface becomes metallic.
     let f0 = mix(vec3<f32>(0.04), base, metallic);
+    let n_dot_v_amb = max(dot(n, v), 1e-4);
+    let brdf = textureSampleLevel(brdf_lut, lut_samp, vec2<f32>(n_dot_v_amb, roughness), 0.0).rg;
+    // The LUT's A+B response is the GGX directional albedo for F0=1. Reuse it to restore the energy lost
+    // by a single-scattering microfacet BRDF (white-furnace consistency), for direct and image lighting.
+    let directional_albedo = max(brdf.x + brdf.y, 0.08);
+    let energy_compensation = min(
+        vec3<f32>(4.0),
+        vec3<f32>(1.0) + f0 * (1.0 / directional_albedo - 1.0),
+    );
 
     // M11.3 — accumulate every authored light (directional/point/spot). The list is never empty (render.rs
     // falls back to a default key light), so an unlit scene still renders.
@@ -374,13 +479,14 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
             shadow = shadow_factor(in.world_pos, dot(n, l));
         }
         let radiance = lt.color_intensity.xyz * lt.color_intensity.w * atten * shadow;
-        lo = lo + light_contrib(n, v, base, metallic, roughness, f0, l, radiance);
+        lo = lo + light_contrib(
+            n, v, base, metallic, roughness, f0, energy_compensation, l, radiance,
+        );
     }
 
     // M11.3 inc.2 — image-based ambient (replaces the flat fill): diffuse from a blurred env mip (a cheap
     // irradiance) + specular from the roughness-matched env mip × the split-sum BRDF LUT. THIS is what
     // gives a metal something to reflect, so chrome/gold are no longer near-black (the M11.2 dark-metal).
-    let n_dot_v_amb = max(dot(n, v), 1e-4);
     let max_mip = f32(textureNumLevels(env) - 1);
     let f_amb = fresnel_schlick_roughness(n_dot_v_amb, f0, roughness);
     let kd_amb = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);
@@ -388,14 +494,24 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
     let diffuse_ibl = kd_amb * irradiance * base;
     let refl = reflect(-v, n);
     let prefiltered = textureSampleLevel(env, env_samp, dir_to_equirect(refl), roughness * max_mip).rgb;
-    let brdf = textureSampleLevel(brdf_lut, lut_samp, vec2<f32>(n_dot_v_amb, roughness), 0.0).rg;
-    let specular_ibl = prefiltered * (f_amb * brdf.x + brdf.y);
+    let horizon = clamp(1.0 + dot(refl, geo_n), 0.0, 1.0);
     // Linear HDR → tonemapped, sRGB-encoded display colour (the swapchain is linear-store).
-    var col = display_encode(diffuse_ibl + specular_ibl + lo);
+    // AO is visibility for indirect light. Missing maps bind a white dummy, preserving prior output.
+    let ao = clamp(textureSample(ao_tex, base_color_samp, in.uv).r, 0.0, 1.0);
+    let specular_ao = specular_ambient_occlusion(n_dot_v_amb, ao, roughness);
+    let specular_ibl = prefiltered * (f_amb * brdf.x + brdf.y) * energy_compensation
+        * specular_ao * horizon * horizon;
+    var col = display_encode(diffuse_ibl * ao + specular_ibl + lo);
 
-    // Editor overlays applied AFTER shading, in display space: selection highlight + focus-dim.
+    // CAD inspection gets a restrained silhouette cue; it clarifies coincident curved bodies without
+    // painting over face colors. Selection is a subtle wash plus a strong rim instead of the old 55% flat
+    // yellow replacement, so selected materials remain inspectable.
+    if (cam.shadow.z > 0.5) {
+        col = col * (1.0 - 0.12 * pow(1.0 - n_dot_v_amb, 3.0));
+    }
     if (in.selected > 0.5) {
-        col = mix(col, vec3<f32>(1.0, 0.85, 0.2), 0.55);
+        let rim = smoothstep(0.12, 0.72, pow(1.0 - n_dot_v_amb, 2.2));
+        col = mix(col, vec3<f32>(1.0, 0.82, 0.16), 0.08 + 0.52 * rim);
     }
     col = apply_focus_dim(col, in.selected > 0.5);
     return vec4<f32>(col, 1.0);

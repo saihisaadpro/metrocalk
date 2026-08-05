@@ -1347,6 +1347,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "float-cmp"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b09cf3155332e944990140d967ff5eceb70df778b34f77d8075db46e4704e6d8"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1689,6 +1698,12 @@ dependencies = [
  "indexmap",
  "stable_deref_trait",
 ]
+
+[[package]]
+name = "glam"
+version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3abb554f8ee44336b72d522e0a7fe86a29e09f839a36022fa869a7dfe941a54b"
 
 [[package]]
 name = "glam"
@@ -2642,6 +2657,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "meshopt"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01e77ead21976b3a9f01ec1724f766923da74f0726364e2b0f425658935d71a"
+dependencies = [
+ "bitflags 2.13.0",
+ "cc",
+ "float-cmp",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "metrocalk-animation"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "metrocalk-assets"
 version = "0.1.0"
 dependencies = [
@@ -2651,7 +2687,11 @@ dependencies = [
  "fbxcel-dom",
  "gltf",
  "image",
+ "metrocalk-animation",
  "metrocalk-skeleton",
+ "openusd",
+ "serde",
+ "serde_json",
  "tobj",
  "ufbx",
 ]
@@ -2661,6 +2701,16 @@ name = "metrocalk-authoring"
 version = "0.1.0"
 dependencies = [
  "metrocalk-core",
+]
+
+[[package]]
+name = "metrocalk-conditioning"
+version = "0.1.0"
+dependencies = [
+ "meshopt",
+ "metrocalk-assets",
+ "metrocalk-xatlas",
+ "mikktspace",
 ]
 
 [[package]]
@@ -2729,8 +2779,10 @@ name = "metrocalk-editor-shell"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "metrocalk-animation",
  "metrocalk-assets",
  "metrocalk-authoring",
+ "metrocalk-conditioning",
  "metrocalk-constraint",
  "metrocalk-core",
  "metrocalk-csg",
@@ -2738,17 +2790,23 @@ dependencies = [
  "metrocalk-dst",
  "metrocalk-economy",
  "metrocalk-ecs",
+ "metrocalk-gameplay",
  "metrocalk-gizmo",
  "metrocalk-interchange",
  "metrocalk-physics",
  "metrocalk-plugins",
  "metrocalk-sdf",
+ "metrocalk-skeleton",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "metrocalk-efficiency"
+version = "0.1.0"
+
+[[package]]
+name = "metrocalk-gameplay"
 version = "0.1.0"
 
 [[package]]
@@ -2788,6 +2846,13 @@ version = "0.1.0"
 [[package]]
 name = "metrocalk-lattice"
 version = "0.1.0"
+
+[[package]]
+name = "metrocalk-match-server"
+version = "0.1.0"
+dependencies = [
+ "metrocalk-gameplay",
+]
 
 [[package]]
 name = "metrocalk-mcp"
@@ -2840,6 +2905,22 @@ name = "metrocalk-transport"
 version = "0.1.0"
 dependencies = [
  "tungstenite",
+]
+
+[[package]]
+name = "metrocalk-xatlas"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "mikktspace"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d0b56b403871a8f992ca626d52cc0a690d4841baea8955dc4af6304ac62f8b0"
+dependencies = [
+ "glam 0.15.2",
 ]
 
 [[package]]

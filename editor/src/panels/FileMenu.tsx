@@ -14,9 +14,10 @@ import { projectStore, projectName, useProjectInfo, type ProjectInfo } from "../
 import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
-import { Modal, Popover } from "../theme/Popover";
+import { DialogSurface, Modal, Popover, PopoverSurface } from "../theme/Popover";
 import { Button } from "../theme/primitives";
-import { color, elevation, font, fontSize, radius, space } from "../theme/tokens";
+import { PopupMenuGroup, PopupMenuItem } from "../theme/workspace";
+import { color, font, fontSize, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 
 /** The file's display name *with* its extension (so a save names the real file, not a stem). */
@@ -29,6 +30,7 @@ export function FileMenu({ client }: { client: EditorClient }) {
   const [pending, setPending] = useState<{ run: () => Promise<ProjectInfo>; label: string } | null>(null);
   // The trigger the dropdown anchors to (its on-screen rect drives the portaled panel's position).
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   // (Escape-to-dismiss for both the dropdown and the guard is handled by `Popover`/`Modal` — capture-phase +
   // stopPropagation, so pressing Esc to close a menu never also triggers App's Stop-Play.)
@@ -56,8 +58,12 @@ export function FileMenu({ client }: { client: EditorClient }) {
    *  don't keep pointing at an entity from the old scene — the new scene streams in over the Channel. */
   async function run(action: () => Promise<ProjectInfo>, ok: string, switchProject = false) {
     const info = await action();
-    projectStore.getState().refresh(info);
-    if (switchProject && !info.error) projectionStore.getState().select(null);
+    if (switchProject && !info.error) {
+      projectStore.getState().switchProject(info);
+      projectionStore.getState().select(null);
+    } else {
+      projectStore.getState().refresh(info);
+    }
     setStatus(info.error ? info.error : ok);
     setOpen(false);
     setPending(null);
@@ -108,11 +114,44 @@ export function FileMenu({ client }: { client: EditorClient }) {
     }
   }
 
+  /** Export the authoritative scene without requiring a mesh selection or opening Asset Lab. */
+  async function exportScene(format: "glb" | "usda") {
+    setOpen(false);
+    setStatus(`Preparing complete-scene ${format.toUpperCase()} export…`);
+    try {
+      const result = await client.sceneExport(format);
+      setStatus(result.message);
+      if (result.ok) {
+        const changed = result.fidelity.filter((entry) => entry.status !== "preserved").length;
+        pushToast(
+          changed > 0 ? `${result.message} · ${changed} fidelity note${changed === 1 ? "" : "s"}` : result.message,
+          changed > 0 ? "info" : "success",
+        );
+      } else if (!/cancel/i.test(result.message)) {
+        pushToast(result.message, "error");
+      }
+    } catch (cause) {
+      const message = cause instanceof Error && cause.message ? cause.message : "Complete-scene export failed";
+      setStatus(message);
+      pushToast(message, "error");
+    }
+  }
+
   return (
     <div id="fileMenuRoot" ref={rootRef} style={{ position: "relative", font: font.ui }}>
-      <Button id="fileMenu" data-testid="fileMenu" variant="ghost" compact onClick={() => setOpen((o) => !o)}>
+      <Button
+        ref={triggerRef}
+        id="fileMenu"
+        data-testid="fileMenu"
+        variant="ghost"
+        compact
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={open ? "fileMenuPopover" : undefined}
+        onClick={() => setOpen((o) => !o)}
+      >
         File
-        <span style={{ marginLeft: space.xs, color: color.text.muted }}>{projectName(path)}</span>
+        <span className="mtk-file-menu__project" style={{ marginLeft: space.xs, color: color.text.muted }}>{projectName(path)}</span>
         {dirty && (
           <span id="projectDirty" data-testid="projectDirty" title="unsaved changes" style={{ marginLeft: space.xxs, color: color.token }}>
             •
@@ -123,48 +162,63 @@ export function FileMenu({ client }: { client: EditorClient }) {
       {/* The dropdown is portaled to the body (theme/Popover) so the app header's `overflow: hidden` can never
           clip it and no sibling stacking context can bury it — the fix for "the File menu opens behind the
           suggestion bar / tabs". Edge-aware + Escape/outside-click dismissal are handled by Popover. */}
-      <Popover open={open} anchor={rootRef} onClose={() => setOpen(false)}>
-        <div
+      <Popover
+        open={open}
+        anchor={rootRef}
+        returnFocus={triggerRef}
+        id="fileMenuPopover"
+        ariaLabelledBy="fileMenu"
+        onClose={() => setOpen(false)}
+      >
+        <PopoverSurface
           id="fileMenuPanel"
           data-testid="fileMenuPanel"
-          style={{ minWidth: 220, background: color.bg.raised, border: `1px solid ${color.border.default}`, borderRadius: radius.lg, padding: space.xs, boxShadow: elevation.e3 }}
+          className="mtk-popup-menu"
         >
-          <MenuItem id="fileNew" label="New project" onClick={() => guarded(() => client.newProject(), "New", "new project")} />
-          <MenuItem id="fileOpen" label="Open…" onClick={() => guarded(() => client.openProject(), "Open", "opened")} />
-          <MenuItem id="fileImport" label="Import asset…" onClick={() => void importFile()} />
-          <Divider />
-          <MenuItem id="fileSave" label="Save" onClick={() => void save(false)} />
-          <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void save(true)} />
-          <Divider />
-          <div style={{ color: color.text.muted, fontSize: fontSize.meta, padding: `${space.xs}px ${space.md}px 2px` }}>Recent</div>
-          <div id="fileRecent" data-testid="fileRecent">
-            {recents.length === 0 ? (
-              <div style={{ padding: `${space.xs}px ${space.md}px`, color: color.text.faint, fontSize: fontSize.body }}>— none —</div>
-            ) : (
-              recents.map((p) => (
-                <button
-                  key={p}
-                  className="fileRecentItem mtk-btn mtk-btn--ghost"
-                  data-path={p}
-                  onClick={() => guarded(() => client.openProject(p), "Open", `opened ${projectName(p)}`)}
-                  title={p}
-                  style={{ display: "block", width: "100%", textAlign: "left", padding: `${space.xs}px ${space.md}px`, color: color.text.secondary, fontSize: fontSize.body, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
-                >
-                  {projectName(p)}
-                </button>
-              ))
-            )}
-          </div>
-        </div>
+          <PopupMenuGroup label="Project">
+            <MenuItem id="fileNew" label="New project" onClick={() => guarded(() => client.newProject(), "New", "new project")} />
+            <MenuItem id="fileOpen" label="Open…" onClick={() => guarded(() => client.openProject(), "Open", "opened")} />
+            <MenuItem id="fileImport" label="Import asset…" onClick={() => void importFile()} />
+            <MenuItem id="fileSave" label="Save" onClick={() => void save(false)} />
+            <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void save(true)} />
+          </PopupMenuGroup>
+          <PopupMenuGroup label="Export complete scene">
+            <MenuItem id="fileExportGlb" label="GLB…" title="Self-contained hierarchy, reusable meshes, materials, textures, skins and standard animation" onClick={() => void exportScene("glb")} />
+            <MenuItem id="fileExportUsda" label="USDA…" title="Readable hierarchy-focused USD with an explicit fidelity report; not binary USDC or packaged USDZ" onClick={() => void exportScene("usda")} />
+          </PopupMenuGroup>
+          <PopupMenuGroup label={<span id="fileRecentHeading">Recent</span>}>
+            <div id="fileRecent" data-testid="fileRecent" role="group" aria-labelledby="fileRecentHeading">
+              {recents.length === 0 ? (
+                <div style={{ padding: `${space.xs}px ${space.md}px`, color: color.text.faint, fontSize: fontSize.body }}>— none —</div>
+              ) : (
+                recents.map((p) => (
+                  <PopupMenuItem
+                    key={p}
+                    className="fileRecentItem"
+                    data-path={p}
+                    label={projectName(p)}
+                    onSelect={() => guarded(() => client.openProject(p), "Open", `opened ${projectName(p)}`)}
+                    title={p}
+                  />
+                ))
+              )}
+            </div>
+          </PopupMenuGroup>
+        </PopoverSurface>
       </Popover>
 
       {pending && (
-        <Modal open onClose={() => setPending(null)} id="unsavedGuard">
-          <div
+        <Modal
+          open
+          onClose={() => setPending(null)}
+          id="unsavedGuard"
+          ariaLabelledBy="unsavedGuardTitle"
+        >
+          <DialogSurface
             data-testid="unsavedGuard"
-            style={{ background: color.bg.raised, border: `1px solid ${color.border.strong}`, borderRadius: radius.xl, padding: space.xl, maxWidth: 340, boxShadow: elevation.e3, color: color.text.primary }}
+            style={{ maxWidth: 340 }}
           >
-            <div style={{ marginBottom: space.lg }}>
+            <div id="unsavedGuardTitle" style={{ marginBottom: space.lg }}>
               Discard unsaved changes to <strong>{projectName(path)}</strong>?
             </div>
             <div style={{ display: "flex", gap: space.md, justifyContent: "flex-end" }}>
@@ -181,27 +235,21 @@ export function FileMenu({ client }: { client: EditorClient }) {
                 Discard &amp; {pending.label}
               </Button>
             </div>
-          </div>
+          </DialogSurface>
         </Modal>
       )}
     </div>
   );
 }
 
-function MenuItem({ id, label, onClick }: { id: string; label: string; onClick: () => void }) {
+function MenuItem({ id, label, title, onClick }: { id: string; label: string; title?: string; onClick: () => void }) {
   return (
-    <button
+    <PopupMenuItem
       id={id}
       data-testid={id}
-      className="mtk-btn mtk-btn--ghost"
-      onClick={onClick}
-      style={{ display: "block", width: "100%", textAlign: "left", padding: `${space.sm}px ${space.md}px`, color: color.text.primary, fontSize: fontSize.body }}
-    >
-      {label}
-    </button>
+      label={label}
+      onSelect={onClick}
+      title={title}
+    />
   );
-}
-
-function Divider() {
-  return <div style={{ height: 1, background: color.border.subtle, margin: `${space.xs}px 0` }} />;
 }

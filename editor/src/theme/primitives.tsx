@@ -4,21 +4,36 @@
 //! `mtk-*` classes in `theme/global.css`; these components just pick the right class + forward the stable
 //! `id`/`data-testid` the prompt-40 e2e + Vitest key on. Non-colour layout values come from `theme/tokens`.
 
-import { useEffect, useRef, useState } from "react";
-import type { ButtonHTMLAttributes, CSSProperties, ReactNode, InputHTMLAttributes } from "react";
+import { forwardRef, useEffect, useRef, useState } from "react";
+import type {
+  ButtonHTMLAttributes,
+  CSSProperties,
+  InputHTMLAttributes,
+  LabelHTMLAttributes,
+  AriaRole,
+  ReactNode,
+  SelectHTMLAttributes,
+  TextareaHTMLAttributes,
+} from "react";
 import { color, radius, space, font, fontSize, text } from "./tokens";
 
 /** A data-* / id passthrough the card/icon primitives accept for the stable e2e/Vitest hooks. */
 type DataAttrs = { id?: string; title?: string; "data-testid"?: string; "data-id"?: string; "data-source"?: string; "data-kind"?: string };
 
 export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger" | "toggle";
+export type ControlSize = "compact" | "default" | "comfortable";
 
-export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, "className"> {
+export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  /** `data-*` passthrough. JSX special-cases these on intrinsic elements, but a `ButtonProps` *object*
+   *  (e.g. `triggerProps`) is excess-property-checked — so the e2e/Vitest hooks need declaring here. */
+  [dataAttr: `data-${string}`]: unknown;
   variant?: ButtonVariant;
   /** Toggle-on state (drives `.is-active` → the accent fill, so live tool/snap/space state is unmistakable). */
   active?: boolean;
   /** Tighter padding/size for dense toolbars. */
   compact?: boolean;
+  /** Named target size. Prefer this over one-off height/padding values. */
+  size?: ControlSize;
   /** Icon-only sizing. */
   icon?: boolean;
   children?: ReactNode;
@@ -26,22 +41,51 @@ export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement
 
 /** The one button. Variants: primary · secondary · ghost · danger · toggle (+ `compact`/`icon`/`active`).
  *  Real hover/pressed/disabled/focus states come from the `.mtk-btn*` classes (global.css). */
-export function Button({ variant = "secondary", active = false, compact = false, icon = false, children, style, ...rest }: ButtonProps) {
+export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button({
+  variant = "secondary",
+  active = false,
+  compact = false,
+  size = "default",
+  icon = false,
+  type = "button",
+  role,
+  "aria-checked": ariaChecked,
+  "aria-pressed": ariaPressed,
+  "aria-selected": ariaSelected,
+  className,
+  children,
+  style,
+  ...rest
+}, ref) {
+  const resolvedSize = compact ? "compact" : size;
+  const exposesAnotherSelectionPattern =
+    role != null || ariaChecked != null || ariaSelected != null;
   const cls = [
     "mtk-btn",
     `mtk-btn--${variant}`,
-    compact && "mtk-btn--compact",
+    `mtk-btn--${resolvedSize}`,
     icon && "mtk-btn--icon",
     variant === "toggle" && active && "is-active",
+    className,
   ]
     .filter(Boolean)
     .join(" ");
   return (
-    <button className={cls} style={style} {...rest}>
+    <button
+      ref={ref}
+      type={type}
+      role={role}
+      aria-checked={ariaChecked}
+      aria-pressed={ariaPressed ?? (variant === "toggle" && !exposesAnotherSelectionPattern ? active : undefined)}
+      aria-selected={ariaSelected}
+      className={cls}
+      style={style}
+      {...rest}
+    >
       {children}
     </button>
   );
-}
+});
 
 /** A coherent panel region: opaque panel background + a hairline border, laid out as a flex column. The
  *  opaque background is deliberate — panels paint their own bg so only the viewport stays a transparent hole
@@ -268,6 +312,119 @@ export function TextField({ style, mono = false, ...rest }: Omit<InputHTMLAttrib
 
 /** A small, neutral pill/badge (for live readouts — view label, counts). Not a button. The `title`
  *  carries the plain-language explanation (a requirer's needed cap, a price) — never colour-alone. */
+/** Search is a first-class editor interaction with one shared focus, density and clearing contract. */
+export function SearchField({
+  className,
+  style,
+  ...rest
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "type">) {
+  return (
+    <input
+      type="search"
+      className={["mtk-input", "mtk-search", className].filter(Boolean).join(" ")}
+      style={style}
+      {...rest}
+    />
+  );
+}
+
+/** Shared native select styling preserves platform semantics while removing subsystem-specific controls. */
+export function SelectField({
+  className,
+  children,
+  style,
+  ...rest
+}: SelectHTMLAttributes<HTMLSelectElement>) {
+  return (
+    <select
+      className={["mtk-input", "mtk-select", className].filter(Boolean).join(" ")}
+      style={style}
+      {...rest}
+    >
+      {children}
+    </select>
+  );
+}
+
+/** Multiline input from the same control family as text, numeric, search and select fields. */
+export function TextAreaField({
+  className,
+  style,
+  ...rest
+}: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  return (
+    <textarea
+      className={["mtk-input", "mtk-textarea", className].filter(Boolean).join(" ")}
+      style={style}
+      {...rest}
+    />
+  );
+}
+
+export interface PropertyRowProps {
+  label: ReactNode;
+  children: ReactNode;
+  help?: ReactNode;
+  actions?: ReactNode;
+  /** Required control id: a visible inspector label must always name the value it edits. */
+  htmlFor: string;
+  className?: string;
+  style?: CSSProperties;
+  labelProps?: Omit<LabelHTMLAttributes<HTMLLabelElement>, "htmlFor">;
+  "data-testid"?: string;
+}
+
+/**
+ * Shared inspector anatomy: readable label, value control, contextual actions and concise guidance.
+ * Value state and transactions stay with the authoritative subsystem store.
+ */
+export function PropertyRow({
+  label,
+  children,
+  help,
+  actions,
+  htmlFor,
+  className,
+  style,
+  labelProps,
+  ...rest
+}: PropertyRowProps) {
+  return (
+    <div className={["mtk-property-row", className].filter(Boolean).join(" ")} style={style} {...rest}>
+      <label className="mtk-property-row__label" htmlFor={htmlFor} {...labelProps}>
+        {label}
+      </label>
+      <div className="mtk-property-row__control">{children}</div>
+      {actions != null && <div className="mtk-property-row__actions">{actions}</div>}
+      {help != null && <div className="mtk-property-row__help">{help}</div>}
+    </div>
+  );
+}
+
+export interface SurfaceProps {
+  children: ReactNode;
+  tone?: "panel" | "floating" | "inset";
+  className?: string;
+  style?: CSSProperties;
+  role?: AriaRole;
+  id?: string;
+  "data-testid"?: string;
+}
+
+/** Token-owned visual surface for panels, floating tools and inset wells. */
+export function Surface({
+  children,
+  tone = "panel",
+  className,
+  ...rest
+}: SurfaceProps) {
+  return (
+    <div className={["mtk-surface", `mtk-surface--${tone}`, className].filter(Boolean).join(" ")} {...rest}>
+      {children}
+    </div>
+  );
+}
+
 export function Badge({ children, tone = "neutral", style, title }: { children: ReactNode; tone?: "neutral" | "accent" | "warn" | "success"; style?: CSSProperties; title?: string }) {
   const tones: Record<string, CSSProperties> = {
     neutral: { background: color.bg.inset, color: color.text.secondary, borderColor: color.border.default },
@@ -306,6 +463,7 @@ const ICON_KINDS: Record<string, { glyph: string; hue: number }> = {
   light: { glyph: "☼", hue: 45 },
   camera: { glyph: "◉", hue: 190 },
   requirer: { glyph: "◇", hue: 150 }, // hollow = a needed binding not yet filled
+  character: { glyph: "☗", hue: 15 },
   physics: { glyph: "◍", hue: 270 },
   rule: { glyph: "λ", hue: 30 },
   audio: { glyph: "♪", hue: 330 },
@@ -336,9 +494,9 @@ export function TypeIcon({ kind, size = 40, style }: { kind: string; size?: numb
         fontFamily: font.mono,
         fontSize: Math.round(size * 0.5),
         lineHeight: 1,
-        color: `hsl(${k.hue} 55% 70%)`,
-        background: `hsl(${k.hue} 32% 16%)`,
-        border: `1px solid hsl(${k.hue} 40% 30%)`,
+        color: `hsl(${k.hue} 46% 34%)`,
+        background: `hsl(${k.hue} 58% 95%)`,
+        border: `1px solid hsl(${k.hue} 34% 82%)`,
         borderRadius: radius.md,
         ...style,
       }}

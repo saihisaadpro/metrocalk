@@ -10,6 +10,8 @@
 import { useEffect, useState } from "react";
 import type { EditorClient } from "../transport/session";
 import type { EntityDetails } from "../transport/protocol";
+import { PopoverSurface } from "../theme/Popover";
+import { color, fontSize, space } from "../theme/tokens";
 
 export function HoverTooltip({ client, id }: { client: EditorClient; id: string | null }) {
   const [details, setDetails] = useState<EntityDetails | null>(null);
@@ -37,22 +39,18 @@ export function HoverTooltip({ client, id }: { client: EditorClient; id: string 
   if (!id || !details) return null;
 
   return (
-    <div
+    <PopoverSurface
       id="tooltip"
       data-testid="tooltip"
       role="tooltip"
       style={{
-        padding: "8px 10px",
-        fontSize: 12,
-        background: "#14161f",
-        color: "#cde",
-        border: "1px solid #2a3550",
-        borderRadius: 6,
         maxWidth: 280,
+        color: color.text.secondary,
+        fontSize: fontSize.meta,
         pointerEvents: "none",
       }}
     >
-      <div data-testid="tooltip-name" style={{ fontWeight: 600, marginBottom: 4 }}>
+      <div data-testid="tooltip-name" style={{ color: color.text.primary, fontWeight: 650, marginBottom: space.xs }}>
         {details.name}
       </div>
       {details.components.length > 0 && (
@@ -67,14 +65,14 @@ export function HoverTooltip({ client, id }: { client: EditorClient; id: string 
       {details.boundTo.length > 0 && (
         <Section label="tracking" items={details.boundTo} testid="tooltip-boundto" />
       )}
-    </div>
+    </PopoverSurface>
   );
 }
 
 function Section({ label, items, testid }: { label: string; items: string[]; testid: string }) {
   return (
-    <div data-testid={testid} style={{ marginTop: 2 }}>
-      <span style={{ opacity: 0.55, marginRight: 6 }}>{label}</span>
+    <div data-testid={testid} style={{ marginTop: space.xxs }}>
+      <span style={{ color: color.text.muted, marginRight: space.sm }}>{label}</span>
       <span>{items.join(", ")}</span>
     </div>
   );

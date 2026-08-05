@@ -8,46 +8,46 @@
 //! coloured border + an overlaid "● PLAYING — Esc / ⏹ to stop" badge + de-emphasised edit chrome (C2);
 //! feedback lands as **toasts over the stage** (C11); a fresh scene shows a real **empty state** (C10).
 
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { createSession, isTauri, type EditorClient } from "../transport/session";
-import { projectionStore, useEntityOrder } from "../store/projection";
+import { projectionStore, useDisplayedEntity, useEntityOrder, useSelectedId } from "../store/projection";
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
-import { Popover } from "../theme/Popover";
+import { Modal, Popover } from "../theme/Popover";
 import { Button } from "../theme/primitives";
-import { color, font, fontSize, radius, space, z } from "../theme/tokens";
-import { panelLayout } from "./layout";
-import { Hierarchy } from "../panels/Hierarchy";
-import { AuthoringToolbar } from "../panels/AuthoringToolbar";
+import { DockRail } from "../theme/workspace";
+import { color, elevation, font, fontSize, motion, radius, space, z } from "../theme/tokens";
+import { dockGridColumns, panelLayout } from "./layout";
 import { ViewportToolbar } from "../panels/ViewportToolbar";
 import { Rejections } from "../panels/Rejections";
-import { Onboarding } from "../panels/Onboarding";
-import { Reveal } from "../panels/Reveal";
-import { DescribeBar } from "../panels/DescribeBar";
-import { Wallet } from "../panels/Wallet";
-import { Requirers } from "../panels/Requirers";
 import { StatusBar } from "../panels/StatusBar";
 import { ContextMenu } from "../panels/ContextMenu";
-import { AssetBrowser } from "../panels/AssetBrowser";
-import { FileMenu } from "../panels/FileMenu";
-import { PlayControls } from "../panels/PlayControls";
 import { ToastHost } from "../panels/ToastHost";
 import { EmptyState } from "../panels/EmptyState";
-import { AiEditPanel } from "../panels/AiEditPanel";
-import { ImportReport } from "../panels/ImportReport";
-import { ReimportPanel } from "../panels/ReimportPanel";
-import { JointPanel } from "../panels/JointPanel";
-import { Diagnostics } from "../panels/Diagnostics";
-import { Inspector } from "../inspector/Inspector";
-import { BindingGraph } from "../graph/BindingGraph";
-import { PhysicsPanel } from "../panels/PhysicsPanel";
-import { RulesPanel } from "../panels/RulesPanel";
-import { ComposePanel } from "../panels/ComposePanel";
-import { StateGraphPanel } from "../panels/StateGraphPanel";
-import { RuleDebugPanel } from "../panels/RuleDebugPanel";
-import { TransformPanel } from "../panels/TransformPanel";
+import { Onboarding } from "../panels/Onboarding";
 import { FocusBanner } from "../panels/FocusBanner";
+import { CommandPalette, type EditorCommand } from "../panels/CommandPalette";
+import { ViewportToolRail, type ViewportTool } from "../panels/ViewportToolRail";
+import type { PipeForgeStatus } from "../transport/protocol";
+import { EditorHeader } from "./EditorHeader";
+import { LeftDock, InspectorDock, type LeftWorkspace, type InspectorWorkspace } from "./EditorDocks";
+import { BottomDock, type BottomWorkspace } from "./BottomDock";
+import { normalizeSurfacePoint } from "./viewportCoordinates";
+
+// Pipe Forge's graph/fitting/catalog workbench is substantial and used only when its viewport tool is
+// active. Keep the default editor entry lean; the compact loading state occupies the same overlay region.
+const PipeForge = lazy(() => import("../panels/PipeForge").then((module) => ({ default: module.PipeForge })));
+
+const LEFT_RAIL_ITEMS = [
+  { id: "scene", label: "Scene", icon: "▱" },
+  { id: "create", label: "Create", icon: "+" },
+] as const;
+const RIGHT_RAIL_ITEMS = [
+  { id: "properties", label: "Properties", icon: "⚙" },
+  { id: "relations", label: "Relations", icon: "⌘" },
+  { id: "physics", label: "Physics", icon: "◉" },
+] as const;
 
 /** Build the editor session once: the REAL Tauri shell transport inside the packaged `.exe` (the live
  *  `/core` over the `connect` Channel), else the in-process MockCore for `npm run dev` / tests. */
@@ -57,6 +57,27 @@ function useEditorSession(): EditorClient {
     ref.current = createSession();
   }
   return ref.current;
+}
+
+const SHELL_LAYOUT_STORAGE_PREFIX = "metrocalk:shell-layout:v1:";
+
+function useRememberedBoolean(key: string, fallback: boolean) {
+  const [value, setValue] = useState(() => {
+    try {
+      const stored = window.localStorage.getItem(`${SHELL_LAYOUT_STORAGE_PREFIX}${key}`);
+      return stored == null ? fallback : stored === "true";
+    } catch {
+      return fallback;
+    }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(`${SHELL_LAYOUT_STORAGE_PREFIX}${key}`, String(value));
+    } catch {
+      // A locked-down WebView still keeps the preference for this session.
+    }
+  }, [key, value]);
+  return [value, setValue] as const;
 }
 
 /** The persistent "● PLAYING" badge overlaid ON the stage (not only the toolbar) — Play must be
@@ -82,7 +103,7 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
         color: paused ? color.warn.text : color.success.text,
         font: font.mono,
         fontSize: fontSize.body,
-        boxShadow: "0 4px 16px #0008",
+        boxShadow: elevation.e2,
       }}
     >
       <span>{paused ? "⏸ PAUSED" : "● PLAYING"}</span>
@@ -94,23 +115,10 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
   );
 }
 
-/** A collapsed side panel = a thin icon rail (C8): the stage keeps the space; one click opens the panel
- *  as an overlay drawer. */
-function Rail({ side, label, onOpen }: { side: "left" | "right"; label: string; onOpen: () => void }) {
-  const border = side === "left" ? { borderRight: `1px solid ${color.border.subtle}` } : { borderLeft: `1px solid ${color.border.subtle}` };
-  return (
-    <div style={{ ...border, display: "flex", alignItems: "center", justifyContent: "center", height: "100%", background: color.bg.panel }}>
-      <button
-        data-testid={`rail-${side}`}
-        className="mtk-btn mtk-btn--ghost"
-        onClick={onOpen}
-        title={`Open ${label} (window is narrow — the stage keeps priority)`}
-        style={{ color: color.text.secondary, writingMode: "vertical-rl", padding: `${space.md}px 2px`, fontSize: fontSize.meta, letterSpacing: 1 }}
-      >
-        ☰ {label}
-      </button>
-    </div>
-  );
+function effectiveViewportWidth(): number {
+  if (typeof window === "undefined" || typeof document === "undefined") return 1440;
+  const cssZoom = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("zoom"));
+  return window.innerWidth / (Number.isFinite(cssZoom) && cssZoom > 0 ? cssZoom : 1);
 }
 
 export function App() {
@@ -125,11 +133,35 @@ export function App() {
   // M9 gizmo handle-drag: set by a left-press that HIT a gizmo handle (so the click doesn't re-pick + the
   // release commits). A ref (not state) so the click/up guards read it synchronously off the hot path.
   const gizmoHit = useRef(false);
+  const [pipeStatus, setPipeStatus] = useState<PipeForgeStatus | null>(null);
+  const pipeActive = pipeStatus?.active === true;
+  const [pipeBusy, setPipeBusy] = useState(false);
+  const [activeTool, setActiveTool] = useState<ViewportTool>("select");
+  const [leftWorkspace, setLeftWorkspace] = useState<LeftWorkspace>("scene");
+  const [inspectorWorkspace, setInspectorWorkspace] = useState<InspectorWorkspace>("properties");
+  const [bottomWorkspace, setBottomWorkspace] = useState<BottomWorkspace>("asset");
+  const [bottomOpen, setBottomOpen] = useState(false);
+  const [commandsOpen, setCommandsOpen] = useState(false);
+  const [vw, setVw] = useState(effectiveViewportWidth);
+  const [leftDockCollapsed, setLeftDockCollapsed] = useRememberedBoolean("left-collapsed", false);
+  const [rightDockCollapsed, setRightDockCollapsed] = useRememberedBoolean("right-collapsed", vw < 1200);
+  const [toolRailMinimized, setToolRailMinimized] = useRememberedBoolean("tool-rail-minimized", true);
+  const [dockFlyout, setDockFlyout] = useState<"left" | "right" | null>(null);
+  const dockFlyoutAnchor = useRef<HTMLElement | null>(null);
 
   const playing = usePlaying();
   const paused = usePaused();
   const order = useEntityOrder();
+  const selectedId = useSelectedId();
+  const selectedEntity = useDisplayedEntity(selectedId ?? "");
+  const editablePipeId = selectedId && selectedEntity?.components.PipeRecipe ? selectedId : null;
   const sceneEmpty = order.length === 0;
+
+  useEffect(() => {
+    if (!playing || !focused) return;
+    client.unfocus();
+    setFocused(null);
+  }, [client, focused, playing]);
 
   // Emit a stable "connected · N entities" status the FIRST time the projection streams in (the scaffold's
   // connect signal the prompt-40 black-box E2E keys on — an intentional, stable token, not cosmetic copy).
@@ -156,10 +188,29 @@ export function App() {
     };
   }, [client]);
 
-  // Responsive layout — the stage is layout-priority; panels collapse to rails below a breakpoint (C8).
-  const [vw, setVw] = useState(() => (typeof window !== "undefined" ? window.innerWidth : 1440));
+  // Reconnect the overlay to native render-only tool state after a WebView refresh. The editable route
+  // lives in Rust; React is only its controller/read-model.
   useEffect(() => {
-    const onResize = () => setVw(window.innerWidth);
+    void client.pipeForgeStatus().then(setPipeStatus).catch(() => {});
+  }, [client]);
+
+  // Native project/play transitions can cancel a render-only route without remounting the WebView. While a
+  // route is live, reconcile the small authoritative status at chrome cadence so the UI cannot keep claiming
+  // a stale drawing session after New/Open/Play. This is never a viewport-frame poll.
+  useEffect(() => {
+    if (!pipeActive) return;
+    const timer = window.setInterval(() => {
+      void client.pipeForgeStatus().then((status) => {
+        setPipeStatus(status);
+        if (!status.active) setPipeBusy(false);
+      }).catch(() => {});
+    }, 750);
+    return () => window.clearInterval(timer);
+  }, [client, pipeActive]);
+
+  // Responsive layout — the stage is layout-priority; panels collapse to rails below a breakpoint (C8).
+  useEffect(() => {
+    const onResize = () => setVw(effectiveViewportWidth());
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
@@ -167,19 +218,104 @@ export function App() {
   // Which collapsed panel is currently opened as an overlay drawer.
   const [drawer, setDrawer] = useState<"left" | "right" | null>(null);
   useEffect(() => {
-    if (!layout.collapsed) setDrawer(null); // widening back out closes the drawer
-  }, [layout.collapsed]);
+    if (!layout.collapsed) setDrawer(null); // widening back out closes the responsive drawer
+    if (layout.collapsed || layout.overlay) setDockFlyout(null);
+  }, [layout.collapsed, layout.overlay]);
+
+  // Crossing into the compact shell persists both docks as rails. Widening therefore grows the stage
+  // instead of unexpectedly restoring panels and shrinking it; users pin back only the context they need.
+  useEffect(() => {
+    if (layout.collapsed) {
+      setLeftDockCollapsed(true);
+      setRightDockCollapsed(true);
+      return;
+    }
+    if (!layout.collapsed && vw < 1200) setRightDockCollapsed(true);
+  }, [layout.collapsed, setLeftDockCollapsed, setRightDockCollapsed, vw]);
+
+  function openLeft(workspace: LeftWorkspace) {
+    setLeftWorkspace(workspace);
+    if (layout.collapsed) setDrawer("left");
+    else if (leftDockCollapsed) setLeftDockCollapsed(false);
+    setDockFlyout(null);
+  }
+
+  function openInspector(workspace: InspectorWorkspace = "properties") {
+    setInspectorWorkspace(workspace);
+    if (layout.collapsed) setDrawer("right");
+    else if (rightDockCollapsed) setRightDockCollapsed(false);
+    setDockFlyout(null);
+  }
+
+  function openBottom(workspace: BottomWorkspace) {
+    setBottomWorkspace(workspace);
+    setBottomOpen(true);
+  }
+
+  function activateDockRail(side: "left" | "right", workspace: string, anchor: HTMLButtonElement) {
+    if (side === "left") setLeftWorkspace(workspace as LeftWorkspace);
+    else setInspectorWorkspace(workspace as InspectorWorkspace);
+    if (layout.collapsed) {
+      setDrawer(side);
+      return;
+    }
+    dockFlyoutAnchor.current = anchor;
+    setDockFlyout(side);
+  }
+
+  function chooseTool(tool: ViewportTool) {
+    if (pipeBusy) return;
+    if (pipeActive && tool !== "pipe") {
+      void client.pipeForgeCancel().then((status) => {
+        setPipeStatus(status);
+        setStatus(status.message);
+      });
+    }
+    setActiveTool(tool);
+    if (tool === "move" || tool === "rotate" || tool === "scale") {
+      client.gizmoMode(tool === "move" ? "translate" : tool);
+    }
+  }
 
   // Ctrl-Z / ⌘-Z → undo; Escape closes the context menu, then a drawer, then STOPS Play (the badge says
   // "Esc … to stop"). A discrete event — never the per-frame hot path (invariant 4).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const el = document.activeElement as HTMLElement | null;
-      const editing = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+      const el = (e.target instanceof HTMLElement ? e.target : document.activeElement) as HTMLElement | null;
+      // Timeline selects, buttons, sliders, listboxes and editable inspectors own their keystrokes. Treat
+      // every interactive command scope as editing so W/E/R/F cannot unexpectedly switch viewport tools.
+      const editing = !!el && !!el.closest(
+        "input, textarea, select, button, [contenteditable='true'], [role='button'], [role='slider'], [role='listbox'], [role='menu'], [data-command-scope]",
+      );
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setCommandsOpen(true);
+        return;
+      }
+      const redoGesture =
+        (e.ctrlKey || e.metaKey) &&
+        (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"));
+      if (redoGesture) {
+        if (editing) return;
+        e.preventDefault();
+        if (pipeActive) {
+          setStatus("Finish or cancel the active route before redoing scene changes");
+          return;
+        }
+        void client.redo().then((did) => setStatus(did ? "redo" : "nothing to redo"));
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
         // Don't hijack TEXT undo while the user is typing in a field — only undo the SCENE otherwise.
         if (editing) return;
         e.preventDefault();
+        if (pipeActive && !pipeBusy) {
+          void client.pipeForgeUndo().then((status) => {
+            setPipeStatus(status);
+            setStatus(status.message);
+          });
+          return;
+        }
         // Honest feedback: only say "undo" when a transaction was actually reverted (the shell reports it),
         // else "nothing to undo" — never claim a revert on an empty history.
         void client.undo().then((did) => setStatus(did ? "undo" : "nothing to undo"));
@@ -187,11 +323,29 @@ export function App() {
       // M9 gizmo mode — the universal W/E/R game-editor shortcut (sticky tool state; guarded off text fields
       // + modifier chords so it never fires while editing or during Ctrl-Z). A discrete command, not per-frame.
       const k = e.key.toLowerCase();
-      if ((k === "w" || k === "e" || k === "r") && !e.ctrlKey && !e.metaKey && !e.altKey && !editing) {
-        client.gizmoMode(k === "w" ? "translate" : k === "e" ? "rotate" : "scale");
+      if ((k === "w" || k === "e" || k === "r") && !e.ctrlKey && !e.metaKey && !e.altKey && !editing && !pipeActive && !pipeBusy) {
+        chooseTool(k === "w" ? "move" : k === "e" ? "rotate" : "scale");
         setStatus(k === "w" ? "move (W)" : k === "e" ? "rotate (E)" : "scale (R)");
       }
+      if (k === "f" && !e.ctrlKey && !e.metaKey && !e.altKey && !editing && !pipeActive && !pipeBusy) {
+        e.preventDefault();
+        void client.gizmoSelected().then((id) => {
+          if (id) {
+            client.focusEntity(id);
+            setStatus("Framed the selection (F)");
+          } else {
+            setStatus("Select something to frame");
+          }
+        });
+      }
       if (e.key === "Escape") {
+        if (pipeActive && !pipeBusy) {
+          void client.pipeForgeCancel().then((status) => {
+            setPipeStatus(status);
+            setStatus(status.message);
+          });
+          return;
+        }
         if (ctx) {
           setCtx(null);
           return;
@@ -213,7 +367,7 @@ export function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, ctx, drawer, playing, focused]);
+  }, [client, ctx, drawer, playing, focused, pipeActive, pipeBusy]);
 
   function stopPlay() {
     void client
@@ -228,98 +382,140 @@ export function App() {
   // Edit chrome is de-emphasised while playing (the mode switch is felt in peripheral vision; edits are
   // also gated off on the shell).
   const chromeDim: React.CSSProperties = playing
-    ? { opacity: 0.45, pointerEvents: "none", transition: "opacity .2s" }
-    : { transition: "opacity .2s" };
+    ? { opacity: 0.45, pointerEvents: "none", transition: `opacity ${motion.base}` }
+    : { transition: `opacity ${motion.base}` };
+
+  const selectCreated = (id: string | null) => {
+    if (!id) return;
+    projectionStore.getState().select(id);
+    void client.gizmoSelect(id);
+  };
+
+  const commands: EditorCommand[] = [
+    { id: "workspace-scene", label: "Open Scene", category: "Workspaces", description: "Navigate and organize scene objects", keywords: ["hierarchy", "objects"], execute: () => openLeft("scene") },
+    { id: "workspace-create", label: "Open Create", category: "Workspaces", description: "Browse assets and local creation tools", keywords: ["assets", "library"], execute: () => openLeft("create") },
+    { id: "workspace-properties", label: "Open Properties", category: "Workspaces", description: "Inspect the selected object", execute: () => openInspector("properties") },
+    { id: "workspace-relations", label: "Open Relations", category: "Workspaces", description: "Inspect bindings and graph relationships", execute: () => openInspector("relations") },
+    { id: "workspace-physics", label: "Open Physics", category: "Workspaces", description: "Simulation and collision controls", execute: () => openInspector("physics") },
+    { id: "workspace-asset", label: "Open Asset Lab", category: "Workspaces", description: "Inspect, repair, optimize, finish, validate and export the selected mesh", keywords: ["mesh", "uv", "lod", "bake", "glb"], execute: () => openBottom("asset") },
+    { id: "workspace-animation", label: "Open Animation", category: "Workspaces", description: "Key properties, preview motion and inspect rig readiness", keywords: ["timeline", "keyframe", "clip", "rig", "motion"], execute: () => openBottom("animation") },
+    { id: "workspace-import", label: "Open Import Review", category: "Workspaces", description: "Inspect CAD fidelity and re-import changes", execute: () => openBottom("import") },
+    { id: "workspace-logic", label: "Open Logic", category: "Workspaces", description: "Rules, state machines and binding graphs", execute: () => openBottom("logic") },
+    { id: "workspace-runtime", label: "Open Runtime", category: "Workspaces", description: "Live rule decisions during Play", execute: () => openBottom("runtime") },
+    { id: "tool-select", label: "Select tool", category: "Viewport tools", description: "Select objects in the viewport", execute: () => chooseTool("select") },
+    { id: "tool-move", label: "Move tool", category: "Viewport tools", shortcut: "W", disabled: !selectedId, disabledReason: "Select an object first", execute: () => chooseTool("move") },
+    { id: "tool-rotate", label: "Rotate tool", category: "Viewport tools", shortcut: "E", disabled: !selectedId, disabledReason: "Select an object first", execute: () => chooseTool("rotate") },
+    { id: "tool-scale", label: "Scale tool", category: "Viewport tools", shortcut: "R", disabled: !selectedId, disabledReason: "Select an object first", execute: () => chooseTool("scale") },
+    { id: "tool-pipe", label: "Draw pipe", category: "Create", description: "Author and bake a routed PBR asset in the viewport", keywords: ["pipe forge", "procedural"], disabled: playing, disabledReason: "Stop Play before authoring", execute: () => chooseTool("pipe") },
+    { id: "create-entity", label: "Create empty entity", category: "Create", description: "Add a named object at the origin", execute: async () => selectCreated(await client.createEntity(0, 1, 0, "Entity")) },
+    { id: "create-light", label: "Add point light", category: "Create", description: "Add a warm point light above the origin", execute: async () => selectCreated(await client.addLight("point", 0, 4, 0, 1, 0.96, 0.9, 60)) },
+    { id: "import-asset", label: "Import asset…", category: "Create", description: "Choose a supported 3D, image, or CAD file", execute: async () => selectCreated(await client.importAssetDialog()) },
+    { id: "view-frame-all", label: "Frame all", category: "View", description: "Fit the whole scene in the viewport", execute: () => client.frameAll() },
+    { id: "view-top", label: "Top view", category: "View", execute: () => client.viewPreset("top") },
+    { id: "view-front", label: "Front view", category: "View", execute: () => client.viewPreset("front") },
+    { id: "view-side", label: "Side view", category: "View", execute: () => client.viewPreset("side") },
+    { id: "view-perspective", label: "Perspective view", category: "View", execute: () => client.viewPreset("persp") },
+    { id: "edit-undo", label: "Undo", category: "Edit", shortcut: ["Ctrl", "Z"], execute: async () => setStatus((await client.undo()) ? "Undo complete" : "Nothing to undo") },
+    { id: "edit-redo", label: "Redo", category: "Edit", shortcut: ["Ctrl", "Shift", "Z"], execute: async () => setStatus((await client.redo()) ? "Redo complete" : "Nothing to redo") },
+    {
+      id: playing ? "play-stop" : "play-start",
+      label: playing ? "Stop Play" : "Start Play",
+      category: "Run",
+      description: playing ? "Restore the pre-Play editing state" : "Test the scene in a disposable runtime session",
+      execute: async () => {
+        const info = playing ? await client.stop() : await client.play();
+        playStore.getState().refresh(info);
+        setStatus(playing ? "Stopped" : "Playing");
+      },
+    },
+  ];
 
   const leftPanel = (
-    <div style={{ overflow: "hidden", display: "flex", flexDirection: "column", height: "100%" }}>
-      <div style={{ borderBottom: "1px solid var(--mtk-border-subtle)", maxHeight: 200, overflowY: "auto" }}>
-        <AssetBrowser client={client} />
-      </div>
-      <div style={{ borderBottom: "1px solid var(--mtk-border-subtle)", maxHeight: 140, overflowY: "auto" }}>
-        <Requirers />
-      </div>
-      <AuthoringToolbar client={client} />
-      <div style={{ flex: 1, overflow: "hidden", minHeight: 0 }}>
-        <Hierarchy
-          client={client}
-          onContextMenu={(id, x, y) => {
-            // No context actions while Playing (editing is gated off in Play — mirrors the viewport menu).
-            if (playing) return;
-            setCtx({ id, x, y });
-          }}
-        />
-      </div>
-    </div>
+    <LeftDock
+      client={client}
+      active={leftWorkspace}
+      onChange={setLeftWorkspace}
+      onStartPipe={() => {
+        setActiveTool("pipe");
+        setDrawer(null);
+        setDockFlyout(null);
+      }}
+      onImport={() => void client.importAssetDialog().then((id) => {
+        selectCreated(id);
+        if (id) openBottom("asset");
+      })}
+      onContextMenu={(id, x, y) => {
+        if (!playing) setCtx({ id, x, y });
+      }}
+      onCollapse={!layout.collapsed && !leftDockCollapsed ? () => {
+        setLeftDockCollapsed(true);
+        setDockFlyout(null);
+      } : undefined}
+      onPin={!layout.collapsed && leftDockCollapsed ? () => {
+        setLeftDockCollapsed(false);
+        setDockFlyout(null);
+      } : undefined}
+    />
   );
   const rightPanel = (
-    <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", height: "100%" }}>
-      <Inspector client={client} />
-      <AiEditPanel client={client} />
-      {/* M15.9 — rig + animate the selected part as a mechanism joint (real axis, undoable, scrubbable). */}
-      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
-        <JointPanel client={client} />
-      </div>
-      {/* M15.10 — the re-import diff + adjudication (renders only after a re-import over an existing CAD scene). */}
-      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
-        <ReimportPanel client={client} />
-      </div>
-      {/* M15.7 — the never-silent CAD import report (renders only when the scene has imported CAD). */}
-      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
-        <ImportReport client={client} />
-      </div>
-      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
-        <Diagnostics client={client} />
-      </div>
-      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)" }}>
-        <Reveal client={client} />
-      </div>
-      <TransformPanel client={client} />
-      <PhysicsPanel client={client} />
-      <RulesPanel client={client} />
-      <ComposePanel client={client} />
-      <StateGraphPanel client={client} />
-      <RuleDebugPanel client={client} />
-      <div style={{ borderTop: "1px solid var(--mtk-border-subtle)", flex: 1, minHeight: 220 }}>
-        <BindingGraph />
-      </div>
-    </div>
+    <InspectorDock
+      client={client}
+      active={inspectorWorkspace}
+      onChange={setInspectorWorkspace}
+      onCollapse={!layout.collapsed && !rightDockCollapsed ? () => {
+        setRightDockCollapsed(true);
+        setDockFlyout(null);
+      } : undefined}
+      onPin={!layout.collapsed && rightDockCollapsed ? () => {
+        setRightDockCollapsed(false);
+        setDockFlyout(null);
+      } : undefined}
+    />
   );
 
   return (
     // Root is the chrome backdrop. In the .exe (`native`) it is **transparent** so the native wgpu scene
     // composites up through the transparent viewport hole (ADR-008) — the panels below paint their OWN
-    // opaque background so only the viewport stays a hole. (A `#0a0a0f` root here would occlude the wgpu
+    // opaque background so only the viewport stays a hole. (Any opaque root here would occlude the wgpu
     // layer even behind the transparent viewport div — the bug that left the .exe viewport black.)
-    <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: native ? "transparent" : color.bg.base, color: color.text.primary, font: font.ui }}>
-      <div style={{ height: 40, display: "flex", alignItems: "center", gap: space.lg, padding: `0 ${space.lg}px`, background: color.bg.raised, borderBottom: `1px solid ${color.border.subtle}`, font: font.ui, fontSize: fontSize.label, overflow: "hidden", minWidth: 0 }}>
-        <strong style={{ letterSpacing: 0.3, color: color.text.primary }}>
-          metrocalk<span style={{ color: color.accent.base }}>.</span>
-        </strong>
-        <FileMenu client={client} />
-        <PlayControls client={client} />
-        <div style={{ marginLeft: "auto", minWidth: 0 }}>
-          <Wallet client={client} />
-        </div>
-      </div>
-      <div style={{ borderBottom: `1px solid ${color.border.subtle}`, background: color.bg.panel }}>
-        <DescribeBar client={client} />
-      </div>
-      <div style={{ flex: 1, display: "grid", gridTemplateColumns: layout.gridColumns, minHeight: 0 }}>
+    <div className="mtk-editor-root" style={{ height: "100vh", display: "flex", flexDirection: "column", background: native ? "transparent" : color.bg.base, color: color.text.primary, font: font.ui }}>
+      <EditorHeader
+        client={client}
+        compact={layout.collapsed}
+        onOpenCreate={() => openLeft("create")}
+        onOpenLogic={() => openBottom("logic")}
+        onOpenReview={() => openBottom("import")}
+        onOpenCommands={() => setCommandsOpen(true)}
+        onOpenLeftDock={() => setDrawer("left")}
+        onOpenRightDock={() => setDrawer("right")}
+      />
+      <div style={{ flex: 1, display: "grid", gridTemplateColumns: dockGridColumns(layout, leftDockCollapsed, rightDockCollapsed), minHeight: 0 }}>
         {/* LEFT — full panel, or a collapsed icon rail (the stage keeps priority on resize). */}
-        {layout.collapsed ? (
-          <Rail side="left" label="Scene" onOpen={() => setDrawer("left")} />
+        {!layout.overlay && (layout.collapsed || leftDockCollapsed ? (
+          <DockRail
+            side="left"
+            label="Scene and creation"
+            items={LEFT_RAIL_ITEMS}
+            activeId={leftWorkspace}
+            popupOpen={dockFlyout === "left" || drawer === "left"}
+            onActivate={(id, anchor) => activateDockRail("left", id, anchor)}
+            data-testid="rail-left"
+          />
         ) : (
           <div style={{ borderRight: "1px solid var(--mtk-border-subtle)", overflow: "hidden", background: "var(--mtk-bg-panel)", ...chromeDim }}>{leftPanel}</div>
-        )}
+        ))}
 
         {/* viewport: native-owned (invariant 4). Inside the `.exe` it is **transparent** so the native wgpu
             scene composites through (ADR-008); the per-frame orbit/zoom runs in the native render loop (the
             JS only fires drag_start/drag_end/zoom/pick — never per frame). Left-click → native pick → select;
             right-DRAG → orbit (suppress the menu); right-CLICK → the M3.3 context menu. */}
+        <div className="mtk-stage-column">
         <div
           id="viewport"
           data-testid="viewport"
+          role="region"
+          tabIndex={-1}
+          aria-label="3D viewport"
           onPointerDown={(e) => {
             if (e.button === 2) {
               rightDrag.current = { x: e.clientX, y: e.clientY, moved: false };
@@ -327,15 +523,14 @@ export function App() {
               return;
             }
             if (e.button === 0) {
+              if (pipeActive) return; // drawing owns the click; do not start a gizmo drag underneath it
               // M9 gizmo handle-grab: only when an entity is selected; if a handle is HIT the render loop
               // drags it natively (0 IPC/frame, like orbit) and the release commits. A miss falls through to
               // the normal pick. The hit flag resolves async, so a WebDriver synthetic click (which fires
               // immediately) still picks normally — the suppression is for real human-timed drags.
               gizmoHit.current = false;
               if (projectionStore.getState().selectedId) {
-                const r = e.currentTarget.getBoundingClientRect();
-                const nx = (e.clientX - r.left) / Math.max(1, r.width);
-                const ny = (e.clientY - r.top) / Math.max(1, r.height);
+                const { x: nx, y: ny } = normalizeSurfacePoint(e.clientX, e.clientY);
                 void client
                   .gizmoPickDrag(nx, ny, e.ctrlKey || e.metaKey)
                   .then((hit) => (gizmoHit.current = hit))
@@ -345,16 +540,26 @@ export function App() {
           }}
           onClick={(e) => {
             // A left-press that grabbed a gizmo handle is a DRAG, not a pick — don't re-select.
-            if (gizmoHit.current) {
+            if (gizmoHit.current && !pipeActive) {
               gizmoHit.current = false;
               return;
             }
+            gizmoHit.current = false;
             // Left-click pick on the click event (fires reliably under WebDriver `element.click()`, unlike a
-            // synthesized pointerdown). Pick at the click's NORMALIZED viewport coords (the command rays the
-            // camera — no OS-cursor dependency) → select + a stable "picked"/"nothing here" status.
-            const r = e.currentTarget.getBoundingClientRect();
-            const nx = (e.clientX - r.left) / Math.max(1, r.width);
-            const ny = (e.clientY - r.top) / Math.max(1, r.height);
+            // synthesized pointerdown). Pick at normalized FULL-SURFACE coordinates (the native camera rays
+            // across the whole wgpu/WebView surface, while DOM docks only crop its visible area).
+            const { x: nx, y: ny } = normalizeSurfacePoint(e.clientX, e.clientY);
+            if (pipeActive) {
+              if (pipeBusy) return;
+              void client
+                .pipeForgePoint(nx, ny)
+                .then((status) => {
+                  setPipeStatus(status);
+                  setStatus(status.message);
+                })
+                .catch((err) => console.error("pipe_forge_point failed", err));
+              return;
+            }
             void client
               .viewportPick(nx, ny)
               .then((picked) => {
@@ -381,7 +586,7 @@ export function App() {
             // No context actions while Playing — editing is gated off in Play (and it would let a user open
             // Focus mid-Play, where Esc would then clear focus instead of stopping Play, contradicting the
             // on-stage badge's "Esc to stop"). The badge's promise stays honest.
-            if (playing) {
+            if (playing || pipeActive) {
               rightDrag.current = null;
               return;
             }
@@ -394,6 +599,9 @@ export function App() {
           }}
           style={{
             position: "relative",
+            flex: "1 1 auto",
+            minHeight: 0,
+            overflow: "hidden",
             background: native ? "transparent" : "var(--mtk-bg-inset)", // transparent → wgpu composites through (.exe)
             display: "flex",
             alignItems: "center",
@@ -403,46 +611,142 @@ export function App() {
             fontSize: fontSize.body,
             outline: playing ? `3px solid ${paused ? "var(--mtk-warn-border)" : "var(--mtk-success-border)"}` : "none",
             outlineOffset: -3,
-            boxShadow: playing ? `inset 0 0 60px ${paused ? "#fbbf2433" : "#2f9e5444"}` : "none",
-            transition: "outline-color .2s, box-shadow .2s",
+            boxShadow: playing ? `inset 0 0 60px ${paused ? color.warn.bg : color.success.bg}` : "none",
+            transition: `outline-color ${motion.base}, box-shadow ${motion.base}`,
           }}
         >
           {!native && "native wgpu viewport — drag to orbit · scroll to zoom · click to select (live in the .exe)"}
-          {!playing && <ViewportToolbar client={client} />}
+          {!playing && (
+            <ViewportToolRail
+              data-testid="viewport-tool-rail"
+              activeTool={activeTool}
+              onToolChange={chooseTool}
+              minimized={toolRailMinimized}
+              onMinimizedChange={setToolRailMinimized}
+              availability={{
+                move: { disabled: !selectedId || pipeActive, reason: pipeActive ? "Finish or cancel the pipe route first" : "Select an object first" },
+                rotate: { disabled: !selectedId || pipeActive, reason: pipeActive ? "Finish or cancel the pipe route first" : "Select an object first" },
+                scale: { disabled: !selectedId || pipeActive, reason: pipeActive ? "Finish or cancel the pipe route first" : "Select an object first" },
+                pipe: { disabled: pipeBusy, reason: "The current asset is baking" },
+              }}
+            />
+          )}
+          {!playing && <ViewportToolbar client={client} showTransformTools={false} />}
+          {!playing && activeTool === "pipe" && (
+            <Suspense
+              fallback={
+                <div role="status" aria-live="polite" style={{ position: "absolute", top: 76, left: toolRailMinimized ? 54 : 138, zIndex: z.chrome, width: 220, padding: space.md, borderRadius: radius.lg, color: color.text.secondary, background: color.bg.raised, border: `1px solid ${color.border.default}`, boxShadow: elevation.e2 }}>
+                  Loading Pipe Forge…
+                </div>
+              }
+            >
+              <PipeForge
+                client={client}
+                status={pipeStatus}
+                editableEntityId={editablePipeId}
+                onPendingChange={setPipeBusy}
+                style={{ left: toolRailMinimized ? 54 : 138, width: toolRailMinimized ? "min(336px, calc(100% - 62px))" : 336 }}
+                onStatus={(status) => {
+                  setPipeStatus(status);
+                  setStatus(status.message);
+                }}
+                onBaked={(report) => {
+                  setStatus(report.message);
+                  if (report.entityId) {
+                    projectionStore.getState().select(report.entityId);
+                    void client.gizmoSelect(report.entityId);
+                    setInspectorWorkspace("properties");
+                    openBottom("asset");
+                  }
+                  void client.pipeForgeStatus().then(setPipeStatus);
+                }}
+              />
+            </Suspense>
+          )}
           {playing && <PlayBadge paused={paused} onStop={stopPlay} />}
-          {sceneEmpty && !playing && <EmptyState />}
-          <ToastHost top={playing ? 52 : 14} />
+          {sceneEmpty && !playing && (
+            <EmptyState
+              onDrawPipe={() => setActiveTool("pipe")}
+              onBrowseAssets={() => openLeft("create")}
+              onImport={() => void client.importAssetDialog().then((id) => {
+                selectCreated(id);
+                if (id) openBottom("asset");
+              })}
+            />
+          )}
+          {/* Keep transient feedback below the authoring toolbar; passive toasts must not cover tools. */}
+          <ToastHost top={playing ? 52 : 58} />
+        </div>
+
+        <BottomDock
+          client={client}
+          active={bottomWorkspace}
+          open={bottomOpen}
+          playing={playing}
+          onChange={setBottomWorkspace}
+          onOpenChange={setBottomOpen}
+        />
         </div>
 
         {/* RIGHT — full panel, or a collapsed icon rail. */}
-        {layout.collapsed ? (
-          <Rail side="right" label="Inspector" onOpen={() => setDrawer("right")} />
+        {!layout.overlay && (layout.collapsed || rightDockCollapsed ? (
+          <DockRail
+            side="right"
+            label="Inspector"
+            items={RIGHT_RAIL_ITEMS}
+            activeId={inspectorWorkspace}
+            popupOpen={dockFlyout === "right" || drawer === "right"}
+            onActivate={(id, anchor) => activateDockRail("right", id, anchor)}
+            data-testid="rail-right"
+          />
         ) : (
           <div style={{ borderLeft: "1px solid var(--mtk-border-subtle)", overflow: "hidden", background: "var(--mtk-bg-panel)", ...chromeDim }}>{rightPanel}</div>
-        )}
+        ))}
       </div>
+
+      {/* User-collapsed desktop docks reopen as light, anchored working panels. They preserve the stage and
+          can be pinned back into the grid from their shared panel header. */}
+      {dockFlyout && !layout.collapsed && !layout.overlay && (
+        <Popover
+          open
+          anchor={dockFlyoutAnchor}
+          returnFocus={dockFlyoutAnchor}
+          placement={dockFlyout === "left" ? "bottom-start" : "bottom-end"}
+          role="dialog"
+          ariaLabel={dockFlyout === "left" ? "Scene and creation quick panel" : "Inspector quick panel"}
+          zIndex={z.drawer}
+          onClose={() => setDockFlyout(null)}
+        >
+          <div className="mtk-dock-flyout" data-testid={`dock-flyout-${dockFlyout}`}>
+            {dockFlyout === "left" ? leftPanel : rightPanel}
+          </div>
+        </Popover>
+      )}
 
       {/* Collapsed-panel overlay drawer (opened from a rail). */}
       {drawer && (
-        <>
-          <div onClick={() => setDrawer(null)} style={{ position: "fixed", inset: 0, zIndex: z.overlay, background: "#0006" }} />
-          <div
+        <Modal open onClose={() => setDrawer(null)} zIndex={z.drawer} ariaLabel={drawer === "left" ? "Scene and asset workspace" : "Inspector workspace"}>
+          <aside
             data-testid={`drawer-${drawer}`}
             style={{
-              position: "fixed",
-              top: 40,
+              position: "absolute",
+              top: 0,
               bottom: 0,
               ...(drawer === "left" ? { left: 0, borderRight: "1px solid var(--mtk-border-subtle)" } : { right: 0, borderLeft: "1px solid var(--mtk-border-subtle)" }),
-              width: 300,
-              zIndex: z.drawer,
+              width: "min(340px, calc(100vw - 36px))",
               background: "var(--mtk-bg-inset)",
-              overflow: "auto",
-              boxShadow: "0 0 30px #000a",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              boxShadow: elevation.e3,
             }}
           >
-            {drawer === "left" ? leftPanel : rightPanel}
-          </div>
-        </>
+            <div style={{ display: "flex", justifyContent: "flex-end", padding: space.xs, borderBottom: `1px solid ${color.border.subtle}`, background: color.bg.raised }}>
+              <Button variant="ghost" compact icon aria-label={`Close ${drawer === "left" ? "Scene" : "Inspector"} workspace`} onClick={() => setDrawer(null)}>×</Button>
+            </div>
+            <div style={{ flex: 1, minHeight: 0, overflow: "hidden", ...chromeDim }}>{drawer === "left" ? leftPanel : rightPanel}</div>
+          </aside>
+        </Modal>
       )}
 
       {ctx && (
@@ -468,9 +772,18 @@ export function App() {
           }}
         />
       )}
+      <CommandPalette
+        open={commandsOpen}
+        onClose={() => setCommandsOpen(false)}
+        commands={commands}
+        onCommandError={(error, command) => {
+          console.error(`command ${command.id} failed`, error);
+          setStatus(`${command.label} could not be completed`);
+        }}
+      />
+      <Onboarding show={!sceneEmpty && !playing} onStart={() => openLeft("create")} />
       <StatusBar />
       <Rejections />
-      <Onboarding />
     </div>
   );
 }

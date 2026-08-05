@@ -21,10 +21,10 @@ import {
   type UISchemaElement,
 } from "@jsonforms/core";
 import { JsonFormsDispatch, withJsonFormsControlProps, withJsonFormsLayoutProps } from "@jsonforms/react";
-import { useState } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { NumericField } from "../theme/primitives";
+import { DisclosureSection } from "../theme/workspace";
 
 const hasFormat = (fmt: string) =>
   schemaMatches((s) => (s as { format?: string }).format === fmt);
@@ -69,30 +69,32 @@ export const numberTester = rankWith(6, or(isNumberControl, isIntegerControl));
 // standard `JsonFormsDispatch` so every control (numeric/color/entity-ref) still resolves by tester.
 function GroupLayoutBase({ uischema, schema, path, renderers, cells, enabled, visible }: LayoutProps) {
   const group = uischema as unknown as { label?: string; elements: UISchemaElement[] };
-  const [open, setOpen] = useState(true);
   if (visible === false) return null;
+  const label = group.label ?? "Component";
+  const defaultOpen = label.trim().toLocaleLowerCase("en-GB") === "transform";
   return (
-    <div className="mtk-group" data-testid="inspectorGroup" data-group={group.label}>
-      <button type="button" className="mtk-group-head" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
-        <span className={"mtk-group-caret" + (open ? " is-open" : "")}>▸</span>
-        {group.label ?? "Component"}
-      </button>
-      {open && (
-        <div className="mtk-group-body">
-          {group.elements.map((el, i) => (
-            <JsonFormsDispatch
-              key={i}
-              uischema={el}
-              schema={schema}
-              path={path}
-              renderers={renderers}
-              cells={cells}
-              enabled={enabled}
-            />
-          ))}
-        </div>
-      )}
-    </div>
+    <DisclosureSection
+      title={label}
+      defaultOpen={defaultOpen}
+      storageKey={`inspector-component:${encodeURIComponent(label)}`}
+      tone="card"
+      landmark={false}
+      unmountOnClose={false}
+      data-testid="inspectorGroup"
+      data-group={label}
+    >
+      {group.elements.map((el, i) => (
+        <JsonFormsDispatch
+          key={i}
+          uischema={el}
+          schema={schema}
+          path={path}
+          renderers={renderers}
+          cells={cells}
+          enabled={enabled}
+        />
+      ))}
+    </DisclosureSection>
   );
 }
 export const CollapsibleGroup = withJsonFormsLayoutProps(GroupLayoutBase);

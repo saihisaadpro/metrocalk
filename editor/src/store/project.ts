@@ -24,8 +24,13 @@ export interface ProjectInfo {
 }
 
 interface ProjectState extends ProjectInfo {
+  /** Stable identity for the currently loaded document. It survives Save/Save As and changes only
+   *  when New/Open replaces the document, so editor-only caches cannot bleed across projects. */
+  sessionId: string;
   /** Replace the mirrored state from a fresh `ProjectInfo` (a shell read or a file-op result). */
   refresh(info: ProjectInfo): void;
+  /** Replace the current document and advance its editor-session identity. */
+  switchProject(info: ProjectInfo): void;
   /** Optimistically mark unsaved (an edit happened) — instant "•" before the next authoritative read. */
   markDirty(): void;
   /** Reset to the untitled/empty default (test hygiene + a brand-new session). */
@@ -34,8 +39,12 @@ interface ProjectState extends ProjectInfo {
 
 const EMPTY: ProjectInfo = { path: null, dirty: false, recents: [], error: null };
 
+let projectSessionCounter = 0;
+const nextProjectSessionId = (): string => `project-session-${++projectSessionCounter}`;
+
 export const projectStore = createStore<ProjectState>((set) => ({
   ...EMPTY,
+  sessionId: nextProjectSessionId(),
   refresh: (info) =>
     set({
       path: info.path,
@@ -43,8 +52,16 @@ export const projectStore = createStore<ProjectState>((set) => ({
       recents: info.recents,
       error: info.error ?? null,
     }),
+  switchProject: (info) =>
+    set({
+      path: info.path,
+      dirty: info.dirty,
+      recents: info.recents,
+      error: info.error ?? null,
+      sessionId: nextProjectSessionId(),
+    }),
   markDirty: () => set({ dirty: true }),
-  reset: () => set({ ...EMPTY }),
+  reset: () => set({ ...EMPTY, sessionId: nextProjectSessionId() }),
 }));
 
 /** A short, OS-agnostic display name for a project path (the file's stem), or "untitled". */
@@ -63,3 +80,6 @@ export const useProjectInfo = (): ProjectInfo => ({
   recents: useStore(projectStore, (s) => s.recents),
   error: useStore(projectStore, (s) => s.error),
 });
+
+/** Collision-free identity for editor-only state owned by the currently loaded project. */
+export const useProjectSessionId = (): string => useStore(projectStore, (s) => s.sessionId);

@@ -12,18 +12,15 @@ import { useEffect, useState } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { usePlaying } from "../store/play";
+import { Button } from "../theme/primitives";
+import { color, font, fontSize, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type { ConditionTruth, DecisionEvent, RuleDebugInfo } from "../transport/protocol";
 
-const box: React.CSSProperties = { font: "12px ui-monospace, monospace", padding: 10, borderTop: "1px solid #2a2d35" };
-const btn: React.CSSProperties = {
-  font: "11px ui-monospace, monospace",
-  padding: "2px 8px",
-  background: "#1f2a3a",
-  color: "#cfe3ff",
-  border: "1px solid #2a3550",
-  borderRadius: 4,
-  cursor: "pointer",
+const box: React.CSSProperties = {
+  font: `${fontSize.meta}px ${font.mono}`,
+  padding: space.lg,
+  borderTop: `1px solid ${color.border.subtle}`,
 };
 
 /** A one-line, plain-language summary of a decision-history entry (so the history reads like a story). */
@@ -102,9 +99,9 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
     <div id="ruleDebug" data-testid="ruleDebug" style={box}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
         <strong>Rule debugger</strong>
-        <button id="fireEnemyDied" data-testid="fireEnemyDied" onClick={() => void fireKill()} style={btn} title="fire an EnemyDied event into the running rules">
+        <Button id="fireEnemyDied" data-testid="fireEnemyDied" compact onClick={() => void fireKill()} title="fire an EnemyDied event into the running rules">
           ⚔ Kill an enemy
-        </button>
+        </Button>
       </div>
 
       {!selectedId && <div style={{ opacity: 0.6 }}>click an entity to see its live rule truth-state</div>}
@@ -116,7 +113,7 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
           {/* The machines' live current state: "✅ state = FacingBoss". */}
           {truth.machines.map((m) => (
             <div key={m.machine} id={`truthMachine-${m.machine}`} data-testid={`truthMachine-${m.machine}`} style={{ marginBottom: 4 }}>
-              <span style={{ color: "#7fe39a" }}>✅</span> {m.display}
+              <span style={{ color: color.success.text }}>✅</span> {m.display}
             </div>
           ))}
 
@@ -124,7 +121,7 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
           {truth.rules.map((r) => (
             <div key={r.rule} id={`truthRule-${r.rule}`} data-testid={`truthRule-${r.rule}`} style={{ marginTop: 6 }}>
               <div style={{ fontWeight: 600 }}>
-                {r.fires ? <span style={{ color: "#7fe39a" }}>● fires</span> : <span style={{ color: "#9aa4b2" }}>○ idle</span>} {r.name}{" "}
+                {r.fires ? <span style={{ color: color.success.text }}>● fires</span> : <span style={{ color: color.text.muted }}>○ idle</span>} {r.name}{" "}
                 <span style={{ opacity: 0.5 }}>(When {r.event})</span>
               </div>
               {r.conditions.map((c, i) => (
@@ -144,7 +141,7 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
 
       {/* Determinism: a non-deterministic plugin is held out of the lockstep path — surfaced, never silent. */}
       {flagged.length > 0 && (
-        <div data-testid="ruleFlagged" style={{ marginTop: 8, color: "#fbbf24" }}>
+        <div data-testid="ruleFlagged" style={{ marginTop: space.md, color: color.warn.text }}>
           {flagged.map((f) => (
             <div key={f.rule}>⚠ {f.reason}</div>
           ))}
@@ -152,7 +149,7 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
       )}
 
       {/* Time-travel: scrub the decision history — watch exactly WHEN a counter incremented (box 4). */}
-      <div style={{ marginTop: 10, borderTop: "1px solid #2a2d35", paddingTop: 8 }}>
+      <div style={{ marginTop: space.lg, borderTop: `1px solid ${color.border.subtle}`, paddingTop: space.md }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
           <span style={{ opacity: 0.7 }}>decision history</span>
           <span data-testid="ruleFrame" style={{ opacity: 0.5 }}>frame {frame} / {head}</span>
@@ -189,7 +186,7 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
 function Condition({ cond, rule, idx }: { cond: ConditionTruth; rule: string; idx: number }) {
   return (
     <div id={`truthCond-${rule}-${idx}`} data-testid={`truthCond-${rule}-${idx}`} data-satisfied={cond.satisfied} style={{ marginLeft: 12 }}>
-      <span style={{ color: cond.satisfied ? "#7fe39a" : "#f08a8a" }}>{cond.satisfied ? "✅" : "❌"}</span> {cond.display}
+      <span style={{ color: cond.satisfied ? color.success.text : color.danger.text }}>{cond.satisfied ? "✅" : "❌"}</span> {cond.display}
     </div>
   );
 }

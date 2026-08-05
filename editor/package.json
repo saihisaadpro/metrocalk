@@ -7,7 +7,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "check:ui-constitution": "node scripts/check-ui-constitution.mjs",
+    "build:verify": "npm run check:ui-constitution && npm run build && node scripts/check-bundle.mjs",
     "test": "vitest run",
+    "test:ui-constitution": "node scripts/check-ui-constitution.mjs --self-test",
     "test:watch": "vitest"
   },
   "dependencies": {

@@ -14,7 +14,8 @@
 //! **M10.6 — a real tree editor:** drag a row onto another → **reparent** (`node.move`, cycle-safe on the
 //! engine); shift/ctrl-click → **multi-select**; ArrowUp/Down navigate the selection (scrolled into view).
 
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { useStore } from "zustand";
 import {
   projectionStore,
   useEntityOrder,
@@ -27,7 +28,8 @@ import { thumbnailStore } from "../store/thumbnails";
 import type { EditorClient } from "../transport/session";
 import type { EntitySummary } from "../transport/protocol";
 import { Thumbnail } from "../theme/Thumbnail";
-import { Badge } from "../theme/primitives";
+import { Badge, Button } from "../theme/primitives";
+import { EmptyPanelState } from "../theme/workspace";
 import { color, font, fontSize, space } from "../theme/tokens";
 
 const ROW_H = 32;
@@ -36,6 +38,10 @@ const THUMB = 24;
 const OVERSCAN = 6;
 const INDENT = 12;
 const DRAG_MIME = "text/mtk-id";
+
+function rowDomId(id: string): string {
+  return `hierarchy-item-${id.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+}
 
 /** The type-icon/thumbnail kind for a summary — prefers the server-classified `kind`, else derives a sane
  *  one from the relational summary (so a row needs no component subscription — M2.5 safe). */
@@ -62,11 +68,15 @@ function depthOf(id: string): number {
 const Row = memo(function Row({
   id,
   top,
+  position,
+  setSize,
   client,
   onContextMenu,
 }: {
   id: string;
   top: number;
+  position: number;
+  setSize: number;
   client: EditorClient;
   onContextMenu?: (id: string, x: number, y: number) => void;
 }) {
@@ -95,11 +105,18 @@ const Row = memo(function Row({
 
   return (
     <div
+      id={rowDomId(id)}
       className={cls}
       data-testid="hrow"
       data-id={id}
       data-kind={kind}
       data-needs-binding={rel?.needsBinding ? "1" : "0"}
+      role="treeitem"
+      aria-level={depth + 1}
+      aria-posinset={position}
+      aria-setsize={setSize}
+      aria-selected={primary || inMulti}
+      aria-disabled={deactivated || undefined}
       draggable
       onClick={click}
       onContextMenu={(e) => {
@@ -184,28 +201,66 @@ export function Hierarchy({
   onContextMenu?: (id: string, x: number, y: number) => void;
 }) {
   const order = useEntityOrder();
+  const selectedId = useSelectedId();
+  const [query, setQuery] = useState("");
   const [scrollTop, setScrollTop] = useState(0);
+  const [viewHeight, setViewHeight] = useState(VIEW_H);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  // Avoid subscribing the whole hierarchy to summary edits until search actually needs names.
+  const searchableSummaries = useStore(projectionStore, (state) => normalizedQuery ? state.summaries : null);
+  const filteredOrder = useMemo(() => {
+    if (!normalizedQuery) return order;
+    const summaries = searchableSummaries ?? projectionStore.getState().summaries;
+    return order.filter((id) => {
+      const summary = summaries[id];
+      return id.toLocaleLowerCase().includes(normalizedQuery) || summary?.name?.toLocaleLowerCase().includes(normalizedQuery);
+    });
+  }, [normalizedQuery, order, searchableSummaries]);
   const start = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
-  const end = Math.min(order.length, Math.ceil((scrollTop + VIEW_H) / ROW_H) + OVERSCAN);
-  const visible = order.slice(start, end);
+  const end = Math.min(filteredOrder.length, Math.ceil((scrollTop + viewHeight) / ROW_H) + OVERSCAN);
+  const visible = filteredOrder.slice(start, end);
+
+  useEffect(() => {
+    setScrollTop(0);
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  }, [normalizedQuery]);
+
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const update = () => {
+      if (element.clientHeight > 0) setViewHeight(element.clientHeight);
+    };
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   // Report the visible window to the thumbnail store (the visible-only gate, M2.5): only these ≤~30 rows
   // request a live thumbnail — the 5000-row list never generates 5000. Re-runs on scroll + scene change.
   useEffect(() => {
-    thumbnailStore.getState().setVisible(order.slice(start, end));
-  }, [start, end, order]);
+    thumbnailStore.getState().setVisible(filteredOrder.slice(start, end));
+  }, [start, end, filteredOrder]);
 
   // Keyboard nav (improve where straightforward — preserve every existing flow): ArrowUp/Down move the
   // selection and scroll it into view; the engine selection follows (cross-panel coherence).
   function onKeyDown(e: React.KeyboardEvent) {
-    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
-    if (!order.length) return;
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+    if (!filteredOrder.length) return;
     e.preventDefault();
     const sel = projectionStore.getState().selectedId;
-    const i = sel ? order.indexOf(sel) : -1;
-    const ni = e.key === "ArrowDown" ? Math.min(order.length - 1, i + 1) : Math.max(0, i < 0 ? 0 : i - 1);
-    const nid = order[ni];
+    const i = sel ? filteredOrder.indexOf(sel) : -1;
+    const ni = e.key === "Home"
+      ? 0
+      : e.key === "End"
+        ? filteredOrder.length - 1
+        : e.key === "ArrowDown"
+          ? Math.min(filteredOrder.length - 1, i + 1)
+          : Math.max(0, i < 0 ? 0 : i - 1);
+    const nid = filteredOrder[ni];
     if (!nid) return;
     projectionStore.getState().select(nid);
     void client.gizmoSelect(nid).catch(() => {});
@@ -214,34 +269,100 @@ export function Hierarchy({
     if (el) {
       const rowTop = ni * ROW_H;
       if (rowTop < el.scrollTop) el.scrollTop = rowTop;
-      else if (rowTop + ROW_H > el.scrollTop + VIEW_H) el.scrollTop = rowTop + ROW_H - VIEW_H;
+      else if (rowTop + ROW_H > el.scrollTop + viewHeight) el.scrollTop = rowTop + ROW_H - viewHeight;
     }
   }
 
   return (
-    <div data-testid="hierarchy">
-      <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, padding: `${space.md}px ${space.lg}px`, ...text_title }}>
-        <span>Scene</span>
-        {/* `#count` — the scaffold's stable connect signal ("N entities") the prompt-40 harness reads. */}
-        <span id="count" style={{ font: font.mono, fontSize: fontSize.meta, color: color.text.muted, fontWeight: 400, letterSpacing: 0 }}>
-          {order.length} entities
+    <section
+      data-testid="hierarchy"
+      aria-labelledby="hierarchy-heading"
+      style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}
+    >
+      <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, padding: `${space.md}px ${space.lg}px ${space.xs}px`, ...text_title }}>
+        <h3 id="hierarchy-heading" style={{ margin: 0, font: "inherit", fontSize: "inherit", fontWeight: "inherit" }}>Objects</h3>
+        {/* `#count` remains the stable scene-count signal used by packaged acceptance. */}
+        <span
+          id="count"
+          role="status"
+          aria-live="polite"
+          style={{ font: font.mono, fontSize: fontSize.meta, color: color.text.muted, fontWeight: 400, letterSpacing: 0 }}
+        >
+          {normalizedQuery ? `${filteredOrder.length} of ${order.length} entities` : `${order.length} entities`}
         </span>
       </div>
-      <div
-        ref={scrollRef}
-        className="mtk-scroll"
-        tabIndex={0}
-        onKeyDown={onKeyDown}
-        onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
-        style={{ height: VIEW_H, overflowY: "auto", position: "relative", outline: "none" }}
-      >
-        <div style={{ height: order.length * ROW_H, position: "relative" }}>
-          {visible.map((id, i) => (
-            <Row key={id} id={id} top={(start + i) * ROW_H} client={client} onContextMenu={onContextMenu} />
-          ))}
+
+      {order.length > 0 && (
+        <div style={{ display: "flex", gap: space.xs, padding: `${space.xs}px ${space.md}px ${space.sm}px` }}>
+          <input
+            type="search"
+            className="mtk-input"
+            aria-label="Search scene objects"
+            placeholder="Search objects…"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && query) {
+                event.stopPropagation();
+                setQuery("");
+              }
+            }}
+            style={{ minWidth: 0, flex: "1 1 auto" }}
+          />
+          {query && (
+            <Button icon compact variant="ghost" aria-label="Clear object search" title="Clear search" onClick={() => setQuery("")}>
+              ×
+            </Button>
+          )}
         </div>
-      </div>
-    </div>
+      )}
+
+      {order.length === 0 ? (
+        <EmptyPanelState
+          compact
+          title="No objects in this scene"
+          description="Create an entity above, draw a procedural asset, or import from the Create workspace."
+          icon="◇"
+          style={{ margin: space.md }}
+        />
+      ) : filteredOrder.length === 0 ? (
+        <EmptyPanelState
+          compact
+          title="No matching objects"
+          description={`Nothing matches “${query.trim()}”. Try a name or object ID.`}
+          icon="⌕"
+          primaryAction={<Button compact variant="secondary" onClick={() => setQuery("")}>Clear search</Button>}
+          style={{ margin: space.md }}
+        />
+      ) : (
+        <div
+          ref={scrollRef}
+          className="mtk-scroll"
+          role="tree"
+          aria-label="Scene objects"
+          aria-multiselectable="true"
+          aria-activedescendant={selectedId && filteredOrder.includes(selectedId) ? rowDomId(selectedId) : undefined}
+          tabIndex={0}
+          onKeyDown={onKeyDown}
+          onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+          style={{ flex: "1 1 180px", minHeight: 160, overflowY: "auto", position: "relative", outline: "none" }}
+        >
+          <div style={{ height: filteredOrder.length * ROW_H, position: "relative" }}>
+            {visible.map((id, index) => (
+              <Row
+                key={id}
+                id={id}
+                top={(start + index) * ROW_H}
+                position={start + index + 1}
+                setSize={filteredOrder.length}
+                client={client}
+                onContextMenu={onContextMenu}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 

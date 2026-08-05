@@ -24,7 +24,7 @@
 // truncation (the viewport + reveal both work in f32) and the i64→f32 read are intentional here.
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use metrocalk_core::caps::{canonical, display_name, is_standard};
 use metrocalk_core::marketplace::MarketplaceEntry;
@@ -55,6 +55,15 @@ pub const TRACKS: &str = "tracks";
 /// (a `metrocalk_assets::AssetId`) that references geometry held in the asset store *beside* the doc.
 /// The handle is all that enters the ECS / Loro (invariant 2); the renderer resolves it to a mesh.
 pub const MESH_FIELD: &str = "mesh";
+
+/// Document metadata attached to every non-destructive Asset Lab derivative. The source and root ids
+/// let later conditioning jobs distinguish an intentional side-by-side review offset from an authored
+/// world-space registration without coupling the scene model to transient UI state.
+pub const ASSET_LAB_COMPONENT: &str = "AssetLabVariant";
+/// Immediate derivative parent in the Asset Lab chain.
+pub const ASSET_LAB_SOURCE_FIELD: &str = "sourceEntity";
+/// Original scene entity shared by every derivative in one local-coordinate lineage.
+pub const ASSET_LAB_ROOT_FIELD: &str = "rootEntity";
 
 /// Maps a resolved component **kind** name (e.g. `"HealthBar"`) to the asset **handle** an instance of
 /// that kind should render as. Owned by the shell (built at startup from the loaded [`AssetStore`]);
@@ -272,6 +281,12 @@ pub fn seed(
     let mut ops: Vec<Op> = Vec::with_capacity(n * 5);
     let mut health_bars = Vec::new();
     let mut unbound_health_providers = 0usize;
+    // Per-role counters, so the scene reads as "Health Bar 1, Character 1, Character 2, Prop 1" rather
+    // than as a hex dump of entity keys. Named HERE, at creation, because a name the outliner has to
+    // invent is a name nothing else in the app agrees with: the label, search, the inspector title and a
+    // saved `.mtk` all read the same durable `__meta__.name`, and an entity without one falls back to its
+    // raw Loro key (`1_5`), which tells a user nothing about what they are looking at.
+    let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
 
     for i in 0..n {
         let id = engine.alloc_entity_id();
@@ -309,6 +324,7 @@ pub fn seed(
                 rel: scene.rels.requires,
                 target: health,
             });
+            push_role_name(&mut ops, &mut tally, id, "Health Bar");
             health_bars.push(id);
         } else if force_provider || rng.chance(0.34) {
             // A Health provider — the candidate set. Some start already bound (greyed "already
@@ -330,6 +346,7 @@ pub fn seed(
                 rel: scene.rels.provides,
                 target: health,
             });
+            push_role_name(&mut ops, &mut tally, id, "Character");
             if !force_provider && rng.chance(0.25) {
                 // pre-bound: an outgoing BindsTo marks it consumed (excluded by the reveal query).
                 ops.push(Op::AddPair {
@@ -350,6 +367,23 @@ pub fn seed(
                     rel: scene.rels.provides,
                     target: scene.cap(cap),
                 });
+                // Named for what it actually offers the scene, not for the capability's internal spelling.
+                push_role_name(
+                    &mut ops,
+                    &mut tally,
+                    id,
+                    match cap {
+                        "Renderable" => "Prop",
+                        "Physics" => "Physics Body",
+                        "Audio" => "Speaker",
+                        _ => "Marker",
+                    },
+                );
+            } else {
+                // Deliberately capability-less — the "provides no capabilities" case the reveal greys out.
+                // It still gets a name: an entity a user cannot bind is exactly the one they need to be
+                // able to find and identify.
+                push_role_name(&mut ops, &mut tally, id, "Empty");
             }
         }
     }
@@ -359,6 +393,27 @@ pub fn seed(
         health_bars,
         unbound_health_providers,
     })
+}
+
+/// Name one seeded entity for the role it actually holds, numbered per role.
+///
+/// Named at CREATION, not invented by the outliner: the label, the search box, the inspector title and a
+/// saved `.mtk` all read the same durable `__meta__.name`, and an entity without one falls back to its raw
+/// Loro key (`1_5`) — which tells a user nothing about what they are looking at.
+fn push_role_name(
+    ops: &mut Vec<Op>,
+    tally: &mut BTreeMap<&'static str, usize>,
+    id: EntityId,
+    role: &'static str,
+) {
+    let next = tally.entry(role).or_insert(0);
+    *next += 1;
+    ops.push(Op::SetField {
+        entity: id,
+        component: INSTANCE_META.into(),
+        field: NAME_FIELD.into(),
+        value: FieldValue::Str(format!("{role} {next}")),
+    });
 }
 
 /// Wire a binding-by-intent: `bar` (the requirer) tracks `provider` (a compatible target). **One
@@ -563,6 +618,79 @@ pub fn place_mesh(
         });
     }
     engine.commit("place-mesh", ops)?;
+    Ok(id)
+}
+
+/// Place a source-preserving Asset Lab result beside its input as one named, fully transformed entity.
+/// Geometry remains in the content-addressed asset store; the document carries only the handle and the
+/// comparison transform. Keeping creation, name and TRS in one commit gives the whole result one undo step.
+///
+/// # Errors
+/// Propagates a [`PipelineError`] if the transaction is rejected.
+pub fn place_mesh_variant(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    handle: &str,
+    transform: GizmoTransform,
+    name: &str,
+    source_entity: Option<&str>,
+    root_entity: Option<&str>,
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    for (field, value) in [
+        ("x", transform.translation[0]),
+        ("y", transform.translation[1]),
+        ("z", transform.translation[2]),
+        ("qx", transform.rotation[0]),
+        ("qy", transform.rotation[1]),
+        ("qz", transform.rotation[2]),
+        ("qw", transform.rotation[3]),
+        ("scale", transform.scale[0]),
+    ] {
+        ops.push(Op::SetField {
+            entity: id,
+            component: "Transform".into(),
+            field: field.into(),
+            value: FieldValue::Number(f64::from(value)),
+        });
+    }
+    ops.push(Op::SetField {
+        entity: id,
+        component: "MeshRenderer".into(),
+        field: MESH_FIELD.into(),
+        value: FieldValue::Str(handle.to_string()),
+    });
+    ops.push(Op::SetField {
+        entity: id,
+        component: INSTANCE_META.into(),
+        field: NAME_FIELD.into(),
+        value: FieldValue::Str(name.to_string()),
+    });
+    if let Some(source_entity) = source_entity {
+        ops.push(Op::SetField {
+            entity: id,
+            component: ASSET_LAB_COMPONENT.into(),
+            field: ASSET_LAB_SOURCE_FIELD.into(),
+            value: FieldValue::Str(source_entity.to_string()),
+        });
+    }
+    if let Some(root_entity) = root_entity {
+        ops.push(Op::SetField {
+            entity: id,
+            component: ASSET_LAB_COMPONENT.into(),
+            field: ASSET_LAB_ROOT_FIELD.into(),
+            value: FieldValue::Str(root_entity.to_string()),
+        });
+    }
+    if let Some(&cap) = scene.caps.get(&canonical("Renderable")) {
+        ops.push(Op::AddPair {
+            entity: id,
+            rel: scene.rels.provides,
+            target: cap,
+        });
+    }
+    engine.commit("asset-lab-variant", ops)?;
     Ok(id)
 }
 

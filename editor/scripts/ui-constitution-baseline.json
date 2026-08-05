@@ -1,0 +1,355 @@
+{
+  "version": 1,
+  "description": "Per-file UI constitution debt ceiling. Missing and newly added files have an implicit zero baseline.",
+  "scanRoots": [
+    "src/app",
+    "src/graph",
+    "src/inspector",
+    "src/panels",
+    "src/theme"
+  ],
+  "rules": {
+    "raw-native-control": "raw native controls outside the shared theme authorities",
+    "literal-ui-color": "literal UI colours outside the colour token authorities",
+    "first-party-css": "first-party CSS outside the shared theme",
+    "literal-motion": "literal motion timing outside the motion authority"
+  },
+  "files": {
+    "src/app/App.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/app/BottomDock.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/app/EditorDocks.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/app/EditorHeader.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/app/layout.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/app/LazyWorkspace.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/app/viewportCoordinates.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/graph/animation-graph-model.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/graph/AnimationGraphEditor.tsx": {
+      "raw-native-control": 54,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/graph/BindingGraph.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/graph/StateGraph.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/inspector/Inspector.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/inspector/renderers.tsx": {
+      "raw-native-control": 2,
+      "literal-ui-color": 1,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/AiEditPanel.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/AnimationWorkspace.tsx": {
+      "raw-native-control": 19,
+      "literal-ui-color": 9,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/AssetBrowser.tsx": {
+      "raw-native-control": 1,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/AssetLabPanel.css": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 374,
+      "literal-motion": 0
+    },
+    "src/panels/AssetLabPanel.tsx": {
+      "raw-native-control": 2,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/AssetLabWorkspace.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/AuthoringToolbar.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/CommandPalette.tsx": {
+      "raw-native-control": 2,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/ComposePanel.tsx": {
+      "raw-native-control": 1,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/ContextMenu.tsx": {
+      "raw-native-control": 1,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/DescribeBar.tsx": {
+      "raw-native-control": 1,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/Diagnostics.tsx": {
+      "raw-native-control": 1,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/EmptyState.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/FileMenu.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/FocusBanner.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/Hierarchy.tsx": {
+      "raw-native-control": 1,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/HoverTooltip.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/ImportReport.tsx": {
+      "raw-native-control": 2,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/JointPanel.tsx": {
+      "raw-native-control": 6,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/Onboarding.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/PhysicsPanel.tsx": {
+      "raw-native-control": 2,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/PipeForge.tsx": {
+      "raw-native-control": 10,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/PlayControls.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/ReimportPanel.tsx": {
+      "raw-native-control": 3,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/Rejections.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/Requirers.tsx": {
+      "raw-native-control": 1,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/Reveal.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/RuleDebugPanel.tsx": {
+      "raw-native-control": 1,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/RulesPanel.tsx": {
+      "raw-native-control": 20,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/StateGraphPanel.tsx": {
+      "raw-native-control": 25,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/StatusBar.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/ToastHost.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/TransformPanel.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/ViewportToolbar.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/ViewportToolRail.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/panels/Wallet.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/theme/global.css": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/theme/graph.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/theme/Popover.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/theme/primitives.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 3,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/theme/Thumbnail.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/theme/tokens.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    },
+    "src/theme/workspace.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0
+    }
+  }
+}

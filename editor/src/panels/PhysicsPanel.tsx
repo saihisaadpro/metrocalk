@@ -1,20 +1,19 @@
-//! M8 physics control panel (M10.1 React port of the scaffold's physics surface) — drop a body, the sim
-//! transport (pause/resume + scrub), the "debug by looking" contact overlay, shove, edit-at-pause friction,
-//! and URDF/USD interchange import. The per-frame sim runs NATIVELY on the engine thread (0 IPC/frame,
-//! invariant 4 — this panel never polls per frame; a 250 ms chrome poll only refreshes the slider/label).
-//!
-//! Stable ids mirror the scaffold so the prompt-40 acceptance page-object greens by selector-swap:
-//! #dropBall · #simToggle · #dbgToggle · #shove · #nudgeFriction · #scrub · #frameLbl · #importRobot ·
-//! #impSample · #impText · #impGo · #impResult · #impClose.
+/**
+ * Simulation controls, body actions, contact diagnostics, and robot-description import.
+ *
+ * Simulation transport and common body actions stay at the top. Contact inspection and interchange are
+ * intentionally disclosed as advanced workflows so the everyday physics surface remains compact.
+ */
 
 import { useEffect, useState } from "react";
-import type { EditorClient } from "../transport/session";
-import type { ContactInfo, PhysicsWarning, TimelineTuple } from "../transport/protocol";
 import { useSelectedId } from "../store/projection";
 import { setStatus } from "../store/ui";
+import { Button } from "../theme/primitives";
+import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { DisclosureSection, ShortcutBadge } from "../theme/workspace";
+import type { ContactInfo, PhysicsWarning, TimelineTuple } from "../transport/protocol";
+import type { EditorClient } from "../transport/session";
 
-// A tiny URDF the "Paste sample arm" button injects (parity with the scaffold; the acceptance spec uses its
-// own fixture). Two links → two bodies, one revolute joint with a limit, a cylinder collider.
 const SAMPLE_ARM = `<?xml version="1.0"?>
 <robot name="arm">
   <link name="base"><inertial><mass value="5.0"/><inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/></inertial>
@@ -28,7 +27,29 @@ const SAMPLE_ARM = `<?xml version="1.0"?>
 
 const ZERO_TL: TimelineTuple = [0, 0, false, false, 0];
 
-const btn: React.CSSProperties = { margin: "3px 0", padding: "5px 8px", background: "#1f3a5a", color: "#dce", border: "1px solid #2a3550", borderRadius: 5, cursor: "pointer", font: "12px ui-monospace, monospace" };
+const actionRow: React.CSSProperties = {
+  display: "flex",
+  flexWrap: "wrap",
+  alignItems: "center",
+  gap: space.sm,
+};
+
+const fieldLabel: React.CSSProperties = {
+  display: "block",
+  marginBottom: space.xs,
+  color: color.text.secondary,
+  font: font.ui,
+  fontSize: fontSize.meta,
+  fontWeight: 600,
+};
+
+const helperText: React.CSSProperties = {
+  margin: 0,
+  color: color.text.muted,
+  font: font.ui,
+  fontSize: fontSize.meta,
+  lineHeight: 1.45,
+};
 
 export function PhysicsPanel({ client }: { client: EditorClient }) {
   const selectedId = useSelectedId();
@@ -37,12 +58,13 @@ export function PhysicsPanel({ client }: { client: EditorClient }) {
   const [tl, setTl] = useState<TimelineTuple>(ZERO_TL);
   const [contacts, setContacts] = useState<ContactInfo[]>([]);
   const [warnings, setWarnings] = useState<PhysicsWarning[]>([]);
+  const [dropBusy, setDropBusy] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
   const [importText, setImportText] = useState("");
   const [importResult, setImportResult] = useState("");
 
-  // The ONLY periodic read: a 250 ms chrome poll (NOT per-frame) gated on running||debuggerOn — refreshes
-  // the transport slider/label + the contacts overlay. The sim itself advances natively (invariant 4).
+  // The simulation runs natively. This low-frequency read only refreshes transport chrome and diagnostics.
   useEffect(() => {
     if (!running && !debuggerOn) return;
     let live = true;
@@ -68,19 +90,24 @@ export function PhysicsPanel({ client }: { client: EditorClient }) {
   }
 
   async function dropBall() {
-    const x = (Math.random() - 0.5) * 2;
-    const z = (Math.random() - 0.5) * 2;
-    const id = await client.spawnBody(x, 8, z).catch(() => null);
-    if (id) {
-      client.setSimRunning(true);
-      setRunning(true);
-      setStatus(`dropped a ball · ${id}`);
+    setDropBusy(true);
+    try {
+      const x = (Math.random() - 0.5) * 2;
+      const z = (Math.random() - 0.5) * 2;
+      const id = await client.spawnBody(x, 8, z).catch(() => null);
+      if (id) {
+        client.setSimRunning(true);
+        setRunning(true);
+        setStatus(`dropped a ball · ${id}`);
+      } else {
+        setStatus("couldn't create a test body — try again");
+      }
+    } finally {
+      setDropBusy(false);
     }
   }
 
   async function toggleSim() {
-    // Read the LIVE run-state and flip it (robust to an external set_sim_running — the acceptance harness
-    // establishes a known state via the command, then clicks this toggle).
     const t = await client.simTimeline().catch(() => tl);
     const next = !t[2];
     client.setSimRunning(next);
@@ -91,7 +118,7 @@ export function PhysicsPanel({ client }: { client: EditorClient }) {
 
   async function toggleDebugger() {
     const t = await client.simTimeline().catch(() => tl);
-    const next = !t[3]; // overlays flag
+    const next = !t[3];
     client.simOverlay(next);
     setDebuggerOn(next);
     if (next) setContacts(await client.physicsContacts().catch(() => []));
@@ -113,8 +140,6 @@ export function PhysicsPanel({ client }: { client: EditorClient }) {
       setStatus("select a body to add friction");
       return;
     }
-    // One undoable, reload-persistent transaction (the deterministic replay re-derives it) — the generic
-    // commit path, not a physics command (matches the scaffold).
     client.setField(selectedId, "Collider", "friction", 0.95);
     setStatus("added friction (Ctrl-Z to undo)");
     setTimeout(() => void refreshWarnings(selectedId), 80);
@@ -133,100 +158,331 @@ export function PhysicsPanel({ client }: { client: EditorClient }) {
       setImportResult("paste a URDF or USD document first");
       return;
     }
-    const fmt = source.includes("<robot") ? "urdf" : source.toLowerCase().includes("usd") ? "usd" : "urdf";
-    const r = await client.importInterchange(fmt, source).catch(() => null);
-    if (!r || !r.ok) {
-      setImportResult(`import failed: ${r?.error ?? "unknown error"}`);
-      return;
+
+    setImportBusy(true);
+    try {
+      const fmt = source.includes("<robot") ? "urdf" : source.toLowerCase().includes("usd") ? "usd" : "urdf";
+      const r = await client.importInterchange(fmt, source).catch(() => null);
+      if (!r || !r.ok) {
+        setImportResult(`import failed: ${r?.error ?? "unknown error"}`);
+        return;
+      }
+      const lines = [`imported ${r.bodies} bodies · ${r.joints} joints (${r.format})`, ...r.notes];
+      setImportResult(lines.join("\n"));
+      setStatus(`imported ${r.bodies} bodies (Ctrl-Z to peel)`);
+    } finally {
+      setImportBusy(false);
     }
-    // Stable structured text the acceptance page-object reads (#impResult): "imported N bodies" + the
-    // explained reconciliation notes (cylinder→capsule, unenforced joint limit, …).
-    const lines = [`imported ${r.bodies} bodies · ${r.joints} joints (${r.format})`, ...r.notes];
-    setImportResult(lines.join("\n"));
-    setStatus(`imported ${r.bodies} bodies (Ctrl-Z to peel)`);
   }
 
+  const hasFrames = tl[1] > 0;
+  const importHasError = importResult.startsWith("import failed") || importResult.startsWith("paste ");
+
   return (
-    <div style={{ padding: "8px 12px", borderTop: "1px solid #2a2d35", font: "12px ui-monospace, monospace" }}>
-      <div style={{ opacity: 0.6, fontSize: 11, marginBottom: 4 }}>Physics (M8)</div>
+    <div
+      className="mtk-scroll"
+      role="region"
+      aria-label="Physics controls"
+      style={{ minHeight: 0, overflowY: "auto", background: color.bg.panel }}
+    >
+      <DisclosureSection
+        title="Simulation"
+        summary={hasFrames ? `Frame ${tl[0]} of ${tl[1]}` : "Ready"}
+        defaultOpen
+        storageKey="physics-simulation"
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: space.md }}>
+          <div style={actionRow} role="group" aria-label="Simulation controls">
+            <Button
+              id="dropBall"
+              data-testid="dropBall"
+              type="button"
+              disabled={dropBusy}
+              onClick={() => void dropBall()}
+              title="Create a dynamic test body above the scene and start simulation."
+            >
+              {dropBusy ? (
+                <>
+                  <span className="mtk-spinner" aria-hidden="true" /> Creating body…
+                </>
+              ) : (
+                "Drop test ball"
+              )}
+            </Button>
+            <Button
+              id="simToggle"
+              data-testid="simToggle"
+              type="button"
+              variant="primary"
+              onClick={() => void toggleSim()}
+              aria-label={running ? "Pause simulation" : "Resume simulation"}
+            >
+              {running ? "Pause simulation" : "Resume simulation"}
+            </Button>
+          </div>
 
-      <button id="dropBall" data-testid="dropBall" onClick={() => void dropBall()} style={btn}>🏀 Drop a ball</button>{" "}
-      <button id="simToggle" data-testid="simToggle" onClick={() => void toggleSim()} style={btn}>{running ? "⏸ Pause sim" : "▶ Resume sim"}</button>{" "}
-      <button id="dbgToggle" data-testid="dbgToggle" onClick={() => void toggleDebugger()} style={{ ...btn, background: debuggerOn ? "#3a2f5a" : "#1f3a5a" }}>🔬 Debugger</button>
+          <div>
+            <label htmlFor="scrub" style={fieldLabel}>
+              Recorded timeline
+            </label>
+            <div style={{ ...actionRow, flexWrap: "nowrap" }}>
+              <input
+                id="scrub"
+                data-testid="scrub"
+                type="range"
+                min={0}
+                max={Math.max(1, tl[1])}
+                value={tl[0]}
+                disabled={!hasFrames}
+                aria-describedby="frameLbl scrub-help"
+                aria-valuetext={`Frame ${tl[0]} of ${tl[1]}`}
+                title={hasFrames ? "Scrubbing pauses the simulation." : "Run the simulation to record frames before scrubbing."}
+                onChange={(e) => void scrub(Number(e.target.value))}
+                style={{ flex: "1 1 auto", minWidth: 0, accentColor: color.accent.base }}
+              />
+              <span id="frameLbl" data-testid="frameLbl" style={{ color: color.text.secondary, font: font.mono, fontSize: fontSize.meta, whiteSpace: "nowrap" }}>
+                frame {tl[0]}/{tl[1]}{tl[3] ? " · debug" : ""}
+              </span>
+            </div>
+            <p id="scrub-help" style={{ ...helperText, marginTop: space.xs }}>
+              {hasFrames
+                ? "Scrubbing pauses playback and restores the selected recorded frame."
+                : "Run the simulation to record frames before scrubbing."}
+            </p>
+          </div>
+        </div>
+      </DisclosureSection>
 
-      <div style={{ marginTop: 6 }}>
-        <button id="shove" data-testid="shove" onClick={() => void shove()} style={btn}>👊 Shove</button>{" "}
-        <button id="nudgeFriction" data-testid="nudgeFriction" onClick={nudgeFriction} style={btn}>🧊 +Friction</button>
-      </div>
-
-      <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 8 }}>
-        <input
-          id="scrub"
-          data-testid="scrub"
-          type="range"
-          min={0}
-          max={Math.max(1, tl[1])}
-          value={tl[0]}
-          onChange={(e) => void scrub(Number(e.target.value))}
-          style={{ flex: 1 }}
-        />
-        <span id="frameLbl" data-testid="frameLbl" style={{ opacity: 0.7 }}>
-          frame {tl[0]}/{tl[1]}{tl[3] ? " · 🔬" : ""}
-        </span>
-      </div>
-
-      <div style={{ marginTop: 6 }}>
-        <button id="importRobot" data-testid="importRobot" onClick={() => setImportOpen(true)} style={btn}>🤖 Import URDF/USD</button>
-      </div>
+      <DisclosureSection
+        title="Selected body"
+        summary={selectedId ? "Body actions" : "Selection required"}
+        defaultOpen
+        storageKey="physics-body"
+      >
+        {!selectedId && (
+          <p role="status" style={{ ...helperText, marginBottom: space.sm, color: color.info.text }}>
+            Select a physics body to use these actions. If the selection is incompatible, the status bar will explain why.
+          </p>
+        )}
+        <div style={actionRow}>
+          <Button
+            id="shove"
+            data-testid="shove"
+            type="button"
+            onClick={() => void shove()}
+            title="Apply a short forward-and-up impulse to the selected physics body."
+          >
+            Apply test shove
+          </Button>
+          <Button
+            id="nudgeFriction"
+            data-testid="nudgeFriction"
+            type="button"
+            onClick={nudgeFriction}
+            title="Set the selected collider's friction to 0.95. This is undoable."
+          >
+            Increase friction
+          </Button>
+        </div>
+      </DisclosureSection>
 
       {warnings.length > 0 && (
-        <div id="physWarn" data-testid="physWarn" style={{ marginTop: 6, background: "#3a2f16", border: "1px solid #6a5a1f", borderRadius: 5, padding: 6 }}>
-          {warnings.map((w, i) => (
-            <div key={i} style={{ marginBottom: 4 }}>
-              ⚠ {w.message}{" "}
-              <button
-                onClick={() => {
-                  if (!selectedId) return;
-                  void client.physicsFix(selectedId, w.fixAction).then(() => void refreshWarnings(selectedId)).catch(() => {});
-                }}
-                style={{ ...btn, padding: "1px 6px", margin: 0 }}
-              >
-                {w.fixLabel}
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {debuggerOn && (
-        <div id="contacts" data-testid="contacts" style={{ marginTop: 6, maxHeight: 120, overflowY: "auto", background: "#0d1018", border: "1px solid #2a3550", borderRadius: 5, padding: 6 }}>
-          <div style={{ opacity: 0.6 }}>contacts ({contacts.length})</div>
-          {contacts.slice(0, 12).map((c, i) => (
-            <div key={i} style={{ color: c.friction_saturated ? "#fbbf24" : "#9cd", fontSize: 11 }}>{c.explain}</div>
-          ))}
-        </div>
-      )}
-
-      {importOpen && (
-        <div id="importPanel" data-testid="importPanel" style={{ marginTop: 6, background: "#0d1018", border: "1px solid #2a3550", borderRadius: 6, padding: 8 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-            <span style={{ opacity: 0.7 }}>Import URDF / USD-Physics</span>
-            <button id="impClose" data-testid="impClose" onClick={() => setImportOpen(false)} style={{ ...btn, padding: "1px 8px", margin: 0 }}>Close</button>
+        <div
+          id="physWarn"
+          data-testid="physWarn"
+          role="alert"
+          aria-label="Physics checks"
+          style={{
+            margin: space.md,
+            padding: space.md,
+            border: `1px solid ${color.warn.border}`,
+            borderRadius: radius.lg,
+            background: color.warn.bg,
+          }}
+        >
+          <div style={{ marginBottom: space.sm, color: color.warn.text, font: font.ui, fontSize: fontSize.meta, fontWeight: 600 }}>
+            Physics setup needs attention
           </div>
-          <button id="impSample" data-testid="impSample" onClick={() => setImportText(SAMPLE_ARM)} style={{ ...btn, padding: "2px 8px" }}>Paste sample arm</button>
-          <textarea
-            id="impText"
-            data-testid="impText"
-            value={importText}
-            onChange={(e) => setImportText(e.target.value)}
-            placeholder="paste a URDF or USD-Physics document…"
-            style={{ width: "100%", height: 80, marginTop: 4, background: "#0a0c12", color: "#cde", border: "1px solid #2a3550", borderRadius: 4, font: "11px ui-monospace, monospace" }}
-          />
-          <button id="impGo" data-testid="impGo" onClick={() => void runImport()} style={{ ...btn, marginTop: 4 }}>Import</button>
-          {/* always present while the panel is open so the page-object's getText() never hits a missing node */}
-          <pre id="impResult" data-testid="impResult" style={{ marginTop: 4, whiteSpace: "pre-wrap", color: "#9cd", fontSize: 11, minHeight: 14 }}>{importResult}</pre>
+          <div style={{ display: "flex", flexDirection: "column", gap: space.sm }}>
+            {warnings.map((w, i) => (
+              <div key={`${w.fixAction}-${i}`} style={{ ...actionRow, justifyContent: "space-between" }}>
+                <span style={{ flex: "1 1 180px", color: color.text.secondary, font: font.ui, fontSize: fontSize.body }}>
+                  {w.message}
+                </span>
+                <Button
+                  type="button"
+                  compact
+                  disabled={!selectedId}
+                  title={selectedId ? `Apply suggested fix: ${w.fixLabel}` : "Select the affected body before applying this fix."}
+                  onClick={() => {
+                    if (!selectedId) return;
+                    void client.physicsFix(selectedId, w.fixAction).then(() => void refreshWarnings(selectedId)).catch(() => {});
+                  }}
+                >
+                  {w.fixLabel}
+                </Button>
+              </div>
+            ))}
+          </div>
         </div>
       )}
+
+      <DisclosureSection
+        title="Contact diagnostics"
+        summary={debuggerOn ? `${contacts.length} contacts · overlay on` : "Advanced"}
+        defaultOpen={false}
+        storageKey="physics-diagnostics"
+      >
+        <p style={{ ...helperText, marginBottom: space.sm }}>
+          Draw live contact overlays in the viewport and inspect collision explanations. This may add visual clutter in dense scenes.
+        </p>
+        <Button
+          id="dbgToggle"
+          data-testid="dbgToggle"
+          type="button"
+          variant="toggle"
+          active={debuggerOn}
+          aria-pressed={debuggerOn}
+          onClick={() => void toggleDebugger()}
+        >
+          Contact overlay: {debuggerOn ? "On" : "Off"}
+        </Button>
+
+        {debuggerOn && (
+          <div
+            id="contacts"
+            data-testid="contacts"
+            className="mtk-scroll"
+            role="log"
+            aria-live="polite"
+            aria-label="Live physics contacts"
+            style={{
+              maxHeight: 160,
+              marginTop: space.md,
+              overflowY: "auto",
+              padding: space.md,
+              border: `1px solid ${color.border.subtle}`,
+              borderRadius: radius.lg,
+              background: color.bg.inset,
+            }}
+          >
+            <div style={{ marginBottom: contacts.length ? space.xs : 0, color: color.text.secondary, font: font.ui, fontSize: fontSize.meta, fontWeight: 600 }}>
+              {contacts.length ? `${contacts.length} live contact${contacts.length === 1 ? "" : "s"}` : "No contacts at this frame"}
+            </div>
+            {contacts.slice(0, 12).map((c, i) => (
+              <div
+                key={`${c.explain}-${i}`}
+                style={{ padding: `${space.xs}px 0`, color: c.friction_saturated ? color.warn.text : color.text.secondary, font: font.mono, fontSize: fontSize.meta, lineHeight: 1.4 }}
+              >
+                {c.explain}
+              </div>
+            ))}
+          </div>
+        )}
+      </DisclosureSection>
+
+      <DisclosureSection
+        title="Robot interchange"
+        summary="URDF / USD"
+        defaultOpen={false}
+        storageKey="physics-interchange"
+      >
+        <p style={{ ...helperText, marginBottom: space.sm }}>
+          Import rigid bodies and joints from a URDF robot description or USD Physics document. Review reconciliation notes after import.
+        </p>
+        <Button id="importRobot" data-testid="importRobot" type="button" onClick={() => setImportOpen(true)}>
+          Open importer
+        </Button>
+
+        {importOpen && (
+          <div
+            id="importPanel"
+            data-testid="importPanel"
+            aria-busy={importBusy || undefined}
+            style={{
+              marginTop: space.md,
+              padding: space.md,
+              border: `1px solid ${color.border.subtle}`,
+              borderRadius: radius.lg,
+              background: color.bg.inset,
+            }}
+          >
+            <div style={{ ...actionRow, justifyContent: "space-between", marginBottom: space.sm }}>
+              <div style={{ color: color.text.primary, font: font.ui, fontSize: fontSize.body, fontWeight: 600 }}>
+                Import robot description
+              </div>
+              <Button id="impClose" data-testid="impClose" type="button" variant="ghost" compact disabled={importBusy} onClick={() => setImportOpen(false)}>
+                Close
+              </Button>
+            </div>
+
+            <div style={{ ...actionRow, marginBottom: space.sm }}>
+              <Button id="impSample" data-testid="impSample" type="button" compact disabled={importBusy} onClick={() => setImportText(SAMPLE_ARM)}>
+                Use sample arm
+              </Button>
+              <span style={helperText}>
+                Sample includes two bodies and one revolute joint.
+              </span>
+            </div>
+
+            <label htmlFor="impText" style={fieldLabel}>
+              URDF or USD source
+            </label>
+            <textarea
+              id="impText"
+              data-testid="impText"
+              className="mtk-input mtk-input--mono"
+              value={importText}
+              disabled={importBusy}
+              onChange={(e) => setImportText(e.target.value)}
+              placeholder="Paste a URDF or USD Physics document"
+              aria-describedby="impText-help"
+              spellCheck={false}
+              style={{ boxSizing: "border-box", width: "100%", minHeight: 112, resize: "vertical", lineHeight: 1.4 }}
+            />
+            <p id="impText-help" style={{ ...helperText, marginTop: space.xs }}>
+              The import is one undoable scene operation. Unsupported details are listed below instead of being silently dropped.
+            </p>
+
+            <div style={{ ...actionRow, marginTop: space.md }}>
+              <Button id="impGo" data-testid="impGo" type="button" variant="primary" disabled={importBusy} onClick={() => void runImport()}>
+                {importBusy ? (
+                  <>
+                    <span className="mtk-spinner" aria-hidden="true" /> Importing…
+                  </>
+                ) : (
+                  "Import into scene"
+                )}
+              </Button>
+              <span style={helperText}>
+                Undo with <ShortcutBadge keys={["Ctrl", "Z"]} ariaLabel="Control plus Z" />
+              </span>
+            </div>
+
+            <pre
+              id="impResult"
+              data-testid="impResult"
+              role={importHasError ? "alert" : "status"}
+              aria-live="polite"
+              style={{
+                minHeight: 18,
+                margin: `${space.md}px 0 0`,
+                padding: importResult ? space.md : 0,
+                border: importResult ? `1px solid ${importHasError ? color.danger.border : color.success.border}` : "none",
+                borderRadius: radius.md,
+                background: importResult ? (importHasError ? color.danger.bg : color.success.bg) : "transparent",
+                color: importResult ? (importHasError ? color.danger.text : color.success.text) : color.text.muted,
+                font: font.mono,
+                fontSize: fontSize.meta,
+                lineHeight: 1.45,
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {importResult}
+            </pre>
+          </div>
+        )}
+      </DisclosureSection>
     </div>
   );
 }

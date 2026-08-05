@@ -72,6 +72,28 @@ pub enum Record {
     /// re-placing the same handle; the handle re-resolves against the reloaded (content-addressed)
     /// store, so the placed mesh survives close→reopen (ADR-013 id determinism).
     PlaceMesh { asset: String, pos: [f32; 3] },
+    /// A non-destructive Asset Lab result placed beside its source. The derived content is persisted in
+    /// the asset sidecar; replay restores the exact named comparison entity as one transaction.
+    AssetLabVariant {
+        asset: String,
+        pos: [f32; 3],
+        rotation: [f32; 4],
+        scale: f32,
+        name: String,
+        /// Immediate derivative parent. Optional keeps pre-lineage logs readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_entity: Option<String>,
+        /// Stable root shared by a derivative chain for automatic bake registration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root_entity: Option<String>,
+    },
+    /// Pipe Forge finalized asset: the editable world-space recipe plus its immutable artifact handle.
+    /// Replay rebuilds the deterministic report/anchor, verifies the handle, then lands the same one-shot
+    /// render + recipe + static-collider transaction. Artifact bytes are restored by the blob store first.
+    PipeAsset {
+        recipe: crate::pipe_forge::PipeRecipe,
+        asset: String,
+    },
     /// M11.3 (ADR-042) — an authored Light entity (kind = directional|point|spot, linear colour, intensity).
     /// Replayed deterministically (same id alloc) so the light survives close→reopen. Only the light ENTITY
     /// is persisted (Loro doc state); the per-frame lit result is a render projection, never logged.
@@ -243,6 +265,9 @@ pub enum Record {
     AddKind { name: String, pos: [f32; 3] },
     /// A single-step undo of the most recent action.
     Undo,
+    /// Reapply the most recently undone transaction. Persisted separately so a close/reopen after redo
+    /// reconstructs the same net document instead of silently stopping at the preceding undo.
+    Redo,
 }
 
 /// Header marking the build that wrote a log — its first line, `#mtk <fingerprint>`.
@@ -347,6 +372,42 @@ impl Log {
                 Record::PlaceMesh { asset, pos } => {
                     capscene::place_mesh(engine, scene, &asset, pos).is_ok()
                 }
+                Record::AssetLabVariant {
+                    asset,
+                    pos,
+                    rotation,
+                    scale,
+                    name,
+                    source_entity,
+                    root_entity,
+                } => capscene::place_mesh_variant(
+                    engine,
+                    scene,
+                    &asset,
+                    metrocalk_gizmo::Transform {
+                        translation: pos,
+                        rotation,
+                        scale: [scale; 3],
+                    },
+                    &name,
+                    source_entity.as_deref(),
+                    root_entity.as_deref(),
+                )
+                .is_ok(),
+                Record::PipeAsset { recipe, asset } => crate::pipe_forge::bake_pipe(&recipe)
+                    .ok()
+                    .filter(|built| built.handle == asset)
+                    .is_some_and(|built| {
+                        crate::pipe_forge::land_pipe_asset(
+                            engine,
+                            scene,
+                            &recipe,
+                            &asset,
+                            built.anchor,
+                            &built.report,
+                        )
+                        .is_ok()
+                    }),
                 Record::AddLight {
                     light_kind,
                     pos,
@@ -524,6 +585,7 @@ impl Log {
                     capscene::add_kind(engine, scene, &name, pos, catalog).is_some()
                 }
                 Record::Undo => engine.undo(),
+                Record::Redo => engine.redo(),
             };
             if ok {
                 applied += 1;
