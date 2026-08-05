@@ -44,9 +44,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use metrocalk_core::{Engine, EntityId, FieldValue};
 use metrocalk_ecs::FlecsWorld;
 use metrocalk_gameplay::{
-    ActorKind, ActorSpawn, BasicAttackSpec, Bounty, CombatStats, DamageSchool, DeathRule, LaneId,
-    LanePosition, LaneSpec, MatchConfig, MatchRuntime, OneLaneMatch, PlayerId, RectMm, StatGrowth,
-    TeamId, Vec2Mm, WaveId, WaveSpec, WaveUnitSpec,
+    AbilityAim, AbilityDelivery, AbilityEffect, AbilityId, AbilitySpec, AbilityTargeting,
+    ActorKind, ActorSpawn, BasicAttackSpec, Bounty, CombatStats, DamageSchool, DeathRule,
+    ImpactShape, LaneId, LanePosition, LaneSpec, MatchConfig, MatchRuntime, OneLaneMatch, PlayerId,
+    RectMm, StatGrowth, TeamId, Vec2Mm, WaveId, WaveSpec, WaveUnitSpec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +63,7 @@ pub const MATCH_ACTOR: &str = "MatchActor";
 pub const MATCH_WAVE: &str = "MatchWave";
 
 /// The cooked-artifact schema version. Bump on any change to [`CookedMatch`]'s shape or meaning.
-pub const MATCH_COOK_SCHEMA_VERSION: u32 = 3;
+pub const MATCH_COOK_SCHEMA_VERSION: u32 = 4;
 
 /// The single lane the MOB-2 one-route profile permits.
 const LANE: LaneId = LaneId(0);
@@ -195,6 +196,8 @@ pub struct CookedActor {
     pub bounty_experience: u32,
     pub health_per_level: u32,
     pub attack: Option<CookedAttack>,
+    /// The one ability this actor can cast, if the author gave it one.
+    pub ability: Option<CookedAbility>,
     /// `Some(delay)` = respawn at the authored position after `delay` ticks; `None` = stays dead. A
     /// structure whose loss ends the match is expressed by `objective_for` instead.
     pub respawn_delay_ticks: Option<u32>,
@@ -202,6 +205,32 @@ pub struct CookedActor {
     pub objective_for: Option<u8>,
     /// The authored entity this actor came from — the traceability the evidence chain needs.
     pub source: String,
+}
+
+/// One cooked ability, already in kernel units.
+///
+/// The kernel has had abilities — casts, projectiles, impact shapes, ranks — since MOB-1, and until now
+/// the cook emitted `abilities: vec![]` for every actor and never called `register_ability`. The whole
+/// system was reachable only from tests. This type is what an authored scene says to make it real.
+///
+/// ONE ability per actor in this slice, authored with an `ability` field prefix exactly as the basic
+/// attack is authored with `attack`. That is a declared subset, not a limitation of the kernel: the
+/// kernel's `max_abilities_per_actor` is 8, and a second authored slot is more of this same shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CookedAbility {
+    /// Assigned by the cook in authored order, so the same scene always produces the same ability ids.
+    pub id: u32,
+    pub range_mm: u32,
+    pub damage: u32,
+    pub cooldown_ticks: u32,
+    pub cast_ticks: u16,
+    pub resource_cost: u32,
+    /// Zero means the cast strikes exactly what it named; anything else is a circle around the impact.
+    pub radius_mm: u32,
+    /// Zero means the effect lands on the cast's resolution tick; anything else launches a projectile
+    /// that can MISS, which is the difference between a spell and a guaranteed hit.
+    pub projectile_speed_mm_per_tick: u32,
 }
 
 /// A cooked basic attack, already in kernel units.
@@ -294,6 +323,16 @@ impl CookedMatch {
         };
         let mut runtime = MatchRuntime::new(config, self.seed).map_err(debug)?;
 
+        // Abilities are registered BEFORE any actor is spawned: a spawn that names an ability the
+        // runtime has never heard of is refused, and that refusal would read as a broken scene rather
+        // than as an ordering mistake in here.
+        for actor in &self.actors {
+            if let Some(ability) = actor.ability {
+                runtime
+                    .register_ability(kernel_ability(ability))
+                    .map_err(debug)?;
+            }
+        }
         for actor in &self.actors {
             runtime.spawn_actor(&kernel_spawn(actor)).map_err(debug)?;
         }
@@ -364,7 +403,10 @@ fn kernel_spawn(actor: &CookedActor) -> ActorSpawn {
             gold: actor.bounty_gold,
             experience: actor.bounty_experience,
         },
-        abilities: vec![],
+        abilities: actor
+            .ability
+            .map(|ability| vec![AbilityId(ability.id)])
+            .unwrap_or_default(),
         basic_attack: actor.attack.map(kernel_attack),
         death_rule,
     }
@@ -412,6 +454,48 @@ fn kernel_wave(wave: &CookedWave) -> WaveSpec {
                 basic_attack: wave.unit_attack.map(kernel_attack),
             })
             .collect(),
+    }
+}
+
+/// One cooked ability as the kernel's own definition.
+///
+/// The two "zero means simple" fields are what let an author reach the whole cross-product without
+/// learning the kernel's enum vocabulary: no radius is a single target, no speed is an instant cast.
+fn kernel_ability(ability: CookedAbility) -> AbilitySpec {
+    AbilitySpec {
+        id: AbilityId(ability.id),
+        aim: AbilityAim::Unit,
+        targeting: AbilityTargeting::Enemy,
+        range_mm: ability.range_mm,
+        resource_cost: ability.resource_cost,
+        cooldown_ticks: ability.cooldown_ticks,
+        cast_ticks: ability.cast_ticks,
+        delivery: if ability.projectile_speed_mm_per_tick == 0 {
+            AbilityDelivery::Instant
+        } else {
+            AbilityDelivery::Projectile {
+                speed_mm_per_tick: ability.projectile_speed_mm_per_tick,
+                // A missile with no body cannot strike one. Tied to the authored radius, falling back to
+                // a half-metre so an authored skillshot is hittable rather than infinitely thin.
+                hit_radius_mm: if ability.radius_mm == 0 {
+                    500
+                } else {
+                    ability.radius_mm
+                },
+            }
+        },
+        impact: if ability.radius_mm == 0 {
+            ImpactShape::Single
+        } else {
+            ImpactShape::Circle {
+                radius_mm: ability.radius_mm,
+            }
+        },
+        effect: AbilityEffect::Damage {
+            amount: ability.damage,
+            school: DamageSchool::Magic,
+        },
+        per_rank_amount: 0,
     }
 }
 
@@ -849,6 +933,75 @@ impl Cook {
     }
 
     /// Read an optional basic attack. Present only if `attackDamage` is authored.
+    /// Read the one authored ability off an actor, or `None` when the author gave it none.
+    ///
+    /// Absent is not an error — most actors have no ability, and a scene authored before this field
+    /// existed must keep cooking. `abilityDamage` is the switch: an ability that deals nothing is not an
+    /// ability, so its absence means "no ability" rather than "an ability worth zero".
+    fn ability(
+        &mut self,
+        comps: &Components,
+        entity: EntityId,
+        component: &str,
+        ordinal: usize,
+    ) -> Option<CookedAbility> {
+        let damage = self.optional_u32(comps, entity, component, "abilityDamage")?;
+        if damage == 0 {
+            self.error(
+                "out-of-range",
+                entity,
+                component,
+                Some("abilityDamage"),
+                "`abilityDamage` is 0; remove the ability instead of authoring one that does nothing."
+                    .to_owned(),
+            );
+            return None;
+        }
+        let range_mm = self
+            .optional_metres_mm(comps, entity, component, "abilityRange")
+            .unwrap_or(0);
+        let range_mm = match u32::try_from(range_mm) {
+            Ok(0) | Err(_) => {
+                self.error(
+                    "out-of-range",
+                    entity,
+                    component,
+                    Some("abilityRange"),
+                    "`abilityRange` must be a positive distance in metres.".to_owned(),
+                );
+                return None;
+            }
+            Ok(positive) => positive,
+        };
+        let radius_mm = self
+            .optional_metres_mm(comps, entity, component, "abilityRadius")
+            .unwrap_or(0);
+        let speed_mm = self
+            .optional_metres_mm(comps, entity, component, "abilityProjectileSpeed")
+            .unwrap_or(0);
+        Some(CookedAbility {
+            // Authored order, like the actor ids beside it, so the same scene always cooks to the same
+            // ability ids and a capture that names one keeps meaning it.
+            id: u32::try_from(ordinal).unwrap_or(u32::MAX).saturating_add(1),
+            range_mm,
+            damage,
+            cooldown_ticks: self
+                .optional_u32(comps, entity, component, "abilityCooldownTicks")
+                .unwrap_or(30)
+                .max(1),
+            cast_ticks: u16::try_from(
+                self.optional_u32(comps, entity, component, "abilityCastTicks")
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u16::MAX),
+            resource_cost: self
+                .optional_u32(comps, entity, component, "abilityResourceCost")
+                .unwrap_or(0),
+            radius_mm: u32::try_from(radius_mm).unwrap_or(0),
+            projectile_speed_mm_per_tick: u32::try_from(speed_mm).unwrap_or(0),
+        })
+    }
+
     fn attack(
         &mut self,
         comps: &Components,
@@ -1278,6 +1431,7 @@ pub fn cook_match(engine: &Engine<FlecsWorld>) -> CookOutcome {
         } else {
             None
         };
+        let ability = cook.ability(&comps, id, MATCH_ACTOR, ordinal);
         let respawn_delay_ticks = cook.optional_u32(&comps, id, MATCH_ACTOR, "respawnDelayTicks");
         if objective_for.is_some() && respawn_delay_ticks.is_some() {
             cook.warn(
@@ -1306,6 +1460,7 @@ pub fn cook_match(engine: &Engine<FlecsWorld>) -> CookOutcome {
             bounty_experience,
             health_per_level,
             attack,
+            ability,
             respawn_delay_ticks,
             objective_for,
             source: id.to_loro_key(),
@@ -1862,7 +2017,17 @@ struct StarterActor {
     speed: f64,
     /// `(range in metres, damage)`.
     attack: Option<(f64, i64)>,
+    /// `(range in metres, damage, cooldown ticks, projectile speed in metres/second)`.
+    ///
+    /// The starter authors ONE, on the hero, because the ability system had never been reachable from a
+    /// scene at all: the cook emitted an empty ability list for every actor and never registered one.
+    /// A first-time author now gets a spell they can cast, rather than a kernel feature they cannot find.
+    ability: Option<(f64, i64, i64, f64)>,
 }
+
+/// The tick rate the starter authors. Named once so the per-second speeds in [`STARTER_ROSTER`]
+/// convert against the SAME number the scene declares, rather than a second copy that can drift.
+const STARTER_TICK_RATE_HZ: u16 = 30;
 
 /// The reference one-lane scenario: two cores 12 m apart and a player hero between them.
 const STARTER_ROSTER: [StarterActor; 3] = [
@@ -1876,6 +2041,7 @@ const STARTER_ROSTER: [StarterActor; 3] = [
         health: 2_000,
         speed: 0.0,
         attack: None,
+        ability: None,
     },
     StarterActor {
         name: "Red Core",
@@ -1887,6 +2053,7 @@ const STARTER_ROSTER: [StarterActor; 3] = [
         health: 2_000,
         speed: 0.0,
         attack: None,
+        ability: None,
     },
     StarterActor {
         name: "Hero",
@@ -1898,6 +2065,10 @@ const STARTER_ROSTER: [StarterActor; 3] = [
         health: 1_400,
         speed: 7.8,
         attack: Some((1.1, 110)),
+        // A ranged bolt that TRAVELS: 6 m of reach at 18 m/s, so it can be seen crossing the lane and can
+        // strike a body that steps into it. An instant hit would prove the cast path just as well and
+        // would show none of the projectile work the kernel already does.
+        ability: Some((6.0, 260, 24, 18.0)),
     },
 ];
 
@@ -1951,7 +2122,13 @@ pub fn author_starter_match(
     ] {
         set(&mut ops, settings, MATCH_SETTINGS, field, num(value));
     }
-    set(&mut ops, settings, MATCH_SETTINGS, "tickRateHz", int(30));
+    set(
+        &mut ops,
+        settings,
+        MATCH_SETTINGS,
+        "tickRateHz",
+        int(i64::from(STARTER_TICK_RATE_HZ)),
+    );
     set(&mut ops, settings, MATCH_SETTINGS, "maxTicks", int(3_000));
 
     let lane = engine.alloc_entity_id();
@@ -2001,6 +2178,7 @@ pub fn author_starter_match(
             health,
             speed,
             attack,
+            ability,
         } = actor;
         let id = engine.alloc_entity_id();
         ops.push(Op::CreateEntity { id, parent: None });
@@ -2040,6 +2218,26 @@ pub fn author_starter_match(
             set(&mut ops, id, MATCH_ACTOR, "attackDamage", int(damage));
             set(&mut ops, id, MATCH_ACTOR, "attackWindupTicks", int(1));
             set(&mut ops, id, MATCH_ACTOR, "attackCooldownTicks", int(4));
+        }
+        if let Some((range, damage, cooldown, speed_m_per_s)) = ability {
+            set(&mut ops, id, MATCH_ACTOR, "abilityRange", num(range));
+            set(&mut ops, id, MATCH_ACTOR, "abilityDamage", int(damage));
+            set(
+                &mut ops,
+                id,
+                MATCH_ACTOR,
+                "abilityCooldownTicks",
+                int(cooldown),
+            );
+            // Authored in metres per SECOND like every other speed in this file; the cook converts with
+            // the authored tick rate, so changing the tick rate does not silently change the spell.
+            set(
+                &mut ops,
+                id,
+                MATCH_ACTOR,
+                "abilityProjectileSpeed",
+                num(speed_m_per_s / f64::from(STARTER_TICK_RATE_HZ)),
+            );
         }
         for (field, value) in [("x", x), ("y", 0.0), ("z", 0.0)] {
             set(&mut ops, id, "Transform", field, num(value));

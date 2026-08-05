@@ -448,6 +448,78 @@ fn an_acquisition_range_shorter_than_reach_is_refused_by_name() {
     assert!(message.contains("attackRange"), "{message}");
 }
 
+#[test]
+fn the_starter_hero_has_an_ability_and_it_reaches_the_kernel() {
+    // The gap this closes: the cook emitted `abilities: vec![]` for EVERY actor and never called
+    // `register_ability`, so the kernel's whole ability system — casts, projectiles, impact shapes,
+    // ranks — was reachable only from tests. A cooked artifact that merely CARRIES an ability would
+    // still leave that true, so this asserts all the way through to a built runtime.
+    let engine = starter();
+    let cooked = cooked(&engine);
+
+    let hero = cooked
+        .actors
+        .iter()
+        .find(|actor| actor.owned)
+        .expect("the starter authors one owned hero");
+    let ability = hero
+        .ability
+        .expect("the hero must have an authored ability");
+    assert!(ability.damage > 0 && ability.range_mm > 0);
+    // Authored as a travelling bolt, not an instant hit: a projectile can MISS, and that is the part of
+    // the kernel a guaranteed hit would leave unexercised.
+    assert!(
+        ability.projectile_speed_mm_per_tick > 0,
+        "the starter ability must be a projectile so the flight path is actually exercised"
+    );
+
+    // ...and the built runtime knows it, which is the claim that matters.
+    let game = cooked.build().expect("the starter match builds");
+    let registered = game
+        .runtime()
+        .ability(metrocalk_gameplay::AbilityId(ability.id))
+        .expect("the cook must REGISTER the ability, not merely name it on the spawn");
+    assert_eq!(registered.range_mm, ability.range_mm);
+    assert!(matches!(
+        registered.delivery,
+        metrocalk_gameplay::AbilityDelivery::Projectile { .. }
+    ));
+
+    // And the hero's own spawn names it, or the actor could never cast it.
+    let hero_actor = game
+        .runtime()
+        .actors()
+        .into_iter()
+        .find(|a| a.owner.is_some())
+        .expect("the hero is in the running match");
+    assert!(
+        hero_actor
+            .cooldowns
+            .iter()
+            .any(|c| c.ability == metrocalk_gameplay::AbilityId(ability.id)),
+        "the hero must be equipped with the ability it was authored"
+    );
+}
+
+#[test]
+fn an_ability_that_deals_nothing_is_refused_by_name() {
+    // Zero damage is the one value that means "you meant to delete this", so it is reported against the
+    // FIELD rather than silently cooking an ability that can never do anything.
+    let mut engine = starter();
+    for index in 0..authored_with(&engine, MATCH_ACTOR).len() {
+        set_on_nth(
+            &mut engine,
+            MATCH_ACTOR,
+            index,
+            "abilityDamage",
+            FieldValue::Integer(0),
+        );
+    }
+    let outcome = cook_match(&engine);
+    assert!(!outcome.ok());
+    assert!(format!("{:?}", outcome.diagnostics).contains("abilityDamage"));
+}
+
 // ── refusals ─────────────────────────────────────────────────────────────────────────────────────────
 
 #[test]

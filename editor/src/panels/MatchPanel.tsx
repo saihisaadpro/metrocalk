@@ -191,6 +191,13 @@ export function MatchPanel({ client }: { client: EditorClient }) {
       setStatus(`Locked onto ${nearestEnemy.kind.toLowerCase()} #${nearestEnemy.id} — it will not switch targets.`);
     });
 
+  const cast = () =>
+    guard("Could not cast", async () => {
+      if (!nearestEnemy) return;
+      setMatchStatus(await client.matchCast(nearestEnemy.id));
+      setStatus(`Cast at ${nearestEnemy.kind.toLowerCase()} #${nearestEnemy.id}.`);
+    });
+
   const hold = () =>
     guard("Could not give that order", async () => {
       setMatchStatus(await client.matchHold());
@@ -244,6 +251,9 @@ export function MatchPanel({ client }: { client: EditorClient }) {
       return da - db || a.id - b.id;
     });
   const nearestEnemy = enemies[0] ?? null;
+  // `null` means the hero was authored with no ability at all, which is a different thing from a
+  // cooldown and must not render as one.
+  const abilityReady = hero?.ability_ready_in === 0;
   // Push toward the enemy's furthest structure — the thing a lane exists to reach. Falls back to the
   // furthest hostile of any kind, and finally to a step ahead, so the button is never dead.
   const pushTarget = (() => {
@@ -377,6 +387,33 @@ export function MatchPanel({ client }: { client: EditorClient }) {
               <Button onClick={halt} disabled={busy} data-testid="order-halt" title="Stop moving and stop fighting">
                 Clear orders
               </Button>
+            </div>
+            {/* ── the ability ─────────────────────────────────────────────────────────────────── */}
+            <div style={{ ...row, marginTop: space.xs }}>
+              <Button
+                variant="primary"
+                onClick={cast}
+                disabled={busy || !nearestEnemy || !abilityReady}
+                data-testid="order-cast"
+                title={
+                  hero?.ability_ready_in === null || hero?.ability_ready_in === undefined
+                    ? "This hero has no ability authored on it — add one in the inspector"
+                    : !nearestEnemy
+                      ? "Nothing hostile is left to cast at"
+                      : abilityReady
+                        ? `Cast at ${nearestEnemy.kind.toLowerCase()} #${nearestEnemy.id}`
+                        : `Cooling down — ready in ${hero?.ability_ready_in} ticks`
+                }
+              >
+                {abilityReady ? "Cast ability" : `Cast ability (${hero?.ability_ready_in ?? "—"})`}
+              </Button>
+              <p style={{ ...meta, margin: 0, alignSelf: "center" }} data-testid="ability-state">
+                {hero?.ability_ready_in === null || hero?.ability_ready_in === undefined
+                  ? "No ability authored on this hero."
+                  : abilityReady
+                    ? "Ability ready."
+                    : `Ability cooling down: ${hero.ability_ready_in} ticks.`}
+              </p>
             </div>
             <p style={{ ...meta, marginTop: space.xs }} data-testid="standing-order">
               {/* Worded by the kernel, so this line can never claim behaviour the runtime does not have. */}

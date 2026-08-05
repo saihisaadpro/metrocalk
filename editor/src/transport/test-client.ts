@@ -252,6 +252,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     matchAttackTarget: vi.fn(() => Promise.resolve(emptyMatchStatus())),
     matchHold: vi.fn(() => Promise.resolve(emptyMatchStatus())),
     matchHalt: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    matchCast: vi.fn(() => Promise.resolve(emptyMatchStatus())),
     matchStun: vi.fn(() => Promise.resolve(emptyMatchStatus())),
     matchStatus: vi.fn(() => Promise.resolve(emptyMatchStatus())),
     matchCooked: vi.fn(() => Promise.resolve(null)),

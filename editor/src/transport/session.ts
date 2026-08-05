@@ -437,6 +437,8 @@ export interface EditorClient {
   matchHold(): Promise<MatchStatus>;
   /** Cancel movement AND any standing order. */
   matchHalt(): Promise<MatchStatus>;
+  /** Cast the hero's authored ability at one target — the first player-reachable cast in this editor. */
+  matchCast(target: number): Promise<MatchStatus>;
   /** Apply crowd control to the hero — the live proof status effects run in the viewport. */
   matchStun(ticks: number): Promise<MatchStatus>;
   /** Read the match state without mutating it. */
@@ -1045,6 +1047,9 @@ export class TauriClient implements EditorClient {
   }
   matchHalt(): Promise<MatchStatus> {
     return this.core.invoke<MatchStatus>("moba_halt");
+  }
+  matchCast(target: number): Promise<MatchStatus> {
+    return this.core.invoke<MatchStatus>("moba_cast", { target });
   }
   matchStun(ticks: number): Promise<MatchStatus> {
     return this.core.invoke<MatchStatus>("moba_stun", { ticks });
@@ -2491,13 +2496,14 @@ class MockClient implements EditorClient {
   private matchRunning = false;
   private matchStunTicks = 0;
   private matchOrder: string | null = null;
+  private matchAbilityReadyIn: number | null = 0;
   private devStatus(): MatchStatus {
     const stunned = this.matchStunTicks > 0;
     const actors: MatchActor[] = this.matchAuthored
       ? [
-          { id: 1, team: 0, kind: "Structure", x_mm: 0, y_mm: 0, health: 2000, max_health: 2000, alive: true, owned: false, controls: [], speed: 0, attack_order: null, source: this.matchAuthored.actors[0] },
-          { id: 2, team: 1, kind: "Structure", x_mm: 12000, y_mm: 0, health: 2000, max_health: 2000, alive: true, owned: false, controls: [], speed: 0, attack_order: null, source: this.matchAuthored.actors[1] },
-          { id: 3, team: 0, kind: "Hero", x_mm: 1500 + this.matchTick * 10, y_mm: 0, health: 1400, max_health: 1400, alive: true, owned: true, controls: stunned ? ["Stun"] : [], speed: stunned ? 130 : 260, attack_order: this.matchOrder, source: this.matchAuthored.actors[2] },
+          { id: 1, team: 0, kind: "Structure", x_mm: 0, y_mm: 0, health: 2000, max_health: 2000, alive: true, owned: false, controls: [], speed: 0, ability_ready_in: null, attack_order: null, source: this.matchAuthored.actors[0] },
+          { id: 2, team: 1, kind: "Structure", x_mm: 12000, y_mm: 0, health: 2000, max_health: 2000, alive: true, owned: false, controls: [], speed: 0, ability_ready_in: null, attack_order: null, source: this.matchAuthored.actors[1] },
+          { id: 3, team: 0, kind: "Hero", x_mm: 1500 + this.matchTick * 10, y_mm: 0, health: 1400, max_health: 1400, alive: true, owned: true, controls: stunned ? ["Stun"] : [], speed: stunned ? 130 : 260, ability_ready_in: this.matchAbilityReadyIn, attack_order: this.matchOrder, source: this.matchAuthored.actors[2] },
         ]
       : [];
     return {
@@ -2567,6 +2573,10 @@ class MockClient implements EditorClient {
   }
   matchHalt(): Promise<MatchStatus> {
     this.matchOrder = null;
+    return Promise.resolve(this.devStatus());
+  }
+  matchCast(): Promise<MatchStatus> {
+    this.matchAbilityReadyIn = 24;
     return Promise.resolve(this.devStatus());
   }
   matchStun(ticks: number): Promise<MatchStatus> {

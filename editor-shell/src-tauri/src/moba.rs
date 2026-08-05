@@ -26,8 +26,8 @@ use metrocalk_editor_shell::match_cook::{
     cook_match, CookDiagnostic, CookSeverity, CookedMatch, MATCH_COOK_SCHEMA_VERSION,
 };
 use metrocalk_gameplay::{
-    ActorId, ActorKind, AttackOrder, CommandKind, ControlKind, MatchPhase, ModifierOp, OneLaneMatch,
-    PlayerCommand, PlayerId, StatKind, Vec2Mm,
+    AbilityId, ActorId, ActorKind, AttackOrder, CastTarget, CommandKind, ControlKind, MatchPhase,
+    ModifierOp, OneLaneMatch, PlayerCommand, PlayerId, StatKind, Vec2Mm,
 };
 
 use crate::render::{Instance, SceneState, IDENTITY_QUAT};
@@ -52,6 +52,9 @@ pub struct MobaActor {
     pub owned: bool,
     pub controls: Vec<String>,
     pub speed: u32,
+    /// Ticks until this actor's ability can be cast again. `Some(0)` means ready now; `None` means the
+    /// actor has no ability at all — which was true of EVERY actor until the cook learned to author one.
+    pub ability_ready_in: Option<u64>,
     /// The standing attack order in plain words, or `None` when this actor has none.
     ///
     /// Rendered here rather than in the UI because the kernel owns the vocabulary: a panel that invented
@@ -245,6 +248,9 @@ pub struct MobaSession {
     cooked: CookedMatch,
     /// The actor the local player commands, taken from the cook rather than assumed.
     hero: ActorId,
+    /// The hero's one authored ability, taken from the COOK rather than from a constant here: the panel
+    /// must cast the spell the scene declares, not one this bridge invented.
+    hero_ability: Option<AbilityId>,
     /// The editor scene as it was before the match took over the viewport.
     saved_instances: Vec<Instance>,
     saved_ids: Vec<String>,
@@ -297,10 +303,18 @@ impl MobaSession {
             // rather than unwrapping keeps a future cook change from panicking the shell.
             .unwrap_or(ActorId(0));
 
+        let hero_ability = cooked
+            .actors
+            .iter()
+            .find(|actor| actor.owned)
+            .and_then(|actor| actor.ability)
+            .map(|ability| AbilityId(ability.id));
+
         let mut session = Self {
             game,
             cooked,
             hero,
+            hero_ability,
             saved_instances: scene.instances.clone(),
             saved_ids: scene.ids.clone(),
             saved_slots: scene.mesh_slots.clone(),
@@ -410,6 +424,32 @@ impl MobaSession {
     /// Cancel movement AND any standing order.
     pub fn order_stop(&mut self, scene: &mut SceneState) -> MobaStatus {
         self.issue(scene, CommandKind::Stop)
+    }
+
+    /// Cast the hero's authored ability at one target.
+    ///
+    /// This is the first path by which a PLAYER has ever been able to cast anything in this editor. The
+    /// kernel has carried casts, projectiles, impact shapes and ability ranks since MOB-1; the cook
+    /// emitted an empty ability list for every actor and never registered one, so the entire system was
+    /// reachable only from tests.
+    ///
+    /// A hero with no authored ability is refused HERE with a sentence, rather than being sent to the
+    /// kernel to come back as `AbilityNotEquipped` — the author needs to know their scene is missing a
+    /// field, which is not what that rejection says.
+    pub fn order_cast(&mut self, scene: &mut SceneState, target: u64) -> MobaStatus {
+        let Some(ability) = self.hero_ability else {
+            self.last_rejection =
+                Some("This hero has no ability authored on it — add one in the inspector.".to_owned());
+            self.project(scene);
+            return self.status();
+        };
+        self.issue(
+            scene,
+            CommandKind::Cast {
+                ability,
+                target: CastTarget::Actor(ActorId(target)),
+            },
+        )
     }
 
     /// Apply crowd control to the hero — the visible proof GP-02 is running in the live viewport.
@@ -531,6 +571,9 @@ impl MobaSession {
                     .map(|kind| format!("{kind:?}"))
                     .collect(),
                 speed: actor.move_speed_mm_per_tick,
+                ability_ready_in: actor.cooldowns.first().map(|cooldown| {
+                    cooldown.ready_at.saturating_sub(runtime.tick())
+                }),
                 attack_order: actor.attack_order.map(describe_order),
                 source: self.cooked.source_of(actor.id.get()).map(ToOwned::to_owned),
             })

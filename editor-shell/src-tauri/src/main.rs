@@ -15408,6 +15408,18 @@ fn moba_attack_target(state: State<AppState>, target: u64) -> moba::MobaStatus {
     session.order_attack_target(&mut scene, target)
 }
 
+/// Cast the hero's authored ability at one target — the first player-reachable cast in this editor.
+#[tauri::command]
+fn moba_cast(state: State<AppState>, target: u64) -> moba::MobaStatus {
+    ipc();
+    let mut guard = state.moba.lock().unwrap();
+    let Some(session) = guard.as_mut() else {
+        return moba::idle_status();
+    };
+    let mut scene = state.shared.lock().unwrap();
+    session.order_cast(&mut scene, target)
+}
+
 /// Hold position and engage whatever comes into range.
 #[tauri::command]
 fn moba_hold(state: State<AppState>) -> moba::MobaStatus {
@@ -18788,6 +18800,7 @@ fn main() {
             moba_attack_target,
             moba_hold,
             moba_halt,
+            moba_cast,
             moba_stun,
             moba_status,
             moba_cooked,

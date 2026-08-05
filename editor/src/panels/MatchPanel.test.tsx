@@ -47,6 +47,7 @@ const running: MatchStatus = {
       owned: true,
       controls: ["Stun"],
       speed: 130,
+      ability_ready_in: 0,
       attack_order: null,
       source: "1_7",
     },
@@ -64,6 +65,7 @@ const running: MatchStatus = {
       owned: false,
       controls: [],
       speed: 60,
+      ability_ready_in: null,
       attack_order: null,
       source: null,
     },
@@ -79,6 +81,7 @@ const running: MatchStatus = {
       owned: false,
       controls: [],
       speed: 0,
+      ability_ready_in: null,
       attack_order: null,
       source: "1_9",
     },
@@ -241,6 +244,55 @@ describe("MatchPanel", () => {
     fireEvent.click(screen.getByTestId("order-hold"));
     await waitFor(() =>
       expect(screen.getByTestId("standing-order").textContent).toMatch(/hold position/i),
+    );
+  });
+
+  it("casts the hero's authored ability at the nearest hostile", async () => {
+    // The gap this closes: until now there was no cast button at all, and the only crowd control in the
+    // build was a developer cheat. The kernel has carried casts since MOB-1.
+    const cast = vi.fn(() => Promise.resolve(running));
+    const client = fakeClient({
+      matchValidate: () => Promise.resolve(valid),
+      matchStart: () => Promise.resolve(running),
+      matchCast: cast,
+    });
+    render(<MatchPanel client={client} />);
+    fireEvent.click(await screen.findByRole("button", { name: /start match/i }));
+    fireEvent.click(await screen.findByTestId("order-cast"));
+    await waitFor(() => expect(cast).toHaveBeenCalledWith(9));
+  });
+
+  it("distinguishes a cooling-down ability from a hero that has none at all", async () => {
+    const cooling: MatchStatus = {
+      ...running,
+      actors: running.actors.map((a) => (a.owned ? { ...a, ability_ready_in: 17 } : a)),
+    };
+    const none: MatchStatus = {
+      ...running,
+      actors: running.actors.map((a) => (a.owned ? { ...a, ability_ready_in: null } : a)),
+    };
+
+    const cool = fakeClient({
+      matchValidate: () => Promise.resolve(valid),
+      matchStart: () => Promise.resolve(cooling),
+    });
+    render(<MatchPanel client={cool} />);
+    fireEvent.click(await screen.findByRole("button", { name: /start match/i }));
+    expect((await screen.findByTestId("ability-state")).textContent).toMatch(/cooling down: 17/i);
+    expect(((await screen.findByTestId("order-cast")) as HTMLButtonElement).disabled).toBe(true);
+    cleanup();
+
+    // The two states must not read the same. A hero with no ability is an AUTHORING problem, and telling
+    // the author "cooling down" would send them to wait for something that is never coming.
+    const bare = fakeClient({
+      matchValidate: () => Promise.resolve(valid),
+      matchStart: () => Promise.resolve(none),
+    });
+    render(<MatchPanel client={bare} />);
+    fireEvent.click(await screen.findByRole("button", { name: /start match/i }));
+    expect((await screen.findByTestId("ability-state")).textContent).toMatch(/no ability authored/i);
+    expect(((await screen.findByTestId("order-cast")) as HTMLButtonElement).title).toMatch(
+      /no ability authored/i,
     );
   });
 

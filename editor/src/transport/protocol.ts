@@ -1477,6 +1477,8 @@ export interface MatchActor {
   /** Active control effects by name — the non-colour channel for runtime status. */
   controls: string[];
   speed: number;
+  /** Ticks until this actor's ability is castable again; 0 means ready, null means it has no ability. */
+  ability_ready_in: number | null;
   /** The standing attack order in plain words, or null when this actor has none. Worded by the kernel,
    *  not by this panel, so the UI can never describe behaviour the runtime does not have. */
   attack_order: string | null;
