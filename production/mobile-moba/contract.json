@@ -216,7 +216,13 @@
       "derived-and-test-reverified-pseudo-random-distribution-table",
       "ordered-damage-pipeline-crit-penetration-shield-lifesteal",
       "shields-as-status-effects-owning-a-pool-with-co-expiry",
-      "lifesteal-from-applied-damage-settling-after-the-batch"
+      "lifesteal-from-applied-damage-settling-after-the-batch",
+      "standing-attack-orders-target-move-hold-never-silently-retargeted",
+      "automatic-swings-through-the-same-single-validation-choke-point-as-player-commands",
+      "nearest-first-acquisition-with-an-actor-id-tie-break",
+      "acquisition-range-authored-wider-than-weapon-reach",
+      "per-session-monotonic-command-sequence-independent-of-the-tick",
+      "every-command-kind-round-trips-the-pending-queue"
     ],
     "acceptanceBlockers": [
       "replay-file-checkpoint-index-and-scrub-integration",
@@ -284,12 +290,14 @@
       "baselineP99NsAtCdc6ccb": 877700
     },
     "captureHarness": {
-      "scenarios": 21,
-      "frames": 125,
-      "observableChecks": 68,
+      "scenarios": 24,
+      "frames": 260,
+      "observableChecks": 81,
       "failing": 0,
       "ciExecuted": true,
-      "workflow": ".github/workflows/mobile-gameplay-tripwire.yml"
+      "workflow": ".github/workflows/mobile-gameplay-tripwire.yml",
+      "coverageFloor": 81,
+      "note": "Raised from 21/125/68 by the GP-08 standing-order scenarios (ADR-101). The CI floor is raised in the same change that adds the scenarios, so coverage cannot regress silently."
     },
     "mobileAbiChecks": {
       "status": "RUN-LOCALLY-FIRST-TIME",
@@ -301,7 +309,42 @@
       "toolchain": "pinned 1.92.0-x86_64-pc-windows-msvc (same compiler as the default, so no drift)",
       "note": "rustup was missing as a CLI and was installed. The prior 'CI is green and wasm32 is the local proxy' caveat is closed. This is a COMPILE check, not a device boot."
     },
-    "measurementCaveat": "One unpaced Windows developer machine at ~13% background load. The soak regression is recorded as a regression, not explained away."
+    "measurementCaveat": "One unpaced Windows developer machine at ~13% background load. The soak regression is recorded as a regression, not explained away.",
+    "userDrivenCapture": {
+      "scope": "packaged .exe driven as a player drives it, not through the command surface",
+      "date": "2026-08-05",
+      "spec": "editor-shell/e2e/specs/moba-orders.e2e.js",
+      "config": "editor-shell/e2e/wdio.mobaorders.conf.js",
+      "interactions": 25,
+      "viaRealUiClicks": 22,
+      "screenshots": 50,
+      "screenshotsPerInteraction": "one before and one after, OS-composited",
+      "captureMethod": "PrintWindow(PW_RENDERFULLCONTENT) — returns BOTH the WebView2 UI and the native wgpu surface; the desktop-DC BitBlt is retained only as a fallback",
+      "restarts": 1,
+      "revives": 1,
+      "restartsAndRevivesReported": "The starter match authors a red wave and no blue one, so the blue core is on a losing clock unless the hero fights, and the hero can be killed. Both are the match working; they are counted in the evidence rather than hidden.",
+      "definingObservation": "One attack-move issued at tick 30 was still standing at tick 91, having fought through two 30-tick windows in which nothing was pressed but the clock.",
+      "defectsFoundOnlyByDrivingTheUi": [
+        "decode_command never read tag 4 — a queued UpgradeAbility could not survive a checkpoint",
+        "the editor bridge derived a command sequence from the TICK, so two orders issued between steps collided"
+      ],
+      "ciExecuted": false,
+      "reason": "the packaged-.exe WebDriver harness is local-only; see editor-shell/e2e"
+    },
+    "matchRenderAssets": {
+      "status": "real-imported-models-not-primitives",
+      "meshes": [
+        "moba_hero.glb (RiggedFigure)",
+        "moba_minion.glb (Fox)",
+        "moba_tower.glb (Lantern)"
+      ],
+      "source": "Khronos glTF Sample Assets",
+      "licences": "CC-BY-4.0 / CC0-1.0 — recorded in editor-shell/assets/ATTRIBUTION.md",
+      "transformation": "embedded textures stripped; geometry, skins and animations byte-preserved",
+      "sizeBefore": 9782232,
+      "sizeAfter": 420348,
+      "why": "The projection tints every actor by TEAM, so a baked albedo fights the one colour on screen that carries gameplay meaning — and these are include_bytes!-embedded into the shell binary."
+    }
   },
   "mob2Packaging": {
     "artifact": "production/mobile-moba/server/Dockerfile",
