@@ -4,7 +4,15 @@
 //!
 //! Evaluation is deliberately read-only. The native host consumes [`AnimationDocument::compile`] into a
 //! render projection; sampled values are never committed back into authored component fields.
-
+#![expect(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    reason = "an authoring entry point takes the authored document by value and names every field it               accepts; collapsing them into a struct would only move the same arity behind a name"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "one linear validation pass per document; the order of the checks is the contract"
+)]
 use std::collections::{BTreeMap, BTreeSet};
 
 use metrocalk_animation::{

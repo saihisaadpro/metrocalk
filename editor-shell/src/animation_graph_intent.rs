@@ -4,7 +4,25 @@
 //! granular: graph metadata, nodes, node layout, edges, parameters, machines, states and transitions use
 //! stable independent component fields. One save is one undoable transaction; deleting an element writes
 //! an explicit tombstone instead of replacing an opaque graph blob.
-
+#![expect(
+    clippy::single_match_else,
+    clippy::unnecessary_wraps,
+    clippy::items_after_statements,
+    reason = "shape lints over a validation module whose arms are deliberately parallel: every field               reader has the same match-and-diagnose form, and rewriting some of them as `if let` would               make the odd ones out look meaningful when they are not"
+)]
+#![expect(
+    clippy::float_cmp,
+    reason = "authored keyframe TIMES are compared for exact equality on purpose - two keys at the same               instant is the error being detected, and an epsilon would silently accept a document that               names one instant twice"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "each of these is ONE linear pass over a versioned authoring document - validate, migrate,               adapt - and the order of the checks is the contract. Splitting a pass into helpers hides               which field is read before which, which is exactly what a reader of a migration needs to see."
+)]
+#![expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "authored times and weights cross an i64/f64 wire boundary; the truncation is the intended               quantisation to the document's own units, not an accident"
+)]
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use metrocalk_animation as animation;
@@ -4514,7 +4532,7 @@ mod tests {
                     point.id.as_str() == "sample-walk"
                         && point.node.as_str() == "walk"
                         && point.position == 0.0
-                }))
+                }));
             }
             other => panic!("unexpected adapted node {other:?}"),
         }

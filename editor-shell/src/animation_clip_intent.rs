@@ -5,6 +5,10 @@
 //! mapping use stable granular fields, so one save remains atomic and undoable without hiding the document
 //! in an opaque JSON blob.
 
+#![expect(
+    clippy::too_many_lines,
+    reason = "one linear validation pass per document; the order of the checks is the contract"
+)]
 use std::collections::{BTreeMap, BTreeSet};
 
 use metrocalk_animation::{Binding, BindingRebind, TargetRebind};

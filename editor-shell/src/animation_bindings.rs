@@ -3,6 +3,10 @@
 //! This module reconciles the pure animation descriptors with `/core` component metadata. It is
 //! intentionally target-neutral: instance-specific checks (notably distinguishing a legacy
 //! kinematic `Joint` from a physics joint) remain at the intent/runtime boundary.
+#![expect(
+    clippy::vec_init_then_push,
+    reason = "this is a TABLE - one multi-line row per animatable channel. A `vec![]` literal of twenty               such rows reads and diffs worse than a list of pushes, which is the whole reason it is               written this way."
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;

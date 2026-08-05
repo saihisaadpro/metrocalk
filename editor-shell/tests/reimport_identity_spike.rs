@@ -417,7 +417,13 @@ fn capture_overrides_reads_material_and_joint_but_not_import_authored_fields() {
     set_joint(&mut e, ent);
     let ov = capture_overrides(&e, ent);
     assert_eq!(ov.material.as_deref(), Some("gold"));
-    assert!(ov.components.contains_key("Joint"), "the joint is captured");
+    // Against the CONSTANT, not the literal: this assertion was stranded by the `Joint` ->
+    // `KinematicJoint` rename and kept passing a name the code no longer writes.
+    assert!(
+        ov.components
+            .contains_key(metrocalk_editor_shell::kinematics::JOINT),
+        "the joint is captured"
+    );
     // The mesh handle is import-authored — it must NOT be in the re-bind payload.
     assert!(
         !ov.components.values().any(|f| f.contains_key("mesh")),

@@ -13,6 +13,10 @@
 //! No proprietary-kernel / `zip` / STEP-lib type crosses this seam — the boundary is the neutral [`CadImport`]
 //! behind the `CadReader` trait (invariant 5). The proprietary-CATIA-geometry decode stays the licensed-kernel
 //! seam (ADR-070); this seam does the never-empty/never-silent/substrate-native half no incumbent has.
+#![expect(
+    clippy::too_many_lines,
+    reason = "one linear import pass; the order in which the reader tries each representation is the               contract, and splitting it hides which leg wins"
+)]
 
 use crate::csg_intent::store_mesh;
 use metrocalk_assets::AssetStore;
@@ -108,7 +112,10 @@ pub fn read_cad_with_companion(
 ) -> Result<CadImport, CadError> {
     let primary = read_cad(bytes)?;
     if primary.source_format != "CATIA-3DXML"
-        || primary.parts.iter().all(|part| part.is_real_geometry())
+        || primary
+            .parts
+            .iter()
+            .all(metrocalk_interchange::PartReport::is_real_geometry)
     {
         return Ok(primary);
     }
@@ -140,7 +147,10 @@ pub fn read_cad_with_companion(
         let name_matches =
             !source_name.is_empty() && source_name == normalized_cad_label(&candidate.name);
         if (!stem_matches && !name_matches)
-            || !candidate.parts.iter().any(|part| part.is_real_geometry())
+            || !candidate
+                .parts
+                .iter()
+                .any(metrocalk_interchange::PartReport::is_real_geometry)
         {
             continue;
         }
