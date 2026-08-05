@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "id": "sequence:unified-workflow-v1",
+  "name": "Unified 2D, 3D, and UI Workflow",
+  "time_base": {
+    "ticks_per_second": 60
+  },
+  "duration": 120,
+  "loop_policy": "once",
+  "tracks": [
+    {
+      "id": "track:hero:sprite-frame",
+      "name": "Hero sprite frame",
+      "binding": {
+        "path": {
+          "target": "entity:hero",
+          "component": "Sprite",
+          "property": "frame",
+          "subpath": []
+        },
+        "value_kind": "integer"
+      },
+      "interpolation": "step",
+      "keyframes": [
+        {
+          "id": "key:hero:sprite-frame:000",
+          "tick": 0,
+          "value": { "integer": 0 }
+        },
+        {
+          "id": "key:hero:sprite-frame:030",
+          "tick": 30,
+          "value": { "integer": 1 }
+        },
+        {
+          "id": "key:hero:sprite-frame:060",
+          "tick": 60,
+          "value": { "integer": 2 }
+        },
+        {
+          "id": "key:hero:sprite-frame:090",
+          "tick": 90,
+          "value": { "integer": 3 }
+        },
+        {
+          "id": "key:hero:sprite-frame:120",
+          "tick": 120,
+          "value": { "integer": 0 }
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "id": "track:hero:transform-translation",
+      "name": "Hero world translation",
+      "binding": {
+        "path": {
+          "target": "entity:hero",
+          "component": "Transform",
+          "property": "translation",
+          "subpath": []
+        },
+        "value_kind": "vec3"
+      },
+      "interpolation": "linear",
+      "keyframes": [
+        {
+          "id": "key:hero:translation:000",
+          "tick": 0,
+          "value": { "vec3": [0.0, 0.0, 0.0] }
+        },
+        {
+          "id": "key:hero:translation:060",
+          "tick": 60,
+          "value": { "vec3": [4.0, 1.0, -2.0] }
+        },
+        {
+          "id": "key:hero:translation:120",
+          "tick": 120,
+          "value": { "vec3": [8.0, 0.0, -4.0] }
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "id": "track:hud:opacity",
+      "name": "HUD panel opacity",
+      "binding": {
+        "path": {
+          "target": "entity:hud-panel",
+          "component": "UiStyle",
+          "property": "opacity",
+          "subpath": []
+        },
+        "value_kind": "number"
+      },
+      "interpolation": "linear",
+      "keyframes": [
+        {
+          "id": "key:hud:opacity:000",
+          "tick": 0,
+          "value": { "number": 0.35 }
+        },
+        {
+          "id": "key:hud:opacity:060",
+          "tick": 60,
+          "value": { "number": 1.0 }
+        },
+        {
+          "id": "key:hud:opacity:120",
+          "tick": 120,
+          "value": { "number": 0.6 }
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "id": "track:hud:visible",
+      "name": "HUD panel visibility",
+      "binding": {
+        "path": {
+          "target": "entity:hud-panel",
+          "component": "UiStyle",
+          "property": "visible",
+          "subpath": []
+        },
+        "value_kind": "boolean"
+      },
+      "interpolation": "step",
+      "keyframes": [
+        {
+          "id": "key:hud:visible:000",
+          "tick": 0,
+          "value": { "boolean": true }
+        },
+        {
+          "id": "key:hud:visible:090",
+          "tick": 90,
+          "value": { "boolean": false }
+        },
+        {
+          "id": "key:hud:visible:120",
+          "tick": 120,
+          "value": { "boolean": true }
+        }
+      ],
+      "enabled": true
+    }
+  ],
+  "clips": [],
+  "markers": [
+    {
+      "id": "marker:combat-beat",
+      "name": "Combat beat",
+      "tick": 60,
+      "color": [82, 195, 255, 255]
+    }
+  ],
+  "events": [
+    {
+      "id": "event:attack-window-open",
+      "name": "attack_window_open",
+      "tick": 30,
+      "payload": { "string": "primary" }
+    }
+  ]
+}

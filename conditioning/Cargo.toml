@@ -1,0 +1,21 @@
+[package]
+name = "metrocalk-conditioning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+metrocalk-assets = { path = "../assets" }
+mikktspace = { version = "=0.3.0", default-features = false, features = ["glam"] }
+metrocalk-xatlas = { path = "../xatlas-bridge", optional = true }
+meshopt = { version = "=0.6.2", optional = true }
+
+[features]
+default = []
+native = ["xatlas", "qem"]
+xatlas = ["dep:metrocalk-xatlas"]
+qem = ["dep:meshopt"]
+
+[lints]
+workspace = true
