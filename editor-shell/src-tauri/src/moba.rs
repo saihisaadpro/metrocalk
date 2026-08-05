@@ -397,7 +397,12 @@ impl MobaSession {
     }
 
     /// Attack-move: advance, and engage anything hostile that comes into acquisition range on the way.
-    pub fn order_attack_move(&mut self, scene: &mut SceneState, x_mm: i32, y_mm: i32) -> MobaStatus {
+    pub fn order_attack_move(
+        &mut self,
+        scene: &mut SceneState,
+        x_mm: i32,
+        y_mm: i32,
+    ) -> MobaStatus {
         self.issue(
             scene,
             CommandKind::AttackMove {
@@ -438,8 +443,9 @@ impl MobaSession {
     /// field, which is not what that rejection says.
     pub fn order_cast(&mut self, scene: &mut SceneState, target: u64) -> MobaStatus {
         let Some(ability) = self.hero_ability else {
-            self.last_rejection =
-                Some("This hero has no ability authored on it — add one in the inspector.".to_owned());
+            self.last_rejection = Some(
+                "This hero has no ability authored on it — add one in the inspector.".to_owned(),
+            );
             self.project(scene);
             return self.status();
         };
@@ -571,9 +577,10 @@ impl MobaSession {
                     .map(|kind| format!("{kind:?}"))
                     .collect(),
                 speed: actor.move_speed_mm_per_tick,
-                ability_ready_in: actor.cooldowns.first().map(|cooldown| {
-                    cooldown.ready_at.saturating_sub(runtime.tick())
-                }),
+                ability_ready_in: actor
+                    .cooldowns
+                    .first()
+                    .map(|cooldown| cooldown.ready_at.saturating_sub(runtime.tick())),
                 attack_order: actor.attack_order.map(describe_order),
                 source: self.cooked.source_of(actor.id.get()).map(ToOwned::to_owned),
             })

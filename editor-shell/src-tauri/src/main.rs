@@ -437,7 +437,10 @@ fn load_assets() -> AssetsRuntime {
         (healthbar.as_str(), "healthbar.glb (built-in)"),
         (prop.as_str(), "prop.glb (built-in)"),
         (sphere.as_str(), "sphere.glb (built-in)"),
-        (moba_hero.as_str(), "moba_hero.glb (RiggedFigure, CC-BY-4.0)"),
+        (
+            moba_hero.as_str(),
+            "moba_hero.glb (RiggedFigure, CC-BY-4.0)",
+        ),
         (moba_minion.as_str(), "moba_minion.glb (Fox, CC-BY-4.0)"),
         (moba_tower.as_str(), "moba_tower.glb (Lantern, CC0-1.0)"),
     ]
@@ -3878,11 +3881,13 @@ fn clear_expired_transient_animation_clip(
     preview: &mut AnimationPreviewState,
     now: std::time::Instant,
 ) -> bool {
-    if preview.transient_clip.is_none()
-        || !preview
+    // "there is a transient clip AND its deadline has passed" — stated positively, because the negated
+    // two-clause form said the same thing and read as though the two conditions were independent.
+    let expired = preview.transient_clip.is_some()
+        && preview
             .transient_clip_deadline
-            .is_some_and(|deadline| now >= deadline)
-    {
+            .is_some_and(|deadline| now >= deadline);
+    if !expired {
         return false;
     }
     clear_transient_animation_clip_preserving_events(preview)
@@ -4199,6 +4204,9 @@ fn animation_graph_node_presentations_with_sources(
         .collect()
 }
 
+/// The no-instances form, used only by the tests below. Gated rather than deleted: its five callers are
+/// real, and gated rather than left ungated because in a non-test build it is genuinely dead code.
+#[cfg(test)]
 fn animation_graph_sources(
     assets: &AssetsRuntime,
     plan: Option<&CompiledSequence>,
@@ -6603,9 +6611,10 @@ fn commit_current_animation_asset_identity_at(
         .and_then(|key| index.by_source_key.get(key))
     {
         if logical_id != &resolved.logical_id {
-            return Err(format!(
+            return Err(
                 "animation repository source changed identity while its candidate revision was importing"
-            ));
+                    .to_owned(),
+            );
         }
     }
     let canonical = index
@@ -7968,8 +7977,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let _ = reply.send(moba::validate(&engine));
             }
             EngineCmd::MatchAuthorStarter { reply } => {
-                let authored = metrocalk_editor_shell::match_cook::author_starter_match(&mut engine)
-                    .map_err(|error| format!("{error:?}"));
+                let authored =
+                    metrocalk_editor_shell::match_cook::author_starter_match(&mut engine)
+                        .map_err(|error| format!("{error:?}"));
                 if authored.is_ok() {
                     // A new match's objects must appear in the outliner and the viewport immediately —
                     // this is an ordinary authored transaction, so it re-projects like any other.
@@ -14170,6 +14180,9 @@ struct AnimationApplyReport {
     applied: usize,
 }
 
+/// Whether an animation binding lands on a channel the native sink actually drives. Test-only: its three
+/// callers are assertions below, and in a non-test build it is dead code.
+#[cfg(test)]
 fn animation_binding_has_native_sink(component: &str, property: &str) -> bool {
     metrocalk_editor_shell::standard_animation_binding_registry()
         .descriptor(component, property)
@@ -15243,8 +15256,9 @@ fn frame_all(state: State<AppState>) {
     state.shared.lock().unwrap().frame_all();
 }
 
-/// M10.7 — snap the camera to a canonical view (`top`/`front`/`side`/`persp`) — the orientation cube /
-/// view-preset buttons. A pure camera op.
+// M10.7 — snap the camera to a canonical view (`top`/`front`/`side`/`persp`) — the orientation cube /
+// view-preset buttons. A pure camera op. Left as a plain comment: the item it documented moved, and a
+// doc comment attached to nothing is a compile-time warning rather than documentation.
 
 // ---------------------------------------------------------------------------------------------
 // MOB — run the deterministic match kernel in the live viewport (ADR-091/092/093/094/095)
@@ -15317,8 +15331,8 @@ fn moba_author_starter(state: State<AppState>) -> Result<serde_json::Value, Stri
         .tx
         .send(EngineCmd::MatchAuthorStarter { reply })
         .map_err(|_| "the editor's document thread is not available".to_owned())?;
-    let authored = recv_reply(&rx)
-        .map_err(|_| "authoring the starter match timed out".to_owned())??;
+    let authored =
+        recv_reply(&rx).map_err(|_| "authoring the starter match timed out".to_owned())??;
     serde_json::to_value(authored).map_err(|error| error.to_string())
 }
 
@@ -19683,7 +19697,7 @@ mod animation_native_tests {
         }))
         .expect("fixture JSON");
         let mut json_chunk = json;
-        while json_chunk.len() % 4 != 0 {
+        while !json_chunk.len().is_multiple_of(4) {
             json_chunk.push(b' ');
         }
         while bin.len() % 4 != 0 {
@@ -20785,7 +20799,14 @@ mod animation_native_tests {
             panic!("unexpected engine command");
         };
         assert_eq!(authored_revision, expected_revision);
-        assert_eq!(source_hash, preview.plan.as_ref().unwrap().stable_hash);
+        // The command carries the SOURCE-SET fence, not one plan's stable hash. A graph compiles against
+        // EVERY enabled sequence node, so the fence guarding that compile has to cover all of them —
+        // which is what `animation_graph_source_set_hash` computes and what the production path sends.
+        // This assertion still held the older one-plan meaning and had gone stale against it.
+        assert_eq!(
+            Some(source_hash),
+            current_animation_graph_source_hash(&preview)
+        );
         assert!(parameter_routes.is_empty());
         assert_eq!(edge_provenance[0].edge_id, "edge-main-output");
         assert!(result.is_ok());
