@@ -166,6 +166,22 @@ fn instance_world_bounds(instance: &Instance, local: LocalBounds) -> (Vec3, Vec3
 /// against it can never disagree — they were two unrelated literals before.
 pub const CAMERA_FOV_DEG: f32 = 55.0;
 
+/// How the viewport projects the scene.
+///
+/// The canonical views existed before this did, and every one of them was a 55-degree perspective — a
+/// "top" view rendered with vanishing points, which is precisely why it read as useless. An axis view
+/// is only an axis view if parallel lines stay parallel: that is what lets you compare two distances on
+/// screen, see that two parts share an edge, and read a plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Projection {
+    #[default]
+    Perspective,
+    /// Parallel projection. Its height is derived from the SAME orbit distance the perspective camera
+    /// uses, so zoom, framing and the orientation cube keep working across a mode switch instead of
+    /// needing a second scale to be kept in sync.
+    Orthographic,
+}
+
 /// Viewport exposure. Placed so the lit scene lands near the tone curve's mid-grey rather than a stop
 /// and a half above it. Named once because a second, independent default in the thumbnail path had
 /// already drifted from the viewport's.
@@ -269,6 +285,8 @@ pub struct CamView {
 /// Scene state shared between the app (writer, from core deltas + input) and the render loop (reader).
 #[derive(Default)]
 pub struct SceneState {
+    /// Perspective, or a true parallel projection for the axis views.
+    pub projection: Projection,
     /// The live surface aspect (width/height), published by the render loop each frame.
     ///
     /// Without this, `frame_all` framed against a compile-time constant and produced the SAME camera
@@ -468,6 +486,14 @@ impl SceneState {
             "front" => (FRAC_PI_2, 0.0), // eye on +Z, looking horizontally
             "side" => (0.0, 0.0),       // eye on +X
             _ => (FRAC_PI_4, 0.5),      // perspective 3/4 (the default-ish view)
+        };
+        // An AXIS view is orthographic. Under perspective, a "top" view still has vanishing points, so
+        // two objects the same size read as different sizes and nothing can be compared by eye — which
+        // is the whole reason to be in a top view. The 3/4 view stays perspective, because depth cues
+        // are what make it readable as a space rather than a diagram.
+        self.projection = match preset {
+            "top" | "front" | "side" => Projection::Orthographic,
+            _ => Projection::Perspective,
         };
         self.orbit = orbit;
         self.elevation = elevation;
@@ -1942,6 +1968,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         st.distance,
                         aspect,
                         st.cam_target,
+                        st.projection,
                     );
                     let snap = st.gizmo_snap;
                     let mut world_new = st.gizmo.drag_update(
@@ -2181,12 +2208,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 lights_buf.upload(&device, &queue, &lights_bgl, &st.lights);
             }
             let aspect = w as f32 / h.max(1) as f32;
-            let mut cam = camera_matrix(
+            let mut cam = camera_matrix_with(
                 st.orbit,
                 st.elevation,
                 st.distance,
                 aspect,
                 st.cam_target.into(),
+                st.projection,
             );
             // The camera eye (world) — the PBR view direction in fs_mesh (M11.2). Carried in the Camera
             // uniform's spare `focus.yzw` (focus.x stays the focus-dim flag).
@@ -2683,13 +2711,51 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
 
 #[must_use]
 pub fn camera_matrix(orbit: f32, elevation: f32, distance: f32, aspect: f32, target: Vec3) -> Mat4 {
+    camera_matrix_with(
+        orbit,
+        elevation,
+        distance,
+        aspect,
+        target,
+        Projection::Perspective,
+    )
+}
+
+/// The view-projection for a given projection mode.
+///
+/// The orthographic height is `2 * distance * tan(fov/2)` — the exact height the perspective frustum
+/// spans at the orbit distance. That identity is deliberate: it means switching modes does not move the
+/// subject, `frame_all` needs no separate orthographic path, and zoom keeps its meaning. An independent
+/// "ortho scale" would be a second representation of the same quantity, free to disagree with the first.
+#[must_use]
+pub fn camera_matrix_with(
+    orbit: f32,
+    elevation: f32,
+    distance: f32,
+    aspect: f32,
+    target: Vec3,
+    projection: Projection,
+) -> Mat4 {
     let offset = Vec3::new(
         orbit.cos() * distance * elevation.cos(),
         distance * elevation.sin(),
         orbit.sin() * distance * elevation.cos(),
     );
     let eye = target + offset;
-    let proj = Mat4::perspective_rh(55f32.to_radians(), aspect, 0.1, distance * 8.0 + 100.0);
+    let far = distance * 8.0 + 100.0;
+    let proj = match projection {
+        Projection::Perspective => {
+            Mat4::perspective_rh(CAMERA_FOV_DEG.to_radians(), aspect, 0.1, far)
+        }
+        Projection::Orthographic => {
+            let half_h = distance * (CAMERA_FOV_DEG.to_radians() * 0.5).tan();
+            let half_w = half_h * aspect;
+            // The near plane goes BEHIND the eye. A parallel projection has no apex to clip against, and
+            // starting at the eye would slice away everything between the camera and its orbit target -
+            // which in a top view is most of the scene.
+            Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -far, far)
+        }
+    };
     proj * Mat4::look_at_rh(eye, target, Vec3::Y)
 }
 
@@ -2845,8 +2911,17 @@ pub fn cursor_ray(
     distance: f32,
     aspect: f32,
     target: [f32; 3],
+    projection: Projection,
 ) -> ([f32; 3], [f32; 3]) {
-    let inv = camera_matrix(orbit, elevation, distance, aspect, target.into()).inverse();
+    let inv = camera_matrix_with(
+        orbit,
+        elevation,
+        distance,
+        aspect,
+        target.into(),
+        projection,
+    )
+    .inverse();
     let ndc_x = cursor.0 * 2.0 - 1.0;
     let ndc_y = 1.0 - cursor.1 * 2.0;
     let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
@@ -2867,9 +2942,16 @@ pub fn project_to_screen(
     distance: f32,
     aspect: f32,
     target: [f32; 3],
+    projection: Projection,
 ) -> Option<(f32, f32)> {
-    let clip = camera_matrix(orbit, elevation, distance, aspect, target.into())
-        * Vec3::from(world).extend(1.0);
+    let clip = camera_matrix_with(
+        orbit,
+        elevation,
+        distance,
+        aspect,
+        target.into(),
+        projection,
+    ) * Vec3::from(world).extend(1.0);
     if clip.w <= 1e-6 {
         return None;
     }
@@ -3611,6 +3693,78 @@ mod tests {
     // ── viewport framing ──────────────────────────────────────────────────────────────────────
     // These exist because `frame_all` had NO test coverage at all, which is why a framing constant
     // that ignored both the field of view and the aspect ratio survived unnoticed.
+
+    #[test]
+    fn the_axis_views_are_orthographic_and_the_three_quarter_view_is_not() {
+        // The defect this closes: every canonical view was a 55-degree perspective, so a "top" view
+        // still had vanishing points and nothing in it could be compared by eye.
+        let mut st = SceneState::default();
+        for preset in ["top", "front", "side"] {
+            st.set_view_preset(preset);
+            assert_eq!(
+                st.projection,
+                Projection::Orthographic,
+                "{preset} must be parallel"
+            );
+        }
+        st.set_view_preset("persp");
+        assert_eq!(st.projection, Projection::Perspective);
+    }
+
+    #[test]
+    fn a_parallel_projection_keeps_equal_objects_equal_at_different_depths() {
+        // The property that MAKES it an axis view: two identical objects at different distances from the
+        // camera must measure the same on screen. Under perspective the far one shrinks; that is exactly
+        // what stopped a top view being usable for comparing anything.
+        let (orbit, elevation, distance, aspect) = (0.0, 0.0, 20.0, 16.0 / 9.0);
+        let screen_size = |projection, depth: f32| {
+            let m = camera_matrix_with(orbit, elevation, distance, aspect, Vec3::ZERO, projection);
+            // At orbit 0 the camera sits on +X looking down -X, so DEPTH is the x axis. Probing z
+            // would move the points sideways and measure nothing.
+            let at = |y: f32| {
+                let c = m * Vec3::new(depth, y, 0.0).extend(1.0);
+                c.y / c.w
+            };
+            (at(1.0) - at(-1.0)).abs()
+        };
+        let (near_o, far_o) = (
+            screen_size(Projection::Orthographic, -6.0),
+            screen_size(Projection::Orthographic, 6.0),
+        );
+        assert!(
+            (near_o - far_o).abs() < 1e-5,
+            "parallel projection must not foreshorten: {near_o} vs {far_o}"
+        );
+        let (near_p, far_p) = (
+            screen_size(Projection::Perspective, -6.0),
+            screen_size(Projection::Perspective, 6.0),
+        );
+        assert!(
+            (near_p - far_p).abs() > 1e-3,
+            "the 3/4 view must KEEP its depth cues: {near_p} vs {far_p}"
+        );
+    }
+
+    #[test]
+    fn switching_projection_does_not_move_the_subject() {
+        // The orthographic height is derived from the SAME orbit distance, so a mode switch is a change
+        // of projection and not a jump. An independent "ortho scale" would be free to disagree.
+        let (orbit, elevation, distance, aspect) = (0.0, 0.0, 20.0, 16.0 / 9.0);
+        let height_at_target = |projection| {
+            let m = camera_matrix_with(orbit, elevation, distance, aspect, Vec3::ZERO, projection);
+            let at = |y: f32| {
+                let c = m * Vec3::new(0.0, y, 0.0).extend(1.0);
+                c.y / c.w
+            };
+            (at(1.0) - at(-1.0)).abs()
+        };
+        let p = height_at_target(Projection::Perspective);
+        let o = height_at_target(Projection::Orthographic);
+        assert!(
+            (p - o).abs() < 1e-4,
+            "at the orbit target the two projections must agree: {p} vs {o}"
+        );
+    }
 
     #[test]
     fn frame_all_uses_the_live_surface_aspect_not_a_constant() {

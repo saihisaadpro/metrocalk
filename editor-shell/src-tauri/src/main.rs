@@ -15855,6 +15855,7 @@ fn gizmo_pick_drag(
         st.distance,
         aspect,
         st.cam_target,
+        st.projection,
     );
     let ray = Ray {
         origin: ro,
@@ -15924,6 +15925,7 @@ fn gizmo_grab(window: tauri::WebviewWindow, state: State<AppState>, axis: String
         st.distance,
         aspect,
         st.cam_target,
+        st.projection,
     );
     true
 }
@@ -15950,6 +15952,7 @@ fn gizmo_set_target(
         st.distance,
         aspect,
         st.cam_target,
+        st.projection,
     );
 }
 
@@ -15983,6 +15986,7 @@ fn gizmo_handle_screen(
         st.distance,
         aspect,
         st.cam_target,
+        st.projection,
     )
 }
 
@@ -16021,6 +16025,7 @@ fn gizmo_drag_end(window: tauri::WebviewWindow, state: State<AppState>) {
                         st.distance,
                         aspect,
                         st.cam_target,
+                        st.projection,
                     );
                     let snap = st.gizmo_snap;
                     let world_final = st.gizmo.drag_update(
@@ -16366,6 +16371,7 @@ fn pipe_forge_point(
             distance,
             aspect,
             st.cam_target,
+            st.projection,
         );
         let plane_y = st.pipe_points.first().map_or(0.0, |p| p[1]);
         pipe_world_point_scene(
