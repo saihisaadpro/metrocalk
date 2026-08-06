@@ -103,13 +103,15 @@ describe("viewport stress audit", () => {
     await invoke("view_preset", { preset: "persp" });
     await shot("scale-zoomed-way-out", "Camera pushed far out, subject tiny.", async () => {
       // No absolute camera setter exists, so this uses the SAME zoom command the mouse wheel does.
-      for (let i = 0; i < 40; i += 1) await invoke("zoom", { delta: -120.0 });
+      // POSITIVE delta increases the orbit distance — an earlier version had this inverted, which
+      // swapped these two captions and left the grounding frame below empty.
+      for (let i = 0; i < 40; i += 1) await invoke("zoom", { delta: 120.0 });
     });
     await shot("scale-recovered-by-frame-all", "One frame-all from that state.", async () => {
       await invoke("frame_all");
     });
     await shot("scale-zoomed-way-in", "Camera pushed inside the subject.", async () => {
-      for (let i = 0; i < 60; i += 1) await invoke("zoom", { delta: 120.0 });
+      for (let i = 0; i < 60; i += 1) await invoke("zoom", { delta: -120.0 });
     });
     await shot("scale-recovered-again", "One frame-all from that state.", async () => {
       await invoke("frame_all");
@@ -154,19 +156,21 @@ describe("viewport stress audit", () => {
     await shot("match-close-grounding", "Close on the actors — feet, contact and shadow anchor.", async () => {
       await invoke("view_preset", { preset: "persp" });
       await invoke("frame_all");
-      for (let i = 0; i < 12; i += 1) await invoke("zoom", { delta: 120.0 });
+      for (let i = 0; i < 12; i += 1) await invoke("zoom", { delta: -120.0 });
     });
   });
 
   it("captures selection feedback", async () => {
-    const rows = await $$("#hierarchy-list [role='treeitem'], #hierarchy-list button");
-    if (rows.length > 0) {
-      await shot("selection-none", "Nothing selected.");
-      await shot("selection-one", "One object selected from the outliner.", async () => {
-        await rows[0].click();
-        await browser.pause(250);
-      });
-    }
+    // NOT guarded by a length check. The previous version was, matched zero rows against a selector
+    // that does not exist, and passed green having captured nothing at all — a silent hole in the audit
+    // that only showed up when someone counted the frames.
+    const rows = await $$("#hierarchy-panel button, [data-testid='hierarchy-row']");
+    expect(rows.length).toBeGreaterThan(0);
+    await shot("selection-none", "Nothing selected.");
+    await shot("selection-one", "One object selected from the outliner.", async () => {
+      await rows[0].click();
+      await browser.pause(250);
+    });
   });
 
   // KNOWN LIMITATION, measured not assumed: `browser.setWindowSize` does not resize a Tauri window

@@ -15161,12 +15161,16 @@ fn viewport_pick(
         st.distance = 60.0;
         st.elevation = 0.4;
     }
-    let cam = render::camera_matrix(
+    // The SAME matrix the pixels were drawn with. This built a perspective projection unconditionally,
+    // so once the axis views became truly parallel a click in one of them picked the wrong object -
+    // the unprojection has to invert what was actually rasterised, not what usually is.
+    let cam = render::camera_matrix_with(
         st.orbit,
         st.elevation,
         st.distance,
         aspect,
         st.cam_target.into(),
+        st.projection,
     );
     let hit = render::pick_nearest(&st.instances, (x, y), &cam);
     // update the highlight
@@ -15207,7 +15211,15 @@ fn viewport_peek(
     } else {
         (st.distance, st.elevation)
     };
-    let cam = render::camera_matrix(st.orbit, elev, dist, aspect, st.cam_target.into());
+    // Same rule as `viewport_pick`: hover must test against the projection on screen.
+    let cam = render::camera_matrix_with(
+        st.orbit,
+        elev,
+        dist,
+        aspect,
+        st.cam_target.into(),
+        st.projection,
+    );
     let hit = render::pick_nearest(&st.instances, (x, y), &cam);
     hit.and_then(|i| st.ids.get(i).cloned())
 }

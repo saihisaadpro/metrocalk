@@ -226,7 +226,16 @@
       "authored-cooked-and-registered-abilities-castable-by-a-player",
       "zero-means-simple-authoring-reaching-instant-or-projectile-and-single-or-circle",
       "abilities-registered-before-any-spawn-names-them",
-      "no-ability-authored-refused-in-the-bridge-by-field-name-not-as-a-kernel-rejection"
+      "no-ability-authored-refused-in-the-bridge-by-field-name-not-as-a-kernel-rejection",
+      "auto-framed-on-first-open-instead-of-a-hard-coded-camera-distance",
+      "projected-aabb-frame-fit-reading-the-lens-aspect-and-view-direction-not-a-bounding-sphere",
+      "framing-against-the-live-surface-aspect-not-a-compile-time-constant",
+      "true-parallel-projection-for-the-axis-views-perspective-kept-for-the-three-quarter",
+      "orthographic-height-derived-from-the-orbit-distance-so-no-second-zoom-scale-exists",
+      "actors-seated-from-their-own-mesh-half-height-not-four-cube-era-constants",
+      "grid-drawn-after-the-opaque-ground-instead-of-under-it",
+      "one-named-viewport-exposure-shared-with-the-thumbnail-path",
+      "labelled-viewport-state-audit-pairing-every-capture-with-the-camera-that-produced-it"
     ],
     "acceptanceBlockers": [
       "replay-file-checkpoint-index-and-scrub-integration",
@@ -242,16 +251,14 @@
       "android-gameactivity-emulator-boot-evidence",
       "ios-xcode-simulator-boot-evidence",
       "corridor-following-movement-for-owned-actors-needs-an-owner-safe-server-rules-channel",
-      "editor-bridge-wiring-commit-blocked-by-parallel-lane-entanglement",
       "in-game-hud-input-and-client-runtime",
-      "certified-idle-host-and-min-spec-perf-profile",
-      "auto-attack-loop-and-attack-move-gp08-deferred-from-adr-100"
+      "certified-idle-host-and-min-spec-perf-profile"
     ],
     "ciEvidence": {
-      "status": "pending-push",
-      "commit": "pending",
+      "status": "pushed",
+      "commit": "62f85f51195a6ab266614490a02d896c542f85f5",
       "checks": 25,
-      "note": "Re-verify after the GP-05/GP-14 push. The capture harness floor is now 62 observable checks."
+      "note": "The capture-harness floor is 81 observable checks (.github/workflows/mobile-gameplay-tripwire.yml), not 62."
     }
   },
   "mob2LocalEvidence": {
@@ -369,6 +376,45 @@
       "ciExecuted": false,
       "reason": "the packaged-.exe WebDriver harness is local-only",
       "stillOpen": "stun_hero survives; deleting it honestly requires an ApplyStatus effect in the settlement batch so crowd control can come from a spell"
+    },
+    "viewportAudit": {
+      "date": "2026-08-06",
+      "adr": "ADR-103",
+      "scope": "the packaged .exe's native wgpu surface, captured as OS-composited pixels in one continuous run",
+      "spec": "editor-shell/e2e/specs/viewport-stress.e2e.js",
+      "config": "editor-shell/e2e/wdio.viewportstress.conf.js",
+      "captures": "editor-shell/e2e/.shots-viewport-stress/ (untracked, like every other .shots-* directory here)",
+      "frames": 19,
+      "captureMethod": "PrintWindow(PW_RENDERFULLCONTENT); desktop-DC BitBlt retained as fallback. A WebDriver screenshot returns the React panels and a hole where the 3D is.",
+      "sourceRevision": "NOT RECORDED — audit.json carries capturedAt and nothing else, so only a wall clock ties these images to a commit. Local evidence is exempt from evidencePolicy.requiredKeys, but the gap is real and the harness should stamp the revision.",
+      "ciExecuted": false,
+      "reason": "the packaged-.exe WebDriver harness is local-only",
+      "unitTestsCiExecuted": true,
+      "unitTestWorkflow": ".github/workflows/editor-shell-app.yml",
+      "appTests": 61,
+      "framingAndProjectionTests": 9,
+      "unitTestNote": "The app crate declares its own [workspace], so the root `cargo test --workspace` never sees it. `frame_all` had NO test coverage at all before, which is why a framing constant blind to the FOV, the aspect ratio and the view direction survived unnoticed.",
+      "defectsInTheAuditItself": [
+        "06-scale-zoomed-way-out and 08-scale-zoomed-way-in have SWAPPED captions: zoom delta is added to distance, so a negative delta moves the camera IN.",
+        "16-match-close-grounding sits at distance 400 for the same reason and contains no actors — only ground and grid. The one frame whose job was to show feet, contact and the shadow anchor shows none of them, so the seating fix is NOT evidenced by pixels in this set.",
+        "the selection-feedback block matched zero rows and captured nothing, SILENTLY, because it is guarded by a length check. The outliner is not empty, so the selector is wrong, not the scene. There are no selection frames in the 19."
+      ],
+      "notVerified": [
+        "resize. `browser.setWindowSize` does not resize a Tauri window through tauri-driver: all 19 PNGs are 1696x1018 and the three resize frames report the same camera distance. Kept so the gap is visible in the index rather than absent.",
+        "that any of it looks correct. No automated check can say a viewport looks professional; the set exists so one person can judge every state at once."
+      ],
+      "deliberatelyNotDone": [
+        "an HDR intermediate — every post target is still the 8-bit swapchain format",
+        "framing the visible stage rather than the whole window",
+        "transparency — exactly one blend state exists, in the grid pipeline",
+        "reversed-Z",
+        "TAA or SMAA",
+        "quality presets a user can reach — MSAA, bloom and shadow-map size are MTK_* env-var profiles chosen once at startup",
+        "hover state and selection outlines, beyond the existing selected tint and focus dim",
+        "a rendering stress SCENE — the harness exists, a scene of assorted materials to put through it does not"
+      ],
+      "whyTheHdrMigrationIsAllOrNothing": "Tone mapping happens inside scene.wgsl (`display_encode`), not in a final resolve pass, so bloom and the MSAA resolve both operate on gamma-encoded values. The format threads through three pipeline factories and four target factories; between steps the viewport is a validation panic or a black screen, so there is no half-migrated state that can be shipped or reviewed.",
+      "whyTheCameraFramesTheWholeWindow": "There is no stage-rect concept in the renderer — the fit reads the surface, not the area between the panels. Content near the edge sits behind the inspector: the clipped right-hand tower in 13-match-top.png."
     }
   },
   "mob2Packaging": {
