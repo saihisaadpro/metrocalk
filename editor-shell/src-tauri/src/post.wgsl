@@ -1,14 +1,40 @@
-// M11.4 (ADR-043) — bloom post-processing (display-space). A SEPARATE module from scene.wgsl so its own
-// group(0) bindings (a sampler + source texture[s]) don't clash with the scene shader's Camera uniform.
+// M15.11 — the HDR post chain and THE authoritative final resolve.
 //
-// Per-frame pipeline when bloom is on:
-//   scene pass            → scene_tex (full-res, the composited viewport)
-//   fs_bright(scene_tex)  → bloom_a  (half-res: extract bright highlights)
-//   fs_blur_h(bloom_a)    → bloom_b  (separable Gaussian, horizontal)
-//   fs_blur_v(bloom_b)    → bloom_a  (separable Gaussian, vertical)
-//   fs_composite(scene,bloom_a) → swapchain (scene + bloom)
-// Bright/blur sample one texture (bindings 0,1); composite samples two (0,1,2). Each entry only references
-// the bindings it needs, so the bright/blur pipelines use a 1-texture layout and composite a 2-texture one.
+// Everything upstream of this file is SCENE LINEAR radiance in an Rgba16Float target. `fs_resolve` is the
+// one and only place a frame becomes display colour: exposure, tone curve and transfer function all happen
+// here, exactly once, for every routing combination. If you find yourself adding a tone map or a gamma
+// encode anywhere else, that is the bug this module exists to prevent.
+//
+// Per-frame chain (bloom optional, SSAO optional — both stay inside the HDR half):
+//   scene pass                      → hdr_scene  (Rgba16Float, MSAA-resolved in LINEAR space)
+//   fs_ssao(hdr_scene, depth)       → hdr_scene  (linear AO multiply; see ssao.wgsl)
+//   fs_bright(hdr_scene)            → bloom_a    (half-res: energy the tone curve will compress)
+//   fs_blur_h(bloom_a)              → bloom_b    (separable Gaussian, horizontal)
+//   fs_blur_v(bloom_b)              → bloom_a    (separable Gaussian, vertical)
+//   fs_resolve(hdr_scene, bloom_a)  → swapchain  (exposure → bloom add → tone curve → OETF → dither)
+// With bloom off, `bloom_a` is a 1×1 black texture and the SAME `fs_resolve` runs: one pass, one code
+// path, no branch that can drift.
+//
+// Group 0 is the scene Camera uniform (exposure in `shadow.y`, cinematic/CAD profile in `shadow.z`, the
+// display-encode selector in `grid.w`); group 1 is the sampler + source texture(s). Bright/blur bind a
+// 1-texture layout, resolve a 2-texture one, so each entry point only references bindings it has.
+
+struct Camera {
+    view_proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
+    light_view_proj: mat4x4<f32>,
+    focus: vec4<f32>,
+    // `.y` = exposure, `.z` = cinematic(0)/CAD(1) presentation profile.
+    shadow: vec4<f32>,
+    // `.w` = 1.0 when this pass must apply the sRGB OETF itself (a linear-store swapchain), 0.0 when the
+    // surface format converts in hardware. Applying both would double-encode the frame.
+    grid: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> cam: Camera;
+
+@group(1) @binding(0) var samp: sampler;
+@group(1) @binding(1) var src: texture_2d<f32>;       // scene HDR (bright/resolve) or previous blur (blur)
+@group(1) @binding(2) var bloom_tex: texture_2d<f32>; // resolve only — the blurred bloom (black when off)
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -26,28 +52,36 @@ fn vs_post(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
-@group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var src: texture_2d<f32>;       // scene (bright/composite) or previous blur (blur)
-@group(0) @binding(2) var bloom_tex: texture_2d<f32>; // composite only — the blurred bloom
+// Rec. 709 luminance — the basis for bloom extraction. A per-channel max would let a saturated but dim
+// colour glow as hard as a genuinely bright one; luminance is what "bright" actually means.
+fn luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
 
-// Display-space bloom runs AFTER the ACES tonemap, where values are compressed into ~[0,1], so the
-// threshold is fairly high (only genuinely bright highlights glow) and the add is strong enough to read.
-const THRESHOLD: f32 = 0.78;
-const SOFT_KNEE: f32 = 0.12;
-const INTENSITY: f32 = 0.68;
+// ── bloom ─────────────────────────────────────────────────────────────────────────────────────────────
+// The old threshold of 0.78 was tuned against TONEMAPPED values living in [0,1]; in linear HDR it would
+// have caught most of the lit scene. The threshold is now stated in EXPOSED linear units and sits at the
+// point where the tone curve starts genuinely compressing (ACES maps 1.0 → 0.80), so bloom extracts the
+// energy the display cannot represent — which is what bloom is FOR. Because extraction is exposure-aware,
+// raising exposure blooms more, exactly as a real camera does.
+const BLOOM_THRESHOLD: f32 = 1.0;
+const BLOOM_KNEE: f32 = 0.5;   // soft knee half-width; avoids a hard halo edge at the threshold
+const BLOOM_CLAMP: f32 = 12.0; // firefly suppression: one blown specular texel must not pump the whole kernel
+const BLOOM_INTENSITY: f32 = 0.35;
 
-// Bright pass: keep only the energy ABOVE the threshold (so only bright highlights glow), preserving hue.
+// Bright pass: keep the energy above the threshold, preserving hue. Output is in EXPOSED units, and
+// `fs_resolve` adds it after exposure — so the two never disagree about what scale bloom lives on.
 @fragment
 fn fs_bright(in: VsOut) -> @location(0) vec4<f32> {
-    let c = textureSample(src, samp, in.uv).rgb;
-    // Max-channel detection lets saturated emissive/game highlights glow without requiring high luma.
-    // A quadratic knee avoids the hard halo boundary produced by the old threshold-only extraction.
-    let peak = max(c.r, max(c.g, c.b));
-    var soft = clamp(peak - THRESHOLD + SOFT_KNEE, 0.0, 2.0 * SOFT_KNEE);
-    soft = soft * soft / (4.0 * SOFT_KNEE + 1e-4);
-    let contribution = max(peak - THRESHOLD, soft) / max(peak, 1e-4);
-    let contrib = clamp(contribution, 0.0, 1.0);
-    return vec4<f32>(c * contrib, 1.0);
+    let hdr = max(textureSample(src, samp, in.uv).rgb, vec3<f32>(0.0));
+    let exposed = min(hdr * cam.shadow.y, vec3<f32>(BLOOM_CLAMP));
+    let l = luminance(exposed);
+    // Quadratic knee (Karis): a smooth ramp through the threshold instead of a step, which is what keeps
+    // the halo boundary from crawling as the camera moves.
+    var soft = clamp(l - BLOOM_THRESHOLD + BLOOM_KNEE, 0.0, 2.0 * BLOOM_KNEE);
+    soft = soft * soft / (4.0 * BLOOM_KNEE + 1e-4);
+    let contribution = clamp(max(l - BLOOM_THRESHOLD, soft) / max(l, 1e-4), 0.0, 1.0);
+    return vec4<f32>(exposed * contribution, 1.0);
 }
 
 // A 9-tap separable Gaussian; texel size derived from the source dims (resolution-independent).
@@ -81,10 +115,71 @@ fn fs_blur_v(in: VsOut) -> @location(0) vec4<f32> {
     return blur(in, vec2<f32>(0.0, 1.0));
 }
 
-// Composite: the original scene plus the additive blurred bloom.
+// ── the final resolve ─────────────────────────────────────────────────────────────────────────────────
+// Cinematic mode uses the Narkowicz ACES fit; CAD mode uses the Khronos PBR Neutral reference curve, which
+// preserves material hue/saturation under neutral lighting. These moved here from scene.wgsl — they used
+// to run per scene fragment, which meant MSAA averaged already-compressed values.
+fn tonemap_aces(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn tonemap_pbr_neutral(input_color: vec3<f32>) -> vec3<f32> {
+    let start_compression = 0.8 - 0.04;
+    let desaturation = 0.15;
+    let x = min(input_color.r, min(input_color.g, input_color.b));
+    let offset = select(0.04, x - 6.25 * x * x, x < 0.08);
+    let color = input_color - vec3<f32>(offset);
+    let peak = max(color.r, max(color.g, color.b));
+    if (peak < start_compression) {
+        return color;
+    }
+    let new_peak = 1.0 - (1.0 - start_compression) * (1.0 - start_compression)
+        / (peak + 1.0 - 2.0 * start_compression);
+    let compressed = color * (new_peak / peak);
+    let g = 1.0 / (desaturation * (peak - new_peak) + 1.0);
+    return mix(vec3<f32>(new_peak), compressed, g);
+}
+
+// The exact sRGB OETF rather than a 2.2 approximation, so dark gradients and brand colours stay stable.
+fn to_srgb(x: vec3<f32>) -> vec3<f32> {
+    let safe = clamp(x, vec3<f32>(0.0), vec3<f32>(1.0));
+    let low = safe * 12.92;
+    let high = 1.055 * pow(safe, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    return select(high, low, safe <= vec3<f32>(0.0031308));
+}
+
+// Interleaved-gradient noise, ±0.5/255 in display space. The tone curve's shoulder maps a wide band of HDR
+// values onto adjacent 8-bit codes, so a clear sky or a dark gradient banded visibly; a sub-LSB dither
+// turns those contours back into noise the eye integrates away. Applied AFTER encoding, which is the only
+// place the quantisation step is uniform.
+fn dither(pos: vec2<f32>) -> f32 {
+    let m = fract(52.9829189 * fract(dot(pos, vec2<f32>(0.06711056, 0.00583715))));
+    return (m - 0.5) / 255.0;
+}
+
+// THE final resolve. Every routing combination — SSAO on/off × bloom on/off, MSAA on/off, perspective or
+// orthographic — terminates here and nowhere else.
 @fragment
-fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
-    let scene = textureSample(src, samp, in.uv).rgb;
-    let bloom = textureSample(bloom_tex, samp, in.uv).rgb;
-    return vec4<f32>(scene + bloom * INTENSITY, 1.0);
+fn fs_resolve(in: VsOut) -> @location(0) vec4<f32> {
+    let hdr = max(textureSample(src, samp, in.uv).rgb, vec3<f32>(0.0));
+    // 1. Exposure, on the linear scene.
+    let exposed = hdr * cam.shadow.y;
+    // 2. Bloom, already in exposed units (a 1×1 black texture when bloom is off ⇒ adds exactly nothing).
+    let bloom = max(textureSample(bloom_tex, samp, in.uv).rgb, vec3<f32>(0.0));
+    let composed = exposed + bloom * BLOOM_INTENSITY;
+    // 3. The presentation profile's tone curve.
+    var mapped: vec3<f32>;
+    if (cam.shadow.z > 0.5) {
+        mapped = tonemap_pbr_neutral(composed);
+    } else {
+        mapped = tonemap_aces(composed);
+    }
+    // 4. The display transfer function — but only when the swapchain is not doing it for us.
+    var display = mapped;
+    if (cam.grid.w > 0.5) {
+        display = to_srgb(mapped);
+    }
+    // 5. Break up 8-bit quantisation contours.
+    return vec4<f32>(display + vec3<f32>(dither(in.pos.xy)), 1.0);
 }

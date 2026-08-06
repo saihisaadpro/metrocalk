@@ -1,9 +1,16 @@
 // Screen-space ambient occlusion (SSAO) — a post pass that darkens creases / contact points where geometry
 // is mutually occluded, so an imported CAD assembly reads as solid connected parts, not stacked floating
-// boxes. Runs AFTER the in-shader ACES tonemap (the scene is already display-space), so this is a
-// display-space AO multiply on the offscreen scene colour. Depth is the scene depth (MSAA → textureLoad
-// conservative min-depth resolve); positions are reconstructed via the camera's inv_view_proj; the geometric normal is
-// reconstructed from screen-space derivatives (no G-buffer normal needed).
+// boxes.
+//
+// M15.11: this now runs entirely inside the LINEAR HDR half of the pipeline. It reads the resolved
+// Rgba16Float scene, multiplies by the occlusion term, and writes Rgba16Float — so occlusion attenuates
+// light rather than attenuating an already-compressed display value, and it composes BEFORE the single
+// final tone map in post.wgsl. Nothing here encodes for display.
+//
+// Depth is the scene depth; positions are reconstructed via the camera's inv_view_proj and the geometric
+// normal from screen-space derivatives (no G-buffer normal needed). The depth binding comes in two
+// variants — multisampled and single-sample — because the scene depth follows the MSAA sample count;
+// render.rs substitutes the block below to build the second one, so SSAO works with MSAA off too.
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -17,7 +24,23 @@ struct Camera {
 
 @group(1) @binding(0) var samp: sampler;
 @group(1) @binding(1) var color_tex: texture_2d<f32>;
+
+// >>> DEPTH BINDING BLOCK <<<
+// render.rs::single_sample_ssao_source replaces everything between these two markers to produce the
+// MSAA-off variant of this shader. Keep the markers, the binding index and the `depth_texel` signature
+// identical in both versions — they are the contract.
 @group(1) @binding(2) var depth_tex: texture_depth_multisampled_2d;
+// Resolve depth conservatively across MSAA coverage. Sampling only index 0 creates bright/dark AO fringes
+// whose shape changes with sub-pixel coverage; nearest covered depth keeps silhouettes stable.
+fn depth_texel(coord: vec2<i32>) -> f32 {
+    let count = textureNumSamples(depth_tex);
+    var d = 1.0;
+    for (var s = 0u; s < count; s = s + 1u) {
+        d = min(d, textureLoad(depth_tex, coord, i32(s)));
+    }
+    return d;
+}
+// >>> END DEPTH BINDING BLOCK <<<
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -42,17 +65,10 @@ fn world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return p.xyz / p.w;
 }
 
-// Resolve depth conservatively across MSAA coverage. Sampling only index 0 creates bright/dark AO fringes
-// whose shape changes with sub-pixel coverage; nearest covered depth keeps silhouettes stable.
 fn resolved_depth(uv: vec2<f32>) -> f32 {
     let size = textureDimensions(depth_tex);
     let coord = clamp(vec2<i32>(uv * vec2<f32>(size)), vec2<i32>(0), vec2<i32>(size) - 1);
-    let count = textureNumSamples(depth_tex);
-    var depth = 1.0;
-    for (var sample = 0u; sample < count; sample = sample + 1u) {
-        depth = min(depth, textureLoad(depth_tex, coord, i32(sample)));
-    }
-    return depth;
+    return depth_texel(coord);
 }
 
 fn hash(p: vec2<f32>) -> f32 {
@@ -133,11 +149,8 @@ fn fs_ssao(in: VsOut) -> @location(0) vec4<f32> {
     let ao = clamp(1.0 - occ / f32(SAMPLES), 0.0, 1.0);
     let strength = mix(0.62, 0.78, clamp(cam.shadow.z, 0.0, 1.0));
     let factor = mix(1.0, pow(ao, POWER), strength);
+    // Still SCENE LINEAR HDR — occlusion scales radiance, and the result feeds bloom and then the single
+    // final resolve. The old `fs_blit` companion (SSAO on + bloom off → straight to the swapchain) is gone:
+    // that was a second terminal path, and every route now ends at post.wgsl's `fs_resolve`.
     return vec4<f32>(scene * factor, 1.0);
-}
-
-// Passthrough blit (used when bloom is off): copy the AO'd scene colour to the swapchain.
-@fragment
-fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(textureSample(color_tex, samp, in.uv).rgb, 1.0);
 }

@@ -678,6 +678,322 @@ fn linear_to_srgb(value: f32) -> u8 {
     (encoded * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+// ── COLOUR-SPACE CONTRACT (M15.11 — the linear-HDR intermediate) ──────────────────────────────────────
+//
+// The renderer has exactly THREE colour spaces, and every value belongs to precisely one of them:
+//
+//   1. AUTHORED sRGB      — what a human typed. UI-picked colours, hard-coded helper/gizmo/grid/marker
+//                           constants, the viewport clear colour. Non-linear, display-referred, in [0,1].
+//   2. SCENE LINEAR (HDR) — what lives in the `Rgba16Float` scene target. Radiance, unbounded above 1.
+//                           Lighting, IBL, MSAA resolve, SSAO and bloom ALL operate here.
+//   3. DISPLAY            — what the swapchain receives. Produced exactly ONCE, by `fs_resolve` in
+//                           post.wgsl: exposure → tone curve → transfer function.
+//
+// Lit surfaces produce (2) directly from the BRDF — their albedo factors and light colours are already
+// linear (glTF convention), so they are NEVER passed through a conversion here.
+//
+// UNLIT content (cubes, grid, lines, gizmos, markers, overlays, selection tint, clear colour) is authored
+// in (1) and must reach (2). A plain `srgb_to_linear` is NOT sufficient: the value would then be exposed
+// and tone-mapped like radiance, so a `#9fe` tracking line would land on screen 25–40% darker than the
+// colour the author picked, and would drift again whenever the user changed exposure or switched the
+// presentation profile. `unlit_srgb_to_scene_linear` therefore inverts the *whole* display transform —
+// tone curve and exposure included — so an authored colour renders back as itself. That is still exactly
+// one conversion, at one boundary, in one direction.
+//
+// It takes the exposure to invert AGAINST, and there are two answers:
+//
+//   * CHROME  — grid, lines, markers, the gizmo, the selection tint: the LIVE exposure, so they hold their
+//               authored colour wherever the user puts the slider. A gizmo handle that dims when you stop
+//               the scene down is a handle you cannot grab.
+//   * CONTENT — the placeholder cubes and the clear colour: the REFERENCE exposure (`DEFAULT_EXPOSURE`),
+//               so they brighten and blow out with the frame. An exposure sweep of the captured frames is
+//               what forced this: unlit cubes held at their default brightness while the lit scene around
+//               them blew out, and they read as pasted onto the image. Anchoring at the default keeps
+//               them EXACTLY the authored colour at the default exposure.
+//
+// The inverse is capped, per profile, by `UNLIT_DISPLAY_CAP_*`. The cap is applied to the TARGET and
+// scales the colour uniformly, so hue is exact and only the overall level gives.
+//
+// The WGSL mirror of everything below lives in scene.wgsl (`unlit_srgb_at_exposure` and its two callers)
+// and post.wgsl (the forward direction). The tests in this file are the executable statement of the
+// contract: `unlit_authored_colour_round_trips_through_the_display_transform`,
+// `capping_a_saturated_unlit_colour_preserves_its_hue`, and
+// `chrome_holds_its_colour_across_the_exposure_range_and_content_does_not`.
+
+/// The scene's linear-HDR intermediate format. Every pipeline that draws into the scene colour attachment
+/// declares THIS, never the swapchain format; see [`RenderFormats`].
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The depth format, for the scene pass, the shadow pass and every pipeline's depth-stencil state. Named
+/// once because it must agree everywhere — including with the MSAA sample count, which is where a stray
+/// literal previously hid the fact that the depth texture had its own opinion about sample counts.
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Ceiling on the EXPOSED value an unlit authored colour may inverse-map to. In exposed units so the
+/// clamp behaves identically at every exposure setting. See the colour-space contract above.
+const UNLIT_EXPOSED_CEILING: f32 = 2.0;
+
+/// The brightest display-linear value an unlit authored colour is allowed to target, per presentation
+/// profile. The cap is applied to the TARGET before inverting, and scales the colour UNIFORMLY so the hue
+/// is exact and only the overall level gives.
+///
+/// The two profiles are capped for different reasons, and both are properties of their tone curve:
+///
+/// * **Cinematic (ACES)** — the fit is per channel and monotone, so the only limit is that it approaches
+///   1.0 asymptotically: display white has no finite scene value. The cap is simply the curve evaluated
+///   at [`UNLIT_EXPOSED_CEILING`], so authored white renders at ~0.96 sRGB.
+/// * **CAD (PBR Neutral)** — above `start_compression` the curve DESATURATES: it mixes toward the peak by
+///   `g < 1`, which LIFTS the darkest channel. Past a certain peak a saturated bright colour is no longer
+///   in the operator's range at all, and no inverse can recover it — at a cap of 0.96 the inverse returned
+///   a negative channel and the amber light marker's blue came back at 0.39 instead of 0.20. The cap is
+///   therefore set where that shadow lift is still negligible (below one 8-bit code), which is just inside
+///   the compression region; the cost is that authored white renders at ~0.91 sRGB in this profile.
+///
+/// `the_unlit_display_caps_stay_in_each_curves_faithful_range` pins both.
+const UNLIT_DISPLAY_CAP_ACES: f32 = 0.914_855;
+const UNLIT_DISPLAY_CAP_PBR_NEUTRAL: f32 = 0.78;
+
+/// The cap for a presentation profile. One accessor so the conversion and its tests cannot disagree.
+#[must_use]
+fn unlit_display_cap(cad: bool) -> f32 {
+    if cad {
+        UNLIT_DISPLAY_CAP_PBR_NEUTRAL
+    } else {
+        UNLIT_DISPLAY_CAP_ACES
+    }
+}
+
+/// The two formats the renderer works in, carried together so a scene pipeline cannot be built against the
+/// swapchain format by accident: `hdr` is the scene intermediate, `display` is the surface. Passing one
+/// bare `format` for both was the original defect — MSAA then resolved gamma-encoded samples, and every
+/// scene shader had to encode for display itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderFormats {
+    /// The linear-HDR scene intermediate (always [`HDR_FORMAT`]).
+    pub hdr: wgpu::TextureFormat,
+    /// The swapchain / surface format — written ONLY by the final resolve pass.
+    pub display: wgpu::TextureFormat,
+}
+
+impl RenderFormats {
+    #[must_use]
+    pub fn new(display: wgpu::TextureFormat) -> Self {
+        Self {
+            hdr: HDR_FORMAT,
+            display,
+        }
+    }
+
+    /// `1.0` when `fs_resolve` must apply the sRGB OETF itself (a linear-store swapchain), `0.0` when the
+    /// surface format performs the conversion in hardware. Applying both would double-encode the frame.
+    #[must_use]
+    pub fn manual_display_encode(self) -> f32 {
+        f32::from(u8::from(!self.display.is_srgb()))
+    }
+}
+
+/// sRGB electro-optical transfer function (authored → linear). The exact piecewise curve, not a 2.2
+/// approximation: the approximation visibly shifts near-black gradients, which is where banding shows.
+#[must_use]
+pub fn srgb_to_linear_f32(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+// ── the forward display transform: the CPU mirror of post.wgsl's `fs_resolve` ─────────────────────────
+// In production the GPU does this, once per frame, in the final resolve — nothing on the CPU needs it.
+// It exists so the round-trip that the whole unlit colour contract rests on can be PROVEN rather than
+// asserted: `unlit_round_trips` composes `unlit_srgb_to_scene_linear` with this and checks it lands back
+// on the authored colour. Keep it in step with post.wgsl.
+#[cfg(test)]
+/// The inverse OETF (linear → authored/display encoding).
+#[must_use]
+pub fn linear_to_srgb_f32(value: f32) -> f32 {
+    if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+#[cfg(test)]
+/// The cinematic tone curve (Narkowicz ACES fit), applied per channel. Mirrors `tonemap_aces` in post.wgsl.
+#[must_use]
+fn tonemap_aces_channel(x: f32) -> f32 {
+    let (a, b, c, d, e) = (2.51f32, 0.03f32, 2.43f32, 0.59f32, 0.14f32);
+    ((x * (a * x + b)) / (x * (c * x + d) + e)).clamp(0.0, 1.0)
+}
+
+/// Exact inverse of [`tonemap_aces_channel`]. The fit is a ratio of quadratics, so inverting it is solving
+/// `(yc-a)x² + (yd-b)x + ye = 0`; for every `y` the curve can actually produce, `yc-a < 0` and the root
+/// below is the non-negative one.
+#[must_use]
+fn inverse_tonemap_aces_channel(y: f32) -> f32 {
+    let (a, b, c, d, e) = (2.51f32, 0.03f32, 2.43f32, 0.59f32, 0.14f32);
+    let y = y.clamp(0.0, 0.999);
+    let denom = a - y * c; // > 0 for every reachable y
+    if denom <= 1e-6 {
+        return UNLIT_EXPOSED_CEILING;
+    }
+    let bb = y * d - b;
+    let cc = y * e;
+    let disc = (bb * bb + 4.0 * denom * cc).max(0.0);
+    ((bb + disc.sqrt()) / (2.0 * denom)).max(0.0)
+}
+
+/// The CAD tone curve (Khronos PBR Neutral). Mirrors `tonemap_pbr_neutral` in post.wgsl.
+const PBR_NEUTRAL_START: f32 = 0.8 - 0.04;
+const PBR_NEUTRAL_DESAT: f32 = 0.15;
+
+#[cfg(test)]
+#[must_use]
+fn tonemap_pbr_neutral(input: [f32; 3]) -> [f32; 3] {
+    let x = input[0].min(input[1]).min(input[2]);
+    let offset = if x < 0.08 { x - 6.25 * x * x } else { 0.04 };
+    let color = [input[0] - offset, input[1] - offset, input[2] - offset];
+    let peak = color[0].max(color[1]).max(color[2]);
+    if peak < PBR_NEUTRAL_START {
+        return color;
+    }
+    let new_peak = 1.0
+        - (1.0 - PBR_NEUTRAL_START) * (1.0 - PBR_NEUTRAL_START)
+            / (peak + 1.0 - 2.0 * PBR_NEUTRAL_START);
+    let g = 1.0 / (PBR_NEUTRAL_DESAT * (peak - new_peak) + 1.0);
+    let mut out = [0.0f32; 3];
+    for i in 0..3 {
+        let compressed = color[i] * (new_peak / peak);
+        out[i] = new_peak + g * (compressed - new_peak);
+    }
+    out
+}
+
+/// Exact inverse of [`tonemap_pbr_neutral`]. Every step is invertible: the compression maps `peak` to
+/// `new_peak` monotonically, and the black-lift `offset` is recovered from the minimum channel.
+#[must_use]
+fn inverse_tonemap_pbr_neutral(out: [f32; 3]) -> [f32; 3] {
+    let out_peak = out[0].max(out[1]).max(out[2]).clamp(0.0, 0.999);
+    let mut color = out;
+    if out_peak >= PBR_NEUTRAL_START {
+        // `max(out)` IS `new_peak` (the compressed colour and the desaturation target share that peak).
+        let new_peak = out_peak;
+        let peak =
+            2.0 * PBR_NEUTRAL_START - 1.0 + (1.0 - PBR_NEUTRAL_START).powi(2) / (1.0 - new_peak);
+        let g = 1.0 / (PBR_NEUTRAL_DESAT * (peak - new_peak) + 1.0);
+        for i in 0..3 {
+            let compressed = new_peak + (out[i] - new_peak) / g;
+            color[i] = compressed * (peak / new_peak);
+        }
+    }
+    // Decompression can undershoot below zero for a target the curve cannot actually produce (see
+    // UNLIT_DISPLAY_CAP_PBR_NEUTRAL — the caps keep unlit colour out of that region, but a caller passing
+    // an arbitrary value should get the nearest reachable colour, not a negative one).
+    for c in &mut color {
+        *c = c.max(0.0);
+    }
+    // Undo the black lift. `offset` is 0.04 unless the original minimum channel was below 0.08, and the
+    // pre-offset minimum satisfies `min(color) = x - 6.25x²` there, so `x = 0.4·sqrt(min(color))`.
+    let min_c = color[0].min(color[1]).min(color[2]).max(0.0);
+    let offset = if min_c < 0.04 {
+        0.4 * min_c.sqrt() - min_c
+    } else {
+        0.04
+    };
+    [color[0] + offset, color[1] + offset, color[2] + offset]
+}
+
+/// Turn an AUTHORED sRGB colour into the SCENE-LINEAR value that the single final resolve will render back
+/// as that same colour. `cad` selects the presentation profile's tone curve (`cam.shadow.z > 0.5`).
+///
+/// This is the one and only conversion applied to unlit authored colour, and it is applied on the way IN
+/// to the HDR target — never on the way out. Pass the LIVE exposure for chrome (it then holds its colour
+/// at any exposure) or [`DEFAULT_EXPOSURE`] for content (it then tracks the exposure slider). See the
+/// colour-space contract above.
+#[must_use]
+pub fn unlit_srgb_to_scene_linear(rgb: [f32; 3], exposure: f32, cad: bool) -> [f32; 3] {
+    let mut display_linear = [
+        srgb_to_linear_f32(rgb[0].clamp(0.0, 1.0)),
+        srgb_to_linear_f32(rgb[1].clamp(0.0, 1.0)),
+        srgb_to_linear_f32(rgb[2].clamp(0.0, 1.0)),
+    ];
+    // Cap the TARGET uniformly (hue-preserving) at what this profile can faithfully reproduce.
+    let cap = unlit_display_cap(cad);
+    let peak = display_linear[0]
+        .max(display_linear[1])
+        .max(display_linear[2]);
+    if peak > cap {
+        let scale = cap / peak;
+        for c in &mut display_linear {
+            *c *= scale;
+        }
+    }
+    let exposed = if cad {
+        inverse_tonemap_pbr_neutral(display_linear)
+    } else {
+        [
+            inverse_tonemap_aces_channel(display_linear[0]),
+            inverse_tonemap_aces_channel(display_linear[1]),
+            inverse_tonemap_aces_channel(display_linear[2]),
+        ]
+    };
+    let e = if exposure > 1e-4 { exposure } else { 1.0 };
+    let mut out = [0.0f32; 3];
+    for i in 0..3 {
+        // The cap already bounds the peak; this only guards against negatives and rounding.
+        out[i] = exposed[i].clamp(0.0, UNLIT_EXPOSED_CEILING) / e;
+    }
+    out
+}
+
+#[cfg(test)]
+/// The forward display transform. Mirrors `fs_resolve` in post.wgsl (minus bloom and dither).
+#[must_use]
+fn scene_linear_to_display(rgb: [f32; 3], exposure: f32, cad: bool) -> [f32; 3] {
+    let exposed = [
+        (rgb[0] * exposure).max(0.0),
+        (rgb[1] * exposure).max(0.0),
+        (rgb[2] * exposure).max(0.0),
+    ];
+    let mapped = if cad {
+        tonemap_pbr_neutral(exposed)
+    } else {
+        [
+            tonemap_aces_channel(exposed[0]),
+            tonemap_aces_channel(exposed[1]),
+            tonemap_aces_channel(exposed[2]),
+        ]
+    };
+    [
+        linear_to_srgb_f32(mapped[0].clamp(0.0, 1.0)),
+        linear_to_srgb_f32(mapped[1].clamp(0.0, 1.0)),
+        linear_to_srgb_f32(mapped[2].clamp(0.0, 1.0)),
+    ]
+}
+
+/// The viewport background, AUTHORED in sRGB. Only visible where the sky is not drawn (`MTK_SKY=off`, and
+/// the thumbnail RTT); it still goes through the same conversion as every other authored colour so that
+/// enabling bloom, SSAO or MSAA can never change it.
+pub const CLEAR_COLOR_SRGB: [f32; 3] = [0.04, 0.05, 0.08];
+
+/// The clear colour as the scene-linear value the final resolve renders back as [`CLEAR_COLOR_SRGB`].
+///
+/// Anchored at [`DEFAULT_EXPOSURE`], not the live one: the background is CONTENT (it is what the scene sits
+/// in), so it has to brighten with the frame when the exposure comes up. Chrome — the grid, the gizmo, the
+/// markers — is anchored at the live exposure instead, so it stays legible. Both go through the same
+/// conversion; only the anchor differs. See `scene_srgb_to_scene_linear` in scene.wgsl.
+#[must_use]
+fn clear_color(cad: bool) -> wgpu::Color {
+    let c = unlit_srgb_to_scene_linear(CLEAR_COLOR_SRGB, DEFAULT_EXPOSURE, cad);
+    wgpu::Color {
+        r: f64::from(c[0]),
+        g: f64::from(c[1]),
+        b: f64::from(c[2]),
+        a: 1.0,
+    }
+}
+
 /// Deterministically derive a complete mip chain. Base colour is averaged in linear light, packed
 /// material data is averaged channel-wise, and tangent-space normals are decoded/averaged/renormalized.
 /// This avoids the distant shimmer and dark halos caused by treating every PBR texture as raw colour.
@@ -964,6 +1280,39 @@ fn new_light_storage(device: &wgpu::Device, cap: u64) -> wgpu::Buffer {
 }
 
 const SHADER: &str = include_str!("scene.wgsl");
+const SSAO_SRC: &str = include_str!("ssao.wgsl");
+
+/// The marked block in `ssao.wgsl` that declares the depth binding and its texel reader.
+const SSAO_DEPTH_BLOCK_START: &str = "// >>> DEPTH BINDING BLOCK <<<";
+const SSAO_DEPTH_BLOCK_END: &str = "// >>> END DEPTH BINDING BLOCK <<<";
+
+/// The single-sample depth binding substituted into `ssao.wgsl` when MSAA is off. WGSL types
+/// `texture_depth_multisampled_2d` and `texture_depth_2d` differently and one module cannot hold both, so
+/// the MSAA-off variant is produced by swapping the marked block rather than by disabling SSAO (which is
+/// what used to happen, leaving the "SSAO on, MSAA off" configuration unreachable).
+const SSAO_SINGLE_SAMPLE_BLOCK: &str = "\
+@group(1) @binding(2) var depth_tex: texture_depth_2d;
+fn depth_texel(coord: vec2<i32>) -> f32 {
+    return textureLoad(depth_tex, coord, 0);
+}
+";
+
+/// Produce the single-sample variant of the SSAO shader. Returns the source unchanged if the markers are
+/// missing, which the unit tests assert cannot happen.
+fn single_sample_ssao_source(src: &str) -> String {
+    let (Some(start), Some(end)) = (
+        src.find(SSAO_DEPTH_BLOCK_START),
+        src.find(SSAO_DEPTH_BLOCK_END),
+    ) else {
+        return src.to_string();
+    };
+    let end = end + SSAO_DEPTH_BLOCK_END.len();
+    let mut out = String::with_capacity(src.len());
+    out.push_str(&src[..start]);
+    out.push_str(SSAO_SINGLE_SAMPLE_BLOCK);
+    out.push_str(&src[end..]);
+    out
+}
 /// M11.4 (ADR-043) — the bloom post-processing shaders (separate module; see `post.wgsl`).
 const POST: &str = include_str!("post.wgsl");
 const CUBE_INDICES: [u16; 36] = [
@@ -1133,101 +1482,37 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         desired_maximum_frame_latency: 2,
     };
     surface.configure(&device, &config);
+    // M15.11 — the two render formats, carried together from here down. `hdr` is the linear-HDR scene
+    // intermediate that every scene pipeline draws into; `display` is the swapchain, written by exactly one
+    // pass. Before this split there was a single `format` doing both jobs, which is why MSAA resolved
+    // gamma-encoded samples and each scene shader had to tone-map for itself.
+    let formats = RenderFormats::new(format);
+    if let Err(missing) = hdr_support_gap(&adapter, formats.hdr) {
+        // No silent degrade to the old mixed-space pipeline: that path IS the defect. Rgba16Float
+        // render-attachment + filtering + blending is mandatory in WebGPU core, so this is a tripwire.
+        eprintln!(
+            "[viewport] FATAL: adapter '{}' cannot host the linear-HDR scene target {:?} — missing {missing}. \
+             There is no gamma-space fallback; update the graphics driver or select a conformant adapter.",
+            adapter.get_info().name,
+            formats.hdr
+        );
+        return;
+    }
     // M11.4 (ADR-043) — MSAA anti-aliasing. Sample count chosen once from `MTK_MSAA` (`off`/`1`/`2`/`4`/`8`,
-    // default 4), clamped to adapter support; 1 = off (the min-spec path: render straight to the swapchain,
-    // identical to the pre-MSAA frame). The scene depth + every scene-pass pipeline are built at this count;
-    // the depth-only shadow pass stays single-sample.
-    let samples = msaa_sample_count(&adapter, format);
-    eprintln!("[viewport] MSAA samples={samples}");
-    let mut depth = make_depth(&device, w, h, samples);
-    // The multisampled scene COLOR target (resolved to the swapchain at pass end); `None` when off.
-    let mut msaa = make_msaa(&device, format, w, h, samples);
-
-    // M11.4 (ADR-043) — bloom post-processing. When on, the scene renders/resolves into an offscreen target,
-    // then bright-pass → separable Gaussian blur → composite (scene + bloom) → swapchain. `MTK_BLOOM=off`
-    // skips it entirely (scene → swapchain, byte-identical to pre-bloom). Display-space bloom (the cheap,
-    // overlay-safe path): it operates on the tonemapped scene, so it never touches the scene shaders.
+    // default 4), clamped to adapter support; 1 = off. The scene depth + every scene-pass pipeline are built
+    // at this count; the depth-only shadow pass stays single-sample. The support query now asks about the
+    // HDR format — the format the multisampled target actually is — not about the swapchain.
+    let samples = msaa_sample_count(&adapter, formats);
+    // M11.4 (ADR-043) — bloom. When on, the resolved HDR scene is bright-passed → separable Gaussian →
+    // added back inside the final resolve. `MTK_BLOOM=off` skips the chain and binds a 1×1 black texture,
+    // so the SAME final resolve still runs: bloom changes what is composited, never where the frame ends.
     let bloom = bloom_enabled();
-    eprintln!("[viewport] bloom={bloom}");
-    let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("post"),
-        source: wgpu::ShaderSource::Wgsl(POST.into()),
-    });
-    let post_samp = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("post-sampler"),
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        ..Default::default()
-    });
-    let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    };
-    let samp_entry = wgpu::BindGroupLayoutEntry {
-        binding: 0,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-        count: None,
-    };
-    let post_bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("post-bgl-1tex"),
-        entries: &[samp_entry, tex_entry(1)],
-    });
-    let post_bgl2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("post-bgl-2tex"),
-        entries: &[samp_entry, tex_entry(1), tex_entry(2)],
-    });
-    let post_layout1 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("post-layout-1"),
-        bind_group_layouts: &[Some(&post_bgl1)],
-        immediate_size: 0,
-    });
-    let post_layout2 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("post-layout-2"),
-        bind_group_layouts: &[Some(&post_bgl2)],
-        immediate_size: 0,
-    });
-    let bright_pipeline = make_post_pipeline(
-        &device,
-        &post_shader,
-        &post_layout1,
-        format,
-        "fs_bright",
-        "bloom-bright",
+    eprintln!(
+        "[viewport] hdr={:?} display={:?} manual_srgb_encode={} MSAA samples={samples} bloom={bloom}",
+        formats.hdr,
+        formats.display,
+        formats.manual_display_encode() > 0.5
     );
-    let blur_h_pipeline = make_post_pipeline(
-        &device,
-        &post_shader,
-        &post_layout1,
-        format,
-        "fs_blur_h",
-        "bloom-blur-h",
-    );
-    let blur_v_pipeline = make_post_pipeline(
-        &device,
-        &post_shader,
-        &post_layout1,
-        format,
-        "fs_blur_v",
-        "bloom-blur-v",
-    );
-    let composite_pipeline = make_post_pipeline(
-        &device,
-        &post_shader,
-        &post_layout2,
-        format,
-        "fs_composite",
-        "bloom-composite",
-    );
-    let mut bloom_t = make_bloom_targets(&device, format, w, h, &post_samp, &post_bgl1, &post_bgl2);
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("scene"),
@@ -1274,26 +1559,114 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             resource: camera_buf.as_entire_binding(),
         }],
     });
-    // ── SSAO (screen-space ambient occlusion): a post pass that darkens creases / contact points so an
-    // imported CAD assembly reads as solid, connected parts. When on, the scene renders to `scene_raw`, the
-    // AO pass writes the darkened colour to `bloom_t.scene` (which then feeds bloom, or a blit to the
-    // swapchain). `MTK_SSAO=off` restores the exact pre-SSAO path. Group 0 = camera (for depth→position),
-    // group 1 = { sampler, scene colour, scene depth (multisampled) }. ─────────────────────────────────────
+    // ── the post chain: bloom (HDR) + SSAO (HDR) + THE final resolve (display) ────────────────────────────
+    // Built after the camera layout because every post pass now binds the Camera uniform at group 0: the
+    // final resolve needs exposure and the presentation profile, and bloom extraction is exposure-aware.
+    let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("post"),
+        source: wgpu::ShaderSource::Wgsl(POST.into()),
+    });
+    let post_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("post-sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        ..Default::default()
+    });
+    let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let samp_entry = wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    };
+    let post_bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("post-bgl-1tex"),
+        entries: &[samp_entry, tex_entry(1)],
+    });
+    let post_bgl2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("post-bgl-2tex"),
+        entries: &[samp_entry, tex_entry(1), tex_entry(2)],
+    });
+    let post_layout1 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("post-layout-1"),
+        bind_group_layouts: &[Some(&cam_bgl), Some(&post_bgl1)],
+        immediate_size: 0,
+    });
+    let post_layout2 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("post-layout-2"),
+        bind_group_layouts: &[Some(&cam_bgl), Some(&post_bgl2)],
+        immediate_size: 0,
+    });
+    // Bloom lives entirely in HDR: extract → blur → blur, all Rgba16Float. Nothing here writes display.
+    let bright_pipeline = make_post_pipeline(
+        &device,
+        &post_shader,
+        &post_layout1,
+        formats.hdr,
+        "fs_bright",
+        "bloom-bright(hdr)",
+    );
+    let blur_h_pipeline = make_post_pipeline(
+        &device,
+        &post_shader,
+        &post_layout1,
+        formats.hdr,
+        "fs_blur_h",
+        "bloom-blur-h(hdr)",
+    );
+    let blur_v_pipeline = make_post_pipeline(
+        &device,
+        &post_shader,
+        &post_layout1,
+        formats.hdr,
+        "fs_blur_v",
+        "bloom-blur-v(hdr)",
+    );
+    // THE final resolve — the ONLY pipeline in the renderer whose colour target is the display format, and
+    // the only place exposure, tone mapping and the transfer function are applied. Every route ends here.
+    let resolve_pipeline = make_post_pipeline(
+        &device,
+        &post_shader,
+        &post_layout2,
+        formats.display,
+        "fs_resolve",
+        "final-resolve(display)",
+    );
+    // The stand-in bound as "bloom" when bloom is off: 1×1, black, HDR. It makes the bloom-off route use
+    // the identical pipeline, bind-group layout and shader path as the bloom-on route — the additive term
+    // is simply zero — instead of forking into a second terminal pass that could drift.
+    let black_bloom = black_hdr_dummy(&device, &queue, formats.hdr);
+
+    // ── SSAO (screen-space ambient occlusion): darkens creases / contact points so an imported CAD
+    // assembly reads as solid, connected parts. It now runs INSIDE the HDR half: it reads the resolved
+    // linear scene and writes linear, so occlusion attenuates light and still passes through the single
+    // final resolve. `MTK_SSAO=off` skips the pass; the route still ends at `fs_resolve`.
     //
-    // The AO pass reads the scene depth through a MULTISAMPLED depth binding (`ssao.wgsl`
-    // `texture_depth_multisampled_2d`), so it requires MSAA > 1. With MSAA at 1 (`MTK_MSAA=off`, or an
-    // adapter that can't MSAA this surface format — the min-spec fallback) the depth texture is
-    // single-sampled, and binding it would be a wgpu validation error that kills the render loop — a dead
-    // black viewport at launch. Honest degrade instead: SSAO off, viewport alive.
-    let ssao_requested = ssao_enabled();
-    let ssao = ssao_requested && samples > 1;
-    if ssao_requested && !ssao {
-        eprintln!("[viewport] ssao requested but MSAA=1 (single-sampled depth) — ssao disabled");
-    }
-    eprintln!("[viewport] ssao={ssao}");
+    // The scene depth follows the MSAA sample count, and WGSL types a multisampled depth binding
+    // differently from a single-sampled one. Rather than disabling SSAO whenever MSAA is off (the previous
+    // behaviour — an honest degrade, but it left one required configuration uncovered), the shader carries
+    // a substitutable depth-binding block and we build BOTH variants' resources from it.
+    let ssao = ssao_enabled();
+    eprintln!("[viewport] ssao={ssao} (depth binding: {}-sample)", samples);
+    let ssao_source = if samples > 1 {
+        SSAO_SRC.to_string()
+    } else {
+        single_sample_ssao_source(SSAO_SRC)
+    };
     let ssao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("ssao"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("ssao.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(ssao_source.into()),
     });
     let ssao_input_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("ssao-input-bgl"),
@@ -1320,7 +1693,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Depth,
                     view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: true,
+                    // Must track the depth texture's actual sample count, or the bind group is invalid.
+                    multisampled: samples > 1,
                 },
                 count: None,
             },
@@ -1335,29 +1709,31 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         &device,
         &ssao_shader,
         &ssao_layout,
-        format,
+        formats.hdr,
         "fs_ssao",
-        "ssao",
+        "ssao(hdr)",
     );
-    let ssao_blit_pipeline = make_post_pipeline(
+
+    // Every size-dependent target in one place, built by one constructor, so a resize cannot recreate some
+    // of them against stale dimensions or a stale sample count.
+    let target_spec = TargetSpec {
+        formats,
+        samples,
+        ssao,
+        bloom,
+    };
+    let mut targets = Targets::create(
         &device,
-        &ssao_shader,
-        &ssao_layout,
-        format,
-        "fs_blit",
-        "ssao-blit",
+        &target_spec,
+        w,
+        h,
+        &post_samp,
+        &post_bgl1,
+        &post_bgl2,
+        &ssao_input_bgl,
+        &black_bloom,
     );
-    // The size-dependent SSAO resources — ONLY when the pass can run (multisampled depth exists): the
-    // offscreen the scene renders to (`scene_raw`), the AO input bind group, and the blit input (SSAO on +
-    // bloom off: the AO'd colour in `bloom_t.scene` → swapchain). Creating these against a single-sampled
-    // depth would be the validation panic this gate exists to prevent.
-    let mut ssao_t: Option<(wgpu::TextureView, wgpu::BindGroup, wgpu::BindGroup)> =
-        ssao.then(|| {
-            let scene_raw = make_post_tex(&device, format, w, h);
-            let bg = make_ssao_bg(&device, &ssao_input_bgl, &post_samp, &scene_raw, &depth);
-            let blit = make_ssao_bg(&device, &ssao_input_bgl, &post_samp, &bloom_t.scene, &depth);
-            (scene_raw, bg, blit)
-        });
+
     // Cube instances (the M2.2 placeholder/fallback path + the perf baseline) — the subset of entities
     // with NO mesh asset. Grows with the scene.
     let mut cube = InstanceBuf::new(&device, &inst_bgl, 1024);
@@ -1379,7 +1755,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
+        format: DEPTH_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
@@ -1540,7 +1916,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     );
 
     let depth_state = wgpu::DepthStencilState {
-        format: wgpu::TextureFormat::Depth32Float,
+        format: DEPTH_FORMAT,
         depth_write_enabled: Some(true),
         depth_compare: Some(wgpu::CompareFunction::Less),
         stencil: wgpu::StencilState::default(),
@@ -1596,9 +1972,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         &device,
         &shader,
         &cube_layout,
-        format,
+        formats.hdr,
         &depth_state,
         "vs_cube",
+        "fs_cube",
         wgpu::PrimitiveTopology::TriangleList,
         Some(wgpu::Face::Back),
         samples,
@@ -1615,7 +1992,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         &device,
         &shader,
         &grid_layout,
-        format,
+        formats.hdr,
         &grid_depth_state,
         samples,
     );
@@ -1624,7 +2001,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // draw with an always-pass, no-write depth state so a binding reads as an overlay the user can
     // actually see — never buried inside or behind the dense cube field (the centres they connect).
     let line_depth_state = wgpu::DepthStencilState {
-        format: wgpu::TextureFormat::Depth32Float,
+        format: DEPTH_FORMAT,
         depth_write_enabled: Some(false),
         depth_compare: Some(wgpu::CompareFunction::Always),
         stencil: wgpu::StencilState::default(),
@@ -1634,9 +2011,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         &device,
         &shader,
         &cube_layout,
-        format,
+        formats.hdr,
         &line_depth_state,
         "vs_line",
+        "fs_main",
         wgpu::PrimitiveTopology::LineList,
         None,
         samples,
@@ -1650,9 +2028,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         &device,
         &shader,
         &cube_layout,
-        format,
+        formats.hdr,
         &line_depth_state,
         "vs_overlay",
+        "fs_main",
         wgpu::PrimitiveTopology::LineList,
         None,
         samples,
@@ -1730,7 +2109,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fs_mesh"), // M11.2: per-fragment metallic-roughness PBR (Cook-Torrance)
-            targets: &[Some(format.into())],
+            // Linear HDR, like every scene pipeline. `fs_mesh` writes radiance; nothing is encoded here.
+            targets: &[Some(formats.hdr.into())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }),
         primitive: wgpu::PrimitiveState {
@@ -1749,7 +2129,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // M11.3 inc.2 — skybox: a fullscreen triangle (no vertex buffer) drawn FIRST at the far plane. Depth
     // write OFF + LessEqual so it fills the background but every mesh/grid line draws in front of it.
     let sky_depth = wgpu::DepthStencilState {
-        format: wgpu::TextureFormat::Depth32Float,
+        format: DEPTH_FORMAT,
         depth_write_enabled: Some(false),
         depth_compare: Some(wgpu::CompareFunction::LessEqual),
         stencil: wgpu::StencilState::default(),
@@ -1767,7 +2147,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fs_sky"),
-            targets: &[Some(format.into())],
+            targets: &[Some(formats.hdr.into())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }),
         primitive: wgpu::PrimitiveState {
@@ -1788,7 +2168,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // via DepthBiasState) plus the shader-side bias together fight acne; cull_mode None so thin/flat
     // geometry still occludes. Same `depth_state` format (Depth32Float, Less, write on).
     let shadow_depth_state = wgpu::DepthStencilState {
-        format: wgpu::TextureFormat::Depth32Float,
+        format: DEPTH_FORMAT,
         depth_write_enabled: Some(true),
         depth_compare: Some(wgpu::CompareFunction::Less),
         stencil: wgpu::StencilState::default(),
@@ -1845,6 +2225,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // extent keeps LOD selection tied to projected visual size for both imports and authored geometry.
     let mut mesh_extent: Vec<f32> = Vec::new();
     let mut mesh_world_extent: Vec<f32> = Vec::new();
+    let sky = sky_enabled();
+    eprintln!("[viewport] sky={sky}");
     let lod_on = !matches!(std::env::var("MTK_LOD").ok().as_deref(), Some("off" | "0"));
     let mut cur_mesh_rev = u64::MAX;
     let mut cube_scratch: Vec<Instance> = Vec::new();
@@ -1868,18 +2250,21 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 config.width = w;
                 config.height = h;
                 surface.configure(&device, &config);
-                depth = make_depth(&device, w, h, samples);
-                msaa = make_msaa(&device, format, w, h, samples);
-                bloom_t =
-                    make_bloom_targets(&device, format, w, h, &post_samp, &post_bgl1, &post_bgl2);
-                // SSAO targets follow the window + the recreated depth/scene views (only when the pass runs).
-                ssao_t = ssao.then(|| {
-                    let scene_raw = make_post_tex(&device, format, w, h);
-                    let bg = make_ssao_bg(&device, &ssao_input_bgl, &post_samp, &scene_raw, &depth);
-                    let blit =
-                        make_ssao_bg(&device, &ssao_input_bgl, &post_samp, &bloom_t.scene, &depth);
-                    (scene_raw, bg, blit)
-                });
+                // ONE call rebuilds depth, the MSAA target, the HDR scene, the SSAO input and the bloom
+                // chain together, at the same size and sample count, with the bind groups that reference
+                // them. Recreating these individually is how a resize used to leave a bind group pointing
+                // at a view of the previous size.
+                targets = Targets::create(
+                    &device,
+                    &target_spec,
+                    w,
+                    h,
+                    &post_samp,
+                    &post_bgl1,
+                    &post_bgl2,
+                    &ssao_input_bgl,
+                    &black_bloom,
+                );
             }
         }
 
@@ -2314,7 +2699,14 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 caster_idx,
                 st.exposure,
                 st.render_profile,
-                [st.cam_target[0], st.cam_target[2], st.distance, 0.0],
+                // `.w` tells the final resolve whether IT must apply the sRGB OETF (linear-store
+                // swapchain) or the surface format does it in hardware. Applying both double-encodes.
+                [
+                    st.cam_target[0],
+                    st.cam_target[2],
+                    st.distance,
+                    formats.manual_display_encode(),
+                ],
             )
         };
         queue.write_buffer(
@@ -2369,8 +2761,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 let png = render_thumbnail(
                     &device,
                     &queue,
-                    format,
-                    samples,
+                    &ThumbnailPass {
+                        formats,
+                        samples,
+                        render_profile,
+                        resolve_pipeline: &resolve_pipeline,
+                        post_samp: &post_samp,
+                        post_bgl2: &post_bgl2,
+                        black_bloom: &black_bloom,
+                    },
                     &cam_bgl,
                     &inst_bgl,
                     &mesh_inst_bgl,
@@ -2456,39 +2855,32 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             }
         }
         {
-            // M11.4 — with MSAA on, the scene draws into the multisampled target and RESOLVES to the
-            // swapchain at pass end; off, it draws straight to the swapchain (resolve_target None).
-            // M11.4 — the scene's final color destination: the bloom offscreen when bloom is on, else the
-            // swapchain. With MSAA it's the resolve target; without, the direct color attachment.
-            // When SSAO is on, the scene renders to `scene_raw` (the AO pass then writes `bloom_t.scene`);
-            // else the pre-SSAO destination (bloom offscreen, or the swapchain directly).
-            let scene_dest = match &ssao_t {
-                Some((scene_raw, _, _)) => scene_raw,
-                None if bloom => &bloom_t.scene,
-                None => &view,
-            };
-            let (scene_color, scene_resolve) = match msaa.as_ref() {
+            // The scene pass, entirely in LINEAR HDR. With MSAA on it draws into the multisampled
+            // Rgba16Float target and resolves — in linear light — into a single-sampled Rgba16Float; with
+            // MSAA off it draws straight into that same texture. The destination is `scene_raw` when SSAO
+            // will run (the AO pass then produces `hdr_scene`), otherwise `hdr_scene` itself. The
+            // swapchain is NOT reachable from here under any configuration.
+            let scene_dest = targets.scene_raw.as_ref().unwrap_or(&targets.hdr_scene);
+            let (scene_color, scene_resolve) = match targets.msaa.as_ref() {
                 Some(m) => (m, Some(scene_dest)),
                 None => (scene_dest, None),
             };
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene"),
+                label: Some("scene(hdr-linear)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: scene_color,
                     resolve_target: scene_resolve,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.04,
-                            g: 0.05,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
+                        // The authored background, converted ONCE into scene-linear by the same function
+                        // the shaders use — so the backdrop cannot shift just because bloom, SSAO or MSAA
+                        // was switched on.
+                        load: wgpu::LoadOp::Clear(clear_color(render_profile > 0.5)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth,
+                    view: &targets.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -2503,11 +2895,15 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // M11.3 inc.2 — skybox first: a fullscreen triangle sampling the env (group 3). Depth-write off,
             // so the grid + meshes below draw in front of it. Gives the viewport an HDR backdrop and the
             // environment the metals reflect.
-            rp.set_pipeline(&sky_pipeline);
-            rp.set_bind_group(1, &empty_bg, &[]);
-            rp.set_bind_group(2, &empty_bg, &[]);
-            rp.set_bind_group(3, &ibl.bind_group, &[]);
-            rp.draw(0..3, 0..1);
+            // `MTK_SKY=off` leaves the background as the cleared colour instead — the configuration that
+            // makes the clear colour observable, and the one the colour-space captures need.
+            if sky {
+                rp.set_pipeline(&sky_pipeline);
+                rp.set_bind_group(1, &empty_bg, &[]);
+                rp.set_bind_group(2, &empty_bg, &[]);
+                rp.set_bind_group(3, &ibl.bind_group, &[]);
+                rp.draw(0..3, 0..1);
+            }
             // The grid is drawn AFTER the ground quad, further down this pass. It writes no depth, so
             // drawing it here — before the opaque ground — meant the ground painted over it completely
             // and the viewport had no visible grid at all.
@@ -2600,14 +2996,16 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.draw(0..gizmo_buf.n, 0..1);
             }
         }
-        // SSAO: darken creases / contact points. Reads the offscreen scene (`scene_raw`) + the scene depth,
-        // reconstructs positions via the camera uniform, and writes the AO-multiplied colour to
-        // `bloom_t.scene` — which then feeds the bloom chain (below) or the blit (else-branch).
-        if let Some((_, ssao_bg, _)) = &ssao_t {
-            let mut ap = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ssao"),
+        // Every remaining pass is a fullscreen triangle over the HDR scene. They share one helper so the
+        // group-0 (camera) binding, the clear and the draw cannot diverge between routes.
+        let mut fullscreen = |label: &str,
+                              target: &wgpu::TextureView,
+                              pipeline: &wgpu::RenderPipeline,
+                              bg: &wgpu::BindGroup| {
+            let mut p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &bloom_t.scene,
+                    view: target,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -2620,63 +3018,47 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            ap.set_pipeline(&ssao_pipeline);
-            ap.set_bind_group(0, &cam_bg, &[]);
-            ap.set_bind_group(1, ssao_bg, &[]);
-            ap.draw(0..3, 0..1);
-        }
-        // M11.4 (ADR-043) — bloom post chain: bright-pass → separable Gaussian (H then V) → composite, each
-        // a fullscreen triangle. The scene pass wrote `bloom_t.scene`; composite writes the swapchain.
-        if bloom {
-            let mut post = |target: &wgpu::TextureView,
-                            pipeline: &wgpu::RenderPipeline,
-                            bg: &wgpu::BindGroup| {
-                let mut p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("bloom"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                p.set_pipeline(pipeline);
-                p.set_bind_group(0, bg, &[]);
-                p.draw(0..3, 0..1);
+            p.set_pipeline(pipeline);
+            p.set_bind_group(0, &cam_bg, &[]); // exposure + presentation profile + encode selector
+            p.set_bind_group(1, bg, &[]);
+            p.draw(0..3, 0..1);
+        };
+        // The route is DATA, not control flow: `post_route` appends the final resolve by construction, so
+        // no combination of SSAO/bloom can produce a frame that misses it — and the test module asserts
+        // exactly that for all four combinations, which an `if`/`else` chain could not be held to.
+        let (route, route_len) = post_route(targets.ssao_bg.is_some(), targets.bloom.is_some());
+        for &pass in &route[..route_len] {
+            let resolved = match pass {
+                // SSAO (HDR → HDR): reads `scene_raw` + the scene depth, reconstructs positions from the
+                // camera uniform, and writes occlusion-attenuated LINEAR radiance into `hdr_scene`.
+                PostPass::Ssao => targets
+                    .ssao_bg
+                    .as_ref()
+                    .map(|bg| (pass.label(), &targets.hdr_scene, &ssao_pipeline, bg)),
+                // Bloom (HDR → HDR): bright-pass → separable Gaussian (H then V). It does NOT composite;
+                // the final resolve adds it, so bloom cannot be applied after tone mapping.
+                PostPass::BloomBright => targets
+                    .bloom
+                    .as_ref()
+                    .map(|b| (pass.label(), &b.a, &bright_pipeline, &b.bg_bright)),
+                PostPass::BloomBlurH => targets
+                    .bloom
+                    .as_ref()
+                    .map(|b| (pass.label(), &b.b, &blur_h_pipeline, &b.bg_blur_h)),
+                PostPass::BloomBlurV => targets
+                    .bloom
+                    .as_ref()
+                    .map(|b| (pass.label(), &b.a, &blur_v_pipeline, &b.bg_blur_v)),
+                // THE final resolve — the one pass that writes the swapchain, and the one place exposure,
+                // tone mapping and the display transfer function are applied.
+                PostPass::Resolve => {
+                    Some((pass.label(), &view, &resolve_pipeline, &targets.resolve_bg))
+                }
             };
-            post(&bloom_t.a, &bright_pipeline, &bloom_t.bg_bright); // scene → bloom_a (extract highlights)
-            post(&bloom_t.b, &blur_h_pipeline, &bloom_t.bg_blur_h); // a → b (blur horizontal)
-            post(&bloom_t.a, &blur_v_pipeline, &bloom_t.bg_blur_v); // b → a (blur vertical)
-            post(&view, &composite_pipeline, &bloom_t.bg_composite); // scene + bloom_a → swapchain
-        } else if let Some((_, _, ssao_blit_bg)) = &ssao_t {
-            // SSAO on + bloom off: the AO'd colour is in `bloom_t.scene`; blit it to the swapchain.
-            let mut bp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ssao-blit"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            bp.set_pipeline(&ssao_blit_pipeline);
-            bp.set_bind_group(0, &cam_bg, &[]);
-            bp.set_bind_group(1, ssao_blit_bg, &[]);
-            bp.draw(0..3, 0..1);
+            let Some((label, target, pipeline, bg)) = resolved else {
+                continue;
+            };
+            fullscreen(label, target, pipeline, bg);
         }
         queue.submit([enc.finish()]);
         frame.present();
@@ -2971,7 +3353,7 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32, samples: u32) -> wgpu::Text
             mip_level_count: 1,
             sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
+            format: DEPTH_FORMAT,
             // TEXTURE_BINDING so the SSAO post pass can sample the scene depth (MSAA → textureLoad sample 0).
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
@@ -2982,6 +3364,234 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32, samples: u32) -> wgpu::Text
 /// SSAO on unless `MTK_SSAO=off` — the screen-space ambient-occlusion post pass (crease/contact darkening).
 fn ssao_enabled() -> bool {
     std::env::var("MTK_SSAO").map_or(true, |v| !v.eq_ignore_ascii_case("off"))
+}
+
+/// The procedural sky backdrop, on unless `MTK_SKY=off`. With it off the scene shows the cleared
+/// background instead — the only configuration in which the clear colour is visible on screen, and
+/// therefore the one that can demonstrate it lands in the same colour space as everything else.
+fn sky_enabled() -> bool {
+    !matches!(
+        std::env::var("MTK_SKY").ok().as_deref(),
+        Some("off" | "0" | "false")
+    )
+}
+
+/// What the adapter is missing for the linear-HDR scene target, or `Ok(())` if it can host it. Checked
+/// before anything is allocated so the failure is a clear message rather than a wgpu validation abort.
+fn hdr_support_gap(adapter: &wgpu::Adapter, hdr: wgpu::TextureFormat) -> Result<(), String> {
+    let features = adapter.get_texture_format_features(hdr);
+    let needed = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+    let mut gaps: Vec<&str> = Vec::new();
+    if !features.allowed_usages.contains(needed) {
+        gaps.push("RENDER_ATTACHMENT|TEXTURE_BINDING usage");
+    }
+    if !features
+        .flags
+        .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE)
+    {
+        // The post chain samples the HDR scene with a linear sampler (bloom blur, the final resolve).
+        gaps.push("linear filtering");
+    }
+    if !features
+        .flags
+        .contains(wgpu::TextureFormatFeatureFlags::BLENDABLE)
+    {
+        // The grid is alpha-blended into the HDR target.
+        gaps.push("blending");
+    }
+    if gaps.is_empty() {
+        Ok(())
+    } else {
+        Err(gaps.join(", "))
+    }
+}
+
+/// A 1×1 black HDR texture, bound as the "bloom" input when bloom is off so the final resolve runs the
+/// same pipeline, layout and shader path in every configuration. Its additive contribution is exactly 0.
+fn black_hdr_dummy(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    hdr: wgpu::TextureFormat,
+) -> wgpu::TextureView {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bloom-off-black(hdr)"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: hdr,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    // Four zeroed f16 channels.
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[0u8; 8],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(8),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// One fullscreen pass of the post chain, in execution order.
+///
+/// Every variant except [`PostPass::Resolve`] reads and writes [`RenderFormats::hdr`]; `Resolve` is the
+/// only one that touches [`RenderFormats::display`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostPass {
+    Ssao,
+    BloomBright,
+    BloomBlurH,
+    BloomBlurV,
+    Resolve,
+}
+
+impl PostPass {
+    /// The debug label, so a GPU capture reads as the render graph rather than as five anonymous passes.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ssao => "ssao(hdr)",
+            Self::BloomBright => "bloom-bright(hdr)",
+            Self::BloomBlurH => "bloom-blur-h(hdr)",
+            Self::BloomBlurV => "bloom-blur-v(hdr)",
+            Self::Resolve => "final-resolve(display)",
+        }
+    }
+}
+
+/// The ordered post passes for a configuration.
+///
+/// The point of this function is the LAST write: the final resolve is appended unconditionally, so there
+/// is no arrangement of SSAO and bloom that yields a route ending anywhere else. Before the HDR migration
+/// the three terminal paths (direct-to-swapchain, bloom composite, SSAO blit) were separate `if` branches,
+/// and two of them silently skipped work the third did.
+///
+/// Fixed-capacity rather than a `Vec`, because this runs once per frame on the render thread and the route
+/// has a compile-time maximum length; there is no reason for it to touch the allocator.
+fn post_route(ssao: bool, bloom: bool) -> ([PostPass; 5], usize) {
+    let mut route = [PostPass::Resolve; 5];
+    let mut n = 0;
+    let mut push = |pass| {
+        route[n] = pass;
+        n += 1;
+    };
+    if ssao {
+        push(PostPass::Ssao);
+    }
+    if bloom {
+        push(PostPass::BloomBright);
+        push(PostPass::BloomBlurH);
+        push(PostPass::BloomBlurV);
+    }
+    push(PostPass::Resolve);
+    (route, n)
+}
+
+/// The configuration every size-dependent target is built from. Fixed for the life of the render loop, so
+/// a resize can only change the dimensions — never the formats or the sample count.
+#[derive(Clone, Copy)]
+struct TargetSpec {
+    formats: RenderFormats,
+    samples: u32,
+    ssao: bool,
+    bloom: bool,
+}
+
+/// Every window-sized GPU target, plus the bind groups that reference them, built together.
+///
+/// They are one struct because they are one lifetime: the depth texture's sample count must match the
+/// MSAA colour target, the SSAO bind group holds views of both the scene and the depth, and the final
+/// resolve's bind group holds views of the scene and the bloom result. Recreating any of them alone on a
+/// resize leaves a bind group pointing at a texture of the previous size.
+struct Targets {
+    /// Scene depth, at the scene sample count; also sampled by SSAO.
+    depth: wgpu::TextureView,
+    /// The multisampled HDR colour target; `None` when MSAA is off.
+    msaa: Option<wgpu::TextureView>,
+    /// The composed linear-HDR scene the final resolve reads. When SSAO runs it is the AO pass's output.
+    hdr_scene: wgpu::TextureView,
+    /// The scene pass's destination when SSAO will run (SSAO reads it and writes `hdr_scene`).
+    scene_raw: Option<wgpu::TextureView>,
+    /// SSAO's group-1 input: sampler + `scene_raw` + depth.
+    ssao_bg: Option<wgpu::BindGroup>,
+    /// The half-res bloom ping-pong chain; `None` when bloom is off.
+    bloom: Option<BloomTargets>,
+    /// The final resolve's group-1 input: sampler + `hdr_scene` + (bloom result | 1×1 black).
+    resolve_bg: wgpu::BindGroup,
+}
+
+impl Targets {
+    #[allow(clippy::too_many_arguments)] // each argument is a distinct GPU resource this must reference
+    fn create(
+        device: &wgpu::Device,
+        spec: &TargetSpec,
+        w: u32,
+        h: u32,
+        samp: &wgpu::Sampler,
+        bgl1: &wgpu::BindGroupLayout,
+        bgl2: &wgpu::BindGroupLayout,
+        ssao_bgl: &wgpu::BindGroupLayout,
+        black_bloom: &wgpu::TextureView,
+    ) -> Self {
+        let hdr = spec.formats.hdr;
+        let depth = make_depth(device, w, h, spec.samples);
+        let msaa = make_msaa(device, hdr, w, h, spec.samples);
+        let hdr_scene = make_post_tex(device, hdr, w, h, "hdr-scene");
+        let scene_raw = spec
+            .ssao
+            .then(|| make_post_tex(device, hdr, w, h, "hdr-scene-pre-ao"));
+        let ssao_bg = scene_raw
+            .as_ref()
+            .map(|raw| make_ssao_bg(device, ssao_bgl, samp, raw, &depth));
+        let bloom = spec
+            .bloom
+            .then(|| make_bloom_targets(device, hdr, w, h, samp, bgl1, &hdr_scene));
+        let bloom_src = bloom.as_ref().map_or(black_bloom, |b| &b.a);
+        let resolve_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("final-resolve-input"),
+            layout: bgl2,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&hdr_scene),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(bloom_src),
+                },
+            ],
+        });
+        Self {
+            depth,
+            msaa,
+            hdr_scene,
+            scene_raw,
+            ssao_bg,
+            bloom,
+            resolve_bg,
+        }
+    }
 }
 
 /// The SSAO input bind group (group 1): a filtering sampler + the offscreen scene colour + the scene depth
@@ -3069,6 +3679,10 @@ fn make_pipeline(
     format: wgpu::TextureFormat,
     depth: &wgpu::DepthStencilState,
     vs: &str,
+    // The unlit fragment entry. Explicit rather than hard-coded, because the two unlit outputs differ in
+    // which exposure their authored colour is anchored to: `fs_main` is chrome (constant on screen at any
+    // exposure), `fs_cube` is content (responds to exposure like the rest of the frame).
+    fs: &str,
     topology: wgpu::PrimitiveTopology,
     cull: Option<wgpu::Face>,
     samples: u32,
@@ -3085,7 +3699,7 @@ fn make_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fs),
             targets: &[Some(format.into())],
             compilation_options: Default::default(),
         }),
@@ -3129,7 +3743,11 @@ fn make_grid_pipeline(
             entry_point: Some("fs_grid"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                // PREMULTIPLIED, not straight alpha: `fs_grid` emits `colour × coverage` so the blend is a
+                // plain `src + (1-a)·dst` in LINEAR light. Straight alpha would still work for colour, but
+                // premultiplied keeps the destination alpha meaningful and composes correctly when the
+                // grid overlaps itself at grazing angles.
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: Default::default(),
@@ -3149,26 +3767,59 @@ fn make_grid_pipeline(
     })
 }
 
-/// M11.4 (ADR-043) — MSAA sample count from `MTK_MSAA` (`off`/`1`/`2`/`4`/`8`, default 4), clamped to the
-/// highest count ≤ requested that the adapter supports for `format` (so a downlevel GPU still gets some AA,
-/// or falls back to 1 = off). `1` means no multisample target + no resolve — the pre-MSAA path.
-fn msaa_sample_count(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> u32 {
+/// Sample counts this DEVICE may actually use.
+///
+/// `adapter.get_texture_format_features()` describes the **adapter**, and includes counts that require
+/// `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`. The device here is created with `Features::empty()` (the
+/// web-portable posture — see the `request_device` call), so only the counts WebGPU guarantees are legal,
+/// and asking for one of the others is a validation error at texture creation, not a graceful failure.
+///
+/// That is exactly what `MTK_MSAA=2` and `MTK_MSAA=8` did: this GPU advertises `[1, 2, 4, 8]`, the old
+/// check believed it, and the render thread panicked creating the depth texture — a dead black viewport.
+const PORTABLE_SAMPLE_COUNTS: [u32; 2] = [1, 4];
+
+/// Pick the highest usable count ≤ `requested`. Split out from the adapter query so the choice itself is
+/// testable: `supported` answers whether EVERY format attached to the scene pass can be created at `c`.
+fn choose_sample_count(requested: u32, supported: impl Fn(u32) -> bool) -> u32 {
+    if requested <= 1 {
+        return 1;
+    }
+    for c in [requested, 8, 4, 2] {
+        if c <= requested && PORTABLE_SAMPLE_COUNTS.contains(&c) && supported(c) {
+            return c;
+        }
+    }
+    1
+}
+
+/// M11.4 (ADR-043) — MSAA sample count from `MTK_MSAA` (`off`/`1`/`2`/`4`/`8`, default 4), clamped to what
+/// the device can actually do. `1` means no multisample target + no resolve — the pre-MSAA path.
+///
+/// The count is checked against the HDR colour format AND the depth format, because the scene pass creates
+/// both at this count and a count either one cannot honour is not a usable count. Checking only the colour
+/// format — which is what this did, and against the *swapchain* format at that — is the same
+/// one-format-stands-for-all mistake the `RenderFormats` split exists to prevent.
+fn msaa_sample_count(adapter: &wgpu::Adapter, formats: RenderFormats) -> u32 {
     let requested = match std::env::var("MTK_MSAA").ok().as_deref() {
         Some("off" | "1") => 1,
         Some("2") => 2,
         Some("8") => 8,
         _ => 4,
     };
-    if requested <= 1 {
-        return 1;
+    let colour = adapter.get_texture_format_features(formats.hdr).flags;
+    let depth = adapter.get_texture_format_features(DEPTH_FORMAT).flags;
+    let chosen = choose_sample_count(requested, |c| {
+        colour.sample_count_supported(c) && depth.sample_count_supported(c)
+    });
+    if chosen != requested {
+        // Never a silent downgrade: the user asked for a specific AA quality and did not get it.
+        eprintln!(
+            "[viewport] MSAA {requested}x is not usable on this device for {:?}+{DEPTH_FORMAT:?} \
+             (portable counts are {PORTABLE_SAMPLE_COUNTS:?}) — using {chosen}x",
+            formats.hdr
+        );
     }
-    let flags = adapter.get_texture_format_features(format).flags;
-    for c in [requested, 4, 2] {
-        if c <= requested && flags.sample_count_supported(c) {
-            return c;
-        }
-    }
-    1
+    chosen
 }
 
 /// M11.4 — the multisampled scene COLOR target (resolved to the swapchain at the scene pass's end).
@@ -3213,16 +3864,18 @@ fn bloom_enabled() -> bool {
 }
 
 /// A sampleable post-pass color target (RENDER_ATTACHMENT + TEXTURE_BINDING). The returned view keeps its
-/// texture alive (wgpu resources are ref-counted), so the texture handle isn't returned.
+/// texture alive (wgpu resources are ref-counted), so the texture handle isn't returned. `label` is
+/// per-target rather than generic so a GPU capture names each stage of the HDR chain.
 fn make_post_tex(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     w: u32,
     h: u32,
+    label: &str,
 ) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
-            label: Some("post-target"),
+            label: Some(label),
             size: wgpu::Extent3d {
                 width: w.max(1),
                 height: h.max(1),
@@ -3269,8 +3922,7 @@ fn thumbnail_framing(instance: &Instance, local_bounds: LocalBounds) -> (Instanc
 fn render_thumbnail(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    format: wgpu::TextureFormat,
-    samples: u32,
+    thumb: &ThumbnailPass<'_>,
     cam_bgl: &wgpu::BindGroupLayout,
     inst_bgl: &wgpu::BindGroupLayout,
     mesh_inst_bgl: &wgpu::BindGroupLayout,
@@ -3284,6 +3936,8 @@ fn render_thumbnail(
     mesh: Option<&GpuMesh>,
     size: u32,
 ) -> Option<Vec<u8>> {
+    let (formats, samples) = (thumb.formats, thumb.samples);
+    let format = formats.display;
     let size = size.clamp(32, 256);
     // Frame a COPY of the entity from its real authored bounds. Do not floor the instance scale: production
     // CAD commonly uses millimetre vertices with a 0.001 scale, and replacing it with 0.1 magnifies it 100×.
@@ -3308,10 +3962,12 @@ fn render_thumbnail(
             // No shadow in the thumb: identity light VP ⇒ the lookup falls outside the unit cube ⇒ unshadowed.
             light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             focus: [0.0, eye[0], eye[1], eye[2]],
-            // Exposure shared with the viewport rather than re-stated: these two had already drifted, so
-            // an asset-browser thumbnail was graded differently from the same asset in the scene.
-            shadow: [-1.0, DEFAULT_EXPOSURE, 0.0, 0.0], // caster -1 = none
-            grid: [0.0, 0.0, dist, 0.0],
+            // Exposure AND the presentation profile are shared with the viewport rather than re-stated:
+            // both had already drifted (the profile was pinned to cinematic here), so an asset-browser
+            // thumbnail was graded differently from the same asset on the stage.
+            shadow: [-1.0, DEFAULT_EXPOSURE, thumb.render_profile, 0.0], // caster -1 = none
+            // `.w` — the thumbnail resolves into the display format too, so it needs the same OETF answer.
+            grid: [0.0, 0.0, dist, formats.manual_display_encode()],
         }),
     );
     let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3327,10 +3983,13 @@ fn render_thumbnail(
     let mut inst_buf = InstanceBuf::new(device, inst_bgl, 1);
     inst_buf.upload(device, queue, inst_bgl, &[framed]);
 
-    // Offscreen targets: render at the scene `samples` count (so the scene pipelines match), resolving into a
-    // single-sample COPY_SRC target we read back. With MSAA off, render straight into the resolve target.
-    let resolve_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("thumb-resolve"),
+    // Offscreen targets: the thumbnail runs the SAME pipeline as the stage. It renders into a linear-HDR
+    // target at the scene `samples` count (so the scene pipelines match and the MSAA resolve happens in
+    // linear light), then goes through the SAME final resolve to a display-format COPY_SRC texture we read
+    // back. Rendering it straight into the display format would have been a second, divergent grade.
+    let hdr_tex = make_post_tex(device, formats.hdr, size, size, "thumb-hdr");
+    let display_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("thumb-display"),
         size: wgpu::Extent3d {
             width: size,
             height: size,
@@ -3343,31 +4002,46 @@ fn render_thumbnail(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let resolve_view = resolve_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let msaa_view = (samples > 1).then(|| make_post_tex_msaa(device, format, size, size, samples));
+    let display_view = display_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let msaa_view =
+        (samples > 1).then(|| make_post_tex_msaa(device, formats.hdr, size, size, samples));
     let depth = make_depth(device, size, size, samples);
     let (color_view, resolve_target) = match &msaa_view {
-        Some(m) => (m, Some(&resolve_view)),
-        None => (&resolve_view, None),
+        Some(m) => (m, Some(&hdr_tex)),
+        None => (&hdr_tex, None),
     };
+    let resolve_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("thumb-resolve-input"),
+        layout: thumb.post_bgl2,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Sampler(thumb.post_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&hdr_tex),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(thumb.black_bloom),
+            },
+        ],
+    });
 
     let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("thumb-enc"),
     });
     {
         let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("thumb"),
+            label: Some("thumb-scene(hdr-linear)"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: color_view,
                 resolve_target,
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.04,
-                        g: 0.05,
-                        b: 0.08,
-                        a: 1.0,
-                    }),
+                    // The same authored background as the stage, through the same conversion.
+                    load: wgpu::LoadOp::Clear(clear_color(thumb.render_profile > 0.5)),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -3415,6 +4089,29 @@ fn render_thumbnail(
             rp.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..1);
         }
     }
+    {
+        // THE final resolve, the same pipeline the swapchain frame uses: exposure → tone curve → OETF.
+        let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("thumb-final-resolve(display)"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &display_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(thumb.resolve_pipeline);
+        rp.set_bind_group(0, &cam_bg, &[]);
+        rp.set_bind_group(1, &resolve_bg, &[]);
+        rp.draw(0..3, 0..1);
+    }
 
     // Readback: copy the resolved color into a CPU-mappable buffer (256-byte row alignment).
     let unpadded = size * 4;
@@ -3428,7 +4125,7 @@ fn render_thumbnail(
     });
     enc.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: &resolve_tex,
+            texture: &display_tex,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -3491,6 +4188,20 @@ fn render_thumbnail(
     Some(png_bytes)
 }
 
+/// The non-size-dependent resources the thumbnail RTT borrows from the render loop. Grouped so the
+/// already-long parameter list does not grow another five entries — and so the thumbnail provably uses the
+/// SAME final resolve pipeline as the swapchain frame rather than a lookalike of its own.
+struct ThumbnailPass<'a> {
+    formats: RenderFormats,
+    samples: u32,
+    /// The live presentation profile (cinematic 0 / CAD 1), so a thumbnail is graded like the stage.
+    render_profile: f32,
+    resolve_pipeline: &'a wgpu::RenderPipeline,
+    post_samp: &'a wgpu::Sampler,
+    post_bgl2: &'a wgpu::BindGroupLayout,
+    black_bloom: &'a wgpu::TextureView,
+}
+
 /// A multisampled offscreen color target (for the thumbnail RTT to resolve from). Mirrors [`make_msaa`] but
 /// always allocates (the caller only invokes it when `samples > 1`).
 fn make_post_tex_msaa(
@@ -3519,12 +4230,16 @@ fn make_post_tex_msaa(
 }
 
 /// A fullscreen post-processing pipeline (no vertex buffer, no depth, single-sample) running `vs_post` +
-/// the given fragment entry, writing `format`.
+/// the given fragment entry, writing `target`.
+///
+/// `target` is deliberately explicit and per-call: the bloom and SSAO passes write
+/// [`RenderFormats::hdr`], and exactly ONE call — the final resolve — writes [`RenderFormats::display`].
+/// If you are adding a pass here, it almost certainly wants `formats.hdr`.
 fn make_post_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
     layout: &wgpu::PipelineLayout,
-    format: wgpu::TextureFormat,
+    target: wgpu::TextureFormat,
     fs: &str,
     label: &str,
 ) -> wgpu::RenderPipeline {
@@ -3540,7 +4255,7 @@ fn make_post_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some(fs),
-            targets: &[Some(format.into())],
+            targets: &[Some(target.into())],
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState::default(),
@@ -3551,30 +4266,30 @@ fn make_post_pipeline(
     })
 }
 
-/// M11.4 — the bloom render targets + their bind groups. `scene` is the full-res offscreen the scene pass
-/// renders/resolves into; `a`/`b` are half-res ping-pong buffers. Recreated on resize (texture views change).
+/// M11.4 — the bloom ping-pong chain, now entirely in linear HDR. `a`/`b` are half-res `Rgba16Float`
+/// buffers; the composed scene lives in [`Targets::hdr_scene`] and the ADD happens in the final resolve,
+/// so bloom is structurally incapable of being applied after tone mapping. Recreated on resize.
 struct BloomTargets {
-    scene: wgpu::TextureView,
     a: wgpu::TextureView,
     b: wgpu::TextureView,
-    bg_bright: wgpu::BindGroup,    // reads scene → bloom_a
-    bg_blur_h: wgpu::BindGroup,    // reads a → b
-    bg_blur_v: wgpu::BindGroup,    // reads b → a
-    bg_composite: wgpu::BindGroup, // reads scene + a → swapchain
+    bg_bright: wgpu::BindGroup, // reads hdr_scene → a
+    bg_blur_h: wgpu::BindGroup, // reads a → b
+    bg_blur_v: wgpu::BindGroup, // reads b → a
 }
 
 fn make_bloom_targets(
     device: &wgpu::Device,
-    format: wgpu::TextureFormat,
+    hdr: wgpu::TextureFormat,
     w: u32,
     h: u32,
     samp: &wgpu::Sampler,
     bgl1: &wgpu::BindGroupLayout,
-    bgl2: &wgpu::BindGroupLayout,
+    hdr_scene: &wgpu::TextureView,
 ) -> BloomTargets {
-    let scene = make_post_tex(device, format, w, h);
-    let a = make_post_tex(device, format, w / 2, h / 2);
-    let b = make_post_tex(device, format, w / 2, h / 2);
+    // Half-res, at full HDR precision: dropping to 8-bit here would clip exactly the values bloom exists
+    // to carry, and would reintroduce banding in the glow.
+    let a = make_post_tex(device, hdr, (w / 2).max(1), (h / 2).max(1), "bloom-a(hdr)");
+    let b = make_post_tex(device, hdr, (w / 2).max(1), (h / 2).max(1), "bloom-b(hdr)");
     let bg1 = |label: &str, tex: &wgpu::TextureView| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
@@ -3591,30 +4306,10 @@ fn make_bloom_targets(
             ],
         })
     };
-    let bg_composite = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("bloom-composite"),
-        layout: bgl2,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Sampler(samp),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&scene),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(&a),
-            },
-        ],
-    });
     BloomTargets {
-        bg_bright: bg1("bloom-bright", &scene),
-        bg_blur_h: bg1("bloom-blur-h", &a),
-        bg_blur_v: bg1("bloom-blur-v", &b),
-        bg_composite,
-        scene,
+        bg_bright: bg1("bloom-bright-input", hdr_scene),
+        bg_blur_h: bg1("bloom-blur-h-input", &a),
+        bg_blur_v: bg1("bloom-blur-v-input", &b),
         a,
         b,
     }
@@ -3689,6 +4384,601 @@ fn pipe_graph_preview_vertices(
 
 #[cfg(test)]
 mod tests {
+
+    // ── the HDR pipeline: colour space, formats, routing, shader contracts ────────────────────
+    // These exist because the previous pipeline's defects were all invisible to a compiler and to a
+    // screenshot taken on one machine: a scene shader that tone-mapped for itself still produced a
+    // plausible picture, and MSAA resolving gamma-encoded samples only shows on a high-contrast edge.
+
+    /// The four routing configurations, named the way the route matrix is reported.
+    const ROUTES: [(bool, bool); 4] = [(false, false), (true, false), (false, true), (true, true)];
+
+    /// The route for a configuration, as an owned slice (the renderer's own call site iterates in place).
+    fn route_of(ssao: bool, bloom: bool) -> Vec<PostPass> {
+        let (route, n) = post_route(ssao, bloom);
+        route[..n].to_vec()
+    }
+
+    /// WGSL with `//` comments removed. The shader-contract tests below assert on what the shader DOES,
+    /// and the comments explaining what it deliberately no longer does would otherwise trip them.
+    fn wgsl_code(src: &str) -> String {
+        src.lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// This file's source WITHOUT this test module — the source-contract tests scan the renderer, and
+    /// would otherwise match the very literals they are searching for inside their own assertions.
+    fn renderer_source() -> &'static str {
+        let src: &'static str = include_str!("render.rs");
+        // Truncate at THIS module, not at the first `#[cfg(test)]` — several colour helpers above are
+        // test-only too, and cutting at the first one hid the pipeline factories from the scan entirely.
+        src.find("mod tests {").map_or(src, |at| &src[..at])
+    }
+
+    #[test]
+    fn every_route_ends_at_the_final_resolve() {
+        // The whole point of the migration: SSAO on or off, bloom on or off, the frame always terminates
+        // at the one pass that applies exposure, tone mapping and the display transfer function. The old
+        // renderer had THREE terminal paths and they did not agree.
+        for (ssao, bloom) in ROUTES {
+            let route = route_of(ssao, bloom);
+            assert_eq!(
+                route.last(),
+                Some(&PostPass::Resolve),
+                "ssao={ssao} bloom={bloom} must end at the final resolve, got {route:?}"
+            );
+            assert_eq!(
+                route.iter().filter(|p| **p == PostPass::Resolve).count(),
+                1,
+                "ssao={ssao} bloom={bloom} must tone-map exactly ONCE, got {route:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bloom_is_composed_before_tone_mapping_never_after() {
+        // Ordering, not just presence: every bloom pass must precede the resolve, or the glow would be
+        // added to display-encoded pixels — the classic "bloom applied after tone mapping" artefact.
+        for (ssao, bloom) in ROUTES {
+            let route = route_of(ssao, bloom);
+            let resolve = route.iter().position(|p| *p == PostPass::Resolve).unwrap();
+            for (i, pass) in route.iter().enumerate() {
+                assert!(
+                    *pass == PostPass::Resolve || i < resolve,
+                    "ssao={ssao} bloom={bloom}: {pass:?} runs after the resolve"
+                );
+            }
+            assert_eq!(
+                route.contains(&PostPass::BloomBright),
+                bloom,
+                "the bloom chain must appear exactly when bloom is on"
+            );
+            assert_eq!(
+                route.contains(&PostPass::Ssao),
+                ssao,
+                "the SSAO pass must appear exactly when SSAO is on"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scene_intermediate_is_a_float_hdr_format_and_the_display_is_separate() {
+        let formats = RenderFormats::new(wgpu::TextureFormat::Bgra8Unorm);
+        assert_eq!(formats.hdr, wgpu::TextureFormat::Rgba16Float);
+        assert_ne!(
+            formats.hdr, formats.display,
+            "the scene must not render into the swapchain format"
+        );
+        // 16-bit float: values above 1.0 survive, which is what makes bloom extraction and exposure real
+        // rather than a rescale of already-clipped pixels.
+        assert!(formats.hdr.components() == 4);
+    }
+
+    #[test]
+    fn the_sample_count_needs_every_attached_format_to_agree() {
+        // The defect this closes: the count was checked against ONE format (and the swapchain's, at that).
+        // This GPU's adapter advertises [1,2,4,8] for both colour and depth, but the device is created
+        // with `Features::empty()`, so 2 and 8 need TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES and asking
+        // for them panicked the render thread inside `make_depth` — a black viewport at launch.
+        let everything = |_c: u32| true;
+        assert_eq!(choose_sample_count(4, everything), 4);
+        assert_eq!(
+            choose_sample_count(8, everything),
+            4,
+            "8x is not portable — degrade to the highest count that is"
+        );
+        assert_eq!(
+            choose_sample_count(2, everything),
+            1,
+            "2x is not portable either, and 4x is above what was asked for"
+        );
+        assert_eq!(choose_sample_count(1, everything), 1);
+        assert_eq!(choose_sample_count(0, everything), 1);
+
+        // A format that cannot do 4x drags the whole scene pass down to 1, because the colour target, the
+        // depth target and every pipeline's multisample state are all created at this one count.
+        let depth_cannot_multisample = |c: u32| c == 1;
+        assert_eq!(choose_sample_count(4, depth_cannot_multisample), 1);
+        assert_eq!(choose_sample_count(8, depth_cannot_multisample), 1);
+
+        // Whatever is chosen must be a count WebGPU guarantees, for any request.
+        for requested in [0u32, 1, 2, 3, 4, 8, 16, 64] {
+            let chosen = choose_sample_count(requested, everything);
+            assert!(
+                PORTABLE_SAMPLE_COUNTS.contains(&chosen),
+                "requested {requested}x chose {chosen}x, which is not portable"
+            );
+            assert!(
+                chosen <= requested.max(1),
+                "{chosen}x exceeds the {requested}x asked for"
+            );
+        }
+    }
+
+    #[test]
+    fn the_display_encode_follows_the_surface_format() {
+        // Applying the OETF to a swapchain that already converts in hardware double-encodes the frame
+        // (a washed-out, milky image); omitting it on a linear-store swapchain gives a near-black one.
+        assert_eq!(
+            RenderFormats::new(wgpu::TextureFormat::Bgra8Unorm).manual_display_encode(),
+            1.0,
+            "a linear-store swapchain needs the shader to encode"
+        );
+        assert_eq!(
+            RenderFormats::new(wgpu::TextureFormat::Bgra8UnormSrgb).manual_display_encode(),
+            0.0,
+            "an sRGB swapchain converts in hardware"
+        );
+    }
+
+    #[test]
+    fn srgb_conversion_round_trips_and_is_not_a_gamma_approximation() {
+        for step in 0..=255u8 {
+            let v = f32::from(step) / 255.0;
+            let back = linear_to_srgb_f32(srgb_to_linear_f32(v));
+            assert!(
+                (back - v).abs() < 1e-4,
+                "sRGB round-trip broken at {v}: got {back}"
+            );
+        }
+        // The exact curve, not pow(2.2): they differ most in the toe, which is where banding lives.
+        let toe = srgb_to_linear_f32(0.02);
+        assert!(
+            (toe - 0.02 / 12.92).abs() < 1e-6,
+            "the linear segment of the OETF must be exact, got {toe}"
+        );
+    }
+
+    #[test]
+    fn unlit_authored_colour_round_trips_through_the_display_transform() {
+        // The contract for every helper, gizmo, marker, grid line and clear colour: what the author typed
+        // is what lands on screen, at ANY exposure and in EITHER presentation profile. A plain
+        // srgb_to_linear would leave these 25–40% dark and would drift with the exposure slider.
+        let authored: [[f32; 3]; 9] = [
+            [0.10, 0.12, 0.17], // grid
+            [0.60, 1.00, 0.93], // tracking line
+            [0.90, 0.25, 0.25], // gizmo X
+            [0.30, 0.85, 0.30], // gizmo Y
+            [0.30, 0.50, 0.95], // gizmo Z
+            [1.00, 0.82, 0.20], // light marker
+            [0.35, 0.80, 1.00], // camera marker
+            [0.04, 0.05, 0.08], // clear colour
+            [1.00, 0.82, 0.16], // selection tint
+        ];
+        for cad in [false, true] {
+            for exposure in [0.2f32, DEFAULT_EXPOSURE, 1.0, 2.5] {
+                for c in authored {
+                    let scene = unlit_srgb_to_scene_linear(c, exposure, cad);
+                    let back = scene_linear_to_display(scene, exposure, cad);
+                    let peak = c
+                        .iter()
+                        .copied()
+                        .fold(0.0f32, |m, v| m.max(srgb_to_linear_f32(v)));
+                    if peak <= unlit_display_cap(cad) {
+                        // Below the profile's cap, an authored colour round-trips EXACTLY.
+                        for i in 0..3 {
+                            assert!(
+                                (back[i] - c[i]).abs() < 0.02,
+                                "cad={cad} exposure={exposure} channel {i} of {c:?} rendered {back:?}"
+                            );
+                        }
+                        continue;
+                    }
+                    // Above the cap the guarantee is not equality but a single UNIFORM LINEAR SCALE: the
+                    // hue is exact and only the overall level gives. That is the deliberate trade for a
+                    // tone curve that only approaches display white, and for a bloom extractor that
+                    // cannot blow out on a helper line.
+                    let ratio = |i: usize| srgb_to_linear_f32(back[i]) / srgb_to_linear_f32(c[i]);
+                    let k = ratio(0);
+                    // The scale is `cap / peak`, and `peak <= 1`, so it can never fall below the cap.
+                    assert!(
+                        k >= unlit_display_cap(cad) - 0.005,
+                        "cad={cad} exposure={exposure}: {c:?} lost {:.1}% of its level ({back:?}) — \
+                         more than the profile's cap of {} accounts for",
+                        (1.0 - k) * 100.0,
+                        unlit_display_cap(cad)
+                    );
+                    for i in 1..3 {
+                        assert!(
+                            (ratio(i) - k).abs() < 0.01,
+                            "cad={cad} exposure={exposure}: {c:?} was not scaled UNIFORMLY \
+                             (channel 0 ×{k}, channel {i} ×{}) — the hue shifted: {back:?}",
+                            ratio(i)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_unlit_ceiling_keeps_bright_helpers_out_of_bloom_blow_out() {
+        // Authored white would otherwise need an unbounded scene value (the tone curve only approaches
+        // 1.0), and feeding that to the bloom extractor wraps every white helper line in a blown halo.
+        for exposure in [0.2f32, DEFAULT_EXPOSURE, 1.0] {
+            for cad in [false, true] {
+                let white = unlit_srgb_to_scene_linear([1.0, 1.0, 1.0], exposure, cad);
+                for ch in white {
+                    let exposed = ch * exposure;
+                    assert!(
+                        exposed <= UNLIT_EXPOSED_CEILING + 1e-4,
+                        "unlit white reached exposed {exposed} (ceiling {UNLIT_EXPOSED_CEILING})"
+                    );
+                }
+                // …and it still reads as white on screen: exactly the profile's cap, encoded. Cinematic
+                // gives 0.962, CAD 0.896 (its cap is lower, which is what keeps saturated helper colours
+                // exactly reproducible under a curve that desaturates as it compresses).
+                let shown = scene_linear_to_display(white, exposure, cad);
+                let expected = linear_to_srgb_f32(unlit_display_cap(cad));
+                assert!(
+                    expected > 0.89,
+                    "cad={cad}: the cap renders authored white at {expected} — too grey to read"
+                );
+                for ch in shown {
+                    assert!(
+                        (ch - expected).abs() < 0.01,
+                        "unlit white rendered as {shown:?}, expected {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_unlit_display_caps_stay_in_each_curves_faithful_range() {
+        // Cinematic: the cap IS the curve at the ceiling, so white costs exactly the ceiling's worth.
+        assert!(
+            (tonemap_aces_channel(UNLIT_EXPOSED_CEILING) - UNLIT_DISPLAY_CAP_ACES).abs() < 1e-4,
+            "UNLIT_DISPLAY_CAP_ACES is stale: the curve gives {}",
+            tonemap_aces_channel(UNLIT_EXPOSED_CEILING)
+        );
+        // CAD: PBR Neutral desaturates above its compression knee, which LIFTS the darkest channel and
+        // eventually puts saturated bright colours outside the operator's range entirely (at a cap of
+        // 0.96 the amber light marker's blue came back at 0.39 instead of 0.20). The cap must sit where
+        // that lift is still below one 8-bit code — i.e. invisible.
+        let cap = UNLIT_DISPLAY_CAP_PBR_NEUTRAL;
+        let lift = if cap < PBR_NEUTRAL_START {
+            0.0 // no compression at all below the knee
+        } else {
+            let peak =
+                2.0 * PBR_NEUTRAL_START - 1.0 + (1.0 - PBR_NEUTRAL_START).powi(2) / (1.0 - cap);
+            let g = 1.0 / (PBR_NEUTRAL_DESAT * (peak - cap) + 1.0);
+            cap * (1.0 - g) // the darkest display-linear value still reachable alongside `cap`
+        };
+        assert!(
+            linear_to_srgb_f32(lift) < 1.0 / 255.0,
+            "the CAD cap ({cap}) lifts black to {} sRGB — a saturated helper colour would wash out",
+            linear_to_srgb_f32(lift)
+        );
+        // …and it must still be bright enough to read as white.
+        assert!(
+            linear_to_srgb_f32(UNLIT_DISPLAY_CAP_PBR_NEUTRAL) > 0.89,
+            "the CAD cap renders authored white at {} — too dim for a helper line",
+            linear_to_srgb_f32(UNLIT_DISPLAY_CAP_PBR_NEUTRAL)
+        );
+        // The WGSL mirror must carry the same numbers, or unlit colour drifts between CPU and GPU.
+        let code = wgsl_code(SHADER);
+        assert!(code.contains("const UNLIT_EXPOSED_CEILING: f32 = 2.0;"));
+        assert!(code.contains("const UNLIT_DISPLAY_CAP_ACES: f32 = 0.914855;"));
+        assert!(code.contains("const UNLIT_DISPLAY_CAP_PBR_NEUTRAL: f32 = 0.78;"));
+    }
+
+    #[test]
+    fn capping_a_saturated_unlit_colour_preserves_its_hue() {
+        // The bug this closes: clamping the inverse per channel turned the cyan tracking line and the
+        // amber light marker grey, because one saturated channel dragged its neighbours to the ceiling.
+        for cad in [false, true] {
+            for c in [[0.60, 1.00, 0.93], [1.00, 0.82, 0.20], [0.35, 0.80, 1.00]] {
+                let shown = scene_linear_to_display(
+                    unlit_srgb_to_scene_linear(c, DEFAULT_EXPOSURE, cad),
+                    DEFAULT_EXPOSURE,
+                    cad,
+                );
+                // Channel ORDER is the hue signature: it must survive the cap intact.
+                let order = |v: [f32; 3]| (v[0] < v[1], v[1] < v[2], v[0] < v[2]);
+                assert_eq!(
+                    order(shown),
+                    order(c),
+                    "cad={cad}: {c:?} lost its hue, rendered {shown:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_clear_colour_is_the_authored_background_and_tracks_exposure() {
+        // The invariant the brief cares about is that enabling bloom, SSAO or MSAA can never shift the
+        // background — none of them touch it. What the background MUST do is behave like content: render
+        // as authored at the default exposure, and brighten with the frame as the exposure comes up.
+        for cad in [false, true] {
+            let c = clear_color(cad);
+            assert!(c.a == 1.0, "the viewport background is opaque");
+            #[allow(clippy::cast_possible_truncation)]
+            let scene = [c.r as f32, c.g as f32, c.b as f32];
+
+            let at_default = scene_linear_to_display(scene, DEFAULT_EXPOSURE, cad);
+            for i in 0..3 {
+                assert!(
+                    (at_default[i] - CLEAR_COLOR_SRGB[i]).abs() < 0.02,
+                    "cad={cad}: background rendered {at_default:?}, authored {CLEAR_COLOR_SRGB:?}"
+                );
+            }
+            let mut previous = -1.0f32;
+            for exposure in [0.15f32, DEFAULT_EXPOSURE, 1.0, 4.0] {
+                let level = scene_linear_to_display(scene, exposure, cad)[2];
+                assert!(
+                    level > previous,
+                    "cad={cad}: the background must track exposure, but {exposure} gave {level} \
+                     after {previous}"
+                );
+                previous = level;
+            }
+        }
+    }
+
+    #[test]
+    fn chrome_holds_its_colour_across_the_exposure_range_and_content_does_not() {
+        // The distinction the captures forced. At exposure 4.0 the lit scene blew out while the unlit
+        // placeholder cubes sat at their default-exposure brightness, so they read as pasted onto the
+        // image. Chrome SHOULD hold — a gizmo handle that dims when you stop the scene down is one you
+        // cannot grab — but scene content must not.
+        let colour = [0.30, 0.85, 0.30]; // the same authored value, read either way
+        for cad in [false, true] {
+            let mut chrome = Vec::new();
+            let mut content = Vec::new();
+            for exposure in [0.15f32, DEFAULT_EXPOSURE, 1.0, 4.0] {
+                // Chrome converts against the LIVE exposure, so it lands on the same pixel every time.
+                let c = unlit_srgb_to_scene_linear(colour, exposure, cad);
+                chrome.push(scene_linear_to_display(c, exposure, cad)[1]);
+                // Content converts against the REFERENCE exposure, so the slider moves it.
+                let s = unlit_srgb_to_scene_linear(colour, DEFAULT_EXPOSURE, cad);
+                content.push(scene_linear_to_display(s, exposure, cad)[1]);
+            }
+            for level in &chrome {
+                assert!(
+                    (level - chrome[0]).abs() < 0.01,
+                    "cad={cad}: chrome must not move with exposure, got {chrome:?}"
+                );
+            }
+            assert!(
+                content[3] - content[0] > 0.2,
+                "cad={cad}: content must track exposure, got {content:?}"
+            );
+            // …and at the default exposure the two agree exactly. That is what anchoring buys: the
+            // migration changes nothing about how the viewport looks when it opens.
+            assert!(
+                (content[1] - chrome[1]).abs() < 0.001,
+                "cad={cad}: at the default exposure chrome and content must render identically"
+            );
+        }
+        // The WGSL mirror must anchor content at the same reference, or CPU and GPU disagree.
+        let code = wgsl_code(SHADER);
+        assert!(
+            code.contains("const REFERENCE_EXPOSURE: f32 = 0.45;"),
+            "scene.wgsl's REFERENCE_EXPOSURE must equal DEFAULT_EXPOSURE ({DEFAULT_EXPOSURE})"
+        );
+        assert!((DEFAULT_EXPOSURE - 0.45).abs() < 1e-6);
+        assert!(
+            code.contains("fn fs_cube"),
+            "the cube path needs its own unlit output, anchored differently from chrome"
+        );
+    }
+
+    #[test]
+    fn the_tone_curves_are_monotone_bounded_and_stable_at_the_extremes() {
+        // Numerical stability of the operator the whole frame passes through: no NaN, no inversion, no
+        // value escaping [0,1] — including at 0 and at values far above the display range.
+        for cad in [false, true] {
+            let mut previous = -1.0f32;
+            for step in 0i16..2000 {
+                let x = f32::from(step) * 0.05;
+                let mapped = scene_linear_to_display([x, x, x], 1.0, cad)[0];
+                assert!(mapped.is_finite(), "cad={cad} x={x} produced {mapped}");
+                assert!(
+                    (0.0..=1.0).contains(&mapped),
+                    "cad={cad} x={x} escaped the display range: {mapped}"
+                );
+                assert!(
+                    mapped >= previous - 1e-5,
+                    "cad={cad} the curve inverted at x={x}: {previous} → {mapped}"
+                );
+                previous = mapped;
+            }
+            assert_eq!(
+                scene_linear_to_display([0.0; 3], 1.0, cad)[0],
+                0.0,
+                "black must stay black"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tone_curve_inverses_are_exact() {
+        // The unlit round-trip rests on these; a sloppy inverse would show as a hue shift on the gizmo.
+        for step in 1i16..999 {
+            let y = f32::from(step) / 1000.0;
+            let back = tonemap_aces_channel(inverse_tonemap_aces_channel(y));
+            assert!(
+                (back - y).abs() < 1e-3,
+                "ACES inverse broken at {y}: got {back}"
+            );
+        }
+        for step in 1i16..99 {
+            let v = f32::from(step) / 100.0;
+            let colour = [v, v * 0.6, v * 0.3];
+            let back = tonemap_pbr_neutral(inverse_tonemap_pbr_neutral(colour));
+            for i in 0..3 {
+                assert!(
+                    (back[i] - colour[i]).abs() < 2e-3,
+                    "PBR-Neutral inverse broken at {colour:?}: got {back:?}"
+                );
+            }
+        }
+    }
+
+    // ── shader-source contracts ───────────────────────────────────────────────────────────────
+    // Cheap, exact, and they fail the moment someone reintroduces the thing the migration removed.
+
+    #[test]
+    fn no_scene_shader_encodes_for_display() {
+        let code = wgsl_code(SHADER);
+        for banned in ["display_encode", "fn to_srgb", "to_srgb(", "fn tonemap_"] {
+            assert!(
+                !code.contains(banned),
+                "scene.wgsl must write LINEAR HDR, but still contains `{banned}` — tone mapping and \
+                 display encoding belong in post.wgsl's fs_resolve, which runs once per frame"
+            );
+        }
+        // The conversion that IS allowed there: authored sRGB coming IN.
+        assert!(SHADER.contains("fn unlit_srgb_to_scene_linear"));
+    }
+
+    #[test]
+    fn the_final_resolve_is_the_only_display_encode() {
+        assert!(
+            POST.contains("fn fs_resolve"),
+            "the final resolve must exist"
+        );
+        assert!(
+            POST.contains("fn to_srgb"),
+            "the display transfer function lives in post.wgsl"
+        );
+        // The old second terminal path is gone from the SSAO module.
+        assert!(
+            !wgsl_code(SSAO_SRC).contains("fs_blit"),
+            "the SSAO blit was a second path to the swapchain; every route now ends at fs_resolve"
+        );
+        assert!(
+            !wgsl_code(POST).contains("fs_composite"),
+            "bloom no longer composites to the swapchain — the final resolve adds it"
+        );
+    }
+
+    #[test]
+    fn the_bloom_threshold_was_retuned_for_linear_hdr() {
+        // 0.78 was tuned against TONEMAPPED values in [0,1]. Carried into linear HDR unchanged it would
+        // have caught most of a normally-lit scene, so the whole image would glow.
+        assert!(
+            !POST.contains("THRESHOLD: f32 = 0.78"),
+            "the display-space bloom threshold survived the migration to linear HDR"
+        );
+        assert!(
+            POST.contains("BLOOM_THRESHOLD"),
+            "bloom extraction must state its threshold explicitly"
+        );
+        for expected in ["BLOOM_KNEE", "BLOOM_CLAMP", "fn luminance"] {
+            assert!(
+                POST.contains(expected),
+                "HDR bloom needs {expected} (soft knee, firefly suppression, luminance extraction)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scene_shader_writes_linear_and_the_grid_writes_premultiplied() {
+        assert!(
+            SHADER.contains("unlit_srgb_to_scene_linear(GRID_COLOR) * alpha"),
+            "the grid must emit premultiplied linear colour to match PREMULTIPLIED_ALPHA_BLENDING"
+        );
+    }
+
+    #[test]
+    fn ssao_has_a_single_sample_variant_that_differs_only_in_the_depth_binding() {
+        // Without this, "SSAO on + MSAA off" was unreachable: the multisampled depth binding is a hard
+        // validation error against a single-sampled texture, so SSAO silently turned itself off.
+        let single = single_sample_ssao_source(SSAO_SRC);
+        assert_ne!(single, SSAO_SRC, "the depth-binding block must be swapped");
+        assert!(SSAO_SRC.contains("texture_depth_multisampled_2d"));
+        assert!(single.contains("var depth_tex: texture_depth_2d;"));
+        assert!(!single.contains("texture_depth_multisampled_2d"));
+        assert!(
+            !single.contains("textureNumSamples"),
+            "textureNumSamples does not exist for a non-multisampled texture"
+        );
+        // Everything outside the block is untouched — same AO maths, same bindings, same entry point.
+        assert!(single.contains("fn fs_ssao"));
+        assert!(single.contains("fn depth_texel(coord: vec2<i32>) -> f32"));
+        assert!(single.contains("@group(1) @binding(1) var color_tex: texture_2d<f32>;"));
+    }
+
+    #[test]
+    fn every_scene_pipeline_is_built_against_the_hdr_format() {
+        // A pipeline whose declared fragment target does not match its attachment is a wgpu validation
+        // error, so this catches the mistake at `cargo test` rather than as a black viewport at launch.
+        let src = renderer_source();
+        for factory in ["make_pipeline(", "make_grid_pipeline("] {
+            let mut from = 0usize;
+            let mut seen = 0usize;
+            while let Some(at) = src[from..].find(factory) {
+                let start = from + at;
+                // Skip the definitions themselves (`fn make_pipeline(`).
+                if src[..start].trim_end().ends_with("fn") {
+                    from = start + factory.len();
+                    continue;
+                }
+                let window = &src[start..(start + 400).min(src.len())];
+                let hdr = window.find("formats.hdr");
+                let display = window.find("formats.display");
+                assert!(
+                    hdr.is_some() && (display.is_none() || display > hdr),
+                    "a `{factory}` call site does not pass formats.hdr — a scene pipeline must never be \
+                     built against the swapchain format:\n{window}"
+                );
+                seen += 1;
+                from = start + factory.len();
+            }
+            assert!(seen > 0, "expected to find `{factory}` call sites");
+        }
+    }
+
+    #[test]
+    fn only_the_final_resolve_writes_the_display_format() {
+        let src = renderer_source();
+        let mut display_targets = 0usize;
+        let mut from = 0usize;
+        while let Some(at) = src[from..].find("make_post_pipeline(") {
+            let start = from + at;
+            if src[..start].trim_end().ends_with("fn") {
+                from = start + 1;
+                continue;
+            }
+            let window = &src[start..(start + 400).min(src.len())];
+            if window.contains("formats.display") {
+                display_targets += 1;
+                assert!(
+                    window.contains("fs_resolve"),
+                    "only the final resolve may target the display format:\n{window}"
+                );
+            }
+            from = start + 1;
+        }
+        assert_eq!(
+            display_targets, 1,
+            "there must be exactly ONE display-format pipeline in the renderer"
+        );
+    }
 
     // ── viewport framing ──────────────────────────────────────────────────────────────────────
     // These exist because `frame_all` had NO test coverage at all, which is why a framing constant

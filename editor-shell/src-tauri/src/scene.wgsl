@@ -72,13 +72,139 @@ fn shadow_factor(world_pos: vec3<f32>, n_dot_l: f32) -> f32 {
     return sum / weight_sum;
 }
 
+// ── COLOUR-SPACE CONTRACT ─────────────────────────────────────────────────────────────────────────────
+// EVERY fragment entry point in this file writes SCENE-LINEAR HDR into an Rgba16Float attachment.
+// There is no exposure, no tone curve and no transfer function here: post.wgsl's `fs_resolve` is the ONE
+// place the frame becomes display colour. Do not reintroduce a `display_encode` in this file — MSAA would
+// then resolve gamma-encoded samples and bloom/SSAO would operate on compressed values, which is exactly
+// the defect the HDR intermediate exists to remove. The Rust-side statement of this contract (and its
+// tests) lives in render.rs; keep the two in step.
+//
+// Lit surfaces already produce linear radiance, so nothing is converted for them. UNLIT authored colour
+// (cube tints, grid, lines, gizmos, markers, overlays, selection) enters through
+// `unlit_srgb_to_scene_linear`, which inverts the whole display transform so an authored colour renders
+// back as itself at any exposure. Mirror of render.rs's function of the same name.
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let s = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let low = s / 12.92;
+    let high = pow((s + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, s <= vec3<f32>(0.04045));
+}
+
+// Ceiling on the exposed value an unlit colour may inverse-map to; keeps bright helpers out of the bloom
+// extractor's blow-out range. See render.rs `UNLIT_EXPOSED_CEILING`.
+const UNLIT_EXPOSED_CEILING: f32 = 2.0;
+// The brightest display-linear value an unlit colour may target, per profile. Applied to the TARGET and
+// scaling the colour UNIFORMLY, so the hue is exact and only the level gives. ACES is capped at the curve
+// evaluated at the ceiling (authored white → 0.962 sRGB). PBR Neutral is capped much lower (→ 0.896 sRGB)
+// because above its knee that curve DESATURATES, lifting the darkest channel: at a higher cap the inverse
+// returned a negative channel and the amber light marker's blue came back at 0.39 instead of 0.20.
+// Kept in step with render.rs by `the_unlit_display_caps_stay_in_each_curves_faithful_range`.
+const UNLIT_DISPLAY_CAP_ACES: f32 = 0.914855;
+const UNLIT_DISPLAY_CAP_PBR_NEUTRAL: f32 = 0.78;
+
+// Inverse of the Narkowicz ACES fit, per channel: solve (yc-a)x² + (yd-b)x + ye = 0 for the non-negative root.
+fn inverse_tonemap_aces(y_in: vec3<f32>) -> vec3<f32> {
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    let y = clamp(y_in, vec3<f32>(0.0), vec3<f32>(0.999));
+    let denom = vec3<f32>(a) - y * c;
+    let bb = y * d - b;
+    let cc = y * e;
+    let disc = max(bb * bb + 4.0 * denom * cc, vec3<f32>(0.0));
+    return max((bb + sqrt(disc)) / (2.0 * max(denom, vec3<f32>(1e-6))), vec3<f32>(0.0));
+}
+
+// Inverse of the Khronos PBR Neutral curve (the CAD profile). max(out) IS the compressed peak, which
+// recovers the original peak in closed form; the black lift is recovered from the minimum channel.
+fn inverse_tonemap_pbr_neutral(out_in: vec3<f32>) -> vec3<f32> {
+    let start = 0.8 - 0.04;
+    let desaturation = 0.15;
+    let out_peak = clamp(max(out_in.r, max(out_in.g, out_in.b)), 0.0, 0.999);
+    var color = out_in;
+    if (out_peak >= start) {
+        let new_peak = out_peak;
+        let peak = 2.0 * start - 1.0 + (1.0 - start) * (1.0 - start) / (1.0 - new_peak);
+        let g = 1.0 / (desaturation * (peak - new_peak) + 1.0);
+        let compressed = vec3<f32>(new_peak) + (out_in - vec3<f32>(new_peak)) / g;
+        // Decompression can undershoot below zero for a target the curve cannot produce; the caps keep
+        // unlit colour out of that region, but clamp so an out-of-range value yields the nearest colour.
+        color = max(compressed * (peak / new_peak), vec3<f32>(0.0));
+    }
+    let min_c = max(min(color.r, min(color.g, color.b)), 0.0);
+    let offset = select(0.04, 0.4 * sqrt(min_c) - min_c, min_c < 0.04);
+    return color + vec3<f32>(offset);
+}
+
+// AUTHORED sRGB → SCENE LINEAR, against a given exposure. The single conversion applied to unlit colour,
+// on the way IN. Mirror of render.rs's `unlit_srgb_to_scene_linear`.
+fn unlit_srgb_at_exposure(rgb: vec3<f32>, exposure: f32) -> vec3<f32> {
+    let cad = cam.shadow.z > 0.5;
+    var display_linear = srgb_to_linear(rgb);
+    // Cap the TARGET uniformly, so the hue survives a channel that sits at display maximum.
+    let cap = select(UNLIT_DISPLAY_CAP_ACES, UNLIT_DISPLAY_CAP_PBR_NEUTRAL, cad);
+    let peak = max(display_linear.r, max(display_linear.g, display_linear.b));
+    if (peak > cap) {
+        display_linear = display_linear * (cap / peak);
+    }
+    var exposed: vec3<f32>;
+    if (cad) {
+        exposed = inverse_tonemap_pbr_neutral(display_linear);
+    } else {
+        exposed = inverse_tonemap_aces(display_linear);
+    }
+    // Guard exactly as render.rs does — fall back to 1.0 rather than dividing by a near-zero exposure,
+    // or the two mirrors disagree at the bottom of the exposure range.
+    let e = select(1.0, exposure, exposure > 1e-4);
+    return clamp(exposed, vec3<f32>(0.0), vec3<f32>(UNLIT_EXPOSED_CEILING)) / e;
+}
+
+// ── two callers, and the difference between them matters ──────────────────────────────────────────────
+//
+// UI and helper overlays — grid, tracking lines, the contact debugger, light/camera markers, the transform
+// gizmo, the selection tint, the focus-dim target — convert against the LIVE exposure, so they render as
+// the authored colour no matter where the user puts the exposure slider. That is what UI has to do: a
+// gizmo handle that dims when you stop down the scene is a gizmo you cannot grab.
+fn unlit_srgb_to_scene_linear(rgb: vec3<f32>) -> vec3<f32> {
+    return unlit_srgb_at_exposure(rgb, cam.shadow.y);
+}
+
+// Placeholder scene GEOMETRY (the fallback cubes for entities with no mesh asset) converts against the
+// REFERENCE exposure instead. It is content, not chrome: it has to brighten and blow out with the rest of
+// the frame when the exposure comes up, or it reads as pasted onto the image — which is exactly what an
+// exposure sweep of the captured frames showed when this path used the live exposure. Anchoring at the
+// default means the authored identity colour is still exactly right at the default exposure.
+// Must equal render.rs's `DEFAULT_EXPOSURE`.
+const REFERENCE_EXPOSURE: f32 = 0.45;
+fn scene_srgb_to_scene_linear(rgb: vec3<f32>) -> vec3<f32> {
+    return unlit_srgb_at_exposure(rgb, REFERENCE_EXPOSURE);
+}
+
 // Focus mode (M3.3): when `cam.focus_active > 0.5`, every entity that isn't the focused/selected one
 // is grayed toward the background so it reads as faded/transparent (depth-correct, no alpha blend).
 // `is_focused` ⇒ the lit one; everything else dims. Returns the de-emphasized colour.
+//
+// Two variants, because the two callers work in different spaces: the unlit vertex paths compose entirely
+// in AUTHORED space and convert once at the fragment output, while `fs_mesh` is already SCENE LINEAR.
+// Mixing toward the same authored target in each space keeps the faded look identical on both paths.
 const DIM_TARGET = vec3<f32>(0.06, 0.07, 0.10); // the viewport clear colour — fade toward "gone"
+const DIM_AMOUNT = 0.86;
+// The selection accent, AUTHORED sRGB (matches the panel's selection yellow).
+const SELECTION_TINT = vec3<f32>(1.0, 0.82, 0.16);
+// The grid line colour, AUTHORED sRGB. Written PREMULTIPLIED by coverage (see `fs_grid`).
+const GRID_COLOR = vec3<f32>(0.10, 0.12, 0.17);
 fn apply_focus_dim(col: vec3<f32>, is_focused: bool) -> vec3<f32> {
     if (cam.focus.x > 0.5 && !is_focused) {
-        return mix(col, DIM_TARGET, 0.86);
+        return mix(col, DIM_TARGET, DIM_AMOUNT);
+    }
+    return col;
+}
+fn apply_focus_dim_linear(col: vec3<f32>, is_focused: bool) -> vec3<f32> {
+    if (cam.focus.x > 0.5 && !is_focused) {
+        // The CONTENT anchor, not the chrome one: this fades a lit surface toward the BACKGROUND, and the
+        // background is content — so a de-emphasised object and the backdrop it is fading into track
+        // exposure together instead of drifting apart as the slider moves.
+        return mix(col, scene_srgb_to_scene_linear(DIM_TARGET), DIM_AMOUNT);
     }
     return col;
 }
@@ -180,7 +306,11 @@ fn fs_grid(in: GridOut) -> @location(0) vec4<f32> {
     if (alpha < 0.004) {
         discard;
     }
-    return vec4<f32>(0.10, 0.12, 0.17, alpha);
+    // PREMULTIPLIED output into the linear-HDR target. The grid is the one alpha-blended scene element, and
+    // it now blends in linear light rather than over gamma-encoded pixels — which is what stops the lines
+    // going muddy where they cross a bright ground. Premultiplying (rather than straight ALPHA_BLENDING)
+    // keeps the destination alpha meaningful and the maths identical for the colour channels.
+    return vec4<f32>(unlit_srgb_to_scene_linear(GRID_COLOR) * alpha, alpha);
 }
 
 // Tracking lines (binding-by-intent edges, drawn between bound entity centres). Reuses the `instances`
@@ -287,42 +417,9 @@ fn fresnel_schlick_roughness(cos_theta: f32, f0: vec3<f32>, roughness: f32) -> v
     return f0 + (max(inv_rough, f0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
-// The lit/IBL paths work in linear HDR. Cinematic mode uses an ACES filmic fit; CAD mode uses the Khronos
-// PBR Neutral reference curve, which preserves material hue/saturation under neutral lighting. Both use
-// the exact sRGB OETF rather than a 2.2 approximation so dark gradients and brand colors remain stable.
-fn tonemap_aces(x: vec3<f32>) -> vec3<f32> {
-    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
-}
-fn tonemap_pbr_neutral(input_color: vec3<f32>) -> vec3<f32> {
-    let start_compression = 0.8 - 0.04;
-    let desaturation = 0.15;
-    let x = min(input_color.r, min(input_color.g, input_color.b));
-    let offset = select(0.04, x - 6.25 * x * x, x < 0.08);
-    let color = input_color - vec3<f32>(offset);
-    let peak = max(color.r, max(color.g, color.b));
-    if (peak < start_compression) {
-        return color;
-    }
-    let new_peak = 1.0 - (1.0 - start_compression) * (1.0 - start_compression)
-        / (peak + 1.0 - 2.0 * start_compression);
-    let compressed = color * (new_peak / peak);
-    let g = 1.0 / (desaturation * (peak - new_peak) + 1.0);
-    return mix(vec3<f32>(new_peak), compressed, g);
-}
-fn to_srgb(x: vec3<f32>) -> vec3<f32> {
-    let safe = max(x, vec3<f32>(0.0));
-    let low = safe * 12.92;
-    let high = 1.055 * pow(safe, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
-    return select(high, low, safe <= vec3<f32>(0.0031308));
-}
-fn display_encode(hdr: vec3<f32>) -> vec3<f32> {
-    let exposed = max(hdr * cam.shadow.y, vec3<f32>(0.0));
-    if (cam.shadow.z > 0.5) {
-        return to_srgb(tonemap_pbr_neutral(exposed));
-    }
-    return to_srgb(tonemap_aces(exposed));
-}
+// The tone curves and the sRGB OETF used to live here, and `fs_mesh`/`fs_sky` called them per fragment.
+// They now live in post.wgsl and run ONCE, in `fs_resolve`, against the resolved HDR scene. Everything in
+// this file stays in scene-linear radiance.
 
 // GGX/Trowbridge-Reitz normal distribution.
 fn distribution_ggx(n_dot_h: f32, rough: f32) -> f32 {
@@ -495,31 +592,45 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
     let refl = reflect(-v, n);
     let prefiltered = textureSampleLevel(env, env_samp, dir_to_equirect(refl), roughness * max_mip).rgb;
     let horizon = clamp(1.0 + dot(refl, geo_n), 0.0, 1.0);
-    // Linear HDR → tonemapped, sRGB-encoded display colour (the swapchain is linear-store).
     // AO is visibility for indirect light. Missing maps bind a white dummy, preserving prior output.
     let ao = clamp(textureSample(ao_tex, base_color_samp, in.uv).r, 0.0, 1.0);
     let specular_ao = specular_ambient_occlusion(n_dot_v_amb, ao, roughness);
     let specular_ibl = prefiltered * (f_amb * brdf.x + brdf.y) * energy_compensation
         * specular_ao * horizon * horizon;
-    var col = display_encode(diffuse_ibl * ao + specular_ibl + lo);
+    // SCENE LINEAR radiance, straight into the HDR attachment. No exposure, no tone curve, no OETF.
+    var col = diffuse_ibl * ao + specular_ibl + lo;
 
     // CAD inspection gets a restrained silhouette cue; it clarifies coincident curved bodies without
-    // painting over face colors. Selection is a subtle wash plus a strong rim instead of the old 55% flat
-    // yellow replacement, so selected materials remain inspectable.
+    // painting over face colors. A multiplicative darkening is space-agnostic, so it is unchanged.
     if (cam.shadow.z > 0.5) {
         col = col * (1.0 - 0.12 * pow(1.0 - n_dot_v_amb, 3.0));
     }
+    // Selection is a subtle wash plus a strong rim, so selected materials remain inspectable. The tint is
+    // an AUTHORED colour, converted once so it renders back as the same yellow the UI shows; the blend
+    // itself now happens in linear light, which is what keeps the rim from banding against bright metal.
     if (in.selected > 0.5) {
         let rim = smoothstep(0.12, 0.72, pow(1.0 - n_dot_v_amb, 2.2));
-        col = mix(col, vec3<f32>(1.0, 0.82, 0.16), 0.08 + 0.52 * rim);
+        col = mix(col, unlit_srgb_to_scene_linear(SELECTION_TINT), 0.08 + 0.52 * rim);
     }
-    col = apply_focus_dim(col, in.selected > 0.5);
+    col = apply_focus_dim_linear(col, in.selected > 0.5);
     return vec4<f32>(col, 1.0);
 }
 
+// The unlit fragment outputs. Both paths compose their colour in AUTHORED sRGB space (a shade multiply, a
+// selection mix, a focus dim) exactly as they always did, and this is the single point where the result
+// crosses into scene-linear HDR — they differ only in which exposure that conversion is anchored to.
+
+/// Tracking lines, the contact-debugger overlay, light/camera markers, the gizmo, the snap ghost and the
+/// pipe preview: CHROME. Constant on screen at any exposure.
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color, 1.0);
+    return vec4<f32>(unlit_srgb_to_scene_linear(in.color), 1.0);
+}
+
+/// The placeholder cubes: CONTENT. Responds to exposure like every other object in the frame.
+@fragment
+fn fs_cube(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(scene_srgb_to_scene_linear(in.color), 1.0);
 }
 
 // M11.3 inc.2 — skybox. One oversized triangle covers the screen; the fragment reconstructs the world-space
@@ -545,8 +656,10 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     let near = cam.inv_view_proj * vec4<f32>(in.ndc, 0.0, 1.0);
     let far = cam.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - near.xyz / near.w);
+    // The env map is already linear HDR radiance — it goes into the HDR attachment untouched. This is the
+    // backdrop the meshes' specular IBL reflects, so it MUST stay on the same scale as their lighting.
     let hdr = textureSampleLevel(env, env_samp, dir_to_equirect(dir), 0.0).rgb;
-    return vec4<f32>(display_encode(hdr), 1.0);
+    return vec4<f32>(hdr, 1.0);
 }
 
 // M11.3 inc.3 — depth-only shadow pass: render the same cube + mesh geometry from the light's POV into the
