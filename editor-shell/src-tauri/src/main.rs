@@ -16,6 +16,8 @@
 mod ibl;
 mod moba;
 mod render;
+mod scene_pick;
+mod terrain;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Sender};
@@ -55,15 +57,18 @@ use metrocalk_editor_shell::transform_solver::{
     Constraint, ConstraintIntent, SnapKind, SnapTarget,
 };
 use metrocalk_editor_shell::{
-    actions_for, ai_edit_material, apply_ai_patch, apply_edit, audit_asset, bake_pipe,
-    buy_marketplace, capscene, capture_scene, cleanup_asset, decode_pipe_artifact,
-    enrich_relational, land_pipe_asset, optimize_asset, project_entity, project_full,
-    rebake_pipe_in_place, replace_pipe_asset, transform_solver, ActionItem, AiPatch,
-    AssetAuditReport, AssetChangeReport, AuditOptions, CapScene, CapturedMesh, CleanupConfig,
-    EditIntent, EditTx, Log, MeshCatalog, NormalRepairMode, OptimizationConfig, OptimizationPreset,
-    Outcome, PatchOp, PipeBakeReport, PipeBuild, PipeFittingKind, PipeForgeOptions,
-    PipeForgeStatus, PipeRecipe, PipeToolSession, ProjectionDelta, ProjectionOp, Record,
-    UserFittingCatalogEntry, UvGenerationMode, Wallet,
+    actions_for, ai_edit_material, apply_ai_patch, apply_edit, audit_asset, bake_meld,
+    bake_mesh_result, bake_pipe, bake_shape, buy_marketplace, capscene, capture_scene,
+    cleanup_asset, decode_pipe_artifact, decode_shape_artifact, enrich_relational,
+    land_combined_asset, land_pipe_asset, land_shape_asset, meld_field, optimize_asset,
+    project_entity, project_full, rebake_pipe_in_place, recentre, replace_pipe_asset,
+    replace_shape_asset, shape_material, shape_specs, spawn_spot, transform_mesh_world,
+    transform_solver, ActionItem, AiPatch, AssetAuditReport, AssetChangeReport, AuditOptions,
+    CapScene, CapturedMesh, CleanupConfig, EditIntent, EditTx, Log, MeshCatalog, NormalRepairMode,
+    OptimizationConfig, OptimizationPreset, Outcome, PatchOp, PipeBakeReport, PipeBuild,
+    PipeFittingKind, PipeForgeOptions, PipeForgeStatus, PipeRecipe, PipeToolSession,
+    ProjectionDelta, ProjectionOp, Record, ShapeBuild, ShapeRecipe, ShapeReply,
+    UserFittingCatalogEntry, UvGenerationMode, Wallet, SHAPE_COMPONENT,
 };
 use metrocalk_gizmo::{
     Gizmo, GizmoMode, GizmoPivot, GizmoSpace, Handle, Ray, Transform as GizmoTransform,
@@ -76,7 +81,7 @@ use metrocalk_physics::{
 use render::{Instance, SceneState, Shared};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 // C10: a real first-run must open onto a SMALL, navigable scene — never the 5,000-entity stress wall. The
@@ -185,6 +190,9 @@ struct AssetsRuntime {
     animation_assets: HashMap<String, metrocalk_assets::AnimationAsset>,
     /// Editable sources recovered from `MTKPIPE1` artifacts, keyed by the same handle the scene carries.
     pipe_recipes: HashMap<String, PipeRecipe>,
+    /// Editable sources recovered from `MTKSHAP1` artifacts (Shape Studio), keyed by handle. Shape
+    /// meshes are real-metre geometry — membership here keeps the display affine at identity.
+    shape_recipes: HashMap<String, ShapeRecipe>,
 }
 
 /// Replace any older loaded revision of one logical animation asset. Runtime lookup is deliberately
@@ -346,6 +354,7 @@ fn load_assets() -> AssetsRuntime {
     let blob_dir = sidecar("metrocalk-assets");
     let mut blobs_loaded = 0usize;
     let mut pipe_recipes = HashMap::new();
+    let mut shape_recipes: HashMap<String, ShapeRecipe> = HashMap::new();
     let mut authored_affines: HashMap<String, AssetAffine> = HashMap::new();
     let mut animation_assets: HashMap<String, metrocalk_assets::AnimationAsset> = HashMap::new();
     for (id, bytes) in metrocalk_editor_shell::blobstore::load_all(&blob_dir) {
@@ -394,11 +403,22 @@ fn load_assets() -> AssetsRuntime {
                     store.insert(id, asset);
                     blobs_loaded += 1;
                 }
-                Ok(None) => {
-                    if reimport_persisted_blob(&mut store, &importer, &bytes) {
+                // Shape Studio artifacts: a recipe-form blob REBUILDS its mesh deterministically here
+                // (the recipe is the durable unit — a shape can never die with the process); a
+                // mesh-form blob (combine/meld result) carries its geometry.
+                Ok(None) => match decode_shape_artifact(&bytes) {
+                    Ok(Some((recipe, asset))) => {
+                        shape_recipes.insert(id.as_str().to_string(), recipe);
+                        store.insert(id, asset);
                         blobs_loaded += 1;
                     }
-                }
+                    Ok(None) => {
+                        if reimport_persisted_blob(&mut store, &importer, &bytes) {
+                            blobs_loaded += 1;
+                        }
+                    }
+                    Err(e) => eprintln!("[shell] shape artifact {} rejected — {e}", id.as_str()),
+                },
                 Err(e) => eprintln!("[shell] pipe artifact {} rejected — {e}", id.as_str()),
             },
         }
@@ -454,14 +474,15 @@ fn load_assets() -> AssetsRuntime {
     let mut provenance: HashMap<String, metrocalk_assets::Provenance> = HashMap::new();
     for (id, asset) in store.iter() {
         let slot = meshes.len();
-        let affine = if pipe_recipes.contains_key(id.as_str()) {
-            AssetAffine::IDENTITY
-        } else {
-            authored_affines
-                .get(id.as_str())
-                .copied()
-                .unwrap_or_else(|| AssetAffine::unit_from_bounds(asset.bounds()))
-        };
+        let affine =
+            if pipe_recipes.contains_key(id.as_str()) || shape_recipes.contains_key(id.as_str()) {
+                AssetAffine::IDENTITY
+            } else {
+                authored_affines
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or_else(|| AssetAffine::unit_from_bounds(asset.bounds()))
+            };
         let mut gpu = MeshGpu::from_asset(asset);
         gpu.apply_affine(affine);
         meshes.push(gpu);
@@ -500,6 +521,7 @@ fn load_assets() -> AssetsRuntime {
         provenance,
         animation_assets,
         pipe_recipes,
+        shape_recipes,
     }
 }
 
@@ -538,6 +560,110 @@ fn persist_and_register_pipe(
     Ok(())
 }
 
+/// Make a Shape Studio artifact durable and available to every runtime projection (asset store,
+/// renderer and editable-source lookup) as one checked operation — the pipe discipline, shared by a
+/// live bake and project recovery. Persist-first: only a durable content address may enter the doc.
+/// Assemble the object's clause list + the whole sentence the rule now reads as. The role's OWN clause is
+/// shown greyed with provenance, so the user's first exposure to conditionals is READING the one their role
+/// card already wrote — not facing a blank builder.
+fn condition_list_info(engine: &Engine<FlecsWorld>, entity: EntityId) -> ConditionListInfo {
+    let clauses = metrocalk_editor_shell::clauses_of(engine, entity);
+    let row = |(index, c): (usize, &metrocalk_core::rules::Condition), any: bool| ClauseRow {
+        reads: metrocalk_editor_shell::describe_clause(engine, c),
+        index,
+        any,
+    };
+    let all: Vec<ClauseRow> = clauses
+        .all
+        .iter()
+        .enumerate()
+        .map(|c| row(c, false))
+        .collect();
+    let any: Vec<ClauseRow> = clauses
+        .any
+        .iter()
+        .enumerate()
+        .map(|c| row(c, true))
+        .collect();
+
+    let role = metrocalk_editor_shell::role_of(engine, entity);
+    let (role_clause, verb) = match role.as_deref() {
+        Some("collectible") => (
+            Some("it hasn't been collected yet".to_string()),
+            Some((
+                "something touches this object",
+                "collect it and add to the Score",
+            )),
+        ),
+        Some("enemy") => (
+            Some("it hasn't been beaten yet".to_string()),
+            Some((
+                "a companion strikes this object",
+                "beat it and add to the Score",
+            )),
+        ),
+        _ => (None, None),
+    };
+
+    // The sentence — the whole point of the surface. Built from the same fragments the chips show, so
+    // what the user reads and what the engine runs can never drift.
+    let sentence = verb.map_or_else(String::new, |(when, then)| {
+        let mut ifs: Vec<String> = role_clause.iter().cloned().collect();
+        ifs.extend(all.iter().map(|r| r.reads.clone()));
+        let mut s = format!("When {when},");
+        if !ifs.is_empty() {
+            s.push_str(&format!(" only if {}", ifs.join(" and ")));
+        }
+        if !any.is_empty() {
+            let alts: Vec<String> = any.iter().map(|r| r.reads.clone()).collect();
+            s.push_str(&format!(
+                "{} either {}",
+                if ifs.is_empty() { " only if" } else { " and" },
+                alts.join(" or ")
+            ));
+        }
+        s.push_str(&format!(", {then}."));
+        s
+    });
+
+    ConditionListInfo {
+        all,
+        any,
+        role_clause,
+        sentence,
+    }
+}
+
+fn persist_and_register_shape(
+    assets: &mut AssetsRuntime,
+    shared: &Shared,
+    built: &ShapeBuild,
+) -> Result<(), String> {
+    let persisted =
+        metrocalk_editor_shell::blobstore::put(&sidecar("metrocalk-assets"), &built.artifact_bytes)
+            .map_err(|e| format!("could not save the shape: {e}"))?;
+    if persisted.as_str() != built.handle {
+        return Err("shape artifact identity changed while persisting".into());
+    }
+    if !assets.handle_to_slot.contains_key(&built.handle) {
+        // Shapes are authored in metres and keep their real scale — no normalization.
+        let gpu = MeshGpu::from_asset(&built.asset);
+        let slot = assets.meshes.len();
+        assets.meshes.push(gpu.clone());
+        assets.scales.push(1.0);
+        assets.display_affines.push(AssetAffine::IDENTITY);
+        assets.handle_to_slot.insert(built.handle.clone(), slot);
+        let mut st = shared.lock().unwrap();
+        st.meshes.push(gpu);
+        st.meshes_revision = st.meshes_revision.wrapping_add(1);
+    }
+    assets.store.insert(persisted, built.asset.clone());
+    assets
+        .shape_recipes
+        .insert(built.handle.clone(), built.recipe.clone());
+    Ok(())
+}
+
 fn rebuild_document_pipe(expected: &str, source: &str) -> Result<PipeBuild, String> {
     let recipe = serde_json::from_str::<PipeRecipe>(source)
         .map_err(|_| "the editable recipe is corrupt".to_string())?;
@@ -546,6 +672,58 @@ fn rebuild_document_pipe(expected: &str, source: &str) -> Result<PipeBuild, Stri
         return Err("the editable recipe does not match the saved asset identity".into());
     }
     Ok(built)
+}
+
+/// Regenerate the terrain's stand-in vegetation meshes after a project is opened.
+///
+/// The `.mtk` file is the Loro document and nothing else, while the generated tree/shrub/grass/boulder
+/// meshes live only in this process's `AssetStore`. The recipe's prototype handles therefore survive a save
+/// perfectly and resolve to nothing on the next launch: `slot_of` returns -1, the scatter draw is skipped,
+/// and the world reopens bald — with no error, and with the panel still reporting a healthy instance count.
+///
+/// Regeneration rather than persistence, because the geometry is a pure function of the prototype's own
+/// name and every handle is a content address over the bytes it produced: running it again reproduces the
+/// same handles exactly. Only the handles the recipe actually references are registered, so a prototype
+/// bound to real imported art is left alone.
+///
+/// Returns how many meshes were restored.
+fn restore_terrain_proto_assets(engine: &Engine<FlecsWorld>, assets: &mut AssetsRuntime) -> usize {
+    use metrocalk_editor_shell::terrain_intent;
+    let mut restored = 0usize;
+    for id in terrain_intent::terrains(engine) {
+        let Ok(recipe) = terrain_intent::read(engine, id) else {
+            continue;
+        };
+        // Which handles the document expects but this process cannot resolve.
+        let wanted: std::collections::BTreeSet<String> = recipe
+            .protos
+            .iter()
+            .flat_map(|p| {
+                std::iter::once(p.mesh_key.clone())
+                    .chain(p.lod_keys.iter().cloned())
+                    .chain(p.impostor_key.clone())
+            })
+            .filter(|k| !k.is_empty() && !assets.handle_to_slot.contains_key(k))
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        for installed in terrain_intent::regenerate_stand_in_protos(&mut assets.store, &recipe) {
+            for (handle, asset) in &installed.assets {
+                if !wanted.contains(handle) || assets.handle_to_slot.contains_key(handle) {
+                    continue;
+                }
+                let gpu = MeshGpu::from_asset(asset);
+                let slot = assets.meshes.len();
+                assets.meshes.push(gpu);
+                assets.scales.push(1.0);
+                assets.display_affines.push(AssetAffine::IDENTITY);
+                assets.handle_to_slot.insert(handle.clone(), slot);
+                restored += 1;
+            }
+        }
+    }
+    restored
 }
 
 /// Reconstruct missing Pipe Forge artifacts from the editable recipes carried by the scene document.
@@ -591,6 +769,61 @@ fn restore_document_pipe_assets(
             Ok(()) => restored += 1,
             Err(reason) => errors.push(format!("{entity}: {reason}")),
         }
+    }
+    (restored, errors)
+}
+
+/// The shape counterpart of [`restore_document_pipe_assets`]: any document entity whose
+/// `ShapeRecipe.source` survives but whose mesh blob is missing rebuilds DETERMINISTICALLY from the
+/// recipe (same recipe ⇒ same content address) — a parametric or drawn shape can never die with a
+/// lost sidecar. Combine/meld results carry non-re-derivable geometry; their loss is NAMED in the
+/// returned errors, never silent.
+fn restore_document_shape_assets(
+    engine: &Engine<FlecsWorld>,
+    assets: &mut AssetsRuntime,
+    shared: &Shared,
+) -> (usize, Vec<String>) {
+    let candidates: Vec<(String, String, String)> = engine
+        .entity_ids()
+        .into_iter()
+        .filter_map(|id| {
+            let comps = engine.components_of(id);
+            let FieldValue::Str(handle) = comps
+                .get("MeshRenderer")
+                .and_then(|m| m.get(capscene::MESH_FIELD))?
+            else {
+                return None;
+            };
+            if assets.handle_to_slot.contains_key(handle) {
+                return None;
+            }
+            let FieldValue::Str(source) =
+                comps.get(SHAPE_COMPONENT).and_then(|m| m.get("source"))?
+            else {
+                return None;
+            };
+            Some((id.to_loro_key(), handle.clone(), source.clone()))
+        })
+        .collect();
+
+    let mut restored = 0usize;
+    let mut errors = Vec::new();
+    for (entity, expected, source) in candidates {
+        if assets.handle_to_slot.contains_key(&expected) {
+            continue; // another entity already restored this shared content-addressed asset
+        }
+        let result = metrocalk_editor_shell::rebuild_from_source(&expected, &source)
+            .and_then(|built| persist_and_register_shape(assets, shared, &built));
+        match result {
+            Ok(()) => restored += 1,
+            Err(reason) => errors.push(format!("{entity}: {reason}")),
+        }
+    }
+    if restored > 0 {
+        eprintln!("[shell] rebuilt {restored} shape mesh(es) from their document recipes");
+    }
+    for e in &errors {
+        eprintln!("[shell] shape asset NOT restorable — {e}");
     }
     (restored, errors)
 }
@@ -2002,6 +2235,27 @@ enum EngineCmd {
         elapsed_ms: f64,
     },
     Edit(EditTx),
+    /// M19 — create a terrain from a preset (one undoable transaction).
+    TerrainCreate {
+        preset: String,
+        reply: mpsc::Sender<TerrainReply>,
+    },
+    /// M19 — build (or rebuild) a terrain from a plain-language description, one undoable transaction.
+    TerrainDescribe {
+        text: String,
+        reply: mpsc::Sender<TerrainReply>,
+    },
+    /// M19.2 — compile a sentence into a plan and report it, changing nothing.
+    TerrainPlan {
+        text: String,
+        reply: mpsc::Sender<TerrainPlanDto>,
+    },
+    /// M19 — apply one terrain edit, or (with `edit: None`) read the current recipe and validation back.
+    TerrainEdit {
+        entity: Option<String>,
+        edit: Box<Option<metrocalk_editor_shell::terrain_intent::TerrainEdit>>,
+        reply: mpsc::Sender<TerrainReply>,
+    },
     /// Undo the last transaction; reply whether anything was actually reverted (so the UI can be honest —
     /// "undo" vs "nothing to undo" — instead of always claiming a revert on an empty history).
     Undo {
@@ -2465,6 +2719,124 @@ enum EngineCmd {
     },
     PipeStatus {
         reply: Sender<PipeForgeStatus>,
+    },
+    /// Gameplay roles — assign a role to an entity (components + animation + rule + Score binding as
+    /// ONE undoable commit); replies what was added or a plain-language refusal.
+    RoleAssign {
+        id: String,
+        role: String,
+        reply: Sender<metrocalk_editor_shell::RoleReply>,
+    },
+    /// Gameplay roles — remove a role and what it added (one undoable commit).
+    RoleClear {
+        id: String,
+        reply: Sender<metrocalk_editor_shell::RoleReply>,
+    },
+    /// VFX - add one effect layer to an object (one undoable commit).
+    VfxAdd {
+        id: String,
+        kind: String,
+        trigger: String,
+        reply: Sender<metrocalk_editor_shell::VfxReply>,
+    },
+    /// VFX - remove one effect layer by index.
+    VfxRemove {
+        id: String,
+        index: usize,
+        reply: Sender<metrocalk_editor_shell::VfxReply>,
+    },
+    /// VFX - read the effects on an object back as sentences.
+    VfxList {
+        id: String,
+        reply: Sender<metrocalk_editor_shell::VfxReply>,
+    },
+    /// Cinematics - append one shot to an object's cutscene (one undoable commit).
+    CinemaAddShot {
+        id: String,
+        kind: String,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - remove one shot by index.
+    CinemaRemoveShot {
+        id: String,
+        index: usize,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - read an object's cutscene back as sentences.
+    CinemaList {
+        id: String,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Conditionals - add one "only if" clause to an object (one undoable commit).
+    ConditionAdd {
+        id: String,
+        request: metrocalk_editor_shell::ClauseRequest,
+        reply: Sender<metrocalk_editor_shell::RoleReply>,
+    },
+    /// Conditionals — remove one clause by index (`any` picks the OR group).
+    ConditionRemove {
+        id: String,
+        index: usize,
+        any: bool,
+        reply: Sender<metrocalk_editor_shell::RoleReply>,
+    },
+    /// Conditionals — the object's clauses, already rendered as sentence fragments.
+    ConditionList {
+        id: String,
+        reply: Sender<ConditionListInfo>,
+    },
+    /// Gameplay roles — the player's live movement axis (pressed keys), fire-and-forget. The
+    /// resulting per-tick impulses are RECORDED (the replay input channel), so a scrub replays
+    /// the drive; the axis itself is transient play state.
+    PlayerInput {
+        x: f64,
+        z: f64,
+    },
+    /// Gameplay roles — the roster + the score (LIVE from the rules RuntimeState during Play).
+    RoleStatus {
+        reply: Sender<metrocalk_editor_shell::RoleStatusInfo>,
+    },
+    /// Shape Studio — spawn a parametric shape from the catalog with its default parameters, at `pos`
+    /// (or the deterministic golden-angle scatter when `None`). One undoable commit; replies the
+    /// landed entity or a plain-language refusal.
+    ShapeSpawn {
+        kind: String,
+        pos: Option<[f32; 3]>,
+        reply: Sender<ShapeReply>,
+    },
+    /// Shape Studio — re-bake an existing shape entity with edited parameters and swap its mesh +
+    /// editable recipe in one undoable commit (position untouched).
+    ShapeUpdate {
+        id: String,
+        params: std::collections::BTreeMap<String, f64>,
+        reply: Sender<ShapeReply>,
+    },
+    /// Shape Studio — turn a drawn outline into a solid: `mode` = "extrude" (ground plan, raised by
+    /// `height`, walls tapered toward the centroid by `taper` ≤ 1) or "revolve" (side profile spun
+    /// around the vertical axis, `segments` facets).
+    ShapeDraw {
+        mode: String,
+        profile: Vec<[f64; 2]>,
+        height: f64,
+        segments: f64,
+        taper: f64,
+        reply: Sender<ShapeReply>,
+    },
+    /// Shape Studio — exact-predicate boolean of two entities' world-space meshes (union | carve |
+    /// intersect). Creates the result AND retires both sources in ONE undoable commit.
+    ShapeCombine {
+        a: String,
+        b: String,
+        op: String,
+        reply: Sender<ShapeReply>,
+    },
+    /// Shape Studio — meld two shape entities into one smooth blob (SDF smooth-union, blend radius
+    /// `k`), same one-commit replace semantics as Combine.
+    ShapeMeld {
+        a: String,
+        b: String,
+        k: f64,
+        reply: Sender<ShapeReply>,
     },
     /// M11.3 — author a Light entity (Directional/Point/Spot), one undoable commit. Replies its id.
     AddLight {
@@ -6354,6 +6726,15 @@ struct AppState {
     /// The live MOB match, if one is running. Render-side transient state exactly like the other viewport
     /// tools: it never touches the ECS/Loro document, so it needs no engine-thread round trip.
     moba: Mutex<Option<moba::MobaSession>>,
+    /// The picking view of the scene: a BVH over world bounds plus one BVH per mesh asset.
+    ///
+    /// Kept beside the render state rather than inside it because it is derived, not authored, and
+    /// because rebuilding it is the picker's business: it re-syncs itself from the render revisions it
+    /// already watches, so no call site has to remember to invalidate it.
+    picking: Mutex<scene_pick::PickCache>,
+    /// The one selection. The renderer's `selected` index and the front end's ids are both projections
+    /// of this; previously each kept its own copy and they drifted apart on any structural change.
+    selection: Mutex<metrocalk_spatial::SelectionModel>,
 }
 
 fn inactive_pipe_status(message: impl Into<String>) -> PipeForgeStatus {
@@ -7496,6 +7877,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // artifact before the first viewport projection.
     let (pipe_assets_restored, pipe_restore_errors) =
         restore_document_pipe_assets(&engine, &mut assets, &shared);
+    restore_document_shape_assets(&engine, &mut assets, &shared);
+    restore_terrain_proto_assets(&engine, &mut assets);
     if pipe_assets_restored > 0 {
         eprintln!(
             "[shell] reconstructed {pipe_assets_restored} procedural asset(s) from project recipes"
@@ -7521,6 +7904,78 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // Cancel or new session increments this fence so a worker can never land stale geometry afterward.
     let mut pipe_tool: Option<PipeToolSession> = None;
     let mut pipe_revision: u64 = 0;
+    // Shape Studio's spawn scatter slot — a session counter, so quick successive spawns land on the
+    // golden-angle spiral instead of stacking at the origin. Never persisted (positions are).
+    let mut shape_seq: u32 = 0;
+    // The gameplay-roles touch cache: every ACTIVE collectible's authored position + trigger radius,
+    // snapshotted at Play start (collectibles are static during Play — only physics bodies move).
+    // Play-session state only; rebuilt every Play, dropped on Stop.
+    let mut play_collectibles: Vec<PlayCollectible> = Vec::new();
+    // The companion cast, snapshotted at Play start (positions read LIVE from the sim each tick).
+    let mut play_companions: Vec<PlayCompanion> = Vec::new();
+    let mut play_enemies: Vec<(EntityId, String, String)> = Vec::new();
+    let mut play_props: Vec<EntityId> = Vec::new();
+    let mut play_waypoints: Vec<[f64; 3]> = Vec::new();
+    // The player(s): entity + speed, driven by the live key axis through the recorded channel.
+    let mut play_players: Vec<(EntityId, f64)> = Vec::new();
+    // EVERY role-carrying object in the run: the generic effect read-back walks this, so a rule that
+    // deactivates ANY object (a door, a switch, a secret wall) shows on screen — not only the two
+    // hardcoded pickup/defeat cells.
+    let mut play_roles: Vec<(EntityId, String)> = Vec::new();
+    // TIME. Countdowns armed at Play start; when one elapses the loop fires `After` for that object,
+    // exactly the way the touch bridge fires `Touched`. This is the engine's first event that comes
+    // from nothing but elapsed time — fuses, crumbling platforms and timed gates need it to exist.
+    let mut play_countdowns: Vec<(EntityId, String, u32)> = Vec::new();
+    // CINEMATICS. Cutscenes armed at Play start: (entity, key, cutscene, start_frame or None while
+    // idle). The camera pose is SOLVED each tick from the recipe against the subject's live position
+    // and published to `cam_override` — a render projection, never a document write.
+    // The editor view a cutscene borrowed, returned verbatim when it ends.
+    let mut cinema_saved_cam: Option<Option<render::CamView>> = None;
+    // WHO owns the camera. There is one camera, so a cutscene either has it or does not: the first to
+    // ask holds it until its shots run out, and everyone else is skipped rather than fighting for the
+    // view frame by frame. Found by a live test where two authored cutscenes produced a camera aimed
+    // at neither subject in particular - whichever happened to be resolved last that tick won.
+    let mut cinema_owner: Option<EntityId> = None;
+    // The instance whose selection outline a cutscene borrowed, and its original flag. Restored the
+    // moment the shot ends, so the author's selection is never actually changed - only hidden.
+    let mut cinema_dimmed: Option<(String, f32)> = None;
+    // (entity, key, cutscene, start frame while running, ALREADY PLAYED).
+    //
+    // The last flag is what stops a cutscene re-arming itself. `Cinematic.playing` is authored true and
+    // Play never writes the document, so the instant the shots ran out and the camera was released the
+    // very next tick saw `wants == true, started == None` and started the whole thing again — forever.
+    // "The camera takes over, then hands back" was never true. A cutscene now plays ONCE per Play run
+    // unless a rule cycles `playing` false and true again, which is the deliberate re-trigger.
+    type ArmedCutscene = (
+        EntityId,
+        String,
+        metrocalk_animation::shot::Cutscene,
+        Option<u64>,
+        bool,
+    );
+    let mut play_cinematics: Vec<ArmedCutscene> = Vec::new();
+    // VFX. Effects armed at Play start: (entity, key, stack, start_frame or None while idle). A
+    // particle is a pure function of (recipe, index, seconds-since-start), so this holds NO simulation
+    // state — only when each effect began. Resolved every tick into `fx_additive`/`fx_soft`, which are
+    // render projections: the document is never written and Stop clears them.
+    let mut play_vfx: Vec<(
+        EntityId,
+        String,
+        metrocalk_animation::vfx::EffectStack,
+        Option<u64>,
+    )> = Vec::new();
+    // One-shot effects fired by a MOMENT (a pick-up, a hit) rather than by a rule. Each is a detached
+    // copy anchored where the moment happened, because the object that triggered it is often gone by
+    // the next frame: (stack, world origin, radius, start_frame).
+    // Last-seen hp per object, so the "when it's hit" moment is an EDGE (hp went down) rather than a
+    // level (hp is low) — a level would re-fire the effect every tick for the rest of the run.
+    let mut play_vfx_hp: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut play_vfx_bursts: Vec<(metrocalk_animation::vfx::EffectStack, [f32; 3], f32, u64)> =
+        Vec::new();
+    let mut player_axis: [f64; 2] = [0.0, 0.0];
+    // Defeated enemies tumble from the knockback for a beat BEFORE vanishing — (entity, key,
+    // ticks left). The drama is visible; the hide still lands and Stop still restores.
+    let mut dying_enemies: Vec<(EntityId, String, u32)> = Vec::new();
     // Last-touched sequence per entity (higher = more recent) — the reveal's recency ranking signal,
     // bumped on every committed edit/bind so it's live, not inert.
     let mut recency: HashMap<Entity, u64> = HashMap::new();
@@ -7791,6 +8246,269 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .map(|eid| compute_reveal(&engine, &scene, &positions, &recency, eid))
                     .unwrap_or_default();
                 let _ = reply.send(resp);
+            }
+            EngineCmd::TerrainCreate { preset, reply } => {
+                use metrocalk_editor_shell::terrain_intent;
+                // ADR-034: the authored scene must not change while the scene is RUNNING. Terrain never
+                // honoured that — the guard lives on `EngineCmd::Edit`, and these three commands do not go
+                // through it — so an author could sculpt during Play, watch the hill rise in the viewport,
+                // and have every body keep walking through it: the collider is derived once by
+                // `restart_run` and nothing re-derives it. Refusing is the honest half of the fix; the
+                // other half is that a terrain command can SAY so, which the silent `continue` on the edit
+                // path cannot.
+                if play_mode {
+                    let _ = reply.send(TerrainReply {
+                        message: "stop the scene before changing the terrain".into(),
+                        ..TerrainReply::default()
+                    });
+                    continue;
+                }
+                let answer = match terrain_intent::create_from_preset(
+                    &mut engine,
+                    &scene,
+                    &preset,
+                    [0.0, 0.0, 0.0],
+                ) {
+                    Err(e) => TerrainReply {
+                        message: e.to_string(),
+                        ..TerrainReply::default()
+                    },
+                    Ok((id, recipe)) => {
+                        // Generate and bind stand-in meshes so the preset's woodland is actually there. A
+                        // preset that declares 110 trees per hectare and shows an empty field teaches the
+                        // author the feature is broken.
+                        let final_recipe = install_terrain_stand_ins(&mut engine, &mut assets, id)
+                            .unwrap_or(recipe);
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                        frame_new_terrain(&shared, &final_recipe);
+                        // Without this the outliner never learns the terrain exists: the scene reads "0
+                        // objects" and the first-run empty state sits over a fully streamed landscape.
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        terrain_reply(id, &final_recipe, &shared)
+                    }
+                };
+                let _ = reply.send(answer);
+            }
+            EngineCmd::TerrainPlan { text, reply } => {
+                use metrocalk_editor_shell::terrain_intent;
+                use metrocalk_terrain::{operation, plan};
+                let ctx = plan_context(&shared);
+                let recipe = terrain_intent::only_terrain(&engine)
+                    .and_then(|id| terrain_intent::read(&engine, id).ok());
+                let p = plan::compile(&text, recipe.as_ref(), &ctx);
+                let mut dto = TerrainPlanDto {
+                    kind: if p.is_creation() { "create" } else { "modify" }.into(),
+                    understood: p
+                        .understood
+                        .iter()
+                        .filter_map(|u| serde_json::to_value(u).ok())
+                        .collect(),
+                    unused: p.unused.clone(),
+                    notes: p.notes.clone(),
+                    steps: Vec::new(),
+                    ok: true,
+                };
+                // Resolve each operation against a WORKING COPY, so a preview shows the second step's effect
+                // as it will really be — after the first one has run — without touching the document.
+                if let Some(mut working) = recipe.clone() {
+                    for op in p.operations() {
+                        let step = match operation::resolve(op, &working) {
+                            Err(r) => {
+                                dto.ok = false;
+                                PlanStepDto {
+                                    verb: op.verb.label().into(),
+                                    effect: String::new(),
+                                    refusal: Some(r.reason),
+                                    suggestion: r.suggestion,
+                                    ..PlanStepDto::default()
+                                }
+                            }
+                            Ok(res) => {
+                                let region = Some([
+                                    res.region.min[0],
+                                    res.region.min[1],
+                                    res.region.max[0],
+                                    res.region.max[1],
+                                ]);
+                                let rebuilds = res.stages.describe();
+                                let effect = res.effect.clone();
+                                // Advance the working copy so the next step sees this one's result.
+                                let _ = operation::apply(&res, &mut working);
+                                PlanStepDto {
+                                    verb: op.verb.label().into(),
+                                    effect,
+                                    refusal: None,
+                                    suggestion: None,
+                                    rebuilds,
+                                    region,
+                                }
+                            }
+                        };
+                        dto.steps.push(step);
+                    }
+                }
+                let _ = reply.send(dto);
+            }
+            EngineCmd::TerrainDescribe { text, reply } => {
+                use metrocalk_editor_shell::terrain_intent::{self, TerrainEdit};
+                use metrocalk_terrain::plan;
+                // ADR-034: the authored scene must not change while the scene is RUNNING. Terrain never
+                // honoured that — the guard lives on `EngineCmd::Edit`, and these three commands do not go
+                // through it — so an author could sculpt during Play, watch the hill rise in the viewport,
+                // and have every body keep walking through it: the collider is derived once by
+                // `restart_run` and nothing re-derives it. Refusing is the honest half of the fix; the
+                // other half is that a terrain command can SAY so, which the silent `continue` on the edit
+                // path cannot.
+                if play_mode {
+                    let _ = reply.send(TerrainReply {
+                        message: "stop the scene before changing the terrain".into(),
+                        ..TerrainReply::default()
+                    });
+                    continue;
+                }
+                // ONE box, two meanings. With no terrain, or a sentence that describes a world, this builds
+                // one. With a terrain and a sentence that CHANGES something, it compiles operations and
+                // edits in place — keeping every hand edit. Deciding here rather than in the UI is what lets
+                // an author type either without knowing which mode they are in.
+                let existing = terrain_intent::only_terrain(&engine);
+                let ctx = plan_context(&shared);
+                let current = existing.and_then(|id| terrain_intent::read(&engine, id).ok());
+                let compiled = plan::compile(&text, current.as_ref(), &ctx);
+                let local_ops: Vec<_> = compiled.operations().to_vec();
+
+                let outcome = match (existing, compiled.is_creation()) {
+                    (None, _) => terrain_intent::create_from_description(
+                        &mut engine,
+                        &scene,
+                        &text,
+                        [0.0, 0.0, 0.0],
+                    ),
+                    // A LOCAL edit: one undo step, a bounded region, hand edits untouched.
+                    (Some(id), false) if !local_ops.is_empty() => {
+                        let edit = TerrainEdit::Apply { ops: local_ops };
+                        terrain_intent::apply_edit(&mut engine, id, &edit).map(|(r, effect)| {
+                            TERRAIN_DIRTY.with(|c| c.set(effect.bounds()));
+                            TERRAIN_STAGES.with(|c| c.set(Some(effect.stages)));
+                            (id, r, metrocalk_terrain::describe::read(&text))
+                        })
+                    }
+                    // A different world: every derived artefact is stale, which is what `None` means.
+                    (Some(id), _) => {
+                        TERRAIN_DIRTY.with(|c| c.set(None));
+                        TERRAIN_STAGES.with(|c| c.set(None));
+                        let edit = TerrainEdit::Describe { text: text.clone() };
+                        terrain_intent::apply_edit(&mut engine, id, &edit)
+                            .map(|(r, _)| (id, r, metrocalk_terrain::describe::read(&text)))
+                    }
+                };
+                let answer = match outcome {
+                    Err(e) => TerrainReply {
+                        message: e.to_string(),
+                        ..TerrainReply::default()
+                    },
+                    Ok((id, recipe, reading)) => {
+                        let final_recipe = install_terrain_stand_ins(&mut engine, &mut assets, id)
+                            .unwrap_or(recipe);
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                        // Only a NEW world re-frames. Flying the camera away because the author asked to
+                        // raise the mountain in front of them would make every refinement disorienting.
+                        if existing.is_none() || compiled.is_creation() {
+                            frame_new_terrain(&shared, &final_recipe);
+                        }
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        TerrainReply {
+                            reading: serde_json::to_value(&reading).ok(),
+                            ..terrain_reply(id, &final_recipe, &shared)
+                        }
+                    }
+                };
+                let _ = reply.send(answer);
+            }
+            EngineCmd::TerrainEdit {
+                entity,
+                edit,
+                reply,
+            } => {
+                use metrocalk_editor_shell::terrain_intent::{self, TerrainEdit};
+                // ADR-034: the authored scene must not change while the scene is RUNNING. Terrain never
+                // honoured that — the guard lives on `EngineCmd::Edit`, and these three commands do not go
+                // through it — so an author could sculpt during Play, watch the hill rise in the viewport,
+                // and have every body keep walking through it: the collider is derived once by
+                // `restart_run` and nothing re-derives it. Refusing is the honest half of the fix; the
+                // other half is that a terrain command can SAY so, which the silent `continue` on the edit
+                // path cannot.
+                if play_mode {
+                    let _ = reply.send(TerrainReply {
+                        message: "stop the scene before changing the terrain".into(),
+                        ..TerrainReply::default()
+                    });
+                    continue;
+                }
+                let target = entity
+                    .as_deref()
+                    .and_then(EntityId::from_loro_key)
+                    .or_else(|| terrain_intent::only_terrain(&engine));
+                let answer = match target {
+                    None => TerrainReply {
+                        message: "there is no terrain in the scene yet".into(),
+                        ..TerrainReply::default()
+                    },
+                    Some(id) => {
+                        // Cleared first: a REJECTED edit must not leave a stale rectangle behind for the
+                        // next unrelated change to be mis-invalidated by.
+                        TERRAIN_DIRTY.with(|c| c.set(None));
+                        TERRAIN_STAGES.with(|c| c.set(None));
+                        let outcome = match edit.as_ref() {
+                            // No edit: a read. The UI uses this to refresh after an undo or a project open
+                            // without pretending to have changed anything.
+                            None => terrain_intent::read(&engine, id),
+                            // The edit REPORTS what it touched — region and derived stages — so
+                            // `sync_terrain` rebuilds exactly that instead of guessing.
+                            Some(e) => terrain_intent::apply_edit(&mut engine, id, e).map(
+                                |(recipe, effect)| {
+                                    TERRAIN_DIRTY.with(|c| c.set(effect.bounds()));
+                                    TERRAIN_STAGES.with(|c| c.set(Some(effect.stages)));
+                                    recipe
+                                },
+                            ),
+                        };
+                        match outcome {
+                            Err(e) => TerrainReply {
+                                entity: id.to_string(),
+                                message: e.to_string(),
+                                stats: terrain_stats_dto(&shared, 0, 0.0),
+                                ..TerrainReply::default()
+                            },
+                            Ok(recipe) => {
+                                // A preset swap replaces the prototype list wholesale, so the new one
+                                // arrives unbound. Without this, changing preset silently strips every
+                                // tree from the world and the scatter rules become decoration.
+                                let bound = install_terrain_stand_ins(&mut engine, &mut assets, id)
+                                    .unwrap_or(recipe);
+                                rebuild(&engine, &shared, &mut positions, &assets);
+                                // A different preset is a different world; keep the camera pointed at it.
+                                if matches!(
+                                    edit.as_ref(),
+                                    Some(
+                                        TerrainEdit::ApplyPreset { .. }
+                                            | TerrainEdit::SetExtent { .. }
+                                    )
+                                ) {
+                                    frame_new_terrain(&shared, &bound);
+                                }
+                                if let Some(ch) = &channel {
+                                    send_proj!(ch, proj_full(&engine, &scene));
+                                }
+                                terrain_reply(id, &bound, &shared)
+                            }
+                        }
+                    }
+                };
+                let _ = reply.send(answer);
             }
             EngineCmd::Bind { from, to } => {
                 if let (Some(f), Some(t)) =
@@ -8412,6 +9130,1164 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     }
                 }
             }
+            // ── Gameplay roles: one commit from asset to live gameplay participant ──
+            EngineCmd::RoleAssign { id, role, reply } => {
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(metrocalk_editor_shell::RoleReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(metrocalk_editor_shell::RoleReply::refusal(
+                        "stop Play first — roles are authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::assign_role(
+                    &mut engine,
+                    &scene,
+                    &rules_registry,
+                    entity,
+                    &role,
+                ) {
+                    Ok(outcome) => {
+                        log.append(&Record::RoleAssign {
+                            id: id.clone(),
+                            role: role.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                        let label = metrocalk_editor_shell::role_specs()
+                            .into_iter()
+                            .find(|s| s.kind == outcome.role)
+                            .map_or_else(|| outcome.role.clone(), |s| s.label.to_string());
+                        let _ = reply.send(metrocalk_editor_shell::RoleReply {
+                            applied: Some(outcome.role.clone()),
+                            entity: Some(id),
+                            message: format!("Now a {label} · added {}", outcome.added.join(" · ")),
+                            added: outcome.added,
+                            score_entity: outcome.score_entity,
+                            reason: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ =
+                            reply.send(metrocalk_editor_shell::RoleReply::refusal(e.to_string()));
+                    }
+                }
+            }
+            EngineCmd::RoleClear { id, reply } => {
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(metrocalk_editor_shell::RoleReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(metrocalk_editor_shell::RoleReply::refusal(
+                        "stop Play first — roles are authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::clear_role(&mut engine, entity) {
+                    Ok(()) => {
+                        log.append(&Record::RoleClear { id: id.clone() });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                        let _ = reply.send(metrocalk_editor_shell::RoleReply {
+                            entity: Some(id),
+                            message: "Role cleared — the object keeps its mesh and transform"
+                                .into(),
+                            ..Default::default()
+                        });
+                    }
+                    Err(e) => {
+                        let _ =
+                            reply.send(metrocalk_editor_shell::RoleReply::refusal(e.to_string()));
+                    }
+                }
+            }
+            EngineCmd::VfxAdd {
+                id,
+                kind,
+                trigger,
+                reply,
+            } => {
+                use metrocalk_editor_shell::VfxReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(VfxReply::refusal("that object is no longer in the scene"));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(VfxReply::refusal(
+                        "stop Play first - effects are authored, not live-edited",
+                    ));
+                    continue;
+                }
+                let trig = metrocalk_editor_shell::VfxTrigger::parse(&trigger);
+                match metrocalk_editor_shell::add_effect_ops(&engine, entity, &kind, trig) {
+                    Ok((ops, stack)) => {
+                        if let Err(e) = engine.commit("vfx-add", ops) {
+                            let _ = reply
+                                .send(VfxReply::refusal(format!("the effect was refused: {e}")));
+                            continue;
+                        }
+                        log.append(&Record::VfxAdd {
+                            id: id.clone(),
+                            effect: kind.clone(),
+                            trigger: trigger.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let last = stack
+                            .layers
+                            .last()
+                            .map(metrocalk_editor_shell::describe_layer)
+                            .unwrap_or_default();
+                        let _ = reply.send(metrocalk_editor_shell::vfx_reply(
+                            entity,
+                            &stack,
+                            format!("Added {last} - {}", trig.label()),
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(VfxReply::refusal(e.to_string()));
+                    }
+                }
+            }
+            EngineCmd::VfxRemove { id, index, reply } => {
+                use metrocalk_editor_shell::VfxReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(VfxReply::refusal("that object is no longer in the scene"));
+                    continue;
+                };
+                // The UI disables this during Play, but a disabled button is not an invariant: this
+                // command is reachable from IPC, from a test, and from a stale front-end. Every sibling
+                // authoring command refuses here; this one did not, which was a live hole in "Play never
+                // writes the document" (ADR-021).
+                if play_mode {
+                    let _ = reply.send(VfxReply::refusal(
+                        "stop Play first - effects are authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::remove_effect_ops(&engine, entity, index) {
+                    Ok((ops, stack)) => {
+                        if let Err(e) = engine.commit("vfx-remove", ops) {
+                            let _ = reply
+                                .send(VfxReply::refusal(format!("the effect was refused: {e}")));
+                            continue;
+                        }
+                        log.append(&Record::VfxRemove {
+                            id: id.clone(),
+                            index,
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let _ = reply.send(metrocalk_editor_shell::vfx_reply(
+                            entity,
+                            &stack,
+                            "Effect removed",
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(VfxReply::refusal(e.to_string()));
+                    }
+                }
+            }
+            EngineCmd::VfxList { id, reply } => {
+                let info = EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .map(|entity| {
+                        let stack = metrocalk_editor_shell::stack_of(&engine, entity);
+                        metrocalk_editor_shell::vfx_reply(entity, &stack, String::new())
+                    })
+                    .unwrap_or_default();
+                let _ = reply.send(info);
+            }
+            EngineCmd::CinemaAddShot { id, kind, reply } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - shots are authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::add_shot_ops(&engine, entity, &kind, entity) {
+                    Ok((ops, cut)) => {
+                        if let Err(e) = engine.commit("cinema-shot", ops) {
+                            let _ = reply
+                                .send(CinemaReply::refusal(format!("the shot was refused: {e}")));
+                            continue;
+                        }
+                        log.append(&Record::CinemaShot {
+                            id: id.clone(),
+                            shot: kind.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let last = cut
+                            .shots
+                            .last()
+                            .map(|shot| metrocalk_editor_shell::describe_shot(shot, &name))
+                            .unwrap_or_default();
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply(
+                            entity,
+                            &cut,
+                            &name,
+                            format!("Added {last}"),
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(CinemaReply::refusal(e.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaRemoveShot { id, index, reply } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                // Same hole as VfxRemove, and worse: this path can emit `RemoveComponent`, so a mid-Play
+                // call could delete the `Cinematic` component out from under the camera solver that is
+                // driving the view this very tick.
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - shots are authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::remove_shot_ops(&engine, entity, index) {
+                    Ok((ops, cut)) => {
+                        if let Err(e) = engine.commit("cinema-remove", ops) {
+                            let _ = reply
+                                .send(CinemaReply::refusal(format!("the shot was refused: {e}")));
+                            continue;
+                        }
+                        log.append(&Record::CinemaRemove {
+                            id: id.clone(),
+                            index,
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply(
+                            entity,
+                            &cut,
+                            &name,
+                            "Shot removed".to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(CinemaReply::refusal(e.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaList { id, reply } => {
+                let info = EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .map(|entity| {
+                        let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
+                        let name = entity_display_name(&engine, entity);
+                        metrocalk_editor_shell::cinema_reply(entity, &cut, &name, String::new())
+                    })
+                    .unwrap_or_default();
+                let _ = reply.send(info);
+            }
+            EngineCmd::ConditionAdd { id, request, reply } => {
+                use metrocalk_editor_shell::RoleReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(RoleReply::refusal("that object is no longer in the scene"));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(RoleReply::refusal(
+                        "stop Play first — conditions are authored, not live-edited",
+                    ));
+                    continue;
+                }
+                let outcome =
+                    metrocalk_editor_shell::build_clause(&engine, &request).and_then(|clause| {
+                        let reads = metrocalk_editor_shell::describe_clause(&engine, &clause);
+                        metrocalk_editor_shell::add_clause_ops(&engine, entity, clause, request.any)
+                            .map(|ops| (ops, reads))
+                    });
+                match outcome {
+                    Ok((ops, reads)) => {
+                        if let Err(e) = engine.commit("only-if", ops) {
+                            let _ = reply.send(RoleReply::refusal(format!(
+                                "the condition could not be applied: {e}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::ConditionAdd {
+                            id: id.clone(),
+                            request: request.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let _ = reply.send(RoleReply {
+                            applied: Some(request.kind.clone()),
+                            entity: Some(id),
+                            added: vec![reads.clone()],
+                            message: format!("Only if {reads}"),
+                            ..RoleReply::default()
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(RoleReply::refusal(e.to_string()));
+                    }
+                }
+            }
+            EngineCmd::ConditionRemove {
+                id,
+                index,
+                any,
+                reply,
+            } => {
+                use metrocalk_editor_shell::RoleReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(RoleReply::refusal("that object is no longer in the scene"));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(RoleReply::refusal(
+                        "stop Play first — conditions are authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::remove_clause_ops(&engine, entity, index, any) {
+                    Ok(ops) => {
+                        if let Err(e) = engine.commit("clear-only-if", ops) {
+                            let _ =
+                                reply.send(RoleReply::refusal(format!("could not remove it: {e}")));
+                            continue;
+                        }
+                        log.append(&Record::ConditionRemove {
+                            id: id.clone(),
+                            index,
+                            any,
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let _ = reply.send(RoleReply {
+                            entity: Some(id),
+                            message: "Condition removed".into(),
+                            ..RoleReply::default()
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(RoleReply::refusal(e.to_string()));
+                    }
+                }
+            }
+            EngineCmd::ConditionList { id, reply } => {
+                let info = EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .map(|entity| condition_list_info(&engine, entity))
+                    .unwrap_or_default();
+                let _ = reply.send(info);
+            }
+            EngineCmd::PlayerInput { x, z } => {
+                // Transient play state only — the per-tick impulses it produces are what get
+                // recorded. Clamped so a spoofed axis can't turn into a launch.
+                if play_mode {
+                    player_axis = [x.clamp(-1.0, 1.0), z.clamp(-1.0, 1.0)];
+                }
+            }
+            EngineCmd::RoleStatus { reply } => {
+                let roster = metrocalk_editor_shell::role_roster(&engine);
+                let score_id = metrocalk_editor_shell::find_score(&engine);
+                let score_key = score_id.map(|id| id.to_loro_key());
+                // The LIVE score during Play comes from the rules RuntimeState (where AdjustCounter
+                // wrote it); the authored doc value otherwise.
+                let mut score: i64 = 0;
+                if let (true, Some(session), Some(key)) =
+                    (play_mode, rule_session.as_ref(), score_key.as_deref())
+                {
+                    if let Some(v) = session.state().get(key, "KillCounter", "count") {
+                        score = match v {
+                            metrocalk_core::FieldValue::Integer(i) => *i,
+                            metrocalk_core::FieldValue::Number(n) => *n as i64,
+                            _ => 0,
+                        };
+                    }
+                } else if let Some(id) = score_id {
+                    score = match engine.get_field(id, "KillCounter", "count") {
+                        Some(metrocalk_core::FieldValue::Integer(i)) => i,
+                        Some(metrocalk_core::FieldValue::Number(n)) => n as i64,
+                        _ => 0,
+                    };
+                }
+                let remaining = if play_mode {
+                    play_collectibles.iter().filter(|c| !c.collected).count() as i64
+                } else {
+                    roster
+                        .iter()
+                        .filter(|(_, _, role, _, _)| role == "collectible")
+                        .count() as i64
+                };
+                // Live companion one-liners while playing (name resolved from the roster).
+                let companions = if play_mode {
+                    play_companions
+                        .iter()
+                        .map(|c| metrocalk_editor_shell::CompanionRow {
+                            entity: c.key.clone(),
+                            name: roster
+                                .iter()
+                                .find(|(key, _, _, _, _)| *key == c.key)
+                                .map_or_else(|| c.key.clone(), |(_, name, _, _, _)| name.clone()),
+                            doing: c.doing.clone(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                // Victory: the run STARTED with objectives (enemies and/or collectibles) and
+                // every one of them is now down/collected. Play-only; Stop resets it.
+                let won = play_mode && {
+                    let had_objectives = !play_enemies.is_empty() || !play_collectibles.is_empty();
+                    let enemies_down = play_enemies.iter().all(|(e, _, _)| {
+                        PLAY_HIDDEN.with(|h| h.borrow().contains(e))
+                            || dying_enemies.iter().any(|(d, _, _)| d == e)
+                    });
+                    let collected_all = play_collectibles.iter().all(|c| c.collected);
+                    had_objectives && enemies_down && collected_all
+                };
+                // The near miss: the most recent rule whose When matched but whose "only if" failed —
+                // read straight off the decision history the runtime already keeps.
+                let blocked = if play_mode {
+                    rule_session.as_ref().and_then(|session| {
+                        session.history().iter().rev().find_map(|d| match &d.kind {
+                            metrocalk_core::rule_runtime::DecisionKind::RuleBlocked {
+                                name,
+                                subject,
+                                why,
+                                clause,
+                                actual,
+                                ..
+                            } => Some(metrocalk_editor_shell::BlockedInfo {
+                                name: subject
+                                    .as_deref()
+                                    .and_then(EntityId::from_loro_key)
+                                    .map_or_else(String::new, |e| entity_display_name(&engine, e)),
+                                rule: name.clone(),
+                                // Say it the way the user WROTE it — "waiting on: Key is gone" —
+                                // not the engine's "GameRole.active = true (want exactly false)".
+                                // The raw rendering stays the fallback for clauses with no card.
+                                why: clause.as_ref().map_or_else(
+                                    || why.clone(),
+                                    |c| {
+                                        let said =
+                                            metrocalk_editor_shell::describe_clause(&engine, c);
+                                        match actual {
+                                            Some(metrocalk_core::FieldValue::Integer(n)) => {
+                                                format!("waiting on: {said} (right now {n})")
+                                            }
+                                            Some(metrocalk_core::FieldValue::Number(n)) => {
+                                                format!("waiting on: {said} (right now {n})")
+                                            }
+                                            _ => format!("waiting on: {said}"),
+                                        }
+                                    },
+                                ),
+                            }),
+                            _ => None,
+                        })
+                    })
+                } else {
+                    None
+                };
+                // Live health for whatever the player is driving — read from the rules RuntimeState so
+                // it reflects the run, not the authored doc.
+                let health = if play_mode {
+                    play_roles.iter().find_map(|(entity, key)| {
+                        let is_player = matches!(
+                            engine.get_field(*entity, "GameRole", "role"),
+                            Some(metrocalk_core::FieldValue::Str(ref r)) if r == "player"
+                        );
+                        if !is_player {
+                            return None;
+                        }
+                        let read = |field: &str| -> Option<i64> {
+                            match rule_session.as_ref()?.state().get(key, "Health", field) {
+                                Some(metrocalk_core::FieldValue::Integer(i)) => Some(*i),
+                                _ => None,
+                            }
+                        };
+                        Some(metrocalk_editor_shell::HealthInfo {
+                            name: entity_display_name(&engine, *entity),
+                            hp: read("hp")?,
+                            max_hp: read("maxHp").unwrap_or(0),
+                        })
+                    })
+                } else {
+                    None
+                };
+                let _ = reply.send(metrocalk_editor_shell::RoleStatusInfo {
+                    roster: roster
+                        .into_iter()
+                        .map(
+                            |(entity, name, role, _, _)| metrocalk_editor_shell::RoleRow {
+                                entity,
+                                name,
+                                role,
+                            },
+                        )
+                        .collect(),
+                    score,
+                    score_entity: score_key,
+                    remaining,
+                    companions,
+                    won,
+                    health,
+                    blocked,
+                });
+            }
+            // ── Shape Studio (Build sub-engine): parametric shapes · draw-to-3D · combine · meld ──
+            EngineCmd::ShapeSpawn { kind, pos, reply } => {
+                let t0 = std::time::Instant::now();
+                // serde happily narrows a huge JSON number into f32 INFINITY — refuse it before it
+                // can enter the document as a Transform coordinate.
+                if let Some(p) = pos {
+                    if !p.iter().all(|c| c.is_finite() && c.abs() <= 10_000.0) {
+                        let _ = reply.send(ShapeReply::refusal(
+                            "the spawn position must be a real coordinate within 10 km of the origin",
+                        ));
+                        continue;
+                    }
+                }
+                let Some(recipe) = ShapeRecipe::parametric(&kind) else {
+                    let _ = reply.send(ShapeReply::refusal(format!(
+                        "there is no shape called \"{kind}\""
+                    )));
+                    continue;
+                };
+                let label = shape_specs()
+                    .into_iter()
+                    .find(|s| s.kind == kind)
+                    .map_or_else(|| kind.clone(), |s| s.label.to_string());
+                let built = match bake_shape(&recipe) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(e.to_string()));
+                        continue;
+                    }
+                };
+                if let Err(reason) = persist_and_register_shape(&mut assets, &shared, &built) {
+                    let _ = reply.send(ShapeReply::refusal(reason));
+                    continue;
+                }
+                let spot = pos.unwrap_or_else(|| spawn_spot(shape_seq));
+                shape_seq = shape_seq.wrapping_add(1);
+                match land_shape_asset(&mut engine, &scene, &built.landing(), &label, spot) {
+                    Ok(id) => {
+                        log.append(&Record::ShapeAsset {
+                            recipe: built.recipe.clone(),
+                            asset: built.handle.clone(),
+                            pos: spot,
+                            name: label.clone(),
+                        });
+                        echo_created(
+                            &mut engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &channel,
+                            &mut recency,
+                            &mut touch,
+                            id,
+                        );
+                        let _ = reply.send(ShapeReply {
+                            created: Some(id.to_loro_key()),
+                            handle: Some(built.handle.clone()),
+                            triangles: built.triangles,
+                            ms: t0.elapsed().as_secs_f64() * 1000.0,
+                            message: format!("Created a {label} · {} triangles", built.triangles),
+                            reason: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(format!(
+                            "the shape could not be placed: {e}"
+                        )));
+                    }
+                }
+            }
+            EngineCmd::ShapeUpdate { id, params, reply } => {
+                let t0 = std::time::Instant::now();
+                let Some(eid) = EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ =
+                        reply.send(ShapeReply::refusal("that object is no longer in the scene"));
+                    continue;
+                };
+                let Some(metrocalk_core::FieldValue::Str(source)) =
+                    engine.get_field(eid, SHAPE_COMPONENT, "source")
+                else {
+                    let _ = reply.send(ShapeReply::refusal(
+                        "that object is not a Shape Studio shape",
+                    ));
+                    continue;
+                };
+                let mut recipe = match ShapeRecipe::from_json(&source) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(e.to_string()));
+                        continue;
+                    }
+                };
+                if matches!(
+                    recipe.kind.as_str(),
+                    "union" | "carve" | "intersect" | "meld"
+                ) {
+                    let _ = reply.send(ShapeReply::refusal(
+                        "a combined shape has no editable parameters — undo and adjust the source shapes instead",
+                    ));
+                    continue;
+                }
+                // Only keys this kind's builder actually reads: an unread key would silently mint a
+                // new content address for bit-identical geometry (a burned undo step per typo).
+                if let Err(e) = metrocalk_editor_shell::validate_param_keys(
+                    &recipe.kind,
+                    params.keys().map(String::as_str),
+                ) {
+                    let _ = reply.send(ShapeReply::refusal(e.to_string()));
+                    continue;
+                }
+                for (key, value) in params {
+                    recipe.params.insert(key, value);
+                }
+                let built = match bake_shape(&recipe) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(e.to_string()));
+                        continue;
+                    }
+                };
+                if let Err(reason) = persist_and_register_shape(&mut assets, &shared, &built) {
+                    let _ = reply.send(ShapeReply::refusal(reason));
+                    continue;
+                }
+                match replace_shape_asset(&mut engine, eid, &built.landing()) {
+                    Ok(()) => {
+                        log.append(&Record::ShapeEdit {
+                            id: id.clone(),
+                            recipe: built.recipe.clone(),
+                            asset: built.handle.clone(),
+                        });
+                        echo_created(
+                            &mut engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &channel,
+                            &mut recency,
+                            &mut touch,
+                            eid,
+                        );
+                        let _ = reply.send(ShapeReply {
+                            created: Some(id),
+                            handle: Some(built.handle.clone()),
+                            triangles: built.triangles,
+                            ms: t0.elapsed().as_secs_f64() * 1000.0,
+                            message: format!("Updated · {} triangles", built.triangles),
+                            reason: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(format!(
+                            "the edit could not be applied: {e}"
+                        )));
+                    }
+                }
+            }
+            EngineCmd::ShapeDraw {
+                mode,
+                profile,
+                height,
+                segments,
+                taper,
+                reply,
+            } => {
+                let t0 = std::time::Instant::now();
+                let (kind, name, params): (&str, &str, Vec<(String, f64)>) = match mode.as_str() {
+                    "extrude" => (
+                        "extrude",
+                        "Drawn shape",
+                        vec![("height".to_string(), height), ("taper".to_string(), taper)],
+                    ),
+                    "revolve" => (
+                        "revolve",
+                        "Spun shape",
+                        vec![("segments".to_string(), segments)],
+                    ),
+                    other => {
+                        let _ = reply.send(ShapeReply::refusal(format!(
+                            "there is no draw mode called \"{other}\""
+                        )));
+                        continue;
+                    }
+                };
+                let recipe = ShapeRecipe {
+                    v: metrocalk_editor_shell::shape_forge::SHAPE_RECIPE_VERSION,
+                    kind: kind.to_string(),
+                    params: params.into_iter().collect(),
+                    profile,
+                    sources: Vec::new(),
+                };
+                let built = match bake_shape(&recipe) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(e.to_string()));
+                        continue;
+                    }
+                };
+                if let Err(reason) = persist_and_register_shape(&mut assets, &shared, &built) {
+                    let _ = reply.send(ShapeReply::refusal(reason));
+                    continue;
+                }
+                let spot = spawn_spot(shape_seq);
+                shape_seq = shape_seq.wrapping_add(1);
+                match land_shape_asset(&mut engine, &scene, &built.landing(), name, spot) {
+                    Ok(id) => {
+                        log.append(&Record::ShapeAsset {
+                            recipe: built.recipe.clone(),
+                            asset: built.handle.clone(),
+                            pos: spot,
+                            name: name.to_string(),
+                        });
+                        echo_created(
+                            &mut engine,
+                            &shared,
+                            &mut positions,
+                            &assets,
+                            &channel,
+                            &mut recency,
+                            &mut touch,
+                            id,
+                        );
+                        let _ = reply.send(ShapeReply {
+                            created: Some(id.to_loro_key()),
+                            handle: Some(built.handle.clone()),
+                            triangles: built.triangles,
+                            ms: t0.elapsed().as_secs_f64() * 1000.0,
+                            message: format!(
+                                "{} · {} triangles",
+                                if kind == "extrude" {
+                                    "Raised your drawing into a solid"
+                                } else {
+                                    "Spun your drawing into a solid"
+                                },
+                                built.triangles
+                            ),
+                            reason: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(format!(
+                            "the drawn shape could not be placed: {e}"
+                        )));
+                    }
+                }
+            }
+            EngineCmd::ShapeCombine { a, b, op, reply } => {
+                let t0 = std::time::Instant::now();
+                if a == b {
+                    let _ = reply.send(ShapeReply::refusal("pick two different objects"));
+                    continue;
+                }
+                let Some(kind) = metrocalk_editor_shell::combine_kind(&op) else {
+                    let _ = reply.send(ShapeReply::refusal(format!(
+                        "there is no combine called \"{op}\""
+                    )));
+                    continue;
+                };
+                let resolve =
+                    |key: &str| EntityId::from_loro_key(key).filter(|e| engine.entity_exists(*e));
+                let (Some(ea), Some(eb)) = (resolve(&a), resolve(&b)) else {
+                    let _ = reply.send(ShapeReply::refusal(
+                        "one of the two objects is no longer in the scene",
+                    ));
+                    continue;
+                };
+                // The geometry the author is LOOKING at: stored mesh (display affine included) or the
+                // placeholder cube, carried into world space by the entity's global transform.
+                let world_mesh =
+                    |eid: EntityId| -> (metrocalk_editor_shell::TriMesh, Option<[f32; 4]>) {
+                        let handle =
+                            match engine.get_field(eid, "MeshRenderer", capscene::MESH_FIELD) {
+                                Some(metrocalk_core::FieldValue::Str(h)) if !h.is_empty() => {
+                                    Some(h)
+                                }
+                                _ => None,
+                            };
+                        let (mesh, colour, affine) = handle
+                            .as_deref()
+                            .and_then(|h| {
+                                assets.store.get_str(h).map(|asset| {
+                                    let affine = assets
+                                        .handle_to_slot
+                                        .get(h)
+                                        .map_or(AssetAffine::IDENTITY, |&slot| {
+                                            assets.display_affines[slot]
+                                        });
+                                    (
+                                        metrocalk_editor_shell::csg_intent::mesh_asset_to_trimesh(
+                                            asset,
+                                        ),
+                                        asset.materials.first().map(|m| m.base_color),
+                                        affine,
+                                    )
+                                })
+                            })
+                            .unwrap_or_else(|| {
+                                (
+                                    metrocalk_editor_shell::placeholder_cube(),
+                                    None,
+                                    AssetAffine::IDENTITY,
+                                )
+                            });
+                        let g = capscene::global_transform(&engine, eid);
+                        (
+                            transform_mesh_world(
+                                &mesh,
+                                f64::from(affine.scale),
+                                [
+                                    f64::from(affine.translation[0]),
+                                    f64::from(affine.translation[1]),
+                                    f64::from(affine.translation[2]),
+                                ],
+                                f64::from(g.scale[0]),
+                                [
+                                    f64::from(g.rotation[0]),
+                                    f64::from(g.rotation[1]),
+                                    f64::from(g.rotation[2]),
+                                    f64::from(g.rotation[3]),
+                                ],
+                                [
+                                    f64::from(g.translation[0]),
+                                    f64::from(g.translation[1]),
+                                    f64::from(g.translation[2]),
+                                ],
+                            ),
+                            colour,
+                        )
+                    };
+                let name_a = capscene::entity_name(&engine, ea).unwrap_or_else(|| "object".into());
+                let name_b = capscene::entity_name(&engine, eb).unwrap_or_else(|| "object".into());
+                let name = format!(
+                    "{} of {name_a} and {name_b}",
+                    metrocalk_editor_shell::combine_label(kind)
+                );
+                let recipe = ShapeRecipe {
+                    v: metrocalk_editor_shell::shape_forge::SHAPE_RECIPE_VERSION,
+                    kind: kind.to_string(),
+                    params: std::collections::BTreeMap::new(),
+                    profile: Vec::new(),
+                    sources: vec![a.clone(), b.clone()],
+                };
+                // The result wears the mix of its parents' colours — the material story of "these two
+                // became one" (falls back to the neutral steel satin).
+                let colour_of = |eid: EntityId| -> Option<[f32; 4]> {
+                    match engine.get_field(eid, "MeshRenderer", capscene::MESH_FIELD) {
+                        Some(metrocalk_core::FieldValue::Str(h)) => assets
+                            .store
+                            .get_str(&h)
+                            .and_then(|asset| asset.materials.first().map(|m| m.base_color)),
+                        _ => None,
+                    }
+                };
+                let material = match (colour_of(ea), colour_of(eb)) {
+                    (Some(ca), Some(cb)) => metrocalk_assets::Material {
+                        base_color: [
+                            (ca[0] + cb[0]) / 2.0,
+                            (ca[1] + cb[1]) / 2.0,
+                            (ca[2] + cb[2]) / 2.0,
+                            1.0,
+                        ],
+                        metallic: 0.04,
+                        roughness: 0.48,
+                        ..metrocalk_assets::Material::default()
+                    },
+                    _ => shape_material(kind),
+                };
+                // Two ways to combine, chosen by what the sources ARE (ADR-070): unrotated shape
+                // primitives are canonically FIELDS — their boolean is exact in field space and
+                // meshes watertight at a declared tolerance, where the mesh-space BSP would cascade
+                // on their curvature. Everything else takes the exact-predicate mesh boolean (exact
+                // on planar geometry), whose fragment budget refuses fine curvature in plain words.
+                let shape_recipe_of = |eid: EntityId| -> Option<ShapeRecipe> {
+                    match engine.get_field(eid, SHAPE_COMPONENT, "source") {
+                        Some(metrocalk_core::FieldValue::Str(s)) => ShapeRecipe::from_json(&s).ok(),
+                        _ => None,
+                    }
+                };
+                let field_pair =
+                    shape_recipe_of(ea)
+                        .zip(shape_recipe_of(eb))
+                        .and_then(|(ra, rb)| {
+                            let field_at = |recipe: &ShapeRecipe, name: &str, eid: EntityId| {
+                                let g = capscene::global_transform(&engine, eid);
+                                meld_field(
+                                    recipe,
+                                    name,
+                                    [
+                                        f64::from(g.translation[0]),
+                                        f64::from(g.translation[1]),
+                                        f64::from(g.translation[2]),
+                                    ],
+                                    [
+                                        f64::from(g.rotation[0]),
+                                        f64::from(g.rotation[1]),
+                                        f64::from(g.rotation[2]),
+                                        f64::from(g.rotation[3]),
+                                    ],
+                                    f64::from(g.scale[0]),
+                                )
+                                .ok()
+                            };
+                            field_at(&ra, &name_a, ea).zip(field_at(&rb, &name_b, eb))
+                        });
+                let baked = if let Some((fa, fb)) = field_pair {
+                    let field = match kind {
+                        "union" => fa.union(fb),
+                        "carve" => fa.difference(fb),
+                        _ => fa.intersection(fb),
+                    };
+                    bake_meld(&recipe, &field, 72, material)
+                } else {
+                    let (wa, _) = world_mesh(ea);
+                    let (wb, _) = world_mesh(eb);
+                    metrocalk_editor_shell::combine_meshes(&wa, &wb, &op).map(|out| {
+                        let (local, centre) = recentre(&out);
+                        // 0.0 = the exact path: planar results carry no approximation budget.
+                        (
+                            bake_mesh_result(&recipe, &local, material.clone()),
+                            centre,
+                            0.0,
+                        )
+                    })
+                };
+                let (built, centre, tolerance_m) = match baked {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(e.to_string()));
+                        continue;
+                    }
+                };
+                // The honest finish note: field-space results are smooth APPROXIMATIONS within the
+                // grid's chord tolerance — say so, never imply lossless (ADR-070 §4).
+                let finish = if tolerance_m > 0.0 {
+                    format!(" · smooth finish (within {:.0} mm)", tolerance_m * 1000.0)
+                } else {
+                    String::new()
+                };
+                if let Err(reason) = persist_and_register_shape(&mut assets, &shared, &built) {
+                    let _ = reply.send(ShapeReply::refusal(reason));
+                    continue;
+                }
+                let spot = [centre[0] as f32, centre[1] as f32, centre[2] as f32];
+                match land_combined_asset(
+                    &mut engine,
+                    &scene,
+                    &built.landing(),
+                    &name,
+                    spot,
+                    [ea, eb],
+                ) {
+                    Ok(id) => {
+                        log.append(&Record::ShapeCombine {
+                            recipe: built.recipe.clone(),
+                            asset: built.handle.clone(),
+                            triangles: built.triangles,
+                            pos: spot,
+                            name: name.clone(),
+                            retire: [a, b],
+                        });
+                        // Two entities left the scene and one arrived: full projection + rebuild.
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                        let _ = reply.send(ShapeReply {
+                            created: Some(id.to_loro_key()),
+                            handle: Some(built.handle.clone()),
+                            triangles: built.triangles,
+                            ms: t0.elapsed().as_secs_f64() * 1000.0,
+                            message: format!("{name} · {} triangles{finish}", built.triangles),
+                            reason: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(format!(
+                            "the combine could not be placed: {e}"
+                        )));
+                    }
+                }
+            }
+            EngineCmd::ShapeMeld { a, b, k, reply } => {
+                let t0 = std::time::Instant::now();
+                if a == b {
+                    let _ = reply.send(ShapeReply::refusal("pick two different objects"));
+                    continue;
+                }
+                let resolve =
+                    |key: &str| EntityId::from_loro_key(key).filter(|e| engine.entity_exists(*e));
+                let (Some(ea), Some(eb)) = (resolve(&a), resolve(&b)) else {
+                    let _ = reply.send(ShapeReply::refusal(
+                        "one of the two objects is no longer in the scene",
+                    ));
+                    continue;
+                };
+                let shape_of = |eid: EntityId| -> Option<ShapeRecipe> {
+                    match engine.get_field(eid, SHAPE_COMPONENT, "source") {
+                        Some(metrocalk_core::FieldValue::Str(s)) => ShapeRecipe::from_json(&s).ok(),
+                        _ => None,
+                    }
+                };
+                let (Some(ra), Some(rb)) = (shape_of(ea), shape_of(eb)) else {
+                    let _ = reply.send(ShapeReply::refusal(
+                        "Meld works on Shape Studio shapes — use Combine for anything else",
+                    ));
+                    continue;
+                };
+                let name_a = capscene::entity_name(&engine, ea).unwrap_or_else(|| "shape".into());
+                let name_b = capscene::entity_name(&engine, eb).unwrap_or_else(|| "shape".into());
+                let field_of = |recipe: &ShapeRecipe, name: &str, eid: EntityId| {
+                    let g = capscene::global_transform(&engine, eid);
+                    meld_field(
+                        recipe,
+                        name,
+                        [
+                            f64::from(g.translation[0]),
+                            f64::from(g.translation[1]),
+                            f64::from(g.translation[2]),
+                        ],
+                        [
+                            f64::from(g.rotation[0]),
+                            f64::from(g.rotation[1]),
+                            f64::from(g.rotation[2]),
+                            f64::from(g.rotation[3]),
+                        ],
+                        f64::from(g.scale[0]),
+                    )
+                };
+                let fa = match field_of(&ra, &name_a, ea) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(e.to_string()));
+                        continue;
+                    }
+                };
+                let fb = match field_of(&rb, &name_b, eb) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(e.to_string()));
+                        continue;
+                    }
+                };
+                let blend = k.clamp(0.05, 2.0);
+                let field = fa.smooth_union(fb, blend);
+                let recipe = ShapeRecipe {
+                    v: metrocalk_editor_shell::shape_forge::SHAPE_RECIPE_VERSION,
+                    kind: "meld".to_string(),
+                    params: [("k".to_string(), blend)].into_iter().collect(),
+                    profile: Vec::new(),
+                    sources: vec![a.clone(), b.clone()],
+                };
+                let (built, centre, tolerance_m) =
+                    match bake_meld(&recipe, &field, 64, shape_material("meld")) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = reply.send(ShapeReply::refusal(e.to_string()));
+                            continue;
+                        }
+                    };
+                if let Err(reason) = persist_and_register_shape(&mut assets, &shared, &built) {
+                    let _ = reply.send(ShapeReply::refusal(reason));
+                    continue;
+                }
+                let name = format!("Meld of {name_a} and {name_b}");
+                let spot = [centre[0] as f32, centre[1] as f32, centre[2] as f32];
+                match land_combined_asset(
+                    &mut engine,
+                    &scene,
+                    &built.landing(),
+                    &name,
+                    spot,
+                    [ea, eb],
+                ) {
+                    Ok(id) => {
+                        log.append(&Record::ShapeCombine {
+                            recipe: built.recipe.clone(),
+                            asset: built.handle.clone(),
+                            triangles: built.triangles,
+                            pos: spot,
+                            name: name.clone(),
+                            retire: [a, b],
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                        let _ = reply.send(ShapeReply {
+                            created: Some(id.to_loro_key()),
+                            handle: Some(built.handle.clone()),
+                            triangles: built.triangles,
+                            ms: t0.elapsed().as_secs_f64() * 1000.0,
+                            message: format!(
+                                "Melded {name_a} and {name_b} into one shape · {} triangles · smooth finish (within {:.0} mm)",
+                                built.triangles,
+                                tolerance_m * 1000.0
+                            ),
+                            reason: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(ShapeReply::refusal(format!(
+                            "the meld could not be placed: {e}"
+                        )));
+                    }
+                }
+            }
             EngineCmd::AddLight {
                 kind,
                 pos,
@@ -8478,6 +10354,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     if let Some((p, fov, near, far)) = capscene::active_camera(&engine) {
                         shared.lock().unwrap().cam_override = Some(render::CamView {
                             pos: p,
+                            look_at: None,
                             fov_deg: fov,
                             near,
                             far,
@@ -8625,6 +10502,56 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // reload — the M6/M11.1 residual), place an entity carrying the handle, and reply its id.
                 // An unsupported/malformed file → `None` (the React surface explains it).
                 let mut result = None;
+                // ── ENVIRONMENT PANORAMAS ────────────────────────────────────────────────────────
+                // A `.hdr` is not a placeable object; it is the scene's LIGHTING. Routing it here —
+                // in the one canonical dispatcher every entry point reaches — is what makes File →
+                // Import, drag-and-drop, the command palette and automation all do the same thing
+                // with one, instead of three of them silently doing nothing.
+                if std::path::Path::new(&path)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("hdr"))
+                {
+                    match std::fs::read(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|b| {
+                            metrocalk_assets::env_import::load_hdr_equirect(&b)
+                                .map_err(|e| e.to_string())
+                        }) {
+                        Ok(env) => {
+                            let label = std::path::Path::new(&path)
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "environment".into());
+                            let source = render::ibl_env_source(
+                                env.width as usize,
+                                env.height as usize,
+                                env.pixels,
+                                label.clone(),
+                            );
+                            match source.validate() {
+                                Ok(()) => {
+                                    let mut st = shared.lock().unwrap();
+                                    st.pending_env = Some(source);
+                                    st.env_label = label.clone();
+                                    st.env_revision = st.env_revision.wrapping_add(1);
+                                    eprintln!("[env] lighting from '{label}'");
+                                    // An environment creates no entity, so the reply is the label
+                                    // rather than an id - the caller reports it, never "unsupported".
+                                    let _ = reply.send(Some(format!("env:{label}")));
+                                }
+                                Err(why) => {
+                                    eprintln!("[env] refused '{path}': {why}");
+                                    let _ = reply.send(None);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[env] '{path}' is not a readable HDR panorama: {e}");
+                            let _ = reply.send(None);
+                        }
+                    }
+                    continue;
+                }
                 if let Ok(bytes) = std::fs::read(&path) {
                     if metrocalk_editor_shell::is_cad_file(&bytes) {
                         // M15.7 (ADR-077) — a CAD container (CATIA 3DXML / STEP AP242): the never-empty,
@@ -10834,10 +12761,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 reply,
             } => {
                 let normalized = format.to_ascii_lowercase();
-                if !matches!(normalized.as_str(), "glb" | "usda" | "usd") {
+                if !matches!(normalized.as_str(), "glb" | "usda" | "usd" | "step" | "stp") {
                     let _ = reply.send(SceneExportResponse {
                         message: format!(
-                            "Unsupported scene format '{format}'; choose GLB or ASCII USDA"
+                            "Unsupported scene format '{format}'; choose GLB, ASCII USDA, or STEP"
                         ),
                         format,
                         ..SceneExportResponse::default()
@@ -10864,6 +12791,37 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 "usda" | "usd" => export_usda(&scene)
                                     .map(|export| (export.text.into_bytes(), export.report))
                                     .map_err(|error| error.to_string()),
+                                // STEP AP242, faceted. The engine's meshes have no analytic surfaces,
+                                // so writing anything but faceted geometry would mean inventing
+                                // surfaces nobody authored - the note says so at the gesture.
+                                "step" | "stp" => step_parts_from_scene(&scene)
+                                    .and_then(|parts| {
+                                        metrocalk_editor_shell::export_step_parts(&parts)
+                                            .map_err(|e| e.to_string())
+                                    })
+                                    .map(|(text, step_report)| {
+                                        // The STEP notes ride the SAME fidelity ledger the other two
+                                        // exporters use, so the UI has one place to read "what did
+                                        // this cost me" regardless of format.
+                                        let entries = step_report
+                                            .notes
+                                            .into_iter()
+                                            .map(|detail| metrocalk_assets::FidelityEntry {
+                                                status: metrocalk_assets::FidelityStatus::Converted,
+                                                feature: "step-faceted".into(),
+                                                count: step_report.triangles,
+                                                detail,
+                                            })
+                                            .collect();
+                                        (
+                                            text.into_bytes(),
+                                            metrocalk_assets::FidelityReport {
+                                                format: "STEP-AP242 (faceted)".into(),
+                                                scene_version: 1,
+                                                entries,
+                                            },
+                                        )
+                                    }),
                                 _ => unreachable!("format was preflighted"),
                             };
                             let response = encoded.and_then(|(bytes, report)| {
@@ -11871,6 +13829,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         touch = 0;
                         let (restored, restore_errors) =
                             restore_document_pipe_assets(&engine, &mut assets, &shared);
+                        restore_document_shape_assets(&engine, &mut assets, &shared);
+                        restore_terrain_proto_assets(&engine, &mut assets);
                         if restored > 0 {
                             eprintln!(
                                 "[shell] reconstructed {restored} procedural asset(s) from project recipes"
@@ -11961,6 +13921,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         if let Some((p, fov, near, far)) = active {
                             st.cam_override = Some(render::CamView {
                                 pos: p,
+                                look_at: None,
                                 fov_deg: fov,
                                 near,
                                 far,
@@ -11982,7 +13943,193 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rule_flagged = session.flagged;
                     rule_session = Some(metrocalk_core::RuleReplay::new(session.recording));
                     rule_head = 0;
+                    // Gameplay roles: snapshot every ACTIVE collectible's position + trigger radius
+                    // for the touch bridge, and start the run with a clean hide overlay.
+                    PLAY_HIDDEN.with(|hidden| hidden.borrow_mut().clear());
+                    let roster_rows = metrocalk_editor_shell::role_roster(&engine);
+                    // Anything a moving body can bump INTO emits `Touched`: collectibles (which get
+                    // taken) and hazards (which hurt the toucher). Same bridge, same event — the rule
+                    // decides what it means.
+                    play_collectibles = roster_rows
+                        .iter()
+                        .filter(|(_, _, role, _, _)| role == "collectible" || role == "hazard")
+                        .filter_map(|(key, _, _, pos, radius)| {
+                            let entity = EntityId::from_loro_key(key)?;
+                            Some(PlayCollectible {
+                                entity,
+                                key: key.clone(),
+                                pos: *pos,
+                                radius: *radius,
+                                collected: false,
+                                was_inside: false,
+                            })
+                        })
+                        .collect();
+                    // The companion cast. Tunables come off the entity's GameRole fields;
+                    // enemies/props are tracked by id (their positions are read LIVE from the
+                    // sim each tick — both sides of every range check move). Waypoints are
+                    // authored geography: their positions are fixed, sorted by patrol order.
+                    {
+                        use metrocalk_editor_shell::companion_intent as ci;
+                        play_companions = roster_rows
+                            .iter()
+                            .filter(|(_, _, role, _, _)| role == "companion")
+                            .filter_map(|(key, _, _, pos, radius)| {
+                                let entity = EntityId::from_loro_key(key)?;
+                                let comps = engine.resolved_components(entity);
+                                let fields = comps.get("GameRole")?;
+                                Some(PlayCompanion {
+                                    entity,
+                                    key: key.clone(),
+                                    speed: ci::role_number(fields, "speed", ci::DEFAULT_SPEED),
+                                    range: ci::role_number(
+                                        fields,
+                                        "range",
+                                        ci::DEFAULT_ATTACK_RANGE,
+                                    ),
+                                    follow: ci::role_number(
+                                        fields,
+                                        "follow",
+                                        ci::DEFAULT_FOLLOW_DISTANCE,
+                                    ),
+                                    aggro: f64::from(*radius).max(ci::DEFAULT_ATTACK_RANGE),
+                                    cooldown: 0,
+                                    patrol_ix: 0,
+                                    stuck_clock: 0,
+                                    stuck_anchor: [
+                                        f64::from(pos[0]),
+                                        f64::from(pos[1]),
+                                        f64::from(pos[2]),
+                                    ],
+                                    detour_left: 0,
+                                    detour_side: ci::detour_side(key),
+                                    doing: String::new(),
+                                })
+                            })
+                            .collect();
+                        play_enemies = roster_rows
+                            .iter()
+                            .filter(|(_, _, role, _, _)| role == "enemy")
+                            .filter_map(|(key, name, _, _, _)| {
+                                EntityId::from_loro_key(key).map(|e| (e, key.clone(), name.clone()))
+                            })
+                            .collect();
+                        play_props = roster_rows
+                            .iter()
+                            .filter(|(_, _, role, _, _)| role == "prop")
+                            .filter_map(|(key, _, _, _, _)| EntityId::from_loro_key(key))
+                            .collect();
+                        let mut wps: Vec<(i64, String, [f64; 3])> = roster_rows
+                            .iter()
+                            .filter(|(_, _, role, _, _)| role == "waypoint")
+                            .filter_map(|(key, _, _, pos, _)| {
+                                let entity = EntityId::from_loro_key(key)?;
+                                let comps = engine.resolved_components(entity);
+                                let order =
+                                    comps.get("GameRole").map_or(0, |f| match f.get("points") {
+                                        Some(FieldValue::Integer(i)) => *i,
+                                        #[allow(clippy::cast_possible_truncation)]
+                                        Some(FieldValue::Number(n)) => *n as i64,
+                                        _ => 0,
+                                    });
+                                Some((
+                                    order,
+                                    key.clone(),
+                                    [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
+                                ))
+                            })
+                            .collect();
+                        wps.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                        play_waypoints = wps.into_iter().map(|(_, _, p)| p).collect();
+                        play_players = roster_rows
+                            .iter()
+                            .filter(|(_, _, role, _, _)| role == "player")
+                            .filter_map(|(key, _, _, _, _)| {
+                                let entity = EntityId::from_loro_key(key)?;
+                                let comps = engine.resolved_components(entity);
+                                let speed = comps.get("GameRole").map_or(
+                                    ci::DEFAULT_PLAYER_SPEED,
+                                    |fields| {
+                                        ci::role_number(fields, "speed", ci::DEFAULT_PLAYER_SPEED)
+                                    },
+                                );
+                                Some((entity, speed))
+                            })
+                            .collect();
+                        player_axis = [0.0, 0.0];
+                        dying_enemies.clear();
+                        play_roles = roster_rows
+                            .iter()
+                            .filter_map(|(key, _, _, _, _)| {
+                                EntityId::from_loro_key(key).map(|e| (e, key.clone()))
+                            })
+                            .collect();
+                        play_cinematics = {
+                            let mut armed: Vec<_> = engine
+                                .entity_ids()
+                                .into_iter()
+                                .filter_map(|id| {
+                                    let cut = metrocalk_editor_shell::cutscene_of(&engine, id);
+                                    if cut.shots.is_empty() {
+                                        return None;
+                                    }
+                                    Some((id, id.to_loro_key(), cut, None, false))
+                                })
+                                .collect();
+                            // `entity_ids()` walks a HashMap with a per-PROCESS random seed, so with two
+                            // armed cutscenes the one that won the camera differed between launches of
+                            // the same project on the same recorded input. Sorting by key makes the film
+                            // the same film every time.
+                            armed.sort_by(|a, b| a.1.cmp(&b.1));
+                            armed
+                        };
+                        cinema_owner = None;
+                        {
+                            let mut st = shared.lock().unwrap();
+                            st.fx_peak_total = 0;
+                            st.fx_bursts_fired = 0;
+                            st.fx_peak_radiance = 0.0;
+                        }
+                        play_vfx = engine
+                            .entity_ids()
+                            .into_iter()
+                            .filter_map(|id| {
+                                let stack = metrocalk_editor_shell::stack_of(&engine, id);
+                                if stack.layers.is_empty() {
+                                    return None;
+                                }
+                                Some((id, id.to_loro_key(), stack, None))
+                            })
+                            .collect();
+                        play_vfx_bursts.clear();
+                        play_vfx_hp.clear();
+                        play_countdowns = roster_rows
+                            .iter()
+                            .filter(|(_, _, role, _, _)| role == "vanishing")
+                            .filter_map(|(key, _, _, _, _)| {
+                                let entity = EntityId::from_loro_key(key)?;
+                                let seconds = engine
+                                    .resolved_components(entity)
+                                    .get("GameRole")
+                                    .map_or(metrocalk_editor_shell::role_intent::DEFAULT_VANISH_SECONDS, |f| {
+                                        ci::role_number(
+                                            f,
+                                            "speed",
+                                            metrocalk_editor_shell::role_intent::DEFAULT_VANISH_SECONDS,
+                                        )
+                                    });
+                                // 60 Hz heartbeat; clamp so a silly number cannot hang the run.
+                                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                                let ticks = (seconds.clamp(0.1, 600.0) * 60.0) as u32;
+                                Some((entity, key.clone(), ticks))
+                            })
+                            .collect();
+                    }
                     seek_animation_preview(&mut animation_preview, AnimationTick::ZERO);
+                    // Play is a GAME run: an authored idle loop (a role's spin) must not stop
+                    // after one pass the way the editing transport's default `Once` would. The
+                    // policy must be set BEFORE compiling — refresh bakes it into the plan.
+                    animation_preview.loop_policy = AnimationLoopPolicy::Loop;
                     refresh_animation_plan(&engine, &mut animation_preview);
                     animation_preview.playing =
                         animation_preview_has_transport_content(&animation_preview);
@@ -12044,9 +14191,46 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rule_session = None;
                     rule_flagged.clear();
                     rule_head = 0;
+                    // Gameplay roles: collected pickups and defeated enemies come back — the
+                    // hides were play projections; the companion brains die with the run.
+                    play_collectibles.clear();
+                    play_companions.clear();
+                    play_enemies.clear();
+                    play_props.clear();
+                    play_waypoints.clear();
+                    play_players.clear();
+                    play_roles.clear();
+                    play_countdowns.clear();
+                    play_cinematics.clear();
+                    cinema_owner = None;
+                    restore_editor_chrome(&mut shared.lock().unwrap(), &mut cinema_dimmed);
+                    play_vfx.clear();
+                    play_vfx_bursts.clear();
+                    play_vfx_hp.clear();
+                    {
+                        // Particles are a projection, so Stop must leave nothing behind — a frame of
+                        // stale fire hanging over the authored scene is exactly the kind of "Play
+                        // leaked into the editor" bug ADR-021 exists to prevent.
+                        let mut st = shared.lock().unwrap();
+                        st.fx_additive.clear();
+                        st.fx_soft.clear();
+                        st.fx_bursts = 0;
+                        st.fx_peak_total = 0;
+                        st.fx_bursts_fired = 0;
+                        st.fx_peak_radiance = 0.0;
+                        st.fx_revision = st.fx_revision.wrapping_add(1);
+                    }
+                    if let Some(saved) = cinema_saved_cam.take() {
+                        shared.lock().unwrap().cam_override = saved;
+                    }
+                    player_axis = [0.0, 0.0];
+                    dying_enemies.clear();
+                    PLAY_HIDDEN.with(|hidden| hidden.borrow_mut().clear());
                     animation_preview.playing = false;
                     seek_animation_preview(&mut animation_preview, AnimationTick::ZERO);
                     animation_preview.plan = None;
+                    // Play forced Loop for the game run; the editing transport's default is Once.
+                    animation_preview.loop_policy = AnimationLoopPolicy::Once;
                     ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
                     // M11.4 — leave look-through: restore the pre-Play editor view (fly-cam or manual).
                     shared.lock().unwrap().cam_override = pre_play_cam.take();
@@ -12082,13 +14266,726 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // exists + the sim runs. NEVER a commit/Loro write (ADR-021). Off the JS hot path (inv. 4).
                 if sim_running && !body_of.is_empty() {
                     let centers = sync_out(&sim, &body_of, &shared);
+                    // ── The companion brain: one goal per companion per tick (enemy in aggro →
+                    // follow the nearest prop at stand-off → walk the waypoint chain → settle),
+                    // steered through the RECORDED impulse channel — the same frame-stamped
+                    // inputs a SimShove uses, so a timeline scrub replays every decision and
+                    // gravity + collision stay Rapier's truth. Landed strikes fire `Struck`
+                    // into the rules runtime; the authored defeat rule owns the consequence.
+                    // Runs BEFORE sim.step(): recorded inputs at frame F apply before step F,
+                    // exactly matching Replay::advance. ──
+                    if play_mode
+                        && (!play_companions.is_empty()
+                            || !play_players.is_empty()
+                            || !dying_enemies.is_empty())
+                    {
+                        use metrocalk_editor_shell::companion_intent as ci;
+                        let live = |e: &EntityId| {
+                            centers
+                                .get(e)
+                                .map(|p| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])])
+                        };
+                        // Render-only facing: a driven body turns to face its travel. Written
+                        // AFTER sync_out projected the physics rotation, so the override wins
+                        // this frame; never a sim or document write.
+                        let face = |key: &str, vel: [f64; 3]| {
+                            if let Some(q) = ci::facing_quat(vel) {
+                                let mut st = shared.lock().unwrap();
+                                if let Some(i) = st.ids.iter().position(|k| k == key) {
+                                    st.instances[i].rotation = q;
+                                    st.revision = st.revision.wrapping_add(1);
+                                }
+                            }
+                        };
+                        // The PLAYER(s): the pressed-key axis becomes recorded impulses — the
+                        // same channel as a SimShove, so scrubs replay the whole drive.
+                        for (entity, speed) in &play_players {
+                            let key = entity.to_loro_key();
+                            if let (Some(h), Some(idx)) = (
+                                body_of.get(entity).copied(),
+                                rec_index_of(&rec_entities, *entity),
+                            ) {
+                                let vel = sim.velocity(h).map_or([0.0; 3], |(linear, _)| linear);
+                                let impulse = ci::player_impulse(vel, player_axis, *speed);
+                                if impulse[0].abs() + impulse[2].abs() > 1.0e-6 {
+                                    sim.apply_impulse(h, impulse);
+                                    recording.add_input(frame, idx, impulse);
+                                }
+                                face(&key, vel);
+                            }
+                        }
+                        // A defeated enemy tumbles from the knockback for a beat, THEN vanishes.
+                        dying_enemies.retain_mut(|(entity, key, ticks)| {
+                            *ticks = ticks.saturating_sub(1);
+                            if *ticks > 0 {
+                                return true;
+                            }
+                            PLAY_HIDDEN.with(|hidden| {
+                                hidden.borrow_mut().insert(*entity);
+                            });
+                            let mut st = shared.lock().unwrap();
+                            if let Some(i) = st.ids.iter().position(|k| k == key) {
+                                st.instances[i].scale = 0.0;
+                                st.revision = st.revision.wrapping_add(1);
+                            }
+                            false
+                        });
+                        let enemies_live: Vec<(String, [f64; 3])> = play_enemies
+                            .iter()
+                            .filter(|(e, _, _)| {
+                                !PLAY_HIDDEN.with(|h| h.borrow().contains(e))
+                                    && !dying_enemies.iter().any(|(d, _, _)| d == e)
+                            })
+                            .filter_map(|(e, k, _)| live(e).map(|p| (k.clone(), p)))
+                            .collect();
+                        let players_live: Vec<[f64; 3]> =
+                            play_players.iter().filter_map(|(e, _)| live(e)).collect();
+                        let props_live: Vec<[f64; 3]> =
+                            play_props.iter().filter_map(&live).collect();
+                        for c in &mut play_companions {
+                            let Some(pos) = live(&c.entity) else {
+                                c.doing = "has no physics body".into();
+                                continue;
+                            };
+                            c.cooldown = c.cooldown.saturating_sub(1);
+                            let goal = ci::choose_goal(
+                                pos,
+                                c.aggro,
+                                c.follow,
+                                &enemies_live,
+                                &players_live,
+                                &props_live,
+                                &play_waypoints,
+                                c.patrol_ix,
+                            );
+                            let mut seek = match goal {
+                                ci::CompanionGoal::Attack { enemy, goal } => {
+                                    let display = play_enemies
+                                        .iter()
+                                        .find(|(_, k, _)| *k == enemy)
+                                        .map_or_else(|| enemy.clone(), |(_, _, n)| n.clone());
+                                    c.doing = format!("hunting {display}");
+                                    let in_reach = ci::dist2_xz(pos, goal) <= c.range * c.range;
+                                    if in_reach && c.cooldown == 0 {
+                                        c.cooldown = ci::ATTACK_COOLDOWN_TICKS;
+                                        if let Some(session) = rule_session.as_mut() {
+                                            rule_head = session.fire("Struck", Some(enemy.clone()));
+                                            let defeated = matches!(
+                                                session.state().get(&enemy, "GameRole", "active"),
+                                                Some(metrocalk_core::FieldValue::Bool(false))
+                                            );
+                                            if defeated {
+                                                c.doing = format!("defeated {display}!");
+                                                if let Some((ee, _, _)) = play_enemies
+                                                    .iter()
+                                                    .find(|(_, k, _)| *k == enemy)
+                                                {
+                                                    // Knockback rides the SAME recorded
+                                                    // channel; the felled enemy TUMBLES for
+                                                    // a beat (visible drama), then the
+                                                    // play-only hide takes it.
+                                                    if let (Some(h), Some(idx)) = (
+                                                        body_of.get(ee).copied(),
+                                                        rec_index_of(&rec_entities, *ee),
+                                                    ) {
+                                                        let dx = goal[0] - pos[0];
+                                                        let dz = goal[2] - pos[2];
+                                                        let d =
+                                                            (dx * dx + dz * dz).sqrt().max(1.0e-6);
+                                                        let kick =
+                                                            [dx / d * 4.0, 2.5, dz / d * 4.0];
+                                                        sim.apply_impulse(h, kick);
+                                                        recording.add_input(frame, idx, kick);
+                                                    }
+                                                    dying_enemies.push((
+                                                        *ee,
+                                                        enemy.clone(),
+                                                        ci::DEFEAT_LINGER_TICKS,
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Some(goal)
+                                }
+                                ci::CompanionGoal::Follow { goal } => {
+                                    c.doing = "following".into();
+                                    Some(goal)
+                                }
+                                ci::CompanionGoal::Patrol { goal } => {
+                                    c.doing = format!("patrolling — stop {}", c.patrol_ix + 1);
+                                    c.patrol_ix =
+                                        ci::advance_patrol(pos, &play_waypoints, c.patrol_ix);
+                                    Some(goal)
+                                }
+                                ci::CompanionGoal::Idle => {
+                                    c.doing = "resting".into();
+                                    None
+                                }
+                            };
+                            // Honest local avoidance: when the body has provably stopped
+                            // progressing toward a far goal, walk a fixed perpendicular
+                            // detour leg (side chosen deterministically), then re-seek.
+                            if let Some(goal) = seek {
+                                c.stuck_clock += 1;
+                                if c.stuck_clock >= ci::STUCK_CHECK_TICKS {
+                                    c.stuck_clock = 0;
+                                    let moved = (ci::dist2_xz(pos, c.stuck_anchor)).sqrt();
+                                    let far = ci::dist2_xz(pos, goal) > 1.0;
+                                    if c.detour_left == 0 && far && moved < ci::STUCK_EPSILON {
+                                        c.detour_left = ci::DETOUR_TICKS;
+                                    }
+                                    c.stuck_anchor = pos;
+                                }
+                                if c.detour_left > 0 {
+                                    c.detour_left -= 1;
+                                    c.doing = "finding a way around".into();
+                                    seek = Some(ci::detour_goal(pos, goal, c.detour_side));
+                                }
+                            }
+                            if let Some(goal) = seek {
+                                if let (Some(h), Some(idx)) = (
+                                    body_of.get(&c.entity).copied(),
+                                    rec_index_of(&rec_entities, c.entity),
+                                ) {
+                                    let vel =
+                                        sim.velocity(h).map_or([0.0; 3], |(linear, _)| linear);
+                                    let arrive = c.follow.max(0.8);
+                                    let impulse =
+                                        ci::steer_impulse(pos, vel, goal, c.speed, arrive);
+                                    if impulse[0].abs() + impulse[2].abs() > 1.0e-6 {
+                                        sim.apply_impulse(h, impulse);
+                                        recording.add_input(frame, idx, impulse);
+                                    }
+                                    face(&c.key, vel);
+                                }
+                            }
+                        }
+                    }
                     sim.step();
                     frame += 1;
                     max_frame = max_frame.max(frame);
                     if overlays_on {
                         push_overlay(&sim, &body_of, &prev_centers, &shared);
                     }
+                    // ── The gameplay-roles touch bridge (the first AUTOMATIC event source): a moving
+                    // physics body coming within an ACTIVE collectible's trigger radius fires a real
+                    // `Touched` event into the rules runtime (rising edge only), and the pickup rule's
+                    // RuntimeState consequence (GameRole.active=false) is projected into the play-only
+                    // hide overlay — pixels change, the doc never does (ADR-021/034/049). ──
+                    if play_mode && !play_collectibles.is_empty() {
+                        if let Some(session) = rule_session.as_mut() {
+                            for c in &mut play_collectibles {
+                                if c.collected {
+                                    continue;
+                                }
+                                let toucher = centers.iter().find_map(|(mover, m)| {
+                                    // A collectible that is ALSO a body would trivially touch itself.
+                                    if *mover == c.entity {
+                                        return None;
+                                    }
+                                    // Only a body that PROVABLY MOVED this tick can touch (the
+                                    // `Touched` contract): a solid wall or a prop parked inside
+                                    // the radius at Play start must not auto-collect on tick 1.
+                                    // Unknown-last-tick counts as not moved, and sub-jitter
+                                    // displacement of a sleeping body is filtered out.
+                                    let moved = prev_centers.get(mover).is_some_and(|p| {
+                                        let dx = m[0] - p[0];
+                                        let dy = m[1] - p[1];
+                                        let dz = m[2] - p[2];
+                                        dx * dx + dy * dy + dz * dz > 1.0e-8
+                                    });
+                                    let within = {
+                                        let dx = m[0] - c.pos[0];
+                                        let dy = m[1] - c.pos[1];
+                                        let dz = m[2] - c.pos[2];
+                                        dx * dx + dy * dy + dz * dz <= c.radius * c.radius
+                                    };
+                                    (moved && within).then(|| mover.to_loro_key())
+                                });
+                                let touched = toucher.is_some();
+                                // TRUE rising edge: fire only when the trigger goes from empty to
+                                // occupied. Without this, a pickup rule the user disabled or edited
+                                // (so `active` never flips) would refire `Touched` at 60 Hz for the
+                                // whole overlap, flooding the rules recording and any side rules.
+                                let entered = touched && !c.was_inside;
+                                c.was_inside = touched;
+                                if !entered {
+                                    continue;
+                                }
+                                // `$subject` = what was touched, `$other` = who touched it. Naming the
+                                // toucher is what makes "only if the PLAYER touched it" expressible.
+                                rule_head =
+                                    session.fire_from("Touched", Some(c.key.clone()), toucher);
+                                // Consume the rule's verdict: hidden iff the pickup rule really set
+                                // active=false (rules are the logic — the loop only reports touches).
+                                let collected = matches!(
+                                    session.state().get(&c.key, "GameRole", "active"),
+                                    Some(metrocalk_core::FieldValue::Bool(false))
+                                );
+                                if collected {
+                                    // The latch only; the generic effect read-back below owns the
+                                    // hide, so a collectible and a rule-opened door take the exact
+                                    // same path to the screen. A hazard never sets `active=false` on
+                                    // itself, so it simply never latches — walk into the spikes twice
+                                    // and you are hurt twice.
+                                    c.collected = true;
+                                }
+                            }
+                        }
+                    }
                     prev_centers = centers;
+                }
+                // ── THE PLAY CLOCK ──────────────────────────────────────────────────────────────
+                // Tick every armed countdown; when one reaches zero, fire `After` for that object into
+                // the rules runtime. The rule decides what that MEANS (the shipped one deactivates the
+                // object, which the read-back below turns into it disappearing) — the loop only reports
+                // that time passed. Fires once: the entry is dropped when it elapses.
+                if play_mode && sim_running && !play_countdowns.is_empty() {
+                    let mut due: Vec<String> = Vec::new();
+                    play_countdowns.retain_mut(|(_, key, ticks)| {
+                        *ticks = ticks.saturating_sub(1);
+                        if *ticks == 0 {
+                            due.push(key.clone());
+                            return false;
+                        }
+                        true
+                    });
+                    if let Some(session) = rule_session.as_mut() {
+                        for key in due {
+                            rule_head = session.fire("After", Some(key));
+                        }
+                    }
+                }
+                // ── THE PLAY CLOCK IS NOT THE PHYSICS CLOCK ─────────────────────────────────────
+                // `frame` advances inside the sim block above, which is gated on a body existing. So a
+                // scene of static props — a statue on a plinth, say — froze every frame-stamped feature
+                // during Play: a cutscene held its first pose forever and an effect never aged. Found by
+                // a live test where the push-in measured BIT-IDENTICAL 1.5 s apart. The counter is the
+                // play clock that everything time-based reads, so it ticks whenever Play runs, with or
+                // without physics.
+                // `sim_running` is the pause switch, so it gates this too: `frame` IS the physics
+                // replay step count, and advancing it through a pause would stamp every later recorded
+                // input late and make a scrub replay steps that were never simulated. The clock is
+                // decoupled from whether a BODY exists, not from whether time is running.
+                if play_mode && sim_running && body_of.is_empty() {
+                    frame += 1;
+                    max_frame = max_frame.max(frame);
+                }
+                // ── CINEMATICS: the shot solver drives the camera ───────────────────────────────
+                // A rule sets `Cinematic.playing = true` (an ordinary SetField — the action vocabulary
+                // never had to grow). On the rising edge we take camera authority; each tick we solve
+                // the current shot against the subject's LIVE pose and publish it to `cam_override`,
+                // the render projection ADR-021 already sanctions. On the falling edge — or when the
+                // shot list runs out — we hand the camera back exactly as we found it.
+                if play_mode && !play_cinematics.is_empty() {
+                    use metrocalk_animation::shot::{solve_shot, SubjectSample};
+                    for (entity, key, cut, started, played) in &mut play_cinematics {
+                        let wants = rule_session.as_ref().is_some_and(|s| {
+                            matches!(
+                                s.state().get(key, "Cinematic", "playing"),
+                                Some(metrocalk_core::FieldValue::Bool(true))
+                            )
+                        });
+                        // Someone else already has the camera - wait your turn.
+                        if cinema_owner.is_some_and(|owner| owner != *entity) {
+                            continue;
+                        }
+                        // A cutscene that has run is done until a rule explicitly cycles the cue.
+                        if *played && wants {
+                            continue;
+                        }
+                        if !wants {
+                            *played = false; // the cue went low: re-arm for a genuine re-trigger
+                        }
+                        match (wants, *started) {
+                            (true, None) => {
+                                // Rising edge: take authority and remember the editor's view so Stop
+                                // can restore it.
+                                let mut st = shared.lock().unwrap();
+                                if cinema_saved_cam.is_none() {
+                                    cinema_saved_cam = Some(st.cam_override);
+                                }
+                                // The viewport stops being a workspace for the duration of the shot.
+                                st.cinematic = true;
+                                // By KEY, never by index: instance indices are only stable between
+                                // rebuilds, and a rebuild during a cutscene (an undo, a delete, a door
+                                // reopening) would otherwise re-outline an unrelated object when the
+                                // shot ended.
+                                cinema_dimmed =
+                                    st.instances.iter().position(|i| i.selected > 0.5).and_then(
+                                        |i| {
+                                            let was = st.instances[i].selected;
+                                            st.instances[i].selected = 0.0;
+                                            st.ids.get(i).map(|k| (k.clone(), was))
+                                        },
+                                    );
+                                st.revision = st.revision.wrapping_add(1);
+                                drop(st);
+                                cinema_owner = Some(*entity);
+                                *started = Some(frame);
+                            }
+                            (false, Some(_)) => {
+                                *started = None;
+                                cinema_owner = None;
+                                let mut st = shared.lock().unwrap();
+                                if let Some(saved) = cinema_saved_cam.take() {
+                                    st.cam_override = saved;
+                                }
+                                restore_editor_chrome(&mut st, &mut cinema_dimmed);
+                            }
+                            _ => {}
+                        }
+                        let Some(start_frame) = *started else {
+                            continue;
+                        };
+                        // Several commands restart the physics run and reset `frame` to 0. Without this
+                        // the saturating subtraction below silently returns 0 and the shot freezes on
+                        // its first pose for start_frame/60 seconds.
+                        if frame < start_frame {
+                            *started = Some(frame);
+                        }
+                        let start_frame = (*started).unwrap_or(frame);
+                        // The clock is the replay-stamped frame counter, never wall time.
+                        #[allow(clippy::cast_precision_loss)]
+                        let elapsed = (frame.saturating_sub(start_frame)) as f32 / 60.0;
+                        let Some((index, progress)) = cut.shot_at(elapsed) else {
+                            // Out of shots: release the camera - and the authority with it, so the
+                            // next cutscene in the scene can have its turn.
+                            *started = None;
+                            *played = true;
+                            cinema_owner = None;
+                            let mut st = shared.lock().unwrap();
+                            if let Some(saved) = cinema_saved_cam.take() {
+                                st.cam_override = saved;
+                            }
+                            restore_editor_chrome(&mut st, &mut cinema_dimmed);
+                            continue;
+                        };
+                        let shot = &cut.shots[index];
+                        // Resolve the subject: a real key, or this cutscene's own object.
+                        let subject_id = EntityId::from_loro_key(&shot.subject)
+                            .filter(|e| engine.entity_exists(*e))
+                            .unwrap_or(*entity);
+                        // Sample it LIVE — physics position if it has a body, authored otherwise. This
+                        // is why a recipe beats a baked pose: the shot follows a moving subject.
+                        let g = capscene::global_transform(&engine, subject_id);
+                        let subject_key = subject_id.to_loro_key();
+                        // Sample the subject from the RENDER state, not the document. The authored
+                        // Transform scale defaults to 1.0 while the renderer draws the same entity at
+                        // its asset scale (0.45 for a spawned primitive), so framing off the document
+                        // parked every shot ~2x too far and a "Close-up" framed like a "Full".
+                        let (center, draw_scale, aspect) = {
+                            let st = shared.lock().unwrap();
+                            let i = st.ids.iter().position(|k| *k == subject_key);
+                            (
+                                i.and_then(|i| st.instances.get(i).map(|inst| inst.center))
+                                    .unwrap_or(g.translation),
+                                i.and_then(|i| st.instances.get(i).map(|inst| inst.scale)),
+                                if st.surface_aspect.is_finite() && st.surface_aspect > 0.1 {
+                                    st.surface_aspect
+                                } else {
+                                    16.0 / 9.0
+                                },
+                            )
+                        };
+                        let half = draw_scale
+                            .map_or_else(|| g.scale[0].abs(), f32::abs)
+                            .max(0.25);
+                        // The subject's real facing, so "Behind" is behind IT and not behind the world.
+                        // A hardcoded +Z made every angle world-relative and quietly killed the one
+                        // property `shot.rs` is built around.
+                        let fwd = {
+                            let q = g.rotation;
+                            let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+                            let v = [
+                                2.0 * (x * z + w * y),
+                                2.0 * (y * z - w * x),
+                                1.0 - 2.0 * (x * x + y * y),
+                            ];
+                            let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                            if len.is_finite() && len > 1.0e-4 {
+                                [v[0] / len, v[1] / len, v[2] / len]
+                            } else {
+                                [0.0, 0.0, 1.0]
+                            }
+                        };
+                        let sample = SubjectSample {
+                            center,
+                            half_extent: [half, half, half],
+                            forward: fwd,
+                        };
+                        let mut pose = solve_shot(shot, sample, progress, aspect, 50.0);
+                        // A low angle on a subject standing on the ground put the camera UNDER the
+                        // floor - below the ground body every run creates, and below the grid. Clamp
+                        // rather than forbid the angle: the shot still looks up, it just does it from
+                        // a place a camera could actually be.
+                        const CAMERA_FLOOR: f32 = 0.15;
+                        if pose.eye[1] < CAMERA_FLOOR {
+                            pose.eye[1] = CAMERA_FLOOR;
+                        }
+                        let mut st = shared.lock().unwrap();
+                        st.cam_override = Some(render::CamView {
+                            pos: pose.eye,
+                            look_at: Some(pose.look_at),
+                            fov_deg: pose.fov_deg,
+                            near: 0.1,
+                            far: 2000.0,
+                        });
+                        // NOT a revision bump. `revision` means "the scene changed": it re-partitions
+                        // every instance, re-uploads every buffer and RECREATES every submesh and LOD
+                        // bind group - a per-frame cost the render loop explicitly documents as never
+                        // happening per frame. `cam_override` is read outside that gate, so a camera
+                        // move needs nothing here at all.
+                    }
+                }
+                // ── VFX: resolve every live effect into the render projection ───────────────────
+                // Everything here is closed-form. There is no per-frame state to advance, nothing to
+                // integrate and nothing that can drift, so a replay of the same recorded inputs draws
+                // the same particles on the same frames — which a stepped simulation could not promise.
+                if play_mode && (!play_vfx.is_empty() || !play_vfx_bursts.is_empty()) {
+                    use metrocalk_animation::vfx::{
+                        resolve_layers, EmitterSample, FxTrigger, Look, SceneBudget,
+                    };
+                    let mut additive: Vec<render::Instance> = Vec::new();
+                    let mut soft: Vec<render::Instance> = Vec::new();
+                    let mut resolved: Vec<(metrocalk_animation::vfx::ParticleSample, Look)> =
+                        Vec::new();
+                    // ONE budget for the whole frame. Per-stack caps let fifty objects each draw a
+                    // legal 512 and cost the tick 25,000 particles between them.
+                    let mut budget = SceneBudget::new();
+
+                    for (entity, key, stack, started) in &mut play_vfx {
+                        // A rule (or the author's "the whole time" choice) owns this flag; Play only
+                        // reads it. Flipping it is an ordinary SetField, which is why fire and sparks
+                        // cost the action vocabulary nothing.
+                        // `playing` is the CUE, and it now governs only the "when a rule says so"
+                        // layers. "The whole time" layers run because their own trigger says so, and
+                        // moment layers fire from the moment. One boolean per object used to decide for
+                        // every layer at once, so a second card switched the first one off.
+                        let cued = rule_session.as_ref().is_some_and(|s| {
+                            matches!(
+                                s.state().get(key, "Vfx", "playing"),
+                                Some(metrocalk_core::FieldValue::Bool(true))
+                            )
+                        });
+                        let live: Vec<_> = stack
+                            .layers
+                            .iter()
+                            .filter(|l| match l.trigger {
+                                FxTrigger::Always => true,
+                                FxTrigger::OnCue => cued,
+                                FxTrigger::WhenCollected | FxTrigger::WhenHit => false,
+                            })
+                            .cloned()
+                            .collect();
+                        if live.is_empty() {
+                            *started = None;
+                            continue;
+                        }
+                        if started.is_none() {
+                            *started = Some(frame);
+                        }
+                        let mut start_frame = started.unwrap_or(frame);
+                        // A `frame = 0` reset (spawning a body, going dynamic) would otherwise saturate
+                        // the subtraction to 0 and freeze every effect on its first frame.
+                        if frame < start_frame {
+                            *started = Some(frame);
+                            start_frame = frame;
+                        }
+                        // The clock is the replay-stamped frame counter, never wall time.
+                        #[allow(clippy::cast_precision_loss)]
+                        let seconds = (frame.saturating_sub(start_frame)) as f32 / 60.0;
+
+                        // Anchor on the LIVE render position so an effect rides a moving object.
+                        let g = capscene::global_transform(&engine, *entity);
+                        let origin = {
+                            let st = shared.lock().unwrap();
+                            st.ids
+                                .iter()
+                                .position(|k| k == key)
+                                .and_then(|i| st.instances.get(i).map(|inst| inst.center))
+                                .unwrap_or(g.translation)
+                        };
+                        let radius = g.scale[0].abs().max(0.1);
+                        resolved.clear();
+                        resolve_layers(
+                            live.iter(),
+                            EmitterSample { origin, radius },
+                            seconds,
+                            &mut budget,
+                            &mut resolved,
+                        );
+                        for (p, look) in &resolved {
+                            let inst = render::Instance {
+                                center: p.position,
+                                scale: p.radius,
+                                color: p.color,
+                                selected: p.alpha,
+                                rotation: render::IDENTITY_QUAT,
+                                material: [0.0; 4],
+                            };
+                            match look {
+                                Look::Additive => additive.push(inst),
+                                Look::Soft => soft.push(inst),
+                            }
+                        }
+                    }
+
+                    // Moment-fired one-shots, anchored where the moment happened. Retired once their
+                    // longest layer has run out, so the list cannot grow without bound over a long run.
+                    play_vfx_bursts.retain(|(stack, origin, radius, start_frame)| {
+                        #[allow(clippy::cast_precision_loss)]
+                        let seconds = (frame.saturating_sub(*start_frame)) as f32 / 60.0;
+                        // The REAL tail. A burst's last particle is BORN at 0.15*life, so it dies at
+                        // 1.15*life; retiring at `life + 0.4` cut a long burst off while 15% of it was
+                        // still at full opacity, and an absurd authored lifetime made the test
+                        // unreachable so the list grew for the rest of the run.
+                        let longest = stack
+                            .layers
+                            .iter()
+                            .map(metrocalk_animation::vfx::EffectRecipe::total_seconds)
+                            .fold(0.0_f32, f32::max);
+                        if seconds > longest {
+                            return false;
+                        }
+                        resolved.clear();
+                        resolve_layers(
+                            stack.layers.iter(),
+                            EmitterSample {
+                                origin: *origin,
+                                radius: *radius,
+                            },
+                            seconds,
+                            &mut budget,
+                            &mut resolved,
+                        );
+                        for (p, look) in &resolved {
+                            let inst = render::Instance {
+                                center: p.position,
+                                scale: p.radius,
+                                color: p.color,
+                                selected: p.alpha,
+                                rotation: render::IDENTITY_QUAT,
+                                material: [0.0; 4],
+                            };
+                            match look {
+                                Look::Additive => additive.push(inst),
+                                Look::Soft => soft.push(inst),
+                            }
+                        }
+                        true
+                    });
+
+                    let mut st = shared.lock().unwrap();
+                    st.fx_bursts = play_vfx_bursts.len();
+                    st.fx_peak_total = st.fx_peak_total.max(additive.len() + soft.len());
+                    let brightest = additive
+                        .iter()
+                        .chain(soft.iter())
+                        .map(|i| i.color[0].max(i.color[1]).max(i.color[2]))
+                        .fold(0.0_f32, f32::max);
+                    st.fx_peak_radiance = st.fx_peak_radiance.max(brightest);
+                    // Only touch the revision when something actually changed, so an idle scene with
+                    // armed-but-silent effects costs no uploads at all.
+                    if !(additive.is_empty()
+                        && soft.is_empty()
+                        && st.fx_additive.is_empty()
+                        && st.fx_soft.is_empty())
+                    {
+                        st.fx_additive = additive;
+                        st.fx_soft = soft;
+                        st.fx_revision = st.fx_revision.wrapping_add(1);
+                    }
+                }
+                // ── THE GENERIC EFFECT READ-BACK ────────────────────────────────────────────────
+                // A rule can now change what you SEE. Until this existed, the rules runtime could
+                // fire a perfectly correct rule, every condition ticking green in the debugger, and
+                // nothing happened on screen unless it hit one of two hand-written cells (collect a
+                // pickup, defeat an enemy). This pass diffs the rules `RuntimeState` against the
+                // viewport once per tick for every role-carrying object, so ANY authored rule that
+                // sets `GameRole.active` is projected: doors open, switches reveal, walls vanish,
+                // objects come back. Still a projection — the document is never written (ADR-021).
+                if play_mode && !play_roles.is_empty() {
+                    let mut reappeared = false;
+                    if let Some(session) = rule_session.as_ref() {
+                        for (entity, key) in &play_roles {
+                            // A felled enemy is mid-tumble; its linger owns the hide until it ends.
+                            if dying_enemies.iter().any(|(d, _, _)| d == entity) {
+                                continue;
+                            }
+                            // Out of the game when a rule deactivated it OR its health hit zero. Both
+                            // funnel through the same pass, so "defeated" looks the same however it
+                            // happened — and a player at 0 hp visibly loses.
+                            let dead = matches!(
+                                session.state().get(key, "Health", "hp"),
+                                Some(metrocalk_core::FieldValue::Integer(hp)) if *hp <= 0
+                            );
+                            let active = !dead
+                                && !matches!(
+                                    session.state().get(key, "GameRole", "active"),
+                                    Some(metrocalk_core::FieldValue::Bool(false))
+                                );
+                            let hidden = PLAY_HIDDEN.with(|h| h.borrow().contains(entity));
+                            // ── the "when it's hit" MOMENT ──────────────────────────────────
+                            // An edge, not a level: fired the tick hp goes DOWN, so a wounded object
+                            // sparks once per hit instead of every frame it spends wounded.
+                            if let Some(metrocalk_core::FieldValue::Integer(hp)) =
+                                session.state().get(key, "Health", "hp")
+                            {
+                                let was = play_vfx_hp.insert(key.clone(), *hp);
+                                if was.is_some_and(|w| *hp < w) {
+                                    fire_moment_vfx(
+                                        &play_vfx,
+                                        entity,
+                                        metrocalk_animation::vfx::FxTrigger::WhenHit,
+                                        &engine,
+                                        &shared,
+                                        frame,
+                                        &mut play_vfx_bursts,
+                                    );
+                                }
+                            }
+                            if !active && !hidden {
+                                PLAY_HIDDEN.with(|h| {
+                                    h.borrow_mut().insert(*entity);
+                                });
+                                // ── the "when it's picked up / beaten" MOMENT ────────────────────
+                                // ONE hook for every way an object can leave the game — collected,
+                                // defeated, vanished, switched off by a rule. The burst is detached
+                                // and anchored where the object last stood, because the object itself
+                                // is about to stop being drawn.
+                                // A DIFFERENT layer set from the hit moment above, which is also why a
+                                // killing blow no longer fires the same burst twice in one tick: the
+                                // hp edge fires "when it's hit" and this edge fires "when it's picked
+                                // up / beaten", and no layer carries both.
+                                fire_moment_vfx(
+                                    &play_vfx,
+                                    entity,
+                                    metrocalk_animation::vfx::FxTrigger::WhenCollected,
+                                    &engine,
+                                    &shared,
+                                    frame,
+                                    &mut play_vfx_bursts,
+                                );
+                                let mut st = shared.lock().unwrap();
+                                if let Some(i) = st.ids.iter().position(|k| k == key) {
+                                    st.instances[i].scale = 0.0;
+                                    st.revision = st.revision.wrapping_add(1);
+                                }
+                            } else if active && hidden {
+                                PLAY_HIDDEN.with(|h| {
+                                    h.borrow_mut().remove(entity);
+                                });
+                                reappeared = true;
+                            }
+                        }
+                    }
+                    // Coming BACK needs the instance rebuilt (the hide drops it from the draw list).
+                    // Rare (a door reopening), so the full rebuild is the honest, simple answer.
+                    if reappeared {
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                    }
                 }
                 // Animation advances on the same native heartbeat but is independent of physics. A scene
                 // with zero rigid bodies still animates, and integer ticks keep playback deterministic.
@@ -13183,6 +16080,39 @@ fn record_body(
 /// the body-index → entity map (index 0 = the ground = `None`), the freshly-built `sim`, and the rebuilt
 /// `body_of`. The caller resets `frame`/`max_frame` to 0. This is the M8.4 timeline's "scene changed →
 /// new run" reset, and the M8.2/M8.3 mirror-into-the-sim path unified.
+/// Where the Play session's ground should be centred: the first entity that can move, else the first
+/// entity at all, else the world origin.
+///
+/// Deterministic — it reads the document in entity order, not the camera — so two machines building the same
+/// scene build the same colliders.
+fn play_focus_xz(engine: &Engine<FlecsWorld>) -> [f32; 2] {
+    let mut fallback = None;
+    for id in engine.entity_ids() {
+        let comps = engine.components_of(id);
+        let Some(t) = comps.get("Transform") else {
+            continue;
+        };
+        let get = |f: &str| -> f32 {
+            t.get(f).map_or(0.0, |v| match v {
+                FieldValue::Number(n) => *n as f32,
+                FieldValue::Integer(i) => *i as f32,
+                _ => 0.0,
+            })
+        };
+        let p = [get("x"), get("z")];
+        if fallback.is_none() {
+            fallback = Some(p);
+        }
+        let dynamic = comps.get("RigidBody").is_some_and(|b| {
+            !matches!(b.get("kind"), Some(FieldValue::Str(k)) if k.eq_ignore_ascii_case("fixed"))
+        });
+        if dynamic {
+            return p;
+        }
+    }
+    fallback.unwrap_or([0.0, 0.0])
+}
+
 fn restart_run(
     engine: &Engine<FlecsWorld>,
     assets: &AssetsRuntime,
@@ -13205,6 +16135,13 @@ fn restart_run(
         }),
     );
     entities.push(None);
+    // M19 — the terrain's own ground, when there is one. Recorded before the entities so a replay's body
+    // order is stable, and generated from the recipe rather than from whatever the camera had streamed in.
+    // The ring centres on the first thing that will actually move.
+    for (body, collider) in terrain_play_colliders(play_focus_xz(engine)) {
+        recording.add_body(body, collider);
+        entities.push(None);
+    }
     for id in engine.entity_ids() {
         if let Some((body, collider)) = record_body(engine, assets, old_sim, old_body_of, id) {
             recording.add_body(body, collider);
@@ -13937,6 +16874,65 @@ struct AnimationPose {
     render_scale: f32,
 }
 
+/// One Play-cached collectible for the touch bridge: authored world position + trigger radius, the
+/// loro key the rules speak, and whether it has been collected this run (rising-edge latch).
+/// One authored clause, ready to render as a chip: the sentence fragment plus where it lives.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ClauseRow {
+    /// The sentence fragment ("the Score is at least 3").
+    reads: String,
+    /// Index within its list — the remove key.
+    index: usize,
+    /// Whether it sits in the OR group.
+    any: bool,
+}
+
+/// An object's "only if" clauses + the whole sentence the rule now reads as.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ConditionListInfo {
+    /// The AND clauses.
+    all: Vec<ClauseRow>,
+    /// The OR group (any one of these).
+    any: Vec<ClauseRow>,
+    /// The role's OWN built-in clause, shown greyed with provenance (never editable here).
+    role_clause: Option<String>,
+    /// The full sentence, assembled — what the user reads back.
+    sentence: String,
+}
+
+struct PlayCollectible {
+    entity: EntityId,
+    key: String,
+    pos: [f32; 3],
+    radius: f32,
+    collected: bool,
+    /// Whether a qualifying (moving) body was inside the trigger last tick — the enter-edge
+    /// latch, so `Touched` fires once per entry rather than every tick of an overlap.
+    was_inside: bool,
+}
+
+/// One companion's Play-time brain state (play-only; discarded on Stop). The tunables are
+/// snapshotted from `GameRole` at Play start; everything volatile (cooldown, patrol leg,
+/// stuck bookkeeping) lives here so the doc never carries a byte of it.
+struct PlayCompanion {
+    entity: EntityId,
+    key: String,
+    speed: f64,
+    range: f64,
+    follow: f64,
+    aggro: f64,
+    cooldown: u32,
+    patrol_ix: usize,
+    stuck_clock: u32,
+    stuck_anchor: [f64; 3],
+    detour_left: u32,
+    detour_side: f64,
+    /// The live one-line status the Gameplay panel shows ("following", "attacking Skeleton").
+    doing: String,
+}
+
 thread_local! {
     /// M15.9 (ADR-079) — render-only kinematic pose overrides (entity → posed `(position, quat)`), applied
     /// by `rebuild` ON TOP of the authored ECS transforms during a timeline scrub / joint-drag preview.
@@ -13949,6 +16945,13 @@ thread_local! {
     /// includes affected descendants, so a keyed assembly or mechanism parent carries its children.
     static ANIMATION_POSES: std::cell::RefCell<HashMap<EntityId, AnimationPose>> =
         std::cell::RefCell::new(HashMap::new());
+
+    /// Play-only visibility overlay (the gameplay-roles OUT-bridge): entities a fired rule collected
+    /// this run. `rebuild` skips them entirely (no instance, no pick, no snap), the Tick arm zeroes
+    /// their live instance for same-frame feedback, and Stop clears the set — the authored document
+    /// never changes (the ANIMATION_POSES discipline, applied to visibility).
+    static PLAY_HIDDEN: std::cell::RefCell<std::collections::HashSet<EntityId>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 
     /// M15.10 (ADR-080) — the last CAD import's re-import diff (the never-silent report the UI renders) + the
     /// held pending adjudications (a low-confidence match's overrides, kept until the user confirms/rejects —
@@ -14635,6 +17638,12 @@ fn apply_animation_binding_values<'a>(
     let mut memo = HashMap::new();
     let mut poses = HashMap::new();
     for id in affected {
+        // A collected pickup is hidden for the rest of the run (gameplay roles). Its spin
+        // tracks still evaluate, but writing the pose back would resurrect the instance the
+        // same tick the touch bridge zeroed it — the hide overlay outranks the animation.
+        if PLAY_HIDDEN.with(|hidden| hidden.borrow().contains(&id)) {
+            continue;
+        }
         let projected = projected_animation_global(engine, id, &values, &mut memo);
         let base = capscene::global_transform(engine, id);
         let scale_ratio = if base.scale[0].abs() > 1.0e-9 {
@@ -14698,12 +17707,21 @@ fn rebuild(
     // M11.4 — wireframe ICON glyphs for light/camera marker entities (line-segment endpoint pairs). Markers
     // are drawn as these glyphs, NOT as solid placeholder cubes (see the marker skip below).
     let mut marker_glyphs: Vec<Instance> = Vec::new();
+    // The entities those glyphs stand for (see `render::MarkerEntity`) — geometry-free things that are
+    // drawn and must therefore be selectable: lights, cameras, terrain recipes, CAD assembly folders.
+    let mut marker_entities: Vec<render::MarkerEntity> = Vec::new();
     for id in engine.entity_ids() {
         // M9.2 deactivate-not-delete: a deactivated PART is hidden from the viewport (the entity + its
         // data survive; undo re-activates it → it reappears on the next rebuild). Only children can be
         // deactivated, so flat entities skip the (override-map) `is_active` read entirely.
         let is_child = engine.parent_of(id).is_some();
         if is_child && !engine.is_active(id) {
+            continue;
+        }
+        // Play-only hide (gameplay roles): a collected pickup leaves the instance list entirely —
+        // no draw, no shadow, no pick, no snap — for the rest of the run. Cleared on Stop; the
+        // authored document never carried the change.
+        if PLAY_HIDDEN.with(|hidden| hidden.borrow().contains(&id)) {
             continue;
         }
         let comps = engine.components_of(id);
@@ -14729,11 +17747,31 @@ fn rebuild(
             && (comps.contains_key("Light") || comps.contains_key("Camera"))
         {
             let p = [get("x"), get("y"), get("z")];
-            marker_glyphs.extend(if comps.contains_key("Camera") {
+            let is_camera = comps.contains_key("Camera");
+            marker_glyphs.extend(if is_camera {
                 camera_glyph(p)
             } else {
                 light_glyph(p)
             });
+            // Record WHICH entity the glyph is, so the picker can offer it a grab proxy. Drawing an
+            // icon without recording its identity is what made lights and cameras unselectable in the
+            // viewport while being perfectly visible in it.
+            marker_entities.push(render::MarkerEntity {
+                id: id.to_loro_key(),
+                position: p,
+                kind: if is_camera {
+                    metrocalk_spatial::HitKind::Camera
+                } else {
+                    metrocalk_spatial::HitKind::Light
+                },
+            });
+            continue;
+        }
+        // M19 (ADR-104) — a terrain entity carries a RECIPE, not geometry: its chunks are streamed by the
+        // terrain runtime and drawn from their own slot table. It stays selectable in the hierarchy and
+        // editable in the inspector; it is simply not an `instances` entry, so it never appears as a
+        // placeholder cube floating at the world origin on top of its own landscape.
+        if comps.contains_key(metrocalk_editor_shell::terrain_intent::TERRAIN_COMPONENT) {
             continue;
         }
         // A geometry-free ASSEMBLY/GROUP container from a CAD import (a named `__meta__.kind == "group"` node
@@ -14887,6 +17925,7 @@ fn rebuild(
     st.snap_affinity = snap_affinity;
     st.line_points = line_points;
     st.marker_glyphs = marker_glyphs;
+    st.marker_entities = marker_entities;
     st.lights = lights;
     st.shadow_caster = shadow_caster;
     st.lights_revision = st.lights_revision.wrapping_add(1);
@@ -14902,6 +17941,275 @@ fn rebuild(
         st.gizmo.drag_end();
     }
     st.revision = st.revision.wrapping_add(1);
+    drop(st);
+    sync_terrain(engine, shared, assets);
+}
+
+thread_local! {
+    /// The world rectangle the edit currently being committed can change, or `None` for "anywhere".
+    ///
+    /// Set by the terrain-edit handler and consumed by `sync_terrain`, which is otherwise digest-driven and
+    /// has no way to know that a brush dab moved four metres of ground rather than the whole world. Without
+    /// it every paint stroke would re-stream a four-kilometre landscape.
+    /// Which derived stages the last terrain edit invalidated (ADR-106). `None` ⇒ everything, the honest
+    /// default for an edit whose reach is not known.
+    static TERRAIN_STAGES: std::cell::Cell<Option<metrocalk_terrain::stage::StageMask>> =
+        const { std::cell::Cell::new(None) };
+    static TERRAIN_DIRTY: std::cell::Cell<Option<([f32; 2], [f32; 2])>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// The erosion-bake memo, keyed by content digest.
+    ///
+    /// Thread-local because only the engine thread compiles terrain, and a memo needs no lock to be correct
+    /// when it has one writer. This is what makes an erosion-heavy terrain pleasant to edit: the bake key
+    /// covers only the layers *below* the erosion pass, so moving a slider above it, sculpting, or drawing
+    /// a road all recompile in milliseconds against a cached bake instead of re-running the droplets.
+    static TERRAIN_BAKES: std::cell::RefCell<BTreeMap<String, metrocalk_terrain::HeightGrid>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+/// Recompile and publish the scene's terrain when its recipe has changed.
+///
+/// Called at the end of every `rebuild`, so opening a project, undoing a sculpt stroke and applying an edit
+/// all converge on the same path — there is no separate "load terrain" step that could be forgotten at one
+/// of those call sites. The digest check keeps it free when nothing changed.
+fn sync_terrain(engine: &Engine<FlecsWorld>, shared: &Shared, assets: &AssetsRuntime) {
+    use metrocalk_editor_shell::terrain_intent;
+    let wanted = terrain_intent::terrains(engine)
+        .first()
+        .and_then(|id| terrain_intent::read(engine, *id).ok());
+    let current = {
+        let st = shared.lock().unwrap();
+        st.terrain.terrain().map(|t| t.recipe().digest())
+    };
+    // The scatter prototypes' render slots, refreshed every rebuild so binding a mesh in the panel makes
+    // the foliage appear on the next frame without a separate "reload assets" step.
+    if let Some(recipe) = terrain_intent::terrains(engine)
+        .first()
+        .and_then(|id| terrain_intent::read(engine, *id).ok())
+    {
+        let slot_of = |key: &String| -> i32 {
+            if key.is_empty() {
+                return -1;
+            }
+            assets
+                .handle_to_slot
+                .get(key)
+                .and_then(|s| i32::try_from(*s).ok())
+                .unwrap_or(-1)
+        };
+        let table: Vec<[i32; 5]> = recipe
+            .protos
+            .iter()
+            .map(|p| {
+                let mut row = [-1i32; 5];
+                row[0] = slot_of(&p.mesh_key);
+                for (i, k) in p.lod_keys.iter().take(3).enumerate() {
+                    row[i + 1] = slot_of(k);
+                }
+                if let Some(k) = &p.impostor_key {
+                    row[4] = slot_of(k);
+                }
+                row
+            })
+            .collect();
+        shared.lock().unwrap().terrain_proto_slots = table;
+    }
+
+    match (wanted, current) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            let mut st = shared.lock().unwrap();
+            let mut rt = std::mem::take(&mut st.terrain);
+            rt.set_terrain(None, &mut st);
+            st.terrain = rt;
+        }
+        (Some(recipe), cur) => {
+            if cur == Some(recipe.digest()) {
+                return;
+            }
+            let compiled = TERRAIN_BAKES.with(|cache| {
+                let borrowed = cache.borrow();
+                metrocalk_terrain::Terrain::compile_with_bakes(recipe, BTreeMap::new(), &borrowed)
+            });
+            match compiled {
+                Err(e) => {
+                    // Visible and actionable, not a line on stderr nobody reads. The panel shows this and
+                    // the runtime keeps the terrain it HAS rather than silently dropping the world.
+                    eprintln!("[terrain] recipe did not compile: {e}");
+                    shared.lock().unwrap().terrain_problem =
+                        Some(format!("the terrain could not be built: {e}"));
+                }
+                Ok(t) => {
+                    shared.lock().unwrap().terrain_problem = None;
+                    TERRAIN_BAKES.with(|cache| {
+                        let mut c = cache.borrow_mut();
+                        for (k, v) in t.bakes() {
+                            c.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    });
+                    PLAY_TERRAIN.with(|p| *p.borrow_mut() = Some(std::sync::Arc::new(t.clone())));
+                    let dirty = TERRAIN_DIRTY.with(std::cell::Cell::take);
+                    let stages = TERRAIN_STAGES.with(std::cell::Cell::take);
+                    let mut st = shared.lock().unwrap();
+                    let mut rt = std::mem::take(&mut st.terrain);
+                    match dirty {
+                        // A bounded edit rebuilds only its region, and only the derived stages the
+                        // dependency graph says are downstream of it (ADR-106).
+                        Some(region) => rt.replace_terrain_in(t, region, stages, &mut st),
+                        None => rt.set_terrain(Some(t), &mut st),
+                    }
+                    st.terrain = rt;
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// The compiled terrain, as the ENGINE thread sees it.
+    ///
+    /// Play mode's physics world is built here, not from the render-side runtime, and that is deliberate:
+    /// collider resolution must be a function of the recipe and integer chunk rings only. Reading the
+    /// render side's resident set instead would make the simulation depend on where the *camera* happened
+    /// to be — exactly the kind of hidden input that makes a replay diverge.
+    static PLAY_TERRAIN: std::cell::RefCell<Option<std::sync::Arc<metrocalk_terrain::Terrain>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Point the camera at a newly created terrain.
+///
+/// Without this, "create Rolling Hills" leaves the camera sixty metres from the origin — which is the corner
+/// of a two-kilometre world — looking at the inside of whatever hill happens to be there. A render-only
+/// camera move (never the document, ADR-021) is the difference between the feature appearing to work and
+/// appearing to do nothing.
+fn frame_new_terrain(shared: &Shared, recipe: &metrocalk_terrain::TerrainRecipe) {
+    let mut st = shared.lock().unwrap();
+    // Aim at the most interesting ground, not at whatever the world's arithmetic centre happens to be. On a
+    // coastal preset the centre is often a flat sea floor, and opening on it makes a landscape of hills and
+    // forests look like an empty beach. Sampling a coarse grid and taking the highest point costs a few
+    // hundred field evaluations and shows the author what they actually made.
+    let mut target = [recipe.world_size_m * 0.5, 0.0, recipe.world_size_m * 0.5];
+    let mut best = f32::MIN;
+    const PROBES: u32 = 24;
+    for iz in 0..PROBES {
+        for ix in 0..PROBES {
+            // Inset from the edges, so the camera never frames the rim of the world.
+            let f = |i: u32| (i as f32 + 0.5) / PROBES as f32 * 0.7 + 0.15;
+            let (x, z) = (recipe.world_size_m * f(ix), recipe.world_size_m * f(iz));
+            let Some(h) = st.terrain.height_at(x, z) else {
+                continue;
+            };
+            if h > best {
+                best = h;
+                target = [x, h, z];
+            }
+        }
+    }
+    // Never aim below the water line: a camera parked on a lake bed stares at the underside of the ocean.
+    if recipe.water.enabled {
+        target[1] = target[1].max(recipe.water.sea_level_m);
+    }
+    st.cam_target = target;
+    // Far enough to see the shape of the land, near enough that the detail is worth streaming, and looking
+    // down enough that the horizon sits in the upper third rather than at the top of the frame.
+    st.distance = (recipe.world_size_m * 0.22).clamp(140.0, 900.0);
+    st.elevation = 0.62;
+    st.projection = render::Projection::Perspective;
+}
+
+/// Generate stand-in meshes for a new terrain's unbound scatter prototypes, register them with the asset
+/// runtime, and bind the recipe to them in one undoable transaction.
+///
+/// Returns the bound recipe, or `None` when there was nothing to bind (every prototype already had a mesh).
+fn install_terrain_stand_ins(
+    engine: &mut Engine<FlecsWorld>,
+    assets: &mut AssetsRuntime,
+    id: EntityId,
+) -> Option<metrocalk_terrain::TerrainRecipe> {
+    use metrocalk_editor_shell::terrain_intent;
+    let mut recipe = terrain_intent::read(engine, id).ok()?;
+    let installed = terrain_intent::install_stand_in_protos(&mut assets.store, &mut recipe);
+    if installed.is_empty() {
+        return None;
+    }
+    for proto in &installed {
+        for (handle, asset) in &proto.assets {
+            if assets.handle_to_slot.contains_key(handle) {
+                continue;
+            }
+            let gpu = MeshGpu::from_asset(asset);
+            let slot = assets.meshes.len();
+            assets.meshes.push(gpu);
+            assets.scales.push(1.0);
+            assets.display_affines.push(AssetAffine::IDENTITY);
+            assets.handle_to_slot.insert(handle.clone(), slot);
+        }
+    }
+    // One transaction for the whole binding, so undoing the creation undoes the binding with it.
+    let mut last = None;
+    for proto in &installed {
+        let edit = terrain_intent::TerrainEdit::BindProto {
+            index: proto.proto_index,
+            mesh_key: proto.mesh_key.clone(),
+            lod_keys: proto.lod_keys.clone(),
+            impostor_key: Some(proto.impostor_key.clone()),
+        };
+        last = terrain_intent::apply_edit(engine, id, &edit)
+            .ok()
+            .map(|(r, _)| r);
+    }
+    last
+}
+
+/// Height-field colliders for the chunks inside the recipe's physics ring, centred on `focus_xz`.
+///
+/// Bounded by the recipe, chosen by **integer chunk rings**, and therefore identical on every machine: the
+/// simulation must not depend on a float distance or on where a camera happened to be. The centre is where
+/// the action starts — the first dynamic body, or the camera target when the scene has none — because
+/// centring on the world's geometric middle puts the ground somewhere else entirely on a large map.
+///
+/// The ring is fixed for the Play session. Growing it *during* Play would mean adding rigid bodies to a
+/// running world, and `physics::Recording` has no notion of a body that appears at frame N — a replay would
+/// place it at frame 0 and diverge. Frame-stamping body creation is a change to the replay contract
+/// (ADR-020 / the DST guarantee), so it belongs in its own decision rather than being smuggled in here. What
+/// this does instead is make the ring land where the player is, and make it big enough to matter.
+fn terrain_play_colliders(focus_xz: [f32; 2]) -> Vec<(BodyDesc, ColliderDesc)> {
+    PLAY_TERRAIN.with(|slot| {
+        let borrowed = slot.borrow();
+        let Some(t) = borrowed.as_ref() else {
+            return Vec::new();
+        };
+        let recipe = t.recipe();
+        let per_axis = recipe.chunks_per_axis() as i32;
+        let raw = recipe.chunk_at(focus_xz[0], focus_xz[1]);
+        let centre = metrocalk_terrain::ChunkCoord::new(
+            raw.x.clamp(0, per_axis - 1),
+            raw.z.clamp(0, per_axis - 1),
+        );
+        let ring = recipe.lod.physics_ring.max(0);
+        let mut out = Vec::new();
+        for cz in (centre.z - ring).max(0)..=(centre.z + ring).min(per_axis - 1) {
+            for cx in (centre.x - ring).max(0)..=(centre.x + ring).min(per_axis - 1) {
+                let coord = metrocalk_terrain::ChunkCoord::new(cx, cz);
+                let Some(lod) =
+                    metrocalk_terrain::collision::physics_lod(coord, centre, &recipe.lod)
+                else {
+                    continue;
+                };
+                let Ok(samples) = t.sample_chunk(coord) else {
+                    continue;
+                };
+                let collider = metrocalk_terrain::chunk_collider(&samples, lod);
+                out.push(
+                    metrocalk_editor_shell::terrain_intent::chunk_body_and_collider(&collider),
+                );
+            }
+        }
+        out
+    })
 }
 
 /// The tracking-line colour (matches the panel's `#9fe` "tracking" accent). Only carried for parity;
@@ -14936,6 +18244,560 @@ fn material_preset(name: &str) -> Option<([f32; 3], f32, f32)> {
         "plastic" | "matte" => ([0.80, 0.80, 0.82], 0.0, 0.55),
         _ => return None,
     })
+}
+
+// ── terrain (M19 / ADR-104) ────────────────────────────────────────────────────
+
+/// What the Terrain workspace sends. One command carries every authoring operation, because the operations
+/// are already data ([`metrocalk_editor_shell::terrain_intent::TerrainEdit`]) — a command per slider would be
+/// a hundred commands that can drift out of step with the model.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerrainEditArgs {
+    /// Target entity; omitted means "the scene's only terrain".
+    entity: Option<String>,
+    /// The edit to apply. Omitted means "just tell me the current state".
+    edit: Option<metrocalk_editor_shell::terrain_intent::TerrainEdit>,
+}
+
+/// One validation finding, flattened for the UI.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerrainIssueDto {
+    severity: String,
+    field: String,
+    message: String,
+    fix: Option<String>,
+}
+
+/// Live runtime counters, flattened for the UI's profiling readout.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerrainStatsDto {
+    active: bool,
+    resident_chunks: u32,
+    visible_chunks: u32,
+    culled_frustum: u32,
+    culled_horizon: u32,
+    pending_builds: u32,
+    completed_builds: u64,
+    drawn_triangles: u64,
+    drawn_instances: u32,
+    impostor_instances: u32,
+    mesh_mb: f32,
+    texture_mb: f32,
+    scatter_mb: f32,
+    collider_mb: f32,
+    nav_mb: f32,
+    total_mb: f32,
+    budget_mb: u32,
+    budget_fraction: f32,
+    over_budget: bool,
+    build_us_total: u32,
+    dominant_stage: String,
+    /// What is currently wrong with the terrain, in the author's language; empty when nothing is.
+    ///
+    /// The engine has always recorded this — a recipe that would not compile, and now a chunk whose build
+    /// panicked — but nothing carried it across the IPC boundary, so the "visible and actionable" failure
+    /// was in fact a field nobody read. This is the wire.
+    problem: String,
+}
+
+/// The answer to every terrain command: what the recipe now is, what is wrong with it, and what it costs.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerrainReply {
+    ok: bool,
+    entity: String,
+    /// Plain-language failure, empty on success.
+    message: String,
+    /// The recipe as the document now holds it, so the UI never has to guess what was stored.
+    recipe: Option<serde_json::Value>,
+    issues: Vec<TerrainIssueDto>,
+    stats: TerrainStatsDto,
+    /// How a plain-language description was read: what was understood, and which words were not used. `None`
+    /// for every command that was not a description, so the panel shows the explanation only where there is
+    /// one to show.
+    reading: Option<serde_json::Value>,
+}
+
+/// Build the reply every terrain command returns: the stored recipe, its validation, and what it costs.
+fn terrain_reply(
+    id: EntityId,
+    recipe: &metrocalk_terrain::TerrainRecipe,
+    shared: &Shared,
+) -> TerrainReply {
+    let report = metrocalk_terrain::validate::validate(recipe);
+    let cap = recipe.budget.total_bytes();
+    let used = shared.lock().unwrap().terrain.stats().total_bytes();
+    let stats = terrain_stats_dto(
+        shared,
+        u32::try_from(cap / (1024 * 1024)).unwrap_or(u32::MAX),
+        if cap == 0 {
+            0.0
+        } else {
+            used as f32 / cap as f32
+        },
+    );
+    TerrainReply {
+        ok: true,
+        entity: id.to_string(),
+        message: String::new(),
+        recipe: serde_json::to_value(recipe).ok(),
+        issues: report
+            .issues
+            .iter()
+            .map(|i| TerrainIssueDto {
+                severity: match i.severity {
+                    metrocalk_terrain::Severity::Blocking => "blocking",
+                    metrocalk_terrain::Severity::Warning => "warning",
+                    metrocalk_terrain::Severity::Info => "info",
+                }
+                .to_string(),
+                field: i.field.clone(),
+                message: i.message.clone(),
+                fix: i.fix.clone(),
+            })
+            .collect(),
+        stats,
+        // Filled in only by the describe path, which is the only one with a reading to report.
+        reading: None,
+    }
+}
+
+fn terrain_stats_dto(shared: &Shared, budget_mb: u32, budget_fraction: f32) -> TerrainStatsDto {
+    let st = shared.lock().unwrap();
+    let s = st.terrain.stats();
+    let mb = |b: usize| b as f32 / (1024.0 * 1024.0);
+    let (stage, _) = s.timings.dominant();
+    TerrainStatsDto {
+        active: st.terrain.is_active(),
+        resident_chunks: s.resident_chunks,
+        visible_chunks: s.visible_chunks,
+        culled_frustum: s.culled_frustum,
+        culled_horizon: s.culled_horizon,
+        pending_builds: s.pending_builds,
+        completed_builds: s.completed_builds,
+        drawn_triangles: s.drawn_triangles,
+        drawn_instances: s.drawn_instances,
+        impostor_instances: s.impostor_instances,
+        mesh_mb: mb(s.mesh_bytes),
+        texture_mb: mb(s.texture_bytes),
+        scatter_mb: mb(s.scatter_bytes),
+        collider_mb: mb(s.collider_bytes),
+        nav_mb: mb(s.nav_bytes),
+        total_mb: mb(s.total_bytes()),
+        budget_mb,
+        budget_fraction,
+        over_budget: st.terrain.over_budget(),
+        build_us_total: s.timings.total_us(),
+        dominant_stage: stage.to_string(),
+        problem: st.terrain_problem.clone().unwrap_or_default(),
+    }
+}
+
+/// The presets a picker offers. Static data, so it needs no engine round trip.
+#[tauri::command]
+fn terrain_presets() -> Vec<serde_json::Value> {
+    ipc();
+    metrocalk_terrain::preset::all()
+        .into_iter()
+        .map(|p| serde_json::json!({ "id": p.id, "name": p.name, "description": p.description }))
+        .collect()
+}
+
+/// Create a terrain from a preset — one undoable transaction on the engine thread.
+#[tauri::command(async)]
+fn terrain_create(state: State<AppState>, preset: String) -> TerrainReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::TerrainCreate { preset, reply })
+        .is_err()
+    {
+        return TerrainReply {
+            message: "the engine is not running".into(),
+            ..TerrainReply::default()
+        };
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// One step of a compiled plan, as the panel shows it.
+#[derive(Debug, Clone, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PlanStepDto {
+    /// The verb, in the author's words.
+    verb: String,
+    /// What it will do, in a sentence.
+    effect: String,
+    /// Why it cannot be done, when it cannot.
+    refusal: Option<String>,
+    /// The nearest thing that would work.
+    suggestion: Option<String>,
+    /// The derived stages it will rebuild.
+    rebuilds: String,
+    /// The world rectangle it will change, `[minx, minz, maxx, maxz]`.
+    region: Option<[f32; 4]>,
+}
+
+/// What a sentence would do, WITHOUT doing it.
+#[derive(Debug, Clone, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct TerrainPlanDto {
+    /// `"create"` (a whole world) or `"modify"` (part of this one).
+    kind: String,
+    /// Every phrase understood, and what it meant.
+    understood: Vec<serde_json::Value>,
+    /// Words that carried no meaning.
+    unused: Vec<String>,
+    /// Things the author should know — e.g. that "this" fell back to the view centre.
+    notes: Vec<String>,
+    /// The steps, for a modification.
+    steps: Vec<PlanStepDto>,
+    /// Whether anything at all can be carried out.
+    ok: bool,
+}
+
+/// Where the author is pointing, for resolving "this".
+fn plan_context(shared: &Shared) -> metrocalk_terrain::plan::PlanContext {
+    let st = shared.lock().unwrap();
+    metrocalk_terrain::plan::PlanContext {
+        // The viewport already ray-casts the cursor against the terrain for the sculpt brush; that hit IS
+        // "this". Falling back to the camera target keeps the feature usable without a hover.
+        cursor: st.terrain_cursor_hit.map(|h| [h[0], h[2]]),
+        focus: [st.cam_target[0], st.cam_target[2]],
+        here_radius_m: 150.0,
+        // The same ray-cast already carries the height it hit at, so levelling verbs get a real ground
+        // height for free. The camera target is the fallback because the framing pass puts it ON the
+        // ground (and never below the water line), so it is a plausible height rather than a zero.
+        ground_m: st
+            .terrain_cursor_hit
+            .map(|h| h[1])
+            .or(st.terrain.is_active().then(|| st.cam_target[1])),
+    }
+}
+
+/// Compile a sentence into a plan and REPORT it, without touching the world.
+///
+/// Safe to call on every keystroke: it resolves against a snapshot of the recipe, commits nothing, and
+/// cannot fail. This is what makes describe-to-modify inspectable instead of a slot machine.
+#[tauri::command(async)]
+fn terrain_plan(state: State<AppState>, text: String) -> TerrainPlanDto {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::TerrainPlan { text, reply })
+        .is_err()
+    {
+        return TerrainPlanDto::default();
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Build a terrain from a plain-language description.
+///
+/// The whole feature from the UI's side: one string in, the stored recipe plus the reading out. Creating and
+/// re-describing are the same call because the author does not think of them as different actions.
+#[tauri::command(async)]
+fn terrain_describe(state: State<AppState>, text: String) -> TerrainReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::TerrainDescribe { text, reply })
+        .is_err()
+    {
+        return TerrainReply {
+            message: "the engine is not running".into(),
+            ..TerrainReply::default()
+        };
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Read a description WITHOUT building anything — the live "here is what I understood" preview.
+///
+/// Separate from [`terrain_describe`] because it must be safe to call on every keystroke: it touches no
+/// engine, commits nothing, and cannot fail.
+#[tauri::command]
+fn terrain_read_description(text: String) -> serde_json::Value {
+    ipc();
+    serde_json::to_value(metrocalk_terrain::describe::read(&text))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Apply one edit (or just read the current state back).
+#[tauri::command(async)]
+fn terrain_edit(state: State<AppState>, args: TerrainEditArgs) -> TerrainReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::TerrainEdit {
+            entity: args.entity,
+            edit: Box::new(args.edit),
+            reply,
+        })
+        .is_err()
+    {
+        return TerrainReply {
+            message: "the engine is not running".into(),
+            ..TerrainReply::default()
+        };
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// Live counters for the profiling readout. Reads the render-side state directly — no engine round trip, so
+/// a panel can poll it without touching the commit pipeline.
+#[tauri::command]
+fn terrain_stats(state: State<AppState>) -> TerrainStatsDto {
+    ipc();
+    let (budget_mb, fraction) = {
+        let st = state.shared.lock().unwrap();
+        st.terrain.terrain().map_or((0, 0.0), |t| {
+            let cap = t.recipe().budget.total_bytes();
+            let used = st.terrain.stats().total_bytes();
+            (
+                u32::try_from(cap / (1024 * 1024)).unwrap_or(u32::MAX),
+                if cap == 0 {
+                    0.0
+                } else {
+                    used as f32 / cap as f32
+                },
+            )
+        })
+    };
+    terrain_stats_dto(&state.shared, budget_mb, fraction)
+}
+
+/// Choose the terrain tool the pointer drives, and the brush it uses.
+///
+/// One command for both because they change together: picking "sculpt" without a brush would leave the
+/// pointer armed with whatever the last one was.
+#[tauri::command]
+fn terrain_tool(
+    state: State<AppState>,
+    mode: String,
+    kind: Option<u8>,
+    radius_m: Option<f32>,
+    strength: Option<f32>,
+    hardness: Option<f32>,
+    target_m: Option<f32>,
+) -> bool {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.terrain_tool = match mode.as_str() {
+        "sculpt" => render::TerrainTool::Sculpt,
+        "route" => render::TerrainTool::Route,
+        _ => render::TerrainTool::None,
+    };
+    let b = &mut st.terrain_brush;
+    if let Some(v) = kind {
+        b.kind = v.min(3);
+    }
+    if let Some(v) = radius_m {
+        b.radius_m = v.clamp(0.25, 512.0);
+    }
+    if let Some(v) = strength {
+        b.strength = v.clamp(-1000.0, 1000.0);
+    }
+    if let Some(v) = hardness {
+        b.hardness = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = target_m {
+        b.target_m = v;
+    }
+    st.terrain_tool != render::TerrainTool::None
+}
+
+/// Aim the terrain tools from an injected cursor instead of the OS one.
+///
+/// The end-to-end test needs to drive the *same* native brush path a hand does; without this it could only
+/// test a parallel code path, which would prove nothing about the one that ships. Pass `null` to hand
+/// control back to the live cursor.
+#[tauri::command]
+fn terrain_test_cursor(state: State<AppState>, x: Option<f32>, y: Option<f32>) {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.terrain_test_cursor = match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    };
+}
+
+/// Where the cursor currently meets the terrain, if anywhere — the aiming readout a test asserts on.
+#[tauri::command]
+fn terrain_cursor_hit(state: State<AppState>) -> Option<[f32; 3]> {
+    ipc();
+    state.shared.lock().unwrap().terrain_cursor_hit
+}
+
+/// Begin a sculpt gesture. The stroke is then traced natively until [`terrain_paint_end`] — two commands
+/// per gesture however long it lasts (invariant 4).
+#[tauri::command]
+fn terrain_paint_begin(state: State<AppState>) {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.terrain_stroke_path.clear();
+    st.terrain_painting = true;
+}
+
+/// End the gesture and commit what was traced, as ONE undoable transaction.
+#[tauri::command(async)]
+fn terrain_paint_end(state: State<AppState>) -> TerrainReply {
+    ipc();
+    let (path, brush) = {
+        let mut st = state.shared.lock().unwrap();
+        st.terrain_painting = false;
+        (st.terrain_stroke_path.clone(), st.terrain_brush)
+    };
+    if path.is_empty() {
+        // The pointer never found the terrain — nothing happened, and saying so beats an empty commit.
+        return TerrainReply {
+            message: "the brush did not touch the terrain".into(),
+            ..TerrainReply::default()
+        };
+    }
+    let edit = metrocalk_editor_shell::terrain_intent::TerrainEdit::SculptPath {
+        brush: metrocalk_terrain::sculpt::Brush {
+            kind: match brush.kind {
+                1 => metrocalk_terrain::StrokeKind::Smooth,
+                2 => metrocalk_terrain::StrokeKind::Flatten,
+                3 => metrocalk_terrain::StrokeKind::Noise,
+                _ => metrocalk_terrain::StrokeKind::Raise,
+            },
+            radius_m: brush.radius_m,
+            strength: brush.strength,
+            hardness: brush.hardness,
+            target_m: brush.target_m,
+            spacing: 0.25,
+        },
+        path,
+    };
+    send_terrain_edit(&state, edit)
+}
+
+/// Drop a route control point wherever the cursor is over the terrain.
+#[tauri::command]
+fn terrain_route_point(state: State<AppState>) -> usize {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.terrain_place_point = true;
+    st.terrain_route_points.len()
+}
+
+/// Undo the last route point, or clear them all.
+#[tauri::command]
+fn terrain_route_clear(state: State<AppState>, last_only: bool) -> usize {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    if last_only {
+        st.terrain_route_points.pop();
+    } else {
+        st.terrain_route_points.clear();
+    }
+    st.terrain_route_points.len()
+}
+
+/// Commit the drawn route as a road, river or pad — one undoable transaction.
+#[tauri::command(async)]
+fn terrain_route_commit(
+    state: State<AppState>,
+    kind: String,
+    width_m: f32,
+    depth_m: f32,
+    material_layer: Option<usize>,
+) -> TerrainReply {
+    ipc();
+    let points = {
+        let mut st = state.shared.lock().unwrap();
+        std::mem::take(&mut st.terrain_route_points)
+    };
+    if points.len() < 2 {
+        return TerrainReply {
+            message: "a route needs at least two points — click twice on the terrain first".into(),
+            ..TerrainReply::default()
+        };
+    }
+    let spline_kind = match kind.as_str() {
+        "river" => metrocalk_terrain::SplineKind::River,
+        "pad" => metrocalk_terrain::SplineKind::Pad,
+        _ => metrocalk_terrain::SplineKind::Road,
+    };
+    let name = match spline_kind {
+        metrocalk_terrain::SplineKind::River => "River",
+        metrocalk_terrain::SplineKind::Pad => "Pad",
+        metrocalk_terrain::SplineKind::Road => "Road",
+    };
+    let edit = metrocalk_editor_shell::terrain_intent::TerrainEdit::AddSpline {
+        spline: Box::new(metrocalk_terrain::SplineDef {
+            name: name.into(),
+            kind: spline_kind,
+            points,
+            width_m: width_m.clamp(1.0, 200.0),
+            falloff_m: (width_m * 0.6).clamp(1.0, 120.0),
+            depth_m: depth_m.clamp(0.0, 100.0),
+            material_layer,
+            ..metrocalk_terrain::SplineDef::default()
+        }),
+    };
+    send_terrain_edit(&state, edit)
+}
+
+/// Send one terrain edit to the engine thread and wait for its reply.
+fn send_terrain_edit(
+    state: &State<AppState>,
+    edit: metrocalk_editor_shell::terrain_intent::TerrainEdit,
+) -> TerrainReply {
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::TerrainEdit {
+            entity: None,
+            edit: Box::new(Some(edit)),
+            reply,
+        })
+        .is_err()
+    {
+        return TerrainReply {
+            message: "the engine is not running".into(),
+            ..TerrainReply::default()
+        };
+    }
+    rx.recv().unwrap_or_default()
+}
+
+/// A walkable route across the resident terrain, or an explained refusal.
+#[tauri::command(async)]
+fn terrain_path(state: State<AppState>, from: [f32; 3], to: [f32; 3]) -> serde_json::Value {
+    ipc();
+    let st = state.shared.lock().unwrap();
+    match st.terrain.find_path(from, to) {
+        None => serde_json::json!({
+            "found": false,
+            "reason": "no navigation grids are resident yet",
+            "waypoints": Vec::<[f32; 3]>::new(),
+        }),
+        Some(p) => serde_json::json!({
+            "found": p.found,
+            "reason": p.reason,
+            "lengthM": p.length_m(),
+            "visited": p.visited,
+            "waypoints": p.waypoints,
+        }),
+    }
+}
+
+/// The terrain height under a world XZ position — what a placement tool snaps to.
+#[tauri::command]
+fn terrain_height(state: State<AppState>, x: f32, z: f32) -> Option<f32> {
+    ipc();
+    let st = state.shared.lock().unwrap();
+    st.terrain.height_at(x, z)
 }
 
 // ── tauri commands (UI → core) ─────────────────────────────────────────────────
@@ -15091,27 +18953,50 @@ fn zoom(state: State<AppState>, delta: f32) {
 /// `None` (the entity has no renderable instance, or the render timed out → the UI keeps the icon fallback).
 /// Discrete (counted like any IPC); the JS side is dirty-only + budget-limited, so it NEVER fires per frame
 /// (an orbit dirties nothing → 0 thumbnail IPC during orbit, so invariant 4 holds with thumbnails active).
-#[tauri::command]
+///
+/// **`async` is load-bearing, not decoration.** A plain `#[tauri::command]` runs on the tao/main thread,
+/// which is the very thread the render loop calls into each frame. The poll below would then hold that
+/// thread for up to 600 ms *while waiting for the render thread to service the request it just queued* —
+/// blocking the servicing it is waiting on, and freezing the window meanwhile. On a thread from the pool
+/// the sleep costs nothing anyone can see, and the request gets serviced on the next frame as intended.
+/// **Request identity, not entity identity.** Dropping the stale result before re-asking — which is what
+/// this used to do — narrows the window and cannot close it. The sequence it misses:
+///
+/// 1. request N is popped by the render thread and is being rendered;
+/// 2. N's caller hits the 600 ms cap and returns `None`;
+/// 3. N+1 arrives, drains the (still empty) result slot and queues itself;
+/// 4. N finishes and pushes ITS image into the id-keyed slot;
+/// 5. N+1 polls, finds an image for its entity, and returns a picture of the older state.
+///
+/// Every step there is ordinary, and the result is silently wrong at exactly the moment a thumbnail is
+/// being looked at to see what an edit did. So each request now carries a unique id and the hash of the
+/// presentation state it was made under, and the answer quotes both back. A result satisfies exactly one
+/// request; anything else is left for its own caller or aged out. And a render whose state moved under
+/// it — the exposure slider, the view transform, the working space — returns `None` rather than an image
+/// of a state nobody asked about: **the image returned for request N was rendered from the state
+/// requested by N, or the request fails.**
+#[tauri::command(async)]
 fn thumbnail(state: State<AppState>, id: String, size: u32) -> Option<String> {
     ipc();
-    {
-        let mut st = state.shared.lock().unwrap();
-        st.thumb_requests.push((id.clone(), size));
-    }
+    let (req, want_state) = state.shared.lock().unwrap().request_thumbnail(&id, size);
     // Poll for the serviced result (~600 ms cap — the request may wait behind a queued burst before the
     // render thread services it a few-per-frame; a thumbnail is off the hot path, so a brief wait is fine and
     // the UI shows the icon fallback meanwhile). No lock is held during the sleep — zero render-thread contention.
     for _ in 0..120 {
-        {
-            let mut st = state.shared.lock().unwrap();
-            if let Some(pos) = st.thumb_results.iter().position(|(rid, _)| rid == &id) {
-                let (_, bytes) = st.thumb_results.remove(pos);
-                drop(st);
-                return bytes.map(|b| format!("data:image/png;base64,{}", base64_encode(&b)));
+        match state.shared.lock().unwrap().take_thumbnail(req, want_state) {
+            render::ThumbTake::Pending => {}
+            render::ThumbTake::Ready(png) => {
+                return Some(format!("data:image/png;base64,{}", base64_encode(&png)))
             }
+            // Both are "no picture for you", and both are IMMEDIATE — the caller stops waiting. A state
+            // that moved costs one re-request; returning the image instead would put a stale grade in
+            // the asset browser with nothing to say which frame it came from.
+            render::ThumbTake::NoImage | render::ThumbTake::StateMoved => return None,
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    // Timed out. The request may still be in flight; its eventual result carries `req`, which no future
+    // caller will ask for, so it can only age out of the capped result list. It cannot satisfy anyone.
     None
 }
 
@@ -15140,53 +19025,65 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Pick in the viewport (Rust — invariant 4). `x`/`y` are a normalized [0,1] window fraction
-/// (DPI/offset-free), not pixels. Computed **synchronously** here — a pure projection over the current
-/// instances + camera — so it never races the render loop's frame cadence (the bug a hidden/throttled
-/// window exposed). Returns the picked entity's id, or `None` (only when the scene is empty).
+/// Pick in the viewport (Rust — invariant 4). `x`/`y` are a normalized [0,1] surface fraction
+/// (DPI/offset-free), not pixels.
+///
+/// A **real raycast**: the cursor is unprojected through the camera the frame was actually rasterized
+/// with, the ray is tested against the scene BVH and then against real triangles through each
+/// candidate's own mesh BVH, and the nearest visible hit wins. Computed synchronously so it never
+/// races the render loop's frame cadence.
+///
+/// Returns the picked entity's id, or `None` — and `None` now genuinely means *nothing is there*.
+/// The previous implementation ranked instances by screen distance to their projected pivot, so it
+/// returned a hit for any click on any non-empty scene and click-to-deselect was unreachable.
+///
+/// `shift` extends the selection, `ctrl` toggles it. `cycle` asks for the hit *after* the current one
+/// in depth order, which is how obscured geometry stays reachable.
 #[tauri::command]
 fn viewport_pick(
     window: tauri::WebviewWindow,
     state: State<AppState>,
     x: f32,
     y: f32,
+    shift: Option<bool>,
+    ctrl: Option<bool>,
+    cycle: Option<bool>,
 ) -> Option<String> {
     ipc();
-    let aspect = window.inner_size().map_or(16.0 / 9.0, |s| {
-        s.width.max(1) as f32 / s.height.max(1) as f32
-    });
+    // Read the OS-side scale factor before taking the render mutex — never hold the hot lock across a
+    // windowing call.
+    let dpi = window.scale_factor().unwrap_or(1.0);
     let mut st = state.shared.lock().unwrap();
     // Mirror the render loop's camera init so the pick uses the same view as what's drawn.
     if st.distance == 0.0 {
         st.distance = 60.0;
         st.elevation = 0.4;
     }
-    // The SAME matrix the pixels were drawn with. This built a perspective projection unconditionally,
-    // so once the axis views became truly parallel a click in one of them picked the wrong object -
-    // the unprojection has to invert what was actually rasterised, not what usually is.
-    let cam = render::camera_matrix_with(
-        st.orbit,
-        st.elevation,
-        st.distance,
-        aspect,
-        st.cam_target.into(),
-        st.projection,
+    let camera = scene_pick::camera_for(&st);
+    let viewport = scene_pick::viewport_for(&st, dpi);
+    let ray = camera.ray_through_fraction(&viewport, f64::from(x), f64::from(y));
+
+    let mut cache = state.picking.lock().unwrap();
+    cache.sync(&st);
+    let mut selection = state.selection.lock().unwrap();
+    let filter = scene_pick::click_filter();
+    let hit = if cycle.unwrap_or(false) {
+        cache.cycle(&camera, &viewport, &ray, &filter, selection.active())
+    } else {
+        cache.nearest(&camera, &viewport, &ray, &filter)
+    };
+
+    scene_pick::apply_click(
+        &mut selection,
+        hit.as_ref(),
+        scene_pick::modifiers(shift.unwrap_or(false), ctrl.unwrap_or(false)),
     );
-    let hit = render::pick_nearest(&st.instances, (x, y), &cam);
-    // update the highlight
-    if let Some(p) = st.selected {
-        if p < st.instances.len() {
-            st.instances[p].selected = 0.0;
-        }
-    }
-    st.selected = hit;
-    if let Some(i) = hit {
-        if i < st.instances.len() {
-            st.instances[i].selected = 1.0;
-        }
-    }
-    st.revision = st.revision.wrapping_add(1);
-    hit.and_then(|i| st.ids.get(i).cloned())
+
+    scene_pick::apply_selection_highlight(&mut st, &selection);
+    let resolved = hit.as_ref().and_then(|h| scene_pick::entity_of(&st, h));
+    drop(selection);
+    drop(cache);
+    resolved
 }
 
 /// Non-mutating pick (M3.3 hover) — identifies the entity under the cursor **without** changing the
@@ -15202,26 +19099,164 @@ fn viewport_peek(
     y: f32,
 ) -> Option<String> {
     ipc();
-    let aspect = window.inner_size().map_or(16.0 / 9.0, |s| {
-        s.width.max(1) as f32 / s.height.max(1) as f32
-    });
+    let dpi = window.scale_factor().unwrap_or(1.0);
     let st = state.shared.lock().unwrap();
-    let (dist, elev) = if st.distance == 0.0 {
-        (60.0, 0.4) // mirror the render loop's lazy camera init without mutating shared state
-    } else {
-        (st.distance, st.elevation)
-    };
-    // Same rule as `viewport_pick`: hover must test against the projection on screen.
-    let cam = render::camera_matrix_with(
-        st.orbit,
-        elev,
-        dist,
-        aspect,
-        st.cam_target.into(),
-        st.projection,
-    );
-    let hit = render::pick_nearest(&st.instances, (x, y), &cam);
-    hit.and_then(|i| st.ids.get(i).cloned())
+    // Same pipeline as `viewport_pick`, so hover highlights exactly what a click would select. Two
+    // different "what is under the cursor" implementations is how a viewport ends up highlighting one
+    // object and selecting another.
+    let camera = scene_pick::camera_for(&st);
+    let viewport = scene_pick::viewport_for(&st, dpi);
+    let ray = camera.ray_through_fraction(&viewport, f64::from(x), f64::from(y));
+    let mut cache = state.picking.lock().unwrap();
+    cache.sync(&st);
+    let hit = cache.nearest(&camera, &viewport, &ray, &scene_pick::click_filter());
+    hit.as_ref().and_then(|h| scene_pick::entity_of(&st, h))
+}
+
+/// Marquee (box) selection. The two corners are normalized `[0,1]` surface fractions, **in the order
+/// they were dragged** — the direction is the policy: left-to-right takes only objects fully enclosed,
+/// right-to-left takes everything the rectangle touches. Returns the selected entity ids.
+#[tauri::command]
+fn viewport_pick_region(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    shift: Option<bool>,
+) -> Vec<String> {
+    ipc();
+    let dpi = window.scale_factor().unwrap_or(1.0);
+    let mut st = state.shared.lock().unwrap();
+    let camera = scene_pick::camera_for(&st);
+    let viewport = scene_pick::viewport_for(&st, dpi);
+    let start = viewport.fraction_to_ndc(f64::from(x0), f64::from(y0));
+    let end = viewport.fraction_to_ndc(f64::from(x1), f64::from(y1));
+    let rect = metrocalk_spatial::ScreenRect::from_drag([start.0, start.1], [end.0, end.1]);
+
+    let mut cache = state.picking.lock().unwrap();
+    cache.sync(&st);
+    let picked = cache.region(&camera, &viewport, rect, &scene_pick::click_filter());
+
+    let mut selection = state.selection.lock().unwrap();
+    if !shift.unwrap_or(false) {
+        selection.clear();
+    }
+    for (key, instance) in &picked {
+        selection.add(*key, *instance);
+    }
+    // Project onto the renderer's highlight flags through the same helper a click uses.
+    scene_pick::apply_selection_highlight(&mut st, &selection);
+    let ids = scene_pick::selected_ids(&st, &selection);
+    drop(selection);
+    drop(cache);
+    ids
+}
+
+/// **Precision + picking instrumentation** (the brief's §49). Everything needed to answer "why did
+/// that click select that object" without attaching a debugger: the candidate count under the cursor,
+/// the full ordered hit list with distances and hit points, the acceleration-structure size and
+/// health, and the render origin's quantization at the hit — so "is this jitter or is this a bug" has
+/// an answer rather than an opinion.
+///
+/// A developer diagnostic, not a user surface: it is only read when the diagnostics overlay is open.
+#[tauri::command]
+fn pick_diagnostics(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    x: f32,
+    y: f32,
+) -> PickDiagnostics {
+    ipc();
+    let dpi = window.scale_factor().unwrap_or(1.0);
+    let st = state.shared.lock().unwrap();
+    let camera = scene_pick::camera_for(&st);
+    let viewport = scene_pick::viewport_for(&st, dpi);
+    let ray = camera.ray_through_fraction(&viewport, f64::from(x), f64::from(y));
+    let mut cache = state.picking.lock().unwrap();
+    cache.sync(&st);
+    let started = std::time::Instant::now();
+    let hits: Vec<PickHitInfo> = cache
+        .hits(&camera, &viewport, &ray, &scene_pick::click_filter())
+        .iter()
+        .map(|h| PickHitInfo {
+            entity: scene_pick::entity_of(&st, h).unwrap_or_default(),
+            instance: h.instance,
+            kind: format!("{:?}", h.kind),
+            source: format!("{:?}", h.source),
+            distance: h.distance,
+            world_position: h.world_position,
+            local_position: h.local_position,
+            world_normal: h.world_normal,
+            primitive: h.primitive,
+            screen_distance_px: h.screen_distance_px,
+            priority: h.priority,
+            locked: h.locked,
+        })
+        .collect();
+    let query_ms = started.elapsed().as_secs_f64() * 1e3;
+    PickDiagnostics {
+        ray_origin: ray.origin,
+        ray_direction: ray.direction,
+        camera_eye: camera.eye,
+        aspect: viewport.aspect(),
+        dpi_scale: viewport.dpi_scale,
+        orthographic: camera.projection.is_orthographic(),
+        objects: cache.object_count(),
+        triangles: cache.last_triangle_count,
+        build_ms: cache.last_build_ms,
+        query_ms,
+        broad_phase_quality: cache.broad_phase_quality(),
+        world_units_per_pixel: camera.world_units_per_pixel(
+            &viewport,
+            hits.first().map_or(camera.target, |h| h.world_position),
+        ),
+        hits,
+    }
+}
+
+/// One hit in the diagnostics list, ordered exactly as the picker resolved it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PickHitInfo {
+    entity: String,
+    instance: u32,
+    kind: String,
+    source: String,
+    distance: f64,
+    world_position: [f64; 3],
+    local_position: [f64; 3],
+    world_normal: [f64; 3],
+    primitive: Option<u32>,
+    screen_distance_px: f64,
+    priority: i32,
+    locked: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PickDiagnostics {
+    ray_origin: [f64; 3],
+    ray_direction: [f64; 3],
+    camera_eye: [f64; 3],
+    aspect: f64,
+    dpi_scale: f64,
+    orthographic: bool,
+    /// Objects in the picking broad phase.
+    objects: usize,
+    /// Triangles across every mesh BVH.
+    triangles: usize,
+    /// Milliseconds the last acceleration-structure build took.
+    build_ms: f64,
+    /// Milliseconds this query took.
+    query_ms: f64,
+    /// How degraded refitting has left the broad phase; above ~2 a rebuild pays for itself.
+    broad_phase_quality: f64,
+    /// World units one pixel covers at the nearest hit — the scale every screen-space tolerance and
+    /// the gizmo's constant on-screen size are derived from.
+    world_units_per_pixel: f64,
+    hits: Vec<PickHitInfo>,
 }
 
 /// Frame the camera on an entity (M3.3 Focus) — a pure camera/render-state op (no scene mutation, not
@@ -15873,7 +19908,10 @@ fn gizmo_pick_drag(
         origin: ro,
         dir: rd,
     };
-    let basis = [0.0, 0.0, 0.0, 1.0];
+    // The entity's OWN world rotation, so Local space actually means local. This was a hard-coded
+    // identity, which made the space toggle purely cosmetic: the UI reported "local" while every
+    // handle used world axes.
+    let basis = st.instances[sel].rotation;
     let Some(handle) = st.gizmo.pick(ray, origin, basis, scale) else {
         return false;
     };
@@ -15911,7 +19949,9 @@ fn gizmo_grab(window: tauri::WebviewWindow, state: State<AppState>, axis: String
     let scale = metrocalk_gizmo::pixel_scale(eye, origin, GIZMO_FOV.to_radians(), GIZMO_K);
     let dir = [origin[0] - eye[0], origin[1] - eye[1], origin[2] - eye[2]];
     let ray = Ray { origin: eye, dir };
-    let basis = [0.0, 0.0, 0.0, 1.0];
+    // Same real basis as the live path, so the deterministic test drag exercises the same axes the
+    // user would grab rather than a world-aligned stand-in.
+    let basis = rot0;
     let handle = match axis.as_str() {
         "y" => Handle::AxisY,
         "z" => Handle::AxisZ,
@@ -15981,10 +20021,17 @@ fn gizmo_handle_screen(
     let origin = st.instances[sel].center;
     let eye = render::camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
     let scale = metrocalk_gizmo::pixel_scale(eye, origin, GIZMO_FOV.to_radians(), GIZMO_K);
+    // The handle's direction in the gizmo's CURRENT space. Hard-coding world axes here made the
+    // reported screen position disagree with the drawn handle whenever Local space was active, so a
+    // caller that clicked where this said the handle was would miss it.
+    let axes = match st.gizmo.space() {
+        GizmoSpace::World => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        GizmoSpace::Local => metrocalk_gizmo::quat_basis(st.instances[sel].rotation),
+    };
     let a = match axis.as_str() {
-        "y" => [0.0, 1.0, 0.0],
-        "z" => [0.0, 0.0, 1.0],
-        _ => [1.0, 0.0, 0.0],
+        "y" => axes[1],
+        "z" => axes[2],
+        _ => axes[0],
     };
     let tip = [
         origin[0] + a[0] * scale * 0.6,
@@ -16602,6 +20649,917 @@ fn pipe_forge_bake(state: State<AppState>) -> PipeBakeReport {
     })
 }
 
+// ── Gameplay roles ─────────────────────────────────────────────────────────────────────────────────────
+
+/// The role catalog: what an asset can BE in the game, with the exact list of what assigning adds.
+/// Static data — no engine round-trip.
+#[tauri::command(async)]
+fn role_catalog() -> Vec<metrocalk_editor_shell::RoleSpec> {
+    ipc();
+    metrocalk_editor_shell::role_specs()
+}
+
+/// Assign a role to an entity — ONE undoable commit (components + animation + rule + Score binding).
+#[tauri::command(async)]
+fn role_assign(
+    state: State<AppState>,
+    id: String,
+    role: String,
+) -> metrocalk_editor_shell::RoleReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::RoleAssign { id, role, reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::RoleReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::RoleReply::refusal("The role assignment did not finish in time")
+    })
+}
+
+/// Clear an entity's role (one undoable commit; keeps mesh + transform).
+/// Hand the viewport back to the author: the selection outline returns and the gizmo/binding-line
+/// suppression lifts. Idempotent, because a cutscene can end down several paths (its shots run out, a
+/// rule turns it off, or the user presses Stop) and every one of them must leave the same editor.
+fn restore_editor_chrome(st: &mut render::SceneState, dimmed: &mut Option<(String, f32)>) {
+    if let Some((key, was)) = dimmed.take() {
+        if let Some(i) = st.ids.iter().position(|k| *k == key) {
+            if let Some(inst) = st.instances.get_mut(i) {
+                inst.selected = was;
+            }
+        }
+    }
+    if st.cinematic {
+        st.cinematic = false;
+        st.revision = st.revision.wrapping_add(1);
+    }
+}
+
+/// Fire an object's ONE-SHOT effect layers as a detached burst, anchored where the object currently is.
+///
+/// Detached on purpose: the moments worth an effect — a pick-up, a defeat, a door vanishing — are
+/// exactly the moments the object stops being drawn, so an effect parented to it would be cut off
+/// mid-puff. Continuous layers are deliberately skipped: a pick-up should pop, not start a fire.
+fn fire_moment_vfx(
+    armed: &[(
+        EntityId,
+        String,
+        metrocalk_animation::vfx::EffectStack,
+        Option<u64>,
+    )],
+    entity: &EntityId,
+    moment: metrocalk_animation::vfx::FxTrigger,
+    engine: &metrocalk_core::Engine<metrocalk_ecs::FlecsWorld>,
+    shared: &Shared,
+    frame: u64,
+    out: &mut Vec<(metrocalk_animation::vfx::EffectStack, [f32; 3], f32, u64)>,
+) {
+    let Some((_, key, stack, _)) = armed.iter().find(|(e, _, _, _)| e == entity) else {
+        return;
+    };
+    let one_shots: Vec<_> = stack
+        .layers
+        .iter()
+        .filter(|l| l.trigger == moment)
+        .cloned()
+        .collect();
+    if one_shots.is_empty() {
+        return;
+    }
+    let g = capscene::global_transform(engine, *entity);
+    let origin = {
+        let st = shared.lock().unwrap();
+        st.ids
+            .iter()
+            .position(|k| k == key)
+            .and_then(|i| st.instances.get(i).map(|inst| inst.center))
+            .unwrap_or(g.translation)
+    };
+    out.push((
+        metrocalk_animation::vfx::EffectStack {
+            version: 1,
+            layers: one_shots,
+        },
+        origin,
+        g.scale[0].abs().max(0.1),
+        frame,
+    ));
+    let mut st = shared.lock().unwrap();
+    st.fx_bursts_fired = st.fx_bursts_fired.saturating_add(1);
+}
+
+/// Flatten a captured scene into world-space triangle parts for the STEP writer.
+///
+/// Node transforms are COMPOSED down the hierarchy and baked in here, rather than carried. Faceted
+/// AP242 places geometry directly - there is no instancing to preserve - so a converter that used only
+/// each node's local transform would hand a receiving CAD system an assembly with every part stacked
+/// at the origin, which is a wrong file rather than a lossy one.
+fn step_parts_from_scene(
+    scene: &metrocalk_assets::SceneAsset,
+) -> Result<Vec<metrocalk_editor_shell::StepPart>, String> {
+    use std::collections::HashMap;
+
+    let index_of: HashMap<_, usize> = scene
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id, i))
+        .collect();
+
+    // Row-major 4x4 multiply, matching `Matrix4d`.
+    let mul = |a: &[[f64; 4]; 4], b: &[[f64; 4]; 4]| -> [[f64; 4]; 4] {
+        let mut out = [[0.0f64; 4]; 4];
+        for (r, row) in out.iter_mut().enumerate() {
+            for (c, cell) in row.iter_mut().enumerate() {
+                *cell = (0..4).map(|k| a[r][k] * b[k][c]).sum();
+            }
+        }
+        out
+    };
+
+    let mut parts: Vec<metrocalk_editor_shell::StepPart> = Vec::new();
+    for node in &scene.nodes {
+        let Some(mesh_ref) = node.mesh else { continue };
+        let Some(mesh) = scene.meshes.get(mesh_ref.0) else {
+            continue;
+        };
+        if !node.visible {
+            continue;
+        }
+
+        // Compose ancestors. The depth guard matches the rest of the interchange layer: a malformed
+        // scene must be refused, never spun on.
+        let mut world = node.local_transform.rows;
+        let mut cursor = node.parent;
+        let mut depth = 0usize;
+        while let Some(pid) = cursor {
+            depth += 1;
+            if depth > 512 {
+                return Err("this scene's hierarchy is deeper than 512 levels, or contains a cycle                             - export refused rather than producing a wrong file"
+                    .into());
+            }
+            let Some(parent) = index_of.get(&pid).and_then(|i| scene.nodes.get(*i)) else {
+                break;
+            };
+            world = mul(&parent.local_transform.rows, &world);
+            cursor = parent.parent;
+        }
+
+        let xf = |v: [f32; 3]| -> [f64; 3] {
+            let (x, y, z) = (f64::from(v[0]), f64::from(v[1]), f64::from(v[2]));
+            [
+                world[0][0] * x + world[0][1] * y + world[0][2] * z + world[0][3],
+                world[1][0] * x + world[1][1] * y + world[1][2] * z + world[1][3],
+                world[2][0] * x + world[2][1] * y + world[2][2] * z + world[2][3],
+            ]
+        };
+
+        let mut triangles = Vec::new();
+        for prim in &mesh.primitives {
+            for tri in prim.indices.chunks_exact(3) {
+                let (Some(a), Some(b), Some(c)) = (
+                    prim.positions.get(tri[0] as usize),
+                    prim.positions.get(tri[1] as usize),
+                    prim.positions.get(tri[2] as usize),
+                ) else {
+                    continue;
+                };
+                triangles.push([xf(*a), xf(*b), xf(*c)]);
+            }
+        }
+        if triangles.is_empty() {
+            continue;
+        }
+        parts.push(metrocalk_editor_shell::StepPart {
+            name: node.name.clone(),
+            triangles,
+        });
+    }
+    if parts.is_empty() {
+        return Err("there is no triangle geometry in this scene to write as STEP".into());
+    }
+    Ok(parts)
+}
+
+/// What an environment import answers with — the same shape every other command here uses, so a
+/// refusal is always a sentence the UI can show rather than a silent `null`.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvImportReply {
+    /// Set iff the environment changed.
+    applied: bool,
+    /// What it is now called.
+    label: String,
+    /// Panorama size, for the legible-cost line.
+    width: u32,
+    height: u32,
+    /// Mean linear radiance of the environment the renderer is using, `[r, g, b]`.
+    ///
+    /// This exists because the only other way to prove an imported sky REACHES the renderer was an OS
+    /// screenshot, and the desktop refuses those intermittently — a proof that depends on an unreliable
+    /// observation is not a proof. The box-filtered mip chain converges to exactly this mean (asserted
+    /// in `ibl`'s energy-conservation test), so it is what the diffuse IBL actually lights with.
+    mean_radiance: [f32; 3],
+    /// A friendly summary, or the reason nothing changed.
+    message: String,
+    /// Set iff nothing changed.
+    reason: Option<String>,
+}
+
+impl EnvImportReply {
+    fn refusal(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            message: reason.clone(),
+            reason: Some(reason),
+            ..Self::default()
+        }
+    }
+}
+
+/// Load a Radiance `.hdr` panorama as the scene's lighting environment.
+///
+/// The whole IBL chain already existed and already called this decoder - it was reachable only via the
+/// `MTK_ENV_HDR` environment variable, read once at process start. This is the command that makes it a
+/// capability a person can actually use.
+///
+/// Decoding runs on this command's own async thread, never the engine tick: an 8k panorama is ~400 MB
+/// of f32 and decoding it inline would freeze the viewport.
+#[tauri::command(async)]
+fn import_environment(state: State<AppState>, path: String) -> EnvImportReply {
+    ipc();
+    let p = std::path::Path::new(&path);
+    let label = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "environment".into());
+
+    let bytes = match std::fs::read(p) {
+        Ok(b) => b,
+        Err(e) => return EnvImportReply::refusal(format!("that file could not be read: {e}")),
+    };
+    // A bounded read: a decompression bomb must be refused, not allocated.
+    const MAX_HDR_BYTES: usize = 512 * 1024 * 1024;
+    if bytes.len() > MAX_HDR_BYTES {
+        return EnvImportReply::refusal(format!(
+            "that panorama is {} MB, over the {} MB limit - downsample it first",
+            bytes.len() / (1024 * 1024),
+            MAX_HDR_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let env = match metrocalk_assets::env_import::load_hdr_equirect(&bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            return EnvImportReply::refusal(format!(
+                "that is not a readable Radiance HDR panorama ({e})"
+            ))
+        }
+    };
+    let source = render::ibl_env_source(
+        env.width as usize,
+        env.height as usize,
+        env.pixels,
+        label.clone(),
+    );
+    if let Err(why) = source.validate() {
+        return EnvImportReply::refusal(why);
+    }
+    let (w, h) = (source.width as u32, source.height as u32);
+    let mean = mean_radiance(&source.pixels);
+    {
+        let mut st = state.shared.lock().unwrap();
+        st.pending_env = Some(source);
+        st.env_label = label.clone();
+        st.env_revision = st.env_revision.wrapping_add(1);
+    }
+    EnvImportReply {
+        applied: true,
+        label: label.clone(),
+        width: w,
+        height: h,
+        mean_radiance: mean,
+        message: format!(
+            "Lighting from \"{label}\" ({w}x{h}) - it lights the scene and shows in reflections"
+        ),
+        reason: None,
+    }
+}
+
+/// Go back to the built-in studio sky.
+#[tauri::command(async)]
+fn reset_environment(state: State<AppState>) -> EnvImportReply {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.pending_env = None;
+    st.env_label = "Studio (built in)".into();
+    st.env_revision = st.env_revision.wrapping_add(1);
+    EnvImportReply {
+        applied: true,
+        label: st.env_label.clone(),
+        message: "Back to the built-in studio lighting".into(),
+        ..EnvImportReply::default()
+    }
+}
+
+/// What the scene is currently lit by.
+#[tauri::command(async)]
+fn environment_state(state: State<AppState>) -> EnvImportReply {
+    ipc();
+    let st = state.shared.lock().unwrap();
+    let custom = st.pending_env.as_ref();
+    EnvImportReply {
+        applied: custom.is_some(),
+        // The panorama's own label is authoritative when one is loaded; `env_label` only carries the
+        // built-in case, where there is no source to ask.
+        label: custom.map_or_else(
+            || {
+                if st.env_label.is_empty() {
+                    "Studio (built in)".to_string()
+                } else {
+                    st.env_label.clone()
+                }
+            },
+            |e| e.label.clone(),
+        ),
+        width: custom.map_or(0, |e| e.width as u32),
+        height: custom.map_or(0, |e| e.height as u32),
+        mean_radiance: custom.map_or([0.0; 3], |e| mean_radiance(&e.pixels)),
+        message: String::new(),
+        reason: None,
+    }
+}
+
+/// The mean linear radiance of a panorama — what the top mip of the box-filtered chain converges to,
+/// and therefore what the diffuse IBL lights the scene with.
+fn mean_radiance(pixels: &[[f32; 3]]) -> [f32; 3] {
+    if pixels.is_empty() {
+        return [0.0; 3];
+    }
+    let mut sum = [0.0f64; 3];
+    for p in pixels {
+        for (acc, c) in sum.iter_mut().zip(p) {
+            *acc += f64::from(*c);
+        }
+    }
+    let n = pixels.len() as f64;
+    [
+        (sum[0] / n) as f32,
+        (sum[1] / n) as f32,
+        (sum[2] / n) as f32,
+    ]
+}
+
+/// The project's colour configuration, plus an honest account of what is and is not wired.
+///
+/// Colour is the one area where a half-answer is worse than none: a facility that believes the engine
+/// is ACES-managed and finds out later that only the view transform was hooked up has shipped wrong
+/// frames. So this reports per-capability rather than a single "colour: yes".
+#[tauri::command(async)]
+fn colour_status(state: State<AppState>) -> serde_json::Value {
+    use metrocalk_assets::colour::{self, ColourSpace, ViewTransform, WorkingSpace};
+    ipc();
+    let ocio = colour::ocio_status();
+    // The LIVE view transform, read from the renderer rather than restated. The two "presentation
+    // profiles" the viewport already had ARE display transforms — cinematic runs the ACES-like curve,
+    // CAD runs Khronos PBR Neutral. Naming them as colour and reporting which is active turns an
+    // existing switch into something a colourist can reason about, without a second control that could
+    // disagree with the first.
+    let (present, env_source) = {
+        let st = state.shared.lock().unwrap();
+        (st.presentation(), st.env_source_space)
+    };
+    let active = present.view;
+    let working = present.working;
+    let aces2 = colour::aces2_status();
+    // Built before the macro: `json!` cannot parse a method chain on an array literal.
+    let spaces: Vec<_> = ColourSpace::all()
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s,
+                "label": s.label(),
+                "isColour": s.is_colour(),
+                "isLinear": s.is_linear(),
+            })
+        })
+        .collect();
+    let views: Vec<_> = [ViewTransform::AcesFit, ViewTransform::PbrNeutral]
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "id": v,
+                "label": v.label(),
+                "blurb": v.blurb(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        // The spaces the engine can convert between, exactly, with reference-tested matrices.
+        "spaces": spaces,
+        // What the renderer is working in RIGHT NOW, read from the render state rather than restated.
+        // The default is still linear Rec.709, which is not a placeholder — it is what the existing
+        // lights, authored colours and tone curves already mean, so adopting colour management changes
+        // no pixel until someone asks it to.
+        "working": {
+            "current": working,
+            "label": working.label(),
+            "wired": true,
+            "options": WorkingSpace::all().iter().map(|w| serde_json::json!({
+                "id": w, "label": w.label(), "arg": w.wire(),
+            })).collect::<Vec<_>>(),
+            "setCommand": "set_working_space",
+            "luminanceWeights": working.luminance_weights(),
+        },
+        // The state hash every asynchronous render result carries, so a picture can be matched to the
+        // state it was made in. Exposed because "which frame is this thumbnail of?" is otherwise
+        // unanswerable from outside, and an E2E needs to see it change.
+        "presentationHash": format!("{:016x}", present.hash()),
+        "exposure": present.exposure,
+        // What the loaded environment is DECLARED to be, the spaces it may be declared in, and the
+        // command that says so. The default is an assumption and is labelled as one.
+        "environment": {
+            "sourceSpace": env_source,
+            "label": env_source.label(),
+            "assumed": env_source == ColourSpace::LinearRec709,
+            "options": ColourSpace::linear_options().iter().map(|s| serde_json::json!({
+                "id": s, "label": s.label(), "arg": s.wire(),
+            })).collect::<Vec<_>>(),
+            "setCommand": "set_environment_colour_space",
+        },
+        // The display/view transform. Both curves are real and already run in `fs_resolve`.
+        "views": views,
+        // Which one the viewport is running right now, and the command that changes it. A status that
+        // lists possibilities without saying which is in force is not an inspector.
+        "activeView": active,
+        "activeViewLabel": active.label(),
+        "setViewCommand": "set_render_profile",
+        "setViewArg": match active {
+            ViewTransform::AcesFit => "cinematic",
+            ViewTransform::PbrNeutral => "cad",
+        },
+        // Per-capability honesty, so nobody infers more than is true.
+        "capabilities": {
+            "sceneLinearWorkingSpace": true,
+            "dataMapsBypassColourTransform": true,
+            "singleToneMapAtResolve": true,
+            // Precise rather than flattering. The role -> colour-space decision now comes from ONE
+            // policy that the uploader calls (true). Letting a person OVERRIDE it per asset does not
+            // exist yet (false), and calling both of those "explicit colour metadata" would let a
+            // reader assume the second from the first.
+            "colourSpaceDerivedFromOnePolicy": true,
+            // Two separate flags, because they are two separate truths and one word would blur them.
+            // The ENVIRONMENT's source space is live and overridable right now. A mesh texture's is
+            // not: nothing stores a per-texture choice in the asset library yet, so claiming a general
+            // per-asset override would be the flattering answer rather than the true one.
+            "environmentColourSpaceOverride": true,
+            "perTextureColourSpaceOverride": false,
+            "colourDecisionCarriesProvenance": true,
+            // Presentation state (working space, view transform, exposure) is saved beside the project
+            // rather than in it: it survives a reopen and still never dirties the document.
+            "viewTransformPersistedWithProject": true,
+            "presentationStateSeparateFromDocument": true,
+            "referenceTestedPrimaryConversions": true,
+            "acesCgWorkingSpaceSelectable": true,
+            // Every asynchronous render result quotes the request it answers and the presentation state
+            // it was rendered in; a mismatch fails explicitly instead of returning an older image.
+            "renderResultsAreGenerationSafe": true,
+            "ocioConfigLoading": ocio.available,
+            "aces2OutputTransform": aces2.available,
+            // wgpu 29's `SurfaceConfiguration` has no colour-space field at all — surface colour-space
+            // selection landed in wgpu 30 — so this build cannot request an HDR/P3 surface, and does
+            // not pretend to: the swapchain is SDR and the view transform targets sRGB.
+            "hdrDisplayOutput": false,
+        },
+        "notes": [
+            // Names only the FOUR texture kinds the renderer actually has. An earlier draft listed
+            // emissive and mask maps too, because the policy enum has arms for them - but neither is
+            // read by any importer or bound by any pipeline, so a person with an emissive map would
+            // have read a promise the engine cannot keep. And it says "the space is decided by role",
+            // not "textures carry their space": no tag is attached to an asset, which is exactly what
+            // `perAssetColourSpaceOverride: false` on the line above reports.
+            "A texture's colour space is decided by its ROLE, from one policy the uploader calls: base              colour decodes from sRGB, while normal, roughness/metallic and occlusion upload as raw              data and are never given a transfer function. Those four are the texture kinds this              renderer binds; an emissive or mask map is not read at all, so it is not carried rather              than mis-converted.",
+            "An imported HDR panorama is treated as scene-linear with Rec.709 primaries by default. The              Radiance format does not record primaries in any required field, so that is an assumption —              and it is the one assumption a person can now override, per environment, with the choice              carried as an explicit 'set by you' provenance.",
+            "ACEScg is now the renderer's working space when selected: base colour, emissive, light              colour, environment radiance and every authored chrome colour are converted into AP1 BEFORE              the BRDF, bloom meters with AP1's luminance weights, and the frame returns to Rec.709 once,              immediately before the view transform. Selecting linear Rec.709 makes every one of those              conversions the identity matrix, so it is provably the same pipeline rather than a second              one.",
+            "The view transform is still NOT scene data (ADR-021): switching it dirties nothing and              never enters undo. It IS now remembered — working space, view transform and exposure are              saved as a presentation record beside the project and restored on open, so a review session              does not silently return to the filmic default.",
+            ocio.detail,
+            aces2.detail,
+        ],
+    })
+}
+
+/// Every format this build can read or write, with its declared fidelity. Static data.
+///
+/// Exists so the answer to "does Metrocalk handle X?" is one list the UI can show, rather than being
+/// spread across a dialog filter, a magic-byte sniffer and a set of Cargo features that disagree.
+#[tauri::command(async)]
+fn format_catalog() -> Vec<metrocalk_editor_shell::FormatSpec> {
+    ipc();
+    metrocalk_editor_shell::format_catalog()
+}
+
+/// The effect catalogue - every VFX card. Static data.
+#[tauri::command(async)]
+fn vfx_catalog() -> Vec<metrocalk_editor_shell::EffectSpec> {
+    ipc();
+    metrocalk_editor_shell::effect_specs()
+}
+
+/// Add one effect layer to an object (one undoable commit).
+#[tauri::command(async)]
+fn vfx_add(
+    state: State<AppState>,
+    id: String,
+    kind: String,
+    trigger: Option<String>,
+) -> metrocalk_editor_shell::VfxReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::VfxAdd {
+            id,
+            kind,
+            trigger: trigger.unwrap_or_else(|| "always".into()),
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::VfxReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::VfxReply::refusal("The effect did not finish in time")
+    })
+}
+
+/// Remove one effect layer by index (one undoable commit).
+#[tauri::command(async)]
+fn vfx_remove(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+) -> metrocalk_editor_shell::VfxReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::VfxRemove { id, index, reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::VfxReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::VfxReply::refusal("The effect did not finish in time")
+    })
+}
+
+/// An object effect list, read back as sentences plus any warnings.
+#[tauri::command(async)]
+fn vfx_list(state: State<AppState>, id: String) -> metrocalk_editor_shell::VfxReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::VfxList { id, reply }).is_err() {
+        return metrocalk_editor_shell::VfxReply::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
+/// How many particles the renderer is drawing RIGHT NOW, split by look. Exists so an effect can be
+/// verified by measurement rather than by looking at a screenshot and agreeing it seems fiery.
+#[tauri::command(async)]
+fn vfx_probe(state: State<AppState>) -> serde_json::Value {
+    ipc();
+    let st = state.shared.lock().unwrap();
+    let brightest = st
+        .fx_additive
+        .iter()
+        .map(|i| i.color[0].max(i.color[1]).max(i.color[2]))
+        .fold(0.0_f32, f32::max);
+    serde_json::json!({
+        "additive": st.fx_additive.len(),
+        "soft": st.fx_soft.len(),
+        "total": st.fx_additive.len() + st.fx_soft.len(),
+        "bursts": st.fx_bursts,
+        "peakTotal": st.fx_peak_total,
+        "burstsFired": st.fx_bursts_fired,
+        "peakRadianceMax": st.fx_peak_radiance,
+        // Above 1.0 means the scene is genuinely emitting into the HDR buffer, which is what makes
+        // bloom happen. A "particle system" that never exceeds 1.0 is just coloured dots.
+        "peakRadiance": brightest,
+    })
+}
+
+/// Where the camera actually IS, right now, straight off the render state. Exists so a cutscene can be
+/// verified by MEASUREMENT rather than by looking at a screenshot and agreeing it seems cinematic:
+/// `cinematic` is true only while the shot solver owns the view.
+#[tauri::command(async)]
+fn camera_probe(state: State<AppState>) -> serde_json::Value {
+    ipc();
+    let st = state.shared.lock().unwrap();
+    let (eye, look, fov, cinematic) = match st.cam_override {
+        Some(ov) => (
+            ov.pos,
+            ov.look_at.unwrap_or(st.cam_target),
+            ov.fov_deg,
+            ov.look_at.is_some(),
+        ),
+        None => (
+            render::camera_eye(st.orbit, st.elevation, st.distance, st.cam_target),
+            st.cam_target,
+            45.0,
+            false,
+        ),
+    };
+    let d = [eye[0] - look[0], eye[1] - look[1], eye[2] - look[2]];
+    let distance = d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt();
+    serde_json::json!({
+        "eye": eye,
+        "lookAt": look,
+        "fovDeg": fov,
+        "cinematic": cinematic,
+        "distance": distance,
+    })
+}
+
+/// The shot catalogue - every cinematics card. Static data.
+#[tauri::command(async)]
+fn cinema_catalog() -> Vec<metrocalk_editor_shell::ShotSpec> {
+    ipc();
+    metrocalk_editor_shell::shot_specs()
+}
+
+/// Add one shot to an object's cutscene (one undoable commit).
+#[tauri::command(async)]
+fn cinema_add_shot(
+    state: State<AppState>,
+    id: String,
+    kind: String,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaAddShot { id, kind, reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The shot did not finish in time")
+    })
+}
+
+/// Remove one shot by index (one undoable commit).
+#[tauri::command(async)]
+fn cinema_remove_shot(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaRemoveShot { id, index, reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The shot did not finish in time")
+    })
+}
+
+/// An object's cutscene, read back as sentences plus any continuity warnings.
+#[tauri::command(async)]
+fn cinema_list(state: State<AppState>, id: String) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::CinemaList { id, reply }).is_err() {
+        return metrocalk_editor_shell::CinemaReply::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
+/// The conditional catalogue: every "only if" card the Behaviour block offers. Static data.
+#[tauri::command(async)]
+fn condition_catalog() -> Vec<metrocalk_editor_shell::ConditionSpec> {
+    ipc();
+    metrocalk_editor_shell::condition_specs()
+}
+
+/// Add one "only if" clause to an object (one undoable commit; refusals are sentences).
+#[tauri::command(async)]
+fn condition_add(
+    state: State<AppState>,
+    id: String,
+    request: metrocalk_editor_shell::ClauseRequest,
+) -> metrocalk_editor_shell::RoleReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ConditionAdd { id, request, reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::RoleReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::RoleReply::refusal("The condition did not finish in time")
+    })
+}
+
+/// Remove one clause by index (`any` picks the OR group).
+#[tauri::command(async)]
+fn condition_remove(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+    any: bool,
+) -> metrocalk_editor_shell::RoleReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ConditionRemove {
+            id,
+            index,
+            any,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::RoleReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::RoleReply::refusal("The removal did not finish in time")
+    })
+}
+
+/// The object's clauses + the assembled sentence.
+#[tauri::command(async)]
+fn condition_list(state: State<AppState>, id: String) -> ConditionListInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ConditionList { id, reply })
+        .is_err()
+    {
+        return ConditionListInfo::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
+/// The player's live movement axis (pressed keys, camera-agnostic world axes). Fire-and-forget:
+/// no reply channel, no per-frame IPC storm — the frontend sends only on key CHANGES.
+#[tauri::command(async)]
+fn player_input(state: State<AppState>, x: f64, z: f64) {
+    ipc();
+    let _ = state.tx.send(EngineCmd::PlayerInput { x, z });
+}
+
+#[tauri::command(async)]
+fn role_clear(state: State<AppState>, id: String) -> metrocalk_editor_shell::RoleReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::RoleClear { id, reply }).is_err() {
+        return metrocalk_editor_shell::RoleReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::RoleReply::refusal("The role clear did not finish in time")
+    })
+}
+
+/// The roles roster + the score (live from the rules runtime during Play).
+#[tauri::command(async)]
+fn role_status(state: State<AppState>) -> metrocalk_editor_shell::RoleStatusInfo {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::RoleStatus { reply }).is_err() {
+        return metrocalk_editor_shell::RoleStatusInfo::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
+// ── Shape Studio (Build sub-engine) ────────────────────────────────────────────────────────────────────
+
+/// The shape catalog: every parametric shape the Build panel offers, with plain-language parameter
+/// specs (label/min/max/step/default). Static data — no engine round-trip.
+#[tauri::command(async)]
+fn shape_catalog() -> Vec<metrocalk_editor_shell::ShapeSpec> {
+    ipc();
+    shape_specs()
+}
+
+/// Spawn a parametric shape (catalog defaults) at `pos`, or on the deterministic scatter when omitted.
+#[tauri::command(async)]
+fn shape_spawn(state: State<AppState>, kind: String, pos: Option<[f32; 3]>) -> ShapeReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ShapeSpawn { kind, pos, reply })
+        .is_err()
+    {
+        return ShapeReply::refusal("The shape engine is unavailable");
+    }
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT)
+        .unwrap_or_else(|_| ShapeReply::refusal("The shape did not finish in time"))
+}
+
+/// Re-bake an existing shape with edited parameters (one undo step; position untouched).
+#[tauri::command(async)]
+fn shape_update(
+    state: State<AppState>,
+    id: String,
+    params: std::collections::BTreeMap<String, f64>,
+) -> ShapeReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ShapeUpdate { id, params, reply })
+        .is_err()
+    {
+        return ShapeReply::refusal("The shape engine is unavailable");
+    }
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT)
+        .unwrap_or_else(|_| ShapeReply::refusal("The edit did not finish in time"))
+}
+
+/// Turn a drawn outline into a solid: extrude (ground plan, straight up) or revolve (side profile
+/// spun around the vertical axis).
+#[tauri::command(async)]
+fn shape_draw(
+    state: State<AppState>,
+    mode: String,
+    profile: Vec<[f64; 2]>,
+    height: Option<f64>,
+    segments: Option<f64>,
+    taper: Option<f64>,
+) -> ShapeReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ShapeDraw {
+            mode,
+            profile,
+            height: height.unwrap_or(1.0),
+            segments: segments.unwrap_or(48.0),
+            taper: taper.unwrap_or(1.0),
+            reply,
+        })
+        .is_err()
+    {
+        return ShapeReply::refusal("The shape engine is unavailable");
+    }
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT)
+        .unwrap_or_else(|_| ShapeReply::refusal("The drawn shape did not finish in time"))
+}
+
+/// Exact boolean of two scene objects (union | carve | intersect): creates the result and retires
+/// both sources in ONE undoable commit.
+#[tauri::command(async)]
+fn shape_combine(state: State<AppState>, a: String, b: String, op: String) -> ShapeReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ShapeCombine { a, b, op, reply })
+        .is_err()
+    {
+        return ShapeReply::refusal("The shape engine is unavailable");
+    }
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT)
+        .unwrap_or_else(|_| ShapeReply::refusal("The combine did not finish in time"))
+}
+
+/// Meld two shapes into one smooth blob (blend radius `k` metres), same replace semantics as combine.
+#[tauri::command(async)]
+fn shape_meld(state: State<AppState>, a: String, b: String, k: Option<f64>) -> ShapeReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ShapeMeld {
+            a,
+            b,
+            k: k.unwrap_or(0.25),
+            reply,
+        })
+        .is_err()
+    {
+        return ShapeReply::refusal("The shape engine is unavailable");
+    }
+    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT)
+        .unwrap_or_else(|_| ShapeReply::refusal("The meld did not finish in time"))
+}
+
 /// M11.3 (ADR-042) — author a Light entity (kind = directional|point|spot) at a position with a linear RGB
 /// colour + intensity; one undoable commit, persists. Reply its id (the UI selects it). Lighting is a render
 /// projection — only the light ENTITY enters Loro/undo, never the per-frame lit result.
@@ -16779,12 +21737,12 @@ fn import_asset_dialog(app: tauri::AppHandle, state: State<AppState>) -> Option<
     let path = app
         .dialog()
         .file()
+        // DERIVED from `metrocalk_editor_shell::formats`, never hand-maintained: a hand-written list
+        // silently drifts from what the build can actually read (KTX2 was importable and absent here,
+        // so the only way to open one was automation).
         .add_filter(
             "3D models, CAD & assets",
-            &[
-                "fbx", "glb", "gltf", "obj", "png", "jpg", "jpeg", // meshes/textures
-                "3dxml", "stp", "step", // CAD (M15.7 / ADR-077): CATIA 3DXML · STEP AP242
-            ],
+            &metrocalk_editor_shell::import_extensions(),
         )
         .blocking_pick_file()
         .and_then(|f| f.into_path().ok())
@@ -17051,6 +22009,86 @@ fn set_render_profile(state: State<AppState>, profile: String) -> String {
     };
     state.shared.lock().unwrap().render_profile = value;
     label.to_string()
+}
+
+/// Select the space the renderer SHADES in — linear Rec.709 (default) or ACEScg / AP1.
+///
+/// Replies the accepted name, or `"unknown: <what you sent>"` for anything else. It does not fall back
+/// to the default: a typo that silently selects Rec.709 while the caller believes it selected ACEScg is
+/// a colour bug wearing a successful reply, and this is exactly the surface where that would happen.
+///
+/// The switch is ATOMIC by construction rather than by care: the working space is read from the shared
+/// state once per frame, under the same lock as the camera and the exposure, and every colour in that
+/// frame is converted by the matrices derived from that one read. There is no window in which AP1
+/// textures meet Rec.709 lights.
+///
+/// Render-only state: no commit, no undo entry, no dirty flag — and no IBL rebuild either, because the
+/// environment is converted where it is sampled and a primaries conversion commutes with the
+/// convolution that produced the mips.
+#[tauri::command]
+fn set_working_space(state: State<AppState>, space: String) -> String {
+    ipc();
+    let Some(w) = metrocalk_assets::colour::WorkingSpace::parse(&space) else {
+        return format!("unknown: {space}");
+    };
+    state.shared.lock().unwrap().working_space = w;
+    w.wire().to_string()
+}
+
+/// Declare what the loaded environment map's values MEAN — the per-asset colour override, for the one
+/// asset whose colour space the file genuinely does not record.
+///
+/// Only LINEAR spaces are accepted, and the refusal is the point: an environment panorama is
+/// floating-point radiance, so "this EXR is sRGB" is not a thing a person can mean, and accepting it
+/// would apply a transfer function to values that never had one. Roles that carry measurements are
+/// refused by the policy itself ([`metrocalk_assets::colour::decide`]) for the same reason.
+///
+/// Takes effect on the next frame with no IBL rebuild: the conversion is applied where the map is
+/// sampled, and a primaries conversion commutes with the convolution that produced the mip chain — so
+/// the sky, the ambient and every reflection move together, atomically, or none of them do.
+#[tauri::command]
+fn set_environment_colour_space(state: State<AppState>, space: String) -> String {
+    ipc();
+    use metrocalk_assets::colour::ColourSpace;
+    let Some(s) = ColourSpace::parse(&space) else {
+        return format!("unknown: {space}");
+    };
+    if s.linear_to_rec709().is_none() {
+        return format!(
+            "refused: an environment panorama is linear radiance, so it cannot be {}. Choose one of \
+             the linear spaces.",
+            s.label()
+        );
+    }
+    state.shared.lock().unwrap().env_source_space = s;
+    s.wire().to_string()
+}
+
+/// Authoritative environment-source read, so automation can prove the declaration took.
+#[tauri::command]
+fn environment_colour_space_debug(state: State<AppState>) -> String {
+    ipc();
+    state
+        .shared
+        .lock()
+        .unwrap()
+        .env_source_space
+        .wire()
+        .to_string()
+}
+
+/// Authoritative working-space read, for the toolbar and for automation that has to prove the switch
+/// took effect rather than assume it.
+#[tauri::command]
+fn working_space_debug(state: State<AppState>) -> String {
+    ipc();
+    state
+        .shared
+        .lock()
+        .unwrap()
+        .working_space
+        .wire()
+        .to_string()
 }
 
 /// Authoritative render-profile read for the viewport toolbar and visual-quality automation.
@@ -18176,6 +23214,8 @@ fn asset_lab_export(
 fn pick_scene_export_path(app: &tauri::AppHandle, format: &str) -> Option<String> {
     let (label, extension, file_name) = if format.eq_ignore_ascii_case("glb") {
         ("Complete glTF scene", "glb", "scene.glb")
+    } else if format.eq_ignore_ascii_case("step") || format.eq_ignore_ascii_case("stp") {
+        ("STEP AP242 (faceted)", "step", "scene.step")
     } else {
         ("OpenUSD ASCII scene", "usda", "scene.usda")
     };
@@ -18582,6 +23622,56 @@ fn project_state(state: State<AppState>) -> ProjectInfoResp {
     query_project_state(&state)
 }
 
+/// Where a project's PRESENTATION record lives: `thing.mtk` → `thing.mtk.view.json`.
+///
+/// A sidecar, not a field in the `.mtk`, and the choice is the whole design. How a person prefers to
+/// LOOK at a scene — the working space, the tone curve, the exposure — is not a fact about the scene,
+/// so it must not enter the document: not into the CRDT, not into undo, not into the content hash, and
+/// not into a diff two collaborators have to merge. But losing it on every reopen is a workflow bug,
+/// and "it is not scene data" is not an excuse for that. A sidecar satisfies both: it travels with the
+/// project directory, it is human-readable, and deleting it loses nothing but a preference.
+fn presentation_sidecar(project: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{project}.view.json"))
+}
+
+/// Write the current presentation beside the project. Best-effort by design: a read-only directory
+/// must not fail a save of the actual work.
+fn save_presentation(state: &State<AppState>, project: &str) {
+    let present = state.shared.lock().unwrap().presentation();
+    match serde_json::to_string_pretty(&present) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(presentation_sidecar(project), json) {
+                eprintln!("[colour] presentation not saved beside {project}: {e}");
+            }
+        }
+        Err(e) => eprintln!("[colour] presentation not serialisable: {e}"),
+    }
+}
+
+/// Restore the presentation recorded beside a project, if there is one.
+///
+/// Every failure path leaves the renderer at its defaults and SAYS SO. A missing sidecar is silent (a
+/// project saved by an older build simply has none); a malformed one is reported, because a file that
+/// exists and cannot be read is a different situation from a file that was never written, and quietly
+/// treating them the same is how a corrupted preference becomes a mystery.
+fn restore_presentation(state: &State<AppState>, project: &str) {
+    let path = presentation_sidecar(project);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return; // no sidecar — defaults, nothing to say
+    };
+    match serde_json::from_str::<metrocalk_assets::colour::PresentationState>(&text) {
+        Ok(p) => state.shared.lock().unwrap().set_presentation(p),
+        // The number comes from the renderer's own constant, so the message cannot quote an exposure
+        // the renderer has stopped using.
+        Err(e) => eprintln!(
+            "[colour] {} could not be read ({e}); the viewport stays at its defaults \
+             (linear Rec.709, filmic, exposure {}).",
+            path.display(),
+            render::DEFAULT_EXPOSURE
+        ),
+    }
+}
+
 /// Save the project as a `.mtk` (atomic). Explicit `path` wins; else save to the current path; else
 /// (untitled) a native Save dialog. A cancelled dialog is a no-op.
 #[tauri::command]
@@ -18600,10 +23690,12 @@ fn save_project(
     let Some(target) = target else {
         return query_project_state(&state); // cancelled / no target — no-op
     };
-    run_project_cmd(&state, |reply| EngineCmd::SaveProject {
-        path: Some(target),
+    let info = run_project_cmd(&state, |reply| EngineCmd::SaveProject {
+        path: Some(target.clone()),
         reply,
-    })
+    });
+    save_presentation(&state, &target);
+    info
 }
 
 /// Save As — always a native Save dialog to a new path. A cancelled dialog is a no-op.
@@ -18613,10 +23705,12 @@ fn save_project_as(app: tauri::AppHandle, state: State<AppState>) -> ProjectInfo
     let Some(target) = pick_save_path(&app) else {
         return query_project_state(&state); // cancelled — no-op
     };
-    run_project_cmd(&state, |reply| EngineCmd::SaveProject {
-        path: Some(target),
+    let info = run_project_cmd(&state, |reply| EngineCmd::SaveProject {
+        path: Some(target.clone()),
         reply,
-    })
+    });
+    save_presentation(&state, &target);
+    info
 }
 
 /// Open a `.mtk` project (swap in a fresh engine/scene, re-derive caps — ADR-032). Explicit `path` (a
@@ -18633,10 +23727,16 @@ fn open_project(
     let Some(target) = path.or_else(|| pick_open_path(&app)) else {
         return query_project_state(&state); // cancelled — no-op
     };
-    run_project_cmd(&state, |reply| EngineCmd::OpenProject {
-        path: Some(target),
+    let info = run_project_cmd(&state, |reply| EngineCmd::OpenProject {
+        path: Some(target.clone()),
         reply,
-    })
+    });
+    // AFTER the engine swap, not before: opening a project resets render state, so restoring the view
+    // first would have it overwritten by the very load that is supposed to be carrying it.
+    if info.error.is_none() {
+        restore_presentation(&state, &target);
+    }
+    info
 }
 
 /// New empty project (a fresh engine/scene, the session log reset). Accepted on a GUI run.
@@ -18770,10 +23870,14 @@ fn main() {
             }
         });
     }
+    // The drag-drop handler needs its own sender:  is moved into AppState below.
+    let tx_for_drop = tx.clone();
     let app_state = AppState {
         tx,
         shared: shared.clone(),
         moba: Mutex::new(None),
+        picking: Mutex::new(scene_pick::PickCache::new()),
+        selection: Mutex::new(metrocalk_spatial::SelectionModel::new()),
     };
 
     tauri::Builder::default()
@@ -18781,6 +23885,7 @@ fn main() {
         .manage(app_state)
         .setup(move |app| {
             let win = app.get_webview_window("main").expect("main window");
+            let drop_tx = tx_for_drop.clone();
             // Reopen where the editor was left, then persist the geometry on a light write-on-change
             // poll so a hard terminal kill (no close event) still preserves it — and so there's always
             // a baseline even if the window is never moved. ~1s granularity, a tiny sidecar write only
@@ -18801,11 +23906,78 @@ fn main() {
                     }
                 });
             }
+            // ── DROP A FILE ON THE WINDOW ────────────────────────────────────────────────────
+            // The app had no drag-and-drop at all: the only way to bring anything in was the File
+            // menu. Dropping a file onto a 3D editor is the most obvious gesture there is, and the
+            // one every user tries first.
+            //
+            // Routed through the SAME `EngineCmd::ImportAsset` as the menu, so a dropped file gets
+            // the identical landing, provenance and undo behaviour — a second import path that
+            // behaved even slightly differently would be worse than none.
+            {
+                let tx = drop_tx.clone();
+                let handle = app.handle().clone();
+                win.on_window_event(move |event| {
+                    let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) =
+                        event
+                    else {
+                        return;
+                    };
+                    for path in paths.clone() {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        // Refuse what we cannot open BEFORE handing it to the engine, and say why in
+                        // the registry's own words rather than a generic failure.
+                        let ext = path
+                            .extension()
+                            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                            .unwrap_or_default();
+                        let known = metrocalk_editor_shell::spec_for_extension(&ext)
+                            .is_some_and(|f| f.available && f.direction.reads());
+                        if !known {
+                            let why = metrocalk_editor_shell::explain_unsupported(&name);
+                            let _ = handle.emit("mtk://import-refused", why);
+                            continue;
+                        }
+                        let (reply, rx) = mpsc::channel();
+                        if tx
+                            .send(EngineCmd::ImportAsset {
+                                path: path.display().to_string(),
+                                reply,
+                            })
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        let created = recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).ok().flatten();
+                        let _ = handle.emit("mtk://imported", created.unwrap_or_default());
+                    }
+                });
+            }
             render::start(win, shared.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             connect,
+            terrain_presets,
+            terrain_create,
+            terrain_edit,
+            terrain_stats,
+            terrain_height,
+            terrain_path,
+            terrain_tool,
+            terrain_paint_begin,
+            terrain_paint_end,
+            terrain_route_point,
+            terrain_route_clear,
+            terrain_route_commit,
+            terrain_test_cursor,
+            terrain_cursor_hit,
+            terrain_describe,
+            terrain_read_description,
+            terrain_plan,
             submit_edit,
             undo,
             redo,
@@ -18818,6 +23990,8 @@ fn main() {
             thumbnail,
             viewport_pick,
             viewport_peek,
+            viewport_pick_region,
+            pick_diagnostics,
             focus_entity,
             unfocus,
             focus_debug,
@@ -18936,6 +24110,36 @@ fn main() {
             pipe_forge_remove_catalog,
             pipe_forge_bake,
             pipe_forge_cancel,
+            role_catalog,
+            role_assign,
+            role_clear,
+            role_status,
+            player_input,
+            format_catalog,
+            colour_status,
+            import_environment,
+            reset_environment,
+            environment_state,
+            vfx_catalog,
+            vfx_add,
+            vfx_remove,
+            vfx_list,
+            vfx_probe,
+            camera_probe,
+            cinema_catalog,
+            cinema_add_shot,
+            cinema_remove_shot,
+            cinema_list,
+            condition_catalog,
+            condition_add,
+            condition_remove,
+            condition_list,
+            shape_catalog,
+            shape_spawn,
+            shape_update,
+            shape_draw,
+            shape_combine,
+            shape_meld,
             pipe_forge_status,
             add_light,
             lighting_debug,
@@ -18966,6 +24170,10 @@ fn main() {
             set_exposure,
             set_render_profile,
             render_profile_debug,
+            set_working_space,
+            working_space_debug,
+            set_environment_colour_space,
+            environment_colour_space_debug,
             snap_ghost,
             gizmo_debug,
             project_state,

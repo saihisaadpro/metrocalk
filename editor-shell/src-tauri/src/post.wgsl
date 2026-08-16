@@ -29,6 +29,14 @@ struct Camera {
     // `.w` = 1.0 when this pass must apply the sRGB OETF itself (a linear-store swapchain), 0.0 when the
     // surface format converts in hardware. Applying both would double-encode the frame.
     grid: vec4<f32>,
+    // The working space (mirrors render.rs's `ColourUniform`). The two ingress matrices are unused in
+    // this file — nothing enters the pipeline here — but they must be declared to reach `from_working`,
+    // which this file is the ONLY user of: it is the seam where the renderer's working space ends and
+    // the view transform's own space begins. `luma.xyz` is what "bright" means in the working space.
+    to_working: mat3x3<f32>,
+    env_to_working: mat3x3<f32>,
+    from_working: mat3x3<f32>,
+    luma: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 
@@ -52,10 +60,16 @@ fn vs_post(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
-// Rec. 709 luminance — the basis for bloom extraction. A per-channel max would let a saturated but dim
-// colour glow as hard as a genuinely bright one; luminance is what "bright" actually means.
+// Luminance IN THE WORKING SPACE — the basis for bloom extraction. A per-channel max would let a
+// saturated but dim colour glow as hard as a genuinely bright one; luminance is what "bright" means.
+//
+// The weights come from the uniform rather than being the Rec.709 constants they used to be. That was
+// the working-space bug in miniature: the Y row of AP1 is (0.2722, 0.6741, 0.0537), so shading in
+// ACEScg while metering with Rec.709's (0.2126, 0.7152, 0.0722) would under-read reds by a quarter and
+// over-read greens — bloom would pick the wrong pixels, and it would read as a threshold that needs
+// tuning rather than as a colour bug.
 fn luminance(c: vec3<f32>) -> f32 {
-    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return dot(c, cam.luma.xyz);
 }
 
 // ── bloom ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -168,18 +182,26 @@ fn fs_resolve(in: VsOut) -> @location(0) vec4<f32> {
     // 2. Bloom, already in exposed units (a 1×1 black texture when bloom is off ⇒ adds exactly nothing).
     let bloom = max(textureSample(bloom_tex, samp, in.uv).rgb, vec3<f32>(0.0));
     let composed = exposed + bloom * BLOOM_INTENSITY;
-    // 3. The presentation profile's tone curve.
+    // 3. THE SEAM: out of the renderer's working space, into the space the view transform is defined on.
+    //
+    // Both curves below are specified on linear Rec.709/sRGB primaries — the Khronos PBR Neutral
+    // reference implementation is, and the Narkowicz fit was published against the same. Feeding them
+    // AP1 channels would apply a per-channel curve to channels it does not describe, which shows up as
+    // a hue shift in saturated highlights: the fault is invisible on a grey ramp and obvious on a red
+    // light, which is why it survives casual review. Identity when the working space IS Rec.709.
+    let view_input = cam.from_working * composed;
+    // 4. The view transform. Exactly one runs, and this is the only place either is called.
     var mapped: vec3<f32>;
     if (cam.shadow.z > 0.5) {
-        mapped = tonemap_pbr_neutral(composed);
+        mapped = tonemap_pbr_neutral(view_input);
     } else {
-        mapped = tonemap_aces(composed);
+        mapped = tonemap_aces(view_input);
     }
-    // 4. The display transfer function — but only when the swapchain is not doing it for us.
+    // 5. The display transfer function — but only when the swapchain is not doing it for us.
     var display = mapped;
     if (cam.grid.w > 0.5) {
         display = to_srgb(mapped);
     }
-    // 5. Break up 8-bit quantisation contours.
+    // 6. Break up 8-bit quantisation contours.
     return vec4<f32>(display + vec3<f32>(dither(in.pos.xy)), 1.0);
 }

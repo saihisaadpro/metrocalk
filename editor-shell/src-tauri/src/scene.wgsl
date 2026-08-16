@@ -16,8 +16,40 @@ struct Camera {
     shadow: vec4<f32>,
     // Adaptive grid: target X/Z in `.xy`, camera distance in `.z`.
     grid: vec4<f32>,
+    // THE WORKING SPACE, ingress half. `to_working` takes linear Rec.709 — which is what every authored
+    // factor, light colour, imported material and decoded sRGB texel means — into the space this
+    // renderer shades in. The identity when the working space is linear Rec.709, so both working spaces
+    // run the SAME instructions and neither can rot.
+    //
+    // The buffer also carries `from_working` and the luminance weights after this field, and this
+    // struct DELIBERATELY stops here: the scene pass has no business leaving the working space or
+    // metering brightness, and a field it cannot name is a rule it cannot break. post.wgsl declares the
+    // full block. (WGSL permits a uniform struct smaller than its buffer, which is also how ssao.wgsl
+    // and the shadow passes get away with declaring even less.)
+    to_working: mat3x3<f32>,
+    // The ENVIRONMENT's declared source space → the working space, composed into one matrix. Equal to
+    // `to_working` unless someone has declared the panorama to be in another gamut — which the file
+    // itself usually cannot say, since Radiance .hdr has no required primaries header.
+    env_to_working: mat3x3<f32>,
 };
 @group(0) @binding(0) var<uniform> cam: Camera;
+
+// Linear Rec.709 → the renderer's working space.
+//
+// EVERY colour that takes part in a colour computation passes through here FIRST: base colour, emissive,
+// light radiance, environment radiance, and the authored chrome constants. That ordering is the whole
+// claim — converting the finished framebuffer instead would be rendering in Rec.709 and relabelling the
+// result, which is the thing "we support ACEScg" usually turns out to mean.
+fn to_working(c: vec3<f32>) -> vec3<f32> {
+    return cam.to_working * c;
+}
+
+// The environment's declared source space → the working space. Every sample of the env map goes through
+// THIS one — the sky backdrop, the diffuse irradiance and the specular reflection — so a declaration
+// cannot take effect in the reflection but not in the sky behind it.
+fn env_to_working(c: vec3<f32>) -> vec3<f32> {
+    return cam.env_to_working * c;
+}
 
 // M11.3 inc.3 (ADR-042) — the directional shadow map: a depth texture rendered from the shadow-casting
 // light's POV, sampled with a comparison sampler (hardware PCF). Filled by the depth-only shadow pass before
@@ -156,7 +188,11 @@ fn unlit_srgb_at_exposure(rgb: vec3<f32>, exposure: f32) -> vec3<f32> {
     // Guard exactly as render.rs does — fall back to 1.0 rather than dividing by a near-zero exposure,
     // or the two mirrors disagree at the bottom of the exposure range.
     let e = select(1.0, exposure, exposure > 1e-4);
-    return clamp(exposed, vec3<f32>(0.0), vec3<f32>(UNLIT_EXPOSED_CEILING)) / e;
+    // The inverse display transform lands in linear Rec.709 (that is the space the tone curves are
+    // defined on — see `ViewTransform::input_space`), so the last step is into the working space, like
+    // every other colour. Doing it here rather than at the four call sites is why an authored colour
+    // cannot escape the conversion.
+    return to_working(clamp(exposed, vec3<f32>(0.0), vec3<f32>(UNLIT_EXPOSED_CEILING)) / e);
 }
 
 // ── two callers, and the difference between them matters ──────────────────────────────────────────────
@@ -338,6 +374,60 @@ fn vs_overlay(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+// ── VFX particles ────────────────────────────────────────────────────────────────────────────────────
+// One camera-facing quad per particle, six vertices, no vertex buffer: `vertex_index / 6` picks the
+// particle out of the shared instance storage buffer and `% 6` picks the corner. The `Instance` slots are
+// reused as a particle carrier exactly the way the line/overlay passes reuse them as a point carrier:
+// `center` = world position, `scale` = world radius, `color` = LINEAR HDR colour (deliberately allowed
+// above 1.0 — the excess is what the bloom pass picks up), `selected` = opacity.
+//
+// The billboard basis is read straight out of the view-projection matrix. For M = P·V the first two ROWS
+// of the 3×3 part are the camera's world right/up scaled by the projection terms, so normalising them
+// gives the exact camera basis without a second uniform, a CPU-side sort, or a per-frame upload.
+struct FxOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) alpha: f32,
+};
+
+@vertex
+fn vs_particle(@builtin(vertex_index) vi: u32) -> FxOut {
+    let pi = vi / 6u;
+    let ci = vi % 6u;
+    // 0,1,2 / 0,2,3 over the corners (-1,-1) (1,-1) (1,1) (-1,1).
+    var order = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
+    let c = order[ci];
+    let cx = select(-1.0, 1.0, c == 1u || c == 2u);
+    let cy = select(-1.0, 1.0, c == 2u || c == 3u);
+
+    let p = instances[pi];
+    let vp = cam.view_proj;
+    let right = normalize(vec3<f32>(vp[0][0], vp[1][0], vp[2][0]));
+    let up = normalize(vec3<f32>(vp[0][1], vp[1][1], vp[2][1]));
+    let world = p.center + right * (cx * p.scale) + up * (cy * p.scale);
+
+    var out: FxOut;
+    out.pos = vp * vec4<f32>(world, 1.0);
+    out.color = p.color;
+    out.uv = vec2<f32>(cx, cy);
+    out.alpha = p.selected;
+    return out;
+}
+
+@fragment
+fn fs_particle(in: FxOut) -> @location(0) vec4<f32> {
+    // A round, soft-edged dot. A hard-edged square reads as a bug at any size, and the quadratic
+    // falloff is what makes a cluster of quads look like one continuous flame instead of confetti.
+    let d = length(in.uv);
+    if (d > 1.0) { discard; }
+    let falloff = 1.0 - d;
+    let a = in.alpha * falloff * falloff;
+    // PREMULTIPLIED: both blend modes below expect colour already scaled by coverage, so additive and
+    // alpha-blended layers can share one fragment entry without one of them being subtly wrong.
+    return vec4<f32>(in.color * a, a);
+}
+
 // Imported meshes (M4 asset pipeline) with metallic-roughness PBR (M11.2, ADR-041). The vertex stream
 // carries position/normal/baked-base-color + the baked metallic+roughness factors; `vs_mesh` interpolates
 // world position + normal + material across the triangle and `fs_mesh` evaluates a Cook-Torrance BRDF
@@ -516,7 +606,13 @@ fn perturb_normal(n: vec3<f32>, tangent: vec4<f32>, world_pos: vec3<f32>, uv: ve
 fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
     // M11.2 follow-up — albedo = the base-color TEXTURE × the baked/override factor. An untextured mesh
     // binds a 1×1 white dummy, so this is the factor unchanged (identical to the prior flat shading).
-    let base = textureSample(base_color_tex, base_color_samp, in.uv).rgb * in.base_color;
+    //
+    // COLOUR INGRESS #1. The texel arrives already decoded to linear light — by the hardware sRGB unit
+    // when the policy said this is an sRGB colour texture, or untouched when it said data — and the
+    // factor is linear Rec.709 by the glTF specification ("COLOR_0 ... acts as an additional linear
+    // multiplier to base color"). Both are Rec.709, so ONE conversion covers the product, and it
+    // happens here: before F0, before the BRDF, before anything reads a channel.
+    let base = to_working(textureSample(base_color_tex, base_color_samp, in.uv).rgb * in.base_color);
     // M11.2 follow-up — multiply the baked metallic/roughness factors by the MR map (glTF packing:
     // roughness=G, metalness=B); an untextured mesh binds a white dummy (×1 → unchanged).
     let mr_s = textureSample(mr_tex, base_color_samp, in.uv);
@@ -575,7 +671,9 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
         if (kind < 0.5 && cam.shadow.x >= 0.0 && f32(i) == cam.shadow.x) {
             shadow = shadow_factor(in.world_pos, dot(n, l));
         }
-        let radiance = lt.color_intensity.xyz * lt.color_intensity.w * atten * shadow;
+        // COLOUR INGRESS #2 — the light's own colour. An authored light is linear Rec.709; the
+        // intensity, attenuation and shadow terms are scalars and are space-agnostic.
+        let radiance = to_working(lt.color_intensity.xyz) * lt.color_intensity.w * atten * shadow;
         lo = lo + light_contrib(
             n, v, base, metallic, roughness, f0, energy_compensation, l, radiance,
         );
@@ -587,10 +685,22 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
     let max_mip = f32(textureNumLevels(env) - 1);
     let f_amb = fresnel_schlick_roughness(n_dot_v_amb, f0, roughness);
     let kd_amb = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);
-    let irradiance = textureSampleLevel(env, env_samp, dir_to_equirect(n), max(max_mip - 2.0, 0.0)).rgb;
+    // COLOUR INGRESS #3 — environment radiance, diffuse and specular.
+    //
+    // Converted at the point of SAMPLING rather than baked into the map before convolution, and that is
+    // exact, not a shortcut: a primaries conversion is a linear operator, so it commutes with the
+    // weighted sums that mip filtering and the irradiance/prefilter convolution are. Sampling-time
+    // conversion therefore gives bit-comparable results to converting the source first, while costing
+    // no re-convolution when the working space changes and no precision loss from re-encoding an HDR
+    // panorama into another gamut.
+    let irradiance = env_to_working(
+        textureSampleLevel(env, env_samp, dir_to_equirect(n), max(max_mip - 2.0, 0.0)).rgb,
+    );
     let diffuse_ibl = kd_amb * irradiance * base;
     let refl = reflect(-v, n);
-    let prefiltered = textureSampleLevel(env, env_samp, dir_to_equirect(refl), roughness * max_mip).rgb;
+    let prefiltered = env_to_working(
+        textureSampleLevel(env, env_samp, dir_to_equirect(refl), roughness * max_mip).rgb,
+    );
     let horizon = clamp(1.0 + dot(refl, geo_n), 0.0, 1.0);
     // AO is visibility for indirect light. Missing maps bind a white dummy, preserving prior output.
     let ao = clamp(textureSample(ao_tex, base_color_samp, in.uv).r, 0.0, 1.0);
@@ -659,7 +769,10 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     // The env map is already linear HDR radiance — it goes into the HDR attachment untouched. This is the
     // backdrop the meshes' specular IBL reflects, so it MUST stay on the same scale as their lighting.
     let hdr = textureSampleLevel(env, env_samp, dir_to_equirect(dir), 0.0).rgb;
-    return vec4<f32>(hdr, 1.0);
+    // Converted on exactly the same terms as the specular reflection of it in fs_mesh — if the backdrop
+    // and the reflection of the backdrop disagreed about the working space, a mirror would not match
+    // the sky behind it.
+    return vec4<f32>(env_to_working(hdr), 1.0);
 }
 
 // M11.3 inc.3 — depth-only shadow pass: render the same cube + mesh geometry from the light's POV into the

@@ -3865,6 +3865,7 @@ dependencies = [
  "metrocalk-interchange",
  "metrocalk-plugins",
  "metrocalk-sdf",
+ "metrocalk-terrain",
  "serde",
  "serde_json",
 ]
@@ -3886,6 +3887,9 @@ dependencies = [
  "metrocalk-gizmo",
  "metrocalk-interchange",
  "metrocalk-physics",
+ "metrocalk-spatial",
+ "metrocalk-terrain",
+ "naga",
  "png 0.18.1",
  "pollster",
  "raw-window-handle",
@@ -3954,6 +3958,22 @@ version = "0.1.0"
 dependencies = [
  "glam 0.30.10",
  "metrocalk-gizmo",
+]
+
+[[package]]
+name = "metrocalk-spatial"
+version = "0.1.0"
+dependencies = [
+ "glam 0.30.10",
+ "serde",
+]
+
+[[package]]
+name = "metrocalk-terrain"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

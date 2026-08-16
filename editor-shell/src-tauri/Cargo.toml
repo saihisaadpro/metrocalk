@@ -27,7 +27,13 @@ tempfile = "3.27.0"
 # The real authoritative core + the M2.6 bridge (apply_edit / project_full — no MockCore).
 metrocalk-core = { path = "../../core" }
 metrocalk-ecs = { path = "../../ecs" }
-metrocalk-editor-shell = { path = ".." }
+metrocalk-editor-shell = { path = "..", features = [
+    # The app build DOES have these, so the format registry must say so. Without forwarding them the
+    # registry would tell a user with an .fbx that this build cannot read one, while it happily can.
+    "assets-fbx",
+    "assets-ktx2",
+    "interchange-3dxml",
+] }
 metrocalk-animation = { path = "../../animation" }
 # MOB: the deterministic match kernel, so a real match can drive the live viewport (ADR-091/092).
 metrocalk-gameplay = { path = "../../gameplay" }
@@ -51,6 +57,13 @@ metrocalk-interchange = { path = "../../interchange" }
 # The transform gizmo (M9.1 / G1) — translate/rotate/scale behind the Gizmo trait. Its public surface is
 # plain arrays (glam internal only); render.rs converts to/from its glam viewport types at the boundary.
 metrocalk-gizmo = { path = "../../gizmo" }
+# The scene-space subsystem: the canonical f64 transform, the hierarchy evaluator, the picking pipeline
+# (scene BVH + per-asset mesh BVH + canonical HitResult) and the one tolerance policy. Public surface is
+# plain f64 arrays, same discipline as the gizmo crate — glam stays inside it.
+metrocalk-spatial = { path = "../../spatial" }
+# The terrain subsystem (M19 / ADR-104). The app owns the worker pool and the GPU slot table; the crate
+# itself is pure computation with no threads or I/O, so a chunk build is a pure function any worker can run.
+metrocalk-terrain = { path = "../../terrain" }
 
 # Native wgpu viewport (M2.2 instanced render path). DX12 disabled — wgpu-hal 29's DX12 fights the
 # `windows` crate version Tauri/webview2-com pins (the diamond M2.1/M2.3 documented); Vulkan is the
@@ -64,5 +77,19 @@ glam = { version = "0.30", features = ["bytemuck"] }
 # offscreen render-evidence bench (examples/mesh_frame_bench.rs). Desktop-only crate (not in the wasm funnel).
 png = "0.18"
 
+[dev-dependencies]
+# The shader compiler wgpu itself uses, at wgpu's own version — so a WGSL mistake is a TEST failure on
+# any machine, instead of a runtime panic on a machine with a GPU. Every colour conversion this renderer
+# performs now lives in WGSL, and `cargo check` cannot see a word of it: the shaders are `include_str!`
+# and compile at device creation. A dev-dependency is the cheapest way to make them gated.
+naga = { version = "29.0.3", features = ["wgsl-in"] }
+
 [profile.dev]
 opt-level = 1
+
+# The unit-test binary links the entire app (Tauri, wgpu, wasmtime, flecs, …) AND the naga front-end the
+# shader-validation test needs. With full debug info that overflows the PDB format itself — `LINK : fatal
+# error LNK1318: Unexpected PDB error; LIMIT (12)` — and no amount of cleaning fixes it, because the
+# limit is the format's. Line tables keep a readable backtrace at a fraction of the size.
+[profile.test]
+debug = "line-tables-only"

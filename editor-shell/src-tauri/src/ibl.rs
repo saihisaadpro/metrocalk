@@ -21,6 +21,61 @@ pub struct Ibl {
     pub bind_group: wgpu::BindGroup,
 }
 
+/// An environment panorama supplied at RUNTIME.
+///
+/// The whole IBL chain — equirect upload, box-filtered mip chain, diffuse irradiance from the top mip,
+/// roughness-indexed specular — already existed and already called the HDR decoder. It was reachable
+/// only through the `MTK_ENV_HDR` environment variable, read once at process start: a complete
+/// capability that no user could invoke, which is the same failure the STEP writer had. This type is
+/// what lets a command hand the renderer a new sky while the app is running.
+#[derive(Clone, Debug)]
+pub struct EnvSource {
+    /// Equirectangular width in texels.
+    pub width: usize,
+    /// Equirectangular height in texels.
+    pub height: usize,
+    /// Linear radiance per texel, row-major. HDR: values exceed 1.0.
+    pub pixels: Vec<[f32; 3]>,
+    /// What to call it in the UI — usually the file stem.
+    pub label: String,
+}
+
+impl EnvSource {
+    /// Reject a panorama that is not usable as an equirect before it reaches the GPU.
+    ///
+    /// # Errors
+    /// A sentence naming what is wrong, suitable for showing the user directly.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.width == 0 || self.height == 0 {
+            return Err("that image has no pixels".into());
+        }
+        if self.pixels.len() != self.width * self.height {
+            return Err(format!(
+                "that image is {}x{} but carries {} pixels — the file is damaged",
+                self.width,
+                self.height,
+                self.pixels.len()
+            ));
+        }
+        // An equirectangular panorama is 2:1 by definition. Anything else will map to the sphere
+        // wrongly, so it is reported rather than stretched into place silently.
+        let ratio = self.width as f64 / self.height as f64;
+        if (ratio - 2.0).abs() > 0.02 {
+            return Err(format!(
+                "an environment map has to be equirectangular (twice as wide as it is tall); this one \
+                 is {}x{}, a ratio of {ratio:.2}",
+                self.width, self.height
+            ));
+        }
+        if self.pixels.iter().any(|p| !p.iter().all(|c| c.is_finite())) {
+            return Err(
+                "that image contains non-finite radiance values — the file is damaged".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// f32 → IEEE-754 binary16, returned as raw bits. Round-toward-zero (drop low mantissa) is plenty for an
 /// env map; values that overflow half range (the sun) clamp to the largest finite half.
 fn f16_bits(f: f32) -> u16 {
@@ -146,10 +201,15 @@ fn env_level0() -> (usize, usize, Vec<[f32; 3]>) {
     }
 }
 
-/// The equirect env + its box-mip chain, each level as packed `rgba16f` texels (row-major).
+/// The startup env: `MTK_ENV_HDR` if set, else the procedural sky.
 fn build_env_mips() -> Vec<(usize, usize, Vec<u16>)> {
+    build_env_mips_from(env_level0())
+}
+
+/// The equirect env + its box-mip chain, each level as packed `rgba16f` texels (row-major).
+fn build_env_mips_from(level0: (usize, usize, Vec<[f32; 3]>)) -> Vec<(usize, usize, Vec<u16>)> {
     // Level 0 in f32 (kept for clean downsampling; converted to halves at upload).
-    let (w0, h0, level0) = env_level0();
+    let (w0, h0, level0) = level0;
     let mut f32_levels: Vec<(usize, usize, Vec<[f32; 3]>)> = vec![(w0, h0, level0)];
     loop {
         let (pw, ph) = {
@@ -321,7 +381,24 @@ pub fn create(
     shadow_view: &wgpu::TextureView,
     shadow_sampler: &wgpu::Sampler,
 ) -> Ibl {
-    let mips = build_env_mips();
+    create_with(device, queue, layout, shadow_view, shadow_sampler, None)
+}
+
+/// Build the IBL resources from an explicit panorama, or from the startup default when `env` is
+/// `None`. Rebuilding is a whole-texture replacement: the mip chain is box-filtered on the CPU, so
+/// there is no GPU prefilter pass to invalidate, and the new bind group simply supersedes the old.
+pub fn create_with(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    shadow_view: &wgpu::TextureView,
+    shadow_sampler: &wgpu::Sampler,
+    env: Option<&EnvSource>,
+) -> Ibl {
+    let mips = match env {
+        Some(e) => build_env_mips_from((e.width, e.height, e.pixels.clone())),
+        None => build_env_mips(),
+    };
     let mip_count = mips.len() as u32;
     let (base_w, base_h, _) = &mips[0];
     let env = device.create_texture(&wgpu::TextureDescriptor {
@@ -502,6 +579,79 @@ mod tests {
         assert!(
             sky_radiance(Vec3::NEG_Y, false).length() < 0.4,
             "the ground is dim"
+        );
+    }
+    fn env(w: usize, h: usize) -> EnvSource {
+        EnvSource {
+            width: w,
+            height: h,
+            pixels: vec![[1.0, 1.0, 1.0]; w * h],
+            label: "test".into(),
+        }
+    }
+
+    #[test]
+    fn a_two_to_one_panorama_is_accepted() {
+        assert!(env(64, 32).validate().is_ok());
+        assert!(env(4096, 2048).validate().is_ok());
+    }
+
+    #[test]
+    fn a_non_equirectangular_image_is_refused_with_its_actual_shape() {
+        // Stretching a square photo onto the sphere silently is the wrong answer: it produces a
+        // plausible-looking sky whose lighting directions are all wrong.
+        let err = env(32, 32).validate().expect_err("square is refused");
+        assert!(err.contains("equirectangular"), "{err}");
+        assert!(err.contains("32x32"), "must state the actual shape: {err}");
+    }
+
+    #[test]
+    fn an_empty_or_mismatched_image_is_refused() {
+        assert!(env(0, 0).validate().is_err());
+        let mut broken = env(64, 32);
+        broken.pixels.truncate(10);
+        let err = broken.validate().expect_err("refused");
+        assert!(err.contains("damaged"), "{err}");
+    }
+
+    #[test]
+    fn non_finite_radiance_never_reaches_the_gpu() {
+        // A NaN in an env map propagates through the mip chain into every reflection in the scene.
+        let mut bad = env(64, 32);
+        bad.pixels[100] = [f32::NAN, 0.0, 0.0];
+        assert!(bad.validate().is_err());
+        let mut inf = env(64, 32);
+        inf.pixels[7] = [0.0, f32::INFINITY, 0.0];
+        assert!(inf.validate().is_err());
+    }
+
+    #[test]
+    fn a_supplied_panorama_builds_a_complete_mip_chain_down_to_one_texel() {
+        // The diffuse irradiance is read from the TOP mip, so a chain that stops early would leave
+        // ambient lighting sampling a still-detailed image — subtly wrong in a way nobody would trace.
+        let mips = build_env_mips_from((64, 32, vec![[0.5, 0.25, 0.125]; 64 * 32]));
+        assert_eq!(mips[0].0, 64);
+        assert_eq!(mips[0].1, 32);
+        let (lw, lh, _) = mips.last().expect("at least one level");
+        assert_eq!((*lw, *lh), (1, 1), "the chain must reach 1x1");
+        // 64x32 → 32x16 → 16x8 → 8x4 → 4x2 → 2x1 → 1x1
+        assert_eq!(mips.len(), 7, "unexpected chain length");
+    }
+
+    #[test]
+    fn the_mip_chain_preserves_average_radiance() {
+        // A box filter should conserve energy: the 1x1 top mip is the panorama's mean. If it did not,
+        // an imported sky would light the scene at the wrong intensity.
+        let mips = build_env_mips_from((64, 32, vec![[4.0, 2.0, 1.0]; 64 * 32]));
+        let (_, _, top) = mips.last().expect("top mip");
+        // rgba16f: 4 halves per texel. Decode the red channel back to f32.
+        let bits = top[0];
+        let exp = ((bits >> 10) & 0x1f) as i32;
+        let mant = (bits & 0x3ff) as f32;
+        let red = (1.0 + mant / 1024.0) * 2f32.powi(exp - 15);
+        assert!(
+            (red - 4.0).abs() < 0.2,
+            "a uniform 4.0 panorama should average 4.0, got {red}"
         );
     }
 }

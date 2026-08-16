@@ -6,13 +6,14 @@
 //!
 //! The render loop owns no scene truth — it reads a shared [`SceneState`] the app updates from the
 //! authoritative core (deltas). Hot interaction stays in Rust (invariant 4): camera orbit/zoom update
-//! natively in the loop (zero per-frame IPC), and picking is a pure projection ([`pick_nearest`]) run
+//! natively in the loop (zero per-frame IPC), and picking is a real raycast (see `scene_pick`) run
 //! synchronously inside the `viewport_pick` command — neither crosses the JS boundary per frame.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use glam::{Mat4, Quat, Vec3, Vec4};
+use metrocalk_assets::colour::TextureRole as Role;
 use metrocalk_assets::{MeshGpu, MeshVertex, Texture};
 use metrocalk_editor_shell::reveal::intent_order;
 use metrocalk_gizmo::{Gizmo, TransformGizmo};
@@ -20,6 +21,11 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 /// M9.4 — the magnetic-snap radius (world units): during a gizmo drag the dragged instance snaps onto the
 /// nearest meaningful target within this range (the live "magnetic intent snapping").
+/// Terrain instance slots the shared storage buffer holds. Fixed, never reallocated: a chunk's bind group
+/// references this buffer, so growing it would invalidate every chunk's binding at once. 4 096 chunks is far
+/// beyond what any budget lets be resident, and the buffer costs 256 kB.
+pub const TERRAIN_INSTANCE_CAPACITY: u64 = 4096;
+
 pub const SNAP_RADIUS: f32 = 1.5;
 
 /// Total UI→core IPC calls (every `#[tauri::command]` bumps this). The render loop reports it next to
@@ -277,9 +283,82 @@ fn scene_world_bounds(
 #[derive(Clone, Copy)]
 pub struct CamView {
     pub pos: [f32; 3],
+    /// Where the camera AIMS. Until this existed the override reused the editor's orbit target, so a
+    /// scene camera could stand anywhere but could only ever look at the same point — which makes a
+    /// cutscene impossible by construction. `None` keeps the old behaviour (aim at the orbit target).
+    pub look_at: Option<[f32; 3]>,
     pub fov_deg: f32,
     pub near: f32,
     pub far: f32,
+}
+
+/// A drawn-but-geometry-free entity the viewport must still be able to select: a light, a camera, a
+/// CAD assembly container, a terrain recipe.
+///
+/// These are exactly the entities that are visible in the outliner and visible in the viewport but
+/// were absent from every pick candidate list, which is the difference between "you can select it"
+/// and "clicking it selects something else".
+#[derive(Clone, Debug)]
+pub struct MarkerEntity {
+    /// The entity's Loro key.
+    pub id: String,
+    /// Its world position — the centre of the grab proxy.
+    pub position: [f32; 3],
+    /// What it is, so the picker can rank it and the UI can name it.
+    pub kind: metrocalk_spatial::HitKind,
+}
+
+/// A live-thumbnail request, carrying the identity that makes a late answer DETECTABLE.
+///
+/// The previous shape was `(id, size)`, and that is the whole bug: with nothing but an entity id, the
+/// only question a consumer could ask was "is there a picture of this entity?" — never "is this the
+/// picture I asked for?". Draining stale results before re-requesting narrowed the window; it could not
+/// close it, because a request already handed to the render thread finishes AFTER the drain and lands
+/// in the same id-keyed slot the next caller reads. `req` closes it: a result satisfies exactly one
+/// request, by construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThumbRequest {
+    /// The entity to picture.
+    pub id: String,
+    /// Pixel size (clamped by the renderer).
+    pub size: u32,
+    /// Unique and monotonic. The answer must quote it back.
+    pub req: u64,
+    /// The presentation state ([`metrocalk_assets::colour::PresentationState::hash`]) at request time —
+    /// working space, view transform and exposure. Everything that can visibly change the image without
+    /// changing the scene.
+    pub state: u64,
+}
+
+/// A serviced thumbnail, stamped with the request it answers and the state it was actually rendered in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThumbResult {
+    /// The entity pictured (kept for diagnostics and for dropping a superseded entity's leftovers).
+    pub id: String,
+    /// The request this answers. A consumer accepts ONLY its own.
+    pub req: u64,
+    /// The presentation state the render actually used — read at render time, not copied from the
+    /// request. If the user moved the exposure slider in between, these differ, and the consumer is
+    /// told the truth (an explicit miss) rather than handed a picture of a state nobody asked about.
+    pub state: u64,
+    /// The PNG, or `None` when the entity has no renderable instance — an answer, not a silence.
+    pub png: Option<Vec<u8>>,
+}
+
+/// The four honest outcomes of asking for a thumbnail. Four, not "an `Option<Vec<u8>>`": "no image
+/// yet", "this entity has no picture", and "your picture was rendered in a state that has since moved"
+/// are different answers, and collapsing them is what let a stale image pass for a fresh one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThumbTake {
+    /// Not serviced yet. Keep polling.
+    Pending,
+    /// The picture, rendered in the state the caller asked about.
+    Ready(Vec<u8>),
+    /// The entity has no renderable instance — a light, a camera, a folder row. An answer, immediately.
+    NoImage,
+    /// It was rendered, but the presentation state changed underneath it. Reported rather than
+    /// returned: an image of a state nobody asked about is a wrong answer wearing a right one.
+    StateMoved,
 }
 
 /// Scene state shared between the app (writer, from core deltas + input) and the render loop (reader).
@@ -307,6 +386,14 @@ pub struct SceneState {
     /// **overlay** pass (so each glyph is colour-coded), always-pass depth so the icon reads as an overlay.
     /// Built in `rebuild` (markers are NOT rendered as solid cubes); empty ⇒ the marker pass is skipped.
     pub marker_glyphs: Vec<Instance>,
+    /// The marker entities those glyphs belong to — id, world position and kind.
+    ///
+    /// The glyphs above are anonymous line segments: they say where to *draw* an icon and nothing
+    /// about which entity it is. So a light or a camera was drawn but could not be clicked, and
+    /// because the old picker always returned its nearest projected instance, clicking one silently
+    /// selected an unrelated mesh. This list is what lets the picker give a light a pixel-sized grab
+    /// proxy and answer with the light.
+    pub marker_entities: Vec<MarkerEntity>,
     /// M8.4 contact-debugger overlay endpoints — same `LineList` carrier as [`Self::line_points`], drawn by
     /// the same always-pass line pass (each consecutive pair is one segment). **Empty by default** (the
     /// debugger is off → the overlay pass is skipped → zero per-frame cost). Updated independently from
@@ -320,6 +407,49 @@ pub struct SceneState {
     pub pipe_edges: Vec<[[f32; 3]; 2]>,
     /// Every stable graph handle in world space, including branch-only nodes.
     pub pipe_handles: Vec<[f32; 3]>,
+    /// VFX particles that EMIT light — fire, sparks, magic. Reuses [`Instance`] as a particle carrier
+    /// (`center` = world position, `scale` = world radius, `color` = LINEAR HDR colour, `selected` =
+    /// opacity), drawn as camera-facing quads with ADDITIVE blending inside the HDR scene pass, which is
+    /// why an over-1.0 colour blooms without any effect-specific plumbing. A Play-only projection: the
+    /// document is never written, and Stop clears it. Empty ⇒ the pass is skipped, zero per-frame cost.
+    pub fx_additive: Vec<Instance>,
+    /// VFX particles that OCCLUDE light — smoke, dust, steam. Same carrier, alpha-blended, drawn after
+    /// the additive layer so glow reads through haze rather than the other way round.
+    pub fx_soft: Vec<Instance>,
+    /// Bump when either particle list changes so the loop re-uploads them.
+    pub fx_revision: u64,
+    /// A panorama waiting to become the scene's environment, set by the import command and consumed
+    /// by the render loop. `None` = the startup default (procedural sky, or `MTK_ENV_HDR`).
+    pub pending_env: Option<crate::ibl::EnvSource>,
+    /// Bump to make the loop rebuild the IBL from [`Self::pending_env`].
+    pub env_revision: u64,
+    /// What the current environment is called, for the UI to report.
+    pub env_label: String,
+    /// How many MOMENT-fired one-shot bursts are alive right now. Published purely so a test can tell
+    /// "the burst was never created" from "the burst was created and drew nothing" — two failures that
+    /// look identical from a particle count alone.
+    pub fx_bursts: usize,
+    /// HIGH-WATER MARKS since Play started: the most particles drawn in any one frame, and the total
+    /// number of one-shot bursts that have ever come into existence this run.
+    ///
+    /// A sampled count cannot honestly answer "did the pick-up pop fire?": the burst lives 0.86 s and
+    /// each poll costs two IPC round trips, so a test either catches it or does not, at random. A
+    /// high-water mark answers the same question with one read at any later time, which is the
+    /// difference between a measurement and a coin flip.
+    pub fx_peak_total: usize,
+    /// Monotonic count of one-shot bursts created this run.
+    pub fx_bursts_fired: u64,
+    /// Brightest particle seen in ANY frame this run. Sampled radiance has the same problem as a
+    /// sampled count: a 0.6 s spark burst is over before a poll arrives, so the honest answer to "does
+    /// this card emit?" is a high-water mark, not whatever happened to be on screen when asked.
+    pub fx_peak_radiance: f32,
+    /// True while a cutscene owns the camera. The viewport is an AUTHORING surface — a selection
+    /// outline, a transform gizmo and binding lines are all correct there and all wrong the moment the
+    /// frame becomes a shot. Found by looking at a capture of a working hero shot and seeing a yellow
+    /// authoring rectangle and three RGB axis lines drawn across it. Set by the Play tick, cleared on
+    /// Stop; it suppresses editor chrome INSIDE the viewport only — the surrounding UI is untouched,
+    /// because the user still needs Stop.
+    pub cinematic: bool,
     /// Bump when `overlay_lines` changes so the loop re-uploads them (decoupled from `revision`).
     pub overlay_revision: u64,
     /// M11.3 (ADR-042) — the scene's lights, built each rebuild from the authored `Light` entities (a
@@ -373,6 +503,24 @@ pub struct SceneState {
     /// state, like exposure and camera pose. The HDR/PBR core stays shared; tone mapping, selection
     /// treatment and technical edge emphasis are the intentional presentation differences.
     pub render_profile: f32,
+    /// The space the renderer SHADES in. Render-only state, like exposure and the profile.
+    ///
+    /// Not a scene fact: two people can open the same project in different working spaces and neither
+    /// of them has changed the geometry, the materials or the lights. It is persisted with the
+    /// project's PRESENTATION record rather than its document, and changing it dirties nothing.
+    pub working_space: metrocalk_assets::colour::WorkingSpace,
+    /// What the loaded environment map's values MEAN. Render-only state, defaulting to the documented
+    /// assumption (linear Rec.709) rather than to a guess dressed as a fact.
+    ///
+    /// This is the per-asset override that is genuinely wireable here, and it is wireable because the
+    /// environment is the one texture whose colour space the file honestly does not record: Radiance
+    /// `.hdr` has no required primaries header and EXR's chromaticities attribute is optional. A studio
+    /// that authors HDRIs in ACES can now say so, and the reflections, the ambient and the sky backdrop
+    /// all move together, because all three read this one matrix.
+    ///
+    /// No IBL rebuild is needed when it changes: the conversion happens where the map is SAMPLED, and a
+    /// primaries conversion commutes with the convolution that produced the mips.
+    pub env_source_space: metrocalk_assets::colour::ColourSpace,
     /// M11.4 — look-through: when `Some`, the frame renders from this scene camera (the editor fly-cam is
     /// bypassed). Render-only (a projection, never Loro — ADR-021); set by `look_through_camera`.
     pub cam_override: Option<CamView>,
@@ -422,16 +570,228 @@ pub struct SceneState {
     /// target on **its own encoder before the swapchain frame** (off the per-frame orbit path — invariant 4;
     /// a discrete, dirty-only, budget-limited surface, NEVER per-frame). A presentation artifact: thumbnails
     /// never enter the op-stream/Loro doc (zero determinism impact, like the M11.3 lights projection).
-    pub thumb_requests: Vec<(String, u32)>,
-    /// Serviced thumbnail results `(entity id → PNG bytes, or None when the entity has no renderable
-    /// instance)`. The `thumbnail` command polls this for its id, then removes the entry. Capped so a
-    /// timed-out request can't grow it unbounded.
-    pub thumb_results: Vec<(String, Option<Vec<u8>>)>,
+    pub thumb_requests: Vec<ThumbRequest>,
+    /// Serviced thumbnail results. The `thumbnail` command polls for the result carrying ITS OWN
+    /// request id, then removes that entry — never merely the first one bearing the same entity id.
+    /// Capped so a timed-out request can't grow it unbounded.
+    pub thumb_results: Vec<ThumbResult>,
+    /// The next request id to hand out. Monotonic for the life of the process; the counter lives here
+    /// rather than in a global atomic because every producer and consumer already holds this lock, so
+    /// there is exactly one place the ordering can be reasoned about.
+    pub next_thumb_req: u64,
+    /// M19 (ADR-104) — terrain chunks the runtime wants uploaded, drained by the render thread a few per
+    /// frame. Geometry and textures are separate `Option`s: a LOD switch re-sends only the vertices, because
+    /// the chunk's half-megabyte splat texture has not changed.
+    pub terrain_uploads: Vec<TerrainUpload>,
+    /// Terrain slots whose GPU resources may be released (the chunk was evicted or the terrain replaced).
+    pub terrain_drops: Vec<u32>,
+    /// The terrain chunks to draw this frame, after culling and LOD selection. Rebuilt every update; the
+    /// render loop reads it under the same lock it reads `instances` under, so terrain costs no extra IPC
+    /// and no extra synchronization (invariant 4).
+    pub terrain_draws: Vec<TerrainDraw>,
+    /// The live terrain: its worker pool, residency ledger and streaming plan. Lives here so the render
+    /// loop can advance it with the camera it already has, without a second lock or a per-frame command.
+    pub terrain: crate::terrain::TerrainRuntime,
+    /// Render slots for each scatter prototype's representations: `[mesh, lod1, lod2, lod3, impostor]`,
+    /// `-1` where nothing is bound. Published by the engine thread (which owns the handle→slot map) so the
+    /// render side can resolve a scattered instance without a lookup across the boundary.
+    pub terrain_proto_slots: Vec<[i32; 5]>,
+    /// This frame's scattered instances as `(mesh slot, instance)`. Appended to the ordinary per-asset
+    /// instance lists, so vegetation draws through exactly the same instanced path as every other mesh —
+    /// GPU instancing, one draw per prototype per LOD, no bespoke foliage pipeline.
+    pub terrain_scatter: Vec<(i32, Instance)>,
+    /// Which terrain tool the pointer is driving. Render-only state, like the gizmo mode.
+    pub terrain_tool: TerrainTool,
+    /// The active brush. Set once when the author changes it, never per frame.
+    pub terrain_brush: TerrainBrush,
+    /// A sculpt gesture is in flight: the render loop polls the cursor, ray-casts the terrain and extends
+    /// the stroke natively. Only the gesture's start and end cross the JS boundary (invariant 4).
+    pub terrain_painting: bool,
+    /// Where the cursor last hit the terrain, for the brush ring overlay. `None` when it missed.
+    pub terrain_cursor_hit: Option<[f32; 3]>,
+    /// A terrain problem the author must see — a recipe that would not compile, a worker that died. Shown in
+    /// the panel; `None` when the terrain is healthy. Reported rather than printed to a console nobody reads.
+    pub terrain_problem: Option<String>,
+    /// The world-space path the in-flight gesture has traced, in order.
+    pub terrain_stroke_path: Vec<[f32; 2]>,
+    /// Route control points clicked so far, awaiting a commit.
+    pub terrain_route_points: Vec<[f32; 3]>,
+    /// A one-shot request from the UI to place a route point at the cursor; the render loop consumes it,
+    /// ray-casts, and appends. Keeps the click a single command rather than a screen-to-world round trip.
+    pub terrain_place_point: bool,
+    /// A test-injected normalized cursor. When `Some`, the render loop aims the terrain tools from it
+    /// instead of the OS cursor, so an end-to-end test can drive the SAME native brush path deterministically
+    /// — the identical trick `gizmo_test_cursor` plays for the transform gizmo. `None` ⇒ the live cursor
+    /// drives, which is the production path.
+    pub terrain_test_cursor: Option<(f32, f32)>,
+}
+
+/// Which terrain tool the pointer drives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerrainTool {
+    /// The pointer selects and orbits as usual.
+    #[default]
+    None,
+    /// Left-drag sculpts.
+    Sculpt,
+    /// Left-click drops a route control point.
+    Route,
+}
+
+/// The active brush, mirrored render-side so a gesture needs no round trip to know its own settings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainBrush {
+    /// 0 raise, 1 smooth, 2 flatten, 3 noise — the same order the panel lists them in.
+    pub kind: u8,
+    /// Radius in metres.
+    pub radius_m: f32,
+    /// Metres per dab, or blend weight for smooth/flatten.
+    pub strength: f32,
+    /// Falloff shape, 0 linear to 1 smooth.
+    pub hardness: f32,
+    /// Flatten target height, noise wavelength, or smooth radius scale.
+    pub target_m: f32,
+}
+
+impl Default for TerrainBrush {
+    fn default() -> Self {
+        Self {
+            kind: 0,
+            radius_m: 24.0,
+            strength: 2.0,
+            hardness: 0.75,
+            target_m: 0.0,
+        }
+    }
+}
+
+/// One terrain chunk's GPU payload.
+///
+/// `albedo`/`normal` are `None` when only the geometry changed — which is the common case, because a LOD
+/// switch happens far more often than a texture re-bake and copying half a megabyte of splat for it would be
+/// pure waste.
+pub struct TerrainUpload {
+    /// Stable slot index the runtime assigned to this chunk.
+    pub slot: u32,
+    /// Packed vertices, already in renderer form (the worker thread does the packing).
+    pub vertices: Vec<MeshVertex>,
+    /// Triangle-list indices.
+    pub indices: Vec<u32>,
+    /// Baked splat albedo, when it changed.
+    pub albedo: Option<metrocalk_assets::mesh::Texture>,
+    /// Baked detail normal map, when it changed.
+    pub normal: Option<metrocalk_assets::mesh::Texture>,
+}
+
+/// One terrain chunk to draw.
+pub struct TerrainDraw {
+    /// Which uploaded slot.
+    pub slot: u32,
+    /// Where it sits; terrain geometry is chunk-local in XZ, so this is the chunk centre.
+    pub instance: Instance,
+}
+
+/// Build an [`crate::ibl::EnvSource`] without callers naming the `ibl` module — the environment
+/// import command lives in `main` and should not have to know where the IBL implementation sits.
+#[must_use]
+pub fn ibl_env_source(
+    width: usize,
+    height: usize,
+    pixels: Vec<[f32; 3]>,
+    label: String,
+) -> crate::ibl::EnvSource {
+    crate::ibl::EnvSource {
+        width,
+        height,
+        pixels,
+        label,
+    }
 }
 
 pub type Shared = Arc<Mutex<SceneState>>;
 
 impl SceneState {
+    /// How this project is being LOOKED at, as one value.
+    ///
+    /// Everything in here can change the picture without changing the project, which is precisely why
+    /// it is (a) the thing an async render result has to carry, and (b) the thing that must survive a
+    /// reopen without being written into the document. One accessor so the two uses cannot disagree
+    /// about what "the presentation" is — a hash that omits a field a shader reads is a stale image
+    /// that passes every check.
+    #[must_use]
+    pub fn presentation(&self) -> metrocalk_assets::colour::PresentationState {
+        use metrocalk_assets::colour::{PresentationState, ViewTransform};
+        PresentationState {
+            working: self.working_space,
+            view: if self.render_profile > 0.5 {
+                ViewTransform::PbrNeutral
+            } else {
+                ViewTransform::AcesFit
+            },
+            // 0 means "never set" here, and the render loop resolves it the same way. Hashing the raw
+            // 0 would make an untouched project's state hash differ from the state it renders in.
+            exposure: if self.exposure > 1e-4 {
+                self.exposure
+            } else {
+                DEFAULT_EXPOSURE
+            },
+        }
+    }
+
+    /// Adopt a presentation state wholesale — the reopen path. Returns nothing and dirties nothing:
+    /// this is a viewing choice, and the document is not involved.
+    pub fn set_presentation(&mut self, p: metrocalk_assets::colour::PresentationState) {
+        use metrocalk_assets::colour::ViewTransform;
+        self.working_space = p.working;
+        self.render_profile = f32::from(u8::from(p.view == ViewTransform::PbrNeutral));
+        self.exposure = p.exposure.clamp(0.05, 8.0);
+    }
+
+    /// Allocate the next thumbnail request id. Monotonic; wrapping is unreachable in practice (a
+    /// thumbnail per microsecond for 500,000 years) and would be harmless anyway, since only equality
+    /// against a live request is ever tested.
+    pub fn next_request(&mut self) -> u64 {
+        self.next_thumb_req = self.next_thumb_req.wrapping_add(1);
+        self.next_thumb_req
+    }
+
+    /// Queue a thumbnail request and return its identity. One place, so the request id and the state
+    /// hash cannot be captured at two different moments — which would reintroduce the race in miniature.
+    pub fn request_thumbnail(&mut self, id: &str, size: u32) -> (u64, u64) {
+        let req = self.next_request();
+        let state = self.presentation().hash();
+        // Collapse a duplicate PENDING request only. Results are left alone: one may belong to a caller
+        // still waiting, and taking it would be the same theft from the other direction.
+        self.thumb_requests.retain(|r| r.id != id);
+        self.thumb_requests.push(ThumbRequest {
+            id: id.to_string(),
+            size,
+            req,
+            state,
+        });
+        (req, state)
+    }
+
+    /// Take the answer to request `req`, if it has arrived.
+    ///
+    /// THE invariant, in one function so it can be tested without a GPU: *the image returned for
+    /// request N was rendered from the state requested by N, or the request fails.* A result belonging
+    /// to another request is never consumed here — not even one picturing the same entity — so a slow
+    /// render cannot satisfy the request that replaced it.
+    pub fn take_thumbnail(&mut self, req: u64, want_state: u64) -> ThumbTake {
+        let Some(pos) = self.thumb_results.iter().position(|r| r.req == req) else {
+            return ThumbTake::Pending;
+        };
+        let got = self.thumb_results.remove(pos);
+        if got.state != want_state {
+            return ThumbTake::StateMoved;
+        }
+        match got.png {
+            Some(png) => ThumbTake::Ready(png),
+            None => ThumbTake::NoImage,
+        }
+    }
+
     /// M10.7 — **frame the whole scene**: center the orbit target on the scene's bounds and set a distance
     /// that fits them in view. A pure camera op (invariant 4 — render-state only, not undoable). No-op on an
     /// empty scene. Exits focus dim (framing-all looks at everything).
@@ -657,6 +1017,43 @@ enum TextureSemantic {
     Color,
     Data,
     Normal,
+}
+
+impl TextureSemantic {
+    /// The upload treatment for a texture in a given role, DERIVED from the colour policy rather than
+    /// restated here.
+    ///
+    /// The sRGB-or-raw decision belongs to exactly one place — `metrocalk_assets::colour::infer_for_role`
+    /// — because it is the decision that goes wrong silently: a roughness map handed an sRGB decode is
+    /// darkened through the mid-tones, reads as "the material looks off", and is almost never traced
+    /// back to colour management. Previously each call site chose `Color` or `Data` by hand and happened
+    /// to be right; "happened to be right" is not a property that survives a refactor.
+    ///
+    /// `Normal` is a filtering distinction layered ON TOP of that, not a competing one: a normal map is
+    /// raw data as far as the transfer function goes (which is what the policy says), and additionally
+    /// must be renormalised when mipped rather than box-averaged like a scalar.
+    fn for_role(role: metrocalk_assets::colour::TextureRole) -> Self {
+        use metrocalk_assets::colour::{ColourSpace, TextureRole};
+        if role == TextureRole::Normal {
+            return Self::Normal;
+        }
+        // Exhaustive on purpose. `Color` means "hand this to the sRGB hardware path", so ONLY the sRGB
+        // space may map to it — a catch-all `_ => Self::Color` would mean that the day the policy
+        // returns a linear colour space for some role, that texture silently receives an sRGB decode it
+        // was never meant to get. Which is the exact class of bug this whole module exists to prevent.
+        match metrocalk_assets::colour::infer_for_role(role).space {
+            ColourSpace::Srgb => Self::Color,
+            // Already linear, and NOT to be decoded. `Data` is the right treatment for both halves of
+            // that: `Rgba8Unorm` applies no transfer function, and box-averaging a mip is correct for
+            // values that are linear in light — which is exactly what `Color` mipping goes out of its
+            // way to achieve by decoding first.
+            ColourSpace::LinearRec709
+            | ColourSpace::AcesCg
+            | ColourSpace::Aces2065_1
+            | ColourSpace::LinearRec2020
+            | ColourSpace::Data => Self::Data,
+        }
+    }
 }
 
 fn srgb_to_linear(byte: u8) -> f32 {
@@ -983,9 +1380,17 @@ pub const CLEAR_COLOR_SRGB: [f32; 3] = [0.04, 0.05, 0.08];
 /// in), so it has to brighten with the frame when the exposure comes up. Chrome — the grid, the gizmo, the
 /// markers — is anchored at the live exposure instead, so it stays legible. Both go through the same
 /// conversion; only the anchor differs. See `scene_srgb_to_scene_linear` in scene.wgsl.
+///
+/// It is cleared into the HDR scene target, so it is a SCENE value and takes the same working-space
+/// conversion every other scene value takes — the CPU-side mirror of `to_working` in scene.wgsl. Left in
+/// Rec.709 it would be the one colour in the frame that did not move when the working space did, and it
+/// is the colour behind everything.
 #[must_use]
-fn clear_color(cad: bool) -> wgpu::Color {
-    let c = unlit_srgb_to_scene_linear(CLEAR_COLOR_SRGB, DEFAULT_EXPOSURE, cad);
+fn clear_color(cad: bool, working: metrocalk_assets::colour::WorkingSpace) -> wgpu::Color {
+    let c = metrocalk_assets::colour::apply(
+        working.from_rec709(),
+        unlit_srgb_to_scene_linear(CLEAR_COLOR_SRGB, DEFAULT_EXPOSURE, cad),
+    );
     wgpu::Color {
         r: f64::from(c[0]),
         g: f64::from(c[1]),
@@ -1101,11 +1506,7 @@ fn upload_tex(
         height: h,
         depth_or_array_layers: 1,
     };
-    let format = if semantic == TextureSemantic::Color {
-        wgpu::TextureFormat::Rgba8UnormSrgb
-    } else {
-        wgpu::TextureFormat::Rgba8Unorm
-    };
+    let format = texture_format(semantic);
     let mips = texture_mips(tex, semantic);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("mesh-tex"),
@@ -1143,6 +1544,23 @@ fn upload_tex(
 
 /// A 1×1 white texture view — the dummy bound for a mesh with no base-color/MR texture (white × the baked
 /// factor = the factor). Created once at setup, cloned per untextured mesh.
+/// The GPU format for a texture with this semantic — **the actual sRGB decision**, as a pure function.
+///
+/// Pulled out of `upload_tex` for one reason: it could not be tested where it was. `upload_tex` needs a
+/// live `wgpu::Device`, so no unit test reached it, and the test that looked like it covered this only
+/// re-asserted facts about `TextureSemantic::for_role`. Flipping the comparison would have sent every
+/// roughness, metallic and occlusion map through a hardware sRGB decode with the whole suite still
+/// green. Now the decision is one expression with a test on it, and `upload_tex` calls it rather than
+/// restating it — the same discipline `for_role` applies one level up.
+fn texture_format(semantic: TextureSemantic) -> wgpu::TextureFormat {
+    match semantic {
+        TextureSemantic::Color => wgpu::TextureFormat::Rgba8UnormSrgb,
+        // Raw. Both because no transfer function may be applied, and because a normal map's channels
+        // encode a direction rather than light.
+        TextureSemantic::Data | TextureSemantic::Normal => wgpu::TextureFormat::Rgba8Unorm,
+    }
+}
+
 fn white_dummy(device: &wgpu::Device, queue: &wgpu::Queue, srgb: bool) -> wgpu::TextureView {
     upload_tex(
         device,
@@ -1321,6 +1739,78 @@ const CUBE_INDICES: [u16; 36] = [
 ];
 const GRID_VERTS: u32 = 6;
 
+/// The renderer's working space, as the shaders consume it.
+///
+/// This is the whole of "the engine renders in ACEScg": two matrices and a set of luminance weights. It
+/// is deliberately not a shader variant or a second pipeline — a second code path is what lets one of
+/// the two working spaces rot. With [`WorkingSpace::LinearRec709`] both matrices are the identity and
+/// the weights are Rec.709's, so the AP1 path and the Rec.709 path are the SAME instructions, and
+/// selecting Rec.709 is provably a no-op (`selecting_rec709_is_the_identity_transform`).
+///
+/// Where they apply, precisely:
+///
+/// * `to_working` converts every authored/imported colour — base colour, emissive, light colour,
+///   environment radiance, and the unlit chrome constants — from linear Rec.709 into the working space,
+///   BEFORE it takes part in any colour computation. That ordering is the requirement: converting the
+///   framebuffer afterwards is not rendering in ACEScg, it is rendering in Rec.709 and relabelling.
+/// * `from_working` converts the finished frame back to the space the view transform is DEFINED on
+///   (see `ViewTransform::input_space`) — once, in `fs_resolve`, immediately before the tone curve.
+/// * `luma` is what "brightness" means here. Bloom extraction uses it; using Rec.709's weights on AP1
+///   values would bloom the wrong pixels, and it is the kind of wrong that looks like a tuning problem.
+///
+/// Primaries conversion is a LINEAR operator, which is why it is correct to apply it at the point of
+/// sampling rather than baking it into the textures: it commutes with every linear operation between
+/// here and the tone curve — mip filtering, the MSAA resolve, the IBL convolution, the Gaussian blur.
+/// Baking would cost a re-upload per asset per working-space change, and would clip an AP1 value that a
+/// Rec.709-primaries 8-bit texture cannot hold.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ColourUniform {
+    /// linear Rec.709 → working space, WGSL column layout.
+    to_working: [[f32; 4]; 3],
+    /// The ENVIRONMENT's declared source space → working space, composed into one matrix.
+    ///
+    /// Separate from `to_working` because the environment is the one asset whose colour space is a
+    /// genuine unknown rather than a convention: Radiance `.hdr` has no required primaries field and
+    /// EXR's chromaticities attribute is optional, so a facility working in ACES can hand this renderer
+    /// a panorama that is NOT Rec.709 and nothing in the file will say so. Equal to `to_working` until
+    /// someone declares otherwise. Placed here — before `from_working` — so the scene pass can reach it
+    /// while still being unable to name the inverse conversion.
+    env_to_working: [[f32; 4]; 3],
+    /// working space → linear Rec.709, WGSL column layout.
+    from_working: [[f32; 4]; 3],
+    /// `.xyz` = the working space's luminance weights; `.w` = 1.0 when the working space is not
+    /// Rec.709, which is what the double-transform validator keys on.
+    luma: [f32; 4],
+}
+
+impl ColourUniform {
+    fn new(
+        working: metrocalk_assets::colour::WorkingSpace,
+        env_source: metrocalk_assets::colour::ColourSpace,
+    ) -> Self {
+        use metrocalk_assets::colour::{source_to_working, wgsl_mat3, WorkingSpace};
+        let w = working.luminance_weights();
+        Self {
+            to_working: wgsl_mat3(working.from_rec709()),
+            // A non-linear declaration cannot be expressed as a matrix, and the command that sets this
+            // refuses one — so falling back to the Rec.709 assumption here is unreachable rather than
+            // lenient. It is written as a fallback anyway because "unreachable" and "panics the render
+            // thread" are one refactor apart.
+            env_to_working: wgsl_mat3(
+                source_to_working(env_source, working).unwrap_or_else(|| working.from_rec709()),
+            ),
+            from_working: wgsl_mat3(working.to_rec709()),
+            luma: [
+                w[0],
+                w[1],
+                w[2],
+                f32::from(u8::from(working != WorkingSpace::LinearRec709)),
+            ],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Camera {
@@ -1345,10 +1835,19 @@ struct Camera {
     /// Adaptive grid metadata: target X/Z in `.xy`, camera distance in `.z`. This keeps line density stable
     /// in world space while sizing the grid plane to the current view.
     grid: [f32; 4],
+    /// The working space. Appended LAST on purpose: `ssao.wgsl` and the unlit shaders declare only the
+    /// leading fields, and WGSL allows a uniform struct smaller than its buffer — so a pass that has no
+    /// opinion about colour does not have to restate the block, and cannot restate it wrongly.
+    colour: ColourUniform,
 }
-// The WGSL `Camera` (3×mat4 + 3×vec4) is 240 bytes; keep this struct byte-identical or wgpu rejects the
-// uniform at draw. A compile-time tripwire so a future field can't silently desync the layout.
-const _: () = assert!(std::mem::size_of::<Camera>() == 240);
+// The WGSL `Camera` is 3×mat4 (192) + 3×vec4 (48) + the colour block — 3×mat3x3 (48 each: WGSL pads a
+// mat3 column to 16 bytes) + 1×vec4 (16) = 160 — so 400 bytes. Keep this struct byte-identical or wgpu
+// rejects the uniform at draw. A compile-time tripwire so a future field can't silently desync the
+// layout; it caught exactly that when the colour block was added.
+const _: () = assert!(std::mem::size_of::<Camera>() == 400);
+// And the colour block on its own, because a mat3 that is padded wrongly does not fail loudly — it
+// transposes or shears the primaries conversion, which looks like a colour bug somewhere else entirely.
+const _: () = assert!(std::mem::size_of::<ColourUniform>() == 160);
 
 /// M11.3 inc.3 — shadow-map quality profile, chosen once at startup from `MTK_SHADOW_QUALITY`
 /// (`off`|`low`|`medium`|`high`, default medium). Drives the shadow-map resolution; `Low` is the
@@ -1775,7 +2274,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // BRDF LUT (bindings 0-3) + the shadow map/sampler (4/5). The shadow pass does NOT bind group 3, so the
     // map can be a render target there and sampled here without conflict.
     let ibl_bgl = crate::ibl::bind_group_layout(&device);
-    let ibl = crate::ibl::create(&device, &queue, &ibl_bgl, &shadow_view, &shadow_sampler);
+    let mut ibl = crate::ibl::create(&device, &queue, &ibl_bgl, &shadow_view, &shadow_sampler);
+    let mut cur_env_rev: u64 = 0;
 
     let index_buf = create_init_buffer(
         &device,
@@ -2038,6 +2538,48 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         "overlay",
     );
     let mut overlay = InstanceBuf::new(&device, &inst_bgl, 256);
+    // VFX: particles TEST depth (so a flame is correctly hidden behind a wall) but never WRITE it.
+    let fx_depth_state = wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Less),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    };
+    let fx_add_pipeline = make_particle_pipeline(
+        &device,
+        &shader,
+        &cube_layout,
+        formats.hdr,
+        &fx_depth_state,
+        wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        },
+        samples,
+        "fx-additive",
+    );
+    let fx_soft_pipeline = make_particle_pipeline(
+        &device,
+        &shader,
+        &cube_layout,
+        formats.hdr,
+        &fx_depth_state,
+        wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        samples,
+        "fx-soft",
+    );
+    let mut fx_add_buf = InstanceBuf::new(&device, &inst_bgl, 256);
+    let mut fx_soft_buf = InstanceBuf::new(&device, &inst_bgl, 256);
+    let mut cur_fx_rev = u64::MAX;
     // M11.4 — light/camera ICON glyphs (wireframe), drawn via the overlay pipeline. Rebuilt with the scene
     // (uploaded on `revision`, like `lines`); empty ⇒ skipped.
     let mut markers = InstanceBuf::new(&device, &inst_bgl, 256);
@@ -2231,6 +2773,32 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let mut cur_mesh_rev = u64::MAX;
     let mut cube_scratch: Vec<Instance> = Vec::new();
     let mut mesh_scratch: Vec<Vec<Instance>> = Vec::new();
+    // M19 (ADR-104) — terrain chunks. A separate slot table from the entity meshes above, because terrain
+    // slots churn with the camera while the asset set does not: mixing them would mean re-uploading every
+    // asset each time a chunk streamed in. Each slot holds its own geometry and its own baked splat
+    // textures, and every slot shares ONE fixed-capacity instance storage buffer so a chunk's bind group
+    // stays valid for its whole life (the buffer is never reallocated, only written).
+    let mut terrain_geo: Vec<Option<(wgpu::Buffer, wgpu::Buffer, u32)>> = Vec::new();
+    let mut terrain_tex: Vec<(wgpu::TextureView, wgpu::TextureView)> = Vec::new();
+    let mut terrain_bg: Vec<Option<wgpu::BindGroup>> = Vec::new();
+    let terrain_inst_buf = new_instance_storage(&device, TERRAIN_INSTANCE_CAPACITY);
+    // The depth-only shadow pass binds instances alone (no textures), so terrain needs its own group-1 over
+    // the same buffer. Built once: the terrain instance buffer has a fixed capacity and never reallocates,
+    // so this bind group can never go stale the way a growing per-asset one can.
+    let terrain_shadow_bg = make_inst_bg(&device, &inst_bgl, &terrain_inst_buf);
+    let mut terrain_scratch: Vec<Instance> = Vec::new();
+    // The terrain tools' own always-on-top line overlay: the brush ring, and the route being drawn. Its own
+    // buffer rather than the contact debugger's, so a debugger toggle cannot erase the brush.
+    let mut terrain_overlay = InstanceBuf::new(&device, &inst_bgl, 256);
+    let mut terrain_overlay_pts: Vec<Instance> = Vec::new();
+    // M19 — how many entries of each per-slot instance list belong to real entities. Scattered vegetation is
+    // appended after that mark every frame and trimmed back to it before the next append, so the entity
+    // partition is computed once per scene revision while the foliage follows the camera.
+    let mut entity_inst_len: Vec<usize> = Vec::new();
+    let mut scatter_slots_used: Vec<usize> = Vec::new();
+    // Slots parallel to `terrain_scratch`: draw `k` uses slot `terrain_slots[k]` with instance range
+    // `k..k+1`.
+    let mut terrain_slots: Vec<u32> = Vec::new();
 
     eprintln!("[viewport] render loop started");
     let mut cur_rev = u64::MAX;
@@ -2273,6 +2841,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         // across it convoys tao behind the render frame. Read once up-front (like the resize `inner_size`
         // above); the orbit-drag and gizmo-drag branches below consume the snapshot inside the lock.
         let cursor_pos = window.cursor_position().ok();
+        // …and the client area's own position on the desktop, for the same reason. `cursor_position()`
+        // is DESKTOP-relative; every surface-fraction consumer below needs it CLIENT-relative.
+        let client_origin = window
+            .inner_position()
+            .ok()
+            .map(|p| (f64::from(p.x), f64::from(p.y)));
 
         // read shared state; re-upload instances on revision change (picking is NOT serviced here —
         // it's done synchronously in the viewport_pick command, decoupled from the frame cadence)
@@ -2286,6 +2860,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             exposure,
             render_profile,
             grid_meta,
+            terrain_active,
+            env_source_space,
+            working_space,
         ) = {
             // The real surface aspect, so the very first framing fits the lens the user is looking
             // through rather than an assumed one.
@@ -2294,6 +2871,27 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // Publish it before anything reads it, so a `frame_all` arriving from the UI this frame
             // frames against the surface as it is now rather than as it was when the window opened.
             st.surface_aspect = aspect_hint;
+            // M19 (ADR-104) — advance the terrain runtime FIRST, so the uploads and the draw list the
+            // blocks below consume are this frame's. Planning is gated inside the runtime on camera
+            // movement, so a still frame costs a distance check and a draw-list rebuild.
+            if st.terrain.is_active() {
+                let eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+                let vp = camera_matrix_with(
+                    st.orbit,
+                    st.elevation,
+                    st.distance,
+                    aspect_hint,
+                    st.cam_target.into(),
+                    st.projection,
+                )
+                .to_cols_array();
+                let focus = st.terrain.focus_chunk(eye);
+                // Moved out and back so the runtime can write into the very state it lives in; the move is
+                // a handful of pointers.
+                let mut rt = std::mem::take(&mut st.terrain);
+                rt.update(&mut st, eye, vp, focus);
+                st.terrain = rt;
+            }
             if st.distance == 0.0 {
                 // The camera has never been placed. Frame the scene rather than falling back to a
                 // hard-coded distance of 60: that constant is the reason every asset, at every scale,
@@ -2341,9 +2939,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // (the OS cursor, or a test-injected one) + run the gizmo's drag_update, moving the dragged
             // instance live. Only gizmo_pick_drag/gizmo_drag_end cross JS (2 per gesture), never per frame.
             if st.gizmo_dragging {
-                let cursor = st.gizmo_test_cursor.or_else(|| {
-                    cursor_pos.map(|p| (p.x as f32 / w.max(1) as f32, p.y as f32 / h.max(1) as f32))
-                });
+                let cursor = st
+                    .gizmo_test_cursor
+                    .or_else(|| surface_fraction(cursor_pos, client_origin, w, h));
                 if let Some(cur) = cursor {
                     let aspect = w as f32 / h.max(1) as f32;
                     let (ro, rd) = cursor_ray(
@@ -2435,21 +3033,51 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         .map(|sm| GpuSubMesh {
                             index_offset: sm.index_offset,
                             index_count: sm.index_count,
+                            // Each role asks the colour policy what it is, rather than the call site
+                            // asserting it. Same treatment as before — now for a stated reason.
                             base_view: sm.base_color_texture.as_ref().map_or_else(
                                 || dummy_view.clone(),
-                                |t| upload_tex(&device, &queue, t, TextureSemantic::Color),
+                                |t| {
+                                    upload_tex(
+                                        &device,
+                                        &queue,
+                                        t,
+                                        TextureSemantic::for_role(Role::BaseColour),
+                                    )
+                                },
                             ),
                             mr_view: sm.metallic_roughness_texture.as_ref().map_or_else(
                                 || dummy_mr_view.clone(),
-                                |t| upload_tex(&device, &queue, t, TextureSemantic::Data),
+                                |t| {
+                                    upload_tex(
+                                        &device,
+                                        &queue,
+                                        t,
+                                        TextureSemantic::for_role(Role::MetallicRoughness),
+                                    )
+                                },
                             ),
                             normal_view: sm.normal_texture.as_ref().map_or_else(
                                 || dummy_normal_view.clone(),
-                                |t| upload_tex(&device, &queue, t, TextureSemantic::Normal),
+                                |t| {
+                                    upload_tex(
+                                        &device,
+                                        &queue,
+                                        t,
+                                        TextureSemantic::for_role(Role::Normal),
+                                    )
+                                },
                             ),
                             ao_view: sm.occlusion_texture.as_ref().map_or_else(
                                 || dummy_mr_view.clone(),
-                                |t| upload_tex(&device, &queue, t, TextureSemantic::Data),
+                                |t| {
+                                    upload_tex(
+                                        &device,
+                                        &queue,
+                                        t,
+                                        TextureSemantic::for_role(Role::Occlusion),
+                                    )
+                                },
                             ),
                         })
                         .collect();
@@ -2497,7 +3125,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     }
                 }
                 cube.upload(&device, &queue, &inst_bgl, &cube_scratch);
+                entity_inst_len.clear();
                 for (slot, group) in mesh_scratch.iter().enumerate() {
+                    entity_inst_len.push(group.len());
                     mesh_inst[slot].upload(&device, &queue, &inst_bgl, group);
                 }
                 // M11.1 — each slot's instance centroid (the camera-distance basis for LOD selection).
@@ -2577,15 +3207,280 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     lod_main_bg.push(per_lod);
                 }
                 // tracking-line endpoints (rebuilt in lock-step with instances)
-                lines.upload(&device, &queue, &inst_bgl, &st.line_points);
+                // Binding lines are authoring chrome too — hidden while a shot is running.
+                if st.cinematic {
+                    lines.upload(&device, &queue, &inst_bgl, &[]);
+                } else {
+                    lines.upload(&device, &queue, &inst_bgl, &st.line_points);
+                }
                 // M11.4 — light/camera icon glyphs (rebuilt with the scene).
                 markers.upload(&device, &queue, &inst_bgl, &st.marker_glyphs);
+            }
+            // M19 (ADR-104) — the terrain tools. Aiming and stroke extension happen HERE, on the render
+            // thread, from the OS cursor: a paint gesture is two commands (down and up) however long it
+            // lasts, exactly like the orbit and the gizmo drag (invariant 4). Doing it from JS mouse-moves
+            // would put an IPC round trip and a frame of latency between the cursor and the brush.
+            //
+            // The ray-cast runs whenever a terrain is live, NOT only when a tool is armed: the cursor hit is
+            // also what "this" means to a described edit ("raise this mountain"), and an author refining a
+            // world by sentence is not holding a brush. Gating it on the tool made every deictic fall back
+            // to the view centre.
+            if st.terrain.is_active() {
+                let cursor = st
+                    .terrain_test_cursor
+                    .or_else(|| surface_fraction(cursor_pos, client_origin, w, h));
+                let hit = cursor.and_then(|cur| {
+                    let (ro, rd) = cursor_ray(
+                        cur,
+                        st.orbit,
+                        st.elevation,
+                        st.distance,
+                        aspect_hint,
+                        st.cam_target,
+                        st.projection,
+                    );
+                    st.terrain
+                        .terrain()
+                        .and_then(|t| t.raycast(ro, rd, st.distance * 8.0 + 4000.0))
+                });
+                st.terrain_cursor_hit = hit;
+
+                // A one-shot route point, requested by a click in the viewport.
+                if st.terrain_place_point {
+                    st.terrain_place_point = false;
+                    if let Some(p) = hit {
+                        st.terrain_route_points.push(p);
+                    }
+                }
+
+                if st.terrain_painting {
+                    if let Some(p) = hit {
+                        // Space the recorded path by a fraction of the brush so a slow drag and a fast one
+                        // over the same ground record the same stroke.
+                        let spacing = (st.terrain_brush.radius_m * 0.25).max(0.05);
+                        let far_enough = st.terrain_stroke_path.last().is_none_or(|last| {
+                            let dx = p[0] - last[0];
+                            let dz = p[2] - last[1];
+                            (dx * dx + dz * dz).sqrt() >= spacing
+                        });
+                        if far_enough {
+                            st.terrain_stroke_path.push([p[0], p[2]]);
+                            let strokes =
+                                strokes_from_path(&st.terrain_stroke_path, st.terrain_brush);
+                            let mut rt = std::mem::take(&mut st.terrain);
+                            rt.set_preview_strokes(&strokes, &mut st);
+                            st.terrain = rt;
+                        }
+                    }
+                } else if !st.terrain_stroke_path.is_empty() {
+                    // The gesture ended and the commit has landed; drop the preview.
+                    st.terrain_stroke_path.clear();
+                    let mut rt = std::mem::take(&mut st.terrain);
+                    rt.clear_preview(&mut st);
+                    st.terrain = rt;
+                }
+            } else if st.terrain_cursor_hit.is_some() {
+                st.terrain_cursor_hit = None;
+            }
+            // Rebuild the tool overlay each frame: a ring under the cursor, and the route so far.
+            terrain_overlay_pts.clear();
+            if st.terrain_tool == TerrainTool::Sculpt {
+                if let Some(c) = st.terrain_cursor_hit {
+                    push_brush_ring(
+                        &mut terrain_overlay_pts,
+                        c,
+                        st.terrain_brush.radius_m,
+                        &st.terrain,
+                    );
+                }
+            }
+            if st.terrain_tool == TerrainTool::Route {
+                push_route_preview(
+                    &mut terrain_overlay_pts,
+                    &st.terrain_route_points,
+                    st.terrain_cursor_hit,
+                );
+            }
+            terrain_overlay.upload(&device, &queue, &inst_bgl, &terrain_overlay_pts);
+            // Read here, used by the ground-plane decision in the pass below.
+            let terrain_active = st.terrain.is_active();
+
+            // Released slots first (so a slot recycled in the same frame is not
+            // dropped after it is re-filled), then the runtime's budgeted uploads, then this frame's draw
+            // list. All three are plain vectors the runtime refilled under this same lock, so terrain adds
+            // no synchronization and no IPC (invariant 4).
+            for slot in st.terrain_drops.drain(..) {
+                let i = slot as usize;
+                if i < terrain_geo.len() {
+                    terrain_geo[i] = None;
+                    terrain_bg[i] = None;
+                    // Reset the textures too, or a recycled slot inherits the previous chunk's splat map.
+                    // A terrain chunk always uploads its own albedo so it never noticed; a WATER surface
+                    // uploads none (its colour is in the vertex data and the dummy albedo is white), so it
+                    // silently sampled whatever sand or rock the slot held before — which drew the sea as a
+                    // checkerboard of bright chunk-sized patches on the live app.
+                    terrain_tex[i] = (dummy_view.clone(), dummy_normal_view.clone());
+                }
+            }
+            for up in st.terrain_uploads.drain(..) {
+                let i = up.slot as usize;
+                while terrain_geo.len() <= i {
+                    terrain_geo.push(None);
+                    terrain_bg.push(None);
+                    terrain_tex.push((dummy_view.clone(), dummy_normal_view.clone()));
+                }
+                if up.vertices.is_empty() || up.indices.is_empty() {
+                    terrain_geo[i] = None;
+                    terrain_bg[i] = None;
+                    continue;
+                }
+                let vbuf = create_init_buffer(
+                    &device,
+                    "terrain-v",
+                    bytemuck::cast_slice(&up.vertices),
+                    wgpu::BufferUsages::VERTEX,
+                );
+                let ibuf = create_init_buffer(
+                    &device,
+                    "terrain-i",
+                    bytemuck::cast_slice(&up.indices),
+                    wgpu::BufferUsages::INDEX,
+                );
+                let n_idx = up.indices.len() as u32;
+                terrain_geo[i] = Some((vbuf, ibuf, n_idx));
+                // A LOD switch sends no textures; the views already held stay bound, which is the whole
+                // reason the upload splits geometry from textures.
+                let mut retex = false;
+                if let Some(a) = &up.albedo {
+                    terrain_tex[i].0 = upload_tex(
+                        &device,
+                        &queue,
+                        a,
+                        TextureSemantic::for_role(Role::BaseColour),
+                    );
+                    retex = true;
+                }
+                if let Some(n) = &up.normal {
+                    terrain_tex[i].1 =
+                        upload_tex(&device, &queue, n, TextureSemantic::for_role(Role::Normal));
+                    retex = true;
+                }
+                if retex || terrain_bg[i].is_none() {
+                    terrain_bg[i] = Some(make_mesh_main_bg(
+                        &device,
+                        &mesh_inst_bgl,
+                        &terrain_inst_buf,
+                        &terrain_tex[i].0,
+                        &dummy_mr_view,
+                        &terrain_tex[i].1,
+                        &dummy_mr_view,
+                        &albedo_sampler,
+                    ));
+                }
+            }
+            // The draw list, packed into the shared instance buffer in draw order so chunk `k` is drawn with
+            // instance range `k..k+1`.
+            terrain_scratch.clear();
+            terrain_slots.clear();
+            for d in &st.terrain_draws {
+                let i = d.slot as usize;
+                if terrain_geo.get(i).and_then(Option::as_ref).is_none() {
+                    continue;
+                }
+                if terrain_scratch.len() as u64 >= TERRAIN_INSTANCE_CAPACITY {
+                    break;
+                }
+                terrain_slots.push(d.slot);
+                terrain_scratch.push(d.instance);
+            }
+            if !terrain_scratch.is_empty() {
+                queue.write_buffer(&terrain_inst_buf, 0, bytemuck::cast_slice(&terrain_scratch));
+            }
+            // M19 — scattered vegetation and props. Appended to the per-asset instance lists AFTER the
+            // entity partition, so a tree draws through the same instanced call an imported prop does. Only
+            // the slots that actually changed are re-uploaded, and a slot whose buffer had to GROW gets its
+            // bind groups rebuilt — the group-1 binding names the buffer, so a silent reallocation here
+            // would leave every draw for that asset reading a freed allocation.
+            if !st.terrain_scatter.is_empty() || !scatter_slots_used.is_empty() {
+                for slot in scatter_slots_used.drain(..) {
+                    if let (Some(list), Some(base)) =
+                        (mesh_scratch.get_mut(slot), entity_inst_len.get(slot))
+                    {
+                        list.truncate(*base);
+                    }
+                }
+                for (slot, inst) in &st.terrain_scatter {
+                    let Ok(s) = usize::try_from(*slot) else {
+                        continue;
+                    };
+                    if s >= mesh_scratch.len() {
+                        continue;
+                    }
+                    if mesh_scratch[s].len() == entity_inst_len.get(s).copied().unwrap_or(0) {
+                        scatter_slots_used.push(s);
+                    }
+                    mesh_scratch[s].push(*inst);
+                }
+                for &slot in &scatter_slots_used {
+                    let before = mesh_inst[slot].cap;
+                    mesh_inst[slot].upload(&device, &queue, &inst_bgl, &mesh_scratch[slot]);
+                    if mesh_inst[slot].cap != before {
+                        let rebuild_for = |mesh: &GpuMesh| -> Vec<wgpu::BindGroup> {
+                            mesh.submeshes
+                                .iter()
+                                .map(|sm| {
+                                    make_mesh_main_bg(
+                                        &device,
+                                        &mesh_inst_bgl,
+                                        &mesh_inst[slot].buf,
+                                        &sm.base_view,
+                                        &sm.mr_view,
+                                        &sm.normal_view,
+                                        &sm.ao_view,
+                                        &albedo_sampler,
+                                    )
+                                })
+                                .collect()
+                        };
+                        if let (Some(Some(mesh)), Some(dst)) =
+                            (gpu_meshes.get(slot), mesh_main_bg.get_mut(slot))
+                        {
+                            *dst = rebuild_for(mesh);
+                        }
+                        if let (Some(lods), Some(dst)) =
+                            (gpu_lods.get(slot), lod_main_bg.get_mut(slot))
+                        {
+                            *dst = lods.iter().map(rebuild_for).collect();
+                        }
+                    }
+                }
             }
             // M8.4 contact-debugger overlay — uploaded on its OWN revision (the debugger updates
             // independently of scene edits; while off, the buffer is empty so there's nothing to upload).
             if st.overlay_revision != cur_overlay_rev {
                 cur_overlay_rev = st.overlay_revision;
                 overlay.upload(&device, &queue, &inst_bgl, &st.overlay_lines);
+            }
+            // VFX particles change every tick while an effect runs, so they ride their own revision —
+            // a scene edit must not re-upload them and a running effect must not re-upload the scene.
+            if st.fx_revision != cur_fx_rev {
+                cur_fx_rev = st.fx_revision;
+                fx_add_buf.upload(&device, &queue, &inst_bgl, &st.fx_additive);
+                fx_soft_buf.upload(&device, &queue, &inst_bgl, &st.fx_soft);
+            }
+            // A newly imported environment replaces the whole IBL: equirect texture, box-filtered mip
+            // chain and bind group. Gated on its own revision so importing a sky costs nothing on any
+            // other frame, and done HERE because this is the only place that owns the device+queue.
+            if st.env_revision != cur_env_rev {
+                cur_env_rev = st.env_revision;
+                ibl = crate::ibl::create_with(
+                    &device,
+                    &queue,
+                    &ibl_bgl,
+                    &shadow_view,
+                    &shadow_sampler,
+                    st.pending_env.as_ref(),
+                );
             }
             // M11.3 — upload the scene's lights on their own revision (decoupled from entity edits).
             if st.lights_revision != cur_lights_rev {
@@ -2608,8 +3503,21 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // (its position + fov, looking at the orbit target). A pure render projection (never Loro).
             if let Some(ov) = st.cam_override {
                 let eye = Vec3::from(ov.pos);
+                let mut target = Vec3::from(ov.look_at.unwrap_or(st.cam_target));
+                // Two degenerate aims produce a NaN view matrix and a black frame. Both are reachable
+                // from ordinary authoring (a camera dropped exactly on its subject; a top-down shot), so
+                // nudge rather than trust the input.
+                if (target - eye).length_squared() < 1.0e-8 {
+                    target = eye + Vec3::NEG_Z;
+                }
+                let dir = (target - eye).normalize_or_zero();
+                let up = if dir.dot(Vec3::Y).abs() > 0.999 {
+                    Vec3::Z
+                } else {
+                    Vec3::Y
+                };
                 let proj = Mat4::perspective_rh(ov.fov_deg.to_radians(), aspect, ov.near, ov.far);
-                cam = proj * Mat4::look_at_rh(eye, st.cam_target.into(), Vec3::Y);
+                cam = proj * Mat4::look_at_rh(eye, target, up);
                 cam_eye = ov.pos;
             }
             // M11.3 inc.3 — the shadow-casting light's ortho view-proj, fitted to the live instance bounds.
@@ -2639,14 +3547,23 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             };
             // M9.1: regenerate the gizmo geometry at the selected entity each frame — constant pixel size,
             // and it follows the entity through a drag. Empty when nothing is selected → the pass is
-            // skipped (zero cost). World-space basis (the cube/mesh shaders don't show rotation).
+            // skipped (zero cost).
+            //
+            // The basis is the SELECTED ENTITY'S OWN ROTATION, not identity. Passing identity here (and
+            // at both drag-start call sites) made `GizmoSpace::Local` a no-op: the toolbar said
+            // "Local", the handles drew along world axes, and dragging the "local X" arrow moved the
+            // object along world X. A label that does not match the mathematics is worse than no
+            // label, because the user calibrates on it.
             let mut gizmo_verts: Vec<Instance> = match st.selected {
+                // A cutscene is a picture, not a workspace: no handles across the shot.
+                _ if st.cinematic => Vec::new(),
                 Some(sel) if sel < st.instances.len() => {
                     let origin = st.instances[sel].center;
+                    let basis = st.instances[sel].rotation;
                     let eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
                     let scale = metrocalk_gizmo::pixel_scale(eye, origin, 55f32.to_radians(), 0.14);
                     st.gizmo
-                        .geometry(origin, [0.0, 0.0, 0.0, 1.0], scale)
+                        .geometry(origin, basis, scale)
                         .into_iter()
                         .map(|gv| Instance {
                             center: gv.pos,
@@ -2707,6 +3624,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     st.distance,
                     formats.manual_display_encode(),
                 ],
+                terrain_active,
+                st.env_source_space,
+                // Read under the SAME lock as the camera and the exposure. A working space that lags
+                // the frame by one tick is a frame whose textures and lights are in different spaces —
+                // the mixed-state frame the atomicity requirement exists to forbid.
+                st.working_space,
             )
         };
         queue.write_buffer(
@@ -2725,6 +3648,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     shadow_quality.shader_level(),
                 ],
                 grid: grid_meta,
+                colour: ColourUniform::new(working_space, env_source_space),
             }),
         );
         // M9.1: upload the gizmo handle geometry (tiny — regenerated each frame at the selection).
@@ -2737,23 +3661,49 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         // thumbnail request returns promptly (off the hot path). The JS side is dirty-only + budget-limited,
         // so the queue is EMPTY during an orbit (0 thumbnail IPC). A request whose entity vanished is dropped.
         const THUMB_PER_FRAME: usize = 4;
-        let thumb_jobs: Vec<(String, u32, Instance, i32)> = {
+        // The presentation state THIS frame's thumbnails are rendered in, read under the same lock that
+        // hands out the jobs. Stamped onto every result so a consumer can tell "the picture I asked
+        // for" from "a picture of a state that has since moved" — the two are indistinguishable when a
+        // result carries only an entity id, which is what made a timed-out render able to satisfy a
+        // later request.
+        let (thumb_state, thumb_jobs): (u64, Vec<(ThumbRequest, Instance, i32)>) = {
             let mut st = shared.lock().unwrap();
+            let thumb_state = st.presentation().hash();
             let n = st.thumb_requests.len().min(THUMB_PER_FRAME);
             let mut jobs = Vec::with_capacity(n);
+            let mut unrenderable: Vec<ThumbResult> = Vec::new();
             for _ in 0..n {
-                let (id, size) = st.thumb_requests.remove(0);
+                let req = st.thumb_requests.remove(0);
+                let id = req.id.clone();
                 if let Some(i) = st.ids.iter().position(|x| x == &id) {
                     let inst = st.instances[i];
                     let slot = st.mesh_slots.get(i).copied().unwrap_or(-1);
-                    jobs.push((id, size, inst, slot));
+                    jobs.push((req, inst, slot));
+                } else {
+                    // ANSWER "no", rather than saying nothing.
+                    //
+                    // This used to drop the request silently. The caller then polled for the full
+                    // 600 ms and returned `None`, so "this entity has no picture" and "the renderer is
+                    // busy" were indistinguishable — and equally slow. That is the common case, not a
+                    // corner: lights, cameras and the group/folder rows of an imported CAD assembly all
+                    // have no render instance, so scrolling an outliner full of folders cost 600 ms of
+                    // waiting per visible row for an answer that was known immediately.
+                    unrenderable.push(ThumbResult {
+                        id,
+                        req: req.req,
+                        state: thumb_state,
+                        png: None,
+                    });
                 }
             }
-            jobs
+            if !unrenderable.is_empty() {
+                st.thumb_results.extend(unrenderable);
+            }
+            (thumb_state, jobs)
         };
         if !thumb_jobs.is_empty() {
-            let mut results: Vec<(String, Option<Vec<u8>>)> = Vec::with_capacity(thumb_jobs.len());
-            for (id, size, inst, slot) in thumb_jobs {
+            let mut results: Vec<ThumbResult> = Vec::with_capacity(thumb_jobs.len());
+            for (req, inst, slot) in thumb_jobs {
                 let mesh = usize::try_from(slot)
                     .ok()
                     .and_then(|s| gpu_meshes.get(s))
@@ -2765,6 +3715,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         formats,
                         samples,
                         render_profile,
+                        working: working_space,
+                        env_source: env_source_space,
                         resolve_pipeline: &resolve_pipeline,
                         post_samp: &post_samp,
                         post_bgl2: &post_bgl2,
@@ -2781,9 +3733,14 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     &index_buf,
                     &inst,
                     mesh,
-                    size,
+                    req.size,
                 );
-                results.push((id, png));
+                results.push(ThumbResult {
+                    id: req.id,
+                    req: req.req,
+                    state: thumb_state,
+                    png,
+                });
             }
             let mut st = shared.lock().unwrap();
             st.thumb_results.extend(results);
@@ -2852,6 +3809,23 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     sp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     sp.draw_indexed(0..mesh.n_idx, 0, 0..inst.n);
                 }
+                // M19 — terrain casts too. Without this a mountain throws no shadow into the valley below
+                // it, nothing on the ground is shadowed by the land it stands on, and a world made ONLY of
+                // terrain has no shadows at all: the depth pass would render an empty map and every
+                // receiver would sample "lit". Same instance buffer and draw order as the colour pass, so a
+                // chunk's shadow can never disagree with the chunk.
+                for (k, slot) in terrain_slots.iter().enumerate() {
+                    let Some((vbuf, ibuf, n_idx)) =
+                        terrain_geo.get(*slot as usize).and_then(Option::as_ref)
+                    else {
+                        continue;
+                    };
+                    sp.set_bind_group(1, &terrain_shadow_bg, &[]);
+                    sp.set_vertex_buffer(0, vbuf.slice(..));
+                    sp.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    let k = k as u32;
+                    sp.draw_indexed(0..*n_idx, 0, k..k + 1);
+                }
             }
         }
         {
@@ -2875,7 +3849,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         // The authored background, converted ONCE into scene-linear by the same function
                         // the shaders use — so the backdrop cannot shift just because bloom, SSAO or MSAA
                         // was switched on.
-                        load: wgpu::LoadOp::Clear(clear_color(render_profile > 0.5)),
+                        load: wgpu::LoadOp::Clear(clear_color(render_profile > 0.5, working_space)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2958,21 +3932,68 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     rp.draw_indexed(sm.index_offset..end, 0, 0..inst.n);
                 }
             }
+            // M19 (ADR-104) — terrain chunks, on the same pipeline with groups 0/2/3 still bound. Each
+            // chunk is one draw: its own geometry, its own baked splat textures on group 1, and one
+            // instance taken from the shared terrain instance buffer by draw index. Terrain therefore
+            // receives the scene's real lighting, IBL and shadows for free, because it is not a special
+            // case anywhere in this pass.
+            for (k, slot) in terrain_slots.iter().enumerate() {
+                let i = *slot as usize;
+                let (Some((vbuf, ibuf, n_idx)), Some(bg)) = (
+                    terrain_geo.get(i).and_then(Option::as_ref),
+                    terrain_bg.get(i).and_then(Option::as_ref),
+                ) else {
+                    continue;
+                };
+                rp.set_bind_group(1, bg, &[]);
+                rp.set_vertex_buffer(0, vbuf.slice(..));
+                rp.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                let k = k as u32;
+                rp.draw_indexed(0..*n_idx, 0, k..k + 1);
+            }
             // M11.3 inc.3 — the ground plane (matte; receives IBL + the scene's shadows). Same mesh
             // pipeline, so groups 0/2/3 stay bound; only its instance (group 1, the untextured dummy) +
             // geometry change.
-            rp.set_bind_group(1, &ground_main_bg, &[]);
-            rp.set_vertex_buffer(0, ground_vbuf.slice(..));
-            rp.set_index_buffer(ground_ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            rp.draw_indexed(0..GROUND_IDX.len() as u32, 0, 0..1);
-            // The grid, now that the surface it describes has been laid down.
-            rp.set_pipeline(&grid_pipeline);
-            rp.draw(0..GRID_VERTS, 0..1);
+            //
+            // M19: SKIPPED when a terrain is live. The placeholder ground is a flat quad at y = 0 standing in
+            // for "there is no world yet", and a real terrain routinely dips below zero — a shoreline, a
+            // lake bed, a canyon floor. Leaving it in draws an opaque grey lid over exactly those places. On
+            // the live app it hid the entire Rolling Hills sea floor and made the terrain look like it had
+            // never streamed in. The grid goes with it: it describes a surface that is no longer there.
+            if !terrain_active {
+                rp.set_bind_group(1, &ground_main_bg, &[]);
+                rp.set_vertex_buffer(0, ground_vbuf.slice(..));
+                rp.set_index_buffer(ground_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..GROUND_IDX.len() as u32, 0, 0..1);
+                rp.set_pipeline(&grid_pipeline);
+                rp.draw(0..GRID_VERTS, 0..1);
+            }
             // Tracking lines (binding-by-intent overlay) last, with the always-pass depth state.
             if lines.n > 0 {
                 rp.set_pipeline(&line_pipeline);
                 rp.set_bind_group(1, &lines.bg, &[]);
                 rp.draw(0..lines.n, 0..1);
+            }
+            // ── VFX particles ────────────────────────────────────────────────────────────────────
+            // Drawn INSIDE the HDR scene pass, after everything opaque and before the editor overlays:
+            // inside, so bloom and the tone-map see them and an over-1.0 spark actually glows; after the
+            // opaque geometry, so the depth test hides a flame that is genuinely behind a wall; before
+            // the overlays, so a gizmo is never buried in smoke. Six vertices per particle, no vertex
+            // buffer — `vs_particle` reads the shared instance storage buffer by `vertex_index / 6`.
+            // SOFT first, then additive. Alpha blending is order-dependent and additive is not, so
+            // whichever bucket goes last is the one that cannot be corrupted — and drawing smoke last
+            // meant an aged puff BEHIND a flame (soft particles grow to 2.6x, and the Smoke card's own
+            // blurb is "pair it with fire") multiplied the flame core down by (1-a). Glow now reads
+            // through haze, which is what the previous comment claimed and the order contradicted.
+            if fx_soft_buf.n > 0 {
+                rp.set_pipeline(&fx_soft_pipeline);
+                rp.set_bind_group(1, &fx_soft_buf.bg, &[]);
+                rp.draw(0..fx_soft_buf.n * 6, 0..1);
+            }
+            if fx_add_buf.n > 0 {
+                rp.set_pipeline(&fx_add_pipeline);
+                rp.set_bind_group(1, &fx_add_buf.bg, &[]);
+                rp.draw(0..fx_add_buf.n * 6, 0..1);
             }
             // M8.4 contact-debugger overlay, drawn over everything (per-segment colour, always-pass depth).
             // Skipped entirely when the debugger is off (`overlay.n == 0`) — zero per-frame cost.
@@ -2987,6 +4008,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.set_pipeline(&overlay_pipeline);
                 rp.set_bind_group(1, &markers.bg, &[]);
                 rp.draw(0..markers.n, 0..1);
+            }
+            // M19 — the terrain brush ring / route preview, on the same always-pass overlay pipeline as the
+            // contact debugger. Empty unless a terrain tool is active, so it costs nothing otherwise.
+            if terrain_overlay.n > 0 {
+                rp.set_pipeline(&overlay_pipeline);
+                rp.set_bind_group(1, &terrain_overlay.bg, &[]);
+                rp.draw(0..terrain_overlay.n, 0..1);
             }
             // M9.1 transform gizmo, drawn LAST (over everything), per-segment X/Y/Z colour, always-pass
             // depth. Skipped when nothing is selected (`gizmo_buf.n == 0`) — zero per-frame cost.
@@ -3201,38 +4229,31 @@ fn shadow_view_proj(
     proj * view
 }
 
-/// Pick the instance nearest the click in screen space — a pure function over the instance list +
-/// camera, so the `viewport_pick` command runs it synchronously (no render-loop round-trip, no
-/// frame-cadence race — the bug a hidden/throttled window exposed). `cursor` is a normalized [0,1]
-/// window fraction (DPI/offset-free). No tolerance, so a click always selects the closest cube
-/// (immune to the ray-vs-sphere gap problem AND to clicking a big cube's face far from its centre).
-/// `best` prefers cubes in front (ndc.z ∈ [0,1], wgpu depth); `best_nc` is the fallback so a depth/`w`
-/// sign convention can never make picking return `None`. `None` only when there are no instances.
+/// The OS cursor as a normalized `[0, 1]` fraction **of the render surface**.
+///
+/// The bug this exists to make impossible: `WebviewWindow::cursor_position()` reports the cursor in
+/// **desktop** coordinates, and the live gizmo drag and terrain brush both divided it by the
+/// **surface** size as though it were client-relative. The result is an error equal to the window's
+/// own position on screen — so a maximised window on the primary monitor looked fine, and the same
+/// drag on a window 600 px from the left edge moved the object to somewhere else entirely. It reads
+/// as "the gizmo is inaccurate" rather than as a coordinate-space mistake, which is why it survived.
+///
+/// `client_origin` is the client area's top-left in the same desktop space (`inner_position()`);
+/// `None` means the platform could not report it, in which case the raw position is the best
+/// available answer and is used unchanged rather than dropping the input.
 #[must_use]
-pub fn pick_nearest(instances: &[Instance], cursor: (f32, f32), view_proj: &Mat4) -> Option<usize> {
-    let (nx, ny) = cursor;
-    let click_x = nx * 2.0 - 1.0;
-    let click_y = 1.0 - ny * 2.0;
-    let mut best: Option<(usize, f32)> = None; // in-front nearest
-    let mut best_nc: Option<(usize, f32)> = None; // nearest ignoring the depth cull
-    for (i, inst) in instances.iter().enumerate() {
-        let clip = *view_proj * Vec3::from(inst.center).extend(1.0);
-        if clip.w.abs() < 1e-6 {
-            continue;
-        }
-        let ndc = clip.truncate() / clip.w;
-        if ndc.x.is_nan() || ndc.y.is_nan() {
-            continue;
-        }
-        let d2 = (ndc.x - click_x).powi(2) + (ndc.y - click_y).powi(2);
-        if best_nc.is_none_or(|(_, bd)| d2 < bd) {
-            best_nc = Some((i, d2));
-        }
-        if (0.0..=1.0).contains(&ndc.z) && best.is_none_or(|(_, bd)| d2 < bd) {
-            best = Some((i, d2));
-        }
-    }
-    best.or(best_nc).map(|(i, _)| i)
+pub fn surface_fraction(
+    cursor: Option<tauri::PhysicalPosition<f64>>,
+    client_origin: Option<(f64, f64)>,
+    width: u32,
+    height: u32,
+) -> Option<(f32, f32)> {
+    let p = cursor?;
+    let (ox, oy) = client_origin.unwrap_or((0.0, 0.0));
+    let w = f64::from(width.max(1));
+    let h = f64::from(height.max(1));
+    #[allow(clippy::cast_possible_truncation)]
+    Some((((p.x - ox) / w) as f32, ((p.y - oy) / h) as f32))
 }
 
 /// M9.4 — the index of the nearest snap target to `from` (excluding `sel`) within `radius`, ranked by the
@@ -3718,6 +4739,59 @@ fn make_pipeline(
     })
 }
 
+/// VFX particles need their own factory because [`make_pipeline`] hard-codes an opaque target, and the
+/// two particle looks differ ONLY in blend state: `Additive` (src·1 + dst·1) for anything that emits
+/// light, premultiplied-alpha for anything that occludes it. Both TEST depth and neither WRITES it —
+/// a particle that wrote depth would punch a hole in the smoke behind it and, being unsorted, would do
+/// so in whatever order the buffer happened to be in.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a pipeline descriptor builder, matching make_pipeline next to it"
+)]
+fn make_particle_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    depth: &wgpu::DepthStencilState,
+    blend: wgpu::BlendState,
+    samples: u32,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_particle"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_particle"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None, // a billboard is single-sided by construction
+            ..Default::default()
+        },
+        depth_stencil: Some(depth.clone()),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 /// The grid is an antialiased transparent plane, not opaque hardware lines, so it needs its own fragment
 /// entry point and alpha blend state. Keeping this descriptor separate prevents overlay/cube pipelines from
 /// accidentally inheriting transparency or losing depth writes.
@@ -3968,6 +5042,10 @@ fn render_thumbnail(
             shadow: [-1.0, DEFAULT_EXPOSURE, thumb.render_profile, 0.0], // caster -1 = none
             // `.w` — the thumbnail resolves into the display format too, so it needs the same OETF answer.
             grid: [0.0, 0.0, dist, formats.manual_display_encode()],
+            // The SAME working space as the viewport, for the same reason the exposure and profile are
+            // shared: an asset-browser thumbnail graded in a different colour space from the stage is a
+            // picture of a scene that does not exist.
+            colour: ColourUniform::new(thumb.working, thumb.env_source),
         }),
     );
     let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4041,7 +5119,10 @@ fn render_thumbnail(
                 depth_slice: None,
                 ops: wgpu::Operations {
                     // The same authored background as the stage, through the same conversion.
-                    load: wgpu::LoadOp::Clear(clear_color(thumb.render_profile > 0.5)),
+                    load: wgpu::LoadOp::Clear(clear_color(
+                        thumb.render_profile > 0.5,
+                        thumb.working,
+                    )),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -4196,6 +5277,10 @@ struct ThumbnailPass<'a> {
     samples: u32,
     /// The live presentation profile (cinematic 0 / CAD 1), so a thumbnail is graded like the stage.
     render_profile: f32,
+    /// The live working space, for the same reason.
+    working: metrocalk_assets::colour::WorkingSpace,
+    /// And the environment's declared source space, so a thumbnail's reflections match the stage's.
+    env_source: metrocalk_assets::colour::ColourSpace,
     resolve_pipeline: &'a wgpu::RenderPipeline,
     post_samp: &'a wgpu::Sampler,
     post_bgl2: &'a wgpu::BindGroupLayout,
@@ -4345,6 +5430,100 @@ fn lod_level(
     level.min(n_lods)
 }
 
+/// Turn a traced world-space path into the dabs a gesture records.
+///
+/// The same `stroke_run` the committed edit uses, so the live preview and the committed result are the same
+/// geometry — a preview that approximates its own commit is worse than no preview.
+fn strokes_from_path(path: &[[f32; 2]], brush: TerrainBrush) -> Vec<metrocalk_terrain::Stroke> {
+    use metrocalk_terrain::recipe::StrokeKind;
+    let kind = match brush.kind {
+        1 => StrokeKind::Smooth,
+        2 => StrokeKind::Flatten,
+        3 => StrokeKind::Noise,
+        _ => StrokeKind::Raise,
+    };
+    let b = metrocalk_terrain::sculpt::Brush {
+        kind,
+        radius_m: brush.radius_m,
+        strength: brush.strength,
+        hardness: brush.hardness,
+        target_m: brush.target_m,
+        spacing: 0.25,
+    };
+    if path.len() == 1 {
+        return vec![b.dab(path[0][0], path[0][1])];
+    }
+    let mut out = Vec::new();
+    for w in path.windows(2) {
+        out.extend(metrocalk_terrain::sculpt::stroke_run(&b, w[0], w[1]));
+    }
+    out
+}
+
+/// A ring of line segments laid ON the terrain under the cursor, so the brush reads as painting a surface
+/// rather than hovering over one. Sampling the height per segment is what makes it hug a slope.
+fn push_brush_ring(
+    out: &mut Vec<Instance>,
+    centre: [f32; 3],
+    radius_m: f32,
+    rt: &crate::terrain::TerrainRuntime,
+) {
+    const SEGMENTS: usize = 48;
+    const COLOR: [f32; 3] = [1.0, 0.72, 0.22];
+    // A tabulated circle would need 48 entries; the ring is presentation-only and never feeds content, so
+    // trigonometry is fine here (unlike anywhere in the field path).
+    let lift = (radius_m * 0.02).max(0.05);
+    let point = |i: usize| -> [f32; 3] {
+        let a = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        let x = centre[0] + a.cos() * radius_m;
+        let z = centre[2] + a.sin() * radius_m;
+        let y = rt.height_at(x, z).unwrap_or(centre[1]) + lift;
+        [x, y, z]
+    };
+    for i in 0..SEGMENTS {
+        for p in [point(i), point((i + 1) % SEGMENTS)] {
+            out.push(Instance {
+                center: p,
+                scale: 0.0,
+                color: COLOR,
+                selected: 0.0,
+                rotation: IDENTITY_QUAT,
+                material: [0.0; 4],
+            });
+        }
+    }
+}
+
+/// The route being drawn: the committed points joined, a rubber band to the cursor, and a cross at each
+/// point so a single point is still visible.
+fn push_route_preview(out: &mut Vec<Instance>, points: &[[f32; 3]], cursor: Option<[f32; 3]>) {
+    const LINE: [f32; 3] = [0.25, 0.85, 1.0];
+    const MARK: [f32; 3] = [1.0, 0.95, 0.4];
+    let vertex = |p: [f32; 3], c: [f32; 3]| Instance {
+        center: p,
+        scale: 0.0,
+        color: c,
+        selected: 0.0,
+        rotation: IDENTITY_QUAT,
+        material: [0.0; 4],
+    };
+    for w in points.windows(2) {
+        out.push(vertex(w[0], LINE));
+        out.push(vertex(w[1], LINE));
+    }
+    if let (Some(last), Some(c)) = (points.last(), cursor) {
+        out.push(vertex(*last, LINE));
+        out.push(vertex(c, LINE));
+    }
+    for p in points.iter().chain(cursor.iter()) {
+        let m = 1.2;
+        for (dx, dz) in [(m, 0.0), (0.0, m)] {
+            out.push(vertex([p[0] - dx, p[1] + 0.3, p[2] - dz], MARK));
+            out.push(vertex([p[0] + dx, p[1] + 0.3, p[2] + dz], MARK));
+        }
+    }
+}
+
 /// Build the Pipe Forge route overlay as line-list endpoint pairs. Kept pure for interaction regression
 /// tests: N points produce N-1 route segments and three small axis marks at every control point.
 fn pipe_graph_preview_vertices(
@@ -4383,7 +5562,158 @@ fn pipe_graph_preview_vertices(
 }
 
 #[cfg(test)]
+mod colour_policy_tests {
+    use super::{Role, TextureSemantic};
+
+    #[test]
+    fn the_upload_treatment_comes_from_the_colour_policy_and_still_matches_what_the_gpu_needs() {
+        // Light decodes; measurements do not. This is the assertion that stops a policy edit from
+        // quietly handing a roughness map an sRGB decode — the failure nobody traces back.
+        assert_eq!(
+            TextureSemantic::for_role(Role::BaseColour),
+            TextureSemantic::Color
+        );
+        assert_eq!(
+            TextureSemantic::for_role(Role::Emissive),
+            TextureSemantic::Color
+        );
+
+        assert_eq!(
+            TextureSemantic::for_role(Role::MetallicRoughness),
+            TextureSemantic::Data
+        );
+        assert_eq!(
+            TextureSemantic::for_role(Role::Occlusion),
+            TextureSemantic::Data
+        );
+        assert_eq!(TextureSemantic::for_role(Role::Mask), TextureSemantic::Data);
+
+        // Raw as far as the transfer function goes, and renormalised when mipped.
+        assert_eq!(
+            TextureSemantic::for_role(Role::Normal),
+            TextureSemantic::Normal
+        );
+    }
+
+    #[test]
+    fn only_the_srgb_space_reaches_the_srgb_hardware_path() {
+        use metrocalk_assets::colour::{infer_for_role, ColourSpace};
+        // The invariant, stated over the policy rather than over a hand-listed set of roles: a role is
+        // uploaded as `Color` if and only if the policy says it is sRGB. If someone adds a role, or
+        // changes what an existing one is tagged as, this still holds them to it.
+        for role in [
+            Role::BaseColour,
+            Role::Emissive,
+            Role::Normal,
+            Role::MetallicRoughness,
+            Role::Occlusion,
+            Role::Mask,
+            Role::Environment,
+        ] {
+            let is_srgb = infer_for_role(role).space == ColourSpace::Srgb;
+            let decodes = TextureSemantic::for_role(role) == TextureSemantic::Color;
+            assert_eq!(
+                decodes, is_srgb,
+                "{role:?} disagrees with the colour policy"
+            );
+        }
+    }
+
+    #[test]
+    fn role_to_gpu_format_is_covered_end_to_end() {
+        use super::texture_format;
+        use metrocalk_assets::colour::{infer_for_role, ColourSpace};
+
+        // The chain that actually matters: role -> policy -> semantic -> GPU FORMAT. The previous
+        // version of this test stopped at the semantic and never touched the format, so flipping the
+        // comparison inside `upload_tex` would have handed every data map a hardware sRGB decode with
+        // this test still passing. It asserts the last link now.
+        for role in [
+            Role::BaseColour,
+            Role::Emissive,
+            Role::Normal,
+            Role::MetallicRoughness,
+            Role::Occlusion,
+            Role::Mask,
+            Role::Environment,
+        ] {
+            let format = texture_format(TextureSemantic::for_role(role));
+            let expected = if infer_for_role(role).space == ColourSpace::Srgb {
+                wgpu::TextureFormat::Rgba8UnormSrgb
+            } else {
+                wgpu::TextureFormat::Rgba8Unorm
+            };
+            assert_eq!(format, expected, "{role:?} reached the wrong GPU format");
+        }
+
+        // And spelled out literally, so the test STATES the invariant rather than only deriving it: if
+        // both sides of the loop above were wrong in the same way, these still catch it.
+        assert_eq!(
+            texture_format(TextureSemantic::Color),
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        );
+        assert_eq!(
+            texture_format(TextureSemantic::Data),
+            wgpu::TextureFormat::Rgba8Unorm
+        );
+        assert_eq!(
+            texture_format(TextureSemantic::Normal),
+            wgpu::TextureFormat::Rgba8Unorm
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
+
+    // ── cursor coordinate spaces ──────────────────────────────────────────────────────────────
+    #[test]
+    fn the_cursor_fraction_is_client_relative_not_desktop_relative() {
+        use super::surface_fraction;
+        let pos = |x: f64, y: f64| Some(tauri::PhysicalPosition::new(x, y));
+
+        // A window whose client area starts 600 px from the desktop's left edge. The cursor at the
+        // client area's exact centre must read as (0.5, 0.5) — the previous code divided the RAW
+        // desktop position by the surface size and got (0.8125, 0.9629), so a gizmo drag applied a
+        // movement computed for a completely different part of the scene.
+        let f = surface_fraction(pos(1240.0, 620.0), Some((600.0, 350.0)), 1280, 540)
+            .expect("a cursor position");
+        assert!(
+            (f.0 - 0.5).abs() < 1e-6 && (f.1 - 0.5).abs() < 1e-6,
+            "got {f:?}"
+        );
+
+        // The old (wrong) arithmetic, kept explicit so the regression is legible rather than implied.
+        let wrong = (1240.0_f32 / 1280.0, 620.0_f32 / 540.0);
+        assert!(
+            (wrong.0 - f.0).abs() > 0.3,
+            "the desktop-relative reading really is far off ({wrong:?} vs {f:?})"
+        );
+
+        // Corners map to the corners.
+        assert_eq!(
+            surface_fraction(pos(600.0, 350.0), Some((600.0, 350.0)), 1280, 540),
+            Some((0.0, 0.0))
+        );
+        assert_eq!(
+            surface_fraction(pos(1880.0, 890.0), Some((600.0, 350.0)), 1280, 540),
+            Some((1.0, 1.0))
+        );
+        // A window at the desktop origin is unaffected, which is exactly why this survived.
+        assert_eq!(
+            surface_fraction(pos(640.0, 270.0), Some((0.0, 0.0)), 1280, 540),
+            Some((0.5, 0.5))
+        );
+        // No cursor ⇒ no answer; an unknown client origin falls back rather than dropping the input.
+        assert_eq!(surface_fraction(None, Some((0.0, 0.0)), 1280, 540), None);
+        assert_eq!(
+            surface_fraction(pos(640.0, 270.0), None, 1280, 540),
+            Some((0.5, 0.5))
+        );
+        // A zero-sized surface must not divide by zero.
+        let degenerate = surface_fraction(pos(10.0, 10.0), None, 0, 0).expect("still answers");
+        assert!(degenerate.0.is_finite() && degenerate.1.is_finite());
+    }
 
     // ── the HDR pipeline: colour space, formats, routing, shader contracts ────────────────────
     // These exist because the previous pipeline's defects were all invisible to a compiler and to a
@@ -4415,6 +5745,408 @@ mod tests {
         // Truncate at THIS module, not at the first `#[cfg(test)]` — several colour helpers above are
         // test-only too, and cutting at the first one hid the pipeline factories from the scan entirely.
         src.find("mod tests {").map_or(src, |at| &src[..at])
+    }
+
+    // ── the working space ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn every_shader_compiles_and_validates() {
+        // Until now nothing in CI could see a WGSL mistake: the shaders are `include_str!`, so
+        // `cargo check` reads them as string literals and the first real parse happens at device
+        // creation, on a machine with a GPU. Every colour conversion in this work is WGSL, so that gap
+        // had to close with it. naga is the same compiler wgpu uses, at wgpu's own version.
+        for (name, src) in [
+            ("scene.wgsl", SHADER),
+            ("post.wgsl", POST),
+            ("ssao.wgsl", SSAO_SRC),
+        ] {
+            let module = naga::front::wgsl::parse_str(src)
+                .unwrap_or_else(|e| panic!("{name} does not parse:\n{}", e.emit_to_string(src)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::default(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name} does not validate: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn the_uniform_layouts_the_shaders_declare_fit_the_buffer_the_renderer_writes() {
+        // A shader may declare a PREFIX of the uniform — that is deliberate, and it is what stops the
+        // scene pass from being able to name the inverse conversion. What it may never do is declare
+        // MORE than the renderer writes, which wgpu rejects at draw with a message that names a byte
+        // count and nothing else. Checking it here turns that into a sentence.
+        let full = std::mem::size_of::<Camera>();
+        for (name, src, expect) in [
+            // 3 mat4 (192) + 3 vec4 (48) + the two ingress mat3s, column-padded (48 each).
+            ("scene.wgsl", SHADER, 336),
+            // ...the same, plus the egress mat3 (48) and the luma vec4 (16) — the whole block.
+            ("post.wgsl", POST, 400),
+            // No colour block at all.
+            ("ssao.wgsl", SSAO_SRC, 240),
+        ] {
+            let module = naga::front::wgsl::parse_str(src).expect("parses");
+            let cam = module
+                .types
+                .iter()
+                .find(|(_, t)| t.name.as_deref() == Some("Camera"))
+                .expect("every one of these declares a Camera");
+            let naga::TypeInner::Struct { span, .. } = cam.1.inner else {
+                panic!("{name}'s Camera is not a struct");
+            };
+            assert_eq!(
+                span as usize, expect,
+                "{name} declares a {span}-byte Camera; the renderer writes {full}"
+            );
+            assert!(
+                span as usize <= full,
+                "{name} declares MORE uniform than the renderer writes — wgpu rejects this at draw"
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_rec709_is_the_identity_transform() {
+        // The load-bearing property of the whole design: adopting a working space changes NOTHING
+        // until someone selects a different one. If this drifts, every "before" capture in the
+        // repository stops being comparable to every "after" one.
+        let c = ColourUniform::new(
+            metrocalk_assets::colour::WorkingSpace::LinearRec709,
+            metrocalk_assets::colour::ColourSpace::LinearRec709,
+        );
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        assert_eq!(c.to_working, identity, "Rec.709 ingress must be untouched");
+        assert_eq!(c.from_working, identity, "Rec.709 egress must be untouched");
+        assert_eq!(
+            [c.luma[0], c.luma[1], c.luma[2]],
+            metrocalk_assets::colour::REC709_LUMINANCE
+        );
+        assert_eq!(c.luma[3], 0.0, "the 'non-Rec.709' flag must be off");
+    }
+
+    #[test]
+    fn acescg_converts_ingress_and_returns_it_exactly() {
+        use metrocalk_assets::colour::{apply, WorkingSpace};
+        let w = WorkingSpace::AcesCg;
+        let c = ColourUniform::new(w, metrocalk_assets::colour::ColourSpace::LinearRec709);
+        assert_ne!(c.to_working[0][0], 1.0, "AP1 ingress must actually convert");
+        assert_eq!(c.luma[3], 1.0, "the 'non-Rec.709' flag must be on");
+        // The AP1 luminance weights, not Rec.709's. Metering AP1 values with Rec.709's coefficients is
+        // the working-space bug that reads as a mis-tuned bloom threshold.
+        assert_eq!(
+            [c.luma[0], c.luma[1], c.luma[2]],
+            metrocalk_assets::colour::AP1_LUMINANCE
+        );
+        // And the round trip is what makes an authored colour survive: in → shade → out returns the
+        // value the author picked, so switching working space cannot shift a neutral.
+        for probe in [[0.18, 0.18, 0.18], [0.8, 0.2, 0.05], [6.0, 3.0, 0.5]] {
+            let there = apply(w.from_rec709(), probe);
+            let back = apply(w.to_rec709(), there);
+            for i in 0..3 {
+                assert!(
+                    (back[i] - probe[i]).abs() < 2e-3,
+                    "channel {i}: {} → {} → {}",
+                    probe[i],
+                    there[i],
+                    back[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_camera_uniform_carries_the_matrix_in_wgsl_column_order() {
+        // A transposed primaries matrix is the worst kind of wrong: it still produces a plausible
+        // picture. WGSL wants columns; the module writes rows so a reviewer can compare it against the
+        // published table. This pins the one function that bridges them.
+        use metrocalk_assets::colour::{wgsl_mat3, REC709_TO_AP1};
+        let cols = wgsl_mat3(REC709_TO_AP1);
+        for r in 0..3 {
+            for c in 0..3 {
+                assert!(
+                    (cols[c][r] - REC709_TO_AP1[r][c]).abs() < 1e-9,
+                    "column {c} row {r} is not the transpose"
+                );
+            }
+        }
+        for c in &cols {
+            assert_eq!(c[3], 0.0, "each mat3 column pads to a vec4");
+        }
+    }
+
+    #[test]
+    fn every_scene_colour_ingress_is_converted_before_lighting() {
+        // A SOURCE CONTRACT, because the alternative is a screenshot no one re-reads. Each of these is
+        // a place where colour enters the shader; if any of them stops going through `to_working`, the
+        // renderer is mixing two colour spaces in one BRDF and the picture is subtly wrong everywhere.
+        let code = wgsl_code(SHADER);
+        for (what, needle) in [
+            (
+                "base colour",
+                "to_working(textureSample(base_color_tex, base_color_samp, in.uv).rgb * in.base_color)",
+            ),
+            ("light colour", "to_working(lt.color_intensity.xyz)"),
+            ("the sky backdrop", "env_to_working(hdr)"),
+        ] {
+            assert!(
+                code.contains(needle),
+                "{what} no longer enters through the working-space conversion"
+            );
+        }
+        // Count the two conversions separately — "env_to_working(" contains "to_working(", so a naive
+        // count double-counts and would keep passing after a real ingress was dropped.
+        let env_total = code.matches("env_to_working(").count();
+        let env_calls = env_total - code.matches("fn env_to_working(").count();
+        let plain_calls = code.matches("to_working(").count()
+            - env_total
+            - code.matches("fn to_working(").count();
+        assert_eq!(
+            env_calls, 3,
+            "the environment enters in exactly three places — the sky backdrop, the diffuse irradiance \
+             and the specular reflection — and all three must read the SAME declared source space"
+        );
+        assert_eq!(
+            plain_calls, 3,
+            "expected exactly three Rec.709 ingress conversions: base colour, light colour, and the \
+             shared unlit authored path"
+        );
+        // The unlit path converts INSIDE the shared helper, so no caller can forget it.
+        assert!(
+            code.contains("return to_working(clamp(exposed,"),
+            "the unlit authored path must convert inside `unlit_srgb_at_exposure`, not at its callers"
+        );
+    }
+
+    #[test]
+    fn the_scene_pass_never_leaves_the_working_space() {
+        // The other half: nothing in the scene shader converts BACK. Egress is post.wgsl's job, once.
+        let code = wgsl_code(SHADER);
+        assert!(
+            !code.contains("from_working"),
+            "the scene pass must not even DECLARE the inverse — see the note on its Camera struct: a \
+             field it cannot name is a rule it cannot break"
+        );
+        assert!(
+            !code.contains("cam.luma"),
+            "metering brightness is the post chain's job, in the post chain's space"
+        );
+        // The FORWARD curves must not appear. The INVERSE ones legitimately do — that is how an
+        // authored chrome colour is placed in the scene so it renders back as itself — so the count has
+        // to discount them rather than banning the substring, which is why this is subtraction and not
+        // a `contains`.
+        for curve in ["tonemap_aces(", "tonemap_pbr_neutral("] {
+            let forward =
+                code.matches(curve).count() - code.matches(&format!("inverse_{curve}")).count();
+            assert_eq!(
+                forward, 0,
+                "the scene pass calls {curve} — the output transform has exactly one owner, and it is \
+                 post.wgsl's fs_resolve"
+            );
+        }
+        assert!(
+            !code.contains("to_srgb("),
+            "the scene pass must not encode for display: MSAA would then resolve gamma-encoded samples"
+        );
+    }
+
+    #[test]
+    fn the_output_transform_happens_exactly_once_and_after_the_working_space_conversion() {
+        let code = wgsl_code(POST);
+        // Exactly one conversion out of the working space, and it is bound to the view input.
+        assert_eq!(
+            code.matches("cam.from_working").count(),
+            1,
+            "the working space is left exactly once"
+        );
+        let seam = code
+            .find("let view_input = cam.from_working * composed;")
+            .expect("the seam must be the named line the comment describes");
+        // Both curves are CALLED only after that line — the ordering claim, checked by position rather
+        // than by trusting the comment above it.
+        for curve in [
+            "tonemap_pbr_neutral(view_input)",
+            "tonemap_aces(view_input)",
+        ] {
+            let at = code.find(curve).expect("both curves run on the view input");
+            assert!(
+                at > seam,
+                "{curve} must run AFTER the conversion out of the working space"
+            );
+        }
+        // One display encode, guarded by the surface-format answer, and nothing else encodes.
+        assert_eq!(
+            code.matches("to_srgb(").count(),
+            2,
+            "one definition, one call"
+        );
+        // Bloom meters with the working space's own weights, not a hard-coded Rec.709 triple.
+        assert!(
+            code.contains("dot(c, cam.luma.xyz)"),
+            "luminance must come from the working space"
+        );
+        assert!(
+            !code.contains("0.2126"),
+            "a hard-coded Rec.709 luminance triple is exactly the bug this replaced"
+        );
+    }
+
+    #[test]
+    fn the_presentation_default_matches_the_renderer() {
+        // Two crates hold the same default (the assets crate cannot depend on the shell). A drift here
+        // would mean a restored project renders at a different exposure than a fresh one.
+        assert!(
+            (metrocalk_assets::colour::PresentationState::default().exposure - DEFAULT_EXPOSURE)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn the_presentation_hash_moves_with_every_dimension_that_changes_the_picture() {
+        let mut st = SceneState::default();
+        let base = st.presentation().hash();
+        st.working_space = metrocalk_assets::colour::WorkingSpace::AcesCg;
+        let working = st.presentation().hash();
+        assert_ne!(base, working, "the working space changes the picture");
+        st.render_profile = 1.0;
+        let view = st.presentation().hash();
+        assert_ne!(working, view, "the view transform changes the picture");
+        st.exposure = 1.7;
+        assert_ne!(
+            view,
+            st.presentation().hash(),
+            "exposure changes the picture"
+        );
+        // And it is stable: the same state hashes the same, or every thumbnail misses forever.
+        let again = st.presentation().hash();
+        st.exposure = 1.7;
+        assert_eq!(again, st.presentation().hash());
+    }
+
+    // ── generation-safe thumbnails ────────────────────────────────────────────────────────────────
+
+    /// Stand in for the render thread: answer request `req` with `png`, rendered in `state`.
+    fn service(st: &mut SceneState, id: &str, req: u64, state: u64, png: Option<Vec<u8>>) {
+        st.thumb_results.push(ThumbResult {
+            id: id.into(),
+            req,
+            state,
+            png,
+        });
+    }
+
+    #[test]
+    fn a_delayed_render_can_never_satisfy_the_request_that_replaced_it() {
+        // THE named race, reproduced exactly: request N is in flight, its caller times out, N+1 is
+        // made, and only THEN does N finish. Before request identity, N's image was sitting in the
+        // id-keyed slot and N+1 took it.
+        let mut st = SceneState::default();
+        let (n, n_state) = st.request_thumbnail("cube", 64);
+        // ...N's caller gives up (the 600 ms cap) and asks again.
+        let (n1, n1_state) = st.request_thumbnail("cube", 64);
+        assert_ne!(n, n1, "each request has its own identity");
+        // Now the ORIGINAL render lands.
+        service(&mut st, "cube", n, n_state, Some(vec![1, 2, 3]));
+        assert_eq!(
+            st.take_thumbnail(n1, n1_state),
+            ThumbTake::Pending,
+            "N+1 must not be satisfied by N's image"
+        );
+        // N+1's own render lands, and it gets that one.
+        service(&mut st, "cube", n1, n1_state, Some(vec![9, 9, 9]));
+        assert_eq!(
+            st.take_thumbnail(n1, n1_state),
+            ThumbTake::Ready(vec![9, 9, 9])
+        );
+    }
+
+    #[test]
+    fn a_timed_out_result_is_not_eligible_for_anyone() {
+        let mut st = SceneState::default();
+        let (n, n_state) = st.request_thumbnail("cube", 64);
+        service(&mut st, "cube", n, n_state, Some(vec![1]));
+        // Its caller already returned None. A LATER request for the same entity must not find it.
+        let (n1, n1_state) = st.request_thumbnail("cube", 64);
+        assert_eq!(st.take_thumbnail(n1, n1_state), ThumbTake::Pending);
+        // The orphan ages out of the capped list; it never becomes anyone's answer.
+        assert_eq!(st.thumb_results.len(), 1);
+    }
+
+    #[test]
+    fn a_render_whose_state_moved_underneath_it_fails_explicitly() {
+        // The A/B/A case. Ask under view A; the user switches to B before the render is serviced; the
+        // picture that arrives is of B. Returning it would report B's colours as A's.
+        let mut st = SceneState::default();
+        let (req, want) = st.request_thumbnail("cube", 64);
+        st.render_profile = 1.0; // the view transform changed while it rendered
+        let rendered_in = st.presentation().hash();
+        assert_ne!(want, rendered_in);
+        service(&mut st, "cube", req, rendered_in, Some(vec![7]));
+        assert_eq!(
+            st.take_thumbnail(req, want),
+            ThumbTake::StateMoved,
+            "an image of another state must be reported, never returned"
+        );
+    }
+
+    #[test]
+    fn an_entity_with_no_picture_is_answered_immediately_and_distinguishably() {
+        let mut st = SceneState::default();
+        let (req, want) = st.request_thumbnail("a-light", 64);
+        service(&mut st, "a-light", req, want, None);
+        assert_eq!(
+            st.take_thumbnail(req, want),
+            ThumbTake::NoImage,
+            "'no picture exists' must be distinguishable from 'not yet' and from 'wrong state'"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_request_collapses_but_never_steals_a_pending_answer() {
+        let mut st = SceneState::default();
+        let (first, first_state) = st.request_thumbnail("cube", 64);
+        st.request_thumbnail("cube", 64);
+        assert_eq!(
+            st.thumb_requests.len(),
+            1,
+            "a polling caller must not queue a backlog"
+        );
+        // The first caller is still waiting. Its answer arrives and remains ITS answer.
+        service(&mut st, "cube", first, first_state, Some(vec![4]));
+        assert_eq!(
+            st.take_thumbnail(first, first_state),
+            ThumbTake::Ready(vec![4])
+        );
+    }
+
+    #[test]
+    fn a_view_change_never_touches_the_document() {
+        // Presentation is not scene truth. This is a structural claim: `set_presentation` writes only
+        // render-state fields, and the scan below is what keeps it that way when someone adds a field.
+        let src = renderer_source();
+        let body = src
+            .split("pub fn set_presentation(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("set_presentation exists");
+        for banned in [
+            "commit",
+            "revision",
+            "dirty",
+            "undo",
+            "log.append",
+            "tx.send",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "set_presentation must not touch `{banned}` — a viewing choice is not a document edit"
+            );
+        }
     }
 
     #[test]
@@ -4713,7 +6445,7 @@ mod tests {
         // background — none of them touch it. What the background MUST do is behave like content: render
         // as authored at the default exposure, and brighten with the frame as the exposure comes up.
         for cad in [false, true] {
-            let c = clear_color(cad);
+            let c = clear_color(cad, metrocalk_assets::colour::WorkingSpace::LinearRec709);
             assert!(c.a == 1.0, "the viewport background is opaque");
             #[allow(clippy::cast_possible_truncation)]
             let scene = [c.r as f32, c.g as f32, c.b as f32];

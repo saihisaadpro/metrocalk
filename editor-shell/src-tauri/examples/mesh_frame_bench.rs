@@ -31,11 +31,38 @@ struct Instance {
     selected: f32,
 }
 
+/// The camera uniform, laid out to match `src/scene.wgsl` — which is the shader this bench compiles,
+/// so a mismatch is not a style question.
+///
+/// It was `{ view_proj }` alone, 64 bytes, while the shader had grown to declare 336: wgpu rejects a
+/// bind group whose buffer is smaller than the declared struct, so this bench could not have produced a
+/// frame since the Camera last grew. Restated in full here rather than shared with the renderer,
+/// because an example must not need the binary's private types — and pinned by the assertion below, so
+/// the next person to add a field finds out here instead of in a runtime panic.
+///
+/// The colour block matters: `to_working`/`env_to_working` are matrices the shader MULTIPLIES every
+/// colour by, so leaving them zeroed (the tempting `..Default::default()`) renders a black frame that
+/// looks like a lighting bug. They are the identity here — this bench renders in linear Rec.709.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Camera {
     view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    light_view_proj: [[f32; 4]; 4],
+    focus: [f32; 4],
+    shadow: [f32; 4],
+    grid: [f32; 4],
+    to_working: [[f32; 4]; 3],
+    env_to_working: [[f32; 4]; 3],
 }
+const _: () = assert!(std::mem::size_of::<Camera>() == 336);
+
+/// The identity, in the WGSL column-padded layout.
+const IDENTITY_MAT3: [[f32; 4]; 3] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+];
 
 const CUBE_INDICES: [u16; 36] = [
     0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6, 0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4, 2, 6,
@@ -259,8 +286,18 @@ async fn run() {
         std::slice::from_ref(&mesh_vbl),
     );
 
+    let view_proj = camera_matrix(0.7, 0.42, 30.0, W as f32 / H as f32);
     let cam = Camera {
-        view_proj: camera_matrix(0.7, 0.42, 30.0, W as f32 / H as f32).to_cols_array_2d(),
+        view_proj: view_proj.to_cols_array_2d(),
+        inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+        // No shadow caster: identity light-VP puts every lookup outside the unit cube ⇒ unshadowed.
+        light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+        focus: [0.0; 4],
+        // `.x` = -1 (no shadow caster), `.y` = exposure, `.z` = cinematic profile, `.w` = quality 0.
+        shadow: [-1.0, 0.45, 0.0, 0.0],
+        grid: [0.0, 0.0, 30.0, 0.0],
+        to_working: IDENTITY_MAT3,
+        env_to_working: IDENTITY_MAT3,
     };
     queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cam));
 
@@ -350,8 +387,11 @@ async fn run() {
     // The timing above is the representative real-mesh scene; this frame makes the meshes legible —
     // the point being that a described/placed object renders as its mesh (a framed health-bar, a
     // faceted octahedron prop), not a placeholder cube.
+    let show_view_proj = camera_matrix(1.45, 0.2, 22.0, W as f32 / H as f32);
     let show_cam = Camera {
-        view_proj: camera_matrix(1.45, 0.2, 22.0, W as f32 / H as f32).to_cols_array_2d(),
+        view_proj: show_view_proj.to_cols_array_2d(),
+        inv_view_proj: show_view_proj.inverse().to_cols_array_2d(),
+        ..cam
     };
     queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&show_cam));
     let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -577,7 +617,12 @@ fn bgl(device: &wgpu::Device, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLay
         label: None,
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
+            // VERTEX_FRAGMENT, matching `render.rs`'s `cam_bgl`. The fragment stage of `scene.wgsl`
+            // reads the camera — for the exposure and profile the unlit paths invert against, and now
+            // for the working-space matrix — so a VERTEX-only layout fails pipeline creation with
+            // "Visibility flags don't include the shader stage". The live renderer has been
+            // VERTEX_FRAGMENT since the PBR path landed; this bench had not followed.
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty,
                 has_dynamic_offset: false,
@@ -635,7 +680,15 @@ fn pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            // The fragment entry is PAIRED with the vertex one rather than hard-coded to `fs_main`.
+            // `vs_grid` grew its own varyings (a GridOut carrying a world position, not a colour), so
+            // pairing it with `fs_main` fails pipeline creation with "Location[0] ... is not compatible
+            // with the provided Float32x2" — which is what this bench had been doing since the grid
+            // was reworked, and is why it could not produce a frame.
+            entry_point: Some(match vs {
+                "vs_grid" => "fs_grid",
+                _ => "fs_main",
+            }),
             targets: &[Some(format.into())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }),
