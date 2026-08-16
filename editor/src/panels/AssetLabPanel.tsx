@@ -139,7 +139,7 @@ export interface AssetBakeConfig {
 }
 
 export interface AssetExportConfig {
-  format: "glb" | "usda";
+  format: "glb" | "usda" | "step";
   scope: "scene" | "asset";
 }
 
@@ -346,7 +346,7 @@ export function AssetLabPanel({
   if (!asset) {
     return (
       <WorkspacePanel
-        title="Asset Lab"
+        title="Model"
         subtitle="Production preparation"
         icon="R"
         className="asset-lab"
@@ -356,7 +356,7 @@ export function AssetLabPanel({
           data-testid="asset-lab-empty"
           icon="R"
           title="Select one mesh asset"
-          description="Asset Lab audits and produces a reviewable derivative. It never overwrites the source asset."
+          description="Model audits and produces a reviewable derivative. It never overwrites the source asset."
           primaryAction={
             onChooseAsset ? (
               <Button variant="primary" onClick={onChooseAsset} data-testid="asset-lab-choose">
@@ -371,7 +371,7 @@ export function AssetLabPanel({
 
   return (
     <WorkspacePanel
-      title="Asset Lab"
+      title="Model"
       subtitle={`${asset.name}${asset.source ? ` / ${asset.source}` : ""}`}
       icon="R"
       className="asset-lab"

@@ -12,7 +12,7 @@ import { useReveal } from "../store/reveal";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Button, Badge } from "../theme/primitives";
-import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { color, font, fontSize, radius, space, text } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 
 const meta: React.CSSProperties = { font: font.ui, fontSize: fontSize.meta, color: color.text.muted };
@@ -33,7 +33,7 @@ export function Diagnostics({ client }: { client: EditorClient }) {
   const greyed = reveal.greyed;
 
   const title = (
-    <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, marginBottom: space.sm, font: font.ui, fontSize: fontSize.meta, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: color.text.secondary }}>
+    <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, marginBottom: space.sm, ...text.eyebrow }}>
       <span>Diagnostics</span>
       {needs && <Badge tone="warn">1</Badge>}
     </div>

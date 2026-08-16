@@ -22,6 +22,9 @@ import { setStatus } from "../store/ui";
 import { Button } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import { DisclosureSection, EmptyPanelState } from "../theme/workspace";
+import { RolesSection } from "./RolesSection";
+import { CinemaSection } from "./CinemaSection";
+import { VfxSection } from "./VfxSection";
 import type { CookDiagnostic, MatchStatus, MatchValidation } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 
@@ -220,7 +223,10 @@ export function MatchPanel({ client }: { client: EditorClient }) {
   // ── not a match scene yet ────────────────────────────────────────────────────────────────────────────
   if (!validation.is_match_scene) {
     return (
-      <div style={{ padding: space.md }}>
+      <div style={{ padding: space.md, display: "flex", flexDirection: "column", gap: space.md }}>
+        <RolesSection client={client} />
+        <CinemaSection client={client} />
+        <VfxSection client={client} />
         <EmptyPanelState
           icon="⚔"
           title="This scene doesn't have a match yet"
@@ -265,6 +271,9 @@ export function MatchPanel({ client }: { client: EditorClient }) {
 
   return (
     <div style={{ padding: space.md, display: "flex", flexDirection: "column", gap: space.md }}>
+      <RolesSection client={client} />
+      <CinemaSection client={client} />
+      <VfxSection client={client} />
       {/* ── the authored scene ─────────────────────────────────────────────────────────────────────── */}
       <section>
         <h3 style={{ margin: `0 0 ${space.xs}`, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>

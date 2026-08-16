@@ -188,7 +188,7 @@ test("Bake Asset returns the complete build report to the host", async () => {
   expect(screen.queryByTestId("pipe-forge-active")).toBeNull();
   expect(screen.queryByTestId("pipe-forge-setup")).toBeNull();
   expect(screen.getByTestId("pipe-forge-start").textContent).toContain("Draw another pipe");
-  expect(screen.getByText(/Asset Lab is open below/)).toBeTruthy();
+  expect(screen.getByText(/Model is open below/)).toBeTruthy();
 });
 
 test("Cancel ends the tool with the returned authoritative status", async () => {

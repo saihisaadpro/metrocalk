@@ -1,11 +1,19 @@
-//! The editor's stable information architecture. Scene navigation and creation live on the left;
-//! selection-context properties, relationships, and physics live on the right. Feature panels retain
-//! their own state while tabs use predictable ARIA semantics and keyboard navigation.
+//! The editor's stable information architecture.
+//!
+//! **One rule, and it is the whole design:** the LEFT column is the sub-engine you are working in (chosen
+//! from the Engines rail — see `EngineRail`), and the RIGHT column is the thing you have selected. Nothing
+//! else moves. Before this, terrain was a right-hand tab, animation was at the bottom and physics was on the
+//! right, which made the docks *positions* rather than categories — an author could not predict where
+//! anything lived.
+//!
+//! The left dock therefore has no tab strip of its own: the rail is its tab strip, and duplicating it here
+//! would re-create the ambiguity this layout exists to remove.
 
 import { lazy, useRef, useState } from "react";
 import { AssetBrowser } from "../panels/AssetBrowser";
 import { AuthoringToolbar } from "../panels/AuthoringToolbar";
 import { DescribeBar } from "../panels/DescribeBar";
+import { ShapeStudio } from "../panels/ShapeStudio";
 import { Hierarchy } from "../panels/Hierarchy";
 import { Requirers } from "../panels/Requirers";
 import { Reveal } from "../panels/Reveal";
@@ -16,6 +24,7 @@ import { color } from "../theme/tokens";
 import { useEntityOrder, useSelectedId } from "../store/projection";
 import type { EditorClient } from "../transport/session";
 import { LazyWorkspace } from "./LazyWorkspace";
+import { TerrainPanel } from "../panels/TerrainPanel";
 
 const Diagnostics = lazy(() => import("../panels/Diagnostics").then((module) => ({ default: module.Diagnostics })));
 const AiEditPanel = lazy(() => import("../panels/AiEditPanel").then((module) => ({ default: module.AiEditPanel })));
@@ -24,15 +33,19 @@ const PhysicsPanel = lazy(() => import("../panels/PhysicsPanel").then((module) =
 const MatchPanel = lazy(() => import("../panels/MatchPanel").then((module) => ({ default: module.MatchPanel })));
 const TransformPanel = lazy(() => import("../panels/TransformPanel").then((module) => ({ default: module.TransformPanel })));
 const Inspector = lazy(() => import("../inspector/Inspector").then((module) => ({ default: module.Inspector })));
+const BehaviourSection = lazy(() => import("../panels/BehaviourSection").then((module) => ({ default: module.BehaviourSection })));
 const BindingGraph = lazy(() => import("../graph/BindingGraph").then((module) => ({ default: module.BindingGraph })));
 
-export type LeftWorkspace = "scene" | "create";
-export type InspectorWorkspace = "properties" | "relations" | "physics" | "match";
+/// The sub-engines whose workspace is a side panel (a stack of controls). The wide ones — model, import,
+/// animate, logic — open in the bottom dock instead, because a timeline needs width.
+export type LeftWorkspace = "scene" | "build" | "terrain" | "physics" | "gameplay";
+/// The Inspector answers ONE question — "what is selected?" — so it holds only selection-scoped surfaces.
+/// Terrain, physics and match used to live here and are systems, not selections; they moved to the rail.
+export type InspectorWorkspace = "properties" | "relations";
 
 export interface LeftDockProps {
   client: EditorClient;
   active: LeftWorkspace;
-  onChange: (workspace: LeftWorkspace) => void;
   onContextMenu: (id: string, x: number, y: number) => void;
   onStartPipe: () => void;
   onImport: () => void;
@@ -100,31 +113,46 @@ function NeedsAttentionPopup() {
   );
 }
 
-export function LeftDock({ client, active, onChange, onContextMenu, onStartPipe, onImport, onCollapse, onPin }: LeftDockProps) {
+/** Title and subtitle for the side engine currently open, so the panel always says where you are. */
+function sideEngineChrome(active: LeftWorkspace, entities: number, selected: string | null) {
+  switch (active) {
+    case "scene":
+      return { title: "Scene", subtitle: `${entities.toLocaleString("en-GB")} objects` };
+    case "build":
+      return { title: "Build", subtitle: "Shapes, drawing and the asset library" };
+    case "terrain":
+      return { title: "Terrain", subtitle: "Landscape, water and vegetation" };
+    case "physics":
+      return { title: "Physics", subtitle: selected ? "Simulation and collision" : "Whole-scene simulation" };
+    case "gameplay":
+      return { title: "Gameplay", subtitle: "Author and run this scene as a match" };
+  }
+}
+
+export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport, onCollapse, onPin }: LeftDockProps) {
   const entities = useEntityOrder();
-  const tabs = [
-    { id: "scene", label: "Scene", icon: "▱", badge: entities.length, tooltip: "Navigate, select and organize scene objects" },
-    { id: "create", label: "Create", icon: "＋", tooltip: "Add local assets and procedural geometry" },
-  ] as const;
+  const selected = useSelectedId();
+  const chrome = sideEngineChrome(active, entities.length, selected);
   return (
     <WorkspacePanel
       data-testid="left-dock"
-      title={active === "scene" ? "Scene" : "Create"}
-      subtitle={active === "scene" ? `${entities.length.toLocaleString("en-GB")} objects` : "Local tools and asset library"}
+      title={chrome.title}
+      subtitle={chrome.subtitle}
       actions={active === "scene" || onCollapse || onPin ? (
         <>
           {active === "scene" && <NeedsAttentionPopup />}
           {(onCollapse || onPin) && <DockChromeAction label="left" onCollapse={onCollapse} onPin={onPin} />}
         </>
       ) : undefined}
-      actionsLabel="Scene and dock actions"
+      actionsLabel="Workspace actions"
       scroll={false}
-      tabs={<DockTabs id="left-workspaces" ariaLabel="Scene workspaces" tabs={tabs} activeId={active} onChange={(id) => onChange(id as LeftWorkspace)} />}
     >
+      {/* Each panel is a `tabpanel` of the RAIL's `tablist`. That is what makes the rail and this column one
+          control rather than two that happen to agree with each other. */}
       <div
-        id="left-workspaces-scene-panel"
+        id="engine-panel-scene"
         role="tabpanel"
-        aria-labelledby="left-workspaces-scene-tab"
+        aria-labelledby="engine-tab-scene"
         hidden={active !== "scene"}
         className="mtk-dock-panel"
       >
@@ -132,14 +160,16 @@ export function LeftDock({ client, active, onChange, onContextMenu, onStartPipe,
         <div className="mtk-dock-panel__fill"><Hierarchy client={client} onContextMenu={onContextMenu} /></div>
       </div>
       <div
-        id="left-workspaces-create-panel"
+        id="engine-panel-build"
         role="tabpanel"
-        aria-labelledby="left-workspaces-create-tab"
-        hidden={active !== "create"}
+        aria-labelledby="engine-tab-build"
+        hidden={active !== "build"}
         className="mtk-dock-panel mtk-scroll"
       >
+        <ShapeStudio client={client} />
+        <div className="mtk-dock-section-heading">Other tools</div>
         <div className="mtk-quick-create" role="group" aria-label="Quick creation tools">
-          <Button data-testid="create-pipe" variant="primary" onClick={onStartPipe} title="Draw a production pipe asset directly in the viewport">
+          <Button data-testid="create-pipe" variant="secondary" onClick={onStartPipe} title="Draw a production pipe asset directly in the viewport">
             <span aria-hidden="true">⌁</span> Draw pipe
           </Button>
           <Button data-testid="create-import" variant="secondary" onClick={onImport} title="Choose a supported local asset file">
@@ -152,6 +182,33 @@ export function LeftDock({ client, active, onChange, onContextMenu, onStartPipe,
         <div className="mtk-dock-section-heading">Asset library</div>
         <AssetBrowser client={client} />
       </div>
+      <div
+        id="engine-panel-terrain"
+        role="tabpanel"
+        aria-labelledby="engine-tab-terrain"
+        hidden={active !== "terrain"}
+        className="mtk-dock-panel mtk-scroll"
+      >
+        {active === "terrain" && <LazyWorkspace label="Terrain workspace"><TerrainPanel client={client} /></LazyWorkspace>}
+      </div>
+      <div
+        id="engine-panel-physics"
+        role="tabpanel"
+        aria-labelledby="engine-tab-physics"
+        hidden={active !== "physics"}
+        className="mtk-dock-panel mtk-scroll"
+      >
+        {active === "physics" && <LazyWorkspace label="Physics workspace"><PhysicsPanel client={client} /></LazyWorkspace>}
+      </div>
+      <div
+        id="engine-panel-gameplay"
+        role="tabpanel"
+        aria-labelledby="engine-tab-gameplay"
+        hidden={active !== "gameplay"}
+        className="mtk-dock-panel mtk-scroll"
+      >
+        {active === "gameplay" && <LazyWorkspace label="Gameplay workspace"><MatchPanel client={client} /></LazyWorkspace>}
+      </div>
     </WorkspacePanel>
   );
 }
@@ -162,15 +219,15 @@ export interface InspectorDockProps {
   onChange: (workspace: InspectorWorkspace) => void;
   onCollapse?: () => void;
   onPin?: () => void;
+  /** Jump the left rail to a deeper workspace (the Behaviour block's "Animate/Gameplay" links). */
+  onJumpTo?: (engine: "animate" | "gameplay") => void;
 }
 
-export function InspectorDock({ client, active, onChange, onCollapse, onPin }: InspectorDockProps) {
+export function InspectorDock({ client, active, onChange, onCollapse, onPin, onJumpTo }: InspectorDockProps) {
   const selected = useSelectedId();
   const tabs = [
     { id: "properties", label: "Properties", icon: "⚙", tooltip: "Edit the selected object's components and material" },
     { id: "relations", label: "Relations", icon: "⌘", tooltip: "Inspect compatible bindings and graph relationships" },
-    { id: "physics", label: "Physics", icon: "◉", tooltip: "Simulation, collision and mechanism controls" },
-    { id: "match", label: "Match", icon: "⚔", tooltip: "Author, validate and run this scene as a match" },
   ] as const;
   return (
     <WorkspacePanel
@@ -194,6 +251,7 @@ export function InspectorDock({ client, active, onChange, onCollapse, onPin }: I
             <Inspector client={client} />
             {selected ? (
               <>
+                <BehaviourSection client={client} onJumpTo={onJumpTo} />
                 <DisclosureSection title="Diagnostics" summary="Selection health and quick fixes" defaultOpen storageKey="inspect-diagnostics">
                   <Diagnostics client={client} />
                 </DisclosureSection>
@@ -226,24 +284,6 @@ export function InspectorDock({ client, active, onChange, onCollapse, onPin }: I
         ) : (
           <EmptyPanelState title="Select an object to inspect its relationships" description="Compatible bindings and the local relationship graph will appear here." icon="⌘" />
         )}
-      </div>
-      <div
-        id="inspector-workspaces-physics-panel"
-        role="tabpanel"
-        aria-labelledby="inspector-workspaces-physics-tab"
-        hidden={active !== "physics"}
-        className="mtk-dock-panel mtk-scroll"
-      >
-        {active === "physics" && <LazyWorkspace label="Physics inspector"><PhysicsPanel client={client} /></LazyWorkspace>}
-      </div>
-      <div
-        id="inspector-workspaces-match-panel"
-        role="tabpanel"
-        aria-labelledby="inspector-workspaces-match-tab"
-        hidden={active !== "match"}
-        className="mtk-dock-panel mtk-scroll"
-      >
-        {active === "match" && <LazyWorkspace label="Match workspace"><MatchPanel client={client} /></LazyWorkspace>}
       </div>
     </WorkspacePanel>
   );

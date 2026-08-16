@@ -42,6 +42,17 @@ import type {
   RuleData,
   RuleRegistryInfo,
   RuleSummary,
+  ConditionSpec,
+  ShotSpec,
+  CinemaReply,
+  EffectSpec,
+  VfxReply,
+  VfxProbe,
+  CameraProbe,
+  ColourStatus,
+  FormatSpec,
+  ClauseRequest,
+  ConditionListInfo,
   AuthorStateMachineResult,
   StateMachine,
   StateMachineInfo,
@@ -81,6 +92,18 @@ import type {
   AnimationGraphDebugInfo,
   AnimationGraphPreviewResult,
   AnimationGraphValue,
+  TerrainPreset,
+  TerrainRecipe,
+  TerrainPlan,
+  TerrainReading,
+  TerrainReply,
+  TerrainPathResult,
+  TerrainStats,
+  ShapeSpec,
+  ShapeReply,
+  RoleSpec,
+  RoleReply,
+  RoleStatusInfo,
 } from "./protocol";
 import { ANIMATION_GRAPH_SCHEMA_VERSION, GENERATE_COST } from "./protocol";
 import { DeltaClient } from "./client";
@@ -214,6 +237,76 @@ export interface EditorClient {
   pipeForgeRemoveFitting(fittingId: number): Promise<PipeForgeStatus>;
   pipeForgeUpsertCatalog(entry: UserFittingCatalogEntry): Promise<PipeForgeStatus>;
   pipeForgeRemoveCatalog(id: string): Promise<PipeForgeStatus>;
+
+  // ── Shape Studio (Build engine): parametric shapes · draw-to-3D · combine · meld. Every command is
+  // one undoable engine transaction; a refusal (`reply.reason`) changes nothing and is explained. ──
+  /** The shape catalog: kinds + plain-language parameter specs. Static — safe to read once. */
+  shapeCatalog(): Promise<ShapeSpec[]>;
+  /** Create a parametric shape (catalog defaults) — at `pos`, or the deterministic scatter when omitted. */
+  shapeSpawn(kind: string, pos?: [number, number, number]): Promise<ShapeReply>;
+  /** Re-bake the selected shape with edited parameters (one undo step; position untouched). */
+  shapeUpdate(id: string, params: Record<string, number>): Promise<ShapeReply>;
+  /** Turn a drawn outline into a solid: extrude a ground plan up (optionally tapered toward the
+   *  centroid), or revolve a side profile around the vertical axis. */
+  shapeDraw(mode: "extrude" | "revolve", profile: [number, number][], height?: number, segments?: number, taper?: number): Promise<ShapeReply>;
+  /** Exact boolean of two objects (union|carve|intersect): result replaces both sources, one undo step. */
+  shapeCombine(a: string, b: string, op: "union" | "carve" | "intersect"): Promise<ShapeReply>;
+  /** Meld two shapes into one smooth blob (blend radius `k` metres), same replace semantics. */
+  shapeMeld(a: string, b: string, k?: number): Promise<ShapeReply>;
+
+  // ── Gameplay roles: one click from asset to live gameplay participant. Every command is one
+  // undoable engine transaction; a refusal (`reply.reason`) changes nothing and is explained. ──
+  /** The role catalog (label/blurb/what-it-adds). Static — safe to read once. */
+  roleCatalog(): Promise<RoleSpec[]>;
+  /** Assign a role: components + animation + rule + Score binding in ONE commit. */
+  roleAssign(id: string, role: string): Promise<RoleReply>;
+  /** Clear a role (keeps mesh + transform). */
+  roleClear(id: string): Promise<RoleReply>;
+  /** The roster + the score — live from the rules runtime during Play. */
+  roleStatus(): Promise<RoleStatusInfo>;
+  /** The player's movement axis (pressed keys, world x/z in [-1,1]). Fire-and-forget; send on CHANGE only. */
+  playerInput(x: number, z: number): Promise<void>;
+  /** Every format this build can read or write, with its declared fidelity. */
+  formatCatalog(): Promise<FormatSpec[]>;
+  colourStatus(): Promise<ColourStatus>;
+  /**
+   * Select the space the renderer SHADES in. Replies the accepted name; a name it does not know comes
+   * back as `unknown: <what you sent>` rather than silently selecting the default.
+   */
+  setWorkingSpace(space: string): Promise<string>;
+  /**
+   * Declare what the loaded environment map's values mean. Non-linear spaces are refused with the
+   * reason — an HDR panorama is radiance, so "this EXR is sRGB" is not a thing a person can mean.
+   */
+  setEnvironmentColourSpace(space: string): Promise<string>;
+  /** What the renderer is drawing this instant (Play only; zeros otherwise). */
+  vfxProbe(): Promise<VfxProbe>;
+  /** Where the camera actually is this instant. */
+  cameraProbe(): Promise<CameraProbe>;
+  /** Every effect card the Effects block can offer. */
+  vfxCatalog(): Promise<EffectSpec[]>;
+  /** Add one effect layer to an object (one undoable commit). */
+  vfxAdd(id: string, kind: string, trigger: string): Promise<VfxReply>;
+  /** Remove one effect layer by index. */
+  vfxRemove(id: string, index: number): Promise<VfxReply>;
+  /** The object's effects, read back as sentences plus warnings. */
+  vfxList(id: string): Promise<VfxReply>;
+  /** Every shot card the Cinematics block can offer. */
+  cinemaCatalog(): Promise<ShotSpec[]>;
+  /** Append one shot to an object's cutscene (one undoable commit). */
+  cinemaAddShot(id: string, kind: string): Promise<CinemaReply>;
+  /** Remove one shot by index (one undoable commit). */
+  cinemaRemoveShot(id: string, index: number): Promise<CinemaReply>;
+  /** The object's cutscene, read back as sentences plus continuity warnings. */
+  cinemaList(id: string): Promise<CinemaReply>;
+  /** Every "only if" card the Behaviour block can offer. */
+  conditionCatalog(): Promise<ConditionSpec[]>;
+  /** Add one clause to an object (one undoable commit). */
+  conditionAdd(id: string, request: ClauseRequest): Promise<RoleReply>;
+  /** Remove one clause by index (`any` picks the OR group). */
+  conditionRemove(id: string, index: number, any: boolean): Promise<RoleReply>;
+  /** The object's clauses + the sentence its rule reads as. */
+  conditionList(id: string): Promise<ConditionListInfo>;
   /** Measure topology, UV, material, texture and production-readiness facts for a selected mesh. */
   assetLabAudit(id: string): Promise<AssetLabResponse>;
   /** Build and place a content-addressed derivative while preserving the selected source. */
@@ -221,7 +314,7 @@ export interface EditorClient {
   /** Export a selected canonical mesh as an embedded-texture GLB. `path` is for automation. */
   assetLabExport(id: string, path?: string): Promise<AssetLabResponse>;
   /** Export the authoritative hierarchy, reusable meshes, skins and representable animation. */
-  sceneExport(format: "glb" | "usda", path?: string): Promise<SceneExportResponse>;
+  sceneExport(format: "glb" | "usda" | "step", path?: string): Promise<SceneExportResponse>;
   /** M11.3 — author a Light entity (kind = directional|point|spot) at a position with a linear RGB colour +
    *  intensity → its id. One undoable commit; the lit result is a render projection (not in the doc). */
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null>;
@@ -447,6 +540,48 @@ export interface EditorClient {
   matchCooked(): Promise<CookedMatch | null>;
   /** End the match and restore the authored scene verbatim. */
   matchStop(): Promise<MatchStatus>;
+  /** The terrain presets a picker offers (M19 / ADR-104). */
+  terrainPresets(): Promise<TerrainPreset[]>;
+  /** Create a terrain from a preset — one undoable transaction. */
+  terrainCreate(preset: string): Promise<TerrainReply>;
+  /** Build (or rebuild) the terrain a plain-language description asks for — one undoable transaction. */
+  terrainDescribe(text: string): Promise<TerrainReply>;
+  /** Read a description without building anything — safe to call while the author is still typing. */
+  terrainReadDescription(text: string): Promise<TerrainReading | null>;
+  /** Compile a sentence into a plan and report it, changing nothing. Safe per keystroke. */
+  terrainPlan(text: string): Promise<TerrainPlan | null>;
+  /** Apply one terrain edit, or (with no edit) read the current recipe and validation back. */
+  terrainEdit(edit: Record<string, unknown> | null, entity?: string | null): Promise<TerrainReply>;
+  /** Live streaming/memory counters — safe to poll, it never touches the commit pipeline. */
+  terrainStats(): Promise<TerrainStats>;
+  /** Whether a walkable route exists between two world points, over the resident nav grids. */
+  terrainPath(from: [number, number, number], to: [number, number, number]): Promise<TerrainPathResult>;
+  /** Arm the pointer with a terrain tool ("none" | "sculpt" | "route") and its brush settings. */
+  terrainTool(mode: string, brush?: Partial<TerrainBrushArgs>): Promise<boolean>;
+  /** Begin a sculpt gesture; the stroke is then traced natively until `terrainPaintEnd`. */
+  terrainPaintBegin(): Promise<void>;
+  /** End the gesture and commit what was traced as one undoable transaction. */
+  terrainPaintEnd(): Promise<TerrainReply>;
+  /** Drop a route control point where the cursor meets the terrain; resolves to the point count. */
+  terrainRoutePoint(): Promise<number>;
+  /** Remove the last route point, or clear them all; resolves to the remaining count. */
+  terrainRouteClear(lastOnly: boolean): Promise<number>;
+  /** Commit the drawn route as a road, river or pad. */
+  terrainRouteCommit(
+    kind: string,
+    widthM: number,
+    depthM: number,
+    materialLayer: number | null,
+  ): Promise<TerrainReply>;
+}
+
+/** Brush settings the pointer is armed with. `kind` is 0 raise, 1 smooth, 2 flatten, 3 noise. */
+export interface TerrainBrushArgs {
+  kind: number;
+  radiusM: number;
+  strength: number;
+  hardness: number;
+  targetM: number;
 }
 
 // ── the Tauri global (withGlobalTauri: true exposes window.__TAURI__.core; no @tauri-apps/api dep) ──────
@@ -726,6 +861,93 @@ export class TauriClient implements EditorClient {
   pipeForgeRemoveCatalog(id: string): Promise<PipeForgeStatus> {
     return this.core.invoke<PipeForgeStatus>("pipe_forge_remove_catalog", { id }).catch((e: unknown) => { console.error("pipe_forge_remove_catalog failed", e); throw e; });
   }
+  shapeCatalog(): Promise<ShapeSpec[]> {
+    return this.core.invoke<ShapeSpec[]>("shape_catalog").catch((e: unknown) => { console.error("shape_catalog failed", e); throw e; });
+  }
+  shapeSpawn(kind: string, pos?: [number, number, number]): Promise<ShapeReply> {
+    return this.core.invoke<ShapeReply>("shape_spawn", { kind, pos: pos ?? null }).catch((e: unknown) => { console.error("shape_spawn failed", e); throw e; });
+  }
+  shapeUpdate(id: string, params: Record<string, number>): Promise<ShapeReply> {
+    return this.core.invoke<ShapeReply>("shape_update", { id, params }).catch((e: unknown) => { console.error("shape_update failed", e); throw e; });
+  }
+  shapeDraw(mode: "extrude" | "revolve", profile: [number, number][], height?: number, segments?: number, taper?: number): Promise<ShapeReply> {
+    return this.core.invoke<ShapeReply>("shape_draw", { mode, profile, height: height ?? null, segments: segments ?? null, taper: taper ?? null }).catch((e: unknown) => { console.error("shape_draw failed", e); throw e; });
+  }
+  shapeCombine(a: string, b: string, op: "union" | "carve" | "intersect"): Promise<ShapeReply> {
+    return this.core.invoke<ShapeReply>("shape_combine", { a, b, op }).catch((e: unknown) => { console.error("shape_combine failed", e); throw e; });
+  }
+  shapeMeld(a: string, b: string, k?: number): Promise<ShapeReply> {
+    return this.core.invoke<ShapeReply>("shape_meld", { a, b, k: k ?? null }).catch((e: unknown) => { console.error("shape_meld failed", e); throw e; });
+  }
+  roleCatalog(): Promise<RoleSpec[]> {
+    return this.core.invoke<RoleSpec[]>("role_catalog").catch((e: unknown) => { console.error("role_catalog failed", e); throw e; });
+  }
+  roleAssign(id: string, role: string): Promise<RoleReply> {
+    return this.core.invoke<RoleReply>("role_assign", { id, role }).catch((e: unknown) => { console.error("role_assign failed", e); throw e; });
+  }
+  roleClear(id: string): Promise<RoleReply> {
+    return this.core.invoke<RoleReply>("role_clear", { id }).catch((e: unknown) => { console.error("role_clear failed", e); throw e; });
+  }
+  roleStatus(): Promise<RoleStatusInfo> {
+    return this.core.invoke<RoleStatusInfo>("role_status").catch((e: unknown) => { console.error("role_status failed", e); throw e; });
+  }
+  playerInput(x: number, z: number): Promise<void> {
+    return this.core.invoke<void>("player_input", { x, z }).catch(() => { /* a dropped input tick is harmless */ });
+  }
+  formatCatalog(): Promise<FormatSpec[]> {
+    return this.core.invoke<FormatSpec[]>("format_catalog").catch((e: unknown) => { console.error("format_catalog failed", e); throw e; });
+  }
+  colourStatus(): Promise<ColourStatus> {
+    return this.core.invoke<ColourStatus>("colour_status").catch((e: unknown) => { console.error("colour_status failed", e); throw e; });
+  }
+  setWorkingSpace(space: string): Promise<string> {
+    return this.core.invoke<string>("set_working_space", { space }).catch((e: unknown) => { console.error("set_working_space failed", e); throw e; });
+  }
+  setEnvironmentColourSpace(space: string): Promise<string> {
+    return this.core.invoke<string>("set_environment_colour_space", { space }).catch((e: unknown) => { console.error("set_environment_colour_space failed", e); throw e; });
+  }
+  vfxProbe(): Promise<VfxProbe> {
+    return this.core.invoke<VfxProbe>("vfx_probe").catch(() => ({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 }));
+  }
+  cameraProbe(): Promise<CameraProbe> {
+    return this.core.invoke<CameraProbe>("camera_probe").catch(() => ({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0 }));
+  }
+  vfxCatalog(): Promise<EffectSpec[]> {
+    return this.core.invoke<EffectSpec[]>("vfx_catalog").catch((e: unknown) => { console.error("vfx_catalog failed", e); throw e; });
+  }
+  vfxAdd(id: string, kind: string, trigger: string): Promise<VfxReply> {
+    return this.core.invoke<VfxReply>("vfx_add", { id, kind, trigger }).catch((e: unknown) => { console.error("vfx_add failed", e); throw e; });
+  }
+  vfxRemove(id: string, index: number): Promise<VfxReply> {
+    return this.core.invoke<VfxReply>("vfx_remove", { id, index }).catch((e: unknown) => { console.error("vfx_remove failed", e); throw e; });
+  }
+  vfxList(id: string): Promise<VfxReply> {
+    return this.core.invoke<VfxReply>("vfx_list", { id }).catch((e: unknown) => { console.error("vfx_list failed", e); throw e; });
+  }
+  cinemaCatalog(): Promise<ShotSpec[]> {
+    return this.core.invoke<ShotSpec[]>("cinema_catalog").catch((e: unknown) => { console.error("cinema_catalog failed", e); throw e; });
+  }
+  cinemaAddShot(id: string, kind: string): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_add_shot", { id, kind }).catch((e: unknown) => { console.error("cinema_add_shot failed", e); throw e; });
+  }
+  cinemaRemoveShot(id: string, index: number): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_remove_shot", { id, index }).catch((e: unknown) => { console.error("cinema_remove_shot failed", e); throw e; });
+  }
+  cinemaList(id: string): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_list", { id }).catch((e: unknown) => { console.error("cinema_list failed", e); throw e; });
+  }
+  conditionCatalog(): Promise<ConditionSpec[]> {
+    return this.core.invoke<ConditionSpec[]>("condition_catalog").catch((e: unknown) => { console.error("condition_catalog failed", e); throw e; });
+  }
+  conditionAdd(id: string, request: ClauseRequest): Promise<RoleReply> {
+    return this.core.invoke<RoleReply>("condition_add", { id, request }).catch((e: unknown) => { console.error("condition_add failed", e); throw e; });
+  }
+  conditionRemove(id: string, index: number, any: boolean): Promise<RoleReply> {
+    return this.core.invoke<RoleReply>("condition_remove", { id, index, any }).catch((e: unknown) => { console.error("condition_remove failed", e); throw e; });
+  }
+  conditionList(id: string): Promise<ConditionListInfo> {
+    return this.core.invoke<ConditionListInfo>("condition_list", { id }).catch((e: unknown) => { console.error("condition_list failed", e); throw e; });
+  }
   assetLabAudit(id: string): Promise<AssetLabResponse> {
     return this.core.invoke<AssetLabResponse>("asset_lab_audit", { id }).catch((e: unknown) => { console.error("asset_lab_audit failed", e); throw e; });
   }
@@ -735,7 +957,7 @@ export class TauriClient implements EditorClient {
   assetLabExport(id: string, path?: string): Promise<AssetLabResponse> {
     return this.core.invoke<AssetLabResponse>("asset_lab_export", { id, path: path ?? null }).catch((e: unknown) => { console.error("asset_lab_export failed", e); throw e; });
   }
-  sceneExport(format: "glb" | "usda", path?: string): Promise<SceneExportResponse> {
+  sceneExport(format: "glb" | "usda" | "step", path?: string): Promise<SceneExportResponse> {
     return this.core.invoke<SceneExportResponse>("scene_export", { format, path: path ?? null }).catch((e: unknown) => { console.error("scene_export failed", e); throw e; });
   }
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null> {
@@ -1063,6 +1285,175 @@ export class TauriClient implements EditorClient {
   matchStop(): Promise<MatchStatus> {
     return this.core.invoke<MatchStatus>("moba_stop");
   }
+
+  terrainPresets(): Promise<TerrainPreset[]> {
+    return this.core.invoke<TerrainPreset[]>("terrain_presets");
+  }
+
+  terrainCreate(preset: string): Promise<TerrainReply> {
+    return this.core.invoke<TerrainReply>("terrain_create", { preset });
+  }
+
+  terrainDescribe(text: string): Promise<TerrainReply> {
+    return this.core.invoke<TerrainReply>("terrain_describe", { text });
+  }
+
+  terrainReadDescription(text: string): Promise<TerrainReading | null> {
+    return this.core.invoke<TerrainReading | null>("terrain_read_description", { text });
+  }
+
+  terrainPlan(text: string): Promise<TerrainPlan | null> {
+    return this.core.invoke<TerrainPlan | null>("terrain_plan", { text });
+  }
+
+  terrainEdit(edit: Record<string, unknown> | null, entity?: string | null): Promise<TerrainReply> {
+    return this.core.invoke<TerrainReply>("terrain_edit", { args: { entity: entity ?? null, edit } });
+  }
+
+  terrainStats(): Promise<TerrainStats> {
+    return this.core.invoke<TerrainStats>("terrain_stats");
+  }
+
+  terrainPath(
+    from: [number, number, number],
+    to: [number, number, number],
+  ): Promise<TerrainPathResult> {
+    return this.core.invoke<TerrainPathResult>("terrain_path", { from, to });
+  }
+
+  terrainTool(mode: string, brush?: Partial<TerrainBrushArgs>): Promise<boolean> {
+    return this.core.invoke<boolean>("terrain_tool", {
+      mode,
+      kind: brush?.kind ?? null,
+      radiusM: brush?.radiusM ?? null,
+      strength: brush?.strength ?? null,
+      hardness: brush?.hardness ?? null,
+      targetM: brush?.targetM ?? null,
+    });
+  }
+
+  terrainPaintBegin(): Promise<void> {
+    return this.core.invoke<void>("terrain_paint_begin");
+  }
+
+  terrainPaintEnd(): Promise<TerrainReply> {
+    return this.core.invoke<TerrainReply>("terrain_paint_end");
+  }
+
+  terrainRoutePoint(): Promise<number> {
+    return this.core.invoke<number>("terrain_route_point");
+  }
+
+  terrainRouteClear(lastOnly: boolean): Promise<number> {
+    return this.core.invoke<number>("terrain_route_clear", { lastOnly });
+  }
+
+  terrainRouteCommit(
+    kind: string,
+    widthM: number,
+    depthM: number,
+    materialLayer: number | null,
+  ): Promise<TerrainReply> {
+    return this.core.invoke<TerrainReply>("terrain_route_commit", {
+      kind,
+      widthM,
+      depthM,
+      materialLayer,
+    });
+  }
+}
+
+
+/** A believable recipe for the dev shell and the panel tests — the same shape the engine emits. */
+function mockRecipe(preset: string): TerrainRecipe {
+  const named: Record<string, string> = {
+    flat: "Flat Ground",
+    "rolling-hills": "Rolling Hills",
+    alpine: "Alpine Peaks",
+  };
+  return {
+    version: 1,
+    name: named[preset] ?? "Terrain",
+    description: "",
+    seed: 12345,
+    world_size_m: 2048,
+    chunk_size_m: 64,
+    chunk_verts: 65,
+    layers: [
+      { name: "Base", kind: { Constant: { height: 0 } }, blend: "Replace", weight: 1, enabled: true, seed_offset: 0 },
+      { name: "Hills", kind: { Fbm: { amplitude: 38 } }, blend: "Add", weight: 1, enabled: true, seed_offset: 11 },
+    ],
+    strokes: [],
+    splines: [],
+    materials: [
+      { name: "Grass", albedo: [0.22, 0.34, 0.15], roughness: 0.86 },
+      { name: "Rock", albedo: [0.38, 0.37, 0.35], roughness: 0.72 },
+    ],
+    biomes: [{ name: "Meadow", material_layer: 0, enabled: true }],
+    protos: [
+      { name: "Tree", mesh_key: "", lod_keys: [], impostor_key: null, radius_m: 2, height_m: 12, collide: true },
+    ],
+    scatter: [{ name: "Woodland", proto: 0, density_per_hectare: 110, enabled: true }],
+    water: { enabled: true, sea_level_m: 0, shore_blend_m: 2, deep_m: 8 },
+    lod: { levels: 4, screen_error_px: 1, max_view_distance_m: 1024, texture_res: 256, horizon_culling: true },
+    budget: { mesh_mb: 256, texture_mb: 320, scatter_mb: 96, collider_mb: 64, max_resident_chunks: 1200 },
+  };
+}
+
+function mockReading(text: string): TerrainReading {
+  const t = text.toLowerCase();
+  const has = (...w: string[]) => w.some((x) => t.includes(x));
+  const landform = has("mountain", "peak", "alpine") ? "Mountains" : "Hills";
+  const understood = [{ phrase: landform.toLowerCase(), meaning: `landform: ${landform.toLowerCase()}` }];
+  if (has("river")) understood.push({ phrase: "river", meaning: "a river" });
+  if (has("road")) understood.push({ phrase: "road", meaning: "a road" });
+  let seed = 2166136261;
+  for (const ch of t.trim()) seed = Math.imul(seed ^ ch.charCodeAt(0), 16777619) >>> 0;
+  return {
+    brief: {
+      landform,
+      climate: has("desert", "arid") ? "Arid" : "Temperate",
+      relief: 1,
+      worldSizeM: null,
+      water: "Lakes",
+      vegetation: 1,
+      erosion: null,
+      terraces: false,
+      river: has("river"),
+      road: has("road"),
+      name: `Described ${landform}`,
+      seed: (seed % 1000000) + 1,
+    },
+    understood,
+    unused: [],
+  };
+}
+
+function mockTerrainStats(active: boolean): TerrainStats {
+  return {
+    active,
+    residentChunks: active ? 48 : 0,
+    visibleChunks: active ? 21 : 0,
+    culledFrustum: active ? 19 : 0,
+    culledHorizon: active ? 8 : 0,
+    pendingBuilds: 0,
+    completedBuilds: active ? 48 : 0,
+    drawnTriangles: active ? 184_000 : 0,
+    drawnInstances: 0,
+    impostorInstances: 0,
+    meshMb: active ? 31.4 : 0,
+    textureMb: active ? 18.2 : 0,
+    scatterMb: 0,
+    colliderMb: active ? 1.1 : 0,
+    navMb: active ? 0.1 : 0,
+    totalMb: active ? 50.8 : 0,
+    budgetMb: 736,
+    budgetFraction: active ? 0.069 : 0,
+    overBudget: false,
+    buildUsTotal: active ? 92_000 : 0,
+    dominantStage: "field",
+    problem: "",
+  };
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
@@ -1114,6 +1505,55 @@ export function buildWorld(n: number): EntityProjection[] {
     out.push({ id: `e${i}`, name: `Entity ${i}`, parentId: i === 0 ? null : "e0", components });
   }
   return out;
+}
+
+/** The dev-mock mirror of the shell's shape catalog (same kinds/params, so the Build panel renders
+ *  identically under `npm run dev`/Vitest; the .exe serves the authoritative list from Rust). */
+const MOCK_SHAPE_SPECS: ShapeSpec[] = [
+  { kind: "box", label: "Box", blurb: "A rectangular block", icon: "▧", params: [
+    { key: "width", label: "Width", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+    { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+    { key: "depth", label: "Depth", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+  ] },
+  { kind: "sphere", label: "Sphere", blurb: "A ball", icon: "●", params: [
+    { key: "radius", label: "Radius", min: 0.05, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
+    { key: "segments", label: "Smoothness", min: 8, max: 96, step: 4, default: 32, integer: true, unit: "" },
+  ] },
+  { kind: "cylinder", label: "Cylinder", blurb: "A round column", icon: "⬤", params: [
+    { key: "radius", label: "Radius", min: 0.05, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
+    { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+    { key: "segments", label: "Smoothness", min: 3, max: 96, step: 1, default: 32, integer: true, unit: "" },
+  ] },
+  { kind: "cone", label: "Cone", blurb: "A point over a round base", icon: "▲", params: [
+    { key: "radius", label: "Radius", min: 0.05, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
+    { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+    { key: "segments", label: "Smoothness", min: 3, max: 96, step: 1, default: 32, integer: true, unit: "" },
+  ] },
+  { kind: "torus", label: "Ring", blurb: "A doughnut", icon: "◍", params: [
+    { key: "radius", label: "Ring radius", min: 0.1, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
+    { key: "thickness", label: "Thickness", min: 0.02, max: 10, step: 0.02, default: 0.18, integer: false, unit: "m" },
+    { key: "segments", label: "Smoothness", min: 8, max: 96, step: 4, default: 40, integer: true, unit: "" },
+  ] },
+  { kind: "capsule", label: "Capsule", blurb: "A pill — a cylinder with round ends", icon: "▢", params: [
+    { key: "radius", label: "Radius", min: 0.05, max: 10, step: 0.05, default: 0.3, integer: false, unit: "m" },
+    { key: "height", label: "Height", min: 0.2, max: 50, step: 0.1, default: 1.2, integer: false, unit: "m" },
+    { key: "segments", label: "Smoothness", min: 8, max: 96, step: 4, default: 32, integer: true, unit: "" },
+  ] },
+  { kind: "wedge", label: "Wedge", blurb: "A ramp", icon: "◣", params: [
+    { key: "width", label: "Width", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+    { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+    { key: "depth", label: "Depth", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+  ] },
+  { kind: "prism", label: "Prism", blurb: "A column with flat sides", icon: "⬢", params: [
+    { key: "radius", label: "Radius", min: 0.05, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
+    { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+    { key: "sides", label: "Sides", min: 3, max: 12, step: 1, default: 6, integer: true, unit: "" },
+  ] },
+];
+
+/** A Shape Studio refusal — nothing changed, explained in the author's language. */
+function shapeRefusal(reason: string): ShapeReply {
+  return { created: null, handle: null, triangles: 0, ms: 0, message: reason, reason };
 }
 
 const MOCK_ANIMATION_GRAPH_ADMISSION_CODES = new Set([
@@ -2140,6 +2580,204 @@ class MockClient implements EditorClient {
     };
     return Promise.resolve({ ...this.pipeStatus });
   }
+  // ── Shape Studio mocks — same contract as the .exe: a landed reply places + a refusal changes nothing ──
+  shapeCatalog(): Promise<ShapeSpec[]> {
+    return Promise.resolve(MOCK_SHAPE_SPECS.map((spec) => ({ ...spec, params: spec.params.map((p) => ({ ...p })) })));
+  }
+  shapeSpawn(kind: string, pos?: [number, number, number]): Promise<ShapeReply> {
+    const spec = MOCK_SHAPE_SPECS.find((s) => s.kind === kind);
+    if (!spec) return Promise.resolve(shapeRefusal(`there is no shape called "${kind}"`));
+    const [x, y, z] = pos ?? [0, 0, 0];
+    const params = Object.fromEntries(spec.params.map((p) => [p.key, p.default]));
+    const id = this.place(spec.label, {
+      Transform: { x, y, z, scale: 1 },
+      MeshRenderer: { mesh: `mtkasset:mock-shape-${kind}` },
+      ShapeRecipe: { source: JSON.stringify({ v: 1, kind, params }), version: 1, kind, triangles: 480 },
+    });
+    return Promise.resolve({ created: id, handle: `mtkasset:mock-shape-${kind}`, triangles: 480, ms: 2, message: `Created a ${spec.label} · 480 triangles`, reason: null });
+  }
+  shapeUpdate(id: string, params: Record<string, number>): Promise<ShapeReply> {
+    const entity = this.core.entity(id);
+    if (!entity) return Promise.resolve(shapeRefusal("that object is no longer in the scene"));
+    const source = entity.components["ShapeRecipe"]?.["source"];
+    if (typeof source !== "string") return Promise.resolve(shapeRefusal("that object is not a Shape Studio shape"));
+    const recipe = JSON.parse(source) as { v: number; kind: string; params?: Record<string, number> };
+    recipe.params = { ...recipe.params, ...params };
+    this.core.push([
+      { op: "setField", id, component: "ShapeRecipe", field: "source", value: JSON.stringify(recipe) },
+    ]);
+    return Promise.resolve({ created: id, handle: `mtkasset:mock-shape-${recipe.kind}`, triangles: 480, ms: 2, message: "Updated · 480 triangles", reason: null });
+  }
+  shapeDraw(mode: "extrude" | "revolve", profile: [number, number][], height?: number, segments?: number, taper?: number): Promise<ShapeReply> {
+    if (profile.length < 3) return Promise.resolve(shapeRefusal("draw at least three points to outline a shape"));
+    const kind = mode === "extrude" ? "extrude" : "revolve";
+    const params = mode === "extrude" ? { height: height ?? 1, taper: taper ?? 1 } : { segments: segments ?? 48 };
+    const id = this.place(mode === "extrude" ? "Drawn shape" : "Spun shape", {
+      Transform: { x: 0, y: 0, z: 0, scale: 1 },
+      MeshRenderer: { mesh: `mtkasset:mock-shape-${kind}` },
+      ShapeRecipe: { source: JSON.stringify({ v: 1, kind, params, profile }), version: 1, kind, triangles: profile.length * 4 },
+    });
+    return Promise.resolve({ created: id, handle: `mtkasset:mock-shape-${kind}`, triangles: profile.length * 4, ms: 3, message: mode === "extrude" ? `Raised your drawing into a solid · ${profile.length * 4} triangles` : `Spun your drawing into a solid · ${profile.length * 4} triangles`, reason: null });
+  }
+  shapeCombine(a: string, b: string, op: "union" | "carve" | "intersect"): Promise<ShapeReply> {
+    if (a === b) return Promise.resolve(shapeRefusal("pick two different objects"));
+    if (!this.core.entity(a) || !this.core.entity(b)) return Promise.resolve(shapeRefusal("one of the two objects is no longer in the scene"));
+    const label = op === "union" ? "Union" : op === "carve" ? "Carved shape" : "Intersection";
+    const id = this.place(label, {
+      Transform: { x: 0, y: 0, z: 0, scale: 1 },
+      MeshRenderer: { mesh: "mtkasset:mock-shape-combined" },
+      ShapeRecipe: { source: JSON.stringify({ v: 1, kind: op, sources: [a, b] }), version: 1, kind: op, triangles: 960 },
+    });
+    this.core.push([{ op: "remove", id: a }, { op: "remove", id: b }]);
+    return Promise.resolve({ created: id, handle: "mtkasset:mock-shape-combined", triangles: 960, ms: 4, message: `${label} · 960 triangles`, reason: null });
+  }
+  shapeMeld(a: string, b: string, k?: number): Promise<ShapeReply> {
+    if (a === b) return Promise.resolve(shapeRefusal("pick two different objects"));
+    const ra = this.core.entity(a)?.components["ShapeRecipe"];
+    const rb = this.core.entity(b)?.components["ShapeRecipe"];
+    if (!ra || !rb) return Promise.resolve(shapeRefusal("Meld works on Shape Studio shapes — use Combine for anything else"));
+    // Engine parity: only spheres, boxes and cylinders express as fields (shape_forge::meld_field).
+    const meldable = new Set(["sphere", "box", "cylinder"]);
+    for (const r of [ra, rb]) {
+      const kind = typeof r["kind"] === "string" ? (r["kind"] as string) : "";
+      if (!meldable.has(kind)) {
+        return Promise.resolve(shapeRefusal(`Meld works on spheres, boxes and cylinders for now — use Combine instead`));
+      }
+    }
+    const id = this.place("Melded shape", {
+      Transform: { x: 0, y: 0, z: 0, scale: 1 },
+      MeshRenderer: { mesh: "mtkasset:mock-shape-meld" },
+      ShapeRecipe: { source: JSON.stringify({ v: 1, kind: "meld", params: { k: k ?? 0.25 }, sources: [a, b] }), version: 1, kind: "meld", triangles: 1400 },
+    });
+    this.core.push([{ op: "remove", id: a }, { op: "remove", id: b }]);
+    return Promise.resolve({ created: id, handle: "mtkasset:mock-shape-meld", triangles: 1400, ms: 6, message: "Melded into one shape · 1400 triangles", reason: null });
+  }
+  // ── Gameplay-role mocks — same contract as the .exe (landed reply or explained refusal). ──
+  private mockRoles = new Map<string, string>();
+  roleCatalog(): Promise<RoleSpec[]> {
+    return Promise.resolve([
+      { kind: "collectible", label: "Collectible", blurb: "Spins; vanishes and scores when something touches it", icon: "✦", adds: "spin animation · touch trigger · pickup rule · +1 on the Score counter" },
+      { kind: "solid", label: "Solid obstacle", blurb: "An immovable body other things collide with", icon: "▦", adds: "fixed physics body · auto-fit collider" },
+      { kind: "prop", label: "Physics prop", blurb: "Falls, rolls and collides under gravity", icon: "◍", adds: "dynamic physics body · auto-fit collider" },
+      { kind: "spinner", label: "Spinner", blurb: "Turns forever — ambient motion", icon: "↻", adds: "looping spin animation" },
+    ]);
+  }
+  roleAssign(id: string, role: string): Promise<RoleReply> {
+    if (!this.core.entity(id)) return Promise.resolve({ applied: null, entity: null, added: [], scoreEntity: null, message: "that object is no longer in the scene", reason: "that object is no longer in the scene" });
+    if (!["collectible", "solid", "prop", "spinner"].includes(role)) return Promise.resolve({ applied: null, entity: null, added: [], scoreEntity: null, message: `there is no role called "${role}"`, reason: `there is no role called "${role}"` });
+    this.mockRoles.set(id, role);
+    this.core.push([{ op: "setField", id, component: "GameRole", field: "role", value: role }, { op: "setField", id, component: "GameRole", field: "active", value: true }]);
+    return Promise.resolve({ applied: role, entity: id, added: role === "collectible" ? ["spin animation", "the pickup rule", "a Score counter"] : ["a physics body"], scoreEntity: role === "collectible" ? "mock-score" : null, message: `Now a ${role}`, reason: null });
+  }
+  roleClear(id: string): Promise<RoleReply> {
+    if (!this.mockRoles.has(id)) return Promise.resolve({ applied: null, entity: null, added: [], scoreEntity: null, message: "that object has no role to clear", reason: "that object has no role to clear" });
+    this.mockRoles.delete(id);
+    return Promise.resolve({ applied: null, entity: id, added: [], scoreEntity: null, message: "Role cleared — the object keeps its mesh and transform", reason: null });
+  }
+  roleStatus(): Promise<RoleStatusInfo> {
+    const roster = [...this.mockRoles.entries()].map(([entity, role]) => ({ entity, name: this.core.entity(entity)?.name ?? entity, role }));
+    return Promise.resolve({ roster, score: 0, scoreEntity: this.mockRoles.size > 0 ? "mock-score" : null, remaining: roster.filter((r) => r.role === "collectible").length, companions: [], won: false, health: null, blocked: null });
+  }
+  playerInput(): Promise<void> {
+    return Promise.resolve();
+  }
+  formatCatalog(): Promise<FormatSpec[]> {
+    return Promise.resolve([]);
+  }
+  colourStatus(): Promise<ColourStatus> {
+    return Promise.resolve({
+      spaces: [],
+      working: {
+        current: this.workingSpace,
+        label: this.workingSpace === "acesCg" ? "ACEScg (AP1)" : "Linear Rec.709",
+        wired: true,
+        options: [
+          { id: "linearRec709", label: "Linear Rec.709", arg: "linearRec709" },
+          { id: "acesCg", label: "ACEScg (AP1)", arg: "acesCg" },
+        ],
+        setCommand: "set_working_space",
+        luminanceWeights:
+          this.workingSpace === "acesCg" ? [0.2722287, 0.6740818, 0.0536895] : [0.2126, 0.7152, 0.0722],
+      },
+      views: [],
+      activeView: "acesFit",
+      activeViewLabel: "Filmic (ACES-like)",
+      setViewCommand: "set_render_profile",
+      setViewArg: "cinematic",
+      presentationHash: this.workingSpace === "acesCg" ? "00000000000000a1" : "0000000000000709",
+      exposure: 0.45,
+      environment: {
+        sourceSpace: this.envSpace,
+        label: this.envSpace === "acesCg" ? "ACEScg (AP1)" : "Linear Rec.709",
+        assumed: this.envSpace === "linearRec709",
+        options: [
+          { id: "linearRec709", label: "Linear Rec.709", arg: "linearRec709" },
+          { id: "acesCg", label: "ACEScg (AP1)", arg: "acesCg" },
+          { id: "aces2065_1", label: "ACES2065-1 (AP0)", arg: "aces2065_1" },
+          { id: "linearRec2020", label: "Linear Rec.2020", arg: "linearRec2020" },
+        ],
+        setCommand: "set_environment_colour_space",
+      },
+      capabilities: {},
+      notes: [],
+    });
+  }
+
+  /** Mock render state, so the colour card's controls do something in the dev build too. */
+  private workingSpace = "linearRec709";
+  private envSpace = "linearRec709";
+
+  setWorkingSpace(space: string): Promise<string> {
+    this.workingSpace = space;
+    return Promise.resolve(space);
+  }
+
+  setEnvironmentColourSpace(space: string): Promise<string> {
+    this.envSpace = space;
+    return Promise.resolve(space);
+  }
+  vfxProbe(): Promise<VfxProbe> {
+    return Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 });
+  }
+  cameraProbe(): Promise<CameraProbe> {
+    return Promise.resolve({ eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 45, cinematic: false, distance: 0 });
+  }
+  vfxCatalog(): Promise<EffectSpec[]> {
+    return Promise.resolve([]);
+  }
+  vfxAdd(): Promise<VfxReply> {
+    return Promise.resolve({ entity: null, layers: 0, particles: 0, reads: [], problems: [], message: "", reason: "Effects are available in the packaged desktop editor." });
+  }
+  vfxRemove(): Promise<VfxReply> {
+    return Promise.resolve({ entity: null, layers: 0, particles: 0, reads: [], problems: [], message: "", reason: "Effects are available in the packaged desktop editor." });
+  }
+  vfxList(): Promise<VfxReply> {
+    return Promise.resolve({ entity: null, layers: 0, particles: 0, reads: [], problems: [], message: "", reason: null });
+  }
+  cinemaCatalog(): Promise<ShotSpec[]> {
+    return Promise.resolve([]);
+  }
+  cinemaAddShot(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaRemoveShot(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaList(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, reads: [], problems: [], message: "", reason: null });
+  }
+  conditionCatalog(): Promise<ConditionSpec[]> {
+    return Promise.resolve([]);
+  }
+  conditionAdd(): Promise<RoleReply> {
+    return Promise.resolve({ applied: null, entity: null, added: [], scoreEntity: null, message: "", reason: "Conditions are available in the packaged desktop editor." });
+  }
+  conditionRemove(): Promise<RoleReply> {
+    return Promise.resolve({ applied: null, entity: null, added: [], scoreEntity: null, message: "", reason: "Conditions are available in the packaged desktop editor." });
+  }
+  conditionList(): Promise<ConditionListInfo> {
+    return Promise.resolve({ all: [], any: [], roleClause: null, sentence: "" });
+  }
   assetLabAudit(id: string): Promise<AssetLabResponse> {
     return Promise.resolve({
       ok: false,
@@ -2161,7 +2799,7 @@ class MockClient implements EditorClient {
   assetLabExport(id: string): Promise<AssetLabResponse> {
     return this.assetLabAudit(id);
   }
-  sceneExport(format: "glb" | "usda"): Promise<SceneExportResponse> {
+  sceneExport(format: "glb" | "usda" | "step"): Promise<SceneExportResponse> {
     return Promise.resolve({
       ok: false,
       message: "Complete-scene export is available in the packaged desktop editor.",
@@ -2494,6 +3132,8 @@ class MockClient implements EditorClient {
   private matchAuthored: AuthoredMatch | null = null;
   private matchTick = 0;
   private matchRunning = false;
+  private terrainRecipe: TerrainRecipe | null = null;
+  private terrainRoutePoints = 0;
   private matchStunTicks = 0;
   private matchOrder: string | null = null;
   private matchAbilityReadyIn: number | null = 0;
@@ -2589,6 +3229,128 @@ class MockClient implements EditorClient {
   matchCooked(): Promise<CookedMatch | null> {
     return Promise.resolve(null);
   }
+  terrainPresets(): Promise<TerrainPreset[]> {
+    return Promise.resolve([
+      { id: "flat", name: "Flat Ground", description: "A level plate with one material." },
+      { id: "rolling-hills", name: "Rolling Hills", description: "Gentle warped hills." },
+      { id: "alpine", name: "Alpine Peaks", description: "Eroded ridged mountains." },
+    ]);
+  }
+
+  terrainCreate(preset: string): Promise<TerrainReply> {
+    this.terrainRecipe = mockRecipe(preset);
+    return Promise.resolve(this.terrainReply());
+  }
+
+  terrainDescribe(text: string): Promise<TerrainReply> {
+    // A shallow stand-in for the real Rust lexicon: enough that the browser build behaves plausibly, and
+    // deliberately NOT a second implementation of it — the engine is the only place the reading is decided.
+    const reading = mockReading(text);
+    this.terrainRecipe = {
+      ...mockRecipe(reading.brief.landform === "Mountains" ? "alpine" : "rolling-hills"),
+      name: reading.brief.name,
+      seed: reading.brief.seed,
+    };
+    return Promise.resolve({ ...this.terrainReply(), reading });
+  }
+
+  terrainReadDescription(text: string): Promise<TerrainReading | null> {
+    return Promise.resolve(mockReading(text));
+  }
+
+  terrainPlan(text: string): Promise<TerrainPlan | null> {
+    // The browser mock cannot resolve a spatial target — that needs the real world. It says so by
+    // reporting a creation plan, rather than inventing steps the engine would not produce.
+    const r = mockReading(text);
+    return Promise.resolve({
+      kind: "create" as const,
+      understood: r.understood,
+      unused: r.unused,
+      notes: ["the browser preview cannot resolve “this” — run the app for local edits"],
+      steps: [],
+      ok: true,
+    });
+  }
+
+  terrainEdit(edit: Record<string, unknown> | null): Promise<TerrainReply> {
+    if (!this.terrainRecipe) {
+      return Promise.resolve({
+        ok: false,
+        entity: "",
+        message: "there is no terrain in the scene yet",
+        recipe: null,
+        issues: [],
+        stats: mockTerrainStats(false),
+      });
+    }
+    // Only the handful of edits the dev shell needs to feel real; everything else is acknowledged.
+    if (edit && edit.op === "setSeed") this.terrainRecipe.seed = Number(edit.seed ?? 0);
+    if (edit && edit.op === "rename") this.terrainRecipe.name = String(edit.name ?? "");
+    if (edit && edit.op === "applyPreset") this.terrainRecipe = mockRecipe(String(edit.id ?? "flat"));
+    if (edit && edit.op === "toggleLayer") {
+      const i = Number(edit.index ?? 0);
+      if (this.terrainRecipe.layers[i]) this.terrainRecipe.layers[i].enabled = Boolean(edit.enabled);
+    }
+    return Promise.resolve(this.terrainReply());
+  }
+
+  terrainStats(): Promise<TerrainStats> {
+    return Promise.resolve(mockTerrainStats(this.terrainRecipe !== null));
+  }
+
+  terrainPath(
+    from: [number, number, number],
+    to: [number, number, number],
+  ): Promise<TerrainPathResult> {
+    // The dev shell has no resident nav grids, and saying so is the honest answer — a mock that always
+    // reported a route would make the one control whose whole job is to tell the truth about the ground
+    // lie in every dev session.
+    return Promise.resolve({
+      found: false,
+      reason: "no navigation grids are resident yet",
+      waypoints: [from, to].slice(0, 0),
+    });
+  }
+
+  terrainTool(mode: string): Promise<boolean> {
+    // The dev shell has no viewport to arm, so this only reports whether a tool was requested.
+    return Promise.resolve(mode !== "none");
+  }
+
+  terrainPaintBegin(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  terrainPaintEnd(): Promise<TerrainReply> {
+    return Promise.resolve(this.terrainReply());
+  }
+
+  terrainRoutePoint(): Promise<number> {
+    this.terrainRoutePoints += 1;
+    return Promise.resolve(this.terrainRoutePoints);
+  }
+
+  terrainRouteClear(lastOnly: boolean): Promise<number> {
+    this.terrainRoutePoints = lastOnly ? Math.max(0, this.terrainRoutePoints - 1) : 0;
+    return Promise.resolve(this.terrainRoutePoints);
+  }
+
+  terrainRouteCommit(): Promise<TerrainReply> {
+    this.terrainRoutePoints = 0;
+    return Promise.resolve(this.terrainReply());
+  }
+
+  private terrainReply(): TerrainReply {
+    return {
+      ok: true,
+      entity: "terrain-1",
+      message: "",
+      recipe: this.terrainRecipe,
+      issues: [],
+      stats: mockTerrainStats(true),
+    };
+  }
+
   matchStop(): Promise<MatchStatus> {
     this.matchRunning = false;
     this.matchTick = 0;

@@ -9,9 +9,8 @@ test("exposes honest undo and redo actions in the primary editor toolbar", async
   render(
     <EditorHeader
       client={fakeClient({ undo, redo })}
-      onOpenCreate={vi.fn()}
-      onOpenLogic={vi.fn()}
-      onOpenReview={vi.fn()}
+
+
       onOpenCommands={vi.fn()}
     />,
   );
@@ -31,14 +30,12 @@ test("keeps both dock drawers and command search reachable in the compact header
   const openLeft = vi.fn();
   const openRight = vi.fn();
   const openCommands = vi.fn();
-  const openLogic = vi.fn();
   render(
     <EditorHeader
       client={fakeClient()}
       compact
-      onOpenCreate={vi.fn()}
-      onOpenLogic={openLogic}
-      onOpenReview={vi.fn()}
+
+
       onOpenCommands={openCommands}
       onOpenLeftDock={openLeft}
       onOpenRightDock={openRight}
@@ -48,7 +45,6 @@ test("keeps both dock drawers and command search reachable in the compact header
   const scene = screen.getByTestId("header-scene");
   const inspector = screen.getByTestId("header-inspector");
   const commands = screen.getByTestId("command-palette-trigger");
-  const workspaces = screen.getByTestId("header-workspaces");
   expect(screen.getByTestId("editor-header").className).toContain("is-compact");
   expect(scene.closest(".mtk-editor-header__start")).not.toBeNull();
   expect(inspector.closest(".mtk-editor-header__start")).not.toBeNull();
@@ -57,11 +53,10 @@ test("keeps both dock drawers and command search reachable in the compact header
   fireEvent.click(scene);
   fireEvent.click(inspector);
   fireEvent.click(commands);
-  fireEvent.click(workspaces);
-  expect(screen.getByRole("menu", { name: "Open engine workspace" })).toBeTruthy();
-  fireEvent.click(screen.getByTestId("header-logic"));
   expect(openLeft).toHaveBeenCalledTimes(1);
   expect(openRight).toHaveBeenCalledTimes(1);
   expect(openCommands).toHaveBeenCalledTimes(1);
-  expect(openLogic).toHaveBeenCalledTimes(1);
+  // The header no longer lists workspaces: that was a second index offering three of the nine sub-engines
+  // under different names. The Engines rail is the one place they live.
+  expect(screen.queryByTestId("header-workspaces")).toBeNull();
 });

@@ -19,6 +19,7 @@ import { Button } from "../theme/primitives";
 import { DockRail } from "../theme/workspace";
 import { color, elevation, font, fontSize, motion, radius, space, z } from "../theme/tokens";
 import { dockGridColumns, panelLayout } from "./layout";
+import { usePlayerDrive } from "./usePlayerDrive";
 import { ViewportToolbar } from "../panels/ViewportToolbar";
 import { Rejections } from "../panels/Rejections";
 import { StatusBar } from "../panels/StatusBar";
@@ -32,6 +33,7 @@ import { ViewportToolRail, type ViewportTool } from "../panels/ViewportToolRail"
 import type { PipeForgeStatus } from "../transport/protocol";
 import { EditorHeader } from "./EditorHeader";
 import { LeftDock, InspectorDock, type LeftWorkspace, type InspectorWorkspace } from "./EditorDocks";
+import { EngineRail, ENGINES, engineById, type EngineId } from "./EngineRail";
 import { BottomDock, type BottomWorkspace } from "./BottomDock";
 import { normalizeSurfacePoint } from "./viewportCoordinates";
 
@@ -39,14 +41,17 @@ import { normalizeSurfacePoint } from "./viewportCoordinates";
 // active. Keep the default editor entry lean; the compact loading state occupies the same overlay region.
 const PipeForge = lazy(() => import("../panels/PipeForge").then((module) => ({ default: module.PipeForge })));
 
+// The collapsed side rails carry only what that dock actually holds. The sub-engines are NOT repeated
+// here — they live on the Engines rail, which is always visible, and listing them twice in different
+// orders is exactly the confusion this layout removes.
 const LEFT_RAIL_ITEMS = [
   { id: "scene", label: "Scene", icon: "▱" },
-  { id: "create", label: "Create", icon: "+" },
+  { id: "build", label: "Build", icon: "+" },
+  { id: "terrain", label: "Terrain", icon: "◭" },
 ] as const;
 const RIGHT_RAIL_ITEMS = [
   { id: "properties", label: "Properties", icon: "⚙" },
   { id: "relations", label: "Relations", icon: "⌘" },
-  { id: "physics", label: "Physics", icon: "◉" },
 ] as const;
 
 /** Build the editor session once: the REAL Tauri shell transport inside the packaged `.exe` (the live
@@ -123,6 +128,7 @@ function effectiveViewportWidth(): number {
 
 export function App() {
   const client = useEditorSession();
+  usePlayerDrive(client); // arrows / WASD move the Player role while Play runs
   const native = isTauri(); // inside the packaged .exe the viewport is the real wgpu region (composite)
   // The M3.3 right-click context menu, opened for an entity at a cursor position.
   const [ctx, setCtx] = useState<{ id: string; x: number; y: number } | null>(null);
@@ -138,6 +144,9 @@ export function App() {
   const [pipeBusy, setPipeBusy] = useState(false);
   const [activeTool, setActiveTool] = useState<ViewportTool>("select");
   const [leftWorkspace, setLeftWorkspace] = useState<LeftWorkspace>("scene");
+  // Which sub-engine the author is in. One piece of state for the whole rail, so "where am I?" always has
+  // exactly one answer — the thing the old three-dock arrangement could not provide.
+  const [engine, setEngine] = useState<EngineId>("scene");
   const [inspectorWorkspace, setInspectorWorkspace] = useState<InspectorWorkspace>("properties");
   const [bottomWorkspace, setBottomWorkspace] = useState<BottomWorkspace>("asset");
   const [bottomOpen, setBottomOpen] = useState(false);
@@ -250,6 +259,21 @@ export function App() {
   function openBottom(workspace: BottomWorkspace) {
     setBottomWorkspace(workspace);
     setBottomOpen(true);
+  }
+
+  /**
+   * The one router. Every way of reaching a sub-engine — the rail, the command palette, a deep link from
+   * another panel — goes through here, so the active engine and the surface showing it can never disagree.
+   */
+  function openEngine(id: EngineId) {
+    setEngine(id);
+    const def = engineById(id);
+    if (def.surface === "side") {
+      openLeft(id as LeftWorkspace);
+    } else {
+      // The bottom-dock engines keep their existing ids; only the rail's vocabulary is new.
+      openBottom((id === "model" ? "asset" : id === "animate" ? "animation" : id) as BottomWorkspace);
+    }
   }
 
   function activateDockRail(side: "left" | "right", workspace: string, anchor: HTMLButtonElement) {
@@ -385,6 +409,19 @@ export function App() {
     ? { opacity: 0.45, pointerEvents: "none", transition: `opacity ${motion.base}` }
     : { transition: `opacity ${motion.base}` };
 
+  // `opacity` composites the element AND ITS OWN BACKGROUND, which is fine in a browser sitting on an
+  // opaque body and wrong in the packaged app: the native root is deliberately transparent so the wgpu
+  // viewport can show through, so a 45%-opaque dock let the 3D scene bleed into the side panels the
+  // moment Play started. Seen in an OS capture of a Play session — a crate and its shadow drawn across
+  // the object list. The dock therefore keeps a FULLY OPAQUE background and dims only its contents.
+  const dockSurface: React.CSSProperties = { overflow: "hidden", background: "var(--mtk-bg-panel)" };
+  const dockContent: React.CSSProperties = {
+    height: "100%",
+    minHeight: 0,
+    overflow: "hidden",
+    ...chromeDim,
+  };
+
   const selectCreated = (id: string | null) => {
     if (!id) return;
     projectionStore.getState().select(id);
@@ -392,15 +429,17 @@ export function App() {
   };
 
   const commands: EditorCommand[] = [
-    { id: "workspace-scene", label: "Open Scene", category: "Workspaces", description: "Navigate and organize scene objects", keywords: ["hierarchy", "objects"], execute: () => openLeft("scene") },
-    { id: "workspace-create", label: "Open Create", category: "Workspaces", description: "Browse assets and local creation tools", keywords: ["assets", "library"], execute: () => openLeft("create") },
+    // Generated from the SAME list the rail renders, so the palette can never drift out of sync with it.
+    ...ENGINES.map((e) => ({
+      id: `workspace-${e.id}`,
+      label: `Open ${e.label}`,
+      category: "Workspaces",
+      description: e.blurb,
+      execute: () => openEngine(e.id),
+    })),
     { id: "workspace-properties", label: "Open Properties", category: "Workspaces", description: "Inspect the selected object", execute: () => openInspector("properties") },
     { id: "workspace-relations", label: "Open Relations", category: "Workspaces", description: "Inspect bindings and graph relationships", execute: () => openInspector("relations") },
-    { id: "workspace-physics", label: "Open Physics", category: "Workspaces", description: "Simulation and collision controls", execute: () => openInspector("physics") },
-    { id: "workspace-asset", label: "Open Asset Lab", category: "Workspaces", description: "Inspect, repair, optimize, finish, validate and export the selected mesh", keywords: ["mesh", "uv", "lod", "bake", "glb"], execute: () => openBottom("asset") },
-    { id: "workspace-animation", label: "Open Animation", category: "Workspaces", description: "Key properties, preview motion and inspect rig readiness", keywords: ["timeline", "keyframe", "clip", "rig", "motion"], execute: () => openBottom("animation") },
-    { id: "workspace-import", label: "Open Import Review", category: "Workspaces", description: "Inspect CAD fidelity and re-import changes", execute: () => openBottom("import") },
-    { id: "workspace-logic", label: "Open Logic", category: "Workspaces", description: "Rules, state machines and binding graphs", execute: () => openBottom("logic") },
+    { id: "workspace-problems", label: "Open Problems", category: "Workspaces", description: "Selection diagnostics and actionable issues", execute: () => openBottom("problems") },
     { id: "workspace-runtime", label: "Open Runtime", category: "Workspaces", description: "Live rule decisions during Play", execute: () => openBottom("runtime") },
     { id: "tool-select", label: "Select tool", category: "Viewport tools", description: "Select objects in the viewport", execute: () => chooseTool("select") },
     { id: "tool-move", label: "Move tool", category: "Viewport tools", shortcut: "W", disabled: !selectedId, disabledReason: "Select an object first", execute: () => chooseTool("move") },
@@ -434,7 +473,6 @@ export function App() {
     <LeftDock
       client={client}
       active={leftWorkspace}
-      onChange={setLeftWorkspace}
       onStartPipe={() => {
         setActiveTool("pipe");
         setDrawer(null);
@@ -442,7 +480,7 @@ export function App() {
       }}
       onImport={() => void client.importAssetDialog().then((id) => {
         selectCreated(id);
-        if (id) openBottom("asset");
+        if (id) openEngine("model");
       })}
       onContextMenu={(id, x, y) => {
         if (!playing) setCtx({ id, x, y });
@@ -462,6 +500,7 @@ export function App() {
       client={client}
       active={inspectorWorkspace}
       onChange={setInspectorWorkspace}
+      onJumpTo={(target) => openEngine(target)}
       onCollapse={!layout.collapsed && !rightDockCollapsed ? () => {
         setRightDockCollapsed(true);
         setDockFlyout(null);
@@ -482,14 +521,27 @@ export function App() {
       <EditorHeader
         client={client}
         compact={layout.collapsed}
-        onOpenCreate={() => openLeft("create")}
-        onOpenLogic={() => openBottom("logic")}
-        onOpenReview={() => openBottom("import")}
         onOpenCommands={() => setCommandsOpen(true)}
         onOpenLeftDock={() => setDrawer("left")}
         onOpenRightDock={() => setDrawer("right")}
       />
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: dockGridColumns(layout, leftDockCollapsed, rightDockCollapsed), minHeight: 0 }}>
+        {/* ENGINES — the one index of what this editor can do. Always the first column (except in the
+            phone-width overlay layout, where the whole shell is a single column). */}
+        {!layout.overlay && (
+          // Same reason as the docks: the rail dims over an opaque backing rather than dimming its own
+          // background, or the viewport shows through it during Play.
+          <div style={{ display: "flex", ...dockSurface }}>
+            <EngineRail
+              active={engine}
+              compact={layout.collapsed}
+              badges={{ scene: order.length || undefined, gameplay: playing ? "live" : undefined }}
+              onChange={openEngine}
+              style={chromeDim}
+            />
+          </div>
+        )}
+
         {/* LEFT — full panel, or a collapsed icon rail (the stage keeps priority on resize). */}
         {!layout.overlay && (layout.collapsed || leftDockCollapsed ? (
           <DockRail
@@ -502,7 +554,9 @@ export function App() {
             data-testid="rail-left"
           />
         ) : (
-          <div style={{ borderRight: "1px solid var(--mtk-border-subtle)", overflow: "hidden", background: "var(--mtk-bg-panel)", ...chromeDim }}>{leftPanel}</div>
+          <div style={{ borderRight: "1px solid var(--mtk-border-subtle)", ...dockSurface }}>
+            <div style={dockContent}>{leftPanel}</div>
+          </div>
         ))}
 
         {/* viewport: native-owned (invariant 4). Inside the `.exe` it is **transparent** so the native wgpu
@@ -656,7 +710,7 @@ export function App() {
                     projectionStore.getState().select(report.entityId);
                     void client.gizmoSelect(report.entityId);
                     setInspectorWorkspace("properties");
-                    openBottom("asset");
+                    openEngine("model");
                   }
                   void client.pipeForgeStatus().then(setPipeStatus);
                 }}
@@ -667,10 +721,10 @@ export function App() {
           {sceneEmpty && !playing && (
             <EmptyState
               onDrawPipe={() => setActiveTool("pipe")}
-              onBrowseAssets={() => openLeft("create")}
+              onBrowseAssets={() => openEngine("build")}
               onImport={() => void client.importAssetDialog().then((id) => {
                 selectCreated(id);
-                if (id) openBottom("asset");
+                if (id) openEngine("model");
               })}
             />
           )}
@@ -683,7 +737,20 @@ export function App() {
           active={bottomWorkspace}
           open={bottomOpen}
           playing={playing}
-          onChange={setBottomWorkspace}
+          onChange={(w) => {
+            setBottomWorkspace(w);
+            // Keep the rail in step. Switching workspace from the dock's own strip and leaving the rail
+            // pointing somewhere else would put the editor back in the state this layout removed: two
+            // controls, two answers to "where am I?".
+            // Mapped through `engineById`, never cast. Three of the dock's workspaces have no engine —
+            // Problems and Runtime are diagnostics, and Formats is a build-capability report, not a
+            // place you author — and the cast that used to stand here sent `"formats"` into `setEngine`
+            // as an `EngineId` it is not. The rail then lit NOTHING, which is precisely the "two
+            // controls, two answers to where am I" state this layout exists to remove.
+            const asEngine =
+              w === "asset" ? "model" : w === "animation" ? "animate" : w;
+            if (ENGINES.some((e) => e.id === asEngine)) setEngine(asEngine as EngineId);
+          }}
           onOpenChange={setBottomOpen}
         />
         </div>
@@ -700,7 +767,9 @@ export function App() {
             data-testid="rail-right"
           />
         ) : (
-          <div style={{ borderLeft: "1px solid var(--mtk-border-subtle)", overflow: "hidden", background: "var(--mtk-bg-panel)", ...chromeDim }}>{rightPanel}</div>
+          <div style={{ borderLeft: "1px solid var(--mtk-border-subtle)", ...dockSurface }}>
+            <div style={dockContent}>{rightPanel}</div>
+          </div>
         ))}
       </div>
 
@@ -781,7 +850,7 @@ export function App() {
           setStatus(`${command.label} could not be completed`);
         }}
       />
-      <Onboarding show={!sceneEmpty && !playing} onStart={() => openLeft("create")} />
+      <Onboarding show={!sceneEmpty && !playing} onStart={() => openEngine("build")} />
       <StatusBar />
       <Rejections />
     </div>

@@ -1,85 +1,30 @@
 //! Production editor header: project identity and file operations on the left, play transport in the
-//! centre, and high-frequency workspace/command access on the right. Creation and optional AI are no
-//! longer allowed to consume a permanent full-width row above the viewport.
+//! centre, undo/redo and the command palette on the right.
+//!
+//! It deliberately does NOT list workspaces. It used to carry a "Workspaces" menu offering three of the
+//! nine sub-engines under different names — a second, disagreeing index. The Engines rail is the one index
+//! now, and the header's job is the project and the transport.
 
 import { FileMenu } from "../panels/FileMenu";
 import { PlayControls } from "../panels/PlayControls";
 import { Wallet } from "../panels/Wallet";
 import { Button } from "../theme/primitives";
-import { MenuPopup, PopupMenuGroup, PopupMenuItem, ShortcutBadge } from "../theme/workspace";
+import { ShortcutBadge } from "../theme/workspace";
 import { color, font, fontSize, space } from "../theme/tokens";
 import { setStatus } from "../store/ui";
 import type { EditorClient } from "../transport/session";
 
 export interface EditorHeaderProps {
   client: EditorClient;
-  onOpenCreate: () => void;
-  onOpenLogic: () => void;
-  onOpenReview: () => void;
   onOpenCommands: () => void;
   onOpenLeftDock?: () => void;
   onOpenRightDock?: () => void;
   compact?: boolean;
 }
 
-function WorkspaceMenu({
-  compact,
-  onOpenCreate,
-  onOpenLogic,
-  onOpenReview,
-}: Pick<EditorHeaderProps, "compact" | "onOpenCreate" | "onOpenLogic" | "onOpenReview">) {
-  return (
-    <MenuPopup
-      id="header-workspaces-popup"
-      label="Open engine workspace"
-      placement="bottom-end"
-      trigger={compact ? <span aria-hidden="true">◇</span> : <>Workspaces <span aria-hidden="true">⌄</span></>}
-      triggerProps={{
-        "data-testid": "header-workspaces",
-        variant: "ghost",
-        compact: true,
-        icon: compact,
-        "aria-label": compact ? "Open engine workspace" : undefined,
-        title: "Open creation, logic, and review workspaces",
-      }}
-    >
-      {(close) => (
-        <PopupMenuGroup label="Workspaces">
-          <PopupMenuItem
-            data-testid="header-create"
-            label="Create"
-            description="Assets, imports and procedural tools"
-            leading="＋"
-            onSelect={onOpenCreate}
-            onRequestClose={close}
-          />
-          <PopupMenuItem
-            data-testid="header-logic"
-            label="Logic"
-            description="Rules, state machines and bindings"
-            leading="◇"
-            onSelect={onOpenLogic}
-            onRequestClose={close}
-          />
-          <PopupMenuItem
-            data-testid="header-review"
-            label="Review"
-            description="Import fidelity and diagnostics"
-            leading="✓"
-            onSelect={onOpenReview}
-            onRequestClose={close}
-          />
-        </PopupMenuGroup>
-      )}
-    </MenuPopup>
-  );
-}
 
 export function EditorHeader({
   client,
-  onOpenCreate,
-  onOpenLogic,
-  onOpenReview,
   onOpenCommands,
   onOpenLeftDock,
   onOpenRightDock,
@@ -114,7 +59,6 @@ export function EditorHeader({
             <span aria-hidden="true">⚙</span>
           </Button>
         )}
-        {compact && <WorkspaceMenu compact onOpenCreate={onOpenCreate} onOpenLogic={onOpenLogic} onOpenReview={onOpenReview} />}
         <Button data-testid="header-undo" variant="ghost" compact icon aria-label="Undo" onClick={() => void undo()} title="Undo the last scene change (Ctrl/Cmd+Z)">
           <span aria-hidden="true">↶</span>
         </Button>
@@ -142,7 +86,6 @@ export function EditorHeader({
       </div>
 
       <div className="mtk-editor-header__end" role="toolbar" aria-label="Editor workspaces and commands">
-        {!compact && <WorkspaceMenu onOpenCreate={onOpenCreate} onOpenLogic={onOpenLogic} onOpenReview={onOpenReview} />}
         {!compact && (
           <Button
             data-testid="command-palette-trigger"

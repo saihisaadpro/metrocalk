@@ -1526,3 +1526,512 @@ const te = new TextEncoder();
 const td = new TextDecoder();
 export const encodeJson = (v: unknown): Uint8Array => te.encode(JSON.stringify(v));
 export const decodeJson = <T>(b: Uint8Array): T => JSON.parse(td.decode(b)) as T;
+
+// ── terrain (M19 / ADR-104) ─────────────────────────────────────────────────────────────────────────────
+
+/** A terrain preset a picker offers. */
+export interface TerrainPreset {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/** One validation finding, with the field it is about and how to fix it. */
+export interface TerrainIssue {
+  severity: "blocking" | "warning" | "info";
+  field: string;
+  message: string;
+  fix?: string | null;
+}
+
+/** A road, river or pad, as the recipe stores it. Control points are world XZ (metres) with a Y. */
+export interface TerrainSpline {
+  name: string;
+  kind: string | Record<string, unknown>;
+  points: [number, number, number][];
+  width_m: number;
+  enabled: boolean;
+}
+
+/** The answer to "can something actually cross this?" — a route over the resident navigation grids. */
+export interface TerrainPathResult {
+  found: boolean;
+  reason: string;
+  lengthM?: number;
+  visited?: number;
+  waypoints: [number, number, number][];
+}
+
+/** Live runtime counters — what the profiling readout shows. */
+export interface TerrainStats {
+  active: boolean;
+  residentChunks: number;
+  visibleChunks: number;
+  culledFrustum: number;
+  culledHorizon: number;
+  pendingBuilds: number;
+  completedBuilds: number;
+  drawnTriangles: number;
+  drawnInstances: number;
+  impostorInstances: number;
+  meshMb: number;
+  textureMb: number;
+  scatterMb: number;
+  colliderMb: number;
+  navMb: number;
+  totalMb: number;
+  budgetMb: number;
+  budgetFraction: number;
+  overBudget: boolean;
+  buildUsTotal: number;
+  dominantStage: string;
+  /** What is wrong with the terrain right now, in the author's language. Empty when nothing is. */
+  problem: string;
+}
+
+/** A terrain layer, as the recipe stores it. `kind` is the tagged union serde emits. */
+export interface TerrainLayer {
+  name: string;
+  kind: Record<string, unknown> | string;
+  blend: string;
+  weight: number;
+  enabled: boolean;
+  seed_offset: number;
+  mask?: unknown;
+}
+
+/** A scatter prototype and the assets bound to it. */
+export interface TerrainProto {
+  name: string;
+  mesh_key: string;
+  lod_keys: string[];
+  impostor_key: string | null;
+  radius_m: number;
+  height_m: number;
+  collide: boolean;
+}
+
+/** The authored terrain, as the document holds it. Only the parts the panel edits are typed; the rest
+ *  rides through untouched so the UI can never silently drop a field it does not know about. */
+export interface TerrainRecipe {
+  version: number;
+  name: string;
+  /** The sentence this was built from, when it was described rather than picked. Provenance only. */
+  description: string;
+  seed: number;
+  world_size_m: number;
+  chunk_size_m: number;
+  chunk_verts: number;
+  layers: TerrainLayer[];
+  strokes: unknown[];
+  splines: TerrainSpline[];
+  materials: { name: string; albedo: [number, number, number]; roughness: number }[];
+  biomes: { name: string; material_layer: number; enabled: boolean }[];
+  protos: TerrainProto[];
+  scatter: { name: string; proto: number; density_per_hectare: number; enabled: boolean }[];
+  water: {
+    enabled: boolean;
+    sea_level_m: number;
+    shore_blend_m: number;
+    deep_m: number;
+  };
+  lod: {
+    levels: number;
+    screen_error_px: number;
+    max_view_distance_m: number;
+    texture_res: number;
+    horizon_culling: boolean;
+    [k: string]: unknown;
+  };
+  budget: {
+    mesh_mb: number;
+    texture_mb: number;
+    scatter_mb: number;
+    collider_mb: number;
+    max_resident_chunks: number;
+  };
+  [k: string]: unknown;
+}
+
+/** One intent taken from a plain-language description, and the words that produced it. */
+export interface TerrainUnderstood {
+  phrase: string;
+  meaning: string;
+}
+
+/**
+ * How a description was read. Shown to the author verbatim: a generator that quietly ignores half the
+ * sentence is the thing that makes these features feel untrustworthy, so `unused` is a feature, not a
+ * diagnostic.
+ */
+export interface TerrainReading {
+  brief: {
+    landform: string;
+    climate: string;
+    relief: number;
+    worldSizeM: number | null;
+    water: string;
+    vegetation: number;
+    erosion: boolean | null;
+    terraces: boolean;
+    river: boolean;
+    road: boolean;
+    name: string;
+    seed: number;
+    [k: string]: unknown;
+  };
+  understood: TerrainUnderstood[];
+  unused: string[];
+}
+
+/** One step of a compiled plan — what it will do, or why it cannot. */
+export interface TerrainPlanStep {
+  verb: string;
+  effect: string;
+  refusal: string | null;
+  suggestion: string | null;
+  rebuilds: string;
+  /** `[minX, minZ, maxX, maxZ]` — the world rectangle this step changes. */
+  region: [number, number, number, number] | null;
+}
+
+/**
+ * What a sentence WOULD do, without doing it (ADR-106).
+ *
+ * `kind` is `"create"` when the sentence describes a whole world and `"modify"` when it changes part of the
+ * one that exists. The panel shows the steps before the author commits, which is what makes a local edit
+ * inspectable rather than a guess.
+ */
+export interface TerrainPlan {
+  kind: "create" | "modify";
+  understood: TerrainUnderstood[];
+  unused: string[];
+  notes: string[];
+  steps: TerrainPlanStep[];
+  ok: boolean;
+}
+
+/** Every terrain command answers with this: what the recipe now is, what is wrong with it, what it costs. */
+export interface TerrainReply {
+  ok: boolean;
+  entity: string;
+  message: string;
+  recipe: TerrainRecipe | null;
+  issues: TerrainIssue[];
+  stats: TerrainStats;
+  /** Present only for a described terrain. */
+  reading?: TerrainReading | null;
+}
+
+// ── Shape Studio (Build sub-engine): parametric shapes · draw-to-3D · combine · meld ────────────────────
+
+/** One tunable parameter of a shape, in the author's language (mirrors the Rust `ShapeParamSpec`). */
+export interface ShapeParamSpec {
+  key: string;
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  default: number;
+  /** Whole numbers only (segment counts). */
+  integer: boolean;
+  /** Unit shown after the value ("m", or "" for counts). */
+  unit: string;
+}
+
+/** One creatable shape: identity, copy and its parameter specs. */
+export interface ShapeSpec {
+  kind: string;
+  label: string;
+  blurb: string;
+  icon: string;
+  params: ShapeParamSpec[];
+}
+
+/** What every Shape Studio command answers with. Exactly one of `created`/`reason` tells the story:
+ *  `created` = the entity landed (the UI places + selects it); `reason` = a plain-language refusal
+ *  with NO scene change. `triangles`/`ms` are the legible build facts. */
+export interface ShapeReply {
+  created: string | null;
+  handle: string | null;
+  triangles: number;
+  ms: number;
+  message: string;
+  reason: string | null;
+}
+
+/** The editable recipe a shape entity's `ShapeRecipe.source` field stores (canonical JSON). */
+export interface ShapeRecipeSource {
+  v: number;
+  kind: string;
+  params?: Record<string, number>;
+  profile?: [number, number][];
+  sources?: string[];
+}
+
+// ── Gameplay roles (the asset→gameplay bridge) ──────────────────────────────────────────────────────────
+
+/** One assignable role, with the exact list of what assigning adds (mirrors the Rust `RoleSpec`). */
+export interface RoleSpec {
+  kind: string;
+  label: string;
+  blurb: string;
+  icon: string;
+  adds: string;
+}
+
+/** What every role command answers with: `applied` set = landed; `reason` set = explained refusal,
+ *  nothing changed; `added` is the legible what-you-got list. */
+export interface RoleReply {
+  applied: string | null;
+  entity: string | null;
+  added: string[];
+  scoreEntity: string | null;
+  message: string;
+  reason: string | null;
+}
+
+/** One roster row. */
+export interface RoleRow {
+  entity: string;
+  name: string;
+  role: string;
+}
+
+/** One "only if" card the Behaviour block offers. */
+/** What a format carries through this engine. */
+export interface FormatCarries {
+  geometry: boolean;
+  hierarchy: boolean;
+  materials: boolean;
+  textures: boolean;
+  skinning: boolean;
+  animation: boolean;
+  cameras: boolean;
+  metadata: boolean;
+  physics: boolean;
+}
+
+/** One format the engine has a declared opinion about. */
+export interface FormatSpec {
+  id: string;
+  label: string;
+  extensions: string[];
+  domain: string;
+  direction: "import" | "export" | "both";
+  /** How much survives: an explained seam, a declared subset, or full. */
+  fidelity: "seam" | "subset" | "full";
+  carries: FormatCarries;
+  /** The honest sentence: what works and specifically what does not. */
+  note: string;
+  /** False when this build was compiled without the feature that implements it. */
+  available: boolean;
+}
+
+/** One colour space the engine can convert exactly between. */
+export interface ColourSpaceSpec {
+  id: string;
+  label: string;
+  /** False for raw data — a roughness or normal map, which must never receive a transfer function. */
+  isColour: boolean;
+  isLinear: boolean;
+}
+
+/** A display/view transform the viewport can run. */
+export interface ViewTransformSpec {
+  id: string;
+  label: string;
+  blurb: string;
+}
+
+/**
+ * The colour pipeline, reported per capability rather than as one "managed: yes".
+ *
+ * Colour is where a half-answer is worse than none: someone who believes the engine is ACES-managed,
+ * and learns later that only the view transform was hooked up, has already shipped wrong frames. So
+ * every capability is a separate flag and the notes say what is NOT wired.
+ */
+export interface ColourStatus {
+  spaces: ColourSpaceSpec[];
+  /**
+   * The space the renderer SHADES in right now — not a constant. Everything that carries light is
+   * converted into it before the BRDF, and the frame leaves it once, immediately before the view
+   * transform.
+   */
+  working: {
+    current: string;
+    label: string;
+    wired: boolean;
+    options: { id: string; label: string; arg: string }[];
+    setCommand: string;
+    /** What "brightness" means in this space — bloom meters with these. */
+    luminanceWeights: [number, number, number];
+  };
+  views: ViewTransformSpec[];
+  /** The transform the viewport is running RIGHT NOW, not merely one that exists. */
+  activeView: string;
+  activeViewLabel: string;
+  setViewCommand: string;
+  setViewArg: string;
+  /**
+   * The identity every asynchronous render result carries, so a thumbnail can be matched to the state
+   * it was rendered in. Changes whenever the working space, the view transform or the exposure does.
+   */
+  presentationHash: string;
+  exposure: number;
+  /**
+   * What the loaded environment map is DECLARED to be. The one per-asset colour override that is live,
+   * because it is the one asset whose colour space the file genuinely does not record.
+   */
+  environment: {
+    sourceSpace: string;
+    label: string;
+    /** True while this is the engine's assumption rather than someone's declaration. */
+    assumed: boolean;
+    options: { id: string; label: string; arg: string }[];
+    setCommand: string;
+  };
+  capabilities: Record<string, boolean>;
+  notes: string[];
+}
+
+/** What the renderer is drawing this instant — measured, not inferred. */
+export interface VfxProbe {
+  additive: number;
+  soft: number;
+  total: number;
+  /** Live one-shot bursts. */
+  bursts: number;
+  /** Brightest particle in linear HDR; above 1.0 means the scene is genuinely emitting. */
+  peakRadiance: number;
+}
+
+/** Where the camera actually is this instant. */
+export interface CameraProbe {
+  eye: [number, number, number];
+  lookAt: [number, number, number];
+  fovDeg: number;
+  /** True only while a cutscene owns the view. */
+  cinematic: boolean;
+  distance: number;
+}
+
+/** One effect card in the VFX catalogue. */
+export interface EffectSpec {
+  kind: string;
+  label: string;
+  blurb: string;
+  icon: string;
+  /** What it will look like, spelled out. */
+  adds: string;
+  /** True when the card is a one-shot (fires at a moment rather than running). */
+  burst: boolean;
+}
+
+/** What a completed VFX command answers with. */
+export interface VfxReply {
+  entity: string | null;
+  layers: number;
+  /** Particles at once, across the whole stack. */
+  particles: number;
+  /** The effect read back as sentences, one line per layer. */
+  reads: string[];
+  /** Warnings in plain language. */
+  problems: string[];
+  message: string;
+  reason: string | null;
+}
+
+/** One shot card in the cinematics catalogue — the RoleSpec sibling. */
+export interface ShotSpec {
+  kind: string;
+  label: string;
+  blurb: string;
+  icon: string;
+  /** What the shot will look like, spelled out — the legible-cost line. */
+  adds: string;
+}
+
+/** What a completed cinematics command answers with. */
+export interface CinemaReply {
+  entity: string | null;
+  shots: number;
+  seconds: number;
+  /** The cutscene read back as sentences, one line per shot. */
+  reads: string[];
+  /** Continuity warnings in plain language (a jump cut, opening tight, a rushed shot). */
+  problems: string[];
+  message: string;
+  reason: string | null;
+}
+
+export interface ConditionSpec {
+  kind: string;
+  label: string;
+  blurb: string;
+  icon: string;
+  /** What the user must supply: "none" | "number" | "object". */
+  needs: string;
+  /** The sentence fragment, with {n} / {name} blanks. */
+  reads: string;
+}
+
+/** A picked card, before it becomes a real condition. */
+export interface ClauseRequest {
+  kind: string;
+  number?: number | null;
+  object?: string | null;
+  any?: boolean;
+}
+
+/** One authored clause, ready to render as a chip. */
+export interface ClauseRow {
+  reads: string;
+  index: number;
+  any: boolean;
+}
+
+/** An object's clauses plus the whole sentence its rule now reads as. */
+export interface ConditionListInfo {
+  all: ClauseRow[];
+  any: ClauseRow[];
+  /** The role's own built-in clause (greyed, with provenance) — never editable here. */
+  roleClause: string | null;
+  sentence: string;
+}
+
+/** A live health readout for the Gameplay panel. */
+export interface HealthInfo {
+  name: string;
+  hp: number;
+  maxHp: number;
+}
+
+/** A near miss during Play: a rule whose When matched but whose "only if" did not hold. */
+export interface BlockedInfo {
+  name: string;
+  rule: string;
+  why: string;
+}
+
+/** One companion's live status line during Play. */
+export interface CompanionRow {
+  entity: string;
+  name: string;
+  doing: string;
+}
+
+/** The roles overview; `score` is LIVE from the rules runtime during Play. */
+export interface RoleStatusInfo {
+  roster: RoleRow[];
+  score: number;
+  scoreEntity: string | null;
+  remaining: number;
+  companions: CompanionRow[];
+  /** True while playing once every enemy is beaten and every collectible collected. */
+  won: boolean;
+  /** The player's live health during Play — null outside Play or with no Health anywhere. */
+  health: HealthInfo | null;
+  /** The most recent blocked rule during Play — the answer to "nothing happened". */
+  blocked: BlockedInfo | null;
+}

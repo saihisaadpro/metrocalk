@@ -102,7 +102,7 @@ export function AssetLabWorkspace({ client }: { client: EditorClient }) {
             change: next.change ?? current?.change ?? null,
           }));
         }
-        throw new Error(next.message || "Asset Lab could not complete the operation");
+        throw new Error(next.message || "Model could not complete the operation");
       }
       setResponse((current) => action.action === "export" ? {
         ...next,
@@ -168,7 +168,7 @@ function shortHandle(handle: string): string {
 }
 
 function errorMessage(cause: unknown): string {
-  return cause instanceof Error && cause.message ? cause.message : "Asset Lab operation failed";
+  return cause instanceof Error && cause.message ? cause.message : "Model operation failed";
 }
 
 function actionStage(action: AssetLabAction): AssetLabStage {

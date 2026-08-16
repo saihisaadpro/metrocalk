@@ -591,7 +591,7 @@ export function PipeForge({
               {pending === "start" ? "Starting…" : "Draw another pipe"}
             </Button>
           </div>
-          <div style={{ ...hintStyle, marginTop: space.xs, textAlign: "center" }}>Asset Lab is open below for validation and export.</div>
+          <div style={{ ...hintStyle, marginTop: space.xs, textAlign: "center" }}>Model is open below for validation and export.</div>
         </div>
       )}
 

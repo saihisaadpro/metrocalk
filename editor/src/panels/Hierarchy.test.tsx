@@ -66,5 +66,5 @@ test("exposes a searchable semantic tree with result and no-result states", () =
 test("empty hierarchy explains how to add the first object", () => {
   render(<Hierarchy client={fakeClient()} />);
   expect(screen.getByText("No objects in this scene")).toBeTruthy();
-  expect(screen.getByText(/create an entity above/i)).toBeTruthy();
+  expect(screen.getByText(/add an entity above/i)).toBeTruthy();
 });

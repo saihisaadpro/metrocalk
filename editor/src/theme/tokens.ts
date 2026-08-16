@@ -92,22 +92,22 @@ export const space = {
 /** Corner radii (px). Restrained at control scale, softer for floating and feature surfaces. */
 export const radius = {
   none: 0,
-  sm: 4,
-  md: 6,
-  lg: 8,
-  xl: 12,
-  xxl: 16,
+  sm: 6,
+  md: 8,
+  lg: 10,
+  xl: 14,
+  xxl: 18,
   pill: 999,
 } as const;
 
 /** Elevation for a light workbench: broad ambient shadows plus a restrained key shadow. */
 export const elevation = {
   e0: "none",
-  e1: "0 1px 2px rgba(21, 34, 50, 0.08), 0 2px 6px rgba(21, 34, 50, 0.05)",
-  e2: "0 4px 12px rgba(21, 34, 50, 0.10), 0 1px 3px rgba(21, 34, 50, 0.08)",
-  e3: "0 12px 32px rgba(21, 34, 50, 0.14), 0 3px 8px rgba(21, 34, 50, 0.08)",
-  e4: "0 20px 56px rgba(21, 34, 50, 0.18), 0 5px 14px rgba(21, 34, 50, 0.10)",
-  inset: "inset 0 1px 2px rgba(21, 34, 50, 0.06)",
+  e1: "0 1px 2px rgba(17, 26, 38, 0.05), 0 1px 3px rgba(17, 26, 38, 0.04)",
+  e2: "0 2px 8px rgba(17, 26, 38, 0.07), 0 8px 20px rgba(17, 26, 38, 0.06)",
+  e3: "0 4px 16px rgba(17, 26, 38, 0.09), 0 16px 40px rgba(17, 26, 38, 0.09)",
+  e4: "0 8px 28px rgba(17, 26, 38, 0.12), 0 28px 72px rgba(17, 26, 38, 0.12)",
+  inset: "inset 0 1px 2px rgba(17, 26, 38, 0.05)",
 } as const;
 
 /** Motion presets (restrained — a serious tool, not a marketing page). */
@@ -189,8 +189,13 @@ export const z = {
 /** Text roles — ready-to-spread `CSSProperties` for the common copy kinds (panel title · section title ·
  *  item label · metadata · value · warning · disabled). Keeps text styling consistent without re-deriving. */
 export const text = {
-  panelTitle: { font: font.ui, fontSize: fontSize.meta, fontWeight: 650, lineHeight: lineHeight.compact, letterSpacing: 0.15, color: color.text.primary },
-  sectionTitle: { font: font.ui, fontSize: fontSize.meta, fontWeight: 650, lineHeight: lineHeight.compact, color: color.text.secondary },
+  // A panel TITLE was 12px — smaller than body text — which is why every workspace header read as a label
+  // rather than a heading. It is a real title now, and the eyebrow role below carries the small-caps job it
+  // was being asked to do at the same time.
+  panelTitle: { font: font.ui, fontSize: fontSize.title, fontWeight: 600, lineHeight: lineHeight.compact, letterSpacing: -0.1, color: color.text.primary },
+  sectionTitle: { font: font.ui, fontSize: fontSize.body, fontWeight: 600, lineHeight: lineHeight.compact, color: color.text.primary },
+  /** The small-caps label above a group. Quiet on purpose: it orients, it does not compete. */
+  eyebrow: { font: font.ui, fontSize: fontSize.micro, fontWeight: 600, lineHeight: lineHeight.compact, letterSpacing: 0.7, textTransform: "uppercase" as const, color: color.text.muted },
   itemLabel: { font: font.ui, fontSize: fontSize.body, lineHeight: lineHeight.body, color: color.text.primary },
   metadata: { font: font.mono, fontSize: fontSize.meta, lineHeight: lineHeight.body, color: color.text.muted },
   value: { font: font.mono, fontSize: fontSize.body, lineHeight: lineHeight.body, color: color.text.primary },

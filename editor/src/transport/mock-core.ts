@@ -58,6 +58,11 @@ export class MockCore {
     this.emit({ ops });
   }
 
+  /** Read one entity's authoritative projection (dev/test introspection — the mock's `components_of`). */
+  entity(id: string): EntityProjection | undefined {
+    return this.base[id];
+  }
+
   /** Emit the full authoritative scene as one committed delta (the initial load the UI projects). */
   emitScene(): void {
     const ops: ProjectionOp[] = [];
@@ -141,6 +146,10 @@ export class MockCore {
       } else if (op.op === "setField") {
         const e = this.base[op.id];
         if (e) (e.components[op.component] ??= {})[op.field] = op.value;
+      } else if (op.op === "remove") {
+        // Keep the authoritative base in step with the projection — a retired combine source must
+        // not keep answering through `entity()` after the UI has dropped it.
+        delete this.base[op.id];
       }
     }
   }

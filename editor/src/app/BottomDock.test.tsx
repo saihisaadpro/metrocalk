@@ -29,12 +29,21 @@ test("collapsed dock shows one workspace summary and keeps selection separate fr
 
   expect(screen.queryByRole("tablist", { name: "Task workspaces" })).toBeNull();
   const summary = screen.getByTestId("bottom-workspace-summary");
-  expect(summary.textContent).toContain("Asset Lab");
+  // The dock uses the SAME word as the Engines rail — one capability, one name.
+  expect(summary.textContent).toContain("Model");
   expect(screen.getByTestId("bottom-dock-toggle").getAttribute("aria-expanded")).toBe("false");
 
   fireEvent.click(summary);
   expect(screen.getByRole("menu", { name: "Choose task workspace" })).toBeTruthy();
-  expect(screen.getAllByRole("menuitem")).toHaveLength(6);
+  // Named rather than counted. A bare number goes stale every time a workspace is added and teaches
+  // whoever hits it to just bump the digit; naming them means a new workspace has to be acknowledged
+  // here, and a DUPLICATE entry — a panel accidentally mounted twice — still fails on the length.
+  const WORKSPACES = ["Model", "Import", "Formats", "Animate", "Logic", "Problems", "Runtime"];
+  const items = screen.getAllByRole("menuitem").map((el) => el.textContent ?? "");
+  expect(items).toHaveLength(WORKSPACES.length);
+  for (const name of WORKSPACES) {
+    expect(items.filter((t) => t.includes(name))).toHaveLength(1);
+  }
   fireEvent.click(screen.getByRole("menuitem", { name: /runtime/i }));
 
   await waitFor(() => expect(screen.getByTestId("bottom-workspace-summary").textContent).toContain("Runtime"));

@@ -27,6 +27,10 @@ export const OVERLAY_BELOW = 620;
 export const COMPACT_BELOW = 1200;
 /** The collapsed icon-rail width (px). */
 export const RAIL_W = 44;
+/** The Engines rail width (px) — the always-present index of sub-engines. */
+export const ENGINE_RAIL_W = 132;
+/** The Engines rail when the window is too narrow to afford labels. */
+export const ENGINE_RAIL_W_COMPACT = 56;
 
 export function panelLayout(width: number): PanelLayout {
   if (width < OVERLAY_BELOW) {
@@ -47,17 +51,25 @@ export function panelLayout(width: number): PanelLayout {
       gridColumns: `${RAIL_W}px minmax(${STAGE_MIN}px, 1fr) ${RAIL_W}px`,
     };
   }
+  // The LEFT column is the sub-engine you are working in, so it gets the width; the right column is a
+  // read-out of the selection and needs less. Before the Engines rail the left column was only an outliner
+  // and the ratio was the other way round — which left the terrain workspace overflowing its 280px dock the
+  // moment it moved out of the Inspector.
   if (width < COMPACT_BELOW) {
-    return { left: 240, right: 300, collapsed: false, overlay: false, gridColumns: `240px minmax(${STAGE_MIN}px, 1fr) 300px` };
+    return { left: 300, right: 260, collapsed: false, overlay: false, gridColumns: `300px minmax(${STAGE_MIN}px, 1fr) 260px` };
   }
-  return { left: 280, right: 340, collapsed: false, overlay: false, gridColumns: `280px minmax(${STAGE_MIN}px, 1fr) 340px` };
+  return { left: 340, right: 300, collapsed: false, overlay: false, gridColumns: `340px minmax(${STAGE_MIN}px, 1fr) 300px` };
 }
 
 /** Compose the realized grid after user-controlled dock collapse. Responsive rails still win below their
  * breakpoint; at larger sizes each dock can independently yield without changing the workspace context. */
 export function dockGridColumns(layout: PanelLayout, leftCollapsed: boolean, rightCollapsed: boolean): string {
+  // The Engines rail is ALWAYS the first track, even in the collapsed layouts: it is the index of what the
+  // editor can do, and an index you have to open a drawer to reach is not an index. Only in the phone-width
+  // overlay layout — where the whole shell is one column — does it fold into the header drawers.
+  const engines = layout.collapsed ? ENGINE_RAIL_W_COMPACT : ENGINE_RAIL_W;
   if (layout.overlay) return "minmax(0, 1fr)";
   const left = layout.collapsed || leftCollapsed ? RAIL_W : layout.left;
   const right = layout.collapsed || rightCollapsed ? RAIL_W : layout.right;
-  return `${left}px minmax(${STAGE_MIN}px, 1fr) ${right}px`;
+  return `${engines}px ${left}px minmax(${STAGE_MIN}px, 1fr) ${right}px`;
 }

@@ -165,6 +165,8 @@ export interface NumericFieldProps {
   /** Value units per drag pixel (defaults to `step`); Shift = ×10 (coarse), Alt = ×0.1 (fine). */
   scrubSpeed?: number;
   ariaLabel?: string;
+  /** DOM id, so a shared `PropertyRow` label can point at the control it names (accessibility §10). */
+  id?: string;
   title?: string;
   style?: CSSProperties;
   "data-testid"?: string;
@@ -187,6 +189,7 @@ export function NumericField({
   invalid = false,
   scrubSpeed,
   ariaLabel,
+  id,
   title,
   style,
   ...rest
@@ -271,6 +274,7 @@ export function NumericField({
   return (
     <input
       ref={inputRef}
+      id={id}
       type="text"
       inputMode={integer ? "numeric" : "decimal"}
       role="spinbutton"
@@ -308,6 +312,29 @@ export function NumericField({
 /** A styled text field (integrated dark) — the shared input the command bar + forms use. */
 export function TextField({ style, mono = false, ...rest }: Omit<InputHTMLAttributes<HTMLInputElement>, "type" | "className"> & { mono?: boolean }) {
   return <input type="text" className={mono ? "mtk-input mtk-input--mono" : "mtk-input"} style={style} {...rest} />;
+}
+
+/**
+ * A styled multi-line text field — the same input contract as [`TextField`], for prose.
+ *
+ * Shares the `mtk-input` class so focus, density and disabled states cannot drift from the single-line field.
+ * `resize: vertical` because a description can be longer than its box, and taking that away would make the
+ * author scroll a three-line window instead of opening it up.
+ */
+export function TextArea({
+  style,
+  mono = false,
+  rows = 3,
+  ...rest
+}: Omit<TextareaHTMLAttributes<HTMLTextAreaElement>, "className"> & { mono?: boolean }) {
+  return (
+    <textarea
+      className={mono ? "mtk-input mtk-input--mono" : "mtk-input"}
+      rows={rows}
+      style={{ resize: "vertical", lineHeight: 1.45, ...style }}
+      {...rest}
+    />
+  );
 }
 
 /** A small, neutral pill/badge (for live readouts — view label, counts). Not a button. The `title`

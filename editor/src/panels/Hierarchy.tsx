@@ -321,7 +321,7 @@ export function Hierarchy({
         <EmptyPanelState
           compact
           title="No objects in this scene"
-          description="Create an entity above, draw a procedural asset, or import from the Create workspace."
+          description="Add an entity above, or open Build in the Engines rail to draw, import or browse assets."
           icon="◇"
           style={{ margin: space.md }}
         />

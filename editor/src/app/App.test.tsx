@@ -143,22 +143,66 @@ describe("editor app — end-to-end wiring", () => {
     expect(screen.getByTestId("pipe-forge-bake").textContent).toMatch(/rebake asset/i);
   });
 
-  it("groups editor capabilities into discoverable dock workspaces", () => {
+  it("puts every sub-engine on ONE rail, and routes each to a real workspace", () => {
     render(<App />);
     expect(screen.getAllByTestId("vpMove")).toHaveLength(1);
     expect(screen.getByTestId("viewport-tool-rail").querySelector("#vpMove")).toBeTruthy();
     expect(screen.getByTestId("vptoolbar").querySelector("#vpMove")).toBeNull();
-    expect(screen.getByRole("tab", { name: /scene/i }).getAttribute("aria-selected")).toBe("true");
-    fireEvent.click(screen.getByRole("tab", { name: /create/i }));
-    expect(screen.getByRole("tab", { name: /create/i }).getAttribute("aria-selected")).toBe("true");
+
+    // The rail is the single index, and it says where you are.
+    expect(screen.getByTestId("engine-scene").getAttribute("aria-selected")).toBe("true");
+
+    // A side engine opens in the left column.
+    fireEvent.click(screen.getByTestId("engine-build"));
+    expect(screen.getByTestId("engine-build").getAttribute("aria-selected")).toBe("true");
     expect(screen.getByTestId("assetbrowser")).toBeTruthy();
 
+    // A bottom engine opens the bottom dock — same rail, different surface, because a timeline needs width.
+    fireEvent.click(screen.getByTestId("engine-logic"));
+    expect(screen.getByTestId("engine-logic").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByTestId("bottom-dock").className).toContain("is-open");
+
+    // Exactly one engine is ever active: "where am I?" has one answer.
+    const lit = screen
+      .getAllByRole("tab")
+      .filter((t) => t.id.startsWith("engine-tab-") && t.getAttribute("aria-selected") === "true");
+    expect(lit).toHaveLength(1);
+
+    // And the Inspector stayed about the SELECTION throughout — it holds no sub-engines any more.
     fireEvent.click(screen.getByTestId("rail-right-relations"));
     expect(screen.getByRole("tab", { name: /relations/i }).getAttribute("aria-selected")).toBe("true");
-    fireEvent.click(screen.getByTestId("header-workspaces"));
-    fireEvent.click(screen.getByTestId("header-logic"));
-    expect(screen.getByTestId("bottom-dock").className).toContain("is-open");
-    expect(screen.getByRole("tab", { name: /logic/i }).getAttribute("aria-selected")).toBe("true");
+    // Terrain is still a tab — on the RAIL, where it belongs. What must be gone is Terrain as an
+    // *Inspector* tab: the Inspector answers "what is selected?", and terrain is meaningful with nothing
+    // selected at all.
+    const inspectorTabs = screen
+      .getAllByRole("tab")
+      .filter((t) => t.id.startsWith("inspector-workspaces-"))
+      .map((t) => t.textContent ?? "");
+    expect(inspectorTabs).toHaveLength(2);
+    expect(inspectorTabs.join(" ")).not.toMatch(/terrain|physics|match/i);
+    expect(screen.queryByTestId("header-workspaces")).toBeNull();
+  });
+
+  it("a dock workspace that is not an engine leaves the rail where it was", async () => {
+    // Three of the bottom dock's tabs are not sub-engines: Problems and Runtime are diagnostics, and
+    // Formats is a report about what this build can read and write. Selecting one used to CAST its id
+    // to an EngineId and set it, so the rail lit nothing at all — the "two controls, two answers to
+    // where am I" state the whole rail exists to remove, and no test noticed.
+    render(<App />);
+    await waitFor(() => expect(screen.getByTestId("engine-scene")).toBeTruthy());
+
+    fireEvent.click(screen.getByTestId("engine-logic"));
+    expect(screen.getByTestId("engine-logic").getAttribute("aria-selected")).toBe("true");
+
+    // Move the bottom dock to a NON-engine workspace.
+    fireEvent.click(screen.getByRole("tab", { name: /formats/i }));
+
+    // Exactly one engine is still lit, and it is the one the user last chose.
+    const lit = screen
+      .getAllByRole("tab")
+      .filter((t) => t.id.startsWith("engine-tab-") && t.getAttribute("aria-selected") === "true");
+    expect(lit).toHaveLength(1);
+    expect(screen.getByTestId("engine-logic").getAttribute("aria-selected")).toBe("true");
   });
 
   it("opens the searchable command palette from Ctrl/Cmd+K", () => {

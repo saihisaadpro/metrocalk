@@ -12,44 +12,52 @@
  * Imported once from `main.tsx`; components never import CSS (so jsdom/Vitest never load it). */
 
 :root {
-  /* ── backgrounds: calm paper-white layers with a cool technical cast ── */
-  --mtk-bg-base: #eef1f5;     /* dev-only app backdrop; native root remains transparent */
-  --mtk-bg-panel: #f7f8fa;    /* docked panels and inspectors */
+  /* ── surfaces ────────────────────────────────────────────────────────────────────────────────────
+     Hierarchy comes from SURFACE and SPACE, not from outlines. The backdrop sits a clear step below the
+     panels so a panel reads as an object resting on it; before this the three surfaces were within ~4% of
+     each other and the whole editor read as one flat grey field with wireframe boxes drawn on it. */
+  --mtk-bg-base: #e8ebf0;     /* dev-only app backdrop; native root remains transparent */
+  --mtk-bg-panel: #fcfcfd;    /* docked panels and inspectors — near-white, so they lift off the backdrop */
   --mtk-bg-raised: #ffffff;   /* toolbars, menus, dialogs, popovers */
-  --mtk-bg-inset: #e9edf2;    /* wells, timelines, and bounded technical regions */
+  --mtk-bg-inset: #f1f3f7;    /* wells, timelines, and bounded technical regions */
   --mtk-bg-input: #ffffff;    /* fields stay distinct without looking like browser defaults */
-  --mtk-bg-canvas: #f1f4f7;   /* graph/timeline canvas, separate from application transparency */
-  --mtk-bg-hover: #edf3f8;    /* hover fill on quiet surfaces */
-  --mtk-bg-active: #e2eaf2;   /* pressed fill */
-  --mtk-overlay-scrim: rgba(24, 35, 48, 0.28);
+  --mtk-bg-canvas: #f4f6f9;   /* graph/timeline canvas, separate from application transparency */
+  --mtk-bg-hover: #f1f4f8;    /* hover fill on quiet surfaces */
+  --mtk-bg-active: #e7ecf3;   /* pressed fill */
+  --mtk-overlay-scrim: rgba(17, 24, 33, 0.32);
   --mtk-bg-scrim: var(--mtk-overlay-scrim);
 
-  /* ── borders: quiet cool-gray separators; hierarchy comes from surface and spacing first ── */
-  --mtk-border-subtle: #e1e6ec;
-  --mtk-border: #ccd4de;
-  --mtk-border-strong: #aab6c3;
+  /* ── borders: nearly invisible by design ─────────────────────────────────────────────────────────
+     `subtle` is for dividers INSIDE a surface and should barely register; a 1px line on every element is
+     what makes an interface look like a wireframe rather than a tool. Reach for spacing first, then a
+     surface change, and only then a border. */
+  --mtk-border-subtle: #edeff3;
+  --mtk-border: #dfe3ea;
+  --mtk-border-strong: #c2c9d4;
 
-  /* ── text roles ── */
-  --mtk-text: #1d2733;        /* primary */
-  --mtk-text-secondary: #465568;
-  --mtk-text-muted: #627184;  /* readable metadata / supporting copy */
-  --mtk-text-faint: #8793a2;  /* disabled/de-emphasised only, never essential information */
+  /* ── text: crisper at the top of the hierarchy, softer at the bottom ── */
+  --mtk-text: #141a22;        /* primary — near-black, so titles and values read instantly */
+  --mtk-text-secondary: #495260;
+  --mtk-text-muted: #6b7583;  /* readable metadata / supporting copy */
+  --mtk-text-faint: #99a2af;  /* disabled/de-emphasised only, never essential information */
 
-  /* ── the ONE restrained accent (steel azure — "precision engineering", not SaaS purple) ── */
-  --mtk-accent: #2f678f;          /* accent text / active foreground */
-  --mtk-accent-solid: #326f9f;    /* primary action fill */
-  --mtk-accent-solid-hover: #285d86;
-  --mtk-accent-border: #78a2c2;
-  --mtk-accent-subtle: #e3eef7;   /* selected/active row + toggle-on fill */
-  --mtk-ring: #236fa5;            /* focus ring */
-  --mtk-ring-soft: rgba(35, 111, 165, 0.18);
+  /* ── the ONE accent (azure — "precision engineering", not SaaS purple) ───────────────────────────
+     Cleaner and a touch more saturated than the old steel blue, which went muddy against a cool grey
+     field and left primary actions looking switched off. */
+  --mtk-accent: #1a6ec2;          /* accent text / active foreground */
+  --mtk-accent-solid: #1f74cc;    /* primary action fill */
+  --mtk-accent-solid-hover: #1a62ae;
+  --mtk-accent-border: #a6caea;
+  --mtk-accent-subtle: #e9f2fc;   /* selected/active row + toggle-on fill */
+  --mtk-ring: #2b7fd4;            /* focus ring */
+  --mtk-ring-soft: rgba(43, 127, 212, 0.22);
   --mtk-on-accent: #ffffff;
 
   /* ── semantic (used sparingly, never colour-alone — pair with an icon/glyph) ── */
-  --mtk-success: #276b4a; --mtk-success-solid: #347a59; --mtk-success-border: #83b59d; --mtk-success-bg: #e7f3ec;
-  --mtk-warn: #845a16;    --mtk-warn-solid: #a06d1d;    --mtk-warn-border: #d2b071;    --mtk-warn-bg: #faf2df;
-  --mtk-danger: #9b3d38;  --mtk-danger-solid: #b14b44;  --mtk-danger-border: #d79a96;  --mtk-danger-bg: #faecea;
-  --mtk-info: #326b92;    --mtk-info-border: #8eb3cd;   --mtk-info-bg: #e8f1f7;
+  --mtk-success: #1f6b48; --mtk-success-solid: #2c7a56; --mtk-success-border: #8cc0a7; --mtk-success-bg: #eaf5ef;
+  --mtk-warn: #8a5b12;    --mtk-warn-solid: #a56f1c;    --mtk-warn-border: #dcb877;    --mtk-warn-bg: #fdf5e6;
+  --mtk-danger: #a03a34;  --mtk-danger-solid: #b84a42;  --mtk-danger-border: #e0a09b;  --mtk-danger-bg: #fdedeb;
+  --mtk-info: #2a6b96;    --mtk-info-border: #96bcd6;   --mtk-info-bg: #ecf4fa;
   --mtk-token: #8a6317;   /* the economy/token amber (wallet) */
 
   /* ── fonts ── */
@@ -65,15 +73,19 @@
   --mtk-space-6: 16px;
   --mtk-space-7: 24px;
   --mtk-space-8: 32px;
-  --mtk-radius-sm: 4px;
-  --mtk-radius-md: 6px;
-  --mtk-radius-lg: 8px;
-  --mtk-radius-xl: 12px;
-  --mtk-radius-xxl: 16px;
-  --mtk-shadow-1: 0 1px 2px rgba(21, 34, 50, 0.08), 0 2px 6px rgba(21, 34, 50, 0.05);
-  --mtk-shadow-2: 0 4px 12px rgba(21, 34, 50, 0.10), 0 1px 3px rgba(21, 34, 50, 0.08);
-  --mtk-shadow-3: 0 12px 32px rgba(21, 34, 50, 0.14), 0 3px 8px rgba(21, 34, 50, 0.08);
-  --mtk-shadow-4: 0 20px 56px rgba(21, 34, 50, 0.18), 0 5px 14px rgba(21, 34, 50, 0.10);
+  /* Softer corners throughout. 4px on a control reads as a 2015 form field; the whole surface feels
+     mechanical before you have read a single word of it. */
+  --mtk-radius-sm: 6px;
+  --mtk-radius-md: 8px;
+  --mtk-radius-lg: 10px;
+  --mtk-radius-xl: 14px;
+  --mtk-radius-xxl: 18px;
+  /* Wider, softer, lower-opacity shadows: a floating surface should feel lifted, not outlined. The old
+     ramp was tight and dark enough that menus looked stamped on rather than above. */
+  --mtk-shadow-1: 0 1px 2px rgba(17, 26, 38, 0.05), 0 1px 3px rgba(17, 26, 38, 0.04);
+  --mtk-shadow-2: 0 2px 8px rgba(17, 26, 38, 0.07), 0 8px 20px rgba(17, 26, 38, 0.06);
+  --mtk-shadow-3: 0 4px 16px rgba(17, 26, 38, 0.09), 0 16px 40px rgba(17, 26, 38, 0.09);
+  --mtk-shadow-4: 0 8px 28px rgba(17, 26, 38, 0.12), 0 28px 72px rgba(17, 26, 38, 0.12);
   --mtk-ease-standard: cubic-bezier(0.2, 0, 0, 1);
   --mtk-ease-enter: cubic-bezier(0, 0, 0, 1);
   --mtk-ease-exit: cubic-bezier(0.3, 0, 1, 1);
@@ -546,8 +558,10 @@ body > [role="dialog"][aria-modal="true"] {
   align-items: center;
   justify-content: space-between;
   gap: var(--mtk-space-5);
-  min-height: 46px;
-  padding: 8px 12px;
+  /* Room to breathe: a panel header is the first thing read in a column, and 46px with 8px padding made
+     every workspace open on a cramped line rather than a title. */
+  min-height: 52px;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--mtk-border-subtle);
   background: var(--mtk-bg-raised);
 }
@@ -559,19 +573,21 @@ body > [role="dialog"][aria-modal="true"] {
   margin: 0;
   color: var(--mtk-text);
   font-family: var(--mtk-font-ui);
-  font-size: 13px;
-  font-weight: 650;
+  /* A real title. It was 13px/650 with positive tracking — the same weight as a label, so a workspace
+     header competed with its own contents instead of leading them. */
+  font-size: 15px;
+  font-weight: 600;
   line-height: 1.25;
-  letter-spacing: 0.25px;
+  letter-spacing: -0.1px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .mtk-workspace-panel__subtitle {
   overflow: hidden;
-  margin-top: 2px;
+  margin-top: 3px;
   color: var(--mtk-text-muted);
-  font-size: 11px;
-  line-height: 1.3;
+  font-size: 12px;
+  line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

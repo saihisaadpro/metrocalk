@@ -4,7 +4,7 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type MatchStatus } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type MatchStatus, type TerrainReply, type TerrainStats } from "./protocol";
 
 function emptyAnimationState(id: string | null): AnimationWorkspaceInfo {
   return {
@@ -154,6 +154,111 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     pipeForgeRemoveFitting: () => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "Fitting removed", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
     pipeForgeUpsertCatalog: (entry) => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "Catalog saved", handles: [], edges: [], fittings: [], fittingCatalog: [entry], branchFrom: null, editingEntity: null }),
     pipeForgeRemoveCatalog: () => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "Catalog removed", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
+    shapeCatalog: vi.fn(() => Promise.resolve([
+      { kind: "box", label: "Box", blurb: "A rectangular block", icon: "▧", params: [
+        { key: "width", label: "Width", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+        { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+        { key: "depth", label: "Depth", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
+      ] },
+      { kind: "sphere", label: "Sphere", blurb: "A ball", icon: "●", params: [
+        { key: "radius", label: "Radius", min: 0.05, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
+        { key: "segments", label: "Smoothness", min: 8, max: 96, step: 4, default: 32, integer: true, unit: "" },
+      ] },
+    ])),
+    shapeSpawn: vi.fn((kind: string) => Promise.resolve({ created: `shape-${kind}`, handle: `mtkasset:test-${kind}`, triangles: 480, ms: 2, message: `Created a ${kind} · 480 triangles`, reason: null })),
+    shapeUpdate: vi.fn(() => Promise.resolve({ created: "shape-1", handle: "mtkasset:test-updated", triangles: 512, ms: 2, message: "Updated · 512 triangles", reason: null })),
+    shapeDraw: vi.fn((mode: string, profile: [number, number][]) => Promise.resolve(profile.length >= 3
+      ? { created: `drawn-${mode}`, handle: "mtkasset:test-drawn", triangles: profile.length * 4, ms: 3, message: "Raised your drawing into a solid", reason: null }
+      : { created: null, handle: null, triangles: 0, ms: 0, message: "draw at least three points to outline a shape", reason: "draw at least three points to outline a shape" })),
+    shapeCombine: vi.fn((a: string, b: string, op: string) => Promise.resolve(a === b
+      ? { created: null, handle: null, triangles: 0, ms: 0, message: "pick two different objects", reason: "pick two different objects" }
+      : { created: `combined-${op}`, handle: "mtkasset:test-combined", triangles: 960, ms: 4, message: `Union · 960 triangles`, reason: null })),
+    shapeMeld: vi.fn(() => Promise.resolve({ created: "melded-1", handle: "mtkasset:test-meld", triangles: 1400, ms: 6, message: "Melded into one shape · 1400 triangles", reason: null })),
+    roleCatalog: vi.fn(() => Promise.resolve([
+      { kind: "collectible", label: "Collectible", blurb: "Spins; vanishes and scores when something touches it", icon: "✦", adds: "spin animation · touch trigger · pickup rule · +1 on the Score counter" },
+      { kind: "solid", label: "Solid obstacle", blurb: "An immovable body other things collide with", icon: "▦", adds: "fixed physics body · auto-fit collider" },
+      { kind: "prop", label: "Physics prop", blurb: "Falls, rolls and collides under gravity", icon: "◍", adds: "dynamic physics body · auto-fit collider" },
+      { kind: "spinner", label: "Spinner", blurb: "Turns forever — ambient motion", icon: "↻", adds: "looping spin animation" },
+      { kind: "companion", label: "Companion", blurb: "Follows your props, patrols your waypoints, fights your enemies", icon: "♥", adds: "dynamic physics body · auto-fit collider · a live brain (follow / patrol / attack)" },
+      { kind: "enemy", label: "Enemy", blurb: "Companions attack it; it falls when struck", icon: "☠", adds: "dynamic physics body · auto-fit collider · the defeat rule · +1 Score when beaten" },
+      { kind: "waypoint", label: "Waypoint", blurb: "A patrol stop — companions with nothing to follow walk the chain in order", icon: "⚑", adds: "a numbered patrol marker (no physics)" },
+      { kind: "player", label: "Player", blurb: "YOU, during Play — drive it with the arrow keys or WASD; companions follow you first", icon: "🎮", adds: "dynamic physics body · auto-fit collider · live keyboard control while playing" },
+    ])),
+    roleAssign: vi.fn((id: string, role: string) => Promise.resolve({ applied: role, entity: id, added: ["spin animation"], scoreEntity: role === "collectible" ? "score-1" : null, message: `Now a ${role}`, reason: null })),
+    roleClear: vi.fn((id: string) => Promise.resolve({ applied: null, entity: id, added: [], scoreEntity: null, message: "Role cleared — the object keeps its mesh and transform", reason: null })),
+    roleStatus: vi.fn(() => Promise.resolve({ roster: [], score: 0, scoreEntity: null, remaining: 0, companions: [], won: false, health: null, blocked: null })),
+    playerInput: vi.fn(() => Promise.resolve()),
+    formatCatalog: vi.fn(() => Promise.resolve([])),
+    colourStatus: vi.fn(() =>
+      Promise.resolve({
+        spaces: [
+          { id: "srgb", label: "sRGB", isColour: true, isLinear: false },
+          { id: "data", label: "Raw data (not colour)", isColour: false, isLinear: true },
+        ],
+        working: {
+          current: "linearRec709",
+          label: "Linear Rec.709",
+          wired: true,
+          options: [
+            { id: "linearRec709", label: "Linear Rec.709", arg: "linearRec709" },
+            { id: "acesCg", label: "ACEScg (AP1)", arg: "acesCg" },
+          ],
+          setCommand: "set_working_space",
+          luminanceWeights: [0.2126, 0.7152, 0.0722] as [number, number, number],
+        },
+        views: [
+          { id: "acesFit", label: "Filmic (ACES-like)", blurb: "contrasty" },
+          { id: "pbrNeutral", label: "Neutral (Khronos PBR)", blurb: "preserves albedo" },
+        ],
+        activeView: "acesFit",
+        activeViewLabel: "Filmic (ACES-like)",
+        setViewCommand: "set_render_profile",
+        setViewArg: "cinematic",
+        presentationHash: "0000000000000709",
+        exposure: 0.45,
+        environment: {
+          sourceSpace: "linearRec709",
+          label: "Linear Rec.709",
+          assumed: true,
+          options: [
+            { id: "linearRec709", label: "Linear Rec.709", arg: "linearRec709" },
+            { id: "acesCg", label: "ACEScg (AP1)", arg: "acesCg" },
+          ],
+          setCommand: "set_environment_colour_space",
+        },
+        // One wired and one deliberately NOT, so a test can prove the panel shows both. The unwired one
+        // is OCIO, which is genuinely unavailable in this build — see `ocio_status` for the two reasons.
+        capabilities: { sceneLinearWorkingSpace: true, ocioConfigLoading: false },
+        notes: ["Loading a studio .ocio config is not available in this build."],
+      }),
+    ),
+    setWorkingSpace: vi.fn((space: string) => Promise.resolve(space)),
+    setEnvironmentColourSpace: vi.fn((space: string) => Promise.resolve(space)),
+    vfxProbe: vi.fn(() => Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 })),
+    cameraProbe: vi.fn(() => Promise.resolve({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0 })),
+    vfxCatalog: vi.fn(() => Promise.resolve([
+      { kind: "fire", label: "Fire", blurb: "It burns", icon: "\u{1F525}", adds: "a rising flame", burst: false },
+      { kind: "sparks", label: "Sparks", blurb: "A hit landing", icon: "\u26A1", adds: "a one-shot spray of sparks", burst: true },
+    ])),
+    vfxAdd: vi.fn((id: string) => Promise.resolve({ entity: id, layers: 1, particles: 72, reads: ["\u{1F525} Fire - 72 particles, 1.0s per particle"], problems: [], message: "Added Fire", reason: null })),
+    vfxRemove: vi.fn((id: string) => Promise.resolve({ entity: id, layers: 0, particles: 0, reads: [], problems: [], message: "Effect removed", reason: null })),
+    vfxList: vi.fn((id: string) => Promise.resolve({ entity: id, layers: 0, particles: 0, reads: [], problems: [], message: "", reason: null })),
+    cinemaCatalog: vi.fn(() => Promise.resolve([
+      { kind: "establish", label: "Establishing", blurb: "Show where we are before we look at anything closely", icon: "\u{1F304}", adds: "a wide, slowly pulling-out shot from the front" },
+      { kind: "hero", label: "Hero shot", blurb: "The workhorse - three-quarters on, pushing in", icon: "\u{1F3AC}", adds: "a full-body three-quarter shot that creeps closer" },
+      { kind: "closeup", label: "Close-up", blurb: "Tight and still - for the moment that matters", icon: "\u{1F50D}", adds: "a close, locked-off shot in profile" },
+    ])),
+    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, reads: ["a full shot of Crate, three-quarters on, pushing in over 2.5s"], problems: [], message: "Added a hero shot", reason: null })),
+    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, reads: [], problems: [], message: "Shot removed", reason: null })),
+    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, reads: [], problems: [], message: "", reason: null })),
+    conditionCatalog: vi.fn(() => Promise.resolve([
+      { kind: "score_at_least", label: "The Score is at least…", blurb: "gate this behind points the player has already earned", icon: "★", needs: "number", reads: "the Score is at least {n}" },
+      { kind: "still_active", label: "It hasn't been used yet", blurb: "this object has not been collected or beaten", icon: "◆", needs: "none", reads: "it hasn't been used yet" },
+      { kind: "other_gone", label: "Another object is gone", blurb: "that collectible has been collected, or that enemy beaten", icon: "✧", needs: "object", reads: "{name} is gone" },
+    ])),
+    conditionAdd: vi.fn((id: string) => Promise.resolve({ applied: "score_at_least", entity: id, added: ["the Score is at least 3"], scoreEntity: null, message: "Only if the Score is at least 3", reason: null })),
+    conditionRemove: vi.fn((id: string) => Promise.resolve({ applied: null, entity: id, added: [], scoreEntity: null, message: "Condition removed", reason: null })),
+    conditionList: vi.fn(() => Promise.resolve({ all: [], any: [], roleClause: null, sentence: "" })),
     assetLabAudit: (id) => Promise.resolve({ ok: false, message: "No mesh audit fixture", sourceEntity: id, sourceHandle: null, createdEntity: null, createdHandle: null, audit: null, change: null, warnings: [], exportedPath: null, bakeEvidence: null }),
     assetLabProcess: (id) => Promise.resolve({ ok: false, message: "No mesh process fixture", sourceEntity: id, sourceHandle: null, createdEntity: null, createdHandle: null, audit: null, change: null, warnings: [], exportedPath: null, bakeEvidence: null }),
     assetLabExport: (id) => Promise.resolve({ ok: false, message: "No mesh export fixture", sourceEntity: id, sourceHandle: null, createdEntity: null, createdHandle: null, audit: null, change: null, warnings: [], exportedPath: null, bakeEvidence: null }),
@@ -257,6 +362,62 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     matchStatus: vi.fn(() => Promise.resolve(emptyMatchStatus())),
     matchCooked: vi.fn(() => Promise.resolve(null)),
     matchStop: vi.fn(() => Promise.resolve(emptyMatchStatus())),
+    terrainPresets: vi.fn(() => Promise.resolve([])),
+    terrainCreate: vi.fn(() => Promise.resolve(emptyTerrainReply())),
+    terrainDescribe: vi.fn((_text: string) => Promise.resolve(emptyTerrainReply())),
+    terrainReadDescription: vi.fn((_text: string) => Promise.resolve(null)),
+    terrainPlan: vi.fn((_text: string) => Promise.resolve(null)),
+    terrainEdit: vi.fn(() => Promise.resolve(emptyTerrainReply())),
+    terrainStats: vi.fn(() => Promise.resolve(emptyTerrainStats())),
+    terrainPath: vi.fn(() =>
+      Promise.resolve({ found: false, reason: "no navigation grids are resident yet", waypoints: [] }),
+    ),
+    terrainTool: vi.fn(() => Promise.resolve(true)),
+    terrainPaintBegin: vi.fn(() => Promise.resolve()),
+    terrainPaintEnd: vi.fn(() => Promise.resolve(emptyTerrainReply())),
+    terrainRoutePoint: vi.fn(() => Promise.resolve(1)),
+    terrainRouteClear: vi.fn(() => Promise.resolve(0)),
+    terrainRouteCommit: vi.fn(() => Promise.resolve(emptyTerrainReply())),
     ...over,
+  };
+}
+
+/** A terrain runtime with nothing resident — the honest default for a test that has not created one. */
+export function emptyTerrainStats(): TerrainStats {
+  return {
+    active: false,
+    residentChunks: 0,
+    visibleChunks: 0,
+    culledFrustum: 0,
+    culledHorizon: 0,
+    pendingBuilds: 0,
+    completedBuilds: 0,
+    drawnTriangles: 0,
+    drawnInstances: 0,
+    impostorInstances: 0,
+    meshMb: 0,
+    textureMb: 0,
+    scatterMb: 0,
+    colliderMb: 0,
+    navMb: 0,
+    totalMb: 0,
+    budgetMb: 0,
+    budgetFraction: 0,
+    overBudget: false,
+    buildUsTotal: 0,
+    dominantStage: "field",
+    problem: "",
+  };
+}
+
+/** "There is no terrain" — the reply the shell sends before one is created. */
+export function emptyTerrainReply(): TerrainReply {
+  return {
+    ok: false,
+    entity: "",
+    message: "there is no terrain in the scene yet",
+    recipe: null,
+    issues: [],
+    stats: emptyTerrainStats(),
   };
 }

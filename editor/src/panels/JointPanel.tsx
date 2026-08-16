@@ -10,7 +10,7 @@ import { useSelectedId, projectionStore } from "../store/projection";
 import { useStore } from "zustand";
 import { setStatus } from "../store/ui";
 import { Badge } from "../theme/primitives";
-import { color, font, fontSize, space } from "../theme/tokens";
+import { color, font, fontSize, space, text } from "../theme/tokens";
 import type { JointInfo } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 
@@ -67,7 +67,7 @@ export function JointPanel({ client }: { client: EditorClient }) {
   if (!info) {
     return (
       <div id="joint-panel" data-testid="joint-panel" style={{ padding: `${space.md}px ${space.lg}px` }}>
-        <div style={{ font: font.ui, fontSize: fontSize.meta, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: color.text.secondary, marginBottom: space.sm }}>
+        <div style={{ ...text.eyebrow, marginBottom: space.sm }}>
           Mechanism
         </div>
         <div style={{ font: font.ui, fontSize: fontSize.body, color: color.text.muted, marginBottom: space.sm }}>
@@ -98,7 +98,7 @@ export function JointPanel({ client }: { client: EditorClient }) {
   };
   return (
     <div id="joint-panel" data-testid="joint-panel" data-joint-type={info.jointType} data-source={info.source} style={{ padding: `${space.md}px ${space.lg}px` }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, marginBottom: space.xs, font: font.ui, fontSize: fontSize.meta, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: color.text.secondary }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, marginBottom: space.xs, ...text.eyebrow }}>
         <span>Mechanism</span>
         <Badge tone="accent">{info.jointType === "revolute" ? "turns" : "slides"}</Badge>
       </div>

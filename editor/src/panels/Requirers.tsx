@@ -14,7 +14,7 @@ import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { Thumbnail } from "../theme/Thumbnail";
 import { Badge } from "../theme/primitives";
-import { color, font, fontSize, space } from "../theme/tokens";
+import { color, font, fontSize, space, text } from "../theme/tokens";
 
 export function Requirers() {
   // Subscribe to the summary map so a relational FLIP (a bind → needsBinding false) updates the list live.
@@ -26,7 +26,7 @@ export function Requirers() {
 
   return (
     <div id="requirers" data-testid="requirers" style={{ padding: `${space.md}px ${space.lg}px` }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, marginBottom: space.sm, font: font.ui, fontSize: fontSize.meta, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: color.text.secondary }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, marginBottom: space.sm, ...text.eyebrow }}>
         <span>Needs binding</span>
         {requirers.length > 0 && <Badge tone="accent">{requirers.length}</Badge>}
       </div>

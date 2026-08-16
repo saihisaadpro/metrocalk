@@ -12,7 +12,7 @@ import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { Badge } from "../theme/primitives";
-import { color, font, fontSize, space } from "../theme/tokens";
+import { color, font, fontSize, space, text } from "../theme/tokens";
 import type { CadReport } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 
@@ -75,7 +75,7 @@ export function ImportReport({ client }: { client: EditorClient }) {
       data-below-exact={belowExact}
       style={{ padding: `${space.md}px ${space.lg}px` }}
     >
-      <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, marginBottom: space.xs, font: font.ui, fontSize: fontSize.meta, fontWeight: 600, letterSpacing: 0.4, textTransform: "uppercase", color: color.text.secondary }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: space.sm, marginBottom: space.xs, ...text.eyebrow }}>
         <span>Import report</span>
         <Badge tone="accent">{report.total}</Badge>
       </div>

@@ -12,6 +12,7 @@ import { LazyWorkspace } from "./LazyWorkspace";
 const AssetLabWorkspace = lazy(() => import("../panels/AssetLabWorkspace").then((module) => ({ default: module.AssetLabWorkspace })));
 const Diagnostics = lazy(() => import("../panels/Diagnostics").then((module) => ({ default: module.Diagnostics })));
 const ImportReport = lazy(() => import("../panels/ImportReport").then((module) => ({ default: module.ImportReport })));
+const FormatsPanel = lazy(() => import("../panels/FormatsPanel").then((module) => ({ default: module.FormatsPanel })));
 const ReimportPanel = lazy(() => import("../panels/ReimportPanel").then((module) => ({ default: module.ReimportPanel })));
 const RuleDebugPanel = lazy(() => import("../panels/RuleDebugPanel").then((module) => ({ default: module.RuleDebugPanel })));
 const RulesPanel = lazy(() => import("../panels/RulesPanel").then((module) => ({ default: module.RulesPanel })));
@@ -20,7 +21,7 @@ const ComposePanel = lazy(() => import("../panels/ComposePanel").then((module) =
 const BindingGraph = lazy(() => import("../graph/BindingGraph").then((module) => ({ default: module.BindingGraph })));
 const AnimationWorkspace = lazy(() => import("../panels/AnimationWorkspace").then((module) => ({ default: module.AnimationWorkspace })));
 
-export type BottomWorkspace = "asset" | "animation" | "problems" | "import" | "logic" | "runtime";
+export type BottomWorkspace = "asset" | "animation" | "problems" | "import" | "logic" | "runtime" | "formats";
 type LogicWorkspace = "rules" | "states" | "graph" | "compose";
 
 export interface BottomDockProps {
@@ -35,13 +36,18 @@ export interface BottomDockProps {
 export function BottomDock({ client, active, open, playing, onChange, onOpenChange }: BottomDockProps) {
   const selected = useSelectedId();
   const [logic, setLogic] = useState<LogicWorkspace>("rules");
+  // Labels and icons match the Engines rail EXACTLY, and the sub-engines come first in the rail's order.
+  // Calling the same thing "Model" on the rail and "Asset Lab" here was the old confusion in miniature:
+  // one capability, two names, two places. Problems and Runtime sit after a divider because they are
+  // diagnostics, not sub-engines — they are about the state of the world, not a thing you author.
   const tabs = [
-    { id: "asset", label: "Asset Lab", icon: "A", tooltip: "Inspect, repair, optimize, finish, validate and export the selected mesh" },
-    { id: "animation", label: "Animation", icon: "◆", tooltip: "Key entity properties, preview deterministic motion and inspect rig readiness" },
+    { id: "asset", label: "Model", icon: "⬡", tooltip: "Repair, optimise and export meshes" },
+    { id: "import", label: "Import", icon: "↓", tooltip: "CAD fidelity and re-import" },
+    { id: "formats", label: "Formats", icon: "⇄", tooltip: "What this build can read and write" },
+    { id: "animation", label: "Animate", icon: "◆", tooltip: "Timelines, rigs and motion" },
+    { id: "logic", label: "Logic", icon: "◇", tooltip: "Rules, states and bindings" },
     { id: "problems", label: "Problems", icon: "!", tooltip: "Selection diagnostics and actionable issues" },
-    { id: "import", label: "Import", icon: "⇩", tooltip: "CAD fidelity, re-import changes and repair actions" },
-    { id: "logic", label: "Logic", icon: "◇", tooltip: "Rules, state machines, binding graphs and composition" },
-    { id: "runtime", label: "Runtime", icon: "▶", badge: playing ? "live" : undefined, tooltip: "Interactive rule and simulation diagnostics during Play" },
+    { id: "runtime", label: "Runtime", icon: "▶", badge: playing ? "live" : undefined, tooltip: "Live rule and simulation diagnostics during Play" },
   ] as const;
   const activeTab = tabs.find((tab) => tab.id === active) ?? tabs[0];
 
@@ -122,7 +128,7 @@ export function BottomDock({ client, active, open, playing, onChange, onOpenChan
         <div className="mtk-bottom-dock__content">
           {active === "asset" && (
             <div id="bottom-workspaces-asset-panel" role="tabpanel" aria-labelledby="bottom-workspaces-asset-tab" className="mtk-bottom-workspace mtk-scroll">
-              <LazyWorkspace label="Asset Lab"><AssetLabWorkspace client={client} /></LazyWorkspace>
+              <LazyWorkspace label="Model"><AssetLabWorkspace client={client} /></LazyWorkspace>
             </div>
           )}
           {active === "animation" && (
@@ -140,6 +146,13 @@ export function BottomDock({ client, active, open, playing, onChange, onOpenChan
               <LazyWorkspace label="Import tools">
                 <div><ReimportPanel client={client} /></div>
                 <div><ImportReport client={client} /></div>
+              </LazyWorkspace>
+            </div>
+          )}
+          {active === "formats" && (
+            <div id="bottom-workspaces-formats-panel" role="tabpanel" aria-labelledby="bottom-workspaces-formats-tab" className="mtk-bottom-workspace mtk-scroll">
+              <LazyWorkspace label="Supported formats">
+                <FormatsPanel client={client} />
               </LazyWorkspace>
             </div>
           )}

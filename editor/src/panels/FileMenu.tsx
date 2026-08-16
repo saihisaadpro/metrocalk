@@ -115,7 +115,7 @@ export function FileMenu({ client }: { client: EditorClient }) {
   }
 
   /** Export the authoritative scene without requiring a mesh selection or opening Asset Lab. */
-  async function exportScene(format: "glb" | "usda") {
+  async function exportScene(format: "glb" | "usda" | "step") {
     setOpen(false);
     setStatus(`Preparing complete-scene ${format.toUpperCase()} export…`);
     try {
@@ -185,6 +185,7 @@ export function FileMenu({ client }: { client: EditorClient }) {
           <PopupMenuGroup label="Export complete scene">
             <MenuItem id="fileExportGlb" label="GLB…" title="Self-contained hierarchy, reusable meshes, materials, textures, skins and standard animation" onClick={() => void exportScene("glb")} />
             <MenuItem id="fileExportUsda" label="USDA…" title="Readable hierarchy-focused USD with an explicit fidelity report; not binary USDC or packaged USDZ" onClick={() => void exportScene("usda")} />
+            <MenuItem id="fileExportStep" label="STEP AP242…" title="Faceted STEP for CAD, CAM and fabrication — exact tessellated geometry with no materials or animation; trimmed surfaces are not invented" onClick={() => void exportScene("step")} />
           </PopupMenuGroup>
           <PopupMenuGroup label={<span id="fileRecentHeading">Recent</span>}>
             <div id="fileRecent" data-testid="fileRecent" role="group" aria-labelledby="fileRecentHeading">
