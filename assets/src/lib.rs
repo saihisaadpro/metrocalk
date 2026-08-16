@@ -20,6 +20,7 @@
 pub mod animation_import;
 pub mod audio;
 pub mod autorig;
+pub mod colour;
 pub mod demo;
 pub mod env_import;
 /// FBX import (M11.1, ADR-040) — native-only (`ufbx` C-FFI), behind the `fbx` feature so the default crate
