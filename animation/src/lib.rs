@@ -15,8 +15,10 @@ mod instance;
 mod manifest;
 pub mod preset;
 mod runtime;
+pub mod shot;
 mod time;
 mod value;
+pub mod vfx;
 
 pub use binding::{
     AnimationBindingContext, AnimationBindingDescriptor, AnimationBindingDiagnostic,
