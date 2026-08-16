@@ -227,6 +227,8 @@ fn transition(id: &str, from: &str, to: &str, event: &str, target: &str) -> Tran
             enabled: true,
             event: event.to_string(),
             conditions: vec![],
+            any_of: vec![],
+            subject: None,
             actions: vec![Action {
                 action: "SetField".to_string(),
                 entity: target.to_string(),
@@ -245,6 +247,8 @@ fn tally_rule(target: &str) -> RuleData {
         enabled: true,
         event: "EnemyDied".to_string(),
         conditions: vec![],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "AdjustCounter".to_string(),
             entity: target.to_string(),
@@ -280,6 +284,8 @@ fn ignite_rule(target: &str, threshold: i64) -> RuleData {
                 value: FieldValue::Integer(threshold),
             },
         ],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "SetField".to_string(),
             entity: target.to_string(),
@@ -299,6 +305,8 @@ fn cleanup_rule(target: &str) -> RuleData {
         enabled: true,
         event: "ZoneExited".to_string(),
         conditions: vec![],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "SetField".to_string(),
             entity: target.to_string(),

@@ -12,6 +12,14 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+# Mirrors of the upstream feature flags, so `formats.rs` can report what THIS build can actually open
+# instead of a file silently coming back "unrecognised". Enabled by the app's own build below.
+assets-fbx = ["metrocalk-assets/fbx"]
+assets-ktx2 = ["metrocalk-assets/ktx2"]
+interchange-3dxml = ["metrocalk-interchange/3dxml"]
+
 [dependencies]
 metrocalk-core = { path = "../core" }
 metrocalk-ecs = { path = "../ecs" }
@@ -51,6 +59,12 @@ metrocalk-csg = { path = "../csg" }
 # to a deterministic watertight mesh and lands it as a content-addressed MeshAsset + a place_mesh-style
 # undoable commit (like `csg_intent`). Reuses the M13.2 `TriMesh`/validator; pure Rust + wasm-clean.
 metrocalk-sdf = { path = "../sdf" }
+# The terrain subsystem (M19 / ADR-104). `terrain_intent` drives it: a terrain is a RECIPE in the document
+# (one `TerrainRecipe` component, undoable per edit) and every chunk mesh / splat texture / height-field
+# collider / nav grid is DERIVED from it by a pure function and landed in the content-addressed asset store,
+# exactly like a CSG carve or an SDF bake. Pure Rust, serde-only, no threads or I/O of its own, so it stays
+# wasm-clean and the host owns the worker pool.
+metrocalk-terrain = { path = "../terrain" }
 # 2D sketch constraint solving (M15.6 / ADR-076). `constraint_intent` drives it: intent-inference (reuse the
 # M9.4 `reveal::intent_order` ranker), the minimal-conflicting-set (wrapped in the M13.5 `Certificate`), and
 # the witness-config-in-the-op determinism — a solve lands as one undoable tx carrying its witness. `ezpz`

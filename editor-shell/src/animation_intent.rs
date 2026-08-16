@@ -348,6 +348,67 @@ pub fn key_property(
     })
 }
 
+/// Author a continuous yaw spin (360° per `period_ticks`, loop-seamless) as **ops for the caller's
+/// own transaction** — the gameplay-roles path, where the spin must land in the SAME commit as the
+/// role's components so one Ctrl-Z removes everything. Unlike [`key_property`] (which keys the value
+/// currently in the committed doc), the quarter-turn quaternion values here are explicit, so the ops
+/// are valid inside a batch that also creates fields.
+///
+/// Idempotent: if either spin track already exists on the entity, returns an empty op list (the spin
+/// is already authored — re-assigning a role never duplicates tracks).
+///
+/// # Errors
+/// [`AnimationIntentError::InvalidTick`] for a non-positive period; key-encoding failures.
+#[allow(clippy::similar_names)] // qy/qw ARE the quaternion channel names — renaming them would obscure
+pub fn author_spin_ops(
+    engine: &mut Engine<FlecsWorld>,
+    entity: EntityId,
+    period_ticks: i64,
+) -> Result<Vec<Op>, AnimationIntentError> {
+    if period_ticks <= 0 {
+        return Err(AnimationIntentError::InvalidTick);
+    }
+    let target = entity.to_loro_key();
+    let fields = animation_fields(engine, entity);
+    let track_exists = |track_id: &str| {
+        fields.contains_key(&track_field(track_id))
+            || fields
+                .keys()
+                .any(|field| field.starts_with(&format!("{TRACK_FIELD_PREFIX}{track_id}::")))
+    };
+    let qy_id = stable_track_id(&target, "Transform", "qy");
+    let qw_id = stable_track_id(&target, "Transform", "qw");
+    if track_exists(&qy_id) || track_exists(&qw_id) {
+        return Ok(Vec::new());
+    }
+    // A full turn as five quarter-turn poses (a 2-key 0°→360° track would lerp through the origin and
+    // collapse to identity); the wrap is seamless because (0,0,0,−1) ≡ (0,0,0,1) as rotations.
+    let s = std::f64::consts::FRAC_1_SQRT_2;
+    let quarters: [(f64, f64); 5] = [(0.0, 1.0), (s, s), (1.0, 0.0), (s, -s), (0.0, -1.0)];
+    let mut ops = Vec::new();
+    for (property, track_id, pick) in [("qy", &qy_id, 0usize), ("qw", &qw_id, 1usize)] {
+        let track = Track {
+            id: TrackId::new(track_id.clone()),
+            name: format!("{}.{}", display_token("Transform"), display_token(property)),
+            binding: Binding {
+                path: PropertyPath::new(&target, "Transform", property),
+                value_kind: AnimValue::Number(0.0).kind(),
+            },
+            interpolation: Interpolation::Linear,
+            keyframes: Vec::new(),
+            enabled: true,
+        };
+        ops.extend(track_create_ops(entity, &track));
+        for (i, pose) in quarters.iter().enumerate() {
+            let tick = Tick(period_ticks * i64::try_from(i).unwrap_or(4) / 4);
+            let value = AnimValue::Number(if pick == 0 { pose.0 } else { pose.1 });
+            let key = Keyframe::new(allocate_element_id(engine, "key").as_str(), tick, value);
+            ops.extend(key_create_ops(entity, track_id, &key)?);
+        }
+    }
+    Ok(ops)
+}
+
 pub fn delete_key(
     engine: &mut Engine<FlecsWorld>,
     entity: EntityId,

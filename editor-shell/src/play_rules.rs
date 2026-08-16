@@ -49,6 +49,10 @@ pub fn build_recording<W: World>(engine: &Engine<W>, registry: &Registry<W>) -> 
         registry.plugin(name).map(|p| p.deterministic)
     });
 
+    // CONDITIONALS: expand each `$subject` rule into one pinned rule per role-carrying entity, carrying
+    // that entity's own "only if" clauses. The document still holds exactly one copy of each rule — the
+    // per-object variation lives on the objects, and exists only inside this Play-start recording.
+    let kept = crate::condition_intent::expand_subject_rules(engine, kept);
     let recording = RuleRecording::new(initial, kept, engine.state_machines());
     PlaySession { recording, flagged }
 }

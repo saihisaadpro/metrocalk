@@ -23,11 +23,15 @@ pub mod bridge;
 pub mod cad_import;
 pub mod cad_intent;
 pub mod capscene;
+pub mod cinema_intent;
+pub mod companion_intent;
 pub mod compose_ai;
+pub mod condition_intent;
 pub mod constraint_intent;
 pub mod cosim;
 pub mod csg_intent;
 pub mod feature_history;
+pub mod formats;
 pub mod generate;
 pub mod generative;
 pub mod kinematics;
@@ -44,10 +48,15 @@ pub mod pmi_step;
 pub mod project;
 pub mod reimport;
 pub mod reveal;
+pub mod role_intent;
 pub mod scene_capture;
 pub mod sdf_intent;
 pub mod semantic;
+pub mod shape_forge;
+pub mod step_export;
+pub mod terrain_intent;
 pub mod transform_solver;
+pub mod vfx_intent;
 pub mod wallet;
 
 pub use actions::{actions_for, Action, ActionItem};
@@ -77,7 +86,7 @@ pub use animation_graph_intent::{
     ANIMATION_GRAPH_SCHEMA_VERSION,
 };
 pub use animation_intent::{
-    add_event as add_animation_event, add_marker as add_animation_marker,
+    add_event as add_animation_event, add_marker as add_animation_marker, author_spin_ops,
     authored_animation_revision, delete_event as delete_animation_event,
     delete_key as delete_animation_key, delete_keys as delete_animation_keys,
     delete_marker as delete_animation_marker, key_property as key_animation_property,
@@ -114,6 +123,10 @@ pub use capscene::{
     place_generation_placeholder, place_mesh, positions, remove_entity, seed, CapResolver,
     CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
 };
+pub use cinema_intent::{
+    add_shot_ops, cutscene_of, describe_shot, remove_shot_ops, reply_for as cinema_reply,
+    set_mood_ops, shot_specs, CinemaError, CinemaReply, ShotSpec, CINEMA_COMPONENT,
+};
 pub use compose_ai::{ComposeAiError, Composer, DemoComposer, RemoteComposer};
 pub use constraint_intent::{
     explain_conflict, propose_constraints, sketch_point_meta, solve_and_land, witness_from_doc,
@@ -123,6 +136,10 @@ pub use cosim::{co_simulate, land_cosim, CoSimRun, CoSimSchedule, CoSimStep, Fmi
 pub use feature_history::{
     eval_variables, rebuild, rebuild_reproduces, validate_feature_op, validate_history,
     Configuration, Dim, Expr, FeatureError, FeatureHistory, FeatureId, FeatureOp, Rebuilt,
+};
+pub use formats::{
+    explain_unsupported, format_catalog, import_extensions, spec_for_extension, Carries, Direction,
+    Fidelity, FormatSpec,
 };
 pub use generate::{
     FakeGenerator, GenError, GenRequest, MeshGenerator, MeterAction, RemoteGenerator, StubMeter,
@@ -142,8 +159,21 @@ pub use kinematics::{
     KINEMATIC_JOINT, LEGACY_JOINT,
 };
 pub use metering::{ai_edit_material, buy_marketplace, material_patch, Outcome};
+pub use step_export::{
+    export_parts as export_step_parts, scene_from_parts, StepExportError, StepExportReport,
+    StepPart, MAX_EXPORT_TRIANGLES,
+};
+pub use vfx_intent::{
+    add_effect_ops, describe_layer, effect_specs, remove_effect_ops, stack_of, vfx_reply,
+    EffectSpec, Trigger as VfxTrigger, VfxError, VfxReply, VFX_COMPONENT,
+};
 // The project-owned triangle-mesh type (what `bake_basis_into_mesh` takes/returns and `persist_cad_mesh`
 // stores) — re-exported so the app shell can NAME it (`RegOut`) without a direct `metrocalk-csg` dep.
+pub use condition_intent::{
+    add_clause_ops, build_clause, clauses_of, condition_specs, describe_clause,
+    expand_subject_rules, remove_clause_ops, ClauseRequest, Clauses, ConditionError, ConditionSpec,
+    CONDITION_COMPONENT,
+};
 pub use metrocalk_csg::TriMesh;
 pub use pdm::{
     approval_delta, branch_from, merge_eco, release, state_identity, verify as verify_revision,
@@ -174,8 +204,20 @@ pub use reimport::{
     RebindOutcome, ReimportDiffEntry, ReimportSession, REIMPORT_ID,
 };
 pub use reveal::{required_caps, reveal, why_not, Candidate, Context, Rels, Reveal, WhyNot};
+pub use role_intent::{
+    assign_role, clear_role, find_score, role_of, role_specs, roster as role_roster, BlockedInfo,
+    CompanionRow, HealthInfo, RoleError, RoleOutcome, RoleReply, RoleRow, RoleSpec, RoleStatusInfo,
+    DEFAULT_TOUCH_RADIUS, DEFEAT_RULE_ID, PICKUP_RULE_ID, ROLE_COMPONENT, SCORE_NAME,
+};
 pub use scene_capture::{capture_scene, CapturedMesh, SceneCaptureError};
 pub use sdf_intent::{bake as bake_sdf, bake_auto as bake_sdf_auto, SdfBakeError};
+pub use shape_forge::{
+    bake_meld, bake_mesh_result, bake_shape, build_shape, combine_kind, combine_label,
+    combine_meshes, decode_shape_artifact, land_combined_asset, land_shape_asset, meld_field,
+    placeholder_cube, rebuild_from_source, recentre, replace_shape_asset, shape_material,
+    shape_specs, spawn_spot, transform_mesh_world, validate_param_keys, ShapeBuild, ShapeError,
+    ShapeLanding, ShapeRecipe, ShapeReply, ShapeSpec, SHAPE_COMPONENT,
+};
 // M15.11 (ADR-081) — the AI semantic pass landed on the substrate: features as validated typed component
 // data (child entities, one undoable commit), the confidence-gated adjudication hold, semantic search,
 // the defeaturing recommender, and the kernel-verified feature-informed collider planner.

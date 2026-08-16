@@ -94,6 +94,58 @@ pub enum Record {
         recipe: crate::pipe_forge::PipeRecipe,
         asset: String,
     },
+    /// Gameplay role assignment: replayed by re-running `assign_role` on the same id (deterministic
+    /// alloc keeps the Score entity's id stable too) — a role survives close→reopen like any commit.
+    RoleAssign { id: String, role: String },
+    /// A cleared role, replayed the same way.
+    RoleClear { id: String },
+    /// Cinematics - one shot removed by index.
+    CinemaRemove { id: String, index: usize },
+    /// VFX - one effect layer added to an object.
+    VfxAdd {
+        id: String,
+        effect: String,
+        trigger: String,
+    },
+    /// VFX - one effect layer removed by index.
+    VfxRemove { id: String, index: usize },
+    /// Cinematics - one shot appended to an object's cutscene.
+    CinemaShot { id: String, shot: String },
+    /// Conditionals — one "only if" clause added to an object.
+    ConditionAdd {
+        id: String,
+        request: crate::condition_intent::ClauseRequest,
+    },
+    /// Conditionals — one clause removed by index.
+    ConditionRemove { id: String, index: usize, any: bool },
+    /// Shape Studio spawn/draw: the editable recipe + its immutable artifact handle + where it landed.
+    /// Replay re-bakes the (deterministic) recipe, verifies the handle, and lands the same one-shot
+    /// transaction — so a created shape survives close→reopen exactly like a pipe.
+    ShapeAsset {
+        recipe: crate::shape_forge::ShapeRecipe,
+        asset: String,
+        pos: [f32; 3],
+        name: String,
+    },
+    /// Shape Studio parameter edit on an existing shape entity: replay re-bakes the recipe, verifies
+    /// the handle, and swaps the mesh + editable source on the same id (deterministic id alloc).
+    ShapeEdit {
+        id: String,
+        recipe: crate::shape_forge::ShapeRecipe,
+        asset: String,
+    },
+    /// Shape Studio combine/meld: the result's recipe + mesh-form artifact handle + the two source
+    /// entities it retired. The geometry itself is NOT re-derivable (exact boolean / SDF blend), so
+    /// replay lands *by handle* — the blob store restored the mesh before replay ran — and retires the
+    /// same two sources in the same single transaction.
+    ShapeCombine {
+        recipe: crate::shape_forge::ShapeRecipe,
+        asset: String,
+        triangles: usize,
+        pos: [f32; 3],
+        name: String,
+        retire: [String; 2],
+    },
     /// M11.3 (ADR-042) — an authored Light entity (kind = directional|point|spot, linear colour, intensity).
     /// Replayed deterministically (same id alloc) so the light survives close→reopen. Only the light ENTITY
     /// is persisted (Loro doc state); the per-frame lit result is a render projection, never logged.
@@ -408,6 +460,131 @@ impl Log {
                         )
                         .is_ok()
                     }),
+                Record::RoleAssign { id, role } => metrocalk_core::EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .is_some_and(|e| {
+                        // The same stdlib registry the Compose replay rebuilds (rare path, correctness
+                        // over speed) — validation inside assign_role needs the event/action vocab.
+                        crate::role_intent::assign_role(engine, scene, &stdlib_registry(), e, &role)
+                            .is_ok()
+                    }),
+                Record::RoleClear { id } => metrocalk_core::EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .is_some_and(|e| crate::role_intent::clear_role(engine, e).is_ok()),
+                Record::CinemaRemove { id, index } => metrocalk_core::EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .is_some_and(|e| {
+                        crate::cinema_intent::remove_shot_ops(engine, e, index)
+                            .is_ok_and(|(ops, _)| engine.commit("cinema-remove", ops).is_ok())
+                    }),
+                Record::VfxAdd {
+                    id,
+                    effect,
+                    trigger,
+                } => metrocalk_core::EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .is_some_and(|e| {
+                        let trig = crate::vfx_intent::Trigger::parse(&trigger);
+                        crate::vfx_intent::add_effect_ops(engine, e, &effect, trig)
+                            .is_ok_and(|(ops, _)| engine.commit("vfx-add", ops).is_ok())
+                    }),
+                Record::VfxRemove { id, index } => metrocalk_core::EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .is_some_and(|e| {
+                        crate::vfx_intent::remove_effect_ops(engine, e, index)
+                            .is_ok_and(|(ops, _)| engine.commit("vfx-remove", ops).is_ok())
+                    }),
+                Record::CinemaShot { id, shot } => metrocalk_core::EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .is_some_and(|e| {
+                        crate::cinema_intent::add_shot_ops(engine, e, &shot, e)
+                            .is_ok_and(|(ops, _)| engine.commit("cinema-shot", ops).is_ok())
+                    }),
+                Record::ConditionAdd { id, request } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            crate::condition_intent::build_clause(engine, &request)
+                                .and_then(|clause| {
+                                    crate::condition_intent::add_clause_ops(
+                                        engine,
+                                        e,
+                                        clause,
+                                        request.any,
+                                    )
+                                })
+                                .is_ok_and(|ops| engine.commit("only-if", ops).is_ok())
+                        })
+                }
+                Record::ConditionRemove { id, index, any } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            crate::condition_intent::remove_clause_ops(engine, e, index, any)
+                                .is_ok_and(|ops| engine.commit("clear-only-if", ops).is_ok())
+                        })
+                }
+                Record::ShapeAsset {
+                    recipe,
+                    asset,
+                    pos,
+                    name,
+                } => crate::shape_forge::bake_shape(&recipe)
+                    .ok()
+                    .filter(|built| built.handle == asset)
+                    .is_some_and(|built| {
+                        crate::shape_forge::land_shape_asset(
+                            engine,
+                            scene,
+                            &built.landing(),
+                            &name,
+                            pos,
+                        )
+                        .is_ok()
+                    }),
+                Record::ShapeEdit { id, recipe, asset } => crate::shape_forge::bake_shape(&recipe)
+                    .ok()
+                    .filter(|built| built.handle == asset)
+                    .zip(
+                        metrocalk_core::EntityId::from_loro_key(&id)
+                            .filter(|e| engine.entity_exists(*e)),
+                    )
+                    .is_some_and(|(built, eid)| {
+                        crate::shape_forge::replace_shape_asset(engine, eid, &built.landing())
+                            .is_ok()
+                    }),
+                Record::ShapeCombine {
+                    recipe,
+                    asset,
+                    triangles,
+                    pos,
+                    name,
+                    retire,
+                } => {
+                    // The mesh itself was restored by the blob store; land by handle and retire the
+                    // same two sources. Either source missing ⇒ the record cannot apply (skipped).
+                    let sources = metrocalk_core::EntityId::from_loro_key(&retire[0])
+                        .filter(|e| engine.entity_exists(*e))
+                        .zip(
+                            metrocalk_core::EntityId::from_loro_key(&retire[1])
+                                .filter(|e| engine.entity_exists(*e)),
+                        );
+                    sources.is_some_and(|(ea, eb)| {
+                        crate::shape_forge::land_combined_asset(
+                            engine,
+                            scene,
+                            &crate::shape_forge::ShapeLanding {
+                                handle: asset.clone(),
+                                recipe: recipe.clone(),
+                                triangles,
+                            },
+                            &name,
+                            pos,
+                            [ea, eb],
+                        )
+                        .is_ok()
+                    })
+                }
                 Record::AddLight {
                     light_kind,
                     pos,
