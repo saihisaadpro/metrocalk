@@ -44,6 +44,10 @@ impl Interchange for UsdInterchange {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear read of a stage: units, then the prim walk, then the never-silent notes -               splitting it would separate a drop from the place that decided to drop it"
+)]
 fn import_stage(path: &str) -> Result<SceneImport, InterchangeError> {
     use openusd::usd::{PrimPredicate, Stage};
     let stage = Stage::open(path).map_err(|e| InterchangeError::Parse(format!("{e}")))?;
@@ -74,6 +78,11 @@ fn import_stage(path: &str) -> Result<SceneImport, InterchangeError> {
 
     let mut bodies: Vec<ImportedBody> = Vec::new();
     let mut joint_seen = false;
+    // Transform ops seen but not applied, and prims whose non-unit scale was dropped. Both are
+    // reported once at the end rather than per prim, so a thousand-prim stage does not bury the rest
+    // of the report.
+    let mut unsupported_ops: Vec<String> = Vec::new();
+    let mut scaled_prims: Vec<String> = Vec::new();
     for path in &paths {
         let prim = stage.prim_at(path.clone());
         let type_name = prim.type_name().ok().flatten().unwrap_or_default();
@@ -100,23 +109,65 @@ fn import_stage(path: &str) -> Result<SceneImport, InterchangeError> {
         } else {
             BodyKind::Fixed
         };
-        let t = attr_vec3(&prim, "xformOp:translate").unwrap_or([0.0; 3]);
-        let translation = [
-            t[0] * meters_per_unit,
-            t[1] * meters_per_unit,
-            t[2] * meters_per_unit,
-        ];
+        // The WORLD pose, composed down the ancestor chain.
+        //
+        // This used to read only the prim's OWN `xformOp:translate` and hard-code the rotation to
+        // identity. Both are wrong in the same silent way: a body under a translated or rotated `Xform`
+        // - which is how essentially every real USD stage is organised - landed at the wrong place, at
+        // the wrong angle, with no note. A wrong pose that reports success is worse than a refusal,
+        // and it directly contradicted this module's own never-silent claim.
+        let (translation, rotation, dropped_scale) =
+            world_pose(&stage, path, meters_per_unit, &mut unsupported_ops);
         let mass = attr_f64(&prim, "physics:mass")
             .map(|m| m * kilograms_per_unit)
             .filter(|m| *m > 0.0);
         let collider = collider_of(&prim, &type_name, meters_per_unit, &name, &mut notes);
+        if dropped_scale {
+            scaled_prims.push(name.clone());
+        }
         bodies.push(ImportedBody {
             name,
             kind,
             translation,
-            rotation: [0.0, 0.0, 0.0, 1.0],
+            rotation,
             mass,
             collider,
+        });
+    }
+
+    // The transform reader's SCOPE, stated once, always. A limit that can only be reported when it is
+    // detected is not reported at all in the case that matters most — a matrix op this crate cannot
+    // read. Saying what the pose IS composed from lets a reader work out what it is not.
+    notes.push(UnsupportedNote {
+        feature: "transform scope".into(),
+        detail: "world poses are composed from xformOp:translate, xformOp:orient /                  xformOp:rotateXYZ, and the full ancestor chain. A 4x4 xformOp:transform is NOT                  applied — this reader cannot read a matrix value — so a stage authored with matrix                  ops will place bodies at their ancestors' poses only."
+            .into(),
+    });
+    if !unsupported_ops.is_empty() {
+        unsupported_ops.sort_unstable();
+        unsupported_ops.dedup();
+        notes.push(UnsupportedNote {
+            feature: "xformOp".into(),
+            detail: format!(
+                "these transform ops were seen and NOT applied: {} - the pose you get is composed from \
+                 translate, orient/rotate and the ancestor chain only",
+                unsupported_ops.join(", ")
+            ),
+        });
+    }
+    if !scaled_prims.is_empty() {
+        scaled_prims.sort_unstable();
+        scaled_prims.dedup();
+        let shown: Vec<&str> = scaled_prims.iter().take(8).map(String::as_str).collect();
+        notes.push(UnsupportedNote {
+            feature: "xformOp:scale".into(),
+            detail: format!(
+                "{} prim(s) carry a non-unit scale that a rigid body cannot hold ({}{}) - the collider \
+                 is the authored size, unscaled",
+                scaled_prims.len(),
+                shown.join(", "),
+                if scaled_prims.len() > shown.len() { ", ..." } else { "" }
+            ),
         });
     }
 
@@ -203,6 +254,200 @@ fn collider_of(
 
 // ── openusd value readers (the foreign-type firewall: openusd types stay inside these helpers) ───────
 
+/// The world pose of `path`, composed from its own transform ops and every ancestor's.
+///
+/// USD's transform stack is `xformOpOrder`, a list naming which ops apply and in what sequence. This
+/// reads the ops it can honour - `translate`, `orient` (a quaternion), `rotateXYZ` (Euler degrees) -
+/// and RECORDS the name of any other op it saw, so a matrix or a pivot op is reported rather than
+/// quietly ignored. Scale is read separately: a rigid body has no scale, so a non-unit scale is a
+/// reported drop rather than a silent one.
+///
+/// Returns `(translation_in_metres, rotation_quat_xyzw, dropped_non_unit_scale)`.
+fn world_pose(
+    stage: &openusd::usd::Stage,
+    path: &openusd::sdf::Path,
+    meters_per_unit: f64,
+    unsupported_ops: &mut Vec<String>,
+) -> ([f64; 3], [f64; 4], bool) {
+    // Walk up to the root, collecting each ancestor's local transform, then compose root-first.
+    let mut chain: Vec<openusd::sdf::Path> = Vec::new();
+    let mut cursor = Some(path.clone());
+    let mut depth = 0usize;
+    while let Some(p) = cursor {
+        chain.push(p.clone());
+        depth += 1;
+        // A malformed stage must not spin. 256 matches the parser's own nesting guard.
+        if depth > 256 {
+            unsupported_ops.push("an ancestor chain deeper than 256".into());
+            break;
+        }
+        cursor = parent_path(&p);
+    }
+    chain.reverse();
+
+    let (mut t, mut q) = ([0.0f64; 3], [0.0f64, 0.0, 0.0, 1.0]);
+    let mut dropped_scale = false;
+    for p in &chain {
+        let prim = stage.prim_at(p.clone());
+        let (lt, lq, ls) = local_pose(&prim, unsupported_ops);
+        if ls {
+            dropped_scale = true;
+        }
+        // world = world * local: rotate the child's offset into the parent's frame first.
+        let rotated = quat_rotate(q, lt);
+        t = [t[0] + rotated[0], t[1] + rotated[1], t[2] + rotated[2]];
+        q = quat_mul(q, lq);
+    }
+    (
+        [
+            t[0] * meters_per_unit,
+            t[1] * meters_per_unit,
+            t[2] * meters_per_unit,
+        ],
+        normalize_quat(q),
+        dropped_scale,
+    )
+}
+
+/// One prim's own transform: translation, rotation, and whether a non-unit scale was dropped.
+fn local_pose(
+    prim: &openusd::usd::Prim,
+    unsupported_ops: &mut Vec<String>,
+) -> ([f64; 3], [f64; 4], bool) {
+    let t = attr_vec3(prim, "xformOp:translate").unwrap_or([0.0; 3]);
+
+    // `orient` is authored as a quaternion; USD writes it WXYZ while this engine uses XYZW.
+    let q = if let Some(w) = attr_quat(prim, "xformOp:orient") {
+        w
+    } else if let Some(e) = attr_vec3(prim, "xformOp:rotateXYZ") {
+        euler_xyz_degrees_to_quat(e)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+
+    let scale = attr_vec3(prim, "xformOp:scale");
+    let dropped_scale = scale.is_some_and(|s| {
+        (s[0] - 1.0).abs() > 1e-9 || (s[1] - 1.0).abs() > 1e-9 || (s[2] - 1.0).abs() > 1e-9
+    });
+
+    // Any op this function does not apply is NAMED, not ignored.
+    unsupported_ops.extend(unapplied_ops(prim));
+    (t, q, dropped_scale)
+}
+
+/// The transform ops this prim authors that `local_pose` does NOT apply.
+///
+/// USD names the active ops in `xformOpOrder`, a token array the Rust crate does not expose a typed
+/// reader for. Probing for the op ATTRIBUTES by name is the reliable alternative: an op that is
+/// present but absent from the order list is inert in USD too, so at worst this over-reports, and
+/// over-reporting a note is the right side to err on when the alternative is a silently wrong pose.
+fn unapplied_ops(prim: &openusd::usd::Prim) -> Vec<String> {
+    const PIVOTS: [&str; 2] = ["xformOp:translate:pivot", "xformOp:scale:pivot"];
+    const OTHER_EULER: [&str; 8] = [
+        "xformOp:rotateXZY",
+        "xformOp:rotateYXZ",
+        "xformOp:rotateYZX",
+        "xformOp:rotateZXY",
+        "xformOp:rotateZYX",
+        "xformOp:rotateX",
+        "xformOp:rotateY",
+        "xformOp:rotateZ",
+    ];
+    let mut found = Vec::new();
+    // `xformOp:transform` (a 4x4 matrix op) is deliberately NOT probed here: the USD crate exposes no
+    // reader for a matrix value, so its presence cannot be detected per prim. It is covered instead by
+    // the unconditional scope note below, which states exactly which ops the pose is composed from —
+    // the honest way to report a limit you cannot detect case by case.
+    for name in PIVOTS {
+        if attr_vec3(prim, name).is_some() {
+            found.push(name.to_string());
+        }
+    }
+    for name in OTHER_EULER {
+        // The three-axis forms carry a vec3; the single-axis forms carry a scalar.
+        if attr_vec3(prim, name).is_some() || attr_f64(prim, name).is_some() {
+            found.push(name.to_string());
+        }
+    }
+    found
+}
+
+/// A quaternion attribute, converted from USD's WXYZ order to this engine's XYZW.
+fn attr_quat(prim: &openusd::usd::Prim, name: &str) -> Option<[f64; 4]> {
+    if let Ok(Some(v)) = prim.attribute(name).get::<[f64; 4]>() {
+        return Some([v[1], v[2], v[3], v[0]]);
+    }
+    if let Ok(Some(v)) = prim.attribute(name).get::<[f32; 4]>() {
+        return Some([
+            f64::from(v[1]),
+            f64::from(v[2]),
+            f64::from(v[3]),
+            f64::from(v[0]),
+        ]);
+    }
+    None
+}
+
+/// The parent of a USD path, or `None` at the pseudo-root.
+fn parent_path(path: &openusd::sdf::Path) -> Option<openusd::sdf::Path> {
+    let s = path.as_str();
+    let cut = s.rfind('/')?;
+    if cut == 0 {
+        return None;
+    }
+    openusd::sdf::Path::new(&s[..cut]).ok()
+}
+
+/// USD `rotateXYZ` is degrees, applied X then Y then Z.
+fn euler_xyz_degrees_to_quat(e: [f64; 3]) -> [f64; 4] {
+    let half = |d: f64| (d.to_radians()) * 0.5;
+    let (sx, cx) = half(e[0]).sin_cos();
+    let (sy, cy) = half(e[1]).sin_cos();
+    let (sz, cz) = half(e[2]).sin_cos();
+    let qx = [sx, 0.0, 0.0, cx];
+    let qy = [0.0, sy, 0.0, cy];
+    let qz = [0.0, 0.0, sz, cz];
+    quat_mul(quat_mul(qz, qy), qx)
+}
+
+/// Hamilton product, XYZW.
+fn quat_mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+/// Rotate a vector by a unit quaternion: `v + 2q_w(q_v x v) + 2 q_v x (q_v x v)`.
+fn quat_rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
+    let u = [q[0], q[1], q[2]];
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let t = cross(u, v);
+    let t2 = cross(u, t);
+    [
+        v[0] + 2.0 * (q[3] * t[0] + t2[0]),
+        v[1] + 2.0 * (q[3] * t[1] + t2[1]),
+        v[2] + 2.0 * (q[3] * t[2] + t2[2]),
+    ]
+}
+
+/// Guard against a denormal composition drifting off the unit sphere.
+fn normalize_quat(q: [f64; 4]) -> [f64; 4] {
+    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if !n.is_finite() || n < 1e-12 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    [q[0] / n, q[1] / n, q[2] / n, q[3] / n]
+}
+
 fn stage_f64(stage: &openusd::usd::Stage, field: &str) -> Option<f64> {
     let v = stage.stage_metadata(field).ok().flatten()?;
     value_to_f64(&v)
@@ -278,6 +523,85 @@ def Xform "World"
     }
 }
 "#;
+
+    // A body parented under a TRANSLATED and ROTATED Xform - which is how essentially every real USD
+    // stage is organised. Before the world-pose composition landed, this imported at the child's own
+    // local offset with an identity rotation: the wrong place, the wrong angle, and no note about it.
+    const NESTED: &str = r#"#usda 1.0
+(
+    metersPerUnit = 1.0
+    kilogramsPerUnit = 1.0
+    upAxis = "Y"
+)
+
+def Xform "Rig"
+{
+    double3 xformOp:translate = (10, 0, 0)
+    double3 xformOp:rotateXYZ = (0, 90, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+
+    def Xform "Arm"
+    {
+        double3 xformOp:translate = (0, 5, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "hand" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.5
+            double3 xformOp:translate = (2, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn a_body_under_a_moved_and_rotated_parent_lands_where_usd_says() {
+        let scene = UsdInterchange
+            .import(NESTED.as_bytes())
+            .expect("imports the nested stage");
+        let hand = scene
+            .bodies
+            .iter()
+            .find(|b| b.name == "hand")
+            .expect("the hand is imported");
+
+        // Rig sits at x=10 and is yawed 90 deg about Y. Arm adds (0,5,0), which the yaw leaves alone.
+        // The hand's own (2,0,0) is rotated by that yaw into -Z. So the world pose is (10, 5, -2).
+        let t = hand.translation;
+        assert!(
+            (t[0] - 10.0).abs() < 1e-6 && (t[1] - 5.0).abs() < 1e-6 && (t[2] + 2.0).abs() < 1e-6,
+            "expected the composed world pose (10, 5, -2), got {t:?}"
+        );
+
+        // And the rotation is the parent's, not a hard-coded identity.
+        let q = hand.rotation;
+        let half = std::f64::consts::FRAC_PI_4; // 90 deg / 2
+        assert!(
+            (q[1].abs() - half.sin()).abs() < 1e-6,
+            "expected the inherited 90 deg yaw, got {q:?}"
+        );
+    }
+
+    #[test]
+    fn the_transform_reader_always_states_its_own_scope() {
+        // A limit that is only reported when detected is not reported at all in the case that matters
+        // most - a matrix op this crate cannot read. So the scope is stated on every import.
+        let scene = UsdInterchange.import(NESTED.as_bytes()).expect("imports");
+        let scope = scene
+            .notes
+            .iter()
+            .find(|n| n.feature == "transform scope")
+            .expect("every import states the transform scope");
+        assert!(
+            scope.detail.contains("xformOp:transform"),
+            "{:?}",
+            scope.detail
+        );
+        assert!(scope.detail.contains("ancestor"), "{:?}", scope.detail);
+    }
 
     #[test]
     fn imports_usd_physics_with_unit_reconciliation() {

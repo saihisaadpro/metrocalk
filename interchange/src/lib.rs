@@ -69,7 +69,7 @@ pub use usd::UsdInterchange;
 
 // Re-export the /physics boundary types a SceneImport carries, so a consumer (the editor) maps an import
 // to registry components depending only on `metrocalk-interchange` — no separate /physics dep needed.
-pub use metrocalk_physics::{BodyKind, ColliderDesc, ColliderShape, JointDesc};
+pub use metrocalk_physics::{BodyDesc, BodyKind, ColliderDesc, ColliderShape, JointDesc};
 
 /// The stage units a format declares — the M8.5 deliverable-2 ground truth feeding M8.3's scale check.
 /// URDF is SI (1 m / 1 kg per unit); USD declares `metersPerUnit` / `kilogramsPerUnit` (often cm / g).
