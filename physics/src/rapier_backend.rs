@@ -142,6 +142,38 @@ impl RapierPhysics {
                     PhysicsError::UnsupportedShape(format!("tri-mesh build failed: {e:?}"))
                 })
             }
+            ColliderShape::Heightfield {
+                rows,
+                cols,
+                heights,
+                scale,
+            } => {
+                if *rows < 2 || *cols < 2 {
+                    return Err(PhysicsError::UnsupportedShape(format!(
+                        "a height field needs at least 2x2 samples to have any surface; this is {rows}x{cols}"
+                    )));
+                }
+                let expect = (*rows as usize) * (*cols as usize);
+                if heights.len() != expect {
+                    return Err(PhysicsError::UnsupportedShape(format!(
+                        "height field is {rows}x{cols} = {expect} samples but {} were supplied",
+                        heights.len()
+                    )));
+                }
+                if scale[0] <= 0.0 || scale[2] <= 0.0 {
+                    return Err(PhysicsError::UnsupportedShape(
+                        "a height field needs a positive XZ extent".into(),
+                    ));
+                }
+                // Parry's own doc: "the row index i advances grid coordinates along z, and the column index j
+                // along x" — which is exactly the convention the boundary type documents, so this is a
+                // direct copy rather than a transpose.
+                let cols_usize = *cols as usize;
+                let m = Array2::from_fn(*rows as usize, cols_usize, |r, c| {
+                    heights[r * cols_usize + c]
+                });
+                Ok(SharedShape::heightfield(m, vec(*scale)))
+            }
             ColliderShape::ConvexDecomposition { .. } => Err(PhysicsError::UnsupportedShape(
                 "convex decomposition (VHACD) is a seam — not wired in M8.2; \
                  use ConvexHull for a dynamic body or TriMesh for static geometry"
@@ -232,6 +264,12 @@ impl Physics for RapierPhysics {
             return Err(PhysicsError::InvalidForBody(
                 "a tri-mesh collider has no mass — attach it to a Fixed body, or use ConvexHull for dynamics"
                     .into(),
+            ));
+        }
+        // Nor does a height field — it is a surface, not a solid.
+        if matches!(desc.shape, ColliderShape::Heightfield { .. }) && self.bodies[rb].is_dynamic() {
+            return Err(PhysicsError::InvalidForBody(
+                "a height-field collider has no mass — terrain is Fixed world geometry".into(),
             ));
         }
         let col = ColliderBuilder::new(shape)
@@ -664,6 +702,161 @@ mod tests {
         }
         let y1 = p.transform(b).unwrap().0[1];
         assert!(y1 < y0 - 1.0, "the ball fell ({y0} → {y1})");
+    }
+
+    /// A 5×5 height field spanning 40 m × 40 m, flat at `base` except for one raised corner at max X / max Z.
+    fn ramped_heightfield(base: f64, corner: f64) -> ColliderShape {
+        let (rows, cols) = (5u32, 5u32);
+        let mut heights = vec![base; (rows * cols) as usize];
+        // rows along +Z, cols along +X — so the LAST row and LAST column is the +X/+Z corner.
+        for r in 3..rows as usize {
+            for c in 3..cols as usize {
+                heights[r * cols as usize + c] = corner;
+            }
+        }
+        ColliderShape::Heightfield {
+            rows,
+            cols,
+            heights,
+            scale: [40.0, 1.0, 40.0],
+        }
+    }
+
+    #[test]
+    fn a_ball_rests_on_a_height_field() {
+        let mut p = RapierPhysics::new(PhysicsConfig::default());
+        let ground = p.add_body(&BodyDesc::new(BodyKind::Fixed, [0.0, 0.0, 0.0]));
+        p.add_collider(ground, &ColliderDesc::new(ramped_heightfield(0.0, 0.0)))
+            .expect("height field builds");
+        let b = p.add_body(&BodyDesc::new(BodyKind::Dynamic, [0.0, 5.0, 0.0]));
+        p.add_collider(b, &ColliderDesc::new(ColliderShape::Ball { radius: 0.5 }))
+            .unwrap();
+        for _ in 0..600 {
+            p.step();
+        }
+        let y = p.transform(b).unwrap().0[1];
+        assert!(
+            (y - 0.5).abs() < 0.15,
+            "the ball should settle on the surface at y≈0.5, got {y}"
+        );
+    }
+
+    #[test]
+    fn the_height_field_row_column_convention_is_rows_along_z() {
+        // A transposed height field is the classic silent terrain bug: the world looks right from above and
+        // objects sink on every slope. The raised quadrant is at +X/+Z, so a ball dropped there must come to
+        // rest ON it, while one dropped at -X/-Z rests on the flat.
+        let mut p = RapierPhysics::new(PhysicsConfig::default());
+        let ground = p.add_body(&BodyDesc::new(BodyKind::Fixed, [0.0, 0.0, 0.0]));
+        p.add_collider(ground, &ColliderDesc::new(ramped_heightfield(0.0, 8.0)))
+            .expect("height field builds");
+        let high = p.add_body(&BodyDesc::new(BodyKind::Dynamic, [15.0, 20.0, 15.0]));
+        p.add_collider(
+            high,
+            &ColliderDesc::new(ColliderShape::Ball { radius: 0.5 }),
+        )
+        .unwrap();
+        let low = p.add_body(&BodyDesc::new(BodyKind::Dynamic, [-15.0, 20.0, -15.0]));
+        p.add_collider(low, &ColliderDesc::new(ColliderShape::Ball { radius: 0.5 }))
+            .unwrap();
+        for _ in 0..1200 {
+            p.step();
+        }
+        let y_high = p.transform(high).unwrap().0[1];
+        let y_low = p.transform(low).unwrap().0[1];
+        assert!(
+            y_high > 7.0,
+            "the +X/+Z ball should rest on the 8 m plateau, got {y_high} — the field is transposed"
+        );
+        assert!(
+            y_low < 1.0,
+            "the -X/-Z ball should rest on the flat, got {y_low}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_height_field_is_explained_not_guessed() {
+        let mut p = RapierPhysics::new(PhysicsConfig::default());
+        let ground = p.add_body(&BodyDesc::new(BodyKind::Fixed, [0.0, 0.0, 0.0]));
+        // Wrong sample count.
+        let err = p
+            .add_collider(
+                ground,
+                &ColliderDesc::new(ColliderShape::Heightfield {
+                    rows: 4,
+                    cols: 4,
+                    heights: vec![0.0; 9],
+                    scale: [10.0, 1.0, 10.0],
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, PhysicsError::UnsupportedShape(m) if m.contains("16 samples but 9")),
+            "unhelpful error: {err:?}"
+        );
+        // Degenerate grid.
+        let err = p
+            .add_collider(
+                ground,
+                &ColliderDesc::new(ColliderShape::Heightfield {
+                    rows: 1,
+                    cols: 4,
+                    heights: vec![0.0; 4],
+                    scale: [10.0, 1.0, 10.0],
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(&err, PhysicsError::UnsupportedShape(m) if m.contains("2x2")));
+        // Zero extent.
+        let err = p
+            .add_collider(
+                ground,
+                &ColliderDesc::new(ColliderShape::Heightfield {
+                    rows: 4,
+                    cols: 4,
+                    heights: vec![0.0; 16],
+                    scale: [0.0, 1.0, 10.0],
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(&err, PhysicsError::UnsupportedShape(m) if m.contains("XZ extent")));
+    }
+
+    #[test]
+    fn a_height_field_is_refused_on_a_dynamic_body() {
+        let mut p = RapierPhysics::new(PhysicsConfig::default());
+        let b = p.add_body(&BodyDesc::new(BodyKind::Dynamic, [0.0, 1.0, 0.0]));
+        let err = p
+            .add_collider(b, &ColliderDesc::new(ramped_heightfield(0.0, 1.0)))
+            .unwrap_err();
+        assert!(
+            matches!(&err, PhysicsError::InvalidForBody(m) if m.contains("no mass")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_height_field_world_is_deterministic() {
+        // Terrain colliders feed the authoritative simulation, so two identical worlds must hash identically.
+        let build = || {
+            let mut p = RapierPhysics::new(PhysicsConfig::default());
+            let ground = p.add_body(&BodyDesc::new(BodyKind::Fixed, [0.0, 0.0, 0.0]));
+            p.add_collider(ground, &ColliderDesc::new(ramped_heightfield(0.0, 6.0)))
+                .unwrap();
+            for i in 0..8u32 {
+                let b = p.add_body(&BodyDesc::new(
+                    BodyKind::Dynamic,
+                    [f64::from(i) * 2.0 - 8.0, 12.0, f64::from(i) * 1.5 - 6.0],
+                ));
+                p.add_collider(b, &ColliderDesc::new(ColliderShape::Ball { radius: 0.4 }))
+                    .unwrap();
+            }
+            for _ in 0..400 {
+                p.step();
+            }
+            p.world_hash()
+        };
+        assert_eq!(build(), build());
     }
 
     #[test]

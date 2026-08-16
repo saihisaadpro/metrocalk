@@ -84,6 +84,31 @@ pub enum ColliderShape {
         /// Triangle indices, flattened (length must be a multiple of 3).
         indices: Vec<u32>,
     },
+    /// A regular grid of heights over a rectangle in the XZ plane — the **terrain** collider (M19).
+    ///
+    /// This is the right shape for terrain and not merely a cheaper one. A 64 m chunk at 1 m cells is 4 225
+    /// heights: about 17 kB, against roughly 200 kB for the equivalent tri-mesh and its BVH. A point query is
+    /// two floors and a bilinear read rather than a tree descent. And it cannot be non-manifold, so the
+    /// "objects fall through the ground at one triangle" class of bug does not exist for it.
+    ///
+    /// The field spans `scale.x` by `scale.z` **centred on the collider's own translation**, with heights
+    /// multiplied by `scale.y`. Since heights are normally absolute world metres, attach it at
+    /// `[centre_x, 0, centre_z]` — putting the body at the terrain's mean height would add that height twice.
+    ///
+    /// Not valid for a dynamic body (no well-defined mass), like [`Self::TriMesh`].
+    Heightfield {
+        /// Samples along Z.
+        rows: u32,
+        /// Samples along X.
+        cols: u32,
+        /// `rows * cols` heights in metres, row-major with **rows along +Z and columns along +X**. A
+        /// transposed field produces terrain that is subtly wrong in a way that only shows as objects
+        /// sinking on slopes, so the convention is stated here and pinned by a test.
+        heights: Vec<f64>,
+        /// World extent `[x, y, z]`: the rectangle the field spans, and a multiplier on the heights (use
+        /// `1.0` for `y` when the heights are already in metres).
+        scale: Vec3,
+    },
     /// Approximate a concave mesh as a union of convex pieces (VHACD). **Seam:** not wired in M8.2 —
     /// resolves to [`PhysicsError::UnsupportedShape`] with the reason, never a silent convex hull.
     ConvexDecomposition {
