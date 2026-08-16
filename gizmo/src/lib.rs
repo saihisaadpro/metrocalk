@@ -426,6 +426,53 @@ mod tests {
     }
 
     #[test]
+    fn local_space_drags_along_the_entitys_own_axes_not_the_worlds() {
+        // The toggle was cosmetic in the app: every call site passed an identity basis, so "Local"
+        // drew and dragged along world axes. This pins the crate contract the fix relies on — with a
+        // rotated basis, World and Local must produce visibly DIFFERENT movement for the same cursor.
+        let spun = math::axis_angle([0.0, 1.0, 0.0], std::f32::consts::FRAC_PI_2); // 90° about Y
+        let cam = [0.0, 6.0, 14.0];
+        let origin = [0.0; 3];
+
+        let drag_in = |space: GizmoSpace| {
+            let mut g = TransformGizmo::new();
+            if matches!(space, GizmoSpace::Local) {
+                g.toggle_space();
+            }
+            assert_eq!(g.space(), space);
+            g.drag_start(
+                Handle::AxisX,
+                ray_to(cam, origin),
+                origin,
+                spun,
+                1.0,
+                Transform::IDENTITY,
+            );
+            g.drag_update(ray_to(cam, [3.0, 0.0, 0.0]), false)
+                .translation
+        };
+
+        let world = drag_in(GizmoSpace::World);
+        let local = drag_in(GizmoSpace::Local);
+
+        // World X moves along world X.
+        assert!(
+            world[0].abs() > 1.0 && world[2].abs() < 1e-3,
+            "world drag: {world:?}"
+        );
+        // The entity is turned 90° about Y, so its own X axis points along world −Z: the SAME cursor
+        // movement must move it along Z instead.
+        assert!(
+            local[2].abs() > 1.0 && local[0].abs() < 1e-3,
+            "local drag: {local:?}"
+        );
+        assert!(
+            (world[0] - local[0]).abs() > 1.0,
+            "the two spaces must not agree ({world:?} vs {local:?})"
+        );
+    }
+
+    #[test]
     fn snapping_quantizes_translation_and_angle() {
         assert_eq!(snap_vec3([0.62, -0.18, 1.27], 0.5), [0.5, -0.0, 1.5]);
         let inc = 15.0_f32.to_radians();
