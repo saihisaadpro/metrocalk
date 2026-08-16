@@ -1,0 +1,50 @@
+# metrocalk-terrain (M19 / ADR-104) — the terrain subsystem's deterministic computational core.
+#
+# THE ARCHITECTURE IN ONE LINE: **a terrain is a recipe, not a mesh.** The document owns a small,
+# human-legible, undoable `TerrainRecipe` (seed + layer stack + strokes + splines + biome/material/scatter
+# rules + budgets); every heavy artefact — chunk meshes, splat textures, colliders, nav grids, scattered
+# instances — is DERIVED from it by a pure function of `(recipe, chunk, lod)`. That single choice is what
+# makes terrain "highly dynamic, editable and reusable with deterministic generation": an edit is an op on
+# a recipe (kilobytes, undoable, mergeable, diffable), never a repacked gigabyte of baked geometry.
+#
+# Consequences we rely on everywhere else:
+#   * **Seamless by construction.** The height field is POINTWISE — `height(x, z)` — so two neighbouring
+#     chunks, at any two LODs, evaluate the identical expression at a shared edge vertex and get bit-equal
+#     answers. Cracks cannot come from disagreement, only from missing geometry (which the skirts cover).
+#   * **Resolution-independent.** The same recipe bakes a 0.5 m authoring grid or a 32 m distant chunk.
+#   * **Deterministic.** No RNG state, no time, no thread order, no HashMap iteration: every random-looking
+#     value comes from hashing integer world coordinates with the recipe seed. Same recipe ⇒ bit-identical
+#     terrain on every machine, in any build, generated in any order. Erosion — the one genuinely
+#     neighbourhood-coupled stage — is a WHOLE-WORLD BAKE with world-cell-hashed droplet seeding, memoized
+#     by content digest (see `erosion::bake` and its tests). It is deterministic but it is NOT tiled and
+#     NOT parallel: it is a single serial sweep over one world-sized grid, so its cost grows with the
+#     square of the world extent and it is the one stage that does not scale. That is a known limit with a
+#     measured number (`docs/terrain-testing-guide.md`), not a claim of tiling.
+#   * **Fast.** Pointwise evaluation is embarrassingly parallel and needs no locks, so the host can build
+#     chunks on any worker pool and still get identical bytes.
+#
+# Determinism note on FLOAT PRECISION: this crate computes in `f32` and deliberately restricts itself to
+# `+ - * /` and `sqrt`, which IEEE-754 defines exactly and which Rust never contracts into an FMA. It uses
+# NO transcendentals (`sin`/`cos`/`exp`/`ln`/`powf`) anywhere in the field path — gradients come from a
+# fixed integer table, easing from polynomials — so results are bit-identical across ISAs, unlike the f32
+# physics accumulation that ADR-020 ruled out. `debug_assert`s in `noise` guard the invariant.
+#
+# ZERO DEPENDENCIES beyond serde (the recipe is document data, so it must serialize). No C FFI, no rayon, no
+# threads, no `std::time`, no image/mesh crates: the host owns I/O and threading, this crate owns the maths.
+# That keeps it wasm32-portable (it is IN the wasm tripwire) and keeps the render/asset layers unaware of it.
+[package]
+name = "metrocalk-terrain"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Deterministic recipe-driven terrain — procedural generation, sculpting, erosion, biomes, scatter, LOD, streaming, collision and navigation (M19)"
+
+[dependencies]
+# The recipe IS document state (a `TerrainRecipe` component field, like `PipeRecipe`'s `source`), so it
+# serializes. Nothing else is needed: every algorithm here is plain arithmetic over plain arrays.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
