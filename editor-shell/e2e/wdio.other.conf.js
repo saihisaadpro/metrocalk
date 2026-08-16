@@ -24,7 +24,7 @@ for (const f of ["metrocalk-scene.jsonl", "metrocalk-wallet.json", "metrocalk-re
 }
 
 // One run's evidence = one folder's worth.
-const shots = path.resolve(dir, ".shots-roles");
+const shots = path.resolve(dir, ".shots-other");
 if (existsSync(shots)) rmSync(shots, { recursive: true });
 
 let tauriDriver;
@@ -35,7 +35,7 @@ export const config = {
   port: 4444,
   path: "/",
   automationProtocol: "webdriver",
-  specs: ["./specs-roles/**/*.e2e.js"],
+  specs: ["./specs-other/other.e2e.js"],
   maxInstances: 1,
   capabilities: [{ maxInstances: 1, "tauri:options": { application } }],
   logLevel: "error",

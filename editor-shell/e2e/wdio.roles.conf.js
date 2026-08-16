@@ -35,7 +35,7 @@ export const config = {
   port: 4444,
   path: "/",
   automationProtocol: "webdriver",
-  specs: ["./specs-roles/**/*.e2e.js"],
+  specs: ["./specs-roles/roles.e2e.js"],
   maxInstances: 1,
   capabilities: [{ maxInstances: 1, "tauri:options": { application } }],
   logLevel: "error",

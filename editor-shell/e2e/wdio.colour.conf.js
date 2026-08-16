@@ -1,7 +1,7 @@
 // Gameplay roles acceptance — the asset→gameplay bridge exercised on the PACKAGED .exe
 // with OS-composited pixel captures. Empty scene (MTK_SCENE_N=0) so only what the test creates appears.
 //
-// Run: node "node_modules\@wdio\cli\bin\wdio.js" run wdio.roles.conf.js
+// Run: node "node_modules\@wdio\cli\bin\wdio.js" run wdio.cinema.conf.js
 
 import { spawn } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
@@ -24,7 +24,7 @@ for (const f of ["metrocalk-scene.jsonl", "metrocalk-wallet.json", "metrocalk-re
 }
 
 // One run's evidence = one folder's worth.
-const shots = path.resolve(dir, ".shots-roles");
+const shots = path.resolve(dir, ".shots-colour");
 if (existsSync(shots)) rmSync(shots, { recursive: true });
 
 let tauriDriver;
@@ -35,7 +35,7 @@ export const config = {
   port: 4444,
   path: "/",
   automationProtocol: "webdriver",
-  specs: ["./specs-roles/**/*.e2e.js"],
+  specs: ["./specs-interchange/colour.e2e.js"],
   maxInstances: 1,
   capabilities: [{ maxInstances: 1, "tauri:options": { application } }],
   logLevel: "error",

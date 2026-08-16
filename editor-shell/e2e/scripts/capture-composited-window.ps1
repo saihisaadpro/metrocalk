@@ -117,6 +117,10 @@ try {
     if ($printMemory -ne [IntPtr]::Zero) { [MetrocalkWindowCapture]::DeleteDC($printMemory) | Out-Null }
     [MetrocalkWindowCapture]::ReleaseDC($handle, $windowDc) | Out-Null
   }
+  # NOTE: the window is left TOPMOST on purpose. Releasing it here was tried and made EVERY capture blank:
+  # PrintWindow against this DirectComposition surface needs the window unoccluded, and the console this
+  # script runs from will otherwise be over it. A blank result is written as a ~158-byte uniform PNG rather
+  # than failing, so callers must check the output size.
   if ($printed) { return }
 
   # ── path 2: the original desktop-DC BitBlt ────────────────────────────────────────────────────────
