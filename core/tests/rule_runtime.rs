@@ -29,6 +29,8 @@ fn count_rule() -> (RuleId, RuleData) {
             enabled: true,
             event: "EnemyDied".into(),
             conditions: vec![],
+            any_of: vec![],
+            subject: None,
             actions: vec![Action {
                 action: "AdjustCounter".into(),
                 entity: SWORD.into(),
@@ -65,6 +67,8 @@ fn ignite_rule() -> (RuleId, RuleData) {
                     value: FieldValue::Str("BossArena".into()),
                 },
             ],
+            any_of: vec![],
+            subject: None,
             actions: vec![Action {
                 action: "SetField".into(),
                 entity: SWORD.into(),
@@ -88,6 +92,8 @@ fn quest_machine() -> (StateMachineId, StateMachine) {
             enabled: true,
             event: event.into(),
             conditions: vec![],
+            any_of: vec![],
+            subject: None,
             actions: vec![Action {
                 action: "SetField".into(),
                 entity: SWORD.into(),
@@ -393,6 +399,8 @@ fn a_non_deterministic_plugin_is_flagged_out_of_the_replay_path() {
                 enabled: true,
                 event: "EnemyDied".into(),
                 conditions: vec![],
+                any_of: vec![],
+                subject: None,
                 actions: vec![Action {
                     action: "RunPlugin".into(),
                     entity: SWORD.into(),
@@ -443,4 +451,467 @@ fn a_non_deterministic_plugin_is_flagged_out_of_the_replay_path() {
         invoked,
         "the deterministic plugin's invocation is in the decision history"
     );
+}
+
+// ── $subject — one rule covers every entity of a kind (the gameplay-roles substrate) ─────────────
+
+/// `When Touched, If $subject.GameRole.active == true, Then $subject.GameRole.active = false AND
+/// score.KillCounter.count += 1` — ONE rule; the fired event's subject decides which pickup it acts on.
+#[test]
+fn subject_sentinel_resolves_per_event_and_ignores_subjectless_fires() {
+    const SCORE: &str = "1_9";
+    const PICKUP_A: &str = "1_5";
+    const PICKUP_B: &str = "1_6";
+    let pickup_rule = (
+        RuleId::new("r_pickup"),
+        RuleData {
+            name: "collect on touch".into(),
+            enabled: true,
+            event: "Touched".into(),
+            conditions: vec![Condition {
+                entity: "$subject".into(),
+                component: "GameRole".into(),
+                field: "active".into(),
+                op: CompareOp::Eq,
+                value: FieldValue::Bool(true),
+            }],
+            any_of: vec![],
+            subject: None,
+            actions: vec![
+                Action {
+                    action: "SetField".into(),
+                    entity: "$subject".into(),
+                    component: "GameRole".into(),
+                    field: "active".into(),
+                    value: FieldValue::Bool(false),
+                },
+                Action {
+                    action: "AdjustCounter".into(),
+                    entity: SCORE.into(),
+                    component: "KillCounter".into(),
+                    field: "count".into(),
+                    value: FieldValue::Integer(1),
+                },
+            ],
+        },
+    );
+    let mut seeded = RuntimeState::new();
+    seeded.set(PICKUP_A, "GameRole", "active", FieldValue::Bool(true));
+    seeded.set(PICKUP_B, "GameRole", "active", FieldValue::Bool(true));
+    let rec = RuleRecording::new(seeded, vec![pickup_rule], vec![]);
+    let mut replay = RuleReplay::new(rec);
+
+    // Touch A: ONLY A is collected; B stays live; the score is 1.
+    replay.fire("Touched", Some(PICKUP_A.into()));
+    assert_eq!(
+        replay.state().get(PICKUP_A, "GameRole", "active"),
+        Some(&FieldValue::Bool(false)),
+        "the touched pickup is collected"
+    );
+    assert_eq!(
+        replay.state().get(PICKUP_B, "GameRole", "active"),
+        Some(&FieldValue::Bool(true)),
+        "the OTHER pickup is untouched — $subject scopes the rule to the event's entity"
+    );
+    assert_eq!(
+        replay.state().get(SCORE, "KillCounter", "count"),
+        Some(&FieldValue::Integer(1))
+    );
+
+    // Touch A again: the active==true guard fails — no double score.
+    replay.fire("Touched", Some(PICKUP_A.into()));
+    assert_eq!(
+        replay.state().get(SCORE, "KillCounter", "count"),
+        Some(&FieldValue::Integer(1)),
+        "an already-collected pickup scores nothing"
+    );
+
+    // A subjectless fire: the $subject condition cannot resolve — nothing happens, nothing panics.
+    replay.fire("Touched", None);
+    assert_eq!(
+        replay.state().get(SCORE, "KillCounter", "count"),
+        Some(&FieldValue::Integer(1)),
+        "an event with no subject is a no-op for a $subject rule"
+    );
+
+    // Touch B: the same ONE rule handles the second pickup.
+    replay.fire("Touched", Some(PICKUP_B.into()));
+    assert_eq!(
+        replay.state().get(SCORE, "KillCounter", "count"),
+        Some(&FieldValue::Integer(2))
+    );
+    // The decision history records the RESOLVED entities, not the sentinel.
+    let resolved_sets: Vec<&str> = replay
+        .history()
+        .iter()
+        .filter_map(|d| match &d.kind {
+            DecisionKind::FieldSet { entity, .. } => Some(entity.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(resolved_sets.contains(&PICKUP_A) && resolved_sets.contains(&PICKUP_B));
+    assert!(
+        !resolved_sets.contains(&"$subject"),
+        "history never shows the raw sentinel"
+    );
+}
+
+// ── conditionals: the OR group, the subject pin, and the near-miss record ────────────────────────
+
+/// A gate rule shaped like the shipped pickup rule: `When Touched, If count >= n, Then lit = true`.
+fn gate_rule(n: i64) -> (RuleId, RuleData) {
+    (
+        RuleId::new("r_gate"),
+        RuleData {
+            name: "open the vault".into(),
+            enabled: true,
+            event: "Touched".into(),
+            conditions: vec![Condition {
+                entity: SWORD.into(),
+                component: "KillCounter".into(),
+                field: "count".into(),
+                op: CompareOp::Ge,
+                value: FieldValue::Integer(n),
+            }],
+            any_of: vec![],
+            subject: None,
+            actions: vec![Action {
+                action: "SetField".into(),
+                entity: SWORD.into(),
+                component: "Flammable".into(),
+                field: "lit".into(),
+                value: FieldValue::Bool(true),
+            }],
+        },
+    )
+}
+
+fn lit(replay: &RuleReplay) -> bool {
+    matches!(
+        replay.state().get(SWORD, "Flammable", "lit"),
+        Some(FieldValue::Bool(true))
+    )
+}
+
+/// Run one `Touched` event on `SWORD` against `rule` over a state seeded by `seed`.
+fn run_touch(rule: (RuleId, RuleData), seed: &[(&str, &str, FieldValue)]) -> RuleReplay {
+    let mut state = RuntimeState::new();
+    for (component, field, value) in seed {
+        state.set(SWORD, component, field, value.clone());
+    }
+    let mut rec = RuleRecording::new(state, vec![rule], vec![]);
+    rec.add_event(0, "Touched", Some(SWORD.into()));
+    let mut replay = RuleReplay::new(rec);
+    replay.advance();
+    replay
+}
+
+fn blocked_reasons(replay: &RuleReplay) -> Vec<String> {
+    replay
+        .history()
+        .iter()
+        .filter_map(|d| match &d.kind {
+            DecisionKind::RuleBlocked { why, .. } => Some(why.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_or_group_needs_only_one_alternative_and_still_requires_every_and_clause() {
+    // "…only if it is active, AND EITHER the key is taken OR the score is at least 3."
+    let with_or = |count: i64, active: bool, key: bool| {
+        let (id, mut rule) = gate_rule(3);
+        let score_clause = rule.conditions.remove(0);
+        rule.conditions = vec![Condition {
+            entity: SWORD.into(),
+            component: "GameRole".into(),
+            field: "active".into(),
+            op: CompareOp::Eq,
+            value: FieldValue::Bool(true),
+        }];
+        rule.any_of = vec![
+            Condition {
+                entity: SWORD.into(),
+                component: "Flammable".into(),
+                field: "key".into(),
+                op: CompareOp::Eq,
+                value: FieldValue::Bool(true),
+            },
+            score_clause,
+        ];
+        run_touch(
+            (id, rule),
+            &[
+                ("GameRole", "active", FieldValue::Bool(active)),
+                ("KillCounter", "count", FieldValue::Integer(count)),
+                ("Flammable", "key", FieldValue::Bool(key)),
+            ],
+        )
+    };
+
+    assert!(!lit(&with_or(0, true, false)), "no alternative holds");
+    assert!(
+        lit(&with_or(5, true, false)),
+        "the score route alone opens it"
+    );
+    assert!(lit(&with_or(0, true, true)), "the key route alone opens it");
+    assert!(
+        !lit(&with_or(5, false, true)),
+        "an OR group never waives the AND clauses"
+    );
+}
+
+#[test]
+fn a_blocked_rule_records_why_with_the_actual_runtime_value() {
+    let replay = run_touch(
+        gate_rule(3),
+        &[("KillCounter", "count", FieldValue::Integer(1))],
+    );
+    assert!(!lit(&replay), "the threshold is not met");
+    let why = blocked_reasons(&replay);
+    assert_eq!(why.len(), 1, "the near miss is recorded exactly once");
+    // The whole point: the ACTUAL value is in the sentence, not just the requirement.
+    assert!(
+        why[0].contains('1') && why[0].contains('3'),
+        "why should name the actual value and the threshold: {}",
+        why[0]
+    );
+}
+
+#[test]
+fn a_firing_rule_records_no_near_miss_and_an_unrelated_event_is_silent() {
+    let fired = run_touch(
+        gate_rule(1),
+        &[("KillCounter", "count", FieldValue::Integer(5))],
+    );
+    assert!(lit(&fired));
+    assert!(blocked_reasons(&fired).is_empty(), "no noise when it fires");
+
+    // A different event entirely is not a near miss.
+    let mut state = RuntimeState::new();
+    state.set(SWORD, "KillCounter", "count", FieldValue::Integer(0));
+    let mut rec = RuleRecording::new(state, vec![gate_rule(3)], vec![]);
+    rec.add_event(0, "EnemyDied", Some(SWORD.into()));
+    let mut other = RuleReplay::new(rec);
+    other.advance();
+    assert!(
+        blocked_reasons(&other).is_empty(),
+        "another event is not a near miss"
+    );
+}
+
+#[test]
+fn a_subject_pinned_rule_fires_only_for_its_own_object() {
+    const OTHER: &str = "1_9";
+    let pinned = || {
+        let (id, mut rule) = gate_rule(0);
+        rule.subject = Some(SWORD.to_string()); // the Play-start expansion's pin
+        (id, rule)
+    };
+    let mut state = RuntimeState::new();
+    state.set(SWORD, "KillCounter", "count", FieldValue::Integer(9));
+
+    // An event about ANOTHER object must not fire this object's rule, nor log a near miss.
+    let mut rec = RuleRecording::new(state.clone(), vec![pinned()], vec![]);
+    rec.add_event(0, "Touched", Some(OTHER.into()));
+    let mut theirs = RuleReplay::new(rec);
+    theirs.advance();
+    assert!(!lit(&theirs), "a pinned rule ignores other subjects");
+    assert!(
+        blocked_reasons(&theirs).is_empty(),
+        "another object's event is not this object's near miss"
+    );
+
+    // Its own event still fires it.
+    let mine = run_touch(
+        pinned(),
+        &[("KillCounter", "count", FieldValue::Integer(9))],
+    );
+    assert!(lit(&mine), "the pinned subject fires normally");
+}
+
+// ── `$other`: the entity that CAUSED the event ───────────────────────────────────────────────────
+
+/// "Only the PLAYER may collect this" — a clause about the TOUCHER, not the touched. Before `$other`
+/// existed this was not merely unwired, it was inexpressible: a rule had no way to name the toucher.
+#[test]
+fn a_clause_about_the_toucher_distinguishes_who_walked_into_it() {
+    const PLAYER: &str = "1_a";
+    const DOG: &str = "1_b";
+
+    let rule = |_n: i64| {
+        (
+            RuleId::new("r_player_only"),
+            RuleData {
+                name: "player-only pickup".into(),
+                enabled: true,
+                event: "Touched".into(),
+                conditions: vec![Condition {
+                    entity: metrocalk_core::rules::OTHER_ENTITY.into(),
+                    component: "GameRole".into(),
+                    field: "role".into(),
+                    op: CompareOp::Eq,
+                    value: FieldValue::Str("player".into()),
+                }],
+                any_of: vec![],
+                subject: None,
+                actions: vec![Action {
+                    action: "SetField".into(),
+                    entity: SWORD.into(),
+                    component: "Flammable".into(),
+                    field: "lit".into(),
+                    value: FieldValue::Bool(true),
+                }],
+            },
+        )
+    };
+
+    let run = |toucher: &str| {
+        let mut state = RuntimeState::new();
+        state.set(PLAYER, "GameRole", "role", FieldValue::Str("player".into()));
+        state.set(DOG, "GameRole", "role", FieldValue::Str("companion".into()));
+        let mut rec = RuleRecording::new(state, vec![rule(0)], vec![]);
+        rec.add_event_from(0, "Touched", Some(SWORD.into()), Some(toucher.to_string()));
+        let mut replay = RuleReplay::new(rec);
+        replay.advance();
+        replay
+    };
+
+    assert!(lit(&run(PLAYER)), "the player's touch collects it");
+    let by_dog = run(DOG);
+    assert!(!lit(&by_dog), "the companion's touch must NOT collect it");
+    // …and the near miss names the real reason, so the author is never left guessing.
+    let why = blocked_reasons(&by_dog);
+    assert_eq!(
+        why.len(),
+        1,
+        "the companion's touch is a recorded near miss"
+    );
+    assert!(
+        why[0].contains("player"),
+        "the reason should name the role it wanted: {}",
+        why[0]
+    );
+}
+
+#[test]
+fn an_event_with_no_other_leaves_a_toucher_clause_unsatisfied_rather_than_firing() {
+    let rule = (
+        RuleId::new("r_needs_other"),
+        RuleData {
+            name: "player-only".into(),
+            enabled: true,
+            event: "Touched".into(),
+            conditions: vec![Condition {
+                entity: metrocalk_core::rules::OTHER_ENTITY.into(),
+                component: "GameRole".into(),
+                field: "role".into(),
+                op: CompareOp::Eq,
+                value: FieldValue::Str("player".into()),
+            }],
+            any_of: vec![],
+            subject: None,
+            actions: vec![Action {
+                action: "SetField".into(),
+                entity: SWORD.into(),
+                component: "Flammable".into(),
+                field: "lit".into(),
+                value: FieldValue::Bool(true),
+            }],
+        },
+    );
+    let mut rec = RuleRecording::new(RuntimeState::new(), vec![rule], vec![]);
+    rec.add_event(0, "Touched", Some(SWORD.into())); // an emitter that knew no toucher
+    let mut replay = RuleReplay::new(rec);
+    replay.advance();
+    assert!(
+        !lit(&replay),
+        "an unresolvable $other fails closed — it never fires on a guess"
+    );
+}
+
+// ── health: Damage / Heal, with the clamps every game expects ────────────────────────────────────
+
+fn hp_of(replay: &RuleReplay, who: &str) -> i64 {
+    match replay.state().get(who, "Health", "hp") {
+        Some(FieldValue::Integer(i)) => *i,
+        other => panic!("expected integer hp, got {other:?}"),
+    }
+}
+
+/// A hazard harms the TOUCHER (`$other`), not itself — and never past zero.
+#[test]
+fn damage_hurts_the_toucher_and_floors_at_zero() {
+    const HERO: &str = "1_a";
+    let hazard = (
+        RuleId::new("r_hazard"),
+        RuleData {
+            name: "Hurt whoever touches it".into(),
+            enabled: true,
+            event: "Touched".into(),
+            conditions: vec![],
+            any_of: vec![],
+            subject: None,
+            actions: vec![Action {
+                action: "Damage".into(),
+                entity: metrocalk_core::rules::OTHER_ENTITY.into(),
+                component: "Health".into(),
+                field: "hp".into(),
+                value: FieldValue::Integer(2),
+            }],
+        },
+    );
+
+    let mut state = RuntimeState::new();
+    state.set(HERO, "Health", "hp", FieldValue::Integer(3));
+    state.set(HERO, "Health", "maxHp", FieldValue::Integer(3));
+    let mut rec = RuleRecording::new(state, vec![hazard], vec![]);
+    for frame in 0..3 {
+        rec.add_event_from(frame, "Touched", Some(SWORD.into()), Some(HERO.into()));
+    }
+    let mut replay = RuleReplay::new(rec);
+
+    replay.advance();
+    assert_eq!(hp_of(&replay, HERO), 1, "3 - 2 = 1");
+    replay.advance();
+    assert_eq!(hp_of(&replay, HERO), 0, "1 - 2 floors at 0, never negative");
+    replay.advance();
+    assert_eq!(hp_of(&replay, HERO), 0, "and stays there");
+    // The spike does NOT hurt itself.
+    assert!(
+        replay.state().get(SWORD, "Health", "hp").is_none(),
+        "the hazard damages the toucher, not the touched"
+    );
+}
+
+#[test]
+fn heal_never_exceeds_the_maximum() {
+    const HERO: &str = "1_a";
+    let potion = (
+        RuleId::new("r_potion"),
+        RuleData {
+            name: "Heal".into(),
+            enabled: true,
+            event: "Touched".into(),
+            conditions: vec![],
+            any_of: vec![],
+            subject: None,
+            actions: vec![Action {
+                action: "Heal".into(),
+                entity: HERO.into(),
+                component: "Health".into(),
+                field: "hp".into(),
+                value: FieldValue::Integer(5),
+            }],
+        },
+    );
+    let mut state = RuntimeState::new();
+    state.set(HERO, "Health", "hp", FieldValue::Integer(1));
+    state.set(HERO, "Health", "maxHp", FieldValue::Integer(3));
+    let mut rec = RuleRecording::new(state, vec![potion], vec![]);
+    rec.add_event(0, "Touched", Some(SWORD.into()));
+    let mut replay = RuleReplay::new(rec);
+    replay.advance();
+    assert_eq!(hp_of(&replay, HERO), 3, "healed to the cap, not past it");
 }

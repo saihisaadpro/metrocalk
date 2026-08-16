@@ -98,6 +98,33 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .build(),
         // Pipe Forge's durable procedural source. The cooked mesh stays in the content-addressed asset
         // repository; the lightweight recipe JSON + build facts keep the result inspectable and editable.
+        // Terrain (M19, ADR-104). A terrain is a RECIPE, not a mesh: the document holds the seed, layer
+        // stack, sculpt strokes, splines and rules, and every chunk mesh / splat texture / collider / nav
+        // grid is derived from it by a pure function. `source` is the recipe JSON minus its strokes; the
+        // strokes ride their own packed field so a brush gesture writes ~40 bytes per dab instead of
+        // rewriting the whole recipe (undo granularity is per gesture, and history stays small). The summary
+        // fields are projections for the inspector — the recipe is the truth.
+        ComponentMeta::builder("TerrainRecipe")
+            .category("Terrain")
+            .field("source", Str, true)
+            .field("strokes", Str, false)
+            .field("preset", Str, false)
+            .field("seed", Integer, false)
+            .field("worldSizeM", Number, false)
+            .field("chunkSizeM", Number, false)
+            .field("layerCount", Integer, false)
+            .field("strokeCount", Integer, false)
+            .requires("Spatial")
+            .provides("Terrain")
+            .provides("ProceduralAsset")
+            .tag("3d")
+            .tag("terrain")
+            .tag("procedural")
+            .alias("Landscape")
+            .alias("Ground")
+            .ui_hint("source", "editable terrain recipe")
+            .ui_hint("strokes", "packed sculpt strokes")
+            .build(),
         ComponentMeta::builder("PipeRecipe")
             .category("Asset")
             .field("source", Str, true)
@@ -270,6 +297,122 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .tag("effect")
             .ui_hint("lit", "whether the object is currently on fire")
             .build(),
+        // Gameplay roles (the Build→Play bridge). ONE component turns any asset into a live gameplay
+        // participant: `role` names the archetype (collectible|solid|prop|spinner), `radius` is the
+        // touch trigger's reach in metres, `points` what collecting it scores, and `active` is the
+        // runtime liveness flag — a Play-mode rule flips it to false and the play overlay hides the
+        // entity (RuntimeState only; the authored document never changes during Play).
+        ComponentMeta::builder("GameRole")
+            .category("Gameplay")
+            .field("role", Str, true)
+            .field("radius", Number, false)
+            .field("points", Integer, false)
+            .field("active", Boolean, false)
+            // Companion brain tuning (role == "companion"): plain numeric fields so the
+            // Inspector edits them like any other component — no bespoke UI needed.
+            // `radius` doubles as the companion's aggro reach; for a waypoint, `points`
+            // is its order in the patrol chain.
+            .field("speed", Number, false)
+            .field("range", Number, false)
+            .field("follow", Number, false)
+            .requires("Spatial")
+            .provides("Gameplay")
+            .tag("gameplay")
+            .tag("role")
+            .alias("Role")
+            .ui_hint(
+                "role",
+                "enum: collectible|solid|prop|spinner|companion|enemy|waypoint|player",
+            )
+            .ui_hint("radius", "touch trigger / aggro reach, metres")
+            .ui_hint("speed", "companion move speed, metres per second")
+            .ui_hint("range", "companion attack reach, metres")
+            .ui_hint("follow", "companion follow stand-off distance, metres")
+            .build(),
+        // The user's **"only if"** clauses for this object (conditionals). The clauses live HERE, on the
+        // entity they are about — never as a per-entity copy of the role's rule. At Play-start the shared
+        // `$subject` rule is expanded per entity and each object's clauses are appended to its own copy of
+        // the recording, so the document still holds exactly one pickup rule and one defeat rule no matter
+        // how many objects carry conditions. `source` is canonical JSON over the core `Condition` type (the
+        // `ShapeRecipe.source` / `TerrainRecipe.source` precedent) — written only by the validated
+        // `set_condition` command, so the registry's typo-proofing still applies at the one moment it matters.
+        ComponentMeta::builder("PlayIf")
+            .category("Gameplay")
+            .field("source", Str, true)
+            .field("join", Str, false)
+            .requires("Spatial")
+            .provides("PlayCondition")
+            .tag("gameplay")
+            .tag("logic")
+            .alias("OnlyIf")
+            .ui_hint("source", "the \"only if\" clauses this object adds to its role's rule")
+            .ui_hint("join", "enum: all|any")
+            .build(),
+        // CINEMATICS. A cutscene is a RECIPE — an ordered list of shots (subject + size + angle + move
+        // + seconds) — not baked keyframes, because the timeline can only author scalar channels (a
+        // keyed rotation would lerp four quaternion components independently and take the wrong path)
+        // and a baked pose frames where the subject WAS. The camera pose is solved per tick against the
+        // live subject. Registering this component is also what lets an ordinary `SetField` rule start a
+        // cutscene, so the closed action vocabulary never has to grow.
+        ComponentMeta::builder("Cinematic")
+            .category("Gameplay")
+            .field("source", Str, true)
+            .field("playing", Boolean, false)
+            .field("seconds", Number, false)
+            .requires("Spatial")
+            .provides("Cinematic")
+            .tag("gameplay")
+            .tag("camera")
+            .alias("Cutscene")
+            .ui_hint("source", "the shots in this cutscene")
+            .ui_hint("playing", "set true by a rule to roll the cutscene")
+            .build(),
+        // Visual effects. An effect is a RECIPE too, and for a sharper reason than the others: a
+        // particle here is a pure function of (recipe, index, time), so nothing is stored per frame,
+        // a replay is bit-identical, and the timeline can scrub to any second and get the right
+        // picture. `playing` is flipped by an ordinary `SetField` rule, so — exactly as with
+        // `Cinematic` — the closed action vocabulary gains fire, sparks and explosions without
+        // gaining a verb.
+        ComponentMeta::builder("Vfx")
+            .category("Gameplay")
+            .field("source", Str, true)
+            .field("playing", Boolean, false)
+            .field("intensity", Number, false)
+            .requires("Spatial")
+            .provides("Vfx")
+            .tag("gameplay")
+            .tag("vfx")
+            .alias("Effect")
+            .alias("Particles")
+            .ui_hint("source", "the effect layers on this object")
+            .ui_hint("playing", "set true by a rule to start the effect")
+            .ui_hint("intensity", "1 is the authored strength; 2 is twice as much")
+            .build(),
+        // Shape Studio (Build sub-engine). A parametric or drawn shape is a RECIPE, not a mesh: the
+        // document holds the kind + its parameters (+ the drawn outline) as canonical JSON, and the
+        // watertight mesh is derived from it by a pure function in the shell. Editing a parameter
+        // re-bakes the mesh and swaps the handle in one undoable commit; the persisted artifact for a
+        // parametric shape is the recipe itself, so a missing blob rebuilds deterministically on load.
+        ComponentMeta::builder("ShapeRecipe")
+            .category("Props")
+            .field("source", Str, true)
+            .field("version", Integer, true)
+            .field("kind", Str, true)
+            .field("triangles", Integer, false)
+            .requires("Spatial")
+            .provides("ProceduralAsset")
+            .tag("3d")
+            .tag("procedural")
+            .tag("shape")
+            .alias("Shape")
+            .alias("Solid")
+            .alias("Primitive")
+            .ui_hint(
+                "kind",
+                "enum: box|sphere|cylinder|cone|torus|capsule|wedge|prism|extrude|revolve|union|carve|intersect|meld",
+            )
+            .ui_hint("source", "editable shape recipe")
+            .build(),
     ]
 }
 
@@ -283,6 +426,26 @@ pub fn standard_events() -> Vec<EventMeta> {
         EventMeta::new("EntityDestroyed", "an entity was removed from the scene"),
         EventMeta::new("ZoneEntered", "an entity entered an area / zone"),
         EventMeta::new("ZoneExited", "an entity left an area / zone"),
+        // Fired AUTOMATICALLY by the Play loop when a moving physics body comes within a GameRole
+        // entity's trigger radius — the first event the simulation emits by itself (the ADR-049
+        // "live input routing" seam, now real for touch).
+        EventMeta::new(
+            "Touched",
+            "a moving object touched this entity (fired live during Play)",
+        ),
+        // Fired AUTOMATICALLY by a companion's attack landing (in range + off cooldown) —
+        // the second self-emitted Play event; the defeat consequence stays an authored rule.
+        EventMeta::new(
+            "Struck",
+            "a companion's attack landed on this entity (fired live during Play)",
+        ),
+        // TIME. Fired AUTOMATICALLY by the Play clock when this entity's countdown elapses — the
+        // first event that comes from nothing but the passage of time, which is what makes fuses,
+        // crumbling platforms and timed gates expressible at all.
+        EventMeta::new(
+            "After",
+            "this entity's countdown finished (fired live during Play)",
+        ),
         EventMeta::new("StateEntered", "a quest/state machine entered a state"),
         EventMeta::new("StateExited", "a quest/state machine left a state"),
     ]
@@ -295,6 +458,11 @@ pub fn standard_actions() -> Vec<ActionMeta> {
     vec![
         ActionMeta::new("SetField", "set a component field to a value"),
         ActionMeta::new("AdjustCounter", "add a number to a numeric counter field"),
+        // HEALTH. `Damage`/`Heal` are `AdjustCounter` with the two rules every game expects and no
+        // author should have to re-derive: never below zero, never above `maxHp`. Making them their own
+        // verbs is what lets a hazard say "hurt whoever stepped on me" in one clause.
+        ActionMeta::new("Damage", "subtract from a health field, never below zero"),
+        ActionMeta::new("Heal", "add to a health field, never above its maximum"),
         // M12.3 (ADR-047) — the honest-ceiling escape: hand off to a sandboxed WASM plugin for genuinely
         // algorithmic behavior (a boss AI, a procedural generator, a custom solver). Still a CLOSED verb —
         // the algorithm is the plugin's, not free code in a Rule.

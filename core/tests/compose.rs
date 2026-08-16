@@ -54,6 +54,8 @@ fn ignite_rule(q: &str) -> RuleData {
             op: CompareOp::Ge,
             value: FieldValue::Integer(4),
         }],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "SetField".into(),
             entity: q.into(),
@@ -84,6 +86,8 @@ fn quest_machine(q: &str) -> StateMachine {
             enabled: true,
             event: "EnemyDied".into(),
             conditions: vec![],
+            any_of: vec![],
+            subject: None,
             actions: vec![sm.enter_action("ReadyForBoss")],
         },
     }];

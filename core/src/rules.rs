@@ -143,6 +143,18 @@ pub struct RuleData {
     pub event: String,
     /// **If** — conditions that must ALL hold (AND semantics, per test #5). Empty = always-true.
     pub conditions: Vec<Condition>,
+    /// **If … either** — an OR group: when non-empty, at least ONE of these must hold *in addition to*
+    /// every [`Self::conditions`] clause. Exactly one group, never nested: the authored depth ceiling is
+    /// two (an AND list + one OR group), which is what keeps a conditional readable as a sentence.
+    /// Defaulted so every rule authored before this existed still deserializes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub any_of: Vec<Condition>,
+    /// Pins this rule to ONE event subject (an [`EntityId::to_loro_key`] string). `None` = fires for any
+    /// subject, the pre-existing behaviour. Set by the Play-start expansion that turns one `$subject` rule
+    /// into a per-entity rule carrying that entity's own clauses — so a user's "only if" can differ per
+    /// object without the document ever holding a copy of the rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
     /// **Then** — actions run when the rule fires (must be non-empty: a rule has to *do* something).
     pub actions: Vec<Action>,
 }
@@ -253,7 +265,7 @@ where
     if rule.actions.is_empty() {
         return Err(RuleError::NoActions);
     }
-    for c in &rule.conditions {
+    for c in rule.conditions.iter().chain(rule.any_of.iter()) {
         check_entity(&c.entity, &entity_exists)?;
         check_field(registry, &c.component, &c.field, &c.value)?;
     }
@@ -277,7 +289,27 @@ where
     Ok(())
 }
 
+/// The subject sentinel: a condition/action entity slot holding this string is resolved AT DISPATCH
+/// TIME to the fired event's `subject` — "whichever entity this event happened to". One rule written
+/// with `$subject` covers every entity of a kind (the collectible-pickup rule is one rule, not one
+/// per pickup); an event fired without a subject leaves the condition unsatisfied / the action a
+/// no-op, never a panic.
+pub const SUBJECT_ENTITY: &str = "$subject";
+
+/// The **other party** sentinel: the entity that CAUSED the event, as opposed to the one it happened
+/// to. On a touch, `$subject` is the thing that was touched and `$other` is whoever walked into it.
+/// Without this, "the spike hurts whoever stepped on it" is not merely unwired — it is inexpressible,
+/// because a rule has no way to name the toucher. Resolved at dispatch, exactly like `$subject`.
+pub const OTHER_ENTITY: &str = "$other";
+
 fn check_entity<F: Fn(EntityId) -> bool>(key: &str, exists: &F) -> Result<(), RuleError> {
+    if key == OTHER_ENTITY {
+        // Like `$subject`: a per-event slot, so there is no entity to check at authoring time.
+        return Ok(());
+    }
+    if key == SUBJECT_ENTITY {
+        return Ok(()); // resolved per-event at dispatch; there is no authored entity to exist
+    }
     match EntityId::from_loro_key(key) {
         Some(id) if exists(id) => Ok(()),
         _ => Err(RuleError::UnknownEntity(key.to_string())),
@@ -377,6 +409,8 @@ pub fn propose_mirror(rule: &RuleData) -> Option<RuleData> {
         enabled: rule.enabled,
         event: exit.to_string(),
         conditions: rule.conditions.clone(),
+        any_of: rule.any_of.clone(),
+        subject: rule.subject.clone(),
         actions: inverse_actions,
     })
 }

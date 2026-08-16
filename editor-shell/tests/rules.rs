@@ -39,6 +39,8 @@ fn demo_rule() -> RuleData {
             op: CompareOp::Ge,
             value: FieldValue::Integer(4),
         }],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "SetField".into(),
             entity: "1_0".into(),

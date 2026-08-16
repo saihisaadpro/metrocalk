@@ -1326,6 +1326,13 @@ impl<W: World> Engine<W> {
         let actions =
             serde_json::to_string(&rule.actions).map_err(|e| PipelineError::Loro(e.to_string()))?;
         slot.insert("actions", actions.as_str()).map_err(loro_err)?;
+        // The OR group + the subject pin ride the same rule-level JSON discipline. Both are written
+        // ALWAYS (even when empty/None) so clearing them persists rather than leaving a stale slot.
+        let any_of =
+            serde_json::to_string(&rule.any_of).map_err(|e| PipelineError::Loro(e.to_string()))?;
+        slot.insert("any_of", any_of.as_str()).map_err(loro_err)?;
+        slot.insert("subject", rule.subject.clone().unwrap_or_default().as_str())
+            .map_err(loro_err)?;
         Ok(())
     }
 
@@ -1953,11 +1960,17 @@ fn read_rule_slot(slot: &LoroMap) -> Option<RuleData> {
     let conditions =
         serde_json::from_str(&get_str("conditions").unwrap_or_else(|| "[]".into())).ok()?;
     let actions = serde_json::from_str(&get_str("actions").unwrap_or_else(|| "[]".into())).ok()?;
+    // Both post-date the original slot format: a rule written before they existed simply has no key,
+    // which reads as "no OR group, no subject pin" — the pre-existing semantics, exactly.
+    let any_of = serde_json::from_str(&get_str("any_of").unwrap_or_else(|| "[]".into())).ok()?;
+    let subject = get_str("subject").filter(|s| !s.is_empty());
     Some(RuleData {
         name,
         enabled,
         event,
         conditions,
+        any_of,
+        subject,
         actions,
     })
 }

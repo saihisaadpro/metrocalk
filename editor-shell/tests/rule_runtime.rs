@@ -94,6 +94,8 @@ fn authored_scene() -> Engine<FlecsWorld> {
                 enabled: true,
                 event: "EnemyDied".into(),
                 conditions: vec![],
+                any_of: vec![],
+                subject: None,
                 actions: vec![Action {
                     action: "AdjustCounter".into(),
                     entity: SWORD.into(),
@@ -131,6 +133,8 @@ fn authored_scene() -> Engine<FlecsWorld> {
                         value: FieldValue::Str("BossArena".into()),
                     },
                 ],
+                any_of: vec![],
+                subject: None,
                 actions: vec![Action {
                     action: "SetField".into(),
                     entity: SWORD.into(),
@@ -224,6 +228,8 @@ fn stop_restores_pre_play_state_bit_exactly_with_rules_running() {
                     enabled: true,
                     event: "EnemyDied".into(),
                     conditions: vec![],
+                    any_of: vec![],
+                    subject: None,
                     actions: vec![Action {
                         action: "SetField".into(),
                         entity: SWORD.into(),
@@ -317,6 +323,8 @@ fn a_machine_drives_the_quest_in_play() {
             enabled: true,
             event: "EnemyDied".into(),
             conditions: vec![],
+            any_of: vec![],
+            subject: None,
             actions: vec![Action {
                 action: "SetField".into(),
                 entity: SWORD.into(),
@@ -379,6 +387,8 @@ fn a_non_deterministic_plugin_rule_is_flagged_out_of_the_play_recording() {
                     enabled: true,
                     event: "EnemyDied".into(),
                     conditions: vec![],
+                    any_of: vec![],
+                    subject: None,
                     actions: vec![Action {
                         action: "RunPlugin".into(),
                         entity: SWORD.into(),

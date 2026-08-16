@@ -47,6 +47,8 @@ fn run_plugin_rule(entity: &str, plugin: &str) -> RuleData {
         enabled: true,
         event: "EntitySpawned".into(),
         conditions: vec![],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: RUN_PLUGIN_ACTION.into(),
             entity: entity.into(),

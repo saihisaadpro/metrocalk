@@ -48,6 +48,8 @@ fn ignite_rule(i: usize) -> (RuleId, RuleData) {
                     value: FieldValue::Str("BossArena".into()),
                 },
             ],
+            any_of: vec![],
+            subject: None,
             actions: vec![Action {
                 action: "AdjustCounter".into(),
                 entity: SWORD.into(),

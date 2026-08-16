@@ -67,6 +67,8 @@ fn test5_rule(counter: &str, zone: &str, sword: &str) -> RuleData {
                 value: FieldValue::Str("BossArena".into()),
             },
         ],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "SetField".into(),
             entity: sword.into(),
@@ -206,6 +208,8 @@ fn kill_counter_reads_and_mutates_through_the_typed_vocabulary() {
             op: CompareOp::Ge,
             value: FieldValue::Integer(0),
         }],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "AdjustCounter".into(),
             entity: counter,
@@ -338,6 +342,8 @@ fn the_mirror_rule_is_offered_for_an_add_on_enter_rule() {
             op: CompareOp::Eq,
             value: FieldValue::Str("FacingBoss".into()),
         }],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "SetField".into(),
             entity: sword,
@@ -369,6 +375,8 @@ fn no_mirror_is_offered_when_there_is_no_well_defined_inverse() {
         enabled: true,
         event: "EnemyDied".into(),
         conditions: vec![],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "SetField".into(),
             entity: "1_1".into(),

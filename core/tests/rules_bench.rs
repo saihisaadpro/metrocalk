@@ -58,6 +58,8 @@ fn rule(entity: &str) -> RuleData {
                 value: FieldValue::Str("BossArena".into()),
             },
         ],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "SetField".into(),
             entity: entity.into(),

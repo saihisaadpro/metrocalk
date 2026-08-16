@@ -52,6 +52,8 @@ fn demo_machine() -> StateMachine {
                     enabled: true,
                     event: event.into(),
                     conditions: conds,
+                    any_of: vec![],
+                    subject: None,
                     actions: vec![sm.enter_action(to)],
                 },
             }

@@ -188,6 +188,8 @@ fn ignite_rule(target: &str, threshold: i64) -> RuleData {
             op: CompareOp::Ge,
             value: FieldValue::Integer(threshold),
         }],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "SetField".to_string(),
             entity: target.to_string(),

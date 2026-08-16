@@ -59,6 +59,8 @@ fn transition(id: String, from: &str, to: &str, q: &str, event: &str) -> Transit
                 op: CompareOp::Ge,
                 value: FieldValue::Integer(4),
             }],
+            any_of: vec![],
+            subject: None,
             actions: vec![Action {
                 action: "SetField".into(),
                 entity: q.into(),

@@ -54,6 +54,8 @@ fn ignite_rule(entity: &str) -> RuleData {
             op: CompareOp::Ge,
             value: FieldValue::Integer(4),
         }],
+        any_of: vec![],
+        subject: None,
         actions: vec![Action {
             action: "SetField".into(),
             entity: entity.into(),

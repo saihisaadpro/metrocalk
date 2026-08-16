@@ -293,6 +293,8 @@ pub fn lifecycle_state_machine(entity: &str) -> StateMachine {
                 enabled: true,
                 event: event.into(),
                 conditions: vec![],
+                any_of: vec![],
+                subject: None,
                 actions: vec![sm.enter_action(to.as_str())],
             },
         };

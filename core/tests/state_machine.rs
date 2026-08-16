@@ -64,6 +64,8 @@ fn transition(
             enabled: true,
             event: event.into(),
             conditions,
+            any_of: vec![],
+            subject: None,
             actions: vec![sm.enter_action(to)],
         },
     }

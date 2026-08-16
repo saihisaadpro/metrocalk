@@ -27,7 +27,9 @@
 //! FacingBoss`", "❌ `KillCounter = 3 of 4`") — debug by *looking*, not `Debug.Log`.
 
 use crate::pipeline::FieldValue;
-use crate::rules::{Action, Condition, RuleData, RuleId, RUN_PLUGIN_ACTION};
+use crate::rules::{
+    Action, Condition, RuleData, RuleId, OTHER_ENTITY, RUN_PLUGIN_ACTION, SUBJECT_ENTITY,
+};
 use crate::state_machine::{StateMachine, StateMachineId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -111,6 +113,35 @@ pub struct RuleEvent {
     /// The entity the event concerns (a loro key), or `None` for a global event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// The entity that CAUSED it (the toucher), when the emitter knew one. Defaulted, so every
+    /// recording written before this existed still deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<String>,
+}
+
+/// Who the event in flight is about. `subject` is the entity it happened TO (`$subject`); `other` is
+/// the entity that caused it (`$other`) when the emitter knew — on a touch, the toucher. Copy, so
+/// threading it through the evaluation path costs nothing on the per-frame hot path.
+#[derive(Clone, Copy, Default)]
+pub struct Scope<'a> {
+    /// The `$subject` slot.
+    pub subject: Option<&'a str>,
+    /// The `$other` slot.
+    pub other: Option<&'a str>,
+}
+
+impl<'a> Scope<'a> {
+    /// No event in scope — a click-time read, where the sentinels cannot resolve.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// The scope of one dispatched event.
+    #[must_use]
+    pub fn of(subject: Option<&'a str>, other: Option<&'a str>) -> Self {
+        Self { subject, other }
+    }
 }
 
 // ── the decision history (what time-travel scrubs over) ──────────────────────────────────────────
@@ -149,6 +180,31 @@ pub enum DecisionKind {
     /// runs in `/plugins` (`!Send`, out of this pure path) and returns as an ADR-017 patch; the deterministic
     /// **invocation** is recorded here so the decision history stays faithful + replayable.
     PluginInvoked { plugin: String },
+    /// A rule's When MATCHED but its If did not hold — the **near-miss record**. Every other variant is a
+    /// positive effect, which left the single most common authoring question ("I touched it and nothing
+    /// happened — why?") unanswerable from the history. `why` is the first failing clause rendered with its
+    /// ACTUAL runtime value ("the Score is 0, needs at least 3"), so the answer is the record itself.
+    RuleBlocked {
+        rule: String,
+        name: String,
+        subject: Option<String>,
+        why: String,
+        /// The clause that failed, so a caller can re-render it in the AUTHOR'S language rather than
+        /// the engine's. `why` stays the raw, always-available fallback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clause: Option<Condition>,
+        /// What that clause's field actually held at the moment it failed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actual: Option<FieldValue>,
+    },
+}
+
+/// The parts of a failed clause a caller needs to explain it well: the engine's own rendering, the
+/// clause itself (so a UI can re-say it in the author's words) and the value that actually held.
+struct BlockedClause {
+    why: String,
+    clause: Condition,
+    actual: Option<FieldValue>,
 }
 
 /// A frame-stamped [`DecisionKind`] — one row of the decision history.
@@ -197,10 +253,15 @@ pub struct RuleTruth {
     pub name: String,
     /// The rule's When event.
     pub event: String,
-    /// Whether **all** conditions currently hold (it would fire on its event now).
+    /// Whether the whole **If** currently holds (every AND clause, plus one of the OR group when present)
+    /// — i.e. it would fire on its event now.
     pub fires: bool,
-    /// Each condition's live truth, in author order.
+    /// Each AND condition's live truth, in author order.
     pub conditions: Vec<ConditionTruth>,
+    /// The OR group's live truth, in author order — any ONE of these satisfies the group. Empty when the
+    /// rule has no alternatives (the common case), so pre-existing payloads are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<ConditionTruth>,
 }
 
 /// A state machine's **live current state** for the clicked entity (test #5 box 3 — "✅ `state =
@@ -330,10 +391,22 @@ impl RuleRecording {
     /// Record an input event at `frame` (kept frame-sorted, stable within a frame — the
     /// `physics::replay::Recording::add_input` sibling, so a scrub replays it deterministically).
     pub fn add_event(&mut self, frame: u64, event: impl Into<String>, subject: Option<String>) {
+        self.add_event_from(frame, event, subject, None);
+    }
+
+    /// Record an input event that also names the entity that CAUSED it (`$other`).
+    pub fn add_event_from(
+        &mut self,
+        frame: u64,
+        event: impl Into<String>,
+        subject: Option<String>,
+        other: Option<String>,
+    ) {
         self.events.push(RuleEvent {
             frame,
             event: event.into(),
             subject,
+            other,
         });
         // Stable sort preserves within-frame insertion order — two events on the same frame keep their
         // authored order, so the decision history is fully deterministic.
@@ -469,10 +542,21 @@ impl RuleReplay {
     /// Intended for firing at the timeline **head** (during live Play). After a scrub-back, `seek` forward to
     /// the head before firing, so the appended event lands in chronological order.
     pub fn fire(&mut self, event: impl Into<String>, subject: Option<String>) -> u64 {
+        self.fire_from(event, subject, None)
+    }
+
+    /// Fire an event that also names the entity that caused it — the `$other` slot.
+    pub fn fire_from(
+        &mut self,
+        event: impl Into<String>,
+        subject: Option<String>,
+        other: Option<String>,
+    ) -> u64 {
         self.recording.events.push(RuleEvent {
             frame: self.frame,
             event: event.into(),
             subject,
+            other,
         });
         // Stable sort keeps within-frame insertion order — the appended head event stays last on its frame.
         self.recording.events.sort_by_key(|e| e.frame);
@@ -490,19 +574,26 @@ impl RuleReplay {
     /// current state has a matching, satisfied transition (the first in deterministic `ordered_transitions`
     /// order) — rules settle (counters/effects), then the quest phase reacts to the result.
     fn dispatch(&mut self, ev: &RuleEvent) {
+        let subject = ev.subject.clone();
+        let other = ev.other.clone();
+        let scope = Scope::of(subject.as_deref(), other.as_deref());
         // Rules — sequential in sorted-id order; re-check each rule's conditions against the live state so an
         // earlier rule's effect cascades into a later rule this same tick. `rule_to_fire` does the (cheap,
         // allocation-free) check under an immutable borrow and clones **only a firing rule's** id/name/actions
         // — so a non-firing rule costs nothing extra on the per-frame hot path (inv. 4), even @N rules.
         for i in 0..self.recording.rules.len() {
-            if let Some((id, name, actions)) = self.rule_to_fire(i, &ev.event) {
+            if let Some((id, name, actions)) = self.rule_to_fire(i, &ev.event, scope) {
                 self.history.push(DecisionEvent {
                     frame: self.frame,
                     kind: DecisionKind::RuleFired { rule: id, name },
                 });
                 for a in &actions {
-                    self.apply_action(a);
+                    self.apply_action(a, scope);
                 }
+            } else if let Some(blocked) = self.near_miss(i, &ev.event, scope) {
+                // The When matched and the subject was ours, but the If did not hold — record WHY, so
+                // "I touched it and nothing happened" has an answer in the history rather than silence.
+                self.history.push(blocked);
             }
         }
 
@@ -510,7 +601,7 @@ impl RuleReplay {
         // transition out of the current state whose event matches + conditions hold (cloning nothing unless
         // one fires — the same hot-path discipline as the rules loop).
         for mi in 0..self.recording.machines.len() {
-            if let Some(tf) = self.transition_to_fire(mi, &ev.event) {
+            if let Some(tf) = self.transition_to_fire(mi, &ev.event, scope) {
                 // The transition's effect IS entering `to` (M12.2's validator guarantees the rule's action is
                 // exactly the enter-state SetField) — so we set the state field directly + record the
                 // transition, rather than re-running the action (which would double-record the same change).
@@ -535,11 +626,18 @@ impl RuleReplay {
     /// If machine `mi` has a satisfied transition out of its current state on `ev_event`, the owned move to
     /// apply (the first in deterministic `ordered_transitions` order — ADR-046's tie-break). Cloned **only on
     /// a fire**, under an immutable borrow dropped before the caller mutates `self`.
-    fn transition_to_fire(&self, mi: usize, ev_event: &str) -> Option<TransitionFire> {
+    fn transition_to_fire(
+        &self,
+        mi: usize,
+        ev_event: &str,
+        scope: Scope<'_>,
+    ) -> Option<TransitionFire> {
         let (mid, sm) = &self.recording.machines[mi];
         let cur = self.current_state(sm);
         let t = sm.ordered_transitions().into_iter().find(|t| {
-            t.from == cur && t.rule.event == ev_event && self.conditions_hold(&t.rule.conditions)
+            t.from == cur
+                && t.rule.event == ev_event
+                && self.conditions_hold(&t.rule.conditions, scope)
         })?;
         Some(TransitionFire {
             machine: mid.to_string(),
@@ -553,17 +651,24 @@ impl RuleReplay {
 
     /// Apply one Then-action to the runtime state (never Loro), recording its decision. The verb set is the
     /// **closed** M12.1 vocabulary; an unknown verb is impossible (validated at authoring) and ignored.
-    fn apply_action(&mut self, a: &Action) {
+    /// A `$subject` entity slot resolves to the fired event's subject — the decision history records the
+    /// RESOLVED entity, so the debugger shows what actually changed; an event with no subject makes the
+    /// action a no-op (never a panic, never a write to a literal "$subject" key).
+    fn apply_action(&mut self, a: &Action, scope: Scope<'_>) {
+        let Some(entity) = resolve_entity(&a.entity, scope) else {
+            return;
+        };
+        let entity = entity.to_string();
         match a.action.as_str() {
             "SetField" => {
-                let already = self.state.get(&a.entity, &a.component, &a.field) == Some(&a.value);
+                let already = self.state.get(&entity, &a.component, &a.field) == Some(&a.value);
                 if !already {
                     self.state
-                        .set(&a.entity, &a.component, &a.field, a.value.clone());
+                        .set(&entity, &a.component, &a.field, a.value.clone());
                     self.history.push(DecisionEvent {
                         frame: self.frame,
                         kind: DecisionKind::FieldSet {
-                            entity: a.entity.clone(),
+                            entity,
                             component: a.component.clone(),
                             field: a.field.clone(),
                             value: a.value.clone(),
@@ -574,17 +679,55 @@ impl RuleReplay {
             "AdjustCounter" => {
                 let from = self
                     .state
-                    .get(&a.entity, &a.component, &a.field)
+                    .get(&entity, &a.component, &a.field)
                     .cloned()
                     .unwrap_or(FieldValue::Integer(0));
                 let to = add_numeric(&from, &a.value);
                 if to != from {
-                    self.state
-                        .set(&a.entity, &a.component, &a.field, to.clone());
+                    self.state.set(&entity, &a.component, &a.field, to.clone());
                     self.history.push(DecisionEvent {
                         frame: self.frame,
                         kind: DecisionKind::CounterChanged {
-                            entity: a.entity.clone(),
+                            entity,
+                            component: a.component.clone(),
+                            field: a.field.clone(),
+                            from,
+                            to,
+                        },
+                    });
+                }
+            }
+            // Health, with the two clamps baked in so no author has to remember them. `Damage`
+            // floors at 0; `Heal` ceilings at the entity's own `maxHp` when it has one. Both record a
+            // `CounterChanged` row, so the decision history reads the same as any other value change.
+            verb @ ("Damage" | "Heal") => {
+                let from = self
+                    .state
+                    .get(&entity, &a.component, &a.field)
+                    .cloned()
+                    .unwrap_or(FieldValue::Integer(0));
+                let delta = if verb == "Damage" {
+                    negate_numeric(&a.value)
+                } else {
+                    a.value.clone()
+                };
+                let mut to = add_numeric(&from, &delta);
+                if numeric_of(&to) < 0.0 {
+                    to = FieldValue::Integer(0);
+                }
+                if verb == "Heal" {
+                    if let Some(max) = self.state.get(&entity, &a.component, "maxHp").cloned() {
+                        if numeric_of(&to) > numeric_of(&max) {
+                            to = max;
+                        }
+                    }
+                }
+                if to != from {
+                    self.state.set(&entity, &a.component, &a.field, to.clone());
+                    self.history.push(DecisionEvent {
+                        frame: self.frame,
+                        kind: DecisionKind::CounterChanged {
+                            entity,
                             component: a.component.clone(),
                             field: a.field.clone(),
                             from,
@@ -622,24 +765,113 @@ impl RuleReplay {
     /// If rule `i` would fire on `ev_event`, the owned `(id, name, actions)` to apply — cloned **only on a
     /// fire** (a non-firing rule allocates nothing). The condition check runs under an immutable borrow that
     /// is dropped before the caller mutates `self`, so the per-frame loop stays borrow-clean + cheap.
-    fn rule_to_fire(&self, i: usize, ev_event: &str) -> Option<(String, String, Vec<Action>)> {
+    fn rule_to_fire(
+        &self,
+        i: usize,
+        ev_event: &str,
+        scope: Scope<'_>,
+    ) -> Option<(String, String, Vec<Action>)> {
         let (id, rule) = &self.recording.rules[i];
-        if rule.enabled && rule.event == ev_event && self.conditions_hold(&rule.conditions) {
+        if rule.enabled
+            && rule.event == ev_event
+            && Self::rule_subject_matches(rule, scope)
+            && self.rule_if_holds(rule, scope)
+        {
             Some((id.to_string(), rule.name.clone(), rule.actions.clone()))
         } else {
             None
         }
     }
 
-    fn conditions_hold(&self, conditions: &[Condition]) -> bool {
-        conditions.iter().all(|c| self.condition_satisfied(c))
+    /// The near-miss record for rule `i`: `Some` only when the rule was genuinely *relevant* to this event
+    /// (enabled, same When, our subject) yet its If failed. A rule for another event or another object is
+    /// not a near miss and must not add noise to the history.
+    fn near_miss(&self, i: usize, ev_event: &str, scope: Scope<'_>) -> Option<DecisionEvent> {
+        let (id, rule) = &self.recording.rules[i];
+        if !rule.enabled || rule.event != ev_event || !Self::rule_subject_matches(rule, scope) {
+            return None;
+        }
+        let blocked = self.why_blocked(rule, scope)?;
+        Some(DecisionEvent {
+            frame: self.frame,
+            kind: DecisionKind::RuleBlocked {
+                rule: id.to_string(),
+                name: rule.name.clone(),
+                subject: scope.subject.map(str::to_owned),
+                why: blocked.why,
+                clause: Some(blocked.clause),
+                actual: blocked.actual,
+            },
+        })
+    }
+
+    /// A subject-PINNED rule (one produced by the Play-start per-entity expansion) fires only for its own
+    /// entity; an unpinned rule keeps the pre-existing any-subject behaviour.
+    fn rule_subject_matches(rule: &RuleData, scope: Scope<'_>) -> bool {
+        match (&rule.subject, scope.subject) {
+            (None, _) => true,
+            (Some(pinned), Some(actual)) => pinned == actual,
+            (Some(_), None) => false,
+        }
+    }
+
+    /// The rule's whole **If**: every AND clause holds, and — when an OR group exists — at least one of it.
+    fn rule_if_holds(&self, rule: &RuleData, scope: Scope<'_>) -> bool {
+        self.conditions_hold(&rule.conditions, scope)
+            && (rule.any_of.is_empty()
+                || rule
+                    .any_of
+                    .iter()
+                    .any(|c| self.condition_satisfied(c, scope)))
+    }
+
+    /// Why the rule did NOT fire, as one plain sentence naming the first failing clause with its ACTUAL
+    /// value — the near-miss answer. `None` when the If actually holds (nothing to explain).
+    fn why_blocked(&self, rule: &RuleData, scope: Scope<'_>) -> Option<BlockedClause> {
+        for c in &rule.conditions {
+            if !self.condition_satisfied(c, scope) {
+                return Some(self.render_failing(c, scope));
+            }
+        }
+        if !rule.any_of.is_empty()
+            && !rule
+                .any_of
+                .iter()
+                .any(|c| self.condition_satisfied(c, scope))
+        {
+            // None of the alternatives held — name the first, since they are interchangeable routes.
+            return rule.any_of.first().map(|c| self.render_failing(c, scope));
+        }
+        None
+    }
+
+    /// One failing clause rendered with the value the runtime actually holds right now.
+    fn render_failing(&self, c: &Condition, scope: Scope<'_>) -> BlockedClause {
+        let actual = resolve_entity(&c.entity, scope)
+            .and_then(|e| self.state.get(e, &c.component, &c.field))
+            .cloned();
+        BlockedClause {
+            why: render_condition(c, actual.as_ref()),
+            clause: c.clone(),
+            actual,
+        }
+    }
+
+    fn conditions_hold(&self, conditions: &[Condition], scope: Scope<'_>) -> bool {
+        conditions
+            .iter()
+            .all(|c| self.condition_satisfied(c, scope))
     }
 
     /// The **cheap** condition check used on the per-frame tick: just the boolean, no display-string
     /// allocation. The full [`Self::eval_condition`] (with the human copy) is reserved for the click-time
-    /// debugger, so the hot path never builds strings it throws away.
-    fn condition_satisfied(&self, c: &Condition) -> bool {
-        match self.state.get(&c.entity, &c.component, &c.field) {
+    /// debugger, so the hot path never builds strings it throws away. A `$subject` entity slot resolves
+    /// to the fired event's subject; with no subject in scope the condition is unsatisfied.
+    fn condition_satisfied(&self, c: &Condition, scope: Scope<'_>) -> bool {
+        let Some(entity) = resolve_entity(&c.entity, scope) else {
+            return false;
+        };
+        match self.state.get(entity, &c.component, &c.field) {
             Some(v) => c.op.eval(v, &c.value) == Some(true),
             None => false,
         }
@@ -647,10 +879,11 @@ impl RuleReplay {
 
     /// Evaluate one condition into a full [`ConditionTruth`] (with the human overlay copy) — the debugger
     /// read. Shares [`Self::condition_satisfied`] for the boolean, so what fires and what the overlay shows
-    /// can never disagree.
+    /// can never disagree. Click-time evaluation has no live event, so a `$subject` condition reads as
+    /// unsatisfied here — its truth exists only at dispatch.
     fn eval_condition(&self, c: &Condition) -> ConditionTruth {
         let actual = self.state.get(&c.entity, &c.component, &c.field).cloned();
-        let satisfied = self.condition_satisfied(c);
+        let satisfied = self.condition_satisfied(c, Scope::none());
         let display = render_condition(c, actual.as_ref());
         ConditionTruth {
             satisfied,
@@ -683,12 +916,19 @@ impl RuleReplay {
                     .iter()
                     .map(|c| self.eval_condition(c))
                     .collect();
+                let alternatives: Vec<ConditionTruth> =
+                    r.any_of.iter().map(|c| self.eval_condition(c)).collect();
+                // Mirrors `rule_if_holds` exactly — what the overlay claims and what actually fires can
+                // never disagree, including the OR group.
+                let fires = conditions.iter().all(|c| c.satisfied)
+                    && (alternatives.is_empty() || alternatives.iter().any(|c| c.satisfied));
                 RuleTruth {
                     rule: id.to_string(),
                     name: r.name.clone(),
                     event: r.event.clone(),
-                    fires: conditions.iter().all(|c| c.satisfied),
+                    fires,
                     conditions,
+                    alternatives,
                 }
             })
             .collect();
@@ -783,9 +1023,44 @@ fn rule_references(rule: &RuleData, entity: &str) -> bool {
         || rule.actions.iter().any(|a| a.entity == entity)
 }
 
-/// Add two numeric `FieldValue`s for `AdjustCounter` — integer + integer stays an integer (no float drift on a
-/// whole-number counter); any number operand promotes to a number. Non-numeric operands leave the value
-/// unchanged (the validator already type-checks `AdjustCounter` targets, so this is a defensive no-op).
+/// The numeric magnitude of a scalar (non-numbers read as 0) — the shared read for the health clamps.
+fn numeric_of(v: &FieldValue) -> f64 {
+    match v {
+        FieldValue::Integer(i) => {
+            #[allow(clippy::cast_precision_loss)] // health magnitudes are tiny
+            {
+                *i as f64
+            }
+        }
+        FieldValue::Number(n) => *n,
+        _ => 0.0,
+    }
+}
+
+/// `-v` for the numeric arms; anything else passes through unchanged (the add is then a no-op).
+fn negate_numeric(v: &FieldValue) -> FieldValue {
+    match v {
+        FieldValue::Integer(i) => FieldValue::Integer(-*i),
+        FieldValue::Number(n) => FieldValue::Number(-*n),
+        other => other.clone(),
+    }
+}
+
+/// Resolve a condition/action entity slot: the `$subject` sentinel becomes the fired event's subject and
+/// `$other` the party that caused it (`None` when the event carried neither — the caller treats that as
+/// unsatisfied / a no-op); any other string is an ordinary authored entity key.
+fn resolve_entity<'a>(entity: &'a str, scope: Scope<'a>) -> Option<&'a str> {
+    match entity {
+        SUBJECT_ENTITY => scope.subject,
+        OTHER_ENTITY => scope.other,
+        named => Some(named),
+    }
+}
+
+/// Add two numeric `FieldValue`s for `AdjustCounter` — integer + integer stays an integer (no float drift
+/// on a whole-number counter); any number operand promotes to a number. Non-numeric operands leave the
+/// value unchanged (the validator already type-checks `AdjustCounter` targets, so this is a defensive
+/// no-op).
 fn add_numeric(cur: &FieldValue, delta: &FieldValue) -> FieldValue {
     match (cur, delta) {
         (FieldValue::Integer(a), FieldValue::Integer(b)) => FieldValue::Integer(a + b),

@@ -32,6 +32,11 @@ fn ignite_rule(q: &str) -> RuleData {
             op: CompareOp::Ge,
             value: FieldValue::Integer(4),
         }],
+        // This rule is a plain AND with no subject pin — the two fields `RuleData` grew are spelled out
+        // rather than left to `..Default::default()`, so the day a third arrives this fixture fails to
+        // compile and someone decides what it should mean here, instead of silently inheriting it.
+        any_of: Vec::new(),
+        subject: None,
         actions: vec![Action {
             action: "SetField".into(),
             entity: q.into(),
