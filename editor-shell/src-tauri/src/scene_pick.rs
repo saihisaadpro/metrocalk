@@ -638,9 +638,9 @@ mod tests {
         // The pivot metric's worst everyday failure: a big object can only be clicked near its
         // centre, and a small neighbour whose pivot happens to be nearer the cursor steals the click.
         let mut state = scene_with(|_| ([0.0; 3], 1.0));
-        state.instances.truncate(0);
-        state.mesh_slots.truncate(0);
-        state.ids.truncate(0);
+        state.instances.clear();
+        state.mesh_slots.clear();
+        state.ids.clear();
         // A large cube at the origin.
         state.instances.push(Instance {
             center: [0.0; 3],

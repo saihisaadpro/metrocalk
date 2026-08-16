@@ -572,7 +572,7 @@ fn draw_panel(
     );
 }
 
-fn write_png(path: &PathBuf, canvas: &Canvas) {
+fn write_png(path: &std::path::Path, canvas: &Canvas) {
     let file = std::fs::File::create(path).expect("create png");
     let w = std::io::BufWriter::new(file);
     let mut encoder = png::Encoder::new(w, IMG_W as u32, IMG_H as u32);
@@ -719,7 +719,7 @@ fn main() {
 /// **`GizmoSpace::Local` was dead code.** Every call site passed an identity basis, so the toolbar
 /// could read "Local" while every handle pointed along world axes — and dragging the "local X" arrow
 /// moved the object along world X.
-fn draw_gizmo_space_evidence(out_dir: &PathBuf) -> String {
+fn draw_gizmo_space_evidence(out_dir: &std::path::Path) -> String {
     let mut state = base_state();
     state.meshes.push(cube_mesh([0.0; 3]));
     // A deliberately awkward orientation, so world and local axes are visibly different.
@@ -897,7 +897,7 @@ fn draw_gizmo_space_evidence(out_dir: &PathBuf) -> String {
 /// **The live drag used a desktop-relative cursor.** `cursor_position()` reports the pointer in
 /// desktop coordinates; the drag divided it by the *surface* size as if it were client-relative, so
 /// every drag was offset by the window's own position on screen.
-fn draw_cursor_space_evidence(out_dir: &PathBuf) -> String {
+fn draw_cursor_space_evidence(out_dir: &std::path::Path) -> String {
     // A window whose client area sits 600 x 350 into the desktop.
     let (win_x, win_y, win_w, win_h) = (600.0f64, 350.0f64, 1280.0f64, 720.0f64);
     let cursor = (win_x + win_w * 0.5, win_y + win_h * 0.5); // dead centre of the viewport
