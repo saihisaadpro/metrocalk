@@ -1,0 +1,22 @@
+[package]
+name = "metrocalk-spatial"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# The scene-space subsystem: ONE canonical transform representation, ONE hierarchy evaluator, ONE ray
+# builder, ONE picking pipeline, ONE set of numerical tolerances. Everything that needs to answer
+# "where is this object" or "what did the user click" goes through here, so those answers cannot
+# disagree between the renderer, the inspector, the gizmo and the picker.
+#
+# The PUBLIC surface is plain arrays ([f64;3] / [f64;4] / [[f64;4];4]) exactly like `metrocalk-gizmo`:
+# glam is an internal math detail that never crosses the boundary (the /physics boundary discipline),
+# so `editor-shell/src` can depend on this while staying inside CI's `glam::` grep gate.
+[dependencies]
+# Internal math only (f64 DVec3/DQuat/DMat4). Same major version the wgpu viewport uses.
+glam = "0.30"
+serde = { version = "1", features = ["derive"] }

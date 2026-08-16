@@ -2797,6 +2797,7 @@ dependencies = [
  "metrocalk-plugins",
  "metrocalk-sdf",
  "metrocalk-skeleton",
+ "metrocalk-terrain",
  "serde",
  "serde_json",
 ]
@@ -2898,6 +2899,22 @@ version = "0.1.0"
 dependencies = [
  "glam 0.30.10",
  "metrocalk-gizmo",
+]
+
+[[package]]
+name = "metrocalk-spatial"
+version = "0.1.0"
+dependencies = [
+ "glam 0.30.10",
+ "serde",
+]
+
+[[package]]
+name = "metrocalk-terrain"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
