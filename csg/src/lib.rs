@@ -457,7 +457,7 @@ impl Csg for ExactBspCsg {
             ));
         }
 
-        let result_polys = run_boolean(&pa, &pb, op);
+        let result_polys = run_boolean(&pa, &pb, op)?;
         if result_polys.is_empty() {
             // A legitimately empty result (e.g. the intersection of disjoint solids) — not an error.
             return Ok(TriMesh::default());
@@ -782,113 +782,175 @@ struct Node {
     polygons: Vec<Polygon>,
 }
 
+/// The runaway guard: on finely-curved input (two default 32-segment spheres are ~2,000 triangles of
+/// near-parallel planes) the BSP's float-interpolated split points can cascade — slivers re-split into
+/// more slivers. Left unchecked that cascade previously recursed until STATUS_STACK_OVERFLOW, which
+/// **aborts the whole process** (a stack overflow is not a catchable panic). The traversals below are
+/// therefore ITERATIVE (depth can never touch the thread stack), and the work is budgeted.
+///
+/// The budget counts ROUTING work — every polygon sent onward to a front/back child at every level —
+/// so it scales with `polygons × tree depth × clip passes`, not with distinct fragments alone. That is
+/// the honest unit: it is the quantity that actually grows without bound in a sliver cascade, and it
+/// also bounds runtime and memory. Calibration on the real shape catalog: planar booleans (boxes,
+/// wedges, prisms) finish well inside `400 × input`; full-resolution curved meshes (32-segment
+/// spheres) blow through it — which is the intended refusal, since curved primitives take the field
+/// path instead. The absolute ceiling stops a huge imported mesh from authorising a multi-gigabyte
+/// cascade before its refusal.
+const FRAGMENT_BUDGET_PER_INPUT: i64 = 400;
+const FRAGMENT_BUDGET_CEILING: i64 = 20_000_000;
+
+fn budget_exhausted() -> CsgError {
+    CsgError::InvalidInput(
+        "the boolean grew past its fragment budget — these surfaces are too finely curved for the \
+         exact combine; lower the shapes' smoothness (fewer segments) and try again"
+            .into(),
+    )
+}
+
 impl Node {
-    fn build(polygons: &[Polygon]) -> Self {
+    fn build(polygons: &[Polygon], budget: &mut i64) -> Result<Self, CsgError> {
         let mut node = Node::default();
-        node.add(polygons);
-        node
+        node.add(polygons, budget)?;
+        Ok(node)
     }
 
-    /// Add polygons to this node, splitting them by (or establishing) the node's plane (`csg.js` `build`).
-    fn add(&mut self, polygons: &[Polygon]) {
-        if polygons.is_empty() {
-            return;
+    /// Add polygons to this node, splitting them by (or establishing) each node's plane (`csg.js`
+    /// `build`). Iterative — an explicit worklist of `(subtree, polygons)` — so tree depth can never
+    /// overflow the thread stack; per-node polygon order is identical to the recursive form, and the
+    /// final tree shape is independent of worklist order (each subtree is built from its own list).
+    fn add(&mut self, polygons: &[Polygon], budget: &mut i64) -> Result<(), CsgError> {
+        let mut work: Vec<(&mut Node, Vec<Polygon>)> = vec![(self, polygons.to_vec())];
+        while let Some((node, polys)) = work.pop() {
+            if polys.is_empty() {
+                continue;
+            }
+            if node.plane.is_none() {
+                // Balance the tree: csg.js always splits on `polygons[0]`, which degenerates into an
+                // O(n)-deep chain on axis-aligned (box) content. Pick the candidate plane that best
+                // balances front/back and minimises spanning splits.
+                node.plane = Some(pick_split_plane(&polys));
+            }
+            let plane = node.plane.clone().expect("plane set above");
+            // Distinct buckets (the same `&mut Vec` can't be passed twice). Coplanar polygons — either
+            // facing — belong to THIS node (csg.js routes both into `this.polygons`).
+            let mut coplanar_front: Vec<Polygon> = Vec::new();
+            let mut coplanar_back: Vec<Polygon> = Vec::new();
+            let mut front_list: Vec<Polygon> = Vec::new();
+            let mut back_list: Vec<Polygon> = Vec::new();
+            for p in &polys {
+                plane.split_polygon(
+                    p,
+                    &mut coplanar_front,
+                    &mut coplanar_back,
+                    &mut front_list,
+                    &mut back_list,
+                );
+            }
+            *budget -= i64::try_from(front_list.len() + back_list.len()).unwrap_or(i64::MAX);
+            if *budget < 0 {
+                return Err(budget_exhausted());
+            }
+            node.polygons.extend(coplanar_front);
+            node.polygons.extend(coplanar_back);
+            // Disjoint-field borrows: both children may enter the worklist from one parent.
+            let Node { front, back, .. } = node;
+            if !front_list.is_empty() {
+                work.push((front.get_or_insert_with(Box::default), front_list));
+            }
+            if !back_list.is_empty() {
+                work.push((back.get_or_insert_with(Box::default), back_list));
+            }
         }
-        if self.plane.is_none() {
-            // Balance the tree: csg.js always splits on `polygons[0]`, which degenerates into an O(n)-deep
-            // chain on axis-aligned (box) content and overflows the stack. Pick the candidate plane that
-            // best balances front/back and minimises spanning splits → O(log n) depth.
-            self.plane = Some(pick_split_plane(polygons));
-        }
-        let plane = self.plane.clone().expect("plane set above");
-        // Distinct buckets (the same `&mut Vec` can't be passed twice). Coplanar polygons — either facing —
-        // belong to THIS node (csg.js routes both into `this.polygons`).
-        let mut coplanar_front: Vec<Polygon> = Vec::new();
-        let mut coplanar_back: Vec<Polygon> = Vec::new();
-        let mut front_list: Vec<Polygon> = Vec::new();
-        let mut back_list: Vec<Polygon> = Vec::new();
-        for p in polygons {
-            plane.split_polygon(
-                p,
-                &mut coplanar_front,
-                &mut coplanar_back,
-                &mut front_list,
-                &mut back_list,
-            );
-        }
-        self.polygons.extend(coplanar_front);
-        self.polygons.extend(coplanar_back);
-        if !front_list.is_empty() {
-            self.front
-                .get_or_insert_with(|| Box::new(Node::default()))
-                .add(&front_list);
-        }
-        if !back_list.is_empty() {
-            self.back
-                .get_or_insert_with(|| Box::new(Node::default()))
-                .add(&back_list);
-        }
+        Ok(())
     }
 
-    /// Clip `polygons` to this node, removing everything inside the node's solid (`csg.js` `clipPolygons`).
-    fn clip_polygons(&self, polygons: Vec<Polygon>) -> Vec<Polygon> {
-        let Some(plane) = &self.plane else {
-            return polygons;
-        };
-        let mut coplanar_front: Vec<Polygon> = Vec::new();
-        let mut coplanar_back: Vec<Polygon> = Vec::new();
-        let mut front: Vec<Polygon> = Vec::new();
-        let mut back: Vec<Polygon> = Vec::new();
-        for p in &polygons {
-            plane.split_polygon(
-                p,
-                &mut coplanar_front,
-                &mut coplanar_back,
-                &mut front,
-                &mut back,
-            );
+    /// Clip `polygons` to this node, removing everything inside the node's solid (`csg.js`
+    /// `clipPolygons`). Iterative, and ORDER-PRESERVING: pushing the back-subtree item first and the
+    /// front item second makes the LIFO worklist drain the entire front subtree (including its
+    /// leaf-level `out` appends) before the back subtree — byte-identical output order to the
+    /// recursive form, which persisted content addresses depend on.
+    fn clip_polygons(
+        &self,
+        polygons: Vec<Polygon>,
+        budget: &mut i64,
+    ) -> Result<Vec<Polygon>, CsgError> {
+        let mut out: Vec<Polygon> = Vec::new();
+        let mut work: Vec<(&Node, Vec<Polygon>)> = vec![(self, polygons)];
+        while let Some((node, polys)) = work.pop() {
+            let Some(plane) = &node.plane else {
+                out.extend(polys);
+                continue;
+            };
+            let mut coplanar_front: Vec<Polygon> = Vec::new();
+            let mut coplanar_back: Vec<Polygon> = Vec::new();
+            let mut front: Vec<Polygon> = Vec::new();
+            let mut back: Vec<Polygon> = Vec::new();
+            for p in &polys {
+                plane.split_polygon(
+                    p,
+                    &mut coplanar_front,
+                    &mut coplanar_back,
+                    &mut front,
+                    &mut back,
+                );
+            }
+            *budget -= i64::try_from(front.len() + back.len()).unwrap_or(i64::MAX);
+            if *budget < 0 {
+                return Err(budget_exhausted());
+            }
+            // Coplanar pieces route by the splitter's facing (csg.js: coplanarFront→front,
+            // coplanarBack→back).
+            front.extend(coplanar_front);
+            back.extend(coplanar_back);
+            // Back first so the front subtree drains first (see the doc comment above).
+            if let Some(n) = &node.back {
+                work.push((n, back));
+            } // a missing back child means "inside the solid" → dropped
+            match &node.front {
+                Some(n) => work.push((n, front)),
+                None => out.extend(front),
+            }
         }
-        // Coplanar pieces route by the splitter's facing (csg.js: coplanarFront→front, coplanarBack→back).
-        front.extend(coplanar_front);
-        back.extend(coplanar_back);
-        let mut front = match &self.front {
-            Some(n) => n.clip_polygons(front),
-            None => front,
-        };
-        let back = match &self.back {
-            Some(n) => n.clip_polygons(back),
-            None => Vec::new(), // inside the solid → dropped
-        };
-        front.extend(back);
-        front
+        Ok(out)
     }
 
-    /// Remove all of this node's polygons that are inside `other`.
-    fn clip_to(&mut self, other: &Node) {
-        self.polygons = other.clip_polygons(core::mem::take(&mut self.polygons));
-        if let Some(n) = &mut self.front {
-            n.clip_to(other);
+    /// Remove all of this node's polygons that are inside `other`. Iterative; per-node results are
+    /// independent, so worklist order cannot change the outcome.
+    fn clip_to(&mut self, other: &Node, budget: &mut i64) -> Result<(), CsgError> {
+        let mut work: Vec<&mut Node> = vec![self];
+        while let Some(node) = work.pop() {
+            node.polygons = other.clip_polygons(core::mem::take(&mut node.polygons), budget)?;
+            let Node { front, back, .. } = node;
+            if let Some(n) = front {
+                work.push(n);
+            }
+            if let Some(n) = back {
+                work.push(n);
+            }
         }
-        if let Some(n) = &mut self.back {
-            n.clip_to(other);
-        }
+        Ok(())
     }
 
     /// Invert the solid (swap inside/outside): flip every polygon + plane and swap the children.
+    /// Iterative; each node's flip is independent.
     fn invert(&mut self) {
-        for p in &mut self.polygons {
-            p.flip();
+        let mut work: Vec<&mut Node> = vec![self];
+        while let Some(node) = work.pop() {
+            for p in &mut node.polygons {
+                p.flip();
+            }
+            if let Some(pl) = &mut node.plane {
+                pl.flip();
+            }
+            core::mem::swap(&mut node.front, &mut node.back);
+            let Node { front, back, .. } = node;
+            if let Some(n) = front {
+                work.push(n);
+            }
+            if let Some(n) = back {
+                work.push(n);
+            }
         }
-        if let Some(pl) = &mut self.plane {
-            pl.flip();
-        }
-        if let Some(n) = &mut self.front {
-            n.invert();
-        }
-        if let Some(n) = &mut self.back {
-            n.invert();
-        }
-        core::mem::swap(&mut self.front, &mut self.back);
     }
 
     /// Collect every polygon in the subtree — iterative (an explicit stack) so a deep tree can't overflow.
@@ -1005,52 +1067,70 @@ fn polygons_from(mesh: &TriMesh) -> Vec<Polygon> {
     out
 }
 
-/// The four boolean operations as the standard `csg.js` BSP dance.
-fn run_boolean(pa: &[Polygon], pb: &[Polygon], op: BoolOp) -> Vec<Polygon> {
+/// The four boolean operations as the standard `csg.js` BSP dance, under one shared fragment budget
+/// (sized by the input — see [`FRAGMENT_BUDGET_PER_INPUT`]).
+fn run_boolean(pa: &[Polygon], pb: &[Polygon], op: BoolOp) -> Result<Vec<Polygon>, CsgError> {
+    // Scales with the input, small floor (a big floor would only make refusals slower), hard ceiling
+    // (a huge imported mesh must refuse before it allocates unboundedly). Xor is three chained
+    // booleans over intermediate results, so it earns three shares.
+    let ops = if matches!(op, BoolOp::Xor) { 3 } else { 1 };
+    let mut budget = FRAGMENT_BUDGET_PER_INPUT
+        .saturating_mul(i64::try_from(pa.len() + pb.len()).unwrap_or(i64::MAX))
+        .saturating_mul(ops)
+        .clamp(50_000, FRAGMENT_BUDGET_CEILING);
+    let budget = &mut budget;
     match op {
-        BoolOp::Union => csg_union(Node::build(pa), Node::build(pb)),
-        BoolOp::Intersection => csg_intersect(Node::build(pa), Node::build(pb)),
-        BoolOp::Difference => csg_subtract(Node::build(pa), Node::build(pb)),
+        BoolOp::Union => csg_union(Node::build(pa, budget)?, Node::build(pb, budget)?, budget),
+        BoolOp::Intersection => {
+            csg_intersect(Node::build(pa, budget)?, Node::build(pb, budget)?, budget)
+        }
+        BoolOp::Difference => {
+            csg_subtract(Node::build(pa, budget)?, Node::build(pb, budget)?, budget)
+        }
         BoolOp::Xor => {
             // A ⊕ B = (A − B) ∪ (B − A).
-            let amb = csg_subtract(Node::build(pa), Node::build(pb));
-            let bma = csg_subtract(Node::build(pb), Node::build(pa));
-            csg_union(Node::build(&amb), Node::build(&bma))
+            let amb = csg_subtract(Node::build(pa, budget)?, Node::build(pb, budget)?, budget)?;
+            let bma = csg_subtract(Node::build(pb, budget)?, Node::build(pa, budget)?, budget)?;
+            csg_union(
+                Node::build(&amb, budget)?,
+                Node::build(&bma, budget)?,
+                budget,
+            )
         }
     }
 }
 
-fn csg_union(mut a: Node, mut b: Node) -> Vec<Polygon> {
-    a.clip_to(&b);
-    b.clip_to(&a);
+fn csg_union(mut a: Node, mut b: Node, budget: &mut i64) -> Result<Vec<Polygon>, CsgError> {
+    a.clip_to(&b, budget)?;
+    b.clip_to(&a, budget)?;
     b.invert();
-    b.clip_to(&a);
+    b.clip_to(&a, budget)?;
     b.invert();
-    a.add(&b.all_polygons());
-    a.all_polygons()
+    a.add(&b.all_polygons(), budget)?;
+    Ok(a.all_polygons())
 }
 
-fn csg_subtract(mut a: Node, mut b: Node) -> Vec<Polygon> {
+fn csg_subtract(mut a: Node, mut b: Node, budget: &mut i64) -> Result<Vec<Polygon>, CsgError> {
     a.invert();
-    a.clip_to(&b);
-    b.clip_to(&a);
+    a.clip_to(&b, budget)?;
+    b.clip_to(&a, budget)?;
     b.invert();
-    b.clip_to(&a);
+    b.clip_to(&a, budget)?;
     b.invert();
-    a.add(&b.all_polygons());
+    a.add(&b.all_polygons(), budget)?;
     a.invert();
-    a.all_polygons()
+    Ok(a.all_polygons())
 }
 
-fn csg_intersect(mut a: Node, mut b: Node) -> Vec<Polygon> {
+fn csg_intersect(mut a: Node, mut b: Node, budget: &mut i64) -> Result<Vec<Polygon>, CsgError> {
     a.invert();
-    b.clip_to(&a);
+    b.clip_to(&a, budget)?;
     b.invert();
-    a.clip_to(&b);
-    b.clip_to(&a);
-    a.add(&b.all_polygons());
+    a.clip_to(&b, budget)?;
+    b.clip_to(&a, budget)?;
+    a.add(&b.all_polygons(), budget)?;
     a.invert();
-    a.all_polygons()
+    Ok(a.all_polygons())
 }
 
 /// Deterministic vertex weld over polygon loops: fuse coincident vertices within `eps` into a shared set,
