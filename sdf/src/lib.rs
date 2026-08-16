@@ -100,6 +100,23 @@ pub enum Sdf {
     Difference(Box<Sdf>, Box<Sdf>),
     /// `A ∩ B` — the intersection (max of the two fields).
     Intersection(Box<Sdf>, Box<Sdf>),
+    /// `A ∪ B` with a **smooth fillet** of radius `k` where the two surfaces meet — the polynomial
+    /// smooth-minimum (Quilez). Two touching spheres meld into one organic blob instead of a hard crease.
+    ///
+    /// Deliberately the *polynomial* smin: it uses only `+ - * /`, `min`/`max`-style clamps — all IEEE-754
+    /// correctly-rounded — so the crate's bit-determinism contract holds. The *exponential* smin would pull
+    /// in `exp`/`ln` (transcendentals) and is excluded for exactly that reason.
+    ///
+    /// The result is a **bound**, not a true distance (standard for smin): the sign is still exact away
+    /// from the blend region and `f ≥ min(a,b) − k/4` everywhere, which is what [`Sdf::bounds`] uses.
+    SmoothUnion {
+        /// Left operand.
+        a: Box<Sdf>,
+        /// Right operand.
+        b: Box<Sdf>,
+        /// Blend radius in metres (> 0). Bigger melts the two shapes together more.
+        k: f64,
+    },
 }
 
 impl Sdf {
@@ -144,6 +161,16 @@ impl Sdf {
         Sdf::Intersection(Box::new(self), Box::new(other))
     }
 
+    /// `self ∪ other`, melted together with a smooth fillet of radius `k` (consuming builder).
+    #[must_use]
+    pub fn smooth_union(self, other: Sdf, k: f64) -> Self {
+        Sdf::SmoothUnion {
+            a: Box::new(self),
+            b: Box::new(other),
+            k,
+        }
+    }
+
     /// The signed distance at `p` (negative inside). Uses ONLY IEEE-754 correctly-rounded operations
     /// (no `fma`, no transcendentals) so the evaluation is bit-deterministic and wasm-portable.
     #[must_use]
@@ -160,6 +187,7 @@ impl Sdf {
             Sdf::Union(a, b) => a.eval(p).min(b.eval(p)),
             Sdf::Difference(a, b) => a.eval(p).max(-b.eval(p)),
             Sdf::Intersection(a, b) => a.eval(p).max(b.eval(p)),
+            Sdf::SmoothUnion { a, b, k } => smooth_min(a.eval(p), b.eval(p), *k),
         }
     }
 
@@ -189,6 +217,16 @@ impl Sdf {
             Sdf::Union(a, b) => union_box(a.bounds(), b.bounds()),
             // A − B ⊆ A; A ∩ B ⊆ A. Bounding by the left operand is conservative and cheap.
             Sdf::Difference(a, _) | Sdf::Intersection(a, _) => a.bounds(),
+            // The polynomial smin satisfies f ≥ min(a,b) − k/4, so the blended solid lives inside a
+            // k/4 dilation of the hard union's box — conservative and cheap.
+            Sdf::SmoothUnion { a, b, k } => {
+                let (lo, hi) = union_box(a.bounds(), b.bounds());
+                let pad = (k / 4.0).max(0.0);
+                (
+                    [lo[0] - pad, lo[1] - pad, lo[2] - pad],
+                    [hi[0] + pad, hi[1] + pad, hi[2] + pad],
+                )
+            }
         }
     }
 }
@@ -233,6 +271,19 @@ fn sd_cylinder(q: [f64; 3], r: f64, h: f64, axis: Axis) -> f64 {
     let outside = ((d_rad.max(0.0)).powi_sq() + (d_ax.max(0.0)).powi_sq()).sqrt();
     let inside = d_rad.max(d_ax).min(0.0);
     outside + inside
+}
+
+/// The polynomial smooth-minimum (Quilez): `h = clamp(0.5 + 0.5·(b−a)/k, 0, 1); mix(b, a, h) − k·h·(1−h)`.
+/// Only `+ - * /` and clamp (min/max) — every op IEEE-754 correctly-rounded, so bit-determinism holds.
+/// `k ≤ 0` degrades gracefully to the hard `min` (no divide-by-zero, no NaN).
+#[inline]
+fn smooth_min(a: f64, b: f64, k: f64) -> f64 {
+    if k <= 0.0 {
+        return a.min(b);
+    }
+    let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
+    // mix(b, a, h) = b + (a - b) * h
+    b + (a - b) * h - k * h * (1.0 - h)
 }
 
 /// Helper: `x * x` without any `fma` risk (explicit multiply keeps the op-graph IEEE-754-deterministic).
@@ -689,6 +740,72 @@ mod tests {
             validate(&bsp).watertight,
             "the M13.2 exact-mesh path is clean"
         );
+    }
+
+    #[test]
+    fn smooth_union_is_a_bounded_softening_of_the_hard_union() {
+        let left = Sdf::sphere([-0.6, 0.0, 0.0], 0.5);
+        let right = Sdf::sphere([0.6, 0.0, 0.0], 0.5);
+        let hard = left.clone().union(right.clone());
+        let k = 0.3;
+        let soft = left.smooth_union(right, k);
+        // Sample a deterministic lattice: soft ≤ hard everywhere (it only ADDS material), and never
+        // deeper than the k/4 smin bound.
+        for ix in -8..=8 {
+            for iy in -4..=4 {
+                let p = [f64::from(ix) * 0.2, f64::from(iy) * 0.2, 0.0];
+                let h = hard.eval(p);
+                let s = soft.eval(p);
+                assert!(s <= h + 1e-12, "smin adds material, never removes: {p:?}");
+                assert!(s >= h - k / 4.0 - 1e-12, "the k/4 bound holds: {p:?}");
+            }
+        }
+        // In the crease between the spheres the fillet genuinely adds material: the midpoint sits
+        // outside the hard union but inside the smooth one.
+        let mid = [0.0, 0.55, 0.0];
+        assert!(hard.eval(mid) > 0.0, "outside the hard union");
+        // And the smooth field there is strictly closer to the surface than the hard one.
+        assert!(
+            soft.eval(mid) < hard.eval(mid),
+            "the fillet reaches into the crease"
+        );
+    }
+
+    #[test]
+    fn two_melded_spheres_compile_to_one_watertight_blob() {
+        // The "magical meld": two overlapping spheres smooth-unioned compile to a single genus-0,
+        // watertight, manifold solid — and bit-identically so across runs.
+        let blob = Sdf::sphere([-0.4, 0.0, 0.0], 0.5)
+            .smooth_union(Sdf::sphere([0.4, 0.0, 0.0], 0.5), 0.25);
+        let grid = Grid::around(&blob, 40, 0.1);
+        let mesh = compile(&blob, &grid);
+        let r = validate(&mesh);
+        assert!(
+            r.watertight && r.manifold && r.oriented,
+            "the meld is a clean solid: {}",
+            r.explain()
+        );
+        assert_eq!(r.genus, Some(0), "one blob, no tunnels");
+        assert!(mesh.triangle_count() > 100, "a real surface");
+        assert!(
+            compile_reproduces(&blob, &grid, RUNS),
+            "smooth union stays bit-deterministic across {RUNS} runs"
+        );
+    }
+
+    #[test]
+    fn smooth_union_with_zero_k_is_the_hard_union() {
+        let a = Sdf::sphere([-0.5, 0.0, 0.0], 0.6);
+        let b = Sdf::cuboid([0.5, 0.0, 0.0], [0.4, 0.4, 0.4]);
+        let hard = a.clone().union(b.clone());
+        let soft = a.smooth_union(b, 0.0);
+        for ix in -6..=6 {
+            let p = [f64::from(ix) * 0.25, 0.1, -0.05];
+            assert!(
+                (hard.eval(p) - soft.eval(p)).abs() < 1e-15,
+                "k=0 degrades to min at {p:?}"
+            );
+        }
     }
 
     #[test]
