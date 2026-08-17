@@ -34,14 +34,22 @@ use tauri::State;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Placement {
+    pub world_x: f64,
+    pub label: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EntityInfo {
     pub id: String,
     pub parent_id: Option<String>,
+    pub placement: Placement,
 }
 
 #[tauri::command]
 fn entity_info(state: State<AppState>, id: String) -> EntityInfo {
-    EntityInfo { id, parent_id: None }
+    EntityInfo { id, parent_id: None, placement: Placement { world_x: 0.0, label: String::new() } }
 }
 
 fn main() {
@@ -57,9 +65,15 @@ fn main() {
 BASE_LIB = "pub struct Unused;\n"
 
 BASE_PROTOCOL = """\
+export interface Placement {
+  worldX: number;
+  label: string;
+}
+
 export interface EntityInfo {
   id: string;
   parentId: string | null;
+  placement: Placement;
 }
 """
 
@@ -129,6 +143,32 @@ CASES: list[tuple[str, str, dict, dict]] = [
         r"does not send `id`, which the command requires",
         {"overrides": {"editor/src/transport/session.ts":
                        BASE_SESSION.replace('"entity_info", { id }', '"entity_info", {}')}},
+        {},
+    ),
+    (
+        # The reply is fine; the type it CARRIES is not. Before the reader followed a reply past its
+        # own keys, this passed silently — and it is not a hypothetical: moving six fields off a
+        # `RuleSummary` and into the `RuleData` it carries (a strictly better DTO) moved all six out
+        # of the audit's reach in the same commit. A gate whose coverage shrinks when the code
+        # improves is a gate that argues for the worse code.
+        "a renamed field ONE LEVEL DOWN, inside a type the reply carries",
+        r"`EntityInfo\.placement` is read as `Placement`, which requires \['worldXPos'\]",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       BASE_PROTOCOL.replace("  worldX: number;", "  worldXPos: number;")}},
+        {},
+    ),
+    (
+        "a scalar KIND conflict one level down (Rust String read as a TS number)",
+        r"`EntityInfo\.placement\.label` reads number where the reply is string",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       BASE_PROTOCOL.replace("  label: string;", "  label: number;")}},
+        {},
+    ),
+    (
+        "a nested field read as a list that the shell sends as one object",
+        r"`EntityInfo\.placement` is a list in TypeScript, but `EntityInfo\.placement` is `Placement`",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       BASE_PROTOCOL.replace("  placement: Placement;", "  placement: Placement[];")}},
         {},
     ),
     (
@@ -208,7 +248,7 @@ CASES: list[tuple[str, str, dict, dict]] = [
         {"overrides": {"editor-shell/src-tauri/src/main.rs":
                        BASE_MAIN.replace(
                            "fn entity_info(state: State<AppState>, id: String) -> EntityInfo {\n"
-                           "    EntityInfo { id, parent_id: None }\n}",
+                           "    EntityInfo { id, parent_id: None, placement: Placement { world_x: 0.0, label: String::new() } }\n}",
                            "fn entity_info(state: State<AppState>, id: String) -> serde_json::Value {\n"
                            "    serde_json::json!({\n"
                            '        "id": id,\n'
@@ -223,7 +263,7 @@ CASES: list[tuple[str, str, dict, dict]] = [
         {"overrides": {"editor-shell/src-tauri/src/main.rs":
                        BASE_MAIN.replace(
                            "fn entity_info(state: State<AppState>, id: String) -> EntityInfo {\n"
-                           "    EntityInfo { id, parent_id: None }\n}",
+                           "    EntityInfo { id, parent_id: None, placement: Placement { world_x: 0.0, label: String::new() } }\n}",
                            "fn entity_info(state: State<AppState>, id: String) -> serde_json::Value {\n"
                            "    serde_json::json!({\n"
                            '        "id": id,\n'
@@ -275,7 +315,7 @@ READER_MUTATIONS: list[tuple[str, str, str, object, dict]] = [
         _old_return_type,
         {"overrides": {"editor-shell/src-tauri/src/main.rs":
                        BASE_MAIN.replace("-> EntityInfo {", "-> [f64; 8] {")
-                                .replace("EntityInfo { id, parent_id: None }", "[0.0; 8]"),
+                                .replace("EntityInfo { id, parent_id: None, placement: Placement { world_x: 0.0, label: String::new() } }", "[0.0; 8]"),
                        "editor/src/transport/session.ts":
                        BASE_SESSION.replace("invoke<EntityInfo>", "invoke<number[]>")}},
     ),
@@ -287,7 +327,7 @@ READER_MUTATIONS: list[tuple[str, str, str, object, dict]] = [
         {"overrides": {"editor-shell/src-tauri/src/main.rs":
                        BASE_MAIN.replace(
                            "fn entity_info(state: State<AppState>, id: String) -> EntityInfo {\n"
-                           "    EntityInfo { id, parent_id: None }\n}",
+                           "    EntityInfo { id, parent_id: None, placement: Placement { world_x: 0.0, label: String::new() } }\n}",
                            "fn entity_info(state: State<AppState>, id: String) -> serde_json::Value {\n"
                            "    serde_json::json!({\n"
                            '        "id": id,\n'

@@ -32,6 +32,9 @@ class TsType:
     fields: list[tuple[str, bool]]  # (key, optional)
     line: int
     file: str
+    #: key -> the declared type expression. Needed to follow a reply a second level down; kept beside
+    #: `fields` so every existing consumer of `(key, optional)` is untouched.
+    field_types: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -224,23 +227,32 @@ def parse_types(src: str, rel: str) -> dict[str, TsType]:
         cb = _match(src, ob, "{", "}")
         if cb < 0:
             continue
-        types[m.group(1)] = TsType(
-            m.group(1), _object_fields(src[ob + 1 : cb]), src.count("\n", 0, m.start()) + 1, rel
-        )
+        fs, fts = _object_fields_typed(src[ob + 1 : cb])
+        types[m.group(1)] = TsType(m.group(1), fs, src.count("\n", 0, m.start()) + 1, rel, field_types=fts)
     for m in re.finditer(r"\bexport\s+type\s+([A-Za-z_]\w*)(?:<[^>=]*>)?\s*=\s*\{", src):
         ob = src.index("{", m.end() - 1)
         cb = _match(src, ob, "{", "}")
         if cb < 0:
             continue
+        fs, fts = _object_fields_typed(src[ob + 1 : cb])
         types.setdefault(
             m.group(1),
-            TsType(m.group(1), _object_fields(src[ob + 1 : cb]), src.count("\n", 0, m.start()) + 1, rel),
+            TsType(m.group(1), fs, src.count("\n", 0, m.start()) + 1, rel, field_types=fts),
         )
     return types
 
 
 def _object_fields(body: str) -> list[tuple[str, bool]]:
+    return _object_fields_typed(body)[0]
+
+
+def _object_fields_typed(body: str) -> tuple[list[tuple[str, bool]], dict[str, str]]:
+    """The keys, and the type expression each one declares.
+
+    A member's declared type is the only thing that lets the audit follow a reply past its first
+    level. Parsed here, once, rather than re-derived by whoever needs it."""
     fields: list[tuple[str, bool]] = []
+    types: dict[str, str] = {}
     for p in split_top(body, ";\n"):
         p = p.strip()
         if not p or p.startswith("["):
@@ -248,7 +260,8 @@ def _object_fields(body: str) -> list[tuple[str, bool]]:
         fm = re.match(r"""^(?:readonly\s+)?["'`]?([A-Za-z_]\w*)["'`]?\s*(\?)?\s*:""", p)
         if fm:
             fields.append((fm.group(1), bool(fm.group(2))))
-    return fields
+            types[fm.group(1)] = p[fm.end() :].strip().rstrip(";,").strip()
+    return fields, types
 
 
 def object_literal_fields(t: str) -> list[tuple[str, bool]] | None:

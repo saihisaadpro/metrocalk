@@ -28,9 +28,17 @@ This runs the comparison at rest, with no toolchain, no WebView and no GPU:
   arguments     every required argument is sent, and every key sent is one the command accepts
                 (under Tauri's camelCase argument convention)
   shape         every field the caller's `T` requires is one the reply actually carries, a list is
-                a list on both sides, and a fixed-length tuple has the same length on both. TOP
-                LEVEL ONLY: a nested object's fields are not walked, and a field typed
-                `serde_json::Value` is reported by `coverage` rather than counted as agreed
+                a list on both sides, and a fixed-length tuple has the same length on both. A field
+                typed `serde_json::Value` is reported by `coverage` rather than counted as agreed
+  nested        the same three comparisons, applied to every object pair the reply CARRIES, as deep
+                as both sides resolve. This check used to not exist, and its absence had a bias
+                worth naming: the verdict depended on how deeply a shape happened to be nested
+                rather than on whether the two sides agree. Move six fields off a `RuleSummary` and
+                into the `RuleData` it carries — one statement instead of seven, a strictly better
+                DTO — and six fields stop being audited in the same commit. A gate whose coverage
+                shrinks when the code improves is a gate that argues for the worse code. Only pairs
+                where BOTH sides resolve to an object are walked; where one resolves and the other
+                does not, that is `coverage`'s story, not a second telling of it
   coverage      the audit's own reach — see `_coverage_findings`
 
 Known and deliberate limits, so that "0 blocking" is read for what it is: argument STRUCTS
@@ -326,13 +334,107 @@ def _argument_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> list[Finding]:
     return out
 
 
-def _shape_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> tuple[list[Finding], int, int]:
+#: How far past a reply's own keys the reader will follow it. Two levels of nesting is already past
+#: everything this boundary declares; the cap exists so a pathological type graph cannot hang the gate,
+#: not because depth 7 would be uninteresting.
+_MAX_DEPTH = 6
+
+
+def _nested_findings(
+    r_shape: rustipc.Dto,
+    t_shape: tsipc.TsType,
+    rs: rustipc.RustIpc,
+    ts: tsipc.TsIpc,
+    cmd: str,
+    where: str,
+) -> tuple[list[Finding], int]:
+    """Follow a reply PAST its own keys, and compare each nested object pair the same way.
+
+    Comparing only the outermost object was a stated limit, and it was load-bearing in the wrong
+    direction: it made the audit's verdict depend on how deeply a shape happened to be nested rather
+    than on whether the two sides agree. Move six fields off a reply and into a struct the reply
+    carries — a strictly better DTO, one statement instead of seven — and six fields silently stop
+    being audited. A gate whose coverage shrinks when the code improves is a gate that argues for the
+    worse code.
+
+    Only pairs where **both** sides resolve to an object are walked. Where one side resolves and the
+    other does not, that is the coverage story the `Value`-opaque check already tells, and repeating
+    it here would be noise rather than reach. Returns the findings and how many nested object pairs
+    were compared, so the header can state this reach too instead of implying it.
+    """
+    out: list[Finding] = []
+    pairs = 0
+    seen: set[tuple[str, str]] = {(r_shape.name, t_shape.name)}
+    # (rust dto, ts type, path, depth) — breadth-first, so a shallow drift is reported before a deep one.
+    queue: list[tuple[rustipc.Dto, tsipc.TsType, str, int]] = [(r_shape, t_shape, t_shape.name, 0)]
+    while queue:
+        r_dto, t_ty, path, depth = queue.pop(0)
+        if depth >= _MAX_DEPTH:
+            continue
+        carried = {k for k, _ in r_dto.fields}
+        for key, _opt in t_ty.fields:
+            if key not in carried or key in r_dto.opaque:
+                continue  # absence is the top-level check's finding; opaque is already reported
+            r_ft = r_dto.field_types.get(key)
+            t_ft = t_ty.field_types.get(key)
+            if not r_ft or not t_ft:
+                continue
+            r_sub, r_list, r_ok = rust_shape(r_ft, rs.dtos)
+            t_sub, t_list, t_ok = ts_shape(t_ft, ts.types, ts.aliases)
+            if not (r_ok and t_ok):
+                continue
+            here = f"{path}.{key}"
+            if r_list != t_list:
+                out.append(
+                    Finding(
+                        "error", "nested", where,
+                        f'"{cmd}" — `{here}` is {"a list" if t_list else "a single value"} in TypeScript, '
+                        f"but `{r_dto.name}.{key}` is `{r_ft}` ({r_dto.file}:{r_dto.line})",
+                        f"nested@{cmd}",
+                    )
+                )
+                continue
+            if isinstance(r_sub, rustipc.Dto) and isinstance(t_sub, tsipc.TsType):
+                pairs += 1
+                sub_carried = {k for k, _ in r_sub.fields}
+                if not any(k.startswith("<flatten:") for k in sub_carried):
+                    missing = [k for k, o in t_sub.fields if not o and k not in sub_carried]
+                    if missing:
+                        out.append(
+                            Finding(
+                                "error", "nested", where,
+                                f'"{cmd}" — `{here}` is read as `{t_sub.name}`, which requires {missing}; '
+                                f"`{r_sub.name}` never sends {'it' if len(missing) == 1 else 'them'} "
+                                f"({r_sub.file}:{r_sub.line} carries {sorted(sub_carried)}). Nothing throws: "
+                                "JavaScript reads `undefined` this far down exactly as it does at the top",
+                                f"nested@{cmd}",
+                            )
+                        )
+                tag = (r_sub.name, t_sub.name)
+                if tag not in seen:
+                    seen.add(tag)
+                    queue.append((r_sub, t_sub, here, depth + 1))
+            elif isinstance(r_sub, str) and isinstance(t_sub, str):
+                why = _scalar_conflict(r_sub, t_sub)
+                if why:
+                    out.append(
+                        Finding(
+                            "error", "nested", where,
+                            f'"{cmd}" — `{here}` {why}, but `{r_dto.name}.{key}` is `{r_ft}` '
+                            f"({r_dto.file}:{r_dto.line})",
+                            f"nested@{cmd}",
+                        )
+                    )
+    return out, pairs
+
+
+def _shape_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> tuple[list[Finding], int, int, int]:
     """Returns the findings and, so the header can state the check's REACH, how many replies were
     actually compared and how many of those got a field-by-field comparison rather than only a
     kind/list one. A `shape` line that says nothing is the output of both "they agree" and "I never
     resolved either side", and only the header can tell a reader which."""
     out: list[Finding] = []
-    compared = fields_compared = 0
+    compared = fields_compared = nested_pairs = 0
     for inv in ts.invocations:
         if inv.cmd is None or inv.targ is None or inv.cmd not in rs.commands:
             continue
@@ -458,7 +560,11 @@ def _shape_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> tuple[list[Finding]
                     key,
                 )
             )
-    return out, compared, fields_compared
+            continue  # the shapes already disagree here; a walk below it would report the same break twice
+        nf, np = _nested_findings(r_shape, t_shape, rs, ts, inv.cmd, where)
+        out.extend(nf)
+        nested_pairs += np
+    return out, compared, fields_compared, nested_pairs
 
 
 def _coverage_findings(
@@ -695,13 +801,13 @@ def run(root: str) -> tuple[list[Finding], dict]:
     ts = tsipc.parse(list(seen.items()), call_files)
 
     findings = _coverage_findings(root, missing, rs, ts)
-    compared = fields_compared = 0
+    compared = fields_compared = nested_pairs = 0
     if not any(f.check == "coverage" and "audit root does not exist" in f.message for f in findings) \
             and not missing:
         findings += _registration_findings(rs)
         findings += _command_findings(rs, ts)
         findings += _argument_findings(rs, ts)
-        shape, compared, fields_compared = _shape_findings(rs, ts)
+        shape, compared, fields_compared, nested_pairs = _shape_findings(rs, ts)
         findings += shape
 
     stats = {
@@ -718,17 +824,18 @@ def run(root: str) -> tuple[list[Finding], dict]:
         "typed_invocations": len([i for i in ts.invocations if i.targ]),
         "shape_compared": compared,
         "shape_fields": fields_compared,
+        "nested_pairs": nested_pairs,
         "dtos": len(rs.dtos),
         "ts_types": len(ts.types),
     }
-    order = {"registration": 0, "command": 1, "arguments": 2, "shape": 3, "coverage": 4}
+    order = {"registration": 0, "command": 1, "arguments": 2, "shape": 3, "nested": 4, "coverage": 5}
     findings.sort(key=lambda f: (order.get(f.check, 9), f.where, f.message))
     return findings, stats
 
 
 SUCCESS = (
-    "every invoked command exists, every argument key is accepted, and every top-level reply field "
-    "the UI reads is one the shell sends."
+    "every invoked command exists, every argument key is accepted, and every reply field the UI reads "
+    "— at the top level and every level under it the reader can resolve — is one the shell sends."
 )
 
 
@@ -764,7 +871,8 @@ def main() -> int:
             f"{stats['commands']} command(s), {stats['registered']} registered, "
             f"{stats['invocations']} call site(s) ({stats['typed_invocations']} declare a reply "
             f"type); {stats['shape_compared']} of {stats['typed_invocations']} replies compared, "
-            f"{stats['shape_fields']} of those field-by-field"
+            f"{stats['shape_fields']} of those field-by-field, and {stats['nested_pairs']} nested "
+            f"object pair(s) followed below the top level"
         )
         for f in findings:
             tag = "ERROR " if f.severity == "error" else "UNRESL"

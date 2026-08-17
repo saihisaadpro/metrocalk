@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from dataclasses import field as dc_field
 
 # ── Arguments Tauri injects, which JS therefore never sends ───────────────────────────────────────
 # Matched against the type's LAST PATH SEGMENT with its generics stripped, never as a substring.
@@ -70,6 +71,11 @@ class Dto:
     #: `rs.dtos` is keyed by bare name, so the second one silently wins; a verdict derived from the
     #: wrong `Composition` would be confident and wrong.
     collides_with: str = ""
+    #: wire key -> the Rust type expression behind it. Field NAMES alone are enough to compare one
+    #: level; they are not enough to go a second, because the reader cannot follow a field it cannot
+    #: name a type for. Kept beside `fields` rather than folded into it so every existing consumer of
+    #: `(key, optional)` is untouched.
+    field_types: dict[str, str] = dc_field(default_factory=dict)
 
 
 @dataclass
@@ -337,6 +343,7 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
             continue
         fields: list[tuple[str, bool]] = []
         opaque: list[str] = []
+        ftypes: dict[str, str] = {}
         for p in split_top(src[ob + 1 : cb]):
             attr_lines = "\n".join(l for l in p.splitlines() if l.strip().startswith("#["))
             decl = "\n".join(l for l in p.splitlines() if not l.strip().startswith("#["))
@@ -344,7 +351,8 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
             if not fm:
                 continue
             fname = fm.group(1)
-            is_opaque = _is_opaque(fm.group(2).replace("\n", " ").strip())
+            fty = fm.group(2).replace("\n", " ").strip().rstrip(",").strip()
+            is_opaque = _is_opaque(fty)
             serde_attr = " ".join(
                 a for a in re.findall(r"#\[serde\(([^\]]*)\)\]", attr_lines)
             )
@@ -358,6 +366,7 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
             rn = _RENAME.search(serde_attr)
             wire = rn.group(1) if rn else wire_case(fname, rename_all)
             fields.append((wire, "skip_serializing_if" in serde_attr))
+            ftypes[wire] = fty
             if is_opaque:
                 opaque.append(wire)
         name = sm.group(1)
@@ -366,7 +375,9 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
         collides = ""
         if prior is not None and [f for f, _ in prior.fields] != [f for f, _ in fields]:
             collides = f"{prior.file}:{prior.line}"
-        out.dtos[name] = Dto(name, fields, line, rel, opaque=tuple(opaque), collides_with=collides)
+        out.dtos[name] = Dto(
+            name, fields, line, rel, opaque=tuple(opaque), collides_with=collides, field_types=ftypes
+        )
 
 
 _JSON_MACRO = re.compile(r"\bserde_json::json!\s*\(\s*\{")
