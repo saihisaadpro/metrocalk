@@ -13,17 +13,42 @@
 //! back blank. That last part is the difference between this and a build-only job: a scene that stops
 //! mounting is a red gate, not a smaller number in a log nobody diffs.
 
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { projectionStore } from "../../src/store/projection";
 import type { CadReport, CadReportPart } from "../../src/transport/protocol";
 import type { EditorClient } from "../../src/transport/session";
+
+/** What must be true of the rendered scene, checked by `shoot.mjs` in the page before it captures.
+ *
+ *  WHY A SCENE MUST ASSERT SOMETHING. The first version of this gate had three bars — no page error,
+ *  a root that mounted, and a PNG with more than two distinct colours — and an adversarial review
+ *  broke all three at once: deleting **every import row** from the panel left the gate green, because
+ *  the header and the filter chips still painted pixels and the mounted root belonged to the harness,
+ *  not to the scene. Re-introducing the exact defect this session fixed (rendering a literal `null ·
+ *  null · null`) was green too.
+ *
+ *  A capture that proves "something rendered" is not evidence about a panel. So the claim a scene
+ *  makes is written down next to the scene, in the same file, and it FAILS the run — which also makes
+ *  `looking_for` executable prose instead of a comment nobody re-reads. */
+export type Expect = {
+  /** Selectors that must exist, with a minimum count. `["[data-testid='import-row']", 6]`. */
+  present?: [selector: string, atLeast: number][];
+  /** Selectors that must NOT exist. */
+  absent?: string[];
+  /** Substrings that must not appear in the frame's rendered text — `"null"` is the standing one. */
+  text_absent?: string[];
+  /** Substrings that must appear. */
+  text_present?: string[];
+};
 
 export type Scene = {
   /** Stable id — the `?scene=` parameter and the PNG's filename. Never derived from a title. */
   id: string;
   /** What a reader should be checking in the capture. Printed by `shoot.mjs` beside the filename. */
   looking_for: string;
+  /** The machine-checkable part of `looking_for`. A scene without one is rejected by the driver. */
+  expect: Expect;
   width?: number;
   setup?: () => void;
   render: () => ReactNode;
@@ -88,6 +113,16 @@ export const SCENES: Scene[] = [
     looking_for:
       "every row explains itself from its honesty class; NO provenance line anywhere; the word " +
       "'null' appears nowhere on screen",
+    expect: {
+      // Six rows, and five of them below exact — so deleting the row list, or dropping the class
+      // fallback that makes a null `fix` still explain itself, fails here rather than photographing
+      // a header with nothing under it.
+      present: [["[data-testid='import-row']", 6], ["[data-testid='import-row-fix']", 5]],
+      absent: ["[data-testid='import-row-provenance']"],
+      // The defect this session fixed, as a standing assertion: a narrowing that lets `null` reach
+      // the DOM prints the four characters below.
+      text_absent: ["null", "undefined"],
+    },
     setup: seedScene,
     render: () => <ImportReport client={client(() => Promise.resolve(report(ALL_NULL)))} />,
   },
@@ -96,6 +131,11 @@ export const SCENES: Scene[] = [
     looking_for:
       "the part's own reason/fix/provenance replace the class defaults; the provenance line reads " +
       "'ref · strategy · format' and truncates rather than wrapping",
+    expect: {
+      present: [["[data-testid='import-row']", 3], ["[data-testid='import-row-provenance']", 3]],
+      text_present: ["GEARBOX-A/1 · kernel-unavailable · CATPart", "Install the kernel"],
+      text_absent: ["null", "undefined"],
+    },
     setup: seedScene,
     render: () => <ImportReport client={client(() => Promise.resolve(report(DETAILED)))} />,
   },
@@ -105,6 +145,10 @@ export const SCENES: Scene[] = [
       "at 360 px the badge stays on the header row and the provenance line ellipsises — nothing " +
       "wraps onto a line of its own (the ADR-120 defect class)",
     width: 360,
+    expect: {
+      present: [["[data-testid='import-row']", 3], ["[data-testid='import-row-provenance']", 3]],
+      text_absent: ["null", "undefined"],
+    },
     setup: seedScene,
     render: () => <ImportReport client={client(() => Promise.resolve(report(DETAILED)))} />,
   },
@@ -113,7 +157,34 @@ export const SCENES: Scene[] = [
     looking_for:
       "a non-CAD project: the panel renders NOTHING rather than an empty frame, so it never " +
       "clutters a scene it has nothing to say about",
+    // The one scene that is legitimately a flat frame, and therefore the one that needs its claim
+    // written down hardest: "renders nothing" and "the fetch threw" look identical in a PNG. The
+    // sentinel is rendered by the SCENE, after the client resolves, so a rejected promise fails.
+    expect: {
+      absent: ["[data-testid='import-report']"],
+      present: [["[data-testid='empty-sentinel']", 1]],
+    },
     setup: seedScene,
-    render: () => <ImportReport client={client(() => Promise.resolve(report([])))} />,
+    render: () => (
+      <>
+        <ImportReport client={client(() => Promise.resolve(report([])))} />
+        <EmptySentinel client={client(() => Promise.resolve(report([])))} />
+      </>
+    ),
   },
 ];
+
+/** Renders only once the same call the panel makes has RESOLVED. Without it, "the panel chose to
+ *  render nothing" and "the reply never arrived" are the same two-colour frame — which an
+ *  adversarial review turned into a passing capture over a rejecting client. */
+function EmptySentinel({ client: c }: { client: EditorClient }) {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    let live = true;
+    c.cadReport().then(() => live && setReady(true));
+    return () => {
+      live = false;
+    };
+  }, [c]);
+  return ready ? <span data-testid="empty-sentinel" style={{ position: "fixed", left: -9999 }} /> : null;
+}

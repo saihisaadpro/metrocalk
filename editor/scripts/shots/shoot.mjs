@@ -6,18 +6,33 @@
 //! standing lesson: it compiled cleanly through four renderer generations while every contract inside
 //! it rotted, and `clippy --all-targets` called it healthy the whole time. A CI job that only *built*
 //! this harness would repeat that mistake exactly — the bundle would keep building long after a panel
-//! stopped mounting. So each scene must clear three bars that a build cannot:
+//! stopped mounting.
 //!
-//!   1. the page raised no `pageerror` and logged no `console.error`;
-//!   2. the scene's root actually mounted (`[data-testid="shot-frame"]`, or a scene that declares it
-//!      renders nothing);
-//!   3. the captured PNG is not a single flat colour — a blank frame is the exact shape of the
-//!      green-tests-but-black-viewport trap, and it is cheap to detect at rest.
+//! THE FIRST VERSION OF THIS FILE MADE THE SAME MISTAKE ONE LEVEL UP, and an adversarial review
+//! proved it in three lines. Its bars were: no page error · a mounted root · a PNG with more than two
+//! distinct colours. Delete **every import row** from the panel — the entire subject of all four
+//! scenes — and it stayed **green**: the header and the filter chips still painted, and the "root" it
+//! checked (`[data-testid="shot-frame"]`) is emitted by the harness wrapper, not by `scene.render()`,
+//! so it is true whenever the bundle mounts at all. Re-introducing this session's own defect
+//! (rendering a literal `null · null · null`) was green too, while the report claimed of that very
+//! capture that "the string 'null' appears nowhere" — a human having read a PNG once.
 //!
-//! Bar 3 needs the pixels, not the DOM, which is why this decodes the PNG rather than trusting that
-//! `screenshot()` returned bytes. It is deliberately a crude check: distinct colours, not a diff
-//! against a golden. A golden-image baseline would make every legitimate style change a red gate and
-//! would be waived within a month; "did anything render at all" never needs waiving.
+//! So the bars are now, in order of strength:
+//!
+//!   1. **the scene's own claim**, declared as `expect` beside the scene and evaluated in the page —
+//!      selectors that must be present with a minimum count, selectors that must be absent, text that
+//!      must and must not appear. A scene with no `expect` fails the run before it opens;
+//!   2. the page raised no `pageerror` and logged no `console.error`;
+//!   3. the captured PNG painted something at all. This is the weakest bar and is kept only because
+//!      it costs nothing and catches a renderer that dies after the DOM is built. It is deliberately
+//!      not a golden-image diff: that would make every legitimate style change a red gate and would
+//!      be waived within a month.
+//!
+//! There is no "this scene is allowed to be blank" exemption keyed on the filename any more. The
+//! first version had one and it laundered a broken scene: a client that REJECTS and a panel that
+//! chooses to render nothing produce the same two-colour frame, and the id-suffix check could not
+//! tell them apart. A scene that must be empty now says so with `absent` plus a sentinel its own
+//! `render()` only emits after the reply resolves.
 //!
 //! Usage:  node scripts/shots/shoot.mjs [--out DIR] [--scene ID] [--no-build]
 //! Needs:  npm i -D @sparticuz/chromium puppeteer-core   (npm-delivered; no CDN download)
@@ -34,9 +49,18 @@ const EDITOR = resolve(HERE, "..", "..");
 const require = createRequire(import.meta.url);
 
 const argv = process.argv.slice(2);
+/** A flag whose value is missing is an ERROR, not a default. `--out` as the last argument used to
+ *  crash inside `resolve(undefined)`, and `--scene` as the last argument silently captured EVERY
+ *  scene — the exact opposite of the "an unknown scene fails" property this driver advertises. */
 const arg = (flag, dflt) => {
   const i = argv.indexOf(flag);
-  return i >= 0 ? argv[i + 1] : dflt;
+  if (i < 0) return dflt;
+  const v = argv[i + 1];
+  if (v === undefined || v.startsWith("--")) {
+    console.error(`FAIL  ${flag} needs a value`);
+    process.exit(2);
+  }
+  return v;
 };
 const outDir = resolve(arg("--out", resolve(HERE, "shots")));
 const only = arg("--scene", null);
@@ -126,20 +150,6 @@ if (!existsSync(resolve(dist, "harness.html"))) {
   process.exit(1);
 }
 
-// The scene list comes from the built bundle's source, read as text, so this driver never imports
-// TSX. One regex over one file, and a mismatch is a failure rather than an empty run.
-const src = readFileSync(resolve(HERE, "scenes.tsx"), "utf8");
-const ids = [...src.matchAll(/^\s*id:\s*"([a-z0-9-]+)",$/gm)].map((m) => m[1]);
-if (ids.length === 0) {
-  console.error("FAIL  no scenes found in scenes.tsx — the driver would have reported success over an empty run");
-  process.exit(1);
-}
-const scenes = only ? ids.filter((s) => s === only) : ids;
-if (scenes.length === 0) {
-  console.error(`FAIL  --scene ${only} matches none of: ${ids.join(", ")}`);
-  process.exit(1);
-}
-
 const chromium = (await import("@sparticuz/chromium")).default;
 const puppeteer = (await import("puppeteer-core")).default;
 mkdirSync(outDir, { recursive: true });
@@ -149,40 +159,88 @@ const browser = await puppeteer.launch({
   executablePath: await chromium.executablePath(),
   headless: true,
 });
+const href = pathToFileURL(resolve(dist, "harness.html")).href;
+
+// The registry comes off `window.__MTK_SHOTS__` in the BUILT bundle — the same objects the page
+// renders. The first version regexed `scenes.tsx` for `id:` lines, which is a second statement of
+// the scene list that nothing compares to the first: reformat the file and the driver silently
+// captures fewer scenes, reporting success over the ones it stopped opening.
+const boot = await browser.newPage();
+await boot.goto(href, { waitUntil: "networkidle0" });
+const registry = await boot.evaluate(() => window.__MTK_SHOTS__ ?? []);
+await boot.close();
+if (registry.length === 0) {
+  console.error("FAIL  the built bundle exposes no scenes — this run would have reported success over nothing");
+  process.exit(1);
+}
+const missing = registry.filter((s) => !s.expect || Object.keys(s.expect).length === 0);
+if (missing.length) {
+  console.error(`FAIL  scene(s) with no \`expect\`: ${missing.map((s) => s.id).join(", ")}`);
+  console.error("        a capture that asserts nothing is a screenshot, not a gate");
+  process.exit(1);
+}
+const scenes = only ? registry.filter((s) => s.id === only) : registry;
+if (scenes.length === 0) {
+  console.error(`FAIL  --scene ${only} matches none of: ${registry.map((s) => s.id).join(", ")}`);
+  process.exit(1);
+}
 
 let failed = 0;
-for (const id of scenes) {
+for (const scene of scenes) {
+  const { id, looking_for, expect } = scene;
   const page = await browser.newPage();
   await page.setViewport({ width: 620, height: 900, deviceScaleFactor: 2 });
   const problems = [];
   page.on("pageerror", (e) => problems.push(`pageerror: ${e}`));
   page.on("console", (m) => m.type() === "error" && problems.push(`console.error: ${m.text()}`));
 
-  const url = `${pathToFileURL(resolve(dist, "harness.html")).href}?scene=${id}`;
-  await page.goto(url, { waitUntil: "networkidle0" });
+  await page.goto(`${href}?scene=${id}`, { waitUntil: "networkidle0" });
   await new Promise((r) => setTimeout(r, 250)); // the panels fetch their report in an effect
 
   const path = resolve(outDir, `${id}.png`);
   await page.screenshot({ path, fullPage: true });
   const colours = distinctColours(readFileSync(path));
-  const mounted = await page.$('[data-testid="shot-frame"]').then((h) => !!h);
-  // A scene whose whole assertion is "this renders nothing" is the one legitimate flat frame. It is
-  // named in the id rather than inferred, so the empty-by-design case can never launder a broken one.
-  const empty_by_design = id.endsWith("-empty");
 
-  const bad = [];
-  if (problems.length) bad.push(...problems);
-  if (!mounted) bad.push("the scene root never mounted");
+  // The scene's OWN claim, evaluated in the page. `[data-testid="shot-frame"]` is emitted by the
+  // harness wrapper, not by `scene.render()`, so it was never evidence that the scene rendered —
+  // it is true whenever the bundle mounts at all.
+  const claim = await page.evaluate((e) => {
+    const out = [];
+    const frame = document.querySelector('[data-testid="shot-frame"]');
+    if (!frame) return ["the harness itself never mounted"];
+    const text = frame.textContent ?? "";
+    for (const [sel, atLeast] of e.present ?? []) {
+      const n = frame.querySelectorAll(sel).length;
+      if (n < atLeast) out.push(`expected at least ${atLeast} \`${sel}\`, found ${n}`);
+    }
+    for (const sel of e.absent ?? []) {
+      const n = frame.querySelectorAll(sel).length;
+      if (n) out.push(`expected no \`${sel}\`, found ${n}`);
+    }
+    for (const s of e.text_present ?? []) {
+      if (!text.includes(s)) out.push(`the rendered text does not contain ${JSON.stringify(s)}`);
+    }
+    for (const s of e.text_absent ?? []) {
+      if (text.includes(s)) out.push(`the rendered text contains ${JSON.stringify(s)}`);
+    }
+    return out;
+  }, expect);
+
+  const bad = [...problems, ...claim];
   if (colours === null) bad.push("the capture is not an 8-bit RGB/RGBA PNG, so it was not checked");
-  else if (colours < 3 && !empty_by_design) bad.push(`the capture is effectively blank (${colours} distinct colour(s))`);
-  else if (colours >= 3 && empty_by_design) bad.push(`a *-empty scene rendered ${colours} colours — it is meant to render nothing`);
+  // The pixel bar is now the WEAKEST of the three, kept only because it costs nothing and catches a
+  // renderer that dies after the DOM is built. A scene that must be blank says so through `absent`
+  // + a sentinel, not through its filename — the id-suffix exemption the first version used let a
+  // rejecting client photograph as "renders nothing".
+  else if (colours < 2) bad.push(`the capture has ${colours} distinct colour(s) — nothing painted at all`);
 
   if (bad.length) {
     failed++;
     console.error(`FAIL  ${id}`);
+    console.error(`        looking for: ${looking_for}`);
     for (const b of bad) console.error(`        ${b}`);
   } else {
-    console.log(`ok    ${id}.png  (${colours === null ? "?" : colours} colours)`);
+    console.log(`ok    ${id}.png  (${colours} colours)  ${looking_for}`);
   }
   await page.close();
 }
@@ -190,7 +248,7 @@ for (const id of scenes) {
 await browser.close();
 console.log(
   failed
-    ? `\n${failed} of ${scenes.length} scene(s) failed — a capture that is blank, that threw, or that never mounted is not evidence.`
-    : `\n${scenes.length} scene(s) captured to ${outDir}; each one mounted, logged no error, and produced pixels.`,
+    ? `\n${failed} of ${scenes.length} scene(s) failed — a capture that threw, that painted nothing, or that does not show what the scene claims is not evidence.`
+    : `\n${scenes.length} scene(s) captured to ${outDir}; each one rendered what it claims to render.`,
 );
 process.exit(failed ? 1 : 0);

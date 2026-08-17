@@ -9,6 +9,20 @@ import { createRoot } from "react-dom/client";
 import "../../src/theme/global.css";
 import { SCENES } from "./scenes";
 
+// The driver reads the registry from HERE — the built bundle, the same objects the page renders —
+// rather than by regexing `scenes.tsx`. A regex over source is a second statement of the scene list
+// that nothing compares to the first, which is the failure this whole repository keeps gating for.
+declare global {
+  interface Window {
+    __MTK_SHOTS__: { id: string; looking_for: string; expect: unknown }[];
+  }
+}
+window.__MTK_SHOTS__ = SCENES.map((s) => ({
+  id: s.id,
+  looking_for: s.looking_for,
+  expect: s.expect,
+}));
+
 const id = new URLSearchParams(location.search).get("scene") ?? SCENES[0].id;
 const scene = SCENES.find((s) => s.id === id);
 
