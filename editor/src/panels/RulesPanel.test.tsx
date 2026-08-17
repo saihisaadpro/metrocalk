@@ -10,7 +10,7 @@ import { RulesPanel } from "./RulesPanel";
 import { fakeClient } from "../transport/test-client";
 import { projectionStore } from "../store/projection";
 import { toastStore } from "../store/toasts";
-import type { RuleData, RuleRegistryInfo } from "../transport/protocol";
+import type { RuleCondition, RuleData, RuleRegistryInfo, RuleSummary } from "../transport/protocol";
 
 const REGISTRY: RuleRegistryInfo = {
   events: [
@@ -24,8 +24,30 @@ const REGISTRY: RuleRegistryInfo = {
   components: [
     { name: "KillCounter", fields: [{ name: "count", ty: "integer" }] },
     { name: "Flammable", fields: [{ name: "lit", ty: "boolean" }] },
+    { name: "QuestState", fields: [{ name: "state", ty: "string" }] },
   ],
 };
+
+const clause = (component: string, field: string): RuleCondition => ({
+  entity: "1_1",
+  component,
+  field,
+  op: "ge",
+  value: { Integer: 1 },
+});
+/** A Rule-list row. It carries a REAL rule, not a set of counts — which is the point: the row's "1 if ·
+ *  any of 2" is now derived from the rule it describes, so a fixture cannot assert a count the rule
+ *  contradicts. */
+const listed = (id: string, rule: Partial<RuleData> & { name: string }): RuleSummary => ({
+  id,
+  rule: {
+    enabled: true,
+    event: "EnemyDied",
+    conditions: [clause("KillCounter", "count")],
+    actions: [{ action: "SetField", entity: "1_1", component: "Flammable", field: "lit", value: { Bool: true } }],
+    ...rule,
+  },
+});
 
 afterEach(() => {
   projectionStore.getState().reset();
@@ -48,7 +70,7 @@ test("the builder's dropdowns are fed by the registry (typo-proof — no free te
   // Adding a condition surfaces registry component + field pickers.
   fireEvent.click(screen.getByText("+ condition"));
   const comp = screen.getByTestId("rule-component") as HTMLSelectElement;
-  expect([...comp.options].map((o) => o.value)).toEqual(["KillCounter", "Flammable"]);
+  expect([...comp.options].map((o) => o.value)).toEqual(["KillCounter", "Flammable", "QuestState"]);
   // Adding an action surfaces the closed action vocabulary.
   fireEvent.click(screen.getByText("+ action"));
   const action = screen.getByTestId("rule-action") as HTMLSelectElement;
@@ -168,18 +190,110 @@ test("the Rule list states the OR group as its own claim, never folded into the 
     ruleRegistry: () => Promise.resolve(REGISTRY),
     listRules: () =>
       Promise.resolve([
-        { id: "r1", name: "ignite", enabled: true, event: "EnemyDied", conditionCount: 1, anyOfCount: 2, actionCount: 1 },
-        { id: "r2", name: "plain", enabled: true, event: "EnemyDied", conditionCount: 1, anyOfCount: 0, actionCount: 1 },
+        listed("r1", { name: "ignite", any_of: [clause("Flammable", "lit"), clause("QuestState", "state")] }),
+        listed("r2", { name: "plain" }),
       ]),
   });
   render(<RulesPanel client={client} />);
 
   const rows = await screen.findAllByTestId("rule-row");
   // "2 if" about a rule whose second claim is "any ONE of these" would be a false statement about when it
-  // fires — so the alternatives are counted, and counted separately.
+  // fires — so the alternatives are counted, and counted separately. Both figures are read off the rule.
   expect(rows[0].textContent).toMatch(/1 if · any of 2 · 1 then/);
   expect(rows[1].textContent).toMatch(/1 if · 1 then/);
   expect(rows[1].textContent).not.toMatch(/any of/);
+});
+
+test("a boolean or string field offers only = and ≠ — the orderings that can never discriminate are gone", async () => {
+  await openBuilder();
+  fireEvent.click(screen.getByText("+ condition"));
+
+  const op = () => screen.getByRole("combobox", { name: "Condition 1 comparison operator" }) as HTMLSelectElement;
+  // An integer field keeps the full vocabulary — this narrows what is meaningless, not what is useful.
+  expect([...op().options].map((o) => o.value)).toEqual(["eq", "ne", "lt", "le", "gt", "ge"]);
+
+  // `lit ≥ false` is true of every value a boolean can hold: a clause that can never fail, one click away
+  // in the panel whose claim is that clicking cannot produce nonsense.
+  fireEvent.change(screen.getByRole("combobox", { name: "Condition 1 component" }), { target: { value: "Flammable" } });
+  expect([...op().options].map((o) => o.value)).toEqual(["eq", "ne"]);
+
+  // A string field is a categorical name; ordering one would compare it alphabetically.
+  fireEvent.change(screen.getByRole("combobox", { name: "Condition 1 component" }), { target: { value: "QuestState" } });
+  expect([...op().options].map((o) => o.value)).toEqual(["eq", "ne"]);
+});
+
+test("retargeting a clause coerces its operator — a select never shows a value it has no option for", async () => {
+  const authorRule = vi.fn((_rule: RuleData) => Promise.resolve({ id: "r1", error: null, mirror: null }));
+  await openBuilder(fakeClient({ ruleRegistry: () => Promise.resolve(REGISTRY), authorRule }));
+  fireEvent.click(screen.getByText("+ condition"));
+
+  const op = () => screen.getByRole("combobox", { name: "Condition 1 comparison operator" }) as HTMLSelectElement;
+  fireEvent.change(op(), { target: { value: "gt" } });
+  expect(op().value).toBe("gt");
+
+  // Re-point the clause at a boolean. `gt` is no longer offerable, so it must be replaced rather than
+  // left selected: a <select> whose value matches no <option> reads as though nothing is chosen, and
+  // would have submitted `lit > false` from a control showing "=".
+  fireEvent.change(screen.getByRole("combobox", { name: "Condition 1 component" }), { target: { value: "Flammable" } });
+  expect(op().value).toBe("eq");
+
+  fireEvent.click(screen.getByTestId("rule-create"));
+  await waitFor(() => expect(authorRule).toHaveBeenCalled());
+  expect(authorRule.mock.calls[0][0].conditions[0].op).toBe("eq");
+});
+
+test("a rule can be turned off — and off means the runtime will not fire it, said in the row", async () => {
+  const authorRule = vi.fn((_rule: RuleData, _id?: string | null) =>
+    Promise.resolve({ id: "r1", error: null, mirror: null }),
+  );
+  let rules = [listed("r1", { name: "ignite" })];
+  const client = fakeClient({
+    ruleRegistry: () => Promise.resolve(REGISTRY),
+    listRules: () => Promise.resolve(rules),
+    authorRule,
+  });
+  render(<RulesPanel client={client} />);
+
+  const row = await screen.findByTestId("rule-row");
+  expect(row.getAttribute("data-enabled")).toBe("true");
+  expect(row.textContent).not.toMatch(/does not run/);
+
+  // The toggle REPLACES the rule by id through the existing author path — not a second write path, and
+  // it carries the whole rule so nothing about it is lost on the way through.
+  rules = [listed("r1", { name: "ignite", enabled: false })];
+  fireEvent.click(screen.getByRole("button", { name: "Turn off rule ignite" }));
+  await waitFor(() => expect(authorRule).toHaveBeenCalled());
+  expect(authorRule.mock.calls[0][0]).toMatchObject({ name: "ignite", enabled: false, event: "EnemyDied" });
+  expect(authorRule.mock.calls[0][0].conditions).toHaveLength(1);
+  expect(authorRule.mock.calls[0][1]).toBe("r1");
+
+  // The row now says what off MEANS, and offers the way back.
+  await waitFor(() => expect(screen.getByTestId("rule-row").getAttribute("data-enabled")).toBe("false"));
+  expect(screen.getByTestId("rule-row").textContent).toMatch(/off — does not run/);
+  expect(screen.getByRole("button", { name: "Turn on rule ignite" })).toBeTruthy();
+  // Undoable, and the toast says so rather than leaving the user to guess.
+  expect(toastStore.getState().toasts.some((t) => /will not run · Ctrl-Z to undo/.test(t.text))).toBe(true);
+});
+
+test("a refused toggle says so and leaves the row alone — no optimistic lie", async () => {
+  const authorRule = vi.fn(() => Promise.resolve({ id: null, error: "the rule's entity is gone", mirror: null }));
+  const client = fakeClient({
+    ruleRegistry: () => Promise.resolve(REGISTRY),
+    listRules: () => Promise.resolve([listed("r1", { name: "ignite" })]),
+    authorRule,
+  });
+  render(<RulesPanel client={client} />);
+
+  await screen.findByTestId("rule-row");
+  fireEvent.click(screen.getByRole("button", { name: "Turn off rule ignite" }));
+  await waitFor(() => expect(authorRule).toHaveBeenCalled());
+
+  await waitFor(() =>
+    expect(toastStore.getState().toasts.some((t) => t.kind === "error" && /entity is gone/.test(t.text))).toBe(true),
+  );
+  // The list still reflects the core, which refused: the row is still on.
+  expect(screen.getByTestId("rule-row").getAttribute("data-enabled")).toBe("true");
+  expect(screen.getByTestId("rule-row").textContent).not.toMatch(/does not run/);
 });
 
 test("a registry-Blocked rule shows its explained reason inline (ADR-016), no toast-of-success", async () => {
@@ -220,7 +334,7 @@ test("the Rule list renders authored rules and deletes one", async () => {
     ruleRegistry: () => Promise.resolve(REGISTRY),
     listRules: () =>
       Promise.resolve([
-        { id: "r1", name: "ignite", enabled: true, event: "EnemyDied", conditionCount: 2, anyOfCount: 0, actionCount: 1 },
+        listed("r1", { name: "ignite", conditions: [clause("KillCounter", "count"), clause("Flammable", "lit")] }),
       ]),
     deleteRule,
   });
@@ -229,6 +343,7 @@ test("the Rule list renders authored rules and deletes one", async () => {
   const row = await screen.findByTestId("rule-row");
   expect(row.textContent).toMatch(/ignite/);
   expect(row.textContent).toMatch(/When EnemyDied/);
+  expect(row.textContent).toMatch(/2 if/);
   expect(screen.queryByRole("button", { name: "×" })).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Remove rule ignite" }));
   await waitFor(() => expect(deleteRule).toHaveBeenCalledWith("r1"));

@@ -28,14 +28,54 @@ import type {
   RuleSummary,
 } from "../transport/protocol";
 
-const OPS: { op: CompareOp; label: string }[] = [
+const EQUALITY: { op: CompareOp; label: string }[] = [
   { op: "eq", label: "=" },
   { op: "ne", label: "≠" },
+];
+const ORDERING: { op: CompareOp; label: string }[] = [
   { op: "lt", label: "<" },
   { op: "le", label: "≤" },
   { op: "gt", label: ">" },
   { op: "ge", label: "≥" },
 ];
+
+/** The operators that can **mean** something about a field of this type.
+ *
+ *  `CompareOp::eval` orders every scalar kind — `false < true`, strings lexicographically — so the core
+ *  accepts all six on anything. Accepting is not the same as being worth offering, and this builder's
+ *  whole claim is that a clause assembled by clicks is a clause worth having:
+ *
+ *  * **boolean** — on a two-valued totally-ordered domain every ordering comparison collapses to an
+ *    equality or to a constant. `lit > false` *is* `lit = true`; `lit ≥ false` is true of every value the
+ *    field can hold, so it is a clause that can never fail. Nothing is lost by removing them, and a
+ *    guaranteed-true If stops being one click away.
+ *  * **string** — ordering is alphabetical, and every string field the registry defines is a categorical
+ *    name (`state`, `role`, `kind`, `shape`, `preset`, `source`, `anchor`, `kit`, `join`, `current`).
+ *    "the state's name sorts before `idle`" is not a thing an author means, and the bare `<` never said
+ *    that was the question.
+ *
+ *  Numeric fields keep all six. This narrows what is *offered*, never what the core can evaluate: a rule
+ *  authored elsewhere with `lit ≥ false` still loads, still runs, and still means what it meant. */
+function opsFor(ty: string): { op: CompareOp; label: string }[] {
+  return ty === "boolean" || ty === "string" ? EQUALITY : [...EQUALITY, ...ORDERING];
+}
+/** Why an operator list is short, said in the row rather than left as a mystery (`<ux_quality>` 4). */
+function opsHint(ty: string): string {
+  if (ty === "boolean") return "A true/false field is either equal or not — ordering one always answers the same way.";
+  if (ty === "string") return "A name is either equal or not — ordering names would compare them alphabetically.";
+  return "How to compare the field with the value.";
+}
+/** Keep a clause's operator legal for the field it now points at. Re-targeting a clause from `hp` to
+ *  `visible` used to leave `>` selected on a list that no longer offers it — a select showing a value it
+ *  has no option for renders as though nothing is chosen. Same coercion the value already does. */
+function coerceOp(op: CompareOp, ty: string): CompareOp {
+  return opsFor(ty).some((o) => o.op === op) ? op : "eq";
+}
+/** A new clause opens on an operator that suits its field, rather than on whichever one happened to be
+ *  legal for the registry's first component. */
+function defaultOp(ty: string): CompareOp {
+  return ty === "boolean" || ty === "string" ? "eq" : "ge";
+}
 
 const box: React.CSSProperties = { font: `${fontSize.meta}px ${font.mono}`, padding: space.lg };
 /** One clause/action row: the controls wrap rather than overflow the dock at narrow widths. */
@@ -203,6 +243,7 @@ function ClauseRow({
   onChange: (next: RuleCondition) => void;
   onRemove: () => void;
 }) {
+  const ty = fieldTy(reg, clause.component, clause.field);
   return (
     <div style={row}>
       <TargetPicker
@@ -214,29 +255,29 @@ function ClauseRow({
         contextLabel={label}
         onChange={(p) => {
           const next = { ...clause, ...p };
-          if (p.component || p.field) next.value = defaultValue(fieldTy(reg, next.component, next.field));
+          if (p.component || p.field) {
+            const t = fieldTy(reg, next.component, next.field);
+            next.value = defaultValue(t);
+            next.op = coerceOp(next.op, t);
+          }
           onChange(next);
         }}
       />
       <SelectField
         aria-label={`${label} comparison operator`}
         data-testid="rule-op"
+        title={opsHint(ty)}
         style={fixed(68)}
         value={clause.op}
         onChange={(e) => onChange({ ...clause, op: e.target.value as CompareOp })}
       >
-        {OPS.map((o) => (
+        {opsFor(ty).map((o) => (
           <option key={o.op} value={o.op}>
             {o.label}
           </option>
         ))}
       </SelectField>
-      <ValueInput
-        ariaLabel={`${label} value`}
-        ty={fieldTy(reg, clause.component, clause.field)}
-        value={clause.value}
-        onChange={(v) => onChange({ ...clause, value: v })}
-      />
+      <ValueInput ariaLabel={`${label} value`} ty={ty} value={clause.value} onChange={(v) => onChange({ ...clause, value: v })} />
       <Button variant="ghost" compact icon aria-label={`Remove ${label.toLowerCase()}`} onClick={onRemove}>
         ×
       </Button>
@@ -277,7 +318,7 @@ function RuleBuilder({
     entity: defaultEntity,
     component: firstComp,
     field: firstField,
-    op: "ge",
+    op: defaultOp(fieldTy(reg, firstComp, firstField)),
     value: defaultValue(fieldTy(reg, firstComp, firstField)),
   });
   const newAction = (): RuleAction => ({
@@ -484,6 +525,25 @@ export function RulesPanel({ client }: { client: EditorClient }) {
     refresh();
   }
 
+  /** Turn a rule off (or back on) by **replacing** it through the same `author_rule(rule, id)` path the
+   *  builder uses. `RuleData.enabled` was already honoured by the runtime — a disabled rule does not fire —
+   *  but no authoring surface could ever set it `false`, so it was a live semantic nothing could reach.
+   *
+   *  Replace rather than a new `set_rule_enabled` command: the replace path already registry-validates,
+   *  commits ONE undoable transaction, and appends the replay record that survives reload. A second way to
+   *  write a rule would be a second thing to keep correct. The engine offers its mirror "cleanup" rule on
+   *  every author; a toggle is not new authoring, so the offer is not surfaced here. */
+  async function toggle(r: RuleSummary) {
+    const next = !r.rule.enabled;
+    const res = await client.authorRule({ ...r.rule, enabled: next }, r.id).catch(() => null);
+    if (!res || res.error) {
+      pushToast(res?.error ?? `could not turn "${r.rule.name}" ${next ? "on" : "off"}`, "error");
+    } else {
+      pushToast(`"${r.rule.name}" is ${next ? "on — it runs again" : "off — it will not run"} · Ctrl-Z to undo`, "info");
+    }
+    refresh();
+  }
+
   async function acceptMirror() {
     if (!offeredMirror) return;
     const r = await client.authorRule(offeredMirror).catch(() => null);
@@ -532,30 +592,51 @@ export function RulesPanel({ client }: { client: EditorClient }) {
       {rules.length === 0 ? (
         <div style={{ color: color.text.muted }}>No rules yet — author a When / If / Then rule.</div>
       ) : (
-        rules.map((r) => (
-          <div
-            key={r.id}
-            data-testid="rule-row"
-            style={{ display: "flex", justifyContent: "space-between", gap: space.md, padding: `${space.xs}px 0`, borderBottom: `1px solid ${color.border.subtle}` }}
-          >
-            {/* The OR group is counted separately, never folded into the If count: "2 if" about a rule whose
-                second claim is "any one of these" would be a false statement about when it fires. */}
-            <span>
-              <b>{r.name}</b> · When {r.event} · {r.conditionCount} if
-              {r.anyOfCount > 0 ? ` · any of ${r.anyOfCount}` : ""} · {r.actionCount} then
-            </span>
-            <Button
-              variant="ghost"
-              compact
-              icon
-              aria-label={`Remove rule ${r.name}`}
-              onClick={() => void remove(r.id)}
-              title="remove rule"
+        rules.map((r) => {
+          // Read off the rule, never off a count sent beside it — the two cannot disagree if there is
+          // only one of them. The OR group stays a SEPARATE figure: "2 if" about a rule whose second
+          // claim is "any one of these" would be a false statement about when it fires.
+          const { name, enabled, event, conditions, any_of, actions } = r.rule;
+          const anyOf = any_of?.length ?? 0;
+          return (
+            <div
+              key={r.id}
+              data-testid="rule-row"
+              data-enabled={String(enabled)}
+              style={{ display: "flex", justifyContent: "space-between", gap: space.md, padding: `${space.xs}px 0`, borderBottom: `1px solid ${color.border.subtle}` }}
             >
-              ×
-            </Button>
-          </div>
-        ))
+              {/* An off rule reads as off — dimmed, and it SAYS what off means rather than wearing a badge
+                  the reader has to interpret (`<ux_quality>` 4). */}
+              <span style={enabled ? undefined : { opacity: 0.55 }}>
+                <b>{name}</b> · When {event} · {conditions.length} if
+                {anyOf > 0 ? ` · any of ${anyOf}` : ""} · {actions.length} then
+                {!enabled && <span style={{ color: color.text.muted }}> · off — does not run</span>}
+              </span>
+              <span style={{ display: "flex", gap: space.xs, flex: "0 0 auto", alignItems: "center" }}>
+                <Button
+                  variant="ghost"
+                  compact
+                  data-testid="rule-toggle"
+                  aria-label={enabled ? `Turn off rule ${name}` : `Turn on rule ${name}`}
+                  title={enabled ? "This rule runs. Turn it off to stop it without deleting it." : "This rule is off. Turn it on to let it run again."}
+                  onClick={() => void toggle(r)}
+                >
+                  {enabled ? "turn off" : "turn on"}
+                </Button>
+                <Button
+                  variant="ghost"
+                  compact
+                  icon
+                  aria-label={`Remove rule ${name}`}
+                  onClick={() => void remove(r.id)}
+                  title="remove rule"
+                >
+                  ×
+                </Button>
+              </span>
+            </div>
+          );
+        })
       )}
     </div>
   );
