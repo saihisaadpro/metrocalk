@@ -368,9 +368,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # 22, not 20. `puppeteer-core@25` declares `node >= 22.12` and `@sparticuz/chromium@149`
+      # declares `^22.17 || >=24`; pnpm does not enforce engines by default, so on 20 the install
+      # would SUCCEED and the shots step would fail at run time — the one step this job gained.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       # Pin pnpm 10 explicitly (the tracked pnpm-lock.yaml is a v10 lockfile). corepack's bundled default
       # is older and can't read it, so `--frozen-lockfile` fails — install pnpm 10 directly instead.
