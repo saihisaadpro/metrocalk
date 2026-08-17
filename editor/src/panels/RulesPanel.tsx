@@ -11,7 +11,7 @@
 //! whole of When/If/Then. One group, never nested — the authored depth ceiling is two, which is what keeps a
 //! conditional readable as a sentence (the same ceiling the per-object "Only if…" cards hold themselves to).
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { pushToast } from "../store/toasts";
@@ -49,10 +49,13 @@ const ORDERING: { op: CompareOp; label: string }[] = [
  *    equality or to a constant. `lit > false` *is* `lit = true`; `lit ≥ false` is true of every value the
  *    field can hold, so it is a clause that can never fail. Nothing is lost by removing them, and a
  *    guaranteed-true If stops being one click away.
- *  * **string** — ordering is alphabetical, and every string field the registry defines is a categorical
- *    name (`state`, `role`, `kind`, `shape`, `preset`, `source`, `anchor`, `kit`, `join`, `current`).
- *    "the state's name sorts before `idle`" is not a thing an author means, and the bare `<` never said
- *    that was the question.
+ *  * **string** — ordering is alphabetical, and no string field the registry defines is a quantity. The
+ *    27 declared in `stdlib::standard_components()` are categorical names (`state`, `role`, `kind`,
+ *    `shape`, `preset`, `join`, `anchor`, `kit`, `current`), asset paths (`texture`, `mesh`, `material`,
+ *    `clip`, `controller`, `source`), entity references (`bodyA`, `bodyB`) and one serialised payload
+ *    (`strokes`). "the state's name sorts before `idle`" is not a thing an author means; on an entity
+ *    reference it is worse than useless, because `1_10` sorts before `1_2`. The bare `<` never said
+ *    alphabetical was the question.
  *
  *  Numeric fields keep all six. This narrows what is *offered*, never what the core can evaluate: a rule
  *  authored elsewhere with `lit ≥ false` still loads, still runs, and still means what it meant. */
@@ -511,6 +514,14 @@ export function RulesPanel({ client }: { client: EditorClient }) {
   const [rules, setRules] = useState<RuleSummary[]>([]);
   const [building, setBuilding] = useState(false);
   const [offeredMirror, setOfferedMirror] = useState<RuleData | null>(null);
+  /** The rule whose on/off write is in flight — one at a time, see `toggle`.
+   *
+   *  A **ref beside the state**, not state alone. The state is what disables the control; the ref is
+   *  what actually holds the line, because two clicks in the same tick run the SAME render's `toggle`
+   *  closure, in which a `useState` value is still the pre-click one. A guard that reads captured state
+   *  is exactly as racy as no guard — its own test proved that by staying green when it was deleted. */
+  const [pending, setPending] = useState<string | null>(null);
+  const pendingRef = useRef<string | null>(null);
 
   const refresh = () => void client.listRules().then(setRules).catch(() => {});
   useEffect(() => {
@@ -532,16 +543,46 @@ export function RulesPanel({ client }: { client: EditorClient }) {
    *  Replace rather than a new `set_rule_enabled` command: the replace path already registry-validates,
    *  commits ONE undoable transaction, and appends the replay record that survives reload. A second way to
    *  write a rule would be a second thing to keep correct. The engine offers its mirror "cleanup" rule on
-   *  every author; a toggle is not new authoring, so the offer is not surfaced here. */
-  async function toggle(r: RuleSummary) {
-    const next = !r.rule.enabled;
-    const res = await client.authorRule({ ...r.rule, enabled: next }, r.id).catch(() => null);
-    if (!res || res.error) {
-      pushToast(res?.error ?? `could not turn "${r.rule.name}" ${next ? "on" : "off"}`, "error");
-    } else {
-      pushToast(`"${r.rule.name}" is ${next ? "on — it runs again" : "off — it will not run"} · Ctrl-Z to undo`, "info");
+   *  every author; a toggle is not new authoring, so the offer is not surfaced here.
+   *
+   *  Two consequences of "replace" that the row's own cached copy would get wrong, so both are handled
+   *  here rather than assumed away:
+   *
+   *  1. **Re-read before writing.** A replace sends the WHOLE rule, and this list has no change
+   *     subscription — `refresh()` runs on mount and after its own mutations, nothing else. Writing back
+   *     the copy the row last rendered would silently revert whatever changed since: an undo, a
+   *     collaborator, an AI compose. The concrete case is one the toast itself invites — turn off,
+   *     Ctrl-Z, and the row still reads "off" until something refreshes it.
+   *  2. **One at a time.** Two fast clicks would otherwise both read `enabled: true`, both write
+   *     `false`, and commit TWO undoable transactions for one intended change — after which one Ctrl-Z
+   *     leaves the rule still off, having promised otherwise. `create()` already holds this line with
+   *     its own `busy`. */
+  async function toggle(id: string) {
+    if (pendingRef.current) return;
+    pendingRef.current = id;
+    setPending(id);
+    try {
+      const current = (await client.listRules().catch(() => null))?.find((x) => x.id === id);
+      if (!current) {
+        pushToast("that rule is no longer in the document", "error");
+        refresh();
+        return;
+      }
+      const next = !current.rule.enabled;
+      const res = await client.authorRule({ ...current.rule, enabled: next }, id).catch(() => null);
+      if (!res || res.error) {
+        pushToast(res?.error ?? `could not turn "${current.rule.name}" ${next ? "on" : "off"}`, "error");
+      } else {
+        pushToast(
+          `"${current.rule.name}" is ${next ? "on — it runs again" : "off — it will not run"} · Ctrl-Z to undo`,
+          "info",
+        );
+      }
+      refresh();
+    } finally {
+      pendingRef.current = null;
+      setPending(null);
     }
-    refresh();
   }
 
   async function acceptMirror() {
@@ -617,9 +658,16 @@ export function RulesPanel({ client }: { client: EditorClient }) {
                   variant="ghost"
                   compact
                   data-testid="rule-toggle"
+                  disabled={pending !== null}
                   aria-label={enabled ? `Turn off rule ${name}` : `Turn on rule ${name}`}
-                  title={enabled ? "This rule runs. Turn it off to stop it without deleting it." : "This rule is off. Turn it on to let it run again."}
-                  onClick={() => void toggle(r)}
+                  title={
+                    pending !== null
+                      ? "one moment — a rule is being switched"
+                      : enabled
+                        ? "This rule runs. Turn it off to stop it without deleting it."
+                        : "This rule is off. Turn it on to let it run again."
+                  }
+                  onClick={() => void toggle(r.id)}
                 >
                   {enabled ? "turn off" : "turn on"}
                 </Button>

@@ -5,7 +5,7 @@
 //! forced); and the Rule list renders + deletes.
 
 import { afterEach, expect, test, vi } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { RulesPanel } from "./RulesPanel";
 import { fakeClient } from "../transport/test-client";
 import { projectionStore } from "../store/projection";
@@ -243,10 +243,13 @@ test("retargeting a clause coerces its operator — a select never shows a value
 });
 
 test("a rule can be turned off — and off means the runtime will not fire it, said in the row", async () => {
-  const authorRule = vi.fn((_rule: RuleData, _id?: string | null) =>
-    Promise.resolve({ id: "r1", error: null, mirror: null }),
-  );
+  // A store the mock actually writes to, so this is the round trip and not two staged snapshots: the
+  // panel reads, writes, and reads back through the same list the "shell" holds.
   let rules = [listed("r1", { name: "ignite" })];
+  const authorRule = vi.fn((rule: RuleData, id?: string | null) => {
+    rules = rules.map((r) => (r.id === id ? { id: r.id, rule } : r));
+    return Promise.resolve({ id: id ?? "r1", error: null, mirror: null });
+  });
   const client = fakeClient({
     ruleRegistry: () => Promise.resolve(REGISTRY),
     listRules: () => Promise.resolve(rules),
@@ -260,7 +263,6 @@ test("a rule can be turned off — and off means the runtime will not fire it, s
 
   // The toggle REPLACES the rule by id through the existing author path — not a second write path, and
   // it carries the whole rule so nothing about it is lost on the way through.
-  rules = [listed("r1", { name: "ignite", enabled: false })];
   fireEvent.click(screen.getByRole("button", { name: "Turn off rule ignite" }));
   await waitFor(() => expect(authorRule).toHaveBeenCalled());
   expect(authorRule.mock.calls[0][0]).toMatchObject({ name: "ignite", enabled: false, event: "EnemyDied" });
@@ -273,6 +275,91 @@ test("a rule can be turned off — and off means the runtime will not fire it, s
   expect(screen.getByRole("button", { name: "Turn on rule ignite" })).toBeTruthy();
   // Undoable, and the toast says so rather than leaving the user to guess.
   expect(toastStore.getState().toasts.some((t) => /will not run · Ctrl-Z to undo/.test(t.text))).toBe(true);
+});
+
+test("a new clause opens on an operator its own field type offers", async () => {
+  // `defaultOp`. It used to be the constant "ge", which was legal only because the registry's first
+  // component happens to be numeric — luck, not a rule, and a select showing a value it has no option
+  // for the moment that luck changes.
+  const boolFirst: RuleRegistryInfo = { ...REGISTRY, components: [...REGISTRY.components].reverse() };
+  await openBuilder(fakeClient({ ruleRegistry: () => Promise.resolve(boolFirst) }));
+  fireEvent.click(screen.getByText("+ condition"));
+  const op = screen.getByRole("combobox", { name: "Condition 1 comparison operator" }) as HTMLSelectElement;
+  expect(op.value).toBe("eq");
+  expect([...op.options].map((o) => o.value)).toContain(op.value);
+});
+
+test("a new clause on a numeric registry still opens on a threshold, not on equality", async () => {
+  // The control for the case above: if `defaultOp` collapsed to a constant "eq", that test would still
+  // pass and this one would fail. Neither case proves anything without the other.
+  await openBuilder();
+  fireEvent.click(screen.getByText("+ condition"));
+  expect((screen.getByRole("combobox", { name: "Condition 1 comparison operator" }) as HTMLSelectElement).value).toBe(
+    "ge",
+  );
+});
+
+test("the toggle re-reads the rule before replacing it, so it cannot revert an outside change", async () => {
+  // `author_rule(rule, id)` REPLACES, and this list has no change subscription — writing back the copy
+  // the row last rendered would silently undo whatever changed since (an undo, a collaborator, a
+  // compose). Here the rule gains an action between the render and the click.
+  const authorRule = vi.fn((_r: RuleData, _id?: string | null) => Promise.resolve({ id: "r1", error: null, mirror: null }));
+  let served = [listed("r1", { name: "ignite" })];
+  const client = fakeClient({
+    ruleRegistry: () => Promise.resolve(REGISTRY),
+    listRules: () => Promise.resolve(served),
+    authorRule,
+  });
+  render(<RulesPanel client={client} />);
+  await screen.findByTestId("rule-row");
+
+  const grown = {
+    action: "AdjustCounter",
+    entity: "1_1",
+    component: "KillCounter",
+    field: "count",
+    value: { Integer: 5 },
+  };
+  served = [listed("r1", { name: "ignite", actions: [grown, grown] })];
+  fireEvent.click(screen.getByRole("button", { name: "Turn off rule ignite" }));
+
+  await waitFor(() => expect(authorRule).toHaveBeenCalled());
+  // The rule that went out carries the CURRENT two actions, not the one this row was rendered from.
+  expect(authorRule.mock.calls[0][0].actions).toHaveLength(2);
+  expect(authorRule.mock.calls[0][0].enabled).toBe(false);
+});
+
+test("two fast clicks commit ONE transaction — a toggle promising Ctrl-Z must mean one Ctrl-Z", async () => {
+  let release: (v: { id: string; error: null; mirror: null }) => void = () => {};
+  const authorRule = vi.fn(
+    () => new Promise<{ id: string; error: null; mirror: null }>((res) => (release = res)),
+  );
+  const client = fakeClient({
+    ruleRegistry: () => Promise.resolve(REGISTRY),
+    listRules: () => Promise.resolve([listed("r1", { name: "ignite" })]),
+    authorRule,
+  });
+  render(<RulesPanel client={client} />);
+  await screen.findByTestId("rule-row");
+
+  const btn = () => screen.getByTestId("rule-toggle") as HTMLButtonElement;
+  // THREE clicks inside ONE `act` — the real double-click, dispatched before React has re-rendered with
+  // the control disabled. This has to be raw `.click()` inside one `act`: `fireEvent` flushes state
+  // between calls, so the second click would meet an already-disabled button and the test would pass
+  // with no guard at all. (It did — that is how the first version of this test was found to prove
+  // nothing.) Here all three run the SAME render's closure, where a `useState` pending value is still
+  // its pre-click one, so only a guard read at call time can stop clicks 2 and 3.
+  await act(async () => {
+    btn().click();
+    btn().click();
+    btn().click();
+  });
+  await waitFor(() => expect(authorRule).toHaveBeenCalledTimes(1));
+  // …and only then does the control also say it is busy, rather than looking clickable.
+  expect(btn().disabled).toBe(true);
+  release({ id: "r1", error: null, mirror: null });
+  await waitFor(() => expect(btn().disabled).toBe(false));
+  expect(authorRule).toHaveBeenCalledTimes(1);
 });
 
 test("a refused toggle says so and leaves the row alone — no optimistic lie", async () => {
