@@ -26,8 +26,12 @@ use std::collections::BTreeMap;
 
 /// One packed vertex — position, normal (for lighting), a baked RGB base color, the baked
 /// metallic-roughness PBR factors (M11.2, ADR-041), and the **UV** for base-color texture sampling (M11.2
-/// follow-up). 48 bytes, `std430`/vertex-attribute clean. Matches the renderer's WGSL (`vs_mesh` reads all
-/// six attributes; `fs_mesh` samples the base-color texture × the baked factor + a Cook-Torrance BRDF).
+/// follow-up), and the MikkTSpace tangent. **68 bytes** (17 × f32), `std430`/vertex-attribute clean.
+/// Matches the renderer's WGSL (`vs_mesh` reads all **seven** attributes, `@location(0..6)`; `fs_mesh`
+/// samples the base-color texture × the baked factor + a Cook-Torrance BRDF). The count and the size are
+/// both load-bearing: a `VertexBufferLayout` that supplies fewer attributes fails pipeline creation, which
+/// is how the offscreen bench stopped rendering — see `tools/gpu-contract-audit`. (Said "48 bytes … six
+/// attributes" until 2026-08-17 — stale since the tangent landed.)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshVertex {

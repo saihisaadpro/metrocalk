@@ -4,7 +4,12 @@
 // `inv_view_proj` (M11.3 inc.2) lets the skybox turn a screen pixel into a world ray; `light_view_proj`
 // (M11.3 inc.3) is the shadow-casting light's ortho view-proj, for both the depth pass and fs_mesh's shadow
 // lookup. The cube/grid/line shaders ignore the trailing fields. Field order matches render.rs's `Camera`
-// (view_proj · inv_view_proj · light_view_proj · focus · shadow · grid) — 240 bytes, std140-clean.
+// (view_proj · inv_view_proj · light_view_proj · focus · shadow · grid · the colour block) — **336 bytes**,
+// std140-clean: 3 mat4 (192) + 3 vec4 (48) + two column-padded mat3 (48 each). This shader declares a
+// PREFIX of the 400-byte uniform render.rs writes, which is deliberate — naming only the ingress half is
+// what stops the scene pass from being able to apply the inverse conversion. Pinned by
+// `the_uniform_layouts_the_shaders_declare_fit_the_buffer_the_renderer_writes` and by
+// `tools/gpu-contract-audit`. (Said 240 until 2026-08-17 — stale since the colour block landed.)
 struct Camera {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
@@ -247,7 +252,10 @@ fn apply_focus_dim_linear(col: vec3<f32>, is_focused: bool) -> vec3<f32> {
 
 // `rotation` is a unit quaternion (x,y,z,w); identity = (0,0,0,1). Applied per-instance so a tumbling
 // physics body / a rotated authored Transform / a posed part actually *looks* rotated (M9.1+ — the shared
-// renderer-rotation path). Matches render.rs's Instance (48 bytes, std430-clean).
+// renderer-rotation path). Matches render.rs's Instance — **64 bytes**, std430-clean (offsets
+// 0/12/16/28/32/48, align 16). This is an `array<Instance>` STRIDE, so a host struct of any other size
+// does not fail: element N is simply read from the wrong offset. Pinned by `tools/gpu-contract-audit`.
+// (Said 48 until 2026-08-17 — stale since `material` landed.)
 // `material` (M11.2) = per-entity PBR override [metallic, roughness, has_override, _]; when has_override>0.5
 // the mesh path uses it (+ `color` as the override base color) instead of the asset's baked vertex material.
 struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, selected: f32, rotation: vec4<f32>, material: vec4<f32> };
