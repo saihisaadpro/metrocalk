@@ -19,12 +19,16 @@ on:
       - "editor-shell/src-tauri/**"
       - "editor-shell/web/**"
       - "tools/gpu-contract-audit/**"
+      - "tools/ipc-contract-audit/**"
+      - "editor/src/transport/**"
       - ".github/workflows/editor-shell-app.yml"
   pull_request:
     paths:
       - "editor-shell/src-tauri/**"
       - "editor-shell/web/**"
       - "tools/gpu-contract-audit/**"
+      - "tools/ipc-contract-audit/**"
+      - "editor/src/transport/**"
 
 permissions:
   contents: read
@@ -49,6 +53,19 @@ jobs:
         run: |
           python tools/gpu-contract-audit/audit.py --self-test
           python tools/gpu-contract-audit/audit.py
+
+      # The same argument, one boundary over. Every Tauri command is described twice — once as a Rust
+      # `#[tauri::command]`, once as an `invoke("name", { key })` in TypeScript — and NOTHING compares the
+      # two: Tauri dispatches on a string at run time, `cargo` checks one side, `tsc` checks the other. A
+      # renamed reply field does not even error; JavaScript reads `undefined` and the panel renders blank.
+      # The Vitest job cannot catch it either, because the dev path uses an in-process client that never
+      # calls `invoke` at all — so all 1,411 call sites (the React transport AND the E2E suite) are dark
+      # until the packaged `.exe` runs. This compares them at rest, in seconds, before the Rust steps.
+      - name: IPC contract — the TypeScript still asks for the command the Rust answers
+        shell: bash
+        run: |
+          python tools/ipc-contract-audit/audit.py --self-test
+          python tools/ipc-contract-audit/audit.py
 
       # `tauri::generate_context!()` embeds `frontendDist` (tauri.conf.json → ../../editor/dist) at compile
       # time, so the dir must EXIST or the macro panics. `editor/dist` is a gitignored Vite BUILD ARTIFACT

@@ -1,0 +1,50 @@
+# ipc-contract-audit waivers.
+#
+# A waived finding is still audited and still printed — the waiver only stops it failing the gate.
+# A waiver whose finding has gone FAILS the gate, so it expires by itself rather than accumulating.
+# Every line needs a reason naming the tracked defect and what closes it.
+#
+# The key is `check@thing`, where `thing` is a command name (for `shape`) or a path. Never a line
+# number: the next edit above it would silently move the waiver onto a different finding.
+
+# ── five commands whose reply has no static shape on the Rust side ────────────────────────────────
+# Each returns `serde_json::Value` built somewhere this reader cannot follow (a two-branch `match`,
+# a `.map()` inside a `.collect()`, a `to_value()` of a type in another crate) while the caller reads
+# it as a named TypeScript interface. Nothing is currently WRONG in any of the five — each was
+# compared by hand on 2026-08-17 and agrees, and `TerrainPathResult` correctly marks the two fields
+# the `None` branch omits as optional. But agreement verified once by a person is not a gate, and
+# these are the replies with the least protecting them: no Rust type, so not even a `cargo` error
+# stands between a renamed key and a blank panel.
+#
+# Closing gate for all five: give the command a named `#[derive(Serialize)]` reply type (the shape
+# check then compares it field-by-field, as it already does for the other 128 call sites), or build
+# the reply with one tail `serde_json::json!({..})` this reader can see. Delete the line as each one
+# lands — a stale line fails the gate, so they cannot be forgotten.
+shape@moba_author_starter: TRACKED (progress.md, 2026-08-17) — `Result<serde_json::Value, String>` read as `AuthoredMatch`. Closing gate: a named Serialize reply type, or a tail json! literal.
+shape@moba_cooked: TRACKED (progress.md, 2026-08-17) — `Option<serde_json::Value>` read as `CookedMatch | null`. Closing gate: a named Serialize reply type, or a tail json! literal.
+shape@terrain_presets: TRACKED (progress.md, 2026-08-17) — `Vec<serde_json::Value>` built by a `.map()` inside a `.collect()`, read as `TerrainPreset[]`. Closing gate: a named Serialize reply type for the preset row.
+shape@terrain_read_description: TRACKED (progress.md, 2026-08-17) — `serde_json::to_value()` of a `metrocalk_terrain` type, read as `TerrainReading | null`. Closing gate: return that type directly so its fields are readable.
+shape@terrain_path: TRACKED (progress.md, 2026-08-17) — a two-branch `match`, each arm a different json! literal, read as `TerrainPathResult`. Closing gate: one named Serialize reply type covering both arms.
+
+# ── eight replies whose SHAPE is fine but whose contents are opaque one level down ────────────────
+# The reply is a named `#[derive(Serialize)]` struct, so the top-level field check runs and passes —
+# but one of its fields is typed `serde_json::Value` while the panel reads a fully declared
+# TypeScript interface out of it. The key is on the wire, so nothing here is currently broken; what
+# is missing is any check that what is INSIDE it still matches. Same defect as the five above, one
+# level down, and more dangerous for looking covered.
+# Closing gate: give the inner payload a named Serialize type on the Rust side, then delete the line.
+shape@terrain_create: TRACKED (progress.md, 2026-08-17) — `TerrainReply.recipe`/`.reading` are `Value`, read as `TerrainRecipe`/`TerrainReading`.
+shape@terrain_describe: TRACKED (progress.md, 2026-08-17) — as `terrain_create`.
+shape@terrain_edit: TRACKED (progress.md, 2026-08-17) — as `terrain_create`.
+shape@terrain_paint_end: TRACKED (progress.md, 2026-08-17) — as `terrain_create`.
+shape@terrain_route_commit: TRACKED (progress.md, 2026-08-17) — as `terrain_create`.
+shape@terrain_plan: TRACKED (progress.md, 2026-08-17) — `TerrainPlanDto.understood` is `Value`, read as a declared shape.
+shape@animation_graph_state: TRACKED (progress.md, 2026-08-17) — `AnimationGraphStateInfo.graph` is `Value`, read as `AnimationGraphDocument`.
+shape@propose_composition: TRACKED (progress.md, 2026-08-17) — `ComposeProposal.composition` is `Value`, read as `Composition`.
+
+# ── the one class this gate structurally cannot reach ─────────────────────────────────────────────
+# The E2E suite drives the shell through `browser.execute((c, a) => ..invoke(c, a))` helpers, so at
+# the call site the command name is a runtime value. Not a defect and not fixable by parsing harder;
+# the waiver exists so the COUNT is reviewed rather than the lines skimmed. If the number in the
+# message grows, the audited surface shrank and this line should be questioned, not re-waived.
+coverage@computed-command-names: ACCEPTED LIMIT (progress.md, 2026-08-17) — the E2E `browser.execute` bridge passes the command name as a parameter. Review the count on change; it is the size of the blind spot.
