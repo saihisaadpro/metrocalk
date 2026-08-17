@@ -3348,21 +3348,28 @@ struct RuleRegistryInfo {
     components: Vec<RuleComponentVocab>,
 }
 
-/// A row in the editor's Rule list — a compact projection of an authored rule.
+/// A row in the editor's Rule list: the rule's document id, and the rule.
+///
+/// It used to be a *projection* — `name`, `enabled`, `event`, and three derived counts beside them. Six
+/// restatements of facts [`metrocalk_core::RuleData`] already holds, none of them compared to it by
+/// anything, which is precisely how `condition_count` came to be `conditions.len()` and to report a rule
+/// carrying an OR group as though its alternatives were not there. That defect was latent only for as
+/// long as nothing could author an OR group; it went live the moment the builder could.
+///
+/// So the row carries **one** statement and the list derives what it displays. A count cannot disagree
+/// with the rule it counts when there is no second place to write it down. It also gives the Rule list
+/// what it needs to turn a rule **off**: [`RuleData::enabled`] is honoured by the runtime
+/// (`rule_runtime.rs` — a disabled rule does not fire) but nothing could ever set it `false`, because the
+/// list held a `bool` copy and not the rule to write back. The toggle now replaces the rule through the
+/// existing `author_rule(rule, id)` path — validated, undoable, persisted, no new command.
+///
+/// `rule`'s *own* fields stay snake_case: `rename_all` renames this struct's fields, never a nested
+/// type's, and `RuleData` is plain serde by design (`protocol.ts` says the same thing on its side).
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct RuleSummary {
     id: String,
-    name: String,
-    enabled: bool,
-    event: String,
-    condition_count: usize,
-    /// The size of the rule's OR group ([`metrocalk_core::RuleData::any_of`]) — carried separately from
-    /// `condition_count` because it is a different claim: those clauses need only ONE to hold, so folding
-    /// them into the AND count would make the list say "all of these" about a rule that means "any of
-    /// these". A rule with alternatives used to render its If as though they were not there.
-    any_of_count: usize,
-    action_count: usize,
+    rule: metrocalk_core::RuleData,
 }
 
 /// The result of authoring a rule: the new id on success, a plain-language `error` if the registry
@@ -12885,17 +12892,14 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 }
             }
             EngineCmd::ListRules { reply } => {
+                // No projection: the row IS the rule (plus its id). Deriving `condition_count` here is what
+                // let the count drift from the rule — see `RuleSummary`.
                 let out = engine
                     .rules()
                     .into_iter()
-                    .map(|(id, r)| RuleSummary {
+                    .map(|(id, rule)| RuleSummary {
                         id: id.as_str().to_string(),
-                        name: r.name,
-                        enabled: r.enabled,
-                        event: r.event,
-                        condition_count: r.conditions.len(),
-                        any_of_count: r.any_of.len(),
-                        action_count: r.actions.len(),
+                        rule,
                     })
                     .collect();
                 let _ = reply.send(out);

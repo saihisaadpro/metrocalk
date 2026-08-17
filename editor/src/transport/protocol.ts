@@ -946,18 +946,19 @@ export interface RuleData {
   actions: RuleAction[];
 }
 
-/** A row in the editor Rule list (`list_rules`, camelCase serde). */
+/** A row in the editor Rule list (`list_rules`, camelCase serde) — the rule's document id, and the rule.
+ *
+ *  This used to be a projection: `name` / `enabled` / `event` plus `conditionCount` / `anyOfCount` /
+ *  `actionCount` — six restatements of facts `RuleData` already holds, compared to it by nothing. That
+ *  is how `condition_count` came to be `conditions.len()` and to report a rule carrying an OR group as
+ *  though its alternatives were not there. The list derives what it shows from `rule`, so a count has
+ *  nowhere to disagree from.
+ *
+ *  `rule`'s fields stay snake_case: Rust's `rename_all` renames the *outer* struct's fields only, and
+ *  `RuleData` is plain serde. */
 export interface RuleSummary {
   id: string;
-  name: string;
-  enabled: boolean;
-  event: string;
-  /** How many AND clauses the rule's **If** carries. */
-  conditionCount: number;
-  /** How many alternatives its OR group carries — counted separately because they are a different claim
-   *  ("any one of these"), and folding them into `conditionCount` would read as "all of these". */
-  anyOfCount: number;
-  actionCount: number;
+  rule: RuleData;
 }
 
 /** One dropdown entry — a registry event or action verb (name + plain-language description). */

@@ -1605,10 +1605,18 @@ class MockClient implements EditorClient {
     editingEntity: null,
   };
   // M12.2 (dev MockCore): authored machines are kept in-memory so the state-graph actually RENDERS in
-  // `npm run dev` (a graph needs data — unlike the inert rules mock). The real validation/no-dangling +
-  // undo + reload are the live `.exe` path; this dev mock stores + returns, it does not validate.
+  // `npm run dev`. The real validation/no-dangling + undo + reload are the live `.exe` path; this dev
+  // mock stores + returns, it does not validate.
   private machines: StateMachineInfo[] = [];
   private smSeq = 0;
+  // M12.1 (dev MockCore): the same, for rules — and it was NOT the same until now. `listRules` returned
+  // `[]` unconditionally while `authorRule` reported success, so `npm run dev` had a Create button that
+  // announced "Rule created" over a list that stayed empty forever, and every list-side affordance (the
+  // counts, the on/off toggle, the remove) was unreachable in the dev build. A mock that answers
+  // "success" and then "nothing" is worse than one that refuses: it is the C6 failure — green against
+  // the mock, and a different story against `/core` — pointed the other way.
+  private rules: RuleSummary[] = [];
+  private ruleSeq = 0;
   // Browser/dev animation model. The packaged editor routes the same contract to the deterministic Rust
   // service; this small mirror keeps the Animation workspace useful in Vite and component tests.
   private animationTracks: AnimationTrackInfo[] = [];
@@ -3051,14 +3059,24 @@ class MockClient implements EditorClient {
       ],
     });
   }
+  // M12.1 rules (dev MockCore): stateful, for the same reason the machines are — a list needs data. It
+  // stores and returns; it does not validate (the registry-Blocked path is the live `.exe`).
   listRules(): Promise<RuleSummary[]> {
-    return Promise.resolve([]);
+    return Promise.resolve(this.rules.map((r) => ({ id: r.id, rule: { ...r.rule } })));
   }
-  authorRule(): Promise<AuthorRuleResult> {
-    return Promise.resolve({ id: "rule-dev", error: null, mirror: null });
+  authorRule(rule: RuleData, id: string | null = null): Promise<AuthorRuleResult> {
+    // `author_rule(rule, id)` REPLACES when an id is given — that is the path the on/off toggle uses,
+    // so the mock has to honour it or the toggle looks like it adds a duplicate rule.
+    const ruleId = id ?? `rule-dev-${++this.ruleSeq}`;
+    const at = this.rules.findIndex((r) => r.id === ruleId);
+    if (at >= 0) this.rules[at] = { id: ruleId, rule };
+    else this.rules.push({ id: ruleId, rule });
+    return Promise.resolve({ id: ruleId, error: null, mirror: null });
   }
-  deleteRule(): Promise<boolean> {
-    return Promise.resolve(true);
+  deleteRule(id: string): Promise<boolean> {
+    const before = this.rules.length;
+    this.rules = this.rules.filter((r) => r.id !== id);
+    return Promise.resolve(this.rules.length < before);
   }
   // M12.2 state machines (dev MockCore): stateful so the state-graph renders in `npm run dev`. Each new
   // (empty-id) transition gets a dev edge id; `current` defaults to `initial` (the M12.5 seam).
