@@ -17,6 +17,10 @@ target/
 # 26.8 GB and 926 MB respectively when this was written.
 /.codex-pipe-target/
 /target-scene-glb-agent/
+# The zero-byte file the session harness drops at the mount root to prove the mount is writable.
+# It reappears every session; without this it shows up as an untracked file in every `git status`,
+# which is exactly the ambient noise that trains a reader to stop looking at the list.
+/__probe
 # One-off scratch: a layout probe binary + its source, and two extraction dumps.
 /check_layout
 /check_layout.rs
