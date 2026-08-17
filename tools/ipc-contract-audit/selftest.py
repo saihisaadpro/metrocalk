@@ -43,6 +43,7 @@ fn entity_info(state: State<AppState>, id: String) -> EntityInfo {
         placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new() },
         seen_at: 0,
         tag_count: 0,
+        facing: Facing::FaceNorth,
     }
 }"""
 
@@ -89,12 +90,27 @@ pub struct EntityInfo {
     pub placement: Placement,
     pub seen_at: u64,
     pub tag_count: usize,
+    pub facing: Facing,
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Extra {
     pub kind: String,
+}
+
+// A serde enum on a reply field: a bare STRING on the wire, and a contract exactly as binding as a
+// field name. `FaceUp2d` carries a per-variant rename whose value differs from the mechanical
+// snake_case (`face_up2d` — a digit is not an uppercase letter, so serde does not break there),
+// which is the real `Blend1d` -> `blend_1d` shape from this repository. A reader that skipped the
+// attribute would report a drift that is not there.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Facing {
+    FaceNorth,
+    FaceSouth,
+    #[serde(rename = "face_up_2d")]
+    FaceUp2d,
 }
 
 #[derive(serde::Serialize)]
@@ -118,6 +134,7 @@ fn entity_seen(state: State<AppState>) -> EntityInfo {
         placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new() },
         seen_at: 0,
         tag_count: 0,
+        facing: Facing::FaceNorth,
     }
 }
 
@@ -194,10 +211,13 @@ export interface Placement {
   label: string;
 }
 
+export type Facing = "face_north" | "face_south" | "face_up_2d";
+
 export interface EntityInfo {
   id: string;
   parentId: string | null;
   placement: Placement;
+  facing: Facing;
 }
 """
 
@@ -217,7 +237,17 @@ FILES = {
     "editor/src/transport/session.ts": BASE_SESSION,
     "editor/src/store/project.ts": "export interface ProjectInfo { name: string; }\n",
     "editor/src/store/play.ts": "export interface PlayInfo { running: boolean; }\n",
-    "core/src/lib.rs": "pub struct Nothing;\n",
+    # A struct named `Facing` in ANOTHER crate, deliberately. This is the real `Action` collision —
+    # a struct in `core/src/rules.rs` and an unrelated enum in `editor-shell/src/actions.rs`, both
+    # legitimate, both unambiguous in Rust, and indistinguishable to a reader that keys by bare name.
+    # Every `variants` case below therefore also proves same-file resolution: if the reader picked
+    # this struct for `EntityInfo.facing`, no variant comparison would happen at all and the cases
+    # would fail as "missed".
+    "core/src/lib.rs": (
+        "pub struct Nothing;\n\n"
+        "#[derive(serde::Serialize)]\n"
+        "pub struct Facing {\n    pub degrees: f64,\n}\n"
+    ),
 }
 
 
@@ -280,6 +310,42 @@ CASES: list[tuple[str, str, dict, dict]] = [
         r"`EntityInfo\.placement` is read as `Placement`, which requires \['worldXPos'\]",
         {"overrides": {"editor/src/transport/protocol.ts":
                        BASE_PROTOCOL.replace("  worldX: number;", "  worldXPos: number;")}},
+        {},
+    ),
+    (
+        # The quietest drift on this whole boundary. A renamed FIELD reads `undefined` and something
+        # renders blank; a renamed VARIANT arrives as a perfectly ordinary, non-null, correctly-typed
+        # string that simply never equals what the UI compares it to. Nothing throws, nothing is
+        # undefined, and every branch keyed on it is false forever. Changing `rename_all` is the
+        # one-character version: `snake_case` -> `camelCase` and every wire name moves at once.
+        "a `rename_all` that moves every variant's wire name (the quietest drift here)",
+        r"`EntityInfo\.facing` is read as \['face_north'.*\], but `Facing` also sends "
+        r"\['faceNorth', 'faceSouth'\]",
+        {"overrides": {"editor-shell/src-tauri/src/main.rs":
+                       swap(BASE_MAIN,
+                            '#[serde(rename_all = "snake_case")]\npub enum Facing {',
+                            '#[serde(rename_all = "camelCase")]\npub enum Facing {')}},
+        {},
+    ),
+    (
+        # The other direction, and the reason a rename SURVIVES review: the new name gets added on
+        # both sides and the old one is left behind on one of them, where it reads as ordinary
+        # defensive coding rather than as a branch that can never fire.
+        "a union member the enum never sends — a comparison that is false forever",
+        r"admits \['face_down'\], which `Facing` never sends",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       swap(BASE_PROTOCOL, '| "face_up_2d";', '| "face_up_2d" | "face_down";')}},
+        {},
+    ),
+    (
+        # A unit-only enum is a bare string. The moment ONE variant carries data, serde writes the
+        # whole enum externally tagged — `{"FaceNorth": ..}` — and every string comparison the caller
+        # makes is false against an object. Not reach loss: a disagreement.
+        "an enum that stopped being a string on the wire, still read as one",
+        r"is read as the string union .*but `Facing` is not a string on the wire: "
+        r"`FaceSouth` carries data",
+        {"overrides": {"editor-shell/src-tauri/src/main.rs":
+                       swap(BASE_MAIN, "    FaceSouth,\n", "    FaceSouth(u32),\n")}},
         {},
     ),
     (
@@ -442,6 +508,30 @@ CASES: list[tuple[str, str, dict, dict]] = [
 # sense: the assertion is about the repair, and it fails if the repair is reverted.
 
 
+def _field_case_for_variants(name: str, rename_all: str | None) -> str:
+    """The one-table mistake: serde's FIELD rule applied to a variant.
+
+    serde has two rename functions and they disagree on almost every input, because a field arrives
+    snake_case and a variant arrives PascalCase. Under `rename_all = "snake_case"` the field rule is
+    the identity — so `FaceNorth` would stay `FaceNorth` while the wire carries `face_north`, and
+    every variant in the repository would be reported as drifted at once.
+    """
+    import rustipc as _r
+
+    return _r.wire_case(name, rename_all)
+
+
+def _ignore_variant_rename(attrs: str) -> None:
+    """Skip `#[serde(rename = "..")]` on a variant — the FALSE-finding failure mode.
+
+    This is the one that matters most for a check nobody will re-derive by hand: `Blend1d` is on the
+    wire as `blend_1d` only because of this attribute (mechanical snake_case gives `blend1d`), so a
+    reader that ignored it would confidently report a drift in code that is correct. A gate that
+    cries wolf on correct code gets waived, and a waived gate checks nothing.
+    """
+    return None
+
+
 def _old_return_type(src: str, i: int) -> str:
     """The original: a regex stopping at `{` OR `;`. `-> [f64; 8]` contains a semicolon."""
     m = re.match(r"\s*->\s*([^{;]+)\{", src[i:])
@@ -454,6 +544,20 @@ def _old_angle(src: str, i: int) -> bool:
 
 
 READER_MUTATIONS: list[tuple[str, str, str, object, dict]] = [
+    (
+        "serde's variant rule is not its field rule, and one table for both is wrong",
+        r"`Facing` also sends \['FaceNorth', 'FaceSouth'\]",
+        "rustipc.variant_case",
+        _field_case_for_variants,
+        {},
+    ),
+    (
+        "a per-variant #[serde(rename)] ignored invents a drift in correct code",
+        r"`Facing` also sends \['face_up2d'\]",
+        "rustipc.variant_rename",
+        _ignore_variant_rename,
+        {},
+    ),
     (
         "a fixed-size array must not read as no return value at all",
         r"reads a reply, but the command returns nothing",

@@ -14,6 +14,11 @@ declarations, not Rust:
   * the `generate_handler![..]` list, which is what actually decides whether a name exists;
   * `#[derive(Serialize)]` structs, resolved to their WIRE field names under `rename_all`,
     `rename`, `skip` and `skip_serializing_if`;
+  * `#[derive(Serialize)]` **enums**, resolved to the set of STRINGS they can put on the wire —
+    which is a contract exactly as binding as a field name, and quieter when it drifts: a renamed
+    field reads `undefined` and a blank renders, but a renamed *variant* arrives as a perfectly
+    ordinary, non-null, correctly-typed string that simply never equals what the UI compares it to.
+    Nothing is undefined, nothing throws, and the branch is false forever;
   * a command that returns `serde_json::Value` by building one `serde_json::json!({..})` — the
     ad-hoc DTOs, which are the ones with no type anywhere to protect them.
 
@@ -79,11 +84,48 @@ class Dto:
 
 
 @dataclass
+class SerdeEnum:
+    """A Rust enum resolved to the set of strings it can put on the wire.
+
+    Only a **unit-only** enum is a string on the wire. The moment one variant carries data, serde's
+    default representation is externally tagged — `{"Variant": payload}`, an object — and comparing
+    that to a string union would be a confident wrong answer. `string_like` records which it is and
+    `why_not` records the reason, because "this enum is not comparable" and "this enum agrees" must
+    never produce the same silence.
+    """
+
+    name: str
+    variants: tuple[str, ...]  # WIRE names, in declaration order
+    line: int
+    file: str
+    rename_all: str | None = None
+    string_like: bool = True
+    why_not: str = ""
+    #: `#[serde(other)]` on a variant makes the enum accept any unknown string on the way IN, so a
+    #: member the Rust does not declare is not provably dead. Absence stops being provable, exactly
+    #: as `serde(flatten)` stops absence being provable for a struct.
+    has_other: bool = False
+    #: A struct of the same bare name exists. Both readers key by name, so a field typed `Action`
+    #: could mean either; the struct reader is the older and better-guarded one, so it keeps the
+    #: field and this enum is reported as a reach gap rather than used to judge anything.
+    struct_collision: str = ""
+
+
+@dataclass
 class RustIpc:
     commands: dict[str, Command] = field(default_factory=dict)
     registered: list[str] = field(default_factory=list)
     dtos: dict[str, Dto] = field(default_factory=dict)
+    enums: dict[str, SerdeEnum] = field(default_factory=dict)
     handler_found: bool = False
+    #: (file, bare name) -> declaration. `dtos`/`enums` are keyed by bare name and the last file
+    #: parsed wins, which is fine until two files declare the same name — `Action` is a struct in
+    #: `core/src/rules.rs` and an enum in `editor-shell/src/actions.rs`, both legitimate, both
+    #: unambiguous in Rust because Rust resolves through module paths. These let a lookup prefer the
+    #: declaration in the SAME FILE as the field that names it, which is what a bare `Action` in
+    #: that file can only mean.
+    dtos_local: dict[tuple[str, str], Dto] = field(default_factory=dict)
+    enums_local: dict[tuple[str, str], SerdeEnum] = field(default_factory=dict)
 
 
 # ── source hygiene ────────────────────────────────────────────────────────────────────────────────
@@ -204,19 +246,63 @@ def camel(s: str) -> str:
     return head + "".join(w[:1].upper() + w[1:] for w in rest)
 
 
+def _snake_from_pascal(v: str) -> str:
+    """serde's `SnakeCase.apply_to_variant`: an `_` before every uppercase but the first.
+
+    `Blend1d` becomes `blend1d`, NOT `blend_1d` — a digit is not an uppercase letter, so serde does
+    not break there. Getting that wrong in either direction is a false finding, and a false finding
+    on a gate this quiet costs it the authority it needs.
+    """
+    out = []
+    for i, ch in enumerate(v):
+        if i > 0 and ch.isupper():
+            out.append("_")
+        out.append(ch.lower())
+    return "".join(out)
+
+
 def wire_case(name: str, rename_all: str | None) -> str:
+    """serde's `RenameRule::apply_to_FIELD` — the input is a snake_case Rust field name.
+
+    Field rules and variant rules are DIFFERENT functions in serde and must be different functions
+    here. Under `rename_all = "lowercase"` a field is left ALONE (it is already lowercase); the
+    variant `ReferencePose` becomes `referencepose`. One table serving both is one table that is
+    wrong for one of them.
+    """
+    if rename_all in (None, "lowercase", "snake_case"):
+        return name
+    if rename_all in ("UPPERCASE", "SCREAMING_SNAKE_CASE"):
+        return name.upper()
     if rename_all == "camelCase":
         return camel(name)
     if rename_all == "PascalCase":
         c = camel(name)
         return c[:1].upper() + c[1:]
-    if rename_all in ("SCREAMING_SNAKE_CASE", "SCREAMING-KEBAB-CASE"):
-        out = name.upper()
-        return out.replace("_", "-") if rename_all.endswith("KEBAB-CASE") else out
     if rename_all == "kebab-case":
         return name.replace("_", "-")
+    if rename_all == "SCREAMING-KEBAB-CASE":
+        return name.upper().replace("_", "-")
+    return name
+
+
+def variant_case(name: str, rename_all: str | None) -> str:
+    """serde's `RenameRule::apply_to_VARIANT` — the input is a PascalCase Rust variant name."""
+    if rename_all in (None, "PascalCase"):
+        return name
     if rename_all == "lowercase":
-        return name.replace("_", "").lower()
+        return name.lower()
+    if rename_all == "UPPERCASE":
+        return name.upper()
+    if rename_all == "camelCase":
+        return name[:1].lower() + name[1:]
+    if rename_all == "snake_case":
+        return _snake_from_pascal(name)
+    if rename_all == "SCREAMING_SNAKE_CASE":
+        return _snake_from_pascal(name).upper()
+    if rename_all == "kebab-case":
+        return _snake_from_pascal(name).replace("_", "-")
+    if rename_all == "SCREAMING-KEBAB-CASE":
+        return _snake_from_pascal(name).upper().replace("_", "-")
     return name
 
 
@@ -322,6 +408,104 @@ def _is_opaque(ty: str) -> bool:
     return False
 
 
+def variant_rename(attrs: str) -> str | None:
+    """A per-variant `#[serde(rename = "..")]`, which beats `rename_all` outright.
+
+    Its own function so the self-test can replace it and prove that ignoring it produces a FALSE
+    finding — the failure mode that matters most for a check this quiet. `Blend1d` is on the wire as
+    `blend_1d` in this repository only because someone wrote this attribute; the mechanical
+    snake_case of `Blend1d` is `blend1d`, and a reader that skipped the attribute would confidently
+    report a drift that is not there.
+    """
+    m = _RENAME.search(attrs)
+    return m.group(1) if m else None
+
+
+def _parse_enums(src: str, rel: str, out: RustIpc) -> None:
+    """`#[derive(Serialize)] enum X { .. }` resolved to the strings it can put on the wire.
+
+    Three things decide the wire name of a variant and all three are read here: the enum's
+    `rename_all` (through `variant_case`, which is NOT the field rule), a per-variant
+    `#[serde(rename = "..")]` (which wins outright — `Blend1d` is on the wire as `blend_1d` in this
+    repository only because someone wrote that attribute, and a reader that ignored it would report
+    a drift that is not there), and `#[serde(skip)]`, which takes the variant off the wire entirely.
+
+    An enum that is not a bare string on the wire is recorded with `string_like=False` and the
+    reason, never dropped: dropping it would make "I cannot compare this" indistinguishable from
+    "these agree", which is the one outcome this whole tool exists to prevent.
+    """
+    for m in _DERIVE.finditer(src):
+        derives = m.group(1)
+        if "Serialize" not in derives and "Deserialize" not in derives:
+            continue
+        tail = src[m.end() : m.end() + 800]
+        em = re.search(r"\b(?:pub(?:\([^)]*\))?\s+)?enum\s+([A-Za-z_]\w*)(?:<[^>{]*>)?\s*\{", tail)
+        if not em:
+            continue
+        attrs = tail[: em.start()]
+        # Another item in between means this derive belongs to something else.
+        if re.search(r"\b(struct|enum|fn|impl|trait)\b", attrs):
+            continue
+        ob = m.end() + em.end() - 1
+        cb = _match(src, ob, "{", "}")
+        if cb < 0:
+            continue
+        name = em.group(1)
+        line = src.count("\n", 0, m.start()) + 1
+        ra = _RENAME_ALL.search(attrs)
+        rename_all = ra.group(1) if ra else None
+
+        why_not = ""
+        if re.search(r"#\[serde\([^\]]*\buntagged\b", attrs):
+            why_not = "it is #[serde(untagged)], so a variant is its payload and has no name at all"
+        elif re.search(r"#\[serde\([^\]]*\btag\s*=", attrs):
+            why_not = "it is internally/adjacently tagged, so it is an OBJECT on the wire, not a string"
+
+        variants: list[str] = []
+        has_other = False
+        for p in split_top(src[ob + 1 : cb]):
+            p = p.strip()
+            if not p:
+                continue
+            vattrs = " ".join(re.findall(r"#\[serde\(([^\]]*)\)\]", p))
+            decl = re.sub(r"#\[[^\]]*\]", " ", p).strip()
+            vm = re.match(r"([A-Za-z_]\w*)\s*(\(|\{)?", decl)
+            if not vm:
+                continue
+            if re.search(r"(^|[\s,(])skip(?:_serializing)?(\s*[,)]|$)", vattrs):
+                continue  # off the wire entirely
+            if re.search(r"(^|[\s,(])other(\s*[,)]|$)", vattrs):
+                has_other = True
+            forced = variant_rename(vattrs)
+            if vm.group(2) and not why_not:
+                why_not = (
+                    f"`{vm.group(1)}` carries data, so serde writes it externally tagged as "
+                    f'`{{"{vm.group(1)}": ..}}` — an object, which a string union cannot describe'
+                )
+            variants.append(forced if forced else variant_case(vm.group(1), rename_all))
+
+        prior = out.enums.get(name)
+        if prior is not None and prior.variants != tuple(variants):
+            # Same bare name, different variants, two files: `enums` is keyed by bare name, so the
+            # second silently wins and a verdict derived from the wrong one is confident and wrong.
+            why_not = why_not or (
+                f"a different `{name}` is declared at {prior.file}:{prior.line} — the reader cannot "
+                "tell which one a field means"
+            )
+        e = SerdeEnum(
+            name,
+            tuple(variants),
+            line,
+            rel,
+            rename_all=rename_all,
+            string_like=not why_not,
+            why_not=why_not,
+            has_other=has_other,
+        )
+        out.enums[name] = e
+        out.enums_local[(rel, name)] = e
+
+
 def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
     for m in _DERIVE.finditer(src):
         if "Serialize" not in m.group(1):
@@ -375,9 +559,11 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
         collides = ""
         if prior is not None and [f for f, _ in prior.fields] != [f for f, _ in fields]:
             collides = f"{prior.file}:{prior.line}"
-        out.dtos[name] = Dto(
+        dto = Dto(
             name, fields, line, rel, opaque=tuple(opaque), collides_with=collides, field_types=ftypes
         )
+        out.dtos[name] = dto
+        out.dtos_local[(rel, name)] = dto
 
 
 _JSON_MACRO = re.compile(r"\bserde_json::json!\s*\(\s*\{")
@@ -443,6 +629,47 @@ def parse(sources: list[tuple[str, str]]) -> RustIpc:
         _parse_commands(src, rel, out)
         _parse_handler(src, out)
         _parse_structs(src, rel, out)
+        _parse_enums(src, rel, out)
     for rel, src in cleaned:
         attach_json_returns(src, rel, out)
+    # A bare name that is BOTH a struct and an enum cannot be resolved by name, and resolving it
+    # anyway is worse than not resolving it: `Action` is a struct in core/src/rules.rs AND an enum
+    # in editor-shell/src/actions.rs, so a field typed `Action` would be compared against whichever
+    # kind the reader happened to try first — an object against a string union, confidently. This
+    # runs after every file because the two declarations need not be in the same one.
+    # A bare name that is BOTH a struct and an enum is only ambiguous to a reader that keys by bare
+    # name; it is never ambiguous in Rust. `Action` is a struct in core/src/rules.rs and an enum in
+    # editor-shell/src/actions.rs, and a bare `Action` written in either file can only mean that
+    # file's own declaration. So the collision is recorded — and resolution prefers the SAME FILE
+    # (see `local_dto` / `local_enum`) rather than whichever kind the reader happened to try first.
+    for name, e in out.enums.items():
+        d = out.dtos.get(name)
+        if d is not None:
+            e.struct_collision = f"{d.file}:{d.line}"
     return out
+
+
+def local_dto(name: str, out: RustIpc, prefer_file: str | None) -> Dto | None:
+    """The struct `name` means in `prefer_file`, falling back to the bare-name table.
+
+    A declaration in the file that names it wins outright: Rust would reject a bare reference to a
+    same-named type from elsewhere without a `use` that shadowed it, so there is no second reading.
+    """
+    if prefer_file is not None:
+        d = out.dtos_local.get((prefer_file, name))
+        if d is not None:
+            return d
+        if (prefer_file, name) in out.enums_local:
+            return None  # locally an ENUM; the global struct of that name is a different type
+    return out.dtos.get(name)
+
+
+def local_enum(name: str, out: RustIpc, prefer_file: str | None) -> SerdeEnum | None:
+    """The enum `name` means in `prefer_file`, falling back to the bare-name table."""
+    if prefer_file is not None:
+        e = out.enums_local.get((prefer_file, name))
+        if e is not None:
+            return e
+        if (prefer_file, name) in out.dtos_local:
+            return None  # locally a STRUCT; the global enum of that name is a different type
+    return out.enums.get(name)

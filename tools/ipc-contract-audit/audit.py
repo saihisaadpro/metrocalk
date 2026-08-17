@@ -30,6 +30,16 @@ This runs the comparison at rest, with no toolchain, no WebView and no GPU:
   shape         every field the caller's `T` requires is one the reply actually carries, a list is
                 a list on both sides, and a fixed-length tuple has the same length on both. A field
                 typed `serde_json::Value` is reported by `coverage` rather than counted as agreed
+  variants      every Rust serde ENUM that reaches a reply, against the TypeScript string union that
+                reads it. This is the quietest drift on the boundary and the last of the three to
+                get a check: a renamed FIELD reads `undefined` and something renders blank, but a
+                renamed VARIANT arrives as an ordinary, non-null, correctly-typed string that simply
+                never equals what the UI compares it to. Nothing throws, nothing is undefined, and
+                every branch keyed on it is false forever. Both directions are reported — a variant
+                the union does not list (the value arrives with no case for it) and a member the
+                enum never sends (a branch that can never fire, which is how a half-finished rename
+                survives review). Only a **unit-only** enum is a string on the wire; one that carries
+                data is externally tagged and is reported as a disagreement, not compared as a string
   nested        the same three comparisons, applied to every object pair the reply CARRIES, as deep
                 as both sides resolve. This check used to not exist, and its absence had a bias
                 worth naming: the verdict depended on how deeply a shape happened to be nested
@@ -41,10 +51,20 @@ This runs the comparison at rest, with no toolchain, no WebView and no GPU:
                 does not, that is `coverage`'s story, not a second telling of it
   coverage      the audit's own reach — see `_coverage_findings`
 
-Known and deliberate limits, so that "0 blocking" is read for what it is: argument STRUCTS
-(`#[derive(Deserialize)]` payloads handed over inside one key) are not parsed, nullability is not
-compared (`Option<T>` still puts the key on the wire), and Rust enums are not read. Each is a place
-a future check goes, not a place this one silently claims success.
+Known and deliberate limits, so that "0 blocking" is read for what it is. Each is a place a future
+check goes, not a place this one silently claims success:
+
+  * argument STRUCTS — a `#[derive(Deserialize)]` payload handed over inside one key
+    (`author_rule({ rule: {..} })`) is compared by its KEY only; the 7 such keys in this tree hide
+    34 fields. This is the loudest of the three, which is why it is last: a drifted argument key
+    fails to deserialise and the command rejects the call;
+  * nullability — `Option<T>` still puts the key on the wire, so a `T | null` read as `T` passes the
+    field check. Measured at the top level today: 17 of 17 typed call sites against an
+    `Option`-returning command DO declare `| null`, so the surface is currently the 175 `Option`
+    FIELDS inside reply DTOs, not the replies themselves;
+  * the `variants` check reads DECLARED types. A spec comparing a reply against a string LITERAL
+    (`if (n.kind === "blend_1d")`) states the same contract in usage, the way `reads` recovers field
+    paths from usage — that is where this check grows next.
 
 Exit status is 1 if any check fails, so it can stand as a gate. Anything it could not read is
 reported and fails too: this gate's predecessor spent a day reporting agreement about files it had
@@ -189,12 +209,21 @@ def _scalar_conflict(rust: str, ts: str) -> str:
     return f"reads {ts} where the reply is {rust}"
 
 
-def rust_shape(ret: str, dtos: dict[str, rustipc.Dto]) -> tuple[object, bool, bool]:
+def rust_shape(
+    ret: str,
+    dtos: dict[str, rustipc.Dto],
+    rs: rustipc.RustIpc | None = None,
+    prefer_file: str | None = None,
+) -> tuple[object, bool, bool]:
     """(shape, is_list, resolved).
 
     `shape` is a `Dto` for an object, a str for a scalar/opaque kind, or None. `resolved` is False
     when the reader could not decide — never conflated with "it is an empty object", because those
     two produce identical output and only one of them is agreement.
+
+    `rs` + `prefer_file` resolve a bare type name against the declarations of the file that WROTE it
+    before falling back to the bare-name table — the same-file rule that makes two unrelated
+    `Action`s (a struct in one crate, an enum in another) each resolve to the right one.
     """
     t = ret.strip()
     is_list = False
@@ -226,11 +255,85 @@ def rust_shape(ret: str, dtos: dict[str, rustipc.Dto]) -> tuple[object, bool, bo
         return "map", is_list, True
     if head == "Value":
         return None, is_list, False  # an untyped reply: no static shape exists on this side
+    if rs is not None and prefer_file is not None:
+        d = rustipc.local_dto(t, rs, prefer_file) or rustipc.local_dto(head, rs, prefer_file)
+        return (d, is_list, True) if d is not None else (None, is_list, False)
     if t in dtos:
         return dtos[t], is_list, True
     if head in dtos:
         return dtos[head], is_list, True
     return None, is_list, False
+
+
+def rust_enum(
+    ty: str, rs: rustipc.RustIpc, prefer_file: str | None = None
+) -> rustipc.SerdeEnum | None:
+    """The serde enum behind a field's type, through `Option`/`Vec`/`Box`, or None.
+
+    `prefer_file` is the file that WROTE the type name. A bare `Action` in
+    `editor-shell/src/actions.rs` can only mean that file's enum, never the unrelated struct of the
+    same name in `core/src/rules.rs` — Rust resolves it through module paths and a bare-name table
+    cannot. Without this the reader compared `ActionItem.action` against the wrong type entirely,
+    which is the confident-wrong-answer class, not the unresolved one.
+    """
+    t = ty.strip()
+    for _ in range(4):
+        head = rustipc.type_head(t)
+        if head in ("Option", "Vec", "VecDeque", "Box", "Arc", "Rc") and "<" in t:
+            t = t[t.index("<") + 1 : t.rindex(">")].strip()
+            continue
+        break
+    head = rustipc.type_head(t)
+    return rustipc.local_enum(t, rs, prefer_file) or rustipc.local_enum(head, rs, prefer_file)
+
+
+def _variant_findings(
+    e: rustipc.SerdeEnum, members: list[str], cmd: str, where: str, path: str, rust_where: str
+) -> list[Finding]:
+    """Compare the strings a Rust enum SENDS against the strings a TypeScript union ADMITS.
+
+    Two failures, and they are not the same failure:
+
+      * a variant the union does not list — the value arrives and the caller has no case for it. A
+        `Record<Union, Label>` lookup returns `undefined`; a `switch` falls through to a default
+        that was written for "impossible";
+      * a member the enum never sends — a branch that can never fire. Nothing breaks, nothing is
+        undefined, and the code reads as though it handles a state the engine stopped having. This
+        is how a renamed variant SURVIVES review: the new name is added on both sides and the old
+        one is left behind on one of them, where it looks like ordinary defensive coding.
+
+    Both are reported, both as errors, because both are the same fact — the two sides disagree about
+    the vocabulary — and downgrading either one would make a renamed variant half-visible.
+    """
+    out: list[Finding] = []
+    sends, admits = list(e.variants), list(members)
+    unmodelled = [v for v in sends if v not in admits]
+    dead = [m for m in admits if m not in sends]
+    if unmodelled:
+        out.append(
+            Finding(
+                "error",
+                "variants",
+                where,
+                f'"{cmd}" — `{path}` is read as {admits}, but `{e.name}` also sends '
+                f"{unmodelled} ({rust_where}). The string arrives non-null and correctly typed and "
+                "matches no case the caller has; nothing throws",
+                f"variants@{cmd}.{e.name}",
+            )
+        )
+    if dead and not e.has_other:
+        out.append(
+            Finding(
+                "error",
+                "variants",
+                where,
+                f'"{cmd}" — `{path}` admits {dead}, which `{e.name}` never sends '
+                f"({rust_where} sends {sends}) — {'that comparison is' if len(dead) == 1 else 'those comparisons are'} "
+                "false forever",
+                f"variants@{cmd}.{e.name}",
+            )
+        )
+    return out
 
 
 def ts_shape(
@@ -348,7 +451,7 @@ def _nested_findings(
     ts: tsipc.TsIpc,
     cmd: str,
     where: str,
-) -> tuple[list[Finding], int]:
+) -> tuple[list[Finding], int, int, int, set[str]]:
     """Follow a reply PAST its own keys, and compare each nested object pair the same way.
 
     Comparing only the outermost object was a stated limit, and it was load-bearing in the wrong
@@ -362,9 +465,16 @@ def _nested_findings(
     other does not, that is the coverage story the `Value`-opaque check already tells, and repeating
     it here would be noise rather than reach. Returns the findings and how many nested object pairs
     were compared, so the header can state this reach too instead of implying it.
+
+    A field whose Rust type is a serde ENUM is compared here too, and it is compared before the
+    both-sides-resolve gate rather than after: an enum is not in `dtos`, so `rust_shape` calls it
+    unresolved and the walk used to stop dead at every one of them. That silence looked exactly like
+    agreement. Returns `(findings, object pairs, enum pairs compared, enum pairs unresolvable)`.
     """
     out: list[Finding] = []
     pairs = 0
+    enum_pairs = enum_unresolved = 0
+    enum_names: set[str] = set()
     seen: set[tuple[str, str]] = {(r_shape.name, t_shape.name)}
     # (rust dto, ts type, path, depth) — breadth-first, so a shallow drift is reported before a deep one.
     queue: list[tuple[rustipc.Dto, tsipc.TsType, str, int]] = [(r_shape, t_shape, t_shape.name, 0)]
@@ -380,7 +490,36 @@ def _nested_findings(
             t_ft = t_ty.field_types.get(key)
             if not r_ft or not t_ft:
                 continue
-            r_sub, r_list, r_ok = rust_shape(r_ft, rs.dtos)
+            here_e = f"{path}.{key}"
+            # The file that wrote the field's type is the file whose declarations it can name.
+            e = rust_enum(r_ft, rs, r_dto.file)
+            if e is not None:
+                members = tsipc.string_union(t_ft, ts.aliases)
+                if members is not None and not e.string_like:
+                    # The caller reads a string union; the shell does not send a string. This is not
+                    # reach loss, it is a disagreement — every one of those comparisons is false and
+                    # the value is an object besides.
+                    out.append(
+                        Finding(
+                            "error", "variants", where,
+                            f'"{cmd}" — `{here_e}` is read as the string union {members}, but '
+                            f"`{e.name}` is not a string on the wire: {e.why_not} "
+                            f"({e.file}:{e.line})",
+                            f"variants@{cmd}.{e.name}",
+                        )
+                    )
+                elif not e.string_like or members is None:
+                    # Named, not skipped. An enum the reader cannot compare and an enum that agrees
+                    # must not produce the same silence — that is this tool's founding lesson.
+                    enum_unresolved += 1
+                else:
+                    enum_pairs += 1
+                    enum_names.add(e.name)
+                    out += _variant_findings(
+                        e, members, cmd, where, here_e, f"{e.file}:{e.line}"
+                    )
+                continue
+            r_sub, r_list, r_ok = rust_shape(r_ft, rs.dtos, rs, r_dto.file)
             t_sub, t_list, t_ok = ts_shape(t_ft, ts.types, ts.aliases)
             if not (r_ok and t_ok):
                 continue
@@ -426,25 +565,47 @@ def _nested_findings(
                             f"nested@{cmd}",
                         )
                     )
-    return out, pairs
+    return out, pairs, enum_pairs, enum_unresolved, enum_names
 
 
-def _shape_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> tuple[list[Finding], int, int, int]:
+def _shape_findings(
+    rs: rustipc.RustIpc, ts: tsipc.TsIpc
+) -> tuple[list[Finding], int, int, int, int, int, list[str]]:
     """Returns the findings and, so the header can state the check's REACH, how many replies were
     actually compared and how many of those got a field-by-field comparison rather than only a
     kind/list one. A `shape` line that says nothing is the output of both "they agree" and "I never
     resolved either side", and only the header can tell a reader which."""
     out: list[Finding] = []
     compared = fields_compared = nested_pairs = 0
+    enum_pairs = enum_unresolved = 0
+    #: WHICH enums were reached, not just how many pairs. 63 pairs across 8 distinct enums and 63
+    #: across 29 are very different states of coverage, and only the second number distinguishes
+    #: them — the rest sit behind `serde_json::Value` reply fields that `coverage` already waives.
+    enum_names: set[str] = set()
     for inv in ts.invocations:
         if inv.cmd is None or inv.targ is None or inv.cmd not in rs.commands:
             continue
         cmd = rs.commands[inv.cmd]
         if cmd.unreadable:
             continue
+        where = f"{inv.file}:{inv.line}"
+        # A command whose whole reply IS an enum. `rust_shape` cannot resolve it — an enum is not a
+        # DTO — so before this check every such call site fell to `coverage` as unresolved.
+        top_enum = rust_enum(cmd.ret, rs, cmd.file)
+        if top_enum is not None:
+            members = tsipc.string_union(inv.targ, ts.aliases)
+            if not top_enum.string_like or members is None:
+                enum_unresolved += 1
+            else:
+                enum_pairs += 1
+                enum_names.add(top_enum.name)
+                out += _variant_findings(
+                    top_enum, members, inv.cmd, where,
+                    f"invoke<{inv.targ}>", f"{top_enum.file}:{top_enum.line}",
+                )
+            continue
         r_shape, r_list, r_ok = rust_shape(cmd.ret, rs.dtos)
         t_shape, t_list, t_ok = ts_shape(inv.targ, ts.types, ts.aliases)
-        where = f"{inv.file}:{inv.line}"
         if not (r_ok and t_ok):
             continue  # reported by coverage, not silently dropped
         compared += 1
@@ -562,10 +723,14 @@ def _shape_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> tuple[list[Finding]
                 )
             )
             continue  # the shapes already disagree here; a walk below it would report the same break twice
-        nf, np = _nested_findings(r_shape, t_shape, rs, ts, inv.cmd, where)
+        nf, np, ne, nu, nn = _nested_findings(r_shape, t_shape, rs, ts, inv.cmd, where)
         out.extend(nf)
         nested_pairs += np
-    return out, compared, fields_compared, nested_pairs
+        enum_pairs += ne
+        enum_unresolved += nu
+        enum_names |= nn
+    return (out, compared, fields_compared, nested_pairs, enum_pairs, enum_unresolved,
+            sorted(enum_names))
 
 
 def _tuple_read_findings(
@@ -757,6 +922,38 @@ def _coverage_findings(
                 "the transport moved and every call site is now unaudited",
             )
         )
+    # A name that is both a struct and an enum resolves per-file (`local_dto`/`local_enum`), which
+    # is exact wherever the field's own file declares it. What stays genuinely ambiguous is a THIRD
+    # file naming the type without declaring it — there the bare-name table decides, and it can be
+    # wrong. Only that residue is reported, so the finding names a risk rather than a fact the
+    # reader has already handled.
+    for name, e in sorted(rs.enums.items()):
+        if not e.struct_collision:
+            continue
+        elsewhere = sorted(
+            {
+                d.file
+                for d in rs.dtos.values()
+                if any(rustipc.type_head(t.split("<")[-1].strip("<> ")) == name
+                       or rustipc.type_head(t) == name
+                       for t in d.field_types.values())
+                and (d.file, name) not in rs.dtos_local
+                and (d.file, name) not in rs.enums_local
+            }
+        )
+        if elsewhere:
+            out.append(
+                Finding(
+                    "unresolved",
+                    "coverage",
+                    f"{e.file}:{e.line}",
+                    f"`{name}` is a serde enum here AND a struct at {e.struct_collision}, and "
+                    f"{elsewhere} name(s) the type without declaring either. Same-file resolution "
+                    "cannot decide those, so the bare-name table does — and it may pick the wrong "
+                    "kind. Disambiguate the name",
+                    f"coverage@enum-struct-collision.{name}",
+                )
+            )
     for key, c in sorted(rs.commands.items()):
         if c.unreadable:
             out.append(
@@ -936,12 +1133,15 @@ def run(root: str) -> tuple[list[Finding], dict]:
     findings = _coverage_findings(root, missing, rs, ts)
     compared = fields_compared = nested_pairs = 0
     read_steps = read_unresolved = tuples_compared = 0
+    enum_pairs = enum_unres = 0
+    enum_names: list[str] = []
     if not any(f.check == "coverage" and "audit root does not exist" in f.message for f in findings) \
             and not missing:
         findings += _registration_findings(rs)
         findings += _command_findings(rs, ts)
         findings += _argument_findings(rs, ts)
-        shape, compared, fields_compared, nested_pairs = _shape_findings(rs, ts)
+        (shape, compared, fields_compared, nested_pairs, enum_pairs, enum_unres,
+         enum_names) = _shape_findings(rs, ts)
         findings += shape
         rf, read_steps, read_unresolved = _read_findings(rs, reads)
         findings += rf
@@ -969,18 +1169,24 @@ def run(root: str) -> tuple[list[Finding], dict]:
         "read_unresolved": read_unresolved,
         "tuple_reads": len(tuple_reads),
         "tuples_compared": tuples_compared,
+        "enums": len(rs.enums),
+        "enums_string_like": len([e for e in rs.enums.values() if e.string_like]),
+        "enum_pairs": enum_pairs,
+        "enum_unresolved": enum_unres,
+        "enum_names": enum_names,
         "dtos": len(rs.dtos),
         "ts_types": len(ts.types),
     }
-    order = {"registration": 0, "command": 1, "arguments": 2, "shape": 3, "nested": 4, "reads": 5,
-             "coverage": 6}
+    order = {"registration": 0, "command": 1, "arguments": 2, "shape": 3, "nested": 4,
+             "variants": 5, "reads": 6, "coverage": 7}
     findings.sort(key=lambda f: (order.get(f.check, 9), f.where, f.message))
     return findings, stats
 
 
 SUCCESS = (
-    "every invoked command exists, every argument key is accepted, and every reply field the UI reads "
-    "— at the top level and every level under it the reader can resolve — is one the shell sends."
+    "every invoked command exists, every argument key is accepted, every reply field the UI reads "
+    "— at the top level and every level under it the reader can resolve — is one the shell sends, "
+    "and every enum reaching the UI sends exactly the strings the UI compares against."
 )
 
 
@@ -1022,7 +1228,11 @@ def main() -> int:
             f"{stats['read_paths']} distinct field path(s) read off them, {stats['read_steps']} "
             f"step(s) compared ({stats['read_unresolved']} walk(s) stopped early), and "
             f"{stats['tuples_compared']} of {stats['tuple_reads']} positional destructuring(s) "
-            f"compared for arity"
+            f"compared for arity; "
+            f"{stats['enums_string_like']} of {stats['enums']} serde enum(s) are a bare string on "
+            f"the wire, and {stats['enum_pairs']} enum/string-union pair(s) across "
+            f"{len(stats['enum_names'])} distinct enum(s) had their variant sets compared "
+            f"({stats['enum_unresolved']} could not be)"
         )
         for f in findings:
             tag = "ERROR " if f.severity == "error" else "UNRESL"

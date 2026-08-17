@@ -272,6 +272,36 @@ def object_literal_fields(t: str) -> list[tuple[str, bool]] | None:
     return _object_fields(t[1:-1])
 
 
+def string_union(t: str, aliases: dict[str, str] | None = None) -> list[str] | None:
+    """The string literals a type expression admits, or None if it is not a union of them.
+
+    `"a" | "b"`, a named alias of one, `("a" | "b")[]` and `Foo | null` all resolve; `string`,
+    `"a" | number` and anything with a non-literal member do not — a union with `string` in it
+    admits every string, so nothing about it is checkable and pretending otherwise would be the
+    confident-answer-on-a-failed-read this tool exists to avoid.
+
+    Order is preserved and duplicates are kept out, so a caller can report the members in the order
+    a reader would find them in the source.
+    """
+    base, _is_list, _nullable = unwrap(t, aliases)
+    base = base.strip()
+    if base.startswith("(") and _match(base, 0, "(", ")") == len(base) - 1:
+        base = base[1:-1].strip()
+    parts = [p.strip() for p in split_top(base, "|")]
+    if not parts or parts == [""]:
+        return None
+    out: list[str] = []
+    for p in parts:
+        if p in ("null", "undefined"):
+            continue
+        m = re.fullmatch(r"""["'](.*)["']""", p, re.S)
+        if not m:
+            return None
+        if m.group(1) not in out:
+            out.append(m.group(1))
+    return out or None
+
+
 def unwrap(t: str, aliases: dict[str, str] | None = None) -> tuple[str, bool, bool]:
     """`(Foo | null)[]` -> ("Foo", is_list=True, nullable=False). Peels null/undefined and arrays.
 
