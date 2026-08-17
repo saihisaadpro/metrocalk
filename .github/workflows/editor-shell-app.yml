@@ -18,11 +18,13 @@ on:
     paths:
       - "editor-shell/src-tauri/**"
       - "editor-shell/web/**"
+      - "tools/gpu-contract-audit/**"
       - ".github/workflows/editor-shell-app.yml"
   pull_request:
     paths:
       - "editor-shell/src-tauri/**"
       - "editor-shell/web/**"
+      - "tools/gpu-contract-audit/**"
 
 permissions:
   contents: read
@@ -34,6 +36,19 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
+
+      # Every render pipeline is described twice — once in WGSL, once in Rust — and wgpu only compares the
+      # two at pipeline creation, on a machine with a GPU. Neither this job nor `clippy --all-targets` can
+      # see a disagreement: the Rust compiles either way. That is how `examples/mesh_frame_bench` drifted
+      # four times over and took the repository's only automatable render evidence with it. This runs the
+      # same comparison at rest, in milliseconds, before the heavy Rust steps — so it fails FIRST and names
+      # the pipeline, the location and the rule, instead of a byte count at run time. Its `--self-test`
+      # replays the drifts that actually happened, so a gate that stops catching them fails on itself.
+      - name: GPU contract — the Rust still describes the WGSL's pipelines
+        shell: bash
+        run: |
+          python tools/gpu-contract-audit/audit.py --self-test
+          python tools/gpu-contract-audit/audit.py
 
       # `tauri::generate_context!()` embeds `frontendDist` (tauri.conf.json → ../../editor/dist) at compile
       # time, so the dir must EXIST or the macro panics. `editor/dist` is a gitignored Vite BUILD ARTIFACT

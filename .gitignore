@@ -33,3 +33,7 @@ target/
 /progress/
 /decisions/
 /docs/
+
+# Python bytecode from the repo tools (gpu-contract-audit)
+__pycache__/
+*.pyc

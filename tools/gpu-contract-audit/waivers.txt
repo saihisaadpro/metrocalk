@@ -1,0 +1,7 @@
+# gpu-contract-audit waivers.
+#
+# A waived file is still audited and its findings still printed — the waiver only stops them
+# failing the gate. A waiver whose file has become clean FAILS the gate, so it expires by itself.
+# Every line needs a reason naming the tracked defect and what closes it.
+
+examples/mesh_frame_bench.rs: TRACKED (progress.md, 2026-08-16) — the offscreen render-evidence bench restates the renderer's pipeline instead of building it. Closing gate: prompt 118 extracts the renderer's pipeline construction from `render.rs::start`, the bench builds on it, this waiver is deleted, and the bench writes `evidence/m4-mesh-scene.png` again on a GPU host.
