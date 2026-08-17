@@ -138,13 +138,16 @@ export function ImportReport({ client }: { client: EditorClient }) {
                 </span>
                 <Badge tone={cls.tone}>{cls.label}</Badge>
               </div>
+              {/* All three are `string | null` — the shell sends the key holding null when it has
+                  nothing to say — so this line is absent, not empty, when none of them carries a
+                  value. `data-testid` rather than the prose, so the test keys on a stable token. */}
               {(p.reference || p.strategy || p.sourceFormat) && (
-                <div style={{ font: font.mono, fontSize: fontSize.meta, color: color.text.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <div data-testid="import-row-provenance" style={{ font: font.mono, fontSize: fontSize.meta, color: color.text.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {[p.reference, p.strategy, p.sourceFormat].filter(Boolean).join(" · ")}
                 </div>
               )}
               {fix && (
-                <div style={{ font: font.ui, fontSize: fontSize.meta, color: color.text.muted, marginTop: 2 }}>
+                <div data-testid="import-row-fix" style={{ font: font.ui, fontSize: fontSize.meta, color: color.text.muted, marginTop: 2 }}>
                   Fix: {fix}
                 </div>
               )}

@@ -736,16 +736,23 @@ export interface AnimationGraphPreviewResult {
 }
 
 /** One row of the M15.7 (ADR-077) import report — a CAD part + its honesty class (the persisted `CadPart`
- *  fidelity token, so this survives reload). Mirrors `CadReportPart`. */
+ *  fidelity token, so this survives reload). Mirrors `CadReportPart`.
+ *
+ *  The five explanatory fields are `| null`, not `?`, because that is what arrives: they are bare
+ *  `Option<String>` on the shell with no `skip_serializing_if`, so serde puts the key on the wire
+ *  holding `null` rather than omitting it. Under strictNullChecks the two are not interchangeable —
+ *  `?` is `string | undefined` and rejects `null` — so `?` would let `tsc` narrow
+ *  `p.reason !== undefined` to `string` and bless a read that throws. `ipc-contract-audit`'s
+ *  `nullable` check compares this declaration against the serde attribute on every push. */
 export interface CadReportPart {
   id: string;
   name: string;
   fidelity: string; // "exact-brep" | "tessellation-only" | "ai-reconstructed" | "proxy" | "access-denied" | "failed"
-  reference?: string;
-  strategy?: string;
-  reason?: string;
-  fix?: string;
-  sourceFormat?: string;
+  reference: string | null;
+  strategy: string | null;
+  reason: string | null;
+  fix: string | null;
+  sourceFormat: string | null;
 }
 
 /** The per-part CAD import report aggregated from the ECS — the fidelity breakdown (the header) + a capped

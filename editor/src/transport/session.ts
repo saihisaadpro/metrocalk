@@ -2373,7 +2373,12 @@ class MockClient implements EditorClient {
       else if (fidelity === "proxy") r.proxy++;
       else if (fidelity === "access-denied") r.accessDenied++;
       else r.failed++;
-      if (r.parts.length < 500) r.parts.push({ id, name: e.name, fidelity });
+      // `null`, not omitted: the shell's `CadReportPart` is bare `Option<String>` with no
+      // `skip_serializing_if`, so every one of these keys IS on the wire holding null. A mock that
+      // omits them builds a part the real core cannot produce — the C6 shape, where a panel is green
+      // against MockCore and wrong against `/core`.
+      if (r.parts.length < 500)
+        r.parts.push({ id, name: e.name, fidelity, reference: null, strategy: null, reason: null, fix: null, sourceFormat: null });
     }
     return Promise.resolve(r);
   }
