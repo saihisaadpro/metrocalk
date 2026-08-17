@@ -3,3 +3,10 @@ dist/
 *.log
 .vite/
 *.tsbuildinfo
+
+# This project's lockfile is pnpm-lock.yaml — CI installs with `pnpm install --frozen-lockfile`.
+# A package-lock.json here is a local artefact of someone typing `npm install` out of habit, and it
+# is ignored rather than merely deleted: an 85-byte EMPTY one (`"packages": {}`) WAS tracked for two
+# months beside the real lockfile, and made `npm ci` fail with an unhelpful error. Deleting it once
+# would have let the next `npm install` commit it again.
+package-lock.json
