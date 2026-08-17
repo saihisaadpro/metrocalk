@@ -3357,6 +3357,11 @@ struct RuleSummary {
     enabled: bool,
     event: String,
     condition_count: usize,
+    /// The size of the rule's OR group ([`metrocalk_core::RuleData::any_of`]) — carried separately from
+    /// `condition_count` because it is a different claim: those clauses need only ONE to hold, so folding
+    /// them into the AND count would make the list say "all of these" about a rule that means "any of
+    /// these". A rule with alternatives used to render its If as though they were not there.
+    any_of_count: usize,
     action_count: usize,
 }
 
@@ -12889,6 +12894,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         enabled: r.enabled,
                         event: r.event,
                         condition_count: r.conditions.len(),
+                        any_of_count: r.any_of.len(),
                         action_count: r.actions.len(),
                     })
                     .collect();

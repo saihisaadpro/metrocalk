@@ -262,7 +262,7 @@
       "literal-motion": 0
     },
     "src/panels/RulesPanel.tsx": {
-      "raw-native-control": 20,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0

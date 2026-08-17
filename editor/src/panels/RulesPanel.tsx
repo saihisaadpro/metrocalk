@@ -3,11 +3,19 @@
 //! list. Authoring is one undoable transaction; a registry-rejected rule shows its **Blocked + explained**
 //! reason inline (ADR-016); and when the engine offers a **mirror "cleanup" rule** (the missing-"off"-switch
 //! guard) it's surfaced as a toast the user can accept. Running rules is M12.5.
+//!
+//! The **If** is two claims, not one: an AND list every clause of which must hold, plus at most ONE OR group
+//! ("either …") of which any single alternative is enough. That is the shape `metrocalk_core::rules::
+//! RuleData` has always evaluated and persisted; until now this builder could only author the AND half, so a
+//! rule meaning "if it's lit OR it's wet" was unreachable through the panel that presents itself as the
+//! whole of When/If/Then. One group, never nested — the authored depth ceiling is two, which is what keeps a
+//! conditional readable as a sentence (the same ceiling the per-object "Only if…" cards hold themselves to).
 
 import { useEffect, useState } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { pushToast } from "../store/toasts";
+import { Button, NumericField, SelectField, TextField } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type {
@@ -30,15 +38,14 @@ const OPS: { op: CompareOp; label: string }[] = [
 ];
 
 const box: React.CSSProperties = { font: `${fontSize.meta}px ${font.mono}`, padding: space.lg };
-const ctrl: React.CSSProperties = {
-  minHeight: 30,
-  padding: `${space.xxs}px ${space.sm}px`,
-  border: `1px solid ${color.border.default}`,
-  borderRadius: radius.sm,
-  color: color.text.primary,
-  background: color.bg.input,
-  font: `${fontSize.micro}px ${font.mono}`,
-};
+/** One clause/action row: the controls wrap rather than overflow the dock at narrow widths. */
+const row: React.CSSProperties = { display: "flex", gap: 4, flexWrap: "wrap", margin: "3px 0", alignItems: "center" };
+/** The pickers SHARE the row instead of each claiming an intrinsic width — otherwise the shared control
+ *  sizing pushes the row past the dock and the remove button wraps onto a line of its own, which reads as
+ *  a broken row rather than a dense one. They grow into whatever the dock gives them and shrink to these
+ *  floors before the row is allowed to wrap. */
+const grow = (basis: number): React.CSSProperties => ({ flex: `1 1 ${basis}px`, minWidth: 64 });
+const fixed = (w: number): React.CSSProperties => ({ flex: `0 0 ${w}px` });
 
 function fieldTy(reg: RuleRegistryInfo, component: string, field: string): string {
   return reg.components.find((c) => c.name === component)?.fields.find((f) => f.name === field)?.ty ?? "string";
@@ -72,39 +79,35 @@ function ValueInput({
 }) {
   if (ty === "boolean") {
     return (
-      <select
+      <SelectField
         aria-label={ariaLabel}
         data-testid="rule-value"
-        style={ctrl}
+        style={fixed(84)}
         value={"Bool" in value ? String(value.Bool) : "false"}
         onChange={(e) => onChange({ Bool: e.target.value === "true" })}
       >
         <option value="true">true</option>
         <option value="false">false</option>
-      </select>
+      </SelectField>
     );
   }
   if (ty === "integer" || ty === "number") {
     return (
-      <input
-        aria-label={ariaLabel}
+      <NumericField
+        ariaLabel={ariaLabel}
         data-testid="rule-value"
-        type="number"
-        style={{ ...ctrl, width: 64 }}
-        value={rawValue(value)}
-        onChange={(e) => {
-          const n = Number(e.target.value);
-          onChange(ty === "integer" ? { Integer: Math.trunc(n) } : { Number: n });
-        }}
+        value={Number(rawValue(value)) || 0}
+        integer={ty === "integer"}
+        style={{ width: 72, ...fixed(72) }}
+        onCommit={(n) => onChange(ty === "integer" ? { Integer: Math.trunc(n) } : { Number: n })}
       />
     );
   }
   return (
-    <input
+    <TextField
       aria-label={ariaLabel}
       data-testid="rule-value"
-      type="text"
-      style={{ ...ctrl, width: 96 }}
+      style={fixed(96)}
       value={rawValue(value)}
       onChange={(e) => onChange({ Str: e.target.value })}
     />
@@ -132,10 +135,10 @@ function TargetPicker({
   const fields = reg.components.find((c) => c.name === component)?.fields ?? [];
   return (
     <>
-      <select
+      <SelectField
         aria-label={`${contextLabel} entity`}
         data-testid="rule-entity"
-        style={ctrl}
+        style={grow(88)}
         value={entity}
         onChange={(e) => onChange({ entity: e.target.value })}
       >
@@ -145,11 +148,11 @@ function TargetPicker({
             {o.name}
           </option>
         ))}
-      </select>
-      <select
+      </SelectField>
+      <SelectField
         aria-label={`${contextLabel} component`}
         data-testid="rule-component"
-        style={ctrl}
+        style={grow(88)}
         value={component}
         onChange={(e) => {
           const c = reg.components.find((x) => x.name === e.target.value);
@@ -161,11 +164,11 @@ function TargetPicker({
             {c.name}
           </option>
         ))}
-      </select>
-      <select
+      </SelectField>
+      <SelectField
         aria-label={`${contextLabel} field`}
         data-testid="rule-field"
-        style={ctrl}
+        style={grow(72)}
         value={field}
         onChange={(e) => onChange({ field: e.target.value })}
       >
@@ -174,8 +177,70 @@ function TargetPicker({
             {f.name}
           </option>
         ))}
-      </select>
+      </SelectField>
     </>
+  );
+}
+
+/** One **If** clause — `<entity>.<component>.<field> <op> <value>`, plus its remove control.
+ *
+ *  The AND list and the OR group render through this one component on purpose: an alternative is exactly a
+ *  condition that happens to be joined differently, so a divergence between "a condition row" and "an
+ *  alternative row" could only ever be a bug. `label` ("Condition 1" / "Alternative 1") is what makes the
+ *  repeated controls tell an assistive reader — and a black-box test — which row they belong to. */
+function ClauseRow({
+  reg,
+  entityOptions,
+  clause,
+  label,
+  onChange,
+  onRemove,
+}: {
+  reg: RuleRegistryInfo;
+  entityOptions: { id: string; name: string }[];
+  clause: RuleCondition;
+  label: string;
+  onChange: (next: RuleCondition) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <div style={row}>
+      <TargetPicker
+        reg={reg}
+        entityOptions={entityOptions}
+        entity={clause.entity}
+        component={clause.component}
+        field={clause.field}
+        contextLabel={label}
+        onChange={(p) => {
+          const next = { ...clause, ...p };
+          if (p.component || p.field) next.value = defaultValue(fieldTy(reg, next.component, next.field));
+          onChange(next);
+        }}
+      />
+      <SelectField
+        aria-label={`${label} comparison operator`}
+        data-testid="rule-op"
+        style={fixed(68)}
+        value={clause.op}
+        onChange={(e) => onChange({ ...clause, op: e.target.value as CompareOp })}
+      >
+        {OPS.map((o) => (
+          <option key={o.op} value={o.op}>
+            {o.label}
+          </option>
+        ))}
+      </SelectField>
+      <ValueInput
+        ariaLabel={`${label} value`}
+        ty={fieldTy(reg, clause.component, clause.field)}
+        value={clause.value}
+        onChange={(v) => onChange({ ...clause, value: v })}
+      />
+      <Button variant="ghost" compact icon aria-label={`Remove ${label.toLowerCase()}`} onClick={onRemove}>
+        ×
+      </Button>
+    </div>
   );
 }
 
@@ -203,6 +268,7 @@ function RuleBuilder({
   const [name, setName] = useState("");
   const [event, setEvent] = useState(reg.events[0]?.name ?? "");
   const [conditions, setConditions] = useState<RuleCondition[]>([]);
+  const [anyOf, setAnyOf] = useState<RuleCondition[]>([]);
   const [actions, setActions] = useState<RuleAction[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -222,10 +288,20 @@ function RuleBuilder({
     value: defaultValue(fieldTy(reg, firstComp, firstField)),
   });
 
+  /** Replace clause `i` of one list without disturbing the other — the AND list and the OR group are
+   *  independent, so editing an alternative must never renumber a condition. */
+  const patchAt = (
+    list: RuleCondition[],
+    set: (next: RuleCondition[]) => void,
+    i: number,
+    next: RuleCondition,
+  ) => set(list.map((c, j) => (j === i ? next : c)));
+
   async function create() {
     setError(null);
     setBusy(true);
-    const rule: RuleData = { name, enabled: true, event, conditions, actions };
+    // `any_of` is snake_case because `metrocalk_core::rules::RuleData` is plain serde, not camelCase.
+    const rule: RuleData = { name, enabled: true, event, conditions, any_of: anyOf, actions };
     try {
       const r = await client.authorRule(rule);
       if (r.error) {
@@ -243,21 +319,19 @@ function RuleBuilder({
 
   return (
     <div data-testid="rule-builder" style={{ border: `1px solid ${color.border.subtle}`, borderRadius: radius.lg, padding: space.md, marginBottom: space.md, background: color.bg.panel }}>
-      <input
+      <TextField
         aria-label="Rule name"
         data-testid="rule-name"
-        type="text"
         placeholder="rule name"
-        style={{ ...ctrl, width: "100%", marginBottom: 6 }}
+        style={{ width: "100%", marginBottom: 6 }}
         value={name}
         onChange={(e) => setName(e.target.value)}
       />
       <div style={{ marginBottom: 6 }}>
         <b>When</b>{" "}
-        <select
+        <SelectField
           aria-label="Rule trigger event"
           data-testid="rule-event"
-          style={ctrl}
           value={event}
           onChange={(e) => setEvent(e.target.value)}
         >
@@ -266,79 +340,71 @@ function RuleBuilder({
               {ev.name}
             </option>
           ))}
-        </select>
+        </SelectField>
       </div>
 
       <div style={{ marginBottom: 6 }}>
         <b>If</b>{" "}
-        <button style={ctrl} onClick={() => setConditions([...conditions, newCondition()])}>
+        <Button
+          compact
+          title="Add a clause that must hold — every condition has to be true"
+          onClick={() => setConditions([...conditions, newCondition()])}
+        >
           + condition
-        </button>
+        </Button>{" "}
+        <Button
+          compact
+          data-testid="rule-add-alternative"
+          title="Add an alternative — any one of the alternatives is enough, on top of every condition"
+          onClick={() => setAnyOf([...anyOf, newCondition()])}
+        >
+          + alternative
+        </Button>
         {conditions.map((c, i) => (
-          <div key={i} style={{ display: "flex", gap: 4, flexWrap: "wrap", margin: "3px 0" }}>
-            <TargetPicker
-              reg={reg}
-              entityOptions={entityOptions}
-              entity={c.entity}
-              component={c.component}
-              field={c.field}
-              contextLabel={`Condition ${i + 1}`}
-              onChange={(p) => {
-                const next = [...conditions];
-                next[i] = { ...c, ...p };
-                if (p.component || p.field) next[i].value = defaultValue(fieldTy(reg, next[i].component, next[i].field));
-                setConditions(next);
-              }}
-            />
-            <select
-              aria-label={`Condition ${i + 1} comparison operator`}
-              data-testid="rule-op"
-              style={ctrl}
-              value={c.op}
-              onChange={(e) => {
-                const next = [...conditions];
-                next[i] = { ...c, op: e.target.value as CompareOp };
-                setConditions(next);
-              }}
-            >
-              {OPS.map((o) => (
-                <option key={o.op} value={o.op}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-            <ValueInput
-              ariaLabel={`Condition ${i + 1} value`}
-              ty={fieldTy(reg, c.component, c.field)}
-              value={c.value}
-              onChange={(v) => {
-                const next = [...conditions];
-                next[i] = { ...c, value: v };
-                setConditions(next);
-              }}
-            />
-            <button
-              aria-label={`Remove condition ${i + 1}`}
-              style={ctrl}
-              onClick={() => setConditions(conditions.filter((_, j) => j !== i))}
-            >
-              ×
-            </button>
-          </div>
+          <ClauseRow
+            key={i}
+            reg={reg}
+            entityOptions={entityOptions}
+            clause={c}
+            label={`Condition ${i + 1}`}
+            onChange={(next) => patchAt(conditions, setConditions, i, next)}
+            onRemove={() => setConditions(conditions.filter((_, j) => j !== i))}
+          />
         ))}
+
+        {anyOf.length > 0 && (
+          <div data-testid="rule-anyof" style={{ marginTop: 4, paddingLeft: space.sm, borderLeft: `2px solid ${color.border.subtle}` }}>
+            {/* Plain language, not "any_of": what the group MEANS, said once, where it applies. */}
+            <div style={{ color: color.text.muted, margin: "3px 0" }}>
+              {conditions.length > 0 ? "…and either" : "either"}{" "}
+              <span style={{ opacity: 0.8 }}>— any one of these is enough</span>
+            </div>
+            {anyOf.map((c, i) => (
+              <ClauseRow
+                key={i}
+                reg={reg}
+                entityOptions={entityOptions}
+                clause={c}
+                label={`Alternative ${i + 1}`}
+                onChange={(next) => patchAt(anyOf, setAnyOf, i, next)}
+                onRemove={() => setAnyOf(anyOf.filter((_, j) => j !== i))}
+              />
+            ))}
+          </div>
+        )}
       </div>
 
       <div style={{ marginBottom: 6 }}>
         <b>Then</b>{" "}
-        <button style={ctrl} onClick={() => setActions([...actions, newAction()])}>
+        <Button compact onClick={() => setActions([...actions, newAction()])}>
           + action
-        </button>
+        </Button>
         {actions.map((a, i) => (
-          <div key={i} style={{ display: "flex", gap: 4, flexWrap: "wrap", margin: "3px 0" }}>
-            <select
+          <div key={i} style={row}>
+            <SelectField
               aria-label={`Action ${i + 1} type`}
               data-testid="rule-action"
-              style={ctrl}
+              style={grow(96)}
               value={a.action}
               onChange={(e) => {
                 const next = [...actions];
@@ -351,7 +417,7 @@ function RuleBuilder({
                   {ac.name}
                 </option>
               ))}
-            </select>
+            </SelectField>
             <TargetPicker
               reg={reg}
               entityOptions={entityOptions}
@@ -377,13 +443,9 @@ function RuleBuilder({
                 setActions(next);
               }}
             />
-            <button
-              aria-label={`Remove action ${i + 1}`}
-              style={ctrl}
-              onClick={() => setActions(actions.filter((_, j) => j !== i))}
-            >
+            <Button variant="ghost" compact icon aria-label={`Remove action ${i + 1}`} onClick={() => setActions(actions.filter((_, j) => j !== i))}>
               ×
-            </button>
+            </Button>
           </div>
         ))}
       </div>
@@ -393,12 +455,12 @@ function RuleBuilder({
           {error}
         </div>
       )}
-      <button data-testid="rule-create" style={{ ...ctrl, fontWeight: 700 }} disabled={busy} onClick={() => void create()}>
+      <Button variant="primary" data-testid="rule-create" disabled={busy} onClick={() => void create()}>
         {busy ? "creating…" : "Create rule"}
-      </button>{" "}
-      <button style={ctrl} onClick={() => onDone(null)}>
+      </Button>{" "}
+      <Button variant="ghost" onClick={() => onDone(null)}>
         cancel
-      </button>
+      </Button>
     </div>
   );
 }
@@ -434,14 +496,9 @@ export function RulesPanel({ client }: { client: EditorClient }) {
     <div id="rules" data-testid="rules-panel" style={{ ...box, borderTop: `1px solid ${color.border.subtle}` }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
         <b>Rules</b>
-        <button
-          data-testid="rule-new"
-          style={ctrl}
-          disabled={!reg}
-          onClick={() => setBuilding((b) => !b)}
-        >
+        <Button data-testid="rule-new" compact disabled={!reg} onClick={() => setBuilding((b) => !b)}>
           {building ? "close" : "+ New rule"}
-        </button>
+        </Button>
       </div>
 
       {building && reg && (
@@ -463,12 +520,12 @@ export function RulesPanel({ client }: { client: EditorClient }) {
         >
           Also remove the effect on the way out? Add the cleanup rule{" "}
           <b>{offeredMirror.name}</b> (When {offeredMirror.event}).{" "}
-          <button data-testid="mirror-accept" style={ctrl} onClick={() => void acceptMirror()}>
+          <Button data-testid="mirror-accept" compact onClick={() => void acceptMirror()}>
             Add cleanup rule
-          </button>{" "}
-          <button data-testid="mirror-dismiss" style={ctrl} onClick={() => setOfferedMirror(null)}>
+          </Button>{" "}
+          <Button data-testid="mirror-dismiss" variant="ghost" compact onClick={() => setOfferedMirror(null)}>
             No thanks
-          </button>
+          </Button>
         </div>
       )}
 
@@ -481,17 +538,22 @@ export function RulesPanel({ client }: { client: EditorClient }) {
             data-testid="rule-row"
             style={{ display: "flex", justifyContent: "space-between", gap: space.md, padding: `${space.xs}px 0`, borderBottom: `1px solid ${color.border.subtle}` }}
           >
+            {/* The OR group is counted separately, never folded into the If count: "2 if" about a rule whose
+                second claim is "any one of these" would be a false statement about when it fires. */}
             <span>
-              <b>{r.name}</b> · When {r.event} · {r.conditionCount} if · {r.actionCount} then
+              <b>{r.name}</b> · When {r.event} · {r.conditionCount} if
+              {r.anyOfCount > 0 ? ` · any of ${r.anyOfCount}` : ""} · {r.actionCount} then
             </span>
-            <button
+            <Button
+              variant="ghost"
+              compact
+              icon
               aria-label={`Remove rule ${r.name}`}
-              style={ctrl}
               onClick={() => void remove(r.id)}
               title="remove rule"
             >
               ×
-            </button>
+            </Button>
           </div>
         ))
       )}

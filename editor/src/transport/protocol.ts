@@ -923,12 +923,26 @@ export interface RuleAction {
   value: FieldValue;
 }
 
-/** A whole rule — the shape `author_rule` takes + the mirror it returns. */
+/** A whole rule — the shape `author_rule` takes + the mirror it returns.
+ *
+ *  `RuleData` is the one reply/argument DTO here that is NOT `rename_all = "camelCase"` (`metrocalk_core::
+ *  rules::RuleData` is plain serde), so `any_of` is snake_case on the wire and must stay snake_case here.
+ *  Both new fields are `#[serde(default, skip_serializing_if)]` in Rust — absent on the wire when empty,
+ *  hence optional here. */
 export interface RuleData {
   name: string;
   enabled: boolean;
   event: string;
+  /** **If** — every one of these must hold (AND). */
   conditions: RuleCondition[];
+  /** **If … either** — the single OR group: when non-empty, at least one must hold *in addition to* every
+   *  `conditions` clause. One group, never nested — the authored depth ceiling is two, which is what keeps
+   *  a conditional readable as a sentence (`metrocalk_core::rules::RuleData::any_of`). */
+  any_of?: RuleCondition[];
+  /** Pins the rule to ONE event subject. Engine-set, never authored here: the Play-start expansion turns
+   *  one `$subject` rule into a per-entity rule carrying that entity's own clauses. Present on a returned
+   *  rule, omitted when `None`. */
+  subject?: string | null;
   actions: RuleAction[];
 }
 
@@ -938,7 +952,11 @@ export interface RuleSummary {
   name: string;
   enabled: boolean;
   event: string;
+  /** How many AND clauses the rule's **If** carries. */
   conditionCount: number;
+  /** How many alternatives its OR group carries — counted separately because they are a different claim
+   *  ("any one of these"), and folding them into `conditionCount` would read as "all of these". */
+  anyOfCount: number;
   actionCount: number;
 }
 
