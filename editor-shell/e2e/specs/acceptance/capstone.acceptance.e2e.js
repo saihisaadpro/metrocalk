@@ -104,7 +104,7 @@ describe("acceptance / M12.6 — the capstone: one sentence -> a coherent, inspe
     // ── STEP 5: Inspect — each piece is listed + an ordinary entity/component/rule (no god-object) ───────
     const rules = await invoke("list_rules");
     expect(rules.length).toBe(3);
-    expect(rules.every((r) => r.event === "EnemyDied" || r.event === "ZoneExited")).toBe(true);
+    expect(rules.every((r) => r.rule.event === "EnemyDied" || r.rule.event === "ZoneExited")).toBe(true);
     const details = await invoke("entity_details", { id: sword });
     expect(details).toBeTruthy();
     // The quest's data is ordinary registry components on the sword (no privileged container).

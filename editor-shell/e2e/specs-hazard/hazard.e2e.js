@@ -108,8 +108,8 @@ describe("Hazards — the spike hurts whoever stepped on it", () => {
 
     // The rule targets the TOUCHER — the thing that was inexpressible before `$other`.
     const rules = await invoke("list_rules");
-    console.log(`[hz] rules: ${rules.map((r) => r.name).join(", ")}`);
-    expect(rules.some((r) => r.name.includes("Hurt whoever"))).toBe(true);
+    console.log(`[hz] rules: ${rules.map((r) => r.rule.name).join(", ")}`);
+    expect(rules.some((r) => r.rule.name.includes("Hurt whoever"))).toBe(true);
     await invoke("frame_all");
     await shot("scene_hero_and_spike");
   });

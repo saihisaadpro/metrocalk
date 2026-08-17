@@ -64,7 +64,7 @@ describe("LIVE AI compose tier (M12.4)", () => {
     if (!applied.ok || applied.applied !== 7 || applied.rules !== 3 || applied.stateMachines !== 1)
       throw new Error(`apply wrong: ${JSON.stringify(applied)}`);
     let rules = await invoke("list_rules");
-    if (rules.length !== 3 || !rules.some((r) => r.event === "EnemyDied"))
+    if (rules.length !== 3 || !rules.some((r) => r.rule.event === "EnemyDied"))
       throw new Error(`the AI-composed rules aren't listed: ${JSON.stringify(rules)}`);
 
     // ── 3) UNDO reverts the WHOLE composition (the AI is not a privileged path — one transaction). ──

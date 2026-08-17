@@ -80,7 +80,7 @@ describe("LIVE Rules layer (M12.1)", () => {
 
     // 3) It shows in the Rule list.
     let rules = await invoke("list_rules");
-    if (rules.length !== 1 || rules[0].event !== "StateEntered") throw new Error(`list_rules wrong: ${JSON.stringify(rules)}`);
+    if (rules.length !== 1 || rules[0].rule.event !== "StateEntered") throw new Error(`list_rules wrong: ${JSON.stringify(rules)}`);
 
     // 4) An UNKNOWN event is Blocked + explained (ADR-016) — refused, not committed. (Resolve with an
     //    `error`, or — defensively — surface the explanation as a rejection; both prove Blocked+explained.)

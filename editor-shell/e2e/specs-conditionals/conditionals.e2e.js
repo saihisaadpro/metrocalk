@@ -174,7 +174,7 @@ describe("Conditionals — the Key and the Door", () => {
 
   it("THE INVARIANT: two gated objects, still ONE rule in the document — no copies", async () => {
     const rules = await invoke("list_rules");
-    console.log(`[cond] rules in the document: ${rules.map((r) => r.name).join(", ")} (${rules.length})`);
+    console.log(`[cond] rules in the document: ${rules.map((r) => r.rule.name).join(", ")} (${rules.length})`);
     expect(rules.length).toBe(1);
   });
 
