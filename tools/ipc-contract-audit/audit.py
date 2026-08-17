@@ -708,8 +708,10 @@ def run(root: str) -> tuple[list[Finding], dict]:
         "rust_files": len(rust_src),
         "rust_required_present": len(REQUIRED_RUST) - len(rust_missing),
         "rust_required": len(REQUIRED_RUST),
-        "ts_files": len(seen),
-        "ts_files_expected": len({"/".join(p) for p in TS_CALL_SOURCES + TS_TYPE_SOURCES}),
+        "ts_required_present": len({"/".join(p) for p in TS_CALL_SOURCES + TS_TYPE_SOURCES})
+                               - len([m for m in missing if m.startswith("editor/")]),
+        "ts_required": len({"/".join(p) for p in TS_CALL_SOURCES + TS_TYPE_SOURCES}),
+        "ts_swept": len(e2e_src),
         "commands": len([c for c in rs.commands.values() if not c.unreadable]),
         "registered": len(rs.registered),
         "invocations": len(ts.invocations),
@@ -757,7 +759,8 @@ def main() -> int:
         print(
             f"ipc-contract-audit — {stats['rust_files']} Rust file(s) swept "
             f"({stats['rust_required_present']} of {stats['rust_required']} required present) and "
-            f"{stats['ts_files']} of {stats['ts_files_expected']} TS source(s); "
+            f"{stats['ts_required_present']} of {stats['ts_required']} required TS source(s) "
+            f"+ {stats['ts_swept']} E2E file(s) swept; "
             f"{stats['commands']} command(s), {stats['registered']} registered, "
             f"{stats['invocations']} call site(s) ({stats['typed_invocations']} declare a reply "
             f"type); {stats['shape_compared']} of {stats['typed_invocations']} replies compared, "
