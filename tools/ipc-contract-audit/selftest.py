@@ -40,7 +40,7 @@ fn entity_info(state: State<AppState>, id: String) -> EntityInfo {
     EntityInfo {
         id,
         parent_id: None,
-        placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new(), nickname: None },
+        placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new(), nickname: None, alias_name: None, frozen_name: None },
         seen_at: 0,
         tag_count: 0,
         facing: Facing::FaceNorth,
@@ -87,6 +87,8 @@ pub struct Placement {
     // `Option<T>` alone does not determine the wire form.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nickname: Option<String>,
+    pub alias_name: Option<String>,
+    pub frozen_name: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -138,7 +140,7 @@ fn entity_seen(state: State<AppState>) -> EntityInfo {
     EntityInfo {
         id: String::new(),
         parent_id: None,
-        placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new(), nickname: None },
+        placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new(), nickname: None, alias_name: None, frozen_name: None },
         seen_at: 0,
         tag_count: 0,
         facing: Facing::FaceNorth,
@@ -213,10 +215,19 @@ describe("what a spec reads without declaring it", () => {
 BASE_LIB = "pub struct Unused;\n"
 
 BASE_PROTOCOL = """\
+// Two more NEGATIVE pins, correct on every run: an `Option` read through a type ALIAS that resolves
+// to a nullable, and one wrapped in `Readonly`. Both are honest declarations, and the first version
+// of the `nullable` check reported both as drifts — it called `unwrap` without the alias table (the
+// one caller in the file that did not) and `unwrap` peels `ReadonlyArray<T>` but not `Readonly<T>`.
+// A gate that fires on correct code gets waived, and a waived gate checks nothing.
+export type MaybeName = string | null;
+
 export interface Placement {
   worldX: number;
   label: string;
   nickname?: string;
+  aliasName: MaybeName;
+  frozenName: Readonly<string | null>;
 }
 
 export type Facing = "face_north" | "face_south" | "face_up_2d";
@@ -535,6 +546,14 @@ CASES: list[tuple[str, str, dict, dict]] = [
         {},
     ),
     (
+        "the REPLY ITSELF is an Option, and the caller's type does not admit null",
+        r'invoke<EntityInfo>\("entity_info"\).*the whole reply is `null` when it is `None`',
+        {"overrides": {"editor-shell/src-tauri/src/main.rs":
+                       swap(BASE_MAIN, "fn entity_info(state: State<AppState>, id: String) -> EntityInfo {",
+                            "fn entity_info(state: State<AppState>, id: String) -> Option<EntityInfo> {")}},
+        {},
+    ),
+    (
         "the attribute alone flips the verdict: drop skip_serializing_if and `?` stops being honest",
         r"`EntityInfo\.placement\.nickname` is `Option<String>` with no `skip_serializing_if`.*"
         r"`Placement` declares `nickname\?: string`, which admits `undefined`, not `null`",
@@ -581,10 +600,14 @@ def _ignore_variant_rename(attrs: str) -> None:
     return None
 
 
+#: Bound once, at import, so every mutation below calls the ORIGINAL even after the runner has
+#: rebound the module attribute. A default argument was the first shape of this and it broke the
+#: moment the function grew a parameter — the mutation silently received `aliases` as `_orig`.
+_REAL_NULLABLE = audit._nullable_findings
+
+
 def _null_from_type_alone(
-    r_dto, t_ty, key, r_ft, t_ft, t_optional, r_skipped, cmd, where, path,
-    # Bound at def time, so it is the ORIGINAL even after the runner rebinds the module attribute.
-    _orig=audit._nullable_findings,
+    r_dto, t_ty, key, r_ft, t_ft, t_optional, r_skipped, cmd, where, path, aliases=None
 ):
     """`Option<T>` judged by the TYPE, ignoring `skip_serializing_if` — the plausible wrong reader.
 
@@ -596,7 +619,33 @@ def _null_from_type_alone(
     Pinned as a reader mutation rather than a tree case because the CORRECT reader is silent here,
     and silence is also what a missing guard produces.
     """
-    return _orig(r_dto, t_ty, key, r_ft, t_ft, t_optional, False, cmd, where, path)
+    return _REAL_NULLABLE(
+        r_dto, t_ty, key, r_ft, t_ft, t_optional, False, cmd, where, path, aliases
+    )
+
+
+def _null_without_aliases(
+    r_dto, t_ty, key, r_ft, t_ft, t_optional, r_skipped, cmd, where, path, aliases=None
+):
+    """The alias table dropped — a `type MaybeName = string | null` field read as non-nullable.
+
+    Every other resolver in this file passes `ts.aliases`; the first version of this one did not,
+    and `tsipc.unwrap` resolves an alias only when handed the table. The result was a **blocking
+    finding on correct code**, which is the failure mode that costs a gate its authority.
+    """
+    return _REAL_NULLABLE(
+        r_dto, t_ty, key, r_ft, t_ft, t_optional, r_skipped, cmd, where, path, {}
+    )
+
+
+def _no_readonly_peel(t: str) -> str:
+    """`_strip_readonly` as the identity — `Readonly<string | null>` stays wrapped.
+
+    `unwrap` peels `ReadonlyArray<T>` because that changes the shape; `Readonly<T>` does not, so it
+    never needed peeling until a reader started asking what is INSIDE. Same class as the alias bug —
+    a false finding on correct code, not a missed one.
+    """
+    return t
 
 
 def _old_return_type(src: str, i: int) -> str:
@@ -654,6 +703,20 @@ READER_MUTATIONS: list[tuple[str, str, str, object, dict]] = [
         r"`EntityInfo\.placement\.nickname`.*admits `undefined`, not `null`",
         "audit._nullable_findings",
         _null_from_type_alone,
+        {},
+    ),
+    (
+        "an alias that resolves to a nullable, read without the alias table, invents a drift",
+        r"`EntityInfo\.placement\.aliasName`.*admits neither",
+        "audit._nullable_findings",
+        _null_without_aliases,
+        {},
+    ),
+    (
+        "a `Readonly<T | null>` left wrapped invents a drift",
+        r"`EntityInfo\.placement\.frozenName`.*admits neither",
+        "audit._strip_readonly",
+        _no_readonly_peel,
         {},
     ),
 ]

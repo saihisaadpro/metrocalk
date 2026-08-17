@@ -457,6 +457,19 @@ def _argument_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> list[Finding]:
 _MAX_DEPTH = 6
 
 
+_READONLY = re.compile(r"^Readonly<(.*)>$", re.S)
+
+
+def _strip_readonly(t: str) -> str:
+    """`Readonly<Foo | null>` -> `Foo | null`. Purely a modifier; it never changes what can arrive."""
+    for _ in range(4):
+        m = _READONLY.fullmatch(t.strip())
+        if not m:
+            break
+        t = m.group(1)
+    return t.strip()
+
+
 def _nullable_findings(
     r_dto: rustipc.Dto,
     t_ty: tsipc.TsType,
@@ -468,6 +481,7 @@ def _nullable_findings(
     cmd: str,
     where: str,
     path: str,
+    aliases: dict[str, str] | None = None,
 ) -> list[Finding]:
     """Can the shell send a value this field's declared type does not admit?
 
@@ -496,7 +510,12 @@ def _nullable_findings(
     """
     if rustipc.type_head(r_ft) != "Option":
         return []  # the shell cannot send null or omit it; a looser read is the caller's choice
-    _, _, t_nullable = tsipc.unwrap(t_ft)
+    # `aliases` is not optional in practice, only in the signature: without it `unwrap` cannot see
+    # through `type Maybe = string | null`, and this check would report correct code as drifted.
+    # `Readonly<T>` is peeled here for the same reason — `unwrap` handles `ReadonlyArray<T>` because
+    # that changes the shape, and `Readonly<T>` does not, so it never needed peeling until a reader
+    # started asking about the T inside. Both false-positive shapes are pinned by reader mutations.
+    _, _, t_nullable = tsipc.unwrap(_strip_readonly(t_ft), aliases or {})
     if r_skipped:
         # The key is omitted, never null. `?` is the honest spelling; `| null` also survives it,
         # because a reader forced to handle null will handle undefined the same way.
@@ -563,7 +582,7 @@ def _nested_findings(
     out: list[Finding] = []
     pairs = 0
     enum_pairs = enum_unresolved = 0
-    null_pairs = 0
+    null_pairs: set[tuple[str, str]] = set()
     #: WHICH `Option` fields the walk actually reached, deduplicated by (struct, key). The raw pair
     #: count says how much work was done; this says how much of the 175-field surface is covered,
     #: and only the second number distinguishes "reached everything" from "reached one DTO 200 times".
@@ -587,11 +606,17 @@ def _nested_findings(
                 continue
             # BEFORE the enum branch below, which `continue`s: `Option<SomeEnum>` is both an enum
             # field and a nullable one, and a variant comparison says nothing about the null.
-            null_pairs += 1
+            #
+            # Counted by DISTINCT (struct, key), not by call-through. The first version incremented
+            # once per visit and reported 3,719 — five times the real figure, and 85% of those calls
+            # returned on `_nullable_findings`' first line without comparing anything. A header that
+            # inflates its own reach is the exact defect ADR-119 fixed in three other counters.
+            null_pairs.add((r_dto.name, key))
             if rustipc.type_head(r_ft) == "Option":
                 option_pairs.add((r_dto.name, key))
             out += _nullable_findings(
-                r_dto, t_ty, key, r_ft, t_ft, t_opt, skipped.get(key, False), cmd, where, path
+                r_dto, t_ty, key, r_ft, t_ft, t_opt, skipped.get(key, False), cmd, where, path,
+                ts.aliases,
             )
             here_e = f"{path}.{key}"
             # The file that wrote the field's type is the file whose declarations it can name.
@@ -680,7 +705,8 @@ def _shape_findings(
     resolved either side", and only the header can tell a reader which."""
     out: list[Finding] = []
     compared = fields_compared = nested_pairs = 0
-    enum_pairs = enum_unresolved = null_pairs = 0
+    enum_pairs = enum_unresolved = 0
+    null_pairs: set[tuple[str, str]] = set()
     #: WHICH enums were reached, not just how many pairs. 63 pairs across 8 distinct enums and 63
     #: across 29 are very different states of coverage, and only the second number distinguishes
     #: them — the rest sit behind `serde_json::Value` reply fields that `coverage` already waives.
@@ -708,6 +734,26 @@ def _shape_findings(
                     f"invoke<{inv.targ}>", f"{top_enum.file}:{top_enum.line}",
                 )
             continue
+        # The REPLY ITSELF may be an `Option`, and that is a different statement from any of its
+        # fields. `rust_shape` strips `Option` and `ts_shape` discards the nullable flag, so before
+        # this the whole class was invisible — and the doc bullet that used to stand in for it ("17
+        # of 17 typed call sites declare `| null`") was deleted when the field check landed, leaving
+        # nothing measuring it and nothing checking it. That is worse than the gap it replaced.
+        if rustipc.type_head(cmd.ret) == "Option" or (
+            rustipc.type_head(cmd.ret) == "Result"
+            and rustipc.type_head(rustipc.split_top(cmd.ret[cmd.ret.index("<") + 1 : cmd.ret.rindex(">")])[0].strip()) == "Option"
+        ):
+            null_pairs.add((inv.cmd, "<reply>"))
+            option_pairs.add((cmd.name, "<reply>"))
+            if not tsipc.unwrap(_strip_readonly(inv.targ), ts.aliases)[2]:
+                out.append(Finding(
+                    "error", "nullable", where,
+                    f'invoke<{inv.targ}>("{inv.cmd}") — the command returns `{cmd.ret}` '
+                    f"({cmd.file}:{cmd.line}), so the whole reply is `null` when it is `None`, and "
+                    f"`{inv.targ}` does not admit it. This is the reply itself, not a field in it: "
+                    "every read off the result throws, not just one",
+                    f"nullable@{inv.cmd}.<reply>",
+                ))
         r_shape, r_list, r_ok = rust_shape(cmd.ret, rs.dtos)
         t_shape, t_list, t_ok = ts_shape(inv.targ, ts.types, ts.aliases)
         if not (r_ok and t_ok):
@@ -833,10 +879,10 @@ def _shape_findings(
         enum_pairs += ne
         enum_unresolved += nu
         enum_names |= nn
-        null_pairs += nnull
+        null_pairs |= nnull
         option_pairs |= nopt
     return (out, compared, fields_compared, nested_pairs, enum_pairs, enum_unresolved,
-            sorted(enum_names), null_pairs, len(option_pairs))
+            sorted(enum_names), len(null_pairs), len(option_pairs))
 
 
 def _tuple_read_findings(
@@ -1346,9 +1392,10 @@ def main() -> int:
             f"the wire, and {stats['enum_pairs']} enum/string-union pair(s) across "
             f"{len(stats['enum_names'])} distinct enum(s) had their variant sets compared "
             f"({stats['enum_unresolved']} could not be); "
-            f"{stats['null_pairs']} field pair(s) checked for whether the shell can send `null` or "
-            f"omit the key, reaching {stats['option_fields_reached']} of the "
-            f"{stats['rust_option_fields']} `Option` field(s) the swept structs declare"
+            f"{stats['null_pairs']} distinct field pair(s) checked for whether the shell can send "
+            f"`null` or omit the key — {stats['option_fields_reached']} of them `Option`, out of the "
+            f"{stats['rust_option_fields']} `Option` field(s) declared across every swept "
+            f"`Serialize` struct (not all of which are reply DTOs)"
         )
         for f in findings:
             tag = "ERROR " if f.severity == "error" else "UNRESL"
