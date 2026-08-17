@@ -104,7 +104,9 @@ describe("Re-import keeps all your work (M15.10, screenshot-assessed)", () => {
     let jointSurvived = false;
     for (const r of matchedWithWork) {
       const info = await invoke("joint_info", { id: r.newEntity });
-      if (info && !info.error && info.jointType) { jointSurvived = true; break; }
+      // `joint_info` replies `Option<JointInfoResp>` — the struct or null. `!info.error` was a dead
+      // conjunct: `JointInfoResp` has never carried an `error` field, so it was always true.
+      if (info && info.jointType) { jointSurvived = true; break; }
     }
     console.log("joint survived on a matched part:", jointSurvived, "matched-with-work:", matchedWithWork.length);
     if (!jointSurvived) throw new Error("the M15.9 joint animation did NOT survive the re-import onto a matched part");

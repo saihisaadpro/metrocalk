@@ -60,7 +60,12 @@ describe("M15.7 import report — the never-silent per-part surface, live", () =
     console.log("cad_report after:", JSON.stringify({ ...r, parts: `[${r.parts?.length} rows]` }, null, 2));
     await shot("01_after_import");
 
-    if (r.error) throw new Error(`cad_report failed: ${r.error}`);
+    // `cad_report` has NO error channel — it returns `CadReportResp`, never a `Result`, and this guard
+    // used to read `r.error`, a field that struct has never carried. It could not fire. The real
+    // failure mode is the one the command actually takes: if the engine never answers the send, it
+    // returns `CadReportResp::default()` — every count zero and no rows — which is what to name.
+    if (r.total === 0 && Array.isArray(r.parts) && r.parts.length === 0)
+      throw new Error("cad_report returned the default all-zero report — the engine never answered the command");
     if (!(r.total >= 300)) throw new Error(`expected the report to account for the import (>=300 parts), got ${r.total}`);
     // NEVER-SILENT: the breakdown sums to the total — nothing dropped without a class.
     const sum = r.exactBrep + r.tessellationOnly + r.aiReconstructed + r.proxy + r.accessDenied + r.failed;
