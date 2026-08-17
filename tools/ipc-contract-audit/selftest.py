@@ -29,6 +29,47 @@ import audit
 
 # ── the fixture ───────────────────────────────────────────────────────────────────────────────────
 
+#: The one command several cases rewrite. Named rather than restated, because a case that swaps a
+#: multi-line function by literal text is silently disarmed the moment the fixture is edited — the
+#: `.replace()` becomes a no-op and the case goes on "passing" against an undrifted tree. That is a
+#: vacuous pass in the self-test itself, and it happened while the reads fixture was being added.
+#: `swap()` below makes it impossible: a replacement that matches nothing raises.
+ENTITY_INFO_FN = """\
+#[tauri::command]
+fn entity_info(state: State<AppState>, id: String) -> EntityInfo {
+    EntityInfo {
+        id,
+        parent_id: None,
+        placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new() },
+        seen_at: 0,
+        tag_count: 0,
+    }
+}"""
+
+
+#: The same command, rebuilt as a `json!` literal — the ad-hoc DTO shape, with a `match` arm whose
+#: `=>` once unbalanced this reader's bracket depth. Two cases swap it in.
+JSON_ENTITY_INFO_FN = """\
+#[tauri::command]
+fn entity_info(state: State<AppState>, id: String) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "kind": match id.len() { 0 => "empty", _ => "named" },
+        "tags": v.iter().map(|t| t).collect::<Vec<_>>(),
+    })
+}"""
+
+
+def swap(src: str, old: str, new: str) -> str:
+    """`str.replace`, except that replacing nothing is an error rather than a quiet no-op."""
+    if old not in src:
+        raise AssertionError(
+            f"the self-test fixture no longer contains the text a case drifts:\n  {old[:90]!r}\n"
+            "The case would have run against an UNDRIFTED tree and proved nothing."
+        )
+    return src.replace(old, new)
+
+
 BASE_MAIN = """\
 use tauri::State;
 
@@ -37,6 +78,7 @@ use tauri::State;
 pub struct Placement {
     pub world_x: f64,
     pub label: String,
+    pub source_file: String,
 }
 
 #[derive(serde::Serialize)]
@@ -45,21 +87,103 @@ pub struct EntityInfo {
     pub id: String,
     pub parent_id: Option<String>,
     pub placement: Placement,
+    pub seen_at: u64,
+    pub tag_count: usize,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Extra {
+    pub kind: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tagged {
+    pub tagged_id: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+ENTITY_INFO_FN
+
+// The same reply, reached by a command NO case rewrites. The E2E fixture reads its single-object
+// fields off this one so that the two cases which turn `entity_info` into a `json!` literal do not
+// also invalidate reads that are not what those cases are about.
+#[tauri::command]
+fn entity_seen(state: State<AppState>) -> EntityInfo {
+    EntityInfo {
+        id: String::new(),
+        parent_id: None,
+        placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new() },
+        seen_at: 0,
+        tag_count: 0,
+    }
 }
 
 #[tauri::command]
-fn entity_info(state: State<AppState>, id: String) -> EntityInfo {
-    EntityInfo { id, parent_id: None, placement: Placement { world_x: 0.0, label: String::new() } }
+fn entity_list(state: State<AppState>) -> Vec<EntityInfo> {
+    Vec::new()
+}
+
+#[tauri::command]
+fn entity_tagged(state: State<AppState>) -> Tagged {
+    Tagged { tagged_id: String::new(), extra: Extra { kind: String::new() } }
 }
 
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             entity_info,
+            entity_seen,
+            entity_list,
+            entity_tagged,
         ])
         .run(tauri::generate_context!())
         .unwrap();
 }
+""".replace("ENTITY_INFO_FN", ENTITY_INFO_FN)
+
+#: The untyped half of the fixture — a spec that reads a reply without ever declaring its shape,
+#: which is what 142 real files in `editor-shell/e2e` do. It is part of the BASE tree, not only of
+#: the cases that drift it, so the read walk is exercised on every single run rather than only when
+#: a reads case happens to run. Three of its lines are NEGATIVE pins that must never produce a
+#: finding, and the "the repaired tree is not clean" assertion enforces them on every case:
+#:
+#:   * `expect(await invoke(..)).toBeTruthy()` — a call's paren, not a grouping paren. Reading the
+#:     two as the same thing reported `EntityInfo` as failing to send `toBeTruthy`, which is how
+#:     this guard came to exist.
+#:   * `t.kind` on a struct carrying `#[serde(flatten)]` — flatten splices in keys no reader here
+#:     can enumerate, so absence is unprovable, not false.
+#:   * `items.length` / `.join` — JavaScript, not the reply.
+BASE_E2E = """\
+import { invoke } from "../pages/scaffold.js";
+
+describe("what a spec reads without declaring it", () => {
+  it("reads fields off a single reply", async () => {
+    const info = await invoke("entity_seen");
+    if (info.id !== "1") throw new Error("id");
+    if (info.placement.label !== "") throw new Error("label");
+    if (info.seenAt !== 0) throw new Error("seenAt");
+    expect(await invoke("entity_seen")).toBeTruthy();
+  });
+
+  it("reads fields off a list reply, by index and through a callback", async () => {
+    const items = await invoke("entity_list");
+    if (items.length === 0) throw new Error("empty");
+    if (items[0].placement.sourceFile !== "") throw new Error("sourceFile");
+    if (items.some((e) => e.tagCount > 0)) throw new Error("tagCount");
+    if (items.map((e) => e.id).join(",") === "") throw new Error("ids");
+    for (const e of items) {
+      if (!e.parentId) throw new Error("parentId");
+    }
+  });
+
+  it("reads a key a flattened struct splices in, which cannot be called absent", async () => {
+    const t = await invoke("entity_tagged");
+    if (t.kind !== "thing") throw new Error("kind");
+  });
+});
 """
 
 BASE_LIB = "pub struct Unused;\n"
@@ -88,6 +212,7 @@ export class TauriClient {
 FILES = {
     "editor-shell/src-tauri/src/main.rs": BASE_MAIN,
     "editor-shell/src/lib.rs": BASE_LIB,
+    "editor-shell/e2e/specs-entity/entity.e2e.js": BASE_E2E,
     "editor/src/transport/protocol.ts": BASE_PROTOCOL,
     "editor/src/transport/session.ts": BASE_SESSION,
     "editor/src/store/project.ts": "export interface ProjectInfo { name: string; }\n",
@@ -224,7 +349,11 @@ CASES: list[tuple[str, str, dict, dict]] = [
     (
         "a UI that no longer calls the shell anywhere",
         r"no `invoke\(\.\.\)` call site was found",
-        {"overrides": {"editor/src/transport/session.ts": "export const nothing = 1;\n"}},
+        # The E2E spec must go too: it calls the same commands, so leaving it would keep the call-site
+        # count non-zero and the guard would not fire — which is exactly what it did when the reads
+        # fixture was added, and why this case failed until the drop was widened.
+        {"overrides": {"editor/src/transport/session.ts": "export const nothing = 1;\n"},
+         "drop": {"editor-shell/e2e/specs-entity/entity.e2e.js"}},
         {},
     ),
     (
@@ -246,31 +375,15 @@ CASES: list[tuple[str, str, dict, dict]] = [
         "a match arm inside a json! reply, which must not abandon the reply (this tool's own bug)",
         r"requires \['mode'\].*json! literal it builds never sends",
         {"overrides": {"editor-shell/src-tauri/src/main.rs":
-                       BASE_MAIN.replace(
-                           "fn entity_info(state: State<AppState>, id: String) -> EntityInfo {\n"
-                           "    EntityInfo { id, parent_id: None, placement: Placement { world_x: 0.0, label: String::new() } }\n}",
-                           "fn entity_info(state: State<AppState>, id: String) -> serde_json::Value {\n"
-                           "    serde_json::json!({\n"
-                           '        "id": id,\n'
-                           '        "kind": match id.len() { 0 => "empty", _ => "named" },\n'
-                           '        "tags": v.iter().map(|t| t).collect::<Vec<_>>(),\n'
-                           "    })\n}"),
+                       swap(BASE_MAIN, ENTITY_INFO_FN, JSON_ENTITY_INFO_FN),
                        "editor/src/transport/protocol.ts":
                        "export interface EntityInfo {\n  id: string;\n  kind: string;\n"
                        "  tags: string[];\n  mode: string;\n}\n"}},
         # Repaired: the shell also sends `mode`. If the reader ever gives up on the match arm again
         # it resolves nothing, reports nothing, and this control passes while the drifted case fails.
         {"overrides": {"editor-shell/src-tauri/src/main.rs":
-                       BASE_MAIN.replace(
-                           "fn entity_info(state: State<AppState>, id: String) -> EntityInfo {\n"
-                           "    EntityInfo { id, parent_id: None, placement: Placement { world_x: 0.0, label: String::new() } }\n}",
-                           "fn entity_info(state: State<AppState>, id: String) -> serde_json::Value {\n"
-                           "    serde_json::json!({\n"
-                           '        "id": id,\n'
-                           '        "kind": match id.len() { 0 => "empty", _ => "named" },\n'
-                           '        "tags": v.iter().map(|t| t).collect::<Vec<_>>(),\n'
-                           '        "mode": "live",\n'
-                           "    })\n}"),
+                       swap(BASE_MAIN, ENTITY_INFO_FN,
+                            JSON_ENTITY_INFO_FN.replace('    })\n}', '        "mode": "live",\n    })\n}')),
                        "editor/src/transport/protocol.ts":
                        "export interface EntityInfo {\n  id: string;\n  kind: string;\n"
                        "  tags: string[];\n  mode: string;\n}\n"}},
@@ -279,9 +392,42 @@ CASES: list[tuple[str, str, dict, dict]] = [
         "an untyped reply the caller reads as a typed one",
         r"has no field names to compare",
         {"overrides": {"editor-shell/src-tauri/src/main.rs":
-                       BASE_MAIN.replace("-> EntityInfo {", "-> serde_json::Value {")
-                                .replace("EntityInfo { id, parent_id: None }",
-                                         "build_it(id)")}},
+                       swap(BASE_MAIN, ENTITY_INFO_FN,
+                            "#[tauri::command]\nfn entity_info(state: State<AppState>, id: String) "
+                            "-> serde_json::Value {\n    build_it(id)\n}")}},
+        {},
+    ),
+    # ── the reads check: what untyped JavaScript asserts about a reply without declaring it ────────
+    #
+    # The drift in all three is on the RUST side and the spec is untouched — which is the shape of
+    # the incident that motivated the check. `RuleSummary` collapsed to `{ id, rule }`, four specs
+    # went on reading the six fields that had moved, and five green gates said nothing because none
+    # of them opens this tree for anything but `invoke()` call sites.
+    #
+    # Each drifts a field the TypeScript interfaces do NOT declare, so only the reads guard can fire
+    # and the case cannot be satisfied by `shape` or `nested` reporting the same break twice.
+    (
+        "a renamed reply field an untyped spec still reads (the D1 class)",
+        r'invoke\("entity_seen"\) is read as `info`\.seenAt, but `EntityInfo` never sends `seenAt`',
+        {"overrides": {"editor-shell/src-tauri/src/main.rs":
+                       swap(BASE_MAIN, "pub seen_at: u64,", "pub noticed_at: u64,")
+                       .replace("seen_at: 0,", "noticed_at: 0,")}},
+        {},
+    ),
+    (
+        "a renamed field two levels down, reached by index through a list reply",
+        r"is read as `items`\[0\]\.placement\.sourceFile, but `Placement` never sends `sourceFile`",
+        {"overrides": {"editor-shell/src-tauri/src/main.rs":
+                       swap(BASE_MAIN, "pub source_file: String,", "pub origin_file: String,")
+                       .replace("source_file: String::new()", "origin_file: String::new()")}},
+        {},
+    ),
+    (
+        "a renamed field reached through a callback's element parameter",
+        r"is read as `items`\[0\]\.tagCount, but `EntityInfo` never sends `tagCount`",
+        {"overrides": {"editor-shell/src-tauri/src/main.rs":
+                       swap(BASE_MAIN, "pub tag_count: usize,", "pub label_count: usize,")
+                       .replace("tag_count: 0,", "label_count: 0,")}},
         {},
     ),
 ]
@@ -314,8 +460,9 @@ READER_MUTATIONS: list[tuple[str, str, str, object, dict]] = [
         "rustipc._return_type",
         _old_return_type,
         {"overrides": {"editor-shell/src-tauri/src/main.rs":
-                       BASE_MAIN.replace("-> EntityInfo {", "-> [f64; 8] {")
-                                .replace("EntityInfo { id, parent_id: None, placement: Placement { world_x: 0.0, label: String::new() } }", "[0.0; 8]"),
+                       swap(BASE_MAIN, ENTITY_INFO_FN,
+                            "#[tauri::command]\nfn entity_info(state: State<AppState>, id: String) "
+                            "-> [f64; 8] {\n    [0.0; 8]\n}"),
                        "editor/src/transport/session.ts":
                        BASE_SESSION.replace("invoke<EntityInfo>", "invoke<number[]>")}},
     ),
@@ -325,14 +472,9 @@ READER_MUTATIONS: list[tuple[str, str, str, object, dict]] = [
         "rustipc._angle_is_bracket",
         _old_angle,
         {"overrides": {"editor-shell/src-tauri/src/main.rs":
-                       BASE_MAIN.replace(
-                           "fn entity_info(state: State<AppState>, id: String) -> EntityInfo {\n"
-                           "    EntityInfo { id, parent_id: None, placement: Placement { world_x: 0.0, label: String::new() } }\n}",
-                           "fn entity_info(state: State<AppState>, id: String) -> serde_json::Value {\n"
-                           "    serde_json::json!({\n"
-                           '        "id": id,\n'
-                           '        "kind": match id.len() { 0 => "empty", _ => "named" },\n'
-                           "    })\n}"),
+                       swap(BASE_MAIN, ENTITY_INFO_FN,
+                            JSON_ENTITY_INFO_FN.replace(
+                                '        "tags": v.iter().map(|t| t).collect::<Vec<_>>(),\n', "")),
                        "editor/src/transport/protocol.ts":
                        "export interface EntityInfo {\n  id: string;\n  kind: string;\n}\n"}},
     ),

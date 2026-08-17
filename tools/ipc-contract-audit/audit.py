@@ -63,6 +63,7 @@ import re
 import sys
 from dataclasses import dataclass, asdict
 
+import jsreads
 import rustipc
 import tsipc
 
@@ -567,6 +568,127 @@ def _shape_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> tuple[list[Finding]
     return out, compared, fields_compared, nested_pairs
 
 
+def _tuple_read_findings(
+    rs: rustipc.RustIpc, tuples: list[jsreads.TupleRead]
+) -> tuple[list[Finding], int]:
+    """`const [a, , b] = await invoke("c")` claims the reply has at least three positions.
+
+    A destructuring pattern is a binding form the field reader does not recognise, and an
+    unrecognised binding form is the one kind of reach loss no counter can show: the call site
+    increments nothing and looks exactly like a call site that binds nothing. 16 real sites in this
+    tree destructure a tuple reply. Arity is part of the contract — this tool already learned that
+    on the typed side, where a Rust 5-tuple and a TypeScript 3-tuple compared equal until the length
+    was compared. Claiming FEWER positions than the reply has is legal JavaScript and not reported;
+    claiming more is `undefined`.
+    """
+    out: list[Finding] = []
+    compared = 0
+    for tr in tuples:
+        cmd = rs.commands.get(tr.cmd)
+        if cmd is None or cmd.unreadable:
+            continue
+        shape, _, ok = rust_shape(cmd.ret, rs.dtos)
+        if not ok or not (isinstance(shape, str) and shape.startswith("<tuple:")):
+            continue
+        arity = shape[len("<tuple:") : -1]
+        if not arity.isdigit():
+            continue
+        compared += 1
+        if tr.positions > int(arity):
+            out.append(
+                Finding(
+                    "error",
+                    "reads",
+                    f"{tr.file}:{tr.line}",
+                    f'invoke("{tr.cmd}") is destructured as `{tr.text}`, claiming '
+                    f"{tr.positions} position(s), but the command returns `{cmd.ret}` — "
+                    f"{arity} ({cmd.file}:{cmd.line}). The extra name(s) are `undefined`",
+                    f"reads@{tr.cmd}.<arity>",
+                )
+            )
+    return out, compared
+
+
+def _read_findings(
+    rs: rustipc.RustIpc, reads: list[jsreads.Read]
+) -> tuple[list[Finding], int, int]:
+    """Compare what untyped JavaScript READS off a reply against what the reply carries.
+
+    The `shape` check above needs an `invoke<T>` to compare. The 142-file E2E suite never writes one
+    — and reads the replies anyway, in plain `.js` that `tsc` never opens and vitest never loads.
+    `rules[0].rule.event` is the same assertion as `invoke<RuleSummary[]>`, made in usage instead of
+    in a declaration, and until this check existed the only thing that ever evaluated it was a human
+    running wdio against a packaged `.exe`.
+
+    That gap is not theoretical: collapsing `RuleSummary` to `{ id, rule }` broke four specs — one
+    with a TypeError, one inside M12.1's own live acceptance — with all five gates green, because
+    none of them looks at this tree for anything but `invoke()` call sites.
+
+    Conservative by construction, because a false finding here would be read as noise and would cost
+    the check its authority: a field is called absent only when the reply resolves to a struct whose
+    keys are fully enumerable. A `serde(flatten)` splices in keys this reader cannot name, so a
+    struct carrying one can never prove absence; a `Value` has no names at all; anything the walk
+    cannot resolve stops the walk and is counted as unresolved rather than reported as agreement.
+
+    Returns the findings, the number of path steps actually compared, and the number of reads whose
+    walk stopped early — the reach, stated rather than implied.
+    """
+    out: list[Finding] = []
+    steps_compared = unresolved = 0
+    for rd in reads:
+        cmd = rs.commands.get(rd.cmd)
+        if cmd is None or cmd.unreadable:
+            continue  # an unregistered name is the `command` check's finding, not a second telling
+        shape, is_list, ok = rust_shape(cmd.ret, rs.dtos)
+        if not ok:
+            unresolved += 1
+            continue
+        where = f"{rd.file}:{rd.line}"
+        walked: list[str] = []
+        for step in rd.path:
+            if step == "[]":
+                if not is_list:
+                    break  # `x["key"]` on a map, a tuple index, a string index — not provably wrong
+                is_list = False
+                walked.append("[]")
+                continue
+            if is_list or not isinstance(shape, rustipc.Dto):
+                break
+            carried = {k for k, _ in shape.fields}
+            if any(k.startswith("<flatten:") for k in carried):
+                break  # flatten makes absence unprovable, not false
+            if step not in carried:
+                path = "".join(f"[0]" if s == "[]" else f".{s}" for s in walked)
+                out.append(
+                    Finding(
+                        "error",
+                        "reads",
+                        where,
+                        f'invoke("{rd.cmd}") is read as {rd.via}{path}.{step}, but '
+                        f"`{shape.name}` never sends `{step}` ({shape.file}:{shape.line} carries "
+                        f"{sorted(carried)}) — this file is plain .js that no type-checker opens, so "
+                        "the read is `undefined` at run time and only the wdio run says so",
+                        f"reads@{rd.cmd}.{step}",
+                    )
+                )
+                break
+            steps_compared += 1
+            walked.append(step)
+            if step in shape.opaque:
+                break  # the key is there; everything inside it is a `Value`, so unchecked
+            ty = shape.field_types.get(step)
+            if not ty:
+                break
+            shape, is_list, ok = rust_shape(ty, rs.dtos)
+            if not ok:
+                break
+        else:
+            continue
+        if len(walked) < len(rd.path) and not any(f.where == where for f in out[-1:]):
+            unresolved += 1
+    return out, steps_compared, unresolved
+
+
 def _coverage_findings(
     root: str,
     missing_files: list[str],
@@ -800,8 +922,20 @@ def run(root: str) -> tuple[list[Finding], dict]:
     call_files = {"/".join(p) for p in TS_CALL_SOURCES} | {rel for rel, _ in e2e_src}
     ts = tsipc.parse(list(seen.items()), call_files)
 
+    # What the untyped side READS. Recovered per file, from the same text the call-site parser saw,
+    # because a read is only attributable to a reply within the block that bound it.
+    reads: list[jsreads.Read] = []
+    tuple_reads: list[jsreads.TupleRead] = []
+    bound = 0
+    for rel, text in ts_call_src + e2e_src:
+        r = jsreads.parse(tsipc.strip_comments(text), rel)
+        reads += r.reads
+        tuple_reads += r.tuples
+        bound += r.bound
+
     findings = _coverage_findings(root, missing, rs, ts)
     compared = fields_compared = nested_pairs = 0
+    read_steps = read_unresolved = tuples_compared = 0
     if not any(f.check == "coverage" and "audit root does not exist" in f.message for f in findings) \
             and not missing:
         findings += _registration_findings(rs)
@@ -809,6 +943,10 @@ def run(root: str) -> tuple[list[Finding], dict]:
         findings += _argument_findings(rs, ts)
         shape, compared, fields_compared, nested_pairs = _shape_findings(rs, ts)
         findings += shape
+        rf, read_steps, read_unresolved = _read_findings(rs, reads)
+        findings += rf
+        tf, tuples_compared = _tuple_read_findings(rs, tuple_reads)
+        findings += tf
 
     stats = {
         "rust_files": len(rust_src),
@@ -825,10 +963,17 @@ def run(root: str) -> tuple[list[Finding], dict]:
         "shape_compared": compared,
         "shape_fields": fields_compared,
         "nested_pairs": nested_pairs,
+        "untyped_bound": bound,
+        "read_paths": len(reads),
+        "read_steps": read_steps,
+        "read_unresolved": read_unresolved,
+        "tuple_reads": len(tuple_reads),
+        "tuples_compared": tuples_compared,
         "dtos": len(rs.dtos),
         "ts_types": len(ts.types),
     }
-    order = {"registration": 0, "command": 1, "arguments": 2, "shape": 3, "nested": 4, "coverage": 5}
+    order = {"registration": 0, "command": 1, "arguments": 2, "shape": 3, "nested": 4, "reads": 5,
+             "coverage": 6}
     findings.sort(key=lambda f: (order.get(f.check, 9), f.where, f.message))
     return findings, stats
 
@@ -872,7 +1017,12 @@ def main() -> int:
             f"{stats['invocations']} call site(s) ({stats['typed_invocations']} declare a reply "
             f"type); {stats['shape_compared']} of {stats['typed_invocations']} replies compared, "
             f"{stats['shape_fields']} of those field-by-field, and {stats['nested_pairs']} nested "
-            f"object pair(s) followed below the top level"
+            f"object pair(s) followed below the top level; "
+            f"{stats['untyped_bound']} untyped reply(s) bound in JavaScript, "
+            f"{stats['read_paths']} distinct field path(s) read off them, {stats['read_steps']} "
+            f"step(s) compared ({stats['read_unresolved']} walk(s) stopped early), and "
+            f"{stats['tuples_compared']} of {stats['tuple_reads']} positional destructuring(s) "
+            f"compared for arity"
         )
         for f in findings:
             tag = "ERROR " if f.severity == "error" else "UNRESL"
