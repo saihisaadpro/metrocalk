@@ -602,7 +602,12 @@ export const isTauri = (): boolean => tauriCore() !== null;
 
 /** The REAL shell transport: `connect` streams committed `ProjectionDelta`s into the store; edits go out
  *  through the shell's commands (`submit_edit` / `bind_target`) — the exact contract the vanilla scaffold
- *  used, so the 61 commands + the Channel are unchanged (M10.1 swaps the UI, not the core). */
+ *  used, so the command surface + the Channel are unchanged (M10.1 swaps the UI, not the core).
+ *
+ *  This comment used to say "the 61 commands". The shell registers **229** (2026-08-17) and has for a
+ *  long time; the number was true when it was written and nothing re-read it since. `tools/ipc-contract-
+ *  audit` now compares this file against `generate_handler!` at rest and in CI, so the count is measured
+ *  in the audit header rather than asserted here — see ADR-119. */
 export class TauriClient implements EditorClient {
   private opCounter = 0;
   private readonly core: TauriCore;
