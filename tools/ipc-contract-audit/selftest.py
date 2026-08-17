@@ -40,7 +40,7 @@ fn entity_info(state: State<AppState>, id: String) -> EntityInfo {
     EntityInfo {
         id,
         parent_id: None,
-        placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new() },
+        placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new(), nickname: None },
         seen_at: 0,
         tag_count: 0,
         facing: Facing::FaceNorth,
@@ -80,6 +80,13 @@ pub struct Placement {
     pub world_x: f64,
     pub label: String,
     pub source_file: String,
+    // The `skip_serializing_if` half of the nullability contract, and a NEGATIVE pin on every run:
+    // this key is OMITTED when `None`, never null, so `nickname?: string` is the honest reading and
+    // must produce nothing. The `nullable` cases below flip only the ATTRIBUTE and only the TS
+    // spelling — the Rust TYPE never changes — because the whole point of the check is that
+    // `Option<T>` alone does not determine the wire form.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -131,7 +138,7 @@ fn entity_seen(state: State<AppState>) -> EntityInfo {
     EntityInfo {
         id: String::new(),
         parent_id: None,
-        placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new() },
+        placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new(), nickname: None },
         seen_at: 0,
         tag_count: 0,
         facing: Facing::FaceNorth,
@@ -209,6 +216,7 @@ BASE_PROTOCOL = """\
 export interface Placement {
   worldX: number;
   label: string;
+  nickname?: string;
 }
 
 export type Facing = "face_north" | "face_south" | "face_up_2d";
@@ -496,6 +504,47 @@ CASES: list[tuple[str, str, dict, dict]] = [
                        .replace("tag_count: 0,", "label_count: 0,")}},
         {},
     ),
+    # ── nullable ─────────────────────────────────────────────────────────────────────────────────
+    #
+    # Four cases over ONE pair of facts, because the pair is the whole point: `Option<T>` is two
+    # different wire contracts and the TYPE does not say which. Cases 1–2 hold the Rust fixed and
+    # drift the TS; case 3 holds the TS fixed and moves only the serde ATTRIBUTE, so a reader that
+    # keyed on the type instead of the attribute passes 1–2 and fails 3. Case 4 is the asymmetry
+    # control: a declaration that admits MORE than the shell can send must stay silent.
+    (
+        "a bare Option read as `?`, which under strictNullChecks admits undefined and not null",
+        r"`EntityInfo\.parentId` is `Option<String>` with no `skip_serializing_if`.*"
+        r"admits `undefined`, not `null`",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       swap(BASE_PROTOCOL, "parentId: string | null;", "parentId?: string;")}},
+        {},
+    ),
+    (
+        "a bare Option read as a plain required field, which admits neither",
+        r"`EntityInfo\.parentId` is `Option<String>` with no `skip_serializing_if`.*admits neither",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       swap(BASE_PROTOCOL, "parentId: string | null;", "parentId: string;")}},
+        {},
+    ),
+    (
+        "an omitted key read as always present — the Rust TYPE is unchanged, only the attribute is",
+        r"`EntityInfo\.placement\.nickname` is `Option<String>` with `skip_serializing_if`.*"
+        r"`Placement\.nickname` is declared `string`, which says it is always there",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       swap(BASE_PROTOCOL, "nickname?: string;", "nickname: string;")}},
+        {},
+    ),
+    (
+        "the attribute alone flips the verdict: drop skip_serializing_if and `?` stops being honest",
+        r"`EntityInfo\.placement\.nickname` is `Option<String>` with no `skip_serializing_if`.*"
+        r"`Placement` declares `nickname\?: string`, which admits `undefined`, not `null`",
+        {"overrides": {"editor-shell/src-tauri/src/main.rs":
+                       swap(BASE_MAIN,
+                            '    #[serde(skip_serializing_if = "Option::is_none")]\n'
+                            "    pub nickname: Option<String>,",
+                            "    pub nickname: Option<String>,")}},
+        {},
+    ),
 ]
 
 
@@ -530,6 +579,24 @@ def _ignore_variant_rename(attrs: str) -> None:
     cries wolf on correct code gets waived, and a waived gate checks nothing.
     """
     return None
+
+
+def _null_from_type_alone(
+    r_dto, t_ty, key, r_ft, t_ft, t_optional, r_skipped, cmd, where, path,
+    # Bound at def time, so it is the ORIGINAL even after the runner rebinds the module attribute.
+    _orig=audit._nullable_findings,
+):
+    """`Option<T>` judged by the TYPE, ignoring `skip_serializing_if` — the plausible wrong reader.
+
+    This is the version anyone would write first, and it is wrong in the direction that costs a gate
+    its authority: it reports the honest `#[serde(skip_serializing_if)]` + `nickname?: string` pair
+    as a drift. `Option<T>` does not determine the wire form — the attribute does — and a check that
+    cries wolf on correct code gets waived, after which it checks nothing.
+
+    Pinned as a reader mutation rather than a tree case because the CORRECT reader is silent here,
+    and silence is also what a missing guard produces.
+    """
+    return _orig(r_dto, t_ty, key, r_ft, t_ft, t_optional, False, cmd, where, path)
 
 
 def _old_return_type(src: str, i: int) -> str:
@@ -582,6 +649,13 @@ READER_MUTATIONS: list[tuple[str, str, str, object, dict]] = [
                        "editor/src/transport/protocol.ts":
                        "export interface EntityInfo {\n  id: string;\n  kind: string;\n}\n"}},
     ),
+    (
+        "an omitted key judged by its type alone invents a drift in correct code",
+        r"`EntityInfo\.placement\.nickname`.*admits `undefined`, not `null`",
+        "audit._nullable_findings",
+        _null_from_type_alone,
+        {},
+    ),
 ]
 
 
@@ -625,17 +699,21 @@ def run() -> int:
 
     import rustipc
 
+    # A mutation names the module it patches, because the reader is no longer one file: the Rust
+    # parser and the comparison layer can each hold a wrong answer, and both are worth pinning.
+    modules = {"rustipc": rustipc, "audit": audit}
+
     for name, pattern, target, buggy, spec in READER_MUTATIONS:
         rx = re.compile(pattern, re.S)
         mod, attr = target.split(".")
-        assert mod == "rustipc"
-        good = getattr(rustipc, attr)
-        setattr(rustipc, attr, buggy)
+        assert mod in modules, f"unknown mutation target module {mod!r}"
+        good = getattr(modules[mod], attr)
+        setattr(modules[mod], attr, buggy)
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 mutated = _findings(tmp, spec)
         finally:
-            setattr(rustipc, attr, good)
+            setattr(modules[mod], attr, good)
         with tempfile.TemporaryDirectory() as tmp:
             fixed = _findings(tmp, spec)
 

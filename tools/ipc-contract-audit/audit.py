@@ -40,7 +40,21 @@ This runs the comparison at rest, with no toolchain, no WebView and no GPU:
                 enum never sends (a branch that can never fire, which is how a half-finished rename
                 survives review). Only a **unit-only** enum is a string on the wire; one that carries
                 data is externally tagged and is reported as a disagreement, not compared as a string
-  nested        the same three comparisons, applied to every object pair the reply CARRIES, as deep
+  nullable      whether the shell can send a value the caller's type does not admit — `null`, or no
+                key at all. `Option<T>` is TWO different wire contracts and serde picks between them
+                on an attribute: bare, `None` serialises as `"k": null` (the key is THERE, holding
+                null); with `skip_serializing_if = "Option::is_none"`, the key is omitted entirely.
+                TypeScript spells those two differently too — `k: T | null` and `k?: T` — and under
+                `strictNullChecks` they are NOT interchangeable: `?` admits `undefined` and rejects
+                `null`. So `k?: string` against a bare `Option<String>` is a real disagreement that
+                the `shape` check passes, because the key IS on the wire and `shape` only asks
+                whether it is there. What makes it worth its own check is where it fails: `tsc`
+                narrows `if (p.k !== undefined)` to `string` and blesses `p.k.length` — a read that
+                throws at run time, in a file the type-checker just called correct. Reported in ONE
+                direction only, the same asymmetry `_scalar_conflict` already applies: a caller that
+                admits MORE than the shell can send (`T | null` over a non-`Option`) is a dead
+                defensive branch, which is a choice; a caller that admits LESS is a wrong answer
+  nested        the same comparisons, applied to every object pair the reply CARRIES, as deep
                 as both sides resolve. This check used to not exist, and its absence had a bias
                 worth naming: the verdict depended on how deeply a shape happened to be nested
                 rather than on whether the two sides agree. Move six fields off a `RuleSummary` and
@@ -58,10 +72,9 @@ check goes, not a place this one silently claims success:
     (`author_rule({ rule: {..} })`) is compared by its KEY only; the 7 such keys in this tree hide
     34 fields. This is the loudest of the three, which is why it is last: a drifted argument key
     fails to deserialise and the command rejects the call;
-  * nullability — `Option<T>` still puts the key on the wire, so a `T | null` read as `T` passes the
-    field check. Measured at the top level today: 17 of 17 typed call sites against an
-    `Option`-returning command DO declare `| null`, so the surface is currently the 175 `Option`
-    FIELDS inside reply DTOs, not the replies themselves;
+  * the `nullable` check compares DECLARED optionality, so it reaches the typed transport and stops
+    at the untyped E2E suite: `reads` proves a field EXISTS there, and nothing yet proves the spec
+    survives it arriving as `null`;
   * the `variants` check reads DECLARED types. A spec comparing a reply against a string LITERAL
     (`if (n.kind === "blend_1d")`) states the same contract in usage, the way `reads` recovers field
     paths from usage — that is where this check grows next.
@@ -444,6 +457,77 @@ def _argument_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> list[Finding]:
 _MAX_DEPTH = 6
 
 
+def _nullable_findings(
+    r_dto: rustipc.Dto,
+    t_ty: tsipc.TsType,
+    key: str,
+    r_ft: str,
+    t_ft: str,
+    t_optional: bool,
+    r_skipped: bool,
+    cmd: str,
+    where: str,
+    path: str,
+) -> list[Finding]:
+    """Can the shell send a value this field's declared type does not admit?
+
+    `Option<T>` is two different wire contracts, chosen by an attribute rather than by the type:
+
+        reference: Option<String>                                    ->  {"reference": null}
+        #[serde(skip_serializing_if = "Option::is_none")] reference  ->  {}
+
+    TypeScript spells those two differently as well, and under `strictNullChecks` they do not
+    overlap: `k?: T` is `T | undefined` and **rejects `null`**; `k: T | null` is the other one. The
+    `shape` check cannot see any of this — it asks whether the key is on the wire, and in the first
+    case it is.
+
+    The consequence is specific, and it is why this is a check and not a style note. Against a bare
+    `Option<String>` declared `k?: string`, `tsc` narrows
+
+        if (part.reference !== undefined) part.reference.length
+
+    to `string` and calls the file correct. At run time `part.reference` is `null` and the read
+    throws. The type checker is not wrong about the code; it is reasoning from a declaration that is
+    wrong about the other process — which is this whole tool's subject.
+
+    Reported in ONE direction, matching `_scalar_conflict`'s stated asymmetry: a declaration that
+    admits MORE than the shell can send is a dead defensive branch (a choice), and one that admits
+    LESS is a wrong answer. So `T | null` over a non-`Option` is silent here on purpose.
+    """
+    if rustipc.type_head(r_ft) != "Option":
+        return []  # the shell cannot send null or omit it; a looser read is the caller's choice
+    _, _, t_nullable = tsipc.unwrap(t_ft)
+    if r_skipped:
+        # The key is omitted, never null. `?` is the honest spelling; `| null` also survives it,
+        # because a reader forced to handle null will handle undefined the same way.
+        if t_optional or t_nullable:
+            return []
+        return [Finding(
+            "error", "nullable", where,
+            f'"{cmd}" — `{path}.{key}` is `{r_ft}` with `skip_serializing_if` '
+            f"({r_dto.file}:{r_dto.line}), so the key is ABSENT when it is `None`; "
+            f"`{t_ty.name}.{key}` is declared `{t_ft}`, which says it is always there. "
+            "JavaScript reads `undefined` off a key that was never sent, and `tsc` — reading the "
+            "declaration, not the wire — raises nothing",
+            f"nullable@{cmd}.{key}",
+        )]
+    # Bare `Option<T>`: serde puts the key on the wire holding `null`.
+    if t_nullable:
+        return []
+    admits = "`undefined`, not `null`" if t_optional else "neither"
+    spelling = f"{key}?: {t_ft}" if t_optional else f"{key}: {t_ft}"
+    return [Finding(
+        "error", "nullable", where,
+        f'"{cmd}" — `{path}.{key}` is `{r_ft}` with no `skip_serializing_if` '
+        f"({r_dto.file}:{r_dto.line}), so the shell sends `\"{key}\": null`; "
+        f"`{t_ty.name}` declares `{spelling}`, which admits {admits}. Under strictNullChecks "
+        f"`if (x.{key} !== undefined)` narrows to a non-null type and `tsc` blesses the read that "
+        "then throws — the declaration is an assertion about another process, and this is the one "
+        "the type-checker cannot help with",
+        f"nullable@{cmd}.{key}",
+    )]
+
+
 def _nested_findings(
     r_shape: rustipc.Dto,
     t_shape: tsipc.TsType,
@@ -453,6 +537,11 @@ def _nested_findings(
     where: str,
 ) -> tuple[list[Finding], int, int, int, set[str]]:
     """Follow a reply PAST its own keys, and compare each nested object pair the same way.
+
+    This walk is also where the `nullable` check runs, at every level INCLUDING the root — the queue
+    seeds with the top-level pair, so putting it here covers the whole reply in one place rather
+    than in two that could drift apart.
+
 
     Comparing only the outermost object was a stated limit, and it was load-bearing in the wrong
     direction: it made the audit's verdict depend on how deeply a shape happened to be nested rather
@@ -474,6 +563,11 @@ def _nested_findings(
     out: list[Finding] = []
     pairs = 0
     enum_pairs = enum_unresolved = 0
+    null_pairs = 0
+    #: WHICH `Option` fields the walk actually reached, deduplicated by (struct, key). The raw pair
+    #: count says how much work was done; this says how much of the 175-field surface is covered,
+    #: and only the second number distinguishes "reached everything" from "reached one DTO 200 times".
+    option_pairs: set[tuple[str, str]] = set()
     enum_names: set[str] = set()
     seen: set[tuple[str, str]] = {(r_shape.name, t_shape.name)}
     # (rust dto, ts type, path, depth) — breadth-first, so a shallow drift is reported before a deep one.
@@ -483,13 +577,22 @@ def _nested_findings(
         if depth >= _MAX_DEPTH:
             continue
         carried = {k for k, _ in r_dto.fields}
-        for key, _opt in t_ty.fields:
+        skipped = dict(r_dto.fields)  # wire key -> serde omits it when None
+        for key, t_opt in t_ty.fields:
             if key not in carried or key in r_dto.opaque:
                 continue  # absence is the top-level check's finding; opaque is already reported
             r_ft = r_dto.field_types.get(key)
             t_ft = t_ty.field_types.get(key)
             if not r_ft or not t_ft:
                 continue
+            # BEFORE the enum branch below, which `continue`s: `Option<SomeEnum>` is both an enum
+            # field and a nullable one, and a variant comparison says nothing about the null.
+            null_pairs += 1
+            if rustipc.type_head(r_ft) == "Option":
+                option_pairs.add((r_dto.name, key))
+            out += _nullable_findings(
+                r_dto, t_ty, key, r_ft, t_ft, t_opt, skipped.get(key, False), cmd, where, path
+            )
             here_e = f"{path}.{key}"
             # The file that wrote the field's type is the file whose declarations it can name.
             e = rust_enum(r_ft, rs, r_dto.file)
@@ -565,23 +668,24 @@ def _nested_findings(
                             f"nested@{cmd}",
                         )
                     )
-    return out, pairs, enum_pairs, enum_unresolved, enum_names
+    return out, pairs, enum_pairs, enum_unresolved, enum_names, null_pairs, option_pairs
 
 
 def _shape_findings(
     rs: rustipc.RustIpc, ts: tsipc.TsIpc
-) -> tuple[list[Finding], int, int, int, int, int, list[str]]:
+) -> tuple[list[Finding], int, int, int, int, int, list[str], int, int]:
     """Returns the findings and, so the header can state the check's REACH, how many replies were
     actually compared and how many of those got a field-by-field comparison rather than only a
     kind/list one. A `shape` line that says nothing is the output of both "they agree" and "I never
     resolved either side", and only the header can tell a reader which."""
     out: list[Finding] = []
     compared = fields_compared = nested_pairs = 0
-    enum_pairs = enum_unresolved = 0
+    enum_pairs = enum_unresolved = null_pairs = 0
     #: WHICH enums were reached, not just how many pairs. 63 pairs across 8 distinct enums and 63
     #: across 29 are very different states of coverage, and only the second number distinguishes
     #: them — the rest sit behind `serde_json::Value` reply fields that `coverage` already waives.
     enum_names: set[str] = set()
+    option_pairs: set[tuple[str, str]] = set()
     for inv in ts.invocations:
         if inv.cmd is None or inv.targ is None or inv.cmd not in rs.commands:
             continue
@@ -723,14 +827,16 @@ def _shape_findings(
                 )
             )
             continue  # the shapes already disagree here; a walk below it would report the same break twice
-        nf, np, ne, nu, nn = _nested_findings(r_shape, t_shape, rs, ts, inv.cmd, where)
+        nf, np, ne, nu, nn, nnull, nopt = _nested_findings(r_shape, t_shape, rs, ts, inv.cmd, where)
         out.extend(nf)
         nested_pairs += np
         enum_pairs += ne
         enum_unresolved += nu
         enum_names |= nn
+        null_pairs += nnull
+        option_pairs |= nopt
     return (out, compared, fields_compared, nested_pairs, enum_pairs, enum_unresolved,
-            sorted(enum_names))
+            sorted(enum_names), null_pairs, len(option_pairs))
 
 
 def _tuple_read_findings(
@@ -1133,7 +1239,7 @@ def run(root: str) -> tuple[list[Finding], dict]:
     findings = _coverage_findings(root, missing, rs, ts)
     compared = fields_compared = nested_pairs = 0
     read_steps = read_unresolved = tuples_compared = 0
-    enum_pairs = enum_unres = 0
+    enum_pairs = enum_unres = null_pairs = option_reached = 0
     enum_names: list[str] = []
     if not any(f.check == "coverage" and "audit root does not exist" in f.message for f in findings) \
             and not missing:
@@ -1141,7 +1247,7 @@ def run(root: str) -> tuple[list[Finding], dict]:
         findings += _command_findings(rs, ts)
         findings += _argument_findings(rs, ts)
         (shape, compared, fields_compared, nested_pairs, enum_pairs, enum_unres,
-         enum_names) = _shape_findings(rs, ts)
+         enum_names, null_pairs, option_reached) = _shape_findings(rs, ts)
         findings += shape
         rf, read_steps, read_unresolved = _read_findings(rs, reads)
         findings += rf
@@ -1174,11 +1280,17 @@ def run(root: str) -> tuple[list[Finding], dict]:
         "enum_pairs": enum_pairs,
         "enum_unresolved": enum_unres,
         "enum_names": enum_names,
+        "null_pairs": null_pairs,
+        "option_fields_reached": option_reached,
+        "rust_option_fields": sum(
+            1 for d in rs.dtos.values()
+            for t in d.field_types.values() if rustipc.type_head(t) == "Option"
+        ),
         "dtos": len(rs.dtos),
         "ts_types": len(ts.types),
     }
     order = {"registration": 0, "command": 1, "arguments": 2, "shape": 3, "nested": 4,
-             "variants": 5, "reads": 6, "coverage": 7}
+             "variants": 5, "nullable": 6, "reads": 7, "coverage": 8}
     findings.sort(key=lambda f: (order.get(f.check, 9), f.where, f.message))
     return findings, stats
 
@@ -1186,7 +1298,8 @@ def run(root: str) -> tuple[list[Finding], dict]:
 SUCCESS = (
     "every invoked command exists, every argument key is accepted, every reply field the UI reads "
     "— at the top level and every level under it the reader can resolve — is one the shell sends, "
-    "and every enum reaching the UI sends exactly the strings the UI compares against."
+    "every enum reaching the UI sends exactly the strings the UI compares against, and no field "
+    "can arrive `null` or absent in a way the caller's declared type does not admit."
 )
 
 
@@ -1232,7 +1345,10 @@ def main() -> int:
             f"{stats['enums_string_like']} of {stats['enums']} serde enum(s) are a bare string on "
             f"the wire, and {stats['enum_pairs']} enum/string-union pair(s) across "
             f"{len(stats['enum_names'])} distinct enum(s) had their variant sets compared "
-            f"({stats['enum_unresolved']} could not be)"
+            f"({stats['enum_unresolved']} could not be); "
+            f"{stats['null_pairs']} field pair(s) checked for whether the shell can send `null` or "
+            f"omit the key, reaching {stats['option_fields_reached']} of the "
+            f"{stats['rust_option_fields']} `Option` field(s) the swept structs declare"
         )
         for f in findings:
             tag = "ERROR " if f.severity == "error" else "UNRESL"
