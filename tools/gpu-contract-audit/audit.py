@@ -42,7 +42,25 @@ import wgsl
 # it `include_str!`s, so the pairing is read from the source rather than configured here.
 # Split into components rather than written with "/", so the glob is the same on Windows — where
 # this crate is actually built, and where CI runs it.
-RUST_GLOBS = (("src", "*.rs"), ("examples", "*.rs"))
+#
+# **Recursive on purpose.** These were `("src", "*.rs")` — one level, no `**`. `render.rs` is a
+# 334 KB file whose obvious repair is to split it into `src/render/`, and the moment it moved there
+# the audit stopped seeing the renderer AT ALL: not an error, not a warning, just a smaller number in
+# a header line nobody diffs. Losing the renderer does not merely leave it unchecked — it is the
+# *reference* the `parity` check measures examples against, so its absence silently switched that
+# check off for every example (proved: `progress/gpu-contract-audit/discovery-blind-spot.md`).
+# A glob that fails to find the thing it is auditing must never read as "clean", which is what
+# `_coverage_findings` below now enforces.
+RUST_GLOBS = (
+    ("src", "**", "*.rs"),
+    ("examples", "**", "*.rs"),
+    ("tests", "**", "*.rs"),
+    ("benches", "**", "*.rs"),
+)
+
+# A pipeline-creating CALL, not a mention. The trailing `(` and leading `.` keep a source-contract
+# test that merely asserts on the string `"create_render_pipeline"` from reading as a renderer.
+PIPELINE_CALL = re.compile(r"\.create_(?:render|compute)_pipeline\s*\(")
 
 
 @dataclass
@@ -198,6 +216,14 @@ def check_file(
         layouts, problems = _layouts_for(p.buffers, rf)
         for msg in problems:
             out.append(Finding("unresolved", "attributes", where, msg))
+        if problems:
+            # An unreadable `buffers:` expression means the layouts are UNKNOWN, not empty. Falling
+            # through printed a confident "no vertex buffers are bound" for every location the shader
+            # reads — a diagnosis invented on top of "I could not read it", pointing the reader at the
+            # shader when the repair belongs in rustgpu.py. The unresolved finding above already
+            # blocks; adding a wrong reason to a correct failure only costs the next reader an hour.
+            # (`buffers: &[]` is a different case — genuinely empty, no problem reported, still checked.)
+            continue
         provided: dict[int, rustgpu.Attribute] = {}
         for lay in layouts:
             for a in lay.attributes:
@@ -279,6 +305,23 @@ def check_file(
         # the frame renders, and the evidence is of a shader the application never runs: flat
         # unlit colour where the app evaluates a BRDF. Nothing else in the audit can see that, so
         # the pairing the renderer uses is the reference.
+        # A vertex entry the reference has never heard of used to fall out of this `if` in silence,
+        # which is the partial-reference hole: lose SOME of the renderer and the examples drawing the
+        # lost entries go unmeasured, with the same "0 findings" as agreement. There are only two
+        # readings and both are defects — either the renderer genuinely never draws this entry (so
+        # the frame is not evidence of the application) or the audit failed to read the pipeline that
+        # does. Say so rather than skip.
+        if reference is not None and p.vertex_entry and p.vertex_entry not in reference:
+            out.append(
+                Finding(
+                    "error",
+                    "parity",
+                    where,
+                    f"draws `{p.vertex_entry}`, but no pipeline audited under src/ draws it — either the "
+                    f"application never renders this entry, or the renderer's pipeline for it was not read. "
+                    f"src/ draws: {', '.join(sorted('`%s`' % e for e in reference)) or '(nothing)'}",
+                )
+            )
         if reference is not None and p.vertex_entry in reference:
             expected_fs, expected_topo = reference[p.vertex_entry]
             if p.fragment_entry and expected_fs and p.fragment_entry not in expected_fs:
@@ -403,19 +446,111 @@ def _rust_files(root: str) -> list[str]:
 
     out: list[str] = []
     for parts in RUST_GLOBS:
-        out.extend(sorted(glob.glob(os.path.join(root, *parts))))
+        for p in glob.glob(os.path.join(root, *parts), recursive=True):
+            # `target/` holds generated copies of the very sources being audited; auditing a build
+            # artefact would double every finding and pin them to paths nobody edits.
+            if f"{os.sep}target{os.sep}" in p:
+                continue
+            out.append(p)
+    return sorted(set(out))
+
+
+def _coverage_findings(
+    root: str,
+    scanned: list[tuple[str, str]],
+    parsed: list[tuple[str, rustgpu.RustFile, dict[str, wgsl.Module]]],
+    reference: dict[str, tuple[set[str], set[str]]],
+) -> list[Finding]:
+    """Findings about the audit's own reach — the ones that keep "clean" from meaning "invisible".
+
+    Every other check in this file compares two statements of a contract. These compare the audit
+    against the tree, because a checker that silently stops looking is worse than no checker: it
+    reports the same "0 findings" it reports when everything is right. Pointed at a directory that
+    does not exist, this tool used to print *"every pipeline's Rust description matches the WGSL it
+    names"* and exit 0 — its success message, for a tree it never opened.
+    """
+    out: list[Finding] = []
+    read: set[str] = {rel for rel, _, _ in parsed}
+
+    # 0. The tree itself. A renamed crate directory, a wrong --root, or a CI job whose working
+    #    directory moved must never read as agreement. This one is checked first because every
+    #    finding below it would be vacuously absent.
+    if not os.path.isdir(root):
+        return [
+            Finding(
+                "error",
+                "coverage",
+                root.replace(os.sep, "/"),
+                "the audit root does not exist, so nothing was compared. This is a broken invocation "
+                "reported as a clean gate — fix --root",
+            )
+        ]
+    if not scanned:
+        return [
+            Finding(
+                "error",
+                "coverage",
+                root.replace(os.sep, "/"),
+                f"no .rs file was found under {'/, '.join(p[0] for p in RUST_GLOBS)}/ — the audit root "
+                "exists but holds none of the trees this gate reads",
+            )
+        ]
+    if not any(rf.pipelines for _, rf, _ in parsed):
+        out.append(
+            Finding(
+                "error",
+                "coverage",
+                root.replace(os.sep, "/"),
+                f"scanned {len(scanned)} file(s) and found no pipeline anywhere — a renderer the gate "
+                "cannot find is not a renderer the gate agrees with",
+            )
+        )
+
+    # 1. A file that CALLS `create_render_pipeline` and yields no pipeline is unreadable, not clean.
+    #    (`//` comments stripped first, so the explanation of a defect never reads as the defect.)
+    for rel, raw in scanned:
+        if rel in read:
+            continue
+        if PIPELINE_CALL.search(re.sub(r"//[^\n]*", "", raw)):
+            out.append(
+                Finding(
+                    "unresolved",
+                    "coverage",
+                    rel,
+                    "calls create_render_pipeline, but the audit parsed 0 pipelines from it — this file "
+                    "is UNREADABLE to the gate, not clean. Teach rustgpu.py the shape it uses; do not "
+                    "leave it looking green",
+                )
+            )
+
+    # 2. The reference is what `parity` measures examples against. If it is empty, that check has no
+    #    ground truth and reports nothing — which is indistinguishable from agreement.
+    examples = [rel for rel, rf, _ in parsed if rel.startswith("examples/") and rf.pipelines]
+    if examples and not reference:
+        out.append(
+            Finding(
+                "error",
+                "coverage",
+                "src/",
+                "no pipeline was audited under src/, so the parity check has NO reference: the shader "
+                f"pairing and primitive of {len(examples)} example file(s) would pass unexamined. The "
+                "renderer is not where the audit is looking — check RUST_GLOBS against where it lives now",
+            )
+        )
     return out
 
 
-def run(root: str) -> tuple[list[Finding], list[str]]:
+def run(root: str) -> tuple[list[Finding], list[str], list[str]]:
     findings: list[Finding] = []
     audited: list[str] = []
     cache: dict[str, wgsl.Module] = {}
     parsed: list[tuple[str, rustgpu.RustFile, dict[str, wgsl.Module]]] = []
+    scanned: list[tuple[str, str]] = []
 
     for path in _rust_files(root):
         rel = os.path.relpath(path, root).replace(os.sep, "/")
         raw = open(path, encoding="utf-8").read()
+        scanned.append((rel, raw))
         rf = rustgpu.parse_rust(rel, raw)
         if not rf.pipelines and not rf.structs:
             continue
@@ -452,6 +587,8 @@ def run(root: str) -> tuple[list[Finding], list[str]]:
         audited.append(rel)
         findings.extend(check_file(rf, shaders, rel, reference if rel.startswith("examples/") else None))
 
+    findings.extend(_coverage_findings(root, scanned, parsed, reference))
+
     seen: set[tuple[str, str, str, str]] = set()
     unique: list[Finding] = []
     for f in findings:
@@ -459,7 +596,7 @@ def run(root: str) -> tuple[list[Finding], list[str]]:
         if key not in seen:
             seen.add(key)
             unique.append(f)
-    return unique, audited
+    return unique, audited, [rel for rel, _ in scanned]
 
 
 def read_waivers(root: str) -> dict[str, str]:
@@ -501,19 +638,28 @@ def main() -> int:
     if args.self_test:
         return self_test()
 
-    findings, audited = run(args.root)
+    findings, audited, scanned = run(args.root)
     waivers = {} if args.no_waivers else read_waivers(args.root)
 
     if args.json:
         print(
             json.dumps(
-                {"audited": audited, "waived": waivers, "findings": [asdict(f) for f in findings]}, indent=2
+                {
+                    "audited": audited,
+                    "scanned": scanned,
+                    "waived": waivers,
+                    "findings": [asdict(f) for f in findings],
+                },
+                indent=2,
             )
         )
         blocking = [f for f in findings if f.where.split(":")[0] not in waivers]
         return 1 if blocking else 0
 
-    print(f"gpu-contract-audit — {len(audited)} file(s): {', '.join(audited)}")
+    # Both numbers, always. "3 file(s)" alone cannot distinguish a tree with three pipeline files
+    # from a tree whose renderer the globs stopped matching — and that difference was invisible for
+    # exactly as long as only one number was printed.
+    print(f"gpu-contract-audit — {len(audited)} of {len(scanned)} scanned file(s): {', '.join(audited)}")
     blocking: list[Finding] = []
     for f in findings:
         mark = "ERROR " if f.severity == "error" else "UNREAD"
@@ -765,6 +911,158 @@ fn build(device: &D) {
 """
 
 
+def _self_test_coverage() -> bool:
+    """The audit's reach, checked against itself.
+
+    The five cases above are drifts between two statements of a contract. These four are a different
+    species: the gate reporting agreement about code it never read. They are here because all four
+    were live in a tool that passed every one of those five.
+    """
+    import shutil
+    import tempfile
+
+    ok = True
+
+    def case(name: str, build, want_check: str, want_text: str, want_severity: str = "error") -> None:
+        """`want_text` is not decoration. Written without it, two of these cases passed under a
+        mutation that removed the very fix they exist to pin — each caught by a *different* guard
+        that happened to fire on the same input. A case that passes for the wrong reason is a case
+        that will not notice the regression it was written for."""
+        nonlocal ok
+        with tempfile.TemporaryDirectory() as tmp:
+            root = build(tmp)
+            found, _, _ = run(root)
+            hit = [
+                f
+                for f in found
+                if f.check == want_check and f.severity == want_severity and want_text in f.message
+            ]
+            if hit:
+                print(f"pass  caught: {name}\n        → {hit[0].message}")
+            else:
+                ok = False
+                print(
+                    f"FAIL  missed: {name} (expected a `{want_check}` saying {want_text!r}, "
+                    f"got {[(f.check, f.severity, f.message[:60]) for f in found]})"
+                )
+
+    def _pair(tmp: str, renderer_dir: str) -> str:
+        """A renderer and an example that pairs `vs_mesh` with the wrong fragment entry."""
+        rdir = os.path.join(tmp, *renderer_dir.split("/"))
+        examples = os.path.join(tmp, "examples")
+        os.makedirs(rdir, exist_ok=True)
+        os.makedirs(examples, exist_ok=True)
+        open(os.path.join(rdir, "s.wgsl"), "w", encoding="utf-8").write(_SHADER)
+        open(os.path.join(rdir, "case.rs"), "w", encoding="utf-8").write(_PARITY_REFERENCE)
+        rel = "../" * (len(renderer_dir.split("/")) - 1)
+        open(os.path.join(examples, "case.rs"), "w", encoding="utf-8").write(
+            _PARITY_EXAMPLE.replace('include_str!("../src/s.wgsl")', f'include_str!("../{renderer_dir}/s.wgsl")')
+        )
+        _ = rel
+        return tmp
+
+    # 1. The one that would have fired the day prompt 118's own extraction landed: `render.rs` is a
+    #    334 KB file, the obvious repair splits it into `src/render/`, and a one-level glob stops
+    #    seeing it. Losing the renderer disables `parity` for every example, silently.
+    # Pinned to `fs_mesh` — the reference's OWN fragment entry. That name can only appear if the
+    # renderer under src/render/ was actually read; the weaker "any parity error" version of this
+    # case passed even with the one-level glob restored, via the unknown-entry guard below.
+    case(
+        "a renderer one directory deeper than the glob reached",
+        lambda tmp: _pair(tmp, "src/render"),
+        "parity",
+        "the renderer draws it with `fs_mesh`",
+    )
+
+    # 2. The renderer gone entirely: parity has no ground truth, and "nothing to compare against"
+    #    must not print the same 0 findings as "everything agrees".
+    def _no_renderer(tmp: str) -> str:
+        examples = os.path.join(tmp, "examples")
+        src = os.path.join(tmp, "src")
+        os.makedirs(examples)
+        os.makedirs(src)
+        open(os.path.join(src, "s.wgsl"), "w", encoding="utf-8").write(_SHADER)
+        open(os.path.join(examples, "case.rs"), "w", encoding="utf-8").write(_PARITY_EXAMPLE)
+        return tmp
+
+    case(
+        "an example measured against a renderer that is not there",
+        _no_renderer,
+        "coverage",
+        "the parity check has NO reference",
+    )
+
+    # 3. A file that calls create_render_pipeline in a shape the parser cannot read. The prompt's
+    #    rule: do not let a file audit clean because it was unreadable.
+    def _unreadable(tmp: str) -> str:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        open(os.path.join(src, "s.wgsl"), "w", encoding="utf-8").write(_SHADER)
+        open(os.path.join(src, "case.rs"), "w", encoding="utf-8").write(_PARITY_REFERENCE)
+        open(os.path.join(src, "exotic.rs"), "w", encoding="utf-8").write(
+            "fn build(d: &D) { let p = make_it!(d, || d.create_render_pipeline(&desc_from_toml())); }"
+        )
+        return tmp
+
+    case(
+        "a pipeline built in a shape the parser cannot read",
+        _unreadable,
+        "coverage",
+        "UNREADABLE to the gate, not clean",
+        "unresolved",
+    )
+
+    # 4. The partial-reference hole: the renderer IS read, but not the pipeline for the entry this
+    #    example draws. `vs_grid` used to fall out of the parity `if` in silence, so an example
+    #    drawing something the application never draws reported nothing at all.
+    def _orphan_entry(tmp: str) -> str:
+        src = os.path.join(tmp, "src")
+        examples = os.path.join(tmp, "examples")
+        os.makedirs(src)
+        os.makedirs(examples)
+        open(os.path.join(src, "s.wgsl"), "w", encoding="utf-8").write(_SHADER)
+        open(os.path.join(src, "case.rs"), "w", encoding="utf-8").write(_PARITY_REFERENCE)  # draws vs_mesh only
+        open(os.path.join(examples, "case.rs"), "w", encoding="utf-8").write(_TOPOLOGY_EXAMPLE)  # draws vs_grid
+        return tmp
+
+    case(
+        "an example drawing a vertex entry the renderer has no pipeline for",
+        _orphan_entry,
+        "parity",
+        "no pipeline audited under src/ draws it",
+    )
+
+    # 5. The root exists and holds Rust, but no pipeline was found in any of it. Distinct from the
+    #    case above: this is the shape a renderer moved to another crate leaves behind, and the one
+    #    a parser regression leaves behind across the board.
+    def _no_pipelines_anywhere(tmp: str) -> str:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        open(os.path.join(src, "s.wgsl"), "w", encoding="utf-8").write(_SHADER)
+        open(os.path.join(src, "case.rs"), "w", encoding="utf-8").write("fn main() { println!(\"no gpu here\"); }\n")
+        return tmp
+
+    case(
+        "a tree with Rust in it and no pipeline anywhere",
+        _no_pipelines_anywhere,
+        "coverage",
+        "found no pipeline anywhere",
+    )
+
+    # 6. The purest form, and it was live: pointed at a directory that does not exist, the tool
+    #    printed "every pipeline's Rust description matches the WGSL it names" and exited 0.
+    def _missing_root(tmp: str) -> str:
+        gone = os.path.join(tmp, "not-a-crate")
+        shutil.rmtree(gone, ignore_errors=True)
+        return gone
+
+    # Pinned to "does not exist" rather than any coverage error: a missing root also trips the
+    # "no .rs file was found" guard, so the weaker version of this case passed with the isdir check
+    # removed — reporting a real problem under a misleading name.
+    case("an audit root that does not exist", _missing_root, "coverage", "the audit root does not exist")
+    return ok
+
+
 def self_test() -> int:
     import tempfile
 
@@ -780,7 +1078,7 @@ def self_test() -> int:
         def audit(code: str, example: str = "") -> list[Finding]:
             open(os.path.join(src, "case.rs"), "w", encoding="utf-8").write(code)
             open(empty, "w", encoding="utf-8").write(example)
-            found, _ = run(tmp)
+            found, _, _ = run(tmp)
             return found
 
         clean = audit(_CLEAN)
@@ -813,7 +1111,16 @@ def self_test() -> int:
                 ok = False
                 print(f"FAIL  missed: {name} (got {[(f.check, f.message) for f in found]})")
 
-    print("\nself-test: " + ("every historic drift is caught, and a clean pair stays clean." if ok else "FAILED"))
+    ok = _self_test_coverage() and ok
+
+    print(
+        "\nself-test: "
+        + (
+            "every historic drift is caught, the audit's own reach is checked, and a clean pair stays clean."
+            if ok
+            else "FAILED"
+        )
+    )
     return 0 if ok else 1
 
 
