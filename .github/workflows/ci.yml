@@ -351,7 +351,18 @@ jobs:
     # The React editor projection (editor/, ADR-010) has a real vitest suite (transport-frame decode,
     # optimistic-reconcile, 5k selective-subscription projection, end-to-end wiring) that no Rust CI job
     # touches — it would regress invisibly. This runs it. (editor/ uses pnpm — pnpm-lock.yaml is tracked.)
-    name: vitest (editor TS projection)
+    #
+    # It also runs the two editor gates that used to exist WITHOUT ever being run, which is the same thing
+    # as not existing (`<test_and_ci_discipline>` no-dark-tests):
+    #
+    #  * `tsc -b` — vitest transpiles per-file and NEVER type-checks. Every type in `transport/protocol.ts`
+    #    that mirrors a Rust reply, every prop contract, every exhaustive switch was therefore unchecked by
+    #    CI: the editor could ship a type error and this job stayed green.
+    #  * the UI/UX Constitution ratchet — `check-ui-constitution.mjs` had NO CI job at all, and was found
+    #    RED on HEAD (a raw `<select>` in FormatsPanel, unlisted in the baseline) — landed, unnoticed,
+    #    because nothing ran the gate. Its `--self-test` runs FIRST: a ratchet that stops discriminating
+    #    must fail on itself rather than going quiet.
+    name: typecheck + constitution + vitest (editor TS projection)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -366,9 +377,20 @@ jobs:
       - name: Install pnpm 10
         run: npm install -g pnpm@10
 
+      # The ratchet is deliberately Node-built-ins only, so it gates even if the install below breaks.
+      - name: UI constitution ratchet — self-test, then the tree
+        working-directory: editor
+        run: |
+          node scripts/check-ui-constitution.mjs --self-test
+          node scripts/check-ui-constitution.mjs
+
       - name: Install (frozen lockfile)
         working-directory: editor
         run: pnpm install --frozen-lockfile
+
+      - name: typecheck (tsc — vitest does not type-check)
+        working-directory: editor
+        run: pnpm exec tsc -b --force
 
       - name: vitest
         working-directory: editor
