@@ -395,3 +395,27 @@ jobs:
       - name: vitest
         working-directory: editor
         run: pnpm test
+
+      # The panel-screenshot harness (`editor/scripts/shots/`). It had already found two real defects
+      # from a `progress/` folder — a remove button that wrapped onto its own line, and a stale-closure
+      # no-op in its own mock — neither of which a green vitest suite could see, because jsdom has no
+      # layout and no pixels. A tool that has earned its keep twice belongs in the repo with a gate on it.
+      #
+      # This runs the CAPTURE, not just the build. A build-only job would be `mesh_frame_bench.rs` again:
+      # that file compiled cleanly through four renderer generations while every contract inside it rotted.
+      # `shoot.mjs` fails when a scene throws, fails to mount, or comes back as a flat frame — so a panel
+      # that stops rendering is red here rather than discovered by a human, later, on a machine with a display.
+      # Chromium arrives through npm (`@sparticuz/chromium`), so there is no CDN download to be blocked.
+      - name: panel shots — every scene mounts, logs no error, and produces pixels
+        working-directory: editor
+        run: pnpm shots --out "$RUNNER_TEMP/shots"
+
+      # Kept on failure only: the point of the job is the pass/fail, and an artifact nobody looks at on a
+      # green run is storage. On a red run the pixels are the whole diagnosis.
+      - name: upload the captures when a scene fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: panel-shots
+          path: ${{ runner.temp }}/shots
+          if-no-files-found: ignore

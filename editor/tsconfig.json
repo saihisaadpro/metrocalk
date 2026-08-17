@@ -17,5 +17,11 @@
     "noFallthroughCasesInSwitch": true,
     "types": ["vitest/globals"]
   },
-  "include": ["src"]
+  // `scripts/shots` is in here on purpose. It imports real panels and real reply types, so a props or
+  // DTO change breaks it — and vite's esbuild transform discards types, which would leave the capture
+  // run as the only thing that ever noticed. Typechecking it costs nothing and fails faster.
+  // `.tsx` only: the harness's vite config is a build config, like the app's own `vite.config.ts`,
+  // which this project has always kept out of the typecheck (it runs under vite's own esbuild loader,
+  // where `__dirname` exists and `@types/node` does not).
+  "include": ["src", "scripts/shots/*.tsx"]
 }

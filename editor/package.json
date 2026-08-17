@@ -11,7 +11,8 @@
     "build:verify": "npm run check:ui-constitution && npm run build && node scripts/check-bundle.mjs",
     "test": "vitest run",
     "test:ui-constitution": "node scripts/check-ui-constitution.mjs --self-test",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "shots": "node scripts/shots/shoot.mjs"
   },
   "dependencies": {
     "@jsonforms/core": "^3.6.0",
@@ -23,12 +24,14 @@
     "zustand": "^5.0.0"
   },
   "devDependencies": {
+    "@sparticuz/chromium": "^149.0.0",
     "@testing-library/dom": "^10.4.0",
     "@testing-library/react": "^16.1.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^4.3.4",
     "jsdom": "^25.0.1",
+    "puppeteer-core": "^25.8.0",
     "typescript": "^5.6.3",
     "vite": "^6.0.3",
     "vitest": "^2.1.8"
