@@ -16,7 +16,7 @@
 //! * **Every row states what it will not carry**, in the same sentence as what it will.
 
 import { useEffect, useState } from "react";
-import { Button } from "../theme/primitives";
+import { Button, SelectField } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { ColourStatus, FormatSpec } from "../transport/protocol";
 import type { EditorClient, ViewportRenderProfile } from "../transport/session";
@@ -169,27 +169,20 @@ function ColourCard({ client }: { client: EditorClient }) {
 
       <div style={{ display: "flex", gap: space.xs, flexWrap: "wrap", alignItems: "center" }}>
         <span style={{ fontSize: fontSize.meta, color: color.text.muted }}>Environment is</span>
-        <select
+        <SelectField
+          aria-label="Environment colour space"
           data-testid="colour-env-space"
           disabled={busy}
           value={colour.environment.sourceSpace}
           onChange={(e) => pickEnv(e.target.value)}
-          style={{
-            font: font.ui,
-            fontSize: fontSize.meta,
-            color: color.text.primary,
-            background: color.bg.inset,
-            border: `1px solid ${color.border.subtle}`,
-            borderRadius: radius.sm,
-            padding: `${space.xxs}px ${space.xs}px`,
-          }}
+          style={{ fontSize: fontSize.meta }}
         >
           {colour.environment.options.map((o) => (
             <option key={o.id} value={o.arg}>
               {o.label}
             </option>
           ))}
-        </select>
+        </SelectField>
         {colour.environment.assumed && (
           <span style={{ fontSize: fontSize.meta, color: color.text.muted }}>
             assumed — the file does not say
