@@ -41,31 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Every render pipeline is described twice — once in WGSL, once in Rust — and wgpu only compares the
-      # two at pipeline creation, on a machine with a GPU. Neither this job nor `clippy --all-targets` can
-      # see a disagreement: the Rust compiles either way. That is how `examples/mesh_frame_bench` drifted
-      # four times over and took the repository's only automatable render evidence with it. This runs the
-      # same comparison at rest, in milliseconds, before the heavy Rust steps — so it fails FIRST and names
-      # the pipeline, the location and the rule, instead of a byte count at run time. Its `--self-test`
-      # replays the drifts that actually happened, so a gate that stops catching them fails on itself.
-      - name: GPU contract — the Rust still describes the WGSL's pipelines
-        shell: bash
-        run: |
-          python tools/gpu-contract-audit/audit.py --self-test
-          python tools/gpu-contract-audit/audit.py
-
-      # The same argument, one boundary over. Every Tauri command is described twice — once as a Rust
-      # `#[tauri::command]`, once as an `invoke("name", { key })` in TypeScript — and NOTHING compares the
-      # two: Tauri dispatches on a string at run time, `cargo` checks one side, `tsc` checks the other. A
-      # renamed reply field does not even error; JavaScript reads `undefined` and the panel renders blank.
-      # The Vitest job cannot catch it either, because the dev path uses an in-process client that never
-      # calls `invoke` at all — so all 1,411 call sites (the React transport AND the E2E suite) are dark
-      # until the packaged `.exe` runs. This compares them at rest, in seconds, before the Rust steps.
-      - name: IPC contract — the TypeScript still asks for the command the Rust answers
-        shell: bash
-        run: |
-          python tools/ipc-contract-audit/audit.py --self-test
-          python tools/ipc-contract-audit/audit.py
+      # The GPU and IPC contract audits USED to run here, ahead of the heavy Rust steps. They now live in
+      # `contract-gates.yml`, unfiltered, alongside the E2E load gate — because this job's path filter did
+      # not include the trees those audits read (`editor-shell/e2e/**`, `editor/src/store/**`, `core/src/**`),
+      # so the edits most likely to break a contract were exactly the edits that did not run the check. They
+      # are pure Python and cost ~30s; making them conditional on a 35-minute Tauri build was backwards.
 
       # `tauri::generate_context!()` embeds `frontendDist` (tauri.conf.json → ../../editor/dist) at compile
       # time, so the dir must EXIST or the macro panics. `editor/dist` is a gitignored Vite BUILD ARTIFACT

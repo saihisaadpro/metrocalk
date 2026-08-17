@@ -1,0 +1,72 @@
+name: contract-gates
+
+# The three checks that compare a contract stated TWICE, in two languages, that no compiler compares:
+#
+#   gpu-contract-audit   WGSL `@location`/`@group`/`struct` against the Rust `VertexBufferLayout`,
+#                        pipeline layout and `#[repr(C)]`. wgpu compares them at pipeline creation —
+#                        on a machine with a GPU, in a build that got that far.
+#   ipc-contract-audit   every `#[tauri::command]` against every `invoke("name", { key })`, and every
+#                        reply field the UI reads — declared in TypeScript, or merely READ in the
+#                        untyped E2E suite — against what the shell actually sends.
+#   e2e-load-gate        does each of the 142 E2E specs still parse, and does every name it imports
+#                        from a relative module still get exported by it?
+#
+# WHY THIS IS ITS OWN WORKFLOW, AND WHY IT HAS NO PATH FILTER.
+# These used to be steps inside `editor-shell-app.yml`, which is a 35-minute Windows Tauri build
+# gated on `editor-shell/src-tauri/**` and `editor/src/transport/**`. Two things were wrong with
+# that. First, the filter did not include the trees the audits READ: `editor-shell/e2e/**` (1,209 of
+# the 1,411 audited call sites), `editor/src/store/**` (two of the four reply-type sources) and
+# `core/src/**` (where several reply DTOs live) — so exactly the edits most likely to break a
+# contract were the edits that did not run the check. Second, a gate worth having should not cost 35
+# minutes of Tauri build to consult.
+#
+# These are pure Python with no toolchain, no WebView and no GPU — about half a minute in total. So
+# they run on everything, always. A contract gate that sometimes does not run is a contract gate
+# whose green carries no information, and this repository has been caught by that exact shape twice
+# (prompt 40's suite that had never run; `mesh_frame_bench.rs` compiling cleanly through four
+# renderer generations while every contract inside it rotted).
+#
+# Every audit runs `--self-test` FIRST. A ratchet must prove it still discriminates before it is
+# trusted to judge: each self-test case runs drifted (the finding must appear) and repaired (it must
+# be gone), so a guard that stops catching what it was written for fails here rather than going
+# quiet.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: contracts stated twice, compared at rest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # `e2e-load-gate` shells out to `node --check`. It treats a missing `node` as a FAILURE rather
+      # than a skip — a gate that quietly stops checking when a tool is absent reports agreement
+      # about files it never opened — so the runtime is installed explicitly rather than assumed.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: GPU contract — the Rust still describes the WGSL's pipelines
+        run: |
+          python tools/gpu-contract-audit/audit.py --self-test
+          python tools/gpu-contract-audit/audit.py
+
+      - name: IPC contract — the command, the arguments, and every reply field that is read
+        run: |
+          python tools/ipc-contract-audit/audit.py --self-test
+          python tools/ipc-contract-audit/audit.py
+
+      - name: E2E load gate — would these specs still load, if anyone ran them?
+        run: |
+          python tools/e2e-load-gate/gate.py --self-test
+          python tools/e2e-load-gate/gate.py
