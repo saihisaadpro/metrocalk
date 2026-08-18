@@ -2,6 +2,7 @@ import { act, render, screen, waitFor, fireEvent } from "@testing-library/react"
 import { afterEach, expect, test, vi } from "vitest";
 import { projectionStore } from "../store/projection";
 import { playStore } from "../store/play";
+import type { RoleRow } from "../transport/protocol";
 import { fakeClient } from "../transport/test-client";
 import { BehaviourSection } from "./BehaviourSection";
 
@@ -33,27 +34,68 @@ test("clicking an asset surfaces the full behaviour catalog right in the Inspect
   expect(screen.getByTestId("behaviour-companion").getAttribute("title")).toContain("Adds:");
 });
 
+/** `role_assign` and `role_status` are TWO round-trips and the panel makes both: it sets the role
+ *  optimistically from the assign reply, then bumps `refreshKey` and re-reads `role_status`, which is
+ *  authoritative (invariant 1 — the UI holds a projection, so the later read wins).
+ *
+ *  This test used to stub only `roleAssign` and inherit `fakeClient`'s `roleStatus`, which answers
+ *  `roster: []` forever. So the fixture asserted two things the real shell cannot both say: "the
+ *  assign applied `companion` to e1" and "e1 holds no role". The refetch then legitimately set the
+ *  role back to null and unmounted `behaviour-clear` — and whether the test passed came down to
+ *  whether `findByTestId`'s first poll landed before that promise resolved. It flaked ~1 run in 3.
+ *
+ *  Retrying was the wrong repair: this is ADR-123's failure from the other side — green against a
+ *  payload `/core` cannot produce — and the transient it was really pinning is the OPTIMISTIC state,
+ *  not the settled one the test's own name claims. So the roster now changes when the assign lands,
+ *  exactly as the shell's does, and the assertions are about where the panel COMES TO REST. */
 test("assigning from the Inspector lands with the undo hint and updates the held-role line", async () => {
+  // Typed as the wire type, not as the three keys this test happens to read. Left inferred, the
+  // literal below type-checked against itself and omitted `RoleRow.name` — a fixture wrong about the
+  // shell in the exact way the fixture it replaced was, caught here only because `tsc` was asked.
+  let roster: RoleRow[] = [];
   const client = fakeClient({
-    roleAssign: vi.fn(() =>
-      Promise.resolve({
+    roleAssign: vi.fn(() => {
+      roster = [{ entity: "e1", name: "Dog", role: "companion" }];
+      return Promise.resolve({
         applied: "companion",
         entity: "e1",
         added: ["a live brain"],
         scoreEntity: null,
         message: "Now a Companion",
         reason: null,
+      });
+    }),
+    roleStatus: vi.fn(() =>
+      Promise.resolve({
+        roster,
+        score: 0,
+        scoreEntity: null,
+        remaining: 0,
+        companions: [],
+        won: false,
+        health: null,
+        blocked: null,
       }),
     ),
   });
   seed("e1", "Dog");
   render(<BehaviourSection client={client} />);
+  // Before the click the roster is empty, so the held-role line must NOT already read "Companion" —
+  // otherwise the assertion below would pass on a panel that ignored the click entirely.
+  expect((await screen.findByTestId("behaviour-state")).textContent).toContain("doesn't do anything yet");
+
   fireEvent.click(await screen.findByTestId("behaviour-companion"));
   await waitFor(() => {
     expect(screen.getByTestId("behaviour-state").textContent).toContain("Dog is a Companion");
   });
   expect(client.roleAssign).toHaveBeenCalledWith("e1", "companion");
   await screen.findByTestId("behaviour-clear");
+
+  // The settled state, after the authoritative re-read has had its say. Without this the test still
+  // only pins the optimistic flash: `role_status` is what decides what the panel finally shows.
+  await waitFor(() => expect(client.roleStatus).toHaveBeenCalledTimes(2));
+  expect(screen.getByTestId("behaviour-state").textContent).toContain("Dog is a Companion");
+  expect(screen.getByTestId("behaviour-clear")).toBeTruthy();
 });
 
 test("refusals surface inline, in plain language", async () => {
