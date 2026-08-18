@@ -815,3 +815,14 @@ def run() -> int:
         else "self-test: FAILED — the gate does not catch what it claims to catch."
     )
     return 0 if ok else 1
+
+
+# This file is a MODULE — CI reaches it as `audit.py --self-test`. But it is also named `selftest.py`,
+# it sits next to an executable `audit.py`, and the obvious thing to type is `python selftest.py`.
+# Without this block that invocation defined 40-odd functions, called none of them, printed nothing
+# and **exited 0** — a false green of exactly the shape `<test_and_ci_discipline>` §2 forbids, handed
+# to whoever was most likely to be checking. It was believed once in this repository's own history:
+# a session's baseline sweep ran it, read the silent 0 as a pass, and only the missing case list gave
+# it away. A self-test that can be run wrong will be, so the wrong way is now the right way.
+if __name__ == "__main__":
+    raise SystemExit(run())

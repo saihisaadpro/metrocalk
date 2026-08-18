@@ -189,3 +189,11 @@ def run() -> int:
     else:
         print("self-test: FAILED — the gate does not catch what it claims to catch.")
     return 0 if ok else 1
+
+
+# See the identical block in `tools/ipc-contract-audit/selftest.py`. CI reaches this through
+# `gate.py --self-test`; a human reaches for `python selftest.py`, and without this that invocation
+# printed nothing and exited 0 — a self-test reporting success over zero cases, which is the one
+# result a self-test must never be able to give.
+if __name__ == "__main__":
+    raise SystemExit(run())
