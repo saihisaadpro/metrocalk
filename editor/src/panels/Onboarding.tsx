@@ -65,15 +65,24 @@ export function Onboarding({ show = true, onStart, onSkip }: OnboardingProps = {
           </Button>
         </>
       )}
+      // Overlaid on the STAGE, inside it — the same anchoring `PlayBadge` uses, and for the same
+      // reason: what the card talks about (place · bind · Play · Save) happens on the stage. It was
+      // `fixed` and centred on the WINDOW, which is a position that knows nothing about the docks:
+      // at 1000 px a 520 px card centred on the window overlapped the left dock by 192 px and took
+      // the clicks of whatever was under it. Percentages here are of the stage, so the card yields
+      // with the stage instead of ignoring it, and the grid stays the only thing that decides where
+      // the stage is.
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
       style={{
-        position: "fixed",
+        position: "absolute",
         left: "50%",
-        bottom: "calc(var(--mtk-status-bar-height) + var(--mtk-bottom-bar-height) + var(--mtk-space-4))",
+        bottom: space.lg,
         transform: "translateX(-50%)",
         zIndex: z.menu,
         boxSizing: "border-box",
-        width: `min(520px, calc(100vw - ${space.xxl}px))`,
-        maxHeight: `calc(100vh - ${space.xxxl}px)`,
+        width: `min(520px, calc(100% - ${space.xxl}px))`,
+        maxHeight: `calc(100% - ${space.xxxl}px)`,
         overflowX: "hidden",
         overflowY: "auto",
         margin: 0,

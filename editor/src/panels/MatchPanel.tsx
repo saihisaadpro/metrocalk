@@ -223,7 +223,7 @@ export function MatchPanel({ client }: { client: EditorClient }) {
   // ── not a match scene yet ────────────────────────────────────────────────────────────────────────────
   if (!validation.is_match_scene) {
     return (
-      <div style={{ padding: space.md, display: "flex", flexDirection: "column", gap: space.md }}>
+      <div data-testid="match-panel" style={{ padding: space.md, display: "flex", flexDirection: "column", gap: space.md }}>
         <RolesSection client={client} />
         <CinemaSection client={client} />
         <VfxSection client={client} />
@@ -270,7 +270,10 @@ export function MatchPanel({ client }: { client: EditorClient }) {
   })();
 
   return (
-    <div style={{ padding: space.md, display: "flex", flexDirection: "column", gap: space.md }}>
+    // A stable structural handle for the black-box layout gate. Every other side workspace has one
+    // (`terrain-panel`, `assetbrowser`, …) and this panel's only testids belonged to the RUNNING
+    // match, so nothing could name the state a user actually opens it in.
+    <div data-testid="match-panel" style={{ padding: space.md, display: "flex", flexDirection: "column", gap: space.md }}>
       <RolesSection client={client} />
       <CinemaSection client={client} />
       <VfxSection client={client} />

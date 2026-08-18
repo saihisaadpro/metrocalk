@@ -92,6 +92,12 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
     <div
       id="playStageBadge"
       data-testid="playStageBadge"
+      // A DOM overlay ON the stage must not also DRIVE the stage. The viewport's own handlers pick,
+      // orbit and start gizmo drags on pointerdown/click, and this badge is inside it — so without
+      // this, pressing ⏹ Stop also fires a pick at the badge's coordinates. Found while moving the
+      // onboarding card onto the stage; the exposure is the same one and is fixed in both places.
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",
         top: space.lg,
@@ -525,7 +531,7 @@ export function App() {
         onOpenLeftDock={() => setDrawer("left")}
         onOpenRightDock={() => setDrawer("right")}
       />
-      <div style={{ flex: 1, display: "grid", gridTemplateColumns: dockGridColumns(layout, leftDockCollapsed, rightDockCollapsed), minHeight: 0 }}>
+      <div style={{ flex: 1, display: "grid", gridTemplateColumns: dockGridColumns(layout, leftDockCollapsed, rightDockCollapsed, vw), minHeight: 0 }}>
         {/* ENGINES — the one index of what this editor can do. Always the first column (except in the
             phone-width overlay layout, where the whole shell is a single column). */}
         {!layout.overlay && (
@@ -718,6 +724,14 @@ export function App() {
             </Suspense>
           )}
           {playing && <PlayBadge paused={paused} onStop={stopPlay} />}
+          {/* The first-run card is ON THE STAGE, inside it, not floating over the window. It used to
+              be `position: fixed; left: 50%` — centred on the WINDOW — and a 520 px card centred on a
+              1000 px window starts at x=240, which is 192 px inside a left dock that ends at 432. It
+              sat on top of the Build workspace's Combine section and the Terrain presets and took
+              their clicks (`<ux_quality>` 4: no control overlaps another). Centred on the STAGE it
+              cannot reach a dock at any width, because the grid — one source of truth — decides where
+              the stage is and the card simply lives there, exactly as `PlayBadge` does. */}
+          <Onboarding show={!sceneEmpty && !playing} onStart={() => openEngine("build")} />
           {sceneEmpty && !playing && (
             <EmptyState
               onDrawPipe={() => setActiveTool("pipe")}
@@ -850,7 +864,6 @@ export function App() {
           setStatus(`${command.label} could not be completed`);
         }}
       />
-      <Onboarding show={!sceneEmpty && !playing} onStart={() => openEngine("build")} />
       <StatusBar />
       <Rejections />
     </div>
