@@ -14,13 +14,28 @@ import { SCENES } from "./scenes";
 // that nothing compares to the first, which is the failure this whole repository keeps gating for.
 declare global {
   interface Window {
-    __MTK_SHOTS__: { id: string; looking_for: string; expect: unknown }[];
+    __MTK_SHOTS__: {
+      id: string;
+      looking_for: string;
+      expect: unknown;
+      width?: number;
+      viewport?: { width: number; height: number };
+      click?: string[];
+    }[];
   }
 }
 window.__MTK_SHOTS__ = SCENES.map((s) => ({
   id: s.id,
   looking_for: s.looking_for,
   expect: s.expect,
+  // `width` is forwarded even though the DRIVER never applies it — the harness does, below. It is
+  // here so the driver can reject a scene that sets both `width` and `viewport`, and that check was
+  // dead the first time it was written precisely because this line was missing: the guard compared a
+  // field the registry did not carry, so it agreed with everything. Found by mutating a scene to set
+  // both and watching the run pass.
+  width: s.width,
+  viewport: s.viewport,
+  click: s.click,
 }));
 
 const id = new URLSearchParams(location.search).get("scene") ?? SCENES[0].id;
@@ -42,10 +57,18 @@ if (!scene) {
 
 scene.setup?.();
 document.title = scene.id;
+// A scene that resized the WINDOW is measured against the window: capping the frame as well would
+// state the same number twice, and the second statement is the one that goes stale. `100%` of a body
+// whose margin is already 0 IS the viewport width.
 root.render(
   <div
     data-testid="shot-frame"
-    style={{ width: "100%", maxWidth: scene.width ?? 560, background: "var(--mtk-bg-panel)", minHeight: "100vh" }}
+    style={{
+      width: "100%",
+      maxWidth: scene.viewport ? "none" : (scene.width ?? 560),
+      background: "var(--mtk-bg-panel)",
+      minHeight: "100vh",
+    }}
   >
     {scene.render()}
   </div>,

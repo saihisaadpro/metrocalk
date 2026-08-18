@@ -14,6 +14,8 @@
 //! mounting is a red gate, not a smaller number in a log nobody diffs.
 
 import { useEffect, useState, type ReactNode } from "react";
+import { App } from "../../src/app/App";
+import { STAGE_MIN } from "../../src/app/layout";
 import { Diagnostics } from "../../src/panels/Diagnostics";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { Reveal } from "../../src/panels/Reveal";
@@ -51,6 +53,15 @@ export type Expect = {
    *  thing this harness was built to stop, and "did it wrap" is the one question a capture answers
    *  and a DOM assertion cannot. */
   same_line?: [a: string, b: string][];
+  /** Elements that must MEASURE at least this many CSS pixels wide.
+   *
+   *  The stage-is-sacred rule (`<ux_quality>` 5) is a product principle about a **measurement**, and
+   *  until now the only thing asserting it was `layout.test.ts` — which compares the *string*
+   *  `panelLayout` returns (`"340px minmax(320px, 1fr) 300px"`). A grid template is a declaration of
+   *  intent; whether the stage is actually 320 px wide once real content is inside the docks is a
+   *  question jsdom cannot be asked. A dock whose content will not shrink pushes the stage below its
+   *  floor while `panelLayout` keeps returning exactly the string the unit test wants. */
+  min_width?: [selector: string, px: number][];
 };
 
 export type Scene = {
@@ -60,7 +71,28 @@ export type Scene = {
   looking_for: string;
   /** The machine-checkable part of `looking_for`. A scene without one is rejected by the driver. */
   expect: Expect;
+  /** Cap the FRAME's width inside the default window — a panel photographed at the width of the dock
+   *  it lives in. The window stays 620 px, so a component that reads `window.innerWidth` sees 620 no
+   *  matter what this says. */
   width?: number;
+  /** Resize the WINDOW itself. Required for anything responsive: `App` lays itself out from
+   *  `window.innerWidth`, so a CSS `maxWidth` on the frame would photograph a 1440 px-wide box that
+   *  had computed its own layout for 620 px — a capture that is wrong in exactly the way a capture is
+   *  supposed to catch. Mutually exclusive with `width`: two statements of one number is the drift
+   *  this repository gates for everywhere else, and the driver rejects a scene that sets both. */
+  viewport?: { width: number; height: number };
+  /** Selectors clicked, in order, before anything is asserted or captured.
+   *
+   *  A dock is a FIXED-WIDTH track holding one of several workspaces, and which one is a click, not
+   *  a prop — so without this the gate photographs the default workspace and nothing else, and the
+   *  four others go the way `mesh_frame_bench.rs` went. `layout.ts` still carries the scar of that
+   *  exact class ("which left the terrain workspace overflowing its 280px dock the moment it moved
+   *  out of the Inspector") — found, as ever, by a human.
+   *
+   *  A selector that matches nothing FAILS the scene rather than being skipped: a click that quietly
+   *  did nothing would photograph the default state under a caption claiming another, which is worse
+   *  than no capture at all. */
+  click?: string[];
   setup?: () => void;
   render: () => ReactNode;
 };
@@ -297,7 +329,167 @@ export const SCENES: Scene[] = [
     setup: selectUnwiredEntity,
     render: () => <Diagnostics client={revealClient(CAD_REVEAL)} />,
   },
+  ...shellScenes(),
 ];
+
+// ── the shell, composed ───────────────────────────────────────────────────────────────────────────
+
+/** THE ONE THING THE PANEL SCENES CANNOT SEE. Every scene above photographs a panel *in isolation* —
+ *  deliberately, so a capture says something about the panel and nothing about its neighbours. The
+ *  cost of that isolation was logged as owed the day the harness landed: **the invariants cannot see
+ *  a panel colliding with a sibling**, because no capture has ever contained two.
+ *
+ *  These scenes contain all of them. `App` takes no props and falls back to the in-process MockCore
+ *  outside Tauri, so the whole editor — Engines rail, left dock, stage, Inspector, header, bottom
+ *  dock — mounts and lays itself out for real. R1–R4 then apply across the composition for nothing:
+ *  the sibling collision R3 was written for is finally in frame.
+ *
+ *  AND THEY MAKE THE STAGE RULE A MEASUREMENT. `<ux_quality>` 5 — "the stage gets layout priority;
+ *  panels yield/collapse on resize; the stage never collapses first" — is a product principle, and
+ *  the only thing asserting it is `layout.test.ts`, which checks that `panelLayout(w)` returns the
+ *  *string* `"340px minmax(320px, 1fr) 300px"`. That is a statement of intent. Whether the stage is
+ *  320 px wide once the docks hold real content is a different question, it is the one the user
+ *  experiences, and jsdom cannot be asked it: a dock whose content will not shrink pushes the stage
+ *  under its floor while `panelLayout` keeps returning exactly the string the unit test wants.
+ *
+ *  One scene per layout regime `panelLayout` defines, at a width INSIDE each band rather than on its
+ *  edge — a scene pinned to the breakpoint value tests the comparison operator, not the layout. */
+/** A `function`, not a `const` arrow — like `shellScenes` below, and for the same reason. The first
+ *  draft made it an arrow and the whole bundle died on load with `Cannot access 'shell' before
+ *  initialization`: hoisting `shellScenes` moved the *call* above `SCENES` but left the `const` it
+ *  closes over in its temporal dead zone. Worth recording because of how it surfaced — the driver
+ *  reads its registry off `window.__MTK_SHOTS__` in the built bundle, so a module that throws on
+ *  load reports **zero scenes** and fails the run. The version of this driver that regexed
+ *  `scenes.tsx` for `id:` lines would have found eight ids in a file that cannot execute. */
+function shell(id: string, width: number, looking_for: string, expect: Expect, click?: string[]): Scene {
+  return {
+    id,
+    looking_for,
+    viewport: { width, height: 900 },
+    click,
+    expect: {
+      ...expect,
+      present: [["[data-testid='viewport']", 1], ...(expect.present ?? [])],
+      // The stage's protected floor, measured. STAGE_MIN is imported from the layout module rather
+      // than typed as 320 here: a floor written down twice is a floor that only moves in one place.
+      min_width: [["[data-testid='viewport']", STAGE_MIN], ...(expect.min_width ?? [])],
+      text_absent: ["undefined", "NaN", ...(expect.text_absent ?? [])],
+    },
+    render: () => <App />,
+  };
+}
+
+/** A function, not a `const`, purely so the shell scenes can be *read* after the panel scenes while
+ *  still being spliced into the array above them — hoisting is the only thing buying that order. */
+function shellScenes(): Scene[] {
+  return [
+  shell(
+    "shell-wide",
+    1440,
+    "the whole editor at a desktop width: Engines rail · left dock · stage · Inspector, all four " +
+      "tracks open at once. This is the first capture in the repository that contains two panels, " +
+      "so it is the first one where a panel can be caught colliding with its neighbour",
+    {
+      present: [
+        ["[data-testid='engine-rail']", 1],
+        ["[data-testid='hierarchy']", 1],
+        ["[data-testid='editor-header']", 1],
+      ],
+      // Wide open: the docks are panels, not rails. If this ever flips, the layout collapsed at a
+      // width where it had room — the opposite defect to the stage being squeezed.
+      absent: ["[data-testid='rail-left']"],
+    },
+  ),
+  shell(
+    "shell-compact",
+    1100,
+    "below 1200 the open docks take their compact widths (300/260) and stay open. The stage must " +
+      "have absorbed the difference, not the other way round",
+    {
+      present: [
+        ["[data-testid='engine-rail']", 1],
+        ["[data-testid='hierarchy']", 1],
+      ],
+      absent: ["[data-testid='rail-left']"],
+    },
+  ),
+  shell(
+    "shell-rails",
+    900,
+    "below 980 both docks collapse to icon rails so the stage keeps the space — the yield step " +
+      "that the stage-priority rule exists to produce. The Engines rail stays: an index you have to " +
+      "open a drawer to reach is not an index",
+    {
+      present: [
+        ["[data-testid='rail-left']", 1],
+        ["[data-testid='rail-right']", 1],
+        ["[data-testid='engine-rail']", 1],
+      ],
+      // The panels are gone, not merely narrow — the rail IS the collapsed state.
+      absent: ["[data-testid='hierarchy']"],
+    },
+  ),
+  shell(
+    "shell-overlay",
+    600,
+    "below 620 the shell is one column of stage, with both docks reachable as header-opened " +
+      "drawers. Even here the stage holds its floor — the layout that gives up the viewport to keep " +
+      "a panel is the failure this whole rule is written against",
+    {
+      present: [["[data-testid='editor-header']", 1]],
+      absent: ["[data-testid='rail-left']", "[data-testid='rail-right']", "[data-testid='hierarchy']"],
+    },
+  ),
+
+  // THE STATE THE GRID TEMPLATE SAYS IS FINE AND THE WINDOW SAYS IS NOT. Two clicks at 1000 px —
+  // open the Inspector rail, press "Pin this panel open" — and the four tracks come to
+  // 132 + 300 + 320 + 260 = 1012 in a 1000 px window. `layout.test.ts` is green throughout, and
+  // correctly so: it asserts the STRING `dockGridColumns` returns, and the string is exactly what it
+  // is supposed to be. It has no way to add the numbers up against a window it cannot see. What the
+  // browser does with that template is push the Inspector 12 px off the right edge of the screen,
+  // where it cannot be read, reached or scrolled to — the stage held its floor and the docks, which
+  // are the things the rule says must yield, did not.
+  shell(
+    "shell-pinned-inspector",
+    1000,
+    "both docks open at 1000 px — the width where the fixed tracks plus the stage's protected floor " +
+      "add up to more than the window. Nothing may be painted past the right edge: the rule is that " +
+      "the PANELS yield, and a panel that keeps its width by leaving the screen has not yielded",
+    {
+      present: [["[data-testid='inspector-dock']", 1]],
+    },
+    ["[data-testid='rail-right'] button", 'button[aria-label="Pin Inspector dock"]'],
+  ),
+
+  // THE FOUR OTHER THINGS THE LEFT DOCK CAN BE. The dock is a 300 px track between 980 and 1199 —
+  // the narrowest it ever gets while still open — and which workspace is inside it is a click. The
+  // scenes above photograph the default one, so on their own they would gate a fifth of the surface
+  // and leave the rest exactly as unwatched as they were. `layout.ts` already carries the scar of
+  // this class in a comment: the terrain workspace overflowed its dock the moment it moved out of
+  // the Inspector, and the repair was to widen the track by hand after a human noticed.
+  ...(
+    [
+      ["build", "Build — place and create: the toolbar, the asset browser and the describe bar stacked in one 300 px column", "[data-testid='authbar']"],
+      ["terrain", "Terrain — the widest workspace in the dock, and the one that has already overflowed it once", "[data-testid='terrain-presets']"],
+      ["physics", "Physics — numeric read-outs and a contact list, the shape most likely to demand width", "[data-testid='dropBall']"],
+      ["gameplay", "Gameplay — roles, cinema and VFX stacked in a column narrower than any of them", "[data-testid='match-panel']"],
+    ] as const
+  ).map(([engine, blurb, marker]) =>
+    shell(
+      `shell-${engine}`,
+      1000,
+      `${blurb}. Photographed at 1000 px, where the dock is at its narrowest that is still open`,
+      {
+        present: [[marker, 1]],
+        // The stage floor is the point: a dock that will not yield takes the difference out of the
+        // viewport, and this is the width where it has the least room to hide.
+        min_width: [["[data-testid='left-dock']", 1]],
+      },
+      [`[data-testid='engine-${engine}']`],
+    ),
+  ),
+  ];
+}
 
 /** Renders only once the same call the panel makes has RESOLVED. Without it, "the panel chose to
  *  render nothing" and "the reply never arrived" are the same two-colour frame — which an

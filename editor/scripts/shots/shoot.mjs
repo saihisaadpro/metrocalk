@@ -343,6 +343,16 @@ if (missing.length) {
   console.error("        a capture that asserts nothing is a screenshot, not a gate");
   process.exit(1);
 }
+// `width` caps the frame inside the default window; `viewport` resizes the window and the frame
+// spans it. A scene that sets both has written one number twice — and the frame's copy is the one
+// that would quietly stop matching, photographing a box whose contents laid themselves out for a
+// different width. Rejected at the registry, before anything is captured.
+const doubled = registry.filter((s) => s.viewport && s.width !== undefined);
+if (doubled.length) {
+  console.error(`FAIL  scene(s) setting BOTH \`width\` and \`viewport\`: ${doubled.map((s) => s.id).join(", ")}`);
+  console.error("        one of the two is the width the content lays out against; the other is a copy that will drift");
+  process.exit(1);
+}
 const scenes = only ? registry.filter((s) => s.id === only) : registry;
 if (scenes.length === 0) {
   console.error(`FAIL  --scene ${only} matches none of: ${registry.map((s) => s.id).join(", ")}`);
@@ -351,9 +361,34 @@ if (scenes.length === 0) {
 
 let failed = 0;
 for (const scene of scenes) {
-  const { id, looking_for, expect } = scene;
+  const { id, looking_for, expect, viewport, click } = scene;
   const page = await browser.newPage();
-  await page.setViewport({ width: 620, height: 900, deviceScaleFactor: 2 });
+  // EVERY SCENE STARTS FROM A FIRST-RUN USER'S STATE. Chromium serves one storage area to every
+  // `file://` page in a run, and the shell remembers real things there: which docks are pinned
+  // (`metrocalk:shell-layout:v1:*`), which sections are open (`metrocalk:disclosure:*`), and whether
+  // the first-run card has been dismissed (`mtk.onboarded.v1`).
+  //
+  // Measured, not assumed — the first version of this comment blamed a red on the leak and was
+  // wrong, so the claim was tested. Open `shell-build`, click the onboarding card's Skip, then open
+  // `shell-terrain`: WITHOUT this reset the second scene has no first-run card at all, because a
+  // click in a previous scene dismissed it forever. Every later scene is then composed and measured
+  // against a shell that is quietly missing one of its overlays, and whether it is missing depends
+  // on which scenes ran first. That is a verdict decided by run order, which is the isolation rule
+  // in `<test_and_ci_discipline>` 4. WITH the reset, both scenes show the card.
+  //
+  // `evaluateOnNewDocument` runs before the page's own scripts, so a scene that WANTS a remembered
+  // state still writes it in `setup`, which runs later.
+  await page.evaluateOnNewDocument(() => {
+    try {
+      localStorage.clear();
+      sessionStorage.clear();
+    } catch {
+      /* a storage-less context is already isolated */
+    }
+  });
+  // 620×900 is the default a panel scene is composed against; a responsive scene names its own,
+  // because the thing under test reads the window rather than its container.
+  await page.setViewport({ width: 620, height: 900, ...(viewport ?? {}), deviceScaleFactor: 2 });
   const problems = [];
   page.on("pageerror", (e) => problems.push(`pageerror: ${e}`));
   page.on("console", (m) => m.type() === "error" && problems.push(`console.error: ${m.text()}`));
@@ -361,10 +396,29 @@ for (const scene of scenes) {
   await page.goto(`${href}?scene=${id}`, { waitUntil: "networkidle0" });
   await new Promise((r) => setTimeout(r, 250)); // the panels fetch their report in an effect
 
-  const path = resolve(outDir, `${id}.png`);
-  await page.screenshot({ path, fullPage: true });
-  const colours = distinctColours(readFileSync(path));
+  // Drive the scene to the state it claims to photograph. A selector that matches nothing is a
+  // FAILURE: silently skipping it would capture the default state under a caption describing
+  // another, and a caption nothing evaluates is what this harness exists to stop.
+  for (const sel of click ?? []) {
+    const el = await page.$(sel);
+    if (!el) {
+      problems.push(`click \`${sel}\` matched nothing — the scene never reached the state it claims`);
+      break;
+    }
+    await el.click();
+    await new Promise((r) => setTimeout(r, 300)); // the workspace is lazy-loaded behind Suspense
+  }
 
+  // MEASURE BEFORE CAPTURING, because capturing MOVES THINGS. `screenshot({ fullPage: true })`
+  // resizes the page to the content box and puts it back, and a shell that lays itself out from
+  // `window.innerWidth` reacts: `shell-wide` rendered its docks open at 1440, the capture briefly
+  // narrowed the window under the 980 px breakpoint, the shell did exactly what it is supposed to do
+  // and collapsed both docks to rails — and the assertions, which used to run after the capture,
+  // then read a shell that had responded to the camera. Every measurement this gate has ever taken
+  // was taken on the layout the capture left behind; the eight panel scenes never noticed only
+  // because a panel does not listen for `resize`. The claim and the invariants now run on the layout
+  // the SCENE produced, and the perturbation itself is fixed below.
+  //
   // The scene's OWN claim, evaluated in the page. `[data-testid="shot-frame"]` is emitted by the
   // harness wrapper, not by `scene.render()`, so it was never evidence that the scene rendered —
   // it is true whenever the bundle mounts at all.
@@ -386,6 +440,23 @@ for (const scene of scenes) {
     }
     for (const s of e.text_absent ?? []) {
       if (text.includes(s)) out.push(`the rendered text contains ${JSON.stringify(s)}`);
+    }
+    // A protected floor is a MEASUREMENT, and it is the only form the stage-is-sacred rule has that
+    // says anything a grid-template string does not. `layout.test.ts` proves `panelLayout` returns
+    // `minmax(320px, 1fr)`; this proves the stage is 320 px wide with the docks' real content in them.
+    for (const [sel, px] of e.min_width ?? []) {
+      const el = frame.querySelector(sel);
+      if (!el) {
+        out.push(`min_width needs \`${sel}\`, which is not there`);
+        continue;
+      }
+      const w = el.getBoundingClientRect().width;
+      if (w < px - 1) {
+        out.push(
+          `\`${sel}\` measures ${Math.round(w)}px, below its protected floor of ${px}px — ` +
+            "something beside it refused to yield first",
+        );
+      }
     }
     for (const [sa, sb] of e.same_line ?? []) {
       const a = frame.querySelector(sa);
@@ -410,7 +481,45 @@ for (const scene of scenes) {
   // point is that the next panel added here inherits them for nothing.
   const layout = await page.evaluate(layoutInvariants);
 
-  const bad = [...problems, ...claim, ...layout];
+  // A cheap, stable fingerprint of the layout that was just judged: how wide the frame is, and where
+  // every visible control sits inside it. Compared against the same reading taken after the capture.
+  const fingerprint = () => {
+    const frame = document.querySelector('[data-testid="shot-frame"]');
+    if (!frame) return "no frame";
+    const box = frame.getBoundingClientRect();
+    const sel = 'button, a[href], input, select, textarea, [role="button"]';
+    const rows = [...frame.querySelectorAll(sel)].map((el) => {
+      const r = el.getBoundingClientRect();
+      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
+    });
+    return `${Math.round(box.width)}×${Math.round(box.height)}|${rows.length}|${rows.join(" ")}`;
+  };
+  const before = await page.evaluate(fingerprint);
+
+  // `fullPage` exists so a panel taller than the window is captured whole. A scene that set its own
+  // `viewport` has declared the window to BE the subject — there is nothing beyond it to reach for —
+  // and asking for it anyway is what triggers the resize that moved the shell. So it is not asked
+  // for; the two cases are now distinguished by what the scene actually needs.
+  const path = resolve(outDir, `${id}.png`);
+  await page.screenshot({ path, fullPage: !viewport });
+  const colours = distinctColours(readFileSync(path));
+
+  // A GATE ON THE GATE. The reordering above stops the assertions reading a disturbed layout, but on
+  // its own it would leave the PNG showing something the assertions never saw — evidence of a state
+  // nothing checked, which is the failure mode this harness was built against. So the layout is read
+  // again afterwards and must be unchanged: whatever the capture does, the picture and the verdict
+  // are about the same thing, and any future capture path that starts moving the page fails here
+  // instead of quietly making every screenshot a lie.
+  const after = await page.evaluate(fingerprint);
+  const disturbed =
+    before === after
+      ? []
+      : [
+          "the capture DISTURBED the layout it captured — the assertions above were checked against " +
+            "one layout and the PNG shows another, so the picture is not evidence of the verdict",
+        ];
+
+  const bad = [...problems, ...claim, ...layout, ...disturbed];
   if (colours === null) bad.push("the capture is not an 8-bit RGB/RGBA PNG, so it was not checked");
   // The pixel bar is now the WEAKEST of the three, kept only because it costs nothing and catches a
   // renderer that dies after the DOM is built. A scene that must be blank says so through `absent`
