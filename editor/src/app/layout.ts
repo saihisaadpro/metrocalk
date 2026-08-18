@@ -62,14 +62,44 @@ export function panelLayout(width: number): PanelLayout {
 }
 
 /** Compose the realized grid after user-controlled dock collapse. Responsive rails still win below their
- * breakpoint; at larger sizes each dock can independently yield without changing the workspace context. */
-export function dockGridColumns(layout: PanelLayout, leftCollapsed: boolean, rightCollapsed: boolean): string {
+ * breakpoint; at larger sizes each dock can independently yield without changing the workspace context.
+ *
+ * `width` is the window width, and it is REQUIRED rather than optional because the whole point of this
+ * function is that the four tracks have to fit inside something. Without it the tracks were composed from
+ * a table and never added up: at 1000 px with the Inspector pinned open the template read
+ * `132px 300px minmax(320px, 1fr) 260px` — 1012 px of tracks in a 1000 px window — and the browser paid
+ * for it by painting the Inspector 12 px off the right edge of the screen, unreachable and unscrollable.
+ * The unit test was green the whole time and was right to be: it compares the string this function
+ * returns, and the string was exactly the intended one. Adding it up is the part nothing was doing.
+ *
+ * The overflow is resolved the way the product rule says it must be — **the panels yield, the stage does
+ * not** — and in the priority the layout already states: the right dock is a read-out of the selection and
+ * gives first, the left dock is the sub-engine you are working in and gives second, and neither ever
+ * shrinks past its rail width, because a dock narrower than its own rail is not a dock. */
+export function dockGridColumns(
+  layout: PanelLayout,
+  leftCollapsed: boolean,
+  rightCollapsed: boolean,
+  width: number,
+): string {
   // The Engines rail is ALWAYS the first track, even in the collapsed layouts: it is the index of what the
   // editor can do, and an index you have to open a drawer to reach is not an index. Only in the phone-width
   // overlay layout — where the whole shell is one column — does it fold into the header drawers.
   const engines = layout.collapsed ? ENGINE_RAIL_W_COMPACT : ENGINE_RAIL_W;
   if (layout.overlay) return "minmax(0, 1fr)";
-  const left = layout.collapsed || leftCollapsed ? RAIL_W : layout.left;
-  const right = layout.collapsed || rightCollapsed ? RAIL_W : layout.right;
+  let left = layout.collapsed || leftCollapsed ? RAIL_W : layout.left;
+  let right = layout.collapsed || rightCollapsed ? RAIL_W : layout.right;
+
+  let over = engines + left + STAGE_MIN + right - width;
+  if (over > 0) {
+    const give = Math.min(over, right - RAIL_W);
+    right -= give;
+    over -= give;
+  }
+  if (over > 0) {
+    left -= Math.min(over, left - RAIL_W);
+  }
+  // If even two rails and the floor do not fit, there is nothing left to take from the panels and the
+  // stage absorbs the remainder — but that is below OVERLAY_BELOW, where this branch is unreachable.
   return `${engines}px ${left}px minmax(${STAGE_MIN}px, 1fr) ${right}px`;
 }
