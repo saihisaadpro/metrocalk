@@ -133,6 +133,170 @@ function distinctColours(png, cap = 64) {
   return seen.size;
 }
 
+// ── the layout invariants ─────────────────────────────────────────────────────────────────────────
+
+/** Runs IN THE PAGE. Three geometric properties every panel owes, checked against measured boxes.
+ *
+ *  WHY THIS EXISTS AT ALL. `editor/src` has 44 panels, 41 of them with a vitest suite, and 412 tests
+ *  green — and not one of those tests has ever measured a box. jsdom implements no layout: every
+ *  `getBoundingClientRect()` returns zeros, so overflow, clipping, wrapping and overlap are not
+ *  things the suite gets wrong, they are things it CANNOT express. The repository's single
+ *  `getBoundingClientRect` outside this file is a `mockReturnValue`.
+ *
+ *  That blind spot has already cost twice, both times found by a human squinting at a PNG: a remove
+ *  button that wrapped onto its own line, and a provenance line that ran past its panel at 360 px
+ *  (the ADR-120 defect class). "A human looked once" is the same non-gate `mesh_frame_bench.rs`
+ *  stood for — so the part of that judgement which is geometric, and therefore mechanical, is
+ *  written down here and fails the run.
+ *
+ *  These are UNIVERSAL, not per-scene. A scene's `expect` says what that panel shows; these say what
+ *  every panel owes regardless, which is what makes the next scene cost one entry instead of three
+ *  hand-written assertions. There is deliberately no waiver mechanism yet: no legitimate violation
+ *  has appeared, and an escape hatch built before its first real case is an escape hatch that gets
+ *  used for the first real defect. */
+function layoutInvariants() {
+  const frame = document.querySelector('[data-testid="shot-frame"]');
+  if (!frame) return [];
+  const out = [];
+  const TOL = 1; // sub-pixel rounding; fractional layout is not a defect
+
+  // A `data-testid` is the best name an element has, right up until a LIST uses one — and then it is
+  // the worst, because every row answers to it. R3's first real firing read
+  // "[data-testid=\"candidate\"] and [data-testid=\"candidate\"] overlap by 536×14px", which names the
+  // defect class and not one of the two things involved in it. A gate whose entire product is a
+  // sentence a human acts on cannot afford an ambiguous subject: the reader has to re-derive by hand
+  // exactly what the check already knew. So a testid that is not unique inside the frame is qualified
+  // with the row's own text — the thing that actually distinguishes it on screen.
+  const txtOf = (el) => (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 36);
+  const name = (el) => {
+    const tid = el.getAttribute("data-testid");
+    if (tid) {
+      const sel = `[data-testid="${tid}"]`;
+      if (frame.querySelectorAll(sel).length < 2) return sel;
+      const txt = txtOf(el);
+      return txt ? `${sel} "${txt}"` : sel;
+    }
+    const cls =
+      typeof el.className === "string" && el.className.trim()
+        ? "." + el.className.trim().split(/\s+/).slice(0, 2).join(".")
+        : "";
+    const txt = txtOf(el);
+    return `<${el.tagName.toLowerCase()}${cls}>` + (txt ? ` "${txt}"` : "");
+  };
+  const visible = (el, r) => {
+    if (r.width < 1 && r.height < 1) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
+  };
+
+  const box = frame.getBoundingClientRect();
+  const fs = getComputedStyle(frame);
+  const inner = {
+    left: box.left + parseFloat(fs.paddingLeft || 0) + parseFloat(fs.borderLeftWidth || 0),
+    right: box.right - parseFloat(fs.paddingRight || 0) - parseFloat(fs.borderRightWidth || 0),
+  };
+  const els = [...frame.querySelectorAll("*")];
+
+  // R1 — CONTENT ESCAPES ITS PANEL. An element painted outside the frame's content box has left the
+  // surface it belongs to: at best it is clipped by whatever is downstream, at worst it lands on a
+  // neighbour. An ancestor that scrolls or clips horizontally means the overflow is deliberate and
+  // bounded, so the walk up stops there — R2 judges whether that clipping is honest.
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (!visible(el, r)) continue;
+    if (getComputedStyle(el).position === "fixed") continue; // out of the frame's flow by design
+    let clipped = false;
+    for (let p = el.parentElement; p && p !== frame; p = p.parentElement) {
+      const ox = getComputedStyle(p).overflowX;
+      if (ox === "hidden" || ox === "clip" || ox === "auto" || ox === "scroll") {
+        clipped = true;
+        break;
+      }
+    }
+    if (clipped) continue;
+    if (r.right > inner.right + TOL) {
+      out.push(
+        `${name(el)} is painted ${Math.round(r.right - inner.right)}px past the panel's right edge ` +
+          `— nothing between it and the frame clips or scrolls, so it escapes the panel`,
+      );
+    } else if (r.left < inner.left - TOL) {
+      out.push(
+        `${name(el)} starts ${Math.round(inner.left - r.left)}px left of the panel's content box`,
+      );
+    }
+  }
+
+  // R2 — TRUNCATED WITH NOTHING TO SAY SO. `overflow: hidden` without `text-overflow: ellipsis` and
+  // without a scrollbar removes content with no mark at all: the reader cannot tell a name ends at
+  // "Overhead Cra" from a name that is spelled that way. Honest truncation ellipsises; deliberate
+  // panning scrolls. This is the one that makes a narrow-width scene worth capturing.
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (!visible(el, r)) continue;
+    if (el.scrollWidth <= el.clientWidth + TOL) continue;
+    const cs = getComputedStyle(el);
+    if (cs.overflowX === "auto" || cs.overflowX === "scroll") continue; // the user can pan to it
+    if (cs.overflowX !== "hidden" && cs.overflowX !== "clip") continue; // it spills; that is R1's
+    if (cs.textOverflow === "ellipsis") continue;
+    // Only where TEXT is what is lost. A clipped decorative box says nothing to a reader.
+    const own = [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim());
+    if (!own) continue;
+    out.push(
+      `${name(el)} hides ${el.scrollWidth - el.clientWidth}px of its own text with ` +
+        `overflow-x: ${cs.overflowX} and text-overflow: ${cs.textOverflow} — the reader is given no ` +
+        "sign that anything was cut",
+    );
+  }
+
+  // R4 — TEXT PAINTED OUTSIDE ITS OWN BOX. R1 and R2 between them cover content that leaves the
+  // PANEL and content that is clipped away; this is the third outcome, and it is the one that was
+  // missed. Diagnostics' explanatory span is `flex: 1, minWidth: 0` — "take the leftovers, and I am
+  // content at zero" — and next to a button that could not shrink the leftovers were zero. It
+  // measured 0 px wide, `overflow: visible`, and painted its whole sentence straight through the
+  // button on top of it. Nothing escaped the panel, so R1 was silent; nothing was clipped, so R2 was
+  // silent; the two overlapping things were a span and a button, so R3 was silent. A human reading
+  // the capture caught it, which is precisely the dependency this file exists to remove.
+  //
+  // Restricted to box-generating elements with their own text: an inline element's box legitimately
+  // reports its line box, and a clipped decorative div is R2's business.
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (!visible(el, r)) continue;
+    const cs = getComputedStyle(el);
+    if (cs.overflowX !== "visible") continue; // clipped or scrolled — R2 judges those
+    if (!/^(block|flex|grid|list-item|flow-root)$/.test(cs.display)) continue;
+    if (el.scrollWidth <= el.clientWidth + TOL) continue;
+    if (![...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) continue;
+    out.push(
+      `${name(el)} is ${Math.round(r.width)}px wide and its content needs ${el.scrollWidth}px, with ` +
+        "overflow-x: visible — the text is painted outside its own box, over whatever is beside it",
+    );
+  }
+
+  // R3 — TWO CONTROLS ON THE SAME PIXELS. The Progress-Evaluation1 wallet-overlap class. Whichever
+  // one is on top steals the click, and which that is depends on paint order, not on intent.
+  const CONTROLS = 'button, a[href], input, select, textarea, [role="button"], [tabindex]:not([tabindex="-1"])';
+  const controls = [...frame.querySelectorAll(CONTROLS)]
+    .map((el) => [el, el.getBoundingClientRect()])
+    .filter(([el, r]) => visible(el, r));
+  for (let i = 0; i < controls.length; i++) {
+    for (let j = i + 1; j < controls.length; j++) {
+      const [ea, a] = controls[i];
+      const [eb, b] = controls[j];
+      if (ea.contains(eb) || eb.contains(ea)) continue; // nesting is composition, not collision
+      const w = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+      const h = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+      if (w > TOL && h > TOL) {
+        out.push(
+          `${name(ea)} and ${name(eb)} overlap by ${Math.round(w)}×${Math.round(h)}px — one of them ` +
+            "is taking the other's clicks, and which depends on paint order",
+        );
+      }
+    }
+  }
+  return out;
+}
+
 // ── run ───────────────────────────────────────────────────────────────────────────────────────────
 
 if (!argv.includes("--no-build")) {
@@ -223,10 +387,30 @@ for (const scene of scenes) {
     for (const s of e.text_absent ?? []) {
       if (text.includes(s)) out.push(`the rendered text contains ${JSON.stringify(s)}`);
     }
+    for (const [sa, sb] of e.same_line ?? []) {
+      const a = frame.querySelector(sa);
+      const b = frame.querySelector(sb);
+      if (!a || !b) {
+        out.push(`same_line needs both \`${sa}\` and \`${sb}\`; ${a ? sb : sa} is not there`);
+        continue;
+      }
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      if (Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top) <= 1) {
+        out.push(
+          `\`${sa}\` and \`${sb}\` are on different lines (${Math.round(ra.top)}–${Math.round(ra.bottom)} ` +
+            `vs ${Math.round(rb.top)}–${Math.round(rb.bottom)}) — the row wrapped`,
+        );
+      }
+    }
     return out;
   }, expect);
 
-  const bad = [...problems, ...claim];
+  // Universal, and evaluated for every scene whether or not it says anything about layout — the
+  // point is that the next panel added here inherits them for nothing.
+  const layout = await page.evaluate(layoutInvariants);
+
+  const bad = [...problems, ...claim, ...layout];
   if (colours === null) bad.push("the capture is not an 8-bit RGB/RGBA PNG, so it was not checked");
   // The pixel bar is now the WEAKEST of the three, kept only because it costs nothing and catches a
   // renderer that dies after the DOM is built. A scene that must be blank says so through `absent`

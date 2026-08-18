@@ -14,9 +14,11 @@
 //! mounting is a red gate, not a smaller number in a log nobody diffs.
 
 import { useEffect, useState, type ReactNode } from "react";
+import { Diagnostics } from "../../src/panels/Diagnostics";
 import { ImportReport } from "../../src/panels/ImportReport";
+import { Reveal } from "../../src/panels/Reveal";
 import { projectionStore } from "../../src/store/projection";
-import type { CadReport, CadReportPart } from "../../src/transport/protocol";
+import type { CadReport, CadReportPart, RevealResponse } from "../../src/transport/protocol";
 import type { EditorClient } from "../../src/transport/session";
 
 /** What must be true of the rendered scene, checked by `shoot.mjs` in the page before it captures.
@@ -40,6 +42,15 @@ export type Expect = {
   text_absent?: string[];
   /** Substrings that must appear. */
   text_present?: string[];
+  /** Pairs that must share a line — their vertical extents overlap.
+   *
+   *  Added because this file's own rule was broken one scene after it was written. The wide
+   *  Diagnostics scene said "badge, message and fix on ONE line" in `looking_for` and asserted only
+   *  that the button EXISTED, so it passed green while the row wrapped at every width — the fix for
+   *  320 px had quietly become the layout everywhere. `looking_for` that nothing evaluates is the
+   *  thing this harness was built to stop, and "did it wrap" is the one question a capture answers
+   *  and a DOM assertion cannot. */
+  same_line?: [a: string, b: string][];
 };
 
 export type Scene = {
@@ -55,6 +66,9 @@ export type Scene = {
 };
 
 const client = (cadReport: () => Promise<CadReport>) => ({ cadReport }) as unknown as EditorClient;
+
+const revealClient = (r: RevealResponse) =>
+  ({ revealTargets: () => Promise.resolve(r), bind: () => "op-1" }) as unknown as EditorClient;
 
 /** The five explanatory fields exactly as the shell sends them when it has nothing to say: the key is
  *  PRESENT, holding `null`. Bare `Option<String>` with no `skip_serializing_if` (ADR-123). A harness
@@ -106,6 +120,46 @@ const DETAILED = [
     reason: "Reconstructed from the mesh at 0.82 confidence.",
   }),
 ];
+
+/** The reveal, with names of the length the product actually produces. `<visual_acceptance>` §2 is
+ *  explicit that a fixture hides the bugs real content exposes, and here "real content" is not a
+ *  guess: a 3DXML factory cell lands 3,387 entities whose names come from CATIA's product tree
+ *  ("Overhead Crane Assembly Rev C — Long Travel Girder"), and the reasons come from the registry's
+ *  "explain every no" rule, which spells them out in whole sentences. A seeded `Cube_01` would prove
+ *  nothing about either. */
+const CAD_REVEAL: RevealResponse = {
+  required: ["PowerSource", "ControlSignal"],
+  compatible: [
+    { id: "c1", name: "Overhead Crane Assembly Rev C — Long Travel Girder", distance: 2.4, affinity: 92 },
+    { id: "c2", name: "Weld Cell Transformer 480V", distance: 5.1, affinity: 71 },
+    { id: "c3", name: "Busbar", distance: 9.8, affinity: 40 },
+  ],
+  greyed: [
+    {
+      id: "g1",
+      name: "Hydraulic Power Unit — Skid Mounted, 210 bar",
+      reason: "it supplies hydraulic pressure, not electrical power",
+    },
+  ],
+  bound: [{ id: "b1", name: "Main Distribution Panel MDP-1", kind: "PowerSource" }],
+};
+
+const selectCadEntity = () => {
+  const s = projectionStore.getState();
+  s.bulkLoad([{ id: "sel", name: "Weld Gun 7", parentId: null, components: {} }] as never);
+  s.select("sel");
+};
+
+/** Diagnostics reads the SAME reveal as the picker (one round-trip, perf audit F2), so it inherits the
+ *  same long names — and puts the best-ranked one inside a button label ("Bind to …"). `HealthBar` with
+ *  no binding is what `deriveRel` turns into `needsBinding`, which is the branch that renders the fix. */
+const selectUnwiredEntity = () => {
+  const s = projectionStore.getState();
+  s.bulkLoad([
+    { id: "diag", name: "Weld Gun 7", parentId: null, components: { HealthBar: {} } },
+  ] as never);
+  s.select("diag");
+};
 
 export const SCENES: Scene[] = [
   {
@@ -171,6 +225,77 @@ export const SCENES: Scene[] = [
         <EmptySentinel client={client(() => Promise.resolve(report([])))} />
       </>
     ),
+  },
+  {
+    id: "reveal-cad-names",
+    looking_for:
+      "north-star #1 with the names a CAD import really produces: every candidate row shows its " +
+      "name AND its '· match NN', the greyed row shows the whole reason, and no row runs past the " +
+      "panel",
+    expect: {
+      present: [
+        ["[data-testid='candidate']", 3],
+        ["[data-testid='greyed']", 1],
+        ["[data-testid='bound']", 1],
+      ],
+      // The affinity is the RANKING — a row that shows a name and loses its score is a row the user
+      // cannot rank by, which is the whole point of the surface.
+      text_present: ["· match 92", "· match 40", "not electrical power"],
+      text_absent: ["null", "undefined", "NaN"],
+    },
+    setup: selectCadEntity,
+    render: () => <Reveal client={revealClient(CAD_REVEAL)} />,
+  },
+  {
+    id: "reveal-cad-names-narrow",
+    looking_for:
+      "the same reveal in a 320 px drawer — the width a side panel actually collapses to. The score " +
+      "must survive the squeeze, because a candidate list without its ranking is just a list",
+    width: 320,
+    expect: {
+      present: [
+        ["[data-testid='candidate']", 3],
+        ["[data-testid='greyed']", 1],
+      ],
+      text_present: ["· match 92", "not electrical power"],
+      text_absent: ["null", "undefined", "NaN"],
+    },
+    setup: selectCadEntity,
+    render: () => <Reveal client={revealClient(CAD_REVEAL)} />,
+  },
+  {
+    id: "diagnostics-one-click-fix",
+    looking_for:
+      "'every no explained' with its one-click fix: the warn row states what is missing and the Bind " +
+      "button names the target it would bind — both inside a 320 px drawer",
+    width: 320,
+    expect: {
+      present: [
+        ["[data-testid='diag-fix']", 1],
+        ["[data-testid='diag-greyed']", 1],
+      ],
+      // The button must still SAY what it will bind. A fix control that has lost its object is the
+      // <ux_quality> rule-1 failure: the control that starts an action no longer owns its outcome.
+      text_present: ["Bind to", "Needs"],
+      text_absent: ["null", "undefined", "NaN"],
+    },
+    setup: selectUnwiredEntity,
+    render: () => <Diagnostics client={revealClient(CAD_REVEAL)} />,
+  },
+  {
+    id: "diagnostics-one-click-fix-wide",
+    looking_for:
+      "the SAME row with room: badge, message and fix on ONE line. The wrap that rescues 320 px must " +
+      "not fire at a width where everything already fits, or the fix traded one defect for another",
+    expect: {
+      present: [["[data-testid='diag-fix']", 1]],
+      text_present: ["Bind to", "Needs"],
+      text_absent: ["null", "undefined", "NaN"],
+      // The whole point of this scene, and the reason it exists beside the 320 px one.
+      same_line: [["[data-testid='diag-row'] > span", "[data-testid='diag-fix']"]],
+    },
+    setup: selectUnwiredEntity,
+    render: () => <Diagnostics client={revealClient(CAD_REVEAL)} />,
   },
 ];
 

@@ -409,7 +409,15 @@ jobs:
       # `shoot.mjs` fails when a scene throws, fails to mount, or comes back as a flat frame — so a panel
       # that stops rendering is red here rather than discovered by a human, later, on a machine with a display.
       # Chromium arrives through npm (`@sparticuz/chromium`), so there is no CDN download to be blocked.
-      - name: panel shots — every scene mounts, logs no error, and produces pixels
+      #
+      # It now also MEASURES BOXES, which is the part vitest structurally cannot do: 41 panel suites and
+      # 412 green tests, and not one of them has ever read a non-zero `getBoundingClientRect` — jsdom
+      # implements no layout, so overflow, clipping, overlap and wrapping are not things the suite gets
+      # wrong, they are things it cannot express. Four universal invariants (content escaping its panel ·
+      # truncation with no ellipsis · overlapping controls · text painted outside its own box) run against
+      # every scene, so the next panel added here inherits them for free. Each one is mutation-pinned; the
+      # first two caught a real off-screen Bind button and a real off-screen match score (ADR-124).
+      - name: panel shots — every scene mounts, logs no error, produces pixels, and holds its layout
         working-directory: editor
         run: pnpm shots --out "$RUNNER_TEMP/shots"
 
