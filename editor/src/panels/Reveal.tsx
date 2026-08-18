@@ -75,8 +75,20 @@ export function Reveal({ client }: { client: EditorClient }) {
           title={`Click to bind — this object will track ${c.name} (match ${c.affinity} of 100)`}
           style={{ display: "flex", width: "100%", justifyContent: "flex-start", marginBottom: space.xs, textAlign: "left" }}
         >
-          {c.name}{" "}
-          <span style={{ color: color.text.muted }} title="How well this target fits (higher = better match)">
+          {/* The name is DATA — a CAD import names entities "Overhead Crane Assembly Rev C — Long
+              Travel Girder" — and `.mtk-btn` is `white-space: nowrap`, which is right for an authored
+              label and wrong for one that arrives from a file. Left as a bare text node the row grew
+              to its content and pushed the score 148 px outside a 320 px drawer, where the user could
+              neither read it nor scroll to it. So the NAME yields (it truncates, and the button's
+              `title` still carries it in full) and the SCORE never does: it is the ranking this whole
+              list exists to express, and a candidate list without its ranking is just a list. */}
+          <span style={{ flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>
+            {c.name}
+          </span>
+          <span
+            style={{ flex: "0 0 auto", color: color.text.muted }}
+            title="How well this target fits (higher = better match)"
+          >
             · match {c.affinity}
           </span>
         </Button>

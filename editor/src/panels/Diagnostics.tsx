@@ -59,10 +59,23 @@ export function Diagnostics({ client }: { client: EditorClient }) {
           data-testid="diag-row"
           data-severity="error"
           data-kind="needs-binding"
-          style={{ display: "flex", alignItems: "center", gap: space.sm, padding: space.sm, marginBottom: space.xs, border: `1px solid ${color.warn.border}`, borderRadius: radius.md, background: color.warn.bg }}
+          // WRAPS, because three things that must all stay readable do not fit on one 320 px line.
+          // Without it this row had no third outcome: the badge is fixed, the button would not shrink,
+          // so the only give was the message — and `flex: 1` (basis 0%) plus `minWidth: 0` said it was
+          // content at ZERO. It measured 0 px wide and painted its sentence straight through the
+          // button. The message now claims its own content width and the ACTION is what moves to a
+          // second line, which is the right thing to give up: a diagnostic that cannot be read is not
+          // a diagnostic, and a button on its own line is still a button.
+          style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: space.sm, padding: space.sm, marginBottom: space.xs, border: `1px solid ${color.warn.border}`, borderRadius: radius.md, background: color.warn.bg }}
         >
           <Badge tone="warn">needs binding</Badge>
-          <span style={{ flex: 1, minWidth: 0, font: font.ui, fontSize: fontSize.body, color: color.text.primary }} title={`This object needs a source of ${caps} — bind it to one.`}>
+          {/* `0 1 auto`, not `1 1 auto`: the message takes its content width and yields under
+              pressure, but never GROWS into the free space. `flex-grow: 1` was the first repair here
+              and it swallowed the whole row, so the button wrapped to its own line at EVERY width —
+              a fix for 320 px silently becoming the layout at 1440. The `same_line` assertion on the
+              wide scene is what caught that; the number in `looking_for` had said "one line" while
+              the capture showed two. */}
+          <span style={{ flex: "0 1 auto", font: font.ui, fontSize: fontSize.body, color: color.text.primary }} title={`This object needs a source of ${caps} — bind it to one.`}>
             Needs a <strong>{caps}</strong> source
           </span>
           {top ? (
@@ -76,8 +89,28 @@ export function Diagnostics({ client }: { client: EditorClient }) {
                 pushToast(`bound · now tracking ${top.name}`, "success");
               }}
               title={`Bind to ${top.name} — the best-ranked compatible source (match ${top.affinity})`}
+              // `.mtk-btn` is `white-space: nowrap` and `min-width: auto`, so a data-derived name in
+              // the label makes this button un-shrinkable: with a CAD name it was painted 204 px
+              // outside a 320 px drawer — the entire one-click fix, off-screen and unclickable, while
+              // the row it belongs to still looked fine. `minWidth: 0` lets the row take the width
+              // back; the span below decides what is given up, and it is never the verb.
+              // A BOUNDED basis, not `auto`. Under `flex-wrap` the browser assigns items to lines by
+              // their hypothetical size before it shrinks anything, so a button whose base size is
+              // its 430 px CAD label never fits on a shared line and wraps at EVERY width — which is
+              // what the wide scene caught. 12rem is what it asks for; it grows into whatever is left
+              // and truncates when it cannot have it, so whether this row wraps is decided by the
+              // available width and not by how long one entity happens to be called.
+              style={{ flex: "1 1 12rem", minWidth: 0 }}
             >
-              Bind to {top.name}
+              {/* Two flex items on purpose, and no `&nbsp;` between them. The verb is its own
+                  un-shrinkable item so truncation can never eat it — "Bind t…" is not a control —
+                  while the name, which is data, takes the ellipsis. The separator is `.mtk-btn`'s
+                  own `gap: 6px`: an `&nbsp;` here ADDS to that rather than replacing it, and the
+                  capture showed the ~9 px result. Spacing is the button system's contract; stating
+                  it a second time inline is the same two-statements-of-one-contract shape the
+                  repository keeps paying for. */}
+              Bind to
+              <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>{top.name}</span>
             </Button>
           ) : (
             <Badge tone="neutral" title="No compatible source exists in the scene yet — add a provider of this capability.">no source</Badge>
