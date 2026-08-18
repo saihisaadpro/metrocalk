@@ -417,6 +417,14 @@ jobs:
       # truncation with no ellipsis · overlapping controls · text painted outside its own box) run against
       # every scene, so the next panel added here inherits them for free. Each one is mutation-pinned; the
       # first two caught a real off-screen Bind button and a real off-screen match score (ADR-124).
+      #
+      # And since ADR-125 the WHOLE SHELL is among the scenes, at every layout regime — the first captures
+      # in this repository to hold two panels at once, and therefore the first that could catch a panel
+      # colliding with its neighbour. Three on the first run: a first-run card centred on the WINDOW that
+      # sat 192px inside the left dock and took its clicks; an overlay that was also firing viewport picks
+      # underneath itself; and a grid template that was exactly correct and still did not fit — 1012px of
+      # tracks in a 1000px window, the Inspector painted off-screen, while `layout.test.ts`, which compares
+      # that template as a STRING, stayed green.
       - name: panel shots — every scene mounts, logs no error, produces pixels, and holds its layout
         working-directory: editor
         run: pnpm shots --out "$RUNNER_TEMP/shots"
