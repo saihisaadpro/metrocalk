@@ -18,7 +18,7 @@ import { Modal, Popover } from "../theme/Popover";
 import { Button } from "../theme/primitives";
 import { DockRail } from "../theme/workspace";
 import { color, elevation, font, fontSize, motion, radius, space, z } from "../theme/tokens";
-import { dockGridColumns, panelLayout } from "./layout";
+import { STAGE_MIN, dockGridColumns, panelLayout } from "./layout";
 import { usePlayerDrive } from "./usePlayerDrive";
 import { ViewportToolbar } from "../panels/ViewportToolbar";
 import { Rejections } from "../panels/Rejections";
@@ -569,7 +569,13 @@ export function App() {
             scene composites through (ADR-008); the per-frame orbit/zoom runs in the native render loop (the
             JS only fires drag_start/drag_end/zoom/pick — never per frame). Left-click → native pick → select;
             right-DRAG → orbit (suppress the menu); right-CLICK → the M3.3 context menu. */}
-        <div className="mtk-stage-column">
+        {/* The stage's protected floor, published to CSS from the ONE place it is written down. The
+            bottom dock's `max-height` is `calc(100% - var(--mtk-stage-min))` against this element, so
+            the dock yields before the stage does on the vertical axis exactly as `dockGridColumns`
+            makes the side docks yield on the horizontal one. Set here rather than in the stylesheet
+            because `STAGE_MIN` is also what the shots harness imports to measure the floor: a number
+            written down twice is a number that only moves in one place. */}
+        <div className="mtk-stage-column" style={{ "--mtk-stage-min": `${STAGE_MIN}px` } as React.CSSProperties}>
         <div
           id="viewport"
           data-testid="viewport"

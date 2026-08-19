@@ -99,6 +99,11 @@
   --mtk-control-touch: 44px;
   --mtk-header-height: 56px;
   --mtk-bottom-bar-height: 42px;
+  /* The smallest open dock is `clamp(230px, …)` and its bar is the line above, so this is the
+     content height the dock's own heights are built on — 230 − 42. It is a token rather than a
+     literal because `.mtk-bottom-workspace` needs the same number to know when it has stopped
+     fitting, and a floor written down twice is a floor that only moves in one of the two places. */
+  --mtk-dock-content-min: 188px;
   --mtk-status-bar-height: 24px;
 }
 
@@ -132,14 +137,21 @@ body {
 :focus:not(:focus-visible) { outline: none; }
 
 /* ── Styled scrollbars (never raw browser scrollbars) ── */
-.mtk-scroll {
+/* `.mtk-bottom-dock__content` is in these selector lists rather than gaining a class in the JSX: it
+   is a scroller by virtue of one CSS declaration eight hundred lines below, and a class added in TSX
+   to describe a fact stated in CSS is the same contract written twice. */
+.mtk-scroll,
+.mtk-bottom-dock__content {
   scrollbar-width: thin;
   scrollbar-color: var(--mtk-border-strong) transparent;
   scrollbar-gutter: stable;
 }
-.mtk-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
-.mtk-scroll::-webkit-scrollbar-track { background: transparent; }
-.mtk-scroll::-webkit-scrollbar-thumb {
+.mtk-scroll::-webkit-scrollbar,
+.mtk-bottom-dock__content::-webkit-scrollbar { width: 10px; height: 10px; }
+.mtk-scroll::-webkit-scrollbar-track,
+.mtk-bottom-dock__content::-webkit-scrollbar-track { background: transparent; }
+.mtk-scroll::-webkit-scrollbar-thumb,
+.mtk-bottom-dock__content::-webkit-scrollbar-thumb {
   background: var(--mtk-border-strong);
   border-radius: var(--mtk-radius-lg);
   border: 2px solid transparent;
@@ -617,14 +629,27 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-dock-tabs--horizontal { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
 .mtk-dock-tabs--horizontal::-webkit-scrollbar { display: none; }
 .mtk-dock-tabs--vertical { flex-direction: column; padding: 5px; }
+/* A TAB THAT WILL NOT SHRINK IS A TAB THAT DISAPPEARS. `flex: none` plus a strip that scrolls with
+   `scrollbar-width: none` is a silent deletion: the strip pans, nothing says it panned, and the tabs
+   past the edge are simply not there. Measured on HEAD, with the bottom dock open — **`Runtime` was
+   entirely invisible (0 of 92px) at 1280, 1000 and 700px windows** and `Problems` was down to 48px;
+   the Animate workspace lost `UI` (0 of 108) and `Graph` (0 of 61) at 1440. Seven workspaces are
+   authored, the rail advertises them, and on any window narrower than about 1600 you could not reach
+   the last two. `<ux_quality>` 6: an enabled control always does something or says why it can't —
+   a control you cannot see does neither.
+   Yielding is the whole repair. Every tab now gives width in step (`0 1 auto`) and `__label` already
+   ellipsises, so an over-full strip degrades to shorter labels — honest truncation, R2's own rule —
+   instead of vanishing tabs. `min-width` is the floor that keeps a squeezed tab a real click target;
+   it is the tab-strip twin of "neither dock goes below its rail width", and at 7 tabs it needs 308px
+   against the 508px the narrowest open dock has. */
 .mtk-dock-tab {
   position: relative;
   display: inline-flex;
-  flex: none;
+  flex: 0 1 auto;
   align-items: center;
   justify-content: center;
   gap: var(--mtk-space-3);
-  min-width: 0;
+  min-width: 44px;
   min-height: 36px;
   padding: 0 10px;
   border: 0;
@@ -651,10 +676,20 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-dock-tab[aria-selected="true"]::after { background: var(--mtk-accent); }
 .mtk-dock-tab:disabled { color: var(--mtk-text-faint); cursor: not-allowed; }
 .mtk-dock-tab:disabled:hover { background: transparent; }
-.mtk-dock-tab__icon { display: inline-flex; color: currentColor; }
-.mtk-dock-tab__label { overflow: hidden; text-overflow: ellipsis; }
+/* WHAT YIELDS INSIDE A TAB, ONCE THE TAB ITSELF CAN YIELD. Making `.mtk-dock-tab` shrinkable
+   immediately produced its own defect, and R4 caught it in the same run that first proved the tabs
+   were reachable: the `unsupported` badge measured 56px with 63px of content and `overflow-x:
+   visible`, so it painted its text over the tab beside it. The icon is the identity and never gives;
+   the label ellipsises first, because a shortened word still reads; the badge gives last and, when
+   it must, truncates honestly rather than spilling. `min-width: 0` is the part that was missing —
+   `text-overflow: ellipsis` on a flex item that cannot shrink below its content never fires. */
+.mtk-dock-tab__icon { display: inline-flex; flex: none; color: currentColor; }
+.mtk-dock-tab__label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .mtk-dock-tab__badge {
+  flex: 0 1 auto;
   min-width: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 2px 4px;
   border-radius: 999px;
   color: var(--mtk-text-secondary);
@@ -923,13 +958,64 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-quick-create { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px; border-bottom: 1px solid var(--mtk-border-subtle); }
 .mtk-stage-column { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: transparent; }
 
-.mtk-bottom-dock { display: flex; flex: none; flex-direction: column; min-width: 0; height: 42px; border-top: 1px solid var(--mtk-border-subtle); background: var(--mtk-bg-raised); box-shadow: 0 -1px 3px rgba(21, 34, 50, 0.05); transition: height var(--mtk-motion-base) var(--mtk-ease-standard); }
+/* THE STAGE HAS A FLOOR ON THIS AXIS TOO. The six `height` rules below are the dock's PREFERRED
+   height — a design token, and legitimately CSS's business. What they are not, and never were, is an
+   answer to "does that fit". They are `vh`-relative with an absolute MINIMUM (230/320/330px), and
+   `vh` is the whole window: the header and status bar are a fixed cost the dock's own arithmetic has
+   never known about. Paired with `flex: none` — *this panel never yields* — and a viewport at
+   `min-height: 0` — *the stage yields without limit* — that is `<ux_quality>` 5 written backwards,
+   and it measured exactly like that: at a 1440x700 window with the Model workspace open the stage was
+   **282px**; at 420 it was **18px**; at 400 it was **GONE**, zero, while the dock kept all 321 of its
+   pixels; and at 360 the dock ran 17px off the bottom of the screen with its own controls down there.
+
+   This is D3 (ADR-125) one axis over, and it has the same root cause: tracks composed from a table
+   and never added up against the thing they have to fit inside. The horizontal fix made
+   `dockGridColumns` take the window width and do the arithmetic. Here the browser can do it, because
+   `100%` of `.mtk-stage-column` IS the height left after the header and the status bar — measured
+   against the real container rather than reconstructed from constants that would then have to be
+   kept in step with it. So `max-height` is the yield, and it is ONE declaration on the base rule
+   governing all six preferred heights rather than six copies of a floor.
+
+   `min-height` is the dock's own bar: a dock shorter than the strip you click to open it is not a
+   dock, and it is the exact vertical twin of "neither dock goes below its rail width". When the
+   window is so short that the two conflict, CSS resolves min over max, so the dock sits at its bar
+   and the stage takes what is left — degraded honestly, and never clipped, which is the outcome the
+   old `flex: none` could not produce. `--mtk-stage-min` is set from `STAGE_MIN` in `layout.ts` by the
+   element this rule measures against; the floor is stated once, in TypeScript, where the harness that
+   proves it can import it. */
+.mtk-bottom-dock { display: flex; flex: none; flex-direction: column; min-width: 0; height: var(--mtk-bottom-bar-height); min-height: var(--mtk-bottom-bar-height); max-height: calc(100% - var(--mtk-stage-min)); border-top: 1px solid var(--mtk-border-subtle); background: var(--mtk-bg-raised); box-shadow: 0 -1px 3px rgba(21, 34, 50, 0.05); transition: height var(--mtk-motion-base) var(--mtk-ease-standard); }
 .mtk-bottom-dock.is-open { height: clamp(230px, 34vh, 360px); }
 .mtk-bottom-dock.is-open.is-asset { height: clamp(320px, 48vh, 520px); }
 .mtk-bottom-dock.is-open.is-animation { height: clamp(330px, 50vh, 560px); }
 .mtk-bottom-dock__bar { display: flex; flex: none; align-items: center; justify-content: space-between; gap: var(--mtk-space-2); min-height: 41px; padding: 0 var(--mtk-space-2); background: var(--mtk-bg-raised); }
-.mtk-bottom-dock__content { flex: 1 1 auto; min-height: 0; overflow: hidden; border-top: 1px solid var(--mtk-border-subtle); }
-.mtk-bottom-workspace { height: 100%; min-height: 0; overflow: auto; background: var(--mtk-bg-panel); }
+/* AND THE DOCK'S OWN CONTENT HAS TO FIT IN THE DOCK. Making the dock yield vertically exposed the
+   same shape one level in, and it is the shape this whole session is about: `.mtk-workspace-panel__
+   header` is `flex: none` with `min-height: 52px`, so in a short dock the CHROME takes everything and
+   the CONTENT gets nothing. Measured at a 1440×480 window with Model open and the dock correctly
+   yielded to 80px: the header overflowed a 38px content box, `.mtk-workspace-panel__body` — itself a
+   `.mtk-scroll` container — came out at **clientHeight 0 against scrollHeight 179**, and **eleven
+   elements painted outside the dock**, up to 215px past it, clipped by `.mtk-stage-column`. A scroll
+   container with no height can neither scroll nor show a scrollbar, so the workspace was present,
+   laid out, and unreachable with nothing on screen to say so — the tab-strip defect exactly, one box
+   up.
+
+   `hidden auto` is the honest outcome: the panel keeps its natural height and the dock scrolls to it,
+   with the same styled scrollbar as every other scroller here. It appears only when it is needed. The
+   alternative — letting the header shrink — trades a reachable panel for an unreadable title. */
+.mtk-bottom-dock__content { flex: 1 1 auto; min-height: 0; overflow: hidden auto; border-top: 1px solid var(--mtk-border-subtle); }
+/* A WORKSPACE HAS A HEIGHT BELOW WHICH IT IS NOT A WORKSPACE. `height: 100%; min-height: 0` says
+   "be exactly as tall as the box you are in, however small that is", and with the dock now correctly
+   yielding on short windows that box reaches 38px — where `.mtk-workspace-panel__header` alone wants
+   52 and takes all of it, leaving the body at **clientHeight 0 against scrollHeight 179**: a scroll
+   container that can neither scroll nor show a scrollbar (R6).
+
+   `--mtk-dock-content-min` is not a new judgement about how tall a workspace should be. The design
+   already states it: the dock's smallest open height is 230px and its bar is 42, so 188px is the
+   content height every `.is-open` rule below is built on. It is named here so the two agree by
+   construction, and so the dock's `overflow: hidden auto` has something to scroll TO instead of a
+   panel that has obediently shrunk to nothing. Below that height the dock stops pretending it fits
+   and scrolls, which is the same answer the tab strip gives one box over. */
+.mtk-bottom-workspace { height: 100%; min-height: var(--mtk-dock-content-min); overflow: auto; background: var(--mtk-bg-panel); }
 .mtk-bottom-workspace--split { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.3fr); gap: 1px; background: var(--mtk-border-subtle); }
 .mtk-bottom-workspace--split > div { min-width: 0; overflow: auto; background: var(--mtk-bg-panel); }
 .mtk-bottom-workspace--logic { display: flex; flex-direction: column; overflow: hidden; }
@@ -1406,7 +1492,8 @@ body > [role="dialog"][aria-modal="true"] {
   input[type="checkbox"],
   input[type="radio"] { min-width: 20px; min-height: 20px; }
   .mtk-editor-header { height: 56px; min-height: 56px; }
-  .mtk-bottom-dock { height: 48px; }
+  /* The closed dock IS its bar, and `--mtk-bottom-bar-height` is already 48px in this block — the
+     `height: 48px` that used to sit here was a second statement of that, drifting on its own. */
   .mtk-bottom-dock__bar { min-height: 47px; }
 }
 

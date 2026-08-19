@@ -1448,7 +1448,16 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             if (surface !== "graph") animationEditorStore.getState().setView(workspaceKey, activeContext, surface);
           }}
         />
-        <span style={{ padding: `0 ${space.sm}px`, color: color.text.muted, fontSize: fontSize.meta, whiteSpace: "nowrap" }}>
+        {/* A READ-OUT MUST NOT OUTRANK A CONTROL. `nowrap` with no `minWidth: 0` made this caption
+            the one thing on the row that could not yield, so the two tab strips beside it were
+            squeezed until `UI` and `Graph` scrolled out of a strip that shows no scrollbar — 341px
+            of context tabs in 231px at a 1440 window. It is the least important thing here: it names
+            the sequence, and the sequence is also named in the timeline below. It ellipsises now, and
+            keeps its title so the full text is still available. */}
+        <span
+          title={`One sequence · ${model.sequenceName} · rev ${model.revision || "legacy"}`}
+          style={{ flexShrink: 8, minWidth: 0, padding: `0 ${space.sm}px`, overflow: "hidden", color: color.text.muted, fontSize: fontSize.meta, whiteSpace: "nowrap", textOverflow: "ellipsis" }}
+        >
           One sequence · {model.sequenceName} · rev {model.revision || "legacy"}
         </span>
       </div>
