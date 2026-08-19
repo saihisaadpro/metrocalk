@@ -62,6 +62,23 @@ export type Expect = {
    *  question jsdom cannot be asked. A dock whose content will not shrink pushes the stage below its
    *  floor while `panelLayout` keeps returning exactly the string the unit test wants. */
   min_width?: [selector: string, px: number][];
+  /** Elements that must MEASURE at least this many CSS pixels TALL.
+   *
+   *  The vertical axis had no assertion of any kind — not a measurement, and not even the string
+   *  `min_width` was written to improve on. The shell's whole vertical stack (header · stage · bottom
+   *  dock · status bar) is composed in a stylesheet out of `vh` units and absolute minimums, none of
+   *  which can see each other, and every shell scene was captured at one window height. So the one
+   *  regime where the parts do not fit — a short window with a task workspace open — had never been
+   *  photographed, measured, or reasoned about. */
+  min_height?: [selector: string, px: number][];
+  /** EVERY element matching each selector must be fully on screen — its own box, intersected with
+   *  every ancestor that clips, must not have lost anything.
+   *
+   *  `present` counts elements in the DOM, which is a different question from whether a user can see
+   *  or click one. A `.mtk-dock-tab` strip scrolls with `scrollbar-width: none`, so a tab past the
+   *  edge is in the DOM, in the accessibility tree, focusable by keyboard — and invisible, with
+   *  nothing on screen suggesting it is there. */
+  unclipped?: string[];
 };
 
 export type Scene = {
@@ -361,18 +378,50 @@ export const SCENES: Scene[] = [
  *  reads its registry off `window.__MTK_SHOTS__` in the built bundle, so a module that throws on
  *  load reports **zero scenes** and fails the run. The version of this driver that regexed
  *  `scenes.tsx` for `id:` lines would have found eight ids in a file that cannot execute. */
-function shell(id: string, width: number, looking_for: string, expect: Expect, click?: string[]): Scene {
+function shell(
+  id: string,
+  /** The window. A bare number is a width at the default 900px height — the shape every scene had
+   *  when height was a thing nobody had asked a question about. `[w, h]` names both, and it exists
+   *  because the regime that was broken is a SHORT window: a fixed 900 is one more number stated once
+   *  and then never varied, which is how an entire axis goes unwatched. */
+  size: number | [width: number, height: number],
+  looking_for: string,
+  expect: Expect,
+  click?: string[],
+): Scene {
+  const [width, height] = typeof size === "number" ? [size, 900] : size;
   return {
     id,
     looking_for,
-    viewport: { width, height: 900 },
+    viewport: { width, height },
     click,
     expect: {
       ...expect,
       present: [["[data-testid='viewport']", 1], ...(expect.present ?? [])],
       // The stage's protected floor, measured. STAGE_MIN is imported from the layout module rather
       // than typed as 320 here: a floor written down twice is a floor that only moves in one place.
+      // It is the floor on BOTH axes — one number, not two, and the honest reading of "the stage is
+      // sacred": a stage 320px wide and 40px tall has not kept its floor in any sense a user would
+      // recognise. `--mtk-stage-min` on `.mtk-stage-column` is set from this same constant, so the
+      // dock's `max-height` and this assertion cannot disagree about what the floor is.
       min_width: [["[data-testid='viewport']", STAGE_MIN], ...(expect.min_width ?? [])],
+      min_height: [["[data-testid='viewport']", STAGE_MIN], ...(expect.min_height ?? [])],
+      // AND THE PANEL THAT YIELDED IS STILL WHOLE. The stage-is-sacred rule has two halves and only
+      // one of them was ever written down: the stage keeps its floor, AND what gives way gives way
+      // by getting smaller — not by being cut off behind an `overflow: hidden` that shows no
+      // scrollbar. Asserting only the first half certifies the wrong repair, and this is not a
+      // hypothetical: state the floor on the viewport itself (`minHeight: STAGE_MIN` inline, where
+      // the viewport's layout already lives) and leave the dock unyielding, and every stage-floor
+      // assertion here goes **green** while the dock loses **38px at 1440×700, 92px at 640 and 242
+      // of its 321px at 480** — a quarter of a panel, with its own tab strip in the part that was
+      // cut away. Measured, not reasoned: `shell-dock-short` passed under exactly that mutation
+      // before this line existed.
+      //
+      // Universal rather than per-scene, unlike `.mtk-dock-tab`: every shell scene has exactly one
+      // bottom dock in every layout regime, open or closed, and there is no width or height at
+      // which part of it is meant to be off screen. That is what makes it a rule and not a claim
+      // with an owner.
+      unclipped: ["[data-testid='bottom-dock']", ...(expect.unclipped ?? [])],
       text_absent: ["undefined", "NaN", ...(expect.text_absent ?? [])],
     },
     render: () => <App />,
@@ -459,6 +508,87 @@ function shellScenes(): Scene[] {
       present: [["[data-testid='inspector-dock']", 1]],
     },
     ["[data-testid='rail-right'] button", 'button[aria-label="Pin Inspector dock"]'],
+  ),
+
+  // THE AXIS NOTHING HAD EVER LOOKED AT. Every scene above — and every panel scene before them — is
+  // captured at one window HEIGHT, and the bottom dock is closed in all of them, so the shell's
+  // vertical stack has never been composed under pressure. It does not survive it. The dock's height
+  // is a `vh` clamp with an absolute minimum (320px for Model, 330px for Animate) that has never
+  // known the header and status bar exist, and below it sat a viewport at `min-height: 0` — so the
+  // stage paid the entire difference. On HEAD, measured: **282px of stage at 1440×700**, 18px at 420,
+  // and **zero at 400** with the dock still holding all 321 of its pixels; at 360 the dock ran 17px
+  // off the bottom of the screen with its own tab strip down there.
+  //
+  // These three open the dock (a click, like the left dock's workspaces) at the heights where the
+  // parts stop fitting. They are the vertical twin of `shell-pinned-inspector`, and D3's sentence
+  // applies unchanged: adding it up against the window is the part nothing was doing.
+  shell(
+    "shell-dock-model",
+    [1440, 700],
+    "the Model workspace open on an ordinary laptop window. The dock's preferred height here is " +
+      "48vh = 336px against 619px of stage column — it must give back what does not fit, because " +
+      "the rule is that the PANELS yield",
+    {
+      present: [["[data-testid='bottom-dock']", 1]],
+      // The dock is open, not merely present: an assertion that passes on the closed 42px bar would
+      // be green for the one state that was never broken.
+      min_height: [["[data-testid='bottom-dock']", 64]],
+    },
+    ["[data-testid='bottom-dock-toggle']"],
+  ),
+  shell(
+    "shell-dock-animate",
+    [1440, 640],
+    "Animate — the tallest workspace the dock has (a 330px absolute minimum) on the shortest window " +
+      "that still leaves room for it. The one where the dock's own floor and the stage's floor are " +
+      "closest to colliding",
+    {
+      present: [["[data-testid='bottom-dock']", 1]],
+      min_height: [["[data-testid='bottom-dock']", 64]],
+    },
+    [
+      "[data-testid='bottom-workspace-summary']",
+      "[data-testid='bottom-workspace-option-animation']",
+      "[data-testid='bottom-dock-toggle']",
+    ],
+  ),
+  // SEVEN WORKSPACES ARE AUTHORED AND FIVE OF THEM WERE REACHABLE. 1280 is the width where the
+  // bottom dock is at its narrowest with both side docks open (508px), and on HEAD the strip needed
+  // 610 of it: `Runtime` measured **0 of its 92px** — not narrow, not truncated, absent — with
+  // `Problems` down to 48. The strip is `overflow-x: auto` with `scrollbar-width: none`, which is
+  // what let R1 and R2 both wave it through: each exempts a scrollable ancestor on the grounds that
+  // "the user can pan to it", and the stylesheet had removed the only thing that says so.
+  //
+  // Every `.mtk-dock-tab` in frame, not just the dock's — the Animate workspace's own two strips are
+  // here as well, and they were losing `UI` and `Graph` to the same mechanism.
+  shell(
+    "shell-dock-tabs",
+    [1280, 900],
+    "the bottom dock open at the width where its tab strip is narrowest. All seven workspace tabs " +
+      "must be entirely on screen: a strip that pans without a scrollbar deletes its last tabs in " +
+      "silence, and Runtime — the live simulation diagnostics — was the one being deleted",
+    {
+      present: [["[data-testid='bottom-dock']", 1], [".mtk-dock-tab", 7]],
+      unclipped: [".mtk-dock-tab"],
+      text_present: ["Runtime"],
+    },
+    [
+      "[data-testid='bottom-workspace-summary']",
+      "[data-testid='bottom-workspace-option-animation']",
+      "[data-testid='bottom-dock-toggle']",
+    ],
+  ),
+
+  shell(
+    "shell-dock-short",
+    [1440, 480],
+    "480px tall with a workspace open — the window where the dock's 320px minimum is larger than " +
+      "the room there is. Before this session the stage measured 78px here. The dock must be at its " +
+      "bar or just above it, entirely on screen, and the stage must still hold its floor",
+    {
+      present: [["[data-testid='bottom-dock']", 1]],
+    },
+    ["[data-testid='bottom-dock-toggle']"],
   ),
 
   // THE FOUR OTHER THINGS THE LEFT DOCK CAN BE. The dock is a 300 px track between 980 and 1199 —

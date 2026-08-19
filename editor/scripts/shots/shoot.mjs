@@ -154,7 +154,44 @@ function distinctColours(png, cap = 64) {
  *  hand-written assertions. There is deliberately no waiver mechanism yet: no legitimate violation
  *  has appeared, and an escape hatch built before its first real case is an escape hatch that gets
  *  used for the first real defect. */
-function layoutInvariants() {
+/** Runs IN THE PAGE, once, before anything is measured. The rectangle an element ACTUALLY occupies on
+ *  screen: its own box, intersected with every ancestor that clips in that axis, stopping at the
+ *  frame. `getBoundingClientRect()` alone is the box an element *would* occupy — a scroll container
+ *  reports it in full for a row panned a hundred pixels out of view — and every geometric judgement
+ *  this file makes about "is it there" or "are they on the same pixels" is wrong if it reads that.
+ *
+ *  Installed on `window` rather than closed over because the two callers run in separate
+ *  `page.evaluate` calls, which serialize the function and not its scope. One definition, two
+ *  readers. */
+function installClipRect() {
+  window.__mtkClipRect = (el, frame) => {
+    const r = el.getBoundingClientRect();
+    const box = { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
+    for (let p = el.parentElement; p && p !== frame; p = p.parentElement) {
+      const cs = getComputedStyle(p);
+      const cx = cs.overflowX !== "visible";
+      const cy = cs.overflowY !== "visible";
+      if (!cx && !cy) continue;
+      const pr = p.getBoundingClientRect();
+      if (cx) {
+        box.left = Math.max(box.left, pr.left);
+        box.right = Math.min(box.right, pr.right);
+      }
+      if (cy) {
+        box.top = Math.max(box.top, pr.top);
+        box.bottom = Math.min(box.bottom, pr.bottom);
+      }
+    }
+    // `width`/`height` are carried because `visible()` reads them. Returning a bare edge box would
+    // leave `r.width` undefined, `undefined < 1` is false, and the zero-size guard would silently
+    // stop guarding — a check that agrees with everything, which is the H2 shape from ADR-125.
+    box.width = Math.max(0, box.right - box.left);
+    box.height = Math.max(0, box.bottom - box.top);
+    return box;
+  };
+}
+
+function layoutInvariants(windowIsTheSubject) {
   const frame = document.querySelector('[data-testid="shot-frame"]');
   if (!frame) return [];
   const out = [];
@@ -226,6 +263,118 @@ function layoutInvariants() {
     }
   }
 
+  // R5 — CONTENT LEAVES THE WINDOW DOWNWARDS. R1 is the horizontal half of this rule and, until the
+  // shell scenes, that was the only half there could be: the frame is `maxWidth`-capped, so the
+  // frame's right edge is a real boundary — but its height is `minHeight: 100vh` and otherwise
+  // AUTO, so vertically the frame GROWS to whatever is put in it. Ask R1's question against the
+  // frame's bottom edge and the answer is always no, because the edge moved. The reference that
+  // does not move is the WINDOW, and it is only the right reference for a scene that declared the
+  // window to be its subject — a panel scene is a `maxWidth` box on a page that legitimately
+  // scrolls, and judging it against `innerHeight` would fire on every panel taller than the shot.
+  //
+  // Why it is owed at all: `unclipped` catches the bottom dock leaving the screen ONLY because
+  // `.mtk-stage-column` happens to be `overflow: hidden`, so the pixels are lost to an ancestor
+  // that this harness can see. Delete that one declaration and the dock does not get clipped — it
+  // simply paints past the bottom of the window, off the physical screen, and every invariant here
+  // goes quiet. Measured under that mutation: **the dock's own tab strip 217px below a 480px
+  // window**, silent. A defect that hides by being MORE off-screen is the worst possible shape for
+  // a gate to be blind to.
+  if (windowIsTheSubject) {
+    for (const el of els) {
+      const r = el.getBoundingClientRect();
+      if (!visible(el, r)) continue;
+      if (r.height < TOL) continue; // a zero-height marker below the fold is not content
+      const cs0 = getComputedStyle(el);
+      if (cs0.position === "fixed") continue; // positioned against the window by design
+      let clipped = false;
+      for (let p = el.parentElement; p && p !== frame; p = p.parentElement) {
+        const oy = getComputedStyle(p).overflowY;
+        if (oy === "hidden" || oy === "clip" || oy === "auto" || oy === "scroll") {
+          clipped = true;
+          break;
+        }
+      }
+      if (clipped) continue;
+      if (r.bottom > window.innerHeight + TOL) {
+        out.push(
+          `${name(el)} is painted ${Math.round(r.bottom - window.innerHeight)}px below the bottom of ` +
+            `a ${window.innerHeight}px window — nothing between it and the frame clips or scrolls, ` +
+            "so it is off the screen and there is no way to reach it",
+        );
+      }
+    }
+  }
+
+  // R7 — CUT OFF WITH NO WAY TO REACH IT. R2 asks whether an element hides its OWN TEXT; this asks
+  // the same question one relationship out — whether a CONTAINER hides a CHILD — which is the form
+  // the two largest findings of this session both took. `overflow: hidden` on a parent loses the
+  // child outright; `overflow: auto` with `scrollbar-width: none` loses it just as completely while
+  // reading, in the stylesheet, like the affordance that every other invariant here accepts as the
+  // excuse for content leaving a box. R1 and R2 both stop walking at the first clipping ancestor on
+  // the grounds that "the user can pan to it"; this is the check that the sentence is TRUE.
+  //
+  // The bar is deliberately the scrollbar and not the scroll position: content below the fold of a
+  // real scroller is reachable and is not a defect, which is why a long list does not fire here.
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (!visible(el, r) || r.width < TOL || r.height < TOL) continue;
+    if (getComputedStyle(el).position === "fixed") continue;
+    // Per axis, only the FIRST ancestor that clips on that axis decides reachability — the same walk
+    // R1 makes, for the same reason. Judging every clipping ancestor instead was measured at **344
+    // findings across the 21 scenes**, essentially all of them an inner `.mtk-scroll` doing its job
+    // while some outer `overflow: hidden` was blamed for the row it had scrolled past. If that inner
+    // scroller is itself cut, it is reported on its own line, where the subject is right.
+    for (const [axis, oKey, edge] of [
+      ["horizontally", "overflowX", (a, b) => Math.max(b.left - a.left, a.right - b.right)],
+      ["vertically", "overflowY", (a, b) => Math.max(b.top - a.top, a.bottom - b.bottom)],
+    ]) {
+      for (let p = el.parentElement; p && p !== frame; p = p.parentElement) {
+        const cs = getComputedStyle(p);
+        const ov = cs[oKey];
+        if (ov === "visible") continue;
+        const lost = edge(r, p.getBoundingClientRect());
+        const scroller = ov === "auto" || ov === "scroll";
+        if (lost > TOL && !(scroller && cs.scrollbarWidth !== "none")) {
+          out.push(
+            `${name(el)} is cut ${Math.round(lost)}px ${axis} by ${name(p)}, which is ` +
+              (scroller
+                ? `overflow: ${ov} with scrollbar-width: none — it scrolls, and nothing on screen says so`
+                : `overflow: ${ov} — there is no scrollbar and no way to reach what was cut`),
+          );
+        }
+        break;
+      }
+    }
+  }
+
+  // R6 — A SCROLL CONTAINER WITH NOTHING TO SCROLL IN. `overflow: auto` is the affordance R1 and R2
+  // both accept as the excuse for content leaving the box: "the user can pan to it". Collapse that
+  // container to zero and the excuse becomes false while the declaration that bought it stays in the
+  // stylesheet — content allocated, laid out, reachable by neither eye, mouse nor scrollbar, because
+  // a scrollbar needs a box to live in. Every other invariant here goes quiet, and two of them go
+  // quiet *because of* the declaration that is now a lie.
+  //
+  // Found live, and not by reasoning: with the bottom dock correctly yielded to 80px at a 1440×480
+  // window, `.mtk-workspace-panel__body.mtk-scroll` measured **clientHeight 0 against scrollHeight
+  // 179** — the whole Model workspace — because `.mtk-workspace-panel__header` is `flex: none` with a
+  // 52px minimum and takes a 38px content box entirely. The threshold is zero rather than a judgement
+  // about how many pixels are "enough": a box that can show NOTHING is not a matter of taste, and a
+  // threshold with a number in it is the kind that gets argued down to nothing at its first red.
+  for (const el of els) {
+    const cs = getComputedStyle(el);
+    const scrolls = (v) => v === "auto" || v === "scroll";
+    const y = scrolls(cs.overflowY) && el.scrollHeight > TOL && el.clientHeight < TOL;
+    const x = scrolls(cs.overflowX) && el.scrollWidth > TOL && el.clientWidth < TOL;
+    if (!y && !x) continue;
+    if (cs.display === "none" || cs.visibility === "hidden") continue;
+    out.push(
+      `${name(el)} declares overflow-${y ? "y" : "x"}: ${y ? cs.overflowY : cs.overflowX} and holds ` +
+        `${y ? el.scrollHeight : el.scrollWidth}px of content in a box ${y ? el.clientHeight : el.clientWidth}px ` +
+        `${y ? "tall" : "wide"} — it cannot scroll and cannot show a scrollbar, so the content is ` +
+        "there and unreachable, and the declaration is what stops the other invariants asking",
+    );
+  }
+
   // R2 — TRUNCATED WITH NOTHING TO SAY SO. `overflow: hidden` without `text-overflow: ellipsis` and
   // without a scrollbar removes content with no mark at all: the reader cannot tell a name ends at
   // "Overhead Cra" from a name that is spelled that way. Honest truncation ellipsises; deliberate
@@ -275,10 +424,32 @@ function layoutInvariants() {
 
   // R3 — TWO CONTROLS ON THE SAME PIXELS. The Progress-Evaluation1 wallet-overlap class. Whichever
   // one is on top steals the click, and which that is depends on paint order, not on intent.
+  //
+  // ON WHAT "THE SAME PIXELS" MEANS, AND WHY THIS READS THE CLIPPED RECT. The first version compared
+  // `getBoundingClientRect()` directly, which is the box an element WOULD occupy — a scroll container
+  // reports it for rows that are scrolled a hundred pixels out of view, and an `overflow: hidden`
+  // ancestor reports it for content that is not painted at all. So R3 could call two things a
+  // collision when neither of them was on screen, and this session's own new scenes produced twelve
+  // such reports in one run: an `animation-marker-name` at y=768 inside a scroll container ending at
+  // y=648, in a 640px window, "overlapping" an Inspector row that was equally far below the fold.
+  // Twelve confident sentences about pixels that do not exist. R1 has always walked the ancestors for
+  // exactly this reason and skipped what is clipped; R3 never did, so its verdicts were only ever
+  // reliable in a frame with no scrolling in it — which described the eight panel scenes, and stopped
+  // describing anything the moment the whole shell was in frame.
+  //
+  // Intersecting with every clipping ancestor is strictly better than R1's binary skip: an element
+  // half inside a scroll container still collides on the half you can see, and an element entirely
+  // outside one collides with nothing, because there is nothing there.
+  //
+  // `window.__mtkClipRect` is installed once per page by `installClipRect` below and used by BOTH
+  // this and the scene-declared `unclipped` claim. Defining it twice — once here and once in the
+  // claim evaluator, which cannot see this closure — would be two statements of one geometry, which
+  // is the drift every other gate in this repository exists to catch.
+  const clipped = (el) => window.__mtkClipRect(el, frame);
   const CONTROLS = 'button, a[href], input, select, textarea, [role="button"], [tabindex]:not([tabindex="-1"])';
   const controls = [...frame.querySelectorAll(CONTROLS)]
-    .map((el) => [el, el.getBoundingClientRect()])
-    .filter(([el, r]) => visible(el, r));
+    .map((el) => [el, clipped(el)])
+    .filter(([el, r]) => visible(el, r) && r.width > TOL && r.height > TOL);
   for (let i = 0; i < controls.length; i++) {
     for (let j = i + 1; j < controls.length; j++) {
       const [ea, a] = controls[i];
@@ -422,6 +593,7 @@ for (const scene of scenes) {
   // The scene's OWN claim, evaluated in the page. `[data-testid="shot-frame"]` is emitted by the
   // harness wrapper, not by `scene.render()`, so it was never evidence that the scene rendered —
   // it is true whenever the bundle mounts at all.
+  await page.evaluate(installClipRect);
   const claim = await page.evaluate((e) => {
     const out = [];
     const frame = document.querySelector('[data-testid="shot-frame"]');
@@ -441,21 +613,83 @@ for (const scene of scenes) {
     for (const s of e.text_absent ?? []) {
       if (text.includes(s)) out.push(`the rendered text contains ${JSON.stringify(s)}`);
     }
-    // A protected floor is a MEASUREMENT, and it is the only form the stage-is-sacred rule has that
-    // says anything a grid-template string does not. `layout.test.ts` proves `panelLayout` returns
-    // `minmax(320px, 1fr)`; this proves the stage is 320 px wide with the docks' real content in them.
-    for (const [sel, px] of e.min_width ?? []) {
-      const el = frame.querySelector(sel);
-      if (!el) {
-        out.push(`min_width needs \`${sel}\`, which is not there`);
+    // A PROTECTED FLOOR IS A MEASUREMENT — OF THE PIXELS THAT ARE ON SCREEN.
+    //
+    // `min_width` (ADR-125) exists because a grid-template STRING cannot say whether the tracks fit
+    // in the window; `min_height` is the same claim on the axis that had never had even a string —
+    // the dock's height is a `vh` clamp that has never known the header exists, and below it sat a
+    // viewport at `min-height: 0`, so on a short window the stage paid the whole difference (282px
+    // of stage at 1440×700, 78px at 480).
+    //
+    // Both read the CLIPPED rect, and that is not a detail. The first version of `min_height` read
+    // `getBoundingClientRect()`, which is the box an element WOULD occupy — the same mistake R3 was
+    // repaired for twenty lines below, made again in the same session by the check whose entire
+    // subject is "is the stage actually there". `.mtk-stage-column` is `overflow: hidden`, so the
+    // configuration that defeats it is not exotic: it is the NAIVE FIX FOR THE VERY DEFECT THIS
+    // GATE WAS WRITTEN FOR. Put `minHeight: STAGE_MIN` on the viewport — where its layout already
+    // lives, inline, which is why an `#viewport { min-height }` in the stylesheet does not even
+    // apply — leave the dock unyielding, and the element reports 320px while the column clips it to
+    // 78. **Measured: `shell-dock-short` went GREEN under exactly that mutation**, reporting a floor
+    // held about pixels no user can see. Reading the clipped rect turns it red and says which of the
+    // two numbers is the lie. A gate that a plausible wrong repair satisfies is worse than no gate:
+    // it certifies the wrong repair.
+    const floor = (axis, pairs) => {
+      const tall = axis === "height";
+      for (const [sel, px] of pairs ?? []) {
+        const el = frame.querySelector(sel);
+        if (!el) {
+          out.push(`min_${axis} needs \`${sel}\`, which is not there`);
+          continue;
+        }
+        const box = el.getBoundingClientRect();
+        const seen = window.__mtkClipRect(el, frame);
+        const claimed = Math.round(tall ? box.height : box.width);
+        const onScreen = Math.round(tall ? seen.height : seen.width);
+        if (onScreen >= px - 1) continue;
+        out.push(
+          `\`${sel}\` measures ${onScreen}px${tall ? " tall" : ""}, below its protected floor of ${px}px — ` +
+            (claimed - onScreen > 1
+              ? `it CLAIMS ${claimed}px and an ancestor clips the rest away, so the floor is held in the ` +
+                "layout tree and not on the screen"
+              : `something ${tall ? "above or below" : "beside"} it refused to yield first`),
+        );
+      }
+    };
+    floor("width", e.min_width);
+    floor("height", e.min_height);
+    // A CONTROL THAT IS NOT ON SCREEN IS NOT A CONTROL. R1 and R2 both let an element off when a
+    // scrollable ancestor clips it — "the overflow is deliberate and bounded", "the user can pan to
+    // it" — and both exemptions are bought with an affordance: a scrollbar. `.mtk-dock-tabs` sets
+    // `scrollbar-width: none` and hides the WebKit one, so the strip pans and NOTHING says it panned.
+    // The two invariants waved it through and the defect it was hiding is the largest of this
+    // session: with the bottom dock open, **`Runtime` measured 0 of its 92px at 1280, 1000 and 700px
+    // windows** — seven authored workspaces, and on any ordinary laptop you could reach five.
+    //
+    // Declared per scene rather than made universal, deliberately. The universal form would fire on
+    // every collapsed disclosure and every row below the fold of a long list, which are hidden BY
+    // DESIGN; separating those from this needs a rule nobody has had to write yet, and an invariant
+    // that cries wolf is one that gets waived at its first real defect (ADR-124's own argument
+    // against building a waiver mechanism early). A scene that claims "these controls are reachable
+    // here" is a claim with an owner, and it is the claim that was missing.
+    for (const sel of e.unclipped ?? []) {
+      const els = [...frame.querySelectorAll(sel)];
+      if (!els.length) {
+        out.push(`unclipped needs \`${sel}\`, which matches nothing`);
         continue;
       }
-      const w = el.getBoundingClientRect().width;
-      if (w < px - 1) {
-        out.push(
-          `\`${sel}\` measures ${Math.round(w)}px, below its protected floor of ${px}px — ` +
-            "something beside it refused to yield first",
-        );
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        const c = window.__mtkClipRect(el, frame);
+        const lost = Math.round(r.width - c.width);
+        const lostY = Math.round(r.height - c.height);
+        if (lost > 1 || lostY > 1) {
+          const label = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 24) || sel;
+          out.push(
+            `\`${sel}\` "${label}" is ${Math.round(r.width)}×${Math.round(r.height)}px but only ` +
+              `${Math.round(c.width)}×${Math.round(c.height)}px of it is on screen — an ancestor ` +
+              "clips it away, and a scroll container that shows no scrollbar says nothing about it",
+          );
+        }
       }
     }
     for (const [sa, sb] of e.same_line ?? []) {
@@ -478,8 +712,11 @@ for (const scene of scenes) {
   }, expect);
 
   // Universal, and evaluated for every scene whether or not it says anything about layout — the
-  // point is that the next panel added here inherits them for nothing.
-  const layout = await page.evaluate(layoutInvariants);
+  // point is that the next panel added here inherits them for nothing. The one argument is R5's
+  // precondition: a scene that set the WINDOW is a scene whose bottom edge is the window's, and a
+  // scene that set a frame width is a `maxWidth` box on a page that is allowed to scroll. The
+  // driver already rejects a scene that states both, so this reads one flag and not two.
+  const layout = await page.evaluate(layoutInvariants, Boolean(scene.viewport));
 
   // A cheap, stable fingerprint of the layout that was just judged: how wide the frame is, and where
   // every visible control sits inside it. Compared against the same reading taken after the capture.
