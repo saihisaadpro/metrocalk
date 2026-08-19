@@ -46,6 +46,7 @@ const RULES = Object.freeze({
   "literal-ui-color": "literal UI colours outside the colour token authorities",
   "first-party-css": "first-party CSS outside the shared theme",
   "literal-motion": "literal motion timing outside the motion authority",
+  "unitless-length": "a spacing token interpolated into a length with no unit, which the browser drops",
 });
 const RULE_IDS = Object.freeze(Object.keys(RULES));
 
@@ -72,6 +73,23 @@ const MOTION_PROPERTY =
 const NATIVE_CONTROL = /<\s*(?:button|input|select|textarea)\b/g;
 const WAIVER =
   /ui-constitution-allow\s+([a-z][a-z0-9-]*)\s*:\s*(.*?)(?=\*\/|-->|}\s*$|$)/gi;
+
+// A CSS length written as a TEMPLATE LITERAL, and an interpolation inside it that carries no unit.
+// React appends `px` to a NUMBER; it does not look inside a string, so `` `${space.sm} ${space.xs}` ``
+// reaches the DOM as the length list "6 4", which is invalid, and the browser drops the whole
+// declaration in silence. `tsc` sees a string and is satisfied. The colour and motion rules above
+// read values, not units. The `shots` invariants are all geometric and a missing padding overflows
+// nothing, clips nothing, overlaps nothing and reads perfectly — so R1–R8 are silent too.
+//
+// Eleven live instances were found the day this rule was written (ADR-128), across the engine rail
+// (whose heading and every group title had therefore never had any padding, visible in `shell-wide`
+// as labels flush against the window edge beside their own indented items), MatchPanel and
+// TerrainPanel. Every other spacing interpolation in the tree already writes `px`, which is what
+// makes this a slip rather than a convention.
+const LENGTH_TEMPLATE =
+  /\b(?:padding|margin|gap|rowGap|columnGap|inset|top|right|bottom|left|width|height|minWidth|minHeight|maxWidth|maxHeight|blockSize|inlineSize|borderRadius|flexBasis|outlineOffset|(?:padding|margin|inset)(?:Top|Right|Bottom|Left|Inline|Block)(?:Start|End)?)\s*:\s*`([^`]*)`/g;
+// A unit, a percentage, or a CSS-wide keyword may follow; anything else means the value is dropped.
+const UNITLESS_INTERPOLATION = /\$\{[^}]*\}(?!\s*(?:px|%|em|rem|ex|ch|vh|vw|vmin|vmax|cm|mm|in|pt|pc|fr|deg|s\b|ms\b))/g;
 
 function normalisePath(path) {
   return path.split(sep).join("/");
@@ -358,6 +376,22 @@ function analyseFile(path, source) {
     });
   }
 
+  // Applies to EVERY source, theme authorities included: `tokens.ts` composing a length badly is the
+  // same dropped declaration, and there is no authority that gets to write invalid CSS.
+  if (!/\.(?:css|scss)$/i.test(path)) {
+    findAll(LENGTH_TEMPLATE, masked, (propertyMatch) => {
+      const value = propertyMatch[1];
+      // `calc()` and `var()` legitimately carry a unitless operand (`calc(${n} * 1px)`), and the
+      // custom property's own declaration is where a `var()`'s unit lives. Judging inside either
+      // would be guessing at arithmetic this rule has no business doing.
+      if (value.includes("calc(") || value.includes("var(")) return;
+      const valueOffset = propertyMatch.index + propertyMatch[0].indexOf("`") + 1;
+      findAll(UNITLESS_INTERPOLATION, value, (match) => {
+        addFinding("unitless-length", valueOffset + match.index, `${match[0]} in \`${value}\``);
+      });
+    });
+  }
+
   if (!MOTION_AUTHORITIES.has(path)) {
     const cssSource = /\.(?:css|scss)$/i.test(path);
     findAll(MOTION_PROPERTY, masked, (propertyMatch) => {
@@ -494,7 +528,15 @@ function printTotals(results) {
 }
 
 function runSelfTests() {
-  const component = analyseFile(
+  // How many fixtures this run actually exercised. `analyseFile` is the only door into the scanner,
+  // so counting the calls counts the contracts — and a fixture deleted in a refactor lowers the
+  // number rather than leaving a confident constant behind.
+  let selfTestFixtures = 0;
+  const analyse = (path, source) => {
+    selfTestFixtures += 1;
+    return analyseFile(path, source);
+  };
+  const component = analyse(
     "src/panels/Synthetic.tsx",
     'export const Synthetic = () => <button style={{ color: "#fff", transition: "opacity 120ms ease" }}>Go</button>;\n',
   );
@@ -502,26 +544,26 @@ function runSelfTests() {
   assert.equal(component.counts["literal-ui-color"], 1);
   assert.equal(component.counts["literal-motion"], 1);
 
-  const primitive = analyseFile(
+  const primitive = analyse(
     "src/theme/SyntheticPrimitive.tsx",
     "export const SyntheticPrimitive = () => <button>Go</button>;\n",
   );
   assert.equal(primitive.counts["raw-native-control"], 0);
 
-  const sharedConsumer = analyseFile(
+  const sharedConsumer = analyse(
     "src/panels/SyntheticSharedConsumer.tsx",
     "export const SyntheticSharedConsumer = () => <><Button>Go</Button><SelectField /></>;\n",
   );
   assert.equal(sharedConsumer.counts["raw-native-control"], 0);
 
-  const authority = analyseFile(
+  const authority = analyse(
     "src/theme/tokens.ts",
     'export const sample = { color: "#fff", transition: "opacity 120ms ease" };\n',
   );
   assert.equal(authority.counts["literal-ui-color"], 0);
   assert.equal(authority.counts["literal-motion"], 0);
 
-  const css = analyseFile(
+  const css = analyse(
     "src/panels/Synthetic.css",
     ".synthetic { color: #fff; transition: opacity 120ms ease; }\n",
   );
@@ -529,13 +571,53 @@ function runSelfTests() {
   assert.equal(css.counts["literal-ui-color"], 1);
   assert.equal(css.counts["literal-motion"], 1);
 
-  const multilineMotion = analyseFile(
+  const multilineMotion = analyse(
     "src/panels/MultilineMotion.tsx",
     "export const style = {\n  transition:\n    \"opacity 180ms ease, transform 240ms ease\",\n};\n",
   );
   assert.equal(multilineMotion.counts["literal-motion"], 2);
 
-  const waived = analyseFile(
+  // `unitless-length`. The first fixture is the shape that actually shipped eleven times: a spacing
+  // token interpolated straight into a length list, which the browser discards whole.
+  const droppedLength = analyse(
+    "src/app/SyntheticRail.tsx",
+    "export const rail = { padding: `${space.sm} ${space.xs}`, margin: `0 0 ${space.xs}` };\n",
+  );
+  assert.equal(droppedLength.counts["unitless-length"], 3);
+
+  // The control that has to hold, or the rule would rewrite the whole codebase: the same tokens,
+  // written correctly, plus every legitimate way a unit can arrive.
+  const correctLengths = analyse(
+    "src/app/SyntheticCorrect.tsx",
+    "export const ok = {\n" +
+      "  padding: `${space.sm}px ${space.xs}px`,\n" +
+      "  width: `${pct}%`,\n" +
+      "  height: `${rows}rem`,\n" +
+      "  transform: `translateY(${dy})`,\n" +
+      "  gridTemplateColumns: `repeat(${n}, 1fr)`,\n" +
+      "  minHeight: `calc(100% - ${gap})`,\n" +
+      "  maxWidth: `var(--mtk-dock-w)`,\n" +
+      "  flexBasis: `0 0 ${w}px`,\n" +
+      "};\n",
+  );
+  assert.equal(correctLengths.counts["unitless-length"], 0);
+
+  // A number is React's own job — it appends the unit itself — so a bare `padding: space.sm` is
+  // correct and must stay silent. Only a TEMPLATE LITERAL loses the unit.
+  const numericLength = analyse(
+    "src/app/SyntheticNumeric.tsx",
+    "export const ok = { padding: space.sm, gap: 4, top: someNumber };\n",
+  );
+  assert.equal(numericLength.counts["unitless-length"], 0);
+
+  // No file is exempt, including the theme authorities — invalid CSS is invalid there too.
+  const authorityLength = analyse(
+    "src/theme/tokens.ts",
+    "export const pad = { padding: `${space.sm} 0` };\n",
+  );
+  assert.equal(authorityLength.counts["unitless-length"], 1);
+
+  const waived = analyse(
     "src/panels/AuthoredPreview.tsx",
     "// ui-constitution-allow literal-ui-color: authored preview swatch supplied by imported material data\n" +
       'export const swatch = { color: "#c0ffee" };\n',
@@ -544,7 +626,7 @@ function runSelfTests() {
   assert.equal(waived.waivers.length, 1);
   assert.deepEqual(waived.errors, []);
 
-  const jsxWaived = analyseFile(
+  const jsxWaived = analyse(
     "src/panels/JsxAuthoredPreview.tsx",
     "export const Preview = () => <>\n" +
       "  {/* ui-constitution-allow literal-ui-color: imported author swatch rendered without reinterpretation */}\n" +
@@ -555,7 +637,7 @@ function runSelfTests() {
   assert.equal(jsxWaived.waivers.length, 1);
   assert.deepEqual(jsxWaived.errors, []);
 
-  const stale = analyseFile(
+  const stale = analyse(
     "src/panels/Stale.tsx",
     "// ui-constitution-allow raw-native-control: temporary compatibility seam\n" +
       "export const value = 1;\n",
@@ -583,7 +665,10 @@ function runSelfTests() {
   assert.equal(reductionComparison.regressions.length, 0);
   assert.equal(reductionComparison.reductions.length, 1);
 
-  console.log("UI constitution scanner self-tests passed (11 fixtures/contracts).");
+  // Counted from the fixtures above, not restated: the previous hard-coded "11" had already drifted
+  // by four before anyone noticed, which is the smallest possible instance of the thing this whole
+  // file exists to catch — a second statement of a fact, compared to the first by nothing.
+  console.log(`UI constitution scanner self-tests passed (${selfTestFixtures} fixtures/contracts).`);
 }
 
 function main() {

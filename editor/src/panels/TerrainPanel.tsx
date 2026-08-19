@@ -273,7 +273,7 @@ export function TerrainPanel({ client, statsIntervalMs = 1000, style }: TerrainP
             stays editable afterwards. Nothing is baked in.
           </p>
           <DescribeBox client={client} busy={busy} run={run} />
-          <div style={{ height: 1, background: color.border.subtle, margin: `${space.xs} 0` }} aria-hidden />
+          <div style={{ height: 1, background: color.border.subtle, margin: `${space.xs}px 0` }} aria-hidden />
           <SectionHeader>Or start from a preset</SectionHeader>
           <div style={{ display: "grid", gap: space.sm }} data-testid="terrain-presets">
             {presets.map((p) => (
@@ -285,7 +285,7 @@ export function TerrainPanel({ client, statsIntervalMs = 1000, style }: TerrainP
                 onClick={() => void run(() => client.terrainCreate(p.id), `Couldn’t create ${p.name}`)}
                 // Ghost, not bordered: six outlined cards in a column is more chrome than a list of six
                 // choices needs. The hover state carries the affordance.
-                style={{ justifyContent: "flex-start", textAlign: "left", height: "auto", padding: `${space.sm} ${space.md}`, minWidth: 0, whiteSpace: "normal" }}
+                style={{ justifyContent: "flex-start", textAlign: "left", height: "auto", padding: `${space.sm}px ${space.md}px`, minWidth: 0, whiteSpace: "normal" }}
               >
                 <span style={{ display: "grid", gap: space.xxs, minWidth: 0 }}>
                   <span style={{ fontSize: fontSize.label }}>{p.name}</span>
@@ -315,7 +315,7 @@ export function TerrainPanel({ client, statsIntervalMs = 1000, style }: TerrainP
           display: "flex",
           alignItems: "center",
           justifyContent: "flex-end",
-          padding: `${space.xs} ${space.md} 0`,
+          padding: `${space.xs}px ${space.md}px 0`,
         }}
       >
         <Badge tone={stats?.overBudget ? "warn" : "neutral"} title="Resident terrain memory against the budget">
@@ -766,7 +766,7 @@ function DescribeBox({
                 justifyContent: "flex-start",
                 textAlign: "left",
                 height: "auto",
-                padding: `${space.sm} ${space.md}`,
+                padding: `${space.sm}px ${space.md}px`,
                 minWidth: 0,
                 whiteSpace: "normal",
                 background: color.bg.inset,
@@ -1104,7 +1104,7 @@ function LifeSection({ recipe, busy, edit }: { recipe: TerrainRecipe; busy: bool
                   ...textRole.eyebrow,
                   padding: 0,
                   flex: "0 0 auto",
-                  color: color.text.faint,
+                  color: color.text.muted,
                 }}
               >
                 Asset

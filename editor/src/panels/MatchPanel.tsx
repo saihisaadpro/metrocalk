@@ -57,7 +57,7 @@ const summaryGrid: React.CSSProperties = {
   display: "grid",
   gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))",
   gap: space.sm,
-  margin: `${space.sm} 0`,
+  margin: `${space.sm}px 0`,
 };
 
 const statTile: React.CSSProperties = {
@@ -279,7 +279,7 @@ export function MatchPanel({ client }: { client: EditorClient }) {
       <VfxSection client={client} />
       {/* ── the authored scene ─────────────────────────────────────────────────────────────────────── */}
       <section>
-        <h3 style={{ margin: `0 0 ${space.xs}`, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
+        <h3 style={{ margin: `0 0 ${space.xs}px`, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
           Your match
         </h3>
         <div style={summaryGrid}>
@@ -301,7 +301,7 @@ export function MatchPanel({ client }: { client: EditorClient }) {
       {/* ── what is wrong, and where ───────────────────────────────────────────────────────────────── */}
       {errors.length > 0 || warnings.length > 0 || startError ? (
         <section>
-          <h3 style={{ margin: `0 0 ${space.xs}`, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
+          <h3 style={{ margin: `0 0 ${space.xs}px`, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
             {errors.length > 0 ? "Fix these before running" : "Worth knowing"}
           </h3>
           <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
@@ -365,7 +365,7 @@ export function MatchPanel({ client }: { client: EditorClient }) {
           ) : null}
           {/* ── standing orders ─────────────────────────────────────────────────────────────────── */}
           <div style={{ marginTop: space.sm }} data-testid="match-orders">
-            <h4 style={{ margin: `0 0 ${space.xs}`, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
+            <h4 style={{ margin: `0 0 ${space.xs}px`, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
               Orders
             </h4>
             <p style={meta}>

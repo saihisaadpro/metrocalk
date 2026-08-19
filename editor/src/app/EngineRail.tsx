@@ -22,6 +22,7 @@
 
 import type { CSSProperties } from "react";
 import { color, font, fontSize, radius, space, text } from "../theme/tokens";
+import { ENGINE_RAIL_W, ENGINE_RAIL_W_COMPACT } from "./layout";
 
 /** Where an engine's workspace opens. Decided by the shape of its content, not by taste. */
 export type EngineSurface = "side" | "bottom";
@@ -110,7 +111,10 @@ export interface EngineRailProps {
  * the eye, not structure to navigate.
  */
 export function EngineRail({ active, onChange, badges = {}, compact = false, style }: EngineRailProps) {
-  const width = compact ? 56 : 132;
+  // The SAME width `layout.ts` reserves as a grid track. It used to be `compact ? 56 : 132` — the two
+  // constants written a second time, in the one file whose job is to fit inside them, compared to the
+  // originals by nothing. That is the drift ADR-119/122 exist for, one layer up.
+  const width = compact ? ENGINE_RAIL_W_COMPACT : ENGINE_RAIL_W;
   return (
     <nav
       data-testid="engine-rail"
@@ -121,7 +125,21 @@ export function EngineRail({ active, onChange, badges = {}, compact = false, sty
         display: "flex",
         flexDirection: "column",
         gap: space.xs,
-        padding: `${space.sm} ${space.xs}`,
+        // `border-box`, because `width` here IS the track `layout.ts` reserves — 132px of shell, of
+        // which the padding and the border are part. Content-box would make the rail 141px wide in a
+        // 132px track, and `shots` R7 measured exactly that: **9px of the rail cut, no scrollbar**,
+        // across 14 scenes, in the run meant to prove the padding fix below.
+        boxSizing: "border-box",
+        // `px`, on all three paddings in this file. React appends the unit to a NUMBER, never inside
+        // a template string, so `` `${space.sm} ${space.xs}` `` reached the DOM as the invalid length
+        // list "6 4" and the browser dropped the whole declaration — the rail, its heading and every
+        // group title have therefore had NO padding since they were written, which is why the labels
+        // sat flush against the window edge while their own items were indented. Nothing could see
+        // it: `tsc` types this as a string, the constitution ratchet read colours and motion but not
+        // units, and R1–R8 are all silent because a missing padding overflows nothing, clips nothing,
+        // overlaps nothing and is perfectly readable. Found by LOOKING at `shell-wide.png`, and now
+        // gated by the ratchet's `unitless-length` rule (ADR-128).
+        padding: `${space.sm}px ${space.xs}px`,
         background: color.bg.panel,
         borderRight: `1px solid ${color.border.subtle}`,
         overflowY: "auto",
@@ -131,7 +149,7 @@ export function EngineRail({ active, onChange, badges = {}, compact = false, sty
     >
       {!compact && (
         <div
-          style={{ ...text.eyebrow, padding: `0 ${space.sm} ${space.xs}`, color: color.text.faint }}
+          style={{ ...text.eyebrow, padding: `0 ${space.sm}px ${space.xs}px`, color: color.text.muted }}
         >
           Engines
         </div>
@@ -142,7 +160,7 @@ export function EngineRail({ active, onChange, badges = {}, compact = false, sty
             {!compact && (
               <div
                 aria-hidden
-                style={{ ...text.eyebrow, padding: `${space.xs} ${space.xs} 2px` }}
+                style={{ ...text.eyebrow, padding: `${space.xs}px ${space.xs}px 2px` }}
               >
                 {group.title}
               </div>
