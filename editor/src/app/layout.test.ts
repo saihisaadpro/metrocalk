@@ -4,7 +4,7 @@
 //! (jsdom has none): the assertion is on the grid template the resize produces.
 
 import { expect, test } from "vitest";
-import { dockGridColumns, panelLayout, STAGE_MIN, COLLAPSE_BELOW, OVERLAY_BELOW, RAIL_W, ENGINE_RAIL_W, ENGINE_RAIL_W_COMPACT } from "./layout";
+import { dockForm, dockGridColumns, panelLayout, STAGE_MIN, COLLAPSE_BELOW, OVERLAY_BELOW, RAIL_W, ENGINE_RAIL_W, ENGINE_RAIL_W_COMPACT } from "./layout";
 
 test("the stage is ALWAYS the flex region with a protected floor (it never collapses first)", () => {
   for (const w of [1920, 1366, 1024, 900, 768, 500]) {
@@ -99,4 +99,40 @@ test("the RIGHT dock is the one that gives — the left is where the authoring h
   expect(dockGridColumns(panelLayout(COLLAPSE_BELOW), false, false, COLLAPSE_BELOW)).toBe(
     `${ENGINE_RAIL_W}px 300px minmax(${STAGE_MIN}px, 1fr) 228px`,
   );
+});
+
+// ── the vertical axis ─────────────────────────────────────────────────────────────────────────────
+// `dockGridColumns` makes the side docks yield until they cannot; `dockForm` is the answer to what
+// happens after "cannot" on the other axis. These tests state the threshold in the terms the
+// function is written in, so the numbers here are arithmetic and not a second copy of the design.
+
+test("the dock is a track while both floors fit, and a sheet the moment they do not", () => {
+  const BAR = 42; // --mtk-bottom-bar-height at (pointer: fine)
+  const CONTENT = 188; // --mtk-dock-content-min
+  const both = STAGE_MIN + BAR + CONTENT; // 550px of stage column
+
+  // Exactly enough is enough: the boundary belongs to the form that costs the user nothing.
+  expect(dockForm(both, BAR, CONTENT)).toBe("docked");
+  expect(dockForm(both + 1, BAR, CONTENT)).toBe("docked");
+  expect(dockForm(both - 1, BAR, CONTENT)).toBe("sheet");
+  // A 900px window (819px of column) is an ordinary laptop and must never float its dock.
+  expect(dockForm(819, BAR, CONTENT)).toBe("docked");
+  // A 520px window (439px of column) is where HEAD gave the workspace 77px of its 188.
+  expect(dockForm(439, BAR, CONTENT)).toBe("sheet");
+
+  // The touch block widens the bar to 48px, which moves the threshold by exactly that much. This is
+  // why the two minimums are read off the live element instead of copied into TypeScript: a constant
+  // here would be wrong on every coarse-pointer device, and wrong silently.
+  expect(dockForm(both, 48, CONTENT)).toBe("sheet");
+  expect(dockForm(both + 6, 48, CONTENT)).toBe("docked");
+});
+
+test("an unmeasured column is not a short one", () => {
+  // ADR-118's rule inside a layout function: the unknown answer must not be the one that changes
+  // behaviour. jsdom has no layout, so every measurement here is 0 — and the first version of this
+  // function read that as "float the dock and withdraw the stage's overlays", which took an
+  // unrelated end-to-end test down with it.
+  expect(dockForm(0, 42, 188)).toBe("docked");
+  expect(dockForm(Number.NaN, 42, 188)).toBe("docked");
+  expect(dockForm(-1, 42, 188)).toBe("docked");
 });

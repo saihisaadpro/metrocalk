@@ -220,4 +220,62 @@ describe("editor app — end-to-end wiring", () => {
     expect(screen.getByTestId("drawer-left")).toBeTruthy();
     expect(screen.getByRole("dialog", { name: /scene and asset workspace/i })).toBeTruthy();
   });
+
+  // THE SHORT-WINDOW REGIME, AS FAR AS JSDOM CAN CARRY IT. What is being pinned here is the WIRING —
+  // that the measured column reaches `dockForm`, that its answer reaches the dock as a stable
+  // `data-dock-form`, and that the stage's own overlays read it and withdraw. The geometry itself
+  // (the sheet's box, the workspace's content height, the tool rail's occlusion) is not assertable
+  // here at all and is not attempted: jsdom returns 0 for every rectangle, which is the whole reason
+  // `pnpm shots` exists and why `shell-dock-short` is the scene that proves the pixels.
+  //
+  // `clientHeight` is stubbed rather than laid out, and the two custom properties are stubbed with
+  // it, because `getComputedStyle` in jsdom resolves neither — a test that read them for real would
+  // be measuring jsdom's CSS engine, not this shell's decision.
+  it("floats the dock over the stage on a window too short to hold both, and withdraws the stage's own controls", async () => {
+    const shortColumn = 399; // a 480px window: 320px of stage floor + a 42px bar + 188px of workspace does not fit
+    const proto = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", { configurable: true, get: () => shortColumn });
+    const realStyle = window.getComputedStyle;
+    window.getComputedStyle = ((el: Element, pe?: string | null) => {
+      const cs = realStyle.call(window, el, pe ?? undefined);
+      return {
+        ...cs,
+        getPropertyValue: (n: string) =>
+          n === "--mtk-bottom-bar-height" ? "42px" : n === "--mtk-dock-content-min" ? "188px" : cs.getPropertyValue(n),
+      } as CSSStyleDeclaration;
+    }) as typeof window.getComputedStyle;
+    try {
+      render(<App />);
+      // Closed, the dock is its bar and still a track — the sheet form is spent only on `.is-open`,
+      // so a closed dock must never take the stage's controls away.
+      expect(screen.getByTestId("bottom-dock").getAttribute("data-dock-form")).toBe("sheet");
+      expect(screen.getByTestId("viewport-tool-rail")).toBeTruthy();
+
+      fireEvent.click(screen.getByTestId("bottom-dock-toggle"));
+      await waitFor(() => expect(screen.queryByTestId("viewport-tool-rail")).toBeNull());
+      // Withdrawn, not covered: R3 caught these sharing pixels with the dock's tab strip, and at a
+      // 400px window all five transform tools and the toolbar are behind the sheet.
+      expect(screen.queryByTestId("vptoolbar")).toBeNull();
+      expect(screen.queryByTestId("vpMove")).toBeNull();
+
+      // And it is reversible by the same click that caused it — the control the whole design rests
+      // on. A withdrawal that does not come back is a deletion.
+      fireEvent.click(screen.getByTestId("bottom-dock-toggle"));
+      await waitFor(() => expect(screen.getByTestId("viewport-tool-rail")).toBeTruthy());
+    } finally {
+      window.getComputedStyle = realStyle;
+      if (proto) Object.defineProperty(HTMLElement.prototype, "clientHeight", proto);
+      else delete (HTMLElement.prototype as unknown as Record<string, unknown>).clientHeight;
+    }
+  });
+
+  // THE CONTROL THAT MATTERS: the same wiring on an ordinary window must change nothing. A test that
+  // only ever asserts the degraded form passes just as well against a shell that is ALWAYS degraded.
+  it("leaves an ordinary window alone — the dock is a track and the stage keeps its controls", () => {
+    render(<App />);
+    expect(screen.getByTestId("bottom-dock").getAttribute("data-dock-form")).toBe("docked");
+    fireEvent.click(screen.getByTestId("bottom-dock-toggle"));
+    expect(screen.getByTestId("viewport-tool-rail")).toBeTruthy();
+    expect(screen.getByTestId("vptoolbar")).toBeTruthy();
+  });
 });

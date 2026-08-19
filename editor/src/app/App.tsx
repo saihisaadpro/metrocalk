@@ -18,7 +18,7 @@ import { Modal, Popover } from "../theme/Popover";
 import { Button } from "../theme/primitives";
 import { DockRail } from "../theme/workspace";
 import { color, elevation, font, fontSize, motion, radius, space, z } from "../theme/tokens";
-import { STAGE_MIN, dockGridColumns, panelLayout } from "./layout";
+import { STAGE_MIN, type DockForm, dockForm, dockGridColumns, panelLayout } from "./layout";
 import { usePlayerDrive } from "./usePlayerDrive";
 import { ViewportToolbar } from "../panels/ViewportToolbar";
 import { Rejections } from "../panels/Rejections";
@@ -230,8 +230,37 @@ export function App() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
   const layout = panelLayout(vw);
+  // THE SAME QUESTION ON THE OTHER AXIS, AND IT HAS TO BE MEASURED. `panelLayout` reads the window
+  // width because the side tracks are the only thing between the window's two edges; the stage column
+  // is NOT the window's height — the header and the status bar take 81px of it — and reconstructing
+  // that from constants is the second-statement-of-a-number defect this shell has been repairing for
+  // four ADRs. So the column is observed, and the two dock minimums are read off the live element
+  // rather than copied into TypeScript: `--mtk-bottom-bar-height` is genuinely 48px under
+  // `(pointer: coarse)`, so a copy here would be wrong on every touch device.
+  //
+  // A ResizeObserver and not a `resize` listener: the column's height changes when the *chrome* does
+  // (the header collapses its own rows at 760px), not only when the window does. It fires on layout
+  // changes only — never per frame — so the hot path (invariant 4) is untouched.
+  const stageColumn = useRef<HTMLDivElement>(null);
+  const [dockShape, setDockShape] = useState<DockForm>("docked");
+  useEffect(() => {
+    const el = stageColumn.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const read = () => {
+      const cs = getComputedStyle(el);
+      const px = (name: string) => Number.parseFloat(cs.getPropertyValue(name)) || 0;
+      setDockShape(dockForm(el.clientHeight, px("--mtk-bottom-bar-height"), px("--mtk-dock-content-min")));
+    };
+    read();
+    const ro = new ResizeObserver(read);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   // Which collapsed panel is currently opened as an overlay drawer.
   const [drawer, setDrawer] = useState<"left" | "right" | null>(null);
+  // The stage is under a sheet: the dock is in its floating form AND open. Read by the stage's own
+  // overlays, which withdraw rather than sit underneath it (see the tool rail below).
+  const stageSheet = dockShape === "sheet" && bottomOpen;
   useEffect(() => {
     if (!layout.collapsed) setDrawer(null); // widening back out closes the responsive drawer
     if (layout.collapsed || layout.overlay) setDockFlyout(null);
@@ -592,7 +621,17 @@ export function App() {
             makes the side docks yield on the horizontal one. Set here rather than in the stylesheet
             because `STAGE_MIN` is also what the shots harness imports to measure the floor: a number
             written down twice is a number that only moves in one place. */}
-        <div className="mtk-stage-column" style={{ "--mtk-stage-min": `${STAGE_MIN}px` } as React.CSSProperties}>
+        {/* `--mtk-z-dock-sheet` is published here for the same reason `--mtk-stage-min` is: `z` in
+            `tokens.ts` is the one ordering of this shell's layers, and a literal in the stylesheet
+            would be a second one that drifts. The sheet is the bottom dock's drawer, so it takes the
+            drawer's layer — BELOW `z.badge`, deliberately: a sheet that covers the stage in Play mode
+            must not also cover the "● PLAYING" badge, which `<ux_quality>` 5 requires to be
+            unmistakable on the stage itself. */}
+        <div
+          ref={stageColumn}
+          className="mtk-stage-column"
+          style={{ "--mtk-stage-min": `${STAGE_MIN}px`, "--mtk-z-dock-sheet": z.drawer } as React.CSSProperties}
+        >
         <div
           id="viewport"
           data-testid="viewport"
@@ -699,7 +738,21 @@ export function App() {
           }}
         >
           {!native && "native wgpu viewport — drag to orbit · scroll to zoom · click to select (live in the .exe)"}
-          {!playing && (
+          {/* A COVERED CONTROL IS WORSE THAN AN ABSENT ONE. The sheet floats over the stage, and the
+              stage's own controls are absolutely positioned inside the viewport underneath it — so
+              without this they are still in the DOM, still focusable, still counted by every gate,
+              and completely unreachable. R3 caught it in the run meant to prove the sheet worked:
+              `vpSelect`/`vpMove` sharing pixels with the dock's `Model` tab. Measured across the
+              whole regime, it is not an edge: at 520 three of five transform tools are entirely
+              covered, at 480 four of five, and at 400 **all five plus the viewport toolbar** — the
+              rail wants y 104..341 and even at the top of the regime there are only 228px of stage
+              above the sheet. There is no height at which both fit, which is what makes withdrawing
+              them a rule rather than a tuning.
+              The shell already states this contract one mode over: `!playing` removes exactly these
+              two, because in Play the stage is not the surface you are authoring on. A sheet the user
+              opened over the stage is the same statement, and it is reversible by the same click that
+              made it — the tools come back when the sheet closes. */}
+          {!playing && !stageSheet && (
             <ViewportToolRail
               data-testid="viewport-tool-rail"
               activeTool={activeTool}
@@ -714,8 +767,8 @@ export function App() {
               }}
             />
           )}
-          {!playing && <ViewportToolbar client={client} showTransformTools={false} />}
-          {!playing && activeTool === "pipe" && (
+          {!playing && !stageSheet && <ViewportToolbar client={client} showTransformTools={false} />}
+          {!playing && !stageSheet && activeTool === "pipe" && (
             <Suspense
               fallback={
                 <div role="status" aria-live="polite" style={{ position: "absolute", top: 76, left: toolRailMinimized ? 54 : 138, zIndex: z.chrome, width: 220, padding: space.md, borderRadius: radius.lg, color: color.text.secondary, background: color.bg.raised, border: `1px solid ${color.border.default}`, boxShadow: elevation.e2 }}>
@@ -753,9 +806,16 @@ export function App() {
               sat on top of the Build workspace's Combine section and the Terrain presets and took
               their clicks (`<ux_quality>` 4: no control overlaps another). Centred on the STAGE it
               cannot reach a dock at any width, because the grid — one source of truth — decides where
-              the stage is and the card simply lives there, exactly as `PlayBadge` does. */}
-          <Onboarding show={!sceneEmpty && !playing} onStart={() => openEngine("build")} />
-          {sceneEmpty && !playing && (
+              the stage is and the card simply lives there, exactly as `PlayBadge` does.
+              `!stageSheet` for the same reason the tool rail has it, and it was found the same way
+              the sheet's first defect was — by LOOKING at the capture. Every assertion passed and the
+              card was painted straight across the Model workspace's description, because it is
+              `z.menu` (130) against the sheet's `z.drawer` (120). R3 was silent and right to be: it
+              compares CONTROLS, and what the card was covering here is prose. A first-run card
+              inviting you to start on a stage you have just covered up is the wrong invitation
+              anyway — it comes back with the stage. */}
+          <Onboarding show={!sceneEmpty && !playing && !stageSheet} onStart={() => openEngine("build")} />
+          {sceneEmpty && !playing && !stageSheet && (
             <EmptyState
               onDrawPipe={() => setActiveTool("pipe")}
               onBrowseAssets={() => openEngine("build")}
@@ -773,6 +833,7 @@ export function App() {
           client={client}
           active={bottomWorkspace}
           open={bottomOpen}
+          form={dockShape}
           playing={playing}
           onChange={(w) => {
             setBottomWorkspace(w);

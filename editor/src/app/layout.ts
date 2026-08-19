@@ -103,3 +103,51 @@ export function dockGridColumns(
   // stage absorbs the remainder — but that is below OVERLAY_BELOW, where this branch is unreachable.
   return `${engines}px ${left}px minmax(${STAGE_MIN}px, 1fr) ${right}px`;
 }
+
+/** Where the bottom dock lives when it is open: a track BELOW the stage, or a sheet OVER it. */
+export type DockForm = "docked" | "sheet";
+
+/** THE VERTICAL TWIN OF `dockGridColumns`, AND OF THE ≤620px SIDE DRAWERS.
+ *
+ * ADR-126 made the dock yield vertically — `max-height: calc(100% - var(--mtk-stage-min))` — and closed
+ * by naming what yielding could not answer: **below a certain window height the stage's floor and a
+ * usable workspace cannot both hold**, and it left the dock shrinking through that regime "which is
+ * honest but is not an answer". Measured at HEAD it was not honest either. The dock reports `is-open`,
+ * its tab lights up, and the workspace inside it is **37px of 188 at a 480px window, 1px at 440px, and
+ * 1px all the way down to 300px** — a scroll container too short to render a scrollbar, so nothing on
+ * screen says the workspace is there. Every layout invariant is silent: R6 wants `clientHeight < 1` and
+ * the box is exactly 1, R7 exempts a scroller that has not disabled its scrollbar, and this one has not
+ * — it simply has nowhere to draw it. The user clicks a workspace and the editor does nothing, with no
+ * reason given: `<ux_quality>` 6, an enabled control that neither acts nor explains.
+ *
+ * The answer is not new, which is the argument for it. **On the horizontal axis this shell already
+ * solves exactly this problem**: below `OVERLAY_BELOW` the side docks stop being tracks beside the stage
+ * and become drawers over it, because a dock squeezed past its own minimum is a dock that has been
+ * deleted without saying so. Rotate that rule 90° and it reads: when the dock cannot fit BELOW the
+ * stage, it floats OVER it. The stage then keeps its whole column and its floor — a sheet the user
+ * opened and can close is not the stage collapsing — and the workspace gets a real content box with a
+ * real scrollbar. Refusing to open was the other candidate and is worse: it deletes seven workspaces
+ * because a window is short, which is the "seven authored, five reachable" defect of ADR-126 with a
+ * bigger number.
+ *
+ * The three inputs are MEASURED, not restated. `barH` and `contentMin` are read from
+ * `--mtk-bottom-bar-height` and `--mtk-dock-content-min` on the live element, because both are real
+ * variables — the bar is 48px under `(pointer: coarse)` — and a copy of them here would be a second
+ * statement of a number that already moves on its own, which is the class of defect ADR-119 through
+ * ADR-126 are all about. `stageHeight` is the stage column's measured `clientHeight`, for the reason
+ * ADR-125 gave: adding the tracks up against the window is the part nothing was doing.
+ *
+ * AND A MEASUREMENT OF ZERO IS NOT A SHORT WINDOW — IT IS NO MEASUREMENT. The first version returned
+ * `"sheet"` for a zero-height column, which is the *degraded* form, and every environment without
+ * layout gets that answer: jsdom, the first render before the observer has run, a hidden tab. The
+ * vitest suite found it within a minute — `pipe-forge` vanished from an unrelated end-to-end test,
+ * because a shell that believes it is 0px tall floats its dock and withdraws the stage's overlays.
+ * That is `absence is not assent` (ADR-118) in a layout function: an unknown must not read as the
+ * answer that changes behaviour. The docked form is what the shell does when nothing is wrong, so it
+ * is what an unanswered question returns, and the observer corrects it on the first real layout.
+ *
+ * Pure, so the threshold is unit-testable in jsdom, which has no layout to measure. */
+export function dockForm(stageHeight: number, barH: number, contentMin: number): DockForm {
+  if (!(stageHeight > 0)) return "docked"; // not measured yet (and NaN, which compares false either way)
+  return stageHeight >= STAGE_MIN + barH + contentMin ? "docked" : "sheet";
+}

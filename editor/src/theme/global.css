@@ -988,7 +988,11 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-dock-panel__scroll { flex: none; max-height: 44%; overflow: auto; }
 .mtk-dock-section-heading { padding: 12px 12px 6px; color: var(--mtk-text-secondary); font: 650 12px/1.2 var(--mtk-font-ui); letter-spacing: .1px; }
 .mtk-quick-create { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px; border-bottom: 1px solid var(--mtk-border-subtle); }
-.mtk-stage-column { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: transparent; }
+/* `position: relative` is the containing block for the dock's SHEET form (see `.is-sheet` below):
+   the sheet is anchored to the bottom of the stage column, not to the window, for the same reason
+   ADR-125 moved the onboarding card off `position: fixed` — a 100vw overlay centred on the window
+   starts 192px inside the left dock. */
+.mtk-stage-column { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: transparent; }
 
 /* THE STAGE HAS A FLOOR ON THIS AXIS TOO. The six `height` rules below are the dock's PREFERRED
    height — a design token, and legitimately CSS's business. What they are not, and never were, is an
@@ -1019,6 +1023,25 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-bottom-dock.is-open { height: clamp(230px, 34vh, 360px); }
 .mtk-bottom-dock.is-open.is-asset { height: clamp(320px, 48vh, 520px); }
 .mtk-bottom-dock.is-open.is-animation { height: clamp(330px, 50vh, 560px); }
+/* AND YIELDING RUNS OUT. The `max-height` above is the right rule and it has a floor of its own:
+   `100% - 320px` keeps shrinking, and below a 631px window it hands the workspace less than the
+   188px content box every one of the heights above is built on. Measured at HEAD, that is not a
+   cramped dock — it is a **1px** one from a 440px window all the way down, holding 188px of content
+   it cannot scroll to and cannot draw a scrollbar for, while the tab stays lit and the dock reports
+   `is-open`. R6 wants a client box under 1px and this is exactly 1; R7 exempts a scroller that has
+   not hidden its scrollbar, and this one has not — it has nowhere to put one. So the editor did
+   nothing, said nothing, and no invariant disagreed.
+
+   The rule that answers it is already in this stylesheet, one axis over: below `OVERLAY_BELOW` the
+   side docks stop being tracks BESIDE the stage and become drawers OVER it. `dockForm()` rotates
+   that 90°. The stage then keeps its whole column — a sheet the user opened and can close is not the
+   stage collapsing — and the workspace gets a content box with a real scrollbar in it.
+
+   `max-height: 100%` is the override that matters: inheriting `100% - 320px` would cap a floating
+   sheet at 119px on a 520px window and reproduce the defect in a new position. The bar stays
+   `flex: none` and the content scrolls, so what gives way is the workspace, with a scrollbar saying
+   so — ADR-126's rule that what gives way gives way by getting smaller, not by being cut. */
+.mtk-bottom-dock.is-sheet.is-open { position: absolute; left: 0; right: 0; bottom: 0; z-index: var(--mtk-z-dock-sheet); max-height: 100%; box-shadow: 0 -8px 24px rgba(21, 34, 50, .18); }
 .mtk-bottom-dock__bar { display: flex; flex: none; align-items: center; justify-content: space-between; gap: var(--mtk-space-2); min-height: 41px; padding: 0 var(--mtk-space-2); background: var(--mtk-bg-raised); }
 /* AND THE DOCK'S OWN CONTENT HAS TO FIT IN THE DOCK. Making the dock yield vertically exposed the
    same shape one level in, and it is the shape this whole session is about: `.mtk-workspace-panel__

@@ -7,6 +7,7 @@ import { DockTabs, EmptyPanelState, MenuPopup, PopupMenuItem } from "../theme/wo
 import { space } from "../theme/tokens";
 import { useSelectedId } from "../store/projection";
 import type { EditorClient } from "../transport/session";
+import type { DockForm } from "./layout";
 import { LazyWorkspace } from "./LazyWorkspace";
 
 const AssetLabWorkspace = lazy(() => import("../panels/AssetLabWorkspace").then((module) => ({ default: module.AssetLabWorkspace })));
@@ -28,12 +29,14 @@ export interface BottomDockProps {
   client: EditorClient;
   active: BottomWorkspace;
   open: boolean;
+  /** A track below the stage, or — on a window too short for both — a sheet over it. See `dockForm`. */
+  form?: DockForm;
   playing: boolean;
   onChange: (workspace: BottomWorkspace) => void;
   onOpenChange: (open: boolean) => void;
 }
 
-export function BottomDock({ client, active, open, playing, onChange, onOpenChange }: BottomDockProps) {
+export function BottomDock({ client, active, open, form = "docked", playing, onChange, onOpenChange }: BottomDockProps) {
   const selected = useSelectedId();
   const [logic, setLogic] = useState<LogicWorkspace>("rules");
   // Labels and icons match the Engines rail EXACTLY, and the sub-engines come first in the rail's order.
@@ -57,7 +60,11 @@ export function BottomDock({ client, active, open, playing, onChange, onOpenChan
   }
 
   return (
-    <section className={`mtk-bottom-dock${open ? " is-open" : ""}${active === "asset" ? " is-asset" : ""}${active === "animation" ? " is-animation" : ""}`} data-testid="bottom-dock" aria-label="Task and output workspaces">
+    // `is-sheet` states the FORM, and the stylesheet spends it only on `.is-open`: a closed dock is
+    // its 42px bar, it fits at every height there is, and floating it would cover the stage to say
+    // nothing. `data-dock-form` is the stable token the layout gate keys on — a class list is styling
+    // and drifts, and asserting on `position: absolute` would test the mechanism instead of the state.
+    <section className={`mtk-bottom-dock${open ? " is-open" : ""}${form === "sheet" ? " is-sheet" : ""}${active === "asset" ? " is-asset" : ""}${active === "animation" ? " is-animation" : ""}`} data-testid="bottom-dock" data-dock-form={form} aria-label="Task and output workspaces">
       <div className="mtk-bottom-dock__bar">
         {open ? (
           <DockTabs id="bottom-workspaces" ariaLabel="Task workspaces" tabs={tabs} activeId={active} onChange={select} />
