@@ -973,7 +973,18 @@ body > [role="dialog"][aria-modal="true"] {
    A scrolling stack wants natural heights and one scrollbar, not eight compressed sections. */
 .mtk-dock-panel.mtk-scroll > * { flex: none; }
 .mtk-dock-panel[hidden] { display: none; }
-.mtk-dock-panel__fill { flex: 1 1 auto; min-height: 0; overflow: hidden; }
+/* AND THE SAME PAIR ONE PANEL OVER, FOUND BY THE 420px SCENE THIS SESSION ADDED. `overflow: hidden`
+   with `min-height: 0` says "cut whatever does not fit and say nothing", and what is inside does not
+   shrink: `Hierarchy`'s tree is `flex: 1 1 180px` with `min-height: 160` — the height below which a
+   tree is not a tree — above a title row and a search field that are both `flex: none`. Add them up
+   against a 224px fill and they want 234, so the tree was cut **10px** with no scrollbar anywhere:
+   R7's report named the two elements and neither of them had a `data-testid`, which is the harness
+   working exactly as intended on code nobody had photographed at this height.
+   `hidden auto` is the same repair ADR-126 made for `.mtk-bottom-dock__content`, for the same reason
+   and with the same trade: the panel keeps its natural minimum and the DOCK scrolls to it, rather
+   than the panel obediently squashing into something unreadable. At any height where the content
+   fits, `auto` shows nothing. */
+.mtk-dock-panel__fill { flex: 1 1 auto; min-height: 0; overflow: hidden auto; }
 .mtk-dock-panel__scroll { flex: none; max-height: 44%; overflow: auto; }
 .mtk-dock-section-heading { padding: 12px 12px 6px; color: var(--mtk-text-secondary); font: 650 12px/1.2 var(--mtk-font-ui); letter-spacing: .1px; }
 .mtk-quick-create { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px; border-bottom: 1px solid var(--mtk-border-subtle); }
