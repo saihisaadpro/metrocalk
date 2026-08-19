@@ -190,7 +190,7 @@ export function FileMenu({ client }: { client: EditorClient }) {
           <PopupMenuGroup label={<span id="fileRecentHeading">Recent</span>}>
             <div id="fileRecent" data-testid="fileRecent" role="group" aria-labelledby="fileRecentHeading">
               {recents.length === 0 ? (
-                <div style={{ padding: `${space.xs}px ${space.md}px`, color: color.text.faint, fontSize: fontSize.body }}>— none —</div>
+                <div style={{ padding: `${space.xs}px ${space.md}px`, color: color.text.muted, fontSize: fontSize.body }}>— none —</div>
               ) : (
                 recents.map((p) => (
                   <PopupMenuItem

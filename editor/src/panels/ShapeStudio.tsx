@@ -399,7 +399,7 @@ function DrawSection({
         </div>
         {/* Presets on their own row — sharing the mode row made the last one wrap and dangle. */}
         <div style={{ display: "flex", gap: space.xs, alignItems: "center", flexWrap: "wrap" }}>
-          <span style={{ fontSize: fontSize.meta, color: color.text.faint }}>Try:</span>
+          <span style={{ fontSize: fontSize.meta, color: color.text.muted }}>Try:</span>
           {DRAW_PRESETS.map((preset) => (
             <Button
               key={preset.id}
@@ -488,7 +488,7 @@ function DrawSection({
                   onCommit={setHeight}
                   style={{ width: 64 }}
                 />
-                <span style={{ color: color.text.faint }}>m</span>
+                <span style={{ color: color.text.muted }}>m</span>
               </label>
               <label
                 title="1 keeps the walls straight; smaller pinches the top toward the centre"
@@ -640,7 +640,7 @@ function CombineSection({
             disabled={busy || !two}
             style={{ width: 56 }}
           />
-          <span style={{ color: color.text.faint }}>m</span>
+          <span style={{ color: color.text.muted }}>m</span>
         </label>
       </div>
     </DisclosureSection>
@@ -682,7 +682,7 @@ function SelectedShapeSection({
   return (
     <DisclosureSection title="Selected shape" summary="Live parameters — edits re-bake in place" defaultOpen storageKey="build-selected-shape">
       <div data-testid="shape-params" style={{ display: "grid", gap: space.xs }}>
-        <div style={{ ...text.eyebrow, color: color.text.faint }}>{recipe.kind}</div>
+        <div style={{ ...text.eyebrow, color: color.text.muted }}>{recipe.kind}</div>
         {COMBINED_KINDS.has(recipe.kind) ? (
           <div style={hintStyle}>
             A combined shape has no editable parameters — press Ctrl-Z to get its source shapes back.
@@ -721,7 +721,7 @@ function SelectedShapeSection({
                     }}
                     style={{ width: 72 }}
                   />
-                  {param.unit && <span style={{ color: color.text.faint }}>{param.unit}</span>}
+                  {param.unit && <span style={{ color: color.text.muted }}>{param.unit}</span>}
                 </span>
               </label>
             );

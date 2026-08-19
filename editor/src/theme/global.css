@@ -35,16 +35,34 @@
   --mtk-border: #dfe3ea;
   --mtk-border-strong: #c2c9d4;
 
-  /* ── text: crisper at the top of the hierarchy, softer at the bottom ── */
+  /* ── text: crisper at the top of the hierarchy, softer at the bottom ───────────────────────────────
+     EVERY VALUE HERE IS MEASURED AGAINST EVERY SURFACE ABOVE, not against white. The two lower steps
+     were not: `muted` said "readable" and cleared 4.5:1 on `bg-raised`/`bg-input` (#ffffff, 4.67) and
+     `bg-panel` (4.55) and on NOTHING ELSE — 4.20 on `bg-inset`, 3.91 on `bg-base`, under 4.5 on the
+     other TEN published surfaces — so the token was chosen against a background the design system
+     itself tells panels not to use. `faint` measured 2.16–2.58:1 everywhere, below even the 3:1 that
+     WCAG asks of a non-text control boundary. Both now clear their bar on the WORST surface in this
+     file, which is the only version of the claim that survives a panel changing its `tone`, and
+     `scripts/check-palette-contrast.mjs` measures every pair in this block on every run. */
   --mtk-text: #141a22;        /* primary — near-black, so titles and values read instantly */
   --mtk-text-secondary: #495260;
-  --mtk-text-muted: #6b7583;  /* readable metadata / supporting copy */
-  --mtk-text-faint: #99a2af;  /* disabled/de-emphasised only, never essential information */
+  --mtk-text-muted: #606976;  /* readable metadata / supporting copy — ≥4.65:1 on every surface above */
+  /* INACTIVE COMPONENTS ONLY — a `:disabled` / `[aria-disabled="true"]` control's own label, which is
+     the one thing WCAG 2.2 SC 1.4.3 exempts by name ("text ... that is part of an inactive user
+     interface component ... has no contrast requirement"). Text that a user must READ is never this
+     token, however incidental it looks: a unit, a source, a rejection reason and an empty state are
+     all essential, and all thirteen of them were painted in this colour by components reaching past
+     the stylesheet for it. `shots` R8 now measures that, so the rule is checked rather than written.
+     3.13:1 is a floor this project chose ABOVE the standard, which asks for nothing here. */
+  --mtk-text-faint: #7a8596;
 
   /* ── the ONE accent (azure — "precision engineering", not SaaS purple) ───────────────────────────
      Cleaner and a touch more saturated than the old steel blue, which went muddy against a cool grey
      field and left primary actions looking switched off. */
-  --mtk-accent: #1a6ec2;          /* accent text / active foreground */
+  --mtk-accent: #196aba;          /* accent TEXT / active foreground — ≥4.6:1 on every surface above
+                                     (#1a6ec2 was 4.34 on `bg-base` and 4.36 on `bg-active`, the
+                                     PRESSED fill, so an accent label went under AA at the moment it
+                                     was clicked) */
   --mtk-accent-solid: #1f74cc;    /* primary action fill */
   --mtk-accent-solid-hover: #1a62ae;
   --mtk-accent-border: #a6caea;
@@ -55,7 +73,10 @@
 
   /* ── semantic (used sparingly, never colour-alone — pair with an icon/glyph) ── */
   --mtk-success: #1f6b48; --mtk-success-solid: #2c7a56; --mtk-success-border: #8cc0a7; --mtk-success-bg: #eaf5ef;
-  --mtk-warn: #8a5b12;    --mtk-warn-solid: #a56f1c;    --mtk-warn-border: #dcb877;    --mtk-warn-bg: #fdf5e6;
+  /* `warn-solid` carries `--mtk-on-accent` (white) as a filled button. At #a56f1c that pair measured
+     4.29:1 — the one solid fill in this palette whose own label failed AA, and the classic one
+     (white on amber). #9e6a1b is 4.63:1; the other three solids were already 4.74–5.22. */
+  --mtk-warn: #8a5b12;    --mtk-warn-solid: #9e6a1b;    --mtk-warn-border: #dcb877;    --mtk-warn-bg: #fdf5e6;
   --mtk-danger: #a03a34;  --mtk-danger-solid: #b84a42;  --mtk-danger-border: #e0a09b;  --mtk-danger-bg: #fdedeb;
   --mtk-info: #2a6b96;    --mtk-info-border: #96bcd6;   --mtk-info-bg: #ecf4fa;
   --mtk-token: #8a6317;   /* the economy/token amber (wallet) */
@@ -894,7 +915,9 @@ body > [role="dialog"][aria-modal="true"] {
   font: 500 9px/1 var(--mtk-font-mono);
   white-space: nowrap;
 }
-.mtk-shortcut__join { padding: 0 3px; color: var(--mtk-text-faint); }
+/* The `+` in `Ctrl + K` is part of the shortcut, not decoration around it — a chord whose separator
+   is unreadable is a different chord. `muted`, not `faint`; the key caps beside it are already muted. */
+.mtk-shortcut__join { padding: 0 3px; color: var(--mtk-text-muted); }
 
 @media (max-width: 760px) {
   .mtk-workspace-panel__header { min-height: 38px; padding: 6px 8px; }

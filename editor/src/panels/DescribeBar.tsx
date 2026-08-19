@@ -205,7 +205,7 @@ export function DescribeBar({ client }: { client: EditorClient }) {
             <>
               <span style={{ color: color.success.text }}>✓ will place</span>
               <span style={{ color: color.text.secondary }}>{preview.label}</span>
-              <span style={{ color: color.text.faint }}>· {preview.source}</span>
+              <span style={{ color: color.text.muted }}>· {preview.source}</span>
               <span data-testid="previewCost" style={{ color: preview.price ? color.token : color.success.text }}>
                 · {preview.price ? `−${preview.price} tokens` : "free"}
               </span>

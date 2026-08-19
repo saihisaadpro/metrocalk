@@ -100,9 +100,14 @@ export function Reveal({ client }: { client: EditorClient }) {
           className="cand disabled"
           data-testid="greyed"
           data-id={g.id}
-          style={{ marginBottom: space.xs, padding: space.md, color: color.text.faint }}
+          style={{ marginBottom: space.xs, padding: space.md, color: color.text.muted }}
         >
-          {g.name} <span style={{ opacity: 0.75 }}>— {g.reason}</span>
+          {/* The reason is the WHOLE POINT of a greyed row — north-star #1 is "every no explained",
+              and a no whose explanation is dimmed is a no. `opacity: 0.75` cost this sentence
+              5.00:1 → 3.07:1 on the inset surface, which is under AA even after the token repair:
+              a ratio the palette cannot predict, because the palette never sees the compositing.
+              The row is already de-emphasised by its surface and its position under the matches. */}
+          {g.name} <span>— {g.reason}</span>
         </Surface>
       ))}
       {empty && <div style={{ color: color.text.muted }}>No compatible targets</div>}

@@ -523,6 +523,137 @@ function layoutInvariants(windowIsTheSubject) {
       }
     }
   }
+
+  // R8 — TEXT THAT CANNOT BE READ. R1–R7 answer one question in seven ways: is it WHERE it should be.
+  // Every one of them measures a rectangle, and a rectangle in exactly the right place, unclipped,
+  // uncovered and un-overlapped, is silent about whether there is anything legible inside it. That is
+  // not a gap in the rules; it is the axis they are not written on — the same shape as ADR-126's
+  // "every invariant asked a horizontal question", one dimension further out.
+  //
+  // WHAT THIS IS SCOPED TO, AND WHY THAT EXACT SCOPE. WCAG 2.2 SC 1.4.3 (Contrast Minimum, Level AA):
+  // 4.5:1 for text, 3:1 for large-scale text. It is not a house style — EN 301 549 clause 11.1.4.3
+  // binds non-web software to WCAG 2.1 SC 1.4.3, and Section 508 E207.2 binds it to WCAG 2.0's, and
+  // the criterion's text is identical in 2.0/2.1/2.2. The Constitution's own Accessibility section
+  // asks for "High readability" and a "High contrast mode"; this measures the first one.
+  //
+  // THE EXEMPTION IS THE STANDARD'S, NOT OURS — and it is what keeps this rule from being a style
+  // opinion. SC 1.4.3 excepts "text ... that is part of an inactive user interface component", and
+  // Understanding 1.4.3 names the case: "a disabled control in HTML". So an inactive control's own
+  // label is skipped, and everything else must be readable. That draws the "essential information"
+  // line MECHANICALLY, which a gate could never do by judging what matters: the residue after the
+  // exemption is exactly the text a user is expected to read.
+  //
+  // TWO THINGS THE PALETTE CANNOT PREDICT, WHICH IS WHY THIS MEASURES THE PAGE AND NOT THE STYLESHEET:
+  //   * `opacity` on an ancestor dims the text AFTER the colour is chosen and composes with it. The
+  //     Reveal panel's rejection reason was `opacity: 0.75` over a token that clears AA on its own
+  //     surface: 5.00:1 as authored, 3.07:1 as painted. A token audit calls that pair fine.
+  //   * a background is a STACK. A translucent surface over a panel over the backdrop is none of the
+  //     three, and only the composite is what the eye receives.
+  //
+  // Modelled from computed styles rather than sampled from the framebuffer, deliberately: SC 1.4.3 is
+  // defined on specified colours, and Understanding 1.4.3 says as much when it warns that
+  // anti-aliasing can leave text "a contrast ratio that nominally passes ... but has a much lower
+  // contrast in practice". Sampling pixels would measure the renderer's gamma, not the author's choice.
+  const srgb = (c) => {
+    const s = c / 255;
+    return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  };
+  // WCAG 2.2 relative luminance + contrast ratio, verbatim from the normative definitions.
+  const relLum = (c) => 0.2126 * srgb(c.r) + 0.7152 * srgb(c.g) + 0.0722 * srgb(c.b);
+  const contrastOf = (a, b) => {
+    const l1 = relLum(a);
+    const l2 = relLum(b);
+    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+  };
+  const rgbOf = (s) => {
+    const m = /rgba?\(([^)]+)\)/.exec(s || "");
+    if (!m) return null;
+    const p = m[1].split(/[,\s/]+/).filter(Boolean).map(Number);
+    if (p.length < 3 || p.some((n) => Number.isNaN(n))) return null;
+    return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+  };
+  const composite = (fg, bg) => ({
+    r: fg.r * fg.a + bg.r * (1 - fg.a),
+    g: fg.g * fg.a + bg.g * (1 - fg.a),
+    b: fg.b * fg.a + bg.b * (1 - fg.a),
+    a: 1,
+  });
+  // The painted background under an element: the first opaque `background-color` up the tree, with
+  // every translucent one above it composited onto it in paint order. Falls back to white, which is
+  // what a browser paints over nothing — and is the CONSERVATIVE choice for a light theme, since
+  // white is the lightest possible backdrop and therefore the most forgiving to dark text.
+  const paintedBg = (el) => {
+    const layers = [];
+    for (let p = el; p; p = p.parentElement) {
+      const c = rgbOf(getComputedStyle(p).backgroundColor);
+      if (!c || c.a === 0) continue;
+      layers.push(c);
+      if (c.a >= 1) break;
+    }
+    let acc = layers.length && layers[layers.length - 1].a >= 1 ? layers.pop() : { r: 255, g: 255, b: 255, a: 1 };
+    for (let i = layers.length - 1; i >= 0; i--) acc = composite(layers[i], acc);
+    return acc;
+  };
+  // `opacity` below 1 composites the whole subtree against what is behind it, so it multiplies down
+  // the tree and belongs on the TEXT side of the comparison — not on the background, which is behind
+  // the group being faded. Stops at the frame: the harness's own chrome is not the product's.
+  const groupAlpha = (el) => {
+    let a = 1;
+    for (let p = el; p && p !== frame; p = p.parentElement) {
+      const o = parseFloat(getComputedStyle(p).opacity);
+      if (!Number.isNaN(o) && o < 1) a *= o;
+    }
+    return a;
+  };
+  // "Large scale" is normatively 18pt, or 14pt bold (WCAG 2.2 glossary). The px equivalents are
+  // INFORMATIVE and W3C's own two statements disagree — Understanding 1.4.3 says "approximately
+  // 18.5px and 24px" while the conversion it states in the same paragraph (1pt = 1.333px) gives
+  // 18.66px. We take the arithmetic one, because it is derivable from the normative pt figure rather
+  // than rounded from it, and being the LARGER of the two it is the stricter reading: fewer elements
+  // qualify for the relaxed 3:1 bar.
+  const LARGE_PX = 24;
+  const LARGE_BOLD_PX = 14 * (4 / 3);
+  // "An inactive user interface component" — the criterion's own exception, and the only one taken.
+  const inactive = (el) =>
+    !!el.closest('[disabled], [aria-disabled="true"], fieldset[disabled], [aria-hidden="true"]');
+  const reported = new Set();
+  for (const el of els) {
+    // Only an element that owns a text node: a wrapper's `color` is inherited by children that will
+    // be judged themselves, and judging the wrapper too would report one defect as many.
+    if (![...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim().length > 0)) continue;
+    const r = clipped(el);
+    if (!visible(el, r) || r.width < TOL || r.height < TOL) continue;
+    if (inactive(el)) continue;
+    const cs = getComputedStyle(el);
+    const fg = rgbOf(cs.color);
+    if (!fg) continue;
+    const bg = paintedBg(el);
+    const alpha = fg.a * groupAlpha(el);
+    if (alpha <= 0) continue; // invisible, not unreadable — `visible()` and R1..R7 own that
+    const painted = composite({ ...fg, a: alpha }, bg);
+    const px = parseFloat(cs.fontSize);
+    const bold = (parseInt(cs.fontWeight, 10) || 400) >= 700;
+    const large = px >= LARGE_PX || (bold && px >= LARGE_BOLD_PX);
+    const need = large ? 3 : 4.5;
+    const ratio = contrastOf(painted, bg);
+    // Understanding 1.4.3: "the computed values should not be rounded (e.g., 4.499:1 would not meet
+    // the 4.5:1 threshold)". So the comparison is strict, and the reported number is truncated
+    // DOWNWARDS — a report that rounds 4.497 to "4.50" argues against its own finding.
+    if (ratio >= need) continue;
+    const shown = (Math.floor(ratio * 100) / 100).toFixed(2);
+    // One line per (colour, background, size) — the same token failing in forty rows is one defect,
+    // and forty sentences about it is a report nobody finishes reading (the R7 calibration lesson).
+    const key = `${cs.color}|${Math.round(bg.r)},${Math.round(bg.g)},${Math.round(bg.b)}|${alpha.toFixed(3)}|${px}|${bold}`;
+    if (reported.has(key)) continue;
+    reported.add(key);
+    const dimmed = alpha < 1 ? `, dimmed to ${alpha.toFixed(2)} by an ancestor's opacity` : "";
+    out.push(
+      `${name(el)} is ${shown}:1 against what is painted behind it and needs ${need}:1 — ` +
+        `${cs.color} on rgb(${Math.round(bg.r)}, ${Math.round(bg.g)}, ${Math.round(bg.b)})${dimmed} at ` +
+        `${px}px/${cs.fontWeight}. It is not part of an inactive control, so it is text a reader is ` +
+        "expected to read (WCAG 2.2 SC 1.4.3)",
+    );
+  }
   return out;
 }
 

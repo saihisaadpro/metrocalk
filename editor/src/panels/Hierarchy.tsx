@@ -191,7 +191,7 @@ const Row = memo(function Row({
   );
 });
 
-const text_hidden: React.CSSProperties = { font: font.mono, fontSize: fontSize.micro, color: color.text.faint, fontStyle: "italic" };
+const text_hidden: React.CSSProperties = { font: font.mono, fontSize: fontSize.micro, color: color.text.muted, fontStyle: "italic" };
 
 export function Hierarchy({
   client,

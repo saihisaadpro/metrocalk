@@ -728,7 +728,7 @@ export function App() {
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            color: color.text.faint,
+            color: color.text.muted,
             font: font.mono,
             fontSize: fontSize.body,
             outline: playing ? `3px solid ${paused ? "var(--mtk-warn-border)" : "var(--mtk-success-border)"}` : "none",

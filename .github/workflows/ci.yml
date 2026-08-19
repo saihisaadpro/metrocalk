@@ -387,6 +387,21 @@ jobs:
           node scripts/check-ui-constitution.mjs --self-test
           node scripts/check-ui-constitution.mjs
 
+      # The ratchet one layer down. It checks that a colour comes from a TOKEN; this checks that the
+      # token can be READ — which nothing did, and `--mtk-text-muted` said "readable" in a comment
+      # beside a value that cleared 4.5:1 on two of the thirteen surfaces this design system
+      # publishes and on none of the other ten (ADR-128). The `shots` job below measures what is
+      # actually painted and is the stronger claim wherever a scene reaches, but it can only see
+      # pairs some capture renders: reverting `--mtk-accent` or `--mtk-warn-solid` to their broken
+      # values leaves all 23 scenes GREEN, because no scene photographs accent text on the pressed
+      # fill or a filled warning button. This is the half that does not need a photograph. Node
+      # built-ins only, like the ratchet, so it runs before the install too.
+      - name: Palette contrast — self-test, then every text token against every surface
+        working-directory: editor
+        run: |
+          node scripts/check-palette-contrast.mjs --self-test
+          node scripts/check-palette-contrast.mjs
+
       - name: Install (frozen lockfile)
         working-directory: editor
         run: pnpm install --frozen-lockfile
