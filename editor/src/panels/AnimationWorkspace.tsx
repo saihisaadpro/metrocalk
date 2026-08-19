@@ -72,6 +72,19 @@ const EMPTY: AnimationWorkspaceInfo = {
 };
 
 const CONTEXT_LABELS: Record<AnimationContext, string> = { "2d": "2D", "3d": "3D", ui: "UI" };
+/** The sticky ruler's height, and a lane's minimum — both were literals inside the two components
+ *  that draw them, which is why nothing could state the timeline's own floor in terms of them. */
+const RULER_H = 32;
+const LANE_MIN_H = 30;
+/** A TIMELINE BELOW THIS IS NOT A TIMELINE, and it is not a new judgement — it is the ruler plus one
+ *  lane under it, the smallest thing that still shows *when* something happens and *that* something
+ *  does. The viewport was `minHeight: 0` — "be exactly as small as the box you are in" — and in the
+ *  bottom dock at a 640px window that box is **9px**, holding 262px of timeline: a scroll container
+ *  that can show neither its scrollbar nor one row of itself. It had been green in the layout gate
+ *  since ADR-125 because R6's bar was "shows literally nothing" and 9px is not nothing.
+ *  Named here so the floor and the parts it is made of cannot drift apart, exactly as
+ *  `--mtk-dock-content-min` is the dock's smallest open height minus its bar. */
+const TIMELINE_MIN_H = RULER_H + LANE_MIN_H;
 const PROPERTY_DRAFT = "workspace:selected-property";
 const INTERPOLATION_DRAFT = "workspace:new-interpolation";
 const MARKER_NAME_DRAFT = "workspace:new-marker-name";
@@ -1603,7 +1616,20 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
           {error && <div role="alert" style={{ marginTop: space.sm, color: color.danger.text, fontSize: fontSize.meta }}>{error}</div>}
         </section>
 
-        <section className="animation-workspace-timeline" style={{ ...card, display: "grid", gridTemplateRows: "auto minmax(0, 1fr)", minWidth: 0, overflow: "hidden" }} aria-label="Animation timeline editor">
+        {/* `minmax(0, 1fr)` above `overflow: hidden` is the pair this session has now repaired in
+            four places: the row says "shrink to nothing if you must", the container says "and I will
+            cut whatever is left over, silently". With the viewport holding its own floor the leftover
+            became real — 52px of timeline behind an `overflow: hidden` at a 640px window, 16px at
+            1280 — so the row is `minmax(auto, 1fr)` (it may not shrink below its content's minimum)
+            and the section scrolls the remainder like every other container here. `hidden auto`
+            rather than `auto`: the horizontal overflow is the timeline's own business and it already
+            has a scrollbar for it; a second one on this box would be two answers to one gesture.
+            The toolbar row is `min-content` and not `auto` for the reason the whole session keeps
+            finding: an `auto` row inside a scroll container has an automatic minimum of ZERO, so it
+            compresses instead of overflowing — measured at **12px holding 29px**, and it is itself a
+            scroller (an `overflow-x: auto` with no `overflow-y` computes to `auto` on both axes),
+            which means it went straight back to being the same defect one box further in. */}
+        <section className="animation-workspace-timeline" style={{ ...card, display: "grid", gridTemplateRows: "min-content minmax(auto, 1fr)", minWidth: 0, overflow: "hidden auto" }} aria-label="Animation timeline editor">
           <div style={{ display: "flex", alignItems: "center", gap: space.sm, padding: space.sm, borderBottom: `1px solid ${color.border.subtle}`, background: color.bg.raised, overflowX: "auto" }}>
             <input
               type="search"
@@ -1679,7 +1705,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                   scrollCommitTimer.current = null;
                 }, 120);
               }}
-              style={{ minHeight: 0, overflow: "auto", background: color.bg.inset }}
+              style={{ minHeight: TIMELINE_MIN_H, overflow: "auto", background: color.bg.inset }}
             >
               <div style={{ width: 178 + timelineWidth, minHeight: "100%" }}>
                 <Ruler
@@ -2387,7 +2413,7 @@ function Ruler({
 }) {
   const ticks = Array.from({ length: 11 }, (_, index) => Math.round((duration * index) / 10));
   return (
-    <div style={{ display: "grid", gridTemplateColumns: `178px ${width}px`, height: 32, position: "sticky", top: 0, zIndex: 7, borderBottom: `1px solid ${color.border.default}`, background: color.bg.raised }}>
+    <div style={{ display: "grid", gridTemplateColumns: `178px ${width}px`, height: RULER_H, position: "sticky", top: 0, zIndex: 7, borderBottom: `1px solid ${color.border.default}`, background: color.bg.raised }}>
       <div style={{ position: "sticky", left: 0, zIndex: 8, display: "flex", alignItems: "center", padding: `0 ${space.sm}px`, background: color.bg.raised, fontSize: fontSize.meta, color: color.text.secondary }}>Tracks</div>
       <div
         data-testid="animation-ruler"
@@ -2424,7 +2450,7 @@ function AnnotationLane({
   children: React.ReactNode;
 }) {
   return (
-    <div style={{ display: "grid", gridTemplateColumns: `178px ${width}px`, minHeight: 30, borderBottom: `1px solid ${color.border.subtle}` }}>
+    <div style={{ display: "grid", gridTemplateColumns: `178px ${width}px`, minHeight: LANE_MIN_H, borderBottom: `1px solid ${color.border.subtle}` }}>
       <div style={{ position: "sticky", left: 0, zIndex: 5, padding: `${space.xs}px ${space.sm}px`, color: color.text.secondary, background: color.bg.panel, fontSize: fontSize.meta }}>{label}</div>
       <div onClick={onLaneClick} style={{ position: "relative", minHeight: 29, cursor: "crosshair" }}>
         <Playhead tick={currentTick} duration={duration} />
