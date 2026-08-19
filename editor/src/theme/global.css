@@ -610,7 +610,14 @@ body > [role="dialog"][aria-modal="true"] {
   gap: 4px;
 }
 .mtk-workspace-panel__tabs { flex: none; min-width: 0; border-bottom: 1px solid var(--mtk-border-subtle); }
-.mtk-workspace-panel__body { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: hidden; }
+/* The body is a flex COLUMN, not a block. Every tabpanel it holds is authored `flex: 1 1 auto;
+   min-height: 0` — a declaration that means nothing in a block parent, where the child takes its
+   content height and is then cut by the `overflow: hidden` on this line. That is the third and last
+   link in the chain that hid 16 of the Build workspace's controls: the dock track did not constrain
+   the panel, the panel's body did not constrain the tabpanel, and the tabpanel asked for a scrollbar
+   from a class that only draws one. Only one tabpanel is ever not `[hidden]`, so this makes the
+   visible one fill exactly the height the body has. */
+.mtk-workspace-panel__body { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .mtk-workspace-panel__body.mtk-scroll { overflow: auto; overscroll-behavior: contain; }
 .mtk-workspace-panel__body.is-padded { padding: 12px; }
 .mtk-workspace-panel__footer {
@@ -951,6 +958,20 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-skip-link:focus { transform: translate(-50%, 0); }
 
 .mtk-dock-panel { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; min-height: 0; }
+/* `.mtk-scroll` is a scrollbar SKIN — `scrollbar-width`, a thumb colour, a stable gutter — and it has
+   never set `overflow`. Five of the seven dock panels are authored `className="mtk-dock-panel
+   mtk-scroll"`, which reads as "this one scrolls" and produced no scrolling at all: the class was a
+   statement of intent that no rule honoured. Every other `.mtk-scroll` in the stylesheet is paired
+   with an explicit overflow (`.mtk-workspace-panel__body.mtk-scroll`, `.mtk-bottom-workspace`); these
+   were the ones where the pair was missing, so the content simply ran past the panel and was cut. */
+.mtk-dock-panel.mtk-scroll { overflow: hidden auto; }
+/* IN A SCROLLER, NOTHING SHRINKS — THAT IS WHAT THE SCROLLBAR IS FOR. A flex column's children
+   default to `flex: 0 1 auto`, so the moment this panel became a real flex column of the right height
+   its sections started paying for the overflow by squashing: the `Describe` disclosure's own HEADER
+   came out 39px shorter than its content and cut its title, caret and summary — one silent
+   truncation traded for another, and R7 caught the trade in the run that was supposed to be the fix.
+   A scrolling stack wants natural heights and one scrollbar, not eight compressed sections. */
+.mtk-dock-panel.mtk-scroll > * { flex: none; }
 .mtk-dock-panel[hidden] { display: none; }
 .mtk-dock-panel__fill { flex: 1 1 auto; min-height: 0; overflow: hidden; }
 .mtk-dock-panel__scroll { flex: none; max-height: 44%; overflow: auto; }

@@ -421,7 +421,24 @@ export function App() {
   // moment Play started. Seen in an OS capture of a Play session — a crate and its shadow drawn across
   // the object list. The dock therefore keeps a FULLY OPAQUE background and dims only its contents.
   const dockSurface: React.CSSProperties = { overflow: "hidden", background: "var(--mtk-bg-panel)" };
+  // A BLOCK CONTAINER DOES NOT CONSTRAIN THE PANEL INSIDE IT, AND THE PANEL WAS COUNTING ON IT.
+  // `WorkspacePanel` is `display: flex; flex-direction: column` whose body is `flex: 1 1 auto;
+  // min-height: 0` — an arrangement that only means anything if the panel itself has been given a
+  // height. In a `display: block` box it takes its CONTENT height instead, and `overflow: hidden`
+  // here then cuts it with no scrollbar and no mark. Measured in `shell-build` at a 1000×900 window:
+  // the Build workspace laid out at **1274px inside an 819px track** and **16 controls were entirely
+  // below the cut** — `describebar`, `describe`, `describeBtn` (describe-to-create, north-star test
+  // #2), the whole `assetbrowser` with its search and categories, `create-import`, `create-pipe`,
+  // `combine-meld`. Not truncated: absent, with nothing on screen saying so. The scene asserted
+  // `authbar` was PRESENT, which it was, in the DOM, 400px below the bottom of its own panel.
+  //
+  // One word fixes it, because the panel was always written to fill a flex column. Paired with
+  // `.mtk-dock-panel.mtk-scroll { overflow: auto }`, which is the other half: the JSX has said
+  // `mtk-scroll` on those panels since they were written, and `.mtk-scroll` is a scrollbar SKIN that
+  // has never set `overflow` — a class asking for behaviour no rule provided.
   const dockContent: React.CSSProperties = {
+    display: "flex",
+    flexDirection: "column",
     height: "100%",
     minHeight: 0,
     overflow: "hidden",
@@ -833,7 +850,9 @@ export function App() {
             <div style={{ display: "flex", justifyContent: "flex-end", padding: space.xs, borderBottom: `1px solid ${color.border.subtle}`, background: color.bg.raised }}>
               <Button variant="ghost" compact icon aria-label={`Close ${drawer === "left" ? "Scene" : "Inspector"} workspace`} onClick={() => setDrawer(null)}>×</Button>
             </div>
-            <div style={{ flex: 1, minHeight: 0, overflow: "hidden", ...chromeDim }}>{drawer === "left" ? leftPanel : rightPanel}</div>
+            {/* Same as `dockContent`: the drawer is the ≤620px form of the same panel, and a block
+                box would let it lay out at content height and be cut by this `overflow: hidden`. */}
+            <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden", ...chromeDim }}>{drawer === "left" ? leftPanel : rightPanel}</div>
           </aside>
         </Modal>
       )}
