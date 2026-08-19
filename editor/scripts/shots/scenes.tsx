@@ -79,6 +79,27 @@ export type Expect = {
    *  edge is in the DOM, in the accessibility tree, focusable by keyboard — and invisible, with
    *  nothing on screen suggesting it is there. */
   unclipped?: string[];
+  /** The named children TILE their container's content box on screen: their measured heights add up
+   *  to its, with no gap, no overlap and nothing cut away.
+   *
+   *  THE ONE CLAIM THAT WORKS WHERE A FLOOR CANNOT. Every shell scene inherits `min_height` on the
+   *  viewport at `STAGE_MIN`, and that is right in every regime but one. Below a ~443px window the
+   *  chrome (81px), the stage's 320px floor and the dock's 42px bar want more room than the window
+   *  has — the floor is not being violated by a greedy panel, it is arithmetically unreachable. The
+   *  shell's answer is the one `dockGridColumns` already wrote down for the other axis: *if even the
+   *  rails and the floor do not fit, the stage absorbs the remainder.* A gate cannot assert a floor
+   *  there, and the escape hatch that would let a scene waive one is precisely what ADR-124 refused
+   *  to build — an exemption mechanism gets used for the first real defect.
+   *
+   *  So the claim changes shape instead of weakening. What is still true, and is the whole of what
+   *  the user is owed, is that **nothing took space it should not have**: the stage got everything
+   *  the bar left, exactly, and neither of them is cut. Conservation is strictly stronger than a
+   *  floor here — it fails if the dock exceeds its bar, if the stage dips further than it must, if
+   *  the two overlap, and if either is clipped — and it needs no number to argue about. */
+  fills?: [container: string, children: string[]][];
+  /** The stage's protected height, capped by what its column actually has left. Set once by `shell()`;
+   *  see the driver for why this is not a `min_height` entry. */
+  stage_floor?: number;
 };
 
 export type Scene = {
@@ -405,7 +426,15 @@ function shell(
       // recognise. `--mtk-stage-min` on `.mtk-stage-column` is set from this same constant, so the
       // dock's `max-height` and this assertion cannot disagree about what the floor is.
       min_width: [["[data-testid='viewport']", STAGE_MIN], ...(expect.min_width ?? [])],
-      min_height: [["[data-testid='viewport']", STAGE_MIN], ...(expect.min_height ?? [])],
+      // The vertical floor is NOT a `min_height` entry, and the difference is the whole of what
+      // ADR-126 left owed. `min_height` states a flat number, and below a ~443px window the number
+      // 320 is not a rule the layout is breaking — it is arithmetic the window cannot satisfy, with
+      // the chrome and the dock's bar already spoken for. A gate that is wrong in one regime gets a
+      // waiver in that regime, and then the waiver gets used for the first real defect. `stage_floor`
+      // caps the floor by what the column actually has left, measured, so the claim is true
+      // everywhere and no scene needs an exemption.
+      stage_floor: STAGE_MIN,
+      ...(expect.min_height ? { min_height: expect.min_height } : {}),
       // AND THE PANEL THAT YIELDED IS STILL WHOLE. The stage-is-sacred rule has two halves and only
       // one of them was ever written down: the stage keeps its floor, AND what gives way gives way
       // by getting smaller — not by being cut off behind an `overflow: hidden` that shows no
@@ -579,16 +608,76 @@ function shellScenes(): Scene[] {
     ],
   ),
 
+  // THREE WINDOW HEIGHTS, AND THEY ARE THREE DIFFERENT RULES. `dockForm()` divides the vertical axis
+  // into regimes the way `panelLayout` divides the horizontal one, and a scene inside each is the only
+  // way a threshold that drifts turns something red. One scene would pin whichever side it happened to
+  // land on and leave the other free to move — the same argument as "a scene pinned to the breakpoint
+  // value tests the comparison operator, not the layout", one axis over.
+  shell(
+    "shell-dock-docked",
+    [1440, 640],
+    "640px tall — just INSIDE the regime where the dock is still a track below the stage. Both " +
+      "floors hold here (320px of stage, a 188px workspace) and the dock yields the difference, so " +
+      "the sheet must NOT have taken over: this is the scene that turns red if the threshold drifts " +
+      "upward and starts floating a dock that had room to sit down",
+    {
+      present: [["[data-testid='bottom-dock'][data-dock-form='docked']", 1]],
+      // The stage keeps its own controls when it is not under a sheet — the other half of the claim
+      // below, and the thing that makes the withdrawal a rule instead of a disappearance.
+      absent: ["[data-dock-form='sheet']"],
+      min_height: [["[data-testid='viewport-tool-rail']", 1]],
+    },
+    ["[data-testid='bottom-dock-toggle']"],
+  ),
+
   shell(
     "shell-dock-short",
     [1440, 480],
-    "480px tall with a workspace open — the window where the dock's 320px minimum is larger than " +
-      "the room there is. Before this session the stage measured 78px here. The dock must be at its " +
-      "bar or just above it, entirely on screen, and the stage must still hold its floor",
+    "480px tall with a workspace open — the window where the dock cannot be a track at all. Before " +
+      "ADR-126 the stage measured 78px here; after it the stage was right and the WORKSPACE was 37px " +
+      "of its 188, falling to 1px below 440. The dock is now a sheet OVER the stage: the stage keeps " +
+      "its whole column, the workspace gets a real content box, and the stage's own tool rail is " +
+      "withdrawn rather than left underneath to steal clicks",
     {
-      present: [["[data-testid='bottom-dock']", 1]],
+      present: [["[data-testid='bottom-dock'][data-dock-form='sheet']", 1]],
+      // The defect this whole slice is about, stated as a measurement: the workspace has a content
+      // box a user can read. At HEAD this measured 37px, and 1px below a 440px window.
+      min_height: [[".mtk-bottom-dock__content", 188]],
+      // R3 caught these sharing pixels with the dock's tab strip in the run meant to prove the sheet
+      // worked. At 400px window height ALL FIVE transform tools and the viewport toolbar are covered,
+      // so they are withdrawn — a covered control is worse than an absent one, and this is the line
+      // that fails if one of them comes back underneath the sheet.
+      // `onboarding` is the third one, and it is here because a human looked at the PNG. Every
+      // assertion in this scene passed while the first-run card was painted across the workspace's
+      // own description — R3 compares controls and what the card covered was prose, so nothing said
+      // anything. It is the same rule as the two above: a stage overlay withdraws when the stage is
+      // under a sheet, rather than floating above the thing the user just opened.
+      absent: [
+        "[data-testid='viewport-tool-rail']",
+        "[data-testid='vptoolbar']",
+        "[data-testid='onboarding']",
+      ],
     },
     ["[data-testid='bottom-dock-toggle']"],
+  ),
+
+  shell(
+    "shell-dock-floor",
+    [1440, 420],
+    "420px tall with the dock CLOSED — the regime ADR-126 named as owed and could not represent. " +
+      "The chrome (81px), the stage's 320px floor and the dock's 42px bar want more room than the " +
+      "window has, so the floor is not being violated by a greedy panel, it is unreachable. The " +
+      "shell's answer is the one the horizontal axis already gives: the stage absorbs the remainder. " +
+      "What is still owed, and is asserted here, is that it absorbs ALL of it — the bar is whole and " +
+      "on screen, the stage is exactly what the bar left, and nothing is cut between them",
+    {
+      present: [["[data-testid='bottom-dock'][data-dock-form='sheet']", 1]],
+      // The dock is CLOSED here, so it is its bar and still a track: the sheet form only spends
+      // itself on `.is-open`. Conservation is the claim; see `Expect.fills`.
+      fills: [[".mtk-stage-column", ["[data-testid='viewport']", "[data-testid='bottom-dock']"]]],
+      // And the seven workspaces are still reachable from it — the bar is not decoration.
+      unclipped: ["[data-testid='bottom-dock-toggle']"],
+    },
   ),
 
   // THE FOUR OTHER THINGS THE LEFT DOCK CAN BE. The dock is a 300 px track between 980 and 1199 —

@@ -197,6 +197,24 @@ function layoutInvariants(windowIsTheSubject) {
   const out = [];
   const TOL = 1; // sub-pixel rounding; fractional layout is not a defect
 
+  /** How thick a scrollbar is IN THIS BROWSER, at this zoom, under this media query. Measured, never
+   *  chosen: `(pointer: coarse)` widens these to 14px in `global.css` and a zoomed page changes it
+   *  again, so a hard-coded 15 would be wrong in both — and it is **0** here, which is the point.
+   *  Headless Chromium 149 draws OVERLAY scrollbars: `offsetWidth - clientWidth` is 0 for
+   *  `overflow: scroll`, with and without `scrollbar-width: auto`, empty or full. Windows WebView2 —
+   *  the browser the product actually ships in — draws classic ones that cost ~15px. So this number
+   *  is a real variable between the harness and the target, and reading it is the only way the same
+   *  rule means the same thing in both. */
+  const scrollbarSize = () => {
+    const probe = document.createElement("div");
+    probe.style.cssText =
+      "position:absolute;top:-9999px;width:100px;height:100px;overflow:scroll;scrollbar-width:auto";
+    document.body.appendChild(probe);
+    const px = probe.offsetWidth - probe.clientWidth;
+    probe.remove();
+    return px;
+  };
+
   // A `data-testid` is the best name an element has, right up until a LIST uses one — and then it is
   // the worst, because every row answers to it. R3's first real firing read
   // "[data-testid=\"candidate\"] and [data-testid=\"candidate\"] overlap by 536×14px", which names the
@@ -279,27 +297,34 @@ function layoutInvariants(windowIsTheSubject) {
   // goes quiet. Measured under that mutation: **the dock's own tab strip 217px below a 480px
   // window**, silent. A defect that hides by being MORE off-screen is the worst possible shape for
   // a gate to be blind to.
+  //
+  // AND IT USED TO SKIP EVERY CLIPPED ELEMENT, WHICH IS THE GAP ADR-126 NAMED ON ITS WAY OUT. The
+  // first version walked the ancestors and gave up at the first one that clipped vertically, on the
+  // R1 reasoning that "the overflow is deliberate and bounded". That reasoning holds only while the
+  // clipping ancestor is itself on screen. Put a scroll container half off the bottom of the window
+  // and its content is clipped AND off-screen: R5 skipped it because something clipped it, and R7 is
+  // silent because it judges a child against its parent's own rectangle and the child is comfortably
+  // inside a parent that is itself in the wrong place. **Two invariants, both correct about their own
+  // question, and the pixels are gone between them.**
+  //
+  // The repair is to stop asking a yes/no question about clipping and read the rectangle that already
+  // answers it. `__mtkClipRect` is the element's box intersected with every clipping ancestor — the
+  // definition R3, `unclipped` and both protected floors have used since ADR-126 — so a row scrolled
+  // below the fold of an on-screen scroller comes back clamped to that scroller and does not fire,
+  // while the same row inside a scroller hanging off the window keeps a bottom edge below it and
+  // does. One definition, now five readers, and the last special case that had its own opinion about
+  // where an element is has been removed.
   if (windowIsTheSubject) {
     for (const el of els) {
-      const r = el.getBoundingClientRect();
-      if (!visible(el, r)) continue;
-      if (r.height < TOL) continue; // a zero-height marker below the fold is not content
-      const cs0 = getComputedStyle(el);
-      if (cs0.position === "fixed") continue; // positioned against the window by design
-      let clipped = false;
-      for (let p = el.parentElement; p && p !== frame; p = p.parentElement) {
-        const oy = getComputedStyle(p).overflowY;
-        if (oy === "hidden" || oy === "clip" || oy === "auto" || oy === "scroll") {
-          clipped = true;
-          break;
-        }
-      }
-      if (clipped) continue;
+      if (!visible(el, el.getBoundingClientRect())) continue;
+      if (getComputedStyle(el).position === "fixed") continue; // positioned against the window by design
+      const r = window.__mtkClipRect(el, frame);
+      if (r.height < TOL) continue; // clipped to nothing, or a zero-height marker — not content
       if (r.bottom > window.innerHeight + TOL) {
         out.push(
           `${name(el)} is painted ${Math.round(r.bottom - window.innerHeight)}px below the bottom of ` +
-            `a ${window.innerHeight}px window — nothing between it and the frame clips or scrolls, ` +
-            "so it is off the screen and there is no way to reach it",
+            `a ${window.innerHeight}px window — those pixels survive every clip between it and the ` +
+            "frame, so they are off the screen and there is no way to reach them",
         );
       }
     }
@@ -357,21 +382,54 @@ function layoutInvariants(windowIsTheSubject) {
   // Found live, and not by reasoning: with the bottom dock correctly yielded to 80px at a 1440×480
   // window, `.mtk-workspace-panel__body.mtk-scroll` measured **clientHeight 0 against scrollHeight
   // 179** — the whole Model workspace — because `.mtk-workspace-panel__header` is `flex: none` with a
-  // 52px minimum and takes a 38px content box entirely. The threshold is zero rather than a judgement
-  // about how many pixels are "enough": a box that can show NOTHING is not a matter of taste, and a
-  // threshold with a number in it is the kind that gets argued down to nothing at its first red.
+  // 52px minimum and takes a 38px content box entirely.
+  //
+  // THE THRESHOLD WAS ZERO, AND ZERO WAS TOO SMALL BY ONE PIXEL. The first version's reasoning was
+  // right and is kept: "a box that can show NOTHING is not a matter of taste, and a threshold with a
+  // number in it is the kind that gets argued down to nothing at its first red." What it missed is
+  // that a box which can show ALMOST nothing is not a matter of taste either, and the shell produced
+  // one immediately. With a workspace open below a 631px window the dock's content box came out at
+  // **exactly 1px** holding 188px of workspace — and stayed 1px at every window height from 440 down
+  // to 300. `clientHeight < 1` is false for 1, so R6 said nothing; R7 exempts a scroller that has not
+  // hidden its scrollbar, and this one had not — it simply had nowhere to draw one. The dock reported
+  // `is-open`, the tab lit up, and the editor did nothing.
+  //
+  // SO THE BAR IS RAISED FROM "NOTHING" TO "NOT ONE ROW", AND BOTH HALVES ARE MEASURED. An
+  // `overflow: auto` exemption is bought with two promises: an affordance the user can find, and a
+  // box with something visible in it. A container smaller than its own scrollbar cannot keep the
+  // first; a container shorter than one line of its own text cannot keep the second. Neither number
+  // is chosen — `scrollbarSize()` comes from the renderer and `line-height` from the element's own
+  // computed style — and the bar is whichever binds, so the rule means the same thing on a classic-
+  // scrollbar platform (WebView2, ~15px) and an overlay one (this harness, 0px), where the row is
+  // what constrains instead.
+  //
+  // HONEST ABOUT WHAT THIS DID AND DID NOT CHANGE, because the first draft of it over-claimed and the
+  // mutation said so. At a 440px window HEAD's content box came out at `clientHeight` **0** — one
+  // border-box pixel, minus its 1px border — so the OLD `< 1` rule fired there too and R6 was never
+  // blind to that frame. The band it genuinely could not see is `h` 444–458, where the box is 1–15px:
+  // the arithmetic is `content = h - 443`, so those windows produce a box with a real positive height,
+  // holding 188px of workspace, that can show neither a scrollbar nor a single row. Above 459 the box
+  // is taller than a line and R6 is silent BY DESIGN — "37px of 188 is not enough" is a judgement
+  // about a specific panel, which is a scene's `min_height` and not a universal invariant's business.
+  const gutter = scrollbarSize();
   for (const el of els) {
     const cs = getComputedStyle(el);
     const scrolls = (v) => v === "auto" || v === "scroll";
-    const y = scrolls(cs.overflowY) && el.scrollHeight > TOL && el.clientHeight < TOL;
-    const x = scrolls(cs.overflowX) && el.scrollWidth > TOL && el.clientWidth < TOL;
+    // `scrollbar-width: none` is R7's business — that container hides its affordance deliberately and
+    // R7 says so by name. Judging it here too would report one defect twice under two rule numbers.
+    if (cs.scrollbarWidth === "none") continue;
+    const line = Math.round(Number.parseFloat(cs.lineHeight)) || Math.round(Number.parseFloat(cs.fontSize) * 1.2) || 1;
+    const bar = Math.max(gutter, line);
+    const y = scrolls(cs.overflowY) && el.scrollHeight > el.clientHeight + TOL && el.clientHeight < bar;
+    const x = scrolls(cs.overflowX) && el.scrollWidth > el.clientWidth + TOL && el.clientWidth < bar;
     if (!y && !x) continue;
     if (cs.display === "none" || cs.visibility === "hidden") continue;
     out.push(
       `${name(el)} declares overflow-${y ? "y" : "x"}: ${y ? cs.overflowY : cs.overflowX} and holds ` +
         `${y ? el.scrollHeight : el.scrollWidth}px of content in a box ${y ? el.clientHeight : el.clientWidth}px ` +
-        `${y ? "tall" : "wide"} — it cannot scroll and cannot show a scrollbar, so the content is ` +
-        "there and unreachable, and the declaration is what stops the other invariants asking",
+        `${y ? "tall" : "wide"} — less than the ${bar}px it would take to show ` +
+        (gutter >= line ? `this browser's ${gutter}px scrollbar` : `one ${line}px line of its own content`) +
+        ", so it can show neither the affordance nor a row, and the content is there and unreachable",
     );
   }
 
@@ -657,6 +715,70 @@ for (const scene of scenes) {
     };
     floor("width", e.min_width);
     floor("height", e.min_height);
+
+    // THE STAGE'S FLOOR, STATED SO THAT IT IS TRUE IN EVERY REGIME — INCLUDING THE ONE WHERE 320px
+    // CANNOT EXIST. Below a ~443px window the chrome (81px), the stage's floor and the dock's 42px
+    // bar want more room than there is. A flat `min_height: 320` on the viewport is then asserting
+    // arithmetic, not a rule, and a gate that must be wrong somewhere is a gate that gets an
+    // exemption bolted on at its first red — which is exactly the waiver mechanism ADR-124 refused
+    // to build. So the claim is not weakened for that regime, it is stated completely: **the stage
+    // gets its floor, or everything that is left, whichever is smaller** — the sentence
+    // `dockGridColumns` already wrote down for the other axis ("if even the rails and the floor do
+    // not fit, the stage absorbs the remainder").
+    //
+    // "What is left" is measured, never assumed — and it is what the siblings are ENTITLED to, not
+    // what they took. The first version subtracted each sibling's measured height, and that is the
+    // shape of a gate that certifies the wrong repair: a dock forced to `min-height: 230px` at a
+    // 480px window leaves the stage 169px, and a cap computed from 230 then declares 169 to be all
+    // the stage was owed. **A greedy panel would have justified its own greed, and the scene's other
+    // new claim — a 188px content box — is satisfied by exactly the same wrong repair.** So the
+    // subtraction is each sibling's own computed `min-height`: the irreducible part, the thing the
+    // stylesheet says it may never go below (the dock's is `var(--mtk-bottom-bar-height)`, which
+    // resolves here to the same 42px the layout rule means by it). Everything above that minimum is
+    // space the sibling is supposed to yield, so the floor is measured against a column where it
+    // already has.
+    //
+    // In-flow is the general structural test and not a reading of the dock's mechanism — a floating
+    // sheet takes no layout space, so the stage's room is the whole column, and that is true of any
+    // future overlay for the same reason rather than because it is the dock.
+    if (e.stage_floor != null) {
+      const col = frame.querySelector(".mtk-stage-column");
+      const vp = frame.querySelector("[data-testid='viewport']");
+      if (!col || !vp) out.push("stage_floor needs .mtk-stage-column and the viewport, and one is not there");
+      else {
+        // …AND A SIBLING CANNOT RAISE ITS OWN ENTITLEMENT. Reading the declared `min-height` alone
+        // still lets the stylesheet argue with the gate: set the dock to `min-height: 230px`, let it
+        // yield to exactly that, and the cap becomes 169px — the stage is "owed" 169, gets 169, the
+        // workspace measures its full 188px content box, and every claim here is satisfied by a
+        // repair that quietly halved the stage on a window with room for the floor. So the
+        // entitlement is capped by `--mtk-bottom-bar-height`: the shell's ONE statement of the
+        // irreducible part of the thing below the stage — the strip you click to open it, the number
+        // `dockForm` reads for the same purpose, and a constant a reviewer sees change. A sibling
+        // that genuinely needs more than a bar has to make that argument on THIS line, in review,
+        // instead of silently in its own rule.
+        const barH = Number.parseFloat(getComputedStyle(col).getPropertyValue("--mtk-bottom-bar-height")) || 0;
+        let taken = 0;
+        for (const sib of col.children) {
+          if (sib === vp || sib.contains(vp)) continue;
+          const cs = getComputedStyle(sib);
+          if (cs.position === "absolute" || cs.position === "fixed") continue; // floats over the stage, costs it nothing
+          taken += Math.min(Number.parseFloat(cs.minHeight) || 0, barH); // `auto`/`0px` → 0: entitled to nothing
+        }
+        const room = Math.max(0, Math.round(col.clientHeight - taken));
+        const want = Math.min(e.stage_floor, room);
+        const seen = Math.round(window.__mtkClipRect(vp, frame).height);
+        if (seen < want - 1) {
+          out.push(
+            `the stage measures ${seen}px tall against the ${want}px it is owed here — its ${e.stage_floor}px ` +
+              `floor capped by the ${room}px this ${Math.round(col.clientHeight)}px column has left after ` +
+              `everything in flow beside it. ` +
+              (want === e.stage_floor
+                ? "There was room for the floor and something else took it"
+                : "The window cannot give the full floor, but it can give this, and it did not"),
+          );
+        }
+      }
+    }
     // A CONTROL THAT IS NOT ON SCREEN IS NOT A CONTROL. R1 and R2 both let an element off when a
     // scrollable ancestor clips it — "the overflow is deliberate and bounded", "the user can pan to
     // it" — and both exemptions are bought with an affordance: a scrollbar. `.mtk-dock-tabs` sets
@@ -690,6 +812,36 @@ for (const scene of scenes) {
               "clips it away, and a scroll container that shows no scrollbar says nothing about it",
           );
         }
+      }
+    }
+    // CONSERVATION, WHERE A FLOOR IS ARITHMETICALLY UNREACHABLE. See `Expect.fills` for why this
+    // exists rather than a waiver on `min_height`. The children must tile the container's content
+    // box: measured on screen (so a child clipped away is a child that did not tile), summed, and
+    // compared to the container. A gap means something is missing; a surplus means two of them are
+    // on the same pixels; either way the column is not accounted for.
+    for (const [csel, kids] of e.fills ?? []) {
+      const container = frame.querySelector(csel);
+      if (!container) {
+        out.push(`fills needs \`${csel}\`, which is not there`);
+        continue;
+      }
+      const have = kids.map((k) => [k, frame.querySelector(k)]);
+      const gone = have.filter(([, el]) => !el).map(([k]) => k);
+      if (gone.length) {
+        out.push(`fills \`${csel}\` names ${gone.join(", ")}, which ${gone.length > 1 ? "are" : "is"} not there`);
+        continue;
+      }
+      const box = container.clientHeight;
+      const parts = have.map(([k, el]) => [k, Math.round(window.__mtkClipRect(el, frame).height)]);
+      const sum = parts.reduce((a, [, h]) => a + h, 0);
+      if (Math.abs(sum - box) > 1) {
+        out.push(
+          `\`${csel}\` is ${box}px tall and the ${parts.length} things inside it measure ` +
+            `${parts.map(([k, h]) => `${k} ${h}px`).join(" + ")} = ${sum}px — ` +
+            (sum < box
+              ? `${box - sum}px of it is accounted for by nothing, so something was cut or never laid out`
+              : `${sum - box}px more than there is, so two of them are on the same pixels or one is clipped away`),
+        );
       }
     }
     for (const [sa, sb] of e.same_line ?? []) {
