@@ -2,12 +2,19 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { expect, test, vi } from "vitest";
 import { CommandPalette, type EditorCommand } from "./CommandPalette";
 
-function command(overrides: Partial<EditorCommand> & Pick<EditorCommand, "id" | "label">): EditorCommand {
-  return {
-    category: "General",
-    execute: vi.fn(),
-    ...overrides,
-  };
+/** The correlation `EditorCommand` enforces, restated for the overrides object so **each call site is
+ *  still checked**: `command({ id, label, disabled: true })` with no reason is a compile error here
+ *  exactly as it is in the shell. `Partial<EditorCommand>` could not express it — `Partial` of a union
+ *  distributes into two independently-optional halves and the pairing evaporates. */
+type CommandOverrides = Pick<EditorCommand, "id" | "label"> &
+  Partial<Pick<EditorCommand, "category" | "description" | "keywords" | "shortcut" | "execute">> &
+  ({ disabled?: false | undefined; disabledReason?: undefined } | { disabled: boolean; disabledReason: string });
+
+function command(overrides: CommandOverrides): EditorCommand {
+  // The one assertion: the argument above has ALREADY been checked against the same union, so this
+  // only re-states what the call site proved. Spreading a union-typed value produces a union of object
+  // types that TypeScript will not re-narrow back into `EditorCommand` on its own.
+  return { category: "General", execute: vi.fn(), ...overrides } as EditorCommand;
 }
 
 const COMMANDS: EditorCommand[] = [

@@ -8,7 +8,7 @@ import { Button } from "../theme/primitives";
 import { ShortcutBadge } from "../theme/workspace";
 import { color, fontSize, space, text } from "../theme/tokens";
 
-export interface EditorCommand {
+interface EditorCommandBase {
   /** Stable unique id used for selection and tests. */
   id: string;
   label: string;
@@ -19,12 +19,22 @@ export interface EditorCommand {
   keywords?: readonly string[];
   /** Display-only shortcut. Global shortcut handling remains owned by the editor shell. */
   shortcut?: string | readonly string[];
-  disabled?: boolean;
-  /** Plain-language explanation shown for a disabled command. */
-  disabledReason?: string;
   /** The real action. The palette closes only after this resolves successfully. */
   execute: () => void | Promise<void>;
 }
+
+/** A command, and — **if it can ever be off — the plain-language reason, required by the compiler**.
+ *
+ *  WHY A UNION RATHER THAN TWO OPTIONAL FIELDS. It was two optional fields, and the row below rendered
+ *  `command.disabledReason ?? "This command is currently unavailable"` — a fallback that repeats the
+ *  state back at the user and calls it an explanation. Every command in the shell happens to supply a
+ *  real reason today, so that string has never been on screen; what it actually did was make the next
+ *  silent refusal look like a handled case, in the one surface where a user goes precisely BECAUSE
+ *  they cannot find the control. R9 in the shots gate catches a wordless refusal that a scene
+ *  photographs. This catches it in `tsc`, for every command, photographed or not — and the fallback is
+ *  gone, so there is nothing left to say the untrue thing. */
+export type EditorCommand = EditorCommandBase &
+  ({ disabled?: false | undefined; disabledReason?: undefined } | { disabled: boolean; disabledReason: string });
 
 export interface CommandPaletteProps {
   open: boolean;
@@ -270,6 +280,21 @@ export function CommandPalette({
                   {categoryCommands.map((command) => {
                     const active = activeId === command.id;
                     const running = runningId === command.id;
+                    // A THIRD REFUSAL NOBODY HAD NAMED. The row below is disabled by `command.disabled
+                    // || runningId != null` — so while ANY command is running, EVERY OTHER command in
+                    // the palette goes dark, `command.disabled` is false for all of them, and the
+                    // title fell through to `command.description`, which is optional. A palette full
+                    // of grey rows and no sentence anywhere is the exact failure this session is
+                    // about, in the surface a user opens *because* they could not find the control.
+                    // Found by reading the line the type change made me look at, not by the probe: no
+                    // scene photographs a running command.
+                    const refusal = command.disabled
+                      ? command.disabledReason
+                      : running
+                        ? `${command.label} is running`
+                        : runningId != null
+                          ? "Another command is still running — it finishes before the palette takes another"
+                          : undefined;
                     return (
                       <button
                         key={command.id}
@@ -280,7 +305,7 @@ export function CommandPalette({
                         aria-selected={active}
                         aria-disabled={command.disabled || undefined}
                         disabled={command.disabled || runningId != null}
-                        title={command.disabled ? command.disabledReason ?? "This command is currently unavailable" : command.description}
+                        title={refusal ?? command.description}
                         data-command-id={command.id}
                         data-active={active ? "true" : "false"}
                         onMouseEnter={() => {

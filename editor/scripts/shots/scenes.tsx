@@ -19,6 +19,11 @@ import { STAGE_MIN } from "../../src/app/layout";
 import { Diagnostics } from "../../src/panels/Diagnostics";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { Reveal } from "../../src/panels/Reveal";
+import { RigPanel, type RigDocument } from "../../src/panels/RigPanel";
+import RIG_MIXAMO from "../../src/panels/__fixtures__/rig-characterization.json";
+import RIG_BLOCKED from "../../src/panels/__fixtures__/rig-not-retargetable.json";
+import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
+import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { projectionStore } from "../../src/store/projection";
 import type { CadReport, CadReportPart, RevealResponse } from "../../src/transport/protocol";
 import type { EditorClient } from "../../src/transport/session";
@@ -53,6 +58,15 @@ export type Expect = {
    *  thing this harness was built to stop, and "did it wrap" is the one question a capture answers
    *  and a DOM assertion cannot. */
   same_line?: [a: string, b: string][];
+  /** The exact dual: `a` and `b` are separate sentences, on separate lines, `a` above `b`.
+   *
+   *  `same_line` could only ever assert the defect it was written against here. The rig panel's
+   *  blocking diagnostic ran its twelve-item comma list straight into the instruction that resolves
+   *  it — "…Right Lower Arm, Right Hand Assign each one in the rig panel" — with no terminator and no
+   *  break, so the seam was a colour change mid-line. Every `present`/`text_present` claim on that
+   *  scene passed; reading the PNG is what found it. Order is part of the claim, because two blocks
+   *  that swapped places are still stacked, and a fix printed above its own complaint is not this. */
+  stacked?: [above: string, below: string][];
   /** Elements that must MEASURE at least this many CSS pixels wide.
    *
    *  The stage-is-sacred rule (`<ux_quality>` 5) is a product principle about a **measurement**, and
@@ -367,8 +381,178 @@ export const SCENES: Scene[] = [
     setup: selectUnwiredEntity,
     render: () => <Diagnostics client={revealClient(CAD_REVEAL)} />,
   },
+  ...rigScenes(),
+  ...poseScenes(),
   ...shellScenes(),
 ];
+
+// ── the pose preview ──────────────────────────────────────────────────────────────────────────────
+
+/** THE ONE CAPTURE THAT SHOWS THE ANIMATION ITSELF. Every other scene in this file photographs a
+ *  panel; this one photographs a POSE — five skeletons drawn from coordinates that came out of the
+ *  real `bind_sequence → sample → Skeleton::globals` path (`character/tests/pose_preview_fixture.rs`
+ *  regenerates them and fails if they drift).
+ *
+ *  It is the claim made visible: ONE clip, keyed to humanoid bones rather than to a skeleton, moving
+ *  two characters that share no bone name, are not the same height, and do not even rest in the same
+ *  pose — with no retarget asset, no bone mapping and no user step between them. In Unreal that
+ *  arrangement costs three authored assets; in Unity the clip silently T-poses.
+ *
+ *  A still preview is also the feature, not just the evidence: both incumbents make "did the retarget
+ *  work" a question you answer by pressing play and looking at the character. */
+function poseScenes(): Scene[] {
+  return [
+    {
+      id: "pose-preview-one-clip-two-rigs",
+      looking_for:
+        "five stick figures at ONE shared scale: the Mixamo rig at rest and animated, the taller " +
+        "A-posed Unreal rig at rest and animated by the SAME clip, and the retargeted result. Both " +
+        "animated figures must visibly differ from their own rest pose — arms up — and the Unreal " +
+        "figures must be visibly TALLER, because a shared scale is what makes the comparison honest",
+      viewport: { width: 900, height: 620 },
+      expect: {
+        // 5 figures x 18 bones. Drop a figure, or stop drawing bones, and this goes red rather than
+        // photographing a caption over an empty box.
+        present: [
+          ["[data-testid='pose-figure']", 5],
+          ["[data-testid='pose-bone']", 90],
+          ["[data-testid='pose-caption']", 5],
+          // THE TINT, ASSERTED. 8 left-side bones per figure x 5 figures. The first version of this
+          // preview inferred the side from the joint name in TypeScript, matched `upperarm_l` and not
+          // `LeftArm`, and drew the two Mixamo figures entirely untinted under a caption promising
+          // otherwise — every assertion above stayed green. Only reading the PNG caught it.
+          // 7 a side per figure (shoulder · upper arm · lower arm · hand · upper leg · lower leg ·
+          // foot) x 5 figures. The hips are the root and draw no segment; the spine, chest, neck and
+          // head are the centre column and are deliberately untinted.
+          ["[data-testid='pose-bone'][data-side='left']", 35],
+          ["[data-testid='pose-bone'][data-side='right']", 35],
+        ],
+        text_present: [
+          "Raise arms",
+          "humanoid",
+          "4/4 channels bound on mixamo",
+          "4/4 channels bound on unreal",
+          "nothing to report",
+          "no retarget asset, no mapping, no user step",
+          // The last two figures are pixel-identical and the panel now says why. Asserted because the
+          // sentence is conditional on a MEASUREMENT (`routesAgree`): a capture that stopped showing
+          // it would mean the two routes had separated, which is a defect, not a copy change.
+          "identical on purpose",
+        ],
+        // Every figure must be entirely on screen — a preview whose last figure is past the edge has
+        // silently deleted the comparison it exists to make.
+        unclipped: ["[data-testid='pose-figure']"],
+        text_absent: ["null", "undefined", "NaN"],
+      },
+      render: () => <PosePreview doc={POSE_PREVIEW as PoseDocument} />,
+    },
+  ];
+}
+
+// ── the rig panel ─────────────────────────────────────────────────────────────────────────────────
+
+/** THE CHARACTER-ANIMATION CLAIM, PHOTOGRAPHED. The engine's differentiator against Unreal and Unity
+ *  is that a character's humanoid characterization is INFERRED at import rather than authored — no IK
+ *  Rig per skeleton, no IK Retargeter per pair, no Avatar configuration screen. That claim is only
+ *  worth anything if the answer is legible the moment the panel opens, and legibility is exactly the
+ *  property a passing unit test cannot report on.
+ *
+ *  BOTH DOCUMENTS BELOW ARE REAL. They are not hand-written mocks: `skeleton/tests/rig_contract.rs`
+ *  generates them from `metrocalk_skeleton::characterize` and fails if the committed JSON and the Rust
+ *  output ever disagree. So a scene here cannot photograph a payload the core is incapable of
+ *  producing — the C6 failure this file's own header warns about, reached through a screenshot. */
+function rigScenes(): Scene[] {
+  return [
+    {
+      id: "rig-recognized",
+      looking_for:
+        "a Mixamo character opens ALREADY CHARACTERIZED: the headline names the convention and says " +
+        "nothing needs mapping, every bone row shows the source joint it matched AND why, and the two " +
+        "tail bones are listed as KEPT — the bones Unity's humanoid enum silently discards",
+      expect: {
+        // 21 mapped bones, each with its joint name and its evidence sentence. Delete the evidence
+        // column — the thing that makes a wrong row visible without clicking it — and this goes red.
+        present: [
+          ["[data-testid='rig-row']", 21],
+          ["[data-testid='rig-row-joint']", 21],
+          ["[data-testid='rig-row-evidence']", 21],
+          ["[data-testid='rig-extra-joint']", 2],
+        ],
+        // The headline claim, and the preservation claim, in the words the user actually reads.
+        text_present: [
+          "Recognized as a",
+          "Mixamo",
+          "Nothing to map by hand",
+          "Ready to retarget",
+          "mixamorig:LeftUpLeg",
+          "Tail_01",
+        ],
+        // A ROW IS A ROW. The bone's name and the joint it matched must share a line — the two grid
+        // columns side by side. The joint name and its evidence sentence deliberately STACK beneath it
+        // (a `mixamorig:` name plus a convention sentence does not fit one 620 px line, and forcing it
+        // would ellipsise away the half that makes a wrong row visible), so the claim is about the
+        // columns, not the stack. The first version of this scene asserted the stack shared a line and
+        // this gate rejected it — which is the point of writing the claim down beside the scene.
+        same_line: [["[data-testid='rig-row-bone']", "[data-testid='rig-row-joint']"]],
+        text_absent: ["null", "undefined", "NaN"],
+      },
+      render: () => <RigPanel doc={RIG_MIXAMO as RigDocument} />,
+    },
+    {
+      id: "rig-recognized-narrow",
+      looking_for:
+        "the same rig in a 320 px drawer — the width a side dock actually collapses to. Bone names are " +
+        "long (`mixamorig:RightShoulder`) and MUST ellipsise rather than wrap: a wrapped row turns a " +
+        "21-row table nobody has to read into a wall nobody does (the ADR-120 defect class)",
+      width: 320,
+      expect: {
+        present: [
+          ["[data-testid='rig-row']", 21],
+          ["[data-testid='rig-row-joint']", 21],
+        ],
+        text_present: ["Mixamo", "Ready to retarget"],
+        text_absent: ["null", "undefined"],
+      },
+      render: () => <RigPanel doc={RIG_MIXAMO as RigDocument} />,
+    },
+    {
+      id: "rig-not-retargetable",
+      looking_for:
+        "the FAILURE state, which is the one that has to be legible: a rig with no limbs says it is not " +
+        "retargetable, NAMES all 12 missing required bones, and carries the fix beside the complaint — " +
+        "against Unity's Avatar screen, whose only failure indicator is a red cross with no sentence",
+      expect: {
+        present: [
+          ["[data-testid='rig-diagnostic']", 1],
+          ["[data-testid='rig-diagnostic-fix']", 1],
+          ["[data-testid='rig-missing-required']", 1],
+        ],
+        text_present: [
+          "Not retargetable",
+          "Left Upper Arm",
+          "Assign each one in the rig panel",
+          "12 required bone(s)",
+        ],
+        // The status is the first thing read, so it must sit ON the header row rather than wrapping
+        // under the title — the badge is the answer to "can I animate this character at all".
+        same_line: [["[data-testid='rig-title']", "[data-testid='rig-status-badge']"]],
+        // The complaint and its fix are two sentences: the twelve-name list has no terminator, so
+        // inline they read as one run-on line whose only seam is a colour change. This is the claim
+        // that could not be written until `stacked` existed.
+        stacked: [
+          ["[data-testid='rig-diagnostic-message']", "[data-testid='rig-diagnostic-fix']"],
+        ],
+        // THE CONTRADICTION THAT ONLY A CAPTURE CAUGHT. Every assertion above passed while the
+        // headline congratulated the user with "Nothing to map by hand" directly over a blocking
+        // diagnostic naming twelve bones to map by hand. Nothing in `present`/`text_present` could
+        // see it — the defect was that two true sentences disagreed — so the reading of the PNG is
+        // what found it, and this is the line that stops it coming back.
+        text_absent: ["null", "undefined", "Nothing to map by hand"],
+      },
+      render: () => <RigPanel doc={RIG_BLOCKED as RigDocument} />,
+    },
+  ];
+}
 
 // ── the shell, composed ───────────────────────────────────────────────────────────────────────────
 

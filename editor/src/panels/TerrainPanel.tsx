@@ -610,6 +610,11 @@ const EXAMPLES = [
  * out is an ordinary recipe — the layer stack, materials and rules below are the ones it wrote, and they are
  * as editable as if you had typed them yourself.
  */
+/** The status line beside `Build it`, which is also its description. One constant, two readers — the
+ *  same reason `ANNOTATION_STATUS_ID` is one in `AnimationWorkspace`: a mistyped `aria-describedby`
+ *  raises nothing, it just goes quiet. */
+const DESCRIBE_STATUS_ID = "terrain-describe-status";
+
 function DescribeBox({
   client,
   busy,
@@ -665,17 +670,34 @@ function DescribeBox({
           }
         }}
       />
+      {/* THE WORDS WERE ALREADY ON SCREEN AND WERE NOT JOINED TO THE CONTROL. The line to the left of
+          the button says "Describe a world, or change this one" — which IS the reason `Build it` is
+          off, and it is a foot away with nothing tying the two together. A sighted user can infer it;
+          a hover gets nothing, a screen reader gets nothing, and a gate reading the DOM can see no
+          relationship at all, because there is none (WCAG 2.2 SC 1.3.1 — a relationship conveyed by
+          visual arrangement alone). `aria-describedby` states it, and the sentence itself now names
+          the refusal rather than only inviting the action. */}
       <div style={{ display: "flex", gap: space.xs, alignItems: "center" }}>
-        <span style={{ flex: 1, fontSize: fontSize.meta, color: color.text.secondary }}>
+        <span id={DESCRIBE_STATUS_ID} data-testid="terrain-describe-status" style={{ flex: 1, fontSize: fontSize.meta, color: color.text.secondary }}>
           {plan
             ? plan.kind === "create"
               ? "builds a new world"
               : `${plan.steps.length} change${plan.steps.length === 1 ? "" : "s"} to this world`
-            : "Describe a world, or change this one — “raise this mountain”, “widen the river”."}
+            : busy
+              ? "Building — the world is being rebuilt from this description."
+              : text.trim()
+                ? "Describe a world, or change this one — “raise this mountain”, “widen the river”."
+                : "Type a description first — “raise this mountain”, “widen the river”."}
         </span>
         <Button
           variant="primary"
           disabled={busy || !text.trim()}
+          disabledReason={
+            busy
+              ? "The world is still being rebuilt from the last description"
+              : "Type a description first — this button builds what the box above says"
+          }
+          aria-describedby={DESCRIBE_STATUS_ID}
           data-testid="terrain-describe-build"
           onClick={submit}
         >

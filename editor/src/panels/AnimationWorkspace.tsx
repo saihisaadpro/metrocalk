@@ -89,6 +89,10 @@ const PROPERTY_DRAFT = "workspace:selected-property";
 const INTERPOLATION_DRAFT = "workspace:new-interpolation";
 const MARKER_NAME_DRAFT = "workspace:new-marker-name";
 const EVENT_NAME_DRAFT = "workspace:new-event-name";
+/** The element the annotation buttons point `aria-describedby` at. One constant, two readers plus the
+ *  box itself — a literal repeated three times is the drift `<test_and_ci_discipline>` 6 is about, and
+ *  the failure is silent: a wrong id is not an error, it is a description nobody ever hears. */
+const ANNOTATION_STATUS_ID = "animation-annotation-status";
 const EVENT_PAYLOAD_DRAFT = "workspace:new-event-payload";
 
 const card: CSSProperties = {
@@ -364,6 +368,19 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
   const [clipTargetMappings, setClipTargetMappings] = useState<Record<string, string>>({});
   const [clipDiscardConfirmId, setClipDiscardConfirmId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** WHY THE TWO ANNOTATION BUTTONS ARE OFF — computed once, next to the boolean that turns them off,
+   *  so the two cannot say different things.
+   *
+   *  TWO REFUSALS, NOT ONE, AND THEY ARE NOT INTERCHANGEABLE. "There is nothing to annotate" is a
+   *  standing state the user has to act on; "an edit is still committing" clears itself and asks for
+   *  nothing. One sentence covering both would be wrong half the time — and being wrong is worse than
+   *  being absent, because the user acts on it. Ordered as the `disabled` expression is (`!selectedId
+   *  || busy`), so the reason names the condition that is actually holding. */
+  const annotationRefusal = !selectedId
+    ? "Select an object first — a marker or event is placed on the selected object's timeline"
+    : busy
+      ? "An animation edit is still committing; this lands as one undoable transaction"
+      : undefined;
   const refreshEpoch = useRef(0);
   const editEpoch = useRef(0);
   const transportEpoch = useRef(0);
@@ -1571,7 +1588,29 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                   <option value="step">Step</option><option value="linear">Linear</option><option value="cubic">Cubic</option>
                 </select>
               </label>
-              <Button data-testid="animation-add-key" style={{ width: "100%", marginTop: space.md }} disabled={busy || !currentProperty?.animatable} onClick={keyCurrent}>
+              {/* THE SAME DEFECT ONE SECTION UP, CAUGHT BY LOOKING RATHER THAN BY THE PROBE: no scene
+                  photographs this button while it is off, so it was not in the 5 findings — but it is
+                  the identical shape, and R9 would red the first scene that did. `#animation-property-
+                  status` was already beside it carrying the words; the button had simply never been
+                  joined to them, so a hover and a screen reader both got nothing. */}
+              <Button
+                data-testid="animation-add-key"
+                style={{ width: "100%", marginTop: space.md }}
+                disabled={busy || !currentProperty?.animatable}
+                disabledReason={
+                  busy
+                    ? "An animation edit is still committing; this lands as one undoable transaction"
+                    : !currentProperty
+                      ? "Choose a property above — only channels with a verified adapter can be keyed"
+                      : !currentProperty.animatable
+                        ? currentProperty.bindingReason ||
+                          currentProperty.reason ||
+                          `${currentProperty.label} has no verified playback adapter, so a key on it would never play back`
+                        : undefined
+                }
+                aria-describedby="animation-property-status"
+                onClick={keyCurrent}
+              >
                 Add key at {displayTick}t
               </Button>
               <div id="animation-property-status">
@@ -1592,7 +1631,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                 value={draftString(contextView.drafts[MARKER_NAME_DRAFT])}
                 onChange={(event) => animationEditorStore.getState().setDraft(workspaceKey, activeContext, MARKER_NAME_DRAFT, event.target.value)}
               />
-              <Button compact data-testid="animation-add-marker" disabled={!selectedId || busy} onClick={addMarker}>+ Marker</Button>
+              <Button compact data-testid="animation-add-marker" disabled={!selectedId || busy} disabledReason={annotationRefusal} aria-describedby={ANNOTATION_STATUS_ID} onClick={addMarker}>+ Marker</Button>
               <input
                 className="mtk-input"
                 data-testid="animation-event-name"
@@ -1601,7 +1640,20 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                 value={draftString(contextView.drafts[EVENT_NAME_DRAFT])}
                 onChange={(event) => animationEditorStore.getState().setDraft(workspaceKey, activeContext, EVENT_NAME_DRAFT, event.target.value)}
               />
-              <Button compact data-testid="animation-add-event" disabled={!selectedId || busy} onClick={addEvent}>+ Event</Button>
+              <Button compact data-testid="animation-add-event" disabled={!selectedId || busy} disabledReason={annotationRefusal} aria-describedby={ANNOTATION_STATUS_ID} onClick={addEvent}>+ Event</Button>
+            </div>
+            {/* THE REASON, IN THE PLACE THE REFUSAL HAPPENS. The panel already said "Select an object to
+                expose context-compatible channels" — but that sentence is about CHANNELS, it is above
+                the divider, and above it again sits a readiness card that keeps talking whatever is
+                selected. Two greyed buttons under a heading of their own, four inches below a sentence
+                about something else, are two buttons that state nothing. `<ux_quality>` 4 asks for
+                plain words; this is where they have to be for a user to connect them to the control.
+
+                The box is rendered UNCONDITIONALLY so `aria-describedby` always resolves to a real
+                element, and it is empty exactly when there is nothing being refused — an id that
+                dangles half the time is a description a screen reader silently drops. */}
+            <div id={ANNOTATION_STATUS_ID} data-testid="animation-annotation-status">
+              {annotationRefusal && <Hint>{annotationRefusal}</Hint>}
             </div>
             <input
               className="mtk-input"

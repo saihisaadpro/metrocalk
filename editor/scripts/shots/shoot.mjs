@@ -654,6 +654,124 @@ function layoutInvariants(windowIsTheSubject) {
         "expected to read (WCAG 2.2 SC 1.4.3)",
     );
   }
+
+  // R9 — A CONTROL THAT REFUSES SAYS WHY. R1–R7 ask whether a thing is where it should be; R8 asks
+  // whether the text in it can be read. All eight are satisfied by a button that is present, correctly
+  // placed, perfectly legible — and dead, with no sentence anywhere on the page saying what would
+  // bring it back. That is not an accessibility footnote in this product: it is north-star #1. The
+  // engine's whole claim against Unity and Unreal is that **every "no" is explained**, `<ux_quality>` 4
+  // says "a disabled control explains *why* in plain words", and `<ux_quality>` 6 says a control either
+  // does something or says why it can't. Eight invariants, and the one property the product is named
+  // for was the one nothing measured.
+  //
+  // THIS IS A HOUSE RULE, AND IT IS WORTH SAYING SO. R8 could point at SC 1.4.3, EN 301 549 and
+  // Section 508 and let the standard draw the line. Nothing normative requires a disabled control to
+  // carry a reason — WCAG's SC 3.3.1/3.3.3 are about *errors in input*, not about refusals, and the
+  // ARIA Authoring Practices only advise `aria-disabled` over `disabled` where the item must stay
+  // reachable. So this rule is the PRODUCT's, derived from its own stated principle, and it is
+  // enforceable for the same reason R8's exemption was: what it asks for is mechanical.
+  //
+  // AND IT IS NOT A NEW CONVENTION. `disabledReason` already existed in SIX surfaces — `ContextMenu`,
+  // `PopupMenuItem`, `CommandPalette`, `AuthoringToolbar`, `ViewportToolbar`, `AssetLabPanel` — three
+  // of which also paint it. What was missing was the shared `Button` primitive, i.e. the control every
+  // panel reaches for when it is not building a menu, so the convention held exactly where it was
+  // invented and nowhere else. Measured on HEAD across 26 scenes: 5 findings, 3 distinct controls
+  // (`+ Marker`, `+ Event`, Terrain's `Build it`) — silent since the day each was written, with 421
+  // green vitest tests and eight green invariants over them the whole time.
+  //
+  // WHAT COUNTS AS A REASON, MECHANICALLY: a non-empty `title`, or an `aria-describedby` that resolves
+  // to non-empty text. Both are the control's accessible description, which is the only thing on the
+  // page that is *about this control* rather than merely near it — Terrain's sentence was a foot to
+  // the left of its button and joined to it by nothing but arrangement, which is what WCAG 2.2 SC
+  // 1.3.1 is about, and which no gate reading a DOM can infer.
+  //
+  // A `title` alone is deliberately ENOUGH, though it is the weaker form: `disabled` removes an
+  // element from the tab order (HTML Standard, "disabled" — a disabled control is not focusable), so a
+  // tooltip on it is unreachable by keyboard. Demanding a *visible* sentence instead would be truer to
+  // "plain words" and would immediately red four established menu surfaces, where a paragraph under
+  // every greyed item is a worse UI than the tooltip. The rule therefore asks for the association and
+  // leaves the strength to a scene, which is the same division of labour as `min_height` versus R6.
+  //
+  // The walk stops at the outermost INACTIVE ancestor, so a disabled `fieldset` may answer for its
+  // eight inputs — one refusal is one sentence — while an ordinary enabled wrapper's `title` cannot be
+  // borrowed as an excuse by a control inside it.
+  const inactiveEl = (el) => {
+    if (el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") return true;
+    return el.tagName === "FIELDSET" && el.hasAttribute("disabled");
+  };
+  const describedText = (el) =>
+    (el.getAttribute("aria-describedby") ?? "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => (document.getElementById(id)?.textContent ?? "").replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .join(" ");
+  const accName = (el) => (el.getAttribute("aria-label") ?? el.textContent ?? "").replace(/\s+/g, " ").trim();
+  // A WIDER SET THAN R3's, deliberately. R3 asks which controls can COVER one another, so it takes
+  // anything focusable, `[tabindex]` included. This asks which controls can REFUSE, and a refusal is
+  // expressed by ARIA role: a `menuitem`, an `option` and a `tab` all go inactive and none of them is
+  // a `<button>` or carries a tabindex once it is the inactive one in a roving-tabindex group — which
+  // is precisely `ContextMenu`, the surface that got this right first and would have been invisible to
+  // R3's list.
+  const CAN_REFUSE =
+    'button, a[href], input, select, textarea, summary, [role="button"], [role="link"], [role="menuitem"], ' +
+    '[role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="tab"], [role="checkbox"], ' +
+    '[role="radio"], [role="switch"], [role="slider"]';
+  const saidAlready = new Set();
+  for (const el of frame.querySelectorAll(CAN_REFUSE)) {
+    if (!inactiveEl(el)) continue;
+    // Not perceivable is not a refusal — nothing is being denied to someone who cannot see the control
+    // at all, and R1..R7 own "it should have been visible and was not".
+    if (el.closest('[aria-hidden="true"]')) continue;
+    // THE ONE RULE HERE THAT READS THE RAW RECT, AND IT IS NOT AN OVERSIGHT — it is the correction that
+    // this rule's own first version needed. R1–R8 all read `__mtkClipRect`, because every one of them
+    // asserts something about PIXELS, and a claim about pixels that are scrolled out of a container is
+    // a claim about pixels that do not exist (ADR-126/127 established that at some cost). R9 asserts
+    // nothing about pixels. It asks whether a control carries an explanation — a property of the
+    // markup, identical at every scroll offset.
+    //
+    // MEASURED, NOT REASONED: with the clipped rect, `animation-add-marker` reports 75×34 raw and
+    // **75×0 clipped** in `shell-dock-animate` — the annotations row sits below the fold of the dock's
+    // scroll container — so a clipped-rect R9 was SILENT on two of the three controls that made the
+    // case for writing it, and its mutation run went green with HEAD's exact defect restored. A gate
+    // that a plausible wrong repair satisfies certifies the wrong repair; so does a gate that the
+    // original defect satisfies. It also means the throwaway probe that chose this subject was reading
+    // raw boxes and was right to.
+    //
+    // What is still skipped is what is not RENDERED at all: a zero-size box (an ancestor is
+    // `display: none`, so the element's own computed style still says `flex` while it occupies
+    // nothing), `visibility: hidden`, and a fully transparent group. Those are not controls a user can
+    // scroll to; they are controls that are not there.
+    const r = el.getBoundingClientRect();
+    if (!visible(el, r) || r.width < TOL || r.height < TOL) continue;
+    if (groupAlpha(el) <= 0) continue;
+    const label = accName(el);
+    let reason = "";
+    for (let p = el; p && p !== frame && inactiveEl(p); p = p.parentElement) {
+      const t = (p.getAttribute("title") ?? "").replace(/\s+/g, " ").trim();
+      const d = describedText(p);
+      // A "reason" that is the control's own label says nothing twice: `title="+ Marker"` on the
+      // `+ Marker` button is the shape a well-meant repair takes when the author has no reason to
+      // give, and it would satisfy any check that only counted characters.
+      for (const candidate of [t, d]) {
+        if (candidate && candidate.toLowerCase() !== label.toLowerCase()) {
+          reason = candidate;
+          break;
+        }
+      }
+      if (reason) break;
+    }
+    if (reason) continue;
+    const key = name(el);
+    if (saidAlready.has(key)) continue;
+    saidAlready.add(key);
+    out.push(
+      `${key} is refusing and says why nowhere — no \`title\`, no \`aria-describedby\` resolving to ` +
+        "text, on it or on any inactive ancestor. A user sees a control they cannot use and is told " +
+        "nothing about what would change that (north-star #1 — every “no” explained; " +
+        "`<ux_quality>` 4 and 6). The shared `Button` takes a `disabledReason`",
+    );
+  }
   return out;
 }
 
@@ -988,6 +1106,39 @@ for (const scene of scenes) {
         out.push(
           `\`${sa}\` and \`${sb}\` are on different lines (${Math.round(ra.top)}–${Math.round(ra.bottom)} ` +
             `vs ${Math.round(rb.top)}–${Math.round(rb.bottom)}) — the row wrapped`,
+        );
+      }
+    }
+    // THE DUAL OF `same_line`, AND IT EXISTS BECAUSE ONE DEFECT COULD ONLY BE STATED THIS WAY.
+    // `same_line` says "these two belong on one row"; there was no way to say "these two are separate
+    // sentences and must not run together", and the rig panel's blocking diagnostic was doing exactly
+    // that — a twelve-item comma list with no terminator flowing straight into the instruction that
+    // resolves it, distinguishable only by a colour change mid-line. Every `present`/`text_present`
+    // claim on that scene passed; the defect was found by reading the PNG.
+    //
+    // The test is the same geometry with the comparison inverted, deliberately: one definition of
+    // "share a line", two claims, so the pair cannot drift into disagreeing about what a line is. It
+    // asserts the ORDER too (`sa` above `sb`), because two blocks that swapped places are still
+    // stacked, and a fix printed above the complaint it fixes is not the thing being claimed.
+    for (const [sa, sb] of e.stacked ?? []) {
+      const a = frame.querySelector(sa);
+      const b = frame.querySelector(sb);
+      if (!a || !b) {
+        out.push(`stacked needs both \`${sa}\` and \`${sb}\`; ${a ? sb : sa} is not there`);
+        continue;
+      }
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      if (Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top) > 1) {
+        out.push(
+          `\`${sa}\` and \`${sb}\` share a line (${Math.round(ra.top)}–${Math.round(ra.bottom)} vs ` +
+            `${Math.round(rb.top)}–${Math.round(rb.bottom)}) — they are separate sentences and run ` +
+            "together, so the reader has to find the seam by noticing where the colour changes",
+        );
+      } else if (ra.top > rb.top) {
+        out.push(
+          `\`${sa}\` is BELOW \`${sb}\` (${Math.round(ra.top)} vs ${Math.round(rb.top)}) — stacked, ` +
+            "but in the wrong order",
         );
       }
     }

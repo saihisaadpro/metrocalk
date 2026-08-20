@@ -36,6 +36,23 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   size?: ControlSize;
   /** Icon-only sizing. */
   icon?: boolean;
+  /** **WHY THIS CONTROL IS REFUSING, in the user's words** — rendered as the button's `title`, which is
+   *  its accessible description.
+   *
+   *  WHY IT LIVES ON THE PRIMITIVE. `disabledReason` was already this repository's convention in six
+   *  places — `PopupMenuItem`, `ContextMenu`, `CommandPalette`, `AuthoringToolbar`, `ViewportToolbar`,
+   *  `AssetLabPanel` — and in none of them is it optional-by-accident: three of the six also PAINT it.
+   *  The one thing missing was the shared `Button` itself, which is what a panel reaches for when it
+   *  is not building a menu. So every surface that used the primitive directly had no path to state a
+   *  reason and, measured across all 26 shot scenes, three of them did not: `+ Marker`, `+ Event` and
+   *  Terrain's `Build it` went dark with no sentence anywhere. A convention that the most-used control
+   *  cannot express is a convention that is only followed where it was invented.
+   *
+   *  It does NOT imply `disabled` — the two stay orthogonal, exactly as `PopupMenuItem` has them, so a
+   *  reason can be computed once and handed over beside the boolean that consumed it. The gate that
+   *  makes it non-optional is R9 in `scripts/shots/shoot.mjs`; this prop is only what makes obeying it
+   *  the shortest path. */
+  disabledReason?: string;
   children?: ReactNode;
 }
 
@@ -47,6 +64,8 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
   compact = false,
   size = "default",
   icon = false,
+  disabledReason,
+  title,
   type = "button",
   role,
   "aria-checked": ariaChecked,
@@ -70,11 +89,21 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
   ]
     .filter(Boolean)
     .join(" ");
+  // The reason only speaks while the control is actually refusing. Left on an enabled button it would
+  // be a tooltip claiming an unavailability that is over — the stale-status-line bug `<ux_quality>` 2
+  // names by hand — and an explicit `title` still wins, because a caller that wrote one meant it.
+  // BOTH SPELLINGS OF "OFF", because the codebase uses both and for good reasons: `disabled` for a
+  // plain control, `aria-disabled` where the item must stay focusable so a keyboard user can reach the
+  // explanation at all (`ContextMenu`, `PopupMenuItem`). A reason that only attached to one of the two
+  // would be missing from exactly the surfaces that went to the trouble of staying reachable.
+  const refusing = rest.disabled === true || rest["aria-disabled"] === true || rest["aria-disabled"] === "true";
+  const resolvedTitle = title ?? (refusing && disabledReason ? disabledReason : undefined);
   return (
     <button
       ref={ref}
       type={type}
       role={role}
+      title={resolvedTitle}
       aria-checked={ariaChecked}
       aria-pressed={ariaPressed ?? (variant === "toggle" && !exposesAnotherSelectionPattern ? active : undefined)}
       aria-selected={ariaSelected}
