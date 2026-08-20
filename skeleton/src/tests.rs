@@ -16,7 +16,9 @@ const EPS: f32 = 1e-4;
 fn skeleton(specs: &[(Option<usize>, Transform)]) -> Skeleton {
     let joints: Vec<Joint> = specs
         .iter()
-        .map(|(parent, local_bind)| Joint {
+        .enumerate()
+        .map(|(i, (parent, local_bind))| Joint {
+            name: format!("joint{i}"),
             parent: *parent,
             local_bind: *local_bind,
             inverse_bind: [[0.0; 4]; 4], // filled below

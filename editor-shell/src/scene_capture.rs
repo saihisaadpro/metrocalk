@@ -625,6 +625,13 @@ mod tests {
         };
         asset.skeleton = Some(Skeleton {
             joints: vec![Joint {
+                // The joint's own source name. `capture_scene` does NOT read it yet — it synthesizes
+                // `Joint_{index}` for both the node and the `SceneJoint` (above, ~line 287) — because
+                // `usd_export::validate_identifier` rejects the punctuation real rigs use
+                // (`mixamorig:LeftForeArm` has a colon). Carrying a real name here keeps the fixture
+                // honest about what an imported rig actually holds, and is the value the tracked
+                // name-preserving export slice has to start reading.
+                name: "root".into(),
                 parent: None,
                 local_bind: identity,
                 inverse_bind: identity.to_matrix(),

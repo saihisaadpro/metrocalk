@@ -133,6 +133,10 @@ pub fn bake_standard_lbs(
         joints: order
             .iter()
             .map(|&old| Joint {
+                // A procedural rig has no source names; MTKRIG predicts joints, not spellings. Empty is
+                // the honest value — `characterize` skips unnamed joints and falls back to topology
+                // rather than matching a name that was never authored.
+                name: String::new(),
                 parent: parent_of[old].filter(|p| *p < n_joints).map(|p| remap[p]),
                 local_bind: rig.joints[old].local_bind,
                 inverse_bind: [[0.0; 4]; 4], // filled below

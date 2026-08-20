@@ -1,0 +1,765 @@
+{
+  "boundChannels": {
+    "mixamo": 4,
+    "unreal": 4
+  },
+  "clip": {
+    "channels": 4,
+    "keyedBy": "humanoid",
+    "name": "Raise arms"
+  },
+  "diagnostics": 0,
+  "figures": [
+    {
+      "caption": "Mixamo · rest",
+      "detail": "the character as authored — a T-pose",
+      "segments": [
+        {
+          "name": "mixamorig:Spine",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.0,
+          "y2": 1.15
+        },
+        {
+          "name": "mixamorig:Spine1",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.15,
+          "y2": 1.3
+        },
+        {
+          "name": "mixamorig:Neck",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.3,
+          "y2": 1.42
+        },
+        {
+          "name": "mixamorig:Head",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.42,
+          "y2": 1.56
+        },
+        {
+          "name": "mixamorig:LeftShoulder",
+          "side": "left",
+          "x1": 0.0,
+          "x2": 0.06,
+          "y1": 1.3,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:LeftArm",
+          "side": "left",
+          "x1": 0.06,
+          "x2": 0.16,
+          "y1": 1.4,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:LeftForeArm",
+          "side": "left",
+          "x1": 0.16,
+          "x2": 0.42,
+          "y1": 1.4,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:LeftHand",
+          "side": "left",
+          "x1": 0.42,
+          "x2": 0.66,
+          "y1": 1.4,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:RightShoulder",
+          "side": "right",
+          "x1": 0.0,
+          "x2": -0.06,
+          "y1": 1.3,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:RightArm",
+          "side": "right",
+          "x1": -0.06,
+          "x2": -0.16,
+          "y1": 1.4,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:RightForeArm",
+          "side": "right",
+          "x1": -0.16,
+          "x2": -0.42,
+          "y1": 1.4,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:RightHand",
+          "side": "right",
+          "x1": -0.42,
+          "x2": -0.66,
+          "y1": 1.4,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:LeftUpLeg",
+          "side": "left",
+          "x1": 0.0,
+          "x2": 0.09,
+          "y1": 1.0,
+          "y2": 0.94
+        },
+        {
+          "name": "mixamorig:LeftLeg",
+          "side": "left",
+          "x1": 0.09,
+          "x2": 0.09,
+          "y1": 0.94,
+          "y2": 0.52
+        },
+        {
+          "name": "mixamorig:LeftFoot",
+          "side": "left",
+          "x1": 0.09,
+          "x2": 0.09,
+          "y1": 0.52,
+          "y2": 0.1
+        },
+        {
+          "name": "mixamorig:RightUpLeg",
+          "side": "right",
+          "x1": 0.0,
+          "x2": -0.09,
+          "y1": 1.0,
+          "y2": 0.94
+        },
+        {
+          "name": "mixamorig:RightLeg",
+          "side": "right",
+          "x1": -0.09,
+          "x2": -0.09,
+          "y1": 0.94,
+          "y2": 0.52
+        },
+        {
+          "name": "mixamorig:RightFoot",
+          "side": "right",
+          "x1": -0.09,
+          "x2": -0.09,
+          "y1": 0.52,
+          "y2": 0.1
+        }
+      ]
+    },
+    {
+      "caption": "Mixamo · the clip",
+      "detail": "bound with 0 diagnostics",
+      "segments": [
+        {
+          "name": "mixamorig:Spine",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.0,
+          "y2": 1.15
+        },
+        {
+          "name": "mixamorig:Spine1",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.15,
+          "y2": 1.3
+        },
+        {
+          "name": "mixamorig:Neck",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.3,
+          "y2": 1.42
+        },
+        {
+          "name": "mixamorig:Head",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.42,
+          "y2": 1.56
+        },
+        {
+          "name": "mixamorig:LeftShoulder",
+          "side": "left",
+          "x1": 0.0,
+          "x2": 0.06,
+          "y1": 1.3,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:LeftArm",
+          "side": "left",
+          "x1": 0.06,
+          "x2": 0.16,
+          "y1": 1.4,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:LeftForeArm",
+          "side": "left",
+          "x1": 0.16,
+          "x2": 0.309,
+          "y1": 1.4,
+          "y2": 1.613
+        },
+        {
+          "name": "mixamorig:LeftHand",
+          "side": "left",
+          "x1": 0.309,
+          "x2": 0.288,
+          "y1": 1.613,
+          "y2": 1.852
+        },
+        {
+          "name": "mixamorig:RightShoulder",
+          "side": "right",
+          "x1": 0.0,
+          "x2": -0.06,
+          "y1": 1.3,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:RightArm",
+          "side": "right",
+          "x1": -0.06,
+          "x2": -0.16,
+          "y1": 1.4,
+          "y2": 1.4
+        },
+        {
+          "name": "mixamorig:RightForeArm",
+          "side": "right",
+          "x1": -0.16,
+          "x2": -0.309,
+          "y1": 1.4,
+          "y2": 1.613
+        },
+        {
+          "name": "mixamorig:RightHand",
+          "side": "right",
+          "x1": -0.309,
+          "x2": -0.288,
+          "y1": 1.613,
+          "y2": 1.852
+        },
+        {
+          "name": "mixamorig:LeftUpLeg",
+          "side": "left",
+          "x1": 0.0,
+          "x2": 0.09,
+          "y1": 1.0,
+          "y2": 0.94
+        },
+        {
+          "name": "mixamorig:LeftLeg",
+          "side": "left",
+          "x1": 0.09,
+          "x2": 0.09,
+          "y1": 0.94,
+          "y2": 0.52
+        },
+        {
+          "name": "mixamorig:LeftFoot",
+          "side": "left",
+          "x1": 0.09,
+          "x2": 0.09,
+          "y1": 0.52,
+          "y2": 0.1
+        },
+        {
+          "name": "mixamorig:RightUpLeg",
+          "side": "right",
+          "x1": 0.0,
+          "x2": -0.09,
+          "y1": 1.0,
+          "y2": 0.94
+        },
+        {
+          "name": "mixamorig:RightLeg",
+          "side": "right",
+          "x1": -0.09,
+          "x2": -0.09,
+          "y1": 0.94,
+          "y2": 0.52
+        },
+        {
+          "name": "mixamorig:RightFoot",
+          "side": "right",
+          "x1": -0.09,
+          "x2": -0.09,
+          "y1": 0.52,
+          "y2": 0.1
+        }
+      ]
+    },
+    {
+      "caption": "Unreal Mannequin · rest",
+      "detail": "a different rig: 1.45x taller, A-posed, no bone name in common",
+      "segments": [
+        {
+          "name": "spine_01",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.45,
+          "y2": 1.668
+        },
+        {
+          "name": "spine_02",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.668,
+          "y2": 1.885
+        },
+        {
+          "name": "neck_01",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.885,
+          "y2": 2.059
+        },
+        {
+          "name": "head",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 2.059,
+          "y2": 2.262
+        },
+        {
+          "name": "clavicle_l",
+          "side": "left",
+          "x1": 0.0,
+          "x2": 0.087,
+          "y1": 1.885,
+          "y2": 2.03
+        },
+        {
+          "name": "upperarm_l",
+          "side": "left",
+          "x1": 0.087,
+          "x2": 0.18,
+          "y1": 2.03,
+          "y2": 1.919
+        },
+        {
+          "name": "lowerarm_l",
+          "side": "left",
+          "x1": 0.18,
+          "x2": 0.423,
+          "y1": 1.919,
+          "y2": 1.63
+        },
+        {
+          "name": "hand_l",
+          "side": "left",
+          "x1": 0.423,
+          "x2": 0.646,
+          "y1": 1.63,
+          "y2": 1.364
+        },
+        {
+          "name": "clavicle_r",
+          "side": "right",
+          "x1": 0.0,
+          "x2": -0.087,
+          "y1": 1.885,
+          "y2": 2.03
+        },
+        {
+          "name": "upperarm_r",
+          "side": "right",
+          "x1": -0.087,
+          "x2": -0.18,
+          "y1": 2.03,
+          "y2": 1.919
+        },
+        {
+          "name": "lowerarm_r",
+          "side": "right",
+          "x1": -0.18,
+          "x2": -0.423,
+          "y1": 1.919,
+          "y2": 1.63
+        },
+        {
+          "name": "hand_r",
+          "side": "right",
+          "x1": -0.423,
+          "x2": -0.646,
+          "y1": 1.63,
+          "y2": 1.364
+        },
+        {
+          "name": "thigh_l",
+          "side": "left",
+          "x1": 0.0,
+          "x2": 0.131,
+          "y1": 1.45,
+          "y2": 1.363
+        },
+        {
+          "name": "calf_l",
+          "side": "left",
+          "x1": 0.131,
+          "x2": 0.131,
+          "y1": 1.363,
+          "y2": 0.754
+        },
+        {
+          "name": "foot_l",
+          "side": "left",
+          "x1": 0.131,
+          "x2": 0.131,
+          "y1": 0.754,
+          "y2": 0.145
+        },
+        {
+          "name": "thigh_r",
+          "side": "right",
+          "x1": 0.0,
+          "x2": -0.131,
+          "y1": 1.45,
+          "y2": 1.363
+        },
+        {
+          "name": "calf_r",
+          "side": "right",
+          "x1": -0.131,
+          "x2": -0.131,
+          "y1": 1.363,
+          "y2": 0.754
+        },
+        {
+          "name": "foot_r",
+          "side": "right",
+          "x1": -0.131,
+          "x2": -0.131,
+          "y1": 0.754,
+          "y2": 0.145
+        }
+      ]
+    },
+    {
+      "caption": "Unreal Mannequin · the SAME clip",
+      "detail": "no retarget asset, no mapping, no user step",
+      "segments": [
+        {
+          "name": "spine_01",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.45,
+          "y2": 1.668
+        },
+        {
+          "name": "spine_02",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.668,
+          "y2": 1.885
+        },
+        {
+          "name": "neck_01",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.885,
+          "y2": 2.059
+        },
+        {
+          "name": "head",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 2.059,
+          "y2": 2.262
+        },
+        {
+          "name": "clavicle_l",
+          "side": "left",
+          "x1": 0.0,
+          "x2": 0.087,
+          "y1": 1.885,
+          "y2": 2.03
+        },
+        {
+          "name": "upperarm_l",
+          "side": "left",
+          "x1": 0.087,
+          "x2": 0.18,
+          "y1": 2.03,
+          "y2": 1.919
+        },
+        {
+          "name": "lowerarm_l",
+          "side": "left",
+          "x1": 0.18,
+          "x2": 0.556,
+          "y1": 1.919,
+          "y2": 1.952
+        },
+        {
+          "name": "hand_l",
+          "side": "left",
+          "x1": 0.556,
+          "x2": 0.802,
+          "y1": 1.952,
+          "y2": 2.198
+        },
+        {
+          "name": "clavicle_r",
+          "side": "right",
+          "x1": 0.0,
+          "x2": -0.087,
+          "y1": 1.885,
+          "y2": 2.03
+        },
+        {
+          "name": "upperarm_r",
+          "side": "right",
+          "x1": -0.087,
+          "x2": -0.18,
+          "y1": 2.03,
+          "y2": 1.919
+        },
+        {
+          "name": "lowerarm_r",
+          "side": "right",
+          "x1": -0.18,
+          "x2": -0.556,
+          "y1": 1.919,
+          "y2": 1.952
+        },
+        {
+          "name": "hand_r",
+          "side": "right",
+          "x1": -0.556,
+          "x2": -0.802,
+          "y1": 1.952,
+          "y2": 2.198
+        },
+        {
+          "name": "thigh_l",
+          "side": "left",
+          "x1": 0.0,
+          "x2": 0.131,
+          "y1": 1.45,
+          "y2": 1.363
+        },
+        {
+          "name": "calf_l",
+          "side": "left",
+          "x1": 0.131,
+          "x2": 0.131,
+          "y1": 1.363,
+          "y2": 0.754
+        },
+        {
+          "name": "foot_l",
+          "side": "left",
+          "x1": 0.131,
+          "x2": 0.131,
+          "y1": 0.754,
+          "y2": 0.145
+        },
+        {
+          "name": "thigh_r",
+          "side": "right",
+          "x1": 0.0,
+          "x2": -0.131,
+          "y1": 1.45,
+          "y2": 1.363
+        },
+        {
+          "name": "calf_r",
+          "side": "right",
+          "x1": -0.131,
+          "x2": -0.131,
+          "y1": 1.363,
+          "y2": 0.754
+        },
+        {
+          "name": "foot_r",
+          "side": "right",
+          "x1": -0.131,
+          "x2": -0.131,
+          "y1": 0.754,
+          "y2": 0.145
+        }
+      ]
+    },
+    {
+      "caption": "Unreal Mannequin · retargeted",
+      "detail": "19 bones driven · 0 target bones held at bind · 0 non-humanoid joints preserved · root motion scaled ×1.450",
+      "segments": [
+        {
+          "name": "spine_01",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.45,
+          "y2": 1.668
+        },
+        {
+          "name": "spine_02",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.668,
+          "y2": 1.885
+        },
+        {
+          "name": "neck_01",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 1.885,
+          "y2": 2.059
+        },
+        {
+          "name": "head",
+          "side": null,
+          "x1": 0.0,
+          "x2": 0.0,
+          "y1": 2.059,
+          "y2": 2.262
+        },
+        {
+          "name": "clavicle_l",
+          "side": "left",
+          "x1": 0.0,
+          "x2": 0.087,
+          "y1": 1.885,
+          "y2": 2.03
+        },
+        {
+          "name": "upperarm_l",
+          "side": "left",
+          "x1": 0.087,
+          "x2": 0.18,
+          "y1": 2.03,
+          "y2": 1.919
+        },
+        {
+          "name": "lowerarm_l",
+          "side": "left",
+          "x1": 0.18,
+          "x2": 0.556,
+          "y1": 1.919,
+          "y2": 1.952
+        },
+        {
+          "name": "hand_l",
+          "side": "left",
+          "x1": 0.556,
+          "x2": 0.802,
+          "y1": 1.952,
+          "y2": 2.198
+        },
+        {
+          "name": "clavicle_r",
+          "side": "right",
+          "x1": 0.0,
+          "x2": -0.087,
+          "y1": 1.885,
+          "y2": 2.03
+        },
+        {
+          "name": "upperarm_r",
+          "side": "right",
+          "x1": -0.087,
+          "x2": -0.18,
+          "y1": 2.03,
+          "y2": 1.919
+        },
+        {
+          "name": "lowerarm_r",
+          "side": "right",
+          "x1": -0.18,
+          "x2": -0.556,
+          "y1": 1.919,
+          "y2": 1.952
+        },
+        {
+          "name": "hand_r",
+          "side": "right",
+          "x1": -0.556,
+          "x2": -0.802,
+          "y1": 1.952,
+          "y2": 2.198
+        },
+        {
+          "name": "thigh_l",
+          "side": "left",
+          "x1": 0.0,
+          "x2": 0.131,
+          "y1": 1.45,
+          "y2": 1.363
+        },
+        {
+          "name": "calf_l",
+          "side": "left",
+          "x1": 0.131,
+          "x2": 0.131,
+          "y1": 1.363,
+          "y2": 0.754
+        },
+        {
+          "name": "foot_l",
+          "side": "left",
+          "x1": 0.131,
+          "x2": 0.131,
+          "y1": 0.754,
+          "y2": 0.145
+        },
+        {
+          "name": "thigh_r",
+          "side": "right",
+          "x1": 0.0,
+          "x2": -0.131,
+          "y1": 1.45,
+          "y2": 1.363
+        },
+        {
+          "name": "calf_r",
+          "side": "right",
+          "x1": -0.131,
+          "x2": -0.131,
+          "y1": 1.363,
+          "y2": 0.754
+        },
+        {
+          "name": "foot_r",
+          "side": "right",
+          "x1": -0.131,
+          "x2": -0.131,
+          "y1": 0.754,
+          "y2": 0.145
+        }
+      ]
+    }
+  ],
+  "routesAgree": true
+}

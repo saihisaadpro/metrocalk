@@ -2704,6 +2704,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrocalk-character"
+version = "0.1.0"
+dependencies = [
+ "metrocalk-animation",
+ "metrocalk-skeleton",
+ "serde_json",
+]
+
+[[package]]
 name = "metrocalk-conditioning"
 version = "0.1.0"
 dependencies = [
@@ -2899,6 +2908,8 @@ version = "0.1.0"
 dependencies = [
  "glam 0.30.10",
  "metrocalk-gizmo",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

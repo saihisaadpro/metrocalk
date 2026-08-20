@@ -1,0 +1,176 @@
+{
+  "characterization": {
+    "diagnostics": [
+      {
+        "code": "extraBonesKept",
+        "message": "2 joint(s) are outside the humanoid set (twist bones, hair, cape, props)",
+        "remediation": "Nothing to do — they are kept, animated and skinned as authored. Retargeting leaves them exactly as the character's own rig poses them."
+      }
+    ],
+    "evidence": {
+      "chest": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "spine1"
+      },
+      "head": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "head"
+      },
+      "hips": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "hips"
+      },
+      "leftFoot": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "leftfoot"
+      },
+      "leftHand": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "lefthand"
+      },
+      "leftLowerArm": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "leftforearm"
+      },
+      "leftLowerLeg": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "leftleg"
+      },
+      "leftShoulder": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "leftshoulder"
+      },
+      "leftToes": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "lefttoebase"
+      },
+      "leftUpperArm": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "leftarm"
+      },
+      "leftUpperLeg": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "leftupleg"
+      },
+      "neck": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "neck"
+      },
+      "rightFoot": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "rightfoot"
+      },
+      "rightHand": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "righthand"
+      },
+      "rightLowerArm": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "rightforearm"
+      },
+      "rightLowerLeg": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "rightleg"
+      },
+      "rightShoulder": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "rightshoulder"
+      },
+      "rightToes": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "righttoebase"
+      },
+      "rightUpperArm": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "rightarm"
+      },
+      "rightUpperLeg": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "rightupleg"
+      },
+      "spine": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "spine"
+      }
+    },
+    "jointCount": 23,
+    "profile": {
+      "bones": {
+        "chest": 2,
+        "head": 4,
+        "hips": 0,
+        "leftFoot": 15,
+        "leftHand": 8,
+        "leftLowerArm": 7,
+        "leftLowerLeg": 14,
+        "leftShoulder": 5,
+        "leftToes": 16,
+        "leftUpperArm": 6,
+        "leftUpperLeg": 13,
+        "neck": 3,
+        "rightFoot": 19,
+        "rightHand": 12,
+        "rightLowerArm": 11,
+        "rightLowerLeg": 18,
+        "rightShoulder": 9,
+        "rightToes": 20,
+        "rightUpperArm": 10,
+        "rightUpperLeg": 17,
+        "spine": 1
+      },
+      "convention": "mixamo"
+    }
+  },
+  "coverage": 0.38181817531585693,
+  "extraJoints": [
+    21,
+    22
+  ],
+  "jointNames": [
+    "mixamorig:Hips",
+    "mixamorig:Spine",
+    "mixamorig:Spine1",
+    "mixamorig:Neck",
+    "mixamorig:Head",
+    "mixamorig:LeftShoulder",
+    "mixamorig:LeftArm",
+    "mixamorig:LeftForeArm",
+    "mixamorig:LeftHand",
+    "mixamorig:RightShoulder",
+    "mixamorig:RightArm",
+    "mixamorig:RightForeArm",
+    "mixamorig:RightHand",
+    "mixamorig:LeftUpLeg",
+    "mixamorig:LeftLeg",
+    "mixamorig:LeftFoot",
+    "mixamorig:LeftToeBase",
+    "mixamorig:RightUpLeg",
+    "mixamorig:RightLeg",
+    "mixamorig:RightFoot",
+    "mixamorig:RightToeBase",
+    "Tail_01",
+    "Tail_02"
+  ],
+  "retargetable": true
+}

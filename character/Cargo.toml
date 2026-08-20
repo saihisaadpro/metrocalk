@@ -1,0 +1,27 @@
+[package]
+name = "metrocalk-character"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# THE CRATE THAT INTRODUCES THE TWO HALVES. `metrocalk-animation` is a deterministic property-animation
+# kernel that knows nothing about bones (its only address is a 4-part string path); `metrocalk-skeleton`
+# is a posing runtime that cannot sample a clip. Neither should depend on the other — the kernel is
+# deliberately dependency-free so the same validated asset drives editor, runtime, server and wasm, and
+# the skeleton crate is the low-level "what a body is". The bridge belongs ABOVE both, which is here.
+#
+# This is also the home for everything that turns a pose into a *performance* — foot IK and ground
+# adaptation, look-at, twist distribution, spring bones — each of which needs the clip side and the
+# skeleton side in the same room.
+[dependencies]
+metrocalk-animation = { path = "../animation" }
+metrocalk-skeleton = { path = "../skeleton" }
+
+[dev-dependencies]
+# The editor's pose preview is drawn from REAL sampler output — `pose_preview_fixture.rs` emits it and
+# fails if the committed JSON and the live computation ever disagree.
+serde_json = "1"

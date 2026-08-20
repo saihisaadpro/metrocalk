@@ -22,3 +22,12 @@ glam = "0.30"
 # The shared plain-array math types (Transform/Mat4/Vec3/Quat + mat_mul) — a bone's local TRS IS a gizmo
 # Transform, so a posed bone (G1 gizmo) and a pose bundle (G2 override) reuse one type, no conversion.
 metrocalk-gizmo = { path = "../gizmo" }
+# A characterization is a DOCUMENT — it is inferred once at import, stored with the character, shown in
+# the rig panel and read by the editor over the transport. Serde is what makes it one artifact rather
+# than a value that has to be restated in every layer that touches it (the drift this repo gates for).
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# The rig panel's fixture is the REAL serialized output, not a hand-written mock — `rig_contract.rs`
+# pins the committed JSON against what this crate actually produces, so the two cannot drift apart.
+serde_json = "1"

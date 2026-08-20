@@ -340,9 +340,16 @@ fn build_skeleton(doc: &Gltf, skin: &gltf::Skin, blob: &[u8]) -> (Skeleton, Vec<
     for (new_idx, &old) in order.iter().enumerate() {
         remap[old] = new_idx;
     }
+    // THE JOINT'S OWN NAME, KEPT. glTF nodes carry names and the `names` feature is on, so this costs
+    // one call — and without it a `Skeleton` is an anonymous index array that nothing can say anything
+    // about: not which joint is the left forearm, not whether a clip authored against another rig
+    // applies. Every humanoid characterization (`metrocalk_skeleton::characterize`) and therefore all
+    // retargeting rests on this string. A node with no name keeps the empty string, which the matcher
+    // skips rather than guessing about.
     let joints: Vec<Joint> = order
         .iter()
         .map(|&old| Joint {
+            name: joint_nodes[old].name().unwrap_or_default().to_string(),
             parent: parent_slot[old].map(|p| remap[p]),
             local_bind: locals[old],
             inverse_bind: ibms[old],

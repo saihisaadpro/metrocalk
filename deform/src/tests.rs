@@ -387,11 +387,13 @@ fn ribbon_and_skeleton() -> (DeformMesh, metrocalk_skeleton::Skeleton, [(Vec3, V
     let mut skel = Skeleton {
         joints: vec![
             Joint {
+                name: "root".into(),
                 parent: None,
                 local_bind: tf([1.0, 0.0, 0.0]), // root at the bottom-center
                 inverse_bind: [[0.0; 4]; 4],
             },
             Joint {
+                name: "child".into(),
                 parent: Some(0),
                 local_bind: tf([0.0, 5.0, 0.0]), // child 5 up → global (1,5,0)
                 inverse_bind: [[0.0; 4]; 4],

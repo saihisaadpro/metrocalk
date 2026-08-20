@@ -30,7 +30,11 @@
     clippy::module_name_repetitions
 )]
 
+pub mod characterize;
+pub mod humanoid;
 pub mod ik;
+pub mod pose_ops;
+pub mod retarget;
 
 use glam::{Mat3, Mat4 as GMat4, Quat as GQuat, Vec3 as GVec3, Vec4 as GVec4};
 pub use metrocalk_gizmo::{mat_mul, Mat4, Quat, Transform, Vec3};
@@ -51,6 +55,16 @@ pub(crate) fn unm(m: GMat4) -> Mat4 {
 /// its `inverseBindMatrix` (from glTF — maps a vertex from mesh space into this joint's local space at bind).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Joint {
+    /// The joint's **own name**, as the source file spelled it (`mixamorig:LeftForeArm`, `lowerarm_l`).
+    ///
+    /// THE JOIN KEY, AND WHY IT IS ON THE JOINT. Without it a `Skeleton` is an anonymous array of
+    /// indices, and nothing can be said about it: not which bone is the left forearm, not whether two
+    /// rigs are the same rig, not whether a clip authored elsewhere applies. This crate's own
+    /// [`humanoid`]/[`characterize`]/[`retarget`] chain rests entirely on it, and so does the ability to
+    /// join a mesh-side skeleton to a clip-side skeleton signature. Empty is allowed (a procedurally
+    /// built rig has no source names) and simply means "unnamed" — matching skips it rather than
+    /// guessing.
+    pub name: String,
     /// Parent joint index. **Must be `< self` (topological order, parent before child)** — the importer
     /// topo-sorts to guarantee this, so FK is a single forward pass.
     pub parent: Option<usize>,

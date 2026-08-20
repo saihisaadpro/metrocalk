@@ -2,7 +2,7 @@
 # excluded (see below). Build everything: `cargo build` · test: `cargo test` · lint: `cargo clippy`.
 [workspace]
 resolver = "2"
-members = ["core", "ecs", "transport", "plugins", "assets", "conditioning", "xatlas-bridge", "economy", "physics", "interchange", "spatial", "gizmo", "skeleton", "animation", "gameplay", "match-server", "deform", "dst", "csg", "sdf", "constraint", "hotpatch", "ivm", "authoring", "efficiency", "lattice", "terrain", "editor-shell", "mcp", "tools/scene-bench", "tools/query-gate"]
+members = ["core", "ecs", "transport", "plugins", "assets", "conditioning", "xatlas-bridge", "economy", "physics", "interchange", "spatial", "gizmo", "skeleton", "animation", "character", "gameplay", "match-server", "deform", "dst", "csg", "sdf", "constraint", "hotpatch", "ivm", "authoring", "efficiency", "lattice", "terrain", "editor-shell", "mcp", "tools/scene-bench", "tools/query-gate"]
 
 # Spikes are M0 throwaways: heavy/independent deps, their own pinned lockfiles, and they use
 # `unsafe` (peak-RSS counters) which this workspace forbids. Excluding them keeps the workspace the

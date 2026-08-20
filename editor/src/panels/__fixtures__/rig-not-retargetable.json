@@ -1,0 +1,59 @@
+{
+  "characterization": {
+    "diagnostics": [
+      {
+        "code": "missingRequiredBone",
+        "message": "12 required bone(s) could not be identified: Left Upper Leg, Left Lower Leg, Left Foot, Right Upper Leg, Right Lower Leg, Right Foot, Left Upper Arm, Left Lower Arm, Left Hand, Right Upper Arm, Right Lower Arm, Right Hand",
+        "remediation": "Assign each one in the rig panel — pick the joint from the skeleton tree. Animation can be retargeted onto this character as soon as all 15 required bones are set."
+      }
+    ],
+    "evidence": {
+      "chest": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "spine1"
+      },
+      "head": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "head"
+      },
+      "hips": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "hips"
+      },
+      "neck": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "neck"
+      },
+      "spine": {
+        "convention": "mixamo",
+        "kind": "nameMatch",
+        "matched": "spine"
+      }
+    },
+    "jointCount": 5,
+    "profile": {
+      "bones": {
+        "chest": 2,
+        "head": 4,
+        "hips": 0,
+        "neck": 3,
+        "spine": 1
+      },
+      "convention": "mixamo"
+    }
+  },
+  "coverage": 0.09090909361839294,
+  "extraJoints": [],
+  "jointNames": [
+    "mixamorig:Hips",
+    "mixamorig:Spine",
+    "mixamorig:Spine1",
+    "mixamorig:Neck",
+    "mixamorig:Head"
+  ],
+  "retargetable": false
+}
