@@ -112,10 +112,13 @@ pub use bridge::{
     ProjectionDelta, ProjectionOp, RelSummary,
 };
 pub use cad_import::{
-    bake_basis_into_mesh, basis_is_rigid, cad_z_up_to_editor_mesh, cad_z_up_to_editor_transform,
-    changed_count, import_cad, is_cad_file, land_import, load_persisted_cad_meshes,
+    active_cad_source_members, active_cad_source_roots, bake_basis_into_mesh, basis_is_rigid,
+    cad_source_content_hash, cad_source_owner_ops, cad_source_root_ops, cad_source_selection,
+    cad_source_selection_op, cad_z_up_to_editor_mesh, cad_z_up_to_editor_transform, changed_count,
+    import_cad, is_cad_file, land_import, land_import_from_source, load_persisted_cad_meshes,
     load_persisted_cad_meshes_for, persist_cad_mesh, read_cad, read_cad_with_companion,
-    reimport_diff, CadImportError, CadLanding, CAD_PART,
+    reimport_diff, CadImportError, CadLanding, CadSourceIdentity, CAD_IMPORT_OWNER,
+    CAD_IMPORT_SOURCE, CAD_PART,
 };
 pub use cad_intent::{import_step, StepImport};
 pub use capscene::{

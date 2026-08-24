@@ -402,6 +402,23 @@ jobs:
           node scripts/check-palette-contrast.mjs --self-test
           node scripts/check-palette-contrast.mjs
 
+      # The third Node-built-ins-only gate, and the one that answers a question the other two cannot ask.
+      # `check-bundle.mjs` measures SIZE, and size is one-directional: every surface is cheaper absent, so
+      # a budget that only says "smaller" is satisfied most completely by an editor that ships nothing and
+      # fetches everything. Followed exactly, it produced exactly that — the first-run card and the OS-drop
+      # listener were both moved behind `React.lazy` with a `fallback={null}` in a split pass that took the
+      # entry chunk from 287,644 to 230,618 bytes and was, by the only written rule, a success. The drop
+      # listener IS that component's mount effect, so a file dropped before the chunk resolved was gone
+      # with no error; the first-run card simply arrived late, worst on the machines principle 3 targets.
+      # No number can tell those apart from a panel that is fine to fetch on click, so the rule is declared
+      # (`scripts/first-paint.json`, with the reason in prose) and this checks the declaration against the
+      # real static import graph, in both directions. Self-test first, per the convention above.
+      - name: first paint — the surfaces that must already be there, and the ones that must not
+        working-directory: editor
+        run: |
+          node scripts/check-first-paint.mjs --self-test
+          node scripts/check-first-paint.mjs
+
       - name: Install (frozen lockfile)
         working-directory: editor
         run: pnpm install --frozen-lockfile
@@ -443,6 +460,23 @@ jobs:
       - name: panel shots — every scene mounts, logs no error, produces pixels, and holds its layout
         working-directory: editor
         run: pnpm shots --out "$RUNNER_TEMP/shots"
+
+      # THE BUNDLE BUDGET, WHICH UNTIL NOW NO JOB HAS EVER RUN. `check-bundle.mjs` and its five ceilings
+      # were written, committed, wired into `npm run build:verify` — and `build:verify` appears in no
+      # workflow, so the gate had never executed anywhere. Measured against HEAD on 2026-08-23, THREE of
+      # its five budgets were red (entry 287,644 > 256,000 · initial 482,196 > 425,984 · total 1,273,275 >
+      # 1,177,600). This is `<test_and_ci_discipline>` 1 exactly: a gate no job runs is not a safety net,
+      # it is a file — and this one had been silently red for long enough that the numbers in it had
+      # stopped describing anything. They are a measured ratchet now (budget schemaVersion 2), which is
+      # only meaningful because this step exists to enforce it.
+      #
+      # It runs the production `vite build`, so it goes after the install, and it is the last step because
+      # it is the slowest. It also writes `dist/bundle-report.json` — the per-chunk evidence the ADR cites.
+      - name: production bundle budget — build, then measure every ceiling
+        working-directory: editor
+        run: |
+          pnpm exec vite build
+          node scripts/check-bundle.mjs
 
       # Kept on failure only: the point of the job is the pass/fail, and an artifact nobody looks at on a
       # green run is storage. On a red run the pixels are the whole diagnosis.

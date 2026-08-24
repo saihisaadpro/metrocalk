@@ -736,11 +736,22 @@ pub fn tessellate_faces(faces: &[crate::step::CadFace]) -> TriMesh {
             *c *= inv;
         }
         let out_dir = [fc[0] - sc[0], fc[1] - sc[1], fc[2] - sc[2]];
-        let i0 = vid(face.outer[0], &mut positions);
-        for w in 1..face.outer.len() - 1 {
-            let ia = vid(face.outer[w], &mut positions);
-            let ib = vid(face.outer[w + 1], &mut positions);
-            push_outward(&positions, &mut triangles, [i0, ia, ib], out_dir);
+        if face.inner.is_empty() {
+            let i0 = vid(face.outer[0], &mut positions);
+            for w in 1..face.outer.len() - 1 {
+                let ia = vid(face.outer[w], &mut positions);
+                let ib = vid(face.outer[w + 1], &mut positions);
+                push_outward(&positions, &mut triangles, [i0, ia, ib], out_dir);
+            }
+        } else if let Ok(face_triangles) = crate::step::triangulate_planar_face(face) {
+            for [a, b, c] in face_triangles {
+                let tri = [
+                    vid(a, &mut positions),
+                    vid(b, &mut positions),
+                    vid(c, &mut positions),
+                ];
+                push_outward(&positions, &mut triangles, tri, out_dir);
+            }
         }
     }
     TriMesh::new(positions, triangles)
@@ -1012,8 +1023,10 @@ impl CadReader for StepAssemblyReader {
         // AP242 part (the M15.5 exact/PMI leg) has the standard PRODUCT_DEFINITION/SDR structure too, and
         // must NOT be hijacked into a "tessellation-only" diagnosis — it takes leg (B) below (exact faces,
         // exact fidelity, PMI, interpret()'s notes).
-        let tess = crate::step::parse_tessellated_assembly(&entities);
-        let (brep, brep_notes, brep_faces, groups) = crate::step::parse_brep_assembly(&entities);
+        let (tess, mut groups) = crate::step::parse_tessellated_assembly(&entities);
+        let (brep, brep_notes, brep_faces, brep_groups) =
+            crate::step::parse_brep_assembly(&entities);
+        groups.extend(brep_groups);
         let is_assembly = crate::step::has_nauo(&entities);
         if !tess.is_empty() || (is_assembly && !brep.is_empty()) {
             let name =

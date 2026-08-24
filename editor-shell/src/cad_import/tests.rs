@@ -4,7 +4,7 @@
 use super::*;
 use crate::capscene::{CapResolver, CapScene};
 use metrocalk_assets::AssetStore;
-use metrocalk_core::{Engine, FieldValue};
+use metrocalk_core::{Engine, FieldValue, Op};
 use metrocalk_ecs::FlecsWorld;
 use metrocalk_interchange::{
     build_import, CadInterchange, GroupNode, PartSource, RawPart, StepInterchange, Units,
@@ -108,7 +108,14 @@ fn a_cad_import_lands_as_one_undoable_transaction_of_queryable_deduped_entities(
 
     // One entity per part.
     assert_eq!(landing.entities.len(), 3);
-    assert_eq!(engine.entity_count(), 3, "3 part entities");
+    assert_eq!(engine.entity_count(), 4, "source wrapper + 3 part entities");
+    assert!(engine
+        .components_of(landing.root_entity)
+        .contains_key(CAD_IMPORT_SOURCE));
+    assert!(landing
+        .entities
+        .iter()
+        .all(|entity| engine.parent_of(*entity) == Some(landing.root_entity)));
 
     // DEDUP: two identical bolts share one stored mesh; the proxy is a second → 2 unique meshes for 3 parts.
     assert_eq!(landing.unique_meshes, 2, "bolt mesh + proxy box = 2 unique");
@@ -223,7 +230,11 @@ fn a_cad_import_preserves_the_source_hierarchy_as_named_group_folders() {
     );
     let landing = land_import(&mut engine, &scene, &mut store, report).expect("land");
     assert_eq!(landing.group_entities.len(), 2);
-    assert_eq!(engine.entity_count(), 3, "2 group folders + 1 part");
+    assert_eq!(
+        engine.entity_count(),
+        4,
+        "source wrapper + 2 group folders + 1 part"
+    );
     let (line, cell) = (landing.group_entities[0], landing.group_entities[1]);
     let meta = metrocalk_core::variant::INSTANCE_META;
     assert_eq!(
@@ -238,10 +249,191 @@ fn a_cad_import_preserves_the_source_hierarchy_as_named_group_folders() {
     // The source nesting survives: gun › cell › line.
     assert_eq!(engine.parent_of(landing.entities[0]), Some(cell));
     assert_eq!(engine.parent_of(cell), Some(line));
-    assert_eq!(engine.parent_of(line), None);
+    assert_eq!(engine.parent_of(line), Some(landing.root_entity));
+    assert_eq!(engine.parent_of(landing.root_entity), None);
     // Still ONE undoable transaction — the tree peels with the parts.
     assert!(engine.undo());
     assert_eq!(engine.entity_count(), 0);
+}
+
+fn source(key: &str, hash: u64) -> CadSourceIdentity {
+    CadSourceIdentity {
+        key: key.into(),
+        path: format!("X:/fixtures/{key}.step"),
+        format: "STEP-AP242".into(),
+        content_hash: hash,
+    }
+}
+
+fn grouped_import(hash: u64) -> CadImport {
+    let mut report = mixed_import();
+    report.source_hash = hash;
+    report.groups = vec![GroupNode {
+        id: 900,
+        name: "Factory Cell".into(),
+        parent: None,
+    }];
+    for part in &mut report.parts {
+        part.parent = Some(900);
+    }
+    report
+}
+
+#[test]
+fn source_wrappers_keep_independent_cad_imports_coexisting_in_one_hierarchy() {
+    let (mut engine, scene) = engine();
+    let mut store = AssetStore::new();
+    let a = land_import_from_source(
+        &mut engine,
+        &scene,
+        &mut store,
+        source("source-a", 0xa1),
+        grouped_import(0xa1),
+    )
+    .expect("land A");
+    let b = land_import_from_source(
+        &mut engine,
+        &scene,
+        &mut store,
+        source("source-b", 0xb1),
+        grouped_import(0xb1),
+    )
+    .expect("land B");
+
+    assert_ne!(a.root_entity, b.root_entity);
+    assert_eq!(active_cad_source_roots(&engine, "source-a"), [a.root_entity]);
+    assert_eq!(active_cad_source_roots(&engine, "source-b"), [b.root_entity]);
+    assert_eq!(engine.parent_of(a.group_entities[0]), Some(a.root_entity));
+    assert_eq!(engine.parent_of(b.group_entities[0]), Some(b.root_entity));
+    assert!(a
+        .entities
+        .iter()
+        .all(|part| engine.parent_of(*part) == Some(a.group_entities[0])));
+    assert!(b
+        .entities
+        .iter()
+        .all(|part| engine.parent_of(*part) == Some(b.group_entities[0])));
+    assert!(active_cad_source_members(&engine, "source-a")
+        .iter()
+        .all(|entity| !active_cad_source_members(&engine, "source-b").contains(entity)));
+}
+
+#[test]
+fn identical_same_source_import_is_an_idempotent_noop() {
+    let (mut engine, scene) = engine();
+    let mut store = AssetStore::new();
+    let first = land_import_from_source(
+        &mut engine,
+        &scene,
+        &mut store,
+        source("same-source", 0xc1),
+        grouped_import(0xc1),
+    )
+    .expect("first land");
+    let count = engine.entity_count();
+    let active_before = active_cad_source_members(&engine, "same-source");
+
+    let again = land_import_from_source(
+        &mut engine,
+        &scene,
+        &mut store,
+        source("same-source", 0xc1),
+        grouped_import(0xc1),
+    )
+    .expect("idempotent re-drop");
+
+    assert_eq!(engine.entity_count(), count, "no duplicate hierarchy was authored");
+    assert_eq!(again.root_entity, first.root_entity);
+    assert_eq!(again.entities, first.entities);
+    assert_eq!(again.group_entities, first.group_entities);
+    assert_eq!(
+        active_cad_source_members(&engine, "same-source"),
+        active_before
+    );
+    assert_eq!(
+        cad_source_selection(&engine, again.root_entity),
+        first.group_entities[0],
+        "selection remains the same source hierarchy node"
+    );
+}
+
+#[test]
+fn changed_reimport_retires_only_same_source_and_preserves_unrelated_and_legacy_cad() {
+    let (mut engine, scene) = engine();
+    let mut store = AssetStore::new();
+    let old_a = land_import_from_source(
+        &mut engine,
+        &scene,
+        &mut store,
+        source("source-a", 0xd1),
+        grouped_import(0xd1),
+    )
+    .expect("land old A");
+    let b = land_import_from_source(
+        &mut engine,
+        &scene,
+        &mut store,
+        source("source-b", 0xe1),
+        grouped_import(0xe1),
+    )
+    .expect("land B");
+    let old_a_members = active_cad_source_members(&engine, "source-a");
+    let b_members = active_cad_source_members(&engine, "source-b");
+
+    // A pre-wrapper persisted part: it is CAD, but has no source owner and must never be guessed into scope.
+    let legacy = engine.alloc_entity_id();
+    engine
+        .commit(
+            "legacy-cad",
+            vec![
+                Op::CreateEntity {
+                    id: legacy,
+                    parent: None,
+                },
+                Op::SetField {
+                    entity: legacy,
+                    component: CAD_PART.into(),
+                    field: "fidelity".into(),
+                    value: FieldValue::Str("exact-brep".into()),
+                },
+            ],
+        )
+        .expect("seed legacy CAD");
+
+    let new_a = land_import_from_source(
+        &mut engine,
+        &scene,
+        &mut store,
+        source("source-a", 0xd2),
+        grouped_import(0xd2),
+    )
+    .expect("replace A");
+
+    assert_ne!(new_a.root_entity, old_a.root_entity);
+    assert!(old_a_members.iter().all(|entity| !engine.is_active(*entity)));
+    assert!(b_members.iter().all(|entity| engine.is_active(*entity)));
+    assert!(engine.is_active(legacy), "legacy unscoped CAD is untouched");
+    assert_eq!(active_cad_source_roots(&engine, "source-a"), [new_a.root_entity]);
+    assert_eq!(active_cad_source_roots(&engine, "source-b"), [b.root_entity]);
+    assert_eq!(engine.parent_of(new_a.group_entities[0]), Some(new_a.root_entity));
+
+    let active_report_parts = engine
+        .entity_ids()
+        .into_iter()
+        .filter(|entity| engine.is_active(*entity))
+        .filter(|entity| engine.components_of(*entity).contains_key(CAD_PART))
+        .count();
+    assert_eq!(
+        active_report_parts,
+        new_a.entities.len() + b.entities.len() + 1,
+        "inactive old A parts do not leak into an ECS-native report"
+    );
+    assert!(old_a
+        .group_entities
+        .iter()
+        .all(|group| !engine.is_active(*group)),
+        "old assembly folders retire with their source"
+    );
 }
 
 #[test]

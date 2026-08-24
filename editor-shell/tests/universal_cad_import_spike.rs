@@ -80,7 +80,11 @@ fn step_ap242_imports_never_empty_never_silent_exact_and_lands_undoable() {
     // Lands as ONE undoable transaction of queryable entities.
     assert_eq!(engine.entity_count(), 0);
     let landing = import_cad(&mut engine, &scene, &mut store, CUBE_STEP.as_bytes()).expect("land");
-    assert_eq!(engine.entity_count(), 1, "one part entity");
+    assert_eq!(
+        engine.entity_count(),
+        2,
+        "one explicit source wrapper + one part entity"
+    );
     assert_eq!(
         engine.get_field(landing.entities[0], CAD_PART, "fidelity"),
         Some(FieldValue::Str("exact-brep".into()))
@@ -199,8 +203,8 @@ fn real_catia_3dxml_beats_the_documented_unreal_failure() {
     // group-folder entities (hierarchy preserved, never flattened).
     assert_eq!(
         engine.entity_count(),
-        report.part_count() + report.groups.len(),
-        "every part is a queryable entity + the named group folders"
+        1 + report.part_count() + report.groups.len(),
+        "one source wrapper + every queryable part + the named group folders"
     );
     assert_eq!(landing.group_entities.len(), report.groups.len());
     assert!(

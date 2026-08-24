@@ -490,16 +490,16 @@ FILE_NAME('tess','',(''),(''),'','','');\nFILE_SCHEMA(('AP242'));\nENDSEC;\nDATA
 #23=AXIS2_PLACEMENT_3D('',#22,#20,#21);\n\
 #30=CARTESIAN_POINT('',(0.,0.,10.));\n\
 #31=AXIS2_PLACEMENT_3D('',#30,#20,#21);\n\
-#100=(GEOMETRIC_REPRESENTATION_ITEM()REPOSITIONED_TESSELLATED_ITEM(#23)REPRESENTATION_ITEM('')\
+#100=(GEOMETRIC_REPRESENTATION_ITEM()REPOSITIONED_TESSELLATED_ITEM(#23)REPRESENTATION_ITEM('Inner cell')\
 TESSELLATED_GEOMETRIC_SET((#10))TESSELLATED_ITEM());\n\
-#200=(GEOMETRIC_REPRESENTATION_ITEM()REPOSITIONED_TESSELLATED_ITEM(#31)REPRESENTATION_ITEM('')\
+#200=(GEOMETRIC_REPRESENTATION_ITEM()REPOSITIONED_TESSELLATED_ITEM(#31)REPRESENTATION_ITEM('Factory root')\
 TESSELLATED_GEOMETRIC_SET((#100))TESSELLATED_ITEM());\n\
 ENDSEC;\nEND-ISO-10303-21;\n";
 
 #[test]
 fn tessellated_assembly_places_leaf_at_composed_reposition() {
     let entities = crate::step::parse_entities(TESS_STEP).unwrap();
-    let parts = crate::step::parse_tessellated_assembly(&entities);
+    let (parts, groups) = crate::step::parse_tessellated_assembly(&entities);
     assert_eq!(
         parts.len(),
         1,
@@ -521,6 +521,37 @@ fn tessellated_assembly_places_leaf_at_composed_reposition() {
         p.reference, "10",
         "reference keyed on the solid id (dedup key)"
     );
+    assert_eq!(
+        groups.len(),
+        2,
+        "both nested tessellation containers survive"
+    );
+    let leaf_parent = p
+        .parent
+        .expect("the leaf is parented to its containing set");
+    let inner_group = groups
+        .iter()
+        .find(|group| group.id == leaf_parent)
+        .expect("leaf parent resolves to a real structural group");
+    let root_group = groups
+        .iter()
+        .find(|group| Some(group.id) == inner_group.parent)
+        .expect("the inner set resolves to the outer structural group");
+    assert_eq!(inner_group.name, "Inner cell", "authored set name survives");
+    assert_eq!(
+        root_group.name, "Factory root",
+        "authored root name survives"
+    );
+    assert_eq!(root_group.parent, None, "the outer set is the tree root");
+
+    // The end-to-end reader must carry the exact same structural nodes into CadImport; a non-null dangling
+    // parent would be just as corrupt as the old flat `None`.
+    let import = StepAssemblyReader
+        .read(TESS_STEP.as_bytes())
+        .expect("tessellated assembly import");
+    assert_eq!(import.groups, groups);
+    assert_eq!(import.parts[0].parent, Some(inner_group.id));
+    assert_eq!(import.structural_nodes, 2);
 }
 
 #[test]
@@ -528,7 +559,9 @@ fn no_tessellation_falls_through_to_the_planar_interpreter() {
     // A file with zero tessellation → parse_tessellated_assembly is empty so the reader takes the B-rep leg.
     let entities = crate::step::parse_entities(CUBE_STEP).unwrap();
     assert!(
-        crate::step::parse_tessellated_assembly(&entities).is_empty(),
+        crate::step::parse_tessellated_assembly(&entities)
+            .0
+            .is_empty(),
         "no TESSELLATED_* entities → empty, so StepAssemblyReader falls back to the planar interpret path"
     );
 }
@@ -548,7 +581,7 @@ ENDSEC;\nEND-ISO-10303-21;\n";
 #[test]
 fn complex_triangulated_face_fans_use_fan_topology_not_strip() {
     let entities = crate::step::parse_entities(FAN_STEP).unwrap();
-    let parts = crate::step::parse_tessellated_assembly(&entities);
+    let (parts, _) = crate::step::parse_tessellated_assembly(&entities);
     assert_eq!(
         parts.len(),
         1,
@@ -571,7 +604,7 @@ ENDSEC;\nEND-ISO-10303-21;\n";
 #[test]
 fn a_leaf_with_no_decodable_geometry_is_reported_not_silently_dropped() {
     let entities = crate::step::parse_entities(EMPTY_LEAF_STEP).unwrap();
-    let parts = crate::step::parse_tessellated_assembly(&entities);
+    let (parts, _) = crate::step::parse_tessellated_assembly(&entities);
     assert_eq!(
         parts.len(),
         1,

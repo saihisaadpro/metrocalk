@@ -38,7 +38,7 @@ pub const MAX_ENTITIES: usize = 30_000_000;
 /// referenceable face whose exact tessellation is the OCCT seam (an explained note is emitted).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FaceKind {
-    /// A `PLANE` surface — tessellated exactly (fan-triangulated) by this crate.
+    /// A `PLANE` surface — tessellated exactly by this crate, including constrained inner bounds (holes).
     Planar,
     /// A curved / freeform surface (`CYLINDRICAL_SURFACE`, `B_SPLINE_SURFACE`, …) — referenced but NOT
     /// tessellated here; the exact tessellation is the OCCT native/server seam.
@@ -65,7 +65,7 @@ pub struct CadFace {
     /// The outer-boundary polygon, ordered (world coordinates).
     pub outer: Vec<[f64; 3]>,
     /// The INNER boundary polygons (hole rims / trim islands — the non-outer `FACE_BOUND` loops), ordered.
-    /// Tessellation still trims by `outer` only (the declared subset); recognition (M15.11) reads these.
+    /// Planar tessellation treats these as constrained holes; recognition (M15.11) also reads them.
     pub inner: Vec<Vec<[f64; 3]>>,
     /// The face's referenceable edges — from **every** bound (outer + inner), so shared `EDGE_CURVE` ids
     /// give full face adjacency (a bore rim on a plate's inner loop links the bore to the plate).
@@ -159,10 +159,11 @@ impl CadScene {
     }
 
     /// Tessellate the **planar** faces into a single welded [`TriMesh`] for wgpu. Vertices are welded by
-    /// exact coordinate (shared corners are shared) so a closed solid tessellates **watertight**; each
-    /// triangle is oriented outward via the convex-solid centroid (correct for the spike; the general
-    /// non-convex case uses the parsed surface normal + `same_sense` — a named refinement). Curved faces
-    /// are skipped here (their tessellation is the OCCT seam).
+    /// exact coordinate (shared corners are shared) so a closed solid tessellates **watertight**; inner
+    /// bounds are constrained holes rather than silently filled. Each triangle is oriented outward via the
+    /// convex-solid centroid (correct for the spike; the general non-convex case uses the parsed surface
+    /// normal + `same_sense` — a named refinement). Curved faces are skipped here (their tessellation is the
+    /// OCCT seam).
     #[must_use]
     pub fn tessellate(&self) -> TriMesh {
         self.tessellate_with(crate::analytic::DEFLECTION)
@@ -259,16 +260,356 @@ impl CadScene {
                 }
                 let out_dir = [fc[0] - sc[0], fc[1] - sc[1], fc[2] - sc[2]];
 
-                // Fan-triangulate the polygon around vertex 0, oriented outward.
-                let i0 = vid(face.outer[0], &mut positions);
-                for w in 1..face.outer.len() - 1 {
-                    let ia = vid(face.outer[w], &mut positions);
-                    let ib = vid(face.outer[w + 1], &mut positions);
-                    push_outward(&positions, &mut triangles, [i0, ia, ib], out_dir);
+                if face.inner.is_empty() {
+                    // Keep the established deterministic fan for the simple convex planar subset. Hole faces
+                    // take the constrained path below; never fall back to this fan because that would cap the
+                    // opening with plausible-looking but corrupt geometry.
+                    let i0 = vid(face.outer[0], &mut positions);
+                    for w in 1..face.outer.len() - 1 {
+                        let ia = vid(face.outer[w], &mut positions);
+                        let ib = vid(face.outer[w + 1], &mut positions);
+                        push_outward(&positions, &mut triangles, [i0, ia, ib], out_dir);
+                    }
+                } else if let Ok(face_triangles) = triangulate_planar_face(face) {
+                    for [a, b, c] in face_triangles {
+                        let tri = [
+                            vid(a, &mut positions),
+                            vid(b, &mut positions),
+                            vid(c, &mut positions),
+                        ];
+                        push_outward(&positions, &mut triangles, tri, out_dir);
+                    }
                 }
             }
         }
         TriMesh::new(positions, triangles)
+    }
+}
+
+/// A projected vertex retains the exact authored 3D point while `spade` operates only on its stable 2D
+/// projection. The constrained triangulation therefore never synthesizes or perturbs a CAD vertex.
+#[derive(Clone, Copy, Debug)]
+struct ProjectedPlanarVertex {
+    point: spade::Point2<f64>,
+    source: [f64; 3],
+}
+
+impl spade::HasPosition for ProjectedPlanarVertex {
+    type Scalar = f64;
+
+    fn position(&self) -> spade::Point2<Self::Scalar> {
+        self.point
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopLocation {
+    Outside,
+    Inside,
+    Boundary,
+}
+
+/// Triangulate one planar face with inner bounds using an exact-predicate constrained Delaunay
+/// triangulation. Every boundary segment is installed as a constraint and the resulting area is checked
+/// against `outer - holes`. Malformed/self-intersecting/off-plane bounds return an error: callers must skip
+/// the whole face, never fall back to outer-only triangulation (which would silently fill every hole).
+#[allow(clippy::too_many_lines)] // validation + constrained triangulation are one atomic no-corruption gate
+pub(crate) fn triangulate_planar_face(face: &CadFace) -> Result<Vec<[[f64; 3]; 3]>, String> {
+    use spade::{ConstrainedDelaunayTriangulation, Triangulation};
+
+    if face.kind != FaceKind::Planar {
+        return Err("the constrained planar tessellator received a non-planar face".into());
+    }
+
+    let mut loops = Vec::with_capacity(face.inner.len() + 1);
+    loops.push(clean_planar_loop(&face.outer));
+    loops.extend(face.inner.iter().map(|bound| clean_planar_loop(bound)));
+    if loops[0].len() < 3 {
+        return Err("outer bound has fewer than three distinct vertices".into());
+    }
+    if let Some((index, _)) = loops
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, bound)| bound.len() < 3)
+    {
+        return Err(format!(
+            "inner bound {index} has fewer than three distinct vertices"
+        ));
+    }
+    if loops
+        .iter()
+        .flatten()
+        .flatten()
+        .any(|coordinate| !coordinate.is_finite())
+    {
+        return Err("a planar bound contains a non-finite coordinate".into());
+    }
+
+    // A translation-relative polygon normal avoids the cancellation a factory-scale world offset would
+    // cause. Dropping its dominant axis maximizes the projected area and keeps the 2D predicate well posed.
+    let origin = loops[0][0];
+    let mut normal = [0.0; 3];
+    for index in 1..loops[0].len() - 1 {
+        let a = sub(loops[0][index], origin);
+        let b = sub(loops[0][index + 1], origin);
+        let n = cross(a, b);
+        for axis in 0..3 {
+            normal[axis] += n[axis];
+        }
+    }
+    let normal_length = dot(normal, normal).sqrt();
+    if !normal_length.is_finite() || normal_length == 0.0 {
+        return Err("outer bound is degenerate and has no stable plane".into());
+    }
+    let drop_axis = (0..3)
+        .max_by(|&left, &right| normal[left].abs().total_cmp(&normal[right].abs()))
+        .unwrap_or(2);
+    let project = |point: [f64; 3]| {
+        spade::Point2::new(point[(drop_axis + 1) % 3], point[(drop_axis + 2) % 3])
+    };
+
+    // A PLANE face should be coplanar, but a damaged export can disagree with its topology. Refuse to turn
+    // that disagreement into folded triangles. The scale-relative tolerance is below normal CAD modelling
+    // tolerances while remaining stable for large industrial coordinates.
+    let mut lo = origin;
+    let mut hi = origin;
+    for point in loops.iter().flatten() {
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(point[axis]);
+            hi[axis] = hi[axis].max(point[axis]);
+        }
+    }
+    let extent = (0..3).map(|axis| hi[axis] - lo[axis]).fold(0.0, f64::max);
+    let plane_tolerance = extent.max(1.0) * 1.0e-8;
+    let unit_normal = scale3(normal, 1.0 / normal_length);
+    if loops
+        .iter()
+        .flatten()
+        .any(|point| dot(sub(*point, origin), unit_normal).abs() > plane_tolerance)
+    {
+        return Err(format!(
+            "a bound is off the face plane by more than {plane_tolerance:e} scene units"
+        ));
+    }
+
+    let projected: Vec<Vec<spade::Point2<f64>>> = loops
+        .iter()
+        .map(|bound| bound.iter().copied().map(project).collect())
+        .collect();
+    let projected_extent = projected.iter().flatten().fold(
+        [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ],
+        |mut bounds, p| {
+            bounds[0] = bounds[0].min(p.x);
+            bounds[1] = bounds[1].min(p.y);
+            bounds[2] = bounds[2].max(p.x);
+            bounds[3] = bounds[3].max(p.y);
+            bounds
+        },
+    );
+    let projected_scale = (projected_extent[2] - projected_extent[0])
+        .max(projected_extent[3] - projected_extent[1])
+        .max(1.0);
+    let area_tolerance = f64::EPSILON * 256.0 * projected_scale * projected_scale;
+    let outer_area = loop_area_twice(&projected[0]).abs();
+    if !outer_area.is_finite() || outer_area <= area_tolerance {
+        return Err("outer bound has zero or numerically unstable projected area".into());
+    }
+    for (index, hole) in projected.iter().enumerate().skip(1) {
+        let area = loop_area_twice(hole).abs();
+        if !area.is_finite() || area <= area_tolerance {
+            return Err(format!(
+                "inner bound {index} has zero or numerically unstable projected area"
+            ));
+        }
+        if hole
+            .iter()
+            .any(|point| point_in_loop(*point, &projected[0]) != LoopLocation::Inside)
+        {
+            return Err(format!(
+                "inner bound {index} is not strictly inside the outer bound"
+            ));
+        }
+    }
+    // Nested/touching hole loops are not a valid set of FACE_BOUND holes. Edge crossings are rejected by
+    // the constrained triangulator below; containment must be rejected explicitly because it has no crossing.
+    for left in 1..projected.len() {
+        for right in left + 1..projected.len() {
+            if point_in_loop(projected[left][0], &projected[right]) != LoopLocation::Outside
+                || point_in_loop(projected[right][0], &projected[left]) != LoopLocation::Outside
+            {
+                return Err(format!(
+                    "inner bounds {left} and {right} overlap, touch, or nest"
+                ));
+            }
+        }
+    }
+
+    let vertex_count: usize = loops.iter().map(Vec::len).sum();
+    let mut vertices = Vec::with_capacity(vertex_count);
+    let mut constraints = Vec::with_capacity(vertex_count);
+    for (bound, projected_bound) in loops.iter().zip(&projected) {
+        let base = vertices.len();
+        vertices.extend(
+            bound
+                .iter()
+                .zip(projected_bound)
+                .map(|(&source, &point)| ProjectedPlanarVertex { point, source }),
+        );
+        for index in 0..bound.len() {
+            constraints.push([base + index, base + (index + 1) % bound.len()]);
+        }
+    }
+
+    let mut conflicting_constraint = false;
+    let triangulation: ConstrainedDelaunayTriangulation<ProjectedPlanarVertex> =
+        ConstrainedDelaunayTriangulation::try_bulk_load_cdt(vertices, constraints.clone(), |_| {
+            conflicting_constraint = true;
+        })
+        .map_err(|error| format!("constrained triangulation rejected a vertex: {error:?}"))?;
+    if conflicting_constraint {
+        return Err("boundary constraints intersect or overlap".into());
+    }
+    if triangulation.num_vertices() != vertex_count {
+        return Err("two boundary vertices collapse to the same projected coordinate".into());
+    }
+    if triangulation.num_constraints() != constraints.len() {
+        return Err("not every boundary segment survived as a triangulation constraint".into());
+    }
+
+    let mut triangles = Vec::new();
+    let mut tessellated_area = 0.0;
+    for candidate in triangulation.inner_faces() {
+        let handles = candidate.vertices();
+        let points = [
+            handles[0].position(),
+            handles[1].position(),
+            handles[2].position(),
+        ];
+        let centroid = spade::Point2::new(
+            (points[0].x + points[1].x + points[2].x) / 3.0,
+            (points[0].y + points[1].y + points[2].y) / 3.0,
+        );
+        if point_in_loop(centroid, &projected[0]) != LoopLocation::Inside
+            || projected
+                .iter()
+                .skip(1)
+                .any(|hole| point_in_loop(centroid, hole) != LoopLocation::Outside)
+        {
+            continue;
+        }
+        let area = triangle_area_twice(points).abs();
+        if area <= area_tolerance {
+            continue;
+        }
+        tessellated_area += area;
+        triangles.push([
+            handles[0].data().source,
+            handles[1].data().source,
+            handles[2].data().source,
+        ]);
+    }
+
+    let expected_area = outer_area
+        - projected
+            .iter()
+            .skip(1)
+            .map(|hole| loop_area_twice(hole).abs())
+            .sum::<f64>();
+    if expected_area <= area_tolerance {
+        return Err("inner bounds consume the entire outer face".into());
+    }
+    let area_error = (tessellated_area - expected_area).abs();
+    if triangles.is_empty() || area_error > (expected_area * 1.0e-9).max(area_tolerance * 8.0) {
+        return Err(format!(
+            "constrained triangles cover {tessellated_area:e} but the trimmed face area is {expected_area:e}"
+        ));
+    }
+
+    // Spade is stable for stable input; this canonical face order also makes the mesh hash independent of
+    // internal face-storage iteration details across compatible library versions.
+    triangles.sort_by_key(|triangle| {
+        let mut key = triangle.map(|point| point.map(f64::to_bits));
+        key.sort_unstable();
+        key
+    });
+    Ok(triangles)
+}
+
+fn clean_planar_loop(bound: &[[f64; 3]]) -> Vec<[f64; 3]> {
+    let mut cleaned = Vec::with_capacity(bound.len());
+    for &point in bound {
+        if cleaned
+            .last()
+            .is_none_or(|last| point_bits(*last) != point_bits(point))
+        {
+            cleaned.push(point);
+        }
+    }
+    if cleaned.len() > 1
+        && point_bits(cleaned[0]) == point_bits(*cleaned.last().unwrap_or(&cleaned[0]))
+    {
+        cleaned.pop();
+    }
+    cleaned
+}
+
+fn point_bits(point: [f64; 3]) -> [u64; 3] {
+    point.map(f64::to_bits)
+}
+
+fn loop_area_twice(bound: &[spade::Point2<f64>]) -> f64 {
+    let origin = bound[0];
+    (1..bound.len() - 1)
+        .map(|index| triangle_area_twice([origin, bound[index], bound[index + 1]]))
+        .sum()
+}
+
+fn triangle_area_twice(points: [spade::Point2<f64>; 3]) -> f64 {
+    let ab = [points[1].x - points[0].x, points[1].y - points[0].y];
+    let ac = [points[2].x - points[0].x, points[2].y - points[0].y];
+    ab[0] * ac[1] - ab[1] * ac[0]
+}
+
+fn point_in_loop(point: spade::Point2<f64>, bound: &[spade::Point2<f64>]) -> LoopLocation {
+    let mut inside = false;
+    for index in 0..bound.len() {
+        let a = bound[index];
+        let b = bound[(index + 1) % bound.len()];
+        let ab = [b.x - a.x, b.y - a.y];
+        let ap = [point.x - a.x, point.y - a.y];
+        let scale = ab[0]
+            .abs()
+            .max(ab[1].abs())
+            .max(ap[0].abs())
+            .max(ap[1].abs())
+            .max(1.0);
+        let tolerance = f64::EPSILON * 128.0 * scale * scale;
+        let cross = ab[0] * ap[1] - ab[1] * ap[0];
+        let dot_from_a = ap[0] * ab[0] + ap[1] * ab[1];
+        let edge_length_squared = ab[0] * ab[0] + ab[1] * ab[1];
+        if cross.abs() <= tolerance
+            && dot_from_a >= -tolerance
+            && dot_from_a <= edge_length_squared + tolerance
+        {
+            return LoopLocation::Boundary;
+        }
+        if (a.y > point.y) != (b.y > point.y) {
+            let intersection_x = a.x + (b.x - a.x) * (point.y - a.y) / (b.y - a.y);
+            if point.x < intersection_x {
+                inside = !inside;
+            }
+        }
+    }
+    if inside {
+        LoopLocation::Inside
+    } else {
+        LoopLocation::Outside
     }
 }
 
@@ -1042,8 +1383,9 @@ fn interpret_face(
 
     // Every bound is read: the first FACE_OUTER_BOUND is the outer polygon (fallback: the first bound),
     // the rest are INNER loops (hole rims), and ALL loops' edges are kept — inner-loop `EDGE_CURVE` ids
-    // are exactly the adjacency between a bore and the face it pierces (M15.11 recognition needs them;
-    // tessellation still trims by `outer` only, unchanged).
+    // are exactly the adjacency between a bore and the face it pierces (M15.11 recognition needs them).
+    // Planar inner loops are constrained during tessellation; malformed constraints skip + diagnose the
+    // whole face rather than falling back to an outer-only cap.
     let mut outer: Vec<[f64; 3]> = Vec::new();
     let mut inner: Vec<Vec<[f64; 3]>> = Vec::new();
     let mut edges: Vec<CadEdge> = Vec::new();
@@ -1092,7 +1434,7 @@ fn interpret_face(
         }
     }
 
-    Ok(CadFace {
+    let face = CadFace {
         id: fid,
         kind,
         outer,
@@ -1102,7 +1444,18 @@ fn interpret_face(
         recognized,
         same_sense,
         outer_sense,
-    })
+    };
+    if face.kind == FaceKind::Planar && !face.inner.is_empty() {
+        if let Err(reason) = triangulate_planar_face(&face) {
+            notes.push(UnsupportedNote {
+                feature: format!("planar face #{fid} with inner bounds"),
+                detail: format!(
+                    "trimmed tessellation rejected: {reason}. The complete face is skipped instead of silently filling its hole; repair the bound topology or use the OpenCascade native/server seam."
+                ),
+            });
+        }
+    }
+    Ok(face)
 }
 
 /// Recognize the four ANALYTIC surface kinds (M15.8/ADR-078) into their closed forms. `None` for anything
@@ -1276,8 +1629,9 @@ pub(crate) struct TessPart {
     pub parent: Option<u64>,
 }
 
-/// Read a STEP file's embedded tessellation into placed [`TessPart`]s. Returns an empty Vec if the file
-/// carries no tessellation (the caller falls back to the planar B-rep interpreter).
+/// Read a STEP file's embedded tessellation into placed [`TessPart`]s plus the structural group nodes from
+/// its nested tessellation graph. Returns two empty vectors if the file carries no tessellation (the caller
+/// falls back to the planar B-rep interpreter).
 ///
 /// **The real AP242 tessellated-assembly structure** (what commercial CAD — CATIA/NX — actually exports, and
 /// what this file uses): the geometry + placement live entirely in a nested tessellation graph, NOT in the
@@ -1288,10 +1642,12 @@ pub(crate) struct TessPart {
 /// `TESSELLATED_SOLID`/`TESSELLATED_SHELL`s. Each leaf becomes one placed part; its world transform is the
 /// composition of every ancestor node's reposition axis. This captures the curved surfaces (cylinders / cones
 /// / B-splines) the planar B-rep reader can only proxy — the tessellation triangulates every surface.
-pub(crate) fn parse_tessellated_assembly(entities: &EntityTable) -> Vec<TessPart> {
+pub(crate) fn parse_tessellated_assembly(
+    entities: &EntityTable,
+) -> (Vec<TessPart>, Vec<crate::cad_import::GroupNode>) {
     // A quick check: any tessellation at all?
     if !entities.values().any(is_tess_node) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // Every id that is a CHILD of some tessellation container — so roots are the nodes at the top of the
@@ -1316,6 +1672,7 @@ pub(crate) fn parse_tessellated_assembly(entities: &EntityTable) -> Vec<TessPart
     let owners = tessellated_item_owners(entities);
 
     let mut out: Vec<TessPart> = Vec::new();
+    let mut groups = Vec::new();
     let mut on_path: BTreeSet<u64> = BTreeSet::new();
     for root in roots {
         on_path.clear();
@@ -1329,11 +1686,13 @@ pub(crate) fn parse_tessellated_assembly(entities: &EntityTable) -> Vec<TessPart
             crate::cad_import::IDENTITY_4X4,
             0,
             step_path_hash(STEP_TESS_PATH_SEED, root),
+            None,
             &mut on_path,
             &mut out,
+            &mut groups,
         );
     }
-    out
+    (out, groups)
 }
 
 const STEP_TESS_PATH_SEED: u64 = 0x7465_7373_2d72_6f6f;
@@ -1594,6 +1953,34 @@ fn refs_in(values: &[Value]) -> Vec<u64> {
     values.iter().filter_map(Value::as_ref_id).collect()
 }
 
+/// The source-authored `REPRESENTATION_ITEM` name of a tessellation container, or an honest stable fallback
+/// when commercial exporters leave it blank (common for placement-only graph nodes).
+fn tess_group_name(entity: &Entity, id: u64) -> String {
+    let direct = entity.args.iter().find_map(|value| match value {
+        Value::Str(name) if !name.trim().is_empty() => Some(name.clone()),
+        _ => None,
+    });
+    let complex = entity.args.iter().find_map(|value| match value {
+        Value::Typed(kind, args)
+            if matches!(
+                kind.as_str(),
+                "REPRESENTATION_ITEM"
+                    | "TESSELLATED_GEOMETRIC_SET"
+                    | "REPOSITIONED_TESSELLATED_ITEM"
+            ) =>
+        {
+            args.iter().find_map(|argument| match argument {
+                Value::Str(name) if !name.trim().is_empty() => Some(name.clone()),
+                _ => None,
+            })
+        }
+        _ => None,
+    });
+    direct
+        .or(complex)
+        .unwrap_or_else(|| format!("tessellated group #{id}"))
+}
+
 /// Walk one tessellation node: emit a placed part for a leaf solid/shell, else compose this container's
 /// reposition axis onto `world` and recurse into its children.
 /// The parts of a tessellation walk that are FIXED for the whole traversal, grouped so the recursive
@@ -1604,14 +1991,17 @@ pub(crate) struct TessWalk<'a> {
     pub owners: &'a BTreeMap<u64, (u64, String)>,
 }
 
+#[allow(clippy::too_many_arguments)] // recursive traversal state; fixed graph inputs already live in TessWalk
 fn walk_tess(
     walk: &TessWalk<'_>,
     id: u64,
     world: [f64; 16],
     depth: u32,
     path_hash: u64,
+    parent_group: Option<u64>,
     on_path: &mut BTreeSet<u64>,
     out: &mut Vec<TessPart>,
+    groups: &mut Vec<crate::cad_import::GroupNode>,
 ) {
     let (entities, colors, owners) = (walk.entities, walk.colors, walk.owners);
     if depth > crate::cad_import::MAX_ASSEMBLY_DEPTH
@@ -1640,11 +2030,22 @@ fn walk_tess(
             mesh: Arc::new(mesh),
             color: colors.get(&id).copied(),
             exact_brep: false,
-            parent: None,
+            parent: parent_group,
         });
         return;
     }
     let (axis, children) = tess_container(entities, e);
+    let group_for_children = if children.is_empty() {
+        parent_group
+    } else {
+        let group_id = step_path_hash(path_hash, STEP_GROUP_SALT);
+        groups.push(crate::cad_import::GroupNode {
+            id: group_id,
+            name: tess_group_name(e, id),
+            parent: parent_group,
+        });
+        Some(group_id)
+    };
     let local = axis.map_or(crate::cad_import::IDENTITY_4X4, |a| {
         axis_placement_matrix(entities, a)
     });
@@ -1652,7 +2053,17 @@ fn walk_tess(
     on_path.insert(id);
     for (ordinal, c) in children.into_iter().enumerate() {
         let child_path = step_path_hash(step_path_hash(path_hash, c), ordinal as u64);
-        walk_tess(walk, c, child_world, depth + 1, child_path, on_path, out);
+        walk_tess(
+            walk,
+            c,
+            child_world,
+            depth + 1,
+            child_path,
+            group_for_children,
+            on_path,
+            out,
+            groups,
+        );
     }
     on_path.remove(&id);
 }
@@ -2493,6 +2904,7 @@ fn real(x: f64) -> String {
 /// planar faces) is preserved within the round-trip tolerance; curved faces are dropped with a header note
 /// (the honest downgrade — full round-trip of NURBS is the OCCT seam).
 #[allow(clippy::format_push_string)] // a small one-shot serializer; readability over write! churn
+#[allow(clippy::too_many_lines)] // one linear Part-21 DATA-section serializer
 fn export_faceted(scene: &CadScene) -> Result<String, StepError> {
     let mut out = String::new();
     out.push_str("ISO-10303-21;\n");
@@ -2556,9 +2968,40 @@ fn export_faceted(scene: &CadScene) -> Result<String, StepError> {
             out.push_str(&format!(
                 "#{bound_id} = FACE_OUTER_BOUND('',#{loop_id},.T.);\n"
             ));
+            let mut bound_ids = vec![bound_id];
+            for (inner_index, inner) in face.inner.iter().enumerate() {
+                if inner.len() < 3 {
+                    return Err(StepError::Malformed(format!(
+                        "face #{} inner bound {} has fewer than three vertices",
+                        face.id,
+                        inner_index + 1
+                    )));
+                }
+                let inner_points: Vec<u64> = inner
+                    .iter()
+                    .map(|&p| point_id(p, &mut out, &mut next))
+                    .collect();
+                let inner_refs = inner_points
+                    .iter()
+                    .map(|i| format!("#{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let inner_loop = next();
+                out.push_str(&format!("#{inner_loop} = POLY_LOOP('',({inner_refs}));\n"));
+                let inner_bound = next();
+                out.push_str(&format!(
+                    "#{inner_bound} = FACE_BOUND('',#{inner_loop},.T.);\n"
+                ));
+                bound_ids.push(inner_bound);
+            }
+            let bound_refs = bound_ids
+                .iter()
+                .map(|i| format!("#{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
             // A faceted-b-rep FACE (no surface entity — the polygon is planar by construction).
             let f = next();
-            out.push_str(&format!("#{f} = FACE('',(#{bound_id}));\n"));
+            out.push_str(&format!("#{f} = FACE('',({bound_refs}));\n"));
             face_ids.push(f);
             emitted_face.insert(face.id, f);
         }
@@ -2638,6 +3081,9 @@ fn welded_vertices(scene: &CadScene) -> Vec<[f64; 3]> {
                 continue;
             }
             for &p in &face.outer {
+                set.insert([p[0].to_bits(), p[1].to_bits(), p[2].to_bits()], p);
+            }
+            for &p in face.inner.iter().flatten() {
                 set.insert([p[0].to_bits(), p[1].to_bits(), p[2].to_bits()], p);
             }
         }
@@ -2920,6 +3366,33 @@ mod tests {
     /// is standard-conformant and any STEP reader parses it.
     const CUBE_STEP: &str = include_str!("../tests/fixtures/cube_ap242.step");
 
+    /// A 10×10 planar faceted face with a 4×4 inner `FACE_BOUND`. The expected rendered area is 84, not
+    /// the outer-only 100 that silently capped holes before constrained planar tessellation.
+    const PLATE_WITH_HOLE_STEP: &str = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+        FILE_NAME('plate-with-hole','',(''),(''),'','','');\nFILE_SCHEMA(('AP242'));\nENDSEC;\nDATA;\n\
+        #1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=CARTESIAN_POINT('',(10.,0.,0.));\n\
+        #3=CARTESIAN_POINT('',(10.,10.,0.));\n#4=CARTESIAN_POINT('',(0.,10.,0.));\n\
+        #5=CARTESIAN_POINT('',(3.,3.,0.));\n#6=CARTESIAN_POINT('',(3.,7.,0.));\n\
+        #7=CARTESIAN_POINT('',(7.,7.,0.));\n#8=CARTESIAN_POINT('',(7.,3.,0.));\n\
+        #9=POLY_LOOP('',(#1,#2,#3,#4));\n#10=FACE_OUTER_BOUND('',#9,.T.);\n\
+        #11=POLY_LOOP('',(#5,#6,#7,#8));\n#12=FACE_BOUND('',#11,.T.);\n\
+        #13=FACE('',(#10,#12));\n#14=CLOSED_SHELL('',(#13));\n#15=FACETED_BREP('',#14);\n\
+        ENDSEC;\nEND-ISO-10303-21;\n";
+
+    /// The same outer face with a topologically invalid "hole" outside it. This must yield an explained
+    /// skipped face, never the visually plausible outer-only cap.
+    const PLATE_WITH_INVALID_HOLE_STEP: &str =
+        "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n\
+        FILE_NAME('invalid-hole','',(''),(''),'','','');\nFILE_SCHEMA(('AP242'));\nENDSEC;\nDATA;\n\
+        #1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=CARTESIAN_POINT('',(10.,0.,0.));\n\
+        #3=CARTESIAN_POINT('',(10.,10.,0.));\n#4=CARTESIAN_POINT('',(0.,10.,0.));\n\
+        #5=CARTESIAN_POINT('',(20.,20.,0.));\n#6=CARTESIAN_POINT('',(20.,21.,0.));\n\
+        #7=CARTESIAN_POINT('',(21.,21.,0.));\n#8=CARTESIAN_POINT('',(21.,20.,0.));\n\
+        #9=POLY_LOOP('',(#1,#2,#3,#4));\n#10=FACE_OUTER_BOUND('',#9,.T.);\n\
+        #11=POLY_LOOP('',(#5,#6,#7,#8));\n#12=FACE_BOUND('',#11,.T.);\n\
+        #13=FACE('',(#10,#12));\n#14=CLOSED_SHELL('',(#13));\n#15=FACETED_BREP('',#14);\n\
+        ENDSEC;\nEND-ISO-10303-21;\n";
+
     #[test]
     fn a_real_advanced_brep_cube_imports_with_referenceable_faces_and_edges() {
         let scene = StepInterchange
@@ -2950,6 +3423,87 @@ mod tests {
         );
         assert_eq!(r.genus, Some(0), "a cube is genus 0");
         assert_eq!(mesh.triangle_count(), 12, "6 quads → 12 triangles");
+    }
+
+    #[test]
+    fn planar_inner_bounds_are_constrained_holes_not_filled_caps() {
+        let scene = StepInterchange
+            .import(PLATE_WITH_HOLE_STEP.as_bytes())
+            .expect("trimmed planar face imports");
+        let face = &scene.solids[0].faces[0];
+        assert_eq!(face.inner.len(), 1, "the inner FACE_BOUND is retained");
+        assert!(
+            scene.notes.is_empty(),
+            "a valid constrained hole is exact, not an approximation: {:?}",
+            scene.notes
+        );
+
+        let mesh = scene.tessellate();
+        assert!(mesh.triangle_count() >= 4, "the annulus is tessellated");
+        let mut area = 0.0;
+        for triangle in &mesh.triangles {
+            let [a, b, c] = triangle.map(|index| mesh.positions[index as usize]);
+            area += ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5;
+            let centroid = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0];
+            assert!(
+                !(centroid[0] > 3.0 && centroid[0] < 7.0 && centroid[1] > 3.0 && centroid[1] < 7.0),
+                "a triangle crossed the hole: {centroid:?}"
+            );
+        }
+        assert!((area - 84.0).abs() < 1.0e-10, "100 - 16 = 84, got {area}");
+
+        let per_part = crate::cad_import::tessellate_faces(&scene.solids[0].faces);
+        assert_eq!(
+            crate::cad_import::mesh_hash(&per_part),
+            crate::cad_import::mesh_hash(&mesh),
+            "whole-scene and per-part paths use the same constrained tessellation"
+        );
+
+        // Faceted re-export must retain the trim too; otherwise a round-trip would reintroduce the cap.
+        let exported = StepInterchange.export(&scene).expect("faceted re-export");
+        assert!(
+            exported.contains("FACE_BOUND"),
+            "inner bound was serialized"
+        );
+        let after = StepInterchange
+            .import(exported.as_bytes())
+            .expect("trimmed face re-import");
+        assert_eq!(after.solids[0].faces[0].inner.len(), 1);
+        let after_mesh = after.tessellate();
+        let after_area: f64 = after_mesh
+            .triangles
+            .iter()
+            .map(|triangle| {
+                let [a, b, c] = triangle.map(|index| after_mesh.positions[index as usize]);
+                ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+            })
+            .sum();
+        assert!((after_area - 84.0).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn malformed_planar_hole_is_explained_and_skipped_never_outer_only_filled() {
+        let scene = StepInterchange
+            .import(PLATE_WITH_INVALID_HOLE_STEP.as_bytes())
+            .expect("the referenceable B-rep still imports");
+        assert!(
+            scene.notes.iter().any(|note| {
+                note.feature.contains("inner bounds")
+                    && note.detail.contains("skipped instead of silently filling")
+            }),
+            "the rejected trim is explicit: {:?}",
+            scene.notes
+        );
+        assert_eq!(
+            scene.tessellate().triangle_count(),
+            0,
+            "never fall back to the two-triangle outer cap"
+        );
+        assert_eq!(
+            crate::cad_import::tessellate_faces(&scene.solids[0].faces).triangle_count(),
+            0,
+            "the per-part import path rejects the same malformed trim"
+        );
     }
 
     #[test]

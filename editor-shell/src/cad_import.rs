@@ -22,7 +22,7 @@ use crate::csg_intent::store_mesh;
 use metrocalk_assets::AssetStore;
 use metrocalk_core::caps::canonical;
 use metrocalk_core::{Engine, EntityId, FieldValue, Op, PipelineError};
-use metrocalk_ecs::FlecsWorld;
+use metrocalk_ecs::{FlecsWorld, World};
 use metrocalk_interchange::{
     diff, translation_of, CadError, CadImport, CadReader, PartChange, PartDiff, StepAssemblyReader,
     ThreeDxmlReader,
@@ -33,9 +33,279 @@ use crate::capscene::{CapScene, MESH_FIELD};
 /// The queryable per-part component the import writes onto each entity — the never-silent report, ECS-native.
 pub const CAD_PART: &str = "CadPart";
 
+/// The explicit wrapper/root of one imported CAD source. The component lives only on the wrapper and carries
+/// the stable source identity needed to distinguish "re-import A" from "also import B".
+pub const CAD_IMPORT_SOURCE: &str = "CadImportSource";
+
+/// Lightweight ownership marker written on the wrapper and every group/part authored by that import. Keeping
+/// ownership explicit (rather than inferring it from `ReimportId`) makes replacement source-scoped and still
+/// correct if a user reparents an imported part after landing it.
+pub const CAD_IMPORT_OWNER: &str = "CadImportOwner";
+
+const SOURCE_KEY_FIELD: &str = "sourceKey";
+const CONTENT_HASH_FIELD: &str = "contentHash";
+const SOURCE_SELECTION_FIELD: &str = "selection";
+
+/// Stable identity for one CAD source. `key` names the logical source across content revisions; `path` is the
+/// canonical audit/display path; `content_hash` identifies one exact revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CadSourceIdentity {
+    pub key: String,
+    pub path: String,
+    pub format: String,
+    pub content_hash: u64,
+}
+
+impl CadSourceIdentity {
+    /// Identity for a real file-backed import. Existing paths are filesystem-canonicalized; missing paths are
+    /// made absolute lexically so callers still get a deterministic, explicit source instead of an empty key.
+    #[must_use]
+    pub fn from_path(path: &std::path::Path, format: &str, content_hash: u64) -> Self {
+        let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+            }
+        });
+        let path = normalized_source_path(&absolute);
+        let key_path = if cfg!(windows) {
+            path.to_lowercase()
+        } else {
+            path.clone()
+        };
+        Self {
+            key: format!("file:{key_path}"),
+            path,
+            format: format.to_string(),
+            content_hash,
+        }
+    }
+
+    /// Safe identity for the path-less/headless landing seam. Exact content is the logical source because no
+    /// path was supplied; callers that need changed-content replacement use [`land_import_from_source`].
+    #[must_use]
+    pub fn content_addressed(report: &CadImport) -> Self {
+        Self {
+            key: format!(
+                "content:{}:{:016x}",
+                report.source_format.to_ascii_lowercase(),
+                report.source_hash
+            ),
+            path: String::new(),
+            format: report.source_format.clone(),
+            content_hash: report.source_hash,
+        }
+    }
+}
+
+fn normalized_source_path(path: &std::path::Path) -> String {
+    let value = path.to_string_lossy();
+    // `canonicalize` uses the Win32 verbatim prefix. It is useful to the OS but noisy in persisted provenance
+    // and makes the same path compare differently to an already-normalized picker path.
+    let without_verbatim = value
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| value.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| value.into_owned());
+    without_verbatim.replace('\\', "/")
+}
+
+/// Ops for the explicit, geometry-free source wrapper. Callers append the whole set to the same atomic import
+/// commit as the authored hierarchy.
+#[must_use]
+pub fn cad_source_root_ops(
+    root: EntityId,
+    source: &CadSourceIdentity,
+    label: &str,
+) -> Vec<Op> {
+    let mut ops = vec![Op::CreateEntity {
+        id: root,
+        parent: None,
+    }];
+    for (field, value) in [
+        ("x", 0.0),
+        ("y", 0.0),
+        ("z", 0.0),
+        ("qx", 0.0),
+        ("qy", 0.0),
+        ("qz", 0.0),
+        ("qw", 1.0),
+        ("scale", 1.0),
+    ] {
+        ops.push(Op::SetField {
+            entity: root,
+            component: "Transform".into(),
+            field: field.into(),
+            value: FieldValue::Number(value),
+        });
+    }
+    for (field, value) in [
+        (SOURCE_KEY_FIELD, source.key.clone()),
+        ("canonicalPath", source.path.clone()),
+        ("sourceFormat", source.format.clone()),
+        (
+            CONTENT_HASH_FIELD,
+            format!("{:016x}", source.content_hash),
+        ),
+    ] {
+        ops.push(Op::SetField {
+            entity: root,
+            component: CAD_IMPORT_SOURCE.into(),
+            field: field.into(),
+            value: FieldValue::Str(value),
+        });
+    }
+    ops.extend(cad_source_owner_ops(root, &source.key, "root", None));
+    ops.push(Op::SetField {
+        entity: root,
+        component: metrocalk_core::variant::INSTANCE_META.into(),
+        field: "name".into(),
+        value: FieldValue::Str(if label.trim().is_empty() {
+            "CAD import".into()
+        } else {
+            label.to_string()
+        }),
+    });
+    ops.push(Op::SetField {
+        entity: root,
+        component: metrocalk_core::variant::INSTANCE_META.into(),
+        field: "kind".into(),
+        value: FieldValue::Str("group".into()),
+    });
+    ops
+}
+
+/// Ownership marker ops for a CAD-authored wrapper, group, or part.
+#[must_use]
+pub fn cad_source_owner_ops(
+    entity: EntityId,
+    source_key: &str,
+    kind: &str,
+    index: Option<usize>,
+) -> Vec<Op> {
+    let mut ops = vec![
+        Op::SetField {
+            entity,
+            component: CAD_IMPORT_OWNER.into(),
+            field: SOURCE_KEY_FIELD.into(),
+            value: FieldValue::Str(source_key.to_string()),
+        },
+        Op::SetField {
+            entity,
+            component: CAD_IMPORT_OWNER.into(),
+            field: "kind".into(),
+            value: FieldValue::Str(kind.to_string()),
+        },
+    ];
+    if let Some(index) = index {
+        ops.push(Op::SetField {
+            entity,
+            component: CAD_IMPORT_OWNER.into(),
+            field: "index".into(),
+            value: FieldValue::Integer(i64::try_from(index).unwrap_or(i64::MAX)),
+        });
+    }
+    ops
+}
+
+/// Persist the child the import workflow selected before wrappers existed. An idempotent re-drop can return
+/// that same entity instead of moving selection to a different node.
+#[must_use]
+pub fn cad_source_selection_op(root: EntityId, selection: EntityId) -> Op {
+    Op::SetField {
+        entity: root,
+        component: CAD_IMPORT_SOURCE.into(),
+        field: SOURCE_SELECTION_FIELD.into(),
+        value: FieldValue::Str(selection.to_loro_key()),
+    }
+}
+
+/// Active wrappers for one logical source. More than one indicates legacy/corrupt duplicate ownership; callers
+/// replace them rather than treating the import as an idempotent no-op.
+#[must_use]
+pub fn active_cad_source_roots<W: World>(
+    engine: &Engine<W>,
+    source_key: &str,
+) -> Vec<EntityId> {
+    let mut roots: Vec<_> = engine
+        .entity_ids()
+        .into_iter()
+        .filter(|id| engine.is_active(*id))
+        .filter(|id| {
+            matches!(
+                engine
+                    .components_of(*id)
+                    .get(CAD_IMPORT_SOURCE)
+                    .and_then(|fields| fields.get(SOURCE_KEY_FIELD)),
+                Some(FieldValue::Str(key)) if key == source_key
+            )
+        })
+        .collect();
+    roots.sort_unstable();
+    roots
+}
+
+/// Every active entity explicitly owned by one logical CAD source (wrapper + groups + parts). Legacy CAD has
+/// no owner marker and is deliberately absent.
+#[must_use]
+pub fn active_cad_source_members<W: World>(
+    engine: &Engine<W>,
+    source_key: &str,
+) -> Vec<EntityId> {
+    let mut entities: Vec<_> = engine
+        .entity_ids()
+        .into_iter()
+        .filter(|id| engine.is_active(*id))
+        .filter(|id| {
+            matches!(
+                engine
+                    .components_of(*id)
+                    .get(CAD_IMPORT_OWNER)
+                    .and_then(|fields| fields.get(SOURCE_KEY_FIELD)),
+                Some(FieldValue::Str(key)) if key == source_key
+            )
+        })
+        .collect();
+    entities.sort_unstable();
+    entities
+}
+
+/// Exact content hash recorded on a source wrapper.
+#[must_use]
+pub fn cad_source_content_hash<W: World>(engine: &Engine<W>, root: EntityId) -> Option<u64> {
+    let FieldValue::Str(hash) = engine
+        .components_of(root)
+        .get(CAD_IMPORT_SOURCE)?
+        .get(CONTENT_HASH_FIELD)?
+        .clone()
+    else {
+        return None;
+    };
+    u64::from_str_radix(&hash, 16).ok()
+}
+
+/// The selection returned by the original successful landing, falling back to the wrapper if older persisted
+/// source metadata does not carry it.
+#[must_use]
+pub fn cad_source_selection<W: World>(engine: &Engine<W>, root: EntityId) -> EntityId {
+    engine
+        .components_of(root)
+        .get(CAD_IMPORT_SOURCE)
+        .and_then(|fields| fields.get(SOURCE_SELECTION_FIELD))
+        .and_then(|value| match value {
+            FieldValue::Str(key) => EntityId::from_loro_key(key),
+            _ => None,
+        })
+        .filter(|id| engine.entity_exists(*id) && engine.is_active(*id))
+        .unwrap_or(root)
+}
+
 /// What a universal CAD import landed: one entity per part + the neutral report (queryable). The report's
 /// `parts[i]` aligns with `entities[i]`.
 pub struct CadLanding {
+    /// The explicit source wrapper that owns this import's complete authored hierarchy.
+    pub root_entity: EntityId,
     /// One entity per part placement (never-empty: every one has a placed mesh).
     pub entities: Vec<EntityId>,
     /// One geometry-free container entity per [`metrocalk_interchange::GroupNode`] (aligned with
@@ -294,6 +564,77 @@ pub fn land_import(
     store: &mut AssetStore,
     report: CadImport,
 ) -> Result<CadLanding, CadImportError> {
+    let source = CadSourceIdentity::content_addressed(&report);
+    land_import_from_source(engine, scene, store, source, report)
+}
+
+/// Land a neutral CAD report for an explicit logical source. A changed revision atomically replaces only
+/// entities carrying this source's owner marker; a byte-identical re-drop is an idempotent no-op.
+///
+/// # Errors
+/// [`CadImportError::Commit`] if the single authored commit is rejected.
+pub fn land_import_from_source(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    store: &mut AssetStore,
+    source: CadSourceIdentity,
+    report: CadImport,
+) -> Result<CadLanding, CadImportError> {
+    let previous_roots = active_cad_source_roots(engine, &source.key);
+    let previous_members = active_cad_source_members(engine, &source.key);
+
+    // A no-op is safe only for one internally-consistent active wrapper. If persisted state contains duplicate
+    // roots or orphaned ownership markers, fall through to one scoped replacement that converges it.
+    if previous_roots.len() == 1
+        && cad_source_content_hash(engine, previous_roots[0]) == Some(source.content_hash)
+    {
+        let root = previous_roots[0];
+        let below_root = |entity: EntityId| {
+            let mut cursor = Some(entity);
+            while let Some(id) = cursor {
+                if id == root {
+                    return true;
+                }
+                cursor = engine.parent_of(id);
+            }
+            false
+        };
+        if previous_members.iter().all(|entity| below_root(*entity)) {
+            let mut parts = Vec::new();
+            let mut groups = Vec::new();
+            for entity in &previous_members {
+                let components = engine.components_of(*entity);
+                let Some(owner) = components.get(CAD_IMPORT_OWNER) else {
+                    continue;
+                };
+                let kind = match owner.get("kind") {
+                    Some(FieldValue::Str(kind)) => kind.as_str(),
+                    _ => continue,
+                };
+                let index = match owner.get("index") {
+                    Some(FieldValue::Integer(index)) => *index,
+                    _ => continue,
+                };
+                match kind {
+                    "part" => parts.push((index, *entity)),
+                    "group" => groups.push((index, *entity)),
+                    _ => {}
+                }
+            }
+            parts.sort_unstable_by_key(|(index, _)| *index);
+            groups.sort_unstable_by_key(|(index, _)| *index);
+            if parts.len() == report.parts.len() && groups.len() == report.groups.len() {
+                return Ok(CadLanding {
+                    root_entity: root,
+                    entities: parts.into_iter().map(|(_, entity)| entity).collect(),
+                    group_entities: groups.into_iter().map(|(_, entity)| entity).collect(),
+                    unique_meshes: report.meshes.len(),
+                    report,
+                });
+            }
+        }
+    }
+
     // Store each UNIQUE mesh as a content-addressed asset (the store dedups by content too — belt & braces).
     let handles: Vec<String> = report
         .meshes
@@ -306,7 +647,10 @@ pub fn land_import(
     let m_per_unit = report.units.meters_per_unit;
     let renderable = scene.caps.get(&canonical("Renderable")).copied();
 
-    let mut ops: Vec<Op> = Vec::with_capacity(report.parts.len() * 8 + report.groups.len() * 7);
+    let mut ops: Vec<Op> =
+        Vec::with_capacity(report.parts.len() * 10 + report.groups.len() * 9 + 20);
+    let root_entity = engine.alloc_entity_id();
+    ops.extend(cad_source_root_ops(root_entity, &source, &report.name));
 
     // The NAMED structural tree first (report.groups is topological, parent-before-child): one geometry-
     // free identity-transform container per assembly occurrence, marked `__meta__.kind = "group"` — the
@@ -314,11 +658,20 @@ pub fn land_import(
     let mut group_entities = Vec::with_capacity(report.groups.len());
     let mut src_to_entity: std::collections::BTreeMap<u64, EntityId> =
         std::collections::BTreeMap::new();
-    for g in &report.groups {
+    for (group_index, g) in report.groups.iter().enumerate() {
         let ge = engine.alloc_entity_id();
         src_to_entity.insert(g.id, ge);
-        let parent = g.parent.and_then(|pid| src_to_entity.get(&pid).copied());
+        let parent = g
+            .parent
+            .and_then(|pid| src_to_entity.get(&pid).copied())
+            .or(Some(root_entity));
         ops.push(Op::CreateEntity { id: ge, parent });
+        ops.extend(cad_source_owner_ops(
+            ge,
+            &source.key,
+            "group",
+            Some(group_index),
+        ));
         for (f, v) in [("x", 0.0), ("y", 0.0), ("z", 0.0), ("scale", 1.0)] {
             ops.push(Op::SetField {
                 entity: ge,
@@ -345,12 +698,21 @@ pub fn land_import(
     }
 
     let mut entities = Vec::with_capacity(report.parts.len());
-    for p in &report.parts {
+    for (part_index, p) in report.parts.iter().enumerate() {
         let e = engine.alloc_entity_id();
         ops.push(Op::CreateEntity {
             id: e,
-            parent: p.parent.and_then(|pid| src_to_entity.get(&pid).copied()),
+            parent: p
+                .parent
+                .and_then(|pid| src_to_entity.get(&pid).copied())
+                .or(Some(root_entity)),
         });
+        ops.extend(cad_source_owner_ops(
+            e,
+            &source.key,
+            "part",
+            Some(part_index),
+        ));
         // Real placement (units-normalized) — the pivot/position, never the assembly-origin collapse. Both
         // the placement translation AND the mesh geometry live in the source units (mm), so we scale BOTH to
         // the scene's metres: the translation by `m_per_unit`, and the mesh via the entity's uniform `scale`
@@ -403,11 +765,28 @@ pub fn land_import(
         entities.push(e);
     }
 
+    let selection = group_entities
+        .first()
+        .or_else(|| entities.first())
+        .copied()
+        .unwrap_or(root_entity);
+    ops.push(cad_source_selection_op(root_entity, selection));
+
+    // Retire only the exact logical source being replaced. Every old member is directly deactivated so
+    // hierarchy, reports and rendering agree even though active state is not inherited from a parent.
+    for entity in previous_members {
+        ops.push(Op::SetActive {
+            entity,
+            active: false,
+        });
+    }
+
     engine
         .commit("import-cad", ops)
         .map_err(CadImportError::Commit)?;
 
     Ok(CadLanding {
+        root_entity,
         unique_meshes: handles.len(),
         entities,
         group_entities,

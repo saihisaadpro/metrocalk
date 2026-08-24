@@ -2845,6 +2845,7 @@ dependencies = [
  "openusd",
  "quick-xml",
  "serde",
+ "spade",
  "urdf-rs",
  "zip",
 ]
