@@ -419,6 +419,23 @@ jobs:
           node scripts/check-first-paint.mjs --self-test
           node scripts/check-first-paint.mjs
 
+      # The fourth Node-built-ins-only gate. `animation-timeline-tracks.png` captured the animation
+      # transport and showed FOUR buttons, THREE of them empty boxes — and the one that rendered was `▶`.
+      # That asymmetry is the diagnosis: `▶` is U+25B6, Geometric Shapes, 1993, and every font in
+      # `--mtk-font-ui` has it; `⏮ ⏭ ⏸ ⏹` are Unicode 6.0 media controls and NOT ONE font in that stack
+      # does, so the browser leaves the declared stack — .notdef on Linux, a colour Segoe UI Emoji glyph
+      # in a monochrome toolbar on Windows. Every functional test was green throughout, because each
+      # button had an aria-label, a data-testid and a working handler, and a control with no visible
+      # glyph still clicks. Font coverage is a property of the user's machine, not of this repo, so there
+      # is nothing to measure: the rule is declared in `glyph-coverage.json` and this checks it — failing
+      # on a forbidden character AND on any character nobody declared. Self-test first, per the
+      # convention above. See ADR-131.
+      - name: glyph coverage — a control drawn with a character the font actually has
+        working-directory: editor
+        run: |
+          node scripts/check-glyph-coverage.mjs --self-test
+          node scripts/check-glyph-coverage.mjs
+
       - name: Install (frozen lockfile)
         working-directory: editor
         run: pnpm install --frozen-lockfile

@@ -34,7 +34,8 @@ test("Play enters runtime: indicator shown + Stop always reachable", async () =>
 
   await waitFor(() => expect(play).toHaveBeenCalledTimes(1));
   await waitFor(() => expect(playStore.getState().playing).toBe(true));
-  expect(screen.getByTestId("playIndicator").textContent).toBe("● PLAYING");
+  expect(screen.getByTestId("playIndicator").dataset.state).toBe("playing");
+  expect(screen.getByTestId("playIndicator").textContent).toContain("PLAYING");
   expect(screen.getByTestId("stop")).toBeTruthy(); // Stop is reachable while playing
   expect(screen.queryByTestId("play")).toBeNull(); // Play is replaced by Pause/Stop
 });
@@ -53,11 +54,17 @@ test("Pause freezes (indicator → PAUSED), and toggling resumes", async () => {
 
   fireEvent.click(screen.getByTestId("pause"));
   await waitFor(() => expect(playStore.getState().paused).toBe(true));
-  expect(screen.getByTestId("playIndicator").textContent).toBe("⏸ PAUSED");
+  // `data-state` is the assertion, not the badge's text. This line used to read `.toBe("⏸ PAUSED")`,
+  // which coupled a state check to U+23F8 — a character no font in `--mtk-font-ui` contains, so the
+  // test was green while the badge rendered an empty box. `<test_and_ci_discipline>` 3: assert the
+  // structured field, and let the visible word be checked as a word.
+  expect(screen.getByTestId("playIndicator").dataset.state).toBe("paused");
+  expect(screen.getByTestId("playIndicator").textContent).toContain("PAUSED");
 
   fireEvent.click(screen.getByTestId("pause")); // resume
   await waitFor(() => expect(playStore.getState().paused).toBe(false));
-  expect(screen.getByTestId("playIndicator").textContent).toBe("● PLAYING");
+  expect(screen.getByTestId("playIndicator").dataset.state).toBe("playing");
+  expect(screen.getByTestId("playIndicator").textContent).toContain("PLAYING");
 });
 
 test("Stop returns to authoring (indicator clears, Play returns)", async () => {

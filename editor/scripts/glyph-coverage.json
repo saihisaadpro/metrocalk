@@ -1,0 +1,528 @@
+{
+  "$comment": "Every non-ASCII character the editor DRAWS WITH, and whether the declared UI font stack can render it. See scripts/check-glyph-coverage.mjs for why this is declared rather than measured, and decisions/131 for the capture that forced it.",
+  "fontStack": "Inter, Segoe UI, system-ui, -apple-system, Helvetica Neue, Arial, sans-serif",
+  "glyphs": {
+    "U+2190": {
+      "char": "←",
+      "name": "LEFTWARDS ARROW",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2191": {
+      "char": "↑",
+      "name": "UPWARDS ARROW",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2192": {
+      "char": "→",
+      "name": "RIGHTWARDS ARROW",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2193": {
+      "char": "↓",
+      "name": "DOWNWARDS ARROW",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+21B3": {
+      "char": "↳",
+      "name": "DOWNWARDS ARROW WITH TIP RIGHTWARDS",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+21B6": {
+      "char": "↶",
+      "name": "ANTICLOCKWISE TOP SEMICIRCLE ARROW",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+21B7": {
+      "char": "↷",
+      "name": "CLOCKWISE TOP SEMICIRCLE ARROW",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+21BB": {
+      "char": "↻",
+      "name": "CLOCKWISE OPEN CIRCLE ARROW",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+21C4": {
+      "char": "⇄",
+      "name": "RIGHTWARDS ARROW OVER LEFTWARDS ARROW",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+21D2": {
+      "char": "⇒",
+      "name": "RIGHTWARDS DOUBLE ARROW",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+21E9": {
+      "char": "⇩",
+      "name": "DOWNWARDS WHITE ARROW",
+      "status": "allowed",
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2212": {
+      "char": "−",
+      "name": "MINUS SIGN",
+      "status": "allowed",
+      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2260": {
+      "char": "≠",
+      "name": "NOT EQUAL TO",
+      "status": "allowed",
+      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2264": {
+      "char": "≤",
+      "name": "LESS-THAN OR EQUAL TO",
+      "status": "allowed",
+      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2265": {
+      "char": "≥",
+      "name": "GREATER-THAN OR EQUAL TO",
+      "status": "allowed",
+      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2295": {
+      "char": "⊕",
+      "name": "CIRCLED PLUS",
+      "status": "allowed",
+      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2296": {
+      "char": "⊖",
+      "name": "CIRCLED MINUS",
+      "status": "allowed",
+      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2297": {
+      "char": "⊗",
+      "name": "CIRCLED TIMES",
+      "status": "allowed",
+      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+229E": {
+      "char": "⊞",
+      "name": "SQUARED PLUS",
+      "status": "allowed",
+      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2301": {
+      "char": "⌁",
+      "name": "ELECTRIC ARROW",
+      "status": "allowed",
+      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+    },
+    "U+2303": {
+      "char": "⌃",
+      "name": "UP ARROWHEAD",
+      "status": "allowed",
+      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+    },
+    "U+2304": {
+      "char": "⌄",
+      "name": "DOWN ARROWHEAD",
+      "status": "allowed",
+      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+    },
+    "U+2311": {
+      "char": "⌑",
+      "name": "SQUARE LOZENGE",
+      "status": "allowed",
+      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+    },
+    "U+2315": {
+      "char": "⌕",
+      "name": "TELEPHONE RECORDER",
+      "status": "allowed",
+      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+    },
+    "U+2317": {
+      "char": "⌗",
+      "name": "VIEWDATA SQUARE",
+      "status": "allowed",
+      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+    },
+    "U+2318": {
+      "char": "⌘",
+      "name": "PLACE OF INTEREST SIGN",
+      "status": "allowed",
+      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+    },
+    "U+2500": {
+      "char": "─",
+      "name": "BOX DRAWINGS LIGHT HORIZONTAL",
+      "status": "allowed",
+      "reason": "Box Drawing — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25A1": {
+      "char": "□",
+      "name": "WHITE SQUARE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25A2": {
+      "char": "▢",
+      "name": "WHITE SQUARE WITH ROUNDED CORNERS",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25A3": {
+      "char": "▣",
+      "name": "WHITE SQUARE CONTAINING BLACK SMALL SQUARE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25A4": {
+      "char": "▤",
+      "name": "SQUARE WITH HORIZONTAL FILL",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25A6": {
+      "char": "▦",
+      "name": "SQUARE WITH ORTHOGONAL CROSSHATCH FILL",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25A7": {
+      "char": "▧",
+      "name": "SQUARE WITH UPPER LEFT TO LOWER RIGHT FILL",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25B1": {
+      "char": "▱",
+      "name": "WHITE PARALLELOGRAM",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25B2": {
+      "char": "▲",
+      "name": "BLACK UP-POINTING TRIANGLE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25B6": {
+      "char": "▶",
+      "name": "BLACK RIGHT-POINTING TRIANGLE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25B8": {
+      "char": "▸",
+      "name": "BLACK RIGHT-POINTING SMALL TRIANGLE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25C6": {
+      "char": "◆",
+      "name": "BLACK DIAMOND",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25C7": {
+      "char": "◇",
+      "name": "WHITE DIAMOND",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25C9": {
+      "char": "◉",
+      "name": "FISHEYE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25CB": {
+      "char": "○",
+      "name": "WHITE CIRCLE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25CC": {
+      "char": "◌",
+      "name": "DOTTED CIRCLE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25CD": {
+      "char": "◍",
+      "name": "CIRCLE WITH VERTICAL FILL",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25CE": {
+      "char": "◎",
+      "name": "BULLSEYE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25CF": {
+      "char": "●",
+      "name": "BLACK CIRCLE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25E3": {
+      "char": "◣",
+      "name": "BLACK LOWER LEFT TRIANGLE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25ED": {
+      "char": "◭",
+      "name": "UP-POINTING TRIANGLE WITH LEFT HALF BLACK",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+25FB": {
+      "char": "◻",
+      "name": "WHITE MEDIUM SQUARE",
+      "status": "allowed",
+      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+    },
+    "U+2605": {
+      "char": "★",
+      "name": "BLACK STAR",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2617": {
+      "char": "☗",
+      "name": "BLACK SHOGI PIECE",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2620": {
+      "char": "☠",
+      "name": "SKULL AND CROSSBONES",
+      "status": "emoji",
+      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+    },
+    "U+2630": {
+      "char": "☰",
+      "name": "TRIGRAM FOR HEAVEN",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+263C": {
+      "char": "☼",
+      "name": "WHITE SUN WITH RAYS",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2665": {
+      "char": "♥",
+      "name": "BLACK HEART SUIT",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+266A": {
+      "char": "♪",
+      "name": "EIGHTH NOTE",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2691": {
+      "char": "⚑",
+      "name": "BLACK FLAG",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2694": {
+      "char": "⚔",
+      "name": "CROSSED SWORDS",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2699": {
+      "char": "⚙",
+      "name": "GEAR",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+26A0": {
+      "char": "⚠",
+      "name": "WARNING SIGN",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+26D3": {
+      "char": "⛓",
+      "name": "CHAINS",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+26D4": {
+      "char": "⛔",
+      "name": "NO ENTRY",
+      "status": "emoji",
+      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+    },
+    "U+2705": {
+      "char": "✅",
+      "name": "WHITE HEAVY CHECK MARK",
+      "status": "emoji",
+      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+    },
+    "U+2713": {
+      "char": "✓",
+      "name": "CHECK MARK",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2715": {
+      "char": "✕",
+      "name": "MULTIPLICATION X",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2726": {
+      "char": "✦",
+      "name": "BLACK FOUR POINTED STAR",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2727": {
+      "char": "✧",
+      "name": "WHITE FOUR POINTED STAR",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2728": {
+      "char": "✨",
+      "name": "SPARKLES",
+      "status": "emoji",
+      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+    },
+    "U+274C": {
+      "char": "❌",
+      "name": "CROSS MARK",
+      "status": "emoji",
+      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+    },
+    "U+27F3": {
+      "char": "⟳",
+      "name": "CLOCKWISE GAPPED CIRCLE ARROW",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2934": {
+      "char": "⤴",
+      "name": "ARROW POINTING RIGHTWARDS THEN CURVING UPWARDS",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2B12": {
+      "char": "⬒",
+      "name": "SQUARE WITH TOP HALF BLACK",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2B21": {
+      "char": "⬡",
+      "name": "WHITE HEXAGON",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2B22": {
+      "char": "⬢",
+      "name": "BLACK HEXAGON",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+2B24": {
+      "char": "⬤",
+      "name": "BLACK LARGE CIRCLE",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+FF0B": {
+      "char": "＋",
+      "name": "FULLWIDTH PLUS SIGN",
+      "status": "unverified",
+      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+    },
+    "U+1F3AE": {
+      "char": "🎮",
+      "name": "VIDEO GAME",
+      "status": "emoji",
+      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+    },
+    "U+1F3C6": {
+      "char": "🏆",
+      "name": "TROPHY",
+      "status": "emoji",
+      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+    },
+    "U+23EE": {
+      "char": "⏮",
+      "name": "BLACK LEFT-POINTING DOUBLE TRIANGLE WITH VERTICAL BAR",
+      "status": "forbidden",
+      "reason": "a Unicode 6.0 (2010) Miscellaneous Technical media control. NOT ONE font in --mtk-font-ui (Inter / Segoe UI / system-ui / -apple-system / Helvetica Neue / Arial) contains it, so the browser leaves the declared stack entirely: .notdef on Linux, a colour Segoe UI Emoji glyph on Windows. Proven by progress/glyph-coverage/before/animation-timeline-tracks.png, where three of four transport buttons are empty boxes and the one that renders is U+25B6. Use <TransportIcon>."
+    },
+    "U+23ED": {
+      "char": "⏭",
+      "name": "BLACK RIGHT-POINTING DOUBLE TRIANGLE WITH VERTICAL BAR",
+      "status": "forbidden",
+      "reason": "a Unicode 6.0 (2010) Miscellaneous Technical media control. NOT ONE font in --mtk-font-ui (Inter / Segoe UI / system-ui / -apple-system / Helvetica Neue / Arial) contains it, so the browser leaves the declared stack entirely: .notdef on Linux, a colour Segoe UI Emoji glyph on Windows. Proven by progress/glyph-coverage/before/animation-timeline-tracks.png, where three of four transport buttons are empty boxes and the one that renders is U+25B6. Use <TransportIcon>."
+    },
+    "U+23F8": {
+      "char": "⏸",
+      "name": "DOUBLE VERTICAL BAR",
+      "status": "forbidden",
+      "reason": "a Unicode 6.0 (2010) Miscellaneous Technical media control. NOT ONE font in --mtk-font-ui (Inter / Segoe UI / system-ui / -apple-system / Helvetica Neue / Arial) contains it, so the browser leaves the declared stack entirely: .notdef on Linux, a colour Segoe UI Emoji glyph on Windows. Proven by progress/glyph-coverage/before/animation-timeline-tracks.png, where three of four transport buttons are empty boxes and the one that renders is U+25B6. Use <TransportIcon>."
+    },
+    "U+23F9": {
+      "char": "⏹",
+      "name": "BLACK SQUARE FOR STOP",
+      "status": "forbidden",
+      "reason": "a Unicode 6.0 (2010) Miscellaneous Technical media control. NOT ONE font in --mtk-font-ui (Inter / Segoe UI / system-ui / -apple-system / Helvetica Neue / Arial) contains it, so the browser leaves the declared stack entirely: .notdef on Linux, a colour Segoe UI Emoji glyph on Windows. Proven by progress/glyph-coverage/before/animation-timeline-tracks.png, where three of four transport buttons are empty boxes and the one that renders is U+25B6. Use <TransportIcon>."
+    },
+    "U+23EF": {
+      "char": "⏯",
+      "name": "BLACK RIGHT-POINTING TRIANGLE WITH DOUBLE VERTICAL BAR",
+      "status": "forbidden",
+      "reason": "a Unicode 6.0 (2010) Miscellaneous Technical media control. NOT ONE font in --mtk-font-ui (Inter / Segoe UI / system-ui / -apple-system / Helvetica Neue / Arial) contains it, so the browser leaves the declared stack entirely: .notdef on Linux, a colour Segoe UI Emoji glyph on Windows. Proven by progress/glyph-coverage/before/animation-timeline-tracks.png, where three of four transport buttons are empty boxes and the one that renders is U+25B6. Use <TransportIcon>."
+    },
+    "U+23F4": {
+      "char": "⏴",
+      "name": "BLACK MEDIUM LEFT-POINTING TRIANGLE",
+      "status": "forbidden",
+      "reason": "a Unicode 6.0 (2010) Miscellaneous Technical media control. NOT ONE font in --mtk-font-ui (Inter / Segoe UI / system-ui / -apple-system / Helvetica Neue / Arial) contains it, so the browser leaves the declared stack entirely: .notdef on Linux, a colour Segoe UI Emoji glyph on Windows. Proven by progress/glyph-coverage/before/animation-timeline-tracks.png, where three of four transport buttons are empty boxes and the one that renders is U+25B6. Use <TransportIcon>."
+    },
+    "U+23F5": {
+      "char": "⏵",
+      "name": "BLACK MEDIUM RIGHT-POINTING TRIANGLE",
+      "status": "forbidden",
+      "reason": "a Unicode 6.0 (2010) Miscellaneous Technical media control. NOT ONE font in --mtk-font-ui (Inter / Segoe UI / system-ui / -apple-system / Helvetica Neue / Arial) contains it, so the browser leaves the declared stack entirely: .notdef on Linux, a colour Segoe UI Emoji glyph on Windows. Proven by progress/glyph-coverage/before/animation-timeline-tracks.png, where three of four transport buttons are empty boxes and the one that renders is U+25B6. Use <TransportIcon>."
+    },
+    "U+23FA": {
+      "char": "⏺",
+      "name": "BLACK CIRCLE FOR RECORD",
+      "status": "forbidden",
+      "reason": "a Unicode 6.0 (2010) Miscellaneous Technical media control. NOT ONE font in --mtk-font-ui (Inter / Segoe UI / system-ui / -apple-system / Helvetica Neue / Arial) contains it, so the browser leaves the declared stack entirely: .notdef on Linux, a colour Segoe UI Emoji glyph on Windows. Proven by progress/glyph-coverage/before/animation-timeline-tracks.png, where three of four transport buttons are empty boxes and the one that renders is U+25B6. Use <TransportIcon>."
+    },
+    "U+23EA": {
+      "char": "⏪",
+      "name": "BLACK LEFT-POINTING DOUBLE TRIANGLE",
+      "status": "forbidden",
+      "reason": "a Unicode 6.0 (2010) Miscellaneous Technical media control. NOT ONE font in --mtk-font-ui (Inter / Segoe UI / system-ui / -apple-system / Helvetica Neue / Arial) contains it, so the browser leaves the declared stack entirely: .notdef on Linux, a colour Segoe UI Emoji glyph on Windows. Proven by progress/glyph-coverage/before/animation-timeline-tracks.png, where three of four transport buttons are empty boxes and the one that renders is U+25B6. Use <TransportIcon>."
+    },
+    "U+23E9": {
+      "char": "⏩",
+      "name": "BLACK RIGHT-POINTING DOUBLE TRIANGLE",
+      "status": "forbidden",
+      "reason": "a Unicode 6.0 (2010) Miscellaneous Technical media control. NOT ONE font in --mtk-font-ui (Inter / Segoe UI / system-ui / -apple-system / Helvetica Neue / Arial) contains it, so the browser leaves the declared stack entirely: .notdef on Linux, a colour Segoe UI Emoji glyph on Windows. Proven by progress/glyph-coverage/before/animation-timeline-tracks.png, where three of four transport buttons are empty boxes and the one that renders is U+25B6. Use <TransportIcon>."
+    }
+  }
+}

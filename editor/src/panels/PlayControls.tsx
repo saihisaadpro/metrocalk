@@ -10,7 +10,7 @@
 import { useEffect } from "react";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
-import { Button } from "../theme/primitives";
+import { Button, TransportIcon } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type { PlayInfo } from "../store/play";
@@ -44,8 +44,9 @@ export function PlayControls({ client }: { client: EditorClient }) {
   return (
     <div id="playControls" style={{ display: "flex", alignItems: "center", gap: space.sm }}>
       {!playing ? (
-        <Button id="play" data-testid="play" variant="primary" compact onClick={() => void act(() => client.play(), () => "▶ playing")}>
-          ▶ Play
+        <Button id="play" data-testid="play" variant="primary" compact onClick={() => void act(() => client.play(), () => "playing")}>
+          <TransportIcon name="play" />
+          Play
         </Button>
       ) : (
         <>
@@ -54,19 +55,25 @@ export function PlayControls({ client }: { client: EditorClient }) {
             data-testid="pause"
             variant="secondary"
             compact
-            onClick={() => void act(() => client.pause(), (i) => (i.paused ? "⏸ paused" : "▶ resumed"))}
+            onClick={() => void act(() => client.pause(), (i) => (i.paused ? "paused" : "resumed"))}
           >
-            {paused ? "▶ Resume" : "⏸ Pause"}
+            <TransportIcon name={paused ? "play" : "pause"} />
+            {paused ? "Resume" : "Pause"}
           </Button>
           {/* Stop is ALWAYS reachable while playing (the escape hatch). */}
-          <Button id="stop" data-testid="stop" variant="danger" compact onClick={() => void act(() => client.stop(), () => "⏹ stopped")}>
-            ⏹ Stop
+          <Button id="stop" data-testid="stop" variant="danger" compact onClick={() => void act(() => client.stop(), () => "stopped")}>
+            <TransportIcon name="stop" />
+            Stop
           </Button>
           <span
             id="playIndicator"
             data-testid="playIndicator"
             title="the scene is running — edits are disabled until you Stop"
+            data-state={paused ? "paused" : "playing"}
             style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: space.xs,
               marginLeft: space.xs,
               padding: `2px ${space.md}px`,
               borderRadius: radius.md,
@@ -77,7 +84,11 @@ export function PlayControls({ client }: { client: EditorClient }) {
               fontSize: fontSize.meta,
             }}
           >
-            {paused ? "⏸ PAUSED" : "● PLAYING"}
+            {/* `data-state` above is what a test asserts — `<test_and_ci_discipline>` 3. The badge used to
+                carry U+23F8 in its text and PlayControls.test.tsx matched the literal string, which coupled
+                a state assertion to a character the UI font stack does not contain. */}
+            {paused ? <TransportIcon name="pause" size={11} /> : <span aria-hidden>●</span>}
+            {paused ? "PAUSED" : "PLAYING"}
           </span>
         </>
       )}

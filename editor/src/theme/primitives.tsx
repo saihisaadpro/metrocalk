@@ -511,6 +511,54 @@ export function Badge({ children, tone = "neutral", style, title }: { children: 
   );
 }
 
+/** THE FIVE TRANSPORT ICONS, AS GEOMETRY RATHER THAN TEXT — and the reason is a capture, not a theory.
+ *
+ *  The transport used the Unicode media-control characters: U+23EE ⏮, U+23ED ⏭, U+23F8 ⏸, U+23F9 ⏹ and
+ *  U+25B6 ▶. `animation-timeline-tracks.png` shows FOUR buttons of which THREE are empty boxes, and the
+ *  one that renders is ▶ — which is the whole diagnosis. `--mtk-font-ui` is
+ *  `Inter · Segoe UI · system-ui · -apple-system · Helvetica Neue · Arial · sans-serif`; ▶ lives in
+ *  Geometric Shapes (Unicode 1.1, 1993) and every one of those fonts has it. The other four are
+ *  Miscellaneous Technical media controls added in Unicode 6.0 (2010) and NOT ONE font in that stack
+ *  carries them. So the browser leaves the declared stack entirely: on this Linux capture host it finds
+ *  nothing and draws .notdef; on Windows it lands on Segoe UI Emoji and draws a COLOUR pictograph in a
+ *  monochrome toolbar. Both are wrong, and the second is worse because it looks deliberate.
+ *
+ *  Every functional test stayed green throughout, because each button carries an `aria-label` and a
+ *  `data-testid` and a control with no visible glyph still clicks. This is `<visual_acceptance>` in one
+ *  picture: state-only gates cannot see an empty button.
+ *
+ *  Inline SVG has no font dependency at all, inherits `currentColor` so the toggle/active variants keep
+ *  working, and scales with the button rather than the text metrics. `aria-hidden` because the button
+ *  above it already carries the label — the icon must not be announced twice. */
+const TRANSPORT_PATHS = {
+  prev: "M5 4h2.2v12H5zM16 4v12L8.4 10z",
+  next: "M12.8 4H15v12h-2.2zM4 4v12l7.6-6z",
+  play: "M5.5 4l10.5 6-10.5 6z",
+  pause: "M6 4h2.6v12H6zM11.4 4H14v12h-2.6z",
+  stop: "M5 5h10v10H5z",
+} as const;
+
+export type TransportIconName = keyof typeof TRANSPORT_PATHS;
+
+/** One transport control's glyph. `name` is the stable signal — a test keys on `data-icon`, never on a
+ *  character that a font may or may not have. */
+export function TransportIcon({ name, size = 14 }: { name: TransportIconName; size?: number }) {
+  return (
+    <svg
+      data-icon={name}
+      aria-hidden
+      focusable="false"
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      style={{ display: "block", flex: "none" }}
+    >
+      <path d={TRANSPORT_PATHS[name]} />
+    </svg>
+  );
+}
+
 /** The semantic kind of an entity/asset → a glyph + a deterministic dark-theme hue. Keys off a stable
  *  `kind` string the caller derives from the **real** projection (the relational summary / salient
  *  component) or a catalog item's source/category — never a styled string a test would couple to. */

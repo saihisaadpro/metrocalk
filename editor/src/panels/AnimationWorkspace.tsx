@@ -38,6 +38,7 @@ import {
   Toolbar,
   ToolbarGroup,
   ToolbarSeparator,
+  TransportIcon,
 } from "../theme/primitives";
 import { Modal } from "../theme/Popover";
 import { DisclosureSection, DockTabs, EmptyPanelState } from "../theme/workspace";
@@ -1550,7 +1551,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             data-testid="animation-step-back"
             onClick={() => stepFrame(-1)}
           >
-            ⏮
+            <TransportIcon name="prev" />
           </Button>
           <Button
             compact
@@ -1562,7 +1563,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             data-testid="animation-play"
             onClick={() => void transport(model.playing ? "pause" : "play")}
           >
-            {model.playing ? "⏸" : "▶"}
+            <TransportIcon name={model.playing ? "pause" : "play"} />
           </Button>
           <Button
             compact
@@ -1572,10 +1573,10 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             data-testid="animation-step-forward"
             onClick={() => stepFrame(1)}
           >
-            ⏭
+            <TransportIcon name="next" />
           </Button>
           <Button compact icon aria-label="Stop and rewind" title="Stop and rewind to the start" data-testid="animation-stop" onClick={stopAnimation}>
-            ⏹
+            <TransportIcon name="stop" />
           </Button>
         </ToolbarGroup>
         <ToolbarGroup grow={180} aria-label="Scrub">

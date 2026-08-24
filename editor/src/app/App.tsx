@@ -15,7 +15,7 @@ import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
 import { Modal, Popover } from "../theme/Popover";
-import { Button } from "../theme/primitives";
+import { Button, TransportIcon } from "../theme/primitives";
 import { DockRail } from "../theme/workspace";
 import { color, elevation, font, fontSize, motion, radius, space, z } from "../theme/tokens";
 import { STAGE_MIN, type DockForm, dockForm, dockGridColumns, panelLayout } from "./layout";
@@ -126,10 +126,14 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
         boxShadow: elevation.e2,
       }}
     >
-      <span>{paused ? "⏸ PAUSED" : "● PLAYING"}</span>
+      <span data-state={paused ? "paused" : "playing"} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        {paused ? <TransportIcon name="pause" size={12} /> : <span aria-hidden>●</span>}
+        {paused ? "PAUSED" : "PLAYING"}
+      </span>
       <span style={{ color: color.text.muted }}>— Esc or</span>
       <Button data-testid="stageStop" variant="danger" compact onClick={onStop}>
-        ⏹ Stop
+        <TransportIcon name="stop" />
+        Stop
       </Button>
     </div>
   );
@@ -442,7 +446,7 @@ export function App() {
       .stop()
       .then((info) => {
         playStore.getState().refresh(info);
-        setStatus("⏹ stopped");
+        setStatus("stopped");
       })
       .catch((e) => console.error("stop failed", e));
   }
@@ -457,8 +461,9 @@ export function App() {
   // opaque body and wrong in the packaged app: the native root is deliberately transparent so the wgpu
   // viewport can show through, so a 45%-opaque dock let the 3D scene bleed into the side panels the
   // moment Play started. Seen in an OS capture of a Play session — a crate and its shadow drawn across
-  // the object list. The dock therefore keeps a FULLY OPAQUE background and dims only its contents.
-  const dockSurface: React.CSSProperties = { overflow: "hidden", background: "var(--mtk-bg-panel)" };
+  // the object list. The dock therefore keeps a FULLY OPAQUE background and dims only its contents:
+  // `.mtk-shell-track` (the ground) and `.mtk-shell-card` (the panel) both paint, and `chromeDim`
+  // below is applied to the CONTENT, never to either surface.
   // A BLOCK CONTAINER DOES NOT CONSTRAIN THE PANEL INSIDE IT, AND THE PANEL WAS COUNTING ON IT.
   // `WorkspacePanel` is `display: flex; flex-direction: column` whose body is `flex: 1 1 auto;
   // min-height: 0` — an arrangement that only means anything if the panel itself has been given a
@@ -596,14 +601,22 @@ export function App() {
         {!layout.overlay && (
           // Same reason as the docks: the rail dims over an opaque backing rather than dimming its own
           // background, or the viewport shows through it during Play.
-          <div style={{ display: "flex", ...dockSurface }}>
-            <EngineRail
-              active={engine}
-              compact={layout.collapsed}
-              badges={{ scene: order.length || undefined, gameplay: playing ? "live" : undefined }}
-              onChange={openEngine}
-              style={chromeDim}
-            />
+          <div className="mtk-shell-track mtk-shell-track--engines">
+            {/* The CARD is the opaque surface and the RAIL is the content, in that order and never
+                merged: `chromeDim` is an `opacity`, and an opacity composites the element together
+                with its own background. Put it on the painted surface and Play makes the panel 45%
+                transparent over a deliberately transparent native root — the crate-through-the-
+                object-list bleed the comment on `chromeDim` describes. Dim the contents; never the
+                surface. */}
+            <div className="mtk-shell-card">
+              <EngineRail
+                active={engine}
+                compact={layout.collapsed}
+                badges={{ scene: order.length || undefined, gameplay: playing ? "live" : undefined }}
+                onChange={openEngine}
+                style={chromeDim}
+              />
+            </div>
           </div>
         )}
 
@@ -619,8 +632,10 @@ export function App() {
             data-testid="rail-left"
           />
         ) : (
-          <div style={{ borderRight: "1px solid var(--mtk-border-subtle)", ...dockSurface }}>
-            <div style={dockContent}>{leftPanel}</div>
+          <div className="mtk-shell-track mtk-shell-track--left">
+            <div className="mtk-shell-card">
+              <div style={dockContent}>{leftPanel}</div>
+            </div>
           </div>
         ))}
 
@@ -925,8 +940,10 @@ export function App() {
             data-testid="rail-right"
           />
         ) : (
-          <div style={{ borderLeft: "1px solid var(--mtk-border-subtle)", ...dockSurface }}>
-            <div style={dockContent}>{rightPanel}</div>
+          <div className="mtk-shell-track mtk-shell-track--right">
+            <div className="mtk-shell-card">
+              <div style={dockContent}>{rightPanel}</div>
+            </div>
           </div>
         ))}
       </div>

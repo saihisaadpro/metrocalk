@@ -23,6 +23,10 @@ target/
 # `/__probe` above, and worse, because each one is a plausible-looking `.mjs` sitting next to real
 # scripts. They are build output; they never travel.
 *.timestamp-*.mjs
+# Per-machine agent permission grants. The `.local.json` suffix is the convention's own statement that
+# this belongs to one workstation — it records which commands a human approved HERE, which is neither
+# code nor a decision anyone else can act on. Same local-only rule as the docs below.
+/.claude/settings.local.json
 # The zero-byte file the session harness drops at the mount root to prove the mount is writable.
 # It reappears every session; without this it shows up as an untracked file in every `git status`,
 # which is exactly the ambient noise that trains a reader to stop looking at the list.

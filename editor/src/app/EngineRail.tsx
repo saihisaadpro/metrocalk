@@ -22,7 +22,6 @@
 
 import type { CSSProperties } from "react";
 import { color, font, fontSize, radius, space, text } from "../theme/tokens";
-import { ENGINE_RAIL_W, ENGINE_RAIL_W_COMPACT } from "./layout";
 
 /** Where an engine's workspace opens. Decided by the shape of its content, not by taste. */
 export type EngineSurface = "side" | "bottom";
@@ -100,6 +99,11 @@ export interface EngineRailProps {
   badges?: Partial<Record<EngineId, string | number>>;
   /** Icons only. Used when the window is too narrow to afford the labels. */
   compact?: boolean;
+  /** Optional class for the rail element. The shell does NOT pass its `mtk-shell-card` here: the card
+   *  is a painted surface and `style` below carries the Play-mode dim, which is an `opacity` — one
+   *  element cannot be both without making the panel translucent over a transparent native root. The
+   *  shell wraps the rail in the card instead, so the surface paints and the contents dim. */
+  className?: string;
   style?: CSSProperties;
 }
 
@@ -110,25 +114,29 @@ export interface EngineRailProps {
  * three unrelated toolbars, and so arrow keys walk the whole list — the group headings are decoration for
  * the eye, not structure to navigate.
  */
-export function EngineRail({ active, onChange, badges = {}, compact = false, style }: EngineRailProps) {
-  // The SAME width `layout.ts` reserves as a grid track. It used to be `compact ? 56 : 132` — the two
-  // constants written a second time, in the one file whose job is to fit inside them, compared to the
-  // originals by nothing. That is the drift ADR-119/122 exist for, one layer up.
-  const width = compact ? ENGINE_RAIL_W_COMPACT : ENGINE_RAIL_W;
+export function EngineRail({ active, onChange, badges = {}, compact = false, className, style }: EngineRailProps) {
+  // NO WIDTH OF ITS OWN, AND THAT IS THE CHANGE. It used to restate the grid track `layout.ts`
+  // reserves, because the rail WAS that track: it painted the panel background and drew the hairline
+  // separating it from the dock beside it. It is now the contents of a card that floats inside the
+  // track with a gutter around it, so the track's width and the rail's width are deliberately no
+  // longer the same number — and a `flex: 0 0 132px` inside a card that has 120px to give is the
+  // overflow R7 already caught once in this file. It fills the card; the card fills what the gutter
+  // leaves of the track; `layout.ts` still owns the track. One width, one owner, as before.
   return (
     <nav
       data-testid="engine-rail"
       aria-label="Sub-engines"
+      className={className}
       style={{
-        width,
-        flex: `0 0 ${width}px`,
+        width: "100%",
+        flex: "1 1 auto",
         display: "flex",
         flexDirection: "column",
         gap: space.xs,
-        // `border-box`, because `width` here IS the track `layout.ts` reserves — 132px of shell, of
-        // which the padding and the border are part. Content-box would make the rail 141px wide in a
-        // 132px track, and `shots` R7 measured exactly that: **9px of the rail cut, no scrollbar**,
-        // across 14 scenes, in the run meant to prove the padding fix below.
+        // `border-box`, so the padding below comes out of the 100% rather than being added to it —
+        // the same reason it was here when the width was a fixed track number. Content-box made the
+        // rail 141px wide in a 132px track and `shots` R7 measured exactly that: **9px of the rail
+        // cut, no scrollbar**, across 14 scenes, in the run meant to prove the padding fix below.
         boxSizing: "border-box",
         // `px`, on all three paddings in this file. React appends the unit to a NUMBER, never inside
         // a template string, so `` `${space.sm} ${space.xs}` `` reached the DOM as the invalid length
@@ -140,8 +148,11 @@ export function EngineRail({ active, onChange, badges = {}, compact = false, sty
         // overlaps nothing and is perfectly readable. Found by LOOKING at `shell-wide.png`, and now
         // gated by the ratchet's `unitless-length` rule (ADR-128).
         padding: `${space.sm}px ${space.xs}px`,
-        background: color.bg.panel,
-        borderRight: `1px solid ${color.border.subtle}`,
+        // No background and no right-hand hairline. The card behind the rail (`.mtk-shell-card`)
+        // paints the surface now, and the gap the shell gutter leaves is what separates the rail
+        // from the dock beside it — a line drawn on top of a gap says the same thing twice. Leaving
+        // the background here would also be actively wrong: `style` below carries the Play-mode dim,
+        // which is an `opacity`, and an opacity composites an element WITH its own background.
         overflowY: "auto",
         overflowX: "hidden",
         ...style,
