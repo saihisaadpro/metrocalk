@@ -423,10 +423,10 @@ impl Physics for RapierPhysics {
             let col2 = self.colliders.get(pair.collider2);
             let friction = col1
                 .zip(col2)
-                .map_or(0.0, |(c1, c2)| (c1.friction() + c2.friction()) * 0.5);
-            let restitution = col1
-                .zip(col2)
-                .map_or(0.0, |(c1, c2)| (c1.restitution() + c2.restitution()) * 0.5);
+                .map_or(0.0, |(c1, c2)| f64::midpoint(c1.friction(), c2.friction()));
+            let restitution = col1.zip(col2).map_or(0.0, |(c1, c2)| {
+                f64::midpoint(c1.restitution(), c2.restitution())
+            });
             // Collider 1's world placement transforms each manifold point (stored in its local frame) to
             // world space — the exact contact point the overlay marks + the click-to-explain target.
             let pos1 = col1.map(rapier::geometry::Collider::position).copied();

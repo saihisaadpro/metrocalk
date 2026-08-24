@@ -37,9 +37,9 @@ impl Bounds {
             return [0.0; 3];
         }
         [
-            (self.min[0] + self.max[0]) * 0.5,
-            (self.min[1] + self.max[1]) * 0.5,
-            (self.min[2] + self.max[2]) * 0.5,
+            f32::midpoint(self.min[0], self.max[0]),
+            f32::midpoint(self.min[1], self.max[1]),
+            f32::midpoint(self.min[2], self.max[2]),
         ]
     }
 

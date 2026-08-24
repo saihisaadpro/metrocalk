@@ -45,7 +45,7 @@ pub fn solve_knee(a: Vec3, target: Vec3, l_ab: f32, l_cb: f32, pole: Vec3) -> (V
     let reached = a + axis_dir * clamped;
     let l_at = clamped;
     // Projection of the knee onto the a→target axis + its off-axis radius (sphere-sphere intersection).
-    let h = ((l_ab * l_ab - l_cb * l_cb) / l_at + l_at) * 0.5;
+    let h = f32::midpoint((l_ab * l_ab - l_cb * l_cb) / l_at, l_at);
     let r = (l_ab * l_ab - h * h).max(0.0).sqrt();
     // Off-axis direction = the pole component perpendicular to the limb axis (else any perpendicular).
     let pole_vec = pole - a;

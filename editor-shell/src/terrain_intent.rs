@@ -1544,8 +1544,8 @@ pub fn bake_impostor_texture(asset: &MeshAsset, size: u32) -> Texture {
     let span_y = (hi[1] - lo[1]).max(1e-4);
     // Fit the taller axis so the silhouette is not stretched, and keep a texel of margin.
     let span = span_x.max(span_y) * 1.02;
-    let cx = (lo[0] + hi[0]) * 0.5;
-    let cy = (lo[1] + hi[1]) * 0.5;
+    let cx = f32::midpoint(lo[0], hi[0]);
+    let cy = f32::midpoint(lo[1], hi[1]);
     // A key light from the front-upper-left, matching how foliage is usually authored.
     let light = normalize3([-0.4, 0.7, 0.6]);
 
