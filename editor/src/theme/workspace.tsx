@@ -154,8 +154,11 @@ export interface DockRailProps {
 
 /** A calm icon rail for collapsed docks; activation opens a drawer or an anchored quick panel. */
 export function DockRail({ side, label, items, activeId, popupOpen = false, onActivate, ...rest }: DockRailProps) {
+  // No `--${side}` modifier on the shell: the rail is a capsule centred in its track and neither side
+  // has ever had a rule, so the class was two dead names in the DOM. `side` still distinguishes the
+  // rail's buttons (`data-testid`) and its aria-label.
   return (
-    <aside className={`mtk-dock-rail-shell mtk-dock-rail-shell--${side}`} aria-label={`${label} collapsed dock`} {...rest}>
+    <aside className="mtk-dock-rail-shell" aria-label={`${label} collapsed dock`} {...rest}>
       <div className="mtk-dock-rail" role="toolbar" aria-label={label} aria-orientation="vertical">
         {items.map((item) => {
           const active = item.id === activeId;

@@ -714,13 +714,9 @@ body > [role="dialog"][aria-modal="true"] {
 /* ── Inspector property rows + collapsible groups (M14.3 / ADR-059) ── */
 .mtk-field-row { display: flex; align-items: center; gap: var(--mtk-space-4); min-height: var(--mtk-control-default); padding: 2px 0; }
 .mtk-field-label { flex: none; width: 92px; color: var(--mtk-text-secondary); font-size: 12px; font-family: var(--mtk-font-ui); }
-.mtk-group {
-  overflow: hidden;
-  margin-bottom: var(--mtk-space-4);
-  background: var(--mtk-bg-panel);
-  border: 1px solid var(--mtk-border-subtle);
-  border-radius: var(--mtk-radius-lg);
-}
+/* `.mtk-group` and `.mtk-group-body` are gone: the container and body of the M14.3 collapsible group
+   were superseded by `Disclosure` (`.mtk-disclosure*`) and no markup has emitted either since. The
+   HEAD and CARET survive because `Diagnostics.tsx` still uses them as a bare expander. */
 .mtk-group-head {
   display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
   min-height: var(--mtk-control-default); padding: 7px 10px; background: transparent; color: var(--mtk-text-secondary);
@@ -730,7 +726,6 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-group-head:hover { background: var(--mtk-bg-hover); color: var(--mtk-text); }
 .mtk-group-caret { display: inline-block; transition: transform var(--mtk-motion-fast) var(--mtk-ease-standard); color: var(--mtk-text-muted); }
 .mtk-group-caret.is-open { transform: rotate(90deg); }
-.mtk-group-body { padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--mtk-border-subtle); background: var(--mtk-bg-raised); }
 
 /* ── Cards (asset/component cards — M14.2/ADR-058): one card surface with real hover/selected/unavailable
  *    states inline styles can't express. The metadata (type · source · capability) is laid out in JS. ── */
@@ -2195,7 +2190,6 @@ body > [role="dialog"][aria-modal="true"] {
   .mtk-surface,
   .mtk-popover-surface,
   .mtk-dialog-surface,
-  .mtk-group,
   .mtk-shortcut {
     border: 1px solid ButtonText;
     box-shadow: none;
