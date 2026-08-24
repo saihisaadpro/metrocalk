@@ -454,7 +454,8 @@ jobs:
       # run the comparison at rest, in milliseconds. It is also the predictable cost of the pathspec-commit
       # rule (ADR-132) — right with three writers in one tree, but it lands a two-file change as one.
       # Checked in BOTH directions, so a rename cannot leave dead CSS behind either. Self-test first.
-      # See ADR-133.
+      # See ADR-134. (Commit 6a3db8f's message says ADR-133 — 133 was taken by a concurrent lane while
+      # this was being written; the ADR is 134.)
       - name: class hooks — the class the markup asks for exists, and the rule the CSS writes is reached
         working-directory: editor
         run: |
