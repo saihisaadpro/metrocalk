@@ -8,7 +8,7 @@
 import { useEffect, useState } from "react";
 import { useSelectedId } from "../store/projection";
 import { setStatus } from "../store/ui";
-import { Button } from "../theme/primitives";
+import { Button, Slider } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import { DisclosureSection, ShortcutBadge } from "../theme/workspace";
 import type { ContactInfo, PhysicsWarning, TimelineTuple } from "../transport/protocol";
@@ -226,10 +226,9 @@ export function PhysicsPanel({ client }: { client: EditorClient }) {
               Recorded timeline
             </label>
             <div style={{ ...actionRow, flexWrap: "nowrap" }}>
-              <input
+              <Slider
                 id="scrub"
                 data-testid="scrub"
-                type="range"
                 min={0}
                 max={Math.max(1, tl[1])}
                 value={tl[0]}
@@ -238,7 +237,7 @@ export function PhysicsPanel({ client }: { client: EditorClient }) {
                 aria-valuetext={`Frame ${tl[0]} of ${tl[1]}`}
                 title={hasFrames ? "Scrubbing pauses the simulation." : "Run the simulation to record frames before scrubbing."}
                 onChange={(e) => void scrub(Number(e.target.value))}
-                style={{ flex: "1 1 auto", minWidth: 0, accentColor: color.accent.base }}
+                style={{ flex: "1 1 auto", minWidth: 0 }}
               />
               <span id="frameLbl" data-testid="frameLbl" style={{ color: color.text.secondary, font: font.mono, fontSize: fontSize.meta, whiteSpace: "nowrap" }}>
                 frame {tl[0]}/{tl[1]}{tl[3] ? " · debug" : ""}

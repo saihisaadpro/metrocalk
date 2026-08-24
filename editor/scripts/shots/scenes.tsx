@@ -16,6 +16,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { App } from "../../src/app/App";
 import { STAGE_MIN } from "../../src/app/layout";
+import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
 import { Diagnostics } from "../../src/panels/Diagnostics";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { Reveal } from "../../src/panels/Reveal";
@@ -25,7 +26,13 @@ import RIG_BLOCKED from "../../src/panels/__fixtures__/rig-not-retargetable.json
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { projectionStore } from "../../src/store/projection";
-import type { CadReport, CadReportPart, RevealResponse } from "../../src/transport/protocol";
+import type {
+  AnimationTrackInfo,
+  AnimationWorkspaceInfo,
+  CadReport,
+  CadReportPart,
+  RevealResponse,
+} from "../../src/transport/protocol";
 import type { EditorClient } from "../../src/transport/session";
 
 /** What must be true of the rendered scene, checked by `shoot.mjs` in the page before it captures.
@@ -245,6 +252,106 @@ const selectUnwiredEntity = () => {
   s.select("diag");
 };
 
+// ── the animate timeline, with tracks on it ───────────────────────────────────────────────────────
+
+/** WHY THIS SCENE EXISTS. `shell-dock-animate` photographs the Animate dock on a scene where nothing
+ *  is selected — so it captures a ruler, two annotation lanes and an empty state, and **not one track
+ *  row**. Every part of the timeline that only appears once there is something to animate — the track
+ *  header with its mute and lock, the zebra lane, the key diamonds, the selected-row treatment, the
+ *  playhead crossing a lane rather than only the ruler — had never been in a capture at all. A
+ *  surface whose populated state is unphotographed is a surface where the populated state is the one
+ *  that breaks, which is the whole argument this harness was built on.
+ *
+ *  The client is a stub rather than the MockCore because MockCore's sample scene has no authored
+ *  animation: getting tracks through it would mean authoring them at runtime through the transport,
+ *  which photographs the editing path and not the timeline. */
+const ANIMATION_TICKS = 60;
+
+function animTrack(
+  id: string,
+  name: string,
+  property: string,
+  keys: number[],
+  extra: Partial<AnimationTrackInfo> = {},
+): AnimationTrackInfo {
+  return {
+    id,
+    name,
+    targetId: "rig",
+    targetName: "Weld Gun 7",
+    component: "Transform",
+    property,
+    valueKind: "float",
+    interpolation: "cubic",
+    enabled: true,
+    locked: false,
+    context: "3d",
+    editorKind: "scalar",
+    bindingState: "ready",
+    bindingReason: "Bound to Transform." + property,
+    runtimeSink: "transform",
+    keys: keys.map((tick, index) => ({
+      id: `${id}-k${index}`,
+      tick,
+      seconds: tick / ANIMATION_TICKS,
+      value: index % 2 === 0 ? 0 : 1.5,
+      inTangent: null,
+      outTangent: null,
+    })),
+    ...extra,
+  };
+}
+
+const ANIMATED: AnimationWorkspaceInfo = {
+  revision: "rev-7",
+  sequenceId: "main",
+  sequenceName: "Weld pass",
+  ticksPerSecond: ANIMATION_TICKS,
+  durationTick: 180,
+  currentTick: 68,
+  playing: false,
+  loopPolicy: "loop",
+  selectedId: "rig",
+  selectedName: "Weld Gun 7",
+  properties: [],
+  tracks: [
+    animTrack("t1", "Transform · Position Y", "position.y", [0, 45, 96, 150]),
+    animTrack("t2", "Transform · Rotation Z", "rotation.z", [0, 68, 180]),
+    animTrack("t3", "Transform · Scale", "scale", [24, 120], { locked: true }),
+    animTrack("t4", "Emitter · Rate", "rate", [0, 90], {
+      enabled: false,
+      component: "Emitter",
+      bindingState: "preview_only",
+      bindingReason: "Preview only until the emitter is bound.",
+    }),
+  ],
+  markers: [
+    { id: "m1", ownerId: "rig", name: "Contact", tick: 45, seconds: 0.75, color: null },
+    { id: "m2", ownerId: "rig", name: "Release", tick: 150, seconds: 2.5, color: null },
+  ],
+  events: [{ id: "e1", ownerId: "rig", name: "spark", tick: 96, seconds: 1.6, payload: null }],
+  contexts: [
+    { context: "2d", state: "unsupported", properties: 0, tracks: 0, reason: "No 2D channels are present on this selection.", action: null },
+    { context: "3d", state: "ready", properties: 4, tracks: 4, reason: "Four bound Transform channels.", action: null },
+    { context: "ui", state: "unsupported", properties: 0, tracks: 0, reason: "No UI channels are present on this selection.", action: null },
+  ],
+  asset: null,
+  issues: [],
+};
+
+const animationClient = () =>
+  ({
+    animationState: () => Promise.resolve(ANIMATED),
+    animationPlaybackState: () =>
+      Promise.resolve({ playing: false, currentTick: ANIMATED.currentTick, durationTick: ANIMATED.durationTick, loopPolicy: ANIMATED.loopPolicy, crossedEvents: [], eventsTruncated: false }),
+  }) as unknown as EditorClient;
+
+const selectAnimatedEntity = () => {
+  const s = projectionStore.getState();
+  s.bulkLoad([{ id: "rig", name: "Weld Gun 7", parentId: null, components: { Transform: {} } }] as never);
+  s.select("rig");
+};
+
 export const SCENES: Scene[] = [
   {
     id: "import-report-nulls",
@@ -380,6 +487,47 @@ export const SCENES: Scene[] = [
     },
     setup: selectUnwiredEntity,
     render: () => <Diagnostics client={revealClient(CAD_REVEAL)} />,
+  },
+  {
+    id: "animation-timeline-tracks",
+    looking_for:
+      "the timeline with something on it: four track rows under the ruler, each with its name, its " +
+      "binding badge, its key count and its mute/lock pair in a header column that stays put, and " +
+      "its keys as diamonds on a zebra lane. The playhead is a line THROUGH the lanes with a handle " +
+      "on the ruler, the muted track is visibly muted and the locked one is visibly locked — none of " +
+      "which any capture in this repository has ever contained, because the only Animate scene has " +
+      "nothing selected and photographs an empty state",
+    width: 1000,
+    setup: selectAnimatedEntity,
+    expect: {
+      present: [
+        ["[data-testid='animation-track']", 4],
+        ["[data-testid='animation-key']", 11],
+        ["[data-testid='animation-marker']", 2],
+        ["[data-testid='animation-event']", 1],
+      ],
+      // The marker names are in their `title`/`aria-label`, not painted on the 30px lane, so the
+      // claim is the count above plus the sequence and track names that ARE painted.
+      text_present: ["Transform · Position Y", "Weld pass"],
+      // The transport row is the one that used to collide: seven items at one gap on a strip that
+      // scrolled without a scrollbar. Every control on it must be whole and on screen.
+      unclipped: [
+        "[data-testid='animation-transport'] .mtk-btn",
+        "[data-testid='animation-transport'] .mtk-select",
+        "[data-testid='animation-timeline-toolbar'] .mtk-btn",
+        "[data-testid='animation-timeline-toolbar'] .mtk-select",
+        "#animation-contexts .mtk-dock-tab",
+        "#animation-surfaces .mtk-dock-tab",
+      ],
+      // The time read-out sits ON the transport row rather than above or below it — a timecode that
+      // wraps to its own line is the row having run out of width.
+      same_line: [
+        ["[data-testid='animation-time']", "[data-testid='animation-play']"],
+        ["[data-testid='animation-time']", "[data-testid='animation-scrub']"],
+      ],
+      text_absent: ["null", "undefined", "NaN"],
+    },
+    render: () => <AnimationWorkspace client={animationClient()} />,
   },
   ...rigScenes(),
   ...poseScenes(),

@@ -1658,6 +1658,15 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                 <SelectField
                   value={interpolation}
                   disabled={!currentProperty?.animatable || currentProperty.valueKind === "bool" || currentProperty.valueKind === "string"}
+                  title={
+                    !currentProperty
+                      ? "Choose a property above first — interpolation describes how ITS values are read between keys."
+                      : !currentProperty.animatable
+                        ? `"${currentProperty.label}" cannot be keyed, so it has nothing to interpolate. ${currentProperty.bindingReason || currentProperty.reason || ""}`.trim()
+                        : currentProperty.valueKind === "bool" || currentProperty.valueKind === "string"
+                          ? `A ${currentProperty.valueKind === "bool" ? "true/false" : "text"} value has no in-between, so its keys always step.`
+                          : "How values are read between this track's keys"
+                  }
                   onChange={(event) => animationEditorStore.getState().setDraft(workspaceKey, activeContext, INTERPOLATION_DRAFT, event.target.value)}
                 >
                   <option value="step">Step</option><option value="linear">Linear</option><option value="cubic">Cubic</option>
@@ -1927,7 +1936,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                           onClick={() => animationEditorStore.getState().setSelection(workspaceKey, activeContext, [track.id], [])}
                           style={{ minWidth: 0, padding: 0, border: 0, textAlign: "left", color: "inherit", background: "transparent", cursor: "pointer" }}
                         >
-                          <span title={`${track.targetName} / ${track.component}.${track.property}`} style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: fontSize.body }}>{track.name}</span>
+                          <span className="mtk-timeline__track-name" title={`${track.targetName} / ${track.component}.${track.property}`} style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: fontSize.body }}>{track.name}</span>
                           <span style={{ display: "flex", alignItems: "center", gap: space.xs, marginTop: 2 }}>
                             <Badge tone={bindingTone(state)}>{state.replace("_", " ")}</Badge>
                             <span style={{ color: color.text.muted, fontSize: fontSize.micro }}>{track.keys.length} keys</span>
@@ -1943,7 +1952,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                             aria-label={`${track.enabled ? "Mute" : "Unmute"} ${track.name}`}
                             title={track.enabled ? "Mute track without deleting keys" : "Unmute track"}
                             onClick={(event) => { event.stopPropagation(); changeTrackEnabled(track); }}
-                          >{track.enabled ? "M" : "m"}</Button>
+                          >{track.enabled ? "◉" : "◌"}</Button>
                           <Button
                             compact
                             icon
@@ -1978,7 +1987,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                                   deleteSelectedKey({ track, key });
                                 }
                               }}
-                              style={{ position: "absolute", left: `calc(${(key.tick / duration) * 100}% - 12px)`, top: 11, display: "grid", placeItems: "center", width: 24, height: 24, padding: 0, border: 0, background: "transparent", cursor: "pointer", zIndex: 3 }}
+                              style={{ position: "absolute", left: `clamp(0px, calc(${(key.tick / duration) * 100}% - 12px), calc(100% - 24px))`, top: 11, display: "grid", placeItems: "center", width: 24, height: 24, padding: 0, border: 0, background: "transparent", cursor: "pointer", zIndex: 3 }}
                             >
                               <span aria-hidden="true" style={{ width: 12, height: 12, transform: "rotate(45deg)", border: `1px solid ${keyActive ? color.accent.base : state === "invalid" ? color.danger.border : color.border.strong}`, background: keyActive ? color.accent.solid : track.locked ? color.bg.inset : color.bg.raised }} />
                             </button>
@@ -2030,7 +2039,12 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                     {selectedTrack.bindingReason && <Hint>{selectedTrack.bindingReason}</Hint>}
                     <label style={{ display: "grid", gap: space.xs, marginTop: space.sm, color: color.text.secondary, fontSize: fontSize.meta }}>
                       Interpolation
-                      <SelectField value={selectedTrack.interpolation} disabled={selectedTrack.locked} onChange={(event) => changeInterpolation(selectedTrack, event.target.value as AnimationInterpolation)}>
+                      <SelectField
+                        value={selectedTrack.interpolation}
+                        disabled={selectedTrack.locked}
+                        title={selectedTrack.locked ? "This track is locked. Unlock it in the timeline to change how its keys interpolate." : "How values are read between this track's keys"}
+                        onChange={(event) => changeInterpolation(selectedTrack, event.target.value as AnimationInterpolation)}
+                      >
                         <option value="step">Step</option><option value="linear">Linear</option><option value="cubic">Cubic</option>
                       </SelectField>
                     </label>

@@ -1549,7 +1549,21 @@ body > [role="dialog"][aria-modal="true"] {
 }
 .mtk-timeline__row--track > .mtk-timeline__lane { border-bottom-width: 0; border-top: 1px solid var(--mtk-border-subtle); }
 .mtk-timeline__row--track.is-invalid > .mtk-timeline__lane { border-top-color: var(--mtk-danger-border); }
-.mtk-timeline__row--track.is-muted { opacity: 0.52; }
+/* A MUTED TRACK, WITHOUT DIMMING ITS WORDS. This was `opacity: 0.52` on the whole row, which is a
+   state channel that also takes every label inside it under AA — measured at 2.13-2.45:1 on four
+   of them the first time a capture contained a muted track. The row says muted with its SURFACES;
+   its text is at full contrast, and the mute button beside it carries the state and the sentence. */
+.mtk-timeline__row--track.is-muted > .mtk-timeline__head { background: var(--mtk-bg-inset); }
+.mtk-timeline__row--track.is-muted > .mtk-timeline__head .mtk-timeline__track-name {
+  color: var(--mtk-text-muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--mtk-border-strong);
+}
+.mtk-timeline__row--track.is-muted > .mtk-timeline__lane { background: repeating-linear-gradient(
+  135deg,
+  var(--mtk-bg-inset) 0 6px,
+  var(--mtk-bg-active) 6px 12px
+); }
 /* The lane graticule, at the same ten divisions the ruler labels, so a key lines up with a number. */
 /* The empty timeline. A percentage width here resolves against the SCROLLER's visible box, not
    its scroll width, and `sticky` holds it in place while the lanes pan under it. */

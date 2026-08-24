@@ -12,7 +12,7 @@ import { useEffect, useState } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { usePlaying } from "../store/play";
-import { Button } from "../theme/primitives";
+import { Button, Slider } from "../theme/primitives";
 import { color, font, fontSize, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type { ConditionTruth, DecisionEvent, RuleDebugInfo } from "../transport/protocol";
@@ -154,10 +154,9 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
           <span style={{ opacity: 0.7 }}>decision history</span>
           <span data-testid="ruleFrame" style={{ opacity: 0.5 }}>frame {frame} / {head}</span>
         </div>
-        <input
+        <Slider
           id="ruleScrub"
           data-testid="ruleScrub"
-          type="range"
           min={0}
           max={head}
           value={frame}

@@ -36,7 +36,7 @@ import {
   type AnimationDraftValue,
   type AnimationWorkspaceKey,
 } from "../store/animation";
-import { Badge, Button, NumericField } from "../theme/primitives";
+import { Badge, Button, NumericField, Slider } from "../theme/primitives";
 import { EmptyPanelState } from "../theme/workspace";
 import { graphEdgeStyle, graphNodeStyle, graphTheme } from "../theme/graph";
 import { color, elevation, fontSize, space } from "../theme/tokens";
@@ -1545,7 +1545,7 @@ function ParameterPreview({
     };
     control = <label className="animation-graph-preview-parameter">{parameter.name}<input aria-label={`${parameter.name} X`} type="number" value={tuple[0]} onChange={(event) => change(0, event)} /><input aria-label={`${parameter.name} Y`} type="number" value={tuple[1]} onChange={(event) => change(1, event)} /></label>;
   } else {
-    control = <label className="animation-graph-preview-parameter">{parameter.name}<input type="range" min={parameter.min ?? 0} max={parameter.max ?? 1} step={parameter.kind === "integer" ? 1 : 0.01} value={typeof value === "number" ? value : 0} onChange={(event) => onChange(parameter.kind === "integer" ? Math.round(Number(event.target.value)) : Number(event.target.value))} /><output>{typeof value === "number" ? value.toFixed(parameter.kind === "integer" ? 0 : 2) : "0"}</output></label>;
+    control = <label className="animation-graph-preview-parameter">{parameter.name}<Slider min={parameter.min ?? 0} max={parameter.max ?? 1} step={parameter.kind === "integer" ? 1 : 0.01} value={typeof value === "number" ? value : 0} onChange={(event) => onChange(parameter.kind === "integer" ? Math.round(Number(event.target.value)) : Number(event.target.value))} /><output>{typeof value === "number" ? value.toFixed(parameter.kind === "integer" ? 0 : 2) : "0"}</output></label>;
   }
   return <span className="animation-graph-preview-wrap">{control}<button type="button" aria-pressed={watched} title={watched ? "Remove from bounded runtime watches" : "Add to bounded runtime watches"} onClick={() => onWatch(!watched)}>{watched ? "watching" : "watch"}</button></span>;
 }

@@ -9,7 +9,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSelectedId, projectionStore } from "../store/projection";
 import { useStore } from "zustand";
 import { setStatus } from "../store/ui";
-import { Badge } from "../theme/primitives";
+import { Badge, Slider } from "../theme/primitives";
 import { color, font, fontSize, space, text } from "../theme/tokens";
 import type { JointInfo } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
@@ -110,8 +110,7 @@ export function JointPanel({ client }: { client: EditorClient }) {
       {/* Drive the DOF — preview while dragging, ONE undoable commit on release. */}
       <label style={{ display: "block", font: font.ui, fontSize: fontSize.meta, color: color.text.secondary, marginBottom: space.xs }}>
         {info.jointType === "revolute" ? "Angle" : "Travel"}
-        <input
-          type="range"
+        <Slider
           data-testid="joint-value"
           min={rangeMin}
           max={rangeMax}
@@ -169,8 +168,7 @@ export function JointPanel({ client }: { client: EditorClient }) {
       {info.trackEnd > 0 && (
         <label style={{ display: "block", font: font.ui, fontSize: fontSize.meta, color: color.text.secondary }}>
           Timeline {scrubT.toFixed(2)}s / {info.trackEnd.toFixed(2)}s
-          <input
-            type="range"
+          <Slider
             data-testid="joint-scrub"
             min={0}
             max={info.trackEnd}
