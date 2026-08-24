@@ -67,7 +67,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const editorRoot = fileURLToPath(new URL("../", import.meta.url));
 const MANIFEST = join(editorRoot, "scripts", "class-hooks.json");
@@ -115,11 +115,16 @@ export function claimedHooks(root) {
       const ch = source[i];
       if (ch === "\n") { line += 1; continue; }
       if (ch !== '"' && ch !== "'" && ch !== "`") continue;
-      // Walk to the closing quote of the same kind, honouring backslash escapes.
+      // Walk to the closing quote of the same kind, honouring backslash escapes. ONLY A BACKTICK MAY
+      // SPAN LINES, and getting that wrong is not a nicety: JSX text says things like `No, it's
+      // different` (panels/ReimportPanel.tsx), and an apostrophe read as a string opener pairs with
+      // nothing and swallows the REST OF THE FILE — 55 lines, 39% of that file, silently unscanned.
+      // A newline therefore terminates a '/" literal, exactly as the JS grammar does.
       let j = i + 1;
       while (j < source.length) {
         if (source[j] === "\\") { j += 2; continue; }
         if (source[j] === ch) break;
+        if (ch !== "`" && source[j] === "\n") break;
         j += 1;
       }
       const body = source.slice(i + 1, j);
@@ -130,9 +135,12 @@ export function claimedHooks(root) {
         const before = m.index === 0 ? undefined : body[m.index - 1];
         const after = body[m.index + m[0].length];
         // A class name is a whitespace-delimited token. `}` opens the run after an interpolation
-        // closes; `$` closes it before one opens.
-        const delimitedLeft = before === undefined || /\s/.test(before) || before === "}";
-        const delimitedRight = after === undefined || /\s/.test(after) || after === "$";
+        // closes; `$` closes it before one opens; and a QUOTE is a boundary too, because a template
+        // literal's body carries its interpolations verbatim — `${cond ? "mtk-tick--first" : ""}`
+        // is a class name flanked by double quotes and nothing else.
+        const boundary = (c) => c === undefined || /\s/.test(c) || c === '"' || c === "'" || c === "`";
+        const delimitedLeft = boundary(before) || before === "}";
+        const delimitedRight = boundary(after) || after === "$";
         if (!delimitedLeft || !delimitedRight) continue;
         if (!claims.has(m[0])) claims.set(m[0], { sites: [], openEnded: false, idOnly: true });
         const claim = claims.get(m[0]);
@@ -142,6 +150,11 @@ export function claimedHooks(root) {
         if (!isId) claim.idOnly = false;
       }
       line += body.split("\n").length - 1;
+      // A '/" literal closed BY a newline consumes that newline, and `i = j` then steps the outer loop
+      // past it without its `line += 1` ever running — every site after the first apostrophe in the
+      // file reports one line too low. Found by checking a reported line against the real one, which
+      // no count-based assertion would have shown.
+      if (ch !== "`" && source[j] === "\n") line += 1;
       i = j;
     }
   }
@@ -174,15 +187,23 @@ export function check(root, manifest) {
 
   /** Rules any claim reaches — the exact hit plus, for an open-ended claim, everything extending it. */
   const reached = new Set();
+  /** Rules reached ONLY through an interpolated stem, and therefore not individually verified in
+   *  either direction. `` `mtk-btn--${variant}` `` satisfies its stem as long as ONE sibling rule
+   *  survives, and marks every sibling reached so none is reported as an orphan. Resolving the real
+   *  variant set needs a type-checker, which this gate deliberately is not — so the blind spot is
+   *  COUNTED and printed rather than left silent, the same way glyph-coverage prints its `unverified`
+   *  backlog. A number that appears on every run is a number someone can act on. */
+  const exactly = new Set();
+  const viaStem = new Set();
   let counted = 0;
 
   for (const [hook, claim] of [...claims].sort()) {
     if (claim.idOnly || keyframes.has(hook)) continue;
     counted += 1;
     const exact = rules.has(hook);
-    const extensions = claim.openEnded ? ruleNames.filter((r) => r.startsWith(hook)) : [];
-    if (exact) reached.add(hook);
-    for (const r of extensions) reached.add(r);
+    const extensions = claim.openEnded ? ruleNames.filter((r) => r.startsWith(hook) && r !== hook) : [];
+    if (exact) { reached.add(hook); exactly.add(hook); }
+    for (const r of extensions) { reached.add(r); viaStem.add(r); }
     if (exact || extensions.length) continue;
     if (hook in declaredUnstyled) continue;
     findings.push({
@@ -215,11 +236,13 @@ export function check(root, manifest) {
     ...Object.keys(declaredUnstyled).filter((h) => !claims.has(h) || rules.has(h)),
     ...Object.keys(declaredUnused).filter((r) => !rules.has(r) || reached.has(r)),
   ];
-  return { findings, counted, ruleCount: ruleNames.length, stale };
+  const stemOnly = [...viaStem].filter((r) => !exactly.has(r)).sort();
+  return { findings, counted, ruleCount: ruleNames.length, stale, stemOnly };
 }
 
 function report(root, manifest, { quiet = false } = {}) {
-  const { findings, counted, ruleCount, stale } = check(root, manifest);
+  const result = check(root, manifest);
+  const { findings, counted, ruleCount, stale, stemOnly } = result;
   if (!quiet) {
     for (const finding of findings) {
       console.log(`  ERROR  ${finding.message}`);
@@ -234,11 +257,12 @@ function report(root, manifest, { quiet = false } = {}) {
       console.log(
         `class hooks: ${counted} class name(s) in the markup against ${ruleCount} rule(s) in the ` +
           `stylesheets — every hook has a rule and every rule has a hook, ${declared} declared ` +
-          `exception(s). 0 findings.`,
+          `exception(s), ${stemOnly.length} reached only through an interpolated stem and so not ` +
+          `individually verified. 0 findings.`,
       );
     }
   }
-  return findings;
+  return result;
 }
 
 // ── self-test ────────────────────────────────────────────────────────────────────────────────────────
@@ -250,14 +274,27 @@ function selfTest() {
   mkdirSync(join(root, "src"), { recursive: true });
   const cases = [];
 
-  const run = (label, expected, files, manifest = {}) => {
+  /** `expect` is either a count or `{ count, keys, kinds, stale }`. COUNTING ALONE IS NOT ENOUGH, and
+   *  an adversarial review proved it on this very file: unanchoring `ID_POSITION` still produced one
+   *  finding for the aria-labelledby case, so the case printed `ok` — while the finding had silently
+   *  become an orphan-rule about a different class. A test that cannot tell which defect it caught
+   *  cannot pin the defect it was written for. */
+  const run = (label, expect, files, manifest = {}) => {
+    const want = typeof expect === "number" ? { count: expect } : expect;
     rmSync(join(root, "src"), { recursive: true, force: true });
     mkdirSync(join(root, "src"), { recursive: true });
     for (const [name, body] of Object.entries(files)) writeFileSync(join(root, "src", name), body, "utf8");
-    const findings = report(join(root, "src"), manifest, { quiet: true });
-    const ok = findings.length === expected;
+    const { findings, stale } = report(join(root, "src"), manifest, { quiet: true });
+    const got = { count: findings.length, keys: findings.map((f) => f.key).sort(), kinds: [...new Set(findings.map((f) => f.kind))].sort(), stale: stale.length, sites: findings.flatMap((f) => f.sites).sort() };
+    const mismatches = [];
+    if (want.count !== undefined && got.count !== want.count) mismatches.push(`count ${got.count} != ${want.count}`);
+    if (want.keys && String(got.keys) !== String([...want.keys].sort())) mismatches.push(`keys [${got.keys}] != [${[...want.keys].sort()}]`);
+    if (want.kinds && String(got.kinds) !== String([...want.kinds].sort())) mismatches.push(`kinds [${got.kinds}] != [${[...want.kinds].sort()}]`);
+    if (want.stale !== undefined && got.stale !== want.stale) mismatches.push(`stale ${got.stale} != ${want.stale}`);
+    if (want.sites && String(got.sites) !== String([...want.sites].sort())) mismatches.push(`sites [${got.sites}] != [${[...want.sites].sort()}]`);
+    const ok = mismatches.length === 0;
     cases.push({ ok, label });
-    console.log(`${ok ? "ok  " : "FAIL"}  ${label} — expected ${expected} finding(s), got ${findings.length}`);
+    console.log(`${ok ? "ok  " : "FAIL"}  ${label}${ok ? "" : " — " + mismatches.join("; ")}`);
     if (!ok) for (const f of findings) console.log(`        → [${f.kind}] ${f.message}`);
   };
 
@@ -269,7 +306,7 @@ function selfTest() {
   // THE SHIPPED DEFECT. `App.tsx` emits the track and the card; the stylesheet defines neither. The
   // third class in the same attribute DOES have a rule, so the pair proves the gate discriminates
   // inside one file rather than simply distrusting the file.
-  run("the shell hooks with no stylesheet fire", 2, {
+  run("the shell hooks with no stylesheet fire", { count: 2, kinds: ["unstyled-hook"], keys: ["mtk-shell-track", "mtk-shell-card"] }, {
     "a.tsx": 'export const A = () => <div className="mtk-shell-track mtk-ok"><div className="mtk-shell-card" /></div>;\n',
     "a.css": ".mtk-ok { color: red; }\n",
   });
@@ -282,7 +319,7 @@ function selfTest() {
     { "a.tsx": 'export const A = () => <div className="mtk-editor-root" />;\n', "a.css": ".mtk-x { color: red; }\n.mtk-x-used { color: red; }\n" },
     { unstyled: { "mtk-editor-root": { reason: "an E2E anchor" } }, unused: { "mtk-x": { reason: "t" }, "mtk-x-used": { reason: "t" } } });
 
-  run("an orphan rule fires", 1, {
+  run("an orphan rule fires", { count: 1, kinds: ["orphan-rule"], keys: ["mtk-group-body"] }, {
     "a.tsx": "export const A = () => <div />;\n",
     "a.css": ".mtk-group-body { padding: 8px; }\n",
   });
@@ -311,22 +348,67 @@ function selfTest() {
     "a.tsx": "export const A = ({ n }) => { const rowId = `mtk-row-${n}`; return <div id={rowId} className=\"mtk-card\" />; };\n",
     "a.css": ".mtk-card { color: red; }\n",
   });
-  // The regression the orphan direction found in this gate's own first draft.
-  run("an aria-labelledby earlier on the line does not hide the className after it", 1, {
+  // The regression the orphan direction found in this gate's own first draft. Pinned by KEY, not by
+  // count: with a loose ID_POSITION the count is still 1, but the finding becomes an orphan-rule about
+  // `.mtk-ok` instead of the unstyled hook this case exists to catch.
+  run("an aria-labelledby earlier on the line does not hide the className after it",
+    { count: 1, kinds: ["unstyled-hook"], keys: ["mtk-missing"] }, {
     "a.tsx": 'export const A = () => <div aria-labelledby="h" className="mtk-missing mtk-ok" />;\n',
     "a.css": ".mtk-ok { color: red; }\n",
+  });
+  // AN APOSTROPHE IN JSX TEXT IS NOT A STRING OPENER. Read as one it pairs with nothing and swallows
+  // the rest of the file — measured at 55 lines of `panels/ReimportPanel.tsx` ("No, it's different"),
+  // 39% of it, silently unscanned. The hook below sits AFTER the apostrophe on purpose.
+  // Pinned by SITE, because that is where this actually goes wrong. Quote-delimiting (below) means the
+  // hook is still FOUND inside the phantom literal — so a count-based assertion passes either way. What
+  // breaks is the line: every site after the apostrophe reports one line too low, sending a reader to
+  // the wrong place. The hook is on line 3 of the fixture and must be reported as line 3.
+  run("an apostrophe in JSX text does not blind the rest of the file, or shift its line numbers",
+    { count: 1, kinds: ["unstyled-hook"], keys: ["mtk-after-apostrophe"], sites: ["a.tsx:3"] }, {
+    "a.tsx": "export const A = () => (\n  <div className=\"mtk-ok\"><span>No, it's different</span>\n  <b className=\"mtk-after-apostrophe\" /></div>);\n",
+    "a.css": ".mtk-ok { color: red; }\n",
+  });
+  // ...and the second half of the same defect, which is the half that actually needs the newline rule.
+  // An unterminated apostrophe swallows to EOF, so everything after it is ONE literal evaluated under a
+  // SINGLE id-position verdict taken back at the apostrophe. The `mtk-row-` below is a genuine element
+  // id; read inside the phantom literal it stops looking like one and is reported as a missing class.
+  run("an id after an apostrophe is still an id", 0, {
+    "a.tsx": "export const A = ({ n }) => {\n  const label = <span>No, it's different</span>;\n  const rowId = `mtk-row-${n}`;\n  return <div id={rowId} className=\"mtk-card\">{label}</div>;\n};\n",
+    "a.css": ".mtk-card { color: red; }\n",
+  });
+  // A class name inside an interpolation is flanked by QUOTES, not whitespace — the template literal's
+  // body carries `${cond ? "mtk-x" : ""}` verbatim. Real case: panels/AnimationWorkspace.tsx.
+  run("a class inside an interpolation is still claimed",
+    { count: 1, kinds: ["unstyled-hook"], keys: ["mtk-tick--first"] }, {
+    "a.tsx": 'export const A = ({ f }) => <div className={`mtk-tick ${f ? "mtk-tick--first" : ""}`} />;\n',
+    "a.css": ".mtk-tick { color: red; }\n",
   });
   run("a keyframes name is not a class", 0, {
     "a.tsx": 'export const A = () => <div className="mtk-card" style={{ animation: "mtk-fade-in 1s" }} />;\n',
     "a.css": ".mtk-card { color: red; }\n@keyframes mtk-fade-in { from { opacity: 0; } }\n",
   });
-  run("a class named only in a comment is not a use", 0, {
-    "a.tsx": '// the shell wraps everything in mtk-shell-track\nexport const A = () => <div className="mtk-card" />;\n',
+  // COMMENTED-OUT JSX, not prose. A bare word in a comment was never a candidate — it is outside every
+  // literal — so a prose fixture passes with `stripComments` deleted entirely and proves nothing. The
+  // real case is a quoted className inside a comment, which IS a literal and must still be ignored.
+  run("a commented-out className is not a use", 0, {
+    "a.tsx": '// <div className="mtk-shell-track" />\n/* also <b className="mtk-gone-too" /> */\nexport const A = () => <div className="mtk-card" />;\n',
     "a.css": ".mtk-card { color: red; }\n",
   });
-  run("a stale declaration does not block but is reported", 0,
+  run("a stale declaration does not block but is counted", { count: 0, stale: 1 },
     { "a.tsx": 'export const A = () => <div className="mtk-card" />;\n', "a.css": ".mtk-card { color: red; }\n" },
     { unstyled: { "mtk-gone": { reason: "deleted last milestone" } } });
+  // The stem blind spot, made visible rather than silent: `.mtk-btn--primary` is reached only because
+  // an interpolated stem could produce it, so it is NOT individually verified and says so.
+  {
+    rmSync(join(root, "src"), { recursive: true, force: true });
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "a.tsx"), "export const A = ({ v }) => <div className={`mtk-btn mtk-btn--${v}`} />;\n", "utf8");
+    writeFileSync(join(root, "src", "a.css"), ".mtk-btn { color: red; }\n.mtk-btn--primary { color: blue; }\n", "utf8");
+    const { stemOnly } = check(join(root, "src"), {});
+    const ok = stemOnly.length === 1 && stemOnly[0] === "mtk-btn--primary";
+    cases.push({ ok, label: "a stem-only rule is counted as unverified" });
+    console.log(`${ok ? "ok  " : "FAIL"}  a stem-only rule is counted as unverified${ok ? "" : ` — got [${stemOnly}]`}`);
+  }
 
   rmSync(root, { recursive: true, force: true });
   const failed = cases.filter((c) => !c.ok).length;
@@ -337,10 +419,16 @@ function selfTest() {
   return failed === 0;
 }
 
-if (process.argv.includes("--self-test")) {
-  process.exit(selfTest() ? 0 : 1);
-} else {
-  const manifest = JSON.parse(readFileSync(MANIFEST, "utf8"));
-  const findings = report(join(editorRoot, "src"), manifest);
-  process.exit(findings.length === 0 ? 0 : 1);
+// Only when RUN, never when imported — an unguarded `process.exit` at module scope would kill any
+// consumer of the exports above the moment it imported them, which makes the exports a lie.
+const invokedDirectly =
+  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  if (process.argv.includes("--self-test")) {
+    process.exit(selfTest() ? 0 : 1);
+  } else {
+    const manifest = JSON.parse(readFileSync(MANIFEST, "utf8"));
+    const { findings } = report(join(editorRoot, "src"), manifest);
+    process.exit(findings.length === 0 ? 0 : 1);
+  }
 }
