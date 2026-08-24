@@ -148,10 +148,15 @@ pub fn median(points: &[Vec3]) -> Vec3 {
             hi[k] = hi[k].max(p[k]);
         }
     }
+    // `f32::midpoint`, not `(lo + hi) * 0.5`, and it is not only a lint. The sum is the intermediate
+    // that can overflow: a bound of ±3.0e38 is a finite, representable coordinate, and its sum with
+    // its opposite corner is not — so the naive form returns `inf` for a box the caller could
+    // legitimately hand it, while `midpoint` returns the centre. Clippy 1.98 named it
+    // (`manual_midpoint`); the reason to take the fix rather than allow it is the arithmetic.
     [
-        (lo[0] + hi[0]) * 0.5,
-        (lo[1] + hi[1]) * 0.5,
-        (lo[2] + hi[2]) * 0.5,
+        f32::midpoint(lo[0], hi[0]),
+        f32::midpoint(lo[1], hi[1]),
+        f32::midpoint(lo[2], hi[2]),
     ]
 }
 
