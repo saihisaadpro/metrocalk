@@ -15,6 +15,7 @@
 
 mod ibl;
 mod moba;
+mod native_drop_import;
 mod render;
 mod scene_pick;
 mod terrain;
@@ -81,7 +82,7 @@ use metrocalk_physics::{
 use render::{Instance, SceneState, Shared};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 // C10: a real first-run must open onto a SMALL, navigable scene — never the 5,000-entity stress wall. The
@@ -2224,6 +2225,13 @@ struct PlayInfo {
     paused: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ImportAssetResult {
+    Imported(String),
+    Failed,
+    Cancelled,
+}
+
 /// Commands to the engine thread (which owns the `!Send` Engine).
 enum EngineCmd {
     Connect(Channel<ProjectionDelta>),
@@ -2315,6 +2323,9 @@ enum EngineCmd {
     },
     /// M15.7 (ADR-077) — the per-part CAD import report, aggregated from the ECS `CadPart` components (a read).
     CadReport {
+        query: Option<String>,
+        offset: usize,
+        limit: usize,
         reply: Sender<CadReportResp>,
     },
     /// M15.10 (ADR-080) — the last import's re-import diff (matched/added/removed/adjudicate + orphans) — a read.
@@ -2762,6 +2773,12 @@ enum EngineCmd {
         index: usize,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
     },
+    /// Cinematics - set the one authored pacing mood (one undoable commit).
+    CinemaSetMood {
+        id: String,
+        mood: String,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
     /// Cinematics - read an object's cutscene back as sentences.
     CinemaList {
         id: String,
@@ -2920,7 +2937,10 @@ enum EngineCmd {
     /// reply the new entity id (or `None` on an unsupported/malformed file).
     ImportAsset {
         path: String,
-        reply: Sender<Option<String>>,
+        /// Present only for a native OS drop. Menu/API imports preserve their existing non-cancellable
+        /// behaviour by sending `None`.
+        cancellation: Option<native_drop_import::ImportCancellation>,
+        reply: Sender<ImportAssetResult>,
     },
     /// Generation (M6, tier 3): drop a grey placeholder + kick off async text-to-3D; reply the placeholder.
     Generate {
@@ -6735,6 +6755,9 @@ fn animation_asset_profile(
 struct AppState {
     tx: Sender<EngineCmd>,
     shared: Shared,
+    /// Native drop cancellation is a direct control plane, deliberately independent of the serial engine
+    /// command queue so a request can signal an in-flight CAD parser immediately.
+    native_imports: native_drop_import::NativeImportControl,
     /// The live MOB match, if one is running. Render-side transient state exactly like the other viewport
     /// tools: it never touches the ECS/Loro document, so it needs no engine-thread round trip.
     moba: Mutex<Option<moba::MobaSession>>,
@@ -7242,6 +7265,66 @@ fn quat_of_transform(m: &[f64; 16]) -> [f32; 4] {
     [x as f32, y as f32, z as f32, w as f32]
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CadLandResult {
+    Imported(EntityId),
+    Failed,
+    Cancelled,
+}
+
+fn import_cancellation_requested(
+    cancellation: Option<&native_drop_import::ImportCancellation>,
+) -> bool {
+    cancellation.is_some_and(native_drop_import::ImportCancellation::is_requested)
+}
+
+fn seal_import_for_commit(
+    cancellation: Option<&native_drop_import::ImportCancellation>,
+) -> bool {
+    cancellation.is_none_or(native_drop_import::ImportCancellation::seal_for_commit)
+}
+
+/// The final CAD transaction gate. Cancellation and commit contend on the token's atomic phase, so a
+/// successful cancellation cannot race a scene mutation after the last checkpoint.
+fn commit_cad_ops_unless_cancelled(
+    engine: &mut Engine<FlecsWorld>,
+    cancellation: Option<&native_drop_import::ImportCancellation>,
+    ops: Vec<metrocalk_core::Op>,
+) -> Result<bool, String> {
+    if !seal_import_for_commit(cancellation) {
+        return Ok(false);
+    }
+    engine
+        .commit("import-cad", ops)
+        .map(|_| true)
+        .map_err(|error| format!("{error:?}"))
+}
+
+#[derive(Clone, Copy)]
+struct CadRegistrationSnapshot {
+    meshes: usize,
+    scales: usize,
+    display_affines: usize,
+    shared_meshes: usize,
+}
+
+fn rollback_cad_registration(
+    assets: &mut AssetsRuntime,
+    shared: &Shared,
+    snapshot: CadRegistrationSnapshot,
+    handles: &[String],
+) {
+    for handle in handles {
+        assets.handle_to_slot.remove(handle);
+    }
+    assets.meshes.truncate(snapshot.meshes);
+    assets.scales.truncate(snapshot.scales);
+    assets.display_affines.truncate(snapshot.display_affines);
+    let mut state = shared.lock().unwrap();
+    state.meshes.truncate(snapshot.shared_meshes);
+    state.meshes_revision = state.meshes_revision.wrapping_add(1);
+}
+
 /// M15.7 (ADR-077) — land a CAD file (CATIA 3DXML / STEP AP242) onto the live scene: read it via the
 /// never-empty/never-silent pipeline, register each UNIQUE tessellated mesh on the GPU (dedup → instancing),
 /// and create one renderable entity per part at its real (units-normalized) transform as ONE undoable commit.
@@ -7254,7 +7337,8 @@ fn land_cad(
     scene: &CapScene,
     assets: &mut AssetsRuntime,
     shared: &Shared,
-) -> Option<EntityId> {
+    cancellation: Option<&native_drop_import::ImportCancellation>,
+) -> CadLandResult {
     // File log (the .exe is a windows-subsystem GUI app → eprintln has no console; log to a temp file so a
     // live import can be diagnosed).
     let logf = std::env::temp_dir().join("mtk-cad-import.log");
@@ -7270,20 +7354,68 @@ fn land_cad(
         eprintln!("[shell] {m}");
     };
     log(&format!("CAD import start: {} bytes", bytes.len()));
+    if import_cancellation_requested(cancellation) {
+        log("CAD import cancelled before parsing; no scene changes were committed");
+        return CadLandResult::Cancelled;
+    }
     let t_total = std::time::Instant::now();
     let t_read = std::time::Instant::now();
     let report = match metrocalk_editor_shell::read_cad_with_companion(source_path, bytes) {
         Ok(r) => r,
         Err(e) => {
             log(&format!("CAD import FAILED (read): {e}"));
-            return None;
+            return CadLandResult::Failed;
         }
     };
+    if import_cancellation_requested(cancellation) {
+        log("CAD import cancelled after parsing; no scene changes were committed");
+        return CadLandResult::Cancelled;
+    }
     log(&format!(
         "CAD import read OK in {:.1}s: {}",
         t_read.elapsed().as_secs_f64(),
         report.summary()
     ));
+    let source = metrocalk_editor_shell::CadSourceIdentity::from_path(
+        source_path,
+        &report.source_format,
+        report.source_hash,
+    );
+    let old_source_roots =
+        metrocalk_editor_shell::active_cad_source_roots(engine, &source.key);
+    let old_source_members =
+        metrocalk_editor_shell::active_cad_source_members(engine, &source.key);
+    // One healthy wrapper with the exact same content is a true idempotent re-drop. Re-parse still validates
+    // the external source, but no GPU work, hierarchy duplication, undo entry, or stale re-import report is
+    // produced. Duplicate roots/orphaned owner markers deliberately fall through to scoped convergence.
+    if old_source_roots.len() == 1
+        && metrocalk_editor_shell::cad_source_content_hash(engine, old_source_roots[0])
+            == Some(source.content_hash)
+        && old_source_members.contains(&old_source_roots[0])
+        && old_source_members.iter().all(|entity| {
+            let mut cursor = Some(*entity);
+            while let Some(id) = cursor {
+                if id == old_source_roots[0] {
+                    return true;
+                }
+                cursor = engine.parent_of(id);
+            }
+            false
+        })
+    {
+        let root = old_source_roots[0];
+        let selection = metrocalk_editor_shell::cad_source_selection(engine, root);
+        clear_reimport_session();
+        log(&format!(
+            "CAD import idempotent: source '{}' content {:016x} already active",
+            source.path, source.content_hash
+        ));
+        if !seal_import_for_commit(cancellation) {
+            log("CAD import cancelled at the idempotent checkpoint; no scene changes were committed");
+            return CadLandResult::Cancelled;
+        }
+        return CadLandResult::Imported(selection);
+    }
     let fidelity = report.fidelity_counts();
     let real_meshes: Vec<_> = report.meshes.iter().filter(|mesh| !mesh.is_proxy).collect();
     let vertices: usize = real_meshes
@@ -7330,6 +7462,13 @@ fn land_cad(
         })
     ));
     let t_register = std::time::Instant::now();
+    let registration_snapshot = CadRegistrationSnapshot {
+        meshes: assets.meshes.len(),
+        scales: assets.scales.len(),
+        display_affines: assets.display_affines.len(),
+        shared_meshes: shared.lock().unwrap().meshes.len(),
+    };
+    let mut newly_registered_handles: Vec<String> = Vec::new();
     // The derived-mesh persistence jobs run on a DETACHED writer thread after the commit (off the
     // land path — a 400-mesh assembly's sidecar writes were serialising minutes into the import).
     // Never-silent: failures log from the writer; a crash before a write only costs that mesh's
@@ -7349,7 +7488,13 @@ fn land_cad(
         .copied();
 
     let mut ops: Vec<metrocalk_core::Op> =
-        Vec::with_capacity(report.parts.len() * 7 + report.groups.len() * 4);
+        Vec::with_capacity(report.parts.len() * 10 + report.groups.len() * 7 + 20);
+    let source_root = engine.alloc_entity_id();
+    ops.extend(metrocalk_editor_shell::cad_source_root_ops(
+        source_root,
+        &source,
+        &report.name,
+    ));
     let mut first: Option<EntityId> = None;
     // Map each source hierarchy-node id (assembly occurrence) → its allocated engine entity, so leaf parts +
     // child groups resolve their `parent`. `report.groups` is topological (parent-before-child), so a group's
@@ -7362,14 +7507,27 @@ fn land_cad(
     // (1) The NAMED structural tree: one geometry-free container entity per assembly occurrence, nested exactly
     // as the source file. Each is an IDENTITY transform (leaf parts carry the world placement) marked
     // `__meta__.kind = "group"` with NO MeshRenderer, so the rebuild skip renders nothing for it (no cube).
-    for g in &report.groups {
+    for (group_index, g) in report.groups.iter().enumerate() {
+        if import_cancellation_requested(cancellation) {
+            log("CAD import cancelled while staging hierarchy; no scene changes were committed");
+            return CadLandResult::Cancelled;
+        }
         let ge = engine.alloc_entity_id();
         if first.is_none() {
             first = Some(ge);
         }
         src_to_entity.insert(g.id, ge);
-        let parent = g.parent.and_then(|pid| src_to_entity.get(&pid).copied());
+        let parent = g
+            .parent
+            .and_then(|pid| src_to_entity.get(&pid).copied())
+            .or(Some(source_root));
         ops.push(metrocalk_core::Op::CreateEntity { id: ge, parent });
+        ops.extend(metrocalk_editor_shell::cad_source_owner_ops(
+            ge,
+            &source.key,
+            "group",
+            Some(group_index),
+        ));
         for (f, v) in [
             ("x", 0.0),
             ("y", 0.0),
@@ -7443,6 +7601,10 @@ fn land_cad(
     {
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for p in &report.parts {
+            if import_cancellation_requested(cancellation) {
+                log("CAD import cancelled while staging mesh registration; no scene changes were committed");
+                return CadLandResult::Cancelled;
+            }
             if let Some(h) = handle_for(p) {
                 if !assets.handle_to_slot.contains_key(&h) && seen.insert(h.clone()) {
                     reg_work.push((h, p));
@@ -7467,6 +7629,9 @@ fn land_cad(
         std::thread::scope(|s| {
             for _ in 0..workers {
                 s.spawn(|| loop {
+                    if import_cancellation_requested(cancellation) {
+                        break;
+                    }
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some((handle, p)) = reg_work.get(i) else {
                         break;
@@ -7495,8 +7660,23 @@ fn land_cad(
             }
         });
         let results = results.into_inner().unwrap();
+        if import_cancellation_requested(cancellation) {
+            log("CAD import cancelled during mesh preparation; no scene changes were committed");
+            return CadLandResult::Cancelled;
+        }
         let mut st = shared.lock().unwrap();
         for out in results.into_iter().flatten() {
+            if import_cancellation_requested(cancellation) {
+                drop(st);
+                rollback_cad_registration(
+                    assets,
+                    shared,
+                    registration_snapshot,
+                    &newly_registered_handles,
+                );
+                log("CAD import cancelled during mesh registration; registered staging was rolled back and no scene changes were committed");
+                return CadLandResult::Cancelled;
+            }
             let (handle, gpu, tris, color) = out;
             let slot = assets.meshes.len();
             assets.meshes.push(gpu.clone());
@@ -7504,6 +7684,7 @@ fn land_cad(
             assets.display_affines.push(AssetAffine::IDENTITY);
             assets.handle_to_slot.insert(handle.clone(), slot);
             st.meshes.push(gpu);
+            newly_registered_handles.push(handle.clone());
             // Persist the DERIVED mesh so the saved doc's `mtkcad:` handle re-resolves after restart +
             // open (load_assets restores it) — queued for the detached writer thread below (the writes
             // were serialising minutes into a 400-mesh land). Never-silent: failures log.
@@ -7526,17 +7707,14 @@ fn land_cad(
 
     // M15.10 (ADR-080) — persistent re-import identity. The neutral per-part geometric identities of THIS
     // import (fingerprint + world centroid + byte-hash), aligned 1:1 with `report.parts`; each part entity
-    // carries its `ReimportId` so a LATER re-import matches the live scene. And: detect the PREVIOUS import's
-    // still-active CAD parts (entities carrying a `ReimportId`) — if any, this is a RE-IMPORT, and after the
-    // new entities are authored we match + re-bind every override onto the geometrically-matched part.
+    // carries its `ReimportId` so a LATER re-import matches the live scene. Previous parts are selected only
+    // from this source wrapper's explicit ownership set: importing source B can never replace source A, and
+    // pre-wrapper legacy CAD remains untouched rather than being guessed into scope.
     let new_ids = metrocalk_interchange::identities(&report);
     let mut old_reimport: std::collections::BTreeMap<u64, EntityId> =
         std::collections::BTreeMap::new();
     let mut old_names: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
-    for id in engine.entity_ids() {
-        if !engine.is_active(id) {
-            continue;
-        }
+    for &id in &old_source_members {
         let comps = engine.components_of(id);
         if let Some(ri) = comps.get(metrocalk_editor_shell::REIMPORT_ID) {
             if let Some(FieldValue::Str(pid_hex)) = ri.get("pid") {
@@ -7567,13 +7745,32 @@ fn land_cad(
     // in the outliner exactly where the source places it, while keeping its own world transform (identity
     // groups don't perturb `global_transform`, so placement is byte-identical to the flat import).
     for (pi, p) in report.parts.iter().enumerate() {
+        if import_cancellation_requested(cancellation) {
+            rollback_cad_registration(
+                assets,
+                shared,
+                registration_snapshot,
+                &newly_registered_handles,
+            );
+            log("CAD import cancelled while staging parts; registered staging was rolled back and no scene changes were committed");
+            return CadLandResult::Cancelled;
+        }
         let e = engine.alloc_entity_id();
         new_entities.insert(p.id, e);
         if first.is_none() {
             first = Some(e);
         }
-        let parent = p.parent.and_then(|pid| src_to_entity.get(&pid).copied());
+        let parent = p
+            .parent
+            .and_then(|pid| src_to_entity.get(&pid).copied())
+            .or(Some(source_root));
         ops.push(metrocalk_core::Op::CreateEntity { id: e, parent });
+        ops.extend(metrocalk_editor_shell::cad_source_owner_ops(
+            e,
+            &source.key,
+            "part",
+            Some(pi),
+        ));
         let editor_transform = metrocalk_editor_shell::cad_z_up_to_editor_transform(&p.transform);
         let t = metrocalk_interchange::translation_of(&editor_transform);
         let scale = if p.fidelity.is_real_geometry() {
@@ -7679,11 +7876,29 @@ fn land_cad(
         }
     }
 
+    let selection = first.unwrap_or(source_root);
+    ops.push(metrocalk_editor_shell::cad_source_selection_op(
+        source_root,
+        selection,
+    ));
+
     // M15.10 (ADR-080) — if the scene already held CAD parts, this is a RE-IMPORT: match the new parts to the
     // previous ones (byte-hash → geometric fingerprint, prefer-miss-over-wrong), re-bind every matched override
     // (material · collider · the M15.9 joint animation) onto the geometrically-matched NEW entity, deactivate
     // the previous entities (deactivate-not-delete → one Ctrl-Z peels the whole re-import), and record the
     // never-silent per-part diff for the report + adjudication surfaces. All in the SAME import commit.
+    let retired_by_reimport: std::collections::BTreeSet<EntityId> =
+        old_reimport.values().copied().collect();
+    if import_cancellation_requested(cancellation) {
+        rollback_cad_registration(
+            assets,
+            shared,
+            registration_snapshot,
+            &newly_registered_handles,
+        );
+        log("CAD import cancelled before re-import reconciliation; registered staging was rolled back and no scene changes were committed");
+        return CadLandResult::Cancelled;
+    }
     if !old_reimport.is_empty() {
         let session = metrocalk_editor_shell::reimport_over_scene(
             engine,
@@ -7707,16 +7922,48 @@ fn land_cad(
     } else {
         clear_reimport_session();
     }
+    // `reimport_over_scene` retires the scoped old parts. Retire the rest of that exact source's authored
+    // hierarchy (wrapper + assembly folders, plus any diagnosed part lacking an identity) in the same commit.
+    // Direct active flags keep render, report and outliner projections in agreement; unrelated and legacy CAD
+    // have a different/no owner marker and never enter this set.
+    for entity in old_source_members {
+        if !retired_by_reimport.contains(&entity) {
+            ops.push(metrocalk_core::Op::SetActive {
+                entity,
+                active: false,
+            });
+        }
+    }
     log(&format!(
-        "CAD import: {} meshes registered in {:.1}s, {} parts + {} group nodes, committing…",
+        "CAD import: {} meshes registered in {:.1}s, one source root + {} parts + {} group nodes, committing…",
         report.meshes.len(),
         t_register.elapsed().as_secs_f64(),
         report.parts.len(),
         report.groups.len()
     ));
-    if let Err(err) = engine.commit("import-cad", ops) {
-        log(&format!("CAD import commit REJECTED: {err:?}"));
-        return None;
+    match commit_cad_ops_unless_cancelled(engine, cancellation, ops) {
+        Ok(true) => {}
+        Ok(false) => {
+            rollback_cad_registration(
+                assets,
+                shared,
+                registration_snapshot,
+                &newly_registered_handles,
+            );
+            clear_reimport_session();
+            log("CAD import cancelled at the final commit checkpoint; registered staging was rolled back and no scene changes were committed");
+            return CadLandResult::Cancelled;
+        }
+        Err(err) => {
+            rollback_cad_registration(
+                assets,
+                shared,
+                registration_snapshot,
+                &newly_registered_handles,
+            );
+            log(&format!("CAD import commit REJECTED: {err}"));
+            return CadLandResult::Failed;
+        }
     }
     log(&format!(
         "CAD import commit OK in {:.1}s total",
@@ -7736,7 +7983,7 @@ fn land_cad(
             );
         });
     }
-    first
+    CadLandResult::Imported(selection)
 }
 
 fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<EngineCmd>) {
@@ -9426,6 +9673,55 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     }
                 }
             }
+            EngineCmd::CinemaSetMood { id, mood, reply } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - pacing is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::set_mood_ops(&engine, entity, &mood) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-mood", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the pacing change was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaMood {
+                            id: id.clone(),
+                            mood: mood.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let label = match cut.mood {
+                            metrocalk_animation::shot::Mood::Calm => "Calm",
+                            metrocalk_animation::shot::Mood::Normal => "Normal",
+                            metrocalk_animation::shot::Mood::Tense => "Tense",
+                        };
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply(
+                            entity,
+                            &cut,
+                            &name,
+                            format!("Cinematic pacing set to {label}"),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
             EngineCmd::CinemaList { id, reply } => {
                 let info = EntityId::from_loro_key(&id)
                     .filter(|e| engine.entity_exists(*e))
@@ -10508,12 +10804,20 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 }
                 let _ = reply.send(new.map(|n| n.to_loro_key()));
             }
-            EngineCmd::ImportAsset { path, reply } => {
+            EngineCmd::ImportAsset {
+                path,
+                cancellation,
+                reply,
+            } => {
                 // M11.1 — drop any file → a working asset. Read the file, route by MAGIC (glTF/OBJ/FBX/
                 // PNG/…), register its GPU mesh if new, persist the bytes by content address (survives
                 // reload — the M6/M11.1 residual), place an entity carrying the handle, and reply its id.
                 // An unsupported/malformed file → `None` (the React surface explains it).
-                let mut result = None;
+                let mut result = ImportAssetResult::Failed;
+                if import_cancellation_requested(cancellation.as_ref()) {
+                    let _ = reply.send(ImportAssetResult::Cancelled);
+                    continue;
+                }
                 // ── ENVIRONMENT PANORAMAS ────────────────────────────────────────────────────────
                 // A `.hdr` is not a placeable object; it is the scene's LIGHTING. Routing it here —
                 // in the one canonical dispatcher every entry point reaches — is what makes File →
@@ -10530,6 +10834,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 .map_err(|e| e.to_string())
                         }) {
                         Ok(env) => {
+                            if import_cancellation_requested(cancellation.as_ref())
+                                || !seal_import_for_commit(cancellation.as_ref())
+                            {
+                                let _ = reply.send(ImportAssetResult::Cancelled);
+                                continue;
+                            }
                             let label = std::path::Path::new(&path)
                                 .file_stem()
                                 .map(|s| s.to_string_lossy().to_string())
@@ -10549,17 +10859,19 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                     eprintln!("[env] lighting from '{label}'");
                                     // An environment creates no entity, so the reply is the label
                                     // rather than an id - the caller reports it, never "unsupported".
-                                    let _ = reply.send(Some(format!("env:{label}")));
+                                    let _ = reply.send(ImportAssetResult::Imported(format!(
+                                        "env:{label}"
+                                    )));
                                 }
                                 Err(why) => {
                                     eprintln!("[env] refused '{path}': {why}");
-                                    let _ = reply.send(None);
+                                    let _ = reply.send(ImportAssetResult::Failed);
                                 }
                             }
                         }
                         Err(e) => {
                             eprintln!("[env] '{path}' is not a readable HDR panorama: {e}");
-                            let _ = reply.send(None);
+                            let _ = reply.send(ImportAssetResult::Failed);
                         }
                     }
                     continue;
@@ -10569,23 +10881,35 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         // M15.7 (ADR-077) — a CAD container (CATIA 3DXML / STEP AP242): the never-empty,
                         // never-silent pipeline lands each part as a renderable entity in one undoable commit
                         // (proxies for proprietary geometry the licensed kernel would decode, at real transforms).
-                        if let Some(root) = land_cad(
+                        match land_cad(
                             std::path::Path::new(&path),
                             &bytes,
                             &mut engine,
                             &scene,
                             &mut assets,
                             &shared,
+                            cancellation.as_ref(),
                         ) {
-                            rebuild(&engine, &shared, &mut positions, &assets);
-                            if let Some(ch) = &channel {
-                                send_proj!(ch, proj_full(&engine, &scene));
+                            CadLandResult::Imported(root) => {
+                                rebuild(&engine, &shared, &mut positions, &assets);
+                                if let Some(ch) = &channel {
+                                    send_proj!(ch, proj_full(&engine, &scene));
+                                }
+                                result = ImportAssetResult::Imported(root.to_loro_key());
                             }
-                            result = Some(root.to_loro_key());
+                            CadLandResult::Failed => {}
+                            CadLandResult::Cancelled => {
+                                result = ImportAssetResult::Cancelled;
+                            }
                         }
                     } else if let Ok(metrocalk_assets::ImportedAsset::Mesh(asset)) =
                         metrocalk_assets::import_any(&bytes)
                     {
+                        if import_cancellation_requested(cancellation.as_ref())
+                            || !seal_import_for_commit(cancellation.as_ref())
+                        {
+                            result = ImportAssetResult::Cancelled;
+                        } else {
                         let handle = AssetId::of_bytes(&bytes).as_str().to_string();
                         // Retain canonical editable geometry beside the GPU packing; live asset tools can
                         // now condition/bake this mesh instead of losing it after upload.
@@ -10702,8 +11026,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                     &mut touch,
                                     id,
                                 );
-                                result = Some(id.to_loro_key());
+                                result = ImportAssetResult::Imported(id.to_loro_key());
                             }
+                        }
                         }
                     }
                 }
@@ -10714,8 +11039,18 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .and_then(|e| build_entity_details(&engine, &scene, e));
                 let _ = reply.send(details);
             }
-            EngineCmd::CadReport { reply } => {
-                let _ = reply.send(build_cad_report(&engine));
+            EngineCmd::CadReport {
+                query,
+                offset,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(build_cad_report_page(
+                    &engine,
+                    query.as_deref(),
+                    offset,
+                    limit,
+                ));
             }
             EngineCmd::ReimportReport { reply } => {
                 let resp = LAST_REIMPORT.with(|s| s.borrow().resp.clone());
@@ -14589,7 +14924,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // the render projection ADR-021 already sanctions. On the falling edge — or when the
                 // shot list runs out — we hand the camera back exactly as we found it.
                 if play_mode && !play_cinematics.is_empty() {
-                    use metrocalk_animation::shot::{solve_shot, SubjectSample};
+                    use metrocalk_animation::shot::{cinematic_clip_planes, solve_shot_eased};
                     for (entity, key, cut, started, played) in &mut play_cinematics {
                         let wants = rule_session.as_ref().is_some_and(|s| {
                             matches!(
@@ -14659,7 +14994,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         // The clock is the replay-stamped frame counter, never wall time.
                         #[allow(clippy::cast_precision_loss)]
                         let elapsed = (frame.saturating_sub(start_frame)) as f32 / 60.0;
-                        let Some((index, progress)) = cut.shot_at(elapsed) else {
+                        let Some(playback) = cut.playback_at(elapsed) else {
                             // Out of shots: release the camera - and the authority with it, so the
                             // next cutscene in the scene can have its turn.
                             *started = None;
@@ -14672,26 +15007,22 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             restore_editor_chrome(&mut st, &mut cinema_dimmed);
                             continue;
                         };
-                        let shot = &cut.shots[index];
-                        // Resolve the subject: a real key, or this cutscene's own object.
-                        let subject_id = EntityId::from_loro_key(&shot.subject)
-                            .filter(|e| engine.entity_exists(*e))
-                            .unwrap_or(*entity);
-                        // Sample it LIVE — physics position if it has a body, authored otherwise. This
-                        // is why a recipe beats a baked pose: the shot follows a moving subject.
-                        let g = capscene::global_transform(&engine, subject_id);
-                        let subject_key = subject_id.to_loro_key();
-                        // Sample the subject from the RENDER state, not the document. The authored
-                        // Transform scale defaults to 1.0 while the renderer draws the same entity at
-                        // its asset scale (0.45 for a spawned primitive), so framing off the document
-                        // parked every shot ~2x too far and a "Close-up" framed like a "Full".
-                        let (center, draw_scale, aspect) = {
+                        let shot = &cut.shots[playback.index];
+                        // Sample both sides of an intra-cutscene transition LIVE. A previous shot may
+                        // film a different subject, so reusing the current bounds would make the blend
+                        // aim between a correct pose and a pose solved around the wrong object.
+                        let (sample, previous_sample, aspect) = {
                             let st = shared.lock().unwrap();
-                            let i = st.ids.iter().position(|k| *k == subject_key);
                             (
-                                i.and_then(|i| st.instances.get(i).map(|inst| inst.center))
-                                    .unwrap_or(g.translation),
-                                i.and_then(|i| st.instances.get(i).map(|inst| inst.scale)),
+                                cinematic_shot_subject_sample(&engine, &st, *entity, shot),
+                                playback.blend_from.map(|(previous, _)| {
+                                    cinematic_shot_subject_sample(
+                                        &engine,
+                                        &st,
+                                        *entity,
+                                        &cut.shots[previous],
+                                    )
+                                }),
                                 if st.surface_aspect.is_finite() && st.surface_aspect > 0.1 {
                                     st.surface_aspect
                                 } else {
@@ -14699,33 +15030,20 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 },
                             )
                         };
-                        let half = draw_scale
-                            .map_or_else(|| g.scale[0].abs(), f32::abs)
-                            .max(0.25);
-                        // The subject's real facing, so "Behind" is behind IT and not behind the world.
-                        // A hardcoded +Z made every angle world-relative and quietly killed the one
-                        // property `shot.rs` is built around.
-                        let fwd = {
-                            let q = g.rotation;
-                            let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
-                            let v = [
-                                2.0 * (x * z + w * y),
-                                2.0 * (y * z - w * x),
-                                1.0 - 2.0 * (x * x + y * y),
-                            ];
-                            let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-                            if len.is_finite() && len > 1.0e-4 {
-                                [v[0] / len, v[1] / len, v[2] / len]
-                            } else {
-                                [0.0, 0.0, 1.0]
-                            }
-                        };
-                        let sample = SubjectSample {
-                            center,
-                            half_extent: [half, half, half],
-                            forward: fwd,
-                        };
-                        let mut pose = solve_shot(shot, sample, progress, aspect, 50.0);
+                        let current_pose =
+                            solve_shot_eased(shot, sample, playback.progress, aspect, 50.0);
+                        let previous_pose = playback.blend_from.zip(previous_sample).map(
+                            |((previous, _), previous_sample)| {
+                                solve_shot_eased(
+                                    &cut.shots[previous],
+                                    previous_sample,
+                                    1.0,
+                                    aspect,
+                                    50.0,
+                                )
+                            },
+                        );
+                        let mut pose = playback.blend_camera(previous_pose, current_pose);
                         // A low angle on a subject standing on the ground put the camera UNDER the
                         // floor - below the ground body every run creates, and below the grid. Clamp
                         // rather than forbid the angle: the shot still looks up, it just does it from
@@ -14734,13 +15052,29 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         if pose.eye[1] < CAMERA_FLOOR {
                             pose.eye[1] = CAMERA_FLOOR;
                         }
+                        let planes_for = |subject: metrocalk_animation::shot::SubjectSample| {
+                            let camera_distance = pose
+                                .eye
+                                .iter()
+                                .zip(subject.center)
+                                .map(|(eye, center)| (eye - center).powi(2))
+                                .sum::<f32>()
+                                .sqrt();
+                            cinematic_clip_planes(subject.radius(), camera_distance)
+                        };
+                        let (mut near, mut far) = planes_for(sample);
+                        if let Some(previous_sample) = previous_sample {
+                            let (previous_near, previous_far) = planes_for(previous_sample);
+                            near = near.min(previous_near);
+                            far = far.max(previous_far);
+                        }
                         let mut st = shared.lock().unwrap();
                         st.cam_override = Some(render::CamView {
                             pos: pose.eye,
                             look_at: Some(pose.look_at),
                             fov_deg: pose.fov_deg,
-                            near: 0.1,
-                            far: 2000.0,
+                            near,
+                            far,
                         });
                         // NOT a revision bump. `revision` means "the scene changed": it re-partitions
                         // every instance, re-uploads every buffer and RECREATES every submesh and LOD
@@ -16367,10 +16701,27 @@ fn sync_out(
 /// ECS-native + survives reload (the components persist), so this is the never-silent "explain every no"
 /// surface without a stored side copy. The list is capped so a 13k-part cell can't flood the IPC/DOM;
 /// the counts are always the true totals.
+#[cfg(test)]
 fn build_cad_report(engine: &Engine<FlecsWorld>) -> CadReportResp {
-    const MAX_ROWS: usize = 500;
+    build_cad_report_page(engine, None, 0, 500)
+}
+
+/// Deterministic, bounded page over the live CAD report. The default panel still requests the first 500
+/// rows; QA/director tooling can search or page without asking React to hold a 15k-row payload.
+fn build_cad_report_page(
+    engine: &Engine<FlecsWorld>,
+    query: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> CadReportResp {
+    const MAX_PAGE_ROWS: usize = 2_000;
     let mut r = CadReportResp::default();
+    let query = query.map(str::trim).filter(|value| !value.is_empty()).map(str::to_lowercase);
+    let mut rows = Vec::new();
     for id in engine.entity_ids() {
+        if !engine.is_active(id) {
+            continue;
+        }
         let comps = engine.components_of(id);
         let Some(cad) = comps.get(metrocalk_editor_shell::CAD_PART) else {
             continue;
@@ -16378,6 +16729,16 @@ fn build_cad_report(engine: &Engine<FlecsWorld>) -> CadReportResp {
         let Some(FieldValue::Str(fidelity)) = cad.get("fidelity") else {
             continue;
         };
+        let name = match cad.get("name") {
+            Some(FieldValue::Str(n)) if !n.is_empty() => n.clone(),
+            _ => label_of(engine, id),
+        };
+        if query
+            .as_ref()
+            .is_some_and(|needle| !name.to_lowercase().contains(needle))
+        {
+            continue;
+        }
         r.total += 1;
         match fidelity.as_str() {
             "exact-brep" => r.exact_brep += 1,
@@ -16387,23 +16748,29 @@ fn build_cad_report(engine: &Engine<FlecsWorld>) -> CadReportResp {
             "access-denied" => r.access_denied += 1,
             _ => r.failed += 1, // "failed" + any future token → the honest catch-all
         }
-        if r.parts.len() < MAX_ROWS {
-            let name = match cad.get("name") {
-                Some(FieldValue::Str(n)) if !n.is_empty() => n.clone(),
-                _ => label_of(engine, id),
-            };
-            r.parts.push(CadReportPart {
-                id: id.to_loro_key(),
-                name,
-                fidelity: fidelity.clone(),
-                reference: cad.get("reference").and_then(nonempty_field_string),
-                strategy: cad.get("strategy").and_then(nonempty_field_string),
-                reason: cad.get("reason").and_then(nonempty_field_string),
-                fix: cad.get("fix").and_then(nonempty_field_string),
-                source_format: cad.get("sourceFormat").and_then(nonempty_field_string),
-            });
-        }
+        rows.push(CadReportPart {
+            id: id.to_loro_key(),
+            name,
+            fidelity: fidelity.clone(),
+            reference: cad.get("reference").and_then(nonempty_field_string),
+            strategy: cad.get("strategy").and_then(nonempty_field_string),
+            reason: cad.get("reason").and_then(nonempty_field_string),
+            fix: cad.get("fix").and_then(nonempty_field_string),
+            source_format: cad.get("sourceFormat").and_then(nonempty_field_string),
+        });
     }
+    rows.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    r.parts = rows
+        .into_iter()
+        .skip(offset)
+        .take(limit.clamp(1, MAX_PAGE_ROWS))
+        .collect();
     r
 }
 
@@ -16740,12 +17107,14 @@ fn project_info(
 /// M11.3 (ADR-042) — gather the scene's authored `Light` entities into GPU lights (a render projection: the
 /// light ENTITY is the undoable Loro doc state; this is its per-frame upload, never written back to Loro).
 /// `dir` is the direction a directional/spot light SHINES (so the shader's L = -dir); point/spot use the
-/// entity Transform position + `range`. Falls back to a single default key light (the prior hard-coded
-/// directional, now a real list entry) so a scene with no light entities still renders lit, not black.
+/// entity Transform position + `range`. When no directional is authored, a default directional key is
+/// appended so point/spot-only scenes retain the renderer's one honest shadow-casting light instead of
+/// silently losing all contact shadows.
 /// Returns the GPU light list AND the INDEX of the scene's shadow-casting light (M11.3 inc.3): the FIRST
-/// directional `Light` whose `castShadows` isn't explicitly false, else the default key light. `None` ⇒
-/// nothing casts (e.g. only point lights authored) → the render skips the shadow pass. The index (not the
-/// direction) so the shader can apply the single shadow map to ONLY that light, not every directional.
+/// authored directional `Light` whose `castShadows` isn't explicitly false, else the synthesized key when
+/// there is no authored directional. An authored directional suppresses that synthesis even when its
+/// shadows are disabled. Point/spot `castShadows` cannot select this directional-only shadow map. The
+/// index (not the direction) lets the shader apply the single map to ONLY its caster.
 fn collect_lights(engine: &Engine<FlecsWorld>) -> (Vec<render::LightGpu>, Option<usize>) {
     let read = |m: &HashMap<String, FieldValue>, f: &str, d: f32| -> f32 {
         m.get(f).map_or(d, |v| match v {
@@ -16756,6 +17125,7 @@ fn collect_lights(engine: &Engine<FlecsWorld>) -> (Vec<render::LightGpu>, Option
     };
     let mut lights: Vec<render::LightGpu> = Vec::new();
     let mut shadow_caster: Option<usize> = None;
+    let mut has_authored_directional = false;
     for id in engine.entity_ids() {
         let comps = engine.components_of(id);
         let Some(light) = comps.get("Light") else {
@@ -16780,9 +17150,10 @@ fn collect_lights(engine: &Engine<FlecsWorld>) -> (Vec<render::LightGpu>, Option
         ];
         // M11.3 inc.3 — the first directional light that casts is the shadow caster (a single shadow map).
         // Record its INDEX (the slot it's about to occupy) so the shader shadows only this one light.
-        if shadow_caster.is_none() && kind == 0.0 {
+        if kind == 0.0 {
+            has_authored_directional = true;
             let casts = !matches!(light.get("castShadows"), Some(FieldValue::Bool(false)));
-            if casts {
+            if shadow_caster.is_none() && casts {
                 shadow_caster = Some(lights.len());
             }
         }
@@ -16797,7 +17168,7 @@ fn collect_lights(engine: &Engine<FlecsWorld>) -> (Vec<render::LightGpu>, Option
             dir_range: [dir[0], dir[1], dir[2], read(light, "range", 0.0)],
         });
     }
-    if lights.is_empty() {
+    if !has_authored_directional {
         // The default key light — the prior hard-coded directional (M11.2's LIGHT_DIR was the dir TO the
         // light, so the SHINE direction is its negation), intensity 2.4. Keeps unlit scenes readable, and
         // it casts the default shadow.
@@ -16806,7 +17177,7 @@ fn collect_lights(engine: &Engine<FlecsWorld>) -> (Vec<render::LightGpu>, Option
             color_intensity: [1.0, 1.0, 1.0, 2.4],
             dir_range: [-0.4, -0.8, -0.3, 0.0],
         });
-        shadow_caster = Some(0); // the default key light (index 0) casts
+        shadow_caster = Some(lights.len() - 1); // the appended default directional casts
     }
     (lights, shadow_caster)
 }
@@ -17721,13 +18092,13 @@ fn rebuild(
     // drawn and must therefore be selectable: lights, cameras, terrain recipes, CAD assembly folders.
     let mut marker_entities: Vec<render::MarkerEntity> = Vec::new();
     for id in engine.entity_ids() {
-        // M9.2 deactivate-not-delete: a deactivated PART is hidden from the viewport (the entity + its
-        // data survive; undo re-activates it → it reappears on the next rebuild). Only children can be
-        // deactivated, so flat entities skip the (override-map) `is_active` read entirely.
-        let is_child = engine.parent_of(id).is_some();
-        if is_child && !engine.is_active(id) {
+        // M9.2 deactivate-not-delete: every directly-deactivated entity is hidden from the viewport (the
+        // entity + its data survive; undo re-activates it → it reappears on the next rebuild). `SetActive`
+        // is valid for both roots and children, so the render projection must not special-case hierarchy.
+        if !engine.is_active(id) {
             continue;
         }
+        let is_child = engine.parent_of(id).is_some();
         // Play-only hide (gameplay roles): a collected pickup leaves the instance list entirely —
         // no draw, no shadow, no pick, no snap — for the rest of the run. Cleared on Stop; the
         // authored document never carried the change.
@@ -20690,7 +21061,115 @@ fn role_assign(
     })
 }
 
-/// Clear an entity's role (one undoable commit; keeps mesh + transform).
+/// Resolve the live cinematic subject as the union of every rendered instance in its hierarchy subtree.
+///
+/// CAD assembly/group entities intentionally have no render instance of their own, so a direct id lookup
+/// cannot describe them. Walking entity ids (rather than instance indices) also survives render-list
+/// rebuilds and naturally ignores inactive/unresolved descendants that are not currently drawn. Bounds are
+/// accumulated in `f64`: instance geometry is necessarily `f32` because that is what the GPU draws, but a
+/// kilometre-wide assembly translated far from the origin should not lose another mantissa's worth of
+/// precision merely because many part AABBs are combined.
+fn cinematic_subject_sample(
+    engine: &Engine<FlecsWorld>,
+    state: &render::SceneState,
+    subject: EntityId,
+    fallback_transform: GizmoTransform,
+) -> metrocalk_animation::shot::SubjectSample {
+    let mut stack = vec![subject];
+    let mut subtree = HashSet::new();
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    let mut found = false;
+
+    while let Some(id) = stack.pop() {
+        if !subtree.insert(id) {
+            continue;
+        }
+        stack.extend(engine.children_of(id));
+    }
+
+    // Parse the render ids once and test them against the entity-id subtree. This avoids building a second
+    // scene-sized id→index map every cinematic frame — a factory assembly can have thousands of parts, and
+    // the camera path must not introduce two large hash allocations at 60 Hz.
+    for (index, key) in state.ids.iter().enumerate() {
+        let Some(id) = EntityId::from_loro_key(key) else {
+            continue;
+        };
+        if !subtree.contains(&id) {
+            continue;
+        }
+        if let Some((part_lo, part_hi)) = state.rendered_instance_bounds(index) {
+            for axis in 0..3 {
+                lo[axis] = lo[axis].min(f64::from(part_lo[axis]));
+                hi[axis] = hi[axis].max(f64::from(part_hi[axis]));
+            }
+            found = true;
+        }
+    }
+
+    if found {
+        let mut center = [0.0; 3];
+        let mut half_extent = [0.0; 3];
+        for axis in 0..3 {
+            // Difference-first midpoint math avoids overflowing if finite f32 render coordinates happen
+            // to straddle almost the entire representable range.
+            let half = (hi[axis] - lo[axis]) * 0.5;
+            center[axis] = (lo[axis] + half) as f32;
+            half_extent[axis] = half as f32;
+        }
+        return metrocalk_animation::shot::SubjectSample {
+            center,
+            half_extent,
+            forward: [0.0, 0.0, 1.0],
+        };
+    }
+
+    // Preserve the previous behavior for a simple/unresolved subject: its live authored pivot and scalar
+    // cube remain the fallback, including the historical 0.25 m minimum that keeps tiny placeholders
+    // filmable. Drawable simple entities take the mesh-aware branch above.
+    let half = fallback_transform.scale[0].abs().max(0.25);
+    metrocalk_animation::shot::SubjectSample {
+        center: fallback_transform.translation,
+        half_extent: [half; 3],
+        forward: [0.0, 0.0, 1.0],
+    }
+}
+
+/// Resolve one shot's live subject bounds and facing through the shared render projection. Keeping this
+/// lookup reusable is what lets an intra-cutscene blend solve two genuinely different subjects without
+/// duplicating the hierarchy/bounds policy in the playback loop.
+fn cinematic_shot_subject_sample(
+    engine: &Engine<FlecsWorld>,
+    state: &render::SceneState,
+    cutscene_entity: EntityId,
+    shot: &metrocalk_animation::shot::ShotRecipe,
+) -> metrocalk_animation::shot::SubjectSample {
+    let subject = EntityId::from_loro_key(&shot.subject)
+        .filter(|entity| engine.entity_exists(*entity))
+        .unwrap_or(cutscene_entity);
+    let transform = capscene::global_transform(engine, subject);
+    let mut sample = cinematic_subject_sample(engine, state, subject, transform);
+
+    // The subject's real facing, so "Behind" is behind it rather than behind the world.
+    let [x, y, z, w] = transform.rotation;
+    let forward = [
+        2.0 * (x * z + w * y),
+        2.0 * (y * z - w * x),
+        1.0 - 2.0 * (x * x + y * y),
+    ];
+    let length = forward.iter().map(|value| value * value).sum::<f32>().sqrt();
+    sample.forward = if length.is_finite() && length > 1.0e-4 {
+        [
+            forward[0] / length,
+            forward[1] / length,
+            forward[2] / length,
+        ]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    sample
+}
+
 /// Hand the viewport back to the author: the selection outline returns and the gizmo/binding-line
 /// suppression lifts. Idempotent, because a cutscene can end down several paths (its shots run out, a
 /// rule turns it off, or the user presses Stop) and every one of them must leave the same editor.
@@ -21343,6 +21822,27 @@ fn cinema_remove_shot(
     })
 }
 
+/// Set the cutscene's one authored pacing dial (one undoable commit).
+#[tauri::command(async)]
+fn cinema_set_mood(
+    state: State<AppState>,
+    id: String,
+    mood: String,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetMood { id, mood, reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The pacing change did not finish in time")
+    })
+}
+
 /// An object's cutscene, read back as sentences plus any continuity warnings.
 #[tauri::command(async)]
 fn cinema_list(state: State<AppState>, id: String) -> metrocalk_editor_shell::CinemaReply {
@@ -21730,12 +22230,28 @@ fn import_asset(state: State<AppState>, path: String) -> Option<String> {
     let (reply, rx) = mpsc::channel();
     if state
         .tx
-        .send(EngineCmd::ImportAsset { path, reply })
+        .send(EngineCmd::ImportAsset {
+            path,
+            cancellation: None,
+            reply,
+        })
         .is_err()
     {
         return None;
     }
-    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).unwrap_or(None)
+    match recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT) {
+        Ok(ImportAssetResult::Imported(id)) => Some(id),
+        Ok(ImportAssetResult::Failed | ImportAssetResult::Cancelled) | Err(_) => None,
+    }
+}
+
+/// Signal a native OS drop directly, even while the serial engine thread is parsing CAD. `false` means
+/// the batch is already terminal or has crossed its final commit checkpoint; the UI must not claim it is
+/// stopping in that case.
+#[tauri::command]
+fn cancel_native_import(state: State<AppState>, batch_id: u64) -> bool {
+    ipc();
+    state.native_imports.cancel(batch_id)
 }
 
 /// M11.1 — **File → Import**: open a native file dialog filtered to 3D/asset formats, then import the
@@ -21760,12 +22276,19 @@ fn import_asset_dialog(app: tauri::AppHandle, state: State<AppState>) -> Option<
     let (reply, rx) = mpsc::channel();
     if state
         .tx
-        .send(EngineCmd::ImportAsset { path, reply })
+        .send(EngineCmd::ImportAsset {
+            path,
+            cancellation: None,
+            reply,
+        })
         .is_err()
     {
         return None;
     }
-    recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).unwrap_or(None)
+    match recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT) {
+        Ok(ImportAssetResult::Imported(id)) => Some(id),
+        Ok(ImportAssetResult::Failed | ImportAssetResult::Cancelled) | Err(_) => None,
+    }
 }
 
 /// M9.2 — deactivate-not-delete a part (or reactivate); replies whether it applied.
@@ -22173,7 +22696,42 @@ fn entity_details(state: State<AppState>, id: String) -> Option<EntityDetails> {
 fn cad_report(state: State<AppState>) -> CadReportResp {
     ipc();
     let (reply, rx) = mpsc::channel();
-    if state.tx.send(EngineCmd::CadReport { reply }).is_err() {
+    if state
+        .tx
+        .send(EngineCmd::CadReport {
+            query: None,
+            offset: 0,
+            limit: 500,
+            reply,
+        })
+        .is_err()
+    {
+        return CadReportResp::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
+/// Search/page the live CAD report for diagnostics and high-volume authoring tools without changing the
+/// established no-argument `cad_report` IPC contract used by the editor.
+#[tauri::command(async)]
+fn cad_report_page(
+    state: State<AppState>,
+    query: Option<String>,
+    offset: usize,
+    limit: usize,
+) -> CadReportResp {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CadReport {
+            query,
+            offset,
+            limit,
+            reply,
+        })
+        .is_err()
+    {
         return CadReportResp::default();
     }
     recv_reply(&rx).unwrap_or_default()
@@ -23882,9 +24440,12 @@ fn main() {
     }
     // The drag-drop handler needs its own sender:  is moved into AppState below.
     let tx_for_drop = tx.clone();
+    let native_imports = native_drop_import::NativeImportControl::default();
+    let native_imports_for_drop = native_imports.clone();
     let app_state = AppState {
         tx,
         shared: shared.clone(),
+        native_imports,
         moba: Mutex::new(None),
         picking: Mutex::new(scene_pick::PickCache::new()),
         selection: Mutex::new(metrocalk_spatial::SelectionModel::new()),
@@ -23924,48 +24485,12 @@ fn main() {
             // Routed through the SAME `EngineCmd::ImportAsset` as the menu, so a dropped file gets
             // the identical landing, provenance and undo behaviour — a second import path that
             // behaved even slightly differently would be worse than none.
-            {
-                let tx = drop_tx.clone();
-                let handle = app.handle().clone();
-                win.on_window_event(move |event| {
-                    let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) =
-                        event
-                    else {
-                        return;
-                    };
-                    for path in paths.clone() {
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        // Refuse what we cannot open BEFORE handing it to the engine, and say why in
-                        // the registry's own words rather than a generic failure.
-                        let ext = path
-                            .extension()
-                            .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                            .unwrap_or_default();
-                        let known = metrocalk_editor_shell::spec_for_extension(&ext)
-                            .is_some_and(|f| f.available && f.direction.reads());
-                        if !known {
-                            let why = metrocalk_editor_shell::explain_unsupported(&name);
-                            let _ = handle.emit("mtk://import-refused", why);
-                            continue;
-                        }
-                        let (reply, rx) = mpsc::channel();
-                        if tx
-                            .send(EngineCmd::ImportAsset {
-                                path: path.display().to_string(),
-                                reply,
-                            })
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        let created = recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT).ok().flatten();
-                        let _ = handle.emit("mtk://imported", created.unwrap_or_default());
-                    }
-                });
-            }
+            native_drop_import::install(
+                &win,
+                app.handle().clone(),
+                drop_tx.clone(),
+                native_imports_for_drop.clone(),
+            );
             render::start(win, shared.clone());
             Ok(())
         })
@@ -24027,6 +24552,7 @@ fn main() {
             duplicate_entity,
             entity_details,
             cad_report,
+            cad_report_page,
             cad_reimport_report,
             cad_reimport_resolve,
             set_joint,
@@ -24139,6 +24665,7 @@ fn main() {
             cinema_catalog,
             cinema_add_shot,
             cinema_remove_shot,
+            cinema_set_mood,
             cinema_list,
             condition_catalog,
             condition_add,
@@ -24165,6 +24692,7 @@ fn main() {
             cut_subtree,
             paste_clipboard,
             import_asset,
+            cancel_native_import,
             import_asset_dialog,
             set_part_active,
             save_character,
@@ -24431,6 +24959,193 @@ mod material_tests {
 }
 
 #[cfg(test)]
+mod cinematic_subject_tests {
+    use super::*;
+    use metrocalk_animation::shot::{solve_shot, ShotAngle, ShotMove, ShotRecipe, ShotSize};
+    use metrocalk_assets::MeshVertex;
+    use metrocalk_core::Op;
+
+    fn vertex(position: [f32; 3]) -> MeshVertex {
+        MeshVertex {
+            position,
+            normal: [0.0, 1.0, 0.0],
+            color: [1.0; 3],
+            metallic: 0.0,
+            roughness: 1.0,
+            uv: [0.0; 2],
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+    fn bounds_mesh(lo: [f32; 3], hi: [f32; 3]) -> MeshGpu {
+        // Bounds are derived from the vertex positions, independently of topology. Opposite corners are
+        // sufficient and keep these camera-projection tests focused on the bounds contract.
+        MeshGpu {
+            vertices: vec![vertex(lo), vertex(hi)],
+            indices: Vec::new(),
+            submeshes: Vec::new(),
+        }
+    }
+
+    fn instance(center: [f32; 3], scale: f32) -> Instance {
+        Instance {
+            center,
+            scale,
+            color: [1.0; 3],
+            selected: 0.0,
+            rotation: render::IDENTITY_QUAT,
+            material: [0.0; 4],
+        }
+    }
+
+    fn commit_hierarchy(engine: &mut Engine<FlecsWorld>, nodes: &[(EntityId, Option<EntityId>)]) {
+        engine
+            .commit(
+                "cinematic bounds fixture",
+                nodes
+                    .iter()
+                    .map(|(id, parent)| Op::CreateEntity {
+                        id: *id,
+                        parent: *parent,
+                    })
+                    .collect(),
+            )
+            .expect("fixture hierarchy");
+    }
+
+    #[test]
+    fn large_cad_assembly_uses_all_real_part_bounds_for_framing() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCA1);
+        let group = engine.alloc_entity_id();
+        let left = engine.alloc_entity_id();
+        let right = engine.alloc_entity_id();
+        commit_hierarchy(
+            &mut engine,
+            &[(group, None), (left, Some(group)), (right, Some(group))],
+        );
+
+        let mut state = SceneState::default();
+        state.instances = vec![
+            instance([-100.0, 5.0, 0.0], 1.0),
+            instance([100.0, 5.0, 0.0], 1.0),
+        ];
+        state.ids = vec![left.to_loro_key(), right.to_loro_key()];
+        state.mesh_slots = vec![0, 0];
+        state.meshes = vec![bounds_mesh([-10.0, -5.0, -2.0], [10.0, 5.0, 2.0])];
+
+        let sample = cinematic_subject_sample(&engine, &state, group, GizmoTransform::IDENTITY);
+        assert_eq!(sample.center, [0.0, 5.0, 0.0]);
+        assert_eq!(sample.half_extent, [110.0, 5.0, 2.0]);
+
+        let shot = ShotRecipe {
+            id: "assembly-wide".into(),
+            subject: group.to_loro_key(),
+            size: ShotSize::Full,
+            angle: ShotAngle::Front,
+            motion: ShotMove::Hold,
+            amount: 0.0,
+            seconds: 2.0,
+        };
+        let pose = solve_shot(&shot, sample, 0.0, 16.0 / 9.0, 50.0);
+        let camera_distance = pose
+            .eye
+            .iter()
+            .zip(sample.center)
+            .map(|(eye, center)| (eye - center).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            camera_distance > 300.0 && camera_distance.is_finite(),
+            "the full 220 m assembly must drive the lens, not the group's instance-free pivot: {camera_distance}"
+        );
+    }
+
+    #[test]
+    fn selected_group_includes_nested_descendants_but_not_adjacent_assembly_siblings() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCA2);
+        let scene_root = engine.alloc_entity_id();
+        let selected_group = engine.alloc_entity_id();
+        let direct_part = engine.alloc_entity_id();
+        let nested_group = engine.alloc_entity_id();
+        let nested_part = engine.alloc_entity_id();
+        let unrelated_part = engine.alloc_entity_id();
+        commit_hierarchy(
+            &mut engine,
+            &[
+                (scene_root, None),
+                (selected_group, Some(scene_root)),
+                (direct_part, Some(selected_group)),
+                (nested_group, Some(selected_group)),
+                (nested_part, Some(nested_group)),
+                (unrelated_part, Some(scene_root)),
+            ],
+        );
+
+        let mut state = SceneState::default();
+        state.instances = vec![
+            instance([10.0, 0.0, 0.0], 1.0),
+            instance([30.0, 0.0, 0.0], 1.0),
+            instance([1_000.0, 0.0, 0.0], 1.0),
+        ];
+        state.ids = vec![
+            direct_part.to_loro_key(),
+            nested_part.to_loro_key(),
+            unrelated_part.to_loro_key(),
+        ];
+        state.mesh_slots = vec![0, 0, 0];
+        state.meshes = vec![bounds_mesh([-1.0; 3], [1.0; 3])];
+
+        let sample =
+            cinematic_subject_sample(&engine, &state, selected_group, GizmoTransform::IDENTITY);
+        assert_eq!(sample.center, [20.0, 0.0, 0.0]);
+        assert_eq!(sample.half_extent, [11.0, 1.0, 1.0]);
+        assert!(
+            sample.center[0] + sample.half_extent[0] < 100.0,
+            "an adjacent assembly sibling must not contaminate the selected group's shot"
+        );
+    }
+
+    #[test]
+    fn simple_cad_entity_uses_offset_mesh_bounds_and_display_scale_once() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCA3);
+        let part = engine.alloc_entity_id();
+        commit_hierarchy(&mut engine, &[(part, None)]);
+
+        let mut state = SceneState::default();
+        state.instances = vec![instance([1.0, 2.0, 3.0], 0.001)];
+        state.ids = vec![part.to_loro_key()];
+        state.mesh_slots = vec![0];
+        state.meshes = vec![bounds_mesh(
+            [500.0, -250.0, -125.0],
+            [1_500.0, 250.0, 125.0],
+        )];
+
+        let sample = cinematic_subject_sample(&engine, &state, part, GizmoTransform::IDENTITY);
+        assert!((sample.center[0] - 2.0).abs() < 1.0e-5);
+        assert_eq!(sample.center[1..], [2.0, 3.0]);
+        assert!((sample.half_extent[0] - 0.5).abs() < 1.0e-5);
+        assert!((sample.half_extent[1] - 0.25).abs() < 1.0e-5);
+        assert!((sample.half_extent[2] - 0.125).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn geometry_free_simple_subject_preserves_the_legacy_safe_cube_fallback() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCA4);
+        let subject = engine.alloc_entity_id();
+        commit_hierarchy(&mut engine, &[(subject, None)]);
+        let fallback = GizmoTransform {
+            translation: [7.0, 8.0, 9.0],
+            rotation: render::IDENTITY_QUAT,
+            scale: [0.1; 3],
+        };
+
+        let sample = cinematic_subject_sample(&engine, &SceneState::default(), subject, fallback);
+        assert_eq!(sample.center, fallback.translation);
+        assert_eq!(sample.half_extent, [0.25; 3]);
+    }
+}
+
+#[cfg(test)]
 mod pipe_viewport_tests {
     use super::{
         bake_pipe, pipe_world_point, pipe_world_point_scene, rebuild_document_pipe, Instance,
@@ -24620,6 +25335,36 @@ mod lighting_debug_tests {
     }
 
     #[test]
+    fn point_only_scene_keeps_an_honest_synthesized_directional_caster() {
+        let (mut e, scene) = engine();
+        let point = capscene::add_light(
+            &mut e,
+            &scene,
+            "point",
+            [2.0, 4.0, 1.0],
+            [1.0, 0.8, 0.6],
+            12.0,
+        )
+        .expect("add a point light");
+        assert_eq!(
+            e.components_of(point)
+                .get("Light")
+                .and_then(|light| light.get("castShadows")),
+            Some(&FieldValue::Bool(false)),
+            "point lights must not claim support for the directional-only shadow map"
+        );
+
+        let (lights, caster) = collect_lights(&e);
+        assert_eq!(lights.len(), 2, "authored point plus synthesized key");
+        assert_eq!(
+            lights[0].pos_kind[3], 1.0,
+            "the authored light remains point"
+        );
+        assert_eq!(lights[1].pos_kind[3], 0.0, "the fallback is directional");
+        assert_eq!(caster, Some(1), "the synthesized directional casts");
+    }
+
+    #[test]
     fn an_authored_directional_light_casts_and_undo_restores_the_default() {
         let (mut e, scene) = engine();
         capscene::add_light(
@@ -24693,14 +25438,149 @@ mod lighting_debug_tests {
 }
 
 #[cfg(test)]
+mod active_render_tests {
+    use super::*;
+    use metrocalk_core::Op;
+
+    fn empty_assets() -> AssetsRuntime {
+        AssetsRuntime {
+            store: AssetStore::new(),
+            catalog: MeshCatalog::default(),
+            asset_by_name: HashMap::new(),
+            handle_to_slot: HashMap::new(),
+            scales: Vec::new(),
+            display_affines: Vec::new(),
+            meshes: Vec::new(),
+            sphere: String::new(),
+            provenance: HashMap::new(),
+            animation_assets: HashMap::new(),
+            pipe_recipes: HashMap::new(),
+            shape_recipes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn inactive_top_level_renderable_is_not_emitted_and_undo_restores_it() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xAC71);
+        let entity = engine.alloc_entity_id();
+        engine
+            .commit(
+                "top-level renderable",
+                vec![
+                    Op::CreateEntity {
+                        id: entity,
+                        parent: None,
+                    },
+                    Op::SetField {
+                        entity,
+                        component: "Transform".into(),
+                        field: "x".into(),
+                        value: FieldValue::Number(3.0),
+                    },
+                    Op::SetField {
+                        entity,
+                        component: "MeshRenderer".into(),
+                        field: capscene::MESH_FIELD.into(),
+                        value: FieldValue::Str("test-mesh".into()),
+                    },
+                ],
+            )
+            .expect("create top-level renderable");
+
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let mut positions = HashMap::new();
+        let assets = empty_assets();
+        let key = entity.to_loro_key();
+
+        rebuild(&engine, &shared, &mut positions, &assets);
+        assert_eq!(shared.lock().unwrap().ids, vec![key.clone()]);
+
+        engine
+            .commit(
+                "deactivate top-level renderable",
+                vec![Op::SetActive {
+                    entity,
+                    active: false,
+                }],
+            )
+            .expect("deactivate top-level renderable");
+        rebuild(&engine, &shared, &mut positions, &assets);
+        assert!(
+            !shared.lock().unwrap().ids.contains(&key),
+            "a directly inactive root must not enter the render projection"
+        );
+
+        assert!(engine.undo(), "undo reactivates the entity");
+        rebuild(&engine, &shared, &mut positions, &assets);
+        assert_eq!(
+            shared.lock().unwrap().ids,
+            vec![key],
+            "the next rebuild emits the root again after undo"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cad_import_cancellation_tests {
+    use super::{commit_cad_ops_unless_cancelled, native_drop_import};
+    use metrocalk_core::{Engine, Op};
+    use metrocalk_ecs::FlecsWorld;
+
+    #[test]
+    fn cancellation_winning_the_final_checkpoint_makes_no_scene_mutation_and_retry_can_commit() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCA11);
+        let before = engine.entity_count();
+        let cancelled_id = engine.alloc_entity_id();
+        let cancelled = native_drop_import::ImportCancellation::new();
+        assert!(cancelled.request());
+
+        let outcome = commit_cad_ops_unless_cancelled(
+            &mut engine,
+            Some(&cancelled),
+            vec![Op::CreateEntity {
+                id: cancelled_id,
+                parent: None,
+            }],
+        )
+        .expect("the cancellation checkpoint is not a commit error");
+        assert!(!outcome);
+        assert_eq!(engine.entity_count(), before);
+        assert!(!engine.entity_exists(cancelled_id));
+
+        let retry_id = engine.alloc_entity_id();
+        let retry = native_drop_import::ImportCancellation::new();
+        let outcome = commit_cad_ops_unless_cancelled(
+            &mut engine,
+            Some(&retry),
+            vec![Op::CreateEntity {
+                id: retry_id,
+                parent: None,
+            }],
+        )
+        .expect("a fresh retry can commit");
+        assert!(outcome);
+        assert!(engine.entity_exists(retry_id));
+        assert_eq!(engine.entity_count(), before + 1);
+        assert!(
+            !retry.request(),
+            "a sealed commit must not later be reported as successfully cancelled"
+        );
+    }
+}
+
+#[cfg(test)]
 mod cad_report_tests {
-    use super::build_cad_report;
+    use super::{build_cad_report, build_cad_report_page};
     use metrocalk_core::{Engine, FieldValue, Op};
     use metrocalk_ecs::FlecsWorld;
     use metrocalk_editor_shell::CAD_PART;
 
     /// A CadPart entity carrying its persisted fidelity token — what `land_cad` writes onto each part.
-    fn cad_part(e: &mut Engine<FlecsWorld>, name: &str, fidelity: &str) {
+    fn cad_part(
+        e: &mut Engine<FlecsWorld>,
+        name: &str,
+        fidelity: &str,
+    ) -> metrocalk_core::EntityId {
         let id = e.alloc_entity_id();
         e.commit(
             "cad-part",
@@ -24721,6 +25601,7 @@ mod cad_report_tests {
             ],
         )
         .expect("commit a cad part");
+        id
     }
 
     #[test]
@@ -24775,6 +25656,56 @@ mod cad_report_tests {
     fn an_empty_scene_reports_no_cad() {
         let e = Engine::new(FlecsWorld::new(), 1);
         assert_eq!(build_cad_report(&e).total, 0);
+    }
+
+    #[test]
+    fn report_search_and_paging_are_deterministic_and_keep_match_counts_exact() {
+        let mut e = Engine::new(FlecsWorld::new(), 3);
+        cad_part(&mut e, "Motor Z", "exact-brep");
+        cad_part(&mut e, "Clamp", "tessellation-only");
+        cad_part(&mut e, "motor A", "proxy");
+        cad_part(&mut e, "Motor B", "exact-brep");
+
+        let first = build_cad_report_page(&e, Some("MOTOR"), 0, 2);
+        assert_eq!(first.total, 3, "counts describe all query matches, not just the page");
+        assert_eq!(first.parts.iter().map(|part| part.name.as_str()).collect::<Vec<_>>(), ["motor A", "Motor B"]);
+        assert_eq!(first.exact_brep, 2);
+        assert_eq!(first.proxy, 1);
+
+        let second = build_cad_report_page(&e, Some("motor"), 2, 2);
+        assert_eq!(second.total, 3);
+        assert_eq!(second.parts.iter().map(|part| part.name.as_str()).collect::<Vec<_>>(), ["Motor Z"]);
+        assert!(build_cad_report_page(&e, Some("robot"), 0, 10).parts.is_empty());
+    }
+
+    #[test]
+    fn inactive_cad_part_is_not_counted_and_undo_restores_it() {
+        let mut e = Engine::new(FlecsWorld::new(), 2);
+        cad_part(&mut e, "Active plate", "exact-brep");
+        let inactive = cad_part(&mut e, "Retired plate", "proxy");
+        e.commit(
+            "retire stale CAD part",
+            vec![Op::SetActive {
+                entity: inactive,
+                active: false,
+            }],
+        )
+        .expect("deactivate stale CAD part");
+
+        let report = build_cad_report(&e);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.exact_brep, 1);
+        assert_eq!(report.proxy, 0);
+        assert!(report.parts.iter().all(|part| part.name != "Retired plate"));
+
+        assert!(e.undo(), "undo reactivates the retired CAD part");
+        let restored = build_cad_report(&e);
+        assert_eq!(restored.total, 2);
+        assert_eq!(restored.proxy, 1);
+        assert!(restored
+            .parts
+            .iter()
+            .any(|part| part.name == "Retired plate"));
     }
 }
 

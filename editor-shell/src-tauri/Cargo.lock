@@ -3923,6 +3923,7 @@ dependencies = [
  "openusd",
  "quick-xml 0.36.2",
  "serde",
+ "spade",
  "urdf-rs",
  "zip",
 ]
@@ -3958,6 +3959,7 @@ version = "0.1.0"
 dependencies = [
  "glam 0.30.10",
  "metrocalk-gizmo",
+ "serde",
 ]
 
 [[package]]

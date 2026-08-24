@@ -17,7 +17,10 @@ param(
   [string]$Out,
   [string]$ProcName = "metrocalk-editor-shell",
   [int]$X = 40,
-  [int]$Y = 40
+  [int]$Y = 40,
+  # Capture the current presentation without moving, raising, restoring, or changing
+  # z-order. Required while an OLE drag is held over the viewport.
+  [switch]$PreserveWindow
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,18 +68,25 @@ $topmost = [IntPtr](-1)
 $notTopmost = [IntPtr](-2)
 $swpNoSize = 0x0001
 $swpShowWindow = 0x0040
+$preparedWindow = $false
 
 try {
   # Only un-minimise. The old unconditional minimise/restore/topmost dance existed to force DWM to
   # recomposite for the desktop-DC read; PrintWindow does not need it, and doing it ~50 times in a run is
   # what made the window handle transiently invalid.
-  if ([MetrocalkWindowCapture]::IsIconic($handle)) {
+  if ($PreserveWindow -and [MetrocalkWindowCapture]::IsIconic($handle)) {
+    throw "Cannot preserve and capture a minimised '$ProcName' window."
+  }
+  if (-not $PreserveWindow -and [MetrocalkWindowCapture]::IsIconic($handle)) {
     [MetrocalkWindowCapture]::ShowWindow($handle, 9) | Out-Null
     Start-Sleep -Milliseconds 400
   }
-  [MetrocalkWindowCapture]::SetWindowPos($handle, $topmost, $X, $Y, 0, 0, ($swpNoSize -bor $swpShowWindow)) | Out-Null
-  [MetrocalkWindowCapture]::BringWindowToTop($handle) | Out-Null
-  Start-Sleep -Milliseconds 350
+  if (-not $PreserveWindow) {
+    [MetrocalkWindowCapture]::SetWindowPos($handle, $topmost, $X, $Y, 0, 0, ($swpNoSize -bor $swpShowWindow)) | Out-Null
+    [MetrocalkWindowCapture]::BringWindowToTop($handle) | Out-Null
+    $preparedWindow = $true
+    Start-Sleep -Milliseconds 350
+  }
 
   $rect = New-Object MetrocalkWindowCapture+RECT
   if (-not [MetrocalkWindowCapture]::GetWindowRect($handle, [ref]$rect)) {
@@ -88,7 +98,7 @@ try {
 
   Add-Type -AssemblyName System.Drawing
 
-  # ── path 1: PrintWindow ───────────────────────────────────────────────────────────────────────────
+  # -- path 1: PrintWindow ---------------------------------------------------------------------------
   $directory = Split-Path -Path $Out -Parent
   if ($directory -and -not (Test-Path -LiteralPath $directory)) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
@@ -117,18 +127,13 @@ try {
     if ($printMemory -ne [IntPtr]::Zero) { [MetrocalkWindowCapture]::DeleteDC($printMemory) | Out-Null }
     [MetrocalkWindowCapture]::ReleaseDC($handle, $windowDc) | Out-Null
   }
-  # NOTE: the window is left TOPMOST on purpose. Releasing it here was tried and made EVERY capture blank:
-  # PrintWindow against this DirectComposition surface needs the window unoccluded, and the console this
-  # script runs from will otherwise be over it. A blank result is written as a ~158-byte uniform PNG rather
-  # than failing, so callers must check the output size.
-  if ($printed) { return }
-
-  # ── path 2: the original desktop-DC BitBlt ────────────────────────────────────────────────────────
-  # A WebView2 restore can transiently invalidate the desktop DC for one frame. Recreate every GDI
-  # object for each bounded retry; never accept a stale/partial capture. Graphics.CopyFromScreen wraps
-  # this operation but can throw "The handle is invalid" before exposing which handle failed.
-  $captured = $false
-  for ($attempt = 1; $attempt -le 3 -and -not $captured; $attempt++) {
+  if (-not $printed) {
+    # -- path 2: the original desktop-DC BitBlt ------------------------------------------------------
+    # A WebView2 restore can transiently invalidate the desktop DC for one frame. Recreate every GDI
+    # object for each bounded retry; never accept a stale/partial capture. Graphics.CopyFromScreen wraps
+    # this operation but can throw "The handle is invalid" before exposing which handle failed.
+    $captured = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $captured; $attempt++) {
     $screenDc = [MetrocalkWindowCapture]::GetDC([IntPtr]::Zero)
     $memoryDc = [IntPtr]::Zero
     $nativeBitmap = [IntPtr]::Zero
@@ -187,12 +192,41 @@ try {
         [MetrocalkWindowCapture]::ReleaseDC([IntPtr]::Zero, $screenDc) | Out-Null
       }
     }
+    }
   }
 }
 finally {
-  [MetrocalkWindowCapture]::SetWindowPos($handle, $notTopmost, $X, $Y, 0, 0, $swpNoSize) | Out-Null
+  if ($preparedWindow) {
+    [MetrocalkWindowCapture]::SetWindowPos($handle, $notTopmost, $X, $Y, 0, 0, $swpNoSize) | Out-Null
+  }
 }
 
 $captured = Get-Item -LiteralPath $Out
 if ($captured.Length -le 1024) { throw "Capture '$Out' is unexpectedly small ($($captured.Length) bytes)." }
-Write-Output "CAPTURED ${width}x${height} -> $($captured.FullName)"
+$verificationImage = [System.Drawing.Bitmap]::FromFile($captured.FullName)
+try {
+  if ($verificationImage.Width -ne $width -or $verificationImage.Height -ne $height) {
+    throw "Capture dimensions $($verificationImage.Width)x$($verificationImage.Height) do not match the window ${width}x${height}."
+  }
+  # Reject the uniform black/white/transparent frames that PrintWindow can return while
+  # still claiming success. Sampling a regular grid is cheap and sufficient for this gate.
+  $minLuma = 255.0
+  $maxLuma = 0.0
+  for ($gy = 0; $gy -lt 16; $gy++) {
+    $sampleY = [Math]::Min($height - 1, [int](($gy + 0.5) * $height / 16.0))
+    for ($gx = 0; $gx -lt 16; $gx++) {
+      $sampleX = [Math]::Min($width - 1, [int](($gx + 0.5) * $width / 16.0))
+      $pixel = $verificationImage.GetPixel($sampleX, $sampleY)
+      $luma = 0.2126 * $pixel.R + 0.7152 * $pixel.G + 0.0722 * $pixel.B
+      $minLuma = [Math]::Min($minLuma, $luma)
+      $maxLuma = [Math]::Max($maxLuma, $luma)
+    }
+  }
+  if (($maxLuma - $minLuma) -lt 3.0) {
+    throw "Capture '$Out' is visually uniform (sampled luma range $([Math]::Round($minLuma, 2))..$([Math]::Round($maxLuma, 2)))."
+  }
+}
+finally {
+  $verificationImage.Dispose()
+}
+Write-Output "CAPTURED ${width}x${height} luma=$([Math]::Round($minLuma, 1))..$([Math]::Round($maxLuma, 1)) -> $($captured.FullName)"

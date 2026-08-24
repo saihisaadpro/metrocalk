@@ -9,6 +9,8 @@
     "test:animation-native": "node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.animationtest.conf.js",
     "test:reload": "node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.reload.conf.js",
     "test:workbench": "node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.workbench.conf.js",
+    "test:native-cad-drop": "node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.native-cad-drop.conf.js",
+    "test:native-cad-drop-harness": "node --test lib/native-cad-drop.test.mjs",
     "accessibility:preflight": "node scripts/accessibility-preflight.mjs",
     "accessibility:matrix": "node scripts/accessibility-report.mjs --matrix-only",
     "accessibility:report": "node scripts/accessibility-report.mjs",
