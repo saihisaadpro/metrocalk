@@ -302,6 +302,14 @@ namespace MtkDrop
                     // Let the Shown callback return so the source UI thread is actively
                     // dispatching before the synthetic button message arrives.
                     Thread.Sleep(350);
+                    // WebDriver can reclaim foreground z-order after the Form.Shown callback. Reassert
+                    // visibility/topmost immediately before the physical press so this HWND—not the
+                    // destination WebView child—owns mouse capture when Control.DoDragDrop begins.
+                    ShowWindow(sourceHwnd, 5); // SW_SHOW
+                    SetWindowPos(sourceHwnd, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040);
+                    BringWindowToTop(sourceHwnd);
+                    SetForegroundWindow(sourceHwnd);
+                    Thread.Sleep(120);
                     MoveAbs(sx, sy);
                     Thread.Sleep(180);
                     var point = new POINT { X = sx, Y = sy };

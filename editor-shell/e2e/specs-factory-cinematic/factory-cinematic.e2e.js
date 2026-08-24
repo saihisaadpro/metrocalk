@@ -764,6 +764,8 @@ describe("production factory cinematic direction", () => {
       manifest.animation = {
         trackCount: tracks.length,
         distinctTargets: new Set(tracks.map(({ id }) => id)).size,
+        keyframeCount: tracks.reduce((count, track) => count + track.keys.length, 0),
+        loopSeconds: 12,
         tracks,
         workspace: {
           revision: animationState.revision,
@@ -796,6 +798,7 @@ describe("production factory cinematic direction", () => {
         totalSeconds: cinematics.totalSeconds,
         minimumClipSeconds: FACTORY_ACCEPTANCE.minimumCinematicSeconds,
         recommendedCaptureSeconds: Math.ceil(cinematics.totalSeconds) + 1,
+        transitionPolicy: "Calm 0.9s blends within each two-shot subject sequence; deterministic hard cuts between named subjects",
         runtimeOrder: cinematics.cutscenes.map(({ id, name, mood, kinds, plannedSeconds, readback }) => ({
           id,
           name,
