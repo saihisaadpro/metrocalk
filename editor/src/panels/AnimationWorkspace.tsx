@@ -1937,12 +1937,14 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                           style={{ minWidth: 0, padding: 0, border: 0, textAlign: "left", color: "inherit", background: "transparent", cursor: "pointer" }}
                         >
                           <span className="mtk-timeline__track-name" title={`${track.targetName} / ${track.component}.${track.property}`} style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: fontSize.body }}>{track.name}</span>
-                          <span style={{ display: "flex", alignItems: "center", gap: space.xs, marginTop: 2 }}>
-                            <Badge tone={bindingTone(state)}>{state.replace("_", " ")}</Badge>
-                            <span style={{ color: color.text.muted, fontSize: fontSize.micro }}>{track.keys.length} keys</span>
-                          </span>
                         </button>
-                        <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                        {/* The metadata line. The badge, the key count and the track's own two
+                            controls share it, so the NAME above owns the full width of the header
+                            column instead of the 100px it had left over beside the buttons. */}
+                        <div className="mtk-timeline__track-meta">
+                          <Badge tone={bindingTone(state)}>{state.replace("_", " ")}</Badge>
+                          <span style={{ color: color.text.muted, fontSize: fontSize.micro }}>{track.keys.length} keys</span>
+                          <div className="mtk-timeline__track-actions">
                           <Button
                             compact
                             icon
@@ -1950,7 +1952,13 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                             disabled={track.locked || busy}
                             data-testid="animation-track-enabled"
                             aria-label={`${track.enabled ? "Mute" : "Unmute"} ${track.name}`}
-                            title={track.enabled ? "Mute track without deleting keys" : "Unmute track"}
+                            title={
+                              track.locked
+                                ? "This track is locked. Unlock it first to mute or unmute it."
+                                : track.enabled
+                                  ? "Mute track without deleting keys"
+                                  : "Unmute track"
+                            }
                             onClick={(event) => { event.stopPropagation(); changeTrackEnabled(track); }}
                           >{track.enabled ? "◉" : "◌"}</Button>
                           <Button
@@ -1963,6 +1971,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                             title={track.locked ? "Unlock track editing" : "Protect track from editing"}
                             onClick={(event) => { event.stopPropagation(); changeTrackLocked(track); }}
                           >{track.locked ? "▣" : "□"}</Button>
+                          </div>
                         </div>
                       </div>
                       <div className="mtk-timeline__lane mtk-timeline__lane--gridded" onClick={scrubLane}>
@@ -2593,8 +2602,12 @@ function Ruler({
         }}
       >
         <Playhead tick={currentTick} duration={duration} handle />
-        {ticks.map((tick) => (
-          <span key={tick} className="mtk-timeline__tick" style={{ left: `${(tick / duration) * 100}%` }}>
+        {ticks.map((tick, index) => (
+          <span
+            key={tick}
+            className={`mtk-timeline__tick${index === 0 ? " mtk-timeline__tick--first" : ""}`}
+            style={{ left: `${(tick / duration) * 100}%` }}
+          >
             {timeLabel(tick, ticksPerSecond, display)}
           </span>
         ))}

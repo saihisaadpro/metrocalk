@@ -312,6 +312,15 @@ body {
 }
 .mtk-select:disabled {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%237a8596' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  /* THE DISABLED SELECT TILED ITS OWN CHEVRON ACROSS THE WHOLE CONTROL. The shared :disabled rule
+     above sets the background SHORTHAND, which resets background-repeat and background-size to
+     their initial values (repeat / auto), and this rule used to restore only the image — a zig-zag
+     stripe where a dropdown should be, captured the first time a scene contained a disabled one.
+     Restated as longhands here rather than changing that shorthand, which the whole field family
+     shares. */
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 10px 6px;
 }
 .mtk-textarea { min-height: 84px; resize: vertical; }
 .mtk-search {
@@ -1534,14 +1543,25 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-timeline__lane:hover { background: var(--mtk-bg-hover); }
 /* A TRACK row is taller than an annotation lane and its header holds controls, not just a name. */
 .mtk-timeline__row--track { min-height: 48px; }
+/* TWO ROWS, NOT TWO COLUMNS. As a 2-column grid the mute/lock pair sat on the NAME's line and left
+   it 100px of a 178px column, so three sibling tracks all rendered as "Transform . ..." — the
+   distinguishing word was the part being ellipsised. The name gets the full width; the badge, the
+   key count and the controls share the metadata line under it. */
 .mtk-timeline__row--track > .mtk-timeline__head {
   z-index: 4;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: var(--mtk-space-2);
-  align-items: center;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: center;
+  gap: var(--mtk-space-1);
   padding: var(--mtk-space-3) var(--mtk-space-4);
 }
+.mtk-timeline__track-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--mtk-space-2);
+  min-width: 0;
+}
+.mtk-timeline__track-actions { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; margin-left: auto; }
 .mtk-timeline__row--track > .mtk-timeline__head.is-selected {
   color: var(--mtk-accent);
   background: var(--mtk-accent-subtle);
@@ -1611,7 +1631,11 @@ body > [role="dialog"][aria-modal="true"] {
   pointer-events: none;
   white-space: nowrap;
 }
-.mtk-timeline__tick:first-child { transform: none; }
+/* The leftmost label has nothing to its left to be centred against, so it starts at the edge
+   instead. It carries its own class because :first-child matched the PLAYHEAD, which is the lane's
+   first child — so the rule had never applied to a tick at all and the label hung half under the
+   sticky track-header column, reading as ")0s". */
+.mtk-timeline__tick--first { transform: none; }
 
 /* The playhead. A 1px line with a glow was invisible against the ruler and impossible to aim at; the
    handle is what makes it an object. `top: -1px` puts the cap over the ruler's own bottom rule. */
