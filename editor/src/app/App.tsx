@@ -972,13 +972,19 @@ export function App() {
         <Modal open onClose={() => setDrawer(null)} zIndex={z.drawer} ariaLabel={drawer === "left" ? "Scene and asset workspace" : "Inspector workspace"}>
           <aside
             data-testid={`drawer-${drawer}`}
+            // The ≤620px form of the same dock, so it says the same thing about itself: a panel
+            // surface with a soft lift, rounded on the edge that faces the workspace and square on
+            // the one flush with the window. It used to be an inset well behind a 1px hairline —
+            // the vocabulary the docked form has now dropped, and the only place it survived.
             style={{
               position: "absolute",
               top: 0,
               bottom: 0,
-              ...(drawer === "left" ? { left: 0, borderRight: "1px solid var(--mtk-border-subtle)" } : { right: 0, borderLeft: "1px solid var(--mtk-border-subtle)" }),
+              ...(drawer === "left"
+                ? { left: 0, borderRadius: "0 var(--mtk-shell-radius) var(--mtk-shell-radius) 0" }
+                : { right: 0, borderRadius: "var(--mtk-shell-radius) 0 0 var(--mtk-shell-radius)" }),
               width: "min(340px, calc(100vw - 36px))",
-              background: "var(--mtk-bg-inset)",
+              background: "var(--mtk-bg-panel)",
               display: "flex",
               flexDirection: "column",
               overflow: "hidden",

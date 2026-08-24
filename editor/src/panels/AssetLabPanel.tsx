@@ -171,6 +171,17 @@ export interface AssetLabPanelProps {
   onResetResult?: () => void;
 }
 
+/** The Model engine's own glyph — the same one the Engines rail and the bottom dock's tab both
+ *  show for this workspace. It used to be the string "R", which is the INITIAL OF THE REPAIR
+ *  STAGE below: a per-stage mnemonic borrowed for the panel that contains all seven stages, so
+ *  the Model workspace introduced itself with a letter that means one of its parts. Nothing
+ *  could see it — a letter is a perfectly legible icon to every invariant in the harness — and
+ *  it is visible in `shell-dock-short` beside the word "Model" and again inside the empty
+ *  state. Stated once here rather than three times inline, and deliberately NOT imported from
+ *  `EngineRail`: a panel reaching into the shell's engine table to read a glyph is a
+ *  dependency the wrong way round. */
+const MODEL_ICON = "⬡";
+
 const STAGES: readonly { id: AssetLabStage; label: string; icon: string; guidance: string }[] = [
   { id: "inspect", label: "Inspect", icon: "I", guidance: "Measure geometry, topology, UVs, materials, and readiness before changing anything." },
   { id: "repair", label: "Repair", icon: "R", guidance: "Create a cleaned derivative with every change counted and reviewable." },
@@ -348,13 +359,13 @@ export function AssetLabPanel({
       <WorkspacePanel
         title="Model"
         subtitle="Production preparation"
-        icon="R"
+        icon={MODEL_ICON}
         className="asset-lab"
         data-testid="asset-lab"
       >
         <EmptyPanelState
           data-testid="asset-lab-empty"
-          icon="R"
+          icon={MODEL_ICON}
           title="Select one mesh asset"
           description="Model audits and produces a reviewable derivative. It never overwrites the source asset."
           primaryAction={
@@ -373,7 +384,7 @@ export function AssetLabPanel({
     <WorkspacePanel
       title="Model"
       subtitle={`${asset.name}${asset.source ? ` / ${asset.source}` : ""}`}
-      icon="R"
+      icon={MODEL_ICON}
       className="asset-lab"
       data-testid="asset-lab"
       busy={busy}

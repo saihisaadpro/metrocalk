@@ -478,6 +478,24 @@ jobs:
         working-directory: editor
         run: pnpm shots --out "$RUNNER_TEMP/shots"
 
+      # THE ONE QUESTION THE SHOTS INVARIANTS STRUCTURALLY CANNOT ASK. R1–R9 are geometric: they know
+      # where a box is, whether it escaped its panel, whether it overlaps a neighbour, whether its text
+      # can be read. A dock that stopped painting its own background is exactly where it should be, the
+      # right size, unclipped, not overlapping, and perfectly legible — because every capture is taken
+      # over an opaque dev body. In the packaged app the root is deliberately transparent so the wgpu
+      # scene composites through the viewport (ADR-008), and that same dock is then a hole with the 3D
+      # scene inside it. The rule is written in two ADRs and half a dozen comments; nothing compared any
+      # of them to a pixel until this step (`<test_and_ci_discipline>` 6).
+      #
+      # It reuses the harness bundle the step above just built, so it costs a page load, and it runs
+      # its own mutation self-test first: a shell surface that stops painting, and an opaque root that
+      # occludes the wgpu layer — the black-viewport regression itself. A gate that stops catching
+      # those fails on itself.
+      - name: native composite — only the stage is a hole
+        working-directory: editor
+        run: |
+          node scripts/check-composite.mjs --self-test
+
       # THE BUNDLE BUDGET, WHICH UNTIL NOW NO JOB HAS EVER RUN. `check-bundle.mjs` and its five ceilings
       # were written, committed, wired into `npm run build:verify` — and `build:verify` appears in no
       # workflow, so the gate had never executed anywhere. Measured against HEAD on 2026-08-23, THREE of

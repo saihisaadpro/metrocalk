@@ -29,11 +29,18 @@ export function StatusBar() {
         boxSizing: "border-box",
         padding: `${space.xs}px ${space.lg}px`,
         fontSize: fontSize.meta,
-        fontFamily: font.mono,
+        // The UI face, not the mono one. A status line is a SENTENCE about what just happened —
+        // "bound HealthBar", "stopped" — and setting a sentence in a code face was the shell's one
+        // remaining piece of terminal styling: it read as log output rather than as the editor
+        // speaking. `font.mono` is for ids, values and diagnostics, which this is not.
+        fontFamily: font.ui,
         lineHeight: "16px",
         color: idle ? color.text.muted : color.text.secondary,
-        background: color.bg.inset, // opaque chrome — the .exe root is transparent (wgpu composite), so the footer paints its own bg
-        borderTop: `1px solid ${color.border.subtle}`,
+        // The GROUND, the same one the header and the dock tracks paint, so the chrome is one
+        // continuous surface with the panels floating on it. Opaque, as it must be — the .exe root is
+        // transparent for the wgpu composite (ADR-008), so every non-stage surface paints its own.
+        background: color.bg.base,
+        // No top rule: the ground does not need a line drawn across it to prove it is the ground.
         whiteSpace: "nowrap",
         overflow: "hidden",
         textOverflow: "ellipsis",

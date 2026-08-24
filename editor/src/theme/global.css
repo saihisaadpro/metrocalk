@@ -126,6 +126,35 @@
      fitting, and a floor written down twice is a floor that only moves in one of the two places. */
   --mtk-dock-content-min: 188px;
   --mtk-status-bar-height: 24px;
+
+  /* ── The shell's ground, and the gap that makes a panel float on it ────────────────────────
+     The constitution asks for "floating panels", "soft elevation" and "minimal borders", and the
+     shell had the vocabulary already — `.mtk-dock-rail` and `.mtk-dock-flyout` are both rounded,
+     shadowed cards — but only ever spent it on the COLLAPSED forms. Expanded, the same docks were
+     opaque tracks butted edge-to-edge against one another and separated by a 1px hairline, so the
+     editor said two different things about what a panel is depending on how wide the window was.
+     One gutter token settles it: every opaque shell region paints the GROUND and floats its panel
+     inside it, and the hairlines go away because a gap already says "these are two things".
+
+     `--mtk-shell-gutter` is the gap BETWEEN two regions, so a region contributes half of it on any
+     edge it shares with a neighbour and the whole of it on an outer edge — otherwise adjacent
+     tracks add their paddings together and the seam between the rail and the dock is twice as wide
+     as the seam between the dock and the stage.
+
+     THE STAGE PAYS NOTHING FOR THIS. The gutter comes out of the fixed side tracks, never out of
+     `minmax(STAGE_MIN, 1fr)`, and there is no vertical gutter above or below the viewport: on the
+     vertical axis the stage runs from the header to the status bar exactly as it did (ADR-126's
+     floor arithmetic is untouched, and `<ux_quality>` 5 says which way that trade goes). */
+  --mtk-shell-gutter: 8px;
+  --mtk-shell-gutter-half: 4px;
+  /* Softer than a control (10px) and softer than a popover (18px): a dock is a large surface, and
+     large surfaces need more radius to read as rounded at all. */
+  --mtk-shell-radius: 16px;
+  /* The inset of the segmented tab track around its segments. A token because the bottom dock's
+     bar height is `--mtk-bottom-bar-height` and the strip is what fills it: 36 + 2×3 = 42, and
+     under `(pointer: coarse)` 44 + 2×2 = 48. Two numbers that have to agree, so neither is
+     written twice. */
+  --mtk-tabstrip-inset: 3px;
 }
 
 /* Base typography + light form controls — NEVER an opaque root background (composite safety). */
@@ -834,7 +863,11 @@ body > [role="dialog"][aria-modal="true"] {
   align-items: center;
   gap: 4px;
 }
-.mtk-workspace-panel__tabs { flex: none; min-width: 0; border-bottom: 1px solid var(--mtk-border-subtle); }
+/* No bottom rule: the strip is a recessed track now, and a track is already a different surface
+   from the body below it. A line under it draws the same boundary twice. The block padding is the
+   air a floating capsule needs and a panel can afford — unlike the bottom dock's bar, which is
+   exactly one bar-height tall and gives the strip all of it. */
+.mtk-workspace-panel__tabs { flex: none; min-width: 0; padding-block: 6px; }
 /* The body is a flex COLUMN, not a block. Every tabpanel it holds is authored `flex: 1 1 auto;
    min-height: 0` — a declaration that means nothing in a block parent, where the child takes its
    content height and is then cut by the `overflow: hidden` on this line. That is the third and last
@@ -852,11 +885,26 @@ body > [role="dialog"][aria-modal="true"] {
   background: var(--mtk-bg-raised);
 }
 
+/* A SEGMENTED CONTROL, NOT A FILE-FOLDER TAB BAR. The selected tab used to carry three separate
+   signals at once — accent text, an accent-tinted fill AND a 2px underline — on a raised strip, which
+   is a lot of ink to say "this one". The references say it with one: a quiet recessed track, and the
+   chosen segment lifted out of it as a light pill with a soft shadow. Same geometry, same widths,
+   same shrink behaviour (this is still a strip that can hold seven workspaces and yield); only what
+   marks the selection changes, so the tab-reachability measurements below are untouched. */
 .mtk-dock-tabs {
   display: flex;
+  gap: 1px;
   min-width: 0;
-  padding: 3px 5px 0;
-  background: var(--mtk-bg-raised);
+  /* Horizontal only. Several rows hold a tab strip BESIDE other content — the bottom dock's bar has
+     a collapse chevron, the Animation workspace puts two strips and a sequence read-out on one line
+     — so a track that paints edge-to-edge would be a grey band ending abruptly in the middle of a
+     white row. A self-contained rounded capsule is what the references show, and it is what makes
+     the partial width read as deliberate. No vertical margin: the bottom dock's bar is exactly
+     `--mtk-bottom-bar-height` and the strip is what fills it. */
+  margin-inline: 3px;
+  padding: var(--mtk-tabstrip-inset);
+  border-radius: var(--mtk-radius-xl);
+  background: var(--mtk-bg-inset);
 }
 .mtk-dock-tabs--horizontal { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
 .mtk-dock-tabs--horizontal::-webkit-scrollbar { display: none; }
@@ -883,9 +931,17 @@ body > [role="dialog"][aria-modal="true"] {
   gap: var(--mtk-space-3);
   min-width: 44px;
   min-height: 36px;
-  padding: 0 10px;
+  /* 9, not 10, AND THE TWO PIXELS ARE NOT COSMETIC. A segmented capsule carries chrome a bare strip
+     did not — its own inset on both sides, a margin so it reads as one object, and a gap between
+     segments — and that chrome is charged to the same row the labels have to fit in. Measured: the
+     Animation workspace's row holds TWO strips and a sequence read-out, and the first capsule
+     version turned `2D none · 3D none · UI none · Timeline · Curves · Graph` into `2… no… · 3… no… ·
+     U. no… · Timeli… · Curv… · Gra…` — legible, then not, with no invariant firing because every
+     one of those ellipses is honest. Six tabs × 2px pays for the capsule twice over, which is why
+     the label came back rather than merely surviving. */
+  padding: 0 9px;
   border: 0;
-  border-radius: 0;
+  border-radius: var(--mtk-radius-md);
   color: var(--mtk-text-muted);
   background: transparent;
   font: 600 12px/1 var(--mtk-font-ui);
@@ -903,9 +959,10 @@ body > [role="dialog"][aria-modal="true"] {
   background: transparent;
   content: "";
 }
-.mtk-dock-tab:hover { color: var(--mtk-text); background: var(--mtk-bg-hover); }
-.mtk-dock-tab[aria-selected="true"] { color: var(--mtk-accent); background: var(--mtk-accent-subtle); }
-.mtk-dock-tab[aria-selected="true"]::after { background: var(--mtk-accent); }
+/* Hover is a hint of the pill the selection wears, so the two states read as the same gesture at two
+   strengths rather than as two different ideas. */
+.mtk-dock-tab:hover { color: var(--mtk-text); background: color-mix(in srgb, var(--mtk-bg-raised) 62%, transparent); }
+.mtk-dock-tab[aria-selected="true"] { color: var(--mtk-accent); background: var(--mtk-bg-raised); box-shadow: var(--mtk-shadow-1); }
 .mtk-dock-tab:disabled { color: var(--mtk-text-faint); cursor: not-allowed; }
 .mtk-dock-tab:disabled:hover { background: transparent; }
 /* WHAT YIELDS INSIDE A TAB, ONCE THE TAB ITSELF CAN YIELD. Making `.mtk-dock-tab` shrinkable
@@ -1167,7 +1224,10 @@ body > [role="dialog"][aria-modal="true"] {
   height: var(--mtk-header-height);
   min-height: var(--mtk-header-height);
   padding: 0 10px;
-  border-bottom: 1px solid var(--mtk-border-subtle);
+  /* No bottom rule. The header has always painted `--mtk-bg-base`, and now so do the dock tracks
+     below it, so the hairline was drawing a seam across a surface that is continuous — the one
+     visual claim the constitution names twice ("minimal borders", "no hard borders"). What
+     separates the command bar from the workspace is the gap the panels leave, not a line. */
   background: var(--mtk-bg-base);
   color: var(--mtk-text);
   box-shadow: none;
@@ -1229,6 +1289,46 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-dock-panel__scroll { flex: none; max-height: 44%; overflow: auto; }
 .mtk-dock-section-heading { padding: 12px 12px 6px; color: var(--mtk-text-secondary); font: 650 12px/1.2 var(--mtk-font-ui); letter-spacing: .1px; }
 .mtk-quick-create { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px; border-bottom: 1px solid var(--mtk-border-subtle); }
+/* ── Shell regions: a ground band, and one panel floating in it ──────────────────────────────────
+   A `.mtk-shell-track` is a grid cell of the shell. It paints the GROUND — the same
+   `--mtk-bg-base` the header and the status bar already paint, which is what makes the chrome read
+   as one continuous surface instead of four abutting slabs — and it is OPAQUE for the reason every
+   dock has always been opaque: the packaged app's root is transparent so the wgpu scene composites
+   through the viewport hole (ADR-008), and a translucent track would let the 3D bleed into the
+   panels. Only `.mtk-stage-column` stays transparent, and only it.
+
+   `.mtk-shell-card` is the panel that floats in the track. Radius and a soft shadow, and NO border:
+   `.mtk-dock-rail` and `.mtk-dock-flyout` have both looked like this since they were written, so
+   this is the expanded dock finally saying the same thing about itself that its own collapsed form
+   already said. */
+.mtk-shell-track {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  padding: var(--mtk-shell-gutter);
+  background: var(--mtk-bg-base);
+}
+/* Half a gutter on every edge shared with another track, a whole one on the outer edges and on the
+   edge facing the stage — so the rail/dock seam and the dock/stage seam are the same width. */
+.mtk-shell-track--engines { padding-right: var(--mtk-shell-gutter-half); }
+.mtk-shell-track--left { padding-left: var(--mtk-shell-gutter-half); }
+.mtk-shell-card {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: var(--mtk-shell-radius);
+  background: var(--mtk-bg-panel);
+  box-shadow: var(--mtk-shadow-2);
+}
+/* The card clips its own corners, so a header that paints to the edge is rounded by the card and
+   the panel needs no radius of its own. `isolation: isolate` on `.mtk-workspace-panel` already
+   keeps its stacking context local; this only removes the square background it would otherwise
+   paint into the rounded corners on browsers that resolve `overflow: hidden` after the paint. */
+.mtk-shell-card > .mtk-workspace-panel { border-radius: inherit; }
+
 /* `position: relative` is the containing block for the dock's SHEET form (see `.is-sheet` below):
    the sheet is anchored to the bottom of the stage column, not to the window, for the same reason
    ADR-125 moved the onboarding card off `position: fixed` — a 100vw overlay centred on the window
@@ -1260,7 +1360,19 @@ body > [role="dialog"][aria-modal="true"] {
    old `flex: none` could not produce. `--mtk-stage-min` is set from `STAGE_MIN` in `layout.ts` by the
    element this rule measures against; the floor is stated once, in TypeScript, where the harness that
    proves it can import it. */
-.mtk-bottom-dock { display: flex; flex: none; flex-direction: column; min-width: 0; height: var(--mtk-bottom-bar-height); min-height: var(--mtk-bottom-bar-height); max-height: calc(100% - var(--mtk-stage-min)); border-top: 1px solid var(--mtk-border-subtle); background: var(--mtk-bg-raised); box-shadow: 0 -1px 3px rgba(21, 34, 50, 0.05); transition: height var(--mtk-motion-base) var(--mtk-ease-standard); }
+/* THE DOCK LIFTS OFF THE STAGE, AND IT COSTS NEITHER AXIS A PIXEL. Rounded TOP corners (the bottom
+   edge meets the status bar, so there is nothing for a bottom radius to sit against) and a real lift
+   shadow in place of the 1px rule it used to hang from. Every `height` on this element is untouched,
+   so `dockForm()`'s arithmetic and ADR-126's floor still hold exactly.
+
+   FULL WIDTH, DELIBERATELY, AND MEASURED. The first version gave it the shell gutter on both sides
+   to match the side docks. It is the only region of the shell whose contents are laid out along its
+   WIDTH — a timeline, its ruler and two tab strips — and 16px was enough to push the Animate
+   workspace's mode strip past its own ellipsis: `2D none · 3D none · UI none · Timeline · Curves ·
+   Graph` came back from the harness as `2… no… · 3… no… · U. no… · Timeli… · Curv… · Gra…`. Nothing
+   was clipped and nothing overflowed, so no invariant fired; it was legible in `shell-dock-animate`
+   and then it was not. A timeline is full-bleed in the reference for the same reason it is here. */
+.mtk-bottom-dock { display: flex; flex: none; flex-direction: column; min-width: 0; height: var(--mtk-bottom-bar-height); min-height: var(--mtk-bottom-bar-height); max-height: calc(100% - var(--mtk-stage-min)); border-radius: var(--mtk-shell-radius) var(--mtk-shell-radius) 0 0; background: var(--mtk-bg-raised); box-shadow: 0 -2px 10px rgba(21, 34, 50, 0.07), 0 -12px 32px rgba(21, 34, 50, 0.06); transition: height var(--mtk-motion-base) var(--mtk-ease-standard); }
 .mtk-bottom-dock.is-open { height: clamp(230px, 34vh, 360px); }
 .mtk-bottom-dock.is-open.is-asset { height: clamp(320px, 48vh, 520px); }
 .mtk-bottom-dock.is-open.is-animation { height: clamp(330px, 50vh, 560px); }
@@ -1282,8 +1394,12 @@ body > [role="dialog"][aria-modal="true"] {
    sheet at 119px on a 520px window and reproduce the defect in a new position. The bar stays
    `flex: none` and the content scrolls, so what gives way is the workspace, with a scrollbar saying
    so — ADR-126's rule that what gives way gives way by getting smaller, not by being cut. */
-.mtk-bottom-dock.is-sheet.is-open { position: absolute; left: 0; right: 0; bottom: 0; z-index: var(--mtk-z-dock-sheet); max-height: 100%; box-shadow: 0 -8px 24px rgba(21, 34, 50, .18); }
-.mtk-bottom-dock__bar { display: flex; flex: none; align-items: center; justify-content: space-between; gap: var(--mtk-space-2); min-height: 41px; padding: 0 var(--mtk-space-2); background: var(--mtk-bg-raised); }
+.mtk-bottom-dock.is-sheet.is-open { position: absolute; left: 0; right: 0; bottom: 0; z-index: var(--mtk-z-dock-sheet); max-height: 100%; box-shadow: 0 -8px 24px rgba(21, 34, 50, .18), 0 -2px 6px rgba(21, 34, 50, .06); }
+/* The bar is the dock's top edge, so it carries the dock's corners. Rounding the CHILD rather
+   than clipping the parent is deliberate: `overflow: hidden` on `.mtk-bottom-dock` would be a
+   second clipping ancestor over every workspace in it, and R1/R2/R7 all reason about the first
+   one they meet. */
+.mtk-bottom-dock__bar { display: flex; flex: none; align-items: center; justify-content: space-between; gap: var(--mtk-space-2); min-height: var(--mtk-bottom-bar-height); padding: 0 var(--mtk-space-2); border-radius: var(--mtk-shell-radius) var(--mtk-shell-radius) 0 0; background: var(--mtk-bg-raised); }
 /* AND THE DOCK'S OWN CONTENT HAS TO FIT IN THE DOCK. Making the dock yield vertically exposed the
    same shape one level in, and it is the shape this whole session is about: `.mtk-workspace-panel__
    header` is `flex: none` with `min-height: 52px`, so in a short dock the CHROME takes everything and
@@ -1998,7 +2114,10 @@ body > [role="dialog"][aria-modal="true"] {
   .mtk-surface,
   .mtk-popover-surface,
   .mtk-dialog-surface { border-color: var(--mtk-border); }
-  .mtk-dock-tab[aria-selected="true"]::after { height: 3px; }
+  /* The bar the default theme no longer paints. Under `prefers-contrast: more` the selection
+     cannot rest on a shadow and a tint, so the shape-based signal comes back — this is the
+     `::after` element's whole remaining job, and why it was kept rather than deleted. */
+  .mtk-dock-tab[aria-selected="true"]::after { height: 3px; background: var(--mtk-accent); }
 }
 
 @media (pointer: coarse), (any-pointer: coarse) {
@@ -2007,6 +2126,9 @@ body > [role="dialog"][aria-modal="true"] {
     --mtk-control-default: 44px;
     --mtk-control-comfortable: 48px;
     --mtk-bottom-bar-height: 48px;
+    /* 44px of touch target + 2×2 = the 48px bar above, exactly, the way 36 + 2×3 = 42 does in the
+       default block. Keeping 3px here would make the strip 50px inside a 48px bar. */
+    --mtk-tabstrip-inset: 2px;
   }
   .mtk-btn { padding-inline: 14px; }
   .mtk-btn--icon,
@@ -2029,8 +2151,11 @@ body > [role="dialog"][aria-modal="true"] {
   .mtk-toolbar { gap: var(--mtk-space-4) var(--mtk-space-6); }
   .mtk-editor-header { height: 56px; min-height: 56px; }
   /* The closed dock IS its bar, and `--mtk-bottom-bar-height` is already 48px in this block — the
-     `height: 48px` that used to sit here was a second statement of that, drifting on its own. */
-  .mtk-bottom-dock__bar { min-height: 47px; }
+     `height: 48px` that used to sit here was a second statement of that, drifting on its own. The
+     `min-height: 47px` that replaced it was the same mistake one pixel smaller, and it was a pixel
+     short because the dock used to carry a 1px top border that is now a shadow. The bar is the
+     token; the strip's inset is what makes the strip fill it — see `--mtk-tabstrip-inset` in the
+     `:root` block above. */
 }
 
 @media (forced-colors: active) {
