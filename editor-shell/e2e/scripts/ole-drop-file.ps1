@@ -434,11 +434,12 @@ namespace MtkDrop
 # PowerShell below, where its already-loaded runtime assembly can be used directly.
 Add-Type -TypeDefinition $src | Out-Null
 
-# Keep the interactive WinForms drag source visible, but remove PowerShell's console before any evidence
-# capture. Process-wide hidden startup flags also hide the first form and break real mouse capture.
+# Keep the interactive WinForms drag source visible, while moving PowerShell's console far outside the
+# virtual desktop before any evidence capture. Hiding the console suppresses the first form on some
+# Windows builds and breaks real mouse capture.
 $consoleWindow = [MtkDrop.Native]::GetConsoleWindow()
 if ($consoleWindow -ne [IntPtr]::Zero) {
-  [void][MtkDrop.Native]::ShowWindow($consoleWindow, 0) # SW_HIDE
+  [void][MtkDrop.Native]::SetWindowPos($consoleWindow, [IntPtr](-2), -32000, -32000, 0, 0, 0x0001)
 }
 
 # -- locate + raise the target window -----------------------------------------
