@@ -436,6 +436,31 @@ jobs:
           node scripts/check-glyph-coverage.mjs --self-test
           node scripts/check-glyph-coverage.mjs
 
+      # The fifth Node-built-ins-only gate, and the one the LAST TWO COMMITS argue for. `ff5b73a` landed an
+      # `App.tsx` wrapping every shell region in `.mtk-shell-track` / `.mtk-shell-card`, and the `global.css`
+      # defining them stayed in the working tree — so HEAD shipped four class hooks with no rules behind
+      # them for 48 minutes. Not cosmetic: that card carries the opaque background over a deliberately
+      # transparent native root (ADR-008) and gives `WorkspacePanel` a height to fill, and the captured
+      # shell had no panel surfaces, no gutters, and both docks stopping mid-column over dead ground.
+      #
+      # Nothing here could see it. `tsc` types `className` as `string`; a CSS parser accepts rules nobody
+      # uses; vitest asserts roles and testids, which a missing rule does not disturb; and `shots` captured
+      # the broken shell and passed every scene, because each scene's `expect` is a DOM claim and the DOM
+      # was right — an element with an unstyled class is still an element, exactly as a button with an
+      # undrawable glyph still clicks. This is `<test_and_ci_discipline>` 6: a class name is ONE contract
+      # stated TWICE, once as a string in TSX and once as a selector in CSS, each validated alone and
+      # neither against the other, with the browser as the first thing that ever compares them. Same shape
+      # as a WGSL `@location` against a Rust `VertexBufferLayout`, same answer as `gpu-contract-audit`:
+      # run the comparison at rest, in milliseconds. It is also the predictable cost of the pathspec-commit
+      # rule (ADR-132) — right with three writers in one tree, but it lands a two-file change as one.
+      # Checked in BOTH directions, so a rename cannot leave dead CSS behind either. Self-test first.
+      # See ADR-133.
+      - name: class hooks — the class the markup asks for exists, and the rule the CSS writes is reached
+        working-directory: editor
+        run: |
+          node scripts/check-class-hooks.mjs --self-test
+          node scripts/check-class-hooks.mjs
+
       - name: Install (frozen lockfile)
         working-directory: editor
         run: pnpm install --frozen-lockfile

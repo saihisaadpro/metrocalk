@@ -1,0 +1,28 @@
+{
+  "$comment": [
+    "Class names that deliberately sit on ONE side of the markup/stylesheet contract. Checked by",
+    "scripts/check-class-hooks.mjs. Anything not listed here must have both ends: a rule for every hook",
+    "the markup emits, and a hook for every rule the stylesheets define.",
+    "",
+    "An entry is a decision with a reason, not a suppression. The checker also reports entries that have",
+    "stopped being needed, so this file cannot quietly rot into a waiver list.",
+    "",
+    "`unstyled` — markup emits it, no CSS rule backs it.",
+    "`unused`   — CSS defines it, no React markup emits it."
+  ],
+  "unstyled": {
+    "mtk-editor-root": {
+      "reason": "An automation anchor, not a surface. The root's box is set inline because `background` depends on `native` — transparent over the wgpu composite in the .exe, opaque in the browser (ADR-008) — which is a runtime decision a stylesheet cannot make. Two E2E specs measure the shell through it: specs-cadfix/cad-fix.e2e.js:80 and specs-workbench/accessibility.e2e.js:232,389."
+    },
+    "mtk-shell-track--right": {
+      "reason": "The one member of the track family that needs no rule. A track contributes half a gutter on an edge it shares with a neighbour and a whole one on an outer edge, so `--engines` and `--left` override a single side; the right track's inner edge faces the stage and its outer edge faces the window, which is the base `.mtk-shell-track` padding exactly. The modifier stays because it names the region in the DOM and completes a family whose other members are load-bearing."
+    },
+    "mtk-command-palette": {
+      "reason": "A BEM block root that namespaces eight `__` children (`__results`, `__group`, `__category`, `__command`, `__command-copy`, `__command-label`, `__command-description`, `__empty`). The block itself is a `DialogSurface`, so its surface, radius and elevation come from `.mtk-dialog-surface`; only the layout it adds on top is inline. Deleting the root would leave the children named after a block that no longer exists."
+    },
+    "mtk-toast": {
+      "reason": "The block name for the toast element. It carries no rule because a toast must not intercept viewport gestures — `pointerEvents` is toggled per-subtree in JS, and the entrance is `.mtk-anim-toast` — but it is what `data-kind` and the tone styling are reasoned about against, and it is the name the DOM shows a reader."
+    }
+  },
+  "unused": {}
+}
