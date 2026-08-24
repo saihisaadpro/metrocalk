@@ -424,8 +424,10 @@ fn the_committed_pose_preview_is_what_the_sampler_actually_produces() {
             format!("{BLESS} was set, so it HAS been rewritten. Review the diff (the editor draws this \
                  document) and commit it. This run still fails on purpose.")
         } else {
-            format!("Nothing was written. If the new output is the intended one, re-run with \
-                 {BLESS}=1 to regenerate, then review and commit the diff.")
+            format!(
+                "Nothing was written. If the new output is the intended one, re-run with \
+                 {BLESS}=1 to regenerate, then review and commit the diff."
+            )
         }
     );
 }

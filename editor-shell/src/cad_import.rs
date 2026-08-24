@@ -114,11 +114,7 @@ fn normalized_source_path(path: &std::path::Path) -> String {
 /// Ops for the explicit, geometry-free source wrapper. Callers append the whole set to the same atomic import
 /// commit as the authored hierarchy.
 #[must_use]
-pub fn cad_source_root_ops(
-    root: EntityId,
-    source: &CadSourceIdentity,
-    label: &str,
-) -> Vec<Op> {
+pub fn cad_source_root_ops(root: EntityId, source: &CadSourceIdentity, label: &str) -> Vec<Op> {
     let mut ops = vec![Op::CreateEntity {
         id: root,
         parent: None,
@@ -144,10 +140,7 @@ pub fn cad_source_root_ops(
         (SOURCE_KEY_FIELD, source.key.clone()),
         ("canonicalPath", source.path.clone()),
         ("sourceFormat", source.format.clone()),
-        (
-            CONTENT_HASH_FIELD,
-            format!("{:016x}", source.content_hash),
-        ),
+        (CONTENT_HASH_FIELD, format!("{:016x}", source.content_hash)),
     ] {
         ops.push(Op::SetField {
             entity: root,
@@ -224,10 +217,7 @@ pub fn cad_source_selection_op(root: EntityId, selection: EntityId) -> Op {
 /// Active wrappers for one logical source. More than one indicates legacy/corrupt duplicate ownership; callers
 /// replace them rather than treating the import as an idempotent no-op.
 #[must_use]
-pub fn active_cad_source_roots<W: World>(
-    engine: &Engine<W>,
-    source_key: &str,
-) -> Vec<EntityId> {
+pub fn active_cad_source_roots<W: World>(engine: &Engine<W>, source_key: &str) -> Vec<EntityId> {
     let mut roots: Vec<_> = engine
         .entity_ids()
         .into_iter()
@@ -249,10 +239,7 @@ pub fn active_cad_source_roots<W: World>(
 /// Every active entity explicitly owned by one logical CAD source (wrapper + groups + parts). Legacy CAD has
 /// no owner marker and is deliberately absent.
 #[must_use]
-pub fn active_cad_source_members<W: World>(
-    engine: &Engine<W>,
-    source_key: &str,
-) -> Vec<EntityId> {
+pub fn active_cad_source_members<W: World>(engine: &Engine<W>, source_key: &str) -> Vec<EntityId> {
     let mut entities: Vec<_> = engine
         .entity_ids()
         .into_iter()

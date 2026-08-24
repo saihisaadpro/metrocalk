@@ -188,12 +188,16 @@ fn the_committed_rig_fixtures_are_what_this_crate_actually_produces() {
         "the rig panel's fixture(s) no longer match what `characterize` produces:\n  {}\n\n{}",
         stale.join("\n  "),
         if bless {
-            format!("{BLESS} was set, so they HAVE been rewritten. Review the diff (the panel renders \
+            format!(
+                "{BLESS} was set, so they HAVE been rewritten. Review the diff (the panel renders \
                  these documents) and commit it. This run still fails: a run that rewrote its own \
-                 expectation has verified nothing.")
+                 expectation has verified nothing."
+            )
         } else {
-            format!("Nothing was written. If the new output is the intended one, re-run with \
-                 {BLESS}=1 to regenerate, then review and commit the diff.")
+            format!(
+                "Nothing was written. If the new output is the intended one, re-run with \
+                 {BLESS}=1 to regenerate, then review and commit the diff."
+            )
         }
     );
 }

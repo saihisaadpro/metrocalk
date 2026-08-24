@@ -301,8 +301,14 @@ fn source_wrappers_keep_independent_cad_imports_coexisting_in_one_hierarchy() {
     .expect("land B");
 
     assert_ne!(a.root_entity, b.root_entity);
-    assert_eq!(active_cad_source_roots(&engine, "source-a"), [a.root_entity]);
-    assert_eq!(active_cad_source_roots(&engine, "source-b"), [b.root_entity]);
+    assert_eq!(
+        active_cad_source_roots(&engine, "source-a"),
+        [a.root_entity]
+    );
+    assert_eq!(
+        active_cad_source_roots(&engine, "source-b"),
+        [b.root_entity]
+    );
     assert_eq!(engine.parent_of(a.group_entities[0]), Some(a.root_entity));
     assert_eq!(engine.parent_of(b.group_entities[0]), Some(b.root_entity));
     assert!(a
@@ -342,7 +348,11 @@ fn identical_same_source_import_is_an_idempotent_noop() {
     )
     .expect("idempotent re-drop");
 
-    assert_eq!(engine.entity_count(), count, "no duplicate hierarchy was authored");
+    assert_eq!(
+        engine.entity_count(),
+        count,
+        "no duplicate hierarchy was authored"
+    );
     assert_eq!(again.root_entity, first.root_entity);
     assert_eq!(again.entities, first.entities);
     assert_eq!(again.group_entities, first.group_entities);
@@ -410,12 +420,23 @@ fn changed_reimport_retires_only_same_source_and_preserves_unrelated_and_legacy_
     .expect("replace A");
 
     assert_ne!(new_a.root_entity, old_a.root_entity);
-    assert!(old_a_members.iter().all(|entity| !engine.is_active(*entity)));
+    assert!(old_a_members
+        .iter()
+        .all(|entity| !engine.is_active(*entity)));
     assert!(b_members.iter().all(|entity| engine.is_active(*entity)));
     assert!(engine.is_active(legacy), "legacy unscoped CAD is untouched");
-    assert_eq!(active_cad_source_roots(&engine, "source-a"), [new_a.root_entity]);
-    assert_eq!(active_cad_source_roots(&engine, "source-b"), [b.root_entity]);
-    assert_eq!(engine.parent_of(new_a.group_entities[0]), Some(new_a.root_entity));
+    assert_eq!(
+        active_cad_source_roots(&engine, "source-a"),
+        [new_a.root_entity]
+    );
+    assert_eq!(
+        active_cad_source_roots(&engine, "source-b"),
+        [b.root_entity]
+    );
+    assert_eq!(
+        engine.parent_of(new_a.group_entities[0]),
+        Some(new_a.root_entity)
+    );
 
     let active_report_parts = engine
         .entity_ids()
@@ -428,10 +449,11 @@ fn changed_reimport_retires_only_same_source_and_preserves_unrelated_and_legacy_
         new_a.entities.len() + b.entities.len() + 1,
         "inactive old A parts do not leak into an ECS-native report"
     );
-    assert!(old_a
-        .group_entities
-        .iter()
-        .all(|group| !engine.is_active(*group)),
+    assert!(
+        old_a
+            .group_entities
+            .iter()
+            .all(|group| !engine.is_active(*group)),
         "old assembly folders retire with their source"
     );
 }
