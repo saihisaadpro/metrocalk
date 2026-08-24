@@ -9,6 +9,13 @@ export default defineConfig({
   root: __dirname,
   plugins: [react()],
   base: "./",
+
+  // The harness renders the REAL shell, and the real shell needs a core to render against. This is a
+  // `vite build`, so the app config's `command !== "build"` would answer `false` here and every shell
+  // scene would capture the `NoCoreError` surface instead of the editor — which is exactly what
+  // happened the first time the flag existed, in 15 of 27 scenes. Stated explicitly rather than
+  // inherited: this bundle is evidence, never a shipped artifact, and it may have a fake core.
+  define: { __MTK_MOCK_CORE__: "true" },
   build: {
     outDir: "dist",
     emptyOutDir: true,

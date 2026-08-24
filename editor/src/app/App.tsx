@@ -23,23 +23,32 @@ import { usePlayerDrive } from "./usePlayerDrive";
 import { ViewportToolbar } from "../panels/ViewportToolbar";
 import { Rejections } from "../panels/Rejections";
 import { StatusBar } from "../panels/StatusBar";
-import { ContextMenu } from "../panels/ContextMenu";
 import { ToastHost } from "../panels/ToastHost";
 import { EmptyState } from "../panels/EmptyState";
 import { Onboarding } from "../panels/Onboarding";
+import { ImportDropOverlay } from "./ImportDropOverlay";
 import { FocusBanner } from "../panels/FocusBanner";
-import { CommandPalette, type EditorCommand } from "../panels/CommandPalette";
+import type { EditorCommand } from "../panels/CommandPalette";
 import { ViewportToolRail, type ViewportTool } from "../panels/ViewportToolRail";
 import type { PipeForgeStatus } from "../transport/protocol";
 import { EditorHeader } from "./EditorHeader";
 import { LeftDock, InspectorDock, type LeftWorkspace, type InspectorWorkspace } from "./EditorDocks";
 import { EngineRail, ENGINES, engineById, type EngineId } from "./EngineRail";
 import { BottomDock, type BottomWorkspace } from "./BottomDock";
+import { onStageSurface } from "./stageInput";
 import { normalizeSurfacePoint } from "./viewportCoordinates";
 
-// Pipe Forge's graph/fitting/catalog workbench is substantial and used only when its viewport tool is
-// active. Keep the default editor entry lean; the compact loading state occupies the same overlay region.
+// WHAT MAY BE DEFERRED, AND WHY THE LIST IS SHORT. A chunk that loads on demand is absent until the
+// gesture that needs it — so the only safe candidates are surfaces a user REACHES FOR: Pipe Forge
+// (its viewport tool), the command palette (Ctrl/Cmd+K), the entity menu (right-click). Each carries
+// a named loading state, because a gesture that produces nothing is a gesture the user repeats.
+//
+// `Onboarding` and `ImportDropOverlay` were on this list and are deliberately NOT any more — see
+// `scripts/first-paint.json` and ADR-130. The bundle budget only ever said "smaller", and a rule that
+// only says smaller, followed exactly, deletes the product; the counter-rule is declared, not inferred.
 const PipeForge = lazy(() => import("../panels/PipeForge").then((module) => ({ default: module.PipeForge })));
+const CommandPalette = lazy(() => import("../panels/CommandPalette").then((module) => ({ default: module.CommandPalette })));
+const ContextMenu = lazy(() => import("../panels/ContextMenu").then((module) => ({ default: module.ContextMenu })));
 
 // The collapsed side rails carry only what that dock actually holds. The sub-engines are NOT repeated
 // here — they live on the Engines rail, which is always visible, and listing them twice in different
@@ -480,6 +489,13 @@ export function App() {
     void client.gizmoSelect(id);
   };
 
+  const importAsset = () => {
+    void client.importAssetDialog().then((id) => {
+      selectCreated(id);
+      if (id) openEngine("model");
+    });
+  };
+
   const commands: EditorCommand[] = [
     // Generated from the SAME list the rail renders, so the palette can never drift out of sync with it.
     ...ENGINES.map((e) => ({
@@ -530,10 +546,7 @@ export function App() {
         setDrawer(null);
         setDockFlyout(null);
       }}
-      onImport={() => void client.importAssetDialog().then((id) => {
-        selectCreated(id);
-        if (id) openEngine("model");
-      })}
+      onImport={importAsset}
       onContextMenu={(id, x, y) => {
         if (!playing) setCtx({ id, x, y });
       }}
@@ -639,6 +652,11 @@ export function App() {
           tabIndex={-1}
           aria-label="3D viewport"
           onPointerDown={(e) => {
+            // The stage surface, or a control floating over it? An INITIATING gesture that landed on
+            // chrome did not land on the stage — see `stageInput.ts` for why this is the seam's
+            // question and not each overlay's. Without it, a right-press on the "Import file…" button
+            // starts a native ORBIT underneath it (measured: 3 of 3 empty-state buttons, in Chromium).
+            if (!onStageSurface(e)) return;
             if (e.button === 2) {
               rightDrag.current = { x: e.clientX, y: e.clientY, moved: false };
               client.dragStart(); // native orbit begins; the render loop polls the cursor (0 IPC/frame)
@@ -661,6 +679,7 @@ export function App() {
             }
           }}
           onClick={(e) => {
+            if (!onStageSurface(e)) return;
             // A left-press that grabbed a gizmo handle is a DRAG, not a pick — don't re-select.
             if (gizmoHit.current && !pipeActive) {
               gizmoHit.current = false;
@@ -694,6 +713,12 @@ export function App() {
               })
               .catch((err) => console.error("viewport_pick failed", err));
           }}
+          // NO `onStageSurface` ON THESE TWO, DELIBERATELY. They COMPLETE a gesture rather than start
+          // one: a right-drag that began on bare stage and is released with the cursor over the tool
+          // rail must still reach `drag_end`, or the native orbit never stops. Gating them on the
+          // target is precisely the bug the old per-overlay idiom shipped — `PipeForge` stopped
+          // `pointerup` along with everything else, so an orbit released over its panel left the
+          // camera spinning.
           onPointerMove={(e) => {
             const rd = rightDrag.current;
             if (rd && (Math.abs(e.clientX - rd.x) > 6 || Math.abs(e.clientY - rd.y) > 6)) rd.moved = true;
@@ -702,9 +727,27 @@ export function App() {
             if (e.button === 2 && rightDrag.current) client.dragEnd();
             if (e.button === 0 && gizmoHit.current) client.gizmoDragEnd(); // commit the gizmo move (one tx)
           }}
-          onWheel={(e) => client.zoom(e.deltaY * 0.04)}
+          onWheel={(e) => {
+            // A wheel over a panel floating on the stage scrolls THAT PANEL. Before this line every
+            // one of the 35 controls the shell paints inside the viewport turned a scroll into a
+            // camera zoom — including the first-run card, which is itself `overflow-y: auto` and so
+            // was being scrolled and zoomed at once.
+            if (!onStageSurface(e)) return;
+            client.zoom(e.deltaY * 0.04);
+          }}
           onContextMenu={(e) => {
+            // `preventDefault` is UNGATED on purpose, and it is the one asymmetry here. Suppressing
+            // the browser's own menu is a decision about the stage REGION — the whole rectangle is
+            // the engine's surface, and a native "Reload / Save image as…" menu over any part of it
+            // is wrong. Which menu OPENS instead is a decision about the TARGET, and that is gated
+            // below. The old idiom conflated the two and answered differently per overlay: the
+            // viewport toolbar swallowed the event entirely (browser menu on right-click), the tool
+            // rail too, and the empty-state card let the ENGINE's entity menu open over itself.
             e.preventDefault();
+            if (!onStageSurface(e)) {
+              rightDrag.current = null;
+              return;
+            }
             // No context actions while Playing — editing is gated off in Play (and it would let a user open
             // Focus mid-Play, where Esc would then clear focus instead of stopping Play, contradicting the
             // on-stage badge's "Esc to stop"). The badge's promise stays honest.
@@ -800,6 +843,21 @@ export function App() {
             </Suspense>
           )}
           {playing && <PlayBadge paused={paused} onStop={stopPlay} />}
+          {/* NOT deferred, and the comment that said it could be was WRONG about its own code. This
+              component owns the `subscribeNativeImportLifecycle` effect — the OS-drop listener IS this
+              mount, not something beside it — so behind a `lazy` with a `null` fallback the shell is
+              deaf to a drop until the chunk resolves, and a file dropped in that window lands on a
+              stage that never answers. There is no second listener to catch it and no error to read:
+              the user's drop is simply gone. `<ux_quality>` 6 — no inert surfaces. */}
+          <ImportDropOverlay
+            onEntityImported={(rootId) => {
+              selectCreated(rootId);
+              openEngine("model");
+            }}
+            onOpenImportReport={() => openBottom("import")}
+            onOpenFormats={() => openBottom("formats")}
+            onImportAnother={importAsset}
+          />
           {/* The first-run card is ON THE STAGE, inside it, not floating over the window. It used to
               be `position: fixed; left: 50%` — centred on the WINDOW — and a 520 px card centred on a
               1000 px window starts at x=240, which is 192 px inside a left dock that ends at 432. It
@@ -813,16 +871,18 @@ export function App() {
               `z.menu` (130) against the sheet's `z.drawer` (120). R3 was silent and right to be: it
               compares CONTROLS, and what the card was covering here is prose. A first-run card
               inviting you to start on a stage you have just covered up is the wrong invitation
-              anyway — it comes back with the stage. */}
+              anyway — it comes back with the stage.
+              NOT deferred either: this is the first thing a first-run user is shown, and a `lazy` with
+              a `null` fallback means the invitation ARRIVES LATE — a blank stage, then a card popping
+              in — on exactly the machines product principle 3 targets, where the extra request costs
+              most. A surface whose entire job is to be there when you first look cannot be the surface
+              that loads last. */}
           <Onboarding show={!sceneEmpty && !playing && !stageSheet} onStart={() => openEngine("build")} />
           {sceneEmpty && !playing && !stageSheet && (
             <EmptyState
               onDrawPipe={() => setActiveTool("pipe")}
               onBrowseAssets={() => openEngine("build")}
-              onImport={() => void client.importAssetDialog().then((id) => {
-                selectCreated(id);
-                if (id) openEngine("model");
-              })}
+              onImport={importAsset}
             />
           )}
           {/* Keep transient feedback below the authoring toolbar; passive toasts must not cover tools. */}
@@ -919,16 +979,18 @@ export function App() {
       )}
 
       {ctx && (
-        // Portaled + edge-aware (Popover): the right-click menu can no longer be clipped by a panel's
-        // `overflow` or open off-screen near a viewport edge (it clamps/flips into view).
-        <Popover open anchorPoint={{ x: ctx.x, y: ctx.y }} onClose={() => setCtx(null)}>
-          <ContextMenu
-            client={client}
-            id={ctx.id}
-            onClose={() => setCtx(null)}
-            onFocus={(id, dist) => setFocused({ id, dist })}
-          />
-        </Popover>
+        <Suspense fallback={null}>
+          {/* Portaled + edge-aware (Popover): the right-click menu can no longer be clipped by a panel's
+              `overflow` or open off-screen near a viewport edge (it clamps/flips into view). */}
+          <Popover open anchorPoint={{ x: ctx.x, y: ctx.y }} onClose={() => setCtx(null)}>
+            <ContextMenu
+              client={client}
+              id={ctx.id}
+              onClose={() => setCtx(null)}
+              onFocus={(id, dist) => setFocused({ id, dist })}
+            />
+          </Popover>
+        </Suspense>
       )}
       {focused && (
         <FocusBanner
@@ -941,15 +1003,28 @@ export function App() {
           }}
         />
       )}
-      <CommandPalette
-        open={commandsOpen}
-        onClose={() => setCommandsOpen(false)}
-        commands={commands}
-        onCommandError={(error, command) => {
-          console.error(`command ${command.id} failed`, error);
-          setStatus(`${command.label} could not be completed`);
-        }}
-      />
+      {commandsOpen && (
+        <Suspense
+          fallback={(
+            <Modal open onClose={() => setCommandsOpen(false)} ariaLabel="Command palette loading">
+              <div className="mtk-workspace-state" role="status" aria-live="polite">
+                <span className="mtk-spinner" aria-hidden="true" />
+                <span>Loading command palette…</span>
+              </div>
+            </Modal>
+          )}
+        >
+          <CommandPalette
+            open
+            onClose={() => setCommandsOpen(false)}
+            commands={commands}
+            onCommandError={(error, command) => {
+              console.error(`command ${command.id} failed`, error);
+              setStatus(`${command.label} could not be completed`);
+            }}
+          />
+        </Suspense>
+      )}
       <StatusBar />
       <Rejections />
     </div>

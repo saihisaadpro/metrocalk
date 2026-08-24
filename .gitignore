@@ -17,6 +17,12 @@ target/
 # 26.8 GB and 926 MB respectively when this was written.
 /.codex-pipe-target/
 /target-scene-glb-agent/
+# Vite writes a transient bundled copy of a TypeScript config beside the config it loaded, named
+# `<config>.timestamp-<ms>-<hash>.mjs`, and deletes it on a clean exit. A killed or timed-out build
+# leaves it behind, so four had accumulated as untracked files — the same ambient-noise problem as
+# `/__probe` above, and worse, because each one is a plausible-looking `.mjs` sitting next to real
+# scripts. They are build output; they never travel.
+*.timestamp-*.mjs
 # The zero-byte file the session harness drops at the mount root to prove the mount is writable.
 # It reappears every session; without this it shows up as an untracked file in every `git status`,
 # which is exactly the ambient noise that trains a reader to stop looking at the list.

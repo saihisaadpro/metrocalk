@@ -297,6 +297,8 @@ export interface EditorClient {
   cinemaAddShot(id: string, kind: string): Promise<CinemaReply>;
   /** Remove one shot by index (one undoable commit). */
   cinemaRemoveShot(id: string, index: number): Promise<CinemaReply>;
+  /** Set the cutscene's one pacing mood (one undoable commit). */
+  cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply>;
   /** The object's cutscene, read back as sentences plus continuity warnings. */
   cinemaList(id: string): Promise<CinemaReply>;
   /** Every "only if" card the Behaviour block can offer. */
@@ -937,6 +939,9 @@ export class TauriClient implements EditorClient {
   }
   cinemaRemoveShot(id: string, index: number): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_remove_shot", { id, index }).catch((e: unknown) => { console.error("cinema_remove_shot failed", e); throw e; });
+  }
+  cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_mood", { id, mood }).catch((e: unknown) => { console.error("cinema_set_mood failed", e); throw e; });
   }
   cinemaList(id: string): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_list", { id }).catch((e: unknown) => { console.error("cinema_list failed", e); throw e; });
@@ -2776,13 +2781,16 @@ class MockClient implements EditorClient {
     return Promise.resolve([]);
   }
   cinemaAddShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaRemoveShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetMood(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaList(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, reads: [], problems: [], message: "", reason: null });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: null });
   }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return Promise.resolve([]);
@@ -3429,8 +3437,41 @@ export function createMockSession(): EditorClient {
   return new MockClient(client, core);
 }
 
-/** Build the editor session: the real Tauri shell transport inside the WebView, else the dev MockCore. */
+/** Thrown when a PRODUCTION bundle finds no core to talk to. Named, so `main.tsx` can tell this apart
+ *  from a render crash and say the true thing instead of showing a white page. */
+export class NoCoreError extends Error {
+  constructor() {
+    super("The editor could not reach the Metrocalk engine.");
+    this.name = "NoCoreError";
+  }
+}
+
+/** Build the editor session: the real Tauri shell transport inside the WebView; the in-process MockCore
+ *  in `npm run dev` and Vitest, and **only** there.
+ *
+ *  THE `__MTK_MOCK_CORE__` GUARD IS LOAD-BEARING, NOT DEFENSIVE. `dist/` is `frontendDist` for the
+ *  packaged shell and nothing else serves it, so the mock has no role in that build — but the old
+ *  ternary referenced `createMockSession()` unconditionally, which kept `MockClient`, `MockCore`,
+ *  `DeltaClient` and the sample scene reachable and therefore **shipped**: measured at **76,736 bytes,
+ *  one third of the production entry chunk**, for a fake core the packaged app can never construct.
+ *  Vite substitutes the literal `false` there, the branch dies, and Rollup drops all of it (`mock-core`
+ *  stops being emitted as a chunk at all — verified in `bundle-report.json`, not assumed).
+ *
+ *  It is a flag of its own and not `import.meta.env.DEV` because the shots harness disproved that
+ *  shorthand immediately: the harness is a `vite build` (so `DEV` is false) that renders the real shell
+ *  against the MockCore on purpose, and 15 of its 27 scenes captured a black frame the moment the two
+ *  were conflated. "React's production mode" and "there is a real engine behind this window" are
+ *  different facts; only the second may delete the mock. See `env.d.ts`.
+ *
+ *  It is also the stronger half of `<verification_states_and_convergence>` (b). "Verified against the
+ *  mock is not verified against the real core" was a warning about tests; a production bundle that
+ *  still CONTAINS a working fake core is the same mistake with a user on the other end, one missing
+ *  global away from a shell that answers every call plausibly and commits nothing. Now the fake cannot
+ *  be reached in production because it is not there, and its absence is a sentence rather than a
+ *  white page. */
 export function createSession(): EditorClient {
   const core = tauriCore();
-  return core ? new TauriClient(core) : createMockSession();
+  if (core) return new TauriClient(core);
+  if (!__MTK_MOCK_CORE__) throw new NoCoreError();
+  return createMockSession();
 }

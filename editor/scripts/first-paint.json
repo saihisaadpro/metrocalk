@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "entry": "src/main.tsx",
+  "rationale": "The bundle budget only ever says SMALLER. Followed exactly, a rule that only says smaller defers the entire product: every surface is cheaper absent. This file is the counter-rule, and it is DECLARED rather than inferred, because no measurement can tell you which surfaces a user must not have to wait for.",
+  "mustBeStaticallyReachable": [
+    {
+      "module": "src/panels/Onboarding.tsx",
+      "reason": "The first-run card is the first thing a first-run user is shown. Behind a lazy chunk with a null fallback the invitation arrives LATE — a blank stage, then a card popping in — and it arrives latest on the entry-level machines product principle 3 targets. A surface whose whole job is to be there when you first look cannot be the one that loads last."
+    },
+    {
+      "module": "src/app/ImportDropOverlay.tsx",
+      "reason": "This component OWNS the OS-drop listener: subscribeNativeImportLifecycle runs in its mount effect, so the shell is deaf to a drop until this module has loaded. There is no second listener and no error — a file dropped in that window is simply gone. Deferred once already, under a comment claiming the listener mounted with the stage; it did not."
+    },
+    {
+      "module": "src/panels/EmptyState.tsx",
+      "reason": "The empty stage's only next step (<ux_quality> 6: a fresh project shows a real empty state with one next step). A new project that shows nothing at all for a chunk fetch is the state this surface exists to prevent."
+    },
+    {
+      "module": "src/app/RootBoundary.tsx",
+      "reason": "The surface that explains a failed start. Loading it on demand means fetching a chunk at precisely the moment the app has proven it cannot be trusted to fetch chunks."
+    },
+    {
+      "module": "src/panels/ToastHost.tsx",
+      "reason": "Where every confirmation and refusal is shown (<ux_quality> 2: feedback at the gesture). A toast that cannot render yet is a refusal the user never sees."
+    },
+    {
+      "module": "src/panels/StatusBar.tsx",
+      "reason": "Carries connection state — including 'not connected'. Absent, the shell looks fine while being unreachable."
+    }
+  ],
+  "mustNotBeStaticallyReachable": [
+    {
+      "module": "src/panels/PipeForge.tsx",
+      "reason": "Reached only by selecting its viewport tool, and substantial. On demand, with a named loading state."
+    },
+    {
+      "module": "src/panels/CommandPalette.tsx",
+      "reason": "Opened by Ctrl/Cmd+K. On demand, with a named loading state in the modal it will occupy."
+    },
+    {
+      "module": "src/panels/AssetLabWorkspace.tsx",
+      "reason": "A rail destination, and the largest single workspace."
+    },
+    {
+      "module": "src/panels/AnimationWorkspace.tsx",
+      "reason": "A rail destination that drags in the graph vendor bundle."
+    },
+    {
+      "module": "src/panels/TerrainPanel.tsx",
+      "reason": "A rail destination."
+    },
+    {
+      "module": "src/panels/MatchPanel.tsx",
+      "reason": "A rail destination."
+    }
+  ]
+}

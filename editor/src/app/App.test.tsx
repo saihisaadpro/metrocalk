@@ -61,8 +61,13 @@ describe("editor app — end-to-end wiring", () => {
     const bal = await screen.findByTestId("balance");
     await waitFor(() => expect(bal.textContent).toBe("100"));
 
-    // describe a no-match → the Generate offer; clicking Generate debits via the shared wallet store
-    fireEvent.change(screen.getByTestId("describe"), { target: { value: "a nonexistent thingamajig" } });
+    // Describe lives in the Build workspace, which is an on-demand rail destination: it is MOUNTED WHEN
+    // OPENED now, not rendered-and-hidden behind every other engine. So the test opens it, exactly as a
+    // user must. (It used to be reachable without this click because the dock rendered all six engines
+    // at once and hid five — a testid you can query from a workspace you are not in is not evidence that
+    // a user can reach it.)
+    fireEvent.click(screen.getByTestId("engine-build"));
+    fireEvent.change(await screen.findByTestId("describe"), { target: { value: "a nonexistent thingamajig" } });
     fireEvent.click(screen.getByTestId("describeBtn"));
     fireEvent.click(await screen.findByTestId("genBtn"));
 
@@ -143,7 +148,7 @@ describe("editor app — end-to-end wiring", () => {
     expect(screen.getByTestId("pipe-forge-bake").textContent).toMatch(/rebake asset/i);
   });
 
-  it("puts every sub-engine on ONE rail, and routes each to a real workspace", () => {
+  it("puts every sub-engine on ONE rail, and routes each to a real workspace", async () => {
     render(<App />);
     expect(screen.getAllByTestId("vpMove")).toHaveLength(1);
     expect(screen.getByTestId("viewport-tool-rail").querySelector("#vpMove")).toBeTruthy();
@@ -155,7 +160,11 @@ describe("editor app — end-to-end wiring", () => {
     // A side engine opens in the left column.
     fireEvent.click(screen.getByTestId("engine-build"));
     expect(screen.getByTestId("engine-build").getAttribute("aria-selected")).toBe("true");
-    expect(screen.getByTestId("assetbrowser")).toBeTruthy();
+    // `find`, not `get`: the Build workspace is an on-demand chunk, so it arrives a tick after the
+    // click. The rail's `aria-selected` is synchronous and stays so — where you are must never wait on
+    // a network — and the gap between the two is what `LazyWorkspace`'s named "Loading build workspace…"
+    // is for.
+    expect(await screen.findByTestId("assetbrowser")).toBeTruthy();
 
     // A bottom engine opens the bottom dock — same rail, different surface, because a timeline needs width.
     fireEvent.click(screen.getByTestId("engine-logic"));
@@ -205,11 +214,11 @@ describe("editor app — end-to-end wiring", () => {
     expect(screen.getByTestId("engine-logic").getAttribute("aria-selected")).toBe("true");
   });
 
-  it("opens the searchable command palette from Ctrl/Cmd+K", () => {
+  it("opens the searchable command palette from Ctrl/Cmd+K", async () => {
     render(<App />);
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
-    expect(screen.getByTestId("command-palette")).toBeTruthy();
-    expect(screen.getByRole("combobox", { name: /search commands/i })).toBeTruthy();
+    expect(await screen.findByTestId("command-palette")).toBeTruthy();
+    expect(await screen.findByRole("combobox", { name: /search commands/i })).toBeTruthy();
   });
 
   it("uses header-triggered focus-managed drawers at phone width", () => {

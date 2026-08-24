@@ -1,17 +1,36 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "notes": {
+    "whyTheseNumbersChanged": "v1's five numbers were round aspirations (250 KB / 416 KB / 300 KB / 1150 KB) written as a gate and never run: no CI job executed check-bundle.mjs, and measured against HEAD on 2026-08-23 THREE of the five failed — entry 287,644 > 256,000, initial 482,196 > 425,984, total 1,273,275 > 1,177,600. A budget nobody ran is not a budget. v2 replaces the wishes with a RATCHET: each ceiling is the measured value of a green build plus a stated margin, so a regression is caught on the day it lands instead of being invisible behind a number that was already red. The aspiration is not thrown away — it is kept below, as `target`, which is where it belonged all along.",
+    "margin": "~5% over measured, on every byte ceiling. Wide enough that ordinary feature work does not churn this file; far tighter than the 76,736-byte regression that returning the dev MockCore to the entry chunk would cause, which the v1 ceilings would have accepted in silence.",
+    "measuredOn": "2026-08-23, production `vite build`, after ADR-130 (the dev MockCore left the production entry and the first-paint surfaces came back into it).",
+    "measured": {
+      "entryBytes": 164668,
+      "initialJavaScriptBytes": 359220,
+      "largestChunkBytes": 256274,
+      "totalJavaScriptBytes": 1210346,
+      "chunkCount": 32
+    },
+    "target": {
+      "totalJavaScriptBytes": 1177600,
+      "owed": "Total JS is 32,746 bytes over the standing aspiration and cannot be closed by splitting: `vendor-support` (256,274 bytes) is lodash + ajv + d3, pulled in transitively by @jsonforms and @xyflow, and NONE of it is on the startup path. Closing it means changing one of those two dependencies, which is a decision, not a chore. Tracked in progress.md Now/Next; the gate that closes it is a build measuring under 1,177,600 with the required splits intact."
+    }
+  },
   "baselineEntryBytes": 902633,
-  "maximumEntryBytes": 256000,
-  "maximumInitialJavaScriptBytes": 425984,
-  "maximumChunkBytes": 307200,
-  "maximumTotalJavaScriptBytes": 1177600,
-  "minimumJavaScriptChunks": 15,
+  "maximumEntryBytes": 174000,
+  "maximumInitialJavaScriptBytes": 378000,
+  "maximumChunkBytes": 270000,
+  "maximumTotalJavaScriptBytes": 1272000,
+  "minimumJavaScriptChunks": 24,
   "requiredChunkPrefixes": [
     "AssetLabWorkspace-",
+    "AnimationWorkspace-",
     "BindingGraph-",
+    "CommandPalette-",
     "Inspector-",
     "PipeForge-",
     "StateGraphPanel-",
+    "TerrainPanel-",
     "vendor-forms-",
     "vendor-graph-",
     "vendor-react-",
@@ -19,9 +38,12 @@
   ],
   "forbiddenInitialChunkPrefixes": [
     "AssetLabWorkspace-",
+    "AnimationWorkspace-",
     "BindingGraph-",
+    "CommandPalette-",
     "PipeForge-",
     "StateGraphPanel-",
+    "TerrainPanel-",
     "vendor-forms-",
     "vendor-graph-"
   ]

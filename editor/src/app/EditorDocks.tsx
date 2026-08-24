@@ -10,10 +10,7 @@
 //! would re-create the ambiguity this layout exists to remove.
 
 import { lazy, useRef, useState } from "react";
-import { AssetBrowser } from "../panels/AssetBrowser";
 import { AuthoringToolbar } from "../panels/AuthoringToolbar";
-import { DescribeBar } from "../panels/DescribeBar";
-import { ShapeStudio } from "../panels/ShapeStudio";
 import { Hierarchy } from "../panels/Hierarchy";
 import { Requirers } from "../panels/Requirers";
 import { Reveal } from "../panels/Reveal";
@@ -24,8 +21,14 @@ import { color } from "../theme/tokens";
 import { useEntityOrder, useSelectedId } from "../store/projection";
 import type { EditorClient } from "../transport/session";
 import { LazyWorkspace } from "./LazyWorkspace";
-import { TerrainPanel } from "../panels/TerrainPanel";
 
+// Build and Terrain are explicit rail destinations, not startup chrome. Keeping them behind the same
+// shared workspace boundary as the other engines protects the stage's initial bundle while preserving
+// a named, polite loading state when an author actually opens either workspace.
+const AssetBrowser = lazy(() => import("../panels/AssetBrowser").then((module) => ({ default: module.AssetBrowser })));
+const DescribeBar = lazy(() => import("../panels/DescribeBar").then((module) => ({ default: module.DescribeBar })));
+const ShapeStudio = lazy(() => import("../panels/ShapeStudio").then((module) => ({ default: module.ShapeStudio })));
+const TerrainPanel = lazy(() => import("../panels/TerrainPanel").then((module) => ({ default: module.TerrainPanel })));
 const Diagnostics = lazy(() => import("../panels/Diagnostics").then((module) => ({ default: module.Diagnostics })));
 const AiEditPanel = lazy(() => import("../panels/AiEditPanel").then((module) => ({ default: module.AiEditPanel })));
 const JointPanel = lazy(() => import("../panels/JointPanel").then((module) => ({ default: module.JointPanel })));
@@ -166,21 +169,25 @@ export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport,
         hidden={active !== "build"}
         className="mtk-dock-panel mtk-scroll"
       >
-        <ShapeStudio client={client} />
-        <div className="mtk-dock-section-heading">Other tools</div>
-        <div className="mtk-quick-create" role="group" aria-label="Quick creation tools">
-          <Button data-testid="create-pipe" variant="secondary" onClick={onStartPipe} title="Draw a production pipe asset directly in the viewport">
-            <span aria-hidden="true">⌁</span> Draw pipe
-          </Button>
-          <Button data-testid="create-import" variant="secondary" onClick={onImport} title="Choose a supported local asset file">
-            <span aria-hidden="true">⇩</span> Import
-          </Button>
-        </div>
-        <DisclosureSection title="Describe" summary="Optional assisted creation" defaultOpen={false} storageKey="create-describe">
-          <DescribeBar client={client} />
-        </DisclosureSection>
-        <div className="mtk-dock-section-heading">Asset library</div>
-        <AssetBrowser client={client} />
+        {active === "build" && (
+          <LazyWorkspace label="Build workspace">
+            <ShapeStudio client={client} />
+            <div className="mtk-dock-section-heading">Other tools</div>
+            <div className="mtk-quick-create" role="group" aria-label="Quick creation tools">
+              <Button data-testid="create-pipe" variant="secondary" onClick={onStartPipe} title="Draw a production pipe asset directly in the viewport">
+                <span aria-hidden="true">⌁</span> Draw pipe
+              </Button>
+              <Button data-testid="create-import" variant="secondary" onClick={onImport} title="Choose a supported local asset file">
+                <span aria-hidden="true">⇩</span> Import
+              </Button>
+            </div>
+            <DisclosureSection title="Describe" summary="Optional assisted creation" defaultOpen={false} storageKey="create-describe">
+              <DescribeBar client={client} />
+            </DisclosureSection>
+            <div className="mtk-dock-section-heading">Asset library</div>
+            <AssetBrowser client={client} />
+          </LazyWorkspace>
+        )}
       </div>
       <div
         id="engine-panel-terrain"

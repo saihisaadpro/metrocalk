@@ -294,7 +294,25 @@ body {
 .mtk-input:read-only,
 .mtk-textarea:read-only,
 .mtk-search:read-only { background: var(--mtk-bg-panel); }
-.mtk-select { padding-right: 28px; cursor: pointer; }
+/* The chevron is OURS, not the platform's. A native `<select>` paints an OS arrow that changes with
+   the desktop theme and matches nothing else in the editor -- in the animate dock it was the only
+   Windows widget on a row of design-system controls. `appearance: none` removes it; the replacement
+   is a data-URI chevron so no consumer needs a wrapper element and no existing `style` prop changes
+   meaning. The stroke is spelled out here because a data URI cannot read a custom property; the
+   forced-colors block below restates it in system colours, which is the one place it must adapt. */
+.mtk-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 28px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23606976' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 10px 6px;
+}
+.mtk-select:disabled {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%237a8596' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
 .mtk-textarea { min-height: 84px; resize: vertical; }
 .mtk-search {
   width: 100%;
@@ -327,6 +345,183 @@ input[type="checkbox"],
 input[type="radio"],
 input[type="range"],
 progress { accent-color: var(--mtk-accent-solid); }
+
+/* -- Slider: the one range control ---------------------------------------------------------------
+   Before this, every `type="range"` in the engine was a RAW BROWSER CONTROL -- eight of them across
+   five panels (the animation scrub and zoom, the graph's parameter, the joint limits, the physics
+   and rule-debug read-outs) -- styled by a single `accent-color` declaration and nothing else. That
+   is the constitution's "every slider should use the same component family" satisfied by the
+   platform's family rather than this one's, and it shows: a 2px hairline track and an OS thumb sit
+   inside a toolbar whose every other control is a 30px rounded surface.
+
+   The fill is the reason this cannot be pure CSS. WebKit has no `::-moz-range-progress`, so the
+   filled portion is painted as a hard-stopped gradient on the track and the stop position arrives as
+   `--mtk-slider-fill`, set by the `Slider` primitive from the value it already has. Firefox uses its
+   own progress pseudo-element and ignores the variable. */
+.mtk-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 56px;
+  /* The HIT TARGET, not the track: the visible bar is 6px and would be a 6px target. The element is
+     control-height and transparent, so the pointer has the same reach here as on a button. */
+  height: var(--mtk-control-compact);
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  --mtk-slider-fill: 0%;
+}
+.mtk-slider:disabled { cursor: not-allowed; }
+
+.mtk-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background:
+    linear-gradient(
+      to right,
+      var(--mtk-accent-solid) var(--mtk-slider-fill),
+      var(--mtk-bg-active) var(--mtk-slider-fill)
+    );
+  transition: background var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--mtk-bg-active);
+}
+.mtk-slider::-moz-range-progress {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--mtk-accent-solid);
+}
+
+.mtk-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  width: 14px;
+  height: 14px;
+  /* Centre the thumb on a 6px track: (14 - 6) / 2. */
+  margin-top: -4px;
+  border-radius: 999px;
+  border: 2px solid var(--mtk-accent-solid);
+  background: var(--mtk-bg-raised);
+  box-shadow: var(--mtk-shadow-1);
+  transition:
+    transform var(--mtk-motion-fast) var(--mtk-ease-standard),
+    box-shadow var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-slider::-moz-range-thumb {
+  box-sizing: border-box;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid var(--mtk-accent-solid);
+  background: var(--mtk-bg-raised);
+  box-shadow: var(--mtk-shadow-1);
+}
+.mtk-slider:hover:not(:disabled)::-webkit-slider-thumb { transform: scale(1.12); }
+.mtk-slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(1.12); box-shadow: var(--mtk-shadow-2); }
+.mtk-slider:focus { outline: none; }
+.mtk-slider:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px var(--mtk-ring-soft); }
+.mtk-slider:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 3px var(--mtk-ring-soft); }
+.mtk-slider:disabled::-webkit-slider-thumb { border-color: var(--mtk-border-strong); box-shadow: none; }
+.mtk-slider:disabled::-moz-range-thumb { border-color: var(--mtk-border-strong); box-shadow: none; }
+.mtk-slider:disabled::-webkit-slider-runnable-track {
+  background: linear-gradient(to right, var(--mtk-border-strong) var(--mtk-slider-fill), var(--mtk-bg-inset) var(--mtk-slider-fill));
+}
+.mtk-slider:disabled::-moz-range-progress { background: var(--mtk-border-strong); }
+
+/* The label/value wrapper, so a slider is never a bare bar with no unit beside it. */
+.mtk-slider-field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--mtk-space-3);
+  min-width: 0;
+}
+.mtk-slider-field__label {
+  flex: 0 0 auto;
+  color: var(--mtk-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+.mtk-slider-field__value {
+  flex: 0 0 auto;
+  min-width: 34px;
+  color: var(--mtk-text-secondary);
+  font-family: var(--mtk-font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* -- Toolbar: one row rhythm, shared -------------------------------------------------------------
+   Twenty-five hand-rolled `display: flex; align-items: center; gap:` rows existed across the panels
+   with no shared class between them, which is how the same row ends up with a different padding, a
+   different divider and a different overflow answer in each subsystem -- and how controls end up
+   touching. The rule this encodes is the one the references show and the constitution states: items
+   are GROUPED, groups are separated by space (and only then by a hairline), and the row WRAPS rather
+   than shearing its last control off the edge.
+
+   `flex-wrap: wrap` is the whole overflow policy. The alternative already in the tree is
+   `overflow-x: auto` on a strip with no visible scrollbar, which deletes its last controls in
+   silence -- the exact defect `unclipped` was added to `shots` to catch. */
+.mtk-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--mtk-space-3) var(--mtk-space-5);
+  box-sizing: border-box;
+  min-width: 0;
+  padding: var(--mtk-space-4) var(--mtk-space-5);
+}
+.mtk-toolbar--tight { padding: var(--mtk-space-3) var(--mtk-space-4); gap: var(--mtk-space-2) var(--mtk-space-4); }
+.mtk-toolbar--raised { background: var(--mtk-bg-raised); }
+.mtk-toolbar--divided { border-bottom: 1px solid var(--mtk-border-subtle); }
+
+/* A group is items that belong together: they sit at the control gap, not the toolbar gap. */
+.mtk-toolbar__group {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--mtk-space-3);
+  min-width: 0;
+}
+.mtk-toolbar__group--attached { gap: 0; }
+.mtk-toolbar__group--grow { flex: 1 1 var(--mtk-toolbar-grow, 160px); }
+/* An attached group reads as ONE control: the shared radius belongs to the group, not each button. */
+.mtk-toolbar__group--attached > .mtk-btn { border-radius: 0; margin-left: -1px; box-shadow: none; }
+.mtk-toolbar__group--attached > .mtk-btn:first-child { border-start-start-radius: var(--mtk-radius-md); border-end-start-radius: var(--mtk-radius-md); margin-left: 0; }
+.mtk-toolbar__group--attached > .mtk-btn:last-child { border-start-end-radius: var(--mtk-radius-md); border-end-end-radius: var(--mtk-radius-md); }
+.mtk-toolbar__group--attached > .mtk-btn:hover,
+.mtk-toolbar__group--attached > .mtk-btn:focus-visible { position: relative; z-index: 1; }
+
+.mtk-toolbar__sep {
+  flex: 0 0 auto;
+  align-self: stretch;
+  width: 1px;
+  min-height: 18px;
+  margin-block: 2px;
+  background: var(--mtk-border-subtle);
+}
+.mtk-toolbar__spacer { flex: 1 1 var(--mtk-space-5); min-width: 0; }
+/* A read-out is data, not a control: mono, tabular, and it never grows to push a control off the row. */
+.mtk-readout {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--mtk-space-2);
+  flex: 0 0 auto;
+  color: var(--mtk-text);
+  font-family: var(--mtk-font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.mtk-readout__value { font-size: 15px; font-weight: 600; letter-spacing: -0.2px; }
+.mtk-readout__unit { color: var(--mtk-text-muted); font-size: 11px; }
 
 /* ── Shared surfaces and property anatomy ── */
 .mtk-surface {
@@ -900,6 +1095,20 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-empty-panel__title { max-width: 280px; color: var(--mtk-text); font-size: 13px; font-weight: 650; line-height: 1.35; }
 .mtk-empty-panel__description { max-width: 340px; margin-top: 6px; font-size: 12px; line-height: 1.55; }
 .mtk-empty-panel__actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-top: 12px; }
+/* The inline orientation: the same three parts, laid along the band instead of down it. */
+.mtk-empty-panel--inline {
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  min-height: 0;
+  padding: 12px 14px;
+  text-align: left;
+}
+.mtk-empty-panel--inline .mtk-empty-panel__icon { flex: 0 0 auto; width: 32px; height: 32px; margin-bottom: 0; }
+.mtk-empty-panel--inline .mtk-empty-panel__title { flex: 0 0 auto; max-width: none; }
+.mtk-empty-panel--inline .mtk-empty-panel__description { flex: 0 1 auto; min-width: 0; max-width: none; margin-top: 0; }
+.mtk-empty-panel--inline .mtk-empty-panel__actions { flex: 0 0 auto; margin-top: 0; margin-left: auto; }
 
 .mtk-shortcut {
   display: inline-flex;
@@ -1254,8 +1463,167 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-workspace-state strong { color: var(--mtk-text); }
 .mtk-workspace-state[role="alert"] { color: var(--mtk-danger); }
 
+/* The root failure surface (`RootBoundary`). Centred on the whole window rather than inside a dock,
+   because when this renders there is no dock — it is the only thing left on screen. */
+.mtk-root-failure {
+  display: flex;
+  height: 100vh;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  background: var(--mtk-bg-base);
+  color: var(--mtk-text-secondary);
+  font: var(--mtk-font-ui);
+  text-align: center;
+}
+.mtk-root-failure strong { color: var(--mtk-text); }
+.mtk-root-failure span { max-width: 46ch; }
+
 /* The animation workspace is a named container because it usually lives in a resizable dock; viewport
    media queries do not describe the width actually available to that editor. */
+/* -- The timeline surface -------------------------------------------------------------------------
+   ONE framework, per the constitution's "every timeline in every subsystem should share the same
+   implementation". These are the parts that are the same wherever a timeline appears: a track-header
+   column that stays put while the lanes scroll, a ruler band above them, alternating lane fills that
+   let the eye follow a row across, and a playhead that is a line WITH A HANDLE rather than a 1px
+   hairline you cannot grab. Every value is a token; the geometry (`--mtk-track-header`) is declared
+   once here so the ruler and the lanes cannot disagree about where the column ends.
+
+   Why the header column repeated the same width as a literal in three components before this: there
+   was nowhere shared to put it. */
+.mtk-timeline {
+  --mtk-track-header: 178px;
+  --mtk-ruler-height: 32px;
+  --mtk-lane-height: 30px;
+  min-width: 0;
+  background: var(--mtk-bg-inset);
+}
+.mtk-timeline__row {
+  display: grid;
+  /* Both carry a fallback on purpose: a row rendered outside a `.mtk-timeline` would otherwise
+     get an invalid template and collapse to nothing, which is a blank timeline rather than an error. */
+  grid-template-columns: var(--mtk-track-header, 178px) var(--mtk-timeline-width, 1fr);
+  min-height: var(--mtk-lane-height);
+}
+/* The header cell: quiet, sticky, and separated from the lanes by a surface change, not a hard rule. */
+.mtk-timeline__head {
+  position: sticky;
+  left: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: var(--mtk-space-3);
+  box-sizing: border-box;
+  min-width: 0;
+  padding: var(--mtk-space-2) var(--mtk-space-4);
+  color: var(--mtk-text-secondary);
+  background: var(--mtk-bg-panel);
+  box-shadow: 1px 0 0 var(--mtk-border-subtle);
+  font-size: 12px;
+}
+.mtk-timeline__lane {
+  position: relative;
+  min-width: 0;
+  border-bottom: 1px solid var(--mtk-border-subtle);
+  cursor: crosshair;
+}
+/* Zebra fill rather than a rule per lane: at 30px a row of hairlines reads as a spreadsheet. */
+.mtk-timeline__lane--odd { background: color-mix(in srgb, var(--mtk-bg-panel) 55%, transparent); }
+.mtk-timeline__lane:hover { background: var(--mtk-bg-hover); }
+/* A TRACK row is taller than an annotation lane and its header holds controls, not just a name. */
+.mtk-timeline__row--track { min-height: 48px; }
+.mtk-timeline__row--track > .mtk-timeline__head {
+  z-index: 4;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--mtk-space-2);
+  align-items: center;
+  padding: var(--mtk-space-3) var(--mtk-space-4);
+}
+.mtk-timeline__row--track > .mtk-timeline__head.is-selected {
+  color: var(--mtk-accent);
+  background: var(--mtk-accent-subtle);
+  box-shadow: inset 2px 0 0 var(--mtk-accent-solid), 1px 0 0 var(--mtk-accent-border);
+}
+.mtk-timeline__row--track > .mtk-timeline__lane { border-bottom-width: 0; border-top: 1px solid var(--mtk-border-subtle); }
+.mtk-timeline__row--track.is-invalid > .mtk-timeline__lane { border-top-color: var(--mtk-danger-border); }
+.mtk-timeline__row--track.is-muted { opacity: 0.52; }
+/* The lane graticule, at the same ten divisions the ruler labels, so a key lines up with a number. */
+/* The empty timeline. A percentage width here resolves against the SCROLLER's visible box, not
+   its scroll width, and `sticky` holds it in place while the lanes pan under it. */
+.mtk-timeline__empty {
+  position: sticky;
+  left: 0;
+  box-sizing: border-box;
+  width: 100%;
+  padding: var(--mtk-space-6) var(--mtk-space-5);
+}
+
+.mtk-timeline__lane--gridded {
+  background-image: linear-gradient(to right, var(--mtk-border-subtle) 1px, transparent 1px);
+  background-size: 10% 100%;
+}
+
+.mtk-timeline__ruler {
+  position: sticky;
+  top: 0;
+  z-index: 7;
+  height: var(--mtk-ruler-height);
+  min-height: var(--mtk-ruler-height);
+  border-bottom: 1px solid var(--mtk-border);
+  background: var(--mtk-bg-raised);
+}
+.mtk-timeline__ruler .mtk-timeline__head { z-index: 8; background: var(--mtk-bg-raised); }
+.mtk-timeline__ruler-track {
+  position: relative;
+  cursor: crosshair;
+  /* The minute ticks. A ruler with only ten numbers on it gives the eye nothing between them, which
+     is why every reference timeline draws a graticule under its labels. */
+  background-image: linear-gradient(to right, var(--mtk-border-subtle) 1px, transparent 1px);
+  background-size: 10% 100%;
+  background-position: 0 60%;
+  background-repeat: repeat-x;
+}
+.mtk-timeline__tick {
+  position: absolute;
+  top: 6px;
+  transform: translateX(-50%);
+  color: var(--mtk-text-muted);
+  font-family: var(--mtk-font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.mtk-timeline__tick:first-child { transform: none; }
+
+/* The playhead. A 1px line with a glow was invisible against the ruler and impossible to aim at; the
+   handle is what makes it an object. `top: -1px` puts the cap over the ruler's own bottom rule. */
+.mtk-timeline__playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--mtk-accent-solid);
+  pointer-events: none;
+  z-index: 3;
+}
+.mtk-timeline__playhead--handled::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 50%;
+  width: 11px;
+  height: 11px;
+  transform: translateX(-50%);
+  border-radius: 3px 3px 999px 999px;
+  background: var(--mtk-accent-solid);
+  box-shadow: var(--mtk-shadow-1);
+}
+
 .animation-workspace-root {
   container-name: animationWorkspace;
   container-type: inline-size;
@@ -1277,6 +1645,20 @@ body > [role="dialog"][aria-modal="true"] {
   grid-template-areas: "tools timeline inspector";
 }
 
+/* The sequence identity on the transport row: it yields before every control beside it, and it is
+   the one item on that row allowed to be cut short, because its full text is its own `title` and
+   the timeline below names the same sequence. */
+.animation-sequence {
+  flex: 1 1 auto;
+  margin-left: auto;
+  padding-inline: 8px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--mtk-text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
 .animation-workspace-tools { grid-area: tools; }
 .animation-workspace-timeline { grid-area: timeline; }
 .animation-workspace-inspector { grid-area: inspector; }
@@ -1475,18 +1857,44 @@ body > [role="dialog"][aria-modal="true"] {
 .animation-graph-conflict span { flex: 1 1 300px; color: var(--mtk-text-secondary); }
 
 @container animationWorkspace (max-width: 920px) {
+  /* THE TIMELINE IS THIS WORKSPACE'S STAGE, AND STACKED IT WAS THE SMALLEST THING IN IT. Three auto
+     rows under `align-content: start` give each stacked panel its content minimum and nobody the
+     remainder, so the timeline sat at exactly the floor its viewport declares. Measured in the dock
+     at a 1440x900 window, where the workspace has 321px of column: the timeline section took 94 of
+     them — a **62px viewport holding 241px of content** — while the tools panel below it took 110.
+     The ruler was visible, one annotation lane was half visible, and the empty state that says what
+     to do next ("No 3D tracks yet — choose a compatible property and add a key at the playhead") was
+     scrolled out of sight in a 62px window.
+
+     `<ux_quality>` 5 is written about the 3D stage, but the rule it states is general and this is
+     the same shape one level in: the primary surface gets layout priority and the accessories yield.
+     So the timeline row is `minmax(floor, 1fr)` and takes the leftover; tools and inspector are
+     content-sized and already scroll inside their own `max-height`. The floor is the ruler (32) +
+     both annotation lanes (60) + one track row (48) + the view toolbar (~47) — the least that shows
+     a timeline rather than a fragment of one. */
   .animation-workspace-layout,
   .animation-workspace-layout--inspector {
+    --mtk-animation-timeline-floor: 220px;
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(var(--mtk-animation-timeline-floor), 1fr) auto auto;
     grid-template-areas:
       "timeline"
       "tools"
       "inspector";
-    align-content: start;
   }
 
+  /* AND THE PANEL THAT YIELDED IS STILL A PANEL. Giving the timeline the leftover moved the squeeze
+     rather than resolving it: measured immediately afterwards, the tools panel went to **47px holding
+     345** — a header with its own content entirely behind a scrollbar. Three stacked panels do not
+     fit in the 321px a dock-height workspace has, and the repository already settled what a layout
+     does then (ADR-126): what gives way gives way by getting SMALLER, down to a floor, and past that
+     the container scrolls. It is a floor here rather than a crush, and `.animation-workspace-layout`
+     is `overflow: auto` — so a short workspace scrolls, visibly, instead of showing three panels
+     that are each too small to read. */
+  .animation-workspace-timeline { min-height: var(--mtk-animation-timeline-floor); }
   .animation-workspace-tools,
   .animation-workspace-inspector {
+    min-height: 148px;
     max-height: 260px;
   }
 
@@ -1569,6 +1977,14 @@ body > [role="dialog"][aria-modal="true"] {
   .mtk-scroll::-webkit-scrollbar { width: 14px; height: 14px; }
   input[type="checkbox"],
   input[type="radio"] { min-width: 20px; min-height: 20px; }
+  /* A 14px thumb is not a touch target. The element is already control-height, so only the thumb
+     and the track it rides need to grow. */
+  .mtk-slider::-webkit-slider-runnable-track,
+  .mtk-slider::-moz-range-track,
+  .mtk-slider::-moz-range-progress { height: 8px; }
+  .mtk-slider::-webkit-slider-thumb { width: 22px; height: 22px; margin-top: -7px; }
+  .mtk-slider::-moz-range-thumb { width: 22px; height: 22px; }
+  .mtk-toolbar { gap: var(--mtk-space-4) var(--mtk-space-6); }
   .mtk-editor-header { height: 56px; min-height: 56px; }
   /* The closed dock IS its bar, and `--mtk-bottom-bar-height` is already 48px in this block — the
      `height: 48px` that used to sit here was a second statement of that, drifting on its own. */
@@ -1632,6 +2048,21 @@ body > [role="dialog"][aria-modal="true"] {
   .mtk-search:disabled { color: GrayText; border-color: GrayText; }
   .mtk-hrow.is-selected,
   .mtk-hrow.is-multi { color: HighlightText; background: Highlight; }
+  /* The data-URI chevron cannot read a system colour, so it is restated here in one. */
+  .mtk-select {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    forced-color-adjust: none;
+    color: CanvasText;
+    background-color: Field;
+  }
+  .mtk-slider::-webkit-slider-runnable-track { background: ButtonText; }
+  .mtk-slider::-moz-range-track { background: ButtonText; }
+  .mtk-slider::-webkit-slider-thumb,
+  .mtk-slider::-moz-range-thumb { border-color: Highlight; background: Canvas; }
+  .mtk-toolbar__sep { background: ButtonText; }
+  .mtk-timeline__playhead,
+  .mtk-timeline__playhead--handled::before { background: Highlight; }
+  .mtk-timeline__head { box-shadow: 1px 0 0 ButtonText; }
   :is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__edge-path { stroke: CanvasText; }
   :is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__edge.selected .react-flow__edge-path { stroke: Highlight; }
 }

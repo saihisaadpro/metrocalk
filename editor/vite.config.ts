@@ -3,8 +3,24 @@ import react from "@vitejs/plugin-react";
 
 // Editor front-end. Tests run under jsdom (Vitest) with globals on, so the projection-store /
 // transport / reconciliation logic and component render-counts are testable headlessly.
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   plugins: [react()],
+
+  // MAY THIS BUNDLE CONSTRUCT A FAKE CORE? One flag, decided at build time, and the reason it is its
+  // own flag rather than `import.meta.env.DEV` is that the shots harness disproved that shorthand
+  // within a minute of it existing: the harness is a PRODUCTION build (`vite build`, so `DEV` is
+  // false) that legitimately renders the whole shell against the MockCore, and every one of its 15
+  // shell scenes went black with `NoCoreError` — a capture painting one distinct colour, which is the
+  // gate doing its job. "React's production mode" and "there is a real engine behind this window" are
+  // simply different facts, and only the second one may delete the mock.
+  //
+  // `command !== "build"` covers `vite dev` and Vitest (which resolves this config in serve mode);
+  // `vite build` here is the app bundle that becomes the packaged shell's `frontendDist`, and that is
+  // the one bundle in the repository that must not contain a core it can answer with. Substituting a
+  // literal `false` is also what lets Rollup drop `MockClient`, `MockCore`, `DeltaClient` and the
+  // sample scene: 76,736 bytes, a third of the old entry chunk.
+  define: { __MTK_MOCK_CORE__: JSON.stringify(command !== "build") },
+
   build: {
     // Dynamic workspace imports keep the viewport shell immediate. Stable vendor boundaries prevent
     // graph and schema-form libraries from being folded back into the entry chunk.
@@ -26,4 +42,4 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
   },
-});
+}));
