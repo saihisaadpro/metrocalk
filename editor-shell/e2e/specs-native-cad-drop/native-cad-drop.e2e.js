@@ -138,6 +138,8 @@ function startOleDrop() {
     "-NoProfile",
     "-NonInteractive",
     "-Sta",
+    "-WindowStyle",
+    "Hidden",
     "-ExecutionPolicy",
     "Bypass",
     "-File",
@@ -165,7 +167,9 @@ function startOleDrop() {
   ];
   const child = spawn("powershell.exe", args, {
     stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
+    // PowerShell hides only its console via -WindowStyle above. CREATE_NO_WINDOW also hides the first
+    // WinForms HWND, preventing the real source mouse-down/capture that Control.DoDragDrop requires.
+    windowsHide: false,
   });
   const handle = { child, stdout: "", stderr: "", result: null, completion: null };
   child.stdout.on("data", (chunk) => { handle.stdout += chunk.toString(); });
@@ -286,13 +290,43 @@ describe("genuine native CAD drag/drop", () => {
         ]) localStorage.removeItem(key);
       });
       await browser.refresh();
+      let lastCleanProbe = null;
       await browser.waitUntil(
-        async () => browser.execute(async () => {
-          if (!window.__TAURI__?.core) return false;
-          const report = await window.__TAURI__.core.invoke("cad_report");
-          return report?.total === 0 && document.querySelectorAll('[data-testid="hrow"]').length === 0;
-        }),
-        { timeout: 30_000, interval: 250, timeoutMsg: "Clean app did not reconnect with an empty authoritative CAD report and hierarchy" },
+        async () => {
+          lastCleanProbe = await browser.execute(async () => {
+            if (!window.__TAURI__?.core) return { ready: false, report: null, hierarchyRows: null, error: null };
+            try {
+              const report = await window.__TAURI__.core.invoke("cad_report");
+              const hierarchy = [...document.querySelectorAll('[data-testid="hrow"]')].map((row) => ({
+                id: row.getAttribute("data-id"),
+                kind: row.getAttribute("data-kind"),
+                name: (row.querySelector('[data-testid="thumb"]')?.getAttribute("title") || "").trim(),
+                level: Number(row.getAttribute("aria-level")),
+              }));
+              return {
+                ready: true,
+                report,
+                hierarchy,
+                hierarchyRows: hierarchy.length,
+                error: null,
+              };
+            } catch (error) {
+              return {
+                ready: true,
+                report: null,
+                hierarchyRows: document.querySelectorAll('[data-testid="hrow"]').length,
+                error: String(error),
+              };
+            }
+          });
+          manifest.cleanStateProbe = lastCleanProbe;
+          return lastCleanProbe.report?.total === 0 && lastCleanProbe.hierarchyRows === 0;
+        },
+        {
+          timeout: 30_000,
+          interval: 250,
+          timeoutMsg: "Clean app did not reconnect with an empty authoritative CAD report and hierarchy; inspect cleanStateProbe in evidence.json",
+        },
       );
       const beforeReport = await invoke("cad_report");
       const beforeRows = await hierarchySnapshot();

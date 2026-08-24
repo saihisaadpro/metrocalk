@@ -8067,13 +8067,19 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // M9.2: a small **composed character** (a body root + two rigid child parts) for part editing —
     // seeded as deterministic scene construction right after the seed (its ids are stable across launches
     // so the override-edit persistence re-binds; the `mtkscene2` fingerprint reflects this added draw).
+    // `MTK_SCENE_N=0` is the explicit empty-scene contract used for isolated asset authoring and evidence;
+    // honour it for all sample content, including this otherwise-useful demo character.
     // The parts render as the prop mesh; click one → gizmo-edit it (a per-field override).
-    let demo_char = capscene::compose_character(
-        &mut engine,
-        [0.0, 1.0, 6.0],
-        assets.catalog.get("MeshRenderer").map(String::as_str),
-    )
-    .ok();
+    let demo_char = if scene_n == 0 {
+        None
+    } else {
+        capscene::compose_character(
+            &mut engine,
+            [0.0, 1.0, 6.0],
+            assets.catalog.get("MeshRenderer").map(String::as_str),
+        )
+        .ok()
+    };
     if let Some((root, parts)) = &demo_char {
         eprintln!(
             "[shell] composed a demo character: body {} with {} rigid parts (click a part to edit it)",

@@ -34,7 +34,9 @@ const requestedApplication = process.env.MTK_EXE
   : path.resolve(e2eDir, "../src-tauri/target/release/metrocalk-editor-shell.exe");
 const application = requestedApplication;
 const exeDir = path.dirname(application);
-const fixture = path.resolve(e2eDir, "samples/analytic_trio.stp");
+const fixture = process.env.MTK_NATIVE_DROP_FIXTURE
+  ? path.resolve(process.env.MTK_NATIVE_DROP_FIXTURE)
+  : path.resolve(e2eDir, "samples/analytic_trio.stp");
 const nativeDriver = path.resolve(e2eDir, ".driver/msedgedriver.exe");
 const userProfile = process.env.USERPROFILE;
 if (!userProfile) throw new Error("USERPROFILE is required to resolve tauri-driver exactly.");
@@ -120,7 +122,7 @@ function prepareRun() {
   validateDirectFile(application, "Tauri application");
   validateDirectFile(nativeDriver, "WebView2 driver");
   validateDirectFile(tauriDriverBin, "tauri-driver");
-  validateDirectFile(fixture, "analytic STEP fixture");
+  validateDirectFile(fixture, "STEP fixture");
   assertNoConflictingProcesses();
 
   mkdirSync(evidenceRoot, { recursive: true });

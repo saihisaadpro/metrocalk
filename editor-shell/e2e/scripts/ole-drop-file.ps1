@@ -28,7 +28,8 @@
   import lifecycle to report success.
 
 .PARAMETER Files              One or more absolute paths to drop.
-.PARAMETER WindowTitleLike    Substring of the target top-level window title.
+.PARAMETER ProcName           Exact executable process name that owns the target top-level window.
+.PARAMETER WindowTitleLike    Diagnostic/fallback substring of the target top-level window title.
 .PARAMETER DropX / DropY      Fractional point in the target's client rect (0..1).
 .PARAMETER StartX / StartY    Fractional point the drag STARTS from, so there is real
                               travel across the window (a user never drops without moving).
@@ -43,6 +44,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)][string[]] $Files,
+  [string] $ProcName = "metrocalk-editor-shell",
   [string] $WindowTitleLike = "metrocalk",
   [double] $DropX = 0.55,
   [double] $DropY = 0.55,
@@ -299,8 +301,22 @@ namespace MtkDrop
                     IntPtr under = WindowFromPoint(point);
                     if (under != sourceHwnd && !IsChild(sourceHwnd, under))
                     {
-                        _pressStatus = "hit-test-failed: " + under;
-                        PostMessageW(sourceHwnd, 0x0010, IntPtr.Zero, IntPtr.Zero);
+                        // Node launches this helper with CREATE_NO_WINDOW so no console flashes in the
+                        // captured film. Windows can apply that startup show-state to the first WinForms
+                        // HWND too. Keep a real globally-held mouse button, but deliver the initiating
+                        // WM_LBUTTONDOWN only to our own drag-source form. The destination still receives
+                        // genuine OLE DragEnter/DragOver/Drop from Control.DoDragDrop; no target event is
+                        // posted or simulated.
+                        Button(true);
+                        IntPtr clientPoint = new IntPtr((1 << 16) | 1); // MAKELPARAM(1, 1)
+                        if (!PostMessageW(sourceHwnd, 0x0201, new IntPtr(1), clientPoint))
+                        {
+                            Button(false);
+                            _pressStatus = "source-post-failed: under=" + under;
+                            PostMessageW(sourceHwnd, 0x0010, IntPtr.Zero, IntPtr.Zero);
+                            return;
+                        }
+                        _pressStatus = "pressed-source-post: under=" + under;
                         return;
                     }
                     Button(true);
@@ -404,13 +420,21 @@ namespace MtkDrop
 Add-Type -TypeDefinition $src | Out-Null
 
 # -- locate + raise the target window -----------------------------------------
-$targetWindows = @([MtkDrop.Native]::FindTopLevels($WindowTitleLike))
-if ($targetWindows.Count -ne 1) {
-  Write-Output "DROP_RESULT: FAIL expected-one-window titleLike='$WindowTitleLike' count=$($targetWindows.Count)"
+# Chromium/WebView automation can expose a visible, titled zero-client helper HWND. The app process's
+# MainWindowHandle is the actual DWM-composited Tauri host (the same identity used by the screenshot gate),
+# so use process ownership rather than accepting an unrelated title match.
+$targetProcesses = @(
+  Get-Process -Name $ProcName -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowHandle -ne 0 }
+)
+if ($targetProcesses.Count -ne 1) {
+  $fallbackWindows = @([MtkDrop.Native]::FindTopLevels($WindowTitleLike))
+  Write-Output "DROP_RESULT: FAIL expected-one-process-window procName='$ProcName' count=$($targetProcesses.Count) titleFallbackCount=$($fallbackWindows.Count)"
   exit 2
 }
-$hwnd = $targetWindows[0]
-Write-Output "DROP_TARGET: hwnd=$hwnd title='$([MtkDrop.Native]::TitleOf($hwnd))'"
+$targetProcess = $targetProcesses[0]
+$hwnd = [IntPtr]$targetProcess.MainWindowHandle
+Write-Output "DROP_TARGET: pid=$($targetProcess.Id) hwnd=$hwnd title='$([MtkDrop.Native]::TitleOf($hwnd))'"
 
 $SWP_NOMOVE = 0x0002; $SWP_NOSIZE = 0x0001; $SWP_SHOWWINDOW = 0x0040
 if ([MtkDrop.Native]::IsIconic($hwnd)) {
@@ -421,6 +445,9 @@ if ([MtkDrop.Native]::IsIconic($hwnd)) {
 [void][MtkDrop.Native]::BringWindowToTop($hwnd)
 [void][MtkDrop.Native]::SetForegroundWindow($hwnd)
 Start-Sleep -Milliseconds 500
+# The foreground raise above makes the destination visible, but leaving it HWND_TOPMOST prevents the
+# later topmost WinForms drag source from reliably owning the initial mouse-down on WebView2 systems.
+[void][MtkDrop.Native]::SetWindowPos($hwnd, [IntPtr](-2), 0, 0, 0, 0, ($SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW))
 
 $cr = New-Object MtkDrop.RECT
 [void][MtkDrop.Native]::GetClientRect($hwnd, [ref]$cr)
@@ -476,6 +503,8 @@ $state = [hashtable]::Synchronized(@{
   Status = "not-started"
   Effect = [System.Windows.Forms.DragDropEffects]::None
   Error = $null
+  SourceX = $null
+  SourceY = $null
 })
 $allowed = [System.Windows.Forms.DragDropEffects]::Copy -bor [System.Windows.Forms.DragDropEffects]::Link
 
@@ -496,10 +525,10 @@ $sourceForm.add_MouseDown({
   if ($state.Started) { return }
   $state.Started = $true
   $state.Status = "ole-active"
-  $sender.Text = "CAD file drag active"
-  try {
-    [MtkDrop.Native]::StartGesture(
-      $sx, $sy, $tx, $ty, $Steps, $hwnd,
+    $sender.Text = "CAD file drag active"
+    try {
+      [MtkDrop.Native]::StartGesture(
+      ([int]$state.SourceX), ([int]$state.SourceY), $tx, $ty, $Steps, $hwnd,
       $HoverReadyPath, $ReleasePath, ($HoverTimeoutSeconds * 1000))
     $state.Effect = $sender.DoDragDrop($dataObj, $allowed)
     $state.Status = "ole-returned"
@@ -526,8 +555,18 @@ $sourceForm.add_Shown({
   [void][MtkDrop.Native]::SetForegroundWindow($sender.Handle)
   $sender.Text = "CAD file drag source ready"
 
+  # WinForms can reposition or DPI-scale a manually placed tool window. Measure the real client centre
+  # after it is shown instead of assuming the requested Location survived unchanged.
+  $sourceClientCenter = [System.Drawing.Point]::new(
+    [int]($sender.ClientSize.Width / 2),
+    [int]($sender.ClientSize.Height / 2)
+  )
+  $sourcePoint = $sender.PointToScreen($sourceClientCenter)
+  $state.SourceX = $sourcePoint.X
+  $state.SourceY = $sourcePoint.Y
+
   [MtkDrop.Native]::StartWatchdog($sender.Handle, ($TimeoutSeconds * 1000))
-  [MtkDrop.Native]::StartSourcePress($sender.Handle, $sx, $sy)
+  [MtkDrop.Native]::StartSourcePress($sender.Handle, $state.SourceX, $state.SourceY)
 }.GetNewClosure())
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -556,6 +595,7 @@ finally {
 Write-Output "DROP_GESTURE: $([MtkDrop.Native]::GestureStatus)"
 Write-Output "DROP_PRESS: $([MtkDrop.Native]::PressStatus)"
 Write-Output "DROP_WATCHDOG: $([MtkDrop.Native]::WatchdogStatus)"
+Write-Output "DROP_SOURCE_GEOM: measured=($($state.SourceX),$($state.SourceY)) requested=($sx,$sy)"
 Write-Output "DROP_SOURCE: started=$($state.Started) status=$($state.Status)"
 Write-Output "DROP_EFFECT: $($state.Effect) elapsedMs=$($sw.ElapsedMilliseconds)"
 if ($null -ne $state.Error) {

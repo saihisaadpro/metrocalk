@@ -11,6 +11,8 @@
     "test:workbench": "node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.workbench.conf.js",
     "test:native-cad-drop": "node \"node_modules/@wdio/cli/bin/wdio.js\" run wdio.native-cad-drop.conf.js",
     "test:native-cad-drop-harness": "node --test lib/native-cad-drop.test.mjs",
+    "test:video-quality-tools": "node --test scripts/video-quality-gate.test.mjs",
+    "video:quality-gate": "node scripts/video-quality-gate.mjs",
     "accessibility:preflight": "node scripts/accessibility-preflight.mjs",
     "accessibility:matrix": "node scripts/accessibility-report.mjs --matrix-only",
     "accessibility:report": "node scripts/accessibility-report.mjs",
