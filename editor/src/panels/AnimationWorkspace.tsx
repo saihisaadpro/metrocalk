@@ -114,15 +114,6 @@ const card: CSSProperties = {
   background: color.bg.panel,
 };
 
-const selectStyle: CSSProperties = {
-  minWidth: 0,
-  background: color.bg.input,
-  color: color.text.primary,
-  border: `1px solid ${color.border.default}`,
-  borderRadius: radius.md,
-  padding: `${space.xs}px ${space.sm}px`,
-};
-
 function valueLabel(value: unknown): string {
   if (typeof value === "number") return Number.isInteger(value) ? `${value}` : value.toPrecision(5);
   if (typeof value === "boolean") return value ? "true" : "false";
@@ -1637,12 +1628,12 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             <>
               <label style={{ display: "grid", gap: space.xs, color: color.text.secondary, fontSize: fontSize.meta }}>
                 Property
-                <select
+                <SelectField
                   data-testid="animation-property"
                   aria-describedby="animation-property-status"
                   value={currentProperty ? propertyId(currentProperty) : ""}
                   onChange={(event) => animationEditorStore.getState().setDraft(workspaceKey, activeContext, PROPERTY_DRAFT, event.target.value)}
-                  style={{ ...selectStyle, width: "100%" }}
+                  style={{ width: "100%" }}
                 >
                   {!contextProperties.some((property) => property.animatable) && <option value="">No verified {CONTEXT_LABELS[activeContext]} playback properties</option>}
                   {contextProperties.map((property) => (
@@ -1650,7 +1641,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                       {property.label}{property.animatable ? "" : " — unavailable"}
                     </option>
                   ))}
-                </select>
+                </SelectField>
               </label>
               <div style={{ display: "flex", justifyContent: "space-between", gap: space.sm, marginTop: space.sm, fontSize: fontSize.meta }}>
                 <span style={{ color: color.text.muted }} title="Preview is render-only and never rewrites this value.">Authored value</span>
@@ -1664,14 +1655,13 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
               )}
               <label style={{ display: "grid", gap: space.xs, marginTop: space.sm, color: color.text.secondary, fontSize: fontSize.meta }}>
                 New track interpolation
-                <select
+                <SelectField
                   value={interpolation}
                   disabled={!currentProperty?.animatable || currentProperty.valueKind === "bool" || currentProperty.valueKind === "string"}
                   onChange={(event) => animationEditorStore.getState().setDraft(workspaceKey, activeContext, INTERPOLATION_DRAFT, event.target.value)}
-                  style={selectStyle}
                 >
                   <option value="step">Step</option><option value="linear">Linear</option><option value="cubic">Cubic</option>
-                </select>
+                </SelectField>
               </label>
               {/* THE SAME DEFECT ONE SECTION UP, CAUGHT BY LOOKING RATHER THAN BY THE PROBE: no scene
                   photographs this button while it is off, so it was not in the 5 findings — but it is
@@ -2040,9 +2030,9 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                     {selectedTrack.bindingReason && <Hint>{selectedTrack.bindingReason}</Hint>}
                     <label style={{ display: "grid", gap: space.xs, marginTop: space.sm, color: color.text.secondary, fontSize: fontSize.meta }}>
                       Interpolation
-                      <select value={selectedTrack.interpolation} disabled={selectedTrack.locked} onChange={(event) => changeInterpolation(selectedTrack, event.target.value as AnimationInterpolation)} style={selectStyle}>
+                      <SelectField value={selectedTrack.interpolation} disabled={selectedTrack.locked} onChange={(event) => changeInterpolation(selectedTrack, event.target.value as AnimationInterpolation)}>
                         <option value="step">Step</option><option value="linear">Linear</option><option value="cubic">Cubic</option>
-                      </select>
+                      </SelectField>
                     </label>
                     {selectedKey && (
                       <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: space.sm, alignItems: "center", marginTop: space.sm }}>
@@ -2377,6 +2367,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                                                 {sourceLabel}
                                               </label>
                                               <select
+                                                className="mtk-input mtk-select"
                                                 ref={sourceTargetId === firstUnresolvedSourceId ? clipFirstUnresolvedTarget : undefined}
                                                 id={`animation-clip-target-${clip.clipId}-${index}`}
                                                  aria-label={`Target for ${sourceLabel}`}
@@ -2386,7 +2377,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                                                 value={clipTargetMappings[sourceTargetId] ?? ""}
                                                 onChange={(event) => void updateClipTargetMapping(sourceTargetId, event.currentTarget.value)}
                                                 disabled={busy}
-                                                style={{ ...selectStyle, width: "100%", marginTop: space.xs }}
+                                                style={{ width: "100%", marginTop: space.xs }}
                                               >
                                                 <option value="">Choose a live Transform entity…</option>
                                                 {liveTransformTargets.map((target) => (
@@ -2467,10 +2458,9 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                                           >
                                             {model.playing ? "Pause audition" : "Resume audition"}
                                           </Button>
-                                          <input
+                                          <Slider
                                             aria-label="Imported clip audition timeline"
                                             data-testid="animation-clip-audition-scrub"
-                                            type="range"
                                             min={0}
                                             max={duration}
                                             step={Math.max(1, Math.round(model.ticksPerSecond / 120))}

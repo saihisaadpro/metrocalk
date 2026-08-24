@@ -474,6 +474,10 @@ export interface EmptyPanelStateProps {
   secondaryAction?: ReactNode;
   children?: ReactNode;
   compact?: boolean;
+  /** Icon beside the words rather than above them — for a WIDE, SHORT band (a timeline lane strip, a
+   *  results row) where the stacked form needs 128px of height that the band does not have, and the
+   *  title ends up below the fold with only the icon on screen. */
+  inline?: boolean;
   style?: CSSProperties;
   "data-testid"?: string;
 }
@@ -487,12 +491,19 @@ export function EmptyPanelState({
   secondaryAction,
   children,
   compact = false,
+  inline = false,
   style,
   ...rest
 }: EmptyPanelStateProps) {
   return (
     <div
-      className={`mtk-empty-panel${compact ? " mtk-empty-panel--compact" : ""}`}
+      className={[
+        "mtk-empty-panel",
+        compact && "mtk-empty-panel--compact",
+        inline && "mtk-empty-panel--inline",
+      ]
+        .filter(Boolean)
+        .join(" ")}
       role="status"
       style={style}
       {...rest}
