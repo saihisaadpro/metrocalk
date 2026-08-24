@@ -138,8 +138,6 @@ function startOleDrop() {
     "-NoProfile",
     "-NonInteractive",
     "-Sta",
-    "-WindowStyle",
-    "Hidden",
     "-ExecutionPolicy",
     "Bypass",
     "-File",
@@ -167,8 +165,8 @@ function startOleDrop() {
   ];
   const child = spawn("powershell.exe", args, {
     stdio: ["ignore", "pipe", "pipe"],
-    // PowerShell hides only its console via -WindowStyle above. CREATE_NO_WINDOW also hides the first
-    // WinForms HWND, preventing the real source mouse-down/capture that Control.DoDragDrop requires.
+    // The helper hides its console after startup. CREATE_NO_WINDOW / -WindowStyle Hidden also hide the
+    // first WinForms HWND, preventing the real source mouse-down/capture that Control.DoDragDrop requires.
     windowsHide: false,
   });
   const handle = { child, stdout: "", stderr: "", result: null, completion: null };

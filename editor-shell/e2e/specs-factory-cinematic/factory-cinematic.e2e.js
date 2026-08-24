@@ -186,14 +186,15 @@ async function waitForBatchProgress(batchId, stage, timeoutMs = 60_000) {
   await browser.waitUntil(async () => {
     const recording = await readLifecycle();
     if (recording.listenerError) throw new Error(`Native lifecycle recorder failed: ${recording.listenerError}`);
+    match = recording.events.find(({ payload }) =>
+      payload?.phase === "progress" && payload.batchId === batchId && payload.stage === stage) ?? null;
+    if (match) return true;
     const terminal = recording.events.find(({ payload }) =>
       payload?.batchId === batchId && ["succeeded", "failed", "refused", "cancelled"].includes(payload.phase));
     if (terminal && terminal.payload.phase !== "cancelled") {
       throw new Error(`Batch ${batchId} became ${terminal.payload.phase} before ${stage}: ${JSON.stringify(terminal.payload)}`);
     }
-    match = recording.events.find(({ payload }) =>
-      payload?.phase === "progress" && payload.batchId === batchId && payload.stage === stage) ?? null;
-    return !!match;
+    return false;
   }, { timeout: timeoutMs, interval: 150, timeoutMsg: `Batch ${batchId} never reached ${stage} progress.` });
   return match.payload;
 }
@@ -557,6 +558,8 @@ async function authorCinematics(subjects) {
       `Cinema readback drifted for ${assignment.name}: ${JSON.stringify(readback)}`);
     invariant(closeEnough(readback.seconds, assignment.plannedSeconds, 0.02),
       `Calm duration drifted for ${assignment.name}: planned ${assignment.plannedSeconds}, live ${readback.seconds}.`);
+    invariant(readback.problems.length === 0,
+      `Continuity/pacing diagnostics rejected the direction for ${assignment.name}: ${JSON.stringify(readback.problems)}`);
     directed.push({ ...assignment, replies, readback });
   }
   const totalShots = directed.reduce((count, cutscene) => count + cutscene.readback.shots, 0);
@@ -655,9 +658,9 @@ describe("production factory cinematic direction", () => {
       assertOleAccepted(cancelledDrop);
       const cancelledBatchId = await waitForNewDroppedBatch(0);
       const importing = await waitForBatchProgress(cancelledBatchId, "importing");
-      captureComposited("02-first-import-in-progress");
       const accepted = await invoke("cancel_native_import", { batchId: cancelledBatchId });
       invariant(accepted === true, `The direct cancellation plane did not accept batch ${cancelledBatchId}.`);
+      captureComposited("02-first-cancellation-requested");
       const cancelled = await waitForBatchTerminal(cancelledBatchId, "cancelled", cancelledImportTimeoutMs);
       invariant(/safe checkpoint/i.test(cancelled.message) && /no scene changes were committed/i.test(cancelled.message),
         `Cancellation terminal was not truthful: ${JSON.stringify(cancelled)}`);

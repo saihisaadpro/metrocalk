@@ -180,6 +180,7 @@ namespace MtkDrop
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);
         [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
         [DllImport("user32.dll")] public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
+        [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int max);
         [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr l);
@@ -418,6 +419,13 @@ namespace MtkDrop
 # Let Add-Type use the runtime's complete default BCL reference set. WinForms stays in
 # PowerShell below, where its already-loaded runtime assembly can be used directly.
 Add-Type -TypeDefinition $src | Out-Null
+
+# Keep the interactive WinForms drag source visible, but remove PowerShell's console before any evidence
+# capture. Process-wide hidden startup flags also hide the first form and break real mouse capture.
+$consoleWindow = [MtkDrop.Native]::GetConsoleWindow()
+if ($consoleWindow -ne [IntPtr]::Zero) {
+  [void][MtkDrop.Native]::ShowWindow($consoleWindow, 0) # SW_HIDE
+}
 
 # -- locate + raise the target window -----------------------------------------
 # Chromium/WebView automation can expose a visible, titled zero-client helper HWND. The app process's
