@@ -5,8 +5,8 @@
 //! whole window appear hung. One bounded worker preserves user drop order, applies backpressure without
 //! blocking that callback, and still routes every accepted file through `EngineCmd::ImportAsset`.
 
-use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -137,7 +137,11 @@ pub(crate) enum ImportProgressStage {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum ImportedSubject {
     Entity { root_id: String },
     Environment { label: String },
@@ -145,7 +149,11 @@ pub(crate) enum ImportedSubject {
 
 /// Stable, structured UI contract for the complete native-drop lifecycle.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(tag = "phase", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "phase",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum ImportLifecycleEvent {
     Hovered {
         files: Vec<DropFile>,
@@ -403,13 +411,7 @@ fn run_worker(
             let index = offset + 1;
             let completed = offset;
             if batch.cancellation.is_requested() {
-                emit_cancelled(
-                    &emitter,
-                    batch.id,
-                    index,
-                    total,
-                    &candidate.file.name,
-                );
+                emit_cancelled(&emitter, batch.id, index, total, &candidate.file.name);
                 continue;
             }
             if !candidate.file.supported {
@@ -451,8 +453,9 @@ fn run_worker(
                     index,
                     total,
                     file_name: candidate.file.name,
-                    message: "The engine is unavailable. Restart the editor, then try this import again."
-                        .into(),
+                    message:
+                        "The engine is unavailable. Restart the editor, then try this import again."
+                            .into(),
                     recoverable: true,
                 });
                 continue;
@@ -512,13 +515,7 @@ fn run_worker(
                         break;
                     }
                     Ok(ImportAssetResult::Cancelled) => {
-                        emit_cancelled(
-                            &emitter,
-                            batch.id,
-                            index,
-                            total,
-                            &candidate.file.name,
-                        );
+                        emit_cancelled(&emitter, batch.id, index, total, &candidate.file.name);
                         break;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -623,11 +620,7 @@ mod tests {
         (emitter, events)
     }
 
-    fn batch(
-        control: &NativeImportControl,
-        id: u64,
-        candidates: Vec<DropCandidate>,
-    ) -> DropBatch {
+    fn batch(control: &NativeImportControl, id: u64, candidates: Vec<DropCandidate>) -> DropBatch {
         DropBatch {
             id,
             candidates,
@@ -651,7 +644,11 @@ mod tests {
 
         let unknown = classify_path(Path::new("factory.not-a-format"));
         assert!(!unknown.file.supported);
-        assert!(unknown.file.reason.as_deref().is_some_and(|reason| !reason.is_empty()));
+        assert!(unknown
+            .file
+            .reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty()));
     }
 
     #[test]
@@ -678,26 +675,26 @@ mod tests {
         let (batch_tx, _batch_rx) = mpsc::sync_channel(1);
         let control = NativeImportControl::default();
         batch_tx
-            .try_send(batch(
-                &control,
-                1,
-                vec![candidate("already.stp", true)],
-            ))
+            .try_send(batch(&control, 1, vec![candidate("already.stp", true)]))
             .unwrap();
         let (emitter, events) = recording_emitter();
 
         let started = Instant::now();
-        dispatch_drop(
-            &[PathBuf::from("next.stp")],
-            &batch_tx,
-            &emitter,
-            &control,
-        );
+        dispatch_drop(&[PathBuf::from("next.stp")], &batch_tx, &emitter, &control);
         assert!(started.elapsed() < Duration::from_millis(50));
 
         let events = events.lock().unwrap();
-        assert!(matches!(events.first(), Some(ImportLifecycleEvent::Dropped { .. })));
-        assert!(matches!(events.last(), Some(ImportLifecycleEvent::Failed { recoverable: true, .. })));
+        assert!(matches!(
+            events.first(),
+            Some(ImportLifecycleEvent::Dropped { .. })
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(ImportLifecycleEvent::Failed {
+                recoverable: true,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -708,13 +705,7 @@ mod tests {
         let control = NativeImportControl::default();
         let worker_control = control.clone();
         let worker = std::thread::spawn(move || {
-            run_worker(
-                batch_rx,
-                engine_tx,
-                emitter,
-                worker_control,
-                test_timing(),
-            );
+            run_worker(batch_rx, engine_tx, emitter, worker_control, test_timing());
         });
 
         batch_tx
@@ -788,13 +779,7 @@ mod tests {
         let control = NativeImportControl::default();
         let worker_control = control.clone();
         let worker = std::thread::spawn(move || {
-            run_worker(
-                batch_rx,
-                engine_tx,
-                emitter,
-                worker_control,
-                test_timing(),
-            );
+            run_worker(batch_rx, engine_tx, emitter, worker_control, test_timing());
         });
 
         batch_tx
@@ -804,7 +789,8 @@ mod tests {
                 vec![candidate("large_factory.3dxml", true)],
             ))
             .unwrap();
-        let EngineCmd::ImportAsset { reply, .. } = engine_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        let EngineCmd::ImportAsset { reply, .. } =
+            engine_rx.recv_timeout(Duration::from_secs(1)).unwrap()
         else {
             panic!("drop bypassed EngineCmd::ImportAsset");
         };
@@ -842,7 +828,10 @@ mod tests {
             51,
             vec![candidate("cancel-before-start.step", true)],
         );
-        assert!(control.cancel(51), "an open queued batch accepts cancellation");
+        assert!(
+            control.cancel(51),
+            "an open queued batch accepts cancellation"
+        );
         batch_tx.send(cancelled).unwrap();
 
         let retry = batch(
@@ -854,13 +843,7 @@ mod tests {
 
         let worker_control = control.clone();
         let worker = std::thread::spawn(move || {
-            run_worker(
-                batch_rx,
-                engine_tx,
-                emitter,
-                worker_control,
-                test_timing(),
-            );
+            run_worker(batch_rx, engine_tx, emitter, worker_control, test_timing());
         });
 
         let EngineCmd::ImportAsset { path, reply, .. } = engine_rx
@@ -878,14 +861,12 @@ mod tests {
         worker.join().unwrap();
 
         let events = events.lock().unwrap();
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ImportLifecycleEvent::Cancelled { batch_id: 51, .. }
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ImportLifecycleEvent::Succeeded { batch_id: 52, .. }
-        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ImportLifecycleEvent::Cancelled { batch_id: 51, .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ImportLifecycleEvent::Succeeded { batch_id: 52, .. })));
         assert!(!control.contains(51));
         assert!(!control.contains(52));
     }
@@ -898,13 +879,7 @@ mod tests {
         let control = NativeImportControl::default();
         let worker_control = control.clone();
         let worker = std::thread::spawn(move || {
-            run_worker(
-                batch_rx,
-                engine_tx,
-                emitter,
-                worker_control,
-                test_timing(),
-            );
+            run_worker(batch_rx, engine_tx, emitter, worker_control, test_timing());
         });
 
         batch_tx
@@ -951,25 +926,18 @@ mod tests {
         let control = NativeImportControl::default();
         let worker_control = control.clone();
         let worker = std::thread::spawn(move || {
-            run_worker(
-                batch_rx,
-                engine_tx,
-                emitter,
-                worker_control,
-                test_timing(),
-            );
+            run_worker(batch_rx, engine_tx, emitter, worker_control, test_timing());
         });
         batch_tx
-            .send(batch(
-                &control,
-                43,
-                vec![candidate("notes.txt", false)],
-            ))
+            .send(batch(&control, 43, vec![candidate("notes.txt", false)]))
             .unwrap();
         drop(batch_tx);
         worker.join().unwrap();
 
-        assert!(matches!(engine_rx.try_recv(), Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected)));
+        assert!(matches!(
+            engine_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected)
+        ));
         assert!(events
             .lock()
             .unwrap()
