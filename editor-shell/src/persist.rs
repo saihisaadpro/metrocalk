@@ -101,6 +101,8 @@ pub enum Record {
     RoleClear { id: String },
     /// Cinematics - one shot removed by index.
     CinemaRemove { id: String, index: usize },
+    /// Cinematics - the authored pacing mood changed.
+    CinemaMood { id: String, mood: String },
     /// VFX - one effect layer added to an object.
     VfxAdd {
         id: String,
@@ -476,6 +478,12 @@ impl Log {
                     .is_some_and(|e| {
                         crate::cinema_intent::remove_shot_ops(engine, e, index)
                             .is_ok_and(|(ops, _)| engine.commit("cinema-remove", ops).is_ok())
+                    }),
+                Record::CinemaMood { id, mood } => metrocalk_core::EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .is_some_and(|e| {
+                        crate::cinema_intent::set_mood_ops(engine, e, &mood)
+                            .is_ok_and(|(ops, _)| engine.commit("cinema-mood", ops).is_ok())
                     }),
                 Record::VfxAdd {
                     id,

@@ -209,9 +209,11 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .build(),
         // M11.3 (ADR-042): a real, authored light. `kind` picks Directional/Point/Spot; `r/g/b` is the linear
         // colour, `intensity` the strength; point/spot use the entity Transform's position + `range` falloff;
-        // directional/spot aim along `dir*` (default straight down). `castShadows` (consumed by the shadow
-        // pass) defaults off. Authoring a light is one undoable component commit (it rides the registry like
-        // any other component); the per-frame LIT RESULT is a render projection (never Loro), per ADR-021.
+        // directional/spot aim along `dir*` (default straight down). This renderer has one directional
+        // shadow map: `castShadows` is meaningful for directional lights; authored point/spot lights retain
+        // `false` until those shadow modes exist. Authoring a light is one undoable component commit (it
+        // rides the registry like any other component); the per-frame LIT RESULT is a render projection
+        // (never Loro), per ADR-021.
         ComponentMeta::builder("Light")
             .category("Props")
             .field("kind", Str, false)

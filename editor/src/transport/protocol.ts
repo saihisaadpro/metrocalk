@@ -1983,6 +1983,8 @@ export interface CinemaReply {
   entity: string | null;
   shots: number;
   seconds: number;
+  /** The authored pacing dial that drives effective shot duration and transition length. */
+  mood: "calm" | "normal" | "tense";
   /** The cutscene read back as sentences, one line per shot. */
   reads: string[];
   /** Continuity warnings in plain language (a jump cut, opening tight, a rushed shot). */

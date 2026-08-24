@@ -186,6 +186,44 @@ describe("CinemaSection", () => {
     await waitFor(() => expect(screen.getByTestId("cinema-shots").textContent).toMatch(/pushing in/));
   });
 
+  it("authors Calm pacing through the shared control and displays the effective duration", async () => {
+    const client = fakeClient();
+    let mood: "calm" | "normal" | "tense" = "normal";
+    client.cinemaList = vi.fn((id: string) => Promise.resolve({
+      entity: id,
+      shots: 1,
+      seconds: mood === "calm" ? 6.25 : 2.5,
+      mood,
+      reads: ["a full shot of e1, three-quarters on, pushing in"],
+      problems: [],
+      message: "",
+      reason: null,
+    }));
+    client.cinemaSetMood = vi.fn((id: string, next: "calm" | "normal" | "tense") => {
+      mood = next;
+      return Promise.resolve({
+        entity: id,
+        shots: 1,
+        seconds: next === "calm" ? 6.25 : 2.5,
+        mood: next,
+        reads: ["a full shot of e1, three-quarters on, pushing in"],
+        problems: [],
+        message: `Pacing set to ${next}`,
+        reason: null,
+      });
+    });
+    selectSomething();
+    render(<CinemaSection client={client} />);
+
+    const calm = await screen.findByTestId("cinema-mood-calm");
+    expect(calm.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(calm);
+
+    await waitFor(() => expect(client.cinemaSetMood).toHaveBeenCalledWith("e1", "calm"));
+    await waitFor(() => expect(calm.getAttribute("aria-pressed")).toBe("true"));
+    expect(screen.getByTestId("cinema-section").textContent).toContain("6.3s");
+  });
+
   it("locks shot authoring during Play", async () => {
     const client = fakeClient();
     selectSomething();

@@ -34,11 +34,18 @@ const EMPTY: CinemaReply = {
   entity: null,
   shots: 0,
   seconds: 0,
+  mood: "normal",
   reads: [],
   problems: [],
   message: "",
   reason: null,
 };
+
+const MOODS = [
+  { value: "calm", label: "Calm", title: "Measured, cinematic pacing — 2.5× the authored shot length" },
+  { value: "normal", label: "Normal", title: "The authored shot length, unchanged" },
+  { value: "tense", label: "Tense", title: "Urgent pacing — 0.75× the authored shot length" },
+] as const;
 
 export function CinemaSection({ client }: { client: EditorClient }) {
   const selected = useSelectedId();
@@ -157,6 +164,30 @@ export function CinemaSection({ client }: { client: EditorClient }) {
                 · {cut.shots} shot{cut.shots === 1 ? "" : "s"} · {cut.seconds.toFixed(1)}s
               </span>
             )}
+          </div>
+
+          <div
+            role="group"
+            aria-label="Cinematic pacing"
+            style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: space.xs }}
+          >
+            {MOODS.map((mood) => (
+              <Button
+                key={mood.value}
+                data-testid={`cinema-mood-${mood.value}`}
+                variant={cut.mood === mood.value ? "primary" : "secondary"}
+                compact
+                disabled={busy || playing}
+                aria-pressed={cut.mood === mood.value}
+                title={playing ? "Stop Play first — pacing is authored, not live-edited" : mood.title}
+                onClick={() => selected && void run(
+                  () => client.cinemaSetMood(selected, mood.value),
+                  `${mood.label} pacing`,
+                )}
+              >
+                {mood.label}
+              </Button>
+            ))}
           </div>
 
           <div

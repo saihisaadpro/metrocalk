@@ -26,9 +26,21 @@ import {
   animationWorkspaceView,
   type AnimationDraftValue,
 } from "../store/animation";
-import { Badge, Button, NumericField } from "../theme/primitives";
+import {
+  Badge,
+  Button,
+  NumericField,
+  ReadOut,
+  SearchField,
+  SelectField,
+  Slider,
+  SliderField,
+  Toolbar,
+  ToolbarGroup,
+  ToolbarSeparator,
+} from "../theme/primitives";
 import { Modal } from "../theme/Popover";
-import { DisclosureSection, DockTabs, EmptyPanelState, ShortcutBadge } from "../theme/workspace";
+import { DisclosureSection, DockTabs, EmptyPanelState } from "../theme/workspace";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import { AnimationGraphEditor } from "../graph/AnimationGraphEditor";
 import type {
@@ -181,6 +193,25 @@ function capabilityTone(state: string): "success" | "warn" | "neutral" {
 function draftString(value: AnimationDraftValue | undefined): string {
   return typeof value === "string" ? value : "";
 }
+
+/** WHAT A TAB BADGE IS ALLOWED TO SAY. The badge was `state.replace("_", " ")` — so a tab whose
+ *  LABEL is two characters ("2D") carried an eleven-character word ("unsupported") beside it, four
+ *  times the width of the thing it annotates. Measured in the Animate dock at a 1440 window, where
+ *  the workspace is 648px wide: the three context tabs came to 313px, the surface tabs to 178 and the
+ *  sequence caption to 157 — 648 exactly, with no slack at all, and both the label and the badge
+ *  ellipsising inside their own tab ("2.. unsupport…"). A strip with zero slack loses its next
+ *  control silently, which is the defect `unclipped` exists to catch.
+ *
+ *  The full sentence is NOT lost and was never carried here: the tab's `title` is
+ *  `readiness.reason`, and the readiness box directly below the tabs prints the state as a Badge
+ *  WITH the reason and the next action in full. This is the annotation; that is the explanation. */
+const READINESS_BADGE: Record<AnimationBindingState, string> = {
+  ready: "ready",
+  preview_only: "preview",
+  read_only: "read-only",
+  unsupported: "none",
+  invalid: "error",
+};
 
 function contextReadiness(model: AnimationWorkspaceInfo, context: AnimationContext): AnimationContextReadiness {
   const explicit = model.contexts?.find((item) => item.context === context);
@@ -1383,7 +1414,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
     return {
       id: context,
       label: CONTEXT_LABELS[context],
-      badge: readiness.state === "ready" ? readiness.tracks || readiness.properties : readiness.state.replace("_", " "),
+      badge: readiness.state === "ready" ? readiness.tracks || readiness.properties : READINESS_BADGE[readiness.state],
       tooltip: readiness.reason,
     };
   });
@@ -1416,6 +1447,14 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
     void transport("scrub", snapTick(tick));
   }
 
+  /** One frame at a time, in the one place both the arrow keys and the transport buttons read.
+   *  It was inline in the key handler and reachable ONLY from the keyboard, behind a hint printed as
+   *  prose on the toolbar — an affordance that does not exist for anyone who did not read the hint. */
+  function stepFrame(direction: 1 | -1) {
+    const frame = Math.max(1, Math.round(model.ticksPerSecond / 60));
+    void transport("scrub", Math.max(0, Math.min(duration, displayTick + direction * frame)));
+  }
+
   function onWorkspaceKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
     if (isInteractiveTarget(event.target)) {
       // Keep W/E/R/F, Space, Delete, and arrow keys owned by the focused editor control, not App's viewport.
@@ -1436,9 +1475,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
     } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
       event.preventDefault();
       event.stopPropagation();
-      const direction = event.key === "ArrowRight" ? 1 : -1;
-      const frame = Math.max(1, Math.round(model.ticksPerSecond / 60));
-      void transport("scrub", Math.max(0, Math.min(duration, displayTick + direction * frame)));
+      stepFrame(event.key === "ArrowRight" ? 1 : -1);
     }
   }
 
@@ -1454,7 +1491,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
       style={{ display: "grid", gridTemplateRows: "auto auto minmax(0, 1fr)", height: "100%", minHeight: 300, color: color.text.primary, font: font.ui }}
     >
       <div style={{ display: "flex", alignItems: "center", minWidth: 0, borderBottom: `1px solid ${color.border.subtle}`, background: color.bg.panel }}>
-        <div style={{ flex: "1 1 auto", minWidth: 0 }}>
+        <div style={{ flex: "0 1 auto", minWidth: 0 }}>
           <DockTabs
             id="animation-contexts"
             ariaLabel="Animation context"
@@ -1478,56 +1515,104 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             if (surface !== "graph") animationEditorStore.getState().setView(workspaceKey, activeContext, surface);
           }}
         />
-        {/* A READ-OUT MUST NOT OUTRANK A CONTROL. `nowrap` with no `minWidth: 0` made this caption
-            the one thing on the row that could not yield, so the two tab strips beside it were
-            squeezed until `UI` and `Graph` scrolled out of a strip that shows no scrollbar — 341px
-            of context tabs in 231px at a 1440 window. It is the least important thing here: it names
-            the sequence, and the sequence is also named in the timeline below. It ellipsises now, and
-            keeps its title so the full text is still available. */}
+        {/* WHICH DOCUMENT. Metadata, and the only thing on this row that may be cut short — its full
+            text is its own `title` and the timeline below names the same sequence.
+
+            IT USED TO EAT THE ROW. Measured in the Animate dock at a 1440 window, where the workspace
+            is 648px wide: the context tabs wanted 313px (an eleven-character "unsupported" badge on a
+            two-character "2D" label), the surface tabs 178 and this caption 215 — 706 into 648 — so
+            all six tabs ellipsised and `2D` rendered as `2…`. Two changes made the row fit with
+            254px to spare: the badge vocabulary above, and the context strip no longer GROWING into
+            slack it does not need (`0 1 auto`), which is what left the caption to be squeezed out of
+            a row it was already the least important thing on. */}
         <span
+          data-testid="animation-sequence"
+          className="animation-sequence"
           title={`One sequence · ${model.sequenceName} · rev ${model.revision || "legacy"}`}
-          style={{ flexShrink: 8, minWidth: 0, padding: `0 ${space.sm}px`, overflow: "hidden", color: color.text.muted, fontSize: fontSize.meta, whiteSpace: "nowrap", textOverflow: "ellipsis" }}
         >
           One sequence · {model.sequenceName} · rev {model.revision || "legacy"}
         </span>
       </div>
 
-      <div style={{ display: "flex", alignItems: "center", gap: space.sm, padding: space.sm, borderBottom: `1px solid ${color.border.subtle}`, background: color.bg.raised, overflowX: "auto" }}>
-        <Button compact aria-label={model.playing ? "Pause animation" : "Play animation"} data-testid="animation-play" onClick={() => void transport(model.playing ? "pause" : "play")}>
-          {model.playing ? "Pause" : "Play"}
-        </Button>
-        <Button compact variant="ghost" data-testid="animation-stop" onClick={stopAnimation}>Stop</Button>
-        <span style={{ font: font.mono, fontSize: fontSize.body, minWidth: 122 }} data-testid="animation-time">
-          {timeLabel(displayTick, model.ticksPerSecond, contextView.timeDisplay)} · {displayTick}t
-        </span>
-        <input
-          aria-label="Animation timeline"
-          data-testid="animation-scrub"
-          type="range"
-          min={0}
-          max={duration}
-          step={Math.max(1, Math.round(model.ticksPerSecond / 120))}
-          value={Math.min(displayTick, duration)}
-          onChange={(event) => void transport("scrub", snapTick(Number(event.target.value)))}
-          style={{ flex: "1 1 160px", minWidth: 120 }}
-        />
-        <select
-          aria-label="Loop policy"
-          value={model.loopPolicy}
-          disabled={clipPreviewId !== null || clipPreviewPending}
-          title={clipPreviewId !== null || clipPreviewPending
-            ? "Unsaved imported-clip previews use a bounded one-shot lease. Stop preview to change the authored loop policy."
-            : undefined}
-          onChange={(event) => void transport(model.playing ? "play" : "scrub", model.playing ? undefined : displayTick, event.target.value as AnimationLoopPolicy)}
-          style={selectStyle}
-        >
-          <option value="once">Once</option><option value="loop">Loop</option><option value="ping_pong">Ping-pong</option>
-        </select>
-        <Badge tone={model.playing ? "success" : "neutral"}>{model.playing ? "previewing" : "stopped"}</Badge>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: space.xs, color: color.text.muted, fontSize: fontSize.micro }}>
-          <ShortcutBadge keys="Space" /> play · <ShortcutBadge keys={["←", "→"]} ariaLabel="Left or Right arrow" /> frame
-        </span>
-      </div>
+      {/* THE ROW THE REFERENCES ARE ABOUT, AND THE ONE THIS EDITOR HAD LEAST OF. What was here was
+          seven unrelated things at one flex gap on an `overflow-x: auto` strip: Play, Stop, a
+          122px-min timecode, a raw browser range, a raw browser select, a state badge, and then a
+          run of hint prose ("Space play · ←+→ frame") whose kbd chips collided with the badge beside
+          them at every width the dock is actually opened at. Measured on HEAD at 1440: the hint ran
+          into the loop select and the row scrolled its own right-hand end away with no scrollbar.
+
+          It is four GROUPS now, in the order the reference reads: what time it is · the transport ·
+          where you are in the clip · how it repeats and what it is doing. The shortcut hints moved
+          into the `title` of the control they belong to, which is where a hint is discoverable
+          rather than in the way — and the arrow-key step is now a BUTTON as well, because a
+          keyboard-only affordance is not an affordance for someone who has not read the hint. */}
+      <Toolbar tight data-testid="animation-transport" role="group" aria-label="Animation transport">
+        <ReadOut data-testid="animation-time" unit={`${displayTick}t`} title="Playhead position — clip time and absolute ticks">
+          {timeLabel(displayTick, model.ticksPerSecond, contextView.timeDisplay)}
+        </ReadOut>
+        <ToolbarGroup attached aria-label="Playback">
+          <Button
+            compact
+            icon
+            aria-label="Step back one frame"
+            title="Step back one frame (Left arrow)"
+            data-testid="animation-step-back"
+            onClick={() => stepFrame(-1)}
+          >
+            ⏮
+          </Button>
+          <Button
+            compact
+            icon
+            variant={model.playing ? "toggle" : "primary"}
+            active={model.playing}
+            aria-label={model.playing ? "Pause animation" : "Play animation"}
+            title={model.playing ? "Pause (Space)" : "Play (Space)"}
+            data-testid="animation-play"
+            onClick={() => void transport(model.playing ? "pause" : "play")}
+          >
+            {model.playing ? "⏸" : "▶"}
+          </Button>
+          <Button
+            compact
+            icon
+            aria-label="Step forward one frame"
+            title="Step forward one frame (Right arrow)"
+            data-testid="animation-step-forward"
+            onClick={() => stepFrame(1)}
+          >
+            ⏭
+          </Button>
+          <Button compact icon aria-label="Stop and rewind" title="Stop and rewind to the start" data-testid="animation-stop" onClick={stopAnimation}>
+            ⏹
+          </Button>
+        </ToolbarGroup>
+        <ToolbarGroup grow={180} aria-label="Scrub">
+          <Slider
+            aria-label="Animation timeline"
+            data-testid="animation-scrub"
+            min={0}
+            max={duration}
+            step={Math.max(1, Math.round(model.ticksPerSecond / 120))}
+            value={Math.min(displayTick, duration)}
+            onChange={(event) => void transport("scrub", snapTick(Number(event.target.value)))}
+          />
+        </ToolbarGroup>
+        <ToolbarGroup aria-label="Repeat">
+          <SelectField
+            aria-label="Loop policy"
+            value={model.loopPolicy}
+            disabled={clipPreviewId !== null || clipPreviewPending}
+            title={clipPreviewId !== null || clipPreviewPending
+              ? "Unsaved imported-clip previews use a bounded one-shot lease. Stop preview to change the authored loop policy."
+              : "How the clip repeats when it reaches the end"}
+            onChange={(event) => void transport(model.playing ? "play" : "scrub", model.playing ? undefined : displayTick, event.target.value as AnimationLoopPolicy)}
+          >
+            <option value="once">Once</option><option value="loop">Loop</option><option value="ping_pong">Ping-pong</option>
+          </SelectField>
+          <Badge tone={model.playing ? "success" : "neutral"}>{model.playing ? "previewing" : "stopped"}</Badge>
+        </ToolbarGroup>
+      </Toolbar>
 
       {activeSurface === "graph" ? (
         <AnimationGraphEditor client={client} sequenceId={model.sequenceId || "main"} workspaceKey={graphWorkspaceKey} />
@@ -1682,57 +1767,70 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             scroller (an `overflow-x: auto` with no `overflow-y` computes to `auto` on both axes),
             which means it went straight back to being the same defect one box further in. */}
         <section className="animation-workspace-timeline" style={{ ...card, display: "grid", gridTemplateRows: "min-content minmax(auto, 1fr)", minWidth: 0, overflow: "hidden auto" }} aria-label="Animation timeline editor">
-          <div style={{ display: "flex", alignItems: "center", gap: space.sm, padding: space.sm, borderBottom: `1px solid ${color.border.subtle}`, background: color.bg.raised, overflowX: "auto" }}>
-            <input
-              type="search"
-              className="mtk-input"
-              data-testid="animation-search"
-              aria-label="Search animation tracks"
-              placeholder={`Filter ${CONTEXT_LABELS[activeContext]} tracks…`}
-              value={contextView.search}
-              onChange={(event) => animationEditorStore.getState().setSearch(workspaceKey, activeContext, event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Escape" && contextView.search) animationEditorStore.getState().setSearch(workspaceKey, activeContext, "");
-              }}
-              style={{ flex: "1 1 130px", minWidth: 100 }}
-            />
-            <Button
-              compact
-              variant="ghost"
-              active={contextView.snap.enabled}
-              aria-pressed={contextView.snap.enabled}
-              data-testid="animation-snap"
-              onClick={() => animationEditorStore.getState().setSnap(workspaceKey, activeContext, { enabled: !contextView.snap.enabled })}
-              title="Snap timeline clicks to frames, nearby keys, and markers"
-            >
-              Snap {contextView.snap.enabled ? "on" : "off"}
-            </Button>
-            <label style={{ display: "flex", alignItems: "center", gap: space.xs, color: color.text.muted, fontSize: fontSize.micro }}>
-              Zoom
-              <input
-                type="range"
+          {/* Four groups, not six loose controls: what you are looking at (search) · how it snaps ·
+              how far in you are (zoom, WITH its number, which a bare bar can be dragged but not
+              aimed without) · what the ruler counts in, and whether the key inspector is showing.
+              The row wraps; the strip it replaced was `overflow-x: auto` with no visible scrollbar,
+              so at the dock's real widths the unit select and the inspector toggle were simply gone
+              from the screen with nothing saying they existed. */}
+          <Toolbar tight data-testid="animation-timeline-toolbar" role="group" aria-label="Timeline view">
+            <ToolbarGroup grow={140}>
+              <SearchField
+                data-testid="animation-search"
+                aria-label="Search animation tracks"
+                placeholder={`Filter ${CONTEXT_LABELS[activeContext]} tracks…`}
+                value={contextView.search}
+                onChange={(event) => animationEditorStore.getState().setSearch(workspaceKey, activeContext, event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape" && contextView.search) animationEditorStore.getState().setSearch(workspaceKey, activeContext, "");
+                }}
+              />
+            </ToolbarGroup>
+            <ToolbarSeparator />
+            <ToolbarGroup>
+              <Button
+                compact
+                variant="toggle"
+                active={contextView.snap.enabled}
+                data-testid="animation-snap"
+                onClick={() => animationEditorStore.getState().setSnap(workspaceKey, activeContext, { enabled: !contextView.snap.enabled })}
+                title="Snap timeline clicks to frames, nearby keys, and markers"
+              >
+                Snap {contextView.snap.enabled ? "on" : "off"}
+              </Button>
+              <SliderField
+                label="Zoom"
+                ariaLabel="Timeline zoom"
+                data-testid="animation-zoom"
                 min={Math.log2(MIN_ANIMATION_ZOOM)}
                 max={Math.log2(MAX_ANIMATION_ZOOM)}
                 step={0.25}
-                aria-label="Timeline zoom"
-                data-testid="animation-zoom"
                 value={Math.log2(contextView.zoom)}
+                valueLabel={`${contextView.zoom < 1 ? contextView.zoom.toFixed(2) : contextView.zoom.toFixed(1)}×`}
                 onChange={(event) => animationEditorStore.getState().setZoom(workspaceKey, activeContext, 2 ** Number(event.target.value))}
               />
-              <span>{contextView.zoom < 1 ? contextView.zoom.toFixed(2) : contextView.zoom.toFixed(1)}×</span>
-            </label>
-            <select
-              aria-label="Timeline time display"
-              value={contextView.timeDisplay}
-              onChange={(event) => animationEditorStore.getState().setTimeDisplay(workspaceKey, activeContext, event.target.value as "frames" | "seconds" | "ticks")}
-              style={selectStyle}
-            >
-              <option value="frames">Frames</option><option value="seconds">Seconds</option><option value="ticks">Ticks</option>
-            </select>
-            <Button compact variant="ghost" onClick={() => animationEditorStore.getState().setInspectorOpen(workspaceKey, activeContext, !contextView.inspector.open)}>
-              {contextView.inspector.open ? "Hide" : "Show"} inspector
-            </Button>
-          </div>
+            </ToolbarGroup>
+            <ToolbarSeparator />
+            <ToolbarGroup>
+              <SelectField
+                aria-label="Timeline time display"
+                title="What the ruler counts in"
+                value={contextView.timeDisplay}
+                onChange={(event) => animationEditorStore.getState().setTimeDisplay(workspaceKey, activeContext, event.target.value as "frames" | "seconds" | "ticks")}
+              >
+                <option value="frames">Frames</option><option value="seconds">Seconds</option><option value="ticks">Ticks</option>
+              </SelectField>
+              <Button
+                compact
+                variant="toggle"
+                active={contextView.inspector.open}
+                title={contextView.inspector.open ? "Hide the key inspector" : "Show the key inspector"}
+                onClick={() => animationEditorStore.getState().setInspectorOpen(workspaceKey, activeContext, !contextView.inspector.open)}
+              >
+                Keys
+              </Button>
+            </ToolbarGroup>
+          </Toolbar>
 
           {contextView.view === "curves" ? (
             <CurveEditor
@@ -1744,7 +1842,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
           ) : (
             <div
               ref={timelineRef}
-              className="mtk-scroll"
+              className="mtk-scroll mtk-timeline"
               data-testid="animation-timeline-viewport"
               onScroll={(event) => {
                 const x = event.currentTarget.scrollLeft;
@@ -1757,9 +1855,9 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                   scrollCommitTimer.current = null;
                 }, 120);
               }}
-              style={{ minHeight: TIMELINE_MIN_H, overflow: "auto", background: color.bg.inset }}
+              style={{ minHeight: TIMELINE_MIN_H, overflow: "auto" }}
             >
-              <div style={{ width: 178 + timelineWidth, minHeight: "100%" }}>
+              <div style={{ width: 178 + timelineWidth }}>
                 <Ruler
                   duration={duration}
                   currentTick={displayTick}
@@ -1817,17 +1915,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                   ))}
                 </AnnotationLane>
 
-                {visibleTracks.length === 0 ? (
-                  <div style={{ width: 178 + timelineWidth, padding: space.lg }}>
-                    <EmptyPanelState
-                      compact
-                      icon="◇"
-                      title={contextTracks.length === 0 ? `No ${CONTEXT_LABELS[activeContext]} tracks yet` : "No matching tracks"}
-                      description={contextTracks.length === 0 ? "Choose a compatible property and add a key at the playhead." : `Clear “${contextView.search}” to show all context tracks.`}
-                      primaryAction={contextView.search ? <Button compact onClick={() => animationEditorStore.getState().setSearch(workspaceKey, activeContext, "")}>Clear filter</Button> : undefined}
-                    />
-                  </div>
-                ) : visibleTracks.map((track) => {
+                {visibleTracks.length === 0 ? null : visibleTracks.map((track) => {
                   const active = selectedTrack?.id === track.id;
                   const state = bindingState(track);
                   return (
@@ -1838,9 +1926,10 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                       data-enabled={track.enabled}
                       data-locked={track.locked}
                       data-binding-state={state}
-                      style={{ display: "grid", gridTemplateColumns: `178px ${timelineWidth}px`, minHeight: 48, opacity: track.enabled ? 1 : 0.52, borderTop: `1px solid ${state === "invalid" ? color.danger.border : color.border.subtle}` }}
+                      className={`mtk-timeline__row mtk-timeline__row--track${state === "invalid" ? " is-invalid" : ""}${track.enabled ? "" : " is-muted"}`}
+                      style={{ ["--mtk-timeline-width" as string]: `${timelineWidth}px` }}
                     >
-                      <div style={{ position: "sticky", left: 0, zIndex: 4, display: "grid", gridTemplateColumns: "1fr auto", gap: space.xs, padding: space.sm, outline: active ? `1px solid ${color.accent.base}` : "none", background: active ? color.accent.subtle : color.bg.panel }}>
+                      <div className={`mtk-timeline__head${active ? " is-selected" : ""}`}>
                         <button
                           type="button"
                           aria-pressed={active}
@@ -1877,7 +1966,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                           >{track.locked ? "▣" : "□"}</Button>
                         </div>
                       </div>
-                      <div onClick={scrubLane} style={{ position: "relative", minHeight: 47, backgroundImage: `linear-gradient(to right, ${color.border.subtle} 1px, transparent 1px)`, backgroundSize: `${Math.max(20, timelineWidth / 10)}px 100%`, cursor: "crosshair" }}>
+                      <div className="mtk-timeline__lane mtk-timeline__lane--gridded" onClick={scrubLane}>
                         <Playhead />
                         {track.keys.map((key) => {
                           const identity = keySelectionId(track.id, key.id);
@@ -1910,6 +1999,24 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                   );
                 })}
               </div>
+              {/* WHY THIS IS NOT INSIDE THE STRIP ABOVE. It was, and `EmptyPanelState` centres itself
+                  in its container — which there is the 822px SCROLL width (178px of track headers +
+                  644px of lanes), not the 634px the user can see. The result, captured: a lone "◇"
+                  glyph adrift near the right edge with its title and its next step scrolled off the
+                  side of a viewport whose scrollbar is horizontal. As a child of the scroller a
+                  percentage width resolves against the visible box, and `sticky` keeps it there while
+                  the lanes above it pan. */}
+              {visibleTracks.length === 0 && (
+                <div className="mtk-timeline__empty">
+                    <EmptyPanelState
+                      inline
+                      icon="◇"
+                      title={contextTracks.length === 0 ? `No ${CONTEXT_LABELS[activeContext]} tracks yet` : "No matching tracks"}
+                      description={contextTracks.length === 0 ? "Choose a compatible property and add a key at the playhead." : `Clear “${contextView.search}” to show all context tracks.`}
+                      primaryAction={contextView.search ? <Button compact onClick={() => animationEditorStore.getState().setSearch(workspaceKey, activeContext, "")}>Clear filter</Button> : undefined}
+                    />
+                </div>
+              )}
             </div>
           )}
         </section>
@@ -2448,6 +2555,12 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
   );
 }
 
+/** The ruler, on the shared timeline classes. What it looked like before: a bare row with ten mono
+ *  labels floating in it, a 1px accent hairline for a playhead, and the 178px header width written
+ *  as a literal here, again in `AnnotationLane`, and a third time in the track rows — three
+ *  statements of one number that nothing compared. `--mtk-track-header` is that number now, declared
+ *  once on `.mtk-timeline`, and the graticule under the labels is what gives the eye anything to
+ *  read between them. */
 function Ruler({
   duration,
   currentTick,
@@ -2465,19 +2578,19 @@ function Ruler({
 }) {
   const ticks = Array.from({ length: 11 }, (_, index) => Math.round((duration * index) / 10));
   return (
-    <div style={{ display: "grid", gridTemplateColumns: `178px ${width}px`, height: RULER_H, position: "sticky", top: 0, zIndex: 7, borderBottom: `1px solid ${color.border.default}`, background: color.bg.raised }}>
-      <div style={{ position: "sticky", left: 0, zIndex: 8, display: "flex", alignItems: "center", padding: `0 ${space.sm}px`, background: color.bg.raised, fontSize: fontSize.meta, color: color.text.secondary }}>Tracks</div>
+    <div className="mtk-timeline__row mtk-timeline__ruler" style={{ ["--mtk-timeline-width" as string]: `${width}px` }}>
+      <div className="mtk-timeline__head">Tracks</div>
       <div
+        className="mtk-timeline__ruler-track"
         data-testid="animation-ruler"
         onClick={(event) => {
           const bounds = event.currentTarget.getBoundingClientRect();
           if (bounds.width > 0) onScrub(((event.clientX - bounds.left) / bounds.width) * duration);
         }}
-        style={{ position: "relative", cursor: "crosshair" }}
       >
-        <Playhead tick={currentTick} duration={duration} />
+        <Playhead tick={currentTick} duration={duration} handle />
         {ticks.map((tick) => (
-          <span key={tick} style={{ position: "absolute", left: `${(tick / duration) * 100}%`, top: 5, transform: "translateX(-50%)", color: color.text.muted, font: font.mono, fontSize: fontSize.micro }}>
+          <span key={tick} className="mtk-timeline__tick" style={{ left: `${(tick / duration) * 100}%` }}>
             {timeLabel(tick, ticksPerSecond, display)}
           </span>
         ))}
@@ -2502,9 +2615,9 @@ function AnnotationLane({
   children: React.ReactNode;
 }) {
   return (
-    <div style={{ display: "grid", gridTemplateColumns: `178px ${width}px`, minHeight: LANE_MIN_H, borderBottom: `1px solid ${color.border.subtle}` }}>
-      <div style={{ position: "sticky", left: 0, zIndex: 5, padding: `${space.xs}px ${space.sm}px`, color: color.text.secondary, background: color.bg.panel, fontSize: fontSize.meta }}>{label}</div>
-      <div onClick={onLaneClick} style={{ position: "relative", minHeight: 29, cursor: "crosshair" }}>
+    <div className="mtk-timeline__row" style={{ ["--mtk-timeline-width" as string]: `${width}px` }}>
+      <div className="mtk-timeline__head">{label}</div>
+      <div className="mtk-timeline__lane mtk-timeline__lane--odd" onClick={onLaneClick}>
         <Playhead tick={currentTick} duration={duration} />
         {children}
       </div>
@@ -2512,9 +2625,18 @@ function AnnotationLane({
   );
 }
 
-function Playhead({ tick, duration }: { tick?: number; duration?: number }) {
+/** A line you can SEE and aim at. The previous one was 1px wide with a 4px glow, which against the
+ *  ruler's own background was neither visible at a glance nor a target for the pointer; `handle`
+ *  puts a cap on it in the ruler, where the scrub gesture actually lives. */
+function Playhead({ tick, duration, handle = false }: { tick?: number; duration?: number; handle?: boolean }) {
   const left = tick === undefined || duration === undefined ? "var(--animation-playhead, 0%)" : `${(tick / duration) * 100}%`;
-  return <div aria-hidden="true" style={{ position: "absolute", left, top: 0, bottom: 0, width: 1, background: color.accent.base, boxShadow: `0 0 4px ${color.accent.base}`, pointerEvents: "none", zIndex: 2 }} />;
+  return (
+    <div
+      aria-hidden="true"
+      className={`mtk-timeline__playhead${handle ? " mtk-timeline__playhead--handled" : ""}`}
+      style={{ left }}
+    />
+  );
 }
 
 function CurveEditor({

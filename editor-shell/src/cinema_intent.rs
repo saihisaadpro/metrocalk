@@ -151,6 +151,8 @@ pub fn shot_specs() -> Vec<ShotSpec> {
 pub enum CinemaError {
     /// No such card.
     UnknownShot(String),
+    /// No such pacing mood.
+    UnknownMood(String),
     /// The object is gone.
     MissingEntity,
     /// The shot list is full.
@@ -163,6 +165,9 @@ impl std::fmt::Display for CinemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownShot(k) => write!(f, "there is no shot called \"{k}\""),
+            Self::UnknownMood(mood) => {
+                write!(f, "there is no cinematic mood called \"{mood}\"")
+            }
             Self::MissingEntity => write!(f, "that object is no longer in the scene"),
             Self::TooMany(m) | Self::Blocked(m) => write!(f, "{m}"),
         }
@@ -181,6 +186,8 @@ pub struct CinemaReply {
     pub shots: usize,
     /// Total running time, seconds.
     pub seconds: f32,
+    /// The authored pacing dial currently driving effective duration and transitions.
+    pub mood: Mood,
     /// The whole cutscene read back as sentences — one line per shot.
     pub reads: Vec<String>,
     /// Continuity warnings, in plain language (a jump cut, opening tight, a rushed shot).
@@ -417,7 +424,7 @@ pub fn remove_shot_ops<W: World>(
 /// The ops that set the one global dial.
 ///
 /// # Errors
-/// [`CinemaError::UnknownShot`] when the mood name is not one of calm/normal/tense.
+/// [`CinemaError::UnknownMood`] when the mood name is not one of calm/normal/tense.
 pub fn set_mood_ops<W: World>(
     engine: &Engine<W>,
     entity: EntityId,
@@ -428,7 +435,7 @@ pub fn set_mood_ops<W: World>(
         "calm" => Mood::Calm,
         "normal" => Mood::Normal,
         "tense" => Mood::Tense,
-        other => return Err(CinemaError::UnknownShot(other.to_string())),
+        other => return Err(CinemaError::UnknownMood(other.to_string())),
     };
     Ok((write_ops(entity, &cut, false), cut))
 }
@@ -468,6 +475,14 @@ fn write_ops(entity: EntityId, cut: &Cutscene, arm: bool) -> Vec<Op> {
 /// Render one shot as the sentence the user reads back.
 #[must_use]
 pub fn describe_shot(shot: &ShotRecipe, subject_name: &str) -> String {
+    describe_shot_with_seconds(shot, subject_name, shot.seconds)
+}
+
+fn describe_shot_with_seconds(
+    shot: &ShotRecipe,
+    subject_name: &str,
+    effective_seconds: f32,
+) -> String {
     let size = match shot.size {
         ShotSize::ExtremeWide => "a distant",
         ShotSize::Wide => "a wide",
@@ -494,7 +509,7 @@ pub fn describe_shot(shot: &ShotRecipe, subject_name: &str) -> String {
     };
     format!(
         "{size} shot of {subject_name} {angle}, {motion} — {:.1}s",
-        shot.seconds
+        effective_seconds
     )
 }
 
@@ -505,7 +520,19 @@ pub fn reply_for(entity: EntityId, cut: &Cutscene, name: &str, message: String) 
         entity: Some(entity.to_loro_key()),
         shots: cut.shots.len(),
         seconds: cut.seconds(),
-        reads: cut.shots.iter().map(|s| describe_shot(s, name)).collect(),
+        mood: cut.mood,
+        reads: cut
+            .shots
+            .iter()
+            .enumerate()
+            .map(|(index, shot)| {
+                describe_shot_with_seconds(
+                    shot,
+                    name,
+                    cut.effective_shot_seconds(index).unwrap_or(shot.seconds),
+                )
+            })
+            .collect(),
         problems: cut.problems(),
         message,
         reason: None,
@@ -729,6 +756,29 @@ mod tests {
             !engine.components_of(hero).contains_key(CINEMA_COMPONENT),
             "no empty husk left behind"
         );
+    }
+
+    #[test]
+    fn calm_mood_is_one_undoable_authored_change_and_readback_reports_effective_time() {
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let (ops, _) = add_shot_ops(&engine, hero, "hero", hero).expect("shot");
+        engine.commit("cinema-shot", ops).expect("commits");
+        let normal_seconds = cutscene_of(&engine, hero).seconds();
+
+        let (ops, calm) = set_mood_ops(&engine, hero, "calm").expect("known mood");
+        engine.commit("cinema-mood", ops).expect("commits");
+        let reply = reply_for(hero, &calm, "Hero", "Calm pacing".into());
+        assert_eq!(reply.mood, Mood::Calm);
+        assert!((reply.seconds - normal_seconds * 2.5).abs() < 1.0e-5);
+        assert!(reply.reads[0].contains(&format!("{:.1}s", reply.seconds)));
+
+        assert!(engine.undo(), "one Ctrl-Z restores the previous mood");
+        assert_eq!(cutscene_of(&engine, hero).mood, Mood::Normal);
+        assert!(matches!(
+            set_mood_ops(&engine, hero, "dreamy"),
+            Err(CinemaError::UnknownMood(value)) if value == "dreamy"
+        ));
     }
 
     #[test]

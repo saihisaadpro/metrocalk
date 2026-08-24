@@ -595,3 +595,176 @@ export function Card({
     </button>
   );
 }
+
+// ── Slider ────────────────────────────────────────────────────────────────────────────────────────
+
+export interface SliderProps
+  extends Omit<InputHTMLAttributes<HTMLInputElement>, "type" | "value" | "min" | "max"> {
+  value: number;
+  min: number;
+  max: number;
+}
+
+/**
+ * The one range control. Every `type="range"` in the engine was a RAW BROWSER CONTROL before this —
+ * a hairline track and an OS thumb sitting in toolbars whose every other control is a rounded 30px
+ * surface — because a slider primitive did not exist and `global.css` said only `accent-color`.
+ *
+ * WHY THE FILL IS COMPUTED HERE. WebKit has no `::-moz-range-progress`, so the filled part of the
+ * track is a hard-stopped gradient whose stop this component sets as `--mtk-slider-fill` from the
+ * value it is already re-rendering with. Firefox ignores the variable and uses its own pseudo-element.
+ * That is the whole reason `value`/`min`/`max` are required rather than optional passthroughs: a
+ * slider that does not know its own extent cannot paint how far along it is, and an uncontrolled
+ * range is exactly the control that then looks empty at 90%.
+ */
+export function Slider({ value, min, max, className, style, ...rest }: SliderProps) {
+  const span = max - min;
+  const ratio = span > 0 ? (value - min) / span : 0;
+  const fill = `${Math.max(0, Math.min(1, ratio)) * 100}%`;
+  return (
+    <input
+      type="range"
+      className={["mtk-slider", className].filter(Boolean).join(" ")}
+      value={value}
+      min={min}
+      max={max}
+      style={{ ...style, ["--mtk-slider-fill" as string]: fill }}
+      {...rest}
+    />
+  );
+}
+
+/**
+ * A slider with the two things a bare bar never has: what it controls, and what it currently reads.
+ * `<ux_quality>` 4 (plain language) and the constitution's "unit labels" are both about this — a
+ * zoom bar with no number beside it can be dragged but not aimed.
+ *
+ * The label is the control's accessible name via `aria-label`, so the visible text and the
+ * screen-reader text cannot drift apart; a caller that wants a different accessible name passes
+ * `ariaLabel` and takes responsibility for the difference.
+ */
+export function SliderField({
+  label,
+  valueLabel,
+  ariaLabel,
+  style,
+  ...rest
+}: SliderProps & { label: ReactNode; valueLabel?: ReactNode; ariaLabel?: string }) {
+  return (
+    <span className="mtk-slider-field" style={style}>
+      {label !== null && label !== undefined && label !== "" && (
+        <span className="mtk-slider-field__label" aria-hidden="true">{label}</span>
+      )}
+      <Slider aria-label={ariaLabel ?? (typeof label === "string" ? label : undefined)} {...rest} />
+      {valueLabel !== undefined && <span className="mtk-slider-field__value">{valueLabel}</span>}
+    </span>
+  );
+}
+
+// ── Toolbar ───────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The shared row rhythm. Twenty-five hand-rolled `display: flex; align-items: center; gap:` rows
+ * existed across the panels with nothing in common between them, which is how one subsystem's
+ * toolbar ends up with a different padding, a different divider and a different overflow answer from
+ * its neighbour's — and how two controls end up touching.
+ *
+ * The overflow policy is WRAP, deliberately, and it is the reason this is a component and not a
+ * convention: the pattern it replaces is `overflow-x: auto` on a strip with no visible scrollbar,
+ * which puts the last controls off screen with nothing on screen to say they exist. A row that grows
+ * a second line is legible; a row that silently loses its right-hand end is not.
+ */
+export function Toolbar({
+  tight = false,
+  raised = true,
+  divided = true,
+  className,
+  children,
+  style,
+  ...rest
+}: {
+  tight?: boolean;
+  raised?: boolean;
+  divided?: boolean;
+  className?: string;
+  children: ReactNode;
+  style?: CSSProperties;
+  role?: AriaRole;
+  "aria-label"?: string;
+} & DataAttrs) {
+  const cls = [
+    "mtk-toolbar",
+    tight && "mtk-toolbar--tight",
+    raised && "mtk-toolbar--raised",
+    divided && "mtk-toolbar--divided",
+    className,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <div className={cls} style={style} {...rest}>
+      {children}
+    </div>
+  );
+}
+
+/** Controls that belong together, at the control gap rather than the toolbar gap. `attached` fuses
+ *  them into one segmented surface (a transport, a mode switch) so the group reads as a single thing. */
+export function ToolbarGroup({
+  attached = false,
+  grow = false,
+  className,
+  children,
+  style,
+  ...rest
+}: {
+  attached?: boolean;
+  /** Take the row's leftover width. A number sets the flex basis the group prefers before it does. */
+  grow?: boolean | number;
+  className?: string;
+  children: ReactNode;
+  style?: CSSProperties;
+  role?: AriaRole;
+  "aria-label"?: string;
+} & DataAttrs) {
+  const cls = [
+    "mtk-toolbar__group",
+    attached && "mtk-toolbar__group--attached",
+    grow !== false && "mtk-toolbar__group--grow",
+    className,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const basis = typeof grow === "number" ? { ["--mtk-toolbar-grow" as string]: `${grow}px` } : undefined;
+  return (
+    <div className={cls} style={{ ...basis, ...style }} {...rest}>
+      {children}
+    </div>
+  );
+}
+
+/** A hairline between groups — reached for only when space alone has stopped separating them. */
+export function ToolbarSeparator() {
+  return <span className="mtk-toolbar__sep" aria-hidden="true" />;
+}
+
+/** Pushes what follows to the far end of the row. */
+export function ToolbarSpacer() {
+  return <span className="mtk-toolbar__spacer" aria-hidden="true" />;
+}
+
+/** A read-out is DATA, not a control: mono, tabular-figures, and never the thing that grows. A
+ *  timecode that reflows as it counts is the reason the animate transport row jittered. */
+export function ReadOut({
+  children,
+  unit,
+  title,
+  ...rest
+}: { children: ReactNode; unit?: ReactNode; title?: string } & DataAttrs) {
+  return (
+    <span className="mtk-readout" title={title} {...rest}>
+      <span className="mtk-readout__value">{children}</span>
+      {unit !== undefined && <span className="mtk-readout__unit">{unit}</span>}
+    </span>
+  );
+}

@@ -110,6 +110,29 @@ impl SceneState {
             .and_then(local_mesh_bounds)
             .map_or(0.5, |bounds| bounds.half_size[1])
     }
+
+    /// The exact world-space AABB of the rendered instance at `index`.
+    ///
+    /// This is the public projection seam for features that must frame what the viewport actually draws
+    /// (cinematics, selection summaries, and future camera tools). It deliberately resolves the instance's
+    /// real mesh slot, local vertex bounds, uniform display scale, and quaternion rotation through the same
+    /// helper used by frame-all/focus. A missing mesh keeps the renderer's established unit-cube fallback;
+    /// an invalid index or a transform that cannot produce finite geometry returns `None` rather than
+    /// poisoning a camera with infinities.
+    #[must_use]
+    pub fn rendered_instance_bounds(&self, index: usize) -> Option<([f32; 3], [f32; 3])> {
+        let instance = self.instances.get(index)?;
+        let local_bounds = self
+            .mesh_slots
+            .get(index)
+            .and_then(|slot| usize::try_from(*slot).ok())
+            .and_then(|slot| self.meshes.get(slot))
+            .and_then(local_mesh_bounds)
+            .unwrap_or(LocalBounds::UNIT_CUBE);
+        let (lo, hi) = instance_world_bounds(instance, local_bounds);
+        (lo.is_finite() && hi.is_finite() && lo.cmple(hi).all())
+            .then(|| (lo.to_array(), hi.to_array()))
+    }
 }
 
 /// The presentation ground's albedo.
@@ -186,6 +209,49 @@ pub enum Projection {
     /// uses, so zoom, framing and the orientation cube keep working across a mode switch instead of
     /// needing a second scale to be kept in sync.
     Orthographic,
+}
+
+/// The renderer's single visibility policy for viewport presentation chrome.
+///
+/// Scene geometry and the ground/shadow receiver remain visible in both modes. Every editor-only helper
+/// pass is named here so cinematic playback cannot accidentally inherit a newly scattered one-off check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewportVisibility {
+    Editor,
+    Cinematic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewportLayer {
+    GroundShadowReceiver,
+    Grid,
+    TrackingLines,
+    MarkerGlyphs,
+    PhysicsDebugOverlay,
+    TerrainToolOverlay,
+    GizmoAndSnapChrome,
+}
+
+impl ViewportVisibility {
+    const fn from_cinematic(cinematic: bool) -> Self {
+        if cinematic {
+            Self::Cinematic
+        } else {
+            Self::Editor
+        }
+    }
+
+    const fn allows(self, layer: ViewportLayer) -> bool {
+        match layer {
+            ViewportLayer::GroundShadowReceiver => true,
+            ViewportLayer::Grid
+            | ViewportLayer::TrackingLines
+            | ViewportLayer::MarkerGlyphs
+            | ViewportLayer::PhysicsDebugOverlay
+            | ViewportLayer::TerrainToolOverlay
+            | ViewportLayer::GizmoAndSnapChrome => matches!(self, Self::Editor),
+        }
+    }
 }
 
 /// Viewport exposure. Placed so the lit scene lands near the tone curve's mid-grey rather than a stop
@@ -560,10 +626,10 @@ pub struct SceneState {
     /// overlay marker + read by `snap_ghost` (the HUD/E2E). `None` ⇒ no candidate in range / not dragging.
     pub snap_ghost: Option<[f32; 3]>,
     /// M11.3 inc.3 — index (into `lights`) of the scene's shadow-casting directional light (the first
-    /// authored directional with `castShadows`, else the default key light). `None` ⇒ nothing casts → the
-    /// shadow pass is skipped, `light_view_proj` stays identity, and `fs_mesh` shadows nothing. The INDEX
-    /// (not just the direction) so the shader applies the single shadow map to ONLY its caster, not every
-    /// directional light. Rebuilt with `lights` (a render projection).
+    /// authored directional with `castShadows`, or the synthesized key when no directional is authored).
+    /// `None` means an authored directional explicitly disabled shadows: the pass is skipped,
+    /// `light_view_proj` stays identity, and `fs_mesh` shadows nothing. Point/spot flags cannot select the
+    /// directional-only map. Rebuilt with `lights` (a render projection).
     pub shadow_caster: Option<usize>,
     /// M14.2 (ADR-058) — pending live-thumbnail render requests `(entity id, size px)`, pushed by the
     /// `thumbnail` command and drained by the render thread, which renders each entity to a small offscreen
@@ -2861,6 +2927,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             render_profile,
             grid_meta,
             terrain_active,
+            visibility,
             env_source_space,
             working_space,
         ) = {
@@ -2868,6 +2935,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // through rather than an assumed one.
             let aspect_hint = config.width as f32 / config.height.max(1) as f32;
             let mut st = shared.lock().unwrap();
+            let visibility = ViewportVisibility::from_cinematic(st.cinematic);
             // Publish it before anything reads it, so a `frame_all` arriving from the UI this frame
             // frames against the surface as it is now rather than as it was when the window opened.
             st.surface_aspect = aspect_hint;
@@ -3206,13 +3274,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         .collect();
                     lod_main_bg.push(per_lod);
                 }
-                // tracking-line endpoints (rebuilt in lock-step with instances)
-                // Binding lines are authoring chrome too — hidden while a shot is running.
-                if st.cinematic {
-                    lines.upload(&device, &queue, &inst_bgl, &[]);
-                } else {
-                    lines.upload(&device, &queue, &inst_bgl, &st.line_points);
-                }
+                // Tracking-line endpoints (rebuilt in lock-step with instances). Visibility is routed at
+                // the draw pass so switching modes cannot invalidate this scene-owned upload.
+                lines.upload(&device, &queue, &inst_bgl, &st.line_points);
                 // M11.4 — light/camera icon glyphs (rebuilt with the scene).
                 markers.upload(&device, &queue, &inst_bgl, &st.marker_glyphs);
             }
@@ -3554,52 +3618,59 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // "Local", the handles drew along world axes, and dragging the "local X" arrow moved the
             // object along world X. A label that does not match the mathematics is worse than no
             // label, because the user calibrates on it.
-            let mut gizmo_verts: Vec<Instance> = match st.selected {
-                // A cutscene is a picture, not a workspace: no handles across the shot.
-                _ if st.cinematic => Vec::new(),
-                Some(sel) if sel < st.instances.len() => {
-                    let origin = st.instances[sel].center;
-                    let basis = st.instances[sel].rotation;
-                    let eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
-                    let scale = metrocalk_gizmo::pixel_scale(eye, origin, 55f32.to_radians(), 0.14);
-                    st.gizmo
-                        .geometry(origin, basis, scale)
-                        .into_iter()
-                        .map(|gv| Instance {
-                            center: gv.pos,
-                            scale: 0.0,
-                            color: gv.color,
-                            selected: 0.0,
-                            rotation: IDENTITY_QUAT,
-                            material: [0.0; 4],
-                        })
-                        .collect()
+            let mut gizmo_verts: Vec<Instance> = if visibility
+                .allows(ViewportLayer::GizmoAndSnapChrome)
+            {
+                match st.selected {
+                    Some(sel) if sel < st.instances.len() => {
+                        let origin = st.instances[sel].center;
+                        let basis = st.instances[sel].rotation;
+                        let eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+                        let scale =
+                            metrocalk_gizmo::pixel_scale(eye, origin, 55f32.to_radians(), 0.14);
+                        st.gizmo
+                            .geometry(origin, basis, scale)
+                            .into_iter()
+                            .map(|gv| Instance {
+                                center: gv.pos,
+                                scale: 0.0,
+                                color: gv.color,
+                                selected: 0.0,
+                                rotation: IDENTITY_QUAT,
+                                material: [0.0; 4],
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
                 }
-                _ => Vec::new(),
+            } else {
+                Vec::new()
             };
             // M9.4: the snap **ghost** — a small cyan 3-axis cross at the nearest target during a drag
             // (constant pixel size), drawn through the same overlay pass. Empty unless snapping is live.
-            if let Some(g) = st.snap_ghost {
-                let eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
-                let s = metrocalk_gizmo::pixel_scale(eye, g, 55f32.to_radians(), 0.05);
-                const GHOST: [f32; 3] = [0.2, 0.9, 0.9];
-                for ax in [[s, 0.0, 0.0], [0.0, s, 0.0], [0.0, 0.0, s]] {
-                    let mark = |o: f32| Instance {
-                        center: [g[0] + ax[0] * o, g[1] + ax[1] * o, g[2] + ax[2] * o],
-                        scale: 0.0,
-                        color: GHOST,
-                        selected: 0.0,
-                        rotation: IDENTITY_QUAT,
-                        material: [0.0; 4],
-                    };
-                    gizmo_verts.push(mark(-1.0));
-                    gizmo_verts.push(mark(1.0));
+            if visibility.allows(ViewportLayer::GizmoAndSnapChrome) {
+                if let Some(g) = st.snap_ghost {
+                    let eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+                    let s = metrocalk_gizmo::pixel_scale(eye, g, 55f32.to_radians(), 0.05);
+                    const GHOST: [f32; 3] = [0.2, 0.9, 0.9];
+                    for ax in [[s, 0.0, 0.0], [0.0, s, 0.0], [0.0, 0.0, s]] {
+                        let mark = |o: f32| Instance {
+                            center: [g[0] + ax[0] * o, g[1] + ax[1] * o, g[2] + ax[2] * o],
+                            scale: 0.0,
+                            color: GHOST,
+                            selected: 0.0,
+                            rotation: IDENTITY_QUAT,
+                            material: [0.0; 4],
+                        };
+                        gizmo_verts.push(mark(-1.0));
+                        gizmo_verts.push(mark(1.0));
+                    }
                 }
             }
             // Pipe Forge live route: connected amber segments plus a cyan 3-axis cross at each authored
             // point. It shares the tiny gizmo line buffer (no mesh re-upload, no JS per frame) and is always
             // depth-visible, matching the direct-manipulation preview contract.
-            if !st.pipe_handles.is_empty() {
+            if visibility.allows(ViewportLayer::GizmoAndSnapChrome) && !st.pipe_handles.is_empty() {
                 gizmo_verts.extend(pipe_graph_preview_vertices(
                     &st.pipe_edges,
                     &st.pipe_handles,
@@ -3625,6 +3696,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     formats.manual_display_encode(),
                 ],
                 terrain_active,
+                visibility,
                 st.env_source_space,
                 // Read under the SAME lock as the camera and the exposure. A working space that lags
                 // the frame by one tick is a frame whose textures and lights are in different spaces —
@@ -3960,16 +4032,18 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // lake bed, a canyon floor. Leaving it in draws an opaque grey lid over exactly those places. On
             // the live app it hid the entire Rolling Hills sea floor and made the terrain look like it had
             // never streamed in. The grid goes with it: it describes a surface that is no longer there.
-            if !terrain_active {
+            if !terrain_active && visibility.allows(ViewportLayer::GroundShadowReceiver) {
                 rp.set_bind_group(1, &ground_main_bg, &[]);
                 rp.set_vertex_buffer(0, ground_vbuf.slice(..));
                 rp.set_index_buffer(ground_ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..GROUND_IDX.len() as u32, 0, 0..1);
+            }
+            if !terrain_active && visibility.allows(ViewportLayer::Grid) {
                 rp.set_pipeline(&grid_pipeline);
                 rp.draw(0..GRID_VERTS, 0..1);
             }
             // Tracking lines (binding-by-intent overlay) last, with the always-pass depth state.
-            if lines.n > 0 {
+            if visibility.allows(ViewportLayer::TrackingLines) && lines.n > 0 {
                 rp.set_pipeline(&line_pipeline);
                 rp.set_bind_group(1, &lines.bg, &[]);
                 rp.draw(0..lines.n, 0..1);
@@ -3997,28 +4071,28 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             }
             // M8.4 contact-debugger overlay, drawn over everything (per-segment colour, always-pass depth).
             // Skipped entirely when the debugger is off (`overlay.n == 0`) — zero per-frame cost.
-            if overlay.n > 0 {
+            if visibility.allows(ViewportLayer::PhysicsDebugOverlay) && overlay.n > 0 {
                 rp.set_pipeline(&overlay_pipeline);
                 rp.set_bind_group(1, &overlay.bg, &[]);
                 rp.draw(0..overlay.n, 0..1);
             }
             // M11.4 — light/camera ICON glyphs (wireframe, per-segment colour, always-pass depth) so a
             // light/camera reads as an icon, not a solid placeholder cube. Empty ⇒ skipped.
-            if markers.n > 0 {
+            if visibility.allows(ViewportLayer::MarkerGlyphs) && markers.n > 0 {
                 rp.set_pipeline(&overlay_pipeline);
                 rp.set_bind_group(1, &markers.bg, &[]);
                 rp.draw(0..markers.n, 0..1);
             }
             // M19 — the terrain brush ring / route preview, on the same always-pass overlay pipeline as the
             // contact debugger. Empty unless a terrain tool is active, so it costs nothing otherwise.
-            if terrain_overlay.n > 0 {
+            if visibility.allows(ViewportLayer::TerrainToolOverlay) && terrain_overlay.n > 0 {
                 rp.set_pipeline(&overlay_pipeline);
                 rp.set_bind_group(1, &terrain_overlay.bg, &[]);
                 rp.draw(0..terrain_overlay.n, 0..1);
             }
             // M9.1 transform gizmo, drawn LAST (over everything), per-segment X/Y/Z colour, always-pass
             // depth. Skipped when nothing is selected (`gizmo_buf.n == 0`) — zero per-frame cost.
-            if gizmo_buf.n > 0 {
+            if visibility.allows(ViewportLayer::GizmoAndSnapChrome) && gizmo_buf.n > 0 {
                 rp.set_pipeline(&overlay_pipeline);
                 rp.set_bind_group(1, &gizmo_buf.bg, &[]);
                 rp.draw(0..gizmo_buf.n, 0..1);
@@ -5559,6 +5633,33 @@ fn pipe_graph_preview_vertices(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod viewport_visibility_tests {
+    use super::{ViewportLayer, ViewportVisibility};
+
+    #[test]
+    fn cinematic_route_contains_no_editor_helper_passes_but_keeps_the_shadow_receiver() {
+        let editor_helpers = [
+            ViewportLayer::Grid,
+            ViewportLayer::TrackingLines,
+            ViewportLayer::MarkerGlyphs,
+            ViewportLayer::PhysicsDebugOverlay,
+            ViewportLayer::TerrainToolOverlay,
+            ViewportLayer::GizmoAndSnapChrome,
+        ];
+        let cinematic = ViewportVisibility::from_cinematic(true);
+        assert!(cinematic.allows(ViewportLayer::GroundShadowReceiver));
+        assert!(
+            editor_helpers.iter().all(|layer| !cinematic.allows(*layer)),
+            "cinematic frames must contain no editor helper pass"
+        );
+
+        let editor = ViewportVisibility::from_cinematic(false);
+        assert!(editor.allows(ViewportLayer::GroundShadowReceiver));
+        assert!(editor_helpers.iter().all(|layer| editor.allows(*layer)));
+    }
 }
 
 #[cfg(test)]

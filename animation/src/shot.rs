@@ -156,6 +156,18 @@ pub enum Mood {
 }
 
 impl Mood {
+    /// Runtime scale applied to authored shot lengths. `Normal` is exactly 1.0 for schema and playback
+    /// compatibility; Calm deliberately gives production shots enough breathing room for a three-minute
+    /// industrial film without making authors hand-edit every card.
+    #[must_use]
+    pub fn duration_scale(self) -> f32 {
+        match self {
+            Self::Calm => 2.5,
+            Self::Normal => 1.0,
+            Self::Tense => 0.75,
+        }
+    }
+
     /// Blend length between shots, seconds.
     #[must_use]
     pub fn blend_seconds(self) -> f32 {
@@ -194,6 +206,19 @@ pub struct Cutscene {
     pub letterbox: bool,
 }
 
+/// One stable playback lookup: the live shot, its local progress, and an optional transition from the
+/// preceding shot in this same cutscene. A first shot never carries `blend_from`, which keeps separately
+/// directed cutscenes as hard cuts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShotPlayback {
+    /// Index of the live shot.
+    pub index: usize,
+    /// Local progress through the live shot, in `0..=1`.
+    pub progress: f32,
+    /// `(previous shot index, transition progress)` during the opening blend window.
+    pub blend_from: Option<(usize, f32)>,
+}
+
 fn one() -> u32 {
     1
 }
@@ -222,25 +247,59 @@ pub const MIN_SECONDS: f32 = 0.2;
 pub const MAX_SECONDS: f32 = 20.0;
 
 impl Cutscene {
-    /// Total running time in seconds.
+    /// Effective runtime length of one shot after the cutscene mood's pacing is applied.
+    #[must_use]
+    pub fn effective_shot_seconds(&self, index: usize) -> Option<f32> {
+        let authored = self.shots.get(index)?.seconds;
+        let authored = if authored.is_finite() {
+            authored.clamp(MIN_SECONDS, MAX_SECONDS)
+        } else {
+            MIN_SECONDS
+        };
+        Some(authored * self.mood.duration_scale())
+    }
+
+    /// Total effective running time in seconds. For `Mood::Normal`, valid authored timing is unchanged.
     #[must_use]
     pub fn seconds(&self) -> f32 {
-        self.shots.iter().map(|s| s.seconds).sum()
+        (0..self.shots.len())
+            .filter_map(|index| self.effective_shot_seconds(index))
+            .sum()
+    }
+
+    /// Resolve playback timing once, including the within-cutscene incoming blend window.
+    #[must_use]
+    pub fn playback_at(&self, t: f32) -> Option<ShotPlayback> {
+        let mut start = 0.0;
+        for index in 0..self.shots.len() {
+            let duration = self.effective_shot_seconds(index)?;
+            let end = start + duration;
+            if t < end {
+                let local = (t - start).max(0.0);
+                let progress = (local / duration.max(1.0e-6)).clamp(0.0, 1.0);
+                let blend_from = if index == 0 {
+                    None
+                } else {
+                    let blend_span = self.mood.blend_seconds().min(duration * 0.5);
+                    (blend_span > 1.0e-6 && local < blend_span)
+                        .then(|| (index - 1, (local / blend_span).clamp(0.0, 1.0)))
+                };
+                return Some(ShotPlayback {
+                    index,
+                    progress,
+                    blend_from,
+                });
+            }
+            start = end;
+        }
+        None
     }
 
     /// Which shot is live at `t` seconds, and how far through it we are (0..1).
     #[must_use]
     pub fn shot_at(&self, t: f32) -> Option<(usize, f32)> {
-        let mut start = 0.0;
-        for (i, shot) in self.shots.iter().enumerate() {
-            let end = start + shot.seconds.max(MIN_SECONDS);
-            if t < end {
-                let span = (end - start).max(1.0e-6);
-                return Some((i, ((t - start) / span).clamp(0.0, 1.0)));
-            }
-            start = end;
-        }
-        None
+        self.playback_at(t)
+            .map(|playback| (playback.index, playback.progress))
     }
 
     /// Everything wrong with this cutscene, in the author's language. The continuity checks are the
@@ -395,6 +454,51 @@ pub fn solve_shot(
     }
 }
 
+/// Solve a production camera shot with cinematic ease applied to its within-shot progress.
+///
+/// [`solve_shot`] deliberately remains the linear geometric primitive so authoring tools can inspect
+/// exact progress. Playback uses this entry point: it preserves the same endpoints while removing the
+/// mechanical instant start and stop of a linear camera move.
+#[must_use]
+pub fn solve_shot_eased(
+    shot: &ShotRecipe,
+    subject: SubjectSample,
+    progress: f32,
+    aspect: f32,
+    fov_deg: f32,
+) -> CameraSample {
+    solve_shot(shot, subject, ease_in_out(progress), aspect, fov_deg)
+}
+
+/// Derive finite perspective clip planes around a filmed subject.
+///
+/// The near plane follows the closest visible surface without crossing it, while the far plane keeps
+/// generous room behind the subject. Inputs are sanitised because imported industrial scenes can span
+/// millimetres to kilometres, and a non-finite projection poisons the entire frame.
+#[must_use]
+pub fn cinematic_clip_planes(subject_radius: f32, camera_distance: f32) -> (f32, f32) {
+    const MIN_NEAR: f32 = 0.001;
+    const MAX_SAFE_RADIUS: f32 = 10_000_000.0;
+    const MAX_SAFE_DISTANCE: f32 = MAX_SAFE_RADIUS * 10.0;
+
+    let radius = if subject_radius.is_finite() {
+        subject_radius.abs().clamp(MIN_NEAR, MAX_SAFE_RADIUS)
+    } else {
+        0.05
+    };
+    let distance = if camera_distance.is_finite() {
+        camera_distance
+            .abs()
+            .clamp(radius * 1.01, MAX_SAFE_DISTANCE)
+    } else {
+        radius * 2.0
+    };
+    let closest_surface = (distance - radius).max(MIN_NEAR);
+    let near = (distance * 0.01).min(closest_surface * 0.5).max(MIN_NEAR);
+    let far = (distance + radius * 4.0).max(near * 2.0);
+    (near, far)
+}
+
 /// Ease in and out — the shape a camera move should have. Linear starts and stops look mechanical.
 #[must_use]
 pub fn ease_in_out(t: f32) -> f32 {
@@ -424,6 +528,23 @@ pub fn blend(a: CameraSample, b: CameraSample, t: f32) -> CameraSample {
             mix(a.look_at[2], b.look_at[2]),
         ],
         fov_deg: mix(a.fov_deg, b.fov_deg),
+    }
+}
+
+impl ShotPlayback {
+    /// Blend an already-solved current pose from the previous solved endpoint when this lookup falls in
+    /// an intra-cutscene transition. The previous pose is explicit, so callers cannot accidentally carry
+    /// state across separately directed cutscenes.
+    #[must_use]
+    pub fn blend_camera(
+        self,
+        previous: Option<CameraSample>,
+        current: CameraSample,
+    ) -> CameraSample {
+        match (self.blend_from, previous) {
+            (Some((_index, progress)), Some(previous)) => blend(previous, current, progress),
+            _ => current,
+        }
     }
 }
 
@@ -520,6 +641,53 @@ mod tests {
     }
 
     #[test]
+    fn eased_push_in_is_monotonic_and_slower_at_both_endpoints_than_mid_shot() {
+        let s = shot(ShotSize::Full, ShotAngle::ThreeQuarter, ShotMove::PushIn);
+        let sample = cube();
+        let eye_at = |progress| solve_shot_eased(&s, sample, progress, 16.0 / 9.0, 50.0).eye;
+        let step = 0.01;
+        let start_velocity = dist(eye_at(0.0), eye_at(step)) / step;
+        let mid_velocity = dist(eye_at(0.5 - step), eye_at(0.5 + step)) / (step * 2.0);
+        let end_velocity = dist(eye_at(1.0 - step), eye_at(1.0)) / step;
+        assert!(
+            start_velocity < mid_velocity,
+            "ease-in must start slower than mid-shot: start={start_velocity}, mid={mid_velocity}"
+        );
+        assert!(
+            end_velocity < mid_velocity,
+            "ease-out must end slower than mid-shot: end={end_velocity}, mid={mid_velocity}"
+        );
+
+        let distances: Vec<f32> = (0..=100)
+            .map(|frame| dist(eye_at(frame as f32 / 100.0), sample.center))
+            .collect();
+        for pair in distances.windows(2) {
+            assert!(
+                pair[1] <= pair[0] + 1.0e-5,
+                "an eased push-in must never move away from its subject: {pair:?}"
+            );
+        }
+        assert!(distances[100] < distances[0], "the move must make progress");
+    }
+
+    #[test]
+    fn cinematic_clip_planes_are_finite_for_tiny_and_factory_scale_subjects() {
+        for (radius, distance) in [(0.001, 0.008), (120.0, 420.0)] {
+            let (near, far) = cinematic_clip_planes(radius, distance);
+            assert!(near.is_finite() && far.is_finite());
+            assert!(near > 0.0 && far > near, "invalid planes: {near}..{far}");
+            assert!(
+                near < distance - radius,
+                "near plane must stay in front of the subject"
+            );
+            assert!(
+                far > distance + radius,
+                "far plane must stay behind the subject"
+            );
+        }
+    }
+
+    #[test]
     fn the_solver_is_deterministic_and_frames_with_headroom() {
         let s = shot(ShotSize::Close, ShotAngle::ThreeQuarter, ShotMove::Orbit);
         let first = solve_shot(&s, cube(), 0.42, 16.0 / 9.0, 50.0);
@@ -578,6 +746,127 @@ mod tests {
             (progress - 0.5).abs() < 1.0e-3,
             "half way through a 3s shot"
         );
+    }
+
+    #[test]
+    fn calm_effective_timing_carries_three_legal_ten_shot_acts_past_three_minutes() {
+        let ten_shot_act = |mood| Cutscene {
+            version: 1,
+            shots: (0..10)
+                .map(|index| ShotRecipe {
+                    id: format!("shot-{index}"),
+                    seconds: 2.5,
+                    ..shot(ShotSize::Full, ShotAngle::ThreeQuarter, ShotMove::PushIn)
+                })
+                .collect(),
+            mood,
+            letterbox: true,
+        };
+        let normal = ten_shot_act(Mood::Normal);
+        let calm = ten_shot_act(Mood::Calm);
+        assert!((normal.seconds() - 25.0).abs() < 1.0e-6);
+        assert!((calm.seconds() - 62.5).abs() < 1.0e-6);
+        assert!(
+            calm.seconds() * 3.0 > 180.0,
+            "thirty standard Calm shots must clear a three-minute delivery"
+        );
+    }
+
+    #[test]
+    fn playback_lookup_uses_effective_time_and_only_blends_within_the_same_cutscene() {
+        let cut = Cutscene {
+            version: 1,
+            shots: vec![
+                ShotRecipe {
+                    seconds: 2.0,
+                    ..shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold)
+                },
+                ShotRecipe {
+                    id: "shot-2".into(),
+                    seconds: 2.0,
+                    ..shot(ShotSize::Close, ShotAngle::Profile, ShotMove::PushIn)
+                },
+            ],
+            mood: Mood::Normal,
+            letterbox: true,
+        };
+        assert_eq!(cut.playback_at(0.0).unwrap().blend_from, None);
+        let boundary = cut.playback_at(2.0).expect("second shot starts");
+        assert_eq!(boundary.index, 1);
+        assert!(boundary.progress.abs() < 1.0e-6);
+        assert_eq!(boundary.blend_from, Some((0, 0.0)));
+        let middle = cut.playback_at(2.3).expect("inside transition");
+        let (from, blend_progress) = middle.blend_from.expect("incoming blend");
+        assert_eq!(from, 0);
+        assert!((blend_progress - 0.5).abs() < 1.0e-5);
+        assert!(
+            cut.playback_at(2.61).unwrap().blend_from.is_none(),
+            "the current shot must own the camera after the blend window"
+        );
+
+        let separate_act = Cutscene {
+            shots: vec![shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold)],
+            ..Cutscene::default()
+        };
+        assert_eq!(
+            separate_act.playback_at(0.0).unwrap().blend_from,
+            None,
+            "a separately directed act starts with a hard cut"
+        );
+    }
+
+    #[test]
+    fn intra_cutscene_camera_transition_is_continuous_and_finite_at_both_endpoints() {
+        let cut = Cutscene {
+            version: 1,
+            shots: vec![
+                ShotRecipe {
+                    seconds: 2.0,
+                    ..shot(ShotSize::Wide, ShotAngle::Front, ShotMove::PullOut)
+                },
+                ShotRecipe {
+                    id: "shot-2".into(),
+                    seconds: 2.0,
+                    ..shot(ShotSize::Close, ShotAngle::Profile, ShotMove::PushIn)
+                },
+            ],
+            mood: Mood::Normal,
+            letterbox: true,
+        };
+        let camera_at = |time| {
+            let playback = cut.playback_at(time).expect("inside cutscene");
+            let current = solve_shot_eased(
+                &cut.shots[playback.index],
+                cube(),
+                playback.progress,
+                16.0 / 9.0,
+                50.0,
+            );
+            let previous = playback.blend_from.map(|(index, _)| {
+                solve_shot_eased(&cut.shots[index], cube(), 1.0, 16.0 / 9.0, 50.0)
+            });
+            playback.blend_camera(previous, current)
+        };
+
+        let before = camera_at(2.0 - 1.0e-4);
+        let boundary = camera_at(2.0);
+        let after = camera_at(2.0 + 1.0e-4);
+        assert!(dist(before.eye, boundary.eye) < 0.01);
+        assert!(dist(boundary.eye, after.eye) < 0.01);
+
+        for step in 0..=400 {
+            let time = step as f32 * 0.009_9;
+            let camera = camera_at(time);
+            assert!(
+                camera
+                    .eye
+                    .into_iter()
+                    .chain(camera.look_at)
+                    .chain([camera.fov_deg])
+                    .all(f32::is_finite),
+                "transition produced a non-finite camera at {time}s: {camera:?}"
+            );
+        }
     }
 
     #[test]

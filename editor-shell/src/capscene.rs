@@ -697,7 +697,10 @@ pub fn place_mesh_variant(
 /// M11.3 (ADR-042) — author a `Light` entity as ONE undoable transaction: a `Transform` (so it has a
 /// position + rides the gizmo/inspector like any entity) + a `Light` component (`kind`/colour/intensity/
 /// range) + the `Provides(Lighting)` capability pair. Replayed by id so the light survives close→reopen.
-/// `kind` ∈ {"directional","point","spot"}. The per-frame LIT RESULT is a render projection (never Loro).
+/// `kind` ∈ {"directional","point","spot"}. This renderer owns one directional shadow map, so only a
+/// freshly-authored directional starts with `castShadows=true`; point/spot lights store `false` rather than
+/// promising a shadow mode the renderer does not implement. The per-frame LIT RESULT is a render projection
+/// (never Loro).
 pub fn add_light(
     engine: &mut Engine<FlecsWorld>,
     scene: &CapScene,
@@ -737,9 +740,9 @@ pub fn add_light(
         });
     }
     // M11.3 — author the shine DIRECTION (a directional light defaults straight down) + whether the light
-    // CASTS the shadow map, as REAL component fields so they EXIST on the entity: the data-driven inspector
-    // can edit/toggle them (one undoable `SetField`), and `collect_lights` reads the authored values instead
-    // of its absent-field fallbacks. (Render-only effect; the lit/shadow RESULT stays a projection — ADR-021.)
+    // CASTS the renderer's single directional shadow map, as REAL component fields so they EXIST on the
+    // entity. Point/spot shadows are not implemented, so their field is honestly false rather than exposing
+    // a checked control with no effect. (The lit/shadow RESULT stays a projection — ADR-021.)
     for (f, v) in [("dirX", 0.0_f32), ("dirY", -1.0), ("dirZ", 0.0)] {
         ops.push(Op::SetField {
             entity: id,
@@ -752,7 +755,7 @@ pub fn add_light(
         entity: id,
         component: "Light".into(),
         field: "castShadows".into(),
-        value: FieldValue::Bool(true),
+        value: FieldValue::Bool(kind == "directional"),
     });
     if let Some(&c) = scene.caps.get(&canonical("Lighting")) {
         ops.push(Op::AddPair {

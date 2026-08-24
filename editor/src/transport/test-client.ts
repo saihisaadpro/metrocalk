@@ -248,9 +248,10 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
       { kind: "hero", label: "Hero shot", blurb: "The workhorse - three-quarters on, pushing in", icon: "\u{1F3AC}", adds: "a full-body three-quarter shot that creeps closer" },
       { kind: "closeup", label: "Close-up", blurb: "Tight and still - for the moment that matters", icon: "\u{1F50D}", adds: "a close, locked-off shot in profile" },
     ])),
-    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, reads: ["a full shot of Crate, three-quarters on, pushing in over 2.5s"], problems: [], message: "Added a hero shot", reason: null })),
-    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, reads: [], problems: [], message: "Shot removed", reason: null })),
-    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, reads: [], problems: [], message: "", reason: null })),
+    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: ["a full shot of Crate, three-quarters on, pushing in over 2.5s"], problems: [], message: "Added a hero shot", reason: null })),
+    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], problems: [], message: "Shot removed", reason: null })),
+    cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, reads: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
+    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], problems: [], message: "", reason: null })),
     conditionCatalog: vi.fn(() => Promise.resolve([
       { kind: "score_at_least", label: "The Score is at least…", blurb: "gate this behind points the player has already earned", icon: "★", needs: "number", reads: "the Score is at least {n}" },
       { kind: "still_active", label: "It hasn't been used yet", blurb: "this object has not been collected or beaten", icon: "◆", needs: "none", reads: "it hasn't been used yet" },
