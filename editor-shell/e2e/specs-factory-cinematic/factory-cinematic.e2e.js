@@ -513,13 +513,12 @@ async function authorMechanismTrack(part, index) {
     invariant(await invoke("joint_key", { id: part.id, t: key.t }) === true,
       `joint_key refused ${part.name} at t=${key.t}.`);
   }
-  invariant(await invoke("joint_value", { id: part.id, value: 0, commit: true }) === true,
-    `Could not return ${part.name} to its authored zero pose.`);
   const jointInfo = await invoke("joint_info", { id: part.id });
   invariant(jointInfo?.keys === keys.length && closeEnough(jointInfo.trackEnd, 12),
     `Joint readback for ${part.name} does not prove the seven-key 12s loop: ${JSON.stringify(jointInfo)}`);
   invariant(jointInfo.source === "manual" && jointInfo.jointType === profile.motion,
     `Joint readback for ${part.name} changed type/source: ${JSON.stringify(jointInfo)}`);
+  invariant(closeEnough(jointInfo.value, 0), `The closed-loop track did not return ${part.name} to zero: ${JSON.stringify(jointInfo)}`);
   const partDebug = await invoke("part_debug", { id: part.id });
   invariant(Array.isArray(partDebug) && partDebug[3] === true, `Authored mechanism is inactive: ${part.name} ${JSON.stringify(partDebug)}`);
   return {
@@ -626,6 +625,7 @@ describe("production factory cinematic direction", () => {
     let failure = null;
     let lifecycleRecording = { events: [], listenerError: null };
     let playing = false;
+    let inFlightBatchId = null;
     const cadLogOffset = existsSync(cadLog) ? statSync(cadLog).size : 0;
 
     try {
@@ -657,11 +657,13 @@ describe("production factory cinematic direction", () => {
       persistOleLog(cancelledDrop);
       assertOleAccepted(cancelledDrop);
       const cancelledBatchId = await waitForNewDroppedBatch(0);
+      inFlightBatchId = cancelledBatchId;
       const importing = await waitForBatchProgress(cancelledBatchId, "importing");
       const accepted = await invoke("cancel_native_import", { batchId: cancelledBatchId });
       invariant(accepted === true, `The direct cancellation plane did not accept batch ${cancelledBatchId}.`);
       captureComposited("02-first-cancellation-requested");
       const cancelled = await waitForBatchTerminal(cancelledBatchId, "cancelled", cancelledImportTimeoutMs);
+      inFlightBatchId = null;
       invariant(/safe checkpoint/i.test(cancelled.message) && /no scene changes were committed/i.test(cancelled.message),
         `Cancellation terminal was not truthful: ${JSON.stringify(cancelled)}`);
       await browser.waitUntil(async () => {
@@ -693,9 +695,11 @@ describe("production factory cinematic direction", () => {
       persistOleLog(retryDrop);
       assertOleAccepted(retryDrop);
       const retryBatchId = await waitForNewDroppedBatch(cancelledBatchId);
+      inFlightBatchId = retryBatchId;
       await waitForBatchProgress(retryBatchId, "importing");
       captureComposited("05-retry-import-in-progress");
       const succeeded = await waitForBatchTerminal(retryBatchId, "succeeded", completedImportTimeoutMs);
+      inFlightBatchId = null;
       invariant(succeeded.subject?.kind === "entity" && typeof succeeded.subject.rootId === "string",
         `Successful factory import did not return its wrapper entity: ${JSON.stringify(succeeded)}`);
 
@@ -790,6 +794,8 @@ describe("production factory cinematic direction", () => {
         distinctAnimatedSubjectIds: new Set(cinematics.cutscenes.map(({ id }) => id)).size,
         totalShots: cinematics.totalShots,
         totalSeconds: cinematics.totalSeconds,
+        minimumClipSeconds: FACTORY_ACCEPTANCE.minimumCinematicSeconds,
+        recommendedCaptureSeconds: Math.ceil(cinematics.totalSeconds) + 1,
         runtimeOrder: cinematics.cutscenes.map(({ id, name, mood, kinds, plannedSeconds, readback }) => ({
           id,
           name,
@@ -883,6 +889,13 @@ describe("production factory cinematic direction", () => {
         manifest.cleanupErrors.push(`Failure capture: ${String(captureError)}`);
       }
     } finally {
+      if (inFlightBatchId != null) {
+        try {
+          await invoke("cancel_native_import", { batchId: inFlightBatchId });
+        } catch (error) {
+          manifest.cleanupErrors.push(`In-flight import cancellation cleanup: ${String(error)}`);
+        }
+      }
       if (playing) {
         try {
           await invoke("stop");

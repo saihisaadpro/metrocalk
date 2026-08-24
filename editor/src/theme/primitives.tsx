@@ -490,6 +490,7 @@ export function Badge({ children, tone = "neutral", style, title }: { children: 
   };
   return (
     <span
+      className="mtk-badge"
       title={title}
       style={{
         display: "inline-flex",

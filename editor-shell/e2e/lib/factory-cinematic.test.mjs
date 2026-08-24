@@ -76,8 +76,7 @@ test("the 15-subject Calm direction contains 30 shots and clears three minutes w
   const assignments = buildCalmShotAssignments(subjects);
   assert.equal(assignments.length, FACTORY_ACCEPTANCE.filmedSubjects);
   assert.equal(assignments.flatMap(({ kinds }) => kinds).length, FACTORY_ACCEPTANCE.cinematicShots);
-  assert.ok(
-    assignments.reduce((seconds, assignment) => seconds + assignment.plannedSeconds, 0)
-      > FACTORY_ACCEPTANCE.minimumCinematicSeconds,
-  );
+  const seconds = assignments.reduce((total, assignment) => total + assignment.plannedSeconds, 0);
+  assert.equal(seconds, 208.75);
+  assert.ok(seconds > FACTORY_ACCEPTANCE.minimumCinematicSeconds);
 });

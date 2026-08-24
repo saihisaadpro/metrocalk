@@ -1561,6 +1561,10 @@ body > [role="dialog"][aria-modal="true"] {
   gap: var(--mtk-space-2);
   min-width: 0;
 }
+/* The count is two words and never wraps; the BADGE is the thing that gives way, because its word
+   is also printed in full in the key inspector while "2 keys" is stated nowhere else. */
+.mtk-timeline__track-meta > .mtk-badge { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mtk-timeline__track-keys { flex: 0 0 auto; white-space: nowrap; }
 .mtk-timeline__track-actions { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; margin-left: auto; }
 .mtk-timeline__row--track > .mtk-timeline__head.is-selected {
   color: var(--mtk-accent);

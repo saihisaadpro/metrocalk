@@ -192,18 +192,18 @@ export function buildMechanismKeys(amplitude, index) {
 export const CALM_SHOT_PAIRS = Object.freeze([
   ["hero", "orbit"],
   ["vista", "hero"],
-  ["reveal", "detail"],
+  ["reveal", "birdseye"],
   ["birdseye", "dropin"],
-  ["sweep", "closeup"],
+  ["sweep", "pullback"],
   ["pullback", "hero"],
   ["establish", "orbit"],
   ["overshoulder", "reveal"],
   ["looming", "orbit"],
   ["vista", "sweep"],
-  ["hero", "closeup"],
+  ["hero", "confront"],
   ["birdseye", "hero"],
   ["reveal", "orbit"],
-  ["pullback", "detail"],
+  ["pullback", "sweep"],
   ["establish", "sweep"],
 ]);
 
@@ -218,7 +218,7 @@ const authoredShotSeconds = Object.freeze({
   overshoulder: 2.2,
   birdseye: 3.0,
   dropin: 2.2,
-  detail: 1.6,
+  confront: 2.0,
   pullback: 3.2,
   sweep: 3.0,
 });

@@ -1943,7 +1943,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                             column instead of the 100px it had left over beside the buttons. */}
                         <div className="mtk-timeline__track-meta">
                           <Badge tone={bindingTone(state)}>{state.replace("_", " ")}</Badge>
-                          <span style={{ color: color.text.muted, fontSize: fontSize.micro }}>{track.keys.length} keys</span>
+                          <span className="mtk-timeline__track-keys" style={{ color: color.text.muted, fontSize: fontSize.micro }}>{track.keys.length} keys</span>
                           <div className="mtk-timeline__track-actions">
                           <Button
                             compact

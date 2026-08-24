@@ -247,7 +247,8 @@ namespace MtkDrop
                         File.WriteAllText(hoverReadyPath,
                             "hovered=" + DateTimeOffset.UtcNow.ToString("O") + Environment.NewLine +
                             "target=" + expectedTargetRoot + Environment.NewLine +
-                            "point=" + tx + "," + ty + Environment.NewLine);
+                            "point=" + tx + "," + ty + Environment.NewLine +
+                            "press=" + PressStatus + Environment.NewLine);
                         _gestureStatus = "held-over-target";
                         var releaseClock = Stopwatch.StartNew();
                         while (!File.Exists(releasePath))
@@ -266,9 +267,14 @@ namespace MtkDrop
                         }
                         MoveAbs(tx, ty);
                         _gestureStatus = "release-authorized";
+                        File.AppendAllText(hoverReadyPath,
+                            "releaseObserved=" + DateTimeOffset.UtcNow.ToString("O") + Environment.NewLine);
                     }
                     Button(false);
                     _gestureStatus = "released";
+                    if (!String.IsNullOrWhiteSpace(hoverReadyPath))
+                        File.AppendAllText(hoverReadyPath,
+                            "buttonReleased=" + DateTimeOffset.UtcNow.ToString("O") + Environment.NewLine);
                 }
                 catch (Exception ex)
                 {
