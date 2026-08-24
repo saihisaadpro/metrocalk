@@ -504,3 +504,57 @@ jobs:
           name: panel-shots
           path: ${{ runner.temp }}/shots
           if-no-files-found: ignore
+
+  e2e-harness-selftests:
+    # THE HARNESSES THAT DECIDE WHETHER THE ACCEPTANCE EVIDENCE IS EVIDENCE, AND NOTHING HAS EVER RUN
+    # THEIR SELF-TESTS. `editor-shell/e2e` holds four `*.test.mjs` suites — 26 assertions in total — and
+    # no job in this repository executes any of them. One of the four, `lib/factory-cinematic.test.mjs`,
+    # is not wired to an npm script either, so nothing runs it anywhere: it is executed only when a human
+    # remembers to type `node --test` at it, which is the same as not existing
+    # (`<test_and_ci_discipline>` 1).
+    #
+    # This is `check-bundle.mjs` again, one layer further out (ADR-130): written, committed, referenced in
+    # a progress entry as though it gated something, and never executed by any workflow. The difference is
+    # what these four guard. `scripts/video-quality-gate.mjs` is the thing that decides whether the
+    # factory acceptance FILM counts as proof — it is the check that rejects an all-black render and a
+    # duplicated still frame, i.e. the exact two ways a cinematic capture can look like evidence while
+    # showing nothing. `lib/factory-cinematic.js` chooses which mechanisms are filmed at all;
+    # `lib/native-cad-drop.js` drives the OLE drop the CAD acceptance opens with; and
+    # `scripts/accessibility-report.mjs` produces the conformance matrix. If any of them drifts, every
+    # gate downstream keeps passing and stops meaning anything — and the drift is invisible, because the
+    # artifacts they emit still look exactly like artifacts.
+    #
+    # MUTATION-CHECKED BEFORE BEING WIRED, so this is not another file that merely runs. Reverting
+    # `minimumLumaP90`/`minimumLumaPeak` to 0 (a near-black film becomes acceptable) fails 2 of the 9
+    # video-quality tests, and reverting `minimumMovingTransitionFraction`/`minimumPeakMotionDeltaLuma`
+    # to 0 (a frozen film becomes acceptable) fails the same 2. A gate that survives its own defect being
+    # put back is a file; these do not.
+    #
+    # Node built-ins only — the four suites import nothing but `node:*` and their own relative modules —
+    # so this runs with NO install at all and cannot be taken out by a lockfile, a registry outage or a
+    # platform-specific optional dependency. It is seconds long and deliberately has no `paths:` filter:
+    # these harnesses are the measuring instruments, and an instrument is checked on every push.
+    #
+    # The suites are matched by GLOB rather than listed. An explicit list is precisely what missed
+    # `factory-cinematic.test.mjs` for its whole life; a glob means the next harness self-test inherits
+    # this gate the moment it is written, without anyone having to remember this file exists.
+    name: e2e harness self-tests (the instruments, checked at rest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      # 22 to match the editor job; the suites themselves need nothing newer than the built-in test runner.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # `node --test` exits non-zero on any failing assertion, and a glob that matches nothing makes the
+      # shell pass the pattern through literally, so a directory being renamed out from under this gate
+      # fails loudly instead of silently testing zero files.
+      - name: harness self-tests — 4 suites, no install
+        working-directory: editor-shell/e2e
+        shell: bash
+        run: |
+          shopt -s failglob
+          node --test lib/*.test.mjs scripts/*.test.mjs
