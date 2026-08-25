@@ -253,7 +253,11 @@ function encoderArguments(encoder) {
 
 function startStageRecording(output, geometry, seconds, encoder) {
   const args = [
-    "-nostdin",
+    // NOT `-nostdin`: the run stops this recorder early, when the cinematic hands the camera back, and
+    // the only way to stop ffmpeg so that it WRITES THE MOOV ATOM is to send `q` on stdin. With
+    // `-nostdin` it never reads it, the harness fell back to killing the process, and the delivered file
+    // was a headerless mp4 that ffprobe refuses outright ("moov atom not found"). stdin is a pipe this
+    // process owns, so there is no terminal for ffmpeg to steal.
     "-hide_banner",
     "-loglevel",
     "warning",
@@ -275,6 +279,19 @@ function startStageRecording(output, geometry, seconds, encoder) {
     "-t",
     String(seconds),
     "-an",
+    // CONSTANT frame rate out, at the rate we asked for going in.
+    //
+    // `gdigrab` grabs as fast as the desktop lets it, and while the editor is drawing a 17,793-part
+    // assembly that is not quite 30/s: a measured 28.73 fps, which the media gate rejected against its
+    // 30 fps delivery floor. Left variable, the file also carries an average frame rate that no player
+    // and no downstream tool can rely on. Asking the encoder for CFR at the capture rate duplicates a
+    // frame wherever the grab fell behind, so the film runs at TRUE SPEED and is honestly 30 fps -- the
+    // standard answer for screen capture. What it must not do is hide a static or dark film, and it
+    // cannot: the luminance and motion checks read the decoded pixels, not the container.
+    "-fps_mode",
+    "cfr",
+    "-r",
+    "30",
     ...encoderArguments(encoder),
     "-pix_fmt",
     "yuv420p",
@@ -290,7 +307,9 @@ function startStageRecording(output, geometry, seconds, encoder) {
     "+faststart",
     output,
   ];
-  const child = spawn(ffmpeg, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  // stdin stays OPEN (not "ignore") so the run can ask ffmpeg to finalise the file with `q` rather than
+  // killing it mid-container. `-nostdin` in the arguments still stops it consuming a terminal's input.
+  const child = spawn(ffmpeg, args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
   const handle = { child, args, encoder, output, stdout: "", stderr: "", result: null, completion: null };
   child.stdout.on("data", (chunk) => { handle.stdout += chunk.toString(); });
   child.stderr.on("data", (chunk) => { handle.stderr += chunk.toString(); });
@@ -1443,9 +1462,15 @@ describe("production factory cinematic direction", () => {
       // play clock over a known wall-clock interval, so the ratio is observable. `+ 25%` and `+ 12 s`
       // are ordinary head/tail margin on top of the measurement, and the whole thing is capped so a
       // pathological reading cannot produce an hour-long recording.
+      // Engine ticks, whose base is the animation time base rather than 60 -- so this is a RATE, and the
+      // reference it is compared against has to come from the same clock. The transport reports the
+      // plan's own duration in the same units, which is what makes the ratio meaningful.
       const measuredTicksPerSecond = (movingAnimation.currentTick - openingAnimation.currentTick)
         / Math.max(0.001, (movingClockAt - openingClockAt) / 1_000);
-      const nominalTicksPerSecond = 60;
+      const nominalTicksPerSecond = Number.isFinite(movingAnimation.ticksPerSecond)
+        && movingAnimation.ticksPerSecond > 0
+        ? movingAnimation.ticksPerSecond
+        : measuredTicksPerSecond;
       const slowdown = measuredTicksPerSecond > 0
         ? Math.max(1, nominalTicksPerSecond / measuredTicksPerSecond)
         : 1;
@@ -1478,9 +1503,42 @@ describe("production factory cinematic direction", () => {
       invariant(!recordingHandle.result,
         `The ${encoder} recorder exited as soon as it was started: ${JSON.stringify(recordingHandle.result)}
 ${recordingHandle.stderr}`);
-      recordingHandle.result = await waitForRecording(recordingHandle, (captureSeconds + 75) * 1_000);
+      // CUT WHEN THE FILM ENDS, not when the clock runs out.
+      //
+      // `captureSeconds` is a ceiling derived from a measured play-clock rate, and a ceiling is the wrong
+      // thing to deliver: too short truncates the direction mid-shot, too long tapes minutes of restored
+      // editor after the last shot. The cutscene runtime already announces the end by handing the camera
+      // back (`camera_probe().cinematic === false`), which is the real end of the film -- so watch for
+      // that and stop there, leaving the ceiling as nothing but a guard against a film that never ends.
+      let handedBack = false;
+      const filmDeadline = Date.now() + (captureSeconds + 60) * 1_000;
+      while (!recordingHandle.result && Date.now() < filmDeadline) {
+        if ((await invoke("camera_probe")).cinematic === false) { handedBack = true; break; }
+        await delay(1_000);
+      }
+      if (handedBack && !recordingHandle.result) {
+        // A tail beat so the final frame of the last shot is genuinely in the file, then a GRACEFUL stop.
+        // `q` asks ffmpeg to finish writing the container; killing it instead leaves an mp4 with no moov
+        // atom, which no decoder will open. Kill only if it ignores the request.
+        await delay(1_500);
+        try { recordingHandle.child.stdin?.write("q"); } catch { /* already gone */ }
+        const graceful = await waitForRecording(recordingHandle, 45_000);
+        if (graceful.timeout) {
+          recordingHandle.child.kill();
+          recordingHandle.result = await waitForRecording(recordingHandle, 30_000);
+        } else {
+          recordingHandle.result = graceful;
+        }
+      }
+      if (!recordingHandle.result) {
+        recordingHandle.result = await waitForRecording(recordingHandle, 120_000);
+      }
+      manifest.preview.filmEnded = { handedBack, captureCeilingSeconds: captureSeconds };
       const recordingLog = persistRecordingLog("factory-cinematic-recording.log", recordingHandle);
-      invariant(!recordingHandle.result.error && !recordingHandle.result.timeout && recordingHandle.result.code === 0,
+      // A recorder WE stopped at the handoff exits non-zero by construction; one that stopped for
+      // any other reason still has to have succeeded.
+      invariant(!recordingHandle.result.error && !recordingHandle.result.timeout
+        && (recordingHandle.result.code === 0 || handedBack),
         `The ${captureSeconds}s ${encoder} recording failed: ${JSON.stringify(recordingHandle.result)}\n${recordingHandle.stderr}`);
       invariant(existsSync(videoFile) && statSync(videoFile).size > 1_000_000,
         `The recorded cinematic is missing or implausibly small: ${videoFile}`);
