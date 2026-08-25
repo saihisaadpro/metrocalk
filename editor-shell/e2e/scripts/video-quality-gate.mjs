@@ -21,6 +21,13 @@ export const QUALITY_THRESHOLDS = Object.freeze({
   allowedVideoCodecs: Object.freeze(["h264", "hevc", "av1"]),
   maximumFrameCountRelativeError: 0.01,
   maximumFrameDurationMismatchSeconds: 1,
+  visualSampleIntervalSeconds: 2,
+  minimumVisualSamples: 12,
+  minimumLumaP90: 24,
+  minimumLumaPeak: 32,
+  motionDeltaLumaThreshold: 0.25,
+  minimumMovingTransitionFraction: 0.08,
+  minimumPeakMotionDeltaLuma: 1,
 });
 
 const DEFAULT_SAMPLE_COUNT = 12;
@@ -69,6 +76,121 @@ export function parseRational(value) {
 
 function check(id, passed, expected, actual, detail) {
   return { id, passed: Boolean(passed), expected, actual, detail };
+}
+
+function percentile(sortedValues, fraction) {
+  if (sortedValues.length === 0) return null;
+  const position = Math.max(0, Math.min(1, fraction)) * (sortedValues.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sortedValues[lower];
+  const weight = position - lower;
+  return sortedValues[lower] * (1 - weight) + sortedValues[upper] * weight;
+}
+
+function rounded(value) {
+  return value === null ? null : Number(value.toFixed(6));
+}
+
+function summarizeSamples(values) {
+  const finiteValues = values.filter(Number.isFinite).sort((left, right) => left - right);
+  if (finiteValues.length === 0) {
+    return { count: 0, minimum: null, mean: null, p50: null, p90: null, maximum: null };
+  }
+  const mean = finiteValues.reduce((sum, value) => sum + value, 0) / finiteValues.length;
+  return {
+    count: finiteValues.length,
+    minimum: rounded(finiteValues[0]),
+    mean: rounded(mean),
+    p50: rounded(percentile(finiteValues, 0.5)),
+    p90: rounded(percentile(finiteValues, 0.9)),
+    maximum: rounded(finiteValues.at(-1)),
+  };
+}
+
+export function parseSignalStatsMetadata(output) {
+  const frames = [];
+  let current = null;
+  for (const line of String(output ?? "").split(/\r?\n/u)) {
+    const frameMatch = /^frame:(\d+)\s+pts:\S+\s+pts_time:([^\s]+)/u.exec(line.trim());
+    if (frameMatch) {
+      current = {
+        frame: Number.parseInt(frameMatch[1], 10),
+        ptsTimeSeconds: finiteNumber(frameMatch[2]),
+        metrics: {},
+      };
+      frames.push(current);
+      continue;
+    }
+    const metricMatch = /^lavfi\.signalstats\.([A-Z0-9]+)=([^\s]+)/u.exec(line.trim());
+    if (current && metricMatch) {
+      const value = finiteNumber(metricMatch[2]);
+      if (value !== null) current.metrics[metricMatch[1]] = value;
+    }
+  }
+  return frames;
+}
+
+export function evaluateVisualContent(
+  { luminanceSamples = [], motionSamples = [] },
+  thresholds = QUALITY_THRESHOLDS,
+) {
+  const luminance = summarizeSamples(luminanceSamples);
+  const motion = summarizeSamples(motionSamples);
+  const movingTransitions = motionSamples.filter(
+    (value) => Number.isFinite(value) && value >= thresholds.motionDeltaLumaThreshold,
+  ).length;
+  const movingTransitionFraction =
+    motion.count > 0 ? rounded(movingTransitions / motion.count) : null;
+
+  const checks = [
+    check(
+      "visual-luminance-samples",
+      luminance.count >= thresholds.minimumVisualSamples,
+      `>= ${thresholds.minimumVisualSamples} uniformly spaced luminance samples`,
+      luminance.count,
+      "FFmpeg signalstats must report enough decoded frames to characterize the full clip.",
+    ),
+    check(
+      "visual-not-near-black",
+      luminance.p90 !== null &&
+        luminance.maximum !== null &&
+        luminance.p90 >= thresholds.minimumLumaP90 &&
+        luminance.maximum >= thresholds.minimumLumaPeak,
+      `p90 YAVG >= ${thresholds.minimumLumaP90} and peak YAVG >= ${thresholds.minimumLumaPeak}`,
+      { p90YAverage: luminance.p90, peakYAverage: luminance.maximum },
+      "The upper portion of uniformly sampled frames must contain visible image energy; an all-black or near-black render cannot pass.",
+    ),
+    check(
+      "visual-motion-samples",
+      motion.count >= thresholds.minimumVisualSamples - 1,
+      `>= ${thresholds.minimumVisualSamples - 1} uniformly spaced frame-difference samples`,
+      motion.count,
+      "FFmpeg tblend differences must cover the sampled clip.",
+    ),
+    check(
+      "visual-not-static",
+      movingTransitionFraction !== null &&
+        motion.maximum !== null &&
+        movingTransitionFraction >= thresholds.minimumMovingTransitionFraction &&
+        motion.maximum >= thresholds.minimumPeakMotionDeltaLuma,
+      `>= ${thresholds.minimumMovingTransitionFraction * 100}% of transitions with YAVG delta >= ${thresholds.motionDeltaLumaThreshold}, and peak delta >= ${thresholds.minimumPeakMotionDeltaLuma}`,
+      {
+        movingTransitions,
+        transitionCount: motion.count,
+        movingTransitionFraction,
+        peakDeltaYAverage: motion.maximum,
+      },
+      "A small minority of the clip must visibly change. Long legitimate holds remain allowed, while a duplicated still frame or token fade cannot pass.",
+    ),
+  ];
+
+  return {
+    passed: checks.every((item) => item.passed),
+    checks,
+    luminance,
+    motion: { ...motion, movingTransitions, movingTransitionFraction },
+  };
 }
 
 export function evaluateProbe(probe, thresholds = QUALITY_THRESHOLDS) {
@@ -323,6 +445,102 @@ function commandEvidence(result, includeStdout = false) {
   };
 }
 
+export function analyzeVisualContent({
+  ffmpeg,
+  input,
+  thresholds = QUALITY_THRESHOLDS,
+  intervalSeconds = thresholds.visualSampleIntervalSeconds,
+}) {
+  if (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0) {
+    throw new Error("Visual-content analysis requires a positive finite sample interval.");
+  }
+  const sampleRate = Number((1 / intervalSeconds).toFixed(9));
+  const commonArguments = [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    input,
+    "-map",
+    "0:v:0",
+  ];
+  const outputArguments = ["-an", "-sn", "-dn", "-f", "null", NULL_DEVICE];
+  const lumaFilter =
+    `fps=${sampleRate},scale=320:-2:flags=area,format=yuv444p,` +
+    "signalstats,metadata=mode=print:file=-";
+  const motionFilter =
+    `fps=${sampleRate},scale=320:-2:flags=area,format=yuv444p,` +
+    "tblend=all_mode=difference,signalstats,metadata=mode=print:file=-";
+
+  const luminanceResult = runProcess(
+    ffmpeg,
+    [...commonArguments, "-vf", lumaFilter, ...outputArguments],
+    "ffmpeg sampled luminance analysis",
+  );
+  const motionResult = runProcess(
+    ffmpeg,
+    [...commonArguments, "-vf", motionFilter, ...outputArguments],
+    "ffmpeg sampled temporal-difference analysis",
+  );
+  const luminanceFrames = parseSignalStatsMetadata(luminanceResult.stdout);
+  const motionFrames = parseSignalStatsMetadata(motionResult.stdout);
+  const luminanceSamples = luminanceFrames
+    .map((frame) => frame.metrics.YAVG)
+    .filter(Number.isFinite);
+  const motionSamples = motionFrames
+    .map((frame) => frame.metrics.YAVG)
+    .filter(Number.isFinite);
+  const evaluation = evaluateVisualContent({ luminanceSamples, motionSamples }, thresholds);
+  const commandChecks = [
+    check(
+      "visual-luminance-command",
+      luminanceResult.exitCode === 0 && !luminanceResult.spawnError && luminanceResult.stderr.trim().length === 0,
+      "successful FFmpeg sampled luminance analysis",
+      luminanceResult.exitCode,
+      luminanceResult.stderr.trim() || luminanceResult.spawnError || "FFmpeg completed without diagnostics.",
+    ),
+    check(
+      "visual-motion-command",
+      motionResult.exitCode === 0 && !motionResult.spawnError && motionResult.stderr.trim().length === 0,
+      "successful FFmpeg sampled temporal-difference analysis",
+      motionResult.exitCode,
+      motionResult.stderr.trim() || motionResult.spawnError || "FFmpeg completed without diagnostics.",
+    ),
+  ];
+  const checks = [...commandChecks, ...evaluation.checks];
+
+  return {
+    passed: checks.every((item) => item.passed),
+    strategy: {
+      sampleIntervalSeconds: intervalSeconds,
+      sampleRateFramesPerSecond: sampleRate,
+      analysisWidth: 320,
+      luminanceMetric: "signalstats YAVG on uniformly sampled frames",
+      motionMetric: "signalstats YAVG after tblend absolute frame difference",
+    },
+    checks,
+    luminance: {
+      command: commandEvidence(luminanceResult),
+      summary: evaluation.luminance,
+      samples: luminanceFrames.map((frame) => ({
+        frame: frame.frame,
+        ptsTimeSeconds: frame.ptsTimeSeconds,
+        yAverage: frame.metrics.YAVG ?? null,
+      })),
+    },
+    motion: {
+      command: commandEvidence(motionResult),
+      summary: evaluation.motion,
+      samples: motionFrames.map((frame) => ({
+        frame: frame.frame,
+        ptsTimeSeconds: frame.ptsTimeSeconds,
+        deltaYAverage: frame.metrics.YAVG ?? null,
+      })),
+    },
+  };
+}
+
 function writeManifestAtomically(manifestPath, manifest) {
   const temporaryPath = `${manifestPath}.tmp-${process.pid}`;
   fs.writeFileSync(temporaryPath, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
@@ -374,7 +592,7 @@ function contactSheetFilter(sampleCount) {
 export async function runQualityGate(options) {
   const output = prepareOutput(options);
   const manifest = {
-    schema: "metrocalk.video-quality-gate/v1",
+    schema: "metrocalk.video-quality-gate/v2",
     generatedAtUtc: new Date().toISOString(),
     passed: false,
     thresholds: QUALITY_THRESHOLDS,
@@ -383,6 +601,7 @@ export async function runQualityGate(options) {
     probe: null,
     checks: [],
     strictDecode: { passed: false, command: null },
+    visualContent: { passed: false, strategy: null, checks: [], luminance: null, motion: null },
     representativeFrames: { passed: false, strategy: "midpoint of each equal-duration interval", frames: [] },
     contactSheet: { passed: false, artifact: null },
     errors: [],
@@ -448,6 +667,13 @@ export async function runQualityGate(options) {
       passed: decodeResult.exitCode === 0 && !decodeResult.spawnError && decodeResult.stderr.trim().length === 0,
       command: commandEvidence(decodeResult),
     };
+
+    console.log("Measuring sampled luminance and temporal change across the complete clip...");
+    manifest.visualContent = analyzeVisualContent({
+      ffmpeg: options.ffmpeg,
+      input: options.input,
+    });
+    manifest.checks.push(...manifest.visualContent.checks);
 
     const duration = evaluation.normalized.durationSeconds;
     if (duration === null || duration <= 0) throw new Error("Representative sampling requires a positive duration.");
@@ -548,6 +774,7 @@ export async function runQualityGate(options) {
     manifest.checks.length > 0 &&
     manifest.checks.every((item) => item.passed) &&
     manifest.strictDecode.passed &&
+    manifest.visualContent.passed &&
     manifest.representativeFrames.passed &&
     manifest.contactSheet.passed;
   manifest.completedAtUtc = new Date().toISOString();

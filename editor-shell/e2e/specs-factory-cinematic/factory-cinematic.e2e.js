@@ -7,13 +7,14 @@
 // reusable .mtk package plus a machine-auditable evidence manifest.
 
 import { browser } from "@wdio/globals";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   statSync,
   writeFileSync,
@@ -23,9 +24,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   buildCalmShotAssignments,
-  buildMechanismKeys,
+  buildKeysForProfile,
   chooseFilmedSubjects,
+  closedLoopEndValue,
   FACTORY_ACCEPTANCE,
+  isNeutralPose,
   motionProfileFor,
   normalizedPartName,
   selectMechanismParts,
@@ -62,6 +65,14 @@ if (statSync(fixture).size < FACTORY_ACCEPTANCE.minimumFixtureBytes) {
 
 const oleDropScript = realpathSync.native(path.resolve(e2eDir, "scripts/ole-drop-file.ps1"));
 const captureScript = realpathSync.native(path.resolve(e2eDir, "scripts/capture-composited-window.ps1"));
+const windowGeometryScript = realpathSync.native(path.resolve(e2eDir, "scripts/window-client-rect.ps1"));
+const videoQualityGateScript = realpathSync.native(path.resolve(e2eDir, "scripts/video-quality-gate.mjs"));
+const ffmpegDirectory = path.resolve(
+  os.homedir(),
+  "AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-8.0.1-full_build/bin",
+);
+const ffmpeg = realpathSync.native(process.env.MTK_FFMPEG ? path.resolve(process.env.MTK_FFMPEG) : path.join(ffmpegDirectory, "ffmpeg.exe"));
+const ffprobe = realpathSync.native(process.env.MTK_FFPROBE ? path.resolve(process.env.MTK_FFPROBE) : path.join(ffmpegDirectory, "ffprobe.exe"));
 const processName = path.basename(context.application.path, path.extname(context.application.path));
 const fixtureName = path.basename(fixture);
 const cadLog = path.resolve(os.tmpdir(), "mtk-cad-import.log");
@@ -84,6 +95,14 @@ function recordArtifact(file) {
   if (artifactPaths.has(relative)) return;
   artifactPaths.add(relative);
   artifacts.push({ file: relative.replaceAll("\\", "/"), bytes: statSync(absolute).size, sha256: sha256(absolute) });
+}
+
+function recordDirectoryArtifacts(directory) {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const child = path.join(directory, entry.name);
+    if (entry.isDirectory()) recordDirectoryArtifacts(child);
+    else if (entry.isFile()) recordArtifact(child);
+  }
 }
 
 function writeJson(name, value) {
@@ -124,6 +143,207 @@ function captureComposited(label, preserveWindow = false) {
     );
     throw error;
   }
+  recordArtifact(output);
+  return output;
+}
+
+/**
+ * Measure how much two captured frames actually differ, in luma.
+ *
+ * Screenshot evidence is only evidence if somebody looks at it. A "before" and an "after" that are
+ * byte-identical prove the opposite of what they are filed under, and an engine number reported by the
+ * same process that failed to redraw cannot notice. This decodes both PNGs, blends them in difference
+ * mode and reads the real per-pixel statistics back out of FFmpeg.
+ */
+function capturedFrameDelta(beforePath, afterPath) {
+  // `metadata=print` writes through FFmpeg's LOGGER, i.e. stderr - reading only stdout returned an
+  // empty string, both statistics parsed as null, and the gate failed claiming it "could not measure"
+  // rather than reporting a difference. Read BOTH streams so it does not matter which one it uses.
+  const completed = spawnSync(ffmpeg, [
+    "-hide_banner",
+    "-nostdin",
+    "-i", beforePath,
+    "-i", afterPath,
+    "-lavfi", "[0][1]blend=all_mode=difference,signalstats,metadata=print",
+    "-f", "null",
+    "-",
+  ], { encoding: "utf8", timeout: 120_000, windowsHide: true });
+  if (completed.error) throw completed.error;
+  const result = `${completed.stdout ?? ""}
+${completed.stderr ?? ""}`;
+  const read = (key) => {
+    const match = new RegExp(`lavfi\\.signalstats\\.${key}=([-0-9.]+)`).exec(result);
+    return match ? Number(match[1]) : null;
+  };
+  return { meanLuma: read("YAVG"), peakLuma: read("YMAX") };
+}
+
+/**
+ * Fail unless the viewport visibly changed between two captures.
+ *
+ * `peakLuma` rather than the mean on purpose: one mechanism moving in a wide frame changes a small
+ * fraction of the pixels, so a mean-difference threshold would have to be set so low it stopped
+ * discriminating. A real move always produces strongly differing pixels SOMEWHERE.
+ */
+function assertViewportChanged(beforePath, afterPath, what, minimumPeakLuma = 24) {
+  const delta = capturedFrameDelta(beforePath, afterPath);
+  invariant(delta.peakLuma !== null && delta.meanLuma !== null,
+    `Could not measure the frame difference for ${what}: ${JSON.stringify(delta)}`);
+  invariant(delta.peakLuma >= minimumPeakLuma,
+    `${what} did not visibly change the viewport (peak luma difference ${delta.peakLuma}, mean ${delta.meanLuma}). `
+    + `The engine reported the change but the rendered pixels are ${delta.peakLuma === 0 ? "identical" : "effectively identical"}.`);
+  return delta;
+}
+
+function readWindowClientRect() {
+  const stdout = execFileSync("powershell.exe", [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    windowGeometryScript,
+    "-ProcName",
+    processName,
+  ], { encoding: "utf8", timeout: 30_000, windowsHide: true });
+  return JSON.parse(stdout.trim());
+}
+
+async function measureViewportCapture() {
+  const client = readWindowClientRect();
+  const dom = await browser.execute(() => {
+    const viewport = document.querySelector("#viewport");
+    if (!viewport) return null;
+    const rect = viewport.getBoundingClientRect();
+    return {
+      rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio,
+    };
+  });
+  invariant(dom && dom.innerWidth > 0 && dom.innerHeight > 0, `The live viewport could not be measured: ${JSON.stringify(dom)}`);
+  const scaleX = client.width / dom.innerWidth;
+  const scaleY = client.height / dom.innerHeight;
+  invariant(Number.isFinite(scaleX) && Number.isFinite(scaleY) && Math.abs(scaleX - scaleY) < 0.03,
+    `WebView/client scaling is incoherent: ${JSON.stringify({ client, dom, scaleX, scaleY })}`);
+  const x = Math.round(client.x + dom.rect.left * scaleX);
+  const y = Math.round(client.y + dom.rect.top * scaleY);
+  const width = Math.floor((dom.rect.width * scaleX) / 2) * 2;
+  const height = Math.floor((dom.rect.height * scaleY) / 2) * 2;
+  invariant(width >= 1280 && height >= 720,
+    `The maximised clean stage is below the 1280x720 delivery floor: ${JSON.stringify({ x, y, width, height, client, dom })}`);
+  invariant(x >= client.x && y >= client.y && x + width <= client.x + client.width && y + height <= client.y + client.height,
+    `The stage capture rectangle escaped the measured client: ${JSON.stringify({ x, y, width, height, client, dom })}`);
+  // gdigrab records the DESKTOP at this rectangle, not the window. If anything covers the editor, the
+  // film is of THAT application - and a luminance/motion quality gate cannot tell the difference, so the
+  // run would go green over a recording of the wrong program. Refuse, and name what is in the way.
+  invariant(client.occluded !== true,
+    `The editor is occluded by "${client.occludedBy}", so a desktop recording would film that window `
+      + `instead of the cinematic. Close or windowed-mode it before recording: ${JSON.stringify(client)}`);
+  return { x, y, width, height, client, dom, scaleX, scaleY };
+}
+
+function encoderArguments(encoder) {
+  return encoder === "h264_nvenc"
+    ? ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr", "-cq", "16", "-b:v", "0"]
+    : ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14"];
+}
+
+function startStageRecording(output, geometry, seconds, encoder) {
+  const args = [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-n",
+    "-f",
+    "gdigrab",
+    "-framerate",
+    "30",
+    "-draw_mouse",
+    "0",
+    "-offset_x",
+    String(geometry.x),
+    "-offset_y",
+    String(geometry.y),
+    "-video_size",
+    `${geometry.width}x${geometry.height}`,
+    "-i",
+    "desktop",
+    "-t",
+    String(seconds),
+    "-an",
+    ...encoderArguments(encoder),
+    "-pix_fmt",
+    "yuv420p",
+    "-color_primaries",
+    "bt709",
+    "-color_trc",
+    "bt709",
+    "-colorspace",
+    "bt709",
+    "-color_range",
+    "tv",
+    "-movflags",
+    "+faststart",
+    output,
+  ];
+  const child = spawn(ffmpeg, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  const handle = { child, args, encoder, output, stdout: "", stderr: "", result: null, completion: null };
+  child.stdout.on("data", (chunk) => { handle.stdout += chunk.toString(); });
+  child.stderr.on("data", (chunk) => { handle.stderr += chunk.toString(); });
+  handle.completion = new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      handle.result = result;
+      resolve(result);
+    };
+    child.once("error", (error) => finish({ code: null, signal: null, error: String(error) }));
+    child.once("close", (code, signal) => finish({ code, signal, error: null }));
+  });
+  return handle;
+}
+
+async function waitForRecording(handle, timeoutMs) {
+  let timer;
+  const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve({ timeout: true }), timeoutMs); });
+  const result = await Promise.race([handle.completion, timeout]);
+  clearTimeout(timer);
+  if (result?.timeout) {
+    const terminated = handle.child.kill();
+    const afterKill = await Promise.race([
+      handle.completion,
+      delay(5_000).then(() => null),
+    ]);
+    return afterKill
+      ? { ...afterKill, timeout: true, terminated }
+      : {
+          code: null,
+          signal: null,
+          timeout: true,
+          terminated,
+          error: `ffmpeg ${handle.encoder} capture exceeded ${timeoutMs}ms and did not exit within 5s of termination.`,
+        };
+  }
+  return result;
+}
+
+function persistRecordingLog(name, handle) {
+  const output = exactNamedChild(runDir, name);
+  writeFileSync(output, [
+    `encoder=${handle.encoder}`,
+    `result=${JSON.stringify(handle.result)}`,
+    `command=${JSON.stringify([ffmpeg, ...handle.args])}`,
+    "--- stdout ---",
+    handle.stdout,
+    "--- stderr ---",
+    handle.stderr,
+    "",
+  ].join("\n"), { encoding: "utf8", flag: "wx" });
   recordArtifact(output);
   return output;
 }
@@ -285,7 +505,9 @@ function startOleDrop(attempt) {
     "-HoverTimeoutSeconds",
     "60",
   ];
-  const child = spawn("powershell.exe", args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  // The helper moves PowerShell's console off-screen itself. Process-wide hiding also suppresses its first
+  // WinForms source HWND, which prevents genuine mouse capture and leaves Control.DoDragDrop modal forever.
+  const child = spawn("powershell.exe", args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: false });
   const handle = { attempt, child, hoverReady, release, stdout: "", stderr: "", result: null, completion: null };
   child.stdout.on("data", (chunk) => { handle.stdout += chunk.toString(); });
   child.stderr.on("data", (chunk) => { handle.stderr += chunk.toString(); });
@@ -310,7 +532,15 @@ async function waitForHoverBarrier(handle, timeoutMs = 30_000) {
     if (handle.result) throw new Error(`OLE ${handle.attempt} exited before held hover: ${JSON.stringify(handle.result)}\n${handle.stdout}\n${handle.stderr}`);
     await delay(100);
   }
-  throw new Error(`OLE ${handle.attempt} did not reach held hover in ${timeoutMs}ms.`);
+  // A synthetic OLE drag depends on Windows foreground/input rules holding still for its duration: any
+  // window that takes the foreground mid-drag (a console spawned by another tool, an installer toast)
+  // can strand the modal drag loop. Report what the helper had actually said so that a stranded drag is
+  // distinguishable from a target that refused the drop.
+  throw new Error(
+    `OLE ${handle.attempt} did not reach held hover in ${timeoutMs}ms.`
+    + `\nhelper stdout: ${handle.stdout.trim() || "(silent)"}`
+    + `\nhelper stderr: ${handle.stderr.trim() || "(silent)"}`,
+  );
 }
 
 function releaseOleDrop(handle, reason = "authorized-release") {
@@ -340,6 +570,48 @@ function persistOleLog(handle) {
       { encoding: "utf8", flag: "wx" },
     );
     recordArtifact(output);
+  }
+}
+
+/**
+ * Did the helper refuse the gesture because a window that is NOT the editor covered the drop point?
+ *
+ * The distinction is the whole point. A foreign window taking the foreground mid-drag (a console another
+ * tool spawned, a notification toast) is an accident of a shared desktop and is worth retrying. The
+ * editor covering its OWN drop target is a product defect — a modal that swallows drops — and retrying
+ * that would turn a real bug into a flaky test that eventually passes.
+ */
+function occludedByForeignWindow(log) {
+  const gesture = /DROP_GESTURE: target-hit-test-failed: under=\d+ root=(\d+)/.exec(log);
+  const target = /DROP_TARGET: pid=\d+ hwnd=(\d+)/.exec(log);
+  return Boolean(gesture && target && gesture[1] !== target[1]);
+}
+
+/**
+ * Perform the real OS drag, retrying only when a foreign window stole the drop point.
+ *
+ * Each attempt is a complete, genuine Win32 CF_HDROP gesture and keeps its own evidence file, so a run
+ * that needed two tries says so rather than hiding it.
+ */
+async function startOleDropSurvivingOcclusion(attempt, dropHandles, maxAttempts = 3) {
+  for (let index = 0; ; index += 1) {
+    const handle = startOleDrop(index === 0 ? attempt : `${attempt}-again${index}`);
+    dropHandles.push(handle);
+    try {
+      return { handle, hoverBarrier: await waitForHoverBarrier(handle), gestures: index + 1 };
+    } catch (error) {
+      if (!handle.result) {
+        releaseOleDrop(handle, "occlusion-abandon");
+        await waitForDropExit(handle, 20_000).catch(() => {});
+      }
+      persistOleLog(handle);
+      const log = `${handle.stdout}\n${handle.stderr}`;
+      if (index + 1 >= maxAttempts || !occludedByForeignWindow(log)) throw error;
+      // Let whatever took the foreground finish, then put the editor back in front and try again.
+      await browser.pause(2_000);
+      await browser.maximizeWindow();
+      await browser.pause(800);
+    }
   }
 }
 
@@ -488,67 +760,99 @@ async function saveThumbnails(parts) {
   return rows;
 }
 
-async function authorMechanismTrack(part, index) {
+/** Read the part's live transform and derive the mechanism it should perform. No document mutation yet. */
+async function planMechanismTrack(part, index) {
   const transform = await invoke("read_transform", { id: part.id });
   invariant(Array.isArray(transform) && transform.length === 8 && transform.every(Number.isFinite),
     `Part ${part.name} returned a non-finite transform: ${JSON.stringify(transform)}`);
   const profile = motionProfileFor(part);
   const pivot = transform.slice(0, 3);
-  const limit = profile.amplitude * 1.15;
-  const set = await invoke("set_joint", {
-    id: part.id,
-    revolute: profile.revolute,
-    axis: profile.axis,
-    pivot,
-    min: -limit,
-    max: limit,
-    source: "manual",
-  });
-  invariant(set === true, `set_joint refused ${part.name} (${part.id}) with ${JSON.stringify(profile)}.`);
-
-  const keys = buildMechanismKeys(profile.amplitude, index);
-  for (const key of keys) {
-    invariant(await invoke("joint_value", { id: part.id, value: key.value, commit: true }) === true,
-      `joint_value refused ${part.name} at t=${key.t}, value=${key.value}.`);
-    invariant(await invoke("joint_key", { id: part.id, t: key.t }) === true,
-      `joint_key refused ${part.name} at t=${key.t}.`);
-  }
-  const jointInfo = await invoke("joint_info", { id: part.id });
-  invariant(jointInfo?.keys === keys.length && closeEnough(jointInfo.trackEnd, 12),
-    `Joint readback for ${part.name} does not prove the seven-key 12s loop: ${JSON.stringify(jointInfo)}`);
-  invariant(jointInfo.source === "manual" && jointInfo.jointType === profile.motion,
-    `Joint readback for ${part.name} changed type/source: ${JSON.stringify(jointInfo)}`);
-  invariant(closeEnough(jointInfo.value, 0), `The closed-loop track did not return ${part.name} to zero: ${JSON.stringify(jointInfo)}`);
-  const partDebug = await invoke("part_debug", { id: part.id });
-  invariant(Array.isArray(partDebug) && partDebug[3] === true, `Authored mechanism is inactive: ${part.name} ${JSON.stringify(partDebug)}`);
-  return {
-    id: part.id,
-    name: part.name,
-    fidelity: part.fidelity,
-    mechanismFamily: part.mechanismFamily,
-    matchedQueries: part.matchedQueries,
-    transform,
-    profile: { ...profile, pivot, limits: [-limit, limit] },
-    keys,
-    jointInfo,
-    partDebug,
-  };
+  const limit = Math.abs(profile.amplitude) * 1.15;
+  return { part, index, transform, profile, pivot, limit, keys: buildKeysForProfile(profile, index) };
 }
 
-async function authorCinematics(subjects) {
+/**
+ * Author every mechanism as ONE transaction through the shell's `joint_author_batch` command.
+ *
+ * This is the same durable engine capability the editor's own mechanism authoring uses, and it is the
+ * whole point of the command: repeating `set_joint`/`joint_value`/`joint_key` per key made the shell
+ * recompile the animation plan and republish all 17k render instances 336 times for a single authoring
+ * gesture. The batch pays those two costs exactly once, leaves one Ctrl-Z step behind, and is verified
+ * below by ordinary per-joint readback — the assertions did not get weaker, only the round trips fewer.
+ */
+async function authorMechanismTracks(selected) {
+  const plans = [];
+  for (const [index, part] of selected.entries()) plans.push(await planMechanismTrack(part, index));
+  const expectedKeys = plans.reduce((count, plan) => count + plan.keys.length, 0);
+
+  const started = Date.now();
+  const batch = await invoke("joint_author_batch", {
+    requests: plans.map(({ part, profile, pivot, limit, keys }) => ({
+      id: part.id,
+      revolute: profile.revolute,
+      axis: profile.axis,
+      pivot,
+      min: -limit,
+      max: limit,
+      source: "manual",
+      keys: keys.map(({ t, value }) => ({ t, value })),
+    })),
+  });
+  const elapsedMs = Date.now() - started;
+  invariant(batch?.ok === true, `The mechanism transaction was refused: ${JSON.stringify(batch)}`);
+  invariant(batch.authoredJoints === plans.length && batch.authoredKeys === expectedKeys,
+    `The mechanism transaction reported ${batch.authoredJoints}/${batch.authoredKeys}, expected ${plans.length}/${expectedKeys}.`);
+  // A production-size scene must stay workable. One authoring gesture that takes minutes is a defect in
+  // the engine, not an acceptable cost of a large assembly — this gate is what keeps it fixed.
+  invariant(elapsedMs < 60_000,
+    `Authoring ${plans.length} joints and ${expectedKeys} keys took ${elapsedMs}ms in a ${FACTORY_ACCEPTANCE.report.total}-part scene.`);
+
+  const tracks = [];
+  for (const plan of plans) {
+    const { part, profile, pivot, limit, keys, transform } = plan;
+    const jointInfo = await invoke("joint_info", { id: part.id });
+    invariant(jointInfo?.keys === keys.length && closeEnough(jointInfo.trackEnd, 12),
+      `Joint readback for ${part.name} does not prove the seven-key 12s loop: ${JSON.stringify(jointInfo)}`);
+    invariant(jointInfo.source === "manual" && jointInfo.jointType === profile.motion,
+      `Joint readback for ${part.name} changed type/source: ${JSON.stringify(jointInfo)}`);
+    invariant(closeEnough(jointInfo.value, closedLoopEndValue(profile), 1e-6),
+      `The track did not end ${part.name} on its authored final value: ${JSON.stringify(jointInfo)}`);
+    invariant(isNeutralPose(profile, jointInfo.value, 1e-6),
+      `The closed loop did not return ${part.name} to its neutral pose: ${JSON.stringify(jointInfo)}`);
+    const partDebug = await invoke("part_debug", { id: part.id });
+    invariant(Array.isArray(partDebug) && partDebug[3] === true, `Authored mechanism is inactive: ${part.name} ${JSON.stringify(partDebug)}`);
+    tracks.push({
+      id: part.id,
+      name: part.name,
+      fidelity: part.fidelity,
+      mechanismFamily: part.mechanismFamily,
+      matchedQueries: part.matchedQueries,
+      transform,
+      profile: { ...profile, pivot, limits: [-limit, limit] },
+      keys,
+      jointInfo,
+      partDebug,
+    });
+  }
+  return { tracks, batch, elapsedMs };
+}
+
+async function authorCinematics(subjects, assemblyId) {
   const catalog = await invoke("cinema_catalog");
   const knownKinds = new Set(catalog.map(({ kind }) => kind));
+  // Cutscenes are played in entity-key order by the runtime, so the direction is built against exactly
+  // that order: the first subject's sequence opens the film and the last one's closes it.
   const orderedSubjects = [...subjects].sort((left, right) => left.id.localeCompare(right.id));
-  const assignments = buildCalmShotAssignments(orderedSubjects);
+  const assignments = buildCalmShotAssignments(orderedSubjects, { assemblyId });
   const directed = [];
   for (const assignment of assignments) {
-    invariant(assignment.kinds.every((kind) => knownKinds.has(kind)),
+    invariant(assignment.kinds.every(({ kind }) => knownKinds.has(kind)),
       `The direction references a shot kind missing from the live catalogue: ${JSON.stringify(assignment)}`);
     const mood = await invoke("cinema_set_mood", { id: assignment.id, mood: "calm" });
     invariant(mood.reason == null && mood.mood === "calm", `Could not set Calm pacing on ${assignment.name}: ${JSON.stringify(mood)}`);
     const replies = [];
-    for (const kind of assignment.kinds) {
-      const reply = await invoke("cinema_add_shot", { id: assignment.id, kind });
+    for (const { kind, subject } of assignment.kinds) {
+      const reply = await invoke("cinema_add_shot", { id: assignment.id, kind, subject });
       invariant(reply.reason == null, `Shot ${kind} was refused for ${assignment.name}: ${JSON.stringify(reply)}`);
       replies.push(reply);
     }
@@ -583,6 +887,8 @@ async function dismissImportOverlay() {
 
 async function prepareCinematicStage() {
   await dismissImportOverlay();
+  await browser.maximizeWindow();
+  await browser.pause(800);
   await browser.execute(() => {
     const clickNamed = (label) => {
       const control = [...document.querySelectorAll("button")].find((button) => button.getAttribute("aria-label") === label);
@@ -594,6 +900,24 @@ async function prepareCinematicStage() {
     clickNamed("Collapse viewport tool names");
   });
   await browser.pause(600);
+}
+
+async function installCleanCaptureStage() {
+  await browser.execute(() => {
+    const existing = document.querySelector("#mtk-cinematic-capture-style");
+    existing?.remove();
+    const style = document.createElement("style");
+    style.id = "mtk-cinematic-capture-style";
+    style.textContent = [
+      "#viewport > * { display: none !important; }",
+      "#viewport { outline: none !important; box-shadow: none !important; transition: none !important; }",
+    ].join("\n");
+    document.head.append(style);
+  });
+}
+
+async function removeCleanCaptureStage() {
+  await browser.execute(() => document.querySelector("#mtk-cinematic-capture-style")?.remove());
 }
 
 describe("production factory cinematic direction", () => {
@@ -618,6 +942,7 @@ describe("production factory cinematic direction", () => {
       presentation: null,
       savedProject: null,
       preview: null,
+      video: null,
       artifacts,
       cleanupErrors: [],
     };
@@ -625,6 +950,8 @@ describe("production factory cinematic direction", () => {
     let failure = null;
     let lifecycleRecording = { events: [], listenerError: null };
     let playing = false;
+    let cleanCaptureStage = false;
+    let recordingHandle = null;
     let inFlightBatchId = null;
     const cadLogOffset = existsSync(cadLog) ? statSync(cadLog).size : 0;
 
@@ -646,10 +973,54 @@ describe("production factory cinematic direction", () => {
       captureComposited("00-clean-production-shell");
       await installLifecycleRecorder();
 
-      // Attempt 1: real OS gesture, then direct cancellation while the engine owns the long parse.
-      const cancelledDrop = startOleDrop("01-cancel-attempt");
-      dropHandles.push(cancelledDrop);
-      manifest.cancellation = { hoverBarrier: await waitForHoverBarrier(cancelledDrop) };
+      // The real OLE drag is the default, and remains the acceptance path for the drop gesture itself.
+      // It can only land on a target that is visible when the button comes up: if another application
+      // owns a full-screen foreground, Windows re-minimises the editor mid-gesture and ole32's modal
+      // loop spins over the desktop until the harness kills it. MTK_FACTORY_IMPORT_MODE=command imports
+      // the same fixture through the `import_asset` IPC the e2e already owns, so the scene, rendering,
+      // animation and cinematic acceptance below still runs on such a machine. It deliberately does NOT
+      // claim the drag/cancel evidence - that stays the drag path's to prove.
+      const commandImport = process.env.MTK_FACTORY_IMPORT_MODE === "command";
+      let succeeded;
+      let retryBatchId = null;
+      if (commandImport) {
+        // FIRE AND FORGET, then poll. This import takes ~55s on the production fixture, and WebDriver
+        // caps a synchronous `execute` at 30s - awaiting the invoke fails the script, not the import,
+        // which then completes anyway and leaves the session desynchronised. Start it, stash the promise
+        // on window for the result, and watch the engine's own state for the answer.
+        await browser.execute((path) => {
+          const slot = (window.__MTK_COMMAND_IMPORT__ = { done: false, id: null, error: null });
+          window.__TAURI__.core.invoke("import_asset", { path })
+            .then((id) => { slot.id = id; slot.done = true; })
+            .catch((error) => { slot.error = String(error); slot.done = true; });
+        }, fixture);
+        await browser.waitUntil(
+          async () => (await browser.execute(() => window.__MTK_COMMAND_IMPORT__?.done === true)) === true,
+          { timeout: completedImportTimeoutMs, interval: 1_000, timeoutMsg: "import_asset never settled." },
+        );
+        const outcome = await browser.execute(() => ({
+          id: window.__MTK_COMMAND_IMPORT__.id,
+          error: window.__MTK_COMMAND_IMPORT__.error,
+        }));
+        invariant(!outcome.error, `import_asset failed: ${outcome.error}`);
+        const rootId = outcome.id;
+        invariant(typeof rootId === "string" && rootId.length > 0,
+          `import_asset did not return the imported root entity: ${JSON.stringify(outcome)}`);
+        succeeded = { subject: { kind: "entity", rootId }, stage: "succeeded", via: "import_asset" };
+        manifest.retryImport = { via: "import_asset", rootId };
+        manifest.cancellation = {
+          skipped: "command-import mode does not exercise the drag/cancel choreography",
+        };
+        captureComposited("05-retry-import-in-progress");
+      } else {
+      // Attempt 1: real OS gesture, then the same visible Cancel control an operator uses while the
+      // engine owns the long parse. The terminal lifecycle below remains the authoritative acceptance.
+      const cancelledGesture = await startOleDropSurvivingOcclusion("01-cancel-attempt", dropHandles);
+      const cancelledDrop = cancelledGesture.handle;
+      manifest.cancellation = {
+        hoverBarrier: cancelledGesture.hoverBarrier,
+        gestures: cancelledGesture.gestures,
+      };
       await delay(700);
       captureComposited("01-cancel-held-hover", true);
       releaseOleDrop(cancelledDrop);
@@ -659,8 +1030,26 @@ describe("production factory cinematic direction", () => {
       const cancelledBatchId = await waitForNewDroppedBatch(0);
       inFlightBatchId = cancelledBatchId;
       const importing = await waitForBatchProgress(cancelledBatchId, "importing");
-      const accepted = await invoke("cancel_native_import", { batchId: cancelledBatchId });
-      invariant(accepted === true, `The direct cancellation plane did not accept batch ${cancelledBatchId}.`);
+      let cancellationControl = null;
+      await browser.waitUntil(async () => {
+        cancellationControl = await browser.execute(() => {
+          const overlay = document.querySelector('[data-testid="native-import-overlay"]');
+          const button = [...(overlay?.querySelectorAll("button") ?? [])]
+            .find((candidate) => candidate.getAttribute("aria-label") === "Cancel import");
+          return button ? { found: true, disabled: button.disabled } : { found: false, disabled: null };
+        });
+        return cancellationControl.found && cancellationControl.disabled === false;
+      }, { timeout: 15_000, interval: 100, timeoutMsg: `Batch ${cancelledBatchId} never exposed an enabled Cancel import control.` });
+      const clicked = await browser.execute(() => {
+        const overlay = document.querySelector('[data-testid="native-import-overlay"]');
+        const button = [...(overlay?.querySelectorAll("button") ?? [])]
+          .find((candidate) => candidate.getAttribute("aria-label") === "Cancel import");
+        if (!button || button.disabled) return false;
+        button.click();
+        return true;
+      });
+      invariant(clicked === true, `The visible Cancel import control did not accept batch ${cancelledBatchId}.`);
+      const accepted = clicked;
       captureComposited("02-first-cancellation-requested");
       const cancelled = await waitForBatchTerminal(cancelledBatchId, "cancelled", cancelledImportTimeoutMs);
       inFlightBatchId = null;
@@ -680,28 +1069,33 @@ describe("production factory cinematic direction", () => {
         batchId: cancelledBatchId,
         importing,
         accepted,
+        control: { ...cancellationControl, clicked, ariaLabel: "Cancel import" },
         terminal: cancelled,
         zeroCommit: { report: postCancelReport, hierarchyRows: postCancelRows },
       };
 
       // Attempt 2: the exact same real OLE path, now allowed to complete.
-      const retryDrop = startOleDrop("02-retry-attempt");
-      dropHandles.push(retryDrop);
-      manifest.retryImport = { hoverBarrier: await waitForHoverBarrier(retryDrop) };
+      const retryGesture = await startOleDropSurvivingOcclusion("02-retry-attempt", dropHandles);
+      const retryDrop = retryGesture.handle;
+      manifest.retryImport = {
+        hoverBarrier: retryGesture.hoverBarrier,
+        gestures: retryGesture.gestures,
+      };
       await delay(700);
       captureComposited("04-retry-held-hover", true);
       releaseOleDrop(retryDrop);
       retryDrop.result = await waitForDropExit(retryDrop);
       persistOleLog(retryDrop);
       assertOleAccepted(retryDrop);
-      const retryBatchId = await waitForNewDroppedBatch(cancelledBatchId);
+      retryBatchId = await waitForNewDroppedBatch(cancelledBatchId);
       inFlightBatchId = retryBatchId;
       await waitForBatchProgress(retryBatchId, "importing");
       captureComposited("05-retry-import-in-progress");
-      const succeeded = await waitForBatchTerminal(retryBatchId, "succeeded", completedImportTimeoutMs);
+      succeeded = await waitForBatchTerminal(retryBatchId, "succeeded", completedImportTimeoutMs);
       inFlightBatchId = null;
       invariant(succeeded.subject?.kind === "entity" && typeof succeeded.subject.rootId === "string",
         `Successful factory import did not return its wrapper entity: ${JSON.stringify(succeeded)}`);
+      }
 
       const report = await invoke("cad_report");
       assertFactoryReport(report);
@@ -714,9 +1108,9 @@ describe("production factory cinematic direction", () => {
 
       const profile = await invoke("set_render_profile", { profile: "cinematic" });
       const workingSpace = await invoke("set_working_space", { space: "acescg" });
-      const exposure = await invoke("set_exposure", { exposure: 1.0 });
+      const exposure = await invoke("set_exposure", { exposure: 0.45 });
       const environment = await invoke("reset_environment");
-      invariant(profile === "cinematic" && workingSpace === "acescg" && closeEnough(exposure, 1),
+      invariant(profile === "cinematic" && workingSpace === "acesCg" && closeEnough(exposure, 0.45),
         `The cinematic presentation did not apply: ${JSON.stringify({ profile, workingSpace, exposure })}`);
       await invoke("view_preset", { preset: "persp" });
       await invoke("frame_all");
@@ -724,14 +1118,42 @@ describe("production factory cinematic direction", () => {
       manifest.presentation = { profile, workingSpace, exposure, environment };
       captureComposited("06-imported-factory-overview");
 
-      const reportClicked = await browser.execute(() => {
-        const overlay = document.querySelector('[data-testid="native-import-overlay"]');
-        const button = [...(overlay?.querySelectorAll("button") ?? [])]
-          .find((candidate) => candidate.textContent?.trim() === "Import report");
-        button?.click();
-        return !!button;
-      });
-      invariant(reportClicked, "Succeeded production overlay did not expose Import report.");
+      // The drop overlay's "Import report" button is the operator's route to this panel, and stays the
+      // drag path's evidence. A command import raises no overlay, so open the same bottom workspace the
+      // button opens - the panel under test is identical either way.
+      const reportClicked = commandImport
+        ? await (async () => {
+          // Collapsed, the dock shows a summary and keeps its workspace list inside an unrendered
+          // popup; expanded, it renders a real tablist. Expand first, then pick the tab.
+          await browser.execute(() => {
+            const dock = document.querySelector('[data-testid="bottom-dock"]');
+            if (dock && !dock.classList.contains("is-open")) {
+              const toggle = document.querySelector('[data-testid="bottom-dock-toggle"]');
+              if (toggle instanceof HTMLElement) toggle.click();
+            }
+          });
+          await browser.waitUntil(
+            async () => (await browser.execute(() =>
+              !!document.querySelector("#bottom-workspaces-import-tab"))) === true,
+            { timeout: 15_000, interval: 200, timeoutMsg: "The expanded bottom dock never rendered its workspace tabs." },
+          );
+          return browser.execute(() => {
+            const tab = document.querySelector("#bottom-workspaces-import-tab");
+            if (!(tab instanceof HTMLElement)) return false;
+            tab.click();
+            return true;
+          });
+        })()
+        : await browser.execute(() => {
+          const overlay = document.querySelector('[data-testid="native-import-overlay"]');
+          const button = [...(overlay?.querySelectorAll("button") ?? [])]
+            .find((candidate) => candidate.textContent?.trim() === "Import report");
+          button?.click();
+          return !!button;
+        });
+      invariant(reportClicked, commandImport
+        ? "The Import bottom workspace option was not present to open the report."
+        : "Succeeded production overlay did not expose Import report.");
       await browser.waitUntil(
         async () => browser.execute((total) =>
           document.querySelector('[data-testid="import-report"]')?.getAttribute("data-total") === String(total), report.total),
@@ -752,8 +1174,8 @@ describe("production factory cinematic direction", () => {
       manifest.selectedParts = selected;
       manifest.thumbnails = await saveThumbnails(selected);
 
-      const tracks = [];
-      for (const [index, part] of selected.entries()) tracks.push(await authorMechanismTrack(part, index));
+      const authored = await authorMechanismTracks(selected);
+      const tracks = authored.tracks;
       const animationState = await invoke("animation_state", { id: null });
       const selectedIds = new Set(selected.map(({ id }) => id));
       const authoredTracks = animationState.tracks.filter(({ targetId }) => selectedIds.has(targetId));
@@ -766,6 +1188,15 @@ describe("production factory cinematic direction", () => {
         distinctTargets: new Set(tracks.map(({ id }) => id)).size,
         keyframeCount: tracks.reduce((count, track) => count + track.keys.length, 0),
         loopSeconds: 12,
+        revolvingMechanisms: tracks.filter(({ profile }) => profile.cycle === "revolve").length,
+        transaction: {
+          command: "joint_author_batch",
+          undoSteps: 1,
+          authoredJoints: authored.batch.authoredJoints,
+          authoredKeys: authored.batch.authoredKeys,
+          elapsedMs: authored.elapsedMs,
+          message: authored.batch.message,
+        },
         tracks,
         workspace: {
           revision: animationState.revision,
@@ -779,18 +1210,115 @@ describe("production factory cinematic direction", () => {
 
       const subjects = chooseFilmedSubjects(selected);
       invariant(subjects.length === FACTORY_ACCEPTANCE.filmedSubjects, `Only ${subjects.length} named animated subjects were filmable.`);
-      await invoke("focus_entity", { id: subjects[0].id });
+      // CAPTURE-INTEGRITY CONTROL. Every "did it move?" gate here compares two OS captures, and the
+      // capture reads the window's own presentation. A change that touches only the native viewport and
+      // no DOM might therefore not force a recomposite, in which case a stale frame would read as "the
+      // engine did not move" no matter what the engine did. Exposure is a large, 3D-only, DOM-free
+      // change with a known-correct implementation: if THIS pair is identical, the capture is stale and
+      // no viewport-delta measurement in this environment means anything.
+      const controlBefore = captureComposited("07a-capture-control-exposure-base");
+      await invoke("set_exposure", { exposure: 1.6 });
+      await browser.pause(900);
+      const controlAfter = captureComposited("07b-capture-control-exposure-raised");
+      const controlDelta = capturedFrameDelta(controlBefore, controlAfter);
+      await invoke("set_exposure", { exposure: 0.45 });
       await browser.pause(600);
-      captureComposited("08-featured-mechanism-neutral");
+      manifest.captureIntegrity = { change: "exposure 0.45 -> 1.6", viewportDelta: controlDelta };
+      invariant(controlDelta.peakLuma !== null && controlDelta.peakLuma > 0,
+        `The OS capture did not observe a large 3D-only change (exposure 0.45 -> 1.6): `
+        + `${JSON.stringify(controlDelta)}. Every viewport-delta gate below would be measuring a stale `
+        + `frame rather than the renderer, so they are reported as unproven rather than passed.`);
+
+      // DIAGNOSTIC PAIR, whole-factory framing. The focused pair below proves one mechanism moved in
+      // close-up, but a close-up cannot distinguish "the mechanisms did not move" from "the one part in
+      // frame happens not to move much at this instant". Scrub the same timeline with every animated
+      // subject on screen and record the delta without gating on it, so a zero here is attributable.
+      await invoke("view_preset", { preset: "persp" });
+      await invoke("frame_all");
+      await browser.pause(900);
+      const wideNeutralFrame = captureComposited("08a-mechanisms-wide-neutral");
+      // ENGINE TRUTH, not a screenshot. `read_transform` reports the DOCUMENT, and a scrub deliberately
+      // does not touch it, so the only previous way to ask "did the geometry move?" was to diff two
+      // captures - a measurement that cannot tell "the engine did not move it" apart from "it moved
+      // where the camera could not see it", from a part rotationally symmetric about the axis it turns
+      // on, or from one occluded by the machine it is bolted inside. `rendered_transform` reads the
+      // instance the render thread uploads, so this is the engine answering for itself.
+      const neutralRender = {};
+      for (const track of selected) neutralRender[track.id] = await invoke("rendered_transform", { id: track.id });
+      const widePosed = await invoke("joint_scrub", { t: 5.8 });
+      await browser.pause(900);
+      const posedRender = {};
+      for (const track of selected) posedRender[track.id] = await invoke("rendered_transform", { id: track.id });
+      const widePosedFrame = captureComposited("08b-mechanisms-wide-posed");
+
+      const renderDeltas = selected.map((track) => {
+        const before = neutralRender[track.id];
+        const after = posedRender[track.id];
+        const published = Array.isArray(before) && Array.isArray(after) && before.length === 8 && after.length === 8;
+        const translation = published
+          ? Math.hypot(...[0, 1, 2].map((axis) => after[axis] - before[axis]))
+          : null;
+        const rotation = published
+          ? Math.max(...[3, 4, 5, 6].map((axis) => Math.abs(after[axis] - before[axis])))
+          : null;
+        return { id: track.id, name: track.name, family: track.mechanismFamily, published, translation, rotation };
+      });
+      const movedInRender = renderDeltas.filter(({ translation, rotation }) =>
+        (translation ?? 0) > 1e-5 || (rotation ?? 0) > 1e-5);
+      manifest.animation.wideScrubProof = {
+        timeSeconds: 5.8,
+        posedEntities: widePosed,
+        viewportDelta: capturedFrameDelta(wideNeutralFrame, widePosedFrame),
+        publishedInstances: renderDeltas.filter(({ published }) => published).length,
+        movedInRender: movedInRender.length,
+        renderDeltas,
+      };
+      invariant(renderDeltas.every(({ published }) => published),
+        `Some authored mechanisms publish no render instance at all: `
+        + `${JSON.stringify(renderDeltas.filter(({ published }) => !published))}`);
+      invariant(movedInRender.length === selected.length,
+        `Scrubbing to t=5.8s moved only ${movedInRender.length} of ${selected.length} mechanisms in the `
+        + `render projection: ${JSON.stringify(renderDeltas.filter((row) => !movedInRender.includes(row)))}`);
+      await invoke("joint_scrub", { t: -1 });
+      await browser.pause(400);
+
+      // Film the mechanism that actually travels furthest, measured above, rather than whichever part
+      // happens to sort first. The previous choice was a weld-boom BASE: a revolute joint pivoted on its
+      // own axis, on a part that is very nearly a solid of revolution about that axis, framed so tight
+      // that its neighbours fill the shot. It turns 20 degrees and looks identical, which is a perfectly
+      // good reason for two captures to match and a very bad shot to prove anything with.
+      const showcase = [...renderDeltas]
+        .filter(({ published }) => published)
+        .sort((left, right) => (right.translation ?? 0) - (left.translation ?? 0))[0];
+      invariant(showcase && (showcase.translation ?? 0) > 1e-4,
+        `No authored mechanism translates enough to be filmed in close-up: ${JSON.stringify(renderDeltas)}`);
+      manifest.animation.closeUpSubject = showcase;
+      await invoke("focus_entity", { id: showcase.id });
+      await browser.pause(600);
+      const neutralFrame = captureComposited("08-featured-mechanism-neutral");
       const posed = await invoke("joint_scrub", { t: 5.8 });
       invariant(posed >= FACTORY_ACCEPTANCE.animationTracks,
         `Scrubbing the shared timeline posed ${posed} mechanisms, expected at least ${FACTORY_ACCEPTANCE.animationTracks}.`);
-      captureComposited("09-featured-mechanism-posed");
+      // Give the viewport a moment to present the posed frame before the OS capture reads the window.
+      await browser.pause(900);
+      const posedFrame = captureComposited("09-featured-mechanism-posed");
+      const scrubDelta = assertViewportChanged(neutralFrame, posedFrame,
+        `Scrubbing ${posed} mechanisms to t=5.8s`);
       await invoke("joint_scrub", { t: -1 });
       await invoke("unfocus");
-      manifest.animation.scrubProof = { timeSeconds: 5.8, posedEntities: posed };
+      manifest.animation.scrubProof = { timeSeconds: 5.8, posedEntities: posed, viewportDelta: scrubDelta };
 
-      const cinematics = await authorCinematics(subjects);
+      const assemblyId = manifest.retryImport.rootId;
+      invariant(typeof assemblyId === "string" && assemblyId.length > 0,
+        `The import did not report the assembly wrapper to establish on: ${JSON.stringify(manifest.retryImport)}`);
+      const cinematics = await authorCinematics(subjects, assemblyId);
+      // The opening and closing shots must genuinely frame the whole factory rather than a part of it,
+      // otherwise the film never shows the scale of what was imported.
+      const assemblyFramedShots = cinematics.cutscenes
+        .flatMap(({ kinds }) => kinds)
+        .filter(({ subject }) => subject === assemblyId);
+      invariant(assemblyFramedShots.length === 2,
+        `Expected an establishing and a closing shot framed on the assembly, got ${JSON.stringify(assemblyFramedShots)}`);
       manifest.cinematics = {
         subjectCount: cinematics.cutscenes.length,
         distinctAnimatedSubjectIds: new Set(cinematics.cutscenes.map(({ id }) => id)).size,
@@ -798,6 +1326,8 @@ describe("production factory cinematic direction", () => {
         totalSeconds: cinematics.totalSeconds,
         minimumClipSeconds: FACTORY_ACCEPTANCE.minimumCinematicSeconds,
         recommendedCaptureSeconds: Math.ceil(cinematics.totalSeconds) + 1,
+        assemblyId,
+        assemblyFramedShots,
         transitionPolicy: "Calm 0.9s blends within each two-shot subject sequence; deterministic hard cuts between named subjects",
         runtimeOrder: cinematics.cutscenes.map(({ id, name, mood, kinds, plannedSeconds, readback }) => ({
           id,
@@ -851,17 +1381,23 @@ describe("production factory cinematic direction", () => {
       const openingAnimation = await invoke("animation_state", { id: null });
       invariant(openingAnimation.playing === true && openingAnimation.loopPolicy === "loop",
         `The mechanism timeline is not looping during Play: ${JSON.stringify(openingAnimation)}`);
-      captureComposited("11-live-cinematic-opening");
+      const openingFrame = captureComposited("11-live-cinematic-opening");
+      const openingClockAt = Date.now();
       await browser.pause(2_200);
       const movingCamera = await invoke("camera_probe");
       const movingAnimation = await invoke("animation_state", { id: null });
+      const movingClockAt = Date.now();
       const cameraTravel = Math.hypot(...openingCamera.eye.map((value, index) => value - movingCamera.eye[index]));
       invariant(openingCamera.cinematic && movingCamera.cinematic && cameraTravel > 0.01,
         `The opening Hero camera did not visibly move: ${JSON.stringify({ openingCamera, movingCamera, cameraTravel })}`);
       invariant(movingAnimation.currentTick !== openingAnimation.currentTick,
         `The 24-track mechanism timeline did not advance: ${JSON.stringify({ openingAnimation, movingAnimation })}`);
-      captureComposited("12-live-cinematic-mechanisms-moving");
-      manifest.preview = { play, openingCamera, movingCamera, cameraTravel, openingAnimation, movingAnimation };
+      const movingFrame = captureComposited("12-live-cinematic-mechanisms-moving");
+      // The camera reports that it moved and the transport reports that time advanced. Neither is worth
+      // anything if the window is presenting a stale frame, which is exactly what a starved renderer does.
+      const previewDelta = assertViewportChanged(openingFrame, movingFrame,
+        "2.2 seconds of live cinematic playback");
+      manifest.preview = { play, openingCamera, movingCamera, cameraTravel, openingAnimation, movingAnimation, viewportDelta: previewDelta };
       await invoke("stop");
       playing = false;
       const stoppedCamera = await invoke("camera_probe");
@@ -871,14 +1407,174 @@ describe("production factory cinematic direction", () => {
       manifest.preview.stoppedCamera = stoppedCamera;
       manifest.preview.projectState = projectState;
 
+      // Deliver the actual film, not merely its direction metadata. Crop the maximised native viewport,
+      // remove all DOM chrome inside that transparent stage, prove an encoder on a short capture, then run
+      // the complete 208.75-second direction with enough head/tail margin to exceed three minutes.
+      await installCleanCaptureStage();
+      cleanCaptureStage = true;
+      const geometry = await measureViewportCapture();
+      const encoderPreflights = [];
+      let encoder = null;
+      for (const candidate of ["h264_nvenc", "libx264"]) {
+        const slug = candidate.replace(/[^a-z0-9]+/gi, "-").toLocaleLowerCase();
+        const output = exactNamedChild(runDir, `capture-preflight-${slug}.mp4`);
+        const handle = startStageRecording(output, geometry, 2, candidate);
+        handle.result = await waitForRecording(handle, 30_000);
+        const log = persistRecordingLog(`capture-preflight-${slug}.log`, handle);
+        const bytes = existsSync(output) ? statSync(output).size : 0;
+        if (bytes > 0) recordArtifact(output);
+        const passed = !handle.result.error && !handle.result.timeout && handle.result.code === 0 && bytes > 1024;
+        encoderPreflights.push({ encoder: candidate, result: handle.result, bytes, output: path.relative(runDir, output).replaceAll("\\", "/"), log: path.relative(runDir, log).replaceAll("\\", "/"), passed });
+        if (passed) {
+          encoder = candidate;
+          break;
+        }
+      }
+      invariant(encoder, `Neither hardware nor software H.264 capture passed preflight: ${JSON.stringify(encoderPreflights)}`);
+
+      // SIZE THE RECORDING BY THE CLOCK THE FILM ACTUALLY RUNS ON.
+      //
+      // A cutscene advances on the engine's play clock, which is a TICK COUNT, not the wall clock. On a
+      // 17,793-entity scene the engine does not hold 60 Hz, so the film's authored 194 s takes longer
+      // than 194 s to play, and a recorder sized to the authored length stops part way through - which
+      // is exactly what happened: 202 s of capture covered 7 of the 15 directed subjects.
+      //
+      // Measured rather than padded with a guessed factor: the live preview above already advanced the
+      // play clock over a known wall-clock interval, so the ratio is observable. `+ 25%` and `+ 12 s`
+      // are ordinary head/tail margin on top of the measurement, and the whole thing is capped so a
+      // pathological reading cannot produce an hour-long recording.
+      const measuredTicksPerSecond = (movingAnimation.currentTick - openingAnimation.currentTick)
+        / Math.max(0.001, (movingClockAt - openingClockAt) / 1_000);
+      const nominalTicksPerSecond = 60;
+      const slowdown = measuredTicksPerSecond > 0
+        ? Math.max(1, nominalTicksPerSecond / measuredTicksPerSecond)
+        : 1;
+      const captureSeconds = Math.min(
+        900,
+        Math.ceil(cinematics.totalSeconds * slowdown * 1.25) + 12,
+      );
+      manifest.preview.playClock = {
+        ticksPerSecond: measuredTicksPerSecond,
+        nominalTicksPerSecond,
+        slowdown,
+        authoredSeconds: cinematics.totalSeconds,
+        captureSeconds,
+      };
+      const videoFile = exactNamedChild(runDir, `skid-weld-line-cinematic-${captureSeconds}s.mp4`);
+      // ROLL WHEN THE CINEMATIC OWNS THE CAMERA, not before it.
+      //
+      // Entering Play on this scene takes ~15 seconds (measured; see the engine's diagnostics log), and
+      // for all of it the viewport is still an EDITOR: the transform gizmo, the selection outline and
+      // the grid are drawn, and the camera is wherever authoring left it. Starting the recorder first
+      // put that straight into the delivered film -- fifteen seconds of chrome before the first shot.
+      // Waiting costs the opening fraction of a second of the first shot, which is a hold anyway.
+      const filmPlay = await invoke("play");
+      invariant(filmPlay.playing === true, `The recorded direction did not enter Play: ${JSON.stringify(filmPlay)}`);
+      playing = true;
+      await browser.waitUntil(async () => (await invoke("camera_probe")).cinematic === true,
+        { timeout: 60_000, interval: 150, timeoutMsg: "The recorded direction never gave the cinematic camera authority." });
+      recordingHandle = startStageRecording(videoFile, geometry, captureSeconds, encoder);
+      await delay(900);
+      invariant(!recordingHandle.result,
+        `The ${encoder} recorder exited as soon as it was started: ${JSON.stringify(recordingHandle.result)}
+${recordingHandle.stderr}`);
+      recordingHandle.result = await waitForRecording(recordingHandle, (captureSeconds + 75) * 1_000);
+      const recordingLog = persistRecordingLog("factory-cinematic-recording.log", recordingHandle);
+      invariant(!recordingHandle.result.error && !recordingHandle.result.timeout && recordingHandle.result.code === 0,
+        `The ${captureSeconds}s ${encoder} recording failed: ${JSON.stringify(recordingHandle.result)}\n${recordingHandle.stderr}`);
+      invariant(existsSync(videoFile) && statSync(videoFile).size > 1_000_000,
+        `The recorded cinematic is missing or implausibly small: ${videoFile}`);
+      recordArtifact(videoFile);
+      const completedCamera = await invoke("camera_probe");
+      const expectedSubjectIds = subjects.map(({ id }) => id).sort();
+      const visitedSubjectIds = [...new Set(completedCamera.visitedSubjects ?? [])].sort();
+      invariant(completedCamera.cinematic === false,
+        `The capture hard limit truncated the directed film before camera handoff: ${JSON.stringify(completedCamera)}`);
+      invariant(JSON.stringify(visitedSubjectIds) === JSON.stringify(expectedSubjectIds),
+        `Runtime camera coverage missed directed subjects: ${JSON.stringify({ expectedSubjectIds, visitedSubjectIds, completedCamera })}`);
+      await invoke("stop");
+      playing = false;
+      recordingHandle = null;
+      await removeCleanCaptureStage();
+      cleanCaptureStage = false;
+
+      const qualityDirectory = exactNamedChild(runDir, "video-quality");
+      const gateArguments = [
+        videoQualityGateScript,
+        "--input",
+        videoFile,
+        "--output-dir",
+        qualityDirectory,
+        "--ffmpeg",
+        ffmpeg,
+        "--ffprobe",
+        ffprobe,
+        "--sample-count",
+        "15",
+      ];
+      let gateStdout = "";
+      let gateStderr = "";
+      try {
+        gateStdout = execFileSync(process.execPath, gateArguments, {
+          encoding: "utf8",
+          timeout: 10 * 60_000,
+          maxBuffer: 64 * 1024 * 1024,
+          windowsHide: true,
+        });
+      } catch (error) {
+        gateStdout = error?.stdout ?? "";
+        gateStderr = error?.stderr ?? String(error);
+        const gateFailureLog = exactNamedChild(runDir, "video-quality-gate.log");
+        writeFileSync(gateFailureLog, `${gateStdout}\n--- stderr ---\n${gateStderr}\n`, { encoding: "utf8", flag: "wx" });
+        recordArtifact(gateFailureLog);
+        if (existsSync(qualityDirectory)) recordDirectoryArtifacts(qualityDirectory);
+        throw new Error(`The recorded film failed its media quality gate: ${gateStderr || gateStdout}`);
+      }
+      const gateLog = exactNamedChild(runDir, "video-quality-gate.log");
+      writeFileSync(gateLog, `${gateStdout}\n--- stderr ---\n${gateStderr}\n`, { encoding: "utf8", flag: "wx" });
+      recordArtifact(gateLog);
+      recordDirectoryArtifacts(qualityDirectory);
+      const qualityManifestPath = path.join(qualityDirectory, "video-quality-validation.json");
+      const quality = JSON.parse(readFileSync(qualityManifestPath, "utf8"));
+      invariant(quality.passed === true, `The recorded film quality manifest did not pass: ${JSON.stringify(quality)}`);
+      manifest.video = {
+        file: path.relative(runDir, videoFile).replaceAll("\\", "/"),
+        bytes: statSync(videoFile).size,
+        sha256: sha256(videoFile),
+        captureSeconds,
+        encoder,
+        encoderPreflights,
+        geometry,
+        recordingLog: path.relative(runDir, recordingLog).replaceAll("\\", "/"),
+        qualityManifest: path.relative(runDir, qualityManifestPath).replaceAll("\\", "/"),
+        contactSheet: "video-quality/video-quality-contact-sheet.png",
+        sampledFrames: quality.representativeFrames.frames.length,
+        media: quality.probe.media,
+        strictDecode: quality.strictDecode.passed,
+        visualContent: {
+          passed: quality.visualContent.passed,
+          luminance: quality.visualContent.luminance.summary,
+          motion: quality.visualContent.motion.summary,
+        },
+        completedCamera,
+        visitedSubjectIds,
+      };
+
       lifecycleRecording = await readLifecycle();
-      manifest.cancellation.lifecycle = validateBatchLifecycle(lifecycleRecording, manifest.cancellation.batchId, "cancelled");
-      manifest.retryImport.lifecycle = validateBatchLifecycle(lifecycleRecording, manifest.retryImport.batchId, "succeeded");
+      // The batch lifecycle and the cancellation proof belong to the drag path. Command-import mode
+      // never issues a dropped batch or a cancellation, so asserting either would be asserting a
+      // fiction; the CAD log's source/metrics/commit proof still applies to both paths.
+      if (!commandImport) {
+        manifest.cancellation.lifecycle = validateBatchLifecycle(lifecycleRecording, manifest.cancellation.batchId, "cancelled");
+        manifest.retryImport.lifecycle = validateBatchLifecycle(lifecycleRecording, manifest.retryImport.batchId, "succeeded");
+      }
       const cadLogText = preserveCadLog(cadLogOffset);
       invariant(cadLogText.includes(fixtureName) && /CAD_IMPORT_METRICS/.test(cadLogText) && /CAD import commit OK/.test(cadLogText),
         `Run-scoped CAD log lacks retry source, metrics, or commit proof:\n${cadLogText}`);
-      invariant(/CAD import cancelled/i.test(cadLogText) && /no scene changes were committed/i.test(cadLogText),
-        `Run-scoped CAD log lacks atomic cancellation proof:\n${cadLogText}`);
+      if (!commandImport) {
+        invariant(/CAD import cancelled/i.test(cadLogText) && /no scene changes were committed/i.test(cadLogText),
+          `Run-scoped CAD log lacks atomic cancellation proof:\n${cadLogText}`);
+      }
       manifest.status = "passed";
     } catch (error) {
       failure = error;
@@ -904,6 +1600,31 @@ describe("production factory cinematic direction", () => {
           await invoke("stop");
         } catch (error) {
           manifest.cleanupErrors.push(`Stop cleanup: ${String(error)}`);
+        }
+      }
+      if (recordingHandle && !recordingHandle.result) {
+        try {
+          recordingHandle.child.kill();
+          recordingHandle.result = await waitForRecording(recordingHandle, 10_000);
+        } catch (error) {
+          manifest.cleanupErrors.push(`Video recorder cleanup: ${String(error)}`);
+        }
+      }
+      if (recordingHandle) {
+        try {
+          persistRecordingLog("factory-cinematic-recording-partial.log", recordingHandle);
+          if (existsSync(recordingHandle.output) && statSync(recordingHandle.output).size > 0) {
+            recordArtifact(recordingHandle.output);
+          }
+        } catch (error) {
+          manifest.cleanupErrors.push(`Partial video evidence preservation: ${String(error)}`);
+        }
+      }
+      if (cleanCaptureStage) {
+        try {
+          await removeCleanCaptureStage();
+        } catch (error) {
+          manifest.cleanupErrors.push(`Clean capture stage cleanup: ${String(error)}`);
         }
       }
       try {
@@ -940,6 +1661,14 @@ describe("production factory cinematic direction", () => {
       }
       const captureLog = exactNamedChild(runDir, "capture.log");
       if (existsSync(captureLog)) recordArtifact(captureLog);
+      if (manifest.cleanupErrors.length > 0) {
+        manifest.status = "failed";
+        const cleanupFailure = new Error(`Evidence cleanup failed: ${manifest.cleanupErrors.join("; ")}`);
+        if (!failure) {
+          failure = cleanupFailure;
+          manifest.error = { name: cleanupFailure.name, message: cleanupFailure.message, stack: cleanupFailure.stack };
+        }
+      }
       manifest.finishedAt = new Date().toISOString();
       manifest.artifacts = artifacts;
       const evidencePath = exactNamedChild(runDir, "evidence.json");
@@ -947,6 +1676,5 @@ describe("production factory cinematic direction", () => {
     }
 
     if (failure) throw failure;
-    if (manifest.cleanupErrors.length > 0) throw new Error(`Evidence cleanup failed: ${manifest.cleanupErrors.join("; ")}`);
   });
 });
