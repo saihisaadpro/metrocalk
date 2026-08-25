@@ -368,26 +368,30 @@ describe("genuine native CAD drag/drop", () => {
         throw new Error(`Expected exactly one one-file drop batch: ${JSON.stringify(lifecycle.analysis)}`);
       }
       const succeeded = events.find((event) => event.phase === "succeeded");
-      const rootId = succeeded?.subject?.kind === "entity" ? succeeded.subject.rootId : null;
-      if (!rootId) throw new Error(`CAD success did not return an entity wrapper: ${JSON.stringify(succeeded)}`);
+      const selectedId = succeeded?.subject?.kind === "entity" ? succeeded.subject.rootId : null;
+      if (!selectedId) throw new Error(`CAD success did not return an imported entity: ${JSON.stringify(succeeded)}`);
+      // CAD deliberately selects its first editable group/part while retaining one source-ownership wrapper.
+      // Resolve that wrapper through the authoritative parent relation instead of conflating selection with root.
+      const rootId = await invoke("part_parent", { id: selectedId }) ?? selectedId;
 
       await browser.waitUntil(
-        async () => browser.execute((expectedRoot) => {
+        async () => browser.execute((expectedSelection) => {
           const rows = [...document.querySelectorAll('[data-testid="hrow"]')];
-          const root = rows.find((row) => row.getAttribute("data-id") === expectedRoot);
-          return rows.length === 4 && root?.getAttribute("aria-selected") === "true";
-        }, rootId),
-        { timeout: 30_000, interval: 250, timeoutMsg: "Imported wrapper/tree did not settle to exactly four selected hierarchy rows" },
+          const selected = rows.find((row) => row.getAttribute("data-id") === expectedSelection);
+          return rows.length === 4 && selected?.getAttribute("aria-selected") === "true";
+        }, selectedId),
+        { timeout: 30_000, interval: 250, timeoutMsg: "Imported wrapper/tree did not settle to four rows with the authored subject selected" },
       );
 
       const rows = await hierarchySnapshot();
       const wrappers = rows.filter((row) => row.kind === "group" && row.level === 1);
       const parts = rows.filter((row) => row.kind !== "group");
-      if (wrappers.length !== 1 || wrappers[0].id !== rootId || wrappers[0].selected !== true) {
-        throw new Error(`Expected exactly one selected top-level wrapper ${rootId}: ${JSON.stringify(rows)}`);
+      if (wrappers.length !== 1 || wrappers[0].id !== rootId) {
+        throw new Error(`Expected exactly one top-level ownership wrapper ${rootId}: ${JSON.stringify(rows)}`);
       }
-      if (parts.length !== 3 || parts.some((part) => part.level !== 2)) {
-        throw new Error(`Expected exactly three leaf parts nested one level under the wrapper: ${JSON.stringify(rows)}`);
+      const selectedParts = parts.filter((part) => part.selected);
+      if (parts.length !== 3 || parts.some((part) => part.level !== 2) || selectedParts.length !== 1 || selectedParts[0].id !== selectedId) {
+        throw new Error(`Expected exactly three wrapper-owned leaf parts and selected subject ${selectedId}: ${JSON.stringify(rows)}`);
       }
       const expectedNames = ["cone frustum", "cylinder", "sphere band"];
       const actualNames = parts.map((part) => part.name).sort();
@@ -398,16 +402,16 @@ describe("genuine native CAD drag/drop", () => {
         const parent = await invoke("part_parent", { id: part.id });
         if (parent !== rootId) throw new Error(`Part ${part.id} belongs to ${parent}, expected wrapper ${rootId}`);
       }
-      manifest.hierarchy = { rootId, wrappers, parts };
+      manifest.hierarchy = { rootId, selectedId, wrappers, parts };
 
-      const modelWorkspace = await browser.execute((expectedRoot) => ({
+      const modelWorkspace = await browser.execute((expectedSelection) => ({
         overlayPhase: document.querySelector('[data-testid="native-import-overlay"]')?.getAttribute("data-phase") ?? null,
         modelSelected: document.querySelector('[data-testid="engine-model"]')?.getAttribute("aria-selected") === "true",
         dockOpen: document.querySelector('[data-testid="bottom-dock"]')?.classList.contains("is-open") ?? false,
         assetSelected: document.querySelector("#bottom-workspaces-asset-tab")?.getAttribute("aria-selected") === "true",
-        wrapperSelected: document.querySelector(`[data-testid="hrow"][data-id="${CSS.escape(expectedRoot)}"]`)?.getAttribute("aria-selected") === "true",
-      }), rootId);
-      if (modelWorkspace.overlayPhase !== "succeeded" || !modelWorkspace.modelSelected || !modelWorkspace.dockOpen || !modelWorkspace.assetSelected || !modelWorkspace.wrapperSelected) {
+        importedSubjectSelected: document.querySelector(`[data-testid="hrow"][data-id="${CSS.escape(expectedSelection)}"]`)?.getAttribute("aria-selected") === "true",
+      }), selectedId);
+      if (modelWorkspace.overlayPhase !== "succeeded" || !modelWorkspace.modelSelected || !modelWorkspace.dockOpen || !modelWorkspace.assetSelected || !modelWorkspace.importedSubjectSelected) {
         throw new Error(`Success selection/model routing is incoherent: ${JSON.stringify(modelWorkspace)}`);
       }
       manifest.workspace = { afterSuccess: modelWorkspace };
@@ -448,9 +452,17 @@ describe("genuine native CAD drag/drop", () => {
       captureComposited("03-import-report-selected-part");
 
       const cadLogText = preserveCadLog(cadLogOffset);
-      if (!cadLogText.includes(fixture) || !cadLogText.includes("CAD_IMPORT_METRICS") || !cadLogText.includes("CAD import commit OK")) {
+      const metricsLine = cadLogText.match(/^CAD_IMPORT_METRICS\s+(.+)$/mu)?.[1];
+      let metrics = null;
+      try {
+        metrics = metricsLine ? JSON.parse(metricsLine) : null;
+      } catch {
+        metrics = null;
+      }
+      if (metrics?.source !== fixture || !cadLogText.includes("CAD import commit OK")) {
         throw new Error(`Run-scoped CAD log lacks source, metrics, or commit proof:\n${cadLogText}`);
       }
+      manifest.cadMetrics = metrics;
       manifest.status = "passed";
     } catch (error) {
       failure = error;

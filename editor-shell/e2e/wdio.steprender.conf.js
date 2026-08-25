@@ -4,6 +4,7 @@
 // Run: node "node_modules\@wdio\cli\bin\wdio.js" run wdio.steprender.conf.js
 
 import { spawn } from "node:child_process";
+import { reapHarnessProcesses } from "./lib/reap.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,6 +35,8 @@ export const config = {
 
   beforeSession: () =>
     new Promise((resolve) => {
+      // Never inherit the previous run's orphans (see lib/reap.js).
+      reapHarnessProcesses("before");
       tauriDriver = spawn(tauriDriverBin, ["--native-driver", nativeDriver], {
         stdio: [null, process.stdout, process.stderr],
       });
@@ -47,5 +50,7 @@ export const config = {
     } catch {
       /* already gone */
     }
+    // The app and its WebView2 hosts are NOT children of this process; kill them explicitly.
+    reapHarnessProcesses("after");
   },
 };

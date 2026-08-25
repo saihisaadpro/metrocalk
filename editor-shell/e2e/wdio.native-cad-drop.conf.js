@@ -5,6 +5,7 @@
 //   node "node_modules/@wdio/cli/bin/wdio.js" run wdio.native-cad-drop.conf.js
 
 import { spawn, spawnSync } from "node:child_process";
+import { reapHarnessProcesses } from "./lib/reap.js";
 import {
   createHash,
 } from "node:crypto";
@@ -227,6 +228,8 @@ export const config = {
   beforeSession: () => new Promise((resolve, reject) => {
     driverStdout = createWriteStream(exactNamedChild(runDir, "tauri-driver.stdout.log"), { flags: "wx" });
     driverStderr = createWriteStream(exactNamedChild(runDir, "tauri-driver.stderr.log"), { flags: "wx" });
+    // Never inherit the previous run's orphans (see lib/reap.js).
+    reapHarnessProcesses("before");
     tauriDriver = spawn(tauriDriverBin, ["--native-driver", nativeDriver], {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
