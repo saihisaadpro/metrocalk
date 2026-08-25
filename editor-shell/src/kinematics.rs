@@ -252,7 +252,7 @@ pub fn try_author_joint_tracks_ops(
         let base_position = [number("x"), number("y"), number("z")];
         let raw_rotation = [number("qx"), number("qy"), number("qz"), number("qw")];
         // An exact all-zeros comparison IS the test: `number()` defaults a field the Transform does
-        // not carry to 0.0, so four exact zeros mean "no rotation was ever authored" rather than any
+        // not carry to 0.0, so four exact zeros mean "no rotation was ever authored" rather than a
         // measured value. A tolerance here would silently reject a real, very small quaternion.
         #[allow(clippy::float_cmp)]
         let base_rotation = if raw_rotation == [0.0; 4] {

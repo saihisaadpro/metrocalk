@@ -12,7 +12,7 @@
 //! **stdio rule (MCP spec):** stdout is the JSON-RPC channel — this binary NEVER writes to stdout (no
 //! `println!`); diagnostics, if any, go to stderr.
 
-// `#[tool_router]` writes the rmcp `ServerHandler` impl for us, and that trait's methods are `async`
+// `#[tool_router]` writes the rmcp `ServerHandler` impl, and that trait's methods are `async`
 // by its own signature. Both read tools answer from memory with nothing to await, so the generated
 // bodies carry no `.await` -- which is the trait contract, not a mistake. The attribute has to be
 // file-scoped because the code it applies to does not exist until the macro has run.
