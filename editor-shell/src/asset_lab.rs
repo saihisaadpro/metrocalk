@@ -622,7 +622,7 @@ pub fn audit_asset(
     let mut degenerate_uv_triangles = 0;
 
     for (pi, prim) in asset.primitives.iter().enumerate() {
-        for tri in prim.indices.chunks_exact(3) {
+        for tri in prim.indices.as_chunks::<3>().0 {
             let raw = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
             if raw.iter().any(|&i| i >= prim.positions.len()) {
                 invalid_indices += raw.iter().filter(|&&i| i >= prim.positions.len()).count();
@@ -719,7 +719,9 @@ pub fn audit_asset(
         .iter()
         .filter(|p| {
             p.indices
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .any(|tri| tri.iter().all(|&i| (i as usize) < p.positions.len()))
         })
         .count();
@@ -1571,7 +1573,7 @@ fn filter_triangles(prim: &mut Primitive, config: &CleanupConfig, measured: &mut
         .map(|&position| welder.insert(position))
         .collect();
     let mut seen = BTreeSet::<[usize; 3]>::new();
-    for tri in prim.indices.chunks_exact(3) {
+    for tri in prim.indices.as_chunks::<3>().0 {
         let raw = [tri[0], tri[1], tri[2]];
         if raw.iter().any(|&i| (i as usize) >= prim.positions.len()) {
             measured.invalid_triangles_removed += 1;
@@ -1613,7 +1615,9 @@ fn filter_triangles(prim: &mut Primitive, config: &CleanupConfig, measured: &mut
 fn remove_small_components(prim: &mut Primitive, minimum: usize, measured: &mut CleanupChanges) {
     let faces: Vec<[u32; 3]> = prim
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|t| [t[0], t[1], t[2]])
         .collect();
     if faces.is_empty() {
@@ -1670,7 +1674,9 @@ struct DirectedEdge {
 fn repair_winding(prim: &mut Primitive, measured: &mut CleanupChanges, warnings: &mut Vec<String>) {
     let mut faces: Vec<[u32; 3]> = prim
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|t| [t[0], t[1], t[2]])
         .collect();
     if faces.is_empty() {
@@ -1874,7 +1880,7 @@ fn repair_normals(
         return;
     }
     let mut normals = vec![[0.0_f32; 3]; prim.positions.len()];
-    for tri in prim.indices.chunks_exact(3) {
+    for tri in prim.indices.as_chunks::<3>().0 {
         let ids = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
         let face = cross(
             sub(prim.positions[ids[1]], prim.positions[ids[0]]),

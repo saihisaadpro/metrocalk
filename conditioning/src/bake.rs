@@ -460,7 +460,7 @@ impl TextureBaker for CpuTextureBaker {
             let charts = triangle_charts(primitive);
             let primitive_charts = charts.iter().copied().max().map_or(0, |value| value + 1);
             chart_count += primitive_charts as usize;
-            for (triangle, indices) in primitive.indices.chunks_exact(3).enumerate() {
+            for (triangle, indices) in primitive.indices.as_chunks::<3>().0.iter().enumerate() {
                 if triangle % 32 == 0 {
                     checkpoint(
                         observer,
@@ -852,7 +852,7 @@ fn validate_target_primitive(
 fn derive_vertex_normals(primitive: &Primitive) -> Option<Vec<[f32; 3]>> {
     let mut normals = vec![[0.0; 3]; primitive.positions.len()];
     let mut valid = 0usize;
-    for triangle in primitive.indices.chunks_exact(3) {
+    for triangle in primitive.indices.as_chunks::<3>().0 {
         let index = [
             triangle[0] as usize,
             triangle[1] as usize,
@@ -956,7 +956,7 @@ fn append_source_triangles(
         }
         let curvature = vertex_curvature(&positions, &normals, &primitive.indices);
 
-        for (triangle_index, triangle) in primitive.indices.chunks_exact(3).enumerate() {
+        for (triangle_index, triangle) in primitive.indices.as_chunks::<3>().0.iter().enumerate() {
             if output.len() >= limit {
                 return Err(BakeError::InvalidConfig(format!(
                     "high-poly sources exceed the {limit} triangle budget"
@@ -1005,7 +1005,7 @@ fn source_error(source: usize, primitive: usize, reason: &str) -> BakeError {
 fn vertex_curvature(positions: &[[f32; 3]], normals: &[[f32; 3]], indices: &[u32]) -> Vec<f32> {
     let mut laplacian = vec![[0.0; 3]; positions.len()];
     let mut area = vec![0.0f32; positions.len()];
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let i = [
             triangle[0] as usize,
             triangle[1] as usize,
@@ -1444,7 +1444,7 @@ fn closest_to_low(
 fn triangle_charts(primitive: &Primitive) -> Vec<u32> {
     let triangle_count = primitive.indices.len() / 3;
     let mut vertex_triangles = vec![Vec::new(); primitive.positions.len()];
-    for (triangle, indices) in primitive.indices.chunks_exact(3).enumerate() {
+    for (triangle, indices) in primitive.indices.as_chunks::<3>().0.iter().enumerate() {
         for &index in indices {
             vertex_triangles[index as usize].push(triangle);
         }
@@ -1839,7 +1839,9 @@ mod tests {
         let normal = result.maps.normal.expect("normal");
         assert!(normal
             .rgba8
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|pixel| pixel[3] == 255)
             .any(|pixel| pixel[2] > 245));
     }
@@ -1859,7 +1861,8 @@ mod tests {
             .expect("AO bake");
         assert!(result.report.occluded_rays > 0);
         let ao = result.maps.ambient_occlusion.expect("AO");
-        assert!(ao.rgba8.chunks_exact(4).any(|pixel| pixel[0] < 250));
+        let pixels = ao.rgba8.as_chunks::<4>().0;
+        assert!(pixels.iter().any(|pixel| pixel[0] < 250));
     }
 
     #[test]

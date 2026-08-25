@@ -749,12 +749,14 @@ fn request(
 /// terrain-occludes-terrain, which in an open world is the overwhelming majority of occlusion.
 #[must_use]
 pub fn horizon_occluded(terrain: &Terrain, eye: [f32; 3], min: [f32; 3], max: [f32; 3]) -> bool {
+    let mid_x = f32::midpoint(min[0], max[0]);
+    let mid_z = f32::midpoint(min[2], max[2]);
     let corners = [
         [min[0], max[1], min[2]],
         [max[0], max[1], min[2]],
         [min[0], max[1], max[2]],
         [max[0], max[1], max[2]],
-        [(min[0] + max[0]) * 0.5, max[1], (min[2] + max[2]) * 0.5],
+        [mid_x, max[1], mid_z],
     ];
     corners
         .iter()

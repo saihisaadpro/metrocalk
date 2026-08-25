@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(tex.normal_rgba8.as_ref().unwrap().len(), 64 * 64 * 4);
         assert_eq!(tex.bytes(), 64 * 64 * 8);
         // Alpha is opaque everywhere, and no texel is pure black (which would mean an unassigned material).
-        for p in tex.albedo_rgba8.chunks_exact(4) {
+        for p in tex.albedo_rgba8.as_chunks::<4>().0 {
             assert_eq!(p[3], 255);
             assert!(
                 u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]) > 12,
@@ -535,7 +535,7 @@ mod tests {
         let t = Terrain::compile(r, BTreeMap::new()).expect("compile");
         let s = t.sample_chunk(ChunkCoord::new(0, 0)).expect("chunk");
         let tex = bake_chunk_textures(&t, &s, 16, true);
-        for p in tex.normal_rgba8.as_ref().unwrap().chunks_exact(4) {
+        for p in tex.normal_rgba8.as_ref().unwrap().as_chunks::<4>().0 {
             assert_eq!(p[0], 128, "x should be flat");
             assert_eq!(p[1], 128, "y should be flat");
             assert_eq!(p[2], 255, "z should point straight out");

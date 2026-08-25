@@ -57,7 +57,9 @@ fn signed_volume(primitive: &Primitive) -> f32 {
     let p = &primitive.positions;
     primitive
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|t| {
             let (a, b, c) = (p[t[0] as usize], p[t[1] as usize], p[t[2] as usize]);
             let cross = [

@@ -748,7 +748,7 @@ fn parse_open_3drep(bytes: &[u8]) -> Option<TriMesh> {
                     .filter(|x| !x.is_empty())
                     .filter_map(|x| x.parse::<f64>().ok())
                     .collect();
-                for c in nums.chunks_exact(3) {
+                for c in nums.as_chunks::<3>().0 {
                     positions.push([c[0], c[1], c[2]]);
                     if positions.len() > 50_000_000 {
                         return None; // bomb guard
@@ -779,7 +779,7 @@ fn push_face_triangles(e: &quick_xml::events::BytesStart, triangles: &mut Vec<[u
         .filter(|x| !x.is_empty())
         .filter_map(|x| x.parse::<u32>().ok())
         .collect();
-    for c in idx.chunks_exact(3) {
+    for c in idx.as_chunks::<3>().0 {
         triangles.push([c[0], c[1], c[2]]);
     }
 }

@@ -166,7 +166,7 @@ impl Viewport {
     /// NDC → logical window coordinates (the inverse of [`Self::logical_to_ndc`]).
     #[must_use]
     pub fn ndc_to_logical(&self, ndc_x: f64, ndc_y: f64) -> (f64, f64) {
-        let px = (ndc_x + 1.0) * 0.5 * self.surface_width;
+        let px = f64::midpoint(ndc_x, 1.0) * self.surface_width;
         let py = (1.0 - ndc_y) * 0.5 * self.surface_height;
         (
             px / self.dpi_scale + self.origin_x,
@@ -177,7 +177,7 @@ impl Viewport {
     /// NDC → `[0, 1]` surface fraction.
     #[must_use]
     pub fn ndc_to_fraction(&self, ndc_x: f64, ndc_y: f64) -> (f64, f64) {
-        ((ndc_x + 1.0) * 0.5, (1.0 - ndc_y) * 0.5)
+        (f64::midpoint(ndc_x, 1.0), (1.0 - ndc_y) * 0.5)
     }
 
     /// How many NDC units one physical pixel spans, per axis. The conversion that turns a

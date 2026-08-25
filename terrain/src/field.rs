@@ -462,7 +462,7 @@ impl Terrain {
             if above != prev_above {
                 let (mut lo, mut hi) = (prev_t, t);
                 for _ in 0..8 {
-                    let mid = (lo + hi) * 0.5;
+                    let mid = f32::midpoint(lo, hi);
                     let q = at(mid);
                     if (q[1] >= self.height(q[0], q[2])) == prev_above {
                         lo = mid;
@@ -470,7 +470,7 @@ impl Terrain {
                         hi = mid;
                     }
                 }
-                let hit = at((lo + hi) * 0.5);
+                let hit = at(f32::midpoint(lo, hi));
                 return Some([hit[0], self.height(hit[0], hit[2]), hit[2]]);
             }
             prev_above = above;

@@ -135,7 +135,9 @@ impl RapierPhysics {
                 }
                 let verts: Vec<Vector> = vertices.iter().map(|p| vec(*p)).collect();
                 let tris: Vec<[u32; 3]> = indices
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|c| [c[0], c[1], c[2]])
                     .collect();
                 SharedShape::trimesh(verts, tris).map_err(|e| {
@@ -586,7 +588,7 @@ pub fn explain_contact(c: &Contact) -> String {
 /// triangles). `abs()` at the call site handles winding. A non-multiple-of-3 index tail is ignored.
 fn mesh_volume(vertices: &[Vec3], indices: &[u32]) -> f64 {
     let mut v = 0.0f64;
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let a = vertices[tri[0] as usize];
         let b = vertices[tri[1] as usize];
         let c = vertices[tri[2] as usize];

@@ -159,7 +159,7 @@ fn cluster_decimate(prim: &Primitive, cell: f32) -> Primitive {
         })
         .collect();
     let mut indices: Vec<u32> = Vec::new();
-    for tri in prim.indices.chunks_exact(3) {
+    for tri in prim.indices.as_chunks::<3>().0 {
         let (a, b, c) = (
             remap[tri[0] as usize],
             remap[tri[1] as usize],
@@ -302,9 +302,7 @@ mod tests {
     fn a_degenerate_asset_yields_no_lods() {
         // A zero-size (single-point) asset has nothing to reduce — no panic, no LODs.
         let mut asset = grid_plane(2);
-        for p in &mut asset.primitives[0].positions {
-            *p = [0.0, 0.0, 0.0];
-        }
+        asset.primitives[0].positions.fill([0.0, 0.0, 0.0]);
         assert!(GridClusterLod
             .generate(&asset, &LodConfig::default())
             .is_empty());

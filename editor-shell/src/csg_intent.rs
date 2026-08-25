@@ -58,7 +58,7 @@ pub fn mesh_asset_to_trimesh(asset: &MeshAsset) -> TriMesh {
             positions.push([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]);
         }
         let n = u32::try_from(prim.positions.len()).unwrap_or(u32::MAX);
-        for t in prim.indices.chunks_exact(3) {
+        for t in prim.indices.as_chunks::<3>().0 {
             if t[0] < n && t[1] < n && t[2] < n {
                 triangles.push([base + t[0], base + t[1], base + t[2]]);
             }

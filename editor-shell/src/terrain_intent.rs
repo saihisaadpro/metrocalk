@@ -1409,7 +1409,7 @@ fn proto_asset(
     if two {
         let mut stem = Vec::new();
         let mut canopy = Vec::new();
-        for t in data.indices.chunks_exact(3) {
+        for t in data.indices.as_chunks::<3>().0 {
             let dst = if (t[0] as usize) < split {
                 &mut stem
             } else {
@@ -1554,7 +1554,7 @@ pub fn bake_impostor_texture(asset: &MeshAsset, size: u32) -> Texture {
         let base = mat.map_or([0.4, 0.5, 0.3], |m| {
             [m.base_color[0], m.base_color[1], m.base_color[2]]
         });
-        for tri in prim.indices.chunks_exact(3) {
+        for tri in prim.indices.as_chunks::<3>().0 {
             let vs: Vec<[f32; 3]> = tri
                 .iter()
                 .filter_map(|i| prim.positions.get(*i as usize).copied())

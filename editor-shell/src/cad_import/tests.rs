@@ -287,7 +287,7 @@ fn source_wrappers_keep_independent_cad_imports_coexisting_in_one_hierarchy() {
         &mut engine,
         &scene,
         &mut store,
-        source("source-a", 0xa1),
+        &source("source-a", 0xa1),
         grouped_import(0xa1),
     )
     .expect("land A");
@@ -295,7 +295,7 @@ fn source_wrappers_keep_independent_cad_imports_coexisting_in_one_hierarchy() {
         &mut engine,
         &scene,
         &mut store,
-        source("source-b", 0xb1),
+        &source("source-b", 0xb1),
         grouped_import(0xb1),
     )
     .expect("land B");
@@ -332,7 +332,7 @@ fn identical_same_source_import_is_an_idempotent_noop() {
         &mut engine,
         &scene,
         &mut store,
-        source("same-source", 0xc1),
+        &source("same-source", 0xc1),
         grouped_import(0xc1),
     )
     .expect("first land");
@@ -343,7 +343,7 @@ fn identical_same_source_import_is_an_idempotent_noop() {
         &mut engine,
         &scene,
         &mut store,
-        source("same-source", 0xc1),
+        &source("same-source", 0xc1),
         grouped_import(0xc1),
     )
     .expect("idempotent re-drop");
@@ -375,7 +375,7 @@ fn changed_reimport_retires_only_same_source_and_preserves_unrelated_and_legacy_
         &mut engine,
         &scene,
         &mut store,
-        source("source-a", 0xd1),
+        &source("source-a", 0xd1),
         grouped_import(0xd1),
     )
     .expect("land old A");
@@ -383,7 +383,7 @@ fn changed_reimport_retires_only_same_source_and_preserves_unrelated_and_legacy_
         &mut engine,
         &scene,
         &mut store,
-        source("source-b", 0xe1),
+        &source("source-b", 0xe1),
         grouped_import(0xe1),
     )
     .expect("land B");
@@ -414,7 +414,7 @@ fn changed_reimport_retires_only_same_source_and_preserves_unrelated_and_legacy_
         &mut engine,
         &scene,
         &mut store,
-        source("source-a", 0xd2),
+        &source("source-a", 0xd2),
         grouped_import(0xd2),
     )
     .expect("replace A");

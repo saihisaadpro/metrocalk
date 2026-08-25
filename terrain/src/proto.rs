@@ -413,7 +413,7 @@ fn decimate_at(src: &MeshData, cell: f32) -> MeshData {
         ]));
         out.uvs.push([0.5, 0.5]);
     }
-    for t in src.indices.chunks_exact(3) {
+    for t in src.indices.as_chunks::<3>().0 {
         let (a, b, c) = (
             remap[t[0] as usize],
             remap[t[1] as usize],

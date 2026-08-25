@@ -194,6 +194,11 @@ pub fn try_set_joint_ops(
 ///
 /// The returned operations contain no work proportional to unrelated scene entities.  The caller lands the
 /// whole vector with one `Engine::commit`, refreshes the animation plan once and publishes the viewport once.
+// 113 lines against clippy's 100. The body is one linear pipeline -- validate a request, build its
+// joint ops, read its base pose, rewrite its track -- and each step reads the entity state the step
+// before it established, so splitting it would either move the first error a caller sees or hand a
+// helper five arguments to reconstruct that state.
+#[allow(clippy::too_many_lines)]
 pub fn try_author_joint_tracks_ops(
     engine: &Engine<FlecsWorld>,
     requests: &[JointTrackAuthoring],
@@ -246,6 +251,10 @@ pub fn try_author_joint_tracks_ops(
         };
         let base_position = [number("x"), number("y"), number("z")];
         let raw_rotation = [number("qx"), number("qy"), number("qz"), number("qw")];
+        // An exact all-zeros comparison IS the test: `number()` defaults a field the Transform does
+        // not carry to 0.0, so four exact zeros mean "no rotation was ever authored" rather than any
+        // measured value. A tolerance here would silently reject a real, very small quaternion.
+        #[allow(clippy::float_cmp)]
         let base_rotation = if raw_rotation == [0.0; 4] {
             [0.0, 0.0, 0.0, 1.0]
         } else {
@@ -281,11 +290,9 @@ pub fn try_author_joint_tracks_ops(
                 field: "keys".into(),
                 value: FieldValue::Str(encode_track(&keys)),
             });
-            let final_value = request
-                .keys
-                .last()
-                .map(|key| safe_clamp(key.value, authored_joint.min, authored_joint.max))
-                .unwrap_or(0.0);
+            let final_value = request.keys.last().map_or(0.0, |key| {
+                safe_clamp(key.value, authored_joint.min, authored_joint.max)
+            });
             let (position, rotation) =
                 joint_pose(&authored_joint, base_position, base_rotation, final_value);
             for (field, value) in [

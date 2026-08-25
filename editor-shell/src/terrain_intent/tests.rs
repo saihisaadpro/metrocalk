@@ -453,7 +453,8 @@ fn an_impostor_bake_produces_a_silhouette_with_transparency() {
     let tex = bake_impostor_texture(&asset, 64);
     assert_eq!(tex.width, 64);
     assert_eq!(tex.rgba8.len(), 64 * 64 * 4);
-    let opaque = tex.rgba8.chunks_exact(4).filter(|p| p[3] > 0).count();
+    let pixels = tex.rgba8.as_chunks::<4>().0;
+    let opaque = pixels.iter().filter(|p| p[3] > 0).count();
     let total = (tex.width * tex.height) as usize;
     assert!(
         opaque > total / 20,
@@ -464,9 +465,8 @@ fn an_impostor_bake_produces_a_silhouette_with_transparency() {
         "the bake filled the whole texture — there is no silhouette"
     );
     // Something green was drawn, i.e. the material colour and the lighting both reached the pixels.
-    let greenest = tex
-        .rgba8
-        .chunks_exact(4)
+    let greenest = pixels
+        .iter()
         .filter(|p| p[3] > 0)
         .map(|p| p[1])
         .max()

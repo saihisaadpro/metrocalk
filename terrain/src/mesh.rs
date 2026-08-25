@@ -524,8 +524,9 @@ pub fn build_water_mesh(samples: &ChunkSamples, sea_level_m: f32) -> Option<Mesh
     for (dx, dz) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
         m.positions.push([dx * half, sea_level_m, dz * half]);
         m.normals.push([0.0, 1.0, 0.0]);
-        m.uvs
-            .push([(dx + 1.0) * 0.5 * half * 0.1, (dz + 1.0) * 0.5 * half * 0.1]);
+        let u = f32::midpoint(dx, 1.0) * half * 0.1;
+        let v = f32::midpoint(dz, 1.0) * half * 0.1;
+        m.uvs.push([u, v]);
     }
     m.indices.extend_from_slice(&[0, 1, 3, 0, 3, 2]);
     Some(m)

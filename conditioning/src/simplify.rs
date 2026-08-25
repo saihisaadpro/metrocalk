@@ -467,7 +467,7 @@ mod native {
                     )));
                 }
             }
-            for triangle in primitive.indices.chunks_exact(3) {
+            for triangle in primitive.indices.as_chunks::<3>().0 {
                 let [a, b, c] = [
                     triangle[0] as usize,
                     triangle[1] as usize,
@@ -542,7 +542,9 @@ mod native {
         for (primitive_index, primitive) in asset.primitives.iter().enumerate() {
             let normals: Vec<[f32; 3]> = primitive
                 .indices
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|triangle| {
                     face_normal(
                         primitive.positions[triangle[0] as usize],
@@ -553,7 +555,7 @@ mod native {
                 })
                 .collect();
             let mut edges: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
-            for (face, triangle) in primitive.indices.chunks_exact(3).enumerate() {
+            for (face, triangle) in primitive.indices.as_chunks::<3>().0.iter().enumerate() {
                 for (a, b) in [
                     (triangle[0], triangle[1]),
                     (triangle[1], triangle[2]),

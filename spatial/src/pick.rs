@@ -881,9 +881,9 @@ fn narrow_phase(
                 let b = crate::transform::transform_point4(object.world, w[1])?;
                 let distance = crate::ray::ray_segment_distance(ray, a, b);
                 let mid = [
-                    (a[0] + b[0]) * 0.5,
-                    (a[1] + b[1]) * 0.5,
-                    (a[2] + b[2]) * 0.5,
+                    f64::midpoint(a[0], b[0]),
+                    f64::midpoint(a[1], b[1]),
+                    f64::midpoint(a[2], b[2]),
                 ];
                 let upp = camera.world_units_per_pixel(viewport, mid).max(1.0e-12);
                 let px = distance / upp;

@@ -1199,7 +1199,7 @@ fn write_primitive(out: &mut String, mesh: usize, index: usize, primitive: &Prim
     }
     line(out, 16, format_args!("]"));
     line(out, 16, format_args!("int[] faceVertexCounts = ["));
-    for _ in primitive.indices.chunks_exact(3) {
+    for _ in primitive.indices.as_chunks::<3>().0 {
         line(out, 20, format_args!("3,"));
     }
     line(out, 16, format_args!("]"));

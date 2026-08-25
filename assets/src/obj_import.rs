@@ -105,15 +105,25 @@ impl MeshSource for ObjImporter {
             }
             let positions: Vec<[f32; 3]> = m
                 .positions
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|c| [c[0], c[1], c[2]])
                 .collect();
             let normals: Vec<[f32; 3]> = m
                 .normals
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|c| [c[0], c[1], c[2]])
                 .collect();
-            let uvs: Vec<[f32; 2]> = m.texcoords.chunks_exact(2).map(|c| [c[0], c[1]]).collect();
+            let uvs: Vec<[f32; 2]> = m
+                .texcoords
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| [c[0], c[1]])
+                .collect();
             // Every index must be in range — a lying index is an explained rejection, never an over-read.
             let nverts = positions.len();
             if m.indices.iter().any(|&i| (i as usize) >= nverts) {

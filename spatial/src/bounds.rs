@@ -94,9 +94,9 @@ impl Aabb {
     #[must_use]
     pub fn center(&self) -> Vec3 {
         [
-            (self.min[0] + self.max[0]) * 0.5,
-            (self.min[1] + self.max[1]) * 0.5,
-            (self.min[2] + self.max[2]) * 0.5,
+            f64::midpoint(self.min[0], self.max[0]),
+            f64::midpoint(self.min[1], self.max[1]),
+            f64::midpoint(self.min[2], self.max[2]),
         ]
     }
 

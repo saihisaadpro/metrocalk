@@ -1870,7 +1870,7 @@ fn decode<T: DeserializeOwned>(payload: &str) -> Result<T, AnimationIntentError>
         ));
     }
     let mut bytes = Vec::with_capacity(payload.len() / 2);
-    for pair in payload.as_bytes().chunks_exact(2) {
+    for pair in payload.as_bytes().as_chunks::<2>().0 {
         let text = std::str::from_utf8(pair)
             .map_err(|error| AnimationIntentError::CorruptTrack(error.to_string()))?;
         bytes.push(

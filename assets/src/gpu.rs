@@ -166,7 +166,7 @@ impl MeshGpu {
             // Re-base this primitive's (possibly remapped) indices into the merged vertex buffer; drop any
             // out-of-range index (a malformed primitive) rather than emitting a bad draw.
             let n = prim_pos.len() as u32;
-            for tri in prim_idx.chunks_exact(3) {
+            for tri in prim_idx.as_chunks::<3>().0 {
                 if tri.iter().all(|&i| i < n) {
                     indices.push(base + tri[0]);
                     indices.push(base + tri[1]);
@@ -329,7 +329,7 @@ impl MeshGpu {
             old_to_new.push(ni);
         }
         let mut indices = Vec::new();
-        for tri in self.indices.chunks_exact(3) {
+        for tri in self.indices.as_chunks::<3>().0 {
             let (a, b, c) = (
                 old_to_new[tri[0] as usize],
                 old_to_new[tri[1] as usize],

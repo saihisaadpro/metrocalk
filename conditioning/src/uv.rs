@@ -466,7 +466,7 @@ mod native {
                     "primitive {primitive_index} contains non-finite vertex data"
                 )));
             }
-            for triangle in primitive.indices.chunks_exact(3) {
+            for triangle in primitive.indices.as_chunks::<3>().0 {
                 let [a, b, c] = [
                     triangle[0] as usize,
                     triangle[1] as usize,
@@ -512,7 +512,7 @@ mod native {
         let mut total_world_area = 0.0_f64;
         let mut total_pixel_area = 0.0_f64;
         for primitive in &asset.primitives {
-            for triangle in primitive.indices.chunks_exact(3) {
+            for triangle in primitive.indices.as_chunks::<3>().0 {
                 let [a, b, c] = [
                     triangle[0] as usize,
                     triangle[1] as usize,

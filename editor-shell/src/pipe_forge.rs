@@ -2893,7 +2893,7 @@ fn is_watertight(prim: &Primitive) -> bool {
     let mut used_vertices = vec![false; prim.positions.len()];
     let mut used_welds = vec![false; key_ids.len()];
 
-    for tri in prim.indices.chunks_exact(3) {
+    for tri in prim.indices.as_chunks::<3>().0 {
         let [ia, ib, ic] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
         if ia >= prim.positions.len() || ib >= prim.positions.len() || ic >= prim.positions.len() {
             return false;

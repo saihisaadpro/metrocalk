@@ -462,7 +462,7 @@ fn step_companion_candidates(source_path: &std::path::Path) -> Vec<std::path::Pa
             if !matches!(extension.as_str(), "stp" | "step") {
                 return None;
             }
-            let within_limit = path.metadata().ok().is_some_and(|metadata| {
+            let within_limit = path.metadata().is_ok_and(|metadata| {
                 metadata.len() <= metrocalk_interchange::MAX_STEP_ASSEMBLY_BYTES as u64
             });
             if !within_limit {
@@ -552,7 +552,7 @@ pub fn land_import(
     report: CadImport,
 ) -> Result<CadLanding, CadImportError> {
     let source = CadSourceIdentity::content_addressed(&report);
-    land_import_from_source(engine, scene, store, source, report)
+    land_import_from_source(engine, scene, store, &source, report)
 }
 
 /// Land a neutral CAD report for an explicit logical source. A changed revision atomically replaces only
@@ -564,7 +564,7 @@ pub fn land_import_from_source(
     engine: &mut Engine<FlecsWorld>,
     scene: &CapScene,
     store: &mut AssetStore,
-    source: CadSourceIdentity,
+    source: &CadSourceIdentity,
     report: CadImport,
 ) -> Result<CadLanding, CadImportError> {
     let previous_roots = active_cad_source_roots(engine, &source.key);
@@ -637,7 +637,7 @@ pub fn land_import_from_source(
     let mut ops: Vec<Op> =
         Vec::with_capacity(report.parts.len() * 10 + report.groups.len() * 9 + 20);
     let root_entity = engine.alloc_entity_id();
-    ops.extend(cad_source_root_ops(root_entity, &source, &report.name));
+    ops.extend(cad_source_root_ops(root_entity, source, &report.name));
 
     // The NAMED structural tree first (report.groups is topological, parent-before-child): one geometry-
     // free identity-transform container per assembly occurrence, marked `__meta__.kind = "group"` — the

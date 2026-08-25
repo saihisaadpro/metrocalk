@@ -338,7 +338,7 @@ fn quat_normalize(q: [f32; 4]) -> [f32; 4] {
 /// Quaternion for a rotation about +Y given `(cos θ, sin θ)`.
 fn quat_from_cos_sin_y(c: f32, s: f32) -> [f32; 4] {
     // Half-angle: cos(θ/2) = √((1+cos θ)/2), sin(θ/2) = sin θ / (2 cos(θ/2)).
-    let cos_half = ((1.0 + c.clamp(-1.0, 1.0)) * 0.5).max(0.0).sqrt();
+    let cos_half = f32::midpoint(1.0, c.clamp(-1.0, 1.0)).max(0.0).sqrt();
     if cos_half < 1e-5 {
         // θ ≈ 180°.
         return [0.0, 1.0, 0.0, 0.0];
@@ -361,7 +361,7 @@ fn quat_tilt_to_normal(normal: [f32; 3], amount: f32) -> [f32; 4] {
     // Partial tilt: interpolate the cosine of the angle rather than the angle, which needs no `acos`.
     let cos_full = n[1].clamp(-1.0, 1.0);
     let cos_partial = noise::lerp(1.0, cos_full, amount);
-    let cos_half = ((1.0 + cos_partial) * 0.5).max(0.0).sqrt();
+    let cos_half = f32::midpoint(1.0, cos_partial).max(0.0).sqrt();
     let sin_half = ((1.0 - cos_partial) * 0.5).max(0.0).sqrt();
     [ax * sin_half, 0.0, az * sin_half, cos_half]
 }

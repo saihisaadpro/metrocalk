@@ -116,8 +116,8 @@ fn rasterize(
     }
     let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-9);
     let scale = 0.90 * (W.min(H) as f64) / span;
-    let cx = 0.5 * (lo[0] + hi[0]);
-    let cy = 0.5 * (lo[1] + hi[1]);
+    let cx = f64::midpoint(lo[0], hi[0]);
+    let cy = f64::midpoint(lo[1], hi[1]);
     let to_screen = |p: [f64; 3]| -> (f64, f64) {
         (
             (W as f64) * 0.5 + (p[0] - cx) * scale,

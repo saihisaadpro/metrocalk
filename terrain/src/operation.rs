@@ -90,8 +90,8 @@ impl Rect {
     #[must_use]
     pub fn centre(self) -> [f32; 2] {
         [
-            (self.min[0] + self.max[0]) * 0.5,
-            (self.min[1] + self.max[1]) * 0.5,
+            f32::midpoint(self.min[0], self.max[0]),
+            f32::midpoint(self.min[1], self.max[1]),
         ]
     }
 

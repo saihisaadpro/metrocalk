@@ -31,8 +31,6 @@ pub struct ShotSpec {
     pub label: &'static str,
     /// What it is for, one line.
     pub blurb: &'static str,
-    /// Card glyph.
-    pub icon: &'static str,
     /// What the shot will look like, spelled out — the legible-cost line.
     pub adds: &'static str,
 }
@@ -49,98 +47,84 @@ pub fn shot_specs() -> Vec<ShotSpec> {
             kind: "establish",
             label: "Establishing",
             blurb: "Show where we are before we look at anything closely",
-            icon: "🌄",
             adds: "a wide, slowly pulling-out shot from the front",
         },
         ShotSpec {
             kind: "hero",
             label: "Hero shot",
             blurb: "The workhorse — three-quarters on, pushing in",
-            icon: "🎬",
             adds: "a full-body three-quarter shot that creeps closer",
         },
         ShotSpec {
             kind: "closeup",
             label: "Close-up",
             blurb: "Tight and still — for the moment that matters",
-            icon: "🔍",
             adds: "a close, locked-off shot in profile",
         },
         ShotSpec {
             kind: "orbit",
             label: "Show it off",
             blurb: "Circle the object so every side reads",
-            icon: "🔄",
             adds: "a medium shot orbiting a quarter turn",
         },
         ShotSpec {
             kind: "reveal",
             label: "Crane reveal",
             blurb: "Lift away to show the world around it",
-            icon: "🚁",
             adds: "a full shot craning upward",
         },
         ShotSpec {
             kind: "looming",
             label: "Looming",
             blurb: "From below, so the subject towers",
-            icon: "😤",
             adds: "a low-angle medium shot pushing in",
         },
         ShotSpec {
             kind: "vista",
             label: "The vista",
             blurb: "The subject is a speck in its world — scale, before anything else",
-            icon: "🏔",
             adds: "an extreme-wide, locked-off shot from the front",
         },
         ShotSpec {
             kind: "overshoulder",
             label: "Over the shoulder",
             blurb: "Stand where it stands and look where it looks",
-            icon: "🎯",
             adds: "a medium shot from behind, holding steady",
         },
         ShotSpec {
             kind: "birdseye",
             label: "Bird's eye",
             blurb: "Look down on it — the map view, the trap closing",
-            icon: "🦅",
             adds: "a wide shot from high above, craning down",
         },
         ShotSpec {
             kind: "dropin",
             label: "Drop in",
             blurb: "Fall out of the sky onto the subject",
-            icon: "🪂",
             adds: "a full shot craning down from overhead",
         },
         ShotSpec {
             kind: "confront",
             label: "Face to face",
             blurb: "Head-on and closing — the moment before something happens",
-            icon: "😐",
             adds: "a close, front-on shot pushing in hard",
         },
         ShotSpec {
             kind: "detail",
             label: "The detail",
             blurb: "Tighter than the subject — one thing, very large",
-            icon: "🔬",
             adds: "an extreme close-up, locked off, three-quarters on",
         },
         ShotSpec {
             kind: "pullback",
             label: "Pull back",
             blurb: "Start on it, end on everything around it",
-            icon: "↔",
             adds: "a medium shot pulling all the way out",
         },
         ShotSpec {
             kind: "sweep",
             label: "Side sweep",
             blurb: "Track past it in profile — motion without a cut",
-            icon: "🎞",
             adds: "a full shot in profile, orbiting a third of a turn",
         },
     ]
@@ -507,10 +491,7 @@ fn describe_shot_with_seconds(
         ShotMove::CraneUp => "craning up",
         ShotMove::CraneDown => "craning down",
     };
-    format!(
-        "{size} shot of {subject_name} {angle}, {motion} — {:.1}s",
-        effective_seconds
-    )
+    format!("{size} shot of {subject_name} {angle}, {motion} — {effective_seconds:.1}s")
 }
 
 /// Build the reply for a cutscene, including the continuity warnings.
