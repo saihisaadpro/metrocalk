@@ -8033,6 +8033,64 @@ mod tests {
         );
     }
 
+    /// The defect that made the second film's worst frames score as its best: a wall a hand's breadth in
+    /// front of the lens counted as a rich backdrop. Backing has to be measured from the SUBJECT
+    /// outwards, so a near surface contributes nothing to it and is reported as crowding instead.
+    ///
+    /// The fixture is a narrow aisle — panels close on both sides, a clear corridor down the middle to
+    /// the subject. That is the frame `eye_inside` cannot catch and `clear` has no opinion about: the
+    /// camera is outside everything, the subject is in plain view, and most of the picture is the side
+    /// of the machine next door.
+    #[test]
+    fn a_surface_in_front_of_the_lens_is_crowding_and_never_backing() {
+        let mut st = crowded_scene(0);
+        for (index, x) in [-1.6_f32, 1.6].into_iter().enumerate() {
+            st.instances.push(Instance {
+                center: [x, 0.0, -6.0],
+                scale: 2.0,
+                color: [1.0; 3],
+                selected: 0.0,
+                rotation: IDENTITY_QUAT,
+                material: [0.0; 4],
+            });
+            st.ids.push(format!("1_9{index}"));
+            st.mesh_slots.push(0);
+        }
+        st.ids_revision += 1;
+        st.sync_occlusion();
+
+        let aisle = st.vantage([0.0, 0.0, -8.0], [0.0; 3], [0.0; 3], 0.87, &subject_only());
+        assert!(
+            !aisle.eye_inside,
+            "the camera is outside everything: {aisle:?}"
+        );
+        assert!(
+            (aisle.clear - 1.0).abs() < 1.0e-6,
+            "the corridor to the subject is open: {aisle:?}"
+        );
+        assert!(
+            aisle.crowded > metrocalk_animation::shot::MAX_CROWDED_FRACTION,
+            "panels filling most of the frame must read as crowding: {aisle:?}"
+        );
+        assert!(
+            !aisle.acceptable(),
+            "and crowding alone must be enough to reject it: {aisle:?}"
+        );
+        assert!(
+            aisle.backing < 0.5,
+            "surfaces in FRONT of the subject must not count as what is behind it: {aisle:?}"
+        );
+
+        // Take the panels away and the same placement is fine — so the rejection is about them.
+        let mut open = crowded_scene(0);
+        open.sync_occlusion();
+        let clear_view = open.vantage([0.0, 0.0, -8.0], [0.0; 3], [0.0; 3], 0.87, &subject_only());
+        assert!(
+            clear_view.acceptable() && clear_view.crowded == 0.0,
+            "{clear_view:?}"
+        );
+    }
+
     /// The presentation ground is a quad the renderer draws directly, not an instance, so it is absent
     /// from any structure built over the instance list. A bird's-eye shot is aimed straight at it.
     #[test]

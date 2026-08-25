@@ -1302,6 +1302,7 @@ mod tests {
                 eye_inside: d < radius,
                 clear: if d < radius { 0.0 } else { 1.0 },
                 backing: 0.5,
+                crowded: 0.0,
             }
         }
     }
@@ -1467,6 +1468,7 @@ mod tests {
             } else {
                 1.0
             },
+            crowded: 0.0,
         });
         assert!(
             !plan.is_authored(&s),
@@ -1496,6 +1498,7 @@ mod tests {
             eye_inside: false,
             clear: 1.0,
             backing: (dist(pose.eye, cube().center) / (close_distance * 8.0)).clamp(0.0, 1.0),
+            crowded: 0.0,
         });
         assert_eq!(
             plan.size,
@@ -1511,6 +1514,7 @@ mod tests {
                 eye_inside: out < close_distance * 1.5,
                 clear: if out < close_distance * 1.5 { 0.0 } else { 1.0 },
                 backing: 0.9,
+                crowded: 0.0,
             }
         });
         assert_ne!(blocked_near.size, ShotSize::Close, "{blocked_near:?}");
@@ -1520,6 +1524,72 @@ mod tests {
                 cube().center
             ) >= close_distance * 1.5,
             "the fallback must actually clear the obstruction"
+        );
+    }
+
+    /// The failure the SECOND film was made of, and the one the first version of this mechanism could
+    /// not see: the camera a few centimetres clear of a large flat surface. It is outside everything, it
+    /// has a clean line to a subject visible past the edge — and nine tenths of the picture is the side
+    /// of the machine next door.
+    #[test]
+    fn a_camera_boxed_in_by_near_geometry_is_rejected_though_it_sees_its_subject() {
+        let boxed_in = Vantage {
+            eye_inside: false,
+            clear: 1.0,
+            backing: 1.0,
+            crowded: 0.9,
+        };
+        assert!(
+            !boxed_in.acceptable(),
+            "a frame that is nine tenths foreground is not a shot of its subject: {boxed_in:?}"
+        );
+        // A foreground element is composition, not clutter: an industrial film wants to look past a
+        // railing or a column. Under the threshold stays acceptable.
+        let framed_past_something = Vantage {
+            crowded: MAX_CROWDED_FRACTION,
+            ..boxed_in
+        };
+        assert!(
+            framed_past_something.acceptable(),
+            "{framed_past_something:?}"
+        );
+        // Clutter always COSTS. Two frames alike in every other way rank by how much of the picture is
+        // foreground, so among acceptable placements the planner still walks away from the busier one.
+        // (It is deliberately not true that an empty frame beats a well-backed one with some foreground
+        // in it: a backdrop plus a foreground element is depth, which is what an industrial shot wants.)
+        let open = Vantage {
+            crowded: 0.0,
+            ..framed_past_something
+        };
+        assert!(open.score() > framed_past_something.score());
+        // And a unit of clutter costs more than a unit of background is worth, so the ladder can never
+        // buy a busier frame with a richer backdrop.
+        const { assert!(CROWDING_WEIGHT > BACKING_WEIGHT) };
+    }
+
+    /// End to end: a placement the world calls crowded must be escaped, exactly like a buried one.
+    #[test]
+    fn the_planner_escapes_a_crowded_frame() {
+        let s = shot(ShotSize::Close, ShotAngle::ThreeQuarter, ShotMove::Hold);
+        let authored = solve_shot_eased(&s, cube(), 0.0, 16.0 / 9.0, 50.0);
+        let plan = plan_shot(&s, cube(), 16.0 / 9.0, 50.0, |pose, _| Vantage {
+            eye_inside: false,
+            clear: 1.0,
+            backing: 1.0,
+            // Everything near the directed placement is jammed against a surface; elsewhere is open.
+            crowded: if dist(pose.eye, authored.eye) < 1.0 {
+                0.9
+            } else {
+                0.0
+            },
+        });
+        assert!(!plan.is_authored(&s), "{plan:?}");
+        assert!(
+            dist(
+                solve_shot_adjusted(&s, plan, cube(), 0.0, 16.0 / 9.0, 50.0).eye,
+                authored.eye
+            ) >= 1.0,
+            "the escape must leave the crowded region"
         );
     }
 
@@ -1538,6 +1608,7 @@ mod tests {
                     eye_inside: false,
                     clear: 1.0,
                     backing: 0.8,
+                    crowded: 0.0,
                 });
                 assert!(
                     plan.is_authored(&s),
@@ -1559,11 +1630,13 @@ mod tests {
             eye_inside: false,
             clear: 1.0,
             backing: 0.0,
+            crowded: 0.0,
         };
         let backed_but_blocked = Vantage {
             eye_inside: false,
             clear: 0.61,
             backing: 1.0,
+            crowded: 0.0,
         };
         assert!(empty_but_clear.acceptable() && backed_but_blocked.acceptable());
         assert!(empty_but_clear.score() > backed_but_blocked.score());
@@ -1572,6 +1645,7 @@ mod tests {
             eye_inside: true,
             clear: 1.0,
             backing: 1.0,
+            crowded: 0.0,
         };
         assert!(!buried.acceptable());
         assert!(buried.score().is_infinite() && buried.score().is_sign_negative());
@@ -1586,6 +1660,7 @@ mod tests {
             eye_inside: true,
             clear: 0.0,
             backing: 0.0,
+            crowded: 1.0,
         });
         assert!(plan.is_authored(&s), "{plan:?}");
         assert_eq!(
@@ -1614,6 +1689,7 @@ mod tests {
                 eye_inside: true,
                 clear: 0.0,
                 backing: 0.0,
+                crowded: 1.0,
             }
         });
         assert_eq!(calls, 6 * 9 * 5, "one query per candidate per path sample");
