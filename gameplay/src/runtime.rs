@@ -2417,7 +2417,7 @@ impl MatchRuntime {
     #[must_use]
     pub fn world_digest(&self) -> WorldDigest {
         let mut hash = StableHash::new();
-        hash.bytes(b"metrocalk-gameplay-mob2-v11");
+        hash.bytes(WORLD_DIGEST_DOMAIN.as_bytes());
         hash.u64(self.seed);
         hash.u64(self.tick);
         hash.phase(self.phase);
@@ -4225,9 +4225,26 @@ pub(crate) const fn event_tag(event: MatchEvent) -> u8 {
     }
 }
 
+/// Domain-separation tag hashed first into every [`WorldDigest`].
+///
+/// It is part of the digest input, so changing it changes every world digest **by construction**.
+/// That is what it is for: bumping the suffix is how a deliberate change to *what the world digest
+/// covers* is declared, and it is the reason a digest change is not automatically a regression.
+///
+/// It is `pub` so that pinned goldens can carry it beside the number. Without that, a digest
+/// mismatch has two indistinguishable causes — a deliberate, version-stamped change to the digest's
+/// contents, and a real determinism defect — and the only way to tell them apart is to read a commit
+/// message. Pinning the domain splits the verdict: a **changed domain** is a re-bless, an
+/// **unchanged domain with a changed digest** is a determinism regression. See ADR-135.
+pub const WORLD_DIGEST_DOMAIN: &str = "metrocalk-gameplay-mob2-v11";
+
+/// Domain-separation tag hashed first into every [`FrameDigest`]. See [`WORLD_DIGEST_DOMAIN`] for
+/// why it is public and what a change to it means.
+pub const FRAME_DIGEST_DOMAIN: &str = "metrocalk-gameplay-frame-v9";
+
 pub(crate) fn digest_frame(frame: &ServerFrame) -> FrameDigest {
     let mut hash = StableHash::new();
-    hash.bytes(b"metrocalk-gameplay-frame-v9");
+    hash.bytes(FRAME_DIGEST_DOMAIN.as_bytes());
     hash.u64(frame.tick);
     hash.phase(frame.phase);
     hash.len(frame.changed.len());

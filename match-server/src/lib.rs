@@ -13,7 +13,8 @@ use metrocalk_gameplay::{
     ActorId, ActorIntent, ActorKind, ActorSpawn, BasicAttackSpec, Bounty, CombatStats, CommandKind,
     CompiledLane, DamageSchool, DeathRule, FrameDigest, InvariantViolation, LaneError, LaneId,
     LanePosition, LaneSpec, MatchConfig, MatchEndReason, MatchEvent, MatchOutcome, MatchPhase,
-    MatchRuntime, RuntimeError, StatGrowth, TeamId, Tick, Vec2Mm, WorldDigest,
+    MatchRuntime, RuntimeError, StatGrowth, TeamId, Tick, Vec2Mm, WorldDigest, FRAME_DIGEST_DOMAIN,
+    WORLD_DIGEST_DOMAIN,
 };
 
 /// Immutable build metadata exposed by the `--version-json` command.
@@ -111,11 +112,17 @@ impl MatchReport {
             MatchEndReason::TimeLimit => "time-limit",
             MatchEndReason::Host => "host",
         };
+        // The digest domains are emitted beside the digests they produced. A digest number alone
+        // cannot say whether a mismatch against a pinned golden is a deliberate, version-stamped
+        // change to what the digest covers or a real determinism defect; the domain can. They are
+        // kernel constants rather than per-match values, so they are read from the kernel here
+        // instead of being carried through `MatchReport`. See ADR-135.
         format!(
             concat!(
-                "{{\"schemaVersion\":1,\"profileId\":\"{}\",\"seed\":{},",
+                "{{\"schemaVersion\":2,\"profileId\":\"{}\",\"seed\":{},",
                 "\"finalTick\":{},\"outcome\":{},\"reason\":\"{}\",",
-                "\"worldDigest\":{},\"terminalFrameDigest\":{}}}"
+                "\"worldDigest\":{},\"terminalFrameDigest\":{},",
+                "\"digestDomains\":{{\"world\":\"{}\",\"frame\":\"{}\"}}}}"
             ),
             self.profile_id,
             self.seed,
@@ -123,7 +130,9 @@ impl MatchReport {
             outcome,
             reason,
             self.world_digest.0,
-            self.terminal_frame_digest.0
+            self.terminal_frame_digest.0,
+            WORLD_DIGEST_DOMAIN,
+            FRAME_DIGEST_DOMAIN
         )
     }
 }
@@ -544,6 +553,33 @@ mod tests {
         assert_eq!(reusable_host.metrics().matches_completed, 2);
         assert_eq!(reusable_host.metrics().internal_intents_issued, 12);
         assert_eq!(reusable_host.metrics().internal_intents_rejected, 0);
+    }
+
+    /// The smoke JSON is the only thing CI reads, so the domains have to be *in it*, spelled the way
+    /// the golden spells them. Asserting the substring rather than only `contains("digestDomains")`
+    /// is deliberate: a key that is present but empty is exactly the vacuous assertion ADR-134 was
+    /// written about. Mutation: drop either constant from `to_json` and this fails.
+    #[test]
+    fn smoke_json_publishes_the_digest_domains_that_produced_its_digests() {
+        let json = host().run_reference_smoke().unwrap().to_json();
+        assert!(
+            json.contains(&format!(
+                "\"digestDomains\":{{\"world\":\"{WORLD_DIGEST_DOMAIN}\",\"frame\":\"{FRAME_DIGEST_DOMAIN}\"}}"
+            )),
+            "smoke JSON must publish both digest domains verbatim, got: {json}"
+        );
+    }
+
+    /// Pins the domains against the strings the goldens carry. A digest is only adjudicable if the
+    /// domain that produced it is knowable, so bumping a domain must be a deliberate act that breaks
+    /// a named test here *and* the tripwire's golden -- never a silent edit that reads downstream as
+    /// a determinism failure. If you are here because this test is red: that is the system working.
+    /// Re-measure the smoke and re-bless `reference-smoke.config.json`, `reference-smoke.schema.json`
+    /// and `mobile-match-server-tripwire.yml` together. See ADR-135.
+    #[test]
+    fn digest_domains_are_pinned_and_change_only_with_the_goldens() {
+        assert_eq!(WORLD_DIGEST_DOMAIN, "metrocalk-gameplay-mob2-v11");
+        assert_eq!(FRAME_DIGEST_DOMAIN, "metrocalk-gameplay-frame-v9");
     }
 
     #[test]

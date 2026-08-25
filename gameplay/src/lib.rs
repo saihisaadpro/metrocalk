@@ -49,7 +49,10 @@ pub use protocol::{
 pub use replay::{
     ReplayError, ReplayOutcome, Scenario, ScenarioFinish, ScenarioSubmission, SubmissionOutcome,
 };
-pub use runtime::{InvariantViolation, MatchRuntime, HEALTH_SETTLEMENT_POLICY};
+pub use runtime::{
+    InvariantViolation, MatchRuntime, FRAME_DIGEST_DOMAIN, HEALTH_SETTLEMENT_POLICY,
+    WORLD_DIGEST_DOMAIN,
+};
 
 #[cfg(test)]
 mod tests;

@@ -110,17 +110,35 @@
       "required": [
         "finalTick",
         "worldDigest",
-        "terminalFrameDigest"
+        "terminalFrameDigest",
+        "digestDomains"
       ],
       "properties": {
         "finalTick": {
           "const": 3
         },
         "worldDigest": {
-          "const": 14748160577365444726
+          "const": 6163847720121452659
         },
         "terminalFrameDigest": {
-          "const": 4127077091997761738
+          "const": 11326667637310035072
+        },
+        "digestDomains": {
+          "description": "The domain-separation tags the kernel hashes into each digest, pinned beside the digests they produced. A digest number alone cannot distinguish a deliberate, version-stamped change to what a digest covers from a real determinism defect. Pinning the domain splits that verdict: a changed domain here is a re-bless, an unchanged domain with a changed digest is a regression. Bump these only together with the numbers above, and only from a measured run. See ADR-135.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "world",
+            "frame"
+          ],
+          "properties": {
+            "world": {
+              "const": "metrocalk-gameplay-mob2-v11"
+            },
+            "frame": {
+              "const": "metrocalk-gameplay-frame-v9"
+            }
+          }
         }
       }
     },

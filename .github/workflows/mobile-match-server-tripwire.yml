@@ -66,10 +66,19 @@ jobs:
               "status": "not-implemented",
               "listensOnNetwork": False,
           }
+          # Third statement of the golden, on purpose: config and schema can both be edited in one
+          # commit, so without a literal here a re-bless needs no reviewer. `digestDomains` pins the
+          # tags the kernel hashes into each digest, which is what makes a future mismatch
+          # self-diagnosing rather than a number nobody can adjudicate. Blessed 2026-08-25 from a
+          # measured Linux x86_64 run; see ADR-135 for the measurement and its corroboration.
           assert config["expectedEvidence"] == {
               "finalTick": 3,
-              "worldDigest": 14748160577365444726,
-              "terminalFrameDigest": 4127077091997761738,
+              "worldDigest": 6163847720121452659,
+              "terminalFrameDigest": 11326667637310035072,
+              "digestDomains": {
+                  "world": "metrocalk-gameplay-mob2-v11",
+                  "frame": "metrocalk-gameplay-frame-v9",
+              },
           }
           # Exact, not a set membership test: every packaging claim must name what CI actually performs, and
           # the unmet gates must stay spelled out rather than collapsing into a passing aggregate.
@@ -89,6 +98,11 @@ jobs:
           evidence_schema = schema["properties"]["expectedEvidence"]["properties"]
           for key in ("finalTick", "worldDigest", "terminalFrameDigest"):
               assert evidence_schema[key]["const"] == config["expectedEvidence"][key], key
+          domain_schema = evidence_schema["digestDomains"]["properties"]
+          for key in ("world", "frame"):
+              assert (
+                  domain_schema[key]["const"] == config["expectedEvidence"]["digestDomains"][key]
+              ), key
       - name: Check formatting
         run: cargo fmt --manifest-path match-server/Cargo.toml -- --check
       - name: Test deterministic host
@@ -122,8 +136,34 @@ jobs:
           assert smoke["outcome"] == "draw"
           assert smoke["reason"] == "objective-destroyed"
           assert smoke["finalTick"] == config["expectedEvidence"]["finalTick"]
-          assert smoke["worldDigest"] == config["expectedEvidence"]["worldDigest"]
-          assert smoke["terminalFrameDigest"] == config["expectedEvidence"]["terminalFrameDigest"]
+
+          # Read the domains BEFORE the digests, because they decide what a digest mismatch means.
+          # A digest number on its own cannot tell a deliberate, version-stamped change to what the
+          # digest covers from a real determinism defect -- that ambiguity left this gate red for 19
+          # days in 2026-08 while the kernel was in fact perfectly deterministic. See ADR-135.
+          expected_domains = config["expectedEvidence"]["digestDomains"]
+          measured_domains = smoke["digestDomains"]
+          if measured_domains != expected_domains:
+              print(
+                  "::error::the kernel's digest domains moved: expected "
+                  f"{expected_domains}, measured {measured_domains}. This is a DELIBERATE change to "
+                  "what the digests cover, not a determinism failure. Re-bless the golden: run "
+                  "`cargo run -p metrocalk-match-server --release -- --smoke-json`, then write the "
+                  "measured digests AND domains into reference-smoke.config.json, "
+                  "reference-smoke.schema.json and this workflow."
+              )
+              raise SystemExit(1)
+
+          for key in ("worldDigest", "terminalFrameDigest"):
+              if smoke[key] != config["expectedEvidence"][key]:
+                  print(
+                      f"::error::{key} changed while the digest domains did NOT "
+                      f"({expected_domains}). A digest that moves under an unchanged domain is a "
+                      f"DETERMINISM REGRESSION, not a stale golden: expected "
+                      f"{config['expectedEvidence'][key]}, measured {smoke[key]}. Do not re-bless "
+                      "this number -- find what made the kernel stop reproducing."
+                  )
+                  raise SystemExit(1)
           PY
 
   candidate-image:
@@ -172,7 +212,9 @@ jobs:
           assert smoke["seed"] == config["simulation"]["seed"]
           assert smoke["outcome"] == config["simulation"]["expectedOutcome"]
           assert smoke["reason"] == config["simulation"]["expectedReason"]
-          for key in ("finalTick", "worldDigest", "terminalFrameDigest"):
+          # `digestDomains` included: the image is built from the same tree, so a domain that differs
+          # here is a packaging fault (a stale layer, a wrong source copy), not a re-bless.
+          for key in ("finalTick", "worldDigest", "terminalFrameDigest", "digestDomains"):
               assert smoke[key] == config["expectedEvidence"][key], key
           PY
 

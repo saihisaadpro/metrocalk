@@ -23,8 +23,12 @@
   },
   "expectedEvidence": {
     "finalTick": 3,
-    "worldDigest": 14748160577365444726,
-    "terminalFrameDigest": 4127077091997761738
+    "worldDigest": 6163847720121452659,
+    "terminalFrameDigest": 11326667637310035072,
+    "digestDomains": {
+      "world": "metrocalk-gameplay-mob2-v11",
+      "frame": "metrocalk-gameplay-frame-v9"
+    }
   },
   "transport": {
     "status": "not-implemented",
