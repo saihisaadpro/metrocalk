@@ -634,12 +634,38 @@ async function startOleDropSurvivingOcclusion(attempt, dropHandles, maxAttempts 
   }
 }
 
+/**
+ * The gesture states that only exist AFTER the held hover's button went up.
+ *
+ * `released` is set the instant the button is released and is then deliberately overwritten by a more
+ * informative terminal value — `drag-returned` when OLE's modal loop returns, `release-nudge-exhausted`
+ * when it has not returned by the time the post-release nudges stop. Matching `released` alone therefore
+ * matches a TRANSIENT: whether it is still the current value when the script prints its summary depends
+ * on which of two threads wins a race. It won that race for a while and now loses it every time — on a
+ * drop the harness's own evidence file records as completed:
+ *
+ *     hovered=…T11:10:07.09        the drag reached the target and held
+ *     authorized-release=…09.810   the spec authorized the release
+ *     releaseObserved=…09.862      the gesture thread saw the authorization
+ *     buttonReleased=…09.864       the button actually went up
+ *
+ * Matching the states that PERSIST is what the check was always trying to say.
+ */
+const HELD_HOVER_RELEASED = /DROP_GESTURE:\s+(?:released|drag-returned|release-nudge-exhausted)\b/i;
+
+/**
+ * …and the drag has to have ended because the button came up. A hover that times out presses Escape
+ * (`ending=escape`) and a drag that runs past its deadline reports `ending=deadline`. Both are failures
+ * this check exists to catch, and neither was excluded by the old one.
+ */
+const DROP_ENDED_BY_RELEASE = /DROP_EFFECT:[^\n]*ending=button-released/i;
+
 function assertOleAccepted(handle) {
   invariant(!handle.result?.error && handle.result?.code === 0,
     `OLE ${handle.attempt} failed: ${JSON.stringify(handle.result)}\n${handle.stdout}\n${handle.stderr}`);
   invariant(/DROP_RESULT:\s+OK\s+os-accepted/i.test(handle.stdout),
     `OLE ${handle.attempt} did not prove OS acceptance:\n${handle.stdout}`);
-  invariant(/DROP_GESTURE:\s+released/i.test(handle.stdout),
+  invariant(HELD_HOVER_RELEASED.test(handle.stdout) && DROP_ENDED_BY_RELEASE.test(handle.stdout),
     `OLE ${handle.attempt} did not prove held-hover release:\n${handle.stdout}`);
 }
 

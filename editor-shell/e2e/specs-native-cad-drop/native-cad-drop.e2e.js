@@ -353,7 +353,13 @@ describe("genuine native CAD drag/drop", () => {
       if (!/DROP_RESULT:\s+OK\s+os-accepted/i.test(dropHandle.stdout)) {
         throw new Error(`OLE helper did not prove OS acceptance:\n${dropHandle.stdout}`);
       }
-      if (!/DROP_GESTURE:\s+released/i.test(dropHandle.stdout)) {
+      // `released` is a TRANSIENT: the gesture thread sets it the instant the button goes up and then
+      // overwrites it with `drag-returned` (or `release-nudge-exhausted`). Matching it alone is matching
+      // a race between that thread and the summary print. Match the states that persist, and require the
+      // drag to have ended by a button release rather than by Escape (which is what a hover-release
+      // timeout sends) or by the deadline — which is what this check was always trying to say.
+      if (!/DROP_GESTURE:\s+(?:released|drag-returned|release-nudge-exhausted)\b/i.test(dropHandle.stdout)
+        || !/DROP_EFFECT:[^\n]*ending=button-released/i.test(dropHandle.stdout)) {
         throw new Error(`OLE helper did not prove an authorized held-hover release:\n${dropHandle.stdout}`);
       }
 
