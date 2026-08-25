@@ -18,9 +18,11 @@
       left button DOWN at a source point  ->  a run of relative MOVEs across to the
       target  ->  left button UP over the target
 
-  and the drop source uses the standard rule (button released => DRAGDROP_S_DROP). Two
-  independent belts and braces guarantee the loop always terminates: a tick ceiling and a
-  wall-clock deadline inside QueryContinueDrag.
+  and the drop source uses the standard rule (button released => drop). The same reasoning
+  applies AFTER the button-up: if OLE's loop does not observe that release it will never be
+  woken again, so the gesture thread keeps injecting tiny moves until the drag returns.
+  A wall-clock deadline in the source form's QueryContinueDrag handler is the backstop that
+  guarantees the modal loop always terminates.
 
   NOTE ON TIMING: current builds enqueue the import and return from DoDragDrop as soon as
   the OS drop is accepted. A successful script exit therefore proves the end-user OLE
@@ -101,40 +103,10 @@ namespace MtkDrop
         [PreserveSig] int GiveFeedback(int dwEffect);
     }
 
-    // The standard drop-source rule: the drag ends when the button that started it is
-    // released. The tick ceiling and the deadline exist only so the modal loop can never
-    // hang this script if input injection is refused.
-    public class DropSource : IDropSource
-    {
-        const int S_OK = 0;
-        const int DRAGDROP_S_DROP = 0x00040100;
-        const int DRAGDROP_S_CANCEL = 0x00040101;
-        const int DRAGDROP_S_USEDEFAULTCURSORS = 0x00040102;
-        const int MK_LBUTTON = 0x0001;
-
-        private int _ticks;
-        private readonly int _maxTicks;
-        private readonly Stopwatch _clock = Stopwatch.StartNew();
-        private readonly int _deadlineMs;
-
-        public int Ticks { get { return _ticks; } }
-        public string Ending = "(never called)";
-
-        public DropSource(int maxTicks, int deadlineMs)
-        { _maxTicks = maxTicks; _deadlineMs = deadlineMs; }
-
-        public int QueryContinueDrag(int fEscapePressed, int grfKeyState)
-        {
-            _ticks++;
-            if (fEscapePressed != 0) { Ending = "escape"; return DRAGDROP_S_CANCEL; }
-            if ((grfKeyState & MK_LBUTTON) == 0) { Ending = "button-released"; return DRAGDROP_S_DROP; }
-            if (_ticks >= _maxTicks) { Ending = "tick-ceiling"; return DRAGDROP_S_DROP; }
-            if (_clock.ElapsedMilliseconds > _deadlineMs) { Ending = "deadline"; return DRAGDROP_S_DROP; }
-            return S_OK;
-        }
-
-        public int GiveFeedback(int dwEffect) { return DRAGDROP_S_USEDEFAULTCURSORS; }
-    }
+    // NOTE: the drag runs through WinForms' Control.DoDragDrop, which supplies its own IDropSource.
+    // A hand-written IDropSource with a tick ceiling and deadline used to live here, but nothing ever
+    // instantiated it and ole32!DoDragDrop was never called, so it bounded nothing while reading as if
+    // it did. The real bound is the QueryContinueDrag handler attached to the source form below.
 
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
@@ -169,6 +141,7 @@ namespace MtkDrop
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
         [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
         [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
         [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
         [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
         [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
@@ -193,9 +166,17 @@ namespace MtkDrop
         private static Thread _watchdogThread;
         private static volatile bool _watchdogArmed;
         private static volatile string _watchdogStatus = "idle";
+        // Set by the STA once Control.DoDragDrop returns, so the gesture thread can stop feeding the
+        // modal loop the moment it is no longer modal.
+        private static volatile bool _dragReturned = false;
+        // How long to keep waking OLE's loop after the button-up before giving up and letting the
+        // QueryContinueDrag deadline end the drag.
+        public const int PostReleaseNudgeMs = 6000;
         public static string GestureStatus { get { return _gestureStatus; } }
         public static string PressStatus { get { return _pressStatus; } }
         public static string WatchdogStatus { get { return _watchdogStatus; } }
+        public static void MarkDragReturned() { _dragReturned = true; }
+        public static void ResetDragReturned() { _dragReturned = false; }
 
         // DoDragDrop owns the calling STA until the gesture completes. Drive the physical
         // mouse sequence from a plain CLR thread: a nested PowerShell runspace can stall in
@@ -275,6 +256,20 @@ namespace MtkDrop
                     if (!String.IsNullOrWhiteSpace(hoverReadyPath))
                         File.AppendAllText(hoverReadyPath,
                             "buttonReleased=" + DateTimeOffset.UtcNow.ToString("O") + Environment.NewLine);
+
+                    // The hold loop above nudges the pointer precisely because OLE's modal loop only
+                    // re-reads the button state when it dequeues an input message. Stopping those nudges
+                    // at the release is what hung this script: if the loop does not observe THAT button-up
+                    // (WebView2/DirectComposition targets coalesce and re-route pointer input), nothing
+                    // further ever arrives to wake it, and DoDragDrop waits forever. Keep supplying
+                    // messages until the drag actually returns.
+                    var settleClock = Stopwatch.StartNew();
+                    while (!_dragReturned && settleClock.ElapsedMilliseconds < PostReleaseNudgeMs)
+                    {
+                        MoveAbs(tx + ((int)(settleClock.ElapsedMilliseconds / 100) % 2), ty);
+                        Thread.Sleep(100);
+                    }
+                    _gestureStatus = _dragReturned ? "drag-returned" : "release-nudge-exhausted";
                 }
                 catch (Exception ex)
                 {
@@ -314,6 +309,11 @@ namespace MtkDrop
                     Thread.Sleep(180);
                     var point = new POINT { X = sx, Y = sy };
                     IntPtr under = WindowFromPoint(point);
+                    RECT sourceRect;
+                    bool hasSourceRect = GetWindowRect(sourceHwnd, out sourceRect);
+                    string sourceState = " visible=" + IsWindowVisible(sourceHwnd) +
+                        " rectOk=" + hasSourceRect + " rect=" + sourceRect.Left + "," + sourceRect.Top +
+                        ".." + sourceRect.Right + "," + sourceRect.Bottom + " point=" + sx + "," + sy;
                     if (under != sourceHwnd && !IsChild(sourceHwnd, under))
                     {
                         // Node launches this helper with CREATE_NO_WINDOW so no console flashes in the
@@ -331,11 +331,11 @@ namespace MtkDrop
                             PostMessageW(sourceHwnd, 0x0010, IntPtr.Zero, IntPtr.Zero);
                             return;
                         }
-                        _pressStatus = "pressed-source-post: under=" + under;
+                        _pressStatus = "pressed-source-post: under=" + under + sourceState;
                         return;
                     }
                     Button(true);
-                    _pressStatus = "pressed";
+                    _pressStatus = "pressed" + sourceState;
                 }
                 catch (Exception ex)
                 {
@@ -443,26 +443,39 @@ if ($consoleWindow -ne [IntPtr]::Zero) {
 }
 
 # -- locate + raise the target window -----------------------------------------
-# Chromium/WebView automation can expose a visible, titled zero-client helper HWND. The app process's
-# MainWindowHandle is the actual DWM-composited Tauri host (the same identity used by the screenshot gate),
-# so use process ownership rather than accepting an unrelated title match.
-$targetProcesses = @(
-  Get-Process -Name $ProcName -ErrorAction SilentlyContinue |
-    Where-Object { $_.MainWindowHandle -ne 0 }
-)
-if ($targetProcesses.Count -ne 1) {
+# Chromium/WebView automation can expose a visible, titled zero-client helper HWND, and tao publishes a
+# visible unowned 16x16 'Tao Thread Event Target'. `MainWindowHandle` matches that event target as readily
+# as the host, and aiming a drag at a 16x16 rect drops the file nowhere. Select the host by class instead.
+. (Join-Path $PSScriptRoot "lib/app-window.ps1")
+try {
+  $hwnd = Get-MetrocalkAppWindow -ProcName $ProcName
+}
+catch {
   $fallbackWindows = @([MtkDrop.Native]::FindTopLevels($WindowTitleLike))
-  Write-Output "DROP_RESULT: FAIL expected-one-process-window procName='$ProcName' count=$($targetProcesses.Count) titleFallbackCount=$($fallbackWindows.Count)"
+  Write-Output "DROP_RESULT: FAIL expected-one-host-window procName='$ProcName' error='$($_.Exception.Message)' titleFallbackCount=$($fallbackWindows.Count)"
   exit 2
 }
-$targetProcess = $targetProcesses[0]
-$hwnd = [IntPtr]$targetProcess.MainWindowHandle
-Write-Output "DROP_TARGET: pid=$($targetProcess.Id) hwnd=$hwnd title='$([MtkDrop.Native]::TitleOf($hwnd))'"
+Write-Output "DROP_TARGET: hwnd=$hwnd title='$([MtkDrop.Native]::TitleOf($hwnd))'"
 
 $SWP_NOMOVE = 0x0002; $SWP_NOSIZE = 0x0001; $SWP_SHOWWINDOW = 0x0040
 if ([MtkDrop.Native]::IsIconic($hwnd)) {
   [void][MtkDrop.Native]::ShowWindow($hwnd, 9) # SW_RESTORE
   Start-Sleep -Milliseconds 600
+}
+
+# PREFLIGHT. A drag can only land on a window that is visible when the button comes up. If another
+# application owns a full-screen foreground, Windows re-minimises the editor mid-gesture, the cursor
+# ends up over the desktop, and ole32's modal loop spins with no drop target until the harness kills
+# it 45 seconds later - reported as "OLE timed out", which names neither the cause nor the culprit.
+# Refuse in one second with the actual reason instead.
+$foregroundConflict = Get-MetrocalkForegroundConflict
+if ($foregroundConflict) {
+  Write-Output "DROP_RESULT: FAIL foreground-conflict $foregroundConflict"
+  exit 2
+}
+if ([MtkDrop.Native]::IsIconic($hwnd)) {
+  Write-Output "DROP_RESULT: FAIL target-minimised the editor window re-minimised immediately after SW_RESTORE."
+  exit 2
 }
 [void][MtkDrop.Native]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, ($SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW))
 [void][MtkDrop.Native]::BringWindowToTop($hwnd)
@@ -528,7 +541,15 @@ $state = [hashtable]::Synchronized(@{
   Error = $null
   SourceX = $null
   SourceY = $null
+  Ending = "(never queried)"
 })
+# The drag runs through WinForms' Control.DoDragDrop, which supplies its OWN IDropSource. A hand-written
+# IDropSource carrying a tick ceiling and a wall-clock deadline used to sit in the C# block above, but
+# nothing ever instantiated it and ole32!DoDragDrop was never called - so that safety net was dead code
+# and the gesture had no upper bound at all. Six consecutive runs hung here and were SIGTERMed by the
+# harness. Enforce the documented -TimeoutSeconds on the path that actually executes.
+$dragClock = New-Object System.Diagnostics.Stopwatch
+$dragDeadlineMs = ($HoverTimeoutSeconds + $TimeoutSeconds) * 1000
 $allowed = [System.Windows.Forms.DragDropEffects]::Copy -bor [System.Windows.Forms.DragDropEffects]::Link
 
 # A real visible HWND receives the physical WM_LBUTTONDOWN. Its own handler then
@@ -539,8 +560,44 @@ $sourceForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolW
 $sourceForm.ShowInTaskbar = $false
 $sourceForm.TopMost = $true
 $sourceForm.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-$sourceForm.Location = New-Object System.Drawing.Point(($sx - 110), ($sy - 35))
 $sourceForm.ClientSize = New-Object System.Drawing.Size(220, 70)
+
+# Prefer genuine desktop space beside the destination, like dragging from Explorer. Starting the source
+# on top of the WebView makes its automation z-order compete with the helper form on some Windows builds.
+$virtualScreen = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$sourceCenterX = $sx
+$sourceCenterY = $sy
+$targetRight = $o.X + $w
+$targetLeft = $o.X
+if (($virtualScreen.Right - $targetRight) -ge 250) {
+  $sourceCenterX = $targetRight + 125
+  $sourceCenterY = [Math]::Max($virtualScreen.Top + 55, [Math]::Min($virtualScreen.Bottom - 55, $o.Y + 110))
+}
+elseif (($targetLeft - $virtualScreen.Left) -ge 250) {
+  $sourceCenterX = $targetLeft - 125
+  $sourceCenterY = [Math]::Max($virtualScreen.Top + 55, [Math]::Min($virtualScreen.Bottom - 55, $o.Y + 110))
+}
+$sourceForm.Location = New-Object System.Drawing.Point(($sourceCenterX - 110), ($sourceCenterY - 35))
+
+# WinForms raises this on the drag SOURCE for every input event OLE's modal loop dequeues. Its default
+# already ends the drag on button-release; this only adds the missing upper bound, and only overrides
+# the action when the deadline has genuinely expired.
+$sourceForm.add_QueryContinueDrag({
+  param($sender, $eventArgs)
+  if ($eventArgs.EscapePressed) {
+    $state.Ending = "escape"
+    $eventArgs.Action = [System.Windows.Forms.DragAction]::Cancel
+    return
+  }
+  if ($eventArgs.Action -ne [System.Windows.Forms.DragAction]::Continue) {
+    $state.Ending = "button-released"
+    return
+  }
+  if ($dragClock.IsRunning -and $dragClock.ElapsedMilliseconds -gt $dragDeadlineMs) {
+    $state.Ending = "deadline"
+    $eventArgs.Action = [System.Windows.Forms.DragAction]::Drop
+  }
+}.GetNewClosure())
 
 $sourceForm.add_MouseDown({
   param($sender, $eventArgs)
@@ -553,6 +610,8 @@ $sourceForm.add_MouseDown({
       [MtkDrop.Native]::StartGesture(
       ([int]$state.SourceX), ([int]$state.SourceY), $tx, $ty, $Steps, $hwnd,
       $HoverReadyPath, $ReleasePath, ($HoverTimeoutSeconds * 1000))
+    [MtkDrop.Native]::ResetDragReturned()
+    $dragClock.Restart()
     $state.Effect = $sender.DoDragDrop($dataObj, $allowed)
     $state.Status = "ole-returned"
   }
@@ -561,6 +620,9 @@ $sourceForm.add_MouseDown({
     $state.Status = "ole-exception"
   }
   finally {
+    $dragClock.Stop()
+    # Stops the post-release nudges immediately; without this they would run their full budget.
+    [MtkDrop.Native]::MarkDragReturned()
     [MtkDrop.Native]::DisarmWatchdog()
     [MtkDrop.Native]::Button($false)
     $sender.Close()
@@ -620,7 +682,8 @@ Write-Output "DROP_PRESS: $([MtkDrop.Native]::PressStatus)"
 Write-Output "DROP_WATCHDOG: $([MtkDrop.Native]::WatchdogStatus)"
 Write-Output "DROP_SOURCE_GEOM: measured=($($state.SourceX),$($state.SourceY)) requested=($sx,$sy)"
 Write-Output "DROP_SOURCE: started=$($state.Started) status=$($state.Status)"
-Write-Output "DROP_EFFECT: $($state.Effect) elapsedMs=$($sw.ElapsedMilliseconds)"
+Write-Output "DROP_EFFECT: $($state.Effect) elapsedMs=$($sw.ElapsedMilliseconds) ending=$($state.Ending)"
+Write-Output "DROP_GESTURE: $([MtkDrop.Native]::GestureStatus)"
 if ($null -ne $state.Error) {
   Write-Output "DROP_RESULT: FAIL source=$($state.Error)"
   exit 3

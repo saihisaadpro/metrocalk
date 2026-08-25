@@ -53,17 +53,13 @@ public class MetrocalkWindowCapture {
 }
 "@
 
-$visibleProcesses = @(
-  Get-Process -Name $ProcName -ErrorAction SilentlyContinue |
-    Where-Object { $_.MainWindowHandle -ne 0 }
-)
-if ($visibleProcesses.Count -ne 1) {
-  $visibleIds = ($visibleProcesses | ForEach-Object { $_.Id }) -join ", "
-  throw "Expected exactly one visible window for process '$ProcName'; found $($visibleProcesses.Count) (PIDs: $visibleIds)."
-}
-$process = $visibleProcesses[0]
-
-$handle = $process.MainWindowHandle
+# Resolve the composited host by window CLASS. `MainWindowHandle` also matches tao's visible, unowned,
+# top-level 16x16 'Tao Thread Event Target', and returning that one is what produced 158-byte captures.
+. (Join-Path $PSScriptRoot "lib/app-window.ps1")
+# Resolve permissively first: a minimised host is recoverable here (see the SW_SHOWNOACTIVATE below),
+# and rejecting it on size before restoring it would turn that into a failed capture. -PreserveWindow
+# cannot restore, so it keeps the strict resolve and fails loudly.
+$handle = Get-MetrocalkAppWindow -ProcName $ProcName -AllowIconic:(-not $PreserveWindow)
 $topmost = [IntPtr](-1)
 $notTopmost = [IntPtr](-2)
 $swpNoSize = 0x0001
@@ -78,15 +74,21 @@ try {
     throw "Cannot preserve and capture a minimised '$ProcName' window."
   }
   if (-not $PreserveWindow -and [MetrocalkWindowCapture]::IsIconic($handle)) {
-    [MetrocalkWindowCapture]::ShowWindow($handle, 9) | Out-Null
+    # SW_SHOWNOACTIVATE (4), not SW_RESTORE (9). Restoring with activation takes the foreground, and if
+    # a full-screen application owns it (a game, a player, an RDP client) that application immediately
+    # takes it back and re-minimises this window - mid-run, between two captures. PrintWindow reads the
+    # window's own presentation and does not need the foreground, so never ask for it.
+    [MetrocalkWindowCapture]::ShowWindow($handle, 4) | Out-Null
     Start-Sleep -Milliseconds 400
+    # Re-validate strictly: if it is STILL minimised, something is putting it back (see
+    # Get-MetrocalkForegroundConflict) and the capture would be of the 16x28 icon rect.
+    $handle = Get-MetrocalkAppWindow -ProcName $ProcName
   }
-  if (-not $PreserveWindow) {
-    [MetrocalkWindowCapture]::SetWindowPos($handle, $topmost, $X, $Y, 0, 0, ($swpNoSize -bor $swpShowWindow)) | Out-Null
-    [MetrocalkWindowCapture]::BringWindowToTop($handle) | Out-Null
-    $preparedWindow = $true
-    Start-Sleep -Milliseconds 350
-  }
+  # Deliberately NO z-order or activation change here. PrintWindow captures an occluded window
+  # correctly (verified against a full-screen foreground application), so raising the window would
+  # only disturb whatever the user has in front - and start a foreground fight this script loses.
+  # The BitBlt fallback below reads the desktop and DOES need visible pixels; it raises the window
+  # itself, at the point where it is actually needed.
 
   $rect = New-Object MetrocalkWindowCapture+RECT
   if (-not [MetrocalkWindowCapture]::GetWindowRect($handle, [ref]$rect)) {
@@ -97,6 +99,27 @@ try {
   if ($width -le 0 -or $height -le 0) { throw "Invalid window rectangle ${width}x${height}." }
 
   Add-Type -AssemblyName System.Drawing
+
+  # PrintWindow returns TRUE even when it hands back an unpainted (uniform) bitmap - typically when the
+  # target's UI thread is busy and cannot service WM_PRINT in time. Accepting that TRUE at face value set
+  # $printed and made the BitBlt fallback below unreachable, so a recoverable blank frame became a hard
+  # failure. Grade the pixels first; only a frame with actual contrast counts as a capture.
+  function Test-CaptureHasContrast {
+    param([System.Drawing.Bitmap]$Image)
+    $low = 255.0
+    $high = 0.0
+    for ($gy = 0; $gy -lt 16; $gy++) {
+      $sampleY = [Math]::Min($Image.Height - 1, [int](($gy + 0.5) * $Image.Height / 16.0))
+      for ($gx = 0; $gx -lt 16; $gx++) {
+        $sampleX = [Math]::Min($Image.Width - 1, [int](($gx + 0.5) * $Image.Width / 16.0))
+        $pixel = $Image.GetPixel($sampleX, $sampleY)
+        $luma = 0.2126 * $pixel.R + 0.7152 * $pixel.G + 0.0722 * $pixel.B
+        $low = [Math]::Min($low, $luma)
+        $high = [Math]::Max($high, $luma)
+      }
+    }
+    return ($high - $low) -ge 3.0
+  }
 
   # -- path 1: PrintWindow ---------------------------------------------------------------------------
   $directory = Split-Path -Path $Out -Parent
@@ -111,11 +134,21 @@ try {
     if ($printMemory -ne [IntPtr]::Zero -and $printBitmap -ne [IntPtr]::Zero) {
       $printPrevious = [MetrocalkWindowCapture]::SelectObject($printMemory, $printBitmap)
       # 2 = PW_RENDERFULLCONTENT, the flag that makes DirectComposition/WebView2 content render.
-      if ([MetrocalkWindowCapture]::PrintWindow($handle, $printMemory, 2)) {
+      # Retry briefly: a busy UI thread that misses one WM_PRINT usually services the next.
+      for ($printAttempt = 1; $printAttempt -le 3 -and -not $printed; $printAttempt++) {
+        if (-not [MetrocalkWindowCapture]::PrintWindow($handle, $printMemory, 2)) {
+          Start-Sleep -Milliseconds 400
+          continue
+        }
         $image = [System.Drawing.Image]::FromHbitmap($printBitmap)
         try {
-          $image.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
-          $printed = $true
+          if (Test-CaptureHasContrast -Image $image) {
+            $image.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+            $printed = $true
+          }
+          else {
+            Start-Sleep -Milliseconds 400
+          }
         }
         finally { $image.Dispose() }
       }
@@ -129,6 +162,18 @@ try {
   }
   if (-not $printed) {
     # -- path 2: the original desktop-DC BitBlt ------------------------------------------------------
+    # This one reads the DESKTOP, so it can only see pixels that are actually on screen. Raising is
+    # required here and only here; the finally block restores the z-order afterwards.
+    if (-not $PreserveWindow) {
+      [MetrocalkWindowCapture]::SetWindowPos($handle, $topmost, $X, $Y, 0, 0, ($swpNoSize -bor $swpShowWindow)) | Out-Null
+      [MetrocalkWindowCapture]::BringWindowToTop($handle) | Out-Null
+      $preparedWindow = $true
+      Start-Sleep -Milliseconds 350
+      # The rect can move when the window is repositioned above; re-read it before copying.
+      [MetrocalkWindowCapture]::GetWindowRect($handle, [ref]$rect) | Out-Null
+      $width = $rect.Right - $rect.Left
+      $height = $rect.Bottom - $rect.Top
+    }
     # A WebView2 restore can transiently invalidate the desktop DC for one frame. Recreate every GDI
     # object for each bounded retry; never accept a stale/partial capture. Graphics.CopyFromScreen wraps
     # this operation but can throw "The handle is invalid" before exposing which handle failed.

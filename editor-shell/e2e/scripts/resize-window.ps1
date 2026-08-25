@@ -25,11 +25,10 @@ public class MetrocalkWindowResize {
 }
 "@
 
-$visible = @(Get-Process -Name $ProcName -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
-if ($visible.Count -ne 1) {
-  throw "Expected exactly one visible window for '$ProcName'; found $($visible.Count)."
-}
-$handle = $visible[0].MainWindowHandle
+# Select by window class; `MainWindowHandle` can resolve to tao's 16x16 event target, and resizing THAT
+# leaves the host untouched while reporting success.
+. (Join-Path $PSScriptRoot "lib/app-window.ps1")
+$handle = Get-MetrocalkAppWindow -ProcName $ProcName
 if ([MetrocalkWindowResize]::IsIconic($handle)) {
   [MetrocalkWindowResize]::ShowWindow($handle, 9) | Out-Null
   Start-Sleep -Milliseconds 300
