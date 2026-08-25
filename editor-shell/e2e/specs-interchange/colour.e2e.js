@@ -151,14 +151,24 @@ describe("Colour — declared, live, and reaching the pixels", () => {
     expect(caps.singleToneMapAtResolve).toBe(true);
     // The role -> colour-space decision has ONE home now, and the uploader calls it.
     expect(caps.colourSpaceDerivedFromOnePolicy).toBe(true);
+    // ACEScg IS selectable now — the working space is converted into AP1 before the BRDF and back
+    // once before the view transform. This line asserted `false` for as long as that has been
+    // shipping: a capability's VALUE is below what the contract audit can see (it compares the names
+    // on the wire, not the expressions behind them), so nothing said so until it was read by hand.
+    expect(caps).toHaveProperty("acesCgWorkingSpaceSelectable");
+    expect(caps.acesCgWorkingSpaceSelectable).toBe(true);
+    expect(caps).toHaveProperty("ocioConfigLoading");
     // And the false ones, present rather than omitted. A colour report listing only its successes is
     // exactly the report that lets someone assume ACES is end-to-end when it is not.
-    expect(caps).toHaveProperty("acesCgWorkingSpaceSelectable");
-    expect(caps.acesCgWorkingSpaceSelectable).toBe(false);
-    expect(caps).toHaveProperty("ocioConfigLoading");
+    expect(caps.hdrDisplayOutput).toBe(false);
     // Deriving the space from one policy and letting a person OVERRIDE it are different capabilities.
-    // Reporting them as one would let a reader assume the second from the first.
-    expect(caps.perAssetColourSpaceOverride).toBe(false);
+    // Reporting them as one would let a reader assume the second from the first — and the override is
+    // itself two truths rather than one: the ENVIRONMENT's source space is live and overridable, a
+    // mesh texture's is not, because nothing stores a per-texture choice in the asset library yet.
+    // Asserting both is what stops them being quietly re-merged into a single flattering flag.
+    expect(caps).toHaveProperty("perTextureColourSpaceOverride");
+    expect(caps.perTextureColourSpaceOverride).toBe(false);
+    expect(caps.environmentColourSpaceOverride).toBe(true);
     const scope = c.notes.join(" ");
     expect(scope).toContain("ACEScg");
     expect(scope.toLowerCase()).toContain("not wired");
@@ -253,12 +263,18 @@ describe("Colour — declared, live, and reaching the pixels", () => {
     const card = await browser.execute(() => {
       const el = document.querySelector('[data-testid="colour-card"]');
       if (!el) return null;
-      const cap = document.querySelector('[data-testid="colour-cap-acesCgWorkingSpaceSelectable"]');
+      // WHICHEVER capability is currently unwired, found by the flag the panel renders from the
+      // same reply this spec read above — not by naming one. Keyed on `acesCgWorkingSpaceSelectable`
+      // it asserted "the panel shows a gap" by pointing at ACEScg, and went on pointing at it after
+      // ACEScg became selectable, at which point the row it read stopped saying "not wired" at all.
+      const caps = [...document.querySelectorAll('[data-testid^="colour-cap-"]')];
+      const gap = caps.find((n) => n.getAttribute("data-on") === "false");
       return {
         active: el.getAttribute("data-active-view"),
         working: document.querySelector('[data-testid="colour-working"]')?.textContent ?? "",
-        notWiredShown: !!cap,
-        notWiredText: cap?.textContent ?? "",
+        capCount: caps.length,
+        gapKey: gap?.getAttribute("data-testid") ?? "",
+        gapText: gap?.textContent ?? "",
       };
     });
     console.log(`[colour] card: ${JSON.stringify(card)}`);
@@ -266,8 +282,11 @@ describe("Colour — declared, live, and reaching the pixels", () => {
     expect(card).toBeTruthy();
     expect(card.working).toContain("Rec.709");
     expect(card.active).toBe("acesFit");
+    // Every capability the reply carries is rendered, wired or not — a list that showed only the
+    // successes is exactly the list that lets someone assume ACES is end-to-end when it is not.
+    expect(card.capCount).toBeGreaterThan(10);
     // The panel must show the gap, not hide it.
-    expect(card.notWiredShown).toBe(true);
-    expect(card.notWiredText).toContain("not wired");
+    expect(card.gapKey).not.toBe("");
+    expect(card.gapText).toContain("not wired");
   });
 });

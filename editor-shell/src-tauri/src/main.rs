@@ -22296,7 +22296,9 @@ fn colour_status(state: State<AppState>) -> serde_json::Value {
             // read by any importer or bound by any pipeline, so a person with an emissive map would
             // have read a promise the engine cannot keep. And it says "the space is decided by role",
             // not "textures carry their space": no tag is attached to an asset, which is exactly what
-            // `perAssetColourSpaceOverride: false` on the line above reports.
+            // `perTextureColourSpaceOverride: false` reports above. (This comment named the key by
+            // its pre-split name, `perAssetColourSpaceOverride`, for as long as the split has been
+            // shipping — as did the E2E, which read it and got `undefined`.)
             "A texture's colour space is decided by its ROLE, from one policy the uploader calls: base colour decodes from sRGB, while normal, roughness/metallic and occlusion upload as raw data and are never given a transfer function. Those four are the texture kinds this renderer binds; an emissive or mask map is not read at all, so it is not carried rather than mis-converted.",
             "An imported HDR panorama is treated as scene-linear with Rec.709 primaries by default. The              Radiance format does not record primaries in any required field, so that is an assumption —              and it is the one assumption a person can now override, per environment, with the choice carried as an explicit 'set by you' provenance.",
             "ACEScg is now the renderer's working space when selected: base colour, emissive, light colour, environment radiance and every authored chrome colour are converted into AP1 BEFORE              the BRDF, bloom meters with AP1's luminance weights, and the frame returns to Rec.709 once, immediately before the view transform. Selecting linear Rec.709 makes every one of those conversions the identity matrix, so it is provably the same pipeline rather than a second one.",
