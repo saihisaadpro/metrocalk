@@ -23,6 +23,7 @@
     "test:glyph-coverage": "node scripts/check-glyph-coverage.mjs --self-test",
     "test:class-hooks": "node scripts/check-class-hooks.mjs --self-test",
     "test:registry-vocab": "node scripts/check-registry-vocab.mjs --self-test",
+    "test:shots-freshness": "node scripts/shots/shoot.mjs --self-test",
     "test:watch": "vitest",
     "shots": "node scripts/shots/shoot.mjs"
   },

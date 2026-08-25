@@ -43,6 +43,7 @@ import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import zlib from "node:zlib";
+import { selfTest, verifyFreshness } from "./freshness.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const EDITOR = resolve(HERE, "..", "..");
@@ -64,6 +65,18 @@ const arg = (flag, dflt) => {
 };
 const outDir = resolve(arg("--out", resolve(HERE, "shots")));
 const only = arg("--scene", null);
+const REPO_ROOT = resolve(EDITOR, "..");
+
+// The freshness contract's own mutation matrix — the gate on the gate, run before anything is built
+// or opened so it costs milliseconds and cannot be taken out by a browser, a bundle or a display.
+// Same convention as the six `check-*.mjs --self-test` steps this job already runs.
+if (argv.includes("--self-test")) {
+  const results = selfTest();
+  for (const r of results) console.log(`${r.ok ? "ok  " : "FAIL"}  ${r.name}${r.ok ? "" : `  — got ${r.detail}`}`);
+  const failed = results.filter((r) => !r.ok).length;
+  console.log(`\n${results.length - failed}/${results.length} freshness self-checks passed`);
+  process.exit(failed ? 1 : 0);
+}
 
 // ── the pixel check ───────────────────────────────────────────────────────────────────────────────
 
@@ -858,6 +871,31 @@ const dist = resolve(HERE, "dist");
 if (!existsSync(resolve(dist, "harness.html"))) {
   console.error(`FAIL  the harness did not build: no ${resolve(dist, "harness.html")}`);
   process.exit(1);
+}
+
+// `--no-build` GRADES WHATEVER BUNDLE IS THERE, and until now nothing compared it to the tree. Used
+// carelessly once in ADR-127's own session it reported "4 of 23 failed" about source already
+// repaired: a gate certifying a verdict about a build that no longer matched the working tree — the
+// `mesh_frame_bench.rs` family, one level up. The build writes `dist/.sources.json` from rollup's
+// own module graph; this refuses to open the bundle when any of those sources has moved. See
+// `freshness.mjs` for why the module graph and not a directory walk, and for what it cannot see.
+//
+// IT RUNS AFTER A BUILD TOO, and that is the half that keeps the contract from going dark. CI calls
+// `pnpm shots` WITH the build, so if the fingerprint plugin is ever dropped from `vite.config.ts`,
+// removed by a vite upgrade, or silently emits nothing, the very next CI run fails with
+// `no-manifest` — instead of the writer rotting unnoticed while only the verifier's self-test stays
+// green. A gate whose producer nothing exercises is half a gate.
+//
+// The freshness line prints on EVERY `--no-build` run, not only on refusal, because "the bundle is
+// fresh, 214 sources compared" and "nothing was compared" must not look the same in a transcript.
+{
+  const f = verifyFreshness({ root: REPO_ROOT, dist });
+  if (!f.ok) {
+    console.error(`FAIL  \`--no-build\` refused: ${f.lines[0]}`);
+    for (const line of f.lines.slice(1)) console.error(line);
+    process.exit(1);
+  }
+  if (argv.includes("--no-build")) console.log(f.lines[0]);
 }
 
 const chromium = (await import("@sparticuz/chromium")).default;

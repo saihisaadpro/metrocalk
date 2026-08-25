@@ -528,6 +528,22 @@ jobs:
       # underneath itself; and a grid template that was exactly correct and still did not fit — 1012px of
       # tracks in a 1000px window, the Inspector painted off-screen, while `layout.test.ts`, which compares
       # that template as a STRING, stayed green.
+      # THE HARNESS'S OWN FRESHNESS CONTRACT, self-tested first — same shape as the six `check-*.mjs
+      # --self-test` steps above, and for the same reason. `shoot.mjs --no-build` graded whatever
+      # bundle it found and nothing compared that bundle to the tree; used carelessly once in
+      # ADR-127's own session it reported "4 of 23 failed" about source that had already been
+      # repaired. The build now writes `dist/.sources.json` from rollup's module graph and the driver
+      # refuses a bundle whose sources have moved (ADR-139).
+      #
+      # Two halves, and the step below gates the OTHER one for free: this self-test proves the
+      # VERIFIER (nine reverted repairs, each caught by the check it was aimed at); `pnpm shots`
+      # builds, so if the fingerprint plugin is ever dropped from `vite.config.ts` or silenced by a
+      # vite upgrade, the very next run fails with `no-manifest` rather than the writer rotting while
+      # the verifier stays green.
+      - name: shots freshness contract — self-test (the gate on the gate)
+        working-directory: editor
+        run: node scripts/shots/shoot.mjs --self-test
+
       - name: panel shots — every scene mounts, logs no error, produces pixels, and holds its layout
         working-directory: editor
         run: pnpm shots --out "$RUNNER_TEMP/shots"
