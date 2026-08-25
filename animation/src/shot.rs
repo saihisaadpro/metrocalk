@@ -323,10 +323,20 @@ impl Cutscene {
             }
             if shot.seconds > MAX_SECONDS {
                 out.push(format!("shot {n} runs longer than {MAX_SECONDS}s"));
-            } else if shot.seconds < self.mood.min_shot_seconds() {
+            } else if self
+                .effective_shot_seconds(i)
+                .is_some_and(|effective| effective < self.mood.min_shot_seconds())
+            {
+                // Against the EFFECTIVE length, not the authored one. The mood is the dial that decides
+                // how long a shot actually runs — Calm stretches every shot by 2.5x — so judging the
+                // authored number against a per-mood minimum asks whether a shot is too short while
+                // ignoring the only thing that sets its length. It made the two shortest cards in the
+                // catalogue (`closeup` 1.8s, `detail` 1.6s) permanently un-authorable in a Calm
+                // cutscene, where they in fact run 4.5s and 4.0s: a director following the tool's own
+                // warnings could not put a close-up in a calm sequence at all.
                 out.push(format!(
-                    "shot {n} is short for this mood ({:.1}s) — it may feel rushed",
-                    shot.seconds
+                    "shot {n} runs {:.1}s at this pacing — it may feel rushed",
+                    self.effective_shot_seconds(i).unwrap_or(shot.seconds)
                 ));
             }
         }
@@ -640,6 +650,50 @@ mod tests {
         );
     }
 
+    /// A Calm cutscene runs every shot 2.5x longer than authored, so the pacing warning has to be about
+    /// what the viewer sees, not about the number typed in. Before this, the two shortest cards in the
+    /// catalogue could not be used in a Calm sequence without the tool reporting a problem for a shot
+    /// that in fact holds for four and a half seconds.
+    #[test]
+    fn the_pacing_warning_judges_the_length_a_shot_actually_runs() {
+        let close_up = |seconds: f32| ShotRecipe {
+            seconds,
+            ..shot(ShotSize::Close, ShotAngle::Profile, ShotMove::Hold)
+        };
+        let with_mood = |mood: Mood, seconds: f32| Cutscene {
+            shots: vec![
+                shot(ShotSize::Wide, ShotAngle::Front, ShotMove::PullOut),
+                close_up(seconds),
+            ],
+            mood,
+            ..Cutscene::default()
+        };
+        let rushed = |cut: &Cutscene| {
+            cut.problems()
+                .iter()
+                .any(|problem| problem.contains("rushed"))
+        };
+
+        // 1.8s authored is 4.5s on screen in Calm -- more than twice the 2.0s Calm minimum.
+        assert!(
+            !rushed(&with_mood(Mood::Calm, 1.8)),
+            "{:?}",
+            with_mood(Mood::Calm, 1.8).problems()
+        );
+        // And a shot that really is too short still reports: 0.5s authored is 1.25s on screen, under
+        // Calm's own 2.0s floor. The fix must not turn the warning off, only aim it at the right number.
+        assert!(
+            rushed(&with_mood(Mood::Calm, 0.5)),
+            "0.5s authored is 1.25s on screen in Calm, under the 2.0s minimum"
+        );
+        // Tense compresses to 0.75x, so a shot that is comfortable when authored can still be rushed.
+        assert!(
+            rushed(&with_mood(Mood::Tense, 1.0)),
+            "1.0s authored is 0.75s on screen in Tense, under the 0.8s minimum"
+        );
+        assert!(!rushed(&with_mood(Mood::Normal, 2.0)));
+    }
+
     #[test]
     fn eased_push_in_is_monotonic_and_slower_at_both_endpoints_than_mid_shot() {
         let s = shot(ShotSize::Full, ShotAngle::ThreeQuarter, ShotMove::PushIn);
@@ -658,8 +712,8 @@ mod tests {
             "ease-out must end slower than mid-shot: end={end_velocity}, mid={mid_velocity}"
         );
 
-        let distances: Vec<f32> = (0..=100)
-            .map(|frame| dist(eye_at(frame as f32 / 100.0), sample.center))
+        let distances: Vec<f32> = (0..=100u8)
+            .map(|frame| dist(eye_at(f32::from(frame) / 100.0), sample.center))
             .collect();
         for pair in distances.windows(2) {
             assert!(
@@ -854,8 +908,8 @@ mod tests {
         assert!(dist(before.eye, boundary.eye) < 0.01);
         assert!(dist(boundary.eye, after.eye) < 0.01);
 
-        for step in 0..=400 {
-            let time = step as f32 * 0.009_9;
+        for step in 0..=400u16 {
+            let time = f32::from(step) * 0.009_9;
             let camera = camera_at(time);
             assert!(
                 camera

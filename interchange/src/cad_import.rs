@@ -1078,7 +1078,7 @@ impl CadReader for StepAssemblyReader {
         for solid in &scene.solids {
             raw_parts.push(RawPart {
                 id: solid.id,
-                name: format!("solid #{}", solid.id),
+                name: solid.name.clone(),
                 reference: format!("step-solid-{}", solid.id),
                 transform: IDENTITY_4X4,
                 source: PartSource::ExactBrep(solid.faces.clone()),

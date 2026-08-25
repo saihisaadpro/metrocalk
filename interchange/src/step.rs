@@ -93,6 +93,8 @@ pub struct CadFace {
 pub struct CadSolid {
     /// The STEP entity id of the shell.
     pub id: u64,
+    /// The authored solid/B-rep name when available; a deterministic `solid #<shell>` fallback otherwise.
+    pub name: String,
     /// The solid's faces.
     pub faces: Vec<CadFace>,
 }
@@ -1297,6 +1299,25 @@ pub(crate) fn interpret(entities: &EntityTable) -> Result<CadScene, StepError> {
         ));
     }
 
+    // Shells are often intentionally anonymous while their MANIFOLD_SOLID_BREP/FACETED_BREP wrapper owns
+    // the engineering name. Resolve that direct wrapper label once so the fallback importer does not expose
+    // opaque `solid #id` names for otherwise well-authored bodies.
+    let mut shell_names: BTreeMap<u64, String> = BTreeMap::new();
+    for (_id, wrapper) in entities.iter() {
+        let Some(Value::Str(label)) = wrapper.args.first() else {
+            continue;
+        };
+        let label = label.trim();
+        if label.is_empty() {
+            continue;
+        }
+        for shell_id in brep_item_shells(entities, wrapper.id) {
+            shell_names
+                .entry(shell_id)
+                .or_insert_with(|| label.to_owned());
+        }
+    }
+
     let mut solids = Vec::new();
     for shell_id in shell_ids {
         let shell = ent(entities, shell_id)?;
@@ -1312,6 +1333,9 @@ pub(crate) fn interpret(entities: &EntityTable) -> Result<CadScene, StepError> {
         if !faces.is_empty() {
             solids.push(CadSolid {
                 id: shell_id,
+                name: shell_names
+                    .remove(&shell_id)
+                    .unwrap_or_else(|| format!("solid #{shell_id}")),
                 faces,
             });
         }
@@ -2602,6 +2626,7 @@ fn tessellate_product_brep(
         },
         solids: vec![CadSolid {
             id: first_sr,
+            name: name.clone(),
             faces,
         }],
         pmi: Vec::new(),
@@ -3632,6 +3657,10 @@ mod tests {
     #[test]
     fn an_analytic_cylinder_tessellates_smooth_not_faceted_and_deterministic() {
         let scene = StepInterchange.import(CYL_STEP.as_bytes()).expect("import");
+        assert_eq!(
+            scene.solids[0].name, "cyl",
+            "the B-rep wrapper name is preserved"
+        );
         let face = &scene.solids[0].faces[0];
         assert_eq!(
             face.kind,
