@@ -255,6 +255,7 @@ export function App() {
   // (the header collapses its own rows at 760px), not only when the window does. It fires on layout
   // changes only — never per frame — so the hot path (invariant 4) is untouched.
   const stageColumn = useRef<HTMLDivElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
   const [dockShape, setDockShape] = useState<DockForm>("docked");
   useEffect(() => {
     const el = stageColumn.current;
@@ -269,6 +270,43 @@ export function App() {
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
+  // TELL THE RENDERER WHERE THE 3D IS ACTUALLY VISIBLE.
+  //
+  // The wgpu surface is the whole window; this UI is composited on top of it and the viewport is a
+  // transparent hole. The renderer could not see that, so `frame_all` and `focus_entity` fitted and
+  // CENTRED their subject on the window -- and with a dock open on each side the window centre is not
+  // inside the hole at all. In the production factory captures the whole imported assembly sat against
+  // the viewport's left edge with part of the framed area behind panels.
+  //
+  // Same discipline as the dock observer above: a ResizeObserver on the element itself, so it fires on
+  // layout changes (a dock collapsing, the drawer opening) and never per frame. Fractions rather than
+  // pixels, so DPI scaling and the WebView's own zoom cannot make the two sides disagree.
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let last = "";
+    const report = () => {
+      const rect = el.getBoundingClientRect();
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      if (!(w > 0 && h > 0 && rect.width > 0 && rect.height > 0)) return;
+      const next = { x: rect.left / w, y: rect.top / h, width: rect.width / w, height: rect.height / h };
+      // Only on a real change: an observer that fires during an animated collapse would otherwise
+      // send a command per frame of the transition.
+      const key = `${next.x.toFixed(4)}|${next.y.toFixed(4)}|${next.width.toFixed(4)}|${next.height.toFixed(4)}`;
+      if (key === last) return;
+      last = key;
+      client.reportViewportRect(next);
+    };
+    report();
+    const ro = new ResizeObserver(report);
+    ro.observe(el);
+    window.addEventListener("resize", report);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", report);
+    };
+  }, [client]);
   // Which collapsed panel is currently opened as an overlay drawer.
   const [drawer, setDrawer] = useState<"left" | "right" | null>(null);
   // The stage is under a sheet: the dock is in its floating form AND open. Read by the stage's own
@@ -661,6 +699,7 @@ export function App() {
           style={{ "--mtk-stage-min": `${STAGE_MIN}px`, "--mtk-z-dock-sheet": z.drawer } as React.CSSProperties}
         >
         <div
+          ref={viewportRef}
           id="viewport"
           data-testid="viewport"
           role="region"

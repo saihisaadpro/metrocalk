@@ -209,6 +209,13 @@ export interface EditorClient {
   duplicateEntity(id: string): Promise<string | null>;
   /** Frame the camera on an entity (M3.3) — no mutation. */
   focusEntity(id: string): void;
+  /**
+   * Tell the renderer which fraction of the window the 3D is actually visible through.
+   *
+   * The wgpu surface is the whole window and this UI is composited over it, so framing had no way to
+   * know that the docks hide a third of what it was aiming at. Reported on every layout change.
+   */
+  reportViewportRect(rect: { x: number; y: number; width: number; height: number }): void;
   /** M8.3: turn a dead mesh into a correct dynamic body — one undoable transaction. */
   makeDynamic(id: string): Promise<boolean>;
   /** Add a fixed rigid body and generated convex-hull collider as one undoable transaction. */
@@ -811,6 +818,10 @@ export class TauriClient implements EditorClient {
   }
   focusEntity(id: string): void {
     void this.core.invoke("focus_entity", { id }).catch((e: unknown) => console.error("focus_entity failed", e));
+  }
+  reportViewportRect(rect: { x: number; y: number; width: number; height: number }): void {
+    void this.core.invoke("set_viewport_rect", rect)
+      .catch((e: unknown) => console.error("set_viewport_rect failed", e));
   }
   makeDynamic(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("make_dynamic", { id }).catch((e: unknown) => { console.error("make_dynamic failed", e); throw e; });
@@ -2398,6 +2409,7 @@ class MockClient implements EditorClient {
     return Promise.resolve(null);
   }
   focusEntity(_id: string): void {}
+  reportViewportRect(_rect: { x: number; y: number; width: number; height: number }): void {}
   makeDynamic(_id: string): Promise<boolean> {
     return Promise.resolve(true);
   }

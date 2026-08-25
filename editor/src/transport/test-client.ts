@@ -135,6 +135,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     removeEntity: vi.fn(),
     duplicateEntity: () => Promise.resolve(null),
     focusEntity: vi.fn(),
+    reportViewportRect: vi.fn(),
     makeDynamic: () => Promise.resolve(true),
     makeStatic: () => Promise.resolve(true),
     // M10.6 scene-authoring verbs (a test overrides what it exercises).
