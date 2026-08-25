@@ -136,6 +136,58 @@ pub struct MarkRequest {
     pub pinned: bool,
     pub note: Option<String>,
 }
+
+/// FOUR SERDE READINGS, ALL OF THEM NEGATIVE PINS. Every field here is correct code that a reader
+/// missing one attribute reports as drift, and the "repaired tree is clean" assertion enforces all
+/// four on every single case in this file:
+///
+///   * `alias` is accepted on the way IN and never produced on the way out, so a caller sending
+///     `kinds` is right — and a reader that missed it produced TWO findings at once, `kindList`
+///     "never sent" and `kinds` "dropped in silence";
+///   * `skip_deserializing` takes the field off the incoming payload entirely: the caller does not
+///     send it, and it is not `Option` and carries no `default`, so nothing else here excuses it;
+///   * `rename(deserialize = "q")` is the same contract in serde's second spelling, which the
+///     `rename = ".."` pattern does not match;
+///   * `kinds` reaches the TypeScript side through `interface MarkFilter extends MarkFilterBase`,
+///     so a reader that drops the `extends` clause calls an inherited field undeclared.
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkFilter {
+    #[serde(alias = "kinds")]
+    pub kind_list: Vec<String>,
+    #[serde(skip_deserializing)]
+    pub resolved: bool,
+    #[serde(rename(deserialize = "q"))]
+    pub query: String,
+}
+
+/// The CONTAINER-ATTRIBUTE subject, and it is its own struct so that a container `default` does not
+/// make every field of `MarkFilter` omissible and silence the four pins above — which is exactly
+/// what happened when these attributes were first written there. `page` is not `Option`, carries no
+/// field attribute, and the TypeScript does not declare it: it is correct code ONLY because the
+/// container defaults, so a reader that does not read container attributes reports it as required.
+/// `deny_unknown_fields` is here too, and it is the one attribute that changes what a finding SAYS
+/// rather than whether there is one — see the case that pins its sentence.
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct MarkPage {
+    pub page: u32,
+    pub size: u32,
+}
+
+/// The COLLISION subject, and it has its own struct so that it does not silence the five pins above.
+/// `editor/src/store/play.ts` declares a different `MarkScope`, and `ts.types` is keyed by bare name
+/// with the last file parsed winning — the same hazard `Dto.collides_with` records on the Rust side,
+/// left unguarded on this side while the Rust side's docstring argued at length against exactly it.
+/// A collision makes the name unusable, not merely ambiguous: `argfields` must REFUSE and count a
+/// gap. Comparing against whichever declaration happened to be parsed last would report every field
+/// of both, in a commit that touched neither.
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkScope {
+    pub from_frame: u32,
+    pub to_frame: u32,
+}
 """
 
 #: The decoy. Same bare name, different fields, another crate — and nothing in Rust is ambiguous
@@ -153,6 +205,21 @@ pub struct MarkRequest {
 ENTITY_MARK_FN = """\
 #[tauri::command]
 fn entity_mark(state: State<AppState>, request: marks::MarkRequest) -> bool {
+    true
+}
+
+#[tauri::command]
+fn mark_filter(state: State<AppState>, filter: marks::MarkFilter) -> bool {
+    true
+}
+
+#[tauri::command]
+fn mark_scope(state: State<AppState>, scope: marks::MarkScope) -> bool {
+    true
+}
+
+#[tauri::command]
+fn mark_page(state: State<AppState>, paging: marks::MarkPage) -> bool {
     true
 }"""
 
@@ -289,6 +356,9 @@ fn main() {
             entity_list,
             entity_tagged,
             entity_mark,
+            mark_filter,
+            mark_scope,
+            mark_page,
         ])
         .run(tauri::generate_context!())
         .unwrap();
@@ -392,6 +462,22 @@ export interface MarkRequest {
   atFrame: number;
   note?: string | null;
 }
+
+export interface MarkFilterBase {
+  kinds: string[];
+}
+
+/** `kinds` is INHERITED. A reader that throws the `extends` clause away calls it undeclared and
+ *  reports a field the command requires as one the caller never sends — a blocking finding, in its
+ *  most confident wording, about the most ordinary idiom in this file's language. */
+export interface MarkFilter extends MarkFilterBase {
+  q: string;
+}
+
+export interface MarkPage {
+  size: number;
+}
+
 """
 
 BASE_SESSION = """\
@@ -411,6 +497,49 @@ export class TauriClient {
   entityMark(request: MarkRequest): Promise<boolean> {
     return this.core.invoke<boolean>("entity_mark", { request });
   }
+
+  // NEGATIVE PIN: an interface member written WITHOUT a trailing semicolon. The scan that walks past
+  // a return annotation looking for the body has to stop at `}` as well as at `;`, or it walks out
+  // of this declaration, through the next method's parentheses, and adopts THAT body as the scope of
+  // a parameter belonging to a type. Both bindings then span the same text and the tie decides it.
+  // One semicolon here is the difference between silence and six blocking findings.
+  private declare api: {
+    markFilter(filter: MarkRequest): Promise<boolean>
+  };
+
+  markFilter(filter: MarkFilter): Promise<boolean> {
+    return this.core.invoke<boolean>("mark_filter", { filter });
+  }
+
+  // NEGATIVE PIN for the SHORTHAND-ONLY rule. `{ request: mark }` is not a statement that the value
+  // has `request`'s type — it is a statement that it does not. A reader that looked up the KEY's
+  // name would find `request` right here, bound to something else entirely, and compare a payload
+  // struct against a reply type. `{ k }` and `{ k: v }` look alike and mean different things.
+  markScope(scope: MarkScope): Promise<boolean> {
+    return this.core.invoke<boolean>("mark_scope", { scope });
+  }
+
+  markPage(paging: MarkPage): Promise<boolean> {
+    return this.core.invoke<boolean>("mark_page", { paging });
+  }
+
+  entityMarkAlias(request: EntityInfo, mark: MarkRequest): Promise<boolean> {
+    void request;
+    return this.core.invoke<boolean>("entity_mark", { request: mark });
+  }
+
+  // NEGATIVE PIN: an UNANNOTATED binding shadows an annotated outer one. `outer` is declared at the
+  // top of this method with a type; the inner block rebinds it with none. The inner declaration is
+  // the one in effect and it says nothing, so the honest answer is "no type" — reading the outer
+  // compares a payload struct against an unrelated reply type and reports every field of both.
+  entityMarkTwice(): Promise<boolean> {
+    const request: EntityInfo = this.cached;
+    void request;
+    {
+      const request = this.buildMark();
+      return this.core.invoke<boolean>("entity_mark", { request });
+    }
+  }
 }
 """
 
@@ -420,8 +549,22 @@ FILES = {
     "editor-shell/e2e/specs-entity/entity.e2e.js": BASE_E2E,
     "editor/src/transport/protocol.ts": BASE_PROTOCOL,
     "editor/src/transport/session.ts": BASE_SESSION,
-    "editor/src/store/project.ts": "export interface ProjectInfo { name: string; }\n",
-    "editor/src/store/play.ts": "export interface PlayInfo { running: boolean; }\n",
+    "editor/src/store/project.ts": (
+        "export interface ProjectInfo { name: string; }\n\n"
+        "export interface MarkScope { fromFrame: number; toFrame: number; }\n"
+    ),
+    # A SECOND `MarkFilter`, in another swept file, with different fields. `ts.types` is keyed by
+    # bare name and the last file parsed wins — the same hazard `Dto.collides_with` records on the
+    # Rust side, and it was unguarded on this side while the Rust side's docstring argued at length
+    # against exactly it. A collision makes the name unusable: `argfields` must refuse, not compare.
+    "editor/src/store/play.ts": (
+        "export interface PlayInfo { running: boolean; }\n\n"
+        "export interface MarkScope { clip: string; loop: boolean; }\n"
+    ),
+    # BOTH halves of the collision live in files no case rewrites. Declared in `protocol.ts`, the
+    # pin switched ITSELF off in every case that replaces that file wholesale: the second
+    # declaration then stood alone, uncontested, and was compared against as though it were the
+    # subject — a pin that is only armed while unrelated cases leave it alone.
     # A struct named `Facing` in ANOTHER crate, deliberately. This is the real `Action` collision —
     # a struct in `core/src/rules.rs` and an unrelated enum in `editor-shell/src/actions.rs`, both
     # legitimate, both unambiguous in Rust, and indistinguishable to a reader that keys by bare name.
@@ -457,6 +600,14 @@ def build(tmp: str, overrides: dict[str, str] | None = None, drop: set[str] | No
 # guard produces — a bare check name would let a neighbouring guard satisfy the case.
 
 CASES: list[tuple[str, str, dict, dict]] = [
+    (
+        "a struct with deny_unknown_fields REJECTS the payload, and the finding must say so",
+        r"the whole payload is rejected — the struct carries",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       swap(BASE_PROTOCOL, "export interface MarkPage {\n  size: number;",
+                            "export interface MarkPage {\n  cursor: string;\n  size: number;")}},
+        {},
+    ),
     # ── argfields: a payload compared field-by-field, not by the one key that carries it ──────────
     #
     # Every case below was INVISIBLE to this gate until 2026-08-25. Measured on HEAD's own auditor
@@ -980,7 +1131,86 @@ def _binding_ignoring_scope(bindings, name: str, at: int):
     return hits[0][1] if hits else None
 
 
+
+def _arg_struct_one_candidate_wins(rs, ty: str):
+    """`_arg_struct` with the path consulted only to break a TIE — the first repair's own hole.
+
+    Three Rust trees are swept, so an argument type from any other crate has no candidate of its own
+    and a single unrelated struct sharing the bare name won the lookup unopposed. The docstring
+    condemning bare-name resolution and the code doing it were four lines apart.
+    """
+    base, _ = audit._peel(ty)
+    segs = [p for p in base.split("::") if p]
+    bare = re.sub(r"<.*", "", segs[-1]).strip()
+    if not re.fullmatch(r"[A-Za-z_]\w*", bare):
+        return None, ""
+    if bare in audit._ARG_SCALARS or bare in audit._ARG_INJECTED or bare in audit._ARG_OPAQUE:
+        return None, ""
+    cands = [(rel, d) for (rel, n), d in rs.arg_dtos_local.items() if n == bare]
+    if not cands:
+        return None, "none"
+    if len(cands) == 1:
+        return cands[0][1], ""
+    keep = [(rel, d) for rel, d in cands if not audit._path_contradicts(segs[:-1], rel)]
+    return (keep[0][1], "") if len(keep) == 1 else (None, "ambiguous")
+
+
+def _no_extends(types) -> None:
+    """`_fold_extends` as a no-op — an inherited field becomes an undeclared one."""
+    for t in types.values():
+        t.extends = ()
+
+
+#: A `#[serde(alias = "..")]` reader that matches nothing, and a `rename(deserialize = "..")` reader
+#: that matches nothing. Both are UNDER-suppression: correct code is reported as drifted, twice over
+#: in each case, because the name the caller sends and the name the struct declares are then two
+#: different keys and each is reported as missing from the other side.
+_ALIAS_BLIND = re.compile(r"(?!x)x")
+_RENAME_SPLIT_BLIND = re.compile(r"(?!x)x")
+
+#: A `const`/`let` reader that only sees ANNOTATED declarations, so an unannotated inner binding
+#: cannot shadow an outer typed one and the outer type is applied straight through it.
+_UNANNOTATED_BLIND = re.compile(r"(?!x)x")
+
 READER_MUTATIONS: list[tuple[str, str, str, object, dict]] = [
+    (
+        "an inherited field is not a declared one, if `extends` is thrown away",
+        r"`filter\.kindList` is required by `MarkFilter`",
+        "tsipc._fold_extends",
+        _no_extends,
+        {},
+    ),
+    (
+        "the path consulted only to break a tie leaves a type from an unswept crate unopposed",
+        r"`request\.decoy_only` is required by `MarkRequest` \(core/src/lib\.rs",
+        "audit._arg_struct",
+        _arg_struct_one_candidate_wins,
+        {"overrides": {"editor-shell/src-tauri/src/main.rs":
+                       BASE_MAIN.replace("request: marks::MarkRequest",
+                                         "request: metrocalk_wire::proto::MarkRequest")},
+         "drop": {"editor-shell/src/marks.rs"}},
+    ),
+    (
+        "a #[serde(alias)] missed reports the alias AND the field it aliases, in opposite directions",
+        r"`filter\.kindList` is required by `MarkFilter`",
+        "rustipc._ALIAS",
+        _ALIAS_BLIND,
+        {},
+    ),
+    (
+        "the split rename(deserialize = ..) form missed compares the field under its Rust name",
+        r"`filter\.query` is required by `MarkFilter`",
+        "rustipc._RENAME_SPLIT",
+        _RENAME_SPLIT_BLIND,
+        {},
+    ),
+    (
+        "an unannotated inner binding that cannot shadow lets an outer type through",
+        r"the caller declares `request\.parentId`.*has no such field",
+        "tsipc._UNANNOTATED_LOCAL",
+        _UNANNOTATED_BLIND,
+        {},
+    ),
     (
         "an argument type resolved by bare name picks the wrong struct of that name",
         r"`request\.decoy_only` is required by `MarkRequest` \(core/src/lib\.rs",
@@ -1291,6 +1521,68 @@ SHADOW_PATH_PINS = [
 ]
 
 
+# ── pins that no verdict-shaped case can hold ─────────────────────────────────────────────────────
+#
+# Each of these guards a REFUSAL or a SPAN. A refusal and a broken reader produce identical silence,
+# and a span that is too long produces a wrong answer only when some other binding happens to sit
+# inside it — so a case can pass while the mechanism it names is deleted. Every one of these was
+# written because an adversarial pass neutered the code in a single line and the suite stayed green.
+
+#: (label, snippet, name, marker, expected type or None). The offset is taken at `marker`, which must
+#: occur exactly once, so the pin reads like the source it is about.
+BINDING_PINS: list[tuple[str, str, str, str, str | None]] = [
+    (
+        "a const does not reach a later SIBLING block — the span ends at its own brace",
+        "function f() { { const a: Alpha = mk(); void a; } { HERE } }",
+        "a", "HERE", None,
+    ),
+    (
+        "a const DOES reach the rest of its own block",
+        "function f() { const a: Alpha = mk(); HERE }",
+        "a", "HERE", "Alpha",
+    ),
+    (
+        "an unannotated inner binding shadows an annotated outer one, and declares nothing",
+        "function f() { const a: Alpha = mk(); { const a = other(); HERE } }",
+        "a", "HERE", None,
+    ),
+    (
+        "a parameter of a function the call is not inside is not a statement about that call",
+        "function g(a: Alpha) { void a; }\nfunction f() { HERE }",
+        "a", "HERE", None,
+    ),
+    (
+        "an interface member with no trailing semicolon does not steal the next function's body",
+        "interface Api {\n  m(a: Alpha): Promise<void>\n}\nfunction f(a: Beta) { HERE }",
+        "a", "HERE", "Beta",
+    ),
+    (
+        "an UNANNOTATED parameter shadows too",
+        "function g(a: Alpha) { function h(a) { HERE } }",
+        "a", "HERE", None,
+    ),
+]
+
+#: (label, Rust type expression, what `_arg_struct` must do with it). "open" means it resolves to a
+#: struct; "skip" means it is not a struct and is not a gap either — the distinction the header's
+#: numbers rest on, and the one a deleted `_ARG_SCALARS` or a deleted enum guard silently erases.
+ARG_RESOLVE_PINS: list[tuple[str, str, str]] = [
+    ("a payload struct opens", "marks::MarkRequest", "open"),
+    ("a scalar is not a struct and not a gap", "String", "skip"),
+    ("a fixed-size array has no field names", "[f64; 3]", "skip"),
+    ("a map keyed at run time has none either", "BTreeMap<String, serde_json::Value>", "skip"),
+    ("an injected handle is not part of the payload", "State<AppState>", "skip"),
+    # `Channel<T>` IS a key the caller sends — `arguments` checks that it is sent — and it has no
+    # field names inside it. "Not injected" and "nothing to open" are different statements, and an
+    # earlier comment made the first one while meaning the second.
+    ("a channel is sent by the caller and still has nothing to open", "Channel<Delta>", "skip"),
+    ("an enum argument is a variant set, which `variants` compares", "Facing", "skip"),
+    ("a name no swept file corroborates is a GAP, not a resolution",
+     "metrocalk_wire::proto::MarkRequest", "gap"),
+    ("a crate segment corroborates through its directory", "metrocalk_core::Facing", "skip"),
+]
+
+
 def run() -> int:
     ok = True
     for name, pattern, drifted, repaired in CASES:
@@ -1463,6 +1755,75 @@ def run() -> int:
             ok = False
         else:
             print(f"pass  {label}")
+
+    for label, snippet, name, marker, want in BINDING_PINS:
+        assert snippet.count(marker) == 1, f"marker must be unique: {label}"
+        at = snippet.index(marker)
+        got = tsipc.binding_type(tsipc.annotated_bindings(snippet), name, at)
+        if got != want:
+            print(f"FAIL  a binding resolves wrongly: {label}")
+            print(f"        expected {want!r}, got {got!r}")
+            ok = False
+        else:
+            print(f"pass  {label}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prs = rustipc.parse(audit.sweep_rust(build(tmp)))
+    for label, ty, want in ARG_RESOLVE_PINS:
+        dto, why = audit._arg_struct(_prs, ty)
+        got = "open" if dto is not None else ("gap" if why else "skip")
+        if got != want:
+            print(f"FAIL  an argument type resolves wrongly: {label}")
+            print(f"        `{ty}` -> expected {want}, got {got} ({why or 'no reason'})")
+            ok = False
+        else:
+            print(f"pass  {label}")
+
+    # A struct carrying `#[serde(flatten)]` splices in keys this reader cannot enumerate, so neither
+    # "the caller omitted a required field" nor "the caller sent one the struct has no room for" is
+    # provable. The refusal is invisible to a case — it produces the same nothing a clean tree does —
+    # so it is held here, by the count: the key must NOT be opened.
+    with tempfile.TemporaryDirectory() as tmp:
+        flat = audit.run(build(tmp, {"editor-shell/src/marks.rs": swap(
+            MARKS_RS, "    pub note: Option<String>,",
+            "    #[serde(flatten)]\n    pub extra: MarkExtra,")}))
+    if flat[0]:
+        print("FAIL  a flattened argument struct produced findings instead of a refusal:")
+        for f in flat[0]:
+            print(f"        [{f.check}] {f.message[:130]}")
+        ok = False
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            whole = audit.run(build(tmp))[1]["argfields_keys"]
+        if flat[1]["argfields_keys"] != whole - 1:
+            print(f"FAIL  a flattened argument struct was still opened "
+                  f"({flat[1]['argfields_keys']} key(s) opened, expected {whole - 1} — every "
+                  f"argument key in the fixture but `entity_mark`'s)")
+            ok = False
+        else:
+            print("pass  a flattened argument struct is refused, not compared")
+
+    # ── the header's own numbers, pinned as SETS ───────────────────────────────────────────────────
+    #
+    # `opened` and `untyped` describe disjoint parts of ONE population, and the first version counted
+    # `opened` per CALL SITE instead of per (command, key) — which made the header read
+    # `3 of 1 argument key(s) ... opened` the moment a payload command gained a second caller. The
+    # fixture has that second caller (`entityMarkAlias` passes `entity_mark`'s key untyped), so the
+    # two numbers can disagree here, and nothing else in this file would notice if they did: a wrong
+    # number is not a finding, and every case above would stay green beside it.
+    with tempfile.TemporaryDirectory() as tmp:
+        _st = audit.run(build(tmp))[1]
+    _tot, _open, _un = _st["arg_struct_keys"], _st["argfields_keys"], _st["argfields_unresolved"]
+    if _open + _un > _tot:
+        print(f"FAIL  the header's argument numbers do not describe one population: "
+              f"{_open} opened + {_un} untyped > {_tot} keys")
+        ok = False
+    elif (_tot, _open, _un) != (4, 3, 1):
+        print(f"FAIL  the fixture's argument reach moved: expected 4 keys / 3 opened / 1 untyped, "
+              f"got {_tot} / {_open} / {_un}")
+        ok = False
+    else:
+        print("pass  opened and untyped are disjoint parts of one population, counted per key")
 
     with tempfile.TemporaryDirectory() as tmp:
         base = audit.run(build(tmp))[0]

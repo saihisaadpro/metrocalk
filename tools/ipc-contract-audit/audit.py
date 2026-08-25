@@ -465,18 +465,29 @@ def _argument_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> list[Finding]:
 
 #: Rust types that are not a struct, so an argument key holding one has nothing inside it to compare.
 #: Listed rather than inferred: "this is a scalar" and "this is a struct this reader failed to find"
-#: must never produce the same silence, and everything not named here that fails to resolve is
-#: reported as a gap in the check's own reach.
+#: must never produce the same silence. A name not listed here that fails to resolve carries a REASON
+#: out of `_arg_struct` — which is read by the caller and by the self-test, and is NOT printed as a
+#: finding. That is deliberate (an unopenable argument type is a smaller claim than a drift) and it
+#: is stated because the first version of this comment said "reported", which it never was.
 _ARG_SCALARS = frozenset({
     "String", "str", "bool", "char", "f32", "f64", "u8", "u16", "u32", "u64", "u128", "usize",
     "i8", "i16", "i32", "i64", "i128", "isize", "Value", "PathBuf", "Uuid",
 })
 
-#: Tauri injects or owns these; they are not a payload struct. `Channel<T>` is the ipc channel the
-#: command writes back through, not something the caller fills in.
-_ARG_INJECTED = frozenset({
-    "State", "AppHandle", "Window", "WebviewWindow", "Runtime", "Channel", "Request", "Response",
-})
+#: Tauri injects these; they are not part of the payload at all.
+#:
+#: `Channel<T>` is deliberately NOT here. An earlier draft listed it as "injected", which
+#: contradicted `rustipc`'s own note eight lines long — Tauri constructs a channel on the JS side
+#: (`new Channel()`) and passes it through like any other argument, so it IS a key the caller must
+#: send, and `arguments` checks that it is. It has no field names inside it for `argfields` to open,
+#: which is a different statement, and it is made below by `_ARG_OPAQUE` in the words that are true.
+_ARG_INJECTED = frozenset({"State", "AppHandle", "Window", "WebviewWindow", "Runtime"})
+
+#: Types the caller really does send, and which have no comparable field names inside them: a
+#: channel, a map keyed at run time, a raw JSON value. Not a gap in this check's reach — there is
+#: nothing in there to compare — and kept apart from `_ARG_INJECTED` so that the reason each name is
+#: skipped stays readable.
+_ARG_OPAQUE = frozenset({"Channel", "HashMap", "BTreeMap", "IndexMap", "Map"})
 
 
 def _peel(ty: str) -> tuple[str, bool]:
@@ -517,7 +528,7 @@ def _arg_struct(rs: rustipc.RustIpc, ty: str) -> tuple[rustipc.Dto | None, str]:
     # which is a header line arguing that the gate sees less than it does.
     if not re.fullmatch(r"[A-Za-z_]\w*", bare):
         return None, ""
-    if bare in _ARG_SCALARS or bare in _ARG_INJECTED or bare in ("HashMap", "BTreeMap"):
+    if bare in _ARG_SCALARS or bare in _ARG_INJECTED or bare in _ARG_OPAQUE:
         return None, ""
     # An enum argument is a variant SET, not a field set — there is nothing inside it for this check
     # to open, and `variants` is the check that compares it. Reporting it here as a struct this
@@ -530,17 +541,60 @@ def _arg_struct(rs: rustipc.RustIpc, ty: str) -> tuple[rustipc.Dto | None, str]:
             f"`{base}` names no `Deserialize`-deriving struct in the swept trees, so the fields "
             f"inside this key are not compared"
         )
-    if len(cands) == 1:
-        return cands[0][1], ""
-    module = segs[-2] if len(segs) > 1 else ""
-    exact = [d for rel, d in cands if module and rel.rsplit("/", 1)[-1] == f"{module}.rs"]
-    if len(exact) == 1:
-        return exact[0], ""
+    # THE PATH IS CONSULTED ALWAYS, not only to break a tie between two candidates, and an earlier
+    # draft that consulted it only when `len(cands) > 1` had a hole exactly the size of its own
+    # argument. Three Rust trees are swept; a type from any other crate in the workspace has NO
+    # candidate of its own, so a single unrelated struct that happens to share the bare name won the
+    # lookup unopposed — `metrocalk_wire::proto::MarkRequest` resolving to `core/src/lib.rs`, which
+    # is the very failure the paragraph above is written to condemn.
+    keep = [(rel, d) for rel, d in cands if not _path_contradicts(segs[:-1], rel)]
+    if len(keep) == 1:
+        return keep[0][1], ""
     where = ", ".join(f"{rel}:{d.line}" for rel, d in sorted(cands))
+    if not keep:
+        return None, (
+            f"`{base}` names a struct whose path no swept file corroborates (the swept `{bare}` "
+            f"declarations are {where}), so the fields inside this key are not compared"
+        )
     return None, (
-        f"`{base}` resolves to {len(cands)} different structs named `{bare}` ({where}) and its "
+        f"`{base}` resolves to {len(keep)} different structs named `{bare}` ({where}) and its "
         f"path does not say which, so the fields inside this key are not compared"
     )
+
+
+#: `crate`/`super`/`self` locate a module relative to where it is written, which this reader has no
+#: position in. They are skipped rather than treated as path elements that must appear in a filename.
+_PATH_NOISE = frozenset({"crate", "super", "self"})
+
+
+def _path_corroborated(seg: str, rel: str) -> bool:
+    """Does `seg` name something in `rel` — the file's stem, a directory, or its crate?
+
+    `metrocalk_core::compose::Composition` lives in `core/src/compose.rs`: `compose` is the stem and
+    `metrocalk_core` is the crate, whose directory is `core`. Rust crate names use `_` where the
+    directory uses `-`, so both are normalised before comparing. A `mod.rs` is corroborated by its
+    DIRECTORY, which is what the module is actually called.
+    """
+    seg = seg.strip()
+    if not seg or seg in _PATH_NOISE:
+        return True
+    norm = seg.replace("-", "_")
+    parts = rel.split("/")
+    names = {p.replace("-", "_") for p in parts}
+    names.add(parts[-1].removesuffix(".rs").replace("-", "_"))
+    if norm in names:
+        return True
+    # A crate segment: `metrocalk_editor_shell` -> `editor_shell` -> the `editor-shell` directory.
+    return norm.removeprefix("metrocalk_") in names
+
+
+def _path_contradicts(qualifiers: list[str], rel: str) -> bool:
+    """True when some segment of the written path names nothing in this candidate's file path.
+
+    A refusal, not a guess: a qualifier that no part of the path corroborates is positive evidence
+    that this declaration is not the one the type expression means.
+    """
+    return any(not _path_corroborated(q, rel) for q in qualifiers)
 
 
 def _argfields_findings(
@@ -573,8 +627,22 @@ def _argfields_findings(
     caller correctly leaves out.
     """
     out: list[Finding] = []
-    keys_compared = pairs = unresolved = 0
-    seen: set[tuple[str, str, str]] = set()
+    # COUNTED BY DISTINCT (command, key), NOT PER CALL SITE — and the first version was not, which
+    # made the header read `3 of 1 argument key(s) ... opened` the moment one payload command gained
+    # a second caller. `arg_struct_keys` in the stats block is a set of distinct pairs over every
+    # command; a counter incremented per invocation cannot be compared against it, and a number that
+    # is only coherent while every command has exactly one caller is a number that starts lying
+    # without anyone editing it.
+    opened: set[tuple[str, str]] = set()
+    pairs_seen: set[tuple[str, str, str]] = set()
+    #: (command, key) pairs that reached this check and could not be opened, for the single reason
+    #: the header states: the CALLER did not declare a type for the value. A Rust-side resolution
+    #: failure, a key this call site does not pass at all, and a flatten refusal are three other
+    #: stories and are not added here — the first version added all four to one counter and then
+    #: described one of them, so the sentence blamed the TypeScript for a Rust-side refusal and
+    #: counted call sites that pass nothing as call sites that pass the key.
+    untyped: set[tuple[str, str]] = set()
+
     for inv in ts.invocations:
         if inv.cmd is None or inv.cmd not in rs.commands:
             continue
@@ -582,25 +650,31 @@ def _argfields_findings(
         if cmd.unreadable:
             continue
         for wire, rty, _opt in cmd.args:
-            dto, why = _arg_struct(rs, rty)
+            dto, _why = _arg_struct(rs, rty)
             t_name = inv.key_types.get(wire)
-            if dto is None:
-                if why and wire in inv.keys:
-                    unresolved += 1
+            if dto is None or wire not in inv.keys:
                 continue
-            if wire not in inv.keys or t_name is None:
-                unresolved += 1
+            if t_name is None:
+                untyped.add((inv.cmd, wire))
                 continue
             t_base, t_is_list, _ = tsipc.unwrap(t_name, ts.aliases)
             _, r_is_list = _peel(rty)
             t_ty = ts.types.get(t_base.strip())
-            if t_ty is None:
-                unresolved += 1
+            # A TypeScript name that TWO swept files declare differently is unusable for the same
+            # reason its Rust counterpart is, and this side was left unguarded while the Rust side's
+            # docstring argued at length against exactly it: `ts.types` is keyed by bare name and the
+            # last file parsed wins, so a type added to an unrelated store module could silently
+            # become the thing a payload is compared against. Likewise a type whose `extends` parent
+            # this reader could not resolve: its field list is INCOMPLETE, and comparing an
+            # incomplete list against what the Rust requires reports inherited fields as missing.
+            if t_ty is None or t_ty.collides_with:
+                untyped.add((inv.cmd, wire))
                 continue
+            # NOT deduplicated across call sites. Two callers building the same payload wrongly are
+            # two places to fix, and the earlier `seen` set keyed on `file:line` could only ever
+            # collapse two invokes written on one line — a guard for a case that does not occur,
+            # standing where a reader would expect one that does.
             where = f"{inv.file}:{inv.line}"
-            if (wire, inv.cmd, where) in seen:
-                continue
-            seen.add((wire, inv.cmd, where))
             if r_is_list != t_is_list:
                 out.append(Finding(
                     "error", "argfields", where,
@@ -614,13 +688,18 @@ def _argfields_findings(
             # omitted a required field" nor "the caller sent one the struct has no room for" is
             # provable. The same refusal `shape` makes, for the same reason.
             if any(f.startswith("<flatten:") for f, _ in dto.fields):
-                unresolved += 1
                 continue
-            keys_compared += 1
+            opened.add((inv.cmd, wire))
             declared = dict(t_ty.fields)
-            accepts = {f for f, _ in dto.fields}
+            # A key the caller sends that is an `#[serde(alias)]` of a field the struct declares is
+            # ACCEPTED by serde and must not be reported as unknown; the field it aliases must not be
+            # reported as unsent either. Both directions read this one map.
+            accepts = {f for f, _ in dto.fields} | set(dto.aliases)
+            aliased = {dto.aliases[a] for a in dto.aliases if a in declared}
             for f_wire, _skip in dto.fields:
-                pairs += 1
+                pairs_seen.add((inv.cmd, wire, f_wire))
+                if f_wire in aliased:
+                    continue  # the caller sends it under a name serde accepts for it
                 omissible = (
                     rustipc.type_head(dto.field_types.get(f_wire, "")) == "Option"
                     or f_wire in dto.defaulted
@@ -651,7 +730,7 @@ def _argfields_findings(
             for f_key, _t_opt in t_ty.fields:
                 if f_key in accepts:
                     continue
-                pairs += 1
+                pairs_seen.add((inv.cmd, wire, f_key))
                 drop = (
                     "the whole payload is rejected — the struct carries "
                     "`#[serde(deny_unknown_fields)]`"
@@ -666,7 +745,11 @@ def _argfields_findings(
                     f"{drop}",
                     key=f"argfields@{inv.cmd}.{wire}.{f_key}",
                 ))
-    return out, keys_compared, pairs, unresolved
+    # A (command, key) that IS opened at the typed transport and passed untyped somewhere else is
+    # not an unreached key — it is a reached one with a second caller. Subtracting keeps `opened` and
+    # this number describing disjoint sets of the same population, so the two can be read in one
+    # sentence against `arg_struct_keys` without them summing to more than the whole.
+    return out, len(opened), len(pairs_seen), len(untyped - opened)
 
 
 #: How far past a reply's own keys the reader will follow it. Two levels of nesting is already past
@@ -1584,7 +1667,7 @@ def run(root: str) -> tuple[list[Finding], dict]:
     }
     order = {"registration": 0, "command": 1, "arguments": 2, "argfields": 3, "shape": 4,
              "nested": 5, "variants": 6, "nullable": 7, "reads": 8, "coverage": 9}
-    findings.sort(key=lambda f: (order.get(f.check, 9), f.where, f.message))
+    findings.sort(key=lambda f: (order.get(f.check, 1 + max(order.values())), f.where, f.message))
     return findings, stats
 
 
@@ -1643,8 +1726,8 @@ def main() -> int:
             f"compared for arity; "
             f"{stats['argfields_keys']} of {stats['arg_struct_keys']} argument key(s) carrying "
             f"a struct were opened and {stats['argfields_pairs']} field pair(s) inside them "
-            f"compared, with {stats['argfields_unresolved']} further call site(s) passing "
-            f"one of those keys without a declared type and still compared by key alone; "
+            f"compared; of the rest, {stats['argfields_unresolved']} are invoked only where "
+            f"the caller declares no usable type for the value, and stay compared by key alone; "
             f"{stats['enums_string_like']} of {stats['enums']} serde enum(s) are a bare string on "
             f"the wire, and {stats['enum_pairs']} enum/string-union pair(s) across "
             f"{len(stats['enum_names'])} distinct enum(s) had their variant sets compared "

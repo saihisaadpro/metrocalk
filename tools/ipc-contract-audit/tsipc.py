@@ -38,6 +38,19 @@ class TsType:
     fields: list[tuple[str, bool]]  # (key, optional)
     line: int
     file: str
+    #: The names an `interface X extends A, B` inherits from, verbatim. Kept and resolved after every
+    #: file is parsed, because a parent may be declared in another one. Dropping them was a live
+    #: false-finding path on the ARGUMENT side and only a silence on the reply side: a reply check
+    #: that misses inherited fields under-counts and says nothing, while `argfields` compares Rust
+    #: REQUIRES against TypeScript DECLARES and turns the same under-count into a confident
+    #: accusation that correct code fails to deserialise.
+    extends: tuple[str, ...] = ()
+    #: Another swept TypeScript file declares a different type by the same bare name. `ts.types` is
+    #: keyed by bare name and the last file parsed wins — the same hazard `Dto.collides_with` records
+    #: on the Rust side, and it was left unguarded on this side while the Rust side's docstring
+    #: argued at length against exactly it. A collision makes the name unusable, not merely
+    #: ambiguous: `argfields` refuses and counts a gap.
+    collides_with: str = ""
     #: key -> the declared type expression. Needed to follow a reply a second level down; kept beside
     #: `fields` so every existing consumer of `(key, optional)` is untouched.
     field_types: dict[str, str] = field(default_factory=dict)
@@ -206,6 +219,11 @@ def parse_invocations(src: str, rel: str) -> list[Invocation]:
 #: the match inside one statement so a missing initialiser cannot swallow the rest of the file.
 _ANNOTATED_LOCAL = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_]\w*)\s*:\s*([^=;{]+?)\s*=")
 
+#: The same declaration WITHOUT a type. It binds nothing this reader can compare, and it is recorded
+#: for exactly that reason: a name that shadows must shadow whether or not it says what it holds.
+#: `[^=]` after the `=` keeps it off `==` and `=>`.
+_UNANNOTATED_LOCAL = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_]\w*)\s*=[^=]")
+
 #: One simple parameter: `name: T`, `name?: T`, `readonly name: T`. Destructuring (`{ a }: T`) and
 #: rest (`...xs: T[]`) deliberately do NOT match — they bind something other than one name to that
 #: type, and a reader that took the annotation anyway would attribute the wrong shape to the wrong
@@ -257,7 +275,14 @@ def annotated_bindings(src: str) -> list[tuple[str, str, int, int]]:
     n = len(src)
 
     # Parameters. Every `(` whose match is followed by an optional return annotation and then `{` is
-    # a signature — a method, a function, or an arrow with a block body.
+    # a signature — a method, a function, or an arrow with a block body — and NESTED ones are visited
+    # too. An earlier version resumed at the closing paren, so it only ever saw top-level
+    # parentheses: a callback written inline, `xs.forEach((rule: RuleData) => { invoke(..) })`, is a
+    # signature inside a call's argument list and produced no binding at all, while the comment above
+    # it said "every `(`". That was honest silence rather than a wrong answer — the key stayed
+    # unresolved and was counted — but it is silence over the shape a payload is most often built in,
+    # and a comment that overstates what the code reaches is the thing this project treats as a
+    # defect. Resuming one character later costs 2,353 `_match` calls on the largest file here.
     i = 0
     while i < n:
         c = src[i]
@@ -281,38 +306,72 @@ def annotated_bindings(src: str) -> list[tuple[str, str, int, int]]:
             while k < n and src[k].isspace():
                 k += 1
         elif src[k] == ":":                             # a return-type annotation before the body
+            # `}` ENDS THE SEARCH, and leaving it out was a live false-finding path. An interface
+            # member written without a trailing semicolon --
+            #     interface Api { entityMark(request: EntityInfo): Promise<boolean> }
+            # -- has no `;` to stop on, so the scan walked past the interface's own `}`, through the
+            # next function's balanced parentheses, and adopted THAT function's body as the scope of
+            # a parameter belonging to a type DECLARATION. The two bindings then had identical spans
+            # and the tie went to insertion order, which put the phantom first. One semicolon made
+            # six blocking findings appear and disappear.
             depth = 0
-            while k < n and not (src[k] == "{" and depth == 0):
-                if src[k] in "<([":
+            while k < n:
+                c2 = src[k]
+                if c2 == "{" and depth == 0:
+                    break
+                if c2 in "<([":
                     depth += 1
-                elif src[k] in ">)]":
+                elif c2 in ">)]":
                     depth -= 1
-                elif src[k] == ";":
+                elif c2 in ";}" and depth == 0:
                     break                               # a declaration, not a definition
                 k += 1
         if k >= n or src[k] != "{":
-            i = cp + 1
+            i += 1
             continue
         body_end = _match(src, k, "{", "}")
         if body_end < 0:
             body_end = n
         for part in split_top(src[i + 1 : cp]):
-            pm = _SIMPLE_PARAM.match(split_top(part, "=")[0].strip())
+            head = split_top(part, "=")[0].strip()
+            pm = _SIMPLE_PARAM.match(head)
             if pm:
                 out.append((pm.group(1), pm.group(2).strip(), k, body_end))
-        i = cp + 1
+            elif re.fullmatch(r"(?:readonly\s+)?[A-Za-z_]\w*\??", head):
+                # A parameter with NO annotation, recorded with an empty type so that it SHADOWS.
+                out.append((head.replace("readonly", "").strip(" ?"), "", k, body_end))
+        i += 1
 
     for m in _ANNOTATED_LOCAL.finditer(src):
         out.append((m.group(1), m.group(2).strip(), m.end(), _block_end(src, m.end())))
+    for m in _UNANNOTATED_LOCAL.finditer(src):
+        out.append((m.group(1), "", m.end(), _block_end(src, m.end())))
     return out
 
 
 def binding_type(bindings: list[tuple[str, str, int, int]], name: str, at: int) -> str | None:
-    """The declared type of `name` at offset `at` — the INNERMOST span that contains it."""
+    """The declared type of `name` at offset `at` — from the INNERMOST span that contains it.
+
+    An UNANNOTATED binding is carried in this list with an empty type, and it shadows exactly as a
+    typed one does. Leaving it out was a live false-finding path with the same shape as the one the
+    scope rule exists to prevent, one step further in:
+
+        const request: EntityInfo = ..;                        // module scope, span runs to EOF
+        entityMark() { const request = buildMarkRequest();     // shadows, and says no type
+                       invoke("entity_mark", { request }); }
+
+    The inner declaration is the one in effect and it declares nothing, so the honest answer is "no
+    type", not the outer one. Reading the outer compared a real payload struct against an unrelated
+    reply type and reported every field of both — which is precisely the wrong answer the
+    `_binding_ignoring_scope` mutation is written to pin, still reachable through a hole beside it.
+
+    Ties are broken by START offset, not by insertion order: two spans of equal length are two
+    scopes, and the later one is the inner one.
+    """
     hits = [b for b in bindings if b[0] == name and b[2] <= at <= b[3]]
     if not hits:
         return None
-    return min(hits, key=lambda b: b[3] - b[2])[1]
+    return min(hits, key=lambda b: (b[3] - b[2], -b[2]))[1] or None
 
 
 _TYPE_ALIAS = re.compile(r"\bexport\s+type\s+([A-Za-z_]\w*)(?:<[^>=]*>)?\s*=\s*")
@@ -353,13 +412,21 @@ def parse_aliases(src: str, rel: str) -> dict[str, str]:
 def parse_types(src: str, rel: str) -> dict[str, TsType]:
     """`export interface X { .. }` and `export type X = { .. }` — the object shapes only."""
     types: dict[str, TsType] = {}
-    for m in re.finditer(r"\bexport\s+interface\s+([A-Za-z_]\w*)(?:<[^>{]*>)?\s*(?:extends[^{]+)?\{", src):
+    for m in re.finditer(
+        r"\bexport\s+interface\s+([A-Za-z_]\w*)(?:<[^>{]*>)?\s*(?:extends(?P<sup>[^{]+))?\{", src
+    ):
         ob = src.index("{", m.end() - 1)
         cb = _match(src, ob, "{", "}")
         if cb < 0:
             continue
         fs, fts = _object_fields_typed(src[ob + 1 : cb])
-        types[m.group(1)] = TsType(m.group(1), fs, src.count("\n", 0, m.start()) + 1, rel, field_types=fts)
+        # Only a bare parent NAME is followed. `extends Pick<T, "a">` and other computed parents are
+        # recorded verbatim and fail to resolve below, which marks the child unusable rather than
+        # letting it claim to be complete — the whole point of keeping the clause.
+        sup = tuple(x.strip() for x in split_top(m.group("sup") or "") if x.strip())
+        types[m.group(1)] = TsType(
+            m.group(1), fs, src.count("\n", 0, m.start()) + 1, rel, field_types=fts, extends=sup
+        )
     for m in re.finditer(r"\bexport\s+type\s+([A-Za-z_]\w*)(?:<[^>=]*>)?\s*=\s*\{", src):
         ob = src.index("{", m.end() - 1)
         cb = _match(src, ob, "{", "}")
@@ -468,12 +535,71 @@ def unwrap(t: str, aliases: dict[str, str] | None = None) -> tuple[str, bool, bo
     return t, is_list, nullable
 
 
+#: How deep an `extends` chain is followed. Two links is already past everything this boundary
+#: declares; the cap exists so a cycle cannot hang the gate, and a type still unresolved at the cap
+#: is marked unusable rather than reported as complete.
+_EXTENDS_DEPTH = 4
+
+
+def _fold_extends(types: dict[str, TsType]) -> None:
+    """Splice each parent's fields into the child, in place.
+
+    A child REDECLARING a parent's key wins — that is what TypeScript does — so the parent's version
+    is only added for keys the child does not state. A parent this reader cannot find (declared in a
+    file the audit does not sweep, or computed with `Pick`/`Omit`) leaves the child marked
+    `collides_with`, which `argfields` treats as unusable. Saying "I could not read this type" and
+    "this type is complete and disagrees with the Rust" must never produce the same output.
+    """
+    for _ in range(_EXTENDS_DEPTH):
+        moved = False
+        for t in types.values():
+            if not t.extends:
+                continue
+            unresolved = [p for p in t.extends if types.get(re.sub(r"<.*", "", p).strip()) is None]
+            if unresolved:
+                t.collides_with = t.collides_with or (
+                    f"extends `{unresolved[0]}`, which is not a swept object type"
+                )
+                t.extends = ()
+                moved = True
+                continue
+            if any(types[re.sub(r"<.*", "", p).strip()].extends for p in t.extends):
+                continue  # a grandparent is still pending; settle it first
+            own = {k for k, _ in t.fields}
+            for p in t.extends:
+                par = types[re.sub(r"<.*", "", p).strip()]
+                if par.collides_with:
+                    t.collides_with = t.collides_with or f"extends `{par.name}`, which is unusable"
+                for k, opt in par.fields:
+                    if k not in own:
+                        t.fields.append((k, opt))
+                        t.field_types.setdefault(k, par.field_types.get(k, ""))
+                        own.add(k)
+            t.extends = ()
+            moved = True
+        if not moved:
+            break
+    # A cycle (`A extends B`, `B extends A`) survives the loop with `extends` still set.
+    for t in types.values():
+        if t.extends:
+            t.collides_with = t.collides_with or "its `extends` chain does not terminate"
+            t.extends = ()
+
+
 def parse(sources: list[tuple[str, str]], call_files: set[str]) -> TsIpc:
     out = TsIpc()
     for rel, text in sources:
         src = strip_comments(text)
         if rel in call_files:
             out.invocations.extend(parse_invocations(src, rel))
-        out.types.update(parse_types(src, rel))
+        here = parse_types(src, rel)
+        for name, t in here.items():
+            prior = out.types.get(name)
+            if prior is not None and prior.file != rel and (
+                [f for f, _ in prior.fields] != [f for f, _ in t.fields] or prior.extends != t.extends
+            ):
+                t.collides_with = f"{prior.file}:{prior.line} declares a different `{name}`"
+            out.types[name] = t
         out.aliases.update(parse_aliases(src, rel))
+    _fold_extends(out.types)
     return out

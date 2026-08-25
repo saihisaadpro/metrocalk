@@ -47,6 +47,12 @@ _CMD_ATTR = re.compile(r"#\[tauri::command(?:\s*\((?P<args>[^)]*)\))?\s*\]")
 _DERIVE = re.compile(r"#\[derive\(([^)]*)\)\]")
 _RENAME_ALL = re.compile(r'rename_all\s*=\s*"([^"]+)"')
 _RENAME = re.compile(r'\brename\s*=\s*"([^"]+)"')
+#: `#[serde(rename(deserialize = "x"))]` — the split form. `deserialize` is preferred because this
+#: reader's argument side asks what the command will READ; a `serialize`-only rename leaves the
+#: incoming name at the default, which `wire_case` already produces.
+_RENAME_SPLIT = re.compile(r'\brename\s*\(\s*deserialize\s*=\s*"([^"]+)"')
+#: `#[serde(alias = "..")]`, repeatable — accepted on the way in, never produced on the way out.
+_ALIAS = re.compile(r'\balias\s*=\s*"([^"]+)"')
 
 
 @dataclass
@@ -90,6 +96,9 @@ class Dto:
     #: drift, two entirely different failures, so the finding has to say which one it is rather than
     #: describing the one this reader assumed.
     deny_unknown: bool = False
+    #: `#[serde(alias = "..")]` -> the wire key it is an alias FOR. Accepted on the way in only, so
+    #: it belongs to the argument direction and says nothing about what the shell sends.
+    aliases: dict[str, str] = dc_field(default_factory=dict)
     #: wire key -> the Rust type expression behind it. Field NAMES alone are enough to compare one
     #: level; they are not enough to go a second, because the reader cannot follow a field it cannot
     #: name a type for. Kept beside `fields` rather than folded into it so every existing consumer of
@@ -553,11 +562,34 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
         # Another derive/struct/enum in between means this derive belongs to something else.
         if re.search(r"\b(struct|enum|fn|impl)\b", attrs):
             continue
+        # CONTAINER ATTRIBUTES ARE READ FROM BOTH SIDES OF THE DERIVE — but only the two whose
+        # misreading is SAFE, and that restriction is the whole design of this block.
+        #
+        # `attrs` was the text between the derive and the `struct`, so an attribute written above the
+        # derive was invisible. No site in this repository writes one there, and with no rustc in
+        # this sandbox this reader cannot establish whether serde honours that position — so it does
+        # not claim to. What it does instead is choose the direction in which being wrong is
+        # harmless. `default` and `deny_unknown_fields` read from the far side can only make this
+        # reader MORE permissive (a field treated as omissible, a message that says the payload is
+        # rejected rather than silently truncated) — it can miss a finding, never invent one.
+        # `rename_all` is deliberately NOT widened: a wire-name table read from an attribute serde
+        # ignores would rename every field of the struct and report the whole thing as drifted.
+        before, j = [], m.start()
+        while True:
+            ls = src.rfind("\n", 0, j)
+            line_txt = src[ls + 1 : j].strip()
+            if not line_txt.startswith("#["):
+                break
+            before.append(line_txt)
+            j = ls
+            if j <= 0:
+                break
+        wide = "\n".join(reversed(before)) + "\n" + attrs
         ra = _RENAME_ALL.search(attrs)
         rename_all = ra.group(1) if ra else None
-        container_serde = " ".join(re.findall(r"#\[serde\(([^\]]*)\)\]", attrs))
-        deny_unknown = "deny_unknown_fields" in container_serde
-        container_default = bool(_SERDE_DEFAULT.search(container_serde))
+        wide_serde = " ".join(re.findall(r"#\[serde\(([^\]]*)\)\]", wide))
+        deny_unknown = "deny_unknown_fields" in wide_serde
+        container_default = bool(_SERDE_DEFAULT.search(wide_serde))
 
         ob = m.end() + sm.end() - 1
         cb = _match(src, ob, "{", "}")
@@ -567,6 +599,7 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
         opaque: list[str] = []
         ftypes: dict[str, str] = {}
         defaulted: list[str] = []
+        aliases: dict[str, str] = {}
         for p in split_top(src[ob + 1 : cb]):
             attr_lines = "\n".join(l for l in p.splitlines() if l.strip().startswith("#["))
             decl = "\n".join(l for l in p.splitlines() if not l.strip().startswith("#["))
@@ -581,16 +614,29 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
             )
             if re.search(r"(^|[\s,(])skip(\s*[,)]|$)", serde_attr):
                 continue
+            # `skip_deserializing` keeps the field on the wire OUT and takes it off the wire IN: the
+            # caller never has to send it, and serde ignores it if they do. It is omissible for the
+            # same reason `#[serde(default)]` is — a different attribute reaching the same answer,
+            # and reported as required until this line existed.
+            skip_deser = "skip_deserializing" in serde_attr
             if "flatten" in serde_attr:
                 # A flattened field splices another type's keys in. Recording the field name would
                 # invent a key that is never on the wire; recording nothing would invent agreement.
                 fields.append((f"<flatten:{fname}>", True))
                 continue
-            rn = _RENAME.search(serde_attr)
+            # `#[serde(rename(deserialize = "x", serialize = "y"))]` is the same contract in a
+            # second spelling. `rename = "x"` alone was matched and this form was not, so the field
+            # was compared under its Rust name against a wire key it never uses.
+            rn = _RENAME.search(serde_attr) or _RENAME_SPLIT.search(serde_attr)
             wire = rn.group(1) if rn else wire_case(fname, rename_all)
             fields.append((wire, "skip_serializing_if" in serde_attr))
-            if container_default or _SERDE_DEFAULT.search(serde_attr):
+            if container_default or skip_deser or _SERDE_DEFAULT.search(serde_attr):
                 defaulted.append(wire)
+            # `#[serde(alias = "..")]` is accepted on the way IN and never produced on the way out.
+            # A caller sending the alias is correct; without this the key was reported as one the
+            # struct has no field for, AND the real name reported as one the caller never sends.
+            for al in _ALIAS.findall(serde_attr):
+                aliases.setdefault(al, wire)
             ftypes[wire] = fty
             if is_opaque:
                 opaque.append(wire)
@@ -603,6 +649,7 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
         dto = Dto(
             name, fields, line, rel, opaque=tuple(opaque), collides_with=collides,
             field_types=ftypes, defaulted=frozenset(defaulted), deny_unknown=deny_unknown,
+            aliases=aliases,
         )
         if can_send:
             out.dtos[name] = dto
