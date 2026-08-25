@@ -17,6 +17,28 @@
 use metrocalk_core::{Engine, EntityId, FieldValue, Op};
 use metrocalk_ecs::FlecsWorld;
 
+/// One authored sample in a complete mechanism-track transaction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JointTrackKey {
+    pub time: f64,
+    pub value: f64,
+}
+
+/// A complete joint definition and the keys the user wants to add or replace.  A collection of these is
+/// deliberately committed as one transaction by the desktop shell: large assemblies pay for validation,
+/// animation-plan compilation and viewport publication once, while Ctrl-Z still describes the one visible
+/// "author mechanism" action the user performed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JointTrackAuthoring {
+    pub entity: EntityId,
+    pub revolute: bool,
+    pub axis: [f64; 3],
+    pub pivot: [f64; 3],
+    pub limits: (f64, f64),
+    pub source: String,
+    pub keys: Vec<JointTrackKey>,
+}
+
 /// The authored mechanism component — a typed kinematic DOF on the moving part entity.
 ///
 /// This is intentionally distinct from the registry's physics `Joint` relation (`kind`/`bodyA`/`bodyB`).
@@ -156,6 +178,140 @@ pub fn try_set_joint_ops(
         field: "source".into(),
         value: FieldValue::Str(source.into()),
     });
+    Ok(ops)
+}
+
+/// Validate and compile a complete multi-part mechanism authoring gesture into one bounded operation list.
+///
+/// This is the durable high-volume authoring seam used by the ordinary editor transport.  It intentionally
+/// preserves the established single-command semantics:
+///
+/// - a joint definition starts at value zero without moving the current authored transform;
+/// - keys at an existing time replace that sample, while unrelated existing samples survive;
+/// - values outside the authored travel limits are clamped before both storage and final posing;
+/// - the last supplied value becomes the committed pose and joint readback value;
+/// - validation is all-or-nothing, so a bad row cannot leave a half-authored assembly.
+///
+/// The returned operations contain no work proportional to unrelated scene entities.  The caller lands the
+/// whole vector with one `Engine::commit`, refreshes the animation plan once and publishes the viewport once.
+pub fn try_author_joint_tracks_ops(
+    engine: &Engine<FlecsWorld>,
+    requests: &[JointTrackAuthoring],
+) -> Result<Vec<Op>, String> {
+    if requests.is_empty() {
+        return Err("at least one joint is required".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ops = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        if engine.ecs_entity(request.entity).is_none() {
+            return Err(format!(
+                "joint {} targets an entity that no longer exists",
+                index + 1
+            ));
+        }
+        if !seen.insert(request.entity) {
+            return Err(format!(
+                "joint {} targets the same entity more than once",
+                index + 1
+            ));
+        }
+        validate_joint_spec(request.axis, request.pivot, request.limits)
+            .map_err(|reason| format!("joint {}: {reason}", index + 1))?;
+        for (key_index, key) in request.keys.iter().enumerate() {
+            validate_joint_time(key.time).map_err(|reason| {
+                format!("joint {}, key {}: {reason}", index + 1, key_index + 1)
+            })?;
+            validate_joint_value(key.value).map_err(|reason| {
+                format!("joint {}, key {}: {reason}", index + 1, key_index + 1)
+            })?;
+        }
+
+        ops.extend(
+            try_set_joint_ops(
+                request.entity,
+                request.revolute,
+                request.axis,
+                request.pivot,
+                request.limits,
+                &request.source,
+            )
+            .map_err(|reason| format!("joint {}: {reason}", index + 1))?,
+        );
+
+        let components = engine.components_of(request.entity);
+        let transform = components.get("Transform");
+        let number = |field: &str| -> f64 {
+            num_of(transform.and_then(|fields| fields.get(field))).unwrap_or(0.0)
+        };
+        let base_position = [number("x"), number("y"), number("z")];
+        let raw_rotation = [number("qx"), number("qy"), number("qz"), number("qw")];
+        let base_rotation = if raw_rotation == [0.0; 4] {
+            [0.0, 0.0, 0.0, 1.0]
+        } else {
+            raw_rotation
+        };
+
+        let existing = components
+            .get(JOINT_TRACK)
+            .and_then(|fields| fields.get("keys"))
+            .and_then(|value| match value {
+                FieldValue::Str(keys) => Some(keys.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut keys = parse_track(existing);
+        let authored_joint = Joint {
+            revolute: request.revolute,
+            axis: normalize(request.axis),
+            pivot: request.pivot,
+            min: request.limits.0,
+            max: request.limits.1,
+            value: 0.0,
+        };
+        for key in &request.keys {
+            let clamped = safe_clamp(key.value, authored_joint.min, authored_joint.max);
+            keys.retain(|(time, _)| (*time - key.time).abs() > 1.0e-9);
+            keys.push((key.time, clamped));
+        }
+        if !request.keys.is_empty() {
+            ops.push(Op::SetField {
+                entity: request.entity,
+                component: JOINT_TRACK.into(),
+                field: "keys".into(),
+                value: FieldValue::Str(encode_track(&keys)),
+            });
+            let final_value = request
+                .keys
+                .last()
+                .map(|key| safe_clamp(key.value, authored_joint.min, authored_joint.max))
+                .unwrap_or(0.0);
+            let (position, rotation) =
+                joint_pose(&authored_joint, base_position, base_rotation, final_value);
+            for (field, value) in [
+                ("x", position[0]),
+                ("y", position[1]),
+                ("z", position[2]),
+                ("qx", rotation[0]),
+                ("qy", rotation[1]),
+                ("qz", rotation[2]),
+                ("qw", rotation[3]),
+            ] {
+                ops.push(Op::SetField {
+                    entity: request.entity,
+                    component: "Transform".into(),
+                    field: field.into(),
+                    value: FieldValue::Number(value),
+                });
+            }
+            ops.push(Op::SetField {
+                entity: request.entity,
+                component: JOINT.into(),
+                field: "value".into(),
+                value: FieldValue::Number(final_value),
+            });
+        }
+    }
     Ok(ops)
 }
 
@@ -511,6 +667,157 @@ mod tests {
         let id = engine.alloc_entity_id();
         assert!(try_set_joint_ops(id, true, [0.0; 3], [0.0; 3], (-1.0, 1.0), "manual").is_err());
         assert!(set_joint_ops(id, true, [0.0; 3], [0.0; 3], (-1.0, 1.0), "manual").is_empty());
+    }
+
+    #[test]
+    fn complete_mechanism_authoring_is_atomic_readable_and_one_undo_step() {
+        let mut engine = Engine::new(FlecsWorld::new(), 29);
+        let first = engine.alloc_entity_id();
+        let second = engine.alloc_entity_id();
+        engine
+            .commit(
+                "fixture",
+                vec![
+                    Op::CreateEntity {
+                        id: first,
+                        parent: None,
+                    },
+                    Op::CreateEntity {
+                        id: second,
+                        parent: None,
+                    },
+                    Op::SetField {
+                        entity: first,
+                        component: "Transform".into(),
+                        field: "x".into(),
+                        value: FieldValue::Number(12.0),
+                    },
+                    Op::SetField {
+                        entity: first,
+                        component: JOINT_TRACK.into(),
+                        field: "keys".into(),
+                        value: FieldValue::Str(encode_track(&[(9.0, 0.25)])),
+                    },
+                ],
+            )
+            .expect("fixture");
+        engine.clear_history();
+
+        let requests = vec![
+            JointTrackAuthoring {
+                entity: first,
+                revolute: true,
+                axis: [0.0, 0.0, 2.0],
+                pivot: [10.0, 0.0, 0.0],
+                limits: (-2.0, 2.0),
+                source: "manual".into(),
+                // Duplicate t=1 mirrors sequential jointKey replacement; the last sample wins.
+                keys: vec![
+                    JointTrackKey {
+                        time: 0.0,
+                        value: 0.0,
+                    },
+                    JointTrackKey {
+                        time: 1.0,
+                        value: 0.5,
+                    },
+                    JointTrackKey {
+                        time: 1.0,
+                        value: 1.0,
+                    },
+                ],
+            },
+            JointTrackAuthoring {
+                entity: second,
+                revolute: false,
+                axis: [1.0, 0.0, 0.0],
+                pivot: [0.0; 3],
+                limits: (-1.0, 1.0),
+                source: "inferred".into(),
+                keys: vec![JointTrackKey {
+                    time: 2.0,
+                    value: 4.0,
+                }],
+            },
+        ];
+        let ops = try_author_joint_tracks_ops(&engine, &requests).expect("valid batch");
+        engine.commit("author-mechanism", ops).expect("one commit");
+
+        let first_joint = joint_of(&engine, first).expect("first joint readback");
+        assert_eq!(first_joint.axis, [0.0, 0.0, 1.0]);
+        assert_eq!(first_joint.value, 1.0);
+        let first_keys = engine
+            .components_of(first)
+            .get(JOINT_TRACK)
+            .and_then(|fields| fields.get("keys"))
+            .and_then(|value| match value {
+                FieldValue::Str(value) => Some(parse_track(value)),
+                _ => None,
+            })
+            .expect("track readback");
+        assert_eq!(first_keys, vec![(0.0, 0.0), (1.0, 1.0), (9.0, 0.25)]);
+        assert_eq!(joint_of(&engine, second).expect("second joint").value, 1.0);
+
+        assert!(
+            engine.undo(),
+            "one undo removes the complete visible action"
+        );
+        assert!(joint_of(&engine, first).is_none());
+        assert!(joint_of(&engine, second).is_none());
+        assert!(
+            !engine.undo(),
+            "there was exactly one user-visible transaction"
+        );
+    }
+
+    #[test]
+    fn mechanism_batch_cost_and_op_count_do_not_scale_with_unrelated_scene_size() {
+        let mut engine = Engine::new(FlecsWorld::new(), 31);
+        let mut create = Vec::with_capacity(15_711);
+        let mut targets = Vec::with_capacity(24);
+        for index in 0..15_711 {
+            let id = engine.alloc_entity_id();
+            if index < 24 {
+                targets.push(id);
+            }
+            create.push(Op::CreateEntity { id, parent: None });
+        }
+        engine.commit("large-scene", create).expect("large fixture");
+        engine.clear_history();
+        let requests: Vec<_> = targets
+            .into_iter()
+            .map(|entity| JointTrackAuthoring {
+                entity,
+                revolute: true,
+                axis: [0.0, 0.0, 1.0],
+                pivot: [0.0; 3],
+                limits: (-3.2, 3.2),
+                source: "manual".into(),
+                keys: (0..7)
+                    .map(|key| JointTrackKey {
+                        time: f64::from(key),
+                        value: f64::from(key) * 0.1,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let ops = try_author_joint_tracks_ops(&engine, &requests).expect("24-track batch");
+        let elapsed = started.elapsed();
+        // 11 joint fields + one encoded track + 7 transform fields + final value per target. Keys are
+        // compacted into one field, and none of the 15,687 unrelated entities adds an operation.
+        assert_eq!(ops.len(), 24 * 20);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "batch preparation should be local to 24 targets, took {elapsed:?}"
+        );
+        engine
+            .commit("author-mechanism", ops)
+            .expect("batch commit");
+        assert!(engine.undo());
+        assert!(requests
+            .iter()
+            .all(|request| joint_of(&engine, request.entity).is_none()));
     }
 
     #[test]

@@ -64,6 +64,30 @@ fn env_to_working(c: vec3<f32>) -> vec3<f32> {
 @group(3) @binding(4) var shadow_map: texture_depth_2d;
 @group(3) @binding(5) var shadow_samp: sampler_comparison;
 
+// Cosine-convolved SH irradiance (ibl.rs), the diffuse half of the environment. Nine RGB coefficients
+// reproduce a cosine lobe to about 1%, which is why this is a uniform and not a texture fetch.
+struct Irradiance { coeff: array<vec4<f32>, 9> };
+@group(3) @binding(6) var<uniform> sh: Irradiance;
+
+/// Average incident radiance for a normal. The cosine convolution and the Lambert 1/PI are already folded
+/// into the coefficients, so this is directly the quantity the diffuse term multiplies its albedo by.
+fn sh_irradiance(n: vec3<f32>) -> vec3<f32> {
+    let x = n.x;
+    let y = n.y;
+    let z = n.z;
+    var r = sh.coeff[0].rgb * 0.282095;
+    r = r + sh.coeff[1].rgb * (0.488603 * y);
+    r = r + sh.coeff[2].rgb * (0.488603 * z);
+    r = r + sh.coeff[3].rgb * (0.488603 * x);
+    r = r + sh.coeff[4].rgb * (1.092548 * x * y);
+    r = r + sh.coeff[5].rgb * (1.092548 * y * z);
+    r = r + sh.coeff[6].rgb * (0.315392 * (3.0 * z * z - 1.0));
+    r = r + sh.coeff[7].rgb * (1.092548 * x * z);
+    r = r + sh.coeff[8].rgb * (0.546274 * (x * x - y * y));
+    // A truncated SH series can ring slightly negative under a very bright, very small source.
+    return max(r, vec3<f32>(0.0));
+}
+
 // Fraction of the directional light reaching `world_pos` (1 = fully lit, 0 = fully shadowed). Projects into
 // the light's clip space, does quality-scaled tent PCF with receiver/slope bias. Anything outside the
 // shadow frustum is treated as lit (the map only covers the scene's fitted bounds).
@@ -687,12 +711,17 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
         );
     }
 
-    // M11.3 inc.2 — image-based ambient (replaces the flat fill): diffuse from a blurred env mip (a cheap
-    // irradiance) + specular from the roughness-matched env mip × the split-sum BRDF LUT. THIS is what
-    // gives a metal something to reflect, so chrome/gold are no longer near-black (the M11.2 dark-metal).
+    // ── image-based ambient, with MULTIPLE-SCATTERING energy compensation ────────────────────────────
+    //
+    // Fdez-Aguera, "A Multiple-Scattering Microfacet Model for Real-Time Image Based Lighting"
+    // (JCGT 8.1, 2019). A single-scattering split-sum drops the energy that bounces more than once
+    // between microfacets, and drops more of it the rougher the surface gets. Two things follow, and the
+    // renderer previously did neither: that lost energy has to come back (`fms_ems`), and whatever the
+    // specular lobe did NOT take has to be handed to the diffuse lobe rather than assumed away. Without
+    // it, rough metal — which is most of a factory — renders dull and grey no matter how bright and
+    // well-shaped the environment lighting it is.
     let max_mip = f32(textureNumLevels(env) - 1);
-    let f_amb = fresnel_schlick_roughness(n_dot_v_amb, f0, roughness);
-    let kd_amb = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);
+    let refl = reflect(-v, n);
     // COLOUR INGRESS #3 — environment radiance, diffuse and specular.
     //
     // Converted at the point of SAMPLING rather than baked into the map before convolution, and that is
@@ -701,22 +730,36 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
     // conversion therefore gives bit-comparable results to converting the source first, while costing
     // no re-convolution when the working space changes and no precision loss from re-encoding an HDR
     // panorama into another gamut.
-    let irradiance = env_to_working(
-        textureSampleLevel(env, env_samp, dir_to_equirect(n), max(max_mip - 2.0, 0.0)).rgb,
-    );
-    let diffuse_ibl = kd_amb * irradiance * base;
-    let refl = reflect(-v, n);
+    let irradiance = env_to_working(sh_irradiance(n));
+    // `env` is GGX-PREFILTERED per level (see ibl.rs), so this fetch is the environment already convolved
+    // with the lobe for this roughness — which is what the split-sum approximation assumes it samples.
     let prefiltered = env_to_working(
         textureSampleLevel(env, env_samp, dir_to_equirect(refl), roughness * max_mip).rgb,
     );
+
+    // Single-scattering specular: the split-sum (scale, bias) against a roughness-aware Fresnel.
+    let ks = fresnel_schlick_roughness(n_dot_v_amb, f0, roughness);
+    let fss_ess = ks * brdf.x + brdf.y;
+    // The fraction of energy single scattering failed to account for.
+    let ems = max(1.0 - (brdf.x + brdf.y), 0.0);
+    // Average Fresnel over the hemisphere, which sums the multiple-bounce geometric series.
+    let f_avg = f0 + (vec3<f32>(1.0) - f0) / 21.0;
+    let fms_ems = ems * fss_ess * f_avg
+        / max(vec3<f32>(1.0) - f_avg * ems, vec3<f32>(1e-4));
+    // What neither scattering path took is what the diffuse lobe may have. Metals have no diffuse albedo.
+    let c_diff = base * (1.0 - metallic);
+    let k_d = c_diff * max(vec3<f32>(1.0) - fss_ess - fms_ems, vec3<f32>(0.0));
+
     let horizon = clamp(1.0 + dot(refl, geo_n), 0.0, 1.0);
     // AO is visibility for indirect light. Missing maps bind a white dummy, preserving prior output.
     let ao = clamp(textureSample(ao_tex, base_color_samp, in.uv).r, 0.0, 1.0);
     let specular_ao = specular_ambient_occlusion(n_dot_v_amb, ao, roughness);
-    let specular_ibl = prefiltered * (f_amb * brdf.x + brdf.y) * energy_compensation
-        * specular_ao * horizon * horizon;
+    // `energy_compensation` is NOT applied here: it is the direct-light multiple-scattering term, and
+    // `fms_ems` is the image-lighting one. Applying both to the same lobe would count that energy twice.
+    let specular_ibl = fss_ess * prefiltered * specular_ao * horizon * horizon;
+    let diffuse_ibl = (fms_ems + k_d) * irradiance * ao;
     // SCENE LINEAR radiance, straight into the HDR attachment. No exposure, no tone curve, no OETF.
-    var col = diffuse_ibl * ao + specular_ibl + lo;
+    var col = diffuse_ibl + specular_ibl + lo;
 
     // CAD inspection gets a restrained silhouette cue; it clarifies coincident curved bodies without
     // painting over face colors. A multiplicative darkening is space-agnostic, so it is unchanged.

@@ -75,7 +75,7 @@ pub const IDENTITY_QUAT: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 /// intentionally not normalized (millimetre vertices commonly render with a 0.001 instance scale), so any
 /// path that guesses size from `Instance::scale` alone will either clip it or park the camera far away.
 #[derive(Clone, Copy, Debug)]
-struct LocalBounds {
+pub struct LocalBounds {
     center: Vec3,
     half_size: Vec3,
 }
@@ -106,9 +106,72 @@ impl SceneState {
     pub fn mesh_half_height(&self, slot: i32) -> f32 {
         usize::try_from(slot)
             .ok()
-            .and_then(|slot| self.meshes.get(slot))
-            .and_then(local_mesh_bounds)
+            .and_then(|slot| self.local_bounds_for_slot(slot))
             .map_or(0.5, |bounds| bounds.half_size[1])
+    }
+
+    /// One mesh slot's local bounds, from the memo when it is current and by walking the vertices when
+    /// it is not.
+    ///
+    /// [`local_mesh_bounds`] reads EVERY VERTEX of the mesh. That is fine once; it is not fine per
+    /// instance, and [`Self::rendered_instance_bounds`] -- the seam the cinematic camera samples its
+    /// subject through -- called it exactly that way. Framing the imported factory meant ~15,711
+    /// instances each re-walking their shared mesh's vertices, twice a tick at 60 Hz: hundreds of
+    /// millions of vertex reads per frame for an answer that only changes when the meshes do. The engine
+    /// thread stopped draining its command queue and the whole editor stopped answering.
+    ///
+    /// `scene_world_bounds` had already learned this and builds the same table per call; this makes it
+    /// the state's, so every framing path shares one. The fallback is deliberate: a stale memo is SLOW,
+    /// never wrong.
+    #[must_use]
+    fn local_bounds_for_slot(&self, slot: usize) -> Option<LocalBounds> {
+        if self.mesh_bounds_are_current() {
+            return self.mesh_bounds.get(slot).copied().flatten();
+        }
+        self.meshes.get(slot).and_then(local_mesh_bounds)
+    }
+
+    fn mesh_bounds_are_current(&self) -> bool {
+        self.mesh_bounds_revision == self.meshes_revision
+            && self.mesh_bounds.len() == self.meshes.len()
+    }
+
+    /// The instance index for an entity key, through the memo when it is current and by scanning when it
+    /// is not. A stale memo is slow, never wrong.
+    #[must_use]
+    pub fn index_of(&self, key: &str) -> Option<usize> {
+        if self.index_of_id_revision == self.ids_revision
+            && self.index_of_id.len() == self.ids.len()
+        {
+            return self.index_of_id.get(key).copied();
+        }
+        self.ids.iter().position(|candidate| candidate == key)
+    }
+
+    /// Rebuild the key -> index memo if the instance set has moved on.
+    pub fn sync_index_of_id(&mut self) {
+        if self.index_of_id_revision == self.ids_revision
+            && self.index_of_id.len() == self.ids.len()
+        {
+            return;
+        }
+        self.index_of_id = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.clone(), index))
+            .collect();
+        self.index_of_id_revision = self.ids_revision;
+    }
+
+    /// Rebuild the per-slot bounds memo if the mesh table has moved on. Cheap and idempotent when it
+    /// has not, so callers may run it every frame.
+    pub fn sync_mesh_bounds(&mut self) {
+        if self.mesh_bounds_are_current() {
+            return;
+        }
+        self.mesh_bounds = self.meshes.iter().map(local_mesh_bounds).collect();
+        self.mesh_bounds_revision = self.meshes_revision;
     }
 
     /// The exact world-space AABB of the rendered instance at `index`.
@@ -126,8 +189,7 @@ impl SceneState {
             .mesh_slots
             .get(index)
             .and_then(|slot| usize::try_from(*slot).ok())
-            .and_then(|slot| self.meshes.get(slot))
-            .and_then(local_mesh_bounds)
+            .and_then(|slot| self.local_bounds_for_slot(slot))
             .unwrap_or(LocalBounds::UNIT_CUBE);
         let (lo, hi) = instance_world_bounds(instance, local_bounds);
         (lo.is_finite() && hi.is_finite() && lo.cmple(hi).all())
@@ -280,8 +342,53 @@ pub const FRAME_OCCUPANCY: f32 = 0.72;
 ///
 /// The previous implementation was `max_half_edge * 2.4`, which read neither the field of view nor the
 /// aspect ratio nor the view direction - three independent ways for the framing to be wrong.
+/// The camera's viewing direction for an orbit/elevation pair (unit, pointing at the target).
+fn camera_forward(orbit: f32, elevation: f32) -> Vec3 {
+    -Vec3::new(
+        orbit.cos() * elevation.cos(),
+        elevation.sin(),
+        orbit.sin() * elevation.cos(),
+    )
+    .normalize_or_zero()
+}
+
+/// The camera's `(right, up)` basis for an orbit/elevation pair. Shared by the fit and by the framing
+/// offset, so a subject is measured and then placed against the same axes.
+fn camera_right_up(orbit: f32, elevation: f32) -> (Vec3, Vec3) {
+    let forward = camera_forward(orbit, elevation);
+    // Looking near-straight down, world +Y is degenerate as an up reference.
+    let world_up = if forward.y.abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let right = forward.cross(world_up).normalize_or_zero();
+    (right, right.cross(forward).normalize_or_zero())
+}
+
+/// `visible` is `[width_fraction, height_fraction]` of the surface the viewer can actually see. The
+/// projection still spans the whole window -- the editor UI is composited on top of a window-sized
+/// surface -- so framing for the window alone puts part of the subject behind a panel. Each axis needs
+/// its own tangent scaled by that axis's visible fraction; `[1.0, 1.0]` fits the whole surface, which is
+/// what this did before the visible rectangle existed.
 #[must_use]
-pub fn fit_distance(half_extent: Vec3, aspect: f32, orbit: f32, elevation: f32) -> f32 {
+pub fn fit_distance_in_viewport(
+    half_extent: Vec3,
+    aspect: f32,
+    orbit: f32,
+    elevation: f32,
+    visible: [f32; 2],
+) -> f32 {
+    let visible_w = if visible[0].is_finite() {
+        visible[0].clamp(0.05, 1.0)
+    } else {
+        1.0
+    };
+    let visible_h = if visible[1].is_finite() {
+        visible[1].clamp(0.05, 1.0)
+    } else {
+        1.0
+    };
     let aspect = if aspect.is_finite() && aspect > 0.01 {
         aspect
     } else {
@@ -291,19 +398,8 @@ pub fn fit_distance(half_extent: Vec3, aspect: f32, orbit: f32, elevation: f32) 
     let half_h = (half_v.tan() * aspect).atan().max(0.01);
 
     // The camera basis this distance will be used with, so the fit matches the view it frames.
-    let forward = -Vec3::new(
-        orbit.cos() * elevation.cos(),
-        elevation.sin(),
-        orbit.sin() * elevation.cos(),
-    )
-    .normalize_or_zero();
-    let world_up = if forward.y.abs() > 0.99 {
-        Vec3::Z
-    } else {
-        Vec3::Y
-    };
-    let right = forward.cross(world_up).normalize_or_zero();
-    let up = right.cross(forward).normalize_or_zero();
+    let (right, up) = camera_right_up(orbit, elevation);
+    let forward = camera_forward(orbit, elevation);
 
     // An axis-aligned box's extent along an arbitrary unit axis is the dot of its half-extents with
     // that axis's absolute components - no corner enumeration needed.
@@ -314,8 +410,8 @@ pub fn fit_distance(half_extent: Vec3, aspect: f32, orbit: f32, elevation: f32) 
 
     // Each axis needs its own distance; the frame must satisfy the more demanding one. `ext_f` is
     // added because the box has depth: fitting its centre would push its near face through the lens.
-    let need_v = ext_u / half_v.tan();
-    let need_h = ext_r / half_h.tan();
+    let need_v = ext_u / (half_v.tan() * visible_h);
+    let need_h = ext_r / (half_h.tan() * visible_w);
     (need_v.max(need_h) / FRAME_OCCUPANCY + ext_f).clamp(0.3, 4000.0)
 }
 
@@ -343,6 +439,42 @@ fn scene_world_bounds(
     Some((lo, hi))
 }
 
+/// Where the ground receiver must sit, and how big, to stand under `bounds` without ending inside frame.
+///
+/// The receiver used to be a hard-coded scale-60 quad uploaded once at startup and never touched again.
+/// Every imported model was therefore judged against a fixed 120-unit plane: anything larger hung off the
+/// edge into empty space — a weld line whose far end floats over nothing — and anything smaller sat on a
+/// slab that dominated the shot. Neither is a lighting problem, and no amount of shading fixes either.
+///
+/// Returned as `(centre, scale)` for the unit quad, sized generously past the model so that in ordinary
+/// framing the edge falls outside the frame rather than drawing a visible horizon across it.
+fn ground_placement(bounds: Option<(Vec3, Vec3)>) -> ([f32; 3], f32) {
+    const MIN_SCALE: f32 = 60.0;
+    // Enough that the edge falls outside ordinary framing, not so much that the model is left adrift on a
+    // grey plain. At 3.0 the plane came out six times the model's width and the horizon owned the shot.
+    const MARGIN: f32 = 1.6;
+    // A ceiling on the quad's extent. Vertices are placed at +/- scale, so a degenerate bound — a stray
+    // instance at 1e30, a scene caught mid-import with nothing loaded yet — would otherwise put
+    // non-representable positions into the vertex stream and take the device down with it. Any scene that
+    // legitimately needs more than this is already far outside the depth precision the viewport has.
+    const MAX_SCALE: f32 = 100_000.0;
+    let fallback = ([0.0, -0.02, 0.0], MIN_SCALE);
+    let Some((lo, hi)) = bounds else {
+        return fallback;
+    };
+    if !lo.is_finite() || !hi.is_finite() {
+        return fallback;
+    }
+    let centre = (lo + hi) * 0.5;
+    // Only the horizontal footprint matters: a tall model does not need a wider floor.
+    let half_extent = ((hi.x - lo.x) * 0.5).max((hi.z - lo.z) * 0.5);
+    if !half_extent.is_finite() {
+        return fallback;
+    }
+    let scale = (half_extent * MARGIN).clamp(MIN_SCALE, MAX_SCALE);
+    ([centre.x, -0.02, centre.z], scale)
+}
+
 /// M11.4 (ADR-043) — the active scene camera's look-through view parameters. A render PROJECTION (never
 /// Loro/undo): when `SceneState.cam_override` is `Some`, the frame renders from this scene camera instead
 /// of the editor fly-cam. Set by `look_through_camera` from the authored `Camera` entity.
@@ -356,6 +488,69 @@ pub struct CamView {
     pub fov_deg: f32,
     pub near: f32,
     pub far: f32,
+}
+
+/// The camera-centred slice covered by the directional shadow map.
+///
+/// Editor orbiting retains the established whole-scene safety fallback, while a cinematic camera owns
+/// its framing outright: a hero shot aimed at a subject near the edge of a large CAD assembly must not
+/// spend the shadow map back at the assembly centre. Keeping this decision explicit also prevents the
+/// image camera and its shadows from acquiring two independent interpretations of `cam_override`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShadowFraming {
+    target: Vec3,
+    distance: f32,
+    lock_to_camera: bool,
+}
+
+impl ShadowFraming {
+    const fn editor(target: Vec3, distance: f32) -> Self {
+        Self {
+            target,
+            distance,
+            lock_to_camera: false,
+        }
+    }
+
+    fn cinematic(eye: Vec3, target: Vec3) -> Self {
+        Self {
+            target,
+            distance: eye.distance(target).max(0.02),
+            lock_to_camera: true,
+        }
+    }
+}
+
+/// Resolve the authored camera's aim exactly once for both the visible frame and its shadow framing.
+fn resolved_camera_aim(override_view: CamView, editor_target: Vec3) -> (Vec3, Vec3, Vec3) {
+    let eye = Vec3::from(override_view.pos);
+    let mut target = Vec3::from(override_view.look_at.unwrap_or(editor_target.to_array()));
+    // Two degenerate aims produce a NaN view matrix and a black frame. Both are reachable from ordinary
+    // authoring (a camera dropped exactly on its subject; a top-down shot), so nudge rather than trust it.
+    if (target - eye).length_squared() < 1.0e-8 {
+        target = eye + Vec3::NEG_Z;
+    }
+    let dir = (target - eye).normalize_or_zero();
+    let up = if dir.dot(Vec3::Y).abs() > 0.999 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    (eye, target, up)
+}
+
+fn active_shadow_framing(
+    editor_target: Vec3,
+    editor_distance: f32,
+    cam_override: Option<CamView>,
+) -> ShadowFraming {
+    cam_override.map_or_else(
+        || ShadowFraming::editor(editor_target, editor_distance),
+        |override_view| {
+            let (eye, target, _) = resolved_camera_aim(override_view, editor_target);
+            ShadowFraming::cinematic(eye, target)
+        },
+    )
 }
 
 /// A drawn-but-geometry-free entity the viewport must still be able to select: a light, a camera, a
@@ -439,6 +634,51 @@ pub struct SceneState {
     /// byte-identical in camera state, which is how this was found. A framing routine that cannot see
     /// the shape of the frame is guessing.
     pub surface_aspect: f32,
+    /// The sub-rectangle of the surface the viewer can actually SEE, as window fractions
+    /// `[x, y, width, height]`, reported by the shell whenever the layout changes.
+    ///
+    /// The wgpu surface is the whole window; the editor UI is drawn over it and shows the 3D through a
+    /// transparent hole. Framing had no idea that hole existed, so `frame_all` and `focus_entity` fitted
+    /// and CENTRED their subject on the window -- and with a dock open on each side, the window centre
+    /// is not even inside the visible region. In the production factory captures the entire imported
+    /// assembly sat against the left edge of the viewport with a third of the framed area hidden behind
+    /// panels: not a subtle miscomposition, a subject the user cannot see properly.
+    ///
+    /// A degenerate value (including the `[0,0,0,0]` this derives by default) means "the whole surface",
+    /// so the behaviour is unchanged until the shell reports a real rectangle.
+    pub visible_rect: [f32; 4],
+    /// Per-slot local mesh bounds, memoised against `meshes_revision` -- see
+    /// [`Self::local_bounds_for_slot`] for why walking them per instance was ruinous.
+    /// DERIVED: write it only through [`Self::sync_mesh_bounds`], which keeps it and the revision
+    /// below in step. (`pub` only because every other field is, so the struct-update syntax the tests
+    /// and examples build state with keeps working.)
+    pub mesh_bounds: Vec<Option<LocalBounds>>,
+    /// The `meshes_revision` [`Self::mesh_bounds`] was built for. A mismatch is not a bug: it makes the
+    /// readers fall back to walking the vertices, which is slow and correct.
+    pub mesh_bounds_revision: u64,
+    /// Bumped whenever the instance/id SET is replaced -- i.e. by `rebuild`, and not by a pose update.
+    ///
+    /// `revision` moves on every published pose, which is every animation tick; this moves only when the
+    /// scene's membership changes. Anything derived from WHICH entities are drawn (rather than where they
+    /// are) can be memoised against it.
+    pub ids_revision: u64,
+    /// Instance indices under a cinematic subject, memoised against [`Self::ids_revision`].
+    ///
+    /// Resolving a subject means descending its hierarchy and testing every published id against the
+    /// result. On the imported factory that is ~17,000 `children_of` queries plus 17,793 key parses --
+    /// per solve, twice per tick (a shot and the shot it blends from), sixty times a second, for a set
+    /// that cannot change without a rebuild. It was the dominant cost of a 2.5-3 SECOND tick.
+    pub cinema_subtree: std::collections::HashMap<String, Vec<usize>>,
+    /// The `ids_revision` [`Self::cinema_subtree`] was built for.
+    pub cinema_subtree_revision: u64,
+    /// Entity key -> instance index, memoised against [`Self::ids_revision`].
+    ///
+    /// Publishing an animation pose used to scan all of `ids` looking for the handful of keys it had
+    /// posed. That is 17,793 short-string hashes per tick on the imported factory to find 24 of them --
+    /// measured at 21 ms of a 52 ms animation apply, against a 16.7 ms frame budget.
+    pub index_of_id: std::collections::HashMap<String, usize>,
+    /// The `ids_revision` [`Self::index_of_id`] was built for.
+    pub index_of_id_revision: u64,
     pub instances: Vec<Instance>,
     /// Entity id (Loro key) parallel to `instances` — maps a picked index back to an entity.
     pub ids: Vec<String>,
@@ -516,6 +756,15 @@ pub struct SceneState {
     /// Stop; it suppresses editor chrome INSIDE the viewport only — the surrounding UI is untouched,
     /// because the user still needs Stop.
     pub cinematic: bool,
+    /// Diagnostic-only identity of the subject currently owned by cinematic playback. This is render
+    /// evidence for runtime coverage checks; it is neither authored scene data nor persisted project state.
+    pub cinematic_subject_id: Option<String>,
+    /// Diagnostic-only zero-based shot index currently presented by cinematic playback. Like
+    /// [`Self::cinematic_subject_id`], this exists solely to make playback evidence measurable.
+    pub cinematic_shot_index: Option<usize>,
+    /// Diagnostic-only high-water set (in first-visit order) of subjects presented during the current
+    /// playback run. It is cleared/maintained by playback and never enters Loro, undo, or persistence.
+    pub cinematic_visited_subjects: Vec<String>,
     /// Bump when `overlay_lines` changes so the loop re-uploads them (decoupled from `revision`).
     pub overlay_revision: u64,
     /// M11.3 (ADR-042) — the scene's lights, built each rebuild from the authored `Light` entities (a
@@ -858,6 +1107,64 @@ impl SceneState {
         }
     }
 
+    /// The visible sub-rectangle as `([width_fraction, height_fraction], [ndc_x, ndc_y])`, sanitised.
+    ///
+    /// A missing, degenerate or out-of-range report collapses to the whole surface centred on itself,
+    /// which is exactly the pre-existing behaviour -- a bad rectangle must never be able to fling the
+    /// camera somewhere the subject is not.
+    fn visible_frame(&self) -> ([f32; 2], [f32; 2]) {
+        let [x, y, w, h] = self.visible_rect;
+        let sane = [x, y, w, h].iter().all(|v| v.is_finite())
+            && w > 0.02
+            && h > 0.02
+            && w <= 1.001
+            && h <= 1.001
+            && x >= -0.001
+            && y >= -0.001
+            && x + w <= 1.001
+            && y + h <= 1.001;
+        if !sane {
+            return ([1.0, 1.0], [0.0, 0.0]);
+        }
+        // The rectangle is measured from the top-left in DOM fractions; NDC y points up.
+        (
+            [w.min(1.0), h.min(1.0)],
+            [(x + w * 0.5).mul_add(2.0, -1.0), 1.0 - (y + h * 0.5) * 2.0],
+        )
+    }
+
+    /// The visible rectangle actually in force, after sanitisation -- what a caller reporting one gets
+    /// back, so "it was rejected" is observable rather than a silent revert to the whole window.
+    #[must_use]
+    pub fn adopted_visible_rect(&self) -> [f32; 4] {
+        let ([w, h], [ndc_x, ndc_y]) = self.visible_frame();
+        [
+            ndc_x.mul_add(0.5, 0.5) - w * 0.5,
+            (1.0 - ndc_y) * 0.5 - h * 0.5,
+            w,
+            h,
+        ]
+    }
+
+    /// Where to put the orbit target so that `subject` lands in the middle of the visible rectangle.
+    ///
+    /// The target is what projects to the centre of the *surface*, and the visible hole is generally not
+    /// centred there. Offsetting the target along the camera's own right/up by the hole's NDC centre --
+    /// scaled by the frustum half-extents at that distance -- slides the subject into the hole without
+    /// touching the projection, which must keep spanning the window because picking rays and the
+    /// composited image both do.
+    fn target_centred_in_viewport(&self, subject: Vec3, distance: f32, aspect: f32) -> [f32; 3] {
+        let (_, [ndc_x, ndc_y]) = self.visible_frame();
+        if ndc_x.abs() < 1.0e-4 && ndc_y.abs() < 1.0e-4 {
+            return subject.to_array();
+        }
+        let half_v = (CAMERA_FOV_DEG.to_radians() * 0.5).clamp(0.01, 1.5).tan();
+        let (right, up) = camera_right_up(self.orbit, self.elevation);
+        let offset =
+            right * (ndc_x * distance * half_v * aspect) + up * (ndc_y * distance * half_v);
+        (subject - offset).to_array()
+    }
+
     /// M10.7 — **frame the whole scene**: center the orbit target on the scene's bounds and set a distance
     /// that fits them in view. A pure camera op (invariant 4 — render-state only, not undoable). No-op on an
     /// empty scene. Exits focus dim (framing-all looks at everything).
@@ -897,9 +1204,15 @@ impl SceneState {
         else {
             return;
         };
-        self.cam_target = ((lo + hi) * 0.5).to_array();
-        self.distance = fit_distance((hi - lo) * 0.5, aspect, self.orbit, self.elevation);
+        let (visible, _) = self.visible_frame();
+        let distance =
+            fit_distance_in_viewport((hi - lo) * 0.5, aspect, self.orbit, self.elevation, visible);
+        // `clear_focus` restores the pre-focus distance, so it has to run BEFORE the new framing is
+        // written -- otherwise framing everything hands the camera back the distance it had while
+        // focused on one part.
         self.clear_focus();
+        self.distance = distance;
+        self.cam_target = self.target_centred_in_viewport((lo + hi) * 0.5, distance, aspect);
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -964,11 +1277,9 @@ impl SceneState {
             .mesh_slots
             .get(i)
             .and_then(|slot| usize::try_from(*slot).ok())
-            .and_then(|slot| self.meshes.get(slot))
-            .and_then(local_mesh_bounds)
+            .and_then(|slot| self.local_bounds_for_slot(slot))
             .unwrap_or(LocalBounds::UNIT_CUBE);
         let (world_lo, world_hi) = instance_world_bounds(&self.instances[i], local_bounds);
-        self.cam_target = ((world_lo + world_hi) * 0.5).to_array();
         // Get nearby: save the framing once, then zoom to ~4× the entity's half-extent, clamped to the
         // orbit range so a huge or tiny entity still lands at a sensible, in-bounds distance.
         if self.pre_focus_distance.is_none() {
@@ -982,7 +1293,19 @@ impl SceneState {
         // camera NEAR it (the old 6 m floor parked a 2 cm part sub-pixel — the same M15.9 defect family
         // as frame-all's metre floors).
         let half_extent = ((world_hi - world_lo) * 0.5).max_element().max(0.02);
-        self.distance = (half_extent * 4.0).clamp(0.15, 400.0);
+        // Pull back by the visible fraction as well: a part framed to fill the WINDOW is cropped by
+        // whatever share of the window the docks cover, and then centred somewhere the viewer cannot
+        // even see. Both halves of that are fixed here and in `target_centred_in_viewport` below.
+        let (visible, _) = self.visible_frame();
+        let shrink = visible[0].min(visible[1]).clamp(0.05, 1.0);
+        self.distance = (half_extent * 4.0 / shrink).clamp(0.15, 400.0);
+        let aspect = if self.surface_aspect > 0.01 {
+            self.surface_aspect
+        } else {
+            DEFAULT_ASPECT
+        };
+        self.cam_target =
+            self.target_centred_in_viewport((world_lo + world_hi) * 0.5, self.distance, aspect);
         self.focused = Some(i);
         self.revision = self.revision.wrapping_add(1);
     }
@@ -1984,6 +2307,11 @@ impl HasDisplayHandle for WinHandle {
     }
 }
 
+/// The memoised scene bounds: the `(revision, instance count, mesh count)` the bounds were computed
+/// for, and the bounds themselves (`None` when the scene is empty). Recomputing per frame walks every
+/// instance, which at factory scale is the difference between a smooth viewport and a stutter.
+type BoundsCache = Option<((u64, usize, usize), Option<(Vec3, Vec3)>)>;
+
 /// Spawn the render loop targeting `window`'s surface, reading/writing `shared`.
 pub fn start(window: tauri::WebviewWindow, shared: Shared) {
     std::thread::spawn(move || pollster::block_on(render_loop(window, shared)));
@@ -2000,7 +2328,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let surface = match instance.create_surface(target) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[viewport] create_surface FAILED: {e}");
+            crate::diag::log(&format!(
+                "FATAL: create_surface failed: {e} - there will be no viewport this session."
+            ));
             return;
         }
     };
@@ -2012,11 +2342,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         })
         .await
         .expect("no adapter");
-    eprintln!(
-        "[viewport] adapter='{}' backend={:?}",
+    crate::diag::log(&format!(
+        "viewport: adapter='{}' backend={:?} driver='{}'",
         adapter.get_info().name,
-        adapter.get_info().backend
-    );
+        adapter.get_info().backend,
+        adapter.get_info().driver_info
+    ));
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("viewport"),
@@ -2028,6 +2359,18 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         })
         .await
         .expect("device");
+    // A lost device and an uncaptured validation/OOM error are the two ways this loop can stop
+    // producing frames without any code of ours returning an error. Neither had a handler, and in a
+    // windows-subsystem binary the default ones print to a stderr nobody owns -- so a GPU-side death
+    // looked, from outside, exactly like a healthy app that had stopped drawing.
+    device.set_device_lost_callback(|reason, message| {
+        crate::diag::log(&format!(
+            "FATAL: wgpu device LOST ({reason:?}): {message} - the viewport cannot present again without a full re-initialisation."
+        ));
+    });
+    device.on_uncaptured_error(std::sync::Arc::new(|error| {
+        crate::diag::log(&format!("wgpu uncaptured error: {error}"));
+    }));
 
     let caps = surface.get_capabilities(&adapter);
     let format = caps
@@ -2047,6 +2390,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         desired_maximum_frame_latency: 2,
     };
     surface.configure(&device, &config);
+    // Consecutive frames on which the surface vended nothing -- see the acquisition match below.
+    let mut surface_stall_frames: u64 = 0;
     // M15.11 — the two render formats, carried together from here down. `hdr` is the linear-HDR scene
     // intermediate that every scene pipeline draws into; `display` is the swapchain, written by exactly one
     // pass. Before this split there was a single `format` doing both jobs, which is why MSAA resolved
@@ -2055,12 +2400,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     if let Err(missing) = hdr_support_gap(&adapter, formats.hdr) {
         // No silent degrade to the old mixed-space pipeline: that path IS the defect. Rgba16Float
         // render-attachment + filtering + blending is mandatory in WebGPU core, so this is a tripwire.
-        eprintln!(
-            "[viewport] FATAL: adapter '{}' cannot host the linear-HDR scene target {:?} — missing {missing}. \
+        crate::diag::log(&format!(
+            "FATAL: adapter '{}' cannot host the linear-HDR scene target {:?} — missing {missing}. \
              There is no gamma-space fallback; update the graphics driver or select a conformant adapter.",
-            adapter.get_info().name,
-            formats.hdr
-        );
+             adapter.get_info().name,
+             formats.hdr
+        ));
         return;
     }
     // M11.4 (ADR-043) — MSAA anti-aliasing. Sample count chosen once from `MTK_MSAA` (`off`/`1`/`2`/`4`/`8`,
@@ -2453,8 +2798,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     let dummy_view = white_dummy(&device, &queue, true); // base-color (sRGB)
     let dummy_mr_view = white_dummy(&device, &queue, false); // metallic-roughness (linear; b=g=1 → no change)
     let dummy_normal_view = flat_normal_dummy(&device, &queue); // flat +Z normal (linear)
-
     let mut ground_inst = InstanceBuf::new(&device, &inst_bgl, 1);
+    // Placeholder placement for the empty scene; `ground_placement` re-sizes it to whatever gets imported.
+    let mut ground_placed: ([f32; 3], f32) = ([0.0, -0.02, 0.0], 60.0);
+    // Memoized scene bounds — see the frame body for why this must not be recomputed per frame.
+    let mut bounds_cache: BoundsCache = None;
     ground_inst.upload(
         &device,
         &queue,
@@ -3563,26 +3911,52 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // The camera eye (world) — the PBR view direction in fs_mesh (M11.2). Carried in the Camera
             // uniform's spare `focus.yzw` (focus.x stays the focus-dim flag).
             let mut cam_eye = camera_eye(st.orbit, st.elevation, st.distance, st.cam_target);
+            let shadow_framing =
+                active_shadow_framing(Vec3::from(st.cam_target), st.distance, st.cam_override);
             // M11.4 — LOOK THROUGH the active scene camera: replace the editor view-proj with the camera's
-            // (its position + fov, looking at the orbit target). A pure render projection (never Loro).
+            // (its position + fov, looking at its authored target). A pure render projection (never Loro).
             if let Some(ov) = st.cam_override {
-                let eye = Vec3::from(ov.pos);
-                let mut target = Vec3::from(ov.look_at.unwrap_or(st.cam_target));
-                // Two degenerate aims produce a NaN view matrix and a black frame. Both are reachable
-                // from ordinary authoring (a camera dropped exactly on its subject; a top-down shot), so
-                // nudge rather than trust the input.
-                if (target - eye).length_squared() < 1.0e-8 {
-                    target = eye + Vec3::NEG_Z;
-                }
-                let dir = (target - eye).normalize_or_zero();
-                let up = if dir.dot(Vec3::Y).abs() > 0.999 {
-                    Vec3::Z
-                } else {
-                    Vec3::Y
-                };
+                let (eye, target, up) = resolved_camera_aim(ov, Vec3::from(st.cam_target));
                 let proj = Mat4::perspective_rh(ov.fov_deg.to_radians(), aspect, ov.near, ov.far);
                 cam = proj * Mat4::look_at_rh(eye, target, up);
                 cam_eye = ov.pos;
+            }
+            // The scene's world bounds, computed AT MOST once per frame and reused by everything that
+            // needs them. Deriving them walks every vertex of every mesh, so on an imported assembly this
+            // is one of the most expensive things the frame can do — and the answer only changes when the
+            // scene does. Keyed on the revision plus the instance/mesh counts, so an edit invalidates it
+            // but an idle camera orbit does not.
+            let bounds_key = (st.revision, st.instances.len(), st.meshes.len());
+            if bounds_cache.map(|(key, _)| key) != Some(bounds_key) {
+                bounds_cache = Some((
+                    bounds_key,
+                    scene_world_bounds(&st.instances, &st.mesh_slots, &st.meshes),
+                ));
+            }
+            let scene_bounds = bounds_cache.and_then(|(_, bounds)| bounds);
+
+            // Stand the ground receiver under whatever is actually in the scene. Written straight into the
+            // existing single-instance buffer (never reallocated), so `ground_main_bg` stays valid.
+            {
+                let wanted = ground_placement(scene_bounds);
+                // Re-upload only on a real change: this runs every frame and the value rarely moves.
+                let moved = (wanted.1 - ground_placed.1).abs() > ground_placed.1 * 0.01
+                    || (0..3).any(|i| (wanted.0[i] - ground_placed.0[i]).abs() > 0.01);
+                if moved {
+                    ground_placed = wanted;
+                    queue.write_buffer(
+                        &ground_inst.buf,
+                        0,
+                        bytemuck::bytes_of(&Instance {
+                            center: wanted.0,
+                            scale: wanted.1,
+                            color: GROUND_ALBEDO,
+                            selected: 0.0,
+                            rotation: IDENTITY_QUAT,
+                            material: [0.0; 4],
+                        }),
+                    );
+                }
             }
             // M11.3 inc.3 — the shadow-casting light's ortho view-proj, fitted to the live instance bounds.
             // The caster's shine direction comes from its entry in the lights buffer; `caster_idx` (as f32,
@@ -3599,11 +3973,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 (
                     shadow_view_proj(
                         shadow_dir,
-                        &st.instances,
-                        &st.mesh_slots,
-                        &st.meshes,
-                        st.cam_target.into(),
-                        st.distance,
+                        scene_bounds,
+                        shadow_framing,
                         shadow_quality.shadow_size(),
                     ),
                     st.shadow_caster.map_or(-1.0, |i| i as f32),
@@ -3830,11 +4201,27 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 surface.configure(&device, &config);
                 continue;
             }
-            _ => {
+            // Every other state (`Timeout`, `Other`, ...) used to be an unlabelled 16 ms sleep, so a
+            // surface that had permanently stopped vending textures presented as a frozen viewport
+            // with no record anywhere. Log the *first* one and then every ~5 s, which names the
+            // condition without turning a transient hitch into an unbounded log.
+            other => {
+                surface_stall_frames += 1;
+                if surface_stall_frames == 1 || surface_stall_frames.is_multiple_of(300) {
+                    crate::diag::log(&format!(
+                        "viewport: surface returned {other:?} - no frame acquired                          ({surface_stall_frames} consecutive)"
+                    ));
+                }
                 std::thread::sleep(std::time::Duration::from_millis(16));
                 continue;
             }
         };
+        if surface_stall_frames > 0 {
+            crate::diag::log(&format!(
+                "viewport: surface recovered after {surface_stall_frames} stalled acquisitions"
+            ));
+            surface_stall_frames = 0;
+        }
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -4249,11 +4636,8 @@ pub fn camera_matrix_with(
 /// (the depth pass is also skipped). wgpu NDC z ∈ [0,1] (`orthographic_rh`, matching `perspective_rh`).
 fn shadow_view_proj(
     shadow_dir: Option<[f32; 3]>,
-    instances: &[Instance],
-    mesh_slots: &[i32],
-    meshes: &[MeshGpu],
-    camera_target: Vec3,
-    camera_distance: f32,
+    bounds: Option<(Vec3, Vec3)>,
+    framing: ShadowFraming,
     shadow_size: u32,
 ) -> Mat4 {
     let Some(dir) = shadow_dir else {
@@ -4266,17 +4650,19 @@ fn shadow_view_proj(
     // Use authored mesh extents, not just instance scale. The latter made a 1,000 mm CAD body displayed at
     // scale 0.001 look like a millimetre-wide caster to the shadow camera. Fit one camera-centred cascade:
     // frame-all covers the assembly, while focus mode spends the same texels on the inspected part.
-    let Some((mut lo, hi)) = scene_world_bounds(instances, mesh_slots, meshes) else {
+    let Some((mut lo, hi)) = bounds else {
         return Mat4::IDENTITY;
     };
     lo.y = lo.y.min(0.0); // include the ground receiver without imposing a metre-scale minimum.
     let scene_center = (lo + hi) * 0.5;
     let scene_radius = ((hi - lo) * 0.5).length().max(0.02);
-    let radius = (camera_distance * 0.9)
+    let radius = (framing.distance * 0.9)
         .clamp((scene_radius * 0.02).max(0.02), scene_radius)
         .max(0.02);
-    let mut center = if camera_target.distance(scene_center) + radius < scene_radius * 1.15 {
-        camera_target
+    let mut center = if framing.lock_to_camera
+        || framing.target.distance(scene_center) + radius < scene_radius * 1.15
+    {
+        framing.target
     } else {
         scene_center
     };
@@ -5637,7 +6023,77 @@ fn pipe_graph_preview_vertices(
 
 #[cfg(test)]
 mod viewport_visibility_tests {
-    use super::{ViewportLayer, ViewportVisibility};
+    use super::{ground_placement, ViewportLayer, ViewportVisibility};
+    use glam::Vec3;
+
+    #[test]
+    fn the_ground_receiver_stands_under_whatever_was_imported() {
+        // The defect this pins: the receiver was a hard-coded scale-60 quad uploaded once at startup. A
+        // factory larger than 120 units hung off the edge of it into empty space, and a small part sat on
+        // a slab that filled the shot. Both read as a broken render long before anyone looks at shading.
+        let empty = ground_placement(None);
+        assert_eq!(
+            empty,
+            ([0.0, -0.02, 0.0], 60.0),
+            "an empty scene keeps the placeholder"
+        );
+
+        // A long weld line, well past the old fixed extent, offset from the origin.
+        let lo = Vec3::new(-40.0, 0.0, 120.0);
+        let hi = Vec3::new(360.0, 18.0, 200.0);
+        let (centre, scale) = ground_placement(Some((lo, hi)));
+        assert!(
+            (centre[0] - 160.0).abs() < 0.001 && (centre[2] - 160.0).abs() < 0.001,
+            "the receiver must be centred under the model, got {centre:?}"
+        );
+        assert_eq!(centre[1], -0.02, "it stays just below the grid plane");
+        // The unit quad spans +/- scale, so the model has to fall comfortably inside it.
+        assert!(
+            centre[0] - scale < lo.x && centre[0] + scale > hi.x,
+            "the model overhangs the receiver in X: centre {centre:?} scale {scale}"
+        );
+        assert!(
+            centre[2] - scale < lo.z && centre[2] + scale > hi.z,
+            "the model overhangs the receiver in Z: centre {centre:?} scale {scale}"
+        );
+
+        // Height must not drive the footprint: a tall mast does not need a wider floor.
+        let tall = ground_placement(Some((
+            Vec3::new(-1.0, 0.0, -1.0),
+            Vec3::new(1.0, 400.0, 1.0),
+        )));
+        assert_eq!(
+            tall.1, 60.0,
+            "a tall thin model keeps the minimum footprint"
+        );
+
+        // Degenerate bounds must fall back rather than emit non-representable vertex positions. A scene
+        // caught mid-import can transiently report these, and the quad's vertices sit at +/- scale.
+        let huge = ground_placement(Some((Vec3::splat(-1.0e30), Vec3::splat(1.0e30))));
+        assert!(
+            huge.1 <= 100_000.0,
+            "an absurd bound must be clamped, got {}",
+            huge.1
+        );
+        assert!(huge.1.is_finite() && huge.0.iter().all(|c| c.is_finite()));
+
+        let nan = ground_placement(Some((Vec3::splat(f32::NAN), Vec3::splat(1.0))));
+        assert_eq!(
+            nan,
+            ([0.0, -0.02, 0.0], 60.0),
+            "NaN bounds fall back to the placeholder"
+        );
+
+        let infinite = ground_placement(Some((
+            Vec3::splat(f32::INFINITY),
+            Vec3::splat(f32::NEG_INFINITY),
+        )));
+        assert_eq!(
+            infinite,
+            ([0.0, -0.02, 0.0], 60.0),
+            "empty/infinite bounds fall back"
+        );
+    }
 
     #[test]
     fn cinematic_route_contains_no_editor_helper_passes_but_keeps_the_shadow_receiver() {
@@ -5659,6 +6115,126 @@ mod viewport_visibility_tests {
         let editor = ViewportVisibility::from_cinematic(false);
         assert!(editor.allows(ViewportLayer::GroundShadowReceiver));
         assert!(editor_helpers.iter().all(|layer| editor.allows(*layer)));
+    }
+}
+
+#[cfg(test)]
+mod shadow_framing_tests {
+    use super::{
+        active_shadow_framing, scene_world_bounds, shadow_view_proj, CamView, Instance, SceneState,
+        ShadowFraming, IDENTITY_QUAT,
+    };
+    use glam::Vec3;
+
+    fn instance(center: [f32; 3], scale: f32) -> Instance {
+        Instance {
+            center,
+            scale,
+            color: [0.5; 3],
+            selected: 0.0,
+            rotation: IDENTITY_QUAT,
+            material: [0.0; 4],
+        }
+    }
+
+    fn scene() -> Vec<Instance> {
+        vec![
+            instance([-100.0, 10.0, 0.0], 10.0),
+            instance([100.0, 10.0, 0.0], 10.0),
+        ]
+    }
+
+    #[test]
+    fn editor_shadow_framing_retains_the_existing_scene_centre_safety_fallback() {
+        let instances = scene();
+        let at_scene = active_shadow_framing(Vec3::new(0.0, 10.0, 0.0), 8.0, None);
+        let far_editor_orbit = active_shadow_framing(Vec3::new(500.0, 10.0, 0.0), 8.0, None);
+
+        let centred = shadow_view_proj(
+            Some([0.35, -1.0, 0.2]),
+            scene_world_bounds(&instances, &[-1, -1], &[]),
+            at_scene,
+            2048,
+        );
+        let protected = shadow_view_proj(
+            Some([0.35, -1.0, 0.2]),
+            scene_world_bounds(&instances, &[-1, -1], &[]),
+            far_editor_orbit,
+            2048,
+        );
+
+        assert_eq!(far_editor_orbit.target, Vec3::new(500.0, 10.0, 0.0));
+        assert_eq!(far_editor_orbit.distance, 8.0);
+        assert!(!far_editor_orbit.lock_to_camera);
+        assert_eq!(
+            protected, centred,
+            "normal editor framing must keep the pre-existing whole-scene fallback"
+        );
+    }
+
+    #[test]
+    fn cinematic_shadow_framing_tracks_the_live_target_and_camera_distance() {
+        let instances = scene();
+        let target = Vec3::new(500.0, 10.0, 0.0);
+        let camera = |pos| CamView {
+            pos,
+            look_at: Some(target.to_array()),
+            fov_deg: 42.0,
+            near: 0.05,
+            far: 2_000.0,
+        };
+        let near_shot = active_shadow_framing(
+            Vec3::new(-40.0, 0.0, 0.0),
+            80.0,
+            Some(camera([500.0, 16.0, 8.0])),
+        );
+        let wide_shot = active_shadow_framing(
+            Vec3::new(-40.0, 0.0, 0.0),
+            80.0,
+            Some(camera([500.0, 28.0, 24.0])),
+        );
+        let hidden_editor_state = ShadowFraming::editor(target, near_shot.distance);
+
+        assert_eq!(near_shot.target, target);
+        assert!((near_shot.distance - 10.0).abs() < 1.0e-6);
+        assert!(near_shot.lock_to_camera);
+        assert!(wide_shot.distance > near_shot.distance);
+
+        let near_vp = shadow_view_proj(
+            Some([0.35, -1.0, 0.2]),
+            scene_world_bounds(&instances, &[-1, -1], &[]),
+            near_shot,
+            2048,
+        );
+        let wide_vp = shadow_view_proj(
+            Some([0.35, -1.0, 0.2]),
+            scene_world_bounds(&instances, &[-1, -1], &[]),
+            wide_shot,
+            2048,
+        );
+        let editor_vp = shadow_view_proj(
+            Some([0.35, -1.0, 0.2]),
+            scene_world_bounds(&instances, &[-1, -1], &[]),
+            hidden_editor_state,
+            2048,
+        );
+
+        assert_ne!(
+            near_vp, editor_vp,
+            "a cinematic target must not fall back to the hidden editor/scene framing"
+        );
+        assert_ne!(
+            near_vp, wide_vp,
+            "moving the cinematic camera must resize its directional-shadow coverage"
+        );
+    }
+
+    #[test]
+    fn cinematic_coverage_diagnostics_are_empty_by_default() {
+        let state = SceneState::default();
+        assert_eq!(state.cinematic_subject_id, None);
+        assert_eq!(state.cinematic_shot_index, None);
+        assert!(state.cinematic_visited_subjects.is_empty());
     }
 }
 
@@ -5766,6 +6342,11 @@ mod colour_policy_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Fit against the WHOLE surface -- what every framing assertion below is about, and what the
+    /// renderer did before it learned that docks hide part of the window.
+    fn fit_distance(half_extent: super::Vec3, aspect: f32, orbit: f32, elevation: f32) -> f32 {
+        super::fit_distance_in_viewport(half_extent, aspect, orbit, elevation, [1.0, 1.0])
+    }
 
     // ── cursor coordinate spaces ──────────────────────────────────────────────────────────────
     #[test]
@@ -6928,6 +7509,273 @@ mod tests {
         );
         // The squarer window sees LESS horizontally, so it needs more distance for the same subject.
         assert!(tall.distance > wide.distance);
+    }
+
+    // ── the per-slot mesh-bounds memo ─────────────────────────────────────────────────────────────
+
+    fn mesh_of(half: f32) -> metrocalk_assets::MeshGpu {
+        let vertex = |x: f32, y: f32, z: f32| metrocalk_assets::MeshVertex {
+            position: [x, y, z],
+            normal: [0.0, 1.0, 0.0],
+            color: [1.0, 1.0, 1.0],
+            metallic: 0.0,
+            roughness: 1.0,
+            uv: [0.0, 0.0],
+            tangent: [0.0, 0.0, 0.0, 1.0],
+        };
+        metrocalk_assets::MeshGpu {
+            vertices: vec![vertex(-half, -half, -half), vertex(half, half, half)],
+            indices: vec![0, 1, 0],
+            submeshes: Vec::new(),
+        }
+    }
+
+    fn one_instance_scene(half: f32) -> SceneState {
+        SceneState {
+            meshes: vec![mesh_of(half)],
+            meshes_revision: 1,
+            mesh_slots: vec![0],
+            instances: vec![Instance {
+                center: [10.0, 0.0, -4.0],
+                scale: 2.0,
+                color: [1.0, 1.0, 1.0],
+                selected: 0.0,
+                rotation: IDENTITY_QUAT,
+                material: [0.0; 4],
+            }],
+            ids: vec!["1_1".into()],
+            ..SceneState::default()
+        }
+    }
+
+    #[test]
+    fn the_mesh_bounds_memo_answers_exactly_what_walking_the_vertices_does() {
+        let mut st = one_instance_scene(3.0);
+        // Cold: the memo is empty, so this is the vertex walk.
+        let cold = st.rendered_instance_bounds(0).expect("bounds");
+        assert!(!st.mesh_bounds_are_current());
+        st.sync_mesh_bounds();
+        assert!(st.mesh_bounds_are_current());
+        let warm = st.rendered_instance_bounds(0).expect("bounds");
+        assert_eq!(cold, warm, "the memo must not change the answer");
+        // A 3.0 half-extent mesh at instance scale 2.0, centred at (10, 0, -4).
+        assert!(
+            (warm.0[0] - 4.0).abs() < 1.0e-4 && (warm.1[0] - 16.0).abs() < 1.0e-4,
+            "{warm:?}"
+        );
+    }
+
+    #[test]
+    fn replacing_the_meshes_invalidates_the_memo_rather_than_answering_from_it() {
+        let mut st = one_instance_scene(3.0);
+        st.sync_mesh_bounds();
+        let before = st.rendered_instance_bounds(0).expect("bounds");
+
+        // A new mesh table, announced the way every real call site announces one.
+        st.meshes = vec![mesh_of(0.5)];
+        st.meshes_revision = st.meshes_revision.wrapping_add(1);
+        assert!(!st.mesh_bounds_are_current());
+        // STALE, AND STILL RIGHT: the fallback walks the vertices rather than trusting the old table.
+        let stale = st.rendered_instance_bounds(0).expect("bounds");
+        assert_ne!(before, stale, "a smaller mesh must produce smaller bounds");
+        st.sync_mesh_bounds();
+        assert_eq!(stale, st.rendered_instance_bounds(0).expect("bounds"));
+    }
+
+    #[test]
+    fn syncing_the_memo_is_idempotent_and_survives_a_mesh_table_that_shrinks() {
+        let mut st = one_instance_scene(3.0);
+        st.sync_mesh_bounds();
+        let bounds = st.mesh_bounds.clone();
+        st.sync_mesh_bounds();
+        assert_eq!(bounds.len(), st.mesh_bounds.len());
+        // A revision that moves without the length changing must still invalidate; a length that moves
+        // without the revision changing must too. Neither may read past the end.
+        st.meshes = Vec::new();
+        assert!(
+            !st.mesh_bounds_are_current(),
+            "a shorter table is a stale memo"
+        );
+        // No mesh backs the slot now, so both paths fall to the unit cube: 10 - 1.0 * 2.0. The point is
+        // that the stale read and the synced read agree, and that neither indexes past the end.
+        let stale = st.rendered_instance_bounds(0).map(|(lo, _)| lo[0]);
+        st.sync_mesh_bounds();
+        assert!(st.mesh_bounds.is_empty());
+        assert_eq!(stale, Some(8.0));
+        assert_eq!(st.rendered_instance_bounds(0).map(|(lo, _)| lo[0]), stale);
+    }
+
+    // ── framing against the part of the window the viewer can actually see ────────────────────────
+
+    /// Two docks open: the 3D shows through a hole that is neither the window's size nor its centre.
+    /// Fractions taken from the production capture (1296 px window, viewport hole x=478..990).
+    fn docked_scene() -> SceneState {
+        let unit = |x: f32| Instance {
+            center: [x, 0.0, 0.0],
+            scale: 1.0,
+            color: [1.0, 1.0, 1.0],
+            selected: 0.0,
+            rotation: IDENTITY_QUAT,
+            material: [0.0, 0.5, 0.0, 0.0],
+        };
+        SceneState {
+            surface_aspect: 1296.0 / 839.0,
+            instances: vec![unit(-6.0), unit(6.0)],
+            mesh_slots: vec![-1, -1],
+            orbit: std::f32::consts::FRAC_PI_2,
+            elevation: 0.0,
+            ..SceneState::default()
+        }
+    }
+
+    /// Where a world point lands on the surface, in NDC, for the camera state `st` describes. Written
+    /// out rather than reusing the render path so the assertion is about the framing, not about a
+    /// helper that framing also uses.
+    fn project_ndc(st: &SceneState, world: Vec3) -> (f32, f32) {
+        let (right, up) = camera_right_up(st.orbit, st.elevation);
+        let target = Vec3::from_array(st.cam_target);
+        let half_v = (CAMERA_FOV_DEG.to_radians() * 0.5).tan();
+        let aspect = st.surface_aspect;
+        let rel = world - target;
+        (
+            rel.dot(right) / (st.distance * half_v * aspect),
+            rel.dot(up) / (st.distance * half_v),
+        )
+    }
+
+    #[test]
+    fn an_unreported_viewport_frames_exactly_as_it_always_did() {
+        let mut whole = docked_scene();
+        let mut defaulted = docked_scene();
+        // The whole surface, said explicitly, and the `[0,0,0,0]` a `Default` derive produces.
+        whole.visible_rect = [0.0, 0.0, 1.0, 1.0];
+        whole.frame_all();
+        defaulted.frame_all();
+        assert!((whole.distance - defaulted.distance).abs() < 1.0e-5);
+        assert_eq!(whole.cam_target, defaulted.cam_target);
+        assert_eq!(defaulted.adopted_visible_rect(), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_nonsense_viewport_rectangle_falls_back_to_the_whole_surface() {
+        let baseline = {
+            let mut st = docked_scene();
+            st.frame_all();
+            (st.distance, st.cam_target)
+        };
+        for bad in [
+            [0.0, 0.0, 0.0, 0.0],           // the Default derive
+            [0.5, 0.0, 0.9, 1.0],           // runs off the right edge
+            [-0.2, 0.0, 0.5, 1.0],          // starts left of the window
+            [0.0, 0.0, f32::NAN, 1.0],      // not a number
+            [0.0, 0.0, 0.001, 1.0],         // degenerate sliver
+            [0.0, 0.0, 1.0, f32::INFINITY], // not finite
+        ] {
+            let mut st = docked_scene();
+            st.visible_rect = bad;
+            st.frame_all();
+            assert!(
+                (st.distance - baseline.0).abs() < 1.0e-5 && st.cam_target == baseline.1,
+                "a rejected rectangle {bad:?} must frame exactly as no rectangle does"
+            );
+        }
+    }
+
+    #[test]
+    fn framing_puts_the_scene_in_the_middle_of_the_visible_viewport_not_the_window() {
+        let mut docked = docked_scene();
+        // The hole from the production capture: 40% of the width, offset to the right of centre.
+        docked.visible_rect = [0.369, 0.104, 0.395, 0.836];
+        docked.frame_all();
+
+        let (lo, hi) = scene_world_bounds(&docked.instances, &docked.mesh_slots, &docked.meshes)
+            .expect("bounds");
+        let centre = (lo + hi) * 0.5;
+        let (ndc_x, ndc_y) = project_ndc(&docked, centre);
+
+        // The hole's own centre in NDC, which is where the subject now belongs.
+        let want_x = (0.369_f32 + 0.395 * 0.5).mul_add(2.0, -1.0);
+        let want_y = 1.0 - (0.104_f32 + 0.836 * 0.5) * 2.0;
+        assert!(
+            (ndc_x - want_x).abs() < 1.0e-3 && (ndc_y - want_y).abs() < 1.0e-3,
+            "subject projected to ({ndc_x}, {ndc_y}), the visible viewport is centred on \
+             ({want_x}, {want_y})"
+        );
+
+        // And the old behaviour it replaces: dead centre of the WINDOW, which in this layout is 0.133
+        // NDC left of where the viewer is looking -- 86 px of the captured 1296 px window, a sixth of
+        // the visible viewport's width, and consistently toward the left dock.
+        let mut whole = docked_scene();
+        whole.frame_all();
+        let (was_x, _) = project_ndc(&whole, centre);
+        assert!(
+            was_x.abs() < 1.0e-3,
+            "the framing this replaces centred on the window: {was_x}"
+        );
+        assert!(
+            (was_x - want_x).abs() > 0.12,
+            "and that is a real displacement, not a rounding difference: {was_x} vs {want_x}"
+        );
+    }
+
+    #[test]
+    fn a_narrower_viewport_needs_more_distance_to_fit_the_same_scene() {
+        let fit = |rect: [f32; 4]| {
+            let mut st = docked_scene();
+            st.visible_rect = rect;
+            st.frame_all();
+            st.distance
+        };
+        let whole = fit([0.0, 0.0, 1.0, 1.0]);
+        let half_width = fit([0.25, 0.0, 0.5, 1.0]);
+        let narrow = fit([0.30, 0.10, 0.40, 0.84]);
+        assert!(
+            half_width > whole * 1.5,
+            "halving the visible width must roughly double the distance: {whole} -> {half_width}"
+        );
+        assert!(narrow > half_width, "{half_width} -> {narrow}");
+    }
+
+    #[test]
+    fn focusing_an_entity_also_frames_it_inside_the_visible_viewport() {
+        let mut st = docked_scene();
+        st.visible_rect = [0.369, 0.104, 0.395, 0.836];
+        let whole_window_distance = {
+            let mut wide = docked_scene();
+            wide.focus_on(1);
+            wide.distance
+        };
+        st.focus_on(1);
+        assert!(
+            st.distance > whole_window_distance,
+            "a part framed for the window is cropped by the docks: {whole_window_distance} -> {}",
+            st.distance
+        );
+        let (ndc_x, _) = project_ndc(&st, Vec3::new(6.0, 0.0, 0.0));
+        let want_x = (0.369_f32 + 0.395 * 0.5).mul_add(2.0, -1.0);
+        assert!(
+            (ndc_x - want_x).abs() < 1.0e-3,
+            "the focused part projected to {ndc_x}, the visible viewport is centred on {want_x}"
+        );
+    }
+
+    #[test]
+    fn framing_everything_while_focused_uses_the_new_fit_not_the_saved_distance() {
+        // `clear_focus` restores the distance saved when focus was entered. Running it after the new
+        // framing was written threw that framing away, so "frame all" while focused on one part gave
+        // back the pre-focus distance and the scene stayed out of frame.
+        let mut st = docked_scene();
+        st.frame_all();
+        let framed = st.distance;
+        st.focus_on(1);
+        assert!(st.distance < framed, "focusing gets nearer");
+        st.frame_all();
+        assert!(
+            (st.distance - framed).abs() < 1.0e-4,
+            "framing everything must recompute the fit, got {} not {framed}",
+            st.distance
+        );
+        assert!(st.focused.is_none(), "and must leave focus mode");
     }
 
     #[test]

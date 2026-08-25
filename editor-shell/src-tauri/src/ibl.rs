@@ -1,17 +1,30 @@
 //! M11.3 inc.2 (ADR-042) — image-based lighting (IBL) + the skybox source.
 //!
-//! A procedural HDR sky (equirectangular, with a full box-filtered mip chain) gives metals an environment
-//! to REFLECT — closing the M11.2 "dark metal" (a metal has no diffuse, so with nothing to reflect it
-//! renders near-black) — and also backs the viewport as a skybox. Specular IBL is the split-sum
-//! approximation: sample the env mip whose blur matches `roughness`, then scale by a precomputed BRDF LUT.
-//! Diffuse IBL reads the env's top (maximally blurred) mip as a cheap irradiance. All prep is CPU-side
-//! (no GPU prefilter passes). The env is `rgba16float` because the device runs without `FLOAT32_FILTERABLE`
-//! (f32 textures aren't filterable there), so a procedural sky is baked to halves and uploaded per mip.
+//! An HDR environment gives metals something to REFLECT — closing the M11.2 "dark metal" (a metal has no
+//! diffuse, so with nothing to reflect it renders near-black) — and also backs the viewport as a skybox.
+//! Either half of it can come from a user-supplied panorama or from the built-in procedural studio.
+//!
+//! The environment is split into the two halves the rendering equation actually asks for:
+//!
+//! * **Specular** — an equirect mip chain where level `i` is the environment convolved with the GGX lobe
+//!   for roughness `i / last`, by importance sampling ([`prefilter_level`]). This is the half of the
+//!   split-sum approximation that lives in a texture; the other half is the precomputed BRDF LUT.
+//! * **Diffuse** — nine cosine-convolved spherical-harmonic coefficients
+//!   ([`sh_irradiance_coefficients`]), which reproduce a cosine lobe to about 1%.
+//!
+//! Both replaced a single box-filtered mip chain that was asked to serve as both. A box filter is not the
+//! GGX lobe at any roughness and not a cosine lobe either, so every glossy surface reflected a blur that
+//! matched no material and every diffuse surface received ambient light with almost no direction to it.
+//!
+//! All prep is CPU-side (no GPU prefilter passes). The env is `rgba16float` because the device runs
+//! without `FLOAT32_FILTERABLE` (f32 textures aren't filterable there), so the panorama is baked to halves
+//! and uploaded per mip.
 
 use glam::Vec3;
+use wgpu::util::DeviceExt as _;
 
-const ENV_W: usize = 512;
-const ENV_H: usize = 256;
+const ENV_W: usize = 1024;
+const ENV_H: usize = 512;
 const LUT_N: usize = 128;
 const LUT_SAMPLES: u32 = 256;
 
@@ -114,32 +127,150 @@ fn sky_radiance(d: Vec3, studio: bool) -> Vec3 {
     }
 }
 
+/// A rectangular soft-box as the environment sees it: a panel of constant HDR radiance with a feathered
+/// edge, placed by its centre direction and oriented by an up vector.
+///
+/// Rectangular rather than a cosine lobe on purpose. A `pow(dot(d, dir), n)` lobe is a round blob, and a
+/// round blob is the thing that makes CG metal look like CG. Real studio lighting shapes its sources, and
+/// the straight-edged streak a rectangular soft-box leaves along a machined curve is most of what makes a
+/// render read as photographed hardware.
+#[derive(Clone, Copy)]
+struct SoftBox {
+    /// Centre direction of the panel (unit).
+    dir: Vec3,
+    /// Which way is "up" across the panel — this is what makes it rectangular rather than square-agnostic.
+    up: Vec3,
+    /// Half angular width / height in radians.
+    half_u: f32,
+    half_v: f32,
+    /// Angular width of the feathered edge, in radians.
+    feather: f32,
+    /// Radiance inside the panel. HDR by construction: these are the values a reflective surface reflects.
+    radiance: Vec3,
+}
+
+/// Smoothstep, so a panel edge is feathered rather than a hard cut that would alias in the prefilter.
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if edge1 <= edge0 {
+        return if x < edge0 { 0.0 } else { 1.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+impl SoftBox {
+    /// The radiance this panel contributes along `d`.
+    fn radiance_towards(self, d: Vec3) -> Vec3 {
+        let cos = d.dot(self.dir);
+        if cos <= 1.0e-3 {
+            return Vec3::ZERO;
+        }
+        let projected = self.up - self.dir * self.dir.dot(self.up);
+        if projected.length_squared() < 1.0e-6 {
+            return Vec3::ZERO;
+        }
+        let v_axis = projected.normalize();
+        let u_axis = self.dir.cross(v_axis);
+        // Angular offsets from the panel centre, along the panel's own axes.
+        let au = d.dot(u_axis).atan2(cos).abs();
+        let av = d.dot(v_axis).atan2(cos).abs();
+        let inside = (1.0 - smoothstep(self.half_u, self.half_u + self.feather, au))
+            * (1.0 - smoothstep(self.half_v, self.half_v + self.feather, av));
+        self.radiance * inside
+    }
+}
+
+/// The soft-boxes of the neutral studio: a shaped key, a broad fill, a rim, and two ceiling luminaires.
+///
+/// The angular sizes are small and the radiances large on purpose. What makes a metal read as metal is the
+/// RATIO between the brightest thing it can reflect and the room around it; spreading the same energy over
+/// a big dim panel produces exactly the flat, grey, plastic look this replaced. See
+/// [`STUDIO_MEAN_RADIANCE`] for how the total is held steady while the contrast goes up.
+fn studio_panels() -> [SoftBox; 5] {
+    [
+        // Key: the dominant shaping light, high on the front left.
+        SoftBox {
+            dir: Vec3::new(-0.45, 0.72, 0.52).normalize(),
+            up: Vec3::Y,
+            half_u: 0.085,
+            half_v: 0.055,
+            feather: 0.030,
+            radiance: Vec3::splat(170.0),
+        },
+        // Fill: broad and dim, opposite side. Opens the shadows without flattening the form.
+        SoftBox {
+            dir: Vec3::new(0.62, 0.42, -0.30).normalize(),
+            up: Vec3::Y,
+            half_u: 0.200,
+            half_v: 0.150,
+            feather: 0.090,
+            radiance: Vec3::splat(9.0),
+        },
+        // Rim: a tall narrow strip behind the subject. This is what separates machinery from its
+        // background instead of letting a dark part sink into a dark room.
+        SoftBox {
+            dir: Vec3::new(0.18, 0.36, -0.92).normalize(),
+            up: Vec3::Y,
+            half_u: 0.045,
+            half_v: 0.200,
+            feather: 0.030,
+            radiance: Vec3::splat(150.0),
+        },
+        // Two long ceiling luminaires. A linear source draws a straight streak down a cylinder, which is
+        // the single most recognisable "this is a real workshop" cue on turned and extruded parts.
+        SoftBox {
+            dir: Vec3::new(-0.10, 0.97, 0.20).normalize(),
+            up: Vec3::Z,
+            half_u: 0.500,
+            half_v: 0.020,
+            feather: 0.018,
+            radiance: Vec3::splat(45.0),
+        },
+        SoftBox {
+            dir: Vec3::new(0.28, 0.94, -0.20).normalize(),
+            up: Vec3::Z,
+            half_u: 0.460,
+            half_v: 0.018,
+            feather: 0.018,
+            radiance: Vec3::splat(34.0),
+        },
+    ]
+}
+
+/// The solid-angle-weighted mean radiance the studio is normalised to.
+///
+/// This is the measured mean of the ORIGINAL studio environment. Holding it fixed is what lets the
+/// dynamic range be raised by more than an order of magnitude without re-calibrating every scene's
+/// exposure: rough and diffuse surfaces, which integrate the whole environment, receive the same total
+/// energy as before, while polished surfaces — which reflect a narrow cone — finally have something
+/// bright to find.
+const STUDIO_MEAN_RADIANCE: f32 = 0.5111;
+
 /// **Neutral studio** radiance (the `MTK_ENV=studio` default) — a product/CAD-viewer environment (the look
 /// KeyShot / Fusion / Onshape default to), so imported machined parts read as studio-lit metal, not
-/// outdoor-tinted plastic. A bright soft "ceiling" → neutral-grey walls → darker floor, plus **two broad soft
-/// area lights** (a key upper-front-left + a fill upper-right): large + soft (a wide cosine lobe, not a hot
-/// pinpoint) so a metal surface picks up a clean, curvature-tracing streak highlight. Neutral by construction —
-/// a polished part reflects grey, not blue sky.
+/// outdoor-tinted plastic. A dim neutral room (bright ceiling → grey walls → dark floor) carrying five
+/// SHAPED, genuinely HDR sources. Neutral by construction — a polished part reflects grey, not blue sky.
+///
+/// Un-normalised; [`procedural_level0`] scales the baked panorama to [`STUDIO_MEAN_RADIANCE`].
 fn studio_radiance(d: Vec3) -> Vec3 {
     let t = d.y.clamp(-1.0, 1.0);
-    // Vertical neutral gradient: soft-box ceiling (bright), mid grey walls, darker seamless floor.
-    let ceiling = Vec3::new(0.80, 0.81, 0.83);
-    let walls = Vec3::new(0.42, 0.43, 0.45);
-    let floor = Vec3::new(0.14, 0.14, 0.15);
-    let base = if t >= 0.0 {
+    // The room is a backdrop, not the light source — but it still has to BE a room. Normalising to a
+    // fixed mean means every unit of radiance the panels take is a unit the room gives up, and pushing
+    // this gradient too far down crushes every downward-facing surface in the scene to black. Since the
+    // panels dominate the mean anyway, keeping a genuine floor bounce costs almost none of the dynamic
+    // range that makes metal read as metal.
+    let ceiling = Vec3::new(0.60, 0.61, 0.63);
+    let walls = Vec3::new(0.34, 0.35, 0.36);
+    let floor = Vec3::new(0.13, 0.13, 0.14);
+    let mut lit = if t >= 0.0 {
         walls.lerp(ceiling, t.powf(0.65))
     } else {
         walls.lerp(floor, (-t).powf(0.55))
     };
-    // Two broad soft-box lights. `powf(exp)` with a modest exponent = a large, soft source (a real soft-box),
-    // so metals get a smooth streak highlight; the intensity is HDR (> the diffuse base) to read as a light.
-    let softbox = |dir: Vec3, intensity: f32, tightness: f32| -> f32 {
-        intensity * d.dot(dir).max(0.0).powf(tightness)
-    };
-    let key = Vec3::new(-0.45, 0.72, 0.52).normalize(); // upper front-left key
-    let fill = Vec3::new(0.55, 0.55, -0.35).normalize(); // upper right fill
-    let lights = softbox(key, 3.0, 32.0) + softbox(fill, 1.4, 48.0);
-    base + Vec3::new(1.0, 1.0, 1.0) * lights
+    for panel in studio_panels() {
+        lit += panel.radiance_towards(d);
+    }
+    lit
 }
 
 /// **Outdoor daylight** radiance (`MTK_ENV=sky`) — a cool zenith → warm horizon gradient over a dim ground,
@@ -172,7 +303,51 @@ fn procedural_level0() -> (usize, usize, Vec<[f32; 3]>) {
             level0[y * ENV_W + x] = [c.x, c.y, c.z];
         }
     }
+    // The studio is authored for CONTRAST and then normalised for BRIGHTNESS, so the two can be tuned
+    // independently. The outdoor sky is left alone: its sun/sky ratio is already its calibration.
+    if studio {
+        scale_to_mean_radiance(ENV_W, ENV_H, &mut level0, STUDIO_MEAN_RADIANCE);
+    }
     (ENV_W, ENV_H, level0)
+}
+
+/// The solid-angle-weighted mean luminance of an equirectangular panorama.
+///
+/// Weighted by `sin(theta)`, because equirect rows near the poles cover far less of the sphere than rows
+/// near the equator. An unweighted mean would count a handful of pole texels as heavily as the horizon and
+/// mis-calibrate every environment that is not uniform.
+fn mean_radiance(width: usize, height: usize, pixels: &[[f32; 3]]) -> f32 {
+    let mut weighted = 0.0f64;
+    let mut total_weight = 0.0f64;
+    for y in 0..height {
+        let theta = (y as f32 + 0.5) / height as f32 * std::f32::consts::PI;
+        let weight = f64::from(theta.sin());
+        let mut row = 0.0f64;
+        for x in 0..width {
+            let p = pixels[y * width + x];
+            row += f64::from(0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]);
+        }
+        weighted += row * weight;
+        total_weight += weight * width as f64;
+    }
+    if total_weight <= 0.0 {
+        return 0.0;
+    }
+    (weighted / total_weight) as f32
+}
+
+/// Scale a panorama so its mean radiance is exactly `target`, leaving its dynamic range untouched.
+fn scale_to_mean_radiance(width: usize, height: usize, pixels: &mut [[f32; 3]], target: f32) {
+    let mean = mean_radiance(width, height, pixels);
+    if !mean.is_finite() || mean <= 1.0e-6 {
+        return;
+    }
+    let scale = target / mean;
+    for texel in pixels.iter_mut() {
+        texel[0] *= scale;
+        texel[1] *= scale;
+        texel[2] *= scale;
+    }
 }
 
 /// Level 0 for the env: a real `.hdr` panorama if `MTK_ENV_HDR` points to a readable Radiance file
@@ -201,19 +376,33 @@ fn env_level0() -> (usize, usize, Vec<[f32; 3]>) {
     }
 }
 
-/// The startup env: `MTK_ENV_HDR` if set, else the procedural sky.
-fn build_env_mips() -> Vec<(usize, usize, Vec<u16>)> {
-    build_env_mips_from(env_level0())
+/// Direction of an equirect texel at an arbitrary panorama size.
+fn texel_dir_at(x: usize, y: usize, width: usize, height: usize) -> Vec3 {
+    let u = (x as f32 + 0.5) / width as f32;
+    let v = (y as f32 + 0.5) / height as f32;
+    let phi = (u - 0.5) * std::f32::consts::TAU;
+    let theta = v * std::f32::consts::PI;
+    Vec3::new(
+        theta.sin() * phi.cos(),
+        theta.cos(),
+        theta.sin() * phi.sin(),
+    )
 }
 
-/// The equirect env + its box-mip chain, each level as packed `rgba16f` texels (row-major).
-fn build_env_mips_from(level0: (usize, usize, Vec<[f32; 3]>)) -> Vec<(usize, usize, Vec<u16>)> {
-    // Level 0 in f32 (kept for clean downsampling; converted to halves at upload).
-    let (w0, h0, level0) = level0;
-    let mut f32_levels: Vec<(usize, usize, Vec<[f32; 3]>)> = vec![(w0, h0, level0)];
+/// One equirect level as f32 radiance.
+type Level = (usize, usize, Vec<[f32; 3]>);
+
+/// Box-filtered pyramid of the source, used ONLY as the sampling pyramid for prefiltering.
+///
+/// Importance sampling takes a few hundred samples of a panorama that may hold a source hundreds of times
+/// brighter than the room around it. Reading those from the sharp level 0 makes "did this sample happen to
+/// land on the key light" a coin toss, and the prefiltered result fills with fireflies. Reading from a
+/// level whose texels cover roughly the sample's own solid angle is the standard remedy.
+fn box_pyramid(level0: Level) -> Vec<Level> {
+    let mut levels = vec![level0];
     loop {
         let (pw, ph) = {
-            let last = f32_levels.last().unwrap();
+            let last = levels.last().expect("at least one level");
             (last.0, last.1)
         };
         if pw == 1 && ph == 1 {
@@ -223,7 +412,7 @@ fn build_env_mips_from(level0: (usize, usize, Vec<[f32; 3]>)) -> Vec<(usize, usi
         let nh = (ph / 2).max(1);
         let mut next = vec![[0.0f32; 3]; nw * nh];
         {
-            let prev = &f32_levels.last().unwrap().2;
+            let prev = &levels.last().expect("at least one level").2;
             for y in 0..nh {
                 for x in 0..nw {
                     let mut acc = [0.0f32; 3];
@@ -241,10 +430,161 @@ fn build_env_mips_from(level0: (usize, usize, Vec<[f32; 3]>)) -> Vec<(usize, usi
                 }
             }
         }
-        f32_levels.push((nw, nh, next));
+        levels.push((nw, nh, next));
     }
-    // Pack each level to rgba16f (alpha = 1).
-    f32_levels
+    levels
+}
+
+/// Bilinear equirect fetch from one pyramid level. Wraps in longitude, clamps in latitude.
+fn sample_equirect(level: &Level, dir: Vec3) -> Vec3 {
+    let (w, h, texels) = level;
+    let d = dir.normalize_or_zero();
+    let u = d.z.atan2(d.x) / std::f32::consts::TAU + 0.5;
+    let v = d.y.clamp(-1.0, 1.0).acos() / std::f32::consts::PI;
+    let fx = u * *w as f32 - 0.5;
+    let fy = v * *h as f32 - 0.5;
+    let x0 = fx.floor();
+    let y0 = fy.floor();
+    let tx = fx - x0;
+    let ty = fy - y0;
+    let width = *w as i64;
+    let height = *h as i64;
+    let wrap_x = |x: i64| -> usize { x.rem_euclid(width) as usize };
+    let clamp_y = |y: i64| -> usize { y.clamp(0, height - 1) as usize };
+    let (x0i, x1i) = (wrap_x(x0 as i64), wrap_x(x0 as i64 + 1));
+    let (y0i, y1i) = (clamp_y(y0 as i64), clamp_y(y0 as i64 + 1));
+    let fetch = |x: usize, y: usize| -> Vec3 {
+        let p = texels[y * *w + x];
+        Vec3::new(p[0], p[1], p[2])
+    };
+    let top = fetch(x0i, y0i).lerp(fetch(x1i, y0i), tx);
+    let bottom = fetch(x0i, y1i).lerp(fetch(x1i, y1i), tx);
+    top.lerp(bottom, ty)
+}
+
+/// GGX normal distribution (CPU side), for the importance-sampling pdf.
+fn distribution_ggx(n_dot_h: f32, rough: f32) -> f32 {
+    let a = rough * rough;
+    let a2 = a * a;
+    let d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    a2 / (std::f32::consts::PI * d * d).max(1.0e-7)
+}
+
+/// The split-sum prefilter for one roughness level (Karis, *Real Shading in Unreal Engine 4*, 2013).
+///
+/// For each output texel the normal, the view and the reflection vector are all taken to be that texel's
+/// own direction — the standard split-sum simplification, and what makes a single 2D environment usable
+/// from every view direction. Half-vectors are drawn from the GGX distribution, weighted by `n dot l`, and
+/// NORMALISED by the accumulated weight, so a constant environment prefilters to itself and the chain
+/// conserves energy.
+fn prefilter_level(
+    pyramid: &[Level],
+    width: usize,
+    height: usize,
+    roughness: f32,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    let (src_w, src_h, _) = pyramid[0];
+    // Mean solid angle of one level-0 texel, for choosing which pyramid level a sample reads from.
+    let sa_texel = 4.0 * std::f32::consts::PI / (src_w * src_h) as f32;
+    let top_level = pyramid.len() - 1;
+
+    let mut out = vec![[0.0f32; 3]; width * height];
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let rows_per_chunk = height.div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|scope| {
+        for (chunk_index, chunk) in out.chunks_mut(rows_per_chunk * width).enumerate() {
+            scope.spawn(move || {
+                let y_start = chunk_index * rows_per_chunk;
+                for (row, texels) in chunk.chunks_mut(width).enumerate() {
+                    let y = y_start + row;
+                    for (x, texel) in texels.iter_mut().enumerate() {
+                        let n = texel_dir_at(x, y, width, height);
+                        let v = n;
+                        // A tangent frame around n; the choice of up only rotates the sample pattern.
+                        let up = if n.y.abs() < 0.999 { Vec3::Y } else { Vec3::X };
+                        let tangent = up.cross(n).normalize_or_zero();
+                        let bitangent = n.cross(tangent);
+
+                        let mut sum = Vec3::ZERO;
+                        let mut weight = 0.0f32;
+                        for i in 0..samples {
+                            let xi = (i as f32 / samples as f32, radical_inverse_vdc(i));
+                            let ht = importance_sample_ggx(xi, roughness);
+                            let h =
+                                (tangent * ht.x + bitangent * ht.y + n * ht.z).normalize_or_zero();
+                            let l = h * (2.0 * v.dot(h)) - v;
+                            let n_dot_l = n.dot(l);
+                            if n_dot_l <= 0.0 {
+                                continue;
+                            }
+                            let n_dot_h = n.dot(h).max(0.0);
+                            let v_dot_h = v.dot(h).max(1.0e-4);
+                            // The solid angle this sample stands for, against one source texel.
+                            let pdf = distribution_ggx(n_dot_h, roughness) * n_dot_h
+                                / (4.0 * v_dot_h)
+                                + 1.0e-4;
+                            let sa_sample = 1.0 / (samples as f32 * pdf);
+                            let mip = if roughness <= 0.0 {
+                                0.0
+                            } else {
+                                0.5 * (sa_sample / sa_texel).max(1.0e-8).log2()
+                            };
+                            let level = (mip.round().max(0.0) as usize).min(top_level);
+                            sum += sample_equirect(&pyramid[level], l) * n_dot_l;
+                            weight += n_dot_l;
+                        }
+                        let c = if weight > 0.0 {
+                            sum / weight
+                        } else {
+                            sample_equirect(&pyramid[0], n)
+                        };
+                        *texel = [c.x, c.y, c.z];
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
+/// The equirect env + its GGX-PREFILTERED mip chain, each level as packed `rgba16f` texels (row-major).
+///
+/// Level 0 is the sharp environment (the skybox, and what a mirror reflects). Level `i` is the environment
+/// convolved with the GGX lobe for roughness `i / last`, which is exactly what the split-sum approximation
+/// in the shader assumes it is sampling.
+///
+/// This replaced a plain 2x2 box chain. A box filter blurs in TEXEL space — anisotropically on an equirect,
+/// worst at the poles — and its kernel is not the GGX lobe at any roughness, so every glossy surface in the
+/// scene reflected a blur that matched no material. Rough metal came out dull and shapeless: the most
+/// visible way a physically based renderer can look wrong while each individual term in it is right.
+fn build_env_mips_from(level0: Level) -> Vec<(usize, usize, Vec<u16>)> {
+    let pyramid = box_pyramid(level0);
+    let last = pyramid.len() - 1;
+    let mut levels: Vec<Level> = Vec::with_capacity(pyramid.len());
+    for (index, (w, h, _)) in pyramid.iter().enumerate() {
+        if index == 0 || last == 0 {
+            levels.push(pyramid[index].clone());
+            continue;
+        }
+        let roughness = index as f32 / last as f32;
+        // Sample count tracks the LOBE, not the texture. A near-mirror level has a very tight GGX lobe
+        // that converges in a few dozen samples, and it is also the largest texture in the chain — so
+        // sampling it hardest is exactly backwards. Scaling with roughness cuts the dominant level's cost
+        // several-fold at no visible quality difference. The budget term then bounds very large
+        // user-supplied panoramas without starving the small, cheap levels.
+        let texels = w * h;
+        let lobe_samples = (32.0 + roughness * 96.0) as usize;
+        let budget_samples = (20_000_000usize / texels.max(1)).max(24);
+        let samples = lobe_samples.min(budget_samples).clamp(24, 128) as u32;
+        levels.push((
+            *w,
+            *h,
+            prefilter_level(&pyramid, *w, *h, roughness, samples),
+        ));
+    }
+
+    levels
         .into_iter()
         .map(|(w, h, texels)| {
             let mut packed = Vec::with_capacity(w * h * 4);
@@ -259,6 +599,87 @@ fn build_env_mips_from(level0: (usize, usize, Vec<[f32; 3]>)) -> Vec<(usize, usi
             (w, h, packed)
         })
         .collect()
+}
+
+// ── diffuse irradiance as spherical harmonics ─────────────────────────────────────────────────────────
+
+/// Number of L2 spherical-harmonic coefficients.
+const SH_COEFFS: usize = 9;
+
+/// The nine real L2 SH basis functions evaluated along `d`.
+fn sh_basis(d: Vec3) -> [f32; SH_COEFFS] {
+    let (x, y, z) = (d.x, d.y, d.z);
+    [
+        0.282_095,
+        0.488_603 * y,
+        0.488_603 * z,
+        0.488_603 * x,
+        1.092_548 * x * y,
+        1.092_548 * y * z,
+        0.315_392 * (3.0 * z * z - 1.0),
+        1.092_548 * x * z,
+        0.546_274 * (x * x - y * y),
+    ]
+}
+
+/// Project an equirectangular panorama onto cosine-convolved SH, ready for the shader to evaluate.
+///
+/// Ramamoorthi & Hanrahan, *An Efficient Representation for Irradiance Environment Maps* (SIGGRAPH 2001).
+/// Diffuse shading integrates the environment against a COSINE lobe, and a cosine lobe is so smooth that
+/// nine coefficients reproduce it to within about 1% — which is why this is the standard representation
+/// rather than a texture fetch.
+///
+/// What it replaced: the shader read diffuse ambient from a high mip of the specular chain, i.e. the
+/// environment convolved with a GGX lobe at roughness 0.8, from a 4x2 texture. That is the wrong kernel at
+/// far too low a resolution, and it is why ambient light had almost no sense of direction — every surface
+/// facing away from the key received nearly the same grey, so unlit sides of machinery went flat and
+/// shapeless. Softening a bad kernel further is not the same as convolving with the right one.
+///
+/// The convolution and the `1/PI` of the Lambert BRDF are folded into the coefficients, so what the shader
+/// evaluates is directly the average incident radiance for a normal — the same quantity the old texture
+/// fetch stood in for, and therefore a drop-in for it.
+fn sh_irradiance_coefficients(
+    width: usize,
+    height: usize,
+    pixels: &[[f32; 3]],
+) -> [[f32; 4]; SH_COEFFS] {
+    // Cosine-lobe convolution factors per band (Ramamoorthi's A-hat).
+    const A_HAT: [f32; 3] = [
+        std::f32::consts::PI,
+        2.094_395, // 2*PI/3
+        std::f32::consts::FRAC_PI_4,
+    ];
+    const BAND_OF: [usize; SH_COEFFS] = [0, 1, 1, 1, 2, 2, 2, 2, 2];
+
+    let mut acc = [[0.0f64; 3]; SH_COEFFS];
+    // Solid angle of one texel: (2*PI/W) * (PI/H) * sin(theta).
+    let d_phi_d_theta = f64::from(std::f32::consts::TAU / width as f32)
+        * f64::from(std::f32::consts::PI / height as f32);
+    for y in 0..height {
+        let theta = (y as f32 + 0.5) / height as f32 * std::f32::consts::PI;
+        let solid_angle = d_phi_d_theta * f64::from(theta.sin());
+        for x in 0..width {
+            let basis = sh_basis(texel_dir_at(x, y, width, height));
+            let p = pixels[y * width + x];
+            for i in 0..SH_COEFFS {
+                let w = f64::from(basis[i]) * solid_angle;
+                acc[i][0] += f64::from(p[0]) * w;
+                acc[i][1] += f64::from(p[1]) * w;
+                acc[i][2] += f64::from(p[2]) * w;
+            }
+        }
+    }
+
+    let mut out = [[0.0f32; 4]; SH_COEFFS];
+    for i in 0..SH_COEFFS {
+        let scale = f64::from(A_HAT[BAND_OF[i]] / std::f32::consts::PI);
+        for c in 0..3 {
+            let v = acc[i][c] * scale;
+            out[i][c] = if v.is_finite() { v as f32 } else { 0.0 };
+        }
+        out[i][3] = 0.0;
+    }
+    out
 }
 
 // ── split-sum BRDF LUT (the environment-BRDF half of the split-sum approximation) ──────────────────
@@ -367,6 +788,17 @@ pub fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                 count: None,
             },
+            // Cosine-convolved SH irradiance: nine RGB coefficients, the diffuse half of the environment.
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -395,10 +827,17 @@ pub fn create_with(
     shadow_sampler: &wgpu::Sampler,
     env: Option<&EnvSource>,
 ) -> Ibl {
-    let mips = match env {
-        Some(e) => build_env_mips_from((e.width, e.height, e.pixels.clone())),
-        None => build_env_mips(),
+    let level0 = match env {
+        Some(e) => (e.width, e.height, e.pixels.clone()),
+        // No runtime environment supplied yet, so this is the startup default -- and the startup
+        // default has always honoured `MTK_ENV_HDR`. Adding the runtime `EnvSource` had quietly
+        // narrowed this arm to the procedural sky, which left the documented environment variable
+        // doing nothing at all (and `env_level0` dead). A capability that stops working without
+        // saying so is the failure this codebase keeps naming; it stays wired.
+        None => env_level0(),
     };
+    let sh = sh_irradiance_coefficients(level0.0, level0.1, &level0.2);
+    let mips = build_env_mips_from(level0);
     let mip_count = mips.len() as u32;
     let (base_w, base_h, _) = &mips[0];
     let env = device.create_texture(&wgpu::TextureDescriptor {
@@ -496,6 +935,12 @@ pub fn create_with(
         ..Default::default()
     });
 
+    let sh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("ibl-sh-irradiance"),
+        contents: bytemuck::cast_slice(&sh),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ibl-bg"),
         layout,
@@ -525,6 +970,10 @@ pub fn create_with(
                 binding: 5,
                 resource: wgpu::BindingResource::Sampler(shadow_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: sh_buffer.as_entire_binding(),
+            },
         ],
     });
 
@@ -546,13 +995,15 @@ mod tests {
 
     #[test]
     fn env_mip_chain_descends_to_1x1() {
-        let mips = build_env_mips();
+        // The procedural chain by name: this asserts `ENV_W`/`ENV_H`, so it must not be at the mercy
+        // of whatever `MTK_ENV_HDR` happens to point at on the machine running the tests.
+        let mips = build_env_mips_from(procedural_level0());
         assert_eq!(mips[0].0, ENV_W);
         assert_eq!(mips[0].1, ENV_H);
         let last = mips.last().unwrap();
         assert_eq!((last.0, last.1), (1, 1), "mip chain bottoms out at 1x1");
-        // 512 → 1 is 10 levels (inclusive).
-        assert_eq!(mips.len(), 10);
+        // 1024 → 1 is 11 levels (inclusive).
+        assert_eq!(mips.len(), 11);
         // Each level carries rgba16 (4 halves) per texel.
         for (w, h, data) in &mips {
             assert_eq!(data.len(), w * h * 4);
@@ -568,6 +1019,151 @@ mod tests {
             lut.iter().all(|&h| h <= 0x3C00),
             "BRDF terms stay within [0,1]"
         );
+    }
+
+    /// Decode one packed rgba16f texel's red channel back to f32.
+    fn decode_red(packed: &[u16], index: usize) -> f32 {
+        let bits = packed[index * 4];
+        let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exp = ((bits >> 10) & 0x1f) as i32;
+        let mant = (bits & 0x3ff) as f32;
+        if exp == 0 {
+            sign * (mant / 1024.0) * 2f32.powi(-14)
+        } else {
+            sign * (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+        }
+    }
+
+    #[test]
+    fn the_studio_has_the_dynamic_range_a_reflective_surface_needs() {
+        // The defect this pins: the original studio peaked at 7.3x its own mean. A polished part had
+        // nothing bright to reflect, so every metal in an imported assembly read as flat grey plastic no
+        // matter how correct the BRDF was. Studio lighting is a RATIO, and the ratio was the bug.
+        let mut peak = 0.0f32;
+        let mut pixels = Vec::with_capacity(ENV_W * ENV_H);
+        for y in 0..ENV_H {
+            for x in 0..ENV_W {
+                let c = studio_radiance(texel_dir(x, y));
+                pixels.push([c.x, c.y, c.z]);
+            }
+        }
+        scale_to_mean_radiance(ENV_W, ENV_H, &mut pixels, STUDIO_MEAN_RADIANCE);
+        for p in &pixels {
+            peak = peak.max(0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]);
+        }
+        let mean = mean_radiance(ENV_W, ENV_H, &pixels);
+        assert!(
+            (mean - STUDIO_MEAN_RADIANCE).abs() < 1.0e-3,
+            "the studio must keep its calibrated mean so exposure does not move, got {mean}"
+        );
+        assert!(
+            peak / mean > 80.0,
+            "a studio needs a source far brighter than its room; peak/mean was {:.1}:1",
+            peak / mean
+        );
+    }
+
+    #[test]
+    fn prefiltering_spreads_a_bright_source_further_at_every_rougher_level() {
+        // A single hot texel in an otherwise black panorama. Each rougher level must spread its energy
+        // wider — that IS the GGX convolution — while none of them may invent or lose energy.
+        let (w, h) = (64usize, 32usize);
+        let mut pixels = vec![[0.0f32; 3]; w * h];
+        pixels[(h / 2) * w + w / 2] = [400.0, 400.0, 400.0];
+        let mips = build_env_mips_from((w, h, pixels));
+
+        // "Spread" measured as the fraction of texels carrying a meaningful share of the level's peak.
+        let spread = |level: &(usize, usize, Vec<u16>)| -> f32 {
+            let count = level.0 * level.1;
+            let mut peak = 0.0f32;
+            for i in 0..count {
+                peak = peak.max(decode_red(&level.2, i));
+            }
+            let lit = (0..count)
+                .filter(|i| decode_red(&level.2, *i) > peak * 0.1)
+                .count();
+            lit as f32 / count as f32
+        };
+        let sharp = spread(&mips[1]);
+        let rough = spread(&mips[3]);
+        assert!(
+            rough > sharp,
+            "roughness must widen the reflected lobe: level1 {sharp:.3} vs level3 {rough:.3}"
+        );
+
+        // Prefiltering redistributes energy; it must never manufacture any. (The exact-conservation case
+        // is a CONSTANT environment, covered by `the_mip_chain_preserves_average_radiance` — a prefiltered
+        // top mip is NOT the sphere average, because its GGX lobe is centred on that texel's own
+        // direction rather than covering the whole sphere.)
+        for (index, level) in mips.iter().enumerate() {
+            for i in 0..(level.0 * level.1) {
+                let value = decode_red(&level.2, i);
+                assert!(
+                    value.is_finite() && value >= 0.0,
+                    "level {index} texel {i} is not a valid radiance: {value}"
+                );
+                assert!(
+                    value <= 400.0 * 1.01,
+                    "level {index} texel {i} exceeds the source peak: {value}"
+                );
+            }
+        }
+    }
+
+    /// Evaluate the shader's SH sum on the CPU, so the test exercises the same series the GPU will.
+    fn eval_sh(coeff: &[[f32; 4]; SH_COEFFS], n: Vec3) -> Vec3 {
+        let basis = sh_basis(n);
+        let mut out = Vec3::ZERO;
+        for i in 0..SH_COEFFS {
+            out += Vec3::new(coeff[i][0], coeff[i][1], coeff[i][2]) * basis[i];
+        }
+        out.max(Vec3::ZERO)
+    }
+
+    #[test]
+    fn constant_light_from_every_direction_reproduces_itself_exactly() {
+        // The white-furnace case: a uniform environment of radiance L must give every normal exactly L.
+        // Any other answer means the projection, the cosine convolution or the 1/PI is wrong, and the
+        // whole scene would be uniformly mis-lit in a way that is easy to mistake for an exposure choice.
+        let (w, h) = (64usize, 32usize);
+        let pixels = vec![[0.7f32, 0.7, 0.7]; w * h];
+        let coeff = sh_irradiance_coefficients(w, h, &pixels);
+        for dir in [
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::X,
+            Vec3::NEG_Z,
+            Vec3::new(0.3, 0.6, -0.7).normalize(),
+        ] {
+            let got = eval_sh(&coeff, dir);
+            assert!(
+                (got.x - 0.7).abs() < 0.01 && (got.y - 0.7).abs() < 0.01,
+                "uniform radiance 0.7 must come back as 0.7 for {dir:?}, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn irradiance_is_directional_and_peaks_towards_the_light() {
+        // The defect this pins: diffuse ambient used to come from a 4x2 GGX mip, so a surface facing the
+        // key and a surface facing away received nearly the same grey and machinery lost its form. A
+        // correct cosine convolution must be strongly directional.
+        let (w, h) = (128usize, 64usize);
+        let mut pixels = vec![[0.0f32; 3]; w * h];
+        // A bright patch overhead.
+        for y in 0..(h / 8) {
+            for x in 0..w {
+                pixels[y * w + x] = [50.0, 50.0, 50.0];
+            }
+        }
+        let coeff = sh_irradiance_coefficients(w, h, &pixels);
+        let up = eval_sh(&coeff, Vec3::Y).y;
+        let down = eval_sh(&coeff, Vec3::NEG_Y).y;
+        assert!(
+            up > down * 4.0,
+            "a normal facing an overhead source must receive far more than one facing away: {up} vs {down}"
+        );
+        assert!(down >= 0.0, "irradiance must never go negative, got {down}");
     }
 
     #[test]

@@ -157,9 +157,9 @@ pub use generative::{
 };
 pub use kinematics::{
     encode_track, joint_of, joint_of_with_component, joint_pose, joint_source, parse_track,
-    set_joint_ops, track_end, track_value, try_set_joint_ops, validate_joint_spec,
-    validate_joint_time, validate_joint_value, Joint, JointValidationResult, JOINT, JOINT_TRACK,
-    KINEMATIC_JOINT, LEGACY_JOINT,
+    set_joint_ops, track_end, track_value, try_author_joint_tracks_ops, try_set_joint_ops,
+    validate_joint_spec, validate_joint_time, validate_joint_value, Joint, JointTrackAuthoring,
+    JointTrackKey, JointValidationResult, JOINT, JOINT_TRACK, KINEMATIC_JOINT, LEGACY_JOINT,
 };
 pub use metering::{ai_edit_material, buy_marketplace, material_patch, Outcome};
 pub use step_export::{

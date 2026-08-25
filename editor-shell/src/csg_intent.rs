@@ -106,20 +106,29 @@ pub fn trimesh_to_mesh_asset_colored(
         .collect();
     let material = if matches!(name, "cad" | "step") {
         match color {
-            // A part with an AUTHORED colour reads as PAINTED equipment: a dielectric satin paint (no
-            // metalness, mid roughness) so the colour is the surface — a painted crane arm, not glossy plastic.
+            // A part with an AUTHORED colour reads as PAINTED equipment: a dielectric industrial enamel.
+            // Roughness 0.42 rather than the old 0.55 — machine enamel is a satin/semi-gloss coat that
+            // holds a soft sheen along an edge, and that sheen is most of what separates one painted
+            // surface from the next in a wide shot. Fully matte paint is what made the factory read as
+            // one undifferentiated plastic mass.
             Some(c) => Material {
                 base_color: [c[0], c[1], c[2], 1.0],
                 metallic: 0.0,
-                roughness: 0.55,
+                roughness: 0.42,
                 ..Material::default()
             },
-            // No authored colour ⇒ bare machined metal: neutral steel, glossier + slightly metallic so it
-            // catches a form-revealing highlight off the studio IBL.
+            // No authored colour ⇒ bare machined steel.
+            //
+            // `metallic` is 1.0, not the 0.30 this used to carry. In the metal/rough workflow metalness is
+            // a BINARY classification — a surface either has free electrons or it does not — and values
+            // between the two exist only to blend texels along a wear boundary. A uniform 0.30 asks for a
+            // material that does not exist: it suppressed 70% of the diffuse albedo while granting only a
+            // weak, colourless specular, so bare parts came out as dark grey nothing. Real steel is
+            // metallic with a base colour that IS its F0 (~0.56 linear).
             None => Material {
-                base_color: [0.58, 0.59, 0.61, 1.0],
-                metallic: 0.30,
-                roughness: 0.38,
+                base_color: [0.560, 0.570, 0.580, 1.0],
+                metallic: 1.0,
+                roughness: 0.34,
                 ..Material::default()
             },
         }

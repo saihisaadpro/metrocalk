@@ -25,6 +25,11 @@ use metrocalk_spatial::{Aabb, Camera, Transform};
 
 // The crate under test is a binary, so the modules are included directly. This is the same source the
 // shipped `metrocalk-editor-shell.exe` compiles.
+// `render` logs through `crate::diag`, so the example must supply the same module the binary does --
+// otherwise this file compiles a *different* render.rs than the .exe, which is exactly what it exists
+// to avoid.
+#[path = "../src/diag.rs"]
+mod diag;
 #[path = "../src/ibl.rs"]
 mod ibl;
 #[path = "../src/moba.rs"]

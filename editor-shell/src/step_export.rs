@@ -116,7 +116,11 @@ pub fn scene_from_parts(parts: &[StepPart]) -> (CadScene, usize) {
         if faces.is_empty() {
             continue;
         }
-        solids.push(CadSolid { id: next_id, faces });
+        solids.push(CadSolid {
+            id: next_id,
+            name: part.name.clone(),
+            faces,
+        });
         next_id += 1;
     }
 

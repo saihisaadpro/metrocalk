@@ -13,6 +13,7 @@
 //! returns ranked compatible targets + every "no" explained; a candidate click binds in one undoable
 //! transaction (north-star test #1).
 
+mod diag;
 mod ibl;
 mod moba;
 mod native_drop_import;
@@ -122,7 +123,7 @@ fn proj_full(engine: &Engine<FlecsWorld>, scene: &CapScene) -> ProjectionDelta {
             matches!(
                 engine.components_of(*id).get("__meta__").and_then(|fields| fields.get("kind")),
                 Some(FieldValue::Str(kind))
-                    if matches!(
+                if matches!(
                         kind.as_str(),
                         "animation_graph_controller" | "animation_clip_instance"
                     )
@@ -2225,6 +2226,41 @@ struct PlayInfo {
     paused: bool,
 }
 
+const MAX_JOINT_AUTHOR_BATCH: usize = 1_024;
+const MAX_JOINT_KEYS_PER_TRACK: usize = 100_000;
+
+/// One key supplied to the atomic mechanism-authoring command. The transport stays plain data; validation
+/// and deterministic encoding remain owned by `editor-shell::kinematics`.
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct JointTrackKeyRequest {
+    t: f64,
+    value: f64,
+}
+
+/// Complete joint + track authoring row. A vector of these is one visible editor action and one undo step.
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct JointTrackAuthoringRequest {
+    id: String,
+    revolute: bool,
+    axis: [f64; 3],
+    pivot: [f64; 3],
+    min: f64,
+    max: f64,
+    source: String,
+    keys: Vec<JointTrackKeyRequest>,
+}
+
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct JointAuthorBatchResult {
+    ok: bool,
+    message: String,
+    authored_joints: usize,
+    authored_keys: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ImportAssetResult {
     Imported(String),
@@ -2348,6 +2384,12 @@ enum EngineCmd {
         limits: (f64, f64),
         source: String,
         reply: Sender<bool>,
+    },
+    /// Atomically author many complete joint tracks. This is the production high-volume path: one commit,
+    /// one plan refresh, one render rebuild and one undo step regardless of key count.
+    JointAuthorBatch {
+        requests: Vec<JointTrackAuthoringRequest>,
+        reply: Sender<JointAuthorBatchResult>,
     },
     /// M15.9 — key the joint's CURRENT value at time `t` on the entity's track (ONE undoable commit).
     JointKey {
@@ -2765,6 +2807,9 @@ enum EngineCmd {
     CinemaAddShot {
         id: String,
         kind: String,
+        /// The object the shot FRAMES, when that is not the object the cutscene is attached to.
+        /// `None` keeps the long-standing default of filming the cutscene's own owner.
+        subject: Option<String>,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
     },
     /// Cinematics - remove one shot by index.
@@ -3620,8 +3665,10 @@ impl Default for NativeAnimationGraphState {
             debug_trace_incomplete: false,
             evaluation_cost_micros: None,
             runtime: None,
-            parameter_routes: Vec::new(),
-            edge_provenance: Vec::new(),
+            parameter_routes:
+            Vec::new(),
+            edge_provenance:
+            Vec::new(),
             compiled_source_hash: None,
             source_duration: None,
             pending_compile_key: None,
@@ -3790,7 +3837,7 @@ fn imported_uniform_scale_track_is_safe(track: &metrocalk_animation::Track) -> b
             matches!(
                 &key.value,
                 AnimValue::Vec3(value)
-                    if value.iter().all(|part| part.is_finite())
+                if value.iter().all(|part| part.is_finite())
                         && value[0] > 0.0
                         && (value[0] - value[1]).abs() < 1.0e-9
                         && (value[1] - value[2]).abs() < 1.0e-9
@@ -4637,7 +4684,7 @@ fn animation_graph_sources_with_instances(
             Some("Key at least one supported Transform or KinematicJoint property before using Main as a graph source."),
         ),
         Some(plan)
-            if !plan
+        if !plan
                 .evaluate(AnimationTick::ZERO)
                 .bindings
                 .iter()
@@ -4743,9 +4790,9 @@ fn animation_graph_sources_with_instances(
                     .time_base
                     .convert_tick(sequence.duration, ANIMATION_RUNTIME_TIME_BASE)
                     .map_or(0, |tick| tick.0),
-                readiness: "blocked".into(),
-                reason: "This is immutable source provenance, not a live scene address. Create and validate an explicit clip instance before adding it to the graph.".into(),
-                action: Some("Select an entity using this asset in Animation, then choose Set up clip.".into()),
+                    readiness: "blocked".into(),
+                    reason: "This is immutable source provenance, not a live scene address. Create and validate an explicit clip instance before adding it to the graph.".into(),
+                    action: Some("Select an entity using this asset in Animation, then choose Set up clip.".into()),
             });
         }
     }
@@ -6302,9 +6349,9 @@ fn animation_imported_clip_infos(
                                 .get(&binding.path.target)
                                 .cloned()
                                 .unwrap_or_else(|| binding.path.target.clone()),
-                            component: binding.path.component.clone(),
-                            property: binding.path.property.clone(),
-                            value_kind: animation_value_kind(binding.value_kind).into(),
+                                component: binding.path.component.clone(),
+                                property: binding.path.property.clone(),
+                                value_kind: animation_value_kind(binding.value_kind).into(),
                         })
                         .collect();
                     let repair_changes = repair.map_or_else(Vec::new, |document| {
@@ -6440,20 +6487,20 @@ fn animation_imported_clip_infos(
                             .unwrap_or(source_target)
                     })
                     .collect(),
-                source_bindings,
-                channels,
-                readiness: readiness.into(),
-                reason,
-                action,
-                instance_id: existing
+                    source_bindings,
+                    channels,
+                    readiness: readiness.into(),
+                    reason,
+                    action,
+                    instance_id: existing
                     .map(|instance| instance.document.id.clone())
                     .or_else(|| repair.map(|document| document.id.clone())),
-                target_mappings: existing
+                    target_mappings: existing
                     .map(|instance| persisted_clip_target_mappings(&instance.document))
                     .or_else(|| repair.map(persisted_clip_target_mappings))
                     .unwrap_or_default(),
-                repair_changes,
-                instances,
+                    repair_changes,
+                    instances,
             }
         })
         .collect()
@@ -6644,7 +6691,7 @@ fn animation_asset_profile(
         state: "unsupported".into(),
         reason: "Root trajectories are not classified or extracted yet, so pose and movement authority cannot be selected safely."
             .into(),
-        action: Some(
+            action: Some(
             "Keep locomotion entity-driven until root-motion extraction and single-authority controls are verified."
                 .into(),
         ),
@@ -7278,9 +7325,7 @@ fn import_cancellation_requested(
     cancellation.is_some_and(native_drop_import::ImportCancellation::is_requested)
 }
 
-fn seal_import_for_commit(
-    cancellation: Option<&native_drop_import::ImportCancellation>,
-) -> bool {
+fn seal_import_for_commit(cancellation: Option<&native_drop_import::ImportCancellation>) -> bool {
     cancellation.is_none_or(native_drop_import::ImportCancellation::seal_for_commit)
 }
 
@@ -7381,10 +7426,8 @@ fn land_cad(
         &report.source_format,
         report.source_hash,
     );
-    let old_source_roots =
-        metrocalk_editor_shell::active_cad_source_roots(engine, &source.key);
-    let old_source_members =
-        metrocalk_editor_shell::active_cad_source_members(engine, &source.key);
+    let old_source_roots = metrocalk_editor_shell::active_cad_source_roots(engine, &source.key);
+    let old_source_members = metrocalk_editor_shell::active_cad_source_members(engine, &source.key);
     // One healthy wrapper with the exact same content is a true idempotent re-drop. Re-parse still validates
     // the external source, but no GPU work, hierarchy duplication, undo entry, or stale re-import report is
     // produced. Duplicate roots/orphaned owner markers deliberately fall through to scoped convergence.
@@ -7910,11 +7953,11 @@ fn land_cad(
         log(&format!(
             "CAD RE-IMPORT: {} previous parts → {} overrides re-bound · {} removed(flagged) · {} to \
              adjudicate · {} added",
-            old_reimport.len(),
-            session.rebound,
-            session.orphans.len(),
-            session.adjudicate.len(),
-            session.report.iter().filter(|r| r.kind == "added").count()
+             old_reimport.len(),
+             session.rebound,
+             session.orphans.len(),
+             session.adjudicate.len(),
+             session.report.iter().filter(|r| r.kind == "added").count()
         ));
         // Record the diff + held adjudications for the UI (borrows `session`) BEFORE moving its ops out.
         store_reimport_session(&session, &new_entities);
@@ -7985,6 +8028,13 @@ fn land_cad(
     }
     CadLandResult::Imported(selection)
 }
+
+/// How many 60 Hz heartbeats may be in the engine's command queue at once.
+///
+/// Two, not one: one being processed and one already waiting keeps the sim at full rate whenever the
+/// engine can keep up, while bounding how long a UI command can sit behind heartbeats to about two
+/// ticks. Unbounded is what made a heavy scene stop answering entirely.
+const MAX_PENDING_TICKS: usize = 2;
 
 fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<EngineCmd>) {
     // Import the demo mesh assets once (one-shot heavy op) before seeding, so the catalog is ready for
@@ -8325,20 +8375,56 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // A fixed-cadence heartbeat (~60/s) on its own thread enqueues `Tick` via the engine's own sender, so
     // the sim advances ON the engine thread (off the JS hot path, invariant 4) without blocking the
     // command loop. A `Tick` is a no-op until the sim is running with at least one body.
+    // Heartbeats enqueued but not yet processed. See the coalescing note in the ticker below; the loop
+    // decrements exactly once per `Tick` it handles, so the two stay balanced.
+    let pending_ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     {
         let ticker = self_tx.clone();
-        std::thread::spawn(move || loop {
-            // One fixed 60 Hz step. `16 ms` is 62.5 Hz and made animation/physics run 4.17% fast.
-            std::thread::sleep(std::time::Duration::from_nanos(16_666_667));
-            if ticker.send(EngineCmd::Tick).is_err() {
-                // The engine thread is gone (exited or panicked) — say so once (audit F6) instead of the
-                // ticker just silently stopping while the viewport appears frozen.
-                eprintln!("[shell] engine thread is gone — the physics ticker has stopped");
-                break;
+        let pending = pending_ticks.clone();
+        std::thread::spawn(move || {
+            let mut dropped: u64 = 0;
+            let mut last_report = std::time::Instant::now();
+            loop {
+                // One fixed 60 Hz step. `16 ms` is 62.5 Hz and made animation/physics run 4.17% fast.
+                std::thread::sleep(std::time::Duration::from_nanos(16_666_667));
+                // COALESCE, do not queue.
+                //
+                // The heartbeat and every UI command share ONE fifo. A tick that costs more than its
+                // 16.67 ms budget therefore does not merely run late: it puts another tick in front of
+                // every command the user has not sent yet, and the backlog grows for as long as the
+                // overrun lasts. On the 17,793-entity factory that is the whole of "the editor stopped
+                // responding when I pressed Play" -- Play itself returns, and every command after it
+                // waits behind an unbounded and still-growing queue of heartbeats. Twenty seconds of
+                // 100 ms ticks buries the next command under a thousand of them.
+                //
+                // Dropping a beat costs wall-clock RATE, never determinism: a run is recorded and
+                // replayed by TICK INDEX, so a sim that advances slower than real time is still
+                // bit-identical -- it is simply slow, which is the honest thing for it to look like.
+                if pending.load(std::sync::atomic::Ordering::Acquire) >= MAX_PENDING_TICKS {
+                    dropped += 1;
+                    // Never silent: name the rate, at most once every five seconds.
+                    if last_report.elapsed() >= std::time::Duration::from_secs(5) {
+                        diag_log!(
+                            "engine: dropped {dropped} heartbeat(s) in the last {:.1}s - the engine thread cannot keep a 60 Hz tick, so the simulation is running slower than real time to keep the editor responsive", last_report.elapsed().as_secs_f32()
+                        );
+                        dropped = 0;
+                        last_report = std::time::Instant::now();
+                    }
+                    continue;
+                }
+                pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                if ticker.send(EngineCmd::Tick).is_err() {
+                    // The engine thread is gone (exited or panicked) - say so (audit F6) instead of the
+                    // ticker just silently stopping while the viewport appears frozen.
+                    diag::log("engine thread is gone - the physics ticker has stopped");
+                    break;
+                }
             }
         });
     }
 
+    // Rate limiter for the slow-tick report at the end of the `Tick` arm.
+    let mut slow_tick_reported = std::time::Instant::now() - std::time::Duration::from_secs(60);
     while let Ok(cmd) = rx.recv() {
         match cmd {
             EngineCmd::Connect(ch) => {
@@ -9585,7 +9671,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .unwrap_or_default();
                 let _ = reply.send(info);
             }
-            EngineCmd::CinemaAddShot { id, kind, reply } => {
+            EngineCmd::CinemaAddShot {
+                id,
+                kind,
+                subject,
+                reply,
+            } => {
                 use metrocalk_editor_shell::CinemaReply;
                 let Some(entity) =
                     EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
@@ -9601,7 +9692,28 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     ));
                     continue;
                 }
-                match metrocalk_editor_shell::add_shot_ops(&engine, entity, &kind, entity) {
+                // A shot may FRAME something other than the object the cutscene hangs on. The shot
+                // solver, the stored cutscene and the runtime sampler have always supported this; only
+                // the command did not, which forced every shot to be a shot of its own owner and made a
+                // genuine establishing shot — "hold on the whole assembly, then cut in to this part" —
+                // impossible to author. An unresolvable subject is refused rather than silently
+                // redirected at the owner, because a wide shot that quietly became a close-up is the
+                // kind of failure nobody notices until the film is watched.
+                let framed = match subject {
+                    None => entity,
+                    Some(key) => {
+                        match EntityId::from_loro_key(&key).filter(|e| engine.entity_exists(*e)) {
+                            Some(resolved) => resolved,
+                            None => {
+                                let _ = reply.send(CinemaReply::refusal(
+                                    "the object that shot should frame is no longer in the scene",
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                };
+                match metrocalk_editor_shell::add_shot_ops(&engine, entity, &kind, framed) {
                     Ok((ops, cut)) => {
                         if let Err(e) = engine.commit("cinema-shot", ops) {
                             let _ = reply
@@ -10865,9 +10977,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                     eprintln!("[env] lighting from '{label}'");
                                     // An environment creates no entity, so the reply is the label
                                     // rather than an id - the caller reports it, never "unsupported".
-                                    let _ = reply.send(ImportAssetResult::Imported(format!(
-                                        "env:{label}"
-                                    )));
+                                    let _ = reply
+                                        .send(ImportAssetResult::Imported(format!("env:{label}")));
                                 }
                                 Err(why) => {
                                     eprintln!("[env] refused '{path}': {why}");
@@ -10916,87 +11027,91 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         {
                             result = ImportAssetResult::Cancelled;
                         } else {
-                        let handle = AssetId::of_bytes(&bytes).as_str().to_string();
-                        // Retain canonical editable geometry beside the GPU packing; live asset tools can
-                        // now condition/bake this mesh instead of losing it after upload.
-                        assets
-                            .store
-                            .insert(AssetId::from_handle(handle.clone()), asset.clone());
-                        if !assets.handle_to_slot.contains_key(&handle) {
-                            // Normalise the imported geometry to ~1 unit, centred (FBX/glTF are often authored
-                            // in cm, hundreds of units across). The renderer applies `Transform.scale`
-                            // directly to these verts, so this makes `scale` an intuitive world-size
-                            // multiplier (1.0 ≈ one unit) instead of `0.9/extent`-tiny; the collider reads
-                            // the SAME verts (`mesh_geometry`) so it stays matched + centred on the entity.
-                            let affine = AssetAffine::unit_from_bounds(asset.bounds());
-                            let mut gpu = MeshGpu::from_asset(&asset);
-                            gpu.apply_affine(affine);
-                            let slot = assets.meshes.len();
-                            assets.meshes.push(gpu.clone());
-                            assets.scales.push(1.0);
-                            assets.display_affines.push(affine);
-                            assets.handle_to_slot.insert(handle.clone(), slot);
-                            let mut st = shared.lock().unwrap();
-                            st.meshes.push(gpu);
-                            st.meshes_revision = st.meshes_revision.wrapping_add(1);
-                        }
-                        // M11.5 (ADR-044) — record the asset's provenance keyed by its content address, and
-                        // surface a near-duplicate HINT: a perceptual-hash match against an already-imported
-                        // asset with DIFFERENT bytes (a rescaled/recompressed copy the exact dedup misses).
-                        // Never a silent merge — the exact-dedup above already collapsed identical bytes.
-                        let source = std::path::Path::new(&path)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(path.as_str())
-                            .to_string();
-                        let phash = asset
-                            .textures
-                            .first()
-                            .map_or(0, metrocalk_assets::perceptual_hash);
-                        if phash != 0 {
-                            if let Some(dup_of) = assets
-                                .provenance
-                                .values()
-                                .filter(|p| p.content_hash != handle && p.perceptual_hash != 0)
-                                .find(|p| {
-                                    metrocalk_assets::is_near_duplicate(
-                                        phash,
-                                        p.perceptual_hash,
-                                        10,
-                                    )
-                                })
-                                .map(|p| p.source.clone())
-                            {
-                                eprintln!(
+                            let handle = AssetId::of_bytes(&bytes).as_str().to_string();
+                            // Retain canonical editable geometry beside the GPU packing; live asset tools can
+                            // now condition/bake this mesh instead of losing it after upload.
+                            assets
+                                .store
+                                .insert(AssetId::from_handle(handle.clone()), asset.clone());
+                            if !assets.handle_to_slot.contains_key(&handle) {
+                                // Normalise the imported geometry to ~1 unit, centred (FBX/glTF are often authored
+                                // in cm, hundreds of units across). The renderer applies `Transform.scale`
+                                // directly to these verts, so this makes `scale` an intuitive world-size
+                                // multiplier (1.0 ≈ one unit) instead of `0.9/extent`-tiny; the collider reads
+                                // the SAME verts (`mesh_geometry`) so it stays matched + centred on the entity.
+                                let affine = AssetAffine::unit_from_bounds(asset.bounds());
+                                let mut gpu = MeshGpu::from_asset(&asset);
+                                gpu.apply_affine(affine);
+                                let slot = assets.meshes.len();
+                                assets.meshes.push(gpu.clone());
+                                assets.scales.push(1.0);
+                                assets.display_affines.push(affine);
+                                assets.handle_to_slot.insert(handle.clone(), slot);
+                                let mut st = shared.lock().unwrap();
+                                st.meshes.push(gpu);
+                                st.meshes_revision = st.meshes_revision.wrapping_add(1);
+                            }
+                            // M11.5 (ADR-044) — record the asset's provenance keyed by its content address, and
+                            // surface a near-duplicate HINT: a perceptual-hash match against an already-imported
+                            // asset with DIFFERENT bytes (a rescaled/recompressed copy the exact dedup misses).
+                            // Never a silent merge — the exact-dedup above already collapsed identical bytes.
+                            let source = std::path::Path::new(&path)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(path.as_str())
+                                .to_string();
+                            let phash = asset
+                                .textures
+                                .first()
+                                .map_or(0, metrocalk_assets::perceptual_hash);
+                            if phash != 0 {
+                                if let Some(dup_of) = assets
+                                    .provenance
+                                    .values()
+                                    .filter(|p| p.content_hash != handle && p.perceptual_hash != 0)
+                                    .find(|p| {
+                                        metrocalk_assets::is_near_duplicate(
+                                            phash,
+                                            p.perceptual_hash,
+                                            10,
+                                        )
+                                    })
+                                    .map(|p| p.source.clone())
+                                {
+                                    eprintln!(
                                     "[shell] import: '{source}' looks like a near-duplicate of \
                                      '{dup_of}' (perceptual-hash match) — kept as a distinct asset"
                                 );
+                                }
                             }
-                        }
-                        assets.provenance.insert(
-                            handle.clone(),
-                            metrocalk_assets::Provenance::imported(source, handle.clone(), phash),
-                        );
-                        // Persist the bytes content-addressed so the handle re-resolves on reload (audit F3):
-                        // log a write failure rather than swallow it — else the imported mesh silently
-                        // vanishes after restart (the saved handle dangles).
-                        let persisted = match metrocalk_editor_shell::blobstore::put(
-                            &sidecar("metrocalk-assets"),
-                            &bytes,
-                        ) {
-                            Ok(_) => true,
-                            Err(e) => {
-                                eprintln!(
+                            assets.provenance.insert(
+                                handle.clone(),
+                                metrocalk_assets::Provenance::imported(
+                                    source,
+                                    handle.clone(),
+                                    phash,
+                                ),
+                            );
+                            // Persist the bytes content-addressed so the handle re-resolves on reload (audit F3):
+                            // log a write failure rather than swallow it — else the imported mesh silently
+                            // vanishes after restart (the saved handle dangles).
+                            let persisted = match metrocalk_editor_shell::blobstore::put(
+                                &sidecar("metrocalk-assets"),
+                                &bytes,
+                            ) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    eprintln!(
                                     "[shell] import persistence failed; scene placement was refused so no dangling authored handle can survive reload: {e}"
                                 );
-                                false
-                            }
-                        };
-                        // M11.1 — lay successive imports out on a grid so they don't stack on the same spot
-                        // (the persisted record keeps the chosen pos, so reload restores the same layout).
-                        if persisted {
-                            if matches!(detect(&bytes), Some(Detected::Gltf)) {
-                                match import_repository_animation(
+                                    false
+                                }
+                            };
+                            // M11.1 — lay successive imports out on a grid so they don't stack on the same spot
+                            // (the persisted record keeps the chosen pos, so reload restores the same layout).
+                            if persisted {
+                                if matches!(detect(&bytes), Some(Detected::Gltf)) {
+                                    match import_repository_animation(
                                     &GltfImporter::new(),
                                     &bytes,
                                     &handle,
@@ -11014,27 +11129,28 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                         "[shell] animation facet inspection failed for '{path}': {error}"
                                     ),
                                 }
+                                }
+                                let pos = next_import_pos(&engine);
+                                if let Ok(id) =
+                                    capscene::place_mesh(&mut engine, &scene, &handle, pos)
+                                {
+                                    log.append(&Record::PlaceMesh {
+                                        asset: handle.clone(),
+                                        pos,
+                                    });
+                                    echo_created(
+                                        &mut engine,
+                                        &shared,
+                                        &mut positions,
+                                        &assets,
+                                        &channel,
+                                        &mut recency,
+                                        &mut touch,
+                                        id,
+                                    );
+                                    result = ImportAssetResult::Imported(id.to_loro_key());
+                                }
                             }
-                            let pos = next_import_pos(&engine);
-                            if let Ok(id) = capscene::place_mesh(&mut engine, &scene, &handle, pos)
-                            {
-                                log.append(&Record::PlaceMesh {
-                                    asset: handle.clone(),
-                                    pos,
-                                });
-                                echo_created(
-                                    &mut engine,
-                                    &shared,
-                                    &mut positions,
-                                    &assets,
-                                    &channel,
-                                    &mut recency,
-                                    &mut touch,
-                                    id,
-                                );
-                                result = ImportAssetResult::Imported(id.to_loro_key());
-                            }
-                        }
                         }
                     }
                 }
@@ -11132,6 +11248,106 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     }
                 }
                 let _ = reply.send(ok);
+            }
+            EngineCmd::JointAuthorBatch { requests, reply } => {
+                let key_count = requests.iter().map(|request| request.keys.len()).sum();
+                let result = if requests.is_empty() {
+                    JointAuthorBatchResult {
+                        message: "Add at least one joint before authoring the mechanism.".into(),
+                        ..JointAuthorBatchResult::default()
+                    }
+                } else if requests.len() > MAX_JOINT_AUTHOR_BATCH {
+                    JointAuthorBatchResult {
+                        message: format!(
+                            "The mechanism has {} joints; author at most {MAX_JOINT_AUTHOR_BATCH} in one action.", requests.len()
+                        ),
+                        ..JointAuthorBatchResult::default()
+                    }
+                } else if requests
+                    .iter()
+                    .any(|request| request.keys.len() > MAX_JOINT_KEYS_PER_TRACK)
+                {
+                    JointAuthorBatchResult {
+                        message: format!(
+                            "A joint track exceeds the {MAX_JOINT_KEYS_PER_TRACK}-key safety limit. Split the authoring action."
+                        ),
+                        ..JointAuthorBatchResult::default()
+                    }
+                } else {
+                    let converted: Result<Vec<_>, String> = requests
+                        .iter()
+                        .enumerate()
+                        .map(|(index, request)| {
+                            let entity = EntityId::from_loro_key(&request.id).ok_or_else(|| {
+                                format!("Joint {} has an invalid entity identifier.", index + 1)
+                            })?;
+                            Ok(metrocalk_editor_shell::JointTrackAuthoring {
+                                entity,
+                                revolute: request.revolute,
+                                axis: request.axis,
+                                pivot: request.pivot,
+                                limits: (request.min, request.max),
+                                source: request.source.clone(),
+                                keys: request
+                                    .keys
+                                    .iter()
+                                    .map(|key| metrocalk_editor_shell::JointTrackKey {
+                                        time: key.t,
+                                        value: key.value,
+                                    })
+                                    .collect(),
+                            })
+                        })
+                        .collect();
+                    match converted.and_then(|converted| {
+                        let ops = metrocalk_editor_shell::try_author_joint_tracks_ops(
+                            &engine,
+                            &converted,
+                        )?;
+                        engine
+                            .commit("author-mechanism", ops)
+                            .map_err(|_| "The mechanism transaction was rejected.".to_owned())?;
+                        for authored in &converted {
+                            JOINT_POSES.with(|poses| {
+                                poses.borrow_mut().remove(&authored.entity);
+                            });
+                        }
+                        // The plan genuinely changed — new tracks exist — so it is recompiled once for the
+                        // whole gesture rather than once per key (the former scene-size × key-count
+                        // defect). The viewport, however, only needs the authored parts republished:
+                        // authoring a mechanism moves those parts and their children and creates no
+                        // instances, so a full scene rebuild here was pure cost.
+                        refresh_animation_plan(&engine, &mut animation_preview);
+                        let moved = animation_affected_subtrees(
+                            &engine,
+                            &converted.iter().map(|authored| authored.entity).collect(),
+                        );
+                        publish_authored_instances(
+                            &engine,
+                            &shared,
+                            &mut positions,
+                            &assets, moved,
+                        );
+                        if let Some(channel) = &channel {
+                            for authored in &converted {
+                                send_proj!(channel, project_entity(&engine, authored.entity));
+                            }
+                        }
+                        Ok(())
+                    }) {
+                        Ok(()) => JointAuthorBatchResult {
+                            ok: true,
+                            message: format!(
+                                "Authored {} joints and {key_count} keys as one undoable mechanism action.", requests.len()
+                            ), authored_joints: requests.len(), authored_keys: key_count,
+                        },
+                        Err(message) => JointAuthorBatchResult {
+                            message,
+                            ..JointAuthorBatchResult::default()
+                        },
+                    }
+                };
+                let _ = reply.send(result);
             }
             EngineCmd::JointKey { id, t, reply } => {
                 // Key the CURRENT DOF value at time t (append/replace in the sorted track) — one undoable
@@ -11261,15 +11477,24 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // Compatibility entry point for the original mechanism panel. Route it through the same
                 // immutable animation plan as the universal timeline so parent/child assemblies, granular
                 // tracks and legacy JointTrack data all share one deterministic render-only projection.
-                JOINT_POSES.with(|jp| jp.borrow_mut().clear());
-                ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
+                // Undo the previous scrub by restoring the handful of entities it posed, NOT by
+                // republishing every instance in the scene.
                 animation_preview.playing = false;
-                rebuild(&engine, &shared, &mut positions, &assets);
+                restore_posed_instances_to_authored(&engine, &shared, &mut positions, &assets);
+                // Compile the plan only when there isn't one. Scrubbing does not change the document, and
+                // every path that DOES change it already refreshes the plan; re-reading and recompiling the
+                // whole animation document on each scrub tick made dragging a playhead cost a full scene
+                // scan per frame.
+                if animation_preview.plan.is_none() && animation_preview.transient_clip.is_none() {
+                    refresh_animation_plan(&engine, &mut animation_preview);
+                }
                 let posed = if t.is_finite() && t >= 0.0 {
-                    let document = metrocalk_editor_shell::load_animation_document(&engine);
-                    if let Ok(tick) = document.sequence.time_base.from_seconds(t) {
+                    let tick = animation_preview
+                        .plan
+                        .as_ref()
+                        .and_then(|plan| plan.time_base.from_seconds(t).ok());
+                    if let Some(tick) = tick {
                         seek_animation_preview(&mut animation_preview, tick);
-                        refresh_animation_plan(&engine, &mut animation_preview);
                         let _ = apply_animation_preview_state(
                             &engine,
                             &shared,
@@ -11285,9 +11510,6 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     seek_animation_preview(&mut animation_preview, AnimationTick::ZERO);
                     0
                 };
-                if posed == 0 {
-                    rebuild(&engine, &shared, &mut positions, &assets);
-                }
                 let _ = reply.send(posed);
             }
             EngineCmd::JointInfo { id, reply } => {
@@ -14233,6 +14455,18 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 sim_running = run;
             }
             EngineCmd::Play { reply } => {
+                // Entering Play does a lot of one-time work over the WHOLE scene -- a document snapshot,
+                // a physics recording, the rules recording, the role roster. At 17,793 entities that is
+                // the difference between a button press and a stall, and none of it was measured.
+                let play_started = std::time::Instant::now();
+                let mut play_phase = std::time::Instant::now();
+                let mut play_phases: Vec<(&'static str, u128)> = Vec::new();
+                let phase = |name: &'static str,
+                             phases: &mut Vec<(&'static str, u128)>,
+                             at: &mut std::time::Instant| {
+                    phases.push((name, at.elapsed().as_millis()));
+                    *at = std::time::Instant::now();
+                };
                 if refresh_animation_clip_instances(&engine, &assets, &mut animation_preview) {
                     restore_authored_animation_projection(
                         &engine,
@@ -14260,7 +14494,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     pipe_tool = None;
                     pipe_revision = pipe_revision.wrapping_add(1);
                     publish_pipe_preview(&shared, None);
+                    phase("prelude", &mut play_phases, &mut play_phase);
                     play_snapshot = Some(engine.snapshot());
+                    phase("snapshot", &mut play_phases, &mut play_phase);
                     play_mode = true;
                     // M11.4 (ADR-043) — render through the active scene camera while playing. Save the
                     // pre-Play editor view so Stop restores it; if no camera is active, keep the current
@@ -14287,6 +14523,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     // M12.5 (ADR-049) — capture the authored Rules + state machines into a deterministic
                     // `RuleReplay` at Play-start (a projection over a RuntimeState, never the doc). A rule
                     // with a non-deterministic plugin is held out of the lockstep path + surfaced.
+                    phase("physics-recording", &mut play_phases, &mut play_phase);
                     let session = metrocalk_editor_shell::play_rules::build_recording(
                         &engine,
                         &rules_registry,
@@ -14298,6 +14535,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     // for the touch bridge, and start the run with a clean hide overlay.
                     PLAY_HIDDEN.with(|hidden| hidden.borrow_mut().clear());
                     let roster_rows = metrocalk_editor_shell::role_roster(&engine);
+                    phase("role-roster", &mut play_phases, &mut play_phase);
                     // Anything a moving body can bump INTO emits `Touched`: collectibles (which get
                     // taken) and hazards (which hurt the toucher). Same bridge, same event — the rule
                     // decides what it means.
@@ -14437,6 +14675,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         cinema_owner = None;
                         {
                             let mut st = shared.lock().unwrap();
+                            st.cinematic_subject_id = None;
+                            st.cinematic_shot_index = None;
+                            st.cinematic_visited_subjects.clear();
                             st.fx_peak_total = 0;
                             st.fx_bursts_fired = 0;
                             st.fx_peak_radiance = 0.0;
@@ -14494,6 +14735,17 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         );
                     }
                 }
+                phase("cinematics+finish", &mut play_phases, &mut play_phase);
+                diag_log!(
+                    "engine: Play took {} ms over {} entities -- {}",
+                    play_started.elapsed().as_millis(),
+                    engine.entity_ids().len(),
+                    play_phases
+                        .iter()
+                        .map(|(name, ms)| format!("{name} {ms} ms"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
                 let _ = reply.send(PlayInfo {
                     playing: play_mode,
                     paused: play_mode && !sim_running,
@@ -14612,6 +14864,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 });
             }
             EngineCmd::Tick => {
+                pending_ticks.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                let tick_started = std::time::Instant::now();
                 // One fixed-`dt` step + a delta sync of the moved bodies' transforms to the viewport, and
                 // (only if the debugger is open) a refresh of the read-only overlay. A no-op until a body
                 // exists + the sim runs. NEVER a commit/Loro write (ADR-021). Off the JS hot path (inv. 4).
@@ -14959,6 +15213,15 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 }
                                 // The viewport stops being a workspace for the duration of the shot.
                                 st.cinematic = true;
+                                st.cinematic_subject_id = Some(key.clone());
+                                st.cinematic_shot_index = None;
+                                if !st
+                                    .cinematic_visited_subjects
+                                    .iter()
+                                    .any(|visited| visited == key)
+                                {
+                                    st.cinematic_visited_subjects.push(key.clone());
+                                }
                                 // By KEY, never by index: instance indices are only stable between
                                 // rebuilds, and a rebuild during a cutscene (an undo, a delete, a door
                                 // reopening) would otherwise re-outline an unrelated object when the
@@ -15018,13 +15281,17 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         // film a different subject, so reusing the current bounds would make the blend
                         // aim between a correct pose and a pose solved around the wrong object.
                         let (sample, previous_sample, aspect) = {
-                            let st = shared.lock().unwrap();
+                            let mut st = shared.lock().unwrap();
+                            // The subject sampler reads per-instance mesh bounds; make sure it reads
+                            // them from the memo rather than re-walking every vertex of every part in
+                            // the subject's subtree, once per tick, at 60 Hz.
+                            st.sync_mesh_bounds();
                             (
-                                cinematic_shot_subject_sample(&engine, &st, *entity, shot),
+                                cinematic_shot_subject_sample(&engine, &mut st, *entity, shot),
                                 playback.blend_from.map(|(previous, _)| {
                                     cinematic_shot_subject_sample(
                                         &engine,
-                                        &st,
+                                        &mut st,
                                         *entity,
                                         &cut.shots[previous],
                                     )
@@ -15075,6 +15342,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             far = far.max(previous_far);
                         }
                         let mut st = shared.lock().unwrap();
+                        st.cinematic_subject_id = Some(key.clone());
+                        st.cinematic_shot_index = Some(playback.index);
                         st.cam_override = Some(render::CamView {
                             pos: pose.eye,
                             look_at: Some(pose.look_at),
@@ -15342,8 +15611,26 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 if animation_preview.playing {
                     const PREVIEW_STEP: i64 =
                         metrocalk_editor_shell::DEFAULT_TICKS_PER_SECOND as i64 / 60;
-                    let animation_document =
-                        metrocalk_editor_shell::load_animation_document(&engine);
+                    // LAZY, and that is the whole point. `load_animation_document` is a WHOLE-SCENE
+                    // read -- every entity id, sorted, with a component read each -- and it was loaded
+                    // on EVERY tick of playback for one reason: to name the owner of any animation
+                    // event crossed this tick, of which there are usually none. On the imported factory
+                    // that is a 17,793-entity scan at 60 Hz, and it measured as the dominant term in a
+                    // 2.5-3 SECOND tick (the coalescer then drops ~59 of every 60 beats, which is why
+                    // the cinematic camera advanced one frame every three seconds). Read on demand, the
+                    // ordinary tick never touches it.
+                    let animation_document: std::cell::OnceCell<
+                        metrocalk_editor_shell::AnimationDocument,
+                    > = std::cell::OnceCell::new();
+                    let event_owner = |id: &metrocalk_animation::EventId| {
+                        animation_document
+                            .get_or_init(|| {
+                                metrocalk_editor_shell::load_animation_document(&engine)
+                            })
+                            .event_owners
+                            .get(id)
+                            .map_or_else(String::new, EntityId::to_loro_key)
+                    };
                     let duration = animation_transport_duration(&animation_preview);
                     let previous_tick = animation_preview.current_tick;
                     let step = animation_preview_step_delta(
@@ -15368,10 +15655,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             .extend(events.iter().take(remaining).map(|occurrence| {
                                 AnimationEventInfo {
                                     id: occurrence.event.id.as_str().to_owned(),
-                                    owner_id: animation_document
-                                        .event_owners
-                                        .get(&occurrence.event.id)
-                                        .map_or_else(String::new, EntityId::to_loro_key),
+                                    owner_id: event_owner(&occurrence.event.id),
                                     name: occurrence.event.name.clone(),
                                     tick: occurrence.source_local_tick.0,
                                     seconds: animation_preview
@@ -15405,10 +15689,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 .into_iter()
                                 .map(|occurrence| AnimationEventInfo {
                                     id: occurrence.event.id.as_str().to_owned(),
-                                    owner_id: animation_document
-                                        .event_owners
-                                        .get(&occurrence.event.id)
-                                        .map_or_else(String::new, EntityId::to_loro_key),
+                                    owner_id: event_owner(&occurrence.event.id),
                                     name: occurrence.event.name,
                                     tick: occurrence.local_tick.0,
                                     seconds: plan
@@ -15456,6 +15737,18 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         &mut positions,
                         &assets,
                         &mut animation_preview,
+                    );
+                }
+                // What a heartbeat actually cost. Anything past a quarter second means the coalescer is
+                // already dropping beats, and the number is the difference between "the editor froze"
+                // and "the engine is spending 340 ms a tick on a 17,793-entity scene".
+                let tick_cost = tick_started.elapsed();
+                if tick_cost >= std::time::Duration::from_millis(250)
+                    && slow_tick_reported.elapsed() >= std::time::Duration::from_secs(5)
+                {
+                    slow_tick_reported = std::time::Instant::now();
+                    diag_log!(
+                        "engine: one tick took {:.0} ms (budget 16.7 ms) - play_mode={play_mode} bodies={} entities={}", tick_cost.as_secs_f32() * 1000.0, body_of.len(), engine.entity_ids().len()
                     );
                 }
             }
@@ -16722,7 +17015,10 @@ fn build_cad_report_page(
 ) -> CadReportResp {
     const MAX_PAGE_ROWS: usize = 2_000;
     let mut r = CadReportResp::default();
-    let query = query.map(str::trim).filter(|value| !value.is_empty()).map(str::to_lowercase);
+    let query = query
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
     let mut rows = Vec::new();
     for id in engine.entity_ids() {
         if !engine.is_active(id) {
@@ -17330,6 +17626,10 @@ thread_local! {
 
     /// Complete hierarchy-aware global poses for the animation engine. Unlike `JOINT_POSES`, this map
     /// includes affected descendants, so a keyed assembly or mechanism parent carries its children.
+    /// Rate limiter for the per-tick animation cost report.
+    static ANIMATION_COST_REPORTED: std::cell::RefCell<std::time::Instant> =
+        std::cell::RefCell::new(std::time::Instant::now() - std::time::Duration::from_secs(60));
+
     static ANIMATION_POSES: std::cell::RefCell<HashMap<EntityId, AnimationPose>> =
         std::cell::RefCell::new(HashMap::new());
 
@@ -17976,6 +18276,112 @@ fn apply_animation_preview(
     )
 }
 
+/// Return the entities a previous scrub/preview posed to their AUTHORED transforms, in place.
+///
+/// The alternative — republishing the whole render projection to get back to neutral — is what made
+/// scrubbing a timeline unusable in an imported assembly: `rebuild` re-reads every component of every
+/// entity in the scene, so a 17,793-part factory paid seconds for a gesture that moved 24 parts. A scrub
+/// is a render-only projection over authored state, so undoing one is exactly "recompute these few
+/// entities from the document", and it costs what the animation costs.
+///
+/// Deliberately mirrors the pose path (`global_transform` + `base_render_scale`) rather than `rebuild`'s
+/// instance construction: those are the same values the pose path overwrote, so restoring them with the
+/// same two functions is what makes the round trip exact.
+fn restore_posed_instances_to_authored(
+    engine: &Engine<FlecsWorld>,
+    shared: &Shared,
+    positions: &mut HashMap<Entity, [f32; 3]>,
+    assets: &AssetsRuntime,
+) {
+    let mut posed: BTreeSet<EntityId> = BTreeSet::new();
+    ANIMATION_POSES.with(|stored| posed.extend(stored.borrow().keys().copied()));
+    JOINT_POSES.with(|stored| posed.extend(stored.borrow().keys().copied()));
+    ANIMATION_POSES.with(|stored| stored.borrow_mut().clear());
+    JOINT_POSES.with(|stored| stored.borrow_mut().clear());
+    publish_authored_instances(engine, shared, positions, assets, posed);
+}
+
+/// Republish exactly these entities' instances from the authored document, leaving the rest untouched.
+///
+/// This is the incremental counterpart to `rebuild`. `rebuild` re-reads every component of every entity
+/// and reconstructs the whole instance list: correct, but it costs the SCENE. When an edit is known to
+/// have MOVED a bounded set of entities and to have created, deleted, re-parented or re-meshed none of
+/// them, republishing just those is equally correct and costs the EDIT instead. Callers that change the
+/// instance SET still owe a full `rebuild` — that precondition is the whole contract of this function.
+fn publish_authored_instances(
+    engine: &Engine<FlecsWorld>,
+    shared: &Shared,
+    positions: &mut HashMap<Entity, [f32; 3]>,
+    assets: &AssetsRuntime,
+    ids: impl IntoIterator<Item = EntityId>,
+) {
+    let authored: HashMap<String, AnimationPose> = ids
+        .into_iter()
+        .filter(|id| engine.entity_exists(*id))
+        .map(|id| {
+            let transform = capscene::global_transform(engine, id);
+            let pose = AnimationPose {
+                position: transform.translation,
+                rotation: transform.rotation,
+                render_scale: base_render_scale(engine, assets, id),
+            };
+            if let Some(entity) = engine.ecs_entity(id) {
+                positions.insert(entity, pose.position);
+            }
+            (id.to_loro_key(), pose)
+        })
+        .collect();
+    if authored.is_empty() {
+        return;
+    }
+
+    let mut state = shared.lock().unwrap();
+    let mut changed = false;
+    state.sync_index_of_id();
+    for (key, pose) in &authored {
+        let Some(index) = state.index_of(key) else {
+            continue;
+        };
+        let Some(instance) = state.instances.get_mut(index) else {
+            continue;
+        };
+        instance.center = pose.position;
+        instance.rotation = pose.rotation;
+        instance.scale = pose.render_scale;
+        changed = true;
+    }
+    if changed {
+        state.revision = state.revision.wrapping_add(1);
+    }
+}
+
+/// Every entity an animated set moves: the targets themselves plus everything parented beneath them.
+///
+/// The obvious reading of that sentence — "ask each entity whether one of its ancestors is animated" —
+/// is what this replaced, and it is O(scene x depth) in engine queries EVERY animation tick. That is
+/// invisible in a scene of dozens and ruinous in an imported CAD assembly: at 17,793 entities it starved
+/// the engine thread badly enough that an ordinary transport read blocked for minutes and the viewport
+/// presented stale frames while reporting that everything had moved.
+///
+/// Descending from the targets yields exactly the same set for the cost of the animation rather than the
+/// cost of the scene. `descendants` is deliberately measured from the live hierarchy on each call: a
+/// cached subtree would go stale the moment a part is re-parented mid-playback.
+fn animation_affected_subtrees(
+    engine: &Engine<FlecsWorld>,
+    targets: &BTreeSet<EntityId>,
+) -> BTreeSet<EntityId> {
+    let mut affected = BTreeSet::new();
+    let mut frontier: Vec<EntityId> = targets.iter().copied().collect();
+    while let Some(id) = frontier.pop() {
+        // A cycle in the hierarchy would otherwise loop forever; the visited set is the guard.
+        if !affected.insert(id) {
+            continue;
+        }
+        frontier.extend(engine.children_of(id));
+    }
+    affected
+}
+
 /// Project one final, already-mixed property bundle. Both the implicit flat sequence and the authored
 /// graph runtime converge here, so hierarchy propagation, sink admission and unsupported-subpath behavior
 /// cannot drift between the two playback modes.
@@ -18011,17 +18417,18 @@ fn apply_animation_binding_values<'a>(
         animated_targets.insert(id);
         report.applied += 1;
     }
-    let mut affected = BTreeSet::new();
-    for candidate in engine.entity_ids() {
-        let mut cursor = Some(candidate);
-        while let Some(id) = cursor {
-            if animated_targets.contains(&id) {
-                affected.insert(candidate);
-                break;
-            }
-            cursor = engine.parent_of(id);
-        }
-    }
+    let admitted = std::time::Instant::now();
+    // The authored global transform is read ONLY to compare scales; when nothing in this frame animates
+    // a scale at all -- which is every frame of a mechanism timeline -- the ratio is 1 and the whole
+    // ancestor walk per affected entity is dead work.
+    let animates_scale = values.values().any(|fields| {
+        fields
+            .keys()
+            .any(|(_, property)| matches!(property.as_str(), "scale" | "scale3"))
+    });
+    let affected = animation_affected_subtrees(engine, &animated_targets);
+    let subtrees = std::time::Instant::now();
+    let affected_count = affected.len();
     let mut memo = HashMap::new();
     let mut poses = HashMap::new();
     for id in affected {
@@ -18032,9 +18439,13 @@ fn apply_animation_binding_values<'a>(
             continue;
         }
         let projected = projected_animation_global(engine, id, &values, &mut memo);
-        let base = capscene::global_transform(engine, id);
-        let scale_ratio = if base.scale[0].abs() > 1.0e-9 {
-            projected.scale[0] / base.scale[0]
+        let scale_ratio = if animates_scale {
+            let base = capscene::global_transform(engine, id);
+            if base.scale[0].abs() > 1.0e-9 {
+                projected.scale[0] / base.scale[0]
+            } else {
+                1.0
+            }
         } else {
             1.0
         };
@@ -18048,6 +18459,7 @@ fn apply_animation_binding_values<'a>(
         }
         poses.insert(id, pose);
     }
+    let posed = std::time::Instant::now();
     ANIMATION_POSES.with(|stored| *stored.borrow_mut() = poses.clone());
     if !poses.is_empty() {
         let by_key: HashMap<_, _> = poses
@@ -18055,10 +18467,13 @@ fn apply_animation_binding_values<'a>(
             .map(|(id, pose)| (id.to_loro_key(), pose))
             .collect();
         let mut state = shared.lock().unwrap();
-        let ids = state.ids.clone();
         let mut changed = false;
-        for (index, key) in ids.iter().enumerate() {
-            let Some(pose) = by_key.get(key) else {
+        // Look up the POSED keys, rather than scanning every published id looking for them. Walking the
+        // id list hashed 17,793 short strings per tick on the imported factory to find 24 of them; this
+        // does 24 lookups into a map the scene's membership already pays for.
+        state.sync_index_of_id();
+        for (key, pose) in &by_key {
+            let Some(index) = state.index_of(key) else {
                 continue;
             };
             let Some(instance) = state.instances.get_mut(index) else {
@@ -18072,6 +18487,25 @@ fn apply_animation_binding_values<'a>(
         if changed {
             state.revision = state.revision.wrapping_add(1);
         }
+    }
+    // Per-tick during Play, so it has to be cheap; on the imported factory it was not, and nothing said
+    // where the time went. Reported at most once every five seconds, and only when it is over budget.
+    let published = std::time::Instant::now();
+    if admitted.elapsed() >= std::time::Duration::from_millis(50) {
+        ANIMATION_COST_REPORTED.with(|last| {
+            let mut last = last.borrow_mut();
+            if last.elapsed() >= std::time::Duration::from_secs(5) {
+                *last = std::time::Instant::now();
+                diag_log!(
+                    "animation: applying {} binding(s) took {} ms - subtrees {} ms ({affected_count}                      affected), poses {} ms, publish {} ms",
+                    report.applied,
+                    admitted.elapsed().as_millis(),
+                    subtrees.duration_since(admitted).as_millis(),
+                    posed.duration_since(subtrees).as_millis(),
+                    published.duration_since(posed).as_millis()
+                );
+            }
+        });
     }
     report
 }
@@ -18306,8 +18740,14 @@ fn rebuild(
     // entity (e.g. deleting an entity before the selected one). Capture the ids before `ids` is replaced.
     let prev_sel_id = st.selected.and_then(|i| st.ids.get(i).cloned());
     let prev_gizmo_id = st.gizmo_sel.and_then(|i| st.ids.get(i).cloned());
+    // The instance set has changed, so anything that frames it will be asked for mesh bounds; build the
+    // memo here, once, rather than letting the first framing pay for it per instance.
+    st.sync_mesh_bounds();
     st.instances = instances;
     st.ids = ids;
+    // The membership changed, so anything derived from WHICH entities are drawn is stale.
+    st.ids_revision = st.ids_revision.wrapping_add(1);
+    st.sync_index_of_id();
     st.mesh_slots = mesh_slots;
     st.snap_affinity = snap_affinity;
     st.line_points = line_points;
@@ -19663,6 +20103,25 @@ fn focus_entity(state: State<AppState>, id: String) {
     }
 }
 
+/// Tell the renderer which part of the window the viewer can actually SEE, in window fractions.
+///
+/// The wgpu surface is the whole window and the editor UI is composited over it, showing the 3D through
+/// a transparent hole. Framing had no way to know that, so `frame_all` and `focus_entity` fitted and
+/// centred their subject on the WINDOW -- and with a dock open on each side the window centre is not
+/// even inside the visible region. In the production factory captures the whole imported assembly sat
+/// against the left edge of the viewport with a third of the framed area behind panels.
+///
+/// Reported by the shell whenever the layout changes. Rejected values (non-finite, inverted, outside the
+/// window) fall back to the whole surface rather than throwing the camera somewhere the subject is not;
+/// the reply is the rectangle actually adopted, so a caller can see what was accepted.
+#[tauri::command]
+fn set_viewport_rect(state: State<AppState>, x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.visible_rect = [x, y, width, height];
+    st.adopted_visible_rect()
+}
+
 /// Exit M3.3 Focus mode ("everything comes back to normal"): un-dim the other entities and restore the
 /// orbit `distance` saved when focus was entered (see [`render::SceneState::clear_focus`]). Idempotent —
 /// a no-op when nothing is focused, so a stray Escape never disturbs the scene.
@@ -20536,6 +20995,29 @@ fn read_transform(state: State<AppState>, id: String) -> [f64; 8] {
     recv_reply(&rx).unwrap_or([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0])
 }
 
+/// Read the transform an entity is currently RENDERED at: `[x, y, z, qx, qy, qz, qw, scale]` from the
+/// published instance, or `None` if the entity draws nothing.
+///
+/// [`read_transform`] answers a different question — what the DOCUMENT says — and for a timeline scrub
+/// the correct answer there is "unchanged", because a scrub is a render-only projection over authored
+/// state. That left no way at all to ask whether a scrub actually moved any geometry, and a whole
+/// investigation into "the factory's mechanisms do not move" had to be conducted through screenshot
+/// diffing: a measurement that cannot separate "the engine did not move it" from "it moved and the
+/// camera was not looking at it", or from a part that is rotationally symmetric about the axis it
+/// turns on, or from one occluded by the machine it is bolted inside.
+///
+/// This reads the instance the render thread uploads, so it answers the engine question directly.
+#[tauri::command]
+fn rendered_transform(state: State<AppState>, id: String) -> Option<[f32; 8]> {
+    ipc();
+    let st = state.shared.lock().unwrap();
+    let index = st.ids.iter().position(|key| *key == id)?;
+    let instance = st.instances.get(index)?;
+    let [x, y, z] = instance.center;
+    let [qx, qy, qz, qw] = instance.rotation;
+    Some([x, y, z, qx, qy, qz, qw, instance.scale])
+}
+
 /// M9.2 — reparent a part ("drag in hierarchy"); `parent` `None` → root. Fire-and-forget (undoable).
 #[tauri::command]
 fn reparent_part(state: State<AppState>, id: String, parent: Option<String>) {
@@ -21077,33 +21559,58 @@ fn role_assign(
 /// precision merely because many part AABBs are combined.
 fn cinematic_subject_sample(
     engine: &Engine<FlecsWorld>,
-    state: &render::SceneState,
+    state: &mut render::SceneState,
     subject: EntityId,
     fallback_transform: GizmoTransform,
 ) -> metrocalk_animation::shot::SubjectSample {
-    let mut stack = vec![subject];
-    let mut subtree = HashSet::new();
+    // WHICH instances are under this subject changes only when the scene's membership does, so it is
+    // memoised against `ids_revision` rather than recomputed per solve. Recomputing it meant descending
+    // ~17,000 entities and parsing 17,793 render keys twice a tick at 60 Hz on the imported factory: the
+    // dominant term in a measured 2.5-3 SECOND tick, for a set that had not changed since Play began.
+    let key = subject.to_loro_key();
+    if state.cinema_subtree_revision != state.ids_revision {
+        state.cinema_subtree.clear();
+        state.cinema_subtree_revision = state.ids_revision;
+    }
+    if !state.cinema_subtree.contains_key(&key) {
+        let mut stack = vec![subject];
+        let mut subtree = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !subtree.insert(id) {
+                continue;
+            }
+            stack.extend(engine.children_of(id));
+        }
+        let indices: Vec<usize> = state
+            .ids
+            .iter()
+            .enumerate()
+            .filter(|(_, published)| {
+                EntityId::from_loro_key(published).is_some_and(|id| subtree.contains(&id))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        // NEVER SILENT: a subject that resolves to no drawn geometry is framed by the scalar fallback at
+        // the end of this function -- a metre-ish box at its own origin. That is right for a marker and
+        // very wrong for an assembly folder, whose whole job as a shot subject is to stand for everything
+        // under it, and it is invisible from the outside because the camera solves to a plausible number.
+        if indices.is_empty() {
+            diag_log!(
+                "cinematics: subject {key} resolves to no drawn geometry ({} entities in its subtree,                  {} instances published) - the shot will frame its origin, not its contents",
+                subtree.len(),
+                state.ids.len()
+            );
+        }
+        state.cinema_subtree.insert(key.clone(), indices);
+    }
+
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
     let mut found = false;
-
-    while let Some(id) = stack.pop() {
-        if !subtree.insert(id) {
-            continue;
-        }
-        stack.extend(engine.children_of(id));
-    }
-
-    // Parse the render ids once and test them against the entity-id subtree. This avoids building a second
-    // scene-sized id→index map every cinematic frame — a factory assembly can have thousands of parts, and
-    // the camera path must not introduce two large hash allocations at 60 Hz.
-    for (index, key) in state.ids.iter().enumerate() {
-        let Some(id) = EntityId::from_loro_key(key) else {
-            continue;
-        };
-        if !subtree.contains(&id) {
-            continue;
-        }
+    // Moved out and back rather than cloned: the memo is in place, and copying a 15,711-entry index list
+    // twice a tick would put back a slice of what it was built to remove.
+    let indices = state.cinema_subtree.remove(&key).unwrap_or_default();
+    for index in indices.iter().copied() {
         if let Some((part_lo, part_hi)) = state.rendered_instance_bounds(index) {
             for axis in 0..3 {
                 lo[axis] = lo[axis].min(f64::from(part_lo[axis]));
@@ -21112,6 +21619,7 @@ fn cinematic_subject_sample(
             found = true;
         }
     }
+    state.cinema_subtree.insert(key, indices);
 
     if found {
         let mut center = [0.0; 3];
@@ -21146,7 +21654,7 @@ fn cinematic_subject_sample(
 /// duplicating the hierarchy/bounds policy in the playback loop.
 fn cinematic_shot_subject_sample(
     engine: &Engine<FlecsWorld>,
-    state: &render::SceneState,
+    state: &mut render::SceneState,
     cutscene_entity: EntityId,
     shot: &metrocalk_animation::shot::ShotRecipe,
 ) -> metrocalk_animation::shot::SubjectSample {
@@ -21163,7 +21671,11 @@ fn cinematic_shot_subject_sample(
         2.0 * (y * z - w * x),
         1.0 - 2.0 * (x * x + y * y),
     ];
-    let length = forward.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let length = forward
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
     sample.forward = if length.is_finite() && length > 1.0e-4 {
         [
             forward[0] / length,
@@ -21191,6 +21703,8 @@ fn restore_editor_chrome(st: &mut render::SceneState, dimmed: &mut Option<(Strin
         st.cinematic = false;
         st.revision = st.revision.wrapping_add(1);
     }
+    st.cinematic_subject_id = None;
+    st.cinematic_shot_index = None;
 }
 
 /// Fire an object's ONE-SHOT effect layers as a detached burst, anchored where the object currently is.
@@ -21636,12 +22150,10 @@ fn colour_status(state: State<AppState>) -> serde_json::Value {
             // have read a promise the engine cannot keep. And it says "the space is decided by role",
             // not "textures carry their space": no tag is attached to an asset, which is exactly what
             // `perAssetColourSpaceOverride: false` on the line above reports.
-            "A texture's colour space is decided by its ROLE, from one policy the uploader calls: base              colour decodes from sRGB, while normal, roughness/metallic and occlusion upload as raw              data and are never given a transfer function. Those four are the texture kinds this              renderer binds; an emissive or mask map is not read at all, so it is not carried rather              than mis-converted.",
-            "An imported HDR panorama is treated as scene-linear with Rec.709 primaries by default. The              Radiance format does not record primaries in any required field, so that is an assumption —              and it is the one assumption a person can now override, per environment, with the choice              carried as an explicit 'set by you' provenance.",
-            "ACEScg is now the renderer's working space when selected: base colour, emissive, light              colour, environment radiance and every authored chrome colour are converted into AP1 BEFORE              the BRDF, bloom meters with AP1's luminance weights, and the frame returns to Rec.709 once,              immediately before the view transform. Selecting linear Rec.709 makes every one of those              conversions the identity matrix, so it is provably the same pipeline rather than a second              one.",
-            "The view transform is still NOT scene data (ADR-021): switching it dirties nothing and              never enters undo. It IS now remembered — working space, view transform and exposure are              saved as a presentation record beside the project and restored on open, so a review session              does not silently return to the filmic default.",
-            ocio.detail,
-            aces2.detail,
+            "A texture's colour space is decided by its ROLE, from one policy the uploader calls: base colour decodes from sRGB, while normal, roughness/metallic and occlusion upload as raw data and are never given a transfer function. Those four are the texture kinds this renderer binds; an emissive or mask map is not read at all, so it is not carried rather than mis-converted.",
+            "An imported HDR panorama is treated as scene-linear with Rec.709 primaries by default. The              Radiance format does not record primaries in any required field, so that is an assumption —              and it is the one assumption a person can now override, per environment, with the choice carried as an explicit 'set by you' provenance.",
+            "ACEScg is now the renderer's working space when selected: base colour, emissive, light colour, environment radiance and every authored chrome colour are converted into AP1 BEFORE              the BRDF, bloom meters with AP1's luminance weights, and the frame returns to Rec.709 once, immediately before the view transform. Selecting linear Rec.709 makes every one of those conversions the identity matrix, so it is provably the same pipeline rather than a second one.",
+            "The view transform is still NOT scene data (ADR-021): switching it dirties nothing and never enters undo. It IS now remembered — working space, view transform and exposure are saved as a presentation record beside the project and restored on open, so a review session does not silently return to the filmic default.", ocio.detail, aces2.detail,
         ],
     })
 }
@@ -21776,6 +22288,9 @@ fn camera_probe(state: State<AppState>) -> serde_json::Value {
         "fovDeg": fov,
         "cinematic": cinematic,
         "distance": distance,
+        "subjectId": st.cinematic_subject_id.clone(),
+        "shotIndex": st.cinematic_shot_index,
+        "visitedSubjects": st.cinematic_visited_subjects.clone(),
     })
 }
 
@@ -21787,17 +22302,28 @@ fn cinema_catalog() -> Vec<metrocalk_editor_shell::ShotSpec> {
 }
 
 /// Add one shot to an object's cutscene (one undoable commit).
+///
+/// `subject` optionally names the object the shot FRAMES. Omit it and the shot films the cutscene's own
+/// owner, which is the long-standing behaviour; pass a different object to author the shots ordinary
+/// film grammar depends on — an establishing wide of the whole assembly that belongs to the sequence
+/// about one of its parts, or a reveal that ends on the hall rather than the mechanism.
 #[tauri::command(async)]
 fn cinema_add_shot(
     state: State<AppState>,
     id: String,
     kind: String,
+    subject: Option<String>,
 ) -> metrocalk_editor_shell::CinemaReply {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state
         .tx
-        .send(EngineCmd::CinemaAddShot { id, kind, reply })
+        .send(EngineCmd::CinemaAddShot {
+            id,
+            kind,
+            subject,
+            reply,
+        })
         .is_err()
     {
         return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
@@ -22596,7 +23122,7 @@ fn set_environment_colour_space(state: State<AppState>, space: String) -> String
         return format!(
             "refused: an environment panorama is linear radiance, so it cannot be {}. Choose one of \
              the linear spaces.",
-            s.label()
+             s.label()
         );
     }
     state.shared.lock().unwrap().env_source_space = s;
@@ -22818,6 +23344,34 @@ fn set_joint(
         return false;
     }
     recv_reply(&rx).unwrap_or(false)
+}
+
+/// Author a complete multi-part mechanism as one user-visible transaction. Unlike repeatedly invoking
+/// `set_joint` / `joint_value` / `joint_key`, this pays for animation-plan and viewport publication once,
+/// so sophisticated rigs remain interactive in production-size CAD scenes.
+#[tauri::command(async)]
+fn joint_author_batch(
+    state: State<AppState>,
+    requests: Vec<JointTrackAuthoringRequest>,
+) -> JointAuthorBatchResult {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::JointAuthorBatch { requests, reply })
+        .is_err()
+    {
+        return JointAuthorBatchResult {
+            message: "The engine session is unavailable; no mechanism changes were committed."
+                .into(),
+            ..JointAuthorBatchResult::default()
+        };
+    }
+    recv_reply(&rx).unwrap_or_else(|_| JointAuthorBatchResult {
+        message: "The engine did not confirm the mechanism transaction; no success was reported."
+            .into(),
+        ..JointAuthorBatchResult::default()
+    })
 }
 
 /// M15.9 — key the joint's current DOF value at time `t` (ONE undoable commit; the track survives reload).
@@ -24427,6 +24981,10 @@ fn rule_scrub(state: State<AppState>, frame: u64, selected: Option<String>) -> R
 }
 
 fn main() {
+    // FIRST, before anything can fail: this binary is `windows_subsystem = "windows"` in release, so
+    // stderr is a handle nobody owns and a panic message is written into the void. Every unexplained
+    // termination in this app's history is that. `diag::init` gives the process a log it owns.
+    diag::init();
     let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
     let (tx, rx) = mpsc::channel::<EngineCmd>();
     {
@@ -24440,7 +24998,9 @@ fn main() {
             }))
             .is_err()
             {
-                eprintln!("[shell] FATAL: the engine thread panicked — the editor is now unresponsive (the viewport will freeze). Please restart.");
+                diag::log(
+                    "FATAL: the engine thread panicked — the editor is now unresponsive (the viewport will freeze). Please restart. The panic itself is logged above by the panic hook, with its thread, location and backtrace.",
+                );
             }
         });
     }
@@ -24534,6 +25094,7 @@ fn main() {
             viewport_pick_region,
             pick_diagnostics,
             focus_entity,
+            set_viewport_rect,
             unfocus,
             focus_debug,
             frame_all,
@@ -24562,6 +25123,7 @@ fn main() {
             cad_reimport_report,
             cad_reimport_resolve,
             set_joint,
+            joint_author_batch,
             joint_key,
             joint_value,
             joint_scrub,
@@ -24636,6 +25198,7 @@ fn main() {
             gizmo_handle_screen,
             gizmo_drag_end,
             read_transform,
+            rendered_transform,
             reparent_part,
             create_entity,
             pipe_forge_start,
@@ -24734,8 +25297,29 @@ fn main() {
             rule_scrub,
             ipc_count
         ])
-        .run(tauri::generate_context!())
-        .expect("run editor shell");
+        .build(tauri::generate_context!())
+        .expect("build editor shell")
+        // `build` + `run(callback)` rather than `run(context)` purely so the event loop's own
+        // lifecycle lands in the diagnostic log. Without it a webview teardown, an OS-initiated close
+        // and a user quit all leave the same trace — none — which is why an exit could never be told
+        // apart from a crash.
+        .run(|_app, event| match &event {
+            tauri::RunEvent::Ready => diag::log("lifecycle: Ready (event loop running)"),
+            tauri::RunEvent::ExitRequested { code, .. } => {
+                diag_log!("lifecycle: ExitRequested code={code:?}");
+            }
+            tauri::RunEvent::Exit => diag::log("lifecycle: Exit (event loop is terminating)"),
+            tauri::RunEvent::WindowEvent { label, event, .. } => match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    diag_log!("lifecycle: window '{label}' CloseRequested");
+                }
+                tauri::WindowEvent::Destroyed => {
+                    diag_log!("lifecycle: window '{label}' Destroyed");
+                }
+                _ => {}
+            },
+            _ => {}
+        });
 }
 
 #[cfg(test)]
@@ -25030,16 +25614,18 @@ mod cinematic_subject_tests {
             &[(group, None), (left, Some(group)), (right, Some(group))],
         );
 
-        let mut state = SceneState::default();
-        state.instances = vec![
-            instance([-100.0, 5.0, 0.0], 1.0),
-            instance([100.0, 5.0, 0.0], 1.0),
-        ];
-        state.ids = vec![left.to_loro_key(), right.to_loro_key()];
-        state.mesh_slots = vec![0, 0];
-        state.meshes = vec![bounds_mesh([-10.0, -5.0, -2.0], [10.0, 5.0, 2.0])];
+        let mut state = SceneState {
+            instances: vec![
+                instance([-100.0, 5.0, 0.0], 1.0),
+                instance([100.0, 5.0, 0.0], 1.0),
+            ],
+            ids: vec![left.to_loro_key(), right.to_loro_key()],
+            mesh_slots: vec![0, 0],
+            meshes: vec![bounds_mesh([-10.0, -5.0, -2.0], [10.0, 5.0, 2.0])],
+            ..SceneState::default()
+        };
 
-        let sample = cinematic_subject_sample(&engine, &state, group, GizmoTransform::IDENTITY);
+        let sample = cinematic_subject_sample(&engine, &mut state, group, GizmoTransform::IDENTITY);
         assert_eq!(sample.center, [0.0, 5.0, 0.0]);
         assert_eq!(sample.half_extent, [110.0, 5.0, 2.0]);
 
@@ -25087,22 +25673,28 @@ mod cinematic_subject_tests {
             ],
         );
 
-        let mut state = SceneState::default();
-        state.instances = vec![
-            instance([10.0, 0.0, 0.0], 1.0),
-            instance([30.0, 0.0, 0.0], 1.0),
-            instance([1_000.0, 0.0, 0.0], 1.0),
-        ];
-        state.ids = vec![
-            direct_part.to_loro_key(),
-            nested_part.to_loro_key(),
-            unrelated_part.to_loro_key(),
-        ];
-        state.mesh_slots = vec![0, 0, 0];
-        state.meshes = vec![bounds_mesh([-1.0; 3], [1.0; 3])];
+        let mut state = SceneState {
+            instances: vec![
+                instance([10.0, 0.0, 0.0], 1.0),
+                instance([30.0, 0.0, 0.0], 1.0),
+                instance([1_000.0, 0.0, 0.0], 1.0),
+            ],
+            ids: vec![
+                direct_part.to_loro_key(),
+                nested_part.to_loro_key(),
+                unrelated_part.to_loro_key(),
+            ],
+            mesh_slots: vec![0, 0, 0],
+            meshes: vec![bounds_mesh([-1.0; 3], [1.0; 3])],
+            ..SceneState::default()
+        };
 
-        let sample =
-            cinematic_subject_sample(&engine, &state, selected_group, GizmoTransform::IDENTITY);
+        let sample = cinematic_subject_sample(
+            &engine,
+            &mut state,
+            selected_group,
+            GizmoTransform::IDENTITY,
+        );
         assert_eq!(sample.center, [20.0, 0.0, 0.0]);
         assert_eq!(sample.half_extent, [11.0, 1.0, 1.0]);
         assert!(
@@ -25117,16 +25709,18 @@ mod cinematic_subject_tests {
         let part = engine.alloc_entity_id();
         commit_hierarchy(&mut engine, &[(part, None)]);
 
-        let mut state = SceneState::default();
-        state.instances = vec![instance([1.0, 2.0, 3.0], 0.001)];
-        state.ids = vec![part.to_loro_key()];
-        state.mesh_slots = vec![0];
-        state.meshes = vec![bounds_mesh(
-            [500.0, -250.0, -125.0],
-            [1_500.0, 250.0, 125.0],
-        )];
+        let mut state = SceneState {
+            instances: vec![instance([1.0, 2.0, 3.0], 0.001)],
+            ids: vec![part.to_loro_key()],
+            mesh_slots: vec![0],
+            meshes: vec![bounds_mesh(
+                [500.0, -250.0, -125.0],
+                [1_500.0, 250.0, 125.0],
+            )],
+            ..SceneState::default()
+        };
 
-        let sample = cinematic_subject_sample(&engine, &state, part, GizmoTransform::IDENTITY);
+        let sample = cinematic_subject_sample(&engine, &mut state, part, GizmoTransform::IDENTITY);
         assert!((sample.center[0] - 2.0).abs() < 1.0e-5);
         assert_eq!(sample.center[1..], [2.0, 3.0]);
         assert!((sample.half_extent[0] - 0.5).abs() < 1.0e-5);
@@ -25145,7 +25739,8 @@ mod cinematic_subject_tests {
             scale: [0.1; 3],
         };
 
-        let sample = cinematic_subject_sample(&engine, &SceneState::default(), subject, fallback);
+        let sample =
+            cinematic_subject_sample(&engine, &mut SceneState::default(), subject, fallback);
         assert_eq!(sample.center, fallback.translation);
         assert_eq!(sample.half_extent, [0.25; 3]);
     }
@@ -25673,15 +26268,34 @@ mod cad_report_tests {
         cad_part(&mut e, "Motor B", "exact-brep");
 
         let first = build_cad_report_page(&e, Some("MOTOR"), 0, 2);
-        assert_eq!(first.total, 3, "counts describe all query matches, not just the page");
-        assert_eq!(first.parts.iter().map(|part| part.name.as_str()).collect::<Vec<_>>(), ["motor A", "Motor B"]);
+        assert_eq!(
+            first.total, 3,
+            "counts describe all query matches, not just the page"
+        );
+        assert_eq!(
+            first
+                .parts
+                .iter()
+                .map(|part| part.name.as_str())
+                .collect::<Vec<_>>(),
+            ["motor A", "Motor B"]
+        );
         assert_eq!(first.exact_brep, 2);
         assert_eq!(first.proxy, 1);
 
         let second = build_cad_report_page(&e, Some("motor"), 2, 2);
         assert_eq!(second.total, 3);
-        assert_eq!(second.parts.iter().map(|part| part.name.as_str()).collect::<Vec<_>>(), ["Motor Z"]);
-        assert!(build_cad_report_page(&e, Some("robot"), 0, 10).parts.is_empty());
+        assert_eq!(
+            second
+                .parts
+                .iter()
+                .map(|part| part.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Motor Z"]
+        );
+        assert!(build_cad_report_page(&e, Some("robot"), 0, 10)
+            .parts
+            .is_empty());
     }
 
     #[test]
@@ -25919,6 +26533,56 @@ mod animation_native_tests {
 
         assert!((projected.translation[0] - 12.0).abs() < f32::EPSILON);
         assert_eq!(projected.translation[1..], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn the_animated_set_is_every_descendant_and_nothing_else_however_large_the_scene_is() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xA11);
+        let animated = engine.alloc_entity_id();
+        let child = engine.alloc_entity_id();
+        let grandchild = engine.alloc_entity_id();
+        let sibling = engine.alloc_entity_id();
+        let mut hierarchy = vec![
+            (animated, None),
+            (child, Some(animated)),
+            (grandchild, Some(child)),
+            (sibling, None),
+        ];
+        // The rest of an imported assembly. None of it is animated, and none of it may cost anything:
+        // the previous implementation walked every one of these entities' ancestor chains per tick.
+        let bystanders: Vec<_> = (0..5_000).map(|_| engine.alloc_entity_id()).collect();
+        hierarchy.extend(bystanders.iter().map(|id| (*id, Some(sibling))));
+        engine
+            .commit(
+                "fixture",
+                hierarchy
+                    .iter()
+                    .map(|(id, parent)| Op::CreateEntity {
+                        id: *id,
+                        parent: *parent,
+                    })
+                    .collect(),
+            )
+            .expect("fixture hierarchy");
+
+        let targets = BTreeSet::from([animated]);
+        let started = std::time::Instant::now();
+        let affected = animation_affected_subtrees(&engine, &targets);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            affected,
+            BTreeSet::from([animated, child, grandchild]),
+            "a moving part carries its whole subtree and nothing outside it"
+        );
+        assert!(
+            !affected.contains(&sibling) && bystanders.iter().all(|id| !affected.contains(id)),
+            "an unrelated branch must never be posed by someone else's animation"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "the affected set must cost what the animation costs, not what the scene costs; took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -27465,5 +28129,388 @@ mod animation_native_tests {
         assert!(!animation_binding_has_native_sink("UiStyle", "opacity"));
         assert!(!animation_binding_has_native_sink("Light", "intensity"));
         assert!(!animation_binding_has_native_sink("MeshRenderer", "mesh"));
+    }
+}
+
+/// Does a scrub of an *imported CAD assembly* actually move its rendered instances?
+///
+/// The factory-cinematic run reported 24 mechanisms posed while two OS captures either side of the
+/// scrub were byte-identical, and the two innocent readings — a stale capture, and a joint→render path
+/// broken in general — had both been ruled out by controls. What no control could separate was "the
+/// engine did not move the instance" from "the instance moved and the camera did not show it", because
+/// every measurement went through a screenshot.
+///
+/// These tests take the screenshot out of the loop. They build the shape an imported part actually has
+/// — a geometry-free assembly folder, a structural sub-node, and a leaf carrying `MeshRenderer` +
+/// `Transform` + `KinematicJoint`, nested and placed the way a CAD landing leaves them — publish the
+/// render projection through the same `rebuild` the app uses, apply a joint value through the same
+/// `apply_animation_binding_values` a scrub uses, and read the published instance back.
+#[cfg(test)]
+mod imported_assembly_pose_publication_tests {
+    use super::*;
+    use metrocalk_animation::{Binding as AnimBinding, PropertyPath, ValueKind};
+    use metrocalk_core::Op;
+
+    const MESH_HANDLE: &str = "cad-mesh-handle";
+
+    fn assets_with_one_cad_mesh() -> AssetsRuntime {
+        let mut handle_to_slot = HashMap::new();
+        handle_to_slot.insert(MESH_HANDLE.to_string(), 0usize);
+        AssetsRuntime {
+            store: AssetStore::new(),
+            catalog: MeshCatalog::default(),
+            asset_by_name: HashMap::new(),
+            handle_to_slot,
+            // An imported CAD part renders at its real metric size, not the 0.45 placeholder scale.
+            scales: vec![1.0],
+            display_affines: vec![AssetAffine::default()],
+            meshes: Vec::new(),
+            sphere: String::new(),
+            provenance: HashMap::new(),
+            animation_assets: HashMap::new(),
+            pipe_recipes: HashMap::new(),
+            shape_recipes: HashMap::new(),
+        }
+    }
+
+    fn number(entity: EntityId, component: &str, field: &str, value: f64) -> Op {
+        Op::SetField {
+            entity,
+            component: component.into(),
+            field: field.into(),
+            value: FieldValue::Number(value),
+        }
+    }
+
+    /// The hierarchy a CAD landing produces: a named group with no geometry, a structural sub-node, and
+    /// the leaf that actually carries a mesh. Returns `(assembly, node, part)`.
+    fn imported_assembly(engine: &mut Engine<FlecsWorld>) -> (EntityId, EntityId, EntityId) {
+        let assembly = engine.alloc_entity_id();
+        let node = engine.alloc_entity_id();
+        let part = engine.alloc_entity_id();
+        let mut ops = vec![
+            Op::CreateEntity {
+                id: assembly,
+                parent: None,
+            },
+            Op::SetField {
+                entity: assembly,
+                component: metrocalk_core::variant::INSTANCE_META.into(),
+                field: "kind".into(),
+                value: FieldValue::Str("group".into()),
+            },
+            Op::CreateEntity {
+                id: node,
+                parent: Some(assembly),
+            },
+            Op::SetField {
+                entity: node,
+                component: metrocalk_core::variant::INSTANCE_META.into(),
+                field: "kind".into(),
+                value: FieldValue::Str("group".into()),
+            },
+            Op::CreateEntity {
+                id: part,
+                parent: Some(node),
+            },
+            Op::SetField {
+                entity: part,
+                component: "MeshRenderer".into(),
+                field: capscene::MESH_FIELD.into(),
+                value: FieldValue::Str(MESH_HANDLE.into()),
+            },
+        ];
+        // Placements at real factory coordinates: this assembly is ~260 m long, so a part sits tens of
+        // metres from the origin and any float slop in the pose path shows up here, not at 0,0,0.
+        for (entity, x, y, z) in [(node, 41.0, 0.0, -7.5), (part, 2.25, 1.4, 0.35)] {
+            ops.push(number(entity, "Transform", "x", x));
+            ops.push(number(entity, "Transform", "y", y));
+            ops.push(number(entity, "Transform", "z", z));
+        }
+        engine.commit("import factory", ops).expect("import");
+        (assembly, node, part)
+    }
+
+    fn published_instance(shared: &Shared, id: EntityId) -> Option<render::Instance> {
+        let state = shared.lock().unwrap();
+        let key = id.to_loro_key();
+        let index = state.ids.iter().position(|candidate| *candidate == key)?;
+        state.instances.get(index).copied()
+    }
+
+    fn author_joint(
+        engine: &mut Engine<FlecsWorld>,
+        part: EntityId,
+        revolute: bool,
+        axis: [f64; 3],
+        limit: f64,
+    ) {
+        let global = capscene::global_transform(engine, part);
+        let ops = metrocalk_editor_shell::set_joint_ops(
+            part,
+            revolute,
+            axis,
+            global.translation.map(f64::from),
+            (-limit, limit),
+            "manual",
+        );
+        assert!(!ops.is_empty(), "the joint specification was rejected");
+        engine
+            .commit("author mechanism", ops)
+            .expect("author joint");
+    }
+
+    fn scrub_joint_to(
+        engine: &Engine<FlecsWorld>,
+        shared: &Shared,
+        assets: &AssetsRuntime,
+        part: EntityId,
+        value: f64,
+    ) -> AnimationApplyReport {
+        let binding = AnimBinding {
+            path: PropertyPath::new(part.to_loro_key(), "KinematicJoint", "value"),
+            value_kind: ValueKind::Number,
+        };
+        let animated = AnimValue::Number(value);
+        let mut positions = HashMap::new();
+        apply_animation_binding_values(
+            engine,
+            shared,
+            &mut positions,
+            assets,
+            1,
+            std::iter::once((&binding, &animated)),
+        )
+    }
+
+    #[test]
+    fn a_geometry_free_assembly_folder_publishes_only_its_mesh_bearing_leaf() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCAD0);
+        let (assembly, node, part) = imported_assembly(&mut engine);
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let assets = assets_with_one_cad_mesh();
+        rebuild(&engine, &shared, &mut HashMap::new(), &assets);
+
+        assert!(
+            published_instance(&shared, assembly).is_none(),
+            "an assembly folder is hierarchy, not geometry"
+        );
+        assert!(
+            published_instance(&shared, node).is_none(),
+            "a structural sub-node is hierarchy, not geometry"
+        );
+        let instance =
+            published_instance(&shared, part).expect("the mesh-bearing leaf is published");
+        // The leaf renders at its GLOBAL placement (41.0 + 2.25 along x), not its local offset.
+        assert!(
+            (instance.center[0] - 43.25).abs() < 1.0e-4,
+            "leaf published at {:?}",
+            instance.center
+        );
+    }
+
+    #[test]
+    fn scrubbing_a_prismatic_joint_moves_the_published_cad_instance() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCAD1);
+        let (_assembly, _node, part) = imported_assembly(&mut engine);
+        // Exactly how the factory harness authors a clamp: a prismatic stroke along +Y, pivoted on the
+        // part's own global position, with limits 15% wider than the amplitude.
+        author_joint(&mut engine, part, false, [0.0, 1.0, 0.0], 0.0575);
+
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let assets = assets_with_one_cad_mesh();
+        rebuild(&engine, &shared, &mut HashMap::new(), &assets);
+        let neutral = published_instance(&shared, part).expect("published");
+        let revision_before = shared.lock().unwrap().revision;
+
+        let report = scrub_joint_to(&engine, &shared, &assets, part, -0.044);
+        assert_eq!(report.applied, 1, "the joint binding was admitted");
+
+        let posed = published_instance(&shared, part).expect("still published");
+        assert!(
+            (posed.center[1] - (neutral.center[1] - 0.044)).abs() < 1.0e-5,
+            "a -0.044 m stroke along +Y must move the published instance: neutral {:?} posed {:?}",
+            neutral.center,
+            posed.center
+        );
+        assert_ne!(
+            shared.lock().unwrap().revision, revision_before,
+            "the render thread re-uploads instance buffers only when the revision changes, so a pose \
+             that does not bump it is a pose the GPU never sees"
+        );
+    }
+
+    #[test]
+    fn scrubbing_a_revolute_joint_rotates_the_published_cad_instance_in_place() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCAD2);
+        let (_assembly, _node, part) = imported_assembly(&mut engine);
+        author_joint(&mut engine, part, true, [0.0, 0.0, 1.0], 7.23);
+
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let assets = assets_with_one_cad_mesh();
+        rebuild(&engine, &shared, &mut HashMap::new(), &assets);
+        let neutral = published_instance(&shared, part).expect("published");
+
+        scrub_joint_to(&engine, &shared, &assets, part, 3.04);
+        let posed = published_instance(&shared, part).expect("still published");
+
+        // A joint pivoted on the part's own origin turns it in place: the centre must NOT drift, and the
+        // rotation must actually change. Both halves matter — a rotation that also translated would be a
+        // pivot defect, and an unchanged quaternion would be a publication defect.
+        for axis in 0..3 {
+            assert!(
+                (posed.center[axis] - neutral.center[axis]).abs() < 1.0e-5,
+                "a pivot on the part's own origin must not translate it: {:?} -> {:?}",
+                neutral.center,
+                posed.center
+            );
+        }
+        assert!(
+            posed
+                .rotation
+                .iter()
+                .zip(&neutral.rotation)
+                .any(|(posed, neutral)| (posed - neutral).abs() > 1.0e-3),
+            "a 3.04 rad revolution must change the published quaternion: {:?} -> {:?}",
+            neutral.rotation,
+            posed.rotation
+        );
+    }
+
+    #[test]
+    fn a_posed_descendant_follows_its_animated_parent() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCAD3);
+        let (_assembly, _node, part) = imported_assembly(&mut engine);
+        // A second leaf under the animated part: an assembly moves as an assembly, so a mechanism
+        // authored on a sub-assembly has to carry everything mounted on it.
+        let bolt = engine.alloc_entity_id();
+        engine
+            .commit(
+                "mounted child",
+                vec![
+                    Op::CreateEntity {
+                        id: bolt,
+                        parent: Some(part),
+                    },
+                    Op::SetField {
+                        entity: bolt,
+                        component: "MeshRenderer".into(),
+                        field: capscene::MESH_FIELD.into(),
+                        value: FieldValue::Str(MESH_HANDLE.into()),
+                    },
+                    number(bolt, "Transform", "x", 0.1),
+                ],
+            )
+            .expect("mount child");
+        author_joint(&mut engine, part, false, [0.0, 1.0, 0.0], 0.0575);
+
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let assets = assets_with_one_cad_mesh();
+        rebuild(&engine, &shared, &mut HashMap::new(), &assets);
+        let neutral_bolt = published_instance(&shared, bolt).expect("child published");
+
+        scrub_joint_to(&engine, &shared, &assets, part, -0.044);
+        let posed_bolt = published_instance(&shared, bolt).expect("child still published");
+        assert!(
+            (posed_bolt.center[1] - (neutral_bolt.center[1] - 0.044)).abs() < 1.0e-5,
+            "the mounted child must travel with the mechanism it is bolted to: {:?} -> {:?}",
+            neutral_bolt.center,
+            posed_bolt.center
+        );
+    }
+
+    /// The film's establishing and closing shots frame the imported ASSEMBLY, which is a geometry-free
+    /// folder: its size is the size of everything hanging under it. In the live run the opening
+    /// `establish` shot solved to 13 m from the world origin instead of standing off a 260 m factory,
+    /// which is what the sampler's fallback produces when a subject resolves to no rendered geometry at
+    /// all -- so the one shot whose whole job is to show how big the place is showed a point in space.
+    #[test]
+    fn framing_the_assembly_folder_covers_every_part_hanging_under_it() {
+        use metrocalk_animation::shot::{ShotAngle, ShotMove, ShotRecipe, ShotSize};
+
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCAD5);
+        let (assembly, node, near) = imported_assembly(&mut engine);
+        // A second leaf far down the line, so the assembly's extent is unmistakably larger than any one
+        // part's -- a 260 m weld line, in miniature.
+        let far = engine.alloc_entity_id();
+        engine
+            .commit(
+                "far part",
+                vec![
+                    Op::CreateEntity {
+                        id: far,
+                        parent: Some(node),
+                    },
+                    Op::SetField {
+                        entity: far,
+                        component: "MeshRenderer".into(),
+                        field: capscene::MESH_FIELD.into(),
+                        value: FieldValue::Str(MESH_HANDLE.into()),
+                    },
+                    number(far, "Transform", "x", 120.0),
+                ],
+            )
+            .expect("far part");
+
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let assets = assets_with_one_cad_mesh();
+        rebuild(&engine, &shared, &mut HashMap::new(), &assets);
+
+        let shot = ShotRecipe {
+            id: "shot-1".into(),
+            subject: assembly.to_loro_key(),
+            size: ShotSize::Wide,
+            angle: ShotAngle::Front,
+            motion: ShotMove::PullOut,
+            amount: 0.3,
+            seconds: 2.5,
+        };
+        // Read the published placements BEFORE taking the render lock: `published_instance` takes it
+        // too, and the mutex is not reentrant.
+        let near_x = published_instance(&shared, near).expect("near").center[0];
+        let far_x = published_instance(&shared, far).expect("far").center[0];
+        let sample = {
+            let mut state = shared.lock().unwrap();
+            cinematic_shot_subject_sample(&engine, &mut state, assembly, &shot)
+        };
+        let span = (far_x - near_x).abs();
+        assert!(span > 100.0, "the fixture must actually be long: {span}");
+        assert!(
+            sample.half_extent[0] * 2.0 >= span - 1.0,
+            "the assembly must be framed by everything under it: half-extent {:?} for a {span} m span              (the fallback would give a metre-ish box at the folder's own origin, {:?})",
+            sample.half_extent,
+            sample.center
+        );
+        assert!(
+            (sample.center[0] - (near_x + far_x) * 0.5).abs() < 1.0,
+            "and centred on that span, not on the folder: {:?}",
+            sample.center
+        );
+    }
+
+    #[test]
+    fn restoring_after_a_scrub_returns_the_instance_to_its_authored_place() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0xCAD4);
+        let (_assembly, _node, part) = imported_assembly(&mut engine);
+        author_joint(&mut engine, part, false, [0.0, 1.0, 0.0], 0.0575);
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let assets = assets_with_one_cad_mesh();
+        rebuild(&engine, &shared, &mut HashMap::new(), &assets);
+        let neutral = published_instance(&shared, part).expect("published");
+
+        scrub_joint_to(&engine, &shared, &assets, part, -0.044);
+        assert!(published_instance(&shared, part).expect("posed").center[1] < neutral.center[1]);
+
+        restore_posed_instances_to_authored(&engine, &shared, &mut HashMap::new(), &assets);
+        let restored = published_instance(&shared, part).expect("restored");
+        assert!(
+            (restored.center[1] - neutral.center[1]).abs() < 1.0e-6
+                && (restored.scale - neutral.scale).abs() < 1.0e-6,
+            "a scrub is a render-only projection, so leaving it must be exact: {:?} {} -> {:?} {}",
+            neutral.center,
+            neutral.scale,
+            restored.center,
+            restored.scale
+        );
     }
 }
