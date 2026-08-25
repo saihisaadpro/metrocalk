@@ -1275,13 +1275,14 @@ def run(root: str) -> tuple[list[Finding], dict]:
     # because a read is only attributable to a reply within the block that bound it.
     reads: list[jsreads.Read] = []
     tuple_reads: list[jsreads.TupleRead] = []
-    bound = aliases = 0
+    bound = aliases = shadowed = 0
     for rel, text in ts_call_src + e2e_src:
         r = jsreads.parse(tsipc.strip_comments(text), rel)
         reads += r.reads
         tuple_reads += r.tuples
         bound += r.bound
         aliases += r.aliases
+        shadowed += r.shadowed
 
     findings = _coverage_findings(root, missing, rs, ts)
     compared = fields_compared = nested_pairs = 0
@@ -1318,6 +1319,7 @@ def run(root: str) -> tuple[list[Finding], dict]:
         "nested_pairs": nested_pairs,
         "untyped_bound": bound,
         "read_aliases": aliases,
+        "read_shadowed": shadowed,
         "read_paths": len(reads),
         "read_steps": read_steps,
         "read_unresolved": read_unresolved,
@@ -1333,6 +1335,16 @@ def run(root: str) -> tuple[list[Finding], dict]:
         "rust_option_fields": sum(
             1 for d in rs.dtos.values()
             for t in d.field_types.values() if rustipc.type_head(t) == "Option"
+        ),
+        # A `json!` reply has no declared type; its shape is recovered from the literal. Split by
+        # depth because the two say different things: the first number is how many untyped replies
+        # are enumerable at all, the second is how far INTO them the walk can go — the reach that
+        # was missing until 2026-08-25, when every sub-object was a key with nothing behind it.
+        "json_shapes": sum(
+            1 for n, d in rs.dtos.items() if d.origin == "json!" and "." not in n
+        ),
+        "json_shapes_nested": sum(
+            1 for n, d in rs.dtos.items() if d.origin == "json!" and "." in n
         ),
         "dtos": len(rs.dtos),
         "ts_types": len(ts.types),
@@ -1382,11 +1394,14 @@ def main() -> int:
             f"+ {stats['ts_swept']} E2E file(s) swept; "
             f"{stats['commands']} command(s), {stats['registered']} registered, "
             f"{stats['invocations']} call site(s) ({stats['typed_invocations']} declare a reply "
-            f"type); {stats['shape_compared']} of {stats['typed_invocations']} replies compared, "
+            f"type); {stats['json_shapes']} untyped `json!` reply(s) recovered from the literal "
+            f"that builds them ({stats['json_shapes_nested']} object(s) enumerated below the top "
+            f"level); {stats['shape_compared']} of {stats['typed_invocations']} replies compared, "
             f"{stats['shape_fields']} of those field-by-field, and {stats['nested_pairs']} nested "
             f"object pair(s) followed below the top level; "
             f"{stats['untyped_bound']} untyped reply(s) bound in JavaScript "
-            f"({stats['read_aliases']} sub-path(s) followed through an alias binding), "
+            f"({stats['read_aliases']} sub-path(s) followed through an alias binding, "
+            f"{stats['read_shadowed']} occurrence(s) left alone as a function's parameter), "
             f"{stats['read_paths']} distinct field path(s) read off them, {stats['read_steps']} "
             f"step(s) compared ({stats['read_unresolved']} walk(s) stopped early), and "
             f"{stats['tuples_compared']} of {stats['tuple_reads']} positional destructuring(s) "

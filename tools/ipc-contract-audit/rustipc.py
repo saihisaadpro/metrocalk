@@ -567,10 +567,71 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
 
 
 _JSON_MACRO = re.compile(r"\bserde_json::json!\s*\(\s*\{")
+#: The tail of a `.map(..).collect()` / `.collect::<Vec<_>>()` chain. A chain that does NOT collect
+#: is an iterator, not an array, and the reply cannot contain one.
+_COLLECT_TAIL = re.compile(r"\.\s*collect\s*(?:::\s*<[^;]*>\s*)?\(\s*\)\s*$")
+_MAP_CALL = re.compile(r"\.\s*map\s*\(")
+
+#: One entry of a `json!` object literal: its wire key, what kind of value it carries, and — when
+#: that value is itself enumerable — the entries of the object behind it.
+#: kind is "obj" (a nested `{..}` literal), "list" (a `.map(|x| json!({..})).collect()` of one), or
+#: "opaque" (anything this reader cannot prove the shape of, which is most values and must stay
+#: most values).
+JsonEntry = tuple[str, str, "list | None"]
 
 
-def _json_literal_keys(body: str) -> list[str] | None:
-    """Top-level keys of the one `json!({..})` a command returns, or None if it is not that simple.
+def _json_entries(inner: str) -> list[JsonEntry] | None:
+    """The entries of one `json!({..})` object literal, recursively, or None if ANY defeats it.
+
+    All-or-nothing on purpose. A partially enumerated object is the one outcome that turns this
+    reader into a liar: `_read_findings` calls a field absent when it is not among the keys a
+    struct carries, so an object missing three of its keys would report three FALSE findings about
+    code that is correct. Returning None costs reach and keeps the walk stopping where it stops
+    today, which is the honest half of the trade.
+    """
+    entries: list[JsonEntry] = []
+    for entry in split_top(inner):
+        km = re.match(r'^"([^"]*)"\s*:', entry.strip())
+        if not km:
+            return None  # a computed key, or a shape this reader does not understand
+        entries.append((km.group(1), *_json_value_shape(entry.strip()[km.end() :])))
+    return entries or None
+
+
+def _json_value_shape(value: str) -> tuple[str, list[JsonEntry] | None]:
+    """What one entry's VALUE is, as far as this reader can PROVE — never as far as it can guess.
+
+    Two forms are enumerable and both are syntactic; there is no expression evaluation here and no
+    following of a local binding to its initializer:
+
+      * a nested object literal — `"working": { "current": .., "wired": true }`;
+      * an array of them built the only way `json!` allows, since the macro cannot parse a method
+        chain on an array literal: `xs.iter().map(|x| json!({..})).collect::<Vec<_>>()`.
+
+    Everything else is opaque, and opaque means the walk stops exactly where it stopped before this
+    function existed. The `.map()` form requires EXACTLY ONE `json!` in the expression: two means a
+    conditional, a nested map, or a shape with more than one possible reading, and picking one of
+    them would be the confident-wrong-answer class rather than the admitted-unknown one.
+    """
+    v = value.strip()
+    if v.startswith("{"):
+        cb = _match(v, 0, "{", "}")
+        if cb == len(v) - 1:
+            sub = _json_entries(v[1:cb])
+            return ("obj", sub) if sub is not None else ("opaque", None)
+        return ("opaque", None)
+    macros = list(_JSON_MACRO.finditer(v))
+    if len(macros) == 1 and _COLLECT_TAIL.search(v) and _MAP_CALL.search(v, 0, macros[0].start()):
+        ob = v.index("{", macros[0].end() - 1)
+        cb = _match(v, ob, "{", "}")
+        if cb > 0:
+            sub = _json_entries(v[ob + 1 : cb])
+            return ("list", sub) if sub is not None else ("opaque", None)
+    return ("opaque", None)
+
+
+def _json_literal_entries(body: str) -> list[JsonEntry] | None:
+    """The entries of the one `json!({..})` a command returns, or None if it is not that simple.
 
     Only a body whose *last* statement is a single top-level `json!({..})` is resolved. A command
     that builds its reply conditionally has more than one shape, and guessing which is the shape
@@ -589,18 +650,42 @@ def _json_literal_keys(body: str) -> list[str] | None:
         # It must be the tail of the function: only whitespace / a trailing `)` after it.
         if re.sub(r"[\s);,]", "", body[cb + 1 :]) != "":
             continue
-        keys: list[str] = []
-        for entry in split_top(body[ob + 1 : cb]):
-            km = re.match(r'^"([^"]*)"\s*:', entry.strip())
-            if not km:
-                return None  # a computed key, or a shape this reader does not understand
-            keys.append(km.group(1))
-        return keys or None
+        return _json_entries(body[ob + 1 : cb])
     return None
 
 
+def _register_json_dto(
+    entries: list[JsonEntry], name: str, line: int, rel: str, out: RustIpc
+) -> None:
+    """Register `name` and every enumerable object below it, as DTOs the shape walk can follow.
+
+    The synthetic names carry `@`, `.` and `[]`, none of which can appear in a Rust type name, so a
+    nested shape can never be mistaken for — or collide with — a declared struct.
+    """
+    fields: list[tuple[str, bool]] = []
+    ftypes: dict[str, str] = {}
+    for key, kind, sub in entries:
+        # A `json!` literal always emits its key. The VALUE may be `null`; the key is not absent,
+        # which is the same reading the top-level keys have had since this resolver existed.
+        fields.append((key, False))
+        if sub is None:
+            continue  # opaque: no field type, so the walk stops here exactly as it did before
+        child = f"{name}.{key}" + ("[]" if kind == "list" else "")
+        _register_json_dto(sub, child, line, rel, out)
+        ftypes[key] = f"Vec<{child}>" if kind == "list" else child
+    out.dtos[name] = Dto(name, fields, line, rel, origin="json!", field_types=ftypes)
+
+
 def attach_json_returns(src: str, rel: str, out: RustIpc) -> None:
-    """Resolve `-> serde_json::Value` commands to the literal they build, where that is unambiguous."""
+    """Resolve `-> serde_json::Value` commands to the literal they build, where that is unambiguous.
+
+    Recursive since 2026-08-25 (ADR-142). It used to stop at the top-level keys, so a reply's every
+    sub-object was a key that existed with nothing enumerable inside it, and every read below the
+    first step was counted as `walk stopped early` rather than compared. That is how renaming
+    `asDirected` inside `camera_probe`'s `shotPlacements` elements left this gate at `0 blocking`
+    while the spec that reads it published `reaimed: 15 of 15` — a false number about the film, from
+    a green run, because `!undefined` is `true`.
+    """
     for cmd in list(out.commands.values()):
         if cmd.file != rel or cmd.unreadable:
             continue
@@ -613,11 +698,11 @@ def attach_json_returns(src: str, rel: str, out: RustIpc) -> None:
         cb = _match(src, ob, "{", "}")
         if cb < 0:
             continue
-        keys = _json_literal_keys(src[ob + 1 : cb])
-        if keys is None:
+        entries = _json_literal_entries(src[ob + 1 : cb])
+        if entries is None:
             continue
         synth = f"json!@{cmd.name}"
-        out.dtos[synth] = Dto(synth, [(k, False) for k in keys], cmd.line, rel, origin="json!")
+        _register_json_dto(entries, synth, cmd.line, rel, out)
         cmd.ret = synth
 
 

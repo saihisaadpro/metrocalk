@@ -157,6 +157,11 @@ class JsReads:
     #: itself, and a run that followed none and a run with no aliases to follow print the same
     #: findings. See `_reads_of`'s alias branch for what is deliberately NOT followed.
     aliases: int = 0
+    #: Occurrences of a tracked name that were NOT attributed, because a function between the
+    #: binding and the read takes that name as a parameter. Counted rather than silently skipped:
+    #: this is the one number that separates "the shadow rule found nothing to do" from "the shadow
+    #: rule stopped working", and the two are otherwise the same output.
+    shadowed: int = 0
 
 
 # ── source scanning ───────────────────────────────────────────────────────────────────────────────
@@ -345,8 +350,15 @@ def _reads_of(src: str, start: int, end: int, name: str, prefix: list[str], out:
     """
     if depth > 3:
         return
+    # Where `name` means a parameter rather than this reply. Computed once for the range, because
+    # every occurrence inside one of these spans is a read of somebody else's object.
+    shadows = shadow_spans(src, name, start, end)
     for m in re.finditer(rf"(?<![A-Za-z0-9_$.]){re.escape(name)}(?![A-Za-z0-9_$])", src[start:end]):
         at = start + m.end()
+        if any(a <= at - len(name) < b for a, b in shadows):
+            if tally is not None:
+                tally.shadowed += 1
+            continue
         steps, after = _chain(src, at)
         if not steps:
             continue
@@ -407,6 +419,172 @@ def _reads_of(src: str, start: int, end: int, name: str, prefix: list[str], out:
         alias_end = _scope_end(src, alias, alias_start, min(end, block_end(src, alias_start)))
         _reads_of(src, alias_start, alias_end, alias, prefix + path, out, line_of, rel, cmd, via,
                   depth + 1, tally)
+
+
+def _pattern_binds(params: str) -> set[str]:
+    """Every name a parameter list BINDS — which is not every name it contains.
+
+    `({ profile })` binds `profile`; `({ profile: p })` binds `p` and leaves `profile` meaning
+    whatever it meant outside. Getting that backwards would suppress a legitimate read, so the
+    destructuring is walked rather than grepped: only the position a value can be written to counts.
+    """
+    names: set[str] = set()
+    for part in _split_top(params):
+        part = re.split(r"(?<![=!<>])=(?!=)", part, maxsplit=1)[0].strip()  # drop a default
+        part = re.sub(r"^\.\.\.", "", part).strip()  # a rest element binds its own name
+        if not part:
+            continue
+        if part[0] in "{[":
+            close = _match_bracket(part, 0)
+            if close < 0:
+                continue
+            if part[0] == "{":
+                for entry in _split_top(part[1:close]):
+                    entry = re.split(r"(?<![=!<>])=(?!=)", entry, maxsplit=1)[0].strip()
+                    entry = re.sub(r"^\.\.\.", "", entry).strip()
+                    # `key: target` binds TARGET; a bare `key` binds the key itself.
+                    names |= _pattern_binds(entry.split(":", 1)[1] if ":" in entry else entry)
+            else:
+                for entry in _split_top(part[1:close]):
+                    names |= _pattern_binds(entry)
+            continue
+        m = re.match(rf"^{_IDENT}$", part)
+        if m:
+            names.add(part)
+    return names
+
+
+def _split_top(src: str) -> list[str]:
+    """Split on commas at bracket depth 0."""
+    parts, cur, depth, i, n = [], [], 0, 0, len(src)
+    while i < n:
+        c = src[i]
+        if c in "\"'`":
+            j = _skip_string(src, i)
+            cur.append(src[i:j])
+            i = j
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    parts.append("".join(cur))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _match_bracket(src: str, i: int) -> int:
+    """Index of the bracket closing the one at `i`, or -1."""
+    opens, depth, n = "([{", 0, len(src)
+    while i < n:
+        c = src[i]
+        if c in "\"'`":
+            i = _skip_string(src, i)
+            continue
+        if c in opens:
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def shadow_spans(src: str, name: str, start: int, end: int) -> list[tuple[int, int]]:
+    """The body spans within `[start, end)` where `name` means a PARAMETER, not the reply.
+
+    `_scope_end` already knows that a function taking the name shadows it, and checks it only at the
+    binding's own brace depth — deliberately, because a rebind inside an `if` is a conditional retry
+    and truncating there dropped the reads after it from both bindings. But a *shadow* is not an end
+    to the scope at all: it is a HOLE in it, and one brace deeper the hole was invisible. On the real
+    tree that misread `manifest.animation = { revolvingMechanisms:
+    tracks.filter(({ profile }) => profile.cycle === "revolve").length }` as a read of the
+    `set_render_profile` reply bound to `profile` eighty lines above — `set_render_profile` returns a
+    `String`, so the walk stopped on "not a struct" and nothing was printed. It would have printed
+    the day that command grew a struct reply: a confident finding, naming a real file and a real
+    line, about code that is correct. This reader's whole authority rests on not doing that.
+
+    Only forms whose parameter list is unambiguous are recognised — an arrow's, and a `function`'s.
+    A method shorthand (`foo(bar) { .. }` in an object literal) is indistinguishable from a call
+    followed by a block without a real parser, so it is left alone: missing a shadow leaves today's
+    behaviour, and today's behaviour is the thing being improved, not a regression.
+    """
+    spans: list[tuple[int, int]] = []
+    bound = re.compile(rf"(?<![A-Za-z0-9_$.]){re.escape(name)}(?![A-Za-z0-9_$])")
+
+    def body_at(k: int) -> tuple[int, int] | None:
+        while k < len(src) and src[k] in " \t\n\r":
+            k += 1
+        if k >= len(src):
+            return None
+        if src[k] == "{":
+            return (k, block_end(src, k + 1))
+        # A concise arrow body ends at the first separator that closes the expression it is in.
+        j, depth = k, 0
+        while j < len(src):
+            c = src[j]
+            if c in "\"'`":
+                j = _skip_string(src, j)
+                continue
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif c in ",;" and depth == 0:
+                break
+            j += 1
+        return (k, j)
+
+    for m in re.finditer(r"=>", src[start:end]):
+        at = start + m.start()
+        i = at - 1
+        while i >= start and src[i] in " \t\n\r":
+            i -= 1
+        if i < start:
+            continue
+        if src[i] == ")":
+            j = i
+            depth = 0
+            while j >= start:  # walk back to the `(` this `)` closes
+                if src[j] == ")":
+                    depth += 1
+                elif src[j] == "(":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j -= 1
+            if j < start:
+                continue
+            params = src[j + 1 : i]
+        else:  # `name => ..`, a single parameter with no parentheses
+            j = i
+            while j >= start and (src[j].isalnum() or src[j] in "_$"):
+                j -= 1
+            params = src[j + 1 : i + 1]
+        if not bound.search(params) or name not in _pattern_binds(params):
+            continue
+        span = body_at(at + 2)
+        if span:
+            spans.append(span)
+
+    for m in re.finditer(rf"\bfunction\b\s*\*?\s*{_IDENT}?\s*\(", src[start:end]):
+        op = start + m.end() - 1
+        cp = _call_end(src, op)
+        params = src[op + 1 : cp]
+        if not bound.search(params) or name not in _pattern_binds(params):
+            continue
+        span = body_at(cp + 1)
+        if span:
+            spans.append(span)
+    return spans
 
 
 def _callback_param(src: str, open_paren: int) -> tuple[str, int]:

@@ -26,6 +26,8 @@ import shutil
 import tempfile
 
 import audit
+import jsreads
+import rustipc
 
 # ── the fixture ───────────────────────────────────────────────────────────────────────────────────
 
@@ -60,6 +62,60 @@ fn entity_info(state: State<AppState>, id: String) -> serde_json::Value {
         "tags": v.iter().map(|t| t).collect::<Vec<_>>(),
     })
 }"""
+
+
+#: A `json!` reply with structure BELOW its top level, in the two forms the macro permits: a nested
+#: object literal, and a list built by `.map(|x| json!({..})).collect()` — the only way to get one,
+#: since `json!` cannot parse a method chain on an array literal. Both are lifted from the real tree
+#: (`colour_status.working` and `camera_probe.shotPlacements`), and until 2026-08-25 every key below
+#: the first step was a name with nothing behind it: the walk stopped and counted itself unresolved.
+PROBE_FN = """\
+#[tauri::command]
+fn entity_probe(state: State<AppState>) -> serde_json::Value {
+    serde_json::json!({
+        "id": "1",
+        "where": {
+            "label": "",
+            "wired": true,
+        },
+        "marks": v.iter().map(|m| serde_json::json!({
+            "markId": m.id,
+            "asDirected": m.ok,
+        })).collect::<Vec<_>>(),
+    })
+}"""
+
+#: The spec that reads it — untyped, in plain `.js`, exactly as the 161 real E2E files do. The list
+#: is read through an ALIAS with an empty default, because that is the form the real defect had and
+#: it composes the two reach rules: the alias carries `marks` into the element, and the element's
+#: shape now exists to compare against.
+PROBE_E2E = """\
+import { invoke } from "../pages/scaffold.js";
+
+describe("a json! reply with structure below its top level", () => {
+  it("reads through a sub-object and through a list element", async () => {
+    const p = await invoke("entity_probe");
+    if (p.where.label !== "") throw new Error("label");
+    if (p.where.wired !== true) throw new Error("wired");
+    const marks = p.marks ?? [];
+    if (marks.filter((m) => !m.asDirected).length) throw new Error("asDirected");
+  });
+});
+"""
+
+
+def with_probe(probe_fn: str = PROBE_FN) -> dict[str, str]:
+    """The base tree plus `entity_probe` and the spec that reads it, for the nested-`json!` cases."""
+    main = swap(
+        BASE_MAIN,
+        "#[tauri::command]\nfn entity_tagged(",
+        probe_fn + "\n\n#[tauri::command]\nfn entity_tagged(",
+    )
+    main = swap(main, "            entity_tagged,\n", "            entity_tagged,\n            entity_probe,\n")
+    return {
+        "editor-shell/src-tauri/src/main.rs": main,
+        "editor-shell/e2e/specs-probe/probe.e2e.js": PROBE_E2E,
+    }
 
 
 def swap(src: str, old: str, new: str) -> str:
@@ -510,6 +566,29 @@ CASES: list[tuple[str, str, dict, dict]] = [
                        "  tags: string[];\n  mode: string;\n}\n"}},
     ),
     (
+        # A `json!` reply used to be enumerable exactly one level deep: the top-level keys became a
+        # synthetic DTO with no field TYPES, so the walk could name `where` and could not go into
+        # it. Every read below the first step was counted as "walk stopped early" — the same output
+        # a reply nobody reads produces. Proven on the committed tree before this was built: renaming
+        # a key inside `colour_status.working` left the gate at 0 blocking.
+        "a renamed key INSIDE a json! reply's sub-object",
+        r"`p`\.where\.wired, but `json!@entity_probe\.where` never sends `wired`",
+        {"overrides": with_probe(PROBE_FN.replace('"wired": true,', '"wiredUp": true,'))},
+        {"overrides": with_probe()},
+    ),
+    (
+        # The same gap one shape over, and the one ADR-140 named on its way out. The E2E reads
+        # `marks.filter((m) => !m.asDirected)`, so when the key goes missing `!undefined` is `true`,
+        # every element counts as re-aimed, the wdio run PASSES and its manifest publishes a false
+        # number. A missing field that makes a spec throw is a bad afternoon; this one is a green run
+        # that reports something untrue about the product.
+        "a renamed key inside the ELEMENT of a `.map(|x| json!({..})).collect()`",
+        r"`p`\.marks\[0\]\.asDirected, but `json!@entity_probe\.marks\[\]` never sends "
+        r"`asDirected`",
+        {"overrides": with_probe(PROBE_FN.replace('"asDirected": m.ok,', '"asDirectedNow": m.ok,'))},
+        {"overrides": with_probe()},
+    ),
+    (
         "an untyped reply the caller reads as a typed one",
         r"has no field names to compare",
         {"overrides": {"editor-shell/src-tauri/src/main.rs":
@@ -710,6 +789,22 @@ def _no_readonly_peel(t: str) -> str:
     return t
 
 
+def _json_entries_skipping(inner: str) -> list | None:
+    """`_json_entries` as it would be if an unreadable entry were SKIPPED rather than fatal.
+
+    The tempting version: read what you can, ignore what you cannot. It produces an object that
+    claims to carry fewer keys than it does, and `_read_findings` calls a key absent on exactly that
+    evidence. Reach bought with false findings is not reach.
+    """
+    entries = []
+    for entry in rustipc.split_top(inner):
+        km = re.match(r'^"([^"]*)"\s*:', entry.strip())
+        if not km:
+            continue
+        entries.append((km.group(1), *rustipc._json_value_shape(entry.strip()[km.end():])))
+    return entries or None
+
+
 def _old_return_type(src: str, i: int) -> str:
     """The original: a regex stopping at `{` OR `;`. `-> [f64; 8]` contains a semicolon."""
     m = re.match(r"\s*->\s*([^{;]+)\{", src[i:])
@@ -759,6 +854,44 @@ READER_MUTATIONS: list[tuple[str, str, str, object, dict]] = [
                                 '        "tags": v.iter().map(|t| t).collect::<Vec<_>>(),\n', "")),
                        "editor/src/transport/protocol.ts":
                        "export interface EntityInfo {\n  id: string;\n  kind: string;\n}\n"}},
+    ),
+    (
+        # The all-or-nothing rule, mutated into the shape it exists to prevent. `_json_entries`
+        # returns None the moment ONE entry defeats it; a version that skipped the entry instead
+        # would report every key of a partially-read object as absent — fourteen confident findings
+        # about correct code, in a file no type-checker opens. Measured on the real tree while this
+        # was being built: making one `capabilities` key an expression takes the live finding from
+        # 1 blocking to 0, which is the honest direction to fail in.
+        "a json! object read PARTLY, when one entry defeats the reader, invents absent keys",
+        r"`json!@entity_probe\.where` never sends `wired`",
+        "rustipc._json_entries",
+        _json_entries_skipping,
+        # The entry that defeats the reader is the one the spec READS, which is the only arrangement
+        # that makes the two behaviours differ: skipping it enumerates `where` without `wired` and
+        # reports it absent, while refusing the object whole reports nothing at all.
+        {"overrides": with_probe(PROBE_FN.replace('"wired": true,', "WIRED_KEY: true,"))},
+    ),
+    (
+        # The attribution rule. A read inside a function that takes the tracked name as a PARAMETER
+        # is a read of the parameter; attributing it to the reply names a real file and a real line
+        # about code that is correct, which is the one thing that gets a gate waived. Live in the
+        # tree today at `factory-cinematic.e2e.js:1264` — `tracks.filter(({ profile }) =>
+        # profile.cycle === "revolve")`, eighty lines below `const profile = await
+        # invoke("set_render_profile", ..)`. It stays quiet there only because that command returns
+        # a `String` and the walk stops on "not a struct". It would not stay quiet on a struct.
+        "a name rebound as a function parameter, still attributed to the reply",
+        r"`p`\.tally, but `json!@entity_probe` never sends `tally`",
+        "jsreads.shadow_spans",
+        lambda src, name, start, end: [],
+        {"overrides": {
+            **with_probe(),
+            "editor-shell/e2e/specs-probe/probe.e2e.js": PROBE_E2E.replace(
+                "  });\n});\n",
+                "    const rows = [{ tally: 1 }];\n"
+                "    manifest.n = { count: rows.filter(({ p }) => p.tally > 0).length };\n"
+                "  });\n});\n",
+            ),
+        }},
     ),
     (
         "an omitted key judged by its type alone invents a drift in correct code",
@@ -835,6 +968,112 @@ ALIAS_PATH_PINS = [
     ),
 ]
 
+#: `(name, the body of a `json!` command, the shapes the reader must recover)`.
+#:
+#: The nested-`json!` rule has conditions that no verdict-shaped case can hold, for the same reason
+#: two of the alias rule's three cannot: violating them does not produce a wrong FINDING, it
+#: produces a shape the walk cannot resolve, and stops. A run that refused an ambiguous value and a
+#: run whose reader is broken print the same silence. So the recovered shapes are asserted directly:
+#: `name -> sorted keys`, with an absent name meaning "this reader proved nothing about it", which
+#: is the honest outcome for four of these six.
+JSON_SHAPE_PINS = [
+    (
+        "a nested object literal is enumerated as a shape of its own",
+        '{ "a": 1, "b": { "c": 2, "d": 3 } }',
+        {"json!@probe": ["a", "b"], "json!@probe.b": ["c", "d"]},
+    ),
+    (
+        "a `.map(|x| json!({..})).collect()` is enumerated as the shape of its ELEMENTS",
+        '{ "xs": v.iter().map(|x| serde_json::json!({ "p": x.p, "q": x.q })).collect::<Vec<_>>() }',
+        {"json!@probe": ["xs"], "json!@probe.xs[]": ["p", "q"]},
+    ),
+    (
+        # An iterator is not an array and cannot be one: serde has nothing to serialise it as. If
+        # the `.collect()` requirement were dropped this would resolve to a list that the reply
+        # never contains, and every read through it would be judged against an invented shape.
+        "a `.map()` that never collects is not a list, and is not resolved",
+        '{ "xs": v.iter().map(|x| serde_json::json!({ "p": x.p })) }',
+        {"json!@probe": ["xs"]},
+    ),
+    (
+        # Two macros mean a conditional, a nested map, or a shape with more than one reading. There
+        # is no honest way to pick one, and picking one is the confident-wrong-answer class.
+        #
+        # This pin was REWRITTEN because it passed its own mutant. Written as a bare
+        # `if c { json!(..) } else { json!(..) }` it stayed green while the one-macro rule was
+        # deleted — because that value carries no `.collect()` tail, so the branch being mutated was
+        # never reached and the pin was holding the NEXT condition instead. The two macros have to
+        # sit inside a chain that would otherwise resolve, or the case proves nothing.
+        "a value carrying TWO json! literals has more than one shape, so it has none here",
+        '{ "xs": v.iter().map(|x| if x.ok { serde_json::json!({ "p": 1 }) } '
+        'else { serde_json::json!({ "q": 2 }) }).collect::<Vec<_>>() }',
+        {"json!@probe": ["xs"]},
+    ),
+    (
+        # No binding resolution, deliberately. `spaces` is built ten lines above in the real
+        # `colour_status`, and following a name to its initializer means deciding it was never
+        # reassigned in between — a judgement this reader has no basis for.
+        "a value that is a NAME is not followed to whatever built it",
+        '{ "xs": spaces }',
+        {"json!@probe": ["xs"]},
+    ),
+    (
+        "a computed key defeats the object it is in, and only that object",
+        '{ "a": 1, "b": { KEY: 2, "d": 3 } }',
+        {"json!@probe": ["a", "b"]},
+    ),
+]
+
+#: `(name, spec source, the exact field paths the reader must recover)` — the shadow rule, held the
+#: same way and for the same reason. Suppressing a read that should have been attributed and
+#: attributing one that should have been suppressed are both silent: the first shows up as a number
+#: nobody diffs, the second as a finding that looks exactly like a real one.
+SHADOW_PATH_PINS = [
+    (
+        "a destructured parameter one brace deeper rebinds the name, and its reads are not the reply's",
+        'const p = await invoke("c");\nif (p.mode) x();\n'
+        "m.a = { n: rows.filter(({ p }) => p.tally > 0).length };\n",
+        ["mode"],
+    ),
+    (
+        # The other direction, and the reason the pattern is walked rather than grepped: `{ p: q }`
+        # binds `q`. A reader that suppressed on any name APPEARING in the parameter list would drop
+        # this read, and dropping reads is how a gate quietly stops covering things.
+        "`{ p: q }` binds `q`, so the outer `p` still means the reply",
+        'const p = await invoke("c");\n'
+        "m.a = { n: rows.filter(({ p: q }) => q.ok && p.mode).length };\n",
+        ["mode"],
+    ),
+    (
+        "a plain parameter one brace deeper shadows just as a destructured one does",
+        'const p = await invoke("c");\nif (p.mode) x();\n'
+        "m.a = { n: rows.filter((p) => p.tally > 0).length };\n",
+        ["mode"],
+    ),
+    (
+        "a `function` declaration's parameter shadows too",
+        'const p = await invoke("c");\nif (p.mode) x();\n'
+        "m.a = { f: function scan(p) { return p.tally; } };\n",
+        ["mode"],
+    ),
+    (
+        # The shape of the rule, stated as a value: a shadow is a HOLE in the binding's scope, not
+        # an end to it. `_scope_end` truncates at a shadow only at the binding's own brace depth,
+        # where truncating and holing are the same thing; one brace deeper they are not, and reads
+        # after the closure still belong to the reply.
+        #
+        # Also REWRITTEN after passing its own mutant. The later read has to sit inside the same
+        # enclosing block as the closure, or an over-broad span that runs to the end of that block
+        # stops before reaching it and the pin never notices — which is precisely the version this
+        # first had, with `m.a = {..}` and the read outside it.
+        "a nested shadow is a hole in the scope, not an end to it: the reads after it still count",
+        'const p = await invoke("c");\n'
+        "if (ok) {\n  m.a = rows.filter(({ p }) => p.tally > 0).length;\n"
+        "  if (p.mode) x();\n}\n",
+        ["mode"],
+    ),
+]
+
 
 def run() -> int:
     ok = True
@@ -867,11 +1106,10 @@ def run() -> int:
             print(f"pass  caught, and only when drifted: {name}")
             print(f"        → {hit.message[:150]}")
 
-    import rustipc
-
     # A mutation names the module it patches, because the reader is no longer one file: the Rust
-    # parser and the comparison layer can each hold a wrong answer, and both are worth pinning.
-    modules = {"rustipc": rustipc, "audit": audit}
+    # parser, the JavaScript reader and the comparison layer can each hold a wrong answer, and all
+    # three are worth pinning.
+    modules = {"rustipc": rustipc, "audit": audit, "jsreads": jsreads}
 
     for name, pattern, target, buggy, spec in READER_MUTATIONS:
         rx = re.compile(pattern, re.S)
@@ -912,15 +1150,35 @@ def run() -> int:
     # a run that followed nothing print the same silence, so the only way to hold these is to assert
     # the recovered paths themselves. (The GPU audit's string-continuation decoder is pinned to its
     # value for exactly this reason: no verdict-shaped case can see it.)
-    import jsreads as _jsreads
+    for label, pins in (("alias", ALIAS_PATH_PINS), ("shadow", SHADOW_PATH_PINS)):
+        for name, snippet, expected in pins:
+            got = sorted(".".join(rd.path) for rd in jsreads.parse(snippet, "pin.e2e.js").reads)
+            if got != sorted(expected):
+                print(f"FAIL  the {label} rule recovers the wrong paths: {name}")
+                print(f"        expected {sorted(expected)}")
+                print(f"        got      {got}")
+                ok = False
+            else:
+                print(f"pass  {name}")
 
-    for name, snippet, expected in ALIAS_PATH_PINS:
-        got = sorted(
-            ".".join(rd.path) for rd in _jsreads.parse(snippet, "pin.e2e.js").reads
+    # The `json!` shape reader, pinned the same way: four of its six conditions are refusals, and a
+    # refusal and a broken parser produce identical output.
+    for name, body, expected in JSON_SHAPE_PINS:
+        src = (
+            "#[tauri::command]\nfn probe() -> serde_json::Value {\n"
+            f"    serde_json::json!({body})\n}}\n"
+            "fn main() { tauri::Builder::default()"
+            ".invoke_handler(tauri::generate_handler![probe]); }\n"
         )
-        if got != sorted(expected):
-            print(f"FAIL  the alias rule recovers the wrong paths: {name}")
-            print(f"        expected {sorted(expected)}")
+        rs = rustipc.parse([("editor-shell/src-tauri/src/main.rs", src)])
+        got = {
+            n: sorted(k for k, _ in d.fields)
+            for n, d in rs.dtos.items()
+            if d.origin == "json!"
+        }
+        if got != {k: sorted(v) for k, v in expected.items()}:
+            print(f"FAIL  the json! reader recovers the wrong shapes: {name}")
+            print(f"        expected {expected}")
             print(f"        got      {got}")
             ok = False
         else:
