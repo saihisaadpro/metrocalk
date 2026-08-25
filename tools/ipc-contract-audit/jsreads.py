@@ -430,26 +430,31 @@ def _pattern_binds(params: str) -> set[str]:
     """
     names: set[str] = set()
     for part in _split_top(params):
-        part = re.split(r"(?<![=!<>])=(?!=)", part, maxsplit=1)[0].strip()  # drop a default
-        part = re.sub(r"^\.\.\.", "", part).strip()  # a rest element binds its own name
+        part = re.sub(r"^\.\.\.", "", part.strip()).strip()  # a rest element binds its own name
         if not part:
             continue
         if part[0] in "{[":
+            # The bracket is matched BEFORE any default is stripped, because a pattern may carry
+            # one — `({ a } = {}) =>` — and splitting on the `=` first cut the pattern in half, left
+            # the bracket unmatched and made the whole parameter bind NOTHING. That direction is
+            # under-suppression: the callback's reads go back to being attributed to the reply,
+            # which is the false finding this function exists to prevent.
             close = _match_bracket(part, 0)
             if close < 0:
                 continue
             if part[0] == "{":
                 for entry in _split_top(part[1:close]):
-                    entry = re.split(r"(?<![=!<>])=(?!=)", entry, maxsplit=1)[0].strip()
-                    entry = re.sub(r"^\.\.\.", "", entry).strip()
-                    # `key: target` binds TARGET; a bare `key` binds the key itself.
-                    names |= _pattern_binds(entry.split(":", 1)[1] if ":" in entry else entry)
+                    # `key: target` binds TARGET; a bare `key` binds the key itself. Recursed rather
+                    # than matched, so a nested pattern or a default inside one is handled by the
+                    # same two rules instead of a second copy of them.
+                    key, _, target = entry.partition(":")
+                    names |= _pattern_binds(target if target.strip() else key)
             else:
                 for entry in _split_top(part[1:close]):
                     names |= _pattern_binds(entry)
             continue
-        m = re.match(rf"^{_IDENT}$", part)
-        if m:
+        part = re.split(r"(?<![=!<>])=(?!=)", part, maxsplit=1)[0].strip()  # a plain default
+        if re.fullmatch(_IDENT, part):
             names.add(part)
     return names
 
@@ -516,7 +521,12 @@ def shadow_spans(src: str, name: str, start: int, end: int) -> list[tuple[int, i
     behaviour, and today's behaviour is the thing being improved, not a regression.
     """
     spans: list[tuple[int, int]] = []
-    bound = re.compile(rf"(?<![A-Za-z0-9_$.]){re.escape(name)}(?![A-Za-z0-9_$])")
+    # A plain substring test, deliberately — it is only here to skip parsing parameter lists that
+    # cannot possibly bind the name, and `_pattern_binds` below is the actual decision. Written as a
+    # word-boundary regex it rejected `({ ...profile })`, whose lookbehind sees the rest element's
+    # `.`, and a shadow that fails the CHEAP test is a shadow that never gets the exact one.
+    def mentions(params: str) -> bool:
+        return name in params
 
     def body_at(k: int) -> tuple[int, int] | None:
         while k < len(src) and src[k] in " \t\n\r":
@@ -569,7 +579,7 @@ def shadow_spans(src: str, name: str, start: int, end: int) -> list[tuple[int, i
             while j >= start and (src[j].isalnum() or src[j] in "_$"):
                 j -= 1
             params = src[j + 1 : i + 1]
-        if not bound.search(params) or name not in _pattern_binds(params):
+        if not mentions(params) or name not in _pattern_binds(params):
             continue
         span = body_at(at + 2)
         if span:
@@ -579,7 +589,7 @@ def shadow_spans(src: str, name: str, start: int, end: int) -> list[tuple[int, i
         op = start + m.end() - 1
         cp = _call_end(src, op)
         params = src[op + 1 : cp]
-        if not bound.search(params) or name not in _pattern_binds(params):
+        if not mentions(params) or name not in _pattern_binds(params):
             continue
         span = body_at(cp + 1)
         if span:

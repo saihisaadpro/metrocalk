@@ -171,7 +171,16 @@ describe("Colour — declared, live, and reaching the pixels", () => {
     expect(caps.environmentColourSpaceOverride).toBe(true);
     const scope = c.notes.join(" ");
     expect(scope).toContain("ACEScg");
-    expect(scope.toLowerCase()).toContain("not wired");
+    // A FOURTH stale line, and the one this spec's own subject depends on. It grepped the notes for
+    // "not wired" — a string that has never appeared in them: the phrase lives in the PANEL, which
+    // renders " — not wired" beside a row whose capability is false. The reply's prose says "is not
+    // available in this build" and "is not implemented" instead, so `.toContain("not wired")` on
+    // `c.notes` matched nothing and failed. Asserted structurally now, because the honest-report
+    // claim is about the CAPABILITIES and not about how the prose happens to be worded: every
+    // capability is a boolean that is present rather than omitted, and at least one of them is
+    // false. That is exactly "declares what is NOT wired, not only what is" — this test's title.
+    expect(Object.values(caps).every((v) => typeof v === "boolean")).toBe(true);
+    expect(Object.values(caps).some((v) => v === false)).toBe(true);
   });
 
   it("the LIVE reading follows the renderer, not a stored copy of it", async () => {

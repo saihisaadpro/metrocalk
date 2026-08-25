@@ -589,13 +589,16 @@ def _json_entries(inner: str) -> list[JsonEntry] | None:
     code that is correct. Returning None costs reach and keeps the walk stopping where it stops
     today, which is the honest half of the trade.
     """
-    entries: list[JsonEntry] = []
+    # Keyed rather than appended: `json!` builds a map by insertion, so a key written twice is ONE
+    # key on the wire and the last write is what it carries. Listing it twice would put a duplicate
+    # in the "carries [...]" a finding prints, which is a small lie about the reply.
+    entries: dict[str, JsonEntry] = {}
     for entry in split_top(inner):
         km = re.match(r'^"([^"]*)"\s*:', entry.strip())
         if not km:
             return None  # a computed key, or a shape this reader does not understand
-        entries.append((km.group(1), *_json_value_shape(entry.strip()[km.end() :])))
-    return entries or None
+        entries[km.group(1)] = (km.group(1), *_json_value_shape(entry.strip()[km.end() :]))
+    return list(entries.values()) or None
 
 
 def _json_value_shape(value: str) -> tuple[str, list[JsonEntry] | None]:
@@ -637,6 +640,12 @@ def _json_literal_entries(body: str) -> list[JsonEntry] | None:
     that builds its reply conditionally has more than one shape, and guessing which is the shape
     would be exactly the confident-diagnosis-on-top-of-a-failed-read that the GPU audit had to
     remove from its `attributes` message.
+
+    "Conditionally" is enforced in two places, because the tail test alone only looks at what
+    FOLLOWS the macro. A `match` or an `if/else` wrapping it fails the tail test outright, but an
+    early `return json!({..})` sits BEFORE it and used to be silently discarded — one branch's shape
+    published as the whole contract. Nothing in the swept trees does that today; the docstring said
+    it was handled, so now it is.
     """
     # The OUTERMOST macro whose block ends the function — not the last one to start. The replies
     # that matter build nested `json!`s inside `.map(|x| ..)` closures, and those start *after* the
@@ -650,6 +659,8 @@ def _json_literal_entries(body: str) -> list[JsonEntry] | None:
         # It must be the tail of the function: only whitespace / a trailing `)` after it.
         if re.sub(r"[\s);,]", "", body[cb + 1 :]) != "":
             continue
+        if re.search(r"\breturn\b[^;]*serde_json::json!", body[: m.start()]):
+            return None  # a second shape, before the tail, where the test above cannot see it
         return _json_entries(body[ob + 1 : cb])
     return None
 

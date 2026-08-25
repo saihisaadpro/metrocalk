@@ -1022,6 +1022,37 @@ JSON_SHAPE_PINS = [
         '{ "a": 1, "b": { KEY: 2, "d": 3 } }',
         {"json!@probe": ["a", "b"]},
     ),
+    (
+        # Found by an adversarial re-read of this change, not by a case. The tail test only looks at
+        # what FOLLOWS the macro, so an early `return json!({..})` is a second shape sitting where it
+        # cannot see. Nothing in the swept trees writes one; the docstring claimed it was handled,
+        # which is the whole reason to pin it — an unenforced claim decays into a wrong one.
+        "an early `return json!` is a second shape, so the tail literal is not the contract",
+        None,  # a whole body rather than one literal; see the runner
+        {},
+    ),
+    (
+        "a key written twice is ONE key on the wire, and is listed once",
+        '{ "a": 1, "a": 2, "b": 3 }',
+        {"json!@probe": ["a", "b"]},
+    ),
+]
+
+#: `(name, a parameter list, the names it BINDS)`. `shadow_spans` suppresses a read on this answer,
+#: so a pattern this gets wrong is a read silently attributed to the wrong reply (too few names) or
+#: silently dropped (too many). Both are invisible in the verdict — hence a value pin. The first two
+#: are regressions found by re-reading this change adversarially rather than by running it.
+PATTERN_BIND_PINS = [
+    ("a default inside a destructuring must not cut the pattern in half",
+     "{ profile = 1 }", ["profile"]),
+    ("a rest element binds its own name", "{ ...profile }", ["profile"]),
+    ("a pattern may carry a default of its own", "{ a, profile } = {}", ["a", "profile"]),
+    ("`key: target` binds the TARGET, and leaves the key meaning what it meant outside",
+     "{ profile: p }", ["p"]),
+    ("a nested pattern is walked, not skipped", "{ outer: { profile } }", ["profile"]),
+    ("an array pattern binds its elements", "[first, profile]", ["first", "profile"]),
+    ("a plain parameter with a default binds the name, not the default",
+     "profile = fallback", ["profile"]),
 ]
 
 #: `(name, spec source, the exact field paths the reader must recover)` — the shadow rule, held the
@@ -1161,12 +1192,29 @@ def run() -> int:
             else:
                 print(f"pass  {name}")
 
-    # The `json!` shape reader, pinned the same way: four of its six conditions are refusals, and a
+    for name, params, expected in PATTERN_BIND_PINS:
+        got = sorted(jsreads._pattern_binds(params))
+        if got != sorted(expected):
+            print(f"FAIL  a parameter pattern binds the wrong names: {name}")
+            print(f"        `{params}` -> expected {sorted(expected)}, got {got}")
+            ok = False
+        else:
+            print(f"pass  {name}")
+
+    # The `json!` shape reader, pinned the same way: most of its conditions are refusals, and a
     # refusal and a broken parser produce identical output.
     for name, body, expected in JSON_SHAPE_PINS:
+        inner = (
+            f"    serde_json::json!({body})\n"
+            if body is not None
+            # The one pin whose subject is the BODY rather than the literal: two shapes, one of them
+            # before the tail. A literal alone cannot express it.
+            else '    if early { return serde_json::json!({ "err": 1 }); }\n'
+                 '    serde_json::json!({ "ok": 2 })\n'
+        )
         src = (
             "#[tauri::command]\nfn probe() -> serde_json::Value {\n"
-            f"    serde_json::json!({body})\n}}\n"
+            f"{inner}}}\n"
             "fn main() { tauri::Builder::default()"
             ".invoke_handler(tauri::generate_handler![probe]); }\n"
         )
