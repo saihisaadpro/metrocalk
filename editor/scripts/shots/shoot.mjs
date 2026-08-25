@@ -244,6 +244,65 @@ function layoutInvariants(windowIsTheSubject) {
     return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
   };
 
+  // THE SECOND SCROLLING MECHANISM THIS EDITOR USES, WHICH R1/R2/R7 HAD NEVER HEARD OF.
+  //
+  // R7's whole argument is a conditional: content outside its container is a defect UNLESS the user
+  // can reach it, and the thing that makes "the user can scroll to it" TRUE is a visible scrollbar —
+  // which is why R7 checks for one instead of taking the claim on trust. A graph canvas reaches its
+  // off-screen content by DRAGGING, and says so with an on-screen zoom/fit control. That is the same
+  // sentence with a different affordance, and R7 had no way to say it: a pan/zoom pane is
+  // `overflow: hidden` with a `transform`ed child larger than itself, which is the exact shape of the
+  // defect the rule exists to catch. So the first graph scene in this repository produced four
+  // findings about React Flow's own transform containers being "cut with no way to reach what was
+  // cut", every one of them false, and a gate that is wrong in a whole regime gets waived in that
+  // regime — which is how the first real defect there goes out.
+  //
+  // The exemption is CHECKED, exactly as the scrollbar is. A canvas that ships without its navigation
+  // is not pannable-in-any-sense-a-user-would-recognise, and it fails R7 again the moment its zoom
+  // controls disappear — which is the property that makes this a rule rather than a waiver.
+  const PAN_ZOOM = ".mtk-graph-surface, .animation-graph-canvas";
+  const NAVIGATES = 'button[aria-label*="Zoom" i], button[aria-label*="Fit" i], .react-flow__controls-button';
+  const navigable = new WeakMap();
+  const pannable = (el) => {
+    const canvas = el.closest?.(PAN_ZOOM);
+    if (!canvas) return false;
+    let ok = navigable.get(canvas);
+    if (ok === undefined) {
+      ok = canvas.querySelector(NAVIGATES) != null;
+      navigable.set(canvas, ok);
+    }
+    return ok;
+  };
+
+  // A BOUNDING BOX IS NOT A HIT AREA IN SVG. R3's sentence — "one of them is taking the other's
+  // clicks, and which depends on paint order" — is a statement about CSS box hit-testing, where a
+  // rectangle IS the target. SVG hit-tests against PAINTED GEOMETRY, and the box a `<g>` reports is
+  // the union of its children's boxes: two bezier curves whose bounding rectangles overlap by 300px
+  // may share no pixel at all, and an edge's box necessarily touches the node it terminates at,
+  // which is the connection working. React Flow makes every edge group focusable, so all of them
+  // arrive in R3's control set and every graph scene produced a dozen confident sentences about
+  // collisions that are not collisions.
+  //
+  // Leaf shapes are NOT exempt: a `<rect>` or a `<text>` fills its box, so its box is its paint and
+  // R3's reasoning holds. Only CONTAINERS — `<svg>` and `<g>` — are skipped, and they are COUNTED
+  // rather than quietly dropped, so the blind spot prints on every run instead of reading as
+  // coverage (the ADR-134 rule: a gap you can see is a gap someone can close).
+  const svgContainer = (el) => el instanceof SVGGElement || el instanceof SVGSVGElement;
+
+  // WHY THERE IS NO OVERLAY EXEMPTION HERE, AND THE FACT THAT DECIDED IT.
+  //
+  // A first version of this file carried one. The graph surface floated its search field, zoom pill
+  // and legend over the canvas as React Flow panels, R3 duly reported them sitting on nodes, and the
+  // argument for excusing it was real: the content is pannable and the overlay is what navigates it,
+  // which is the same reasoning R7's pan/zoom rule already makes about clipping.
+  //
+  // It was written, and then it was TESTED BY DELETION — and with it disabled, all four graph scenes
+  // stayed green. The exemption had become dead code the moment the surface stopped floating its
+  // chrome and gave the head and foot their own grid rows, which is the repair R3 was pointing at all
+  // along. So it is gone. A gate weakening that nothing needs is a gate weakening waiting to hide a
+  // real defect, and the 300px collision it would have covered (30px of the `+` button under the
+  // search field) is exactly the defect that mattered.
+
   const box = frame.getBoundingClientRect();
   const fs = getComputedStyle(frame);
   const inner = {
@@ -359,7 +418,8 @@ function layoutInvariants(windowIsTheSubject) {
         if (ov === "visible") continue;
         const lost = edge(r, p.getBoundingClientRect());
         const scroller = ov === "auto" || ov === "scroll";
-        if (lost > TOL && !(scroller && cs.scrollbarWidth !== "none")) {
+        const pans = pannable(p);
+        if (lost > TOL && !pans && !(scroller && cs.scrollbarWidth !== "none")) {
           out.push(
             `${name(el)} is cut ${Math.round(lost)}px ${axis} by ${name(p)}, which is ` +
               (scroller
@@ -505,9 +565,17 @@ function layoutInvariants(windowIsTheSubject) {
   // is the drift every other gate in this repository exists to catch.
   const clipped = (el) => window.__mtkClipRect(el, frame);
   const CONTROLS = 'button, a[href], input, select, textarea, [role="button"], [tabindex]:not([tabindex="-1"])';
-  const controls = [...frame.querySelectorAll(CONTROLS)]
+  const judged = [...frame.querySelectorAll(CONTROLS)]
     .map((el) => [el, clipped(el)])
     .filter(([el, r]) => visible(el, r) && r.width > TOL && r.height > TOL);
+  const controls = judged.filter(([el]) => !svgContainer(el));
+  const unjudged = judged.length - controls.length;
+  if (unjudged > 0) {
+    out.push(
+      `NOTE  ${unjudged} focusable SVG container(s) were not judged for overlap — a bounding box is ` +
+        "not a hit area in SVG, so a rect comparison cannot answer whether two of them share a pixel",
+    );
+  }
   for (let i = 0; i < controls.length; i++) {
     for (let j = i + 1; j < controls.length; j++) {
       const [ea, a] = controls[i];
@@ -940,6 +1008,36 @@ for (const scene of scenes) {
     // held about pixels no user can see. Reading the clipped rect turns it red and says which of the
     // two numbers is the lie. A gate that a plausible wrong repair satisfies is worse than no gate:
     // it certifies the wrong repair.
+    // THE DUAL OF A FLOOR, AND IT EXISTS BECAUSE A FLOOR CANNOT SEE A BOX THAT GREW.
+    //
+    // `.mtk-graph-card` is drawn at a width the layout function also reads: `GRAPH_CARD_WIDTH` decides
+    // the inline width, the gap `columnLayout` leaves for a relation pill, and the size handed to
+    // React Flow so the fit knows how big the graph is. Under `content-box` the browser drew 208 + 22
+    // of padding + 2 of border = 232, every one of those three was wrong by 24px per column, and the
+    // fit framed a graph 72px narrower than the real one. NOTHING in this vocabulary could say so: a
+    // `min_width` passes more easily on a box that got bigger, and the `unclipped` claim that caught
+    // it in the end does not apply to a graph that legitimately does not fit its pane.
+    //
+    // A ceiling says "this element is the size its own module says it is", which is the only form the
+    // claim can take when the number lives in TypeScript and the drawing happens in CSS.
+    const ceiling = (axis, pairs) => {
+      const tall = axis === "height";
+      for (const [sel, px] of pairs ?? []) {
+        const el = frame.querySelector(sel);
+        if (!el) {
+          out.push(`max_${axis} needs \`${sel}\`, which is not there`);
+          continue;
+        }
+        const box = el.getBoundingClientRect();
+        const got = Math.round(tall ? box.height : box.width);
+        if (got <= px + 1) continue;
+        out.push(
+          `\`${sel}\` measures ${got}px${tall ? " tall" : " wide"}, over its ceiling of ${px}px — ` +
+            "something is drawing it bigger than the module that owns its geometry says it is",
+        );
+      }
+    };
+
     const floor = (axis, pairs) => {
       const tall = axis === "height";
       for (const [sel, px] of pairs ?? []) {
@@ -964,6 +1062,12 @@ for (const scene of scenes) {
     };
     floor("width", e.min_width);
     floor("height", e.min_height);
+    // The RAW rect, not the clipped one — deliberately, and it is the opposite choice from `floor`.
+    // A floor asks "is it there on the screen", so clipping is the whole question. A ceiling asks
+    // "was it drawn the size its module says", and an ancestor that clips an over-wide box would hide
+    // exactly the defect being looked for.
+    ceiling("width", e.max_width);
+    ceiling("height", e.max_height);
 
     // THE STAGE'S FLOOR, STATED SO THAT IT IS TRUE IN EVERY REGIME — INCLUDING THE ONE WHERE 320px
     // CANNOT EXIST. Below a ~443px window the chrome (81px), the stage's floor and the dock's 42px
@@ -1150,7 +1254,15 @@ for (const scene of scenes) {
   // precondition: a scene that set the WINDOW is a scene whose bottom edge is the window's, and a
   // scene that set a frame width is a `maxWidth` box on a page that is allowed to scroll. The
   // driver already rejects a scene that states both, so this reads one flag and not two.
-  const layout = await page.evaluate(layoutInvariants, Boolean(scene.viewport));
+  const evaluated = await page.evaluate(layoutInvariants, Boolean(scene.viewport));
+  // A COUNTED BLIND SPOT IS NOT A FINDING. An invariant that cannot judge something must say so —
+  // silence reads as coverage — but saying so is not the same as failing, and routing both down one
+  // list would have made every graph scene red for a limitation of the rule rather than a defect in
+  // the panel. `NOTE ` lines print on a passing run, where the reader can act on them, and are
+  // excluded from `bad`. (The prefix is checked with `startsWith` on purpose: a finding whose own
+  // text happens to contain the word is still a finding.)
+  const notes = evaluated.filter((l) => l.startsWith("NOTE "));
+  const layout = evaluated.filter((l) => !l.startsWith("NOTE "));
 
   // A cheap, stable fingerprint of the layout that was just judged: how wide the frame is, and where
   // every visible control sits inside it. Compared against the same reading taken after the capture.
@@ -1206,6 +1318,7 @@ for (const scene of scenes) {
   } else {
     console.log(`ok    ${id}.png  (${colours} colours)  ${looking_for}`);
   }
+  for (const n of notes) console.log(`        ${n}`);
   await page.close();
 }
 

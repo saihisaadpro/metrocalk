@@ -1879,23 +1879,28 @@ body > [role="dialog"][aria-modal="true"] {
 .animation-graph-inspector p,
 .animation-graph-inspector li { color: var(--mtk-text-secondary); font-size: 11px; line-height: 1.45; }
 .animation-graph-canvas { grid-area: canvas; position: relative; min-width: 0; min-height: 0; overflow: hidden; }
-.animation-graph-canvas .react-flow { background: var(--mtk-bg-canvas); }
-.animation-graph-canvas .react-flow__controls {
+:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow { background: var(--mtk-bg-canvas); }
+
+/* ONE graph chrome, not two. Every rule below used to be scoped to `.animation-graph-canvas` alone —
+   which is how the binding and state graphs ended up with React Flow's vendored appearance while the
+   animation graph wore the design system's. The `:is()` group IS the "no subsystem invents its own
+   graph styling" clause of the constitution, expressed where a stylesheet can enforce it. */
+:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls {
   overflow: hidden;
   border: 1px solid var(--mtk-border);
   border-radius: var(--mtk-radius-lg);
   box-shadow: var(--mtk-shadow-2);
 }
-.animation-graph-canvas .react-flow__controls-button {
+:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls-button {
   border: 0;
   border-bottom: 1px solid var(--mtk-border-subtle);
   color: var(--mtk-text-secondary);
   background: var(--mtk-bg-raised);
 }
-.animation-graph-canvas .react-flow__controls-button:last-child { border-bottom: 0; }
-.animation-graph-canvas .react-flow__controls-button svg { fill: currentColor; }
-.animation-graph-canvas .react-flow__controls-button:hover { color: var(--mtk-text); background: var(--mtk-bg-hover); }
-.animation-graph-canvas .react-flow__controls-button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--mtk-ring); outline-offset: -2px; }
+:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls-button:last-child { border-bottom: 0; }
+:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls-button svg { fill: currentColor; }
+:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls-button:hover { color: var(--mtk-text); background: var(--mtk-bg-hover); }
+:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls-button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--mtk-ring); outline-offset: -2px; }
 :is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__edge-path {
   stroke: var(--mtk-border-strong);
   stroke-width: 1.5;
@@ -1915,6 +1920,210 @@ body > [role="dialog"][aria-modal="true"] {
   border: 1px solid var(--mtk-border);
   border-radius: var(--mtk-radius-lg);
   box-shadow: var(--mtk-shadow-2);
+}
+
+/* ── the shared graph surface (theme/graph.tsx) ──────────────────────────────────────────────────
+   The canvas is a SURFACE, not a hole in the panel: it carries the inset background, the radius and
+   the hairline every other content well in this editor has, so a graph docked beside a tree reads as
+   the same kind of object. Before this rule `.mtk-graph-surface` had no declaration at all and the
+   binding graph was a transparent rectangle bleeding into whatever was behind it. */
+.mtk-graph-surface {
+  /* HEAD · CANVAS · FOOT, as tracks — not as things floating over the canvas.
+     The chrome used to be React Flow `Panel`s pinned to the pane's corners, and at the 300px
+     Inspector width the top-left search field and the top-right zoom pill simply landed on each
+     other. A `max-width` on the toolbar patched that one width; a row makes the collision
+     unrepresentable at every width, and hands `fitView` a canvas box that IS the space the graph
+     gets. `minmax(0, 1fr)` because a grid track's default `min-height: auto` would let the canvas
+     refuse to shrink and push the foot out of the surface. */
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-xl);
+  background: var(--mtk-bg-canvas);
+}
+.mtk-graph-surface__head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 10px 0;
+}
+/* The toolbar HUGS rather than fills: a search field stretched across 700px of header reads as an
+   empty bar, and the references put a compact control pill in the corner of a wide canvas, not a
+   ribbon. `1 1 auto` up to a cap, so it still shrinks when the dock is 300px and there is no room. */
+.mtk-graph-surface__head .mtk-graph-toolbar { flex: 0 1 272px; min-width: 0; margin-right: auto; }
+.mtk-graph-surface__canvas { position: relative; min-width: 0; min-height: 0; }
+
+/* The node card. Sized by its content up to a ceiling: a bind neighbourhood holds real CAD names
+   ("Hydraulic Power Unit — Skid Mounted, 210 bar") and a card that grows to fit one is a card that
+   makes its whole column that wide. Two lines, then ellipsis — the ADR-120 rule, one surface over. */
+/* The WIDTH is not here. It is `GRAPH_CARD_WIDTH` in `theme/graph.tsx`, applied inline, because
+   `columnLayout` has to subtract it from the column gap to leave room for the relation pill that
+   rides on the edge between two columns — and a width stated once in a stylesheet and once in a
+   layout function is two numbers that drift until a label lands under a card. */
+.mtk-graph-card {
+  /* BORDER-BOX, AND IT IS NOT HOUSEKEEPING. `GRAPH_CARD_WIDTH` is read by three things: the inline
+     width on this element, the column gap `columnLayout` computes so a relation pill fits between two
+     columns, and the `width` handed to React Flow so `fitView` knows how big the graph is. Under the
+     default `content-box` the browser drew 208 + 22 of padding + 2 of border = 232, so all three were
+     wrong by 24px per column — the fit framed a graph 72px narrower than the real one and clipped
+     15px off the right-hand cards. This stylesheet has no universal reset, so every component states
+     it; measured, not assumed (`.mtk-graph-card` reported 174px at a 0.75 zoom, which is 232). */
+  box-sizing: border-box;
+  padding: 9px 11px;
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-xl);
+  background: var(--mtk-bg-raised);
+  color: var(--mtk-text);
+  transition:
+    opacity var(--mtk-motion-fast) var(--mtk-ease-standard),
+    box-shadow var(--mtk-motion-fast) var(--mtk-ease-standard),
+    border-color var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+/* Dependency tracing. `opacity` rather than a colour swap so it composes with every emphasis ring
+   instead of needing a faded variant of each. */
+.mtk-graph-card[data-dimmed="true"] { opacity: .28; }
+
+.mtk-graph-card__head { display: flex; align-items: flex-start; gap: 8px; }
+.mtk-graph-card__text { min-width: 0; flex: 1 1 auto; }
+.mtk-graph-card__eyebrow {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mtk-graph-card__title {
+  display: -webkit-box;
+  overflow: hidden;
+  margin-top: 1px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  color: var(--mtk-text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.28;
+}
+.mtk-graph-card__meta {
+  margin-top: 2px;
+  color: var(--mtk-text-muted);
+  font-family: var(--mtk-font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.3;
+}
+.mtk-graph-card__chip {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid;
+  border-radius: var(--mtk-radius-sm);
+  font-family: var(--mtk-font-mono, monospace);
+  font-size: 10px;
+  letter-spacing: .4px;
+  text-transform: uppercase;
+}
+
+/* A port is a real target, not a 6px dot: the pointer has to be able to hit it, and the reference
+   screens draw it as a filled bead sitting ON the card edge rather than a ring floating beside it. */
+.mtk-graph-surface .react-flow__handle.mtk-graph-port {
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--mtk-bg-raised);
+  background: var(--mtk-border-strong);
+  box-shadow: 0 0 0 1px var(--mtk-border);
+}
+.mtk-graph-card[data-emphasis="selected"] .mtk-graph-port { background: var(--mtk-accent); }
+.mtk-graph-card[data-emphasis="live"] .mtk-graph-port { background: var(--mtk-success); }
+
+/* The relation pill. HTML rather than SVG (see `GraphRelationEdge`), so it is styled here with the
+   rest of the design system and paints above every wire — the layer React Flow mounts between the
+   edges and the nodes. `position: absolute` + the transform the edge computes is the documented
+   contract for `EdgeLabelRenderer`; `pointer-events: none` keeps a pill from swallowing a pan. */
+.mtk-graph-edge-label {
+  position: absolute;
+  padding: 2px 7px;
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-sm);
+  background: var(--mtk-bg-raised);
+  box-shadow: var(--mtk-shadow-1);
+  font-family: var(--mtk-font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: nowrap;
+  pointer-events: none;
+  transition: opacity var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-graph-edge-label.is-dimmed { opacity: .2; }
+
+/* Edges fade with the nodes they belong to — a traced path with every wire still at full strength
+   traces nothing. */
+.mtk-graph-surface .react-flow__edge { transition: opacity var(--mtk-motion-fast) var(--mtk-ease-standard); }
+.mtk-graph-surface .react-flow__edge.is-dimmed { opacity: .2; }
+
+/* Floating chrome — the toolbar, the zoom pill and the legend are the same object at three sizes:
+   a rounded raised card with a hairline and shadow-2, exactly like every popover in this editor. */
+.mtk-graph-toolbar,
+.mtk-graph-legend,
+.mtk-graph-controls {
+  border: 1px solid var(--mtk-border);
+  border-radius: var(--mtk-radius-lg);
+  background: color-mix(in srgb, var(--mtk-bg-raised) 94%, transparent);
+  box-shadow: var(--mtk-shadow-2);
+  backdrop-filter: blur(6px);
+}
+/* The search field is the side that shrinks: Zoom and Fit are the affordance that makes off-canvas
+   content reachable at all (it is what R7's pan/zoom rule checks for), so they keep their width. */
+.mtk-graph-toolbar { padding: 6px; }
+.mtk-graph-toolbar__row { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.mtk-graph-toolbar__row .mtk-search { flex: 1 1 176px; width: auto; min-width: 84px; }
+.mtk-graph-toolbar__count {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--mtk-text-muted);
+  font-family: var(--mtk-font-mono, monospace);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* `flex: none` — the pill NEVER shrinks. It shrank once, at the 300px Inspector width, and what it
+   shrank away was the `Fit` button: the pill is `overflow: hidden`, so the third control was simply
+   cut off inside it, at exactly the width where the graph least fits its pane and Fit is the control
+   that matters most. The `unclipped` claim on the pill said nothing, because the pill itself was
+   whole — which is why the scene now names the BUTTONS. */
+.mtk-graph-controls { display: flex; flex: none; overflow: hidden; padding: 0; }
+.mtk-graph-controls button {
+  min-width: 30px;
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-right: 1px solid var(--mtk-border-subtle);
+  color: var(--mtk-text-secondary);
+  background: transparent;
+  font-family: var(--mtk-font-ui);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--mtk-motion-fast) var(--mtk-ease-standard), color var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-graph-controls button:last-child { border-right: 0; }
+.mtk-graph-controls button:hover { color: var(--mtk-text); background: var(--mtk-bg-hover); }
+.mtk-graph-controls button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--mtk-ring); outline-offset: -2px; }
+.mtk-graph-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-self: start;
+  gap: 4px 12px;
+  margin: 0 10px 10px;
+  padding: 6px 9px;
+}
+.mtk-graph-legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--mtk-text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
 }
 .animation-graph-canvas .react-flow__node:focus-visible,
 .animation-graph-palette button:focus-visible,

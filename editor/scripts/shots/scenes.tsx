@@ -16,6 +16,8 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { App } from "../../src/app/App";
 import { STAGE_MIN } from "../../src/app/layout";
+import { BindingGraph } from "../../src/graph/BindingGraph";
+import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
 import { Diagnostics } from "../../src/panels/Diagnostics";
 import { ImportReport } from "../../src/panels/ImportReport";
@@ -32,6 +34,7 @@ import type {
   CadReport,
   CadReportPart,
   RevealResponse,
+  StateMachine,
 } from "../../src/transport/protocol";
 import type { EditorClient } from "../../src/transport/session";
 
@@ -92,6 +95,17 @@ export type Expect = {
    *  regime where the parts do not fit — a short window with a task workspace open — had never been
    *  photographed, measured, or reasoned about. */
   min_height?: [selector: string, px: number][];
+  /** The DUAL of `min_width`: the element must measure NO MORE than this, read from its raw rect.
+   *
+   *  A floor cannot see a box that grew. `.mtk-graph-card` is drawn at `GRAPH_CARD_WIDTH`, which
+   *  `columnLayout` also subtracts from the column gap and `GraphSurface` also hands to React Flow —
+   *  one number, three readers. Under the default `content-box` the browser drew 232 instead of 208
+   *  and all three were wrong by 24px per column, while every `min_width` in the suite passed more
+   *  easily than before. This is how a geometry contract that lives in TypeScript gets checked
+   *  against the pixels that CSS actually produced. */
+  max_width?: [selector: string, px: number][];
+  /** The vertical dual of `max_width`. */
+  max_height?: [selector: string, px: number][];
   /** EVERY element matching each selector must be fully on screen — its own box, intersected with
    *  every ancestor that clips, must not have lost anything.
    *
@@ -352,6 +366,273 @@ const selectAnimatedEntity = () => {
   s.select("rig");
 };
 
+// ── the graph editors ─────────────────────────────────────────────────────────────────────────────
+
+/** THE SIGNATURE INTERFACE NOTHING HAS EVER PHOTOGRAPHED. The constitution names the binding editor
+ *  one of the engine's signature surfaces and spells out what it owes — smooth curves, lightweight
+ *  nodes, generous spacing, immediately-understandable relationships, search, filters, zoom, mini
+ *  map. `BindingGraph` is 67 lines that hand React Flow a `data.label` and let the vendored
+ *  stylesheet draw the rest, and `StateGraph` is the same 67 lines re-pointed at state data.
+ *
+ *  Neither has ever appeared in a capture, in this harness or anywhere else, so every one of those
+ *  obligations has been unwatched since the day it was written down. The unit tests cannot see it:
+ *  React Flow measures the pane with `getBoundingClientRect`, which is 0×0 in jsdom, so it renders
+ *  no nodes at all there — the ONE surface in this editor whose populated state is unreachable
+ *  except in a real browser.
+ *
+ *  The fixture is a real bind neighbourhood with all three edge statuses on it at once, because the
+ *  status colour rule is the only thing distinguishing a live wire from a refused one and a capture
+ *  containing one status proves nothing about the other two. */
+const BIND_NEIGHBOURHOOD = {
+  summaries: {
+    gun: { id: "gun", name: "Weld Gun 7", parentId: null, kind: "requirer" },
+    mdp: { id: "mdp", name: "Main Distribution Panel MDP-1", parentId: null, kind: "mesh" },
+    plc: { id: "plc", name: "Cell PLC — Safety Interlock", parentId: null, kind: "mesh" },
+    hpu: { id: "hpu", name: "Hydraulic Power Unit — Skid Mounted, 210 bar", parentId: null, kind: "mesh" },
+    hmi: { id: "hmi", name: "Weld Cell HMI", parentId: null, kind: "requirer" },
+    log: { id: "log", name: "Line Supervisor Log", parentId: null, kind: "requirer" },
+  },
+  edges: {
+    "mdp|PowerSource|gun": { id: "mdp|PowerSource|gun", from: "mdp", rel: "PowerSource", to: "gun", status: "confirmed" },
+    "plc|ControlSignal|gun": { id: "plc|ControlSignal|gun", from: "plc", rel: "ControlSignal", to: "gun", status: "pending" },
+    "hpu|PowerSource|gun": { id: "hpu|PowerSource|gun", from: "hpu", rel: "PowerSource", to: "gun", status: "rejected" },
+    "gun|WeldEvent|hmi": { id: "gun|WeldEvent|hmi", from: "gun", rel: "WeldEvent", to: "hmi", status: "confirmed" },
+    "gun|WeldEvent|log": { id: "gun|WeldEvent|log", from: "gun", rel: "WeldEvent", to: "log", status: "confirmed" },
+  },
+} as const;
+
+/** THE SECOND REGIME, AND THE ONE THE CHROME EXISTS FOR. Six nodes fit on a canvas; a real cell
+ *  does not. `NEIGHBOUR_CAP` (48) and `minimapFrom` (12) are two thresholds that only mean anything
+ *  above a size no capture had ever reached, so the mini map, the "showing 48 of N" notice and the
+ *  behaviour of a column tall enough to need scrolling were all unwatched by construction — the same
+ *  argument as `animation-timeline-tracks` versus the empty Animate dock.
+ *
+ *  Generated rather than typed out, from a fixed table, so the fixture is reproducible and the count
+ *  is a number the scene can assert against rather than a length someone has to keep in sync. */
+const DENSE_KINDS = ["mesh", "light", "camera", "physics", "audio", "imported"] as const;
+
+function denseNeighbourhood(providers: number, consumers: number) {
+  const summaries: Record<string, unknown> = {
+    cell: { id: "cell", name: "Weld Cell 12 — Controller", parentId: null, kind: "requirer" },
+  };
+  const edges: Record<string, unknown> = {};
+  for (let i = 0; i < providers; i++) {
+    const id = `p${i}`;
+    summaries[id] = {
+      id,
+      name: `Feeder ${String(i + 1).padStart(2, "0")} — ${DENSE_KINDS[i % DENSE_KINDS.length]}`,
+      parentId: null,
+      kind: DENSE_KINDS[i % DENSE_KINDS.length],
+    };
+    const eid = `${id}|Supplies|cell`;
+    edges[eid] = { id: eid, from: id, rel: "Supplies", to: "cell", status: i % 7 === 3 ? "pending" : "confirmed" };
+  }
+  for (let i = 0; i < consumers; i++) {
+    const id = `c${i}`;
+    summaries[id] = { id, name: `Station ${String(i + 1).padStart(2, "0")} readout`, parentId: null, kind: "requirer" };
+    const eid = `cell|Reports|${id}`;
+    edges[eid] = { id: eid, from: "cell", rel: "Reports", to: id, status: "confirmed" };
+  }
+  return { summaries, edges };
+}
+
+const DENSE = denseNeighbourhood(9, 7);
+
+const seedDenseNeighbourhood = () => {
+  projectionStore.setState({
+    summaries: { ...DENSE.summaries } as never,
+    edges: { ...DENSE.edges } as never,
+    order: Object.keys(DENSE.summaries),
+    selectedId: "cell",
+    multiSelect: ["cell"],
+  });
+};
+
+const seedBindNeighbourhood = () => {
+  projectionStore.setState({
+    summaries: { ...BIND_NEIGHBOURHOOD.summaries } as never,
+    edges: { ...BIND_NEIGHBOURHOOD.edges } as never,
+    order: Object.keys(BIND_NEIGHBOURHOOD.summaries),
+    selectedId: "gun",
+    multiSelect: ["gun"],
+  });
+};
+
+/** A door with a real event vocabulary rather than `A → B`: the transition LABELS are what the state
+ *  graph exists to make readable, and three of them leave the same node. */
+const DOOR_MACHINE: StateMachine = {
+  name: "Airlock Door",
+  entity: "door",
+  component: "DoorState",
+  field: "phase",
+  states: ["Locked", "Closed", "Opening", "Open", "Closing", "Jammed"],
+  initial: "Locked",
+  transitions: (
+    [
+      ["t1", "Locked", "Closed", "badge_accepted"],
+      ["t2", "Closed", "Opening", "open_requested"],
+      ["t3", "Opening", "Open", "travel_complete"],
+      ["t4", "Open", "Closing", "close_requested"],
+      ["t5", "Closing", "Closed", "travel_complete"],
+      ["t6", "Opening", "Jammed", "obstruction_detected"],
+      ["t7", "Jammed", "Closing", "obstruction_cleared"],
+    ] as const
+  ).map(([id, from, to, event]) => ({
+    id,
+    from,
+    to,
+    rule: { name: event, enabled: true, event, conditions: [], actions: [] },
+  })),
+};
+
+/** Both graph scenes are captured in a box the size of the dock panel that actually holds them —
+ *  `EditorDocks` gives the binding graph a `minHeight: 220` fill inside a 300px track, and the
+ *  Rules panel gives the state graph 240px. A graph photographed at 1440×900 is a graph nobody has
+ *  ever seen: the whole question is whether it stays legible in the space it really gets. */
+function graphFrame(height: number, children: ReactNode) {
+  return (
+    <div
+      style={{
+        display: "grid",
+        height,
+        padding: 16,
+        background: "var(--mtk-bg-panel)",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function graphScenes(): Scene[] {
+  return [
+    {
+      id: "binding-graph-neighbourhood",
+      looking_for:
+        "north-star #1 as a PICTURE: the selected object in the middle, what powers it on the left, " +
+        "what it feeds on the right, and every wire labelled with the relation it carries. The three " +
+        "edge statuses must be told apart at a glance — a confirmed bind, a pending one still in " +
+        "flight, and a refused one — which means the wire's own colour has to be VISIBLE either " +
+        "side of its label, and the legend has to say what each colour means. Three columns need " +
+        "960px and this canvas has 698, so the fit stops at its readability floor and the mini map " +
+        "appears to say there is more graph off to the side",
+      viewport: { width: 760, height: 460 },
+      setup: seedBindNeighbourhood,
+      expect: {
+        present: [
+          [".react-flow__node", 6],
+          [".react-flow__edge", 5],
+          [".react-flow__minimap", 1],
+          [".react-flow__minimap-node", 6],
+          // The positive half of the motion rule: exactly the pending bind marches, because it is
+          // the only thing here that is genuinely still in flight.
+          [".react-flow__edge.animated", 1],
+        ],
+        text_present: ["Weld Gun 7", "PowerSource", "ControlSignal"],
+        text_absent: ["null", "undefined", "NaN"],
+        min_width: [[".mtk-graph-card[data-emphasis='selected']", 150]],
+        unclipped: [".mtk-graph-controls button", ".mtk-graph-legend", "[data-testid='binding-graph-search']"],
+      },
+      render: () => graphFrame(428, <BindingGraph />),
+    },
+    {
+      id: "state-graph-door",
+      looking_for:
+        "the same canvas, the same node card and the same edge language pointed at a state machine: " +
+        "six states, seven transitions, the initial state marked as the initial one and the live " +
+        "state marked as live — two DIFFERENT marks, because a graph where 'where it starts' and " +
+        "'where it is' look alike answers neither question. Six columns do not fit a 260px dock at a " +
+        "readable size, so the fit stops at its floor and the rest is reached by panning — this " +
+        "canvas is 164px tall, below the height where a mini map is navigation rather than " +
+        "furniture, so Fit is the affordance instead. Legible-and-navigable beats all-of-it-at-once, " +
+        "and no capture here is allowed to look fine only at 2x",
+      viewport: { width: 760, height: 340 },
+      expect: {
+        present: [
+          [".react-flow__node", 6],
+          [".react-flow__edge", 7],
+        ],
+        text_present: ["Opening", "obstruction_detected"],
+        text_absent: ["null", "undefined", "NaN"],
+        // The LIVE state is the one the user came to find, so it is the one that has to be on screen
+        // and legible — 148px is the compact card at zoom 1, and 110 is it at the fit floor.
+        min_width: [[".mtk-graph-card[data-emphasis='live']", 110]],
+        // MOTION MEANS IN-FLIGHT, AND ONLY IN-FLIGHT — asserted here in the negative and in
+        // `binding-graph-neighbourhood` in the positive. React Flow's `animated` flag is a CSS class
+        // that dashes a wire and marches it, and the inline style from `graphEdgeStyle` cannot see
+        // it: an "active" transition rendered DASHED while the legend swatch beside it, drawn from
+        // the same function, rendered SOLID. A key that disagrees with its own diagram is worse than
+        // no key, and nothing but this line can tell the two apart in a capture.
+        absent: [".react-flow__edge.animated"],
+        unclipped: [".mtk-graph-controls button", ".mtk-graph-legend"],
+      },
+      render: () => graphFrame(292, <StateGraph machine={DOOR_MACHINE} current="Opening" />),
+    },
+    {
+      id: "binding-graph-narrow",
+      looking_for:
+        "the SAME graph in the 300 px Inspector track it actually ships in — `EditorDocks` gives it a " +
+        "220 px fill under the Reveal list. A card is 208 px wide by design, which leaves 92 px for " +
+        "two gutters, so this is the width where the node, the search field and the zoom pill either " +
+        "fit or start eating each other (they ate each other: 30px of the `+` button). Three columns " +
+        "cannot be framed here at a readable size, so the card stays readable, Fit and the pan carry " +
+        "the navigation, and the chrome is whole",
+      viewport: { width: 300, height: 420 },
+      setup: seedBindNeighbourhood,
+      expect: {
+        present: [[".react-flow__node", 6]],
+        // No mini map at this size, deliberately: 268px of canvas is below the floor where a
+        // thumbnail is navigation rather than furniture. Fit is the affordance, and it must be whole.
+        absent: [".react-flow__minimap"],
+        min_width: [[".mtk-graph-card[data-emphasis='selected']", 150]],
+        // 208px at the 0.75 fit floor is 156. `content-box` would draw 232, which is 174 — over this
+        // ceiling and under every floor in the suite, which is exactly why the ceiling exists.
+        max_width: [[".mtk-graph-card[data-emphasis='selected']", 160]],
+        // The BUTTONS, not the pill. The pill is `overflow: hidden`, so it stayed whole while the
+        // `Fit` button inside it was cut clean off — an assertion on the container is an assertion
+        // about the container.
+        unclipped: [".mtk-graph-controls button", "[data-testid='binding-graph-search']"],
+        text_present: ["Fit"],
+        text_absent: ["null", "undefined", "NaN"],
+      },
+      render: () => graphFrame(388, <BindingGraph />),
+    },
+    {
+      id: "binding-graph-dense",
+      looking_for:
+        "seventeen nodes on the same canvas: the mini map has appeared (it is what makes a graph " +
+        "this size navigable rather than merely large), the two columns stay in their lanes, and " +
+        "every card is still READABLE — the failure this scene is written against is precisely a " +
+        "column that grows until the fit has zoomed the whole thing down to nothing, which is what " +
+        "it did at 0.39 before the fit had a floor",
+      viewport: { width: 900, height: 620 },
+      setup: seedDenseNeighbourhood,
+      expect: {
+        present: [
+          [".react-flow__node", 17],
+          [".react-flow__minimap", 1],
+          // THE MINI MAP HAS TO HAVE THE GRAPH IN IT. This is not pedantry: it shipped BLANK. React
+          // Flow draws each mini-map node by reading `nodeHasDimensions` on the USER node, and in a
+          // controlled flow with no `onNodesChange` the measured size never gets written back — so
+          // every node fails the check, the component renders its mask and nothing else, and what
+          // floats over the graph is an empty white card. Every assertion in this scene passed while
+          // that was true; a human reading the PNG is what found it.
+          [".react-flow__minimap-node", 17],
+        ],
+        text_present: ["Weld Cell 12 — Controller"],
+        text_absent: ["null", "undefined", "NaN"],
+        // Legibility, measured on the card the user selected — which the fit always keeps centred.
+        // 208px is the card at zoom 1; 156 is it at the fit floor. Before the floor existed this
+        // measured 82px and the type inside it was 5px.
+        min_width: [[".mtk-graph-card[data-emphasis='selected']", 150]],
+        max_width: [[".mtk-graph-card[data-emphasis='selected']", 160]],
+        unclipped: [".mtk-graph-controls button", ".mtk-graph-legend"],
+      },
+      render: () => graphFrame(588, <BindingGraph />),
+    },
+  ];
+}
+
 export const SCENES: Scene[] = [
   {
     id: "import-report-nulls",
@@ -531,6 +812,7 @@ export const SCENES: Scene[] = [
   },
   ...rigScenes(),
   ...poseScenes(),
+  ...graphScenes(),
   ...shellScenes(),
 ];
 

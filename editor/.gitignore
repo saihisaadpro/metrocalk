@@ -16,3 +16,9 @@ package-lock.json
 # git history. Evidence worth keeping is copied into progress/ deliberately, per report.
 scripts/shots/dist/
 scripts/shots/shots/
+# …and the copies that appear when something cannot delete `dist` and renames it aside instead. Nine
+# of these accumulated as UNTRACKED directories in one session, each a full copy of the bundle: they
+# pollute `git status` until a reader stops looking at the list, and they are one `git add -A` away
+# from being committed. Same policy as the directory they are copies of — build output never travels.
+scripts/shots/dist.aside.*/
+scripts/shots/dist.stale.*/
