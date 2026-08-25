@@ -11,7 +11,10 @@ name: contract-gates
 #                        moments, both on a machine with a GPU, in a build that got that far.
 #   ipc-contract-audit   every `#[tauri::command]` against every `invoke("name", { key })`, and every
 #                        reply field the UI reads — declared in TypeScript, or merely READ in the
-#                        untyped E2E suite — against what the shell actually sends.
+#                        untyped E2E suite — against what the shell actually sends. Both directions:
+#                        the argument keys AND, where the caller declares a type for the value it
+#                        hands over inside one of them, the fields INSIDE that key. `{ rule }` used
+#                        to agree about the word "rule" and about nothing in it (ADR-143).
 #   e2e-load-gate        does each of the 161 E2E specs still parse, and does every name it imports
 #                        from a relative module still get exported by it?
 #
