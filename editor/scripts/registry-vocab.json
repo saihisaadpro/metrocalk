@@ -1,12 +1,11 @@
 {
-  "//": "Declared divergences between the Inspector's typed-field table (editor/src/schema/registry.ts) and the core's component registry (core/src/stdlib.rs). Same shape as class-hooks.json: a decision a human makes once and writes down, with the reason and the closing gate beside it. Anything not listed here fails check-registry-vocab.mjs. A declaration that stops matching anything is reported as stale on every run so this file cannot rot quietly.",
+  "//": "Declared divergences between the Inspector's typed-field table (editor/src/schema/registry.ts) and the core's component registry (core/src/stdlib.rs). Same shape as class-hooks.json: a decision a human makes once and writes down, with the reason and the closing gate beside it. Anything not listed here FAILS check-registry-vocab.mjs. Every entry must carry a non-empty `reason` — a key alone suppresses nothing, because a suppression that does not say why is not a declaration. A declaration that stops matching anything is printed as `stale` on every run; that is a NOTE, not a failure, the same policy class-hooks.json uses, so this file is kept honest by being read rather than by CI.",
 
   "phantom": {
     "Provides": {
       "reason": "The dev MockCore models a capability as a COMPONENT FIELD (`Provides.capability` / `Socket.accepts`, transport/session.ts) so that bind-by-intent has something to reject in `npm run dev` and in vitest. The core models the same thing as METADATA on ComponentMeta (`.provides(..)` / `.requires(..)`), which never appears in an entity's projected components at all. Keeping the schema entry is what lets the mock's own entities render an enum rather than a free-text box.",
       "owner": "the M3.1/M5 capability lane",
-      "note": "`Socket`, the target half of the same mock pair (`Socket.accepts`), carries no curated entry and so needs no declaration here — it renders through the data-driven fallback as the free-text box it is. If it ever gains one, it belongs beside this line.",
-      "owner": "the M3.1/M5 capability lane",
+      "note": "`Socket`, the target half of the same mock pair (`Socket.accepts`), carries no curated entry and so needs no declaration here — it renders through the data-driven fallback as the free-text box it is. If it ever gains one, it belongs beside this line. The pair is also read by `transport/mock-core.ts`'s default `canBind`, not only by `buildWorld`.",
       "closingGate": "either the mock stops inventing a component and expresses capability the way the core does, or `Provides`/`Socket` become real registered components in core/src/stdlib.rs. Whichever happens, delete this entry and the gate proves it."
     }
   },

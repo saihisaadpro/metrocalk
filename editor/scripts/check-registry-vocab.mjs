@@ -128,11 +128,19 @@ export function parseCoreTable(src) {
     }
     const fields = new Map();
     const hints = new Map();
-    for (const m of block.matchAll(/\.field\(\s*"([\w]+)"\s*,\s*(\w+)\s*,\s*(true|false)\s*\)/g)) {
+    // `FieldType::String` and a trailing comma are both legal spellings rustfmt can produce, and both
+    // were unmatched by the first draft. An adversarial review found the consequence: a `field_fmt`
+    // spelled either way parses as NOTHING, so the format it declares is invisible and the gate goes
+    // green about the one direction it exists for.
+    const TY = "(?:FieldType::)?(\\w+)";
+    for (const m of block.matchAll(new RegExp(`\\.field\\(\\s*"([\\w]+)"\\s*,\\s*${TY}\\s*,\\s*(true|false)\\s*,?\\s*\\)`, "g"))) {
       fields.set(m[1], { ty: FIELD_TYPE[m[2]] ?? m[2], required: m[3] === "true", format: null });
     }
     for (const m of block.matchAll(
-      /\.field_fmt\(\s*"([\w]+)"\s*,\s*(\w+)\s*,\s*(true|false)\s*,\s*(?:Some\(\s*"([\w-]+)"\s*\)|(\w+))\s*\)/g,
+      new RegExp(
+        `\\.field_fmt\\(\\s*"([\\w]+)"\\s*,\\s*${TY}\\s*,\\s*(true|false)\\s*,\\s*(?:Some\\(\\s*"([\\w-]+)"\\s*\\)|(\\w+))\\s*,?\\s*\\)`,
+        "g",
+      ),
     )) {
       const format = m[4] ?? aliases.get(m[5]) ?? null;
       if (!format) problems.push(`${name}.${m[1]}: field_fmt's format is neither a literal nor a resolvable binding`);
@@ -140,6 +148,18 @@ export function parseCoreTable(src) {
     }
     for (const m of block.matchAll(/\.ui_hint\(\s*"([\w]+)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,?\s*\)/g)) {
       hints.set(m[1], m[2].replace(/\\"/g, '"'));
+    }
+    // THE READER COUNTS WHAT IT SHOULD HAVE READ. "no fields at all" only catches a component that
+    // parsed to nothing; a component that loses ONE field to an unrecognised spelling looks healthy,
+    // and if the lost one carried the `format` the gate is silent about exactly what it is for. So the
+    // number of `.field(`/`.field_fmt(` CALLS is compared against the number understood, and a
+    // shortfall is a hard failure — the reader is required to know when it did not understand.
+    const calls = (block.match(/\.field(?:_fmt)?\(/g) ?? []).length;
+    if (fields.size < calls) {
+      problems.push(
+        `${name}: ${calls} field call(s) in the source, ${fields.size} understood — the reader met a ` +
+          "spelling it does not know, and a format or type it cannot see is one it cannot check",
+      );
     }
     if (fields.size === 0) problems.push(`${name}: parsed with NO fields — the reader lost the table's shape`);
     components.set(name, { category: block.match(/\.category\(\s*"([\w]+)"\s*\)/)?.[1] ?? null, fields, hints });
@@ -155,13 +175,28 @@ export function parseCoreTable(src) {
 }
 
 /** `"enum: directional|point|spot"` → `["directional","point","spot"]`; anything else → null. A hint
- *  is prose by default and only this one prefix is a machine-readable vocabulary. */
+ *  is prose by default and only this one prefix is a machine-readable vocabulary.
+ *
+ *  ONE variant is still a closed vocabulary. The first draft required two, on the reasoning that a
+ *  single value is not a choice — but the question this gate asks is "may the user type something
+ *  else", and the answer for `enum: only` is no. Requiring two made a genuinely closed one-value
+ *  vocabulary silent, which is the gate's own failure mode rather than a judgement call. */
 export function hintEnum(hint) {
   const m = /^\s*enum:\s*(.+?)\s*$/.exec(hint ?? "");
   if (!m) return null;
   const variants = m[1].split("|").map((s) => s.trim()).filter(Boolean);
-  return variants.length >= 2 ? variants : null;
+  return variants.length >= 1 ? variants : null;
 }
+
+/** Two vocabularies are the same set. Compared ELEMENT BY ELEMENT, never as a joined string: `["a,b"]`
+ *  and `["a","b"]` join to the same text, so a curated entry with a comma where the core has a pipe
+ *  read as covered — and incremented the `covered` count while doing it. */
+const sameSet = (a, b) => {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  const x = [...a].map(String).sort();
+  const y = [...b].map(String).sort();
+  return x.every((v, i) => v === y[i]);
+};
 
 // ── the editor's table, read from the TypeScript source ───────────────────────────────────────────
 
@@ -246,7 +281,22 @@ export function check(coreSrc, editorSrc, manifest = {}) {
     if (k.startsWith("//") || BUCKETS.includes(k)) continue;
     findings.push({ kind: "unreadable", key: k, message: `registry-vocab.json has an unknown bucket \`${k}\`` });
   }
-  const allow = (bucket, key) => Object.prototype.hasOwnProperty.call(manifest[bucket] ?? {}, key);
+  // A DECLARATION IS A SENTENCE, NOT A KEY. `hasOwnProperty` alone means `{ "Ghost": null }` suppresses
+  // a finding while saying nothing about why, which is the suppression mechanism ADR-124 refused to
+  // build wearing the manifest's clothes. An entry must be an object carrying a `reason`.
+  const allow = (bucket, key) => {
+    const entry = (manifest[bucket] ?? {})[key];
+    if (entry === undefined) return false;
+    if (!entry || typeof entry !== "object" || typeof entry.reason !== "string" || entry.reason.trim() === "") {
+      findings.push({
+        kind: "unreadable",
+        key: `${bucket}:${key}`,
+        message: `registry-vocab.json declares \`${bucket}.${key}\` with no \`reason\` — a suppression that does not say why is not a declaration`,
+      });
+      return false;
+    }
+    return true;
+  };
   const used = new Set();
   const take = (bucket, key) => {
     if (!allow(bucket, key)) return false;
@@ -283,13 +333,45 @@ export function check(coreSrc, editorSrc, manifest = {}) {
         continue;
       }
       const declared = spec?.type;
+      // A CURATED FIELD WITHOUT A TYPE MATCHES NO TESTER. Every tester in the inspector's set is keyed
+      // on a scalar type (`isStringControl`, `isNumberControl`, …), so a `{ title, enum }` with no
+      // `type` resolves to nothing and JSON Forms paints "No applicable renderer found." into the
+      // panel. `JsonSchema7.type` is optional, so TypeScript permits it; the `FieldSchema` alias now
+      // narrows it too, and this is the belt to that brace — the shape is unrenderable, not merely
+      // undeclared, and it is the only hole an adversarial pass found in the renderer set.
+      if (!declared) {
+        findings.push({
+          kind: "untyped-field",
+          key,
+          message:
+            `componentSchemas declares \`${key}\` with no \`type\`; every inspector tester is keyed on a ` +
+            "scalar type, so this field would render as JSON Forms' \"No applicable renderer found.\"",
+        });
+        continue;
+      }
       // integer is a number; the reverse is not true, and only the lossy direction is a finding.
       const compatible = declared === cf.ty || (declared === "number" && cf.ty === "integer");
-      if (declared && !compatible && !take("typeDrift", key)) {
+      if (!compatible && !take("typeDrift", key)) {
         findings.push({
           kind: "type-drift",
           key,
           message: `componentSchemas types \`${key}\` as \`${declared}\`; the core registers it as \`${cf.ty}\``,
+        });
+      }
+      // AND A FORMAT THE CORE DOES NOT DECLARE. Direction 2 catches a format the core publishes and the
+      // table ignores; this is its dual, and it is the shipped defect stated directly rather than
+      // reached through `phantom-component`: `Material.color` was the only `format: "color"` in the
+      // repository and the core has no such field, so the control keyed on it could never fire. With
+      // the phantom component deleted but the format left on a real field, nothing else here objects.
+      const fmt = spec?.format;
+      if (fmt && fmt !== cf.format && !take("unrouted", key)) {
+        findings.push({
+          kind: "invented-format",
+          key,
+          message:
+            `componentSchemas gives \`${key}\` format \`${fmt}\`; the core declares ` +
+            (cf.format ? `\`${cf.format}\`` : "no format for it") +
+            " — a tester keyed on it fires only against data the core cannot send",
         });
       }
     }
@@ -319,7 +401,7 @@ export function check(coreSrc, editorSrc, manifest = {}) {
       const variants = hintEnum(core.hints.get(field));
       if (variants) {
         const declared = props[field]?.enum;
-        if (Array.isArray(declared) && String([...declared].sort()) === String([...variants].sort())) covered++;
+        if (sameSet(declared, variants)) covered++;
         else if (!take("unreadEnum", key)) {
           findings.push({
             kind: "unread-enum",
@@ -514,9 +596,11 @@ export function buildEntitySchema() {}
   // it; a reader that only understood the literal would report those six as having NO format and go
   // green on the very fields this gate exists for. Pinned by key: with the alias resolution deleted,
   // `MeshRenderer.mesh` stops being a finding here and the count drops to 0.
+  // Both directions fire on the same field, which is the point: the table names a format the core does
+  // not have AND stays silent about the one it does.
   run(
     "a format named through a `let` binding is still read",
-    { count: 1, kinds: ["unrouted-format"], keys: ["MeshRenderer.mesh"] },
+    { count: 2, kinds: ["unrouted-format", "invented-format"], keys: ["MeshRenderer.mesh", "MeshRenderer.mesh"] },
     coreOf(),
     editorOf(`{
       MeshRenderer: { type: "object", properties: { mesh: { type: "string", format: "entity-ref" } } },
@@ -601,6 +685,110 @@ export function buildEntitySchema() {}
     coreOf(),
     "export function buildEntitySchema() {}\n",
   );
+  // ── the six holes an adversarial review opened after the first version shipped ─────────────────
+  // Every one of them is a way for the two tables to genuinely disagree while `check` reports ZERO.
+  // That is the only failure mode that matters for a gate, and none of them was reachable from the
+  // cases above, which is why they are pinned individually and by KEY.
+
+  // (1) A SPELLING THE READER DOES NOT KNOW. rustfmt may write `FieldType::String`, and a wrapped call
+  // gets a trailing comma. Either one made `field_fmt` parse as NOTHING — so the format it declares was
+  // invisible and the gate went green about the one direction it exists for. The "no fields at all"
+  // guard could not see it: the component still has its other fields. Now the reader counts the calls
+  // it should have understood.
+  // A field whose NAME is a constant rather than a literal is the general shape: the call is there, the
+  // reader cannot understand it, and before the call-count guard the component simply looked one field
+  // smaller — with whatever `format` that field carried invisible.
+  run(
+    "a field the reader could not parse is a FAILURE, not a component with fewer fields",
+    { count: 1, kinds: ["unreadable"] },
+    coreOf(`        ComponentMeta::builder("Paint").category("Props")
+            .field("opacity", Number, false)
+            .field_fmt(COLOUR_FIELD, Str, true, Some("color"))
+            .build(),`),
+    editorOf(TRUTHFUL),
+  );
+  // ...and once it IS understood, the format it declares is reported like any other.
+  run(
+    "a `FieldType::` spelling with a trailing comma parses, and its format is checked",
+    { count: 1, kinds: ["unrouted-format"], keys: ["Paint.colour"] },
+    coreOf(`        ComponentMeta::builder("Paint").category("Props")
+            .field("opacity", Number, false)
+            .field_fmt("colour", FieldType::String, true, Some("color"),)
+            .build(),`),
+    editorOf(TRUTHFUL),
+  );
+
+  // (2) A FORMAT THE EDITOR INVENTED. Direction 2 catches a format the core publishes and the table
+  // ignores; this is its dual. It is the SHIPPED defect stated directly: `Material.color` was the only
+  // `format: "color"` in the repository and the core has no such field. Delete the phantom component
+  // but leave the format on a REAL field and, before this, nothing objected.
+  run(
+    "a format the core does not declare fires",
+    { count: 1, kinds: ["invented-format"], keys: ["Transform.px"] },
+    coreOf(),
+    editorOf(`{
+      Transform: { type: "object", properties: { px: { type: "number", format: "color" } } },
+      MeshRenderer: { type: "object", properties: { mesh: { type: "string", format: "asset" } } },
+      Joint: { type: "object", properties: {
+        bodyA: { type: "string", format: "entity-ref" },
+        kind: { type: "string", enum: ["revolute", "fixed", "spherical"] } } },
+    }`),
+  );
+
+  // (3) A ONE-VARIANT VOCABULARY IS STILL CLOSED. The question is "may the user type something else",
+  // and for `enum: only` the answer is no. Requiring two variants made it silent.
+  run(
+    "a single-variant vocabulary is still a vocabulary",
+    { count: 1, kinds: ["unread-enum"], keys: ["Solo.mode"] },
+    coreOf(`        ComponentMeta::builder("Solo").field("mode", Str, true)
+            .ui_hint("mode", "enum: only").build(),`),
+    editorOf(TRUTHFUL),
+  );
+
+  // (4) A COMMA WHERE THE CORE HAS A PIPE. Compared as a joined string, `["a,b"]` covers `enum: a|b` —
+  // and incremented `covered` while doing it. Element by element now.
+  run(
+    "a comma inside one variant does not cover two",
+    { count: 1, kinds: ["unread-enum"], keys: ["Joint.kind"] },
+    coreOf(),
+    editorOf(`{
+      MeshRenderer: { type: "object", properties: { mesh: { type: "string", format: "asset" } } },
+      Joint: { type: "object", properties: {
+        bodyA: { type: "string", format: "entity-ref" },
+        kind: { type: "string", enum: ["revolute,fixed,spherical"] } } },
+    }`),
+  );
+
+  // (5) A DECLARATION IS A SENTENCE, NOT A KEY. `{ Ghost: null }` suppressed by existing.
+  run(
+    "a declaration with no reason suppresses nothing and says so",
+    { count: 2, kinds: ["phantom-component", "unreadable"], keys: ["Ghost", "phantom:Ghost"] },
+    coreOf(),
+    editorOf(`{
+      Ghost: { type: "object", properties: {} },
+      MeshRenderer: { type: "object", properties: { mesh: { type: "string", format: "asset" } } },
+      Joint: { type: "object", properties: {
+        bodyA: { type: "string", format: "entity-ref" },
+        kind: { type: "string", enum: ["revolute", "fixed", "spherical"] } } },
+    }`),
+    { phantom: { Ghost: null } },
+  );
+
+  // (6) A CURATED FIELD WITH NO `type` MATCHES NO TESTER, and JSON Forms answers by painting "No
+  // applicable renderer found." into the panel. `JsonSchema7.type` is optional, so this compiles.
+  run(
+    "a curated field with no type fires",
+    { count: 1, kinds: ["untyped-field"], keys: ["Transform.px"] },
+    coreOf(),
+    editorOf(`{
+      Transform: { type: "object", properties: { px: { title: "Position X" } } },
+      MeshRenderer: { type: "object", properties: { mesh: { type: "string", format: "asset" } } },
+      Joint: { type: "object", properties: {
+        bodyA: { type: "string", format: "entity-ref" },
+        kind: { type: "string", enum: ["revolute", "fixed", "spherical"] } } },
+    }`),
+  );
+
   // THE BACKTICK, WHICH IS THIS GATE'S OWN APOSTROPHE. `registry.ts` documents its colour field with
   // `` // `format: color` → … ``; read as a string opener it swallows the rest of the table and the
   // gate reports "unterminated" — red, but for the wrong reason and with none of the real findings.

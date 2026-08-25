@@ -27,8 +27,18 @@ import type { Json } from "../transport/protocol";
 /** A curated field schema. `unit` is the one non-standard key: JSON Schema has no unit concept and the
  *  core's registry carries units only as prose inside `ui_hint` ("companion move speed, metres per
  *  second"), so the readable half is restated here where a control can render it. Every unit below is
- *  the engine's own — metres, degrees, kilograms — never a guess. */
-export type FieldSchema = JsonSchema7 & { unit?: string };
+ *  the engine's own — metres, degrees, kilograms — never a guess.
+ *
+ *  **`type` IS REQUIRED, and `JsonSchema7`'s is not.** Every tester in the inspector's renderer set is
+ *  keyed on a scalar type (`isStringControl`, `isNumberControl`, …), so a curated entry like
+ *  `{ title: "Light", enum: [...] }` — which `JsonSchema7` permits — matches nothing, and JSON Forms
+ *  answers by painting the literal string "No applicable renderer found." into the panel. Narrowing it
+ *  here makes that a compile error; `check-registry-vocab.mjs` reports it as `untyped-field` as well,
+ *  because the table is also read as data by a gate that does not run `tsc`. */
+export type FieldSchema = Omit<JsonSchema7, "type"> & {
+  type: "string" | "number" | "integer" | "boolean";
+  unit?: string;
+};
 
 /** One component's properties. Narrower than `JsonSchema7` on purpose: the inspector's uischema
  *  generator emits one `Control` per leaf, so a curated entry that was not an object of leaves would

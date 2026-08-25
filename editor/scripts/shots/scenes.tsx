@@ -907,25 +907,53 @@ function inspectorScenes(): Scene[] {
         present: [
           // 9 Transform + 3 MeshRenderer + 2 RigidBody + 3 Joint.
           ["[data-testid='prop-row']", 17],
-          // px/py/pz metres, rx/ry/rz degrees, sx/sy/sz multiples. A unit the core states in prose and
-          // the editor never showed: `Transform` is nine bare numbers without them.
-          ["[data-testid='prop-unit']", 9],
+          // px/py/pz metres, rx/ry/rz degrees, sx/sy/sz multiples, and `RigidBody.mass` in kilograms —
+          // TEN, not nine. An adversarial review caught the miscount, and it matters more than an
+          // off-by-one: `present` is at-least, so a scene that under-counts is a scene that would stay
+          // green with a unit deleted. A unit the core states in prose and the editor never showed.
+          ["[data-testid='prop-unit']", 10],
           // THE THREE CONTROLS THAT COULD NOT FIRE BEFORE. Two entity references and one asset
           // reference — the core declares eight such fields and the editor routed none of them.
+          //
+          // ANCHORED ON WHAT EACH CONTROL *IS*, not on its id. Every control in the panel derives its
+          // id the same way (`controlId(path)`), so `#mtk-prop-MeshRenderer-mesh` alone is satisfied by
+          // the plain `StringControl` this fix replaced — the review's sharpest finding, and it would
+          // have left the headline "no renderer for `format: asset`" claim asserted by nothing. The
+          // MONO face is `AssetRefControl`'s and no other control here asks for it, so the compound
+          // selector fails the moment the asset renderer is removed. `bodyA`/`bodyB`/`kind` are rescued
+          // by the `<option>` text below, which only a `<select>` can produce.
           ["#mtk-prop-Joint-bodyA", 1],
           ["#mtk-prop-Joint-bodyB", 1],
-          ["#mtk-prop-MeshRenderer-mesh", 1],
+          ["#mtk-prop-MeshRenderer-mesh.mtk-input--mono", 1],
+          ["#mtk-prop-MeshRenderer-material.mtk-input--mono", 1],
           ["#mtk-prop-RigidBody-kind", 1],
-          // px 2.5, py 1.2, pz -0.75 and ry 45 differ from their declared defaults; sx/sy/sz are 1,
-          // which IS the default, and must NOT offer one — a reset that is always there is furniture.
+          // px 2.5, py 1.2, pz -0.75 and ry 45 differ from their declared defaults, so four rows offer a
+          // reset. The COUNT cannot say the other five must not, because `present` is at-least — an
+          // unconditional reset on all seventeen rows satisfies it. The two `absent` entries below are
+          // what actually state it, and they are stated per row, on values that ARE their default.
           ["[data-testid='prop-reset']", 4],
+          ["[aria-label='Reset Position X to 0']", 1],
         ],
-        // ONE ANATOMY, STATED THE ONLY WAY A GATE CAN CHECK IT. These four are
-        // `@jsonforms/vanilla-renderers`' class names; every boolean, plain string and vocabulary
-        // field in this panel rendered through them, and `check-class-hooks.mjs` cannot see them at
-        // all because they are emitted from `node_modules`. `.mtk-field-row` is the inspector's own
-        // retired row. If any of the five comes back, so has the second design language.
-        absent: [".control", ".input", ".select", ".checkbox", ".mtk-field-row"],
+        // ONE ANATOMY, AND THE HONEST ACCOUNT OF WHAT THIS CAN AND CANNOT SEE. The first four are
+        // `@jsonforms/vanilla-renderers`' class names; every boolean, plain string and vocabulary field
+        // in this panel rendered through them, and `check-class-hooks.mjs` cannot see them at all
+        // because they are emitted from `node_modules`. What this does NOT catch — measured, not
+        // assumed — is `...vanillaRenderers` being spread back into the array: its testers rank 1–4
+        // against 3–10 for the set here, so every control still resolves to a Metrocalk one and the
+        // page is unchanged. What it DOES catch is the case that matters: a field shape no custom
+        // tester matches, reaching a fallback. Today that shape renders JSON Forms' "No applicable
+        // renderer found." instead, which `text_absent` names. `.mtk-field-row` is the retired row and
+        // its rule is deleted, so `check-class-hooks` would reject it returning before a capture could.
+        //
+        // A RESET ON A ROW THAT IS ALREADY ITS DEFAULT is the claim the count above cannot make.
+        // `Rotation X` is 0 against a default of 0 and `Scale X` is 1 against 1; each is named by the
+        // aria-label its own reset would carry, so an unconditional reset fires here even though every
+        // `present` entry still passes.
+        absent: [
+          ".control", ".input", ".select", ".checkbox", ".mtk-field-row",
+          "[aria-label='Reset Rotation X to 0']",
+          "[aria-label='Reset Scale X to 1']",
+        ],
         // `Mast`, `Counterweight`, `dynamic` and `revolute` are `<option>` TEXT, so a claim about them
         // is a claim about what a reader can see. The asset reference is an `<input value=…>` and is
         // deliberately NOT claimed here: `text_present` reads `textContent`, which an input's value is
@@ -944,7 +972,11 @@ function inspectorScenes(): Scene[] {
         // Every row whole inside a 320px track. The retired anatomy spent a fixed 92px on the label
         // and had no actions column at all, so this is the measurement that says the new one fits.
         unclipped: ["[data-testid='prop-row']"],
-        text_absent: ["null", "undefined", "NaN", "[object Object]"],
+        // `No applicable renderer found` is the sentence JSON Forms paints when a uischema element
+        // resolves to no renderer. It is not a crash and not a console error — the panel renders it, in
+        // red, and carries on — so nothing but a claim about the text can see it. It is how this
+        // session found that dropping `vanillaRenderers` had also dropped the LAYOUTS.
+        text_absent: ["null", "undefined", "NaN", "[object Object]", "No applicable renderer found"],
       },
       render: () => dockTrack(<Inspector client={recordingClient(() => {})} />),
     },
@@ -979,7 +1011,7 @@ function inspectorScenes(): Scene[] {
         stacked: [["label[for='mtk-prop-Transform-px']", "#mtk-prop-Transform-px"]],
         unclipped: ["[data-state='open'] [data-testid='prop-row']"],
         text_present: ["Position X", "Cast shadows"],
-        text_absent: ["null", "undefined", "NaN"],
+        text_absent: ["null", "undefined", "NaN", "No applicable renderer found"],
       },
       render: () => <Inspector client={recordingClient(() => {})} />,
     },
@@ -996,11 +1028,22 @@ function inspectorScenes(): Scene[] {
       viewport: { width: 620, height: 1100 },
       setup: inspectorSetup([]),
       expect: {
-        present: [["[data-testid='mount-edits']", 1]],
-        text_present: ["0 transactions since mount"],
+        // AND THE PANEL MUST ACTUALLY HAVE RENDERED. An adversarial review found this scene passing
+        // vacuously: its only claims were the probe's own wrapper and an empty log, so an Inspector
+        // that rendered NOTHING — a crashed selection, a deleted `<JsonForms>` block, the empty state —
+        // emits no transaction either and photographs as green. "It did not write" is only evidence
+        // when paired with "it did render", so the nine open Transform rows are claimed here too.
+        present: [
+          ["[data-testid='mount-edits']", 1],
+          ["[data-state='open'] [data-testid='prop-row']", 9],
+        ],
+        text_present: ["0 transactions since mount", "Position X"],
         // The failure states, spelled out: any non-zero count, and the specific fields whose declared
         // defaults are the ones a validator would inject.
-        text_absent: ["1 transaction", "2 transactions", "3 transactions", "undefined", "NaN"],
+        text_absent: [
+          "1 transaction", "2 transactions", "3 transactions", "undefined", "NaN",
+          "No applicable renderer found", "No editable properties yet",
+        ],
       },
       render: () => <EditProbe />,
     },
