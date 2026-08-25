@@ -29,9 +29,13 @@ function sourceFingerprint() {
         // Build INPUTS that are not graph modules. The config decides `define`/`base` and therefore
         // what every scene renders against; the HTML entry is pre-processed by vite rather than
         // imported; the lockfile is the only cheap statement of which node_modules produced this.
+        // `freshness.mjs` is deliberately NOT here. It decides how the manifest is COMPUTED, not what
+        // went into the bundle, and it was in this list for exactly one commit: the first edit to it
+        // — a comment — refused a bundle that was perfectly fresh, which is the cry-wolf failure its
+        // own ninth self-check exists to prevent. Its coverage rules are covered mechanically instead,
+        // by the `recipe` digest of its marked region.
         extra: [
           resolve(__dirname, "vite.config.ts"),
-          resolve(__dirname, "freshness.mjs"),
           resolve(__dirname, "harness.html"),
           resolve(__dirname, "..", "..", "package-lock.json"),
         ],
