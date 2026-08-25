@@ -76,6 +76,20 @@ class Dto:
     #: `rs.dtos` is keyed by bare name, so the second one silently wins; a verdict derived from the
     #: wrong `Composition` would be confident and wrong.
     collides_with: str = ""
+    #: Wire keys serde FILLS IN when the payload omits them: `#[serde(default)]` on the field,
+    #: `#[serde(default = "..")]`, or `#[serde(default)]` on the container. This is the DESERIALIZE
+    #: direction, and it is a different attribute from `skip_serializing_if`, which is the serialize
+    #: one. `RuleData.any_of` carries BOTH (`#[serde(default, skip_serializing_if = "Vec::is_empty")]`)
+    #: and `ClauseRequest.any` carries only `default` — so a reader that answered "may the sender omit
+    #: this?" out of the `skip_serializing_if` flag would be right on the first by luck and wrong on
+    #: the second, reporting a required field the caller correctly leaves out.
+    defaulted: frozenset[str] = frozenset()
+    #: `#[serde(deny_unknown_fields)]`. Without it — and NO struct in this tree has it — a key the
+    #: caller sends that the struct does not declare is dropped **in silence**: the value never
+    #: reaches the command and nothing anywhere raises. With it, the whole payload is rejected. Same
+    #: drift, two entirely different failures, so the finding has to say which one it is rather than
+    #: describing the one this reader assumed.
+    deny_unknown: bool = False
     #: wire key -> the Rust type expression behind it. Field NAMES alone are enough to compare one
     #: level; they are not enough to go a second, because the reader cannot follow a field it cannot
     #: name a type for. Kept beside `fields` rather than folded into it so every existing consumer of
@@ -126,6 +140,21 @@ class RustIpc:
     #: that file can only mean.
     dtos_local: dict[tuple[str, str], Dto] = field(default_factory=dict)
     enums_local: dict[tuple[str, str], SerdeEnum] = field(default_factory=dict)
+    #: The same structs, selected by `Deserialize` instead of `Serialize` — what a command can READ
+    #: off a payload, which is a different universe from what the shell can SEND. Seven of this
+    #: tree's argument types (`AnimationGraphSaveRequest`, `TerrainEditArgs`,
+    #: `AssetLabProcessRequest`, …) derive **only** `Deserialize`: they exist to be received and
+    #: never go on the wire outbound, so a reader gated on `Serialize` cannot see them at all and
+    #: `argfields` would have reported them as "no such struct" forever.
+    #:
+    #: Kept as its own map rather than by widening `dtos`, and that is the whole point. `dtos` is
+    #: keyed by bare name with the last file parsed winning; adding a second population to it would
+    #: change which struct an existing REPLY check resolves a name to, silently, in a commit about
+    #: arguments. A `Deserialize`-only struct also must never answer a reply question — it is not
+    #: serialisable, so agreeing about it would be a confident answer about a wire shape that cannot
+    #: occur. Two directions, two universes, and nothing about the reply side moves here.
+    arg_dtos: dict[str, Dto] = field(default_factory=dict)
+    arg_dtos_local: dict[tuple[str, str], Dto] = field(default_factory=dict)
 
 
 # ── source hygiene ────────────────────────────────────────────────────────────────────────────────
@@ -508,7 +537,13 @@ def _parse_enums(src: str, rel: str, out: RustIpc) -> None:
 
 def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
     for m in _DERIVE.finditer(src):
-        if "Serialize" not in m.group(1):
+        # `Deserialize` is a substring of nothing else here, but `Serialize` IS a substring of
+        # `Deserialize` — so the outbound test has to exclude the inbound one rather than ask
+        # whether the letters appear. `#[derive(Deserialize, Clone)]` is not a reply DTO.
+        derive_list = [d.strip() for d in m.group(1).split(",")]
+        can_send = any(d.split("::")[-1] == "Serialize" for d in derive_list)
+        can_read = any(d.split("::")[-1] == "Deserialize" for d in derive_list)
+        if not (can_send or can_read):
             continue
         tail = src[m.end() : m.end() + 800]
         sm = re.search(r"\b(?:pub(?:\([^)]*\))?\s+)?struct\s+([A-Za-z_]\w*)(?:<[^>{]*>)?\s*\{", tail)
@@ -520,6 +555,9 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
             continue
         ra = _RENAME_ALL.search(attrs)
         rename_all = ra.group(1) if ra else None
+        container_serde = " ".join(re.findall(r"#\[serde\(([^\]]*)\)\]", attrs))
+        deny_unknown = "deny_unknown_fields" in container_serde
+        container_default = bool(_SERDE_DEFAULT.search(container_serde))
 
         ob = m.end() + sm.end() - 1
         cb = _match(src, ob, "{", "}")
@@ -528,6 +566,7 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
         fields: list[tuple[str, bool]] = []
         opaque: list[str] = []
         ftypes: dict[str, str] = {}
+        defaulted: list[str] = []
         for p in split_top(src[ob + 1 : cb]):
             attr_lines = "\n".join(l for l in p.splitlines() if l.strip().startswith("#["))
             decl = "\n".join(l for l in p.splitlines() if not l.strip().startswith("#["))
@@ -550,21 +589,33 @@ def _parse_structs(src: str, rel: str, out: RustIpc) -> None:
             rn = _RENAME.search(serde_attr)
             wire = rn.group(1) if rn else wire_case(fname, rename_all)
             fields.append((wire, "skip_serializing_if" in serde_attr))
+            if container_default or _SERDE_DEFAULT.search(serde_attr):
+                defaulted.append(wire)
             ftypes[wire] = fty
             if is_opaque:
                 opaque.append(wire)
         name = sm.group(1)
         line = src.count("\n", 0, m.start()) + 1
-        prior = out.dtos.get(name)
+        prior = (out.dtos if can_send else out.arg_dtos).get(name)
         collides = ""
         if prior is not None and [f for f, _ in prior.fields] != [f for f, _ in fields]:
             collides = f"{prior.file}:{prior.line}"
         dto = Dto(
-            name, fields, line, rel, opaque=tuple(opaque), collides_with=collides, field_types=ftypes
+            name, fields, line, rel, opaque=tuple(opaque), collides_with=collides,
+            field_types=ftypes, defaulted=frozenset(defaulted), deny_unknown=deny_unknown,
         )
-        out.dtos[name] = dto
-        out.dtos_local[(rel, name)] = dto
+        if can_send:
+            out.dtos[name] = dto
+            out.dtos_local[(rel, name)] = dto
+        if can_read:
+            out.arg_dtos[name] = dto
+            out.arg_dtos_local[(rel, name)] = dto
 
+
+#: `#[serde(default)]` / `#[serde(default = "path")]`, and NOT `default_value`, `skip_serializing_if`
+#: or any other attribute that merely contains the letters. Anchored on a delimiter both sides so a
+#: longer identifier ending in `default` cannot satisfy it either.
+_SERDE_DEFAULT = re.compile(r"(?:^|[\s,(])default(?=\s*(?:[=,)]|$))")
 
 _JSON_MACRO = re.compile(r"\bserde_json::json!\s*\(\s*\{")
 #: The tail of a `.map(..).collect()` / `.collect::<Vec<_>>()` chain. A chain that does NOT collect

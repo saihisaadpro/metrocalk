@@ -24,6 +24,12 @@ class Invocation:
     file: str
     raw: str = ""
     spread: bool = False  # `...opts` in the argument object: the key set is not fully known
+    #: key -> the TypeScript type DECLARED for the value at that key, for the one form where the
+    #: declaration is unambiguous: a shorthand (`{ request }`) whose name is bound in an enclosing
+    #: scope by an annotated parameter or `const`/`let`. An argument payload handed over inside one
+    #: key is otherwise compared by its KEY alone — `author_rule({ rule })` agrees about the word
+    #: "rule" and about nothing inside it — which is the whole subject of the `argfields` check.
+    key_types: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -134,6 +140,7 @@ _INVOKE = re.compile(r"(?:\.\s*|\b)invoke\s*")
 
 
 def parse_invocations(src: str, rel: str) -> list[Invocation]:
+    bindings = annotated_bindings(src)
     out: list[Invocation] = []
     for m in _INVOKE.finditer(src):
         # A declaration, not a call: `invoke<T = unknown>(cmd: string, args?: ..): Promise<T>`.
@@ -163,6 +170,7 @@ def parse_invocations(src: str, rel: str) -> list[Invocation]:
             out.append(Invocation(None, targ, [], line, rel, raw=parts[0].strip()[:70]))
             continue
         keys: list[str] = []
+        key_types: dict[str, str] = {}
         spread = False
         if len(parts) > 1:
             obj = parts[1].strip()
@@ -176,12 +184,135 @@ def parse_invocations(src: str, rel: str) -> list[Invocation]:
                     k = split_top(kv, ":")[0].strip().strip("\"'`")
                     if re.fullmatch(r"[A-Za-z_]\w*", k):
                         keys.append(k)
+                        # SHORTHAND ONLY. `{ request }` means the key and the variable are the same
+                        # name, so a binding of that name is a statement about that key. `{ request:
+                        # x }` is not: `x` would have to be followed, and `{ request: {..} }` is a
+                        # literal whose keys are visible but whose spreads and conditionals are not.
+                        # Both are left to the header's count rather than guessed at.
+                        if kv == k:
+                            ty = binding_type(bindings, k, i + 1)
+                            if ty:
+                                key_types[k] = ty
                     else:
                         spread = True  # computed key — the set is not fully known
             else:
                 spread = True  # the argument object is a variable; its keys are not visible here
-        out.append(Invocation(nm.group(1), targ, keys, line, rel, spread=spread))
+        out.append(Invocation(nm.group(1), targ, keys, line, rel, spread=spread, key_types=key_types))
     return out
+
+
+
+#: A `const`/`let`/`var` carrying an explicit type annotation. `=` ends the type, and `[^=;]` keeps
+#: the match inside one statement so a missing initialiser cannot swallow the rest of the file.
+_ANNOTATED_LOCAL = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_]\w*)\s*:\s*([^=;{]+?)\s*=")
+
+#: One simple parameter: `name: T`, `name?: T`, `readonly name: T`. Destructuring (`{ a }: T`) and
+#: rest (`...xs: T[]`) deliberately do NOT match — they bind something other than one name to that
+#: type, and a reader that took the annotation anyway would attribute the wrong shape to the wrong
+#: name. Those are left unresolved, which the header counts, rather than guessed at.
+_SIMPLE_PARAM = re.compile(r"^(?:readonly\s+)?([A-Za-z_]\w*)\s*\??\s*:\s*(.+)$", re.S)
+
+
+def _block_end(src: str, i: int) -> int:
+    """The index of the `}` closing the innermost block open at `i`, or len(src)."""
+    depth, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c in "\"'`":
+            j = i + 1
+            while j < n and src[j] != c:
+                j += 2 if src[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            if depth == 0:
+                return i
+            depth -= 1
+        i += 1
+    return n
+
+
+def annotated_bindings(src: str) -> list[tuple[str, str, int, int]]:
+    """Every `name: T` binding whose TYPE is written down, with the span of source it governs.
+
+    Two forms, both purely syntactic: a **function/method parameter**, whose scope is the body that
+    follows its parameter list, and an annotated **local**, whose scope runs to the end of the block
+    that holds it. Returned as `(name, type, start, end)` so a call site can ask for the binding
+    whose span CONTAINS it and, where several do, the innermost — which is what shadowing means.
+
+    Scope is the whole point, and the reason this is not a "nearest preceding declaration" scan. In
+
+        setRule(rule: RuleData) { .. }
+        author() { const rule = build(); invoke("author_rule", { rule }); }
+
+    the nearest preceding annotation of `rule` is a parameter of a function the call is not in.
+    Reading it would attribute `RuleData` to a value whose type is unknown and then compare a real
+    struct against it — a confident wrong answer, which is the failure this tool exists to avoid and
+    strictly worse than the silence it replaces. Here `author`'s `rule` has no annotation, no span
+    contains the call, and the key resolves to nothing.
+    """
+    out: list[tuple[str, str, int, int]] = []
+    n = len(src)
+
+    # Parameters. Every `(` whose match is followed by an optional return annotation and then `{` is
+    # a signature — a method, a function, or an arrow with a block body.
+    i = 0
+    while i < n:
+        c = src[i]
+        if c in "\"'`":
+            j = i + 1
+            while j < n and src[j] != c:
+                j += 2 if src[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c != "(":
+            i += 1
+            continue
+        cp = _match(src, i, "(", ")")
+        if cp < 0:
+            break
+        k = cp + 1
+        while k < n and src[k].isspace():
+            k += 1
+        if src[k : k + 2] == "=>":                      # arrow: skip the fat arrow
+            k += 2
+            while k < n and src[k].isspace():
+                k += 1
+        elif src[k] == ":":                             # a return-type annotation before the body
+            depth = 0
+            while k < n and not (src[k] == "{" and depth == 0):
+                if src[k] in "<([":
+                    depth += 1
+                elif src[k] in ">)]":
+                    depth -= 1
+                elif src[k] == ";":
+                    break                               # a declaration, not a definition
+                k += 1
+        if k >= n or src[k] != "{":
+            i = cp + 1
+            continue
+        body_end = _match(src, k, "{", "}")
+        if body_end < 0:
+            body_end = n
+        for part in split_top(src[i + 1 : cp]):
+            pm = _SIMPLE_PARAM.match(split_top(part, "=")[0].strip())
+            if pm:
+                out.append((pm.group(1), pm.group(2).strip(), k, body_end))
+        i = cp + 1
+
+    for m in _ANNOTATED_LOCAL.finditer(src):
+        out.append((m.group(1), m.group(2).strip(), m.end(), _block_end(src, m.end())))
+    return out
+
+
+def binding_type(bindings: list[tuple[str, str, int, int]], name: str, at: int) -> str | None:
+    """The declared type of `name` at offset `at` — the INNERMOST span that contains it."""
+    hits = [b for b in bindings if b[0] == name and b[2] <= at <= b[3]]
+    if not hits:
+        return None
+    return min(hits, key=lambda b: b[3] - b[2])[1]
 
 
 _TYPE_ALIAS = re.compile(r"\bexport\s+type\s+([A-Za-z_]\w*)(?:<[^>=]*>)?\s*=\s*")

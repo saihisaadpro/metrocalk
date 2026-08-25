@@ -28,6 +28,7 @@ import tempfile
 import audit
 import jsreads
 import rustipc
+import tsipc
 
 # ── the fixture ───────────────────────────────────────────────────────────────────────────────────
 
@@ -102,6 +103,58 @@ describe("a json! reply with structure below its top level", () => {
   });
 });
 """
+
+
+#: THE ARGUMENT-SIDE FIXTURE. A payload struct that derives **only** `Deserialize` — which is what
+#: seven of the real tree's argument types do (`AnimationGraphSaveRequest`, `TerrainEditArgs`,
+#: `AssetLabProcessRequest`, …) and the reason `rustipc` keeps a second universe: a reader gated on
+#: `Serialize` cannot see any of them, so before this existed `argfields` would have reported every
+#: one as "no such struct" forever, in a sentence that reads like agreement.
+#:
+#: It lives in its own file because the case that matters most is a NAME COLLISION. `core/src/lib.rs`
+#: declares a different `MarkRequest`, exactly as the real tree declares two `Composition`s — one in
+#: `core/src/compose.rs` (`{ ops }`, the one `compose()` actually takes) and one in
+#: `core/src/variant.rs` (`{ id, nodes }`, the one a bare-name lookup returns. A first draft of this
+#: check resolved by bare name and produced three confident findings against the wrong struct on its
+#: first run, every one of them about correct code.
+#:
+#: Two of its four fields are NEGATIVE PINS, enforced on every case by "the repaired tree is clean":
+#:   * `pinned` carries `#[serde(default)]` and the TypeScript does not declare it — serde fills it
+#:     in, so the caller is right to leave it out and this must produce NOTHING. `default` is the
+#:     deserialize direction and `skip_serializing_if` is the serialize one; a reader that answered
+#:     out of the wrong attribute would report this correct code as a drift on every run;
+#:   * `note` is `Option<String>` and the TypeScript declares it optional — likewise silent.
+MARKS_RS = """\
+use serde::Deserialize;
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkRequest {
+    pub label: String,
+    pub at_frame: u32,
+    #[serde(default)]
+    pub pinned: bool,
+    pub note: Option<String>,
+}
+"""
+
+#: The decoy. Same bare name, different fields, another crate — and nothing in Rust is ambiguous
+#: about it, because `marks::MarkRequest` says which one. Only a reader that throws the path away
+#: has a problem, which is what the `_arg_struct` mutation below reintroduces.
+DECOY_MARKS = """\
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct MarkRequest {
+    pub decoy_only: String,
+}
+"""
+
+#: The command that takes it, and the one line that makes the fixture a test of PATH resolution
+#: rather than of name lookup: the parameter is `marks::MarkRequest`, not `MarkRequest`.
+ENTITY_MARK_FN = """\
+#[tauri::command]
+fn entity_mark(state: State<AppState>, request: marks::MarkRequest) -> bool {
+    true
+}"""
 
 
 def with_probe(probe_fn: str = PROBE_FN) -> dict[str, str]:
@@ -226,6 +279,8 @@ fn entity_tagged(state: State<AppState>) -> Tagged {
     Tagged { tagged_id: String::new(), extra: Extra { kind: String::new() } }
 }
 
+ENTITY_MARK_FN
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -233,11 +288,12 @@ fn main() {
             entity_seen,
             entity_list,
             entity_tagged,
+            entity_mark,
         ])
         .run(tauri::generate_context!())
         .unwrap();
 }
-""".replace("ENTITY_INFO_FN", ENTITY_INFO_FN)
+""".replace("ENTITY_INFO_FN", ENTITY_INFO_FN).replace("ENTITY_MARK_FN", ENTITY_MARK_FN)
 
 #: The untyped half of the fixture — a spec that reads a reply without ever declaring its shape,
 #: which is what 142 real files in `editor-shell/e2e` do. It is part of the BASE tree, not only of
@@ -330,12 +386,30 @@ export interface EntityInfo {
   placement: Placement;
   facing: Facing;
 }
+
+export interface MarkRequest {
+  label: string;
+  atFrame: number;
+  note?: string | null;
+}
 """
 
 BASE_SESSION = """\
 export class TauriClient {
   entityInfo(id: string): Promise<EntityInfo> {
     return this.core.invoke<EntityInfo>("entity_info", { id });
+  }
+
+  // The SCOPE pin, and the reason `binding_type` asks which span CONTAINS the call rather than which
+  // declaration is nearest. This method binds `request` to an entirely different type, in a body the
+  // invoke below is not inside. A reader that took the first — or the nearest — annotation of that
+  // name would compare `MarkRequest` against `EntityInfo` and report four fields that are not drifted.
+  private remember(request: EntityInfo): void {
+    void request;
+  }
+
+  entityMark(request: MarkRequest): Promise<boolean> {
+    return this.core.invoke<boolean>("entity_mark", { request });
   }
 }
 """
@@ -354,11 +428,12 @@ FILES = {
     # Every `variants` case below therefore also proves same-file resolution: if the reader picked
     # this struct for `EntityInfo.facing`, no variant comparison would happen at all and the cases
     # would fail as "missed".
+    "editor-shell/src/marks.rs": MARKS_RS,
     "core/src/lib.rs": (
         "pub struct Nothing;\n\n"
         "#[derive(serde::Serialize)]\n"
-        "pub struct Facing {\n    pub degrees: f64,\n}\n"
-    ),
+        "pub struct Facing {\n    pub degrees: f64,\n}\n\n"
+    ) + DECOY_MARKS,
 }
 
 
@@ -382,6 +457,59 @@ def build(tmp: str, overrides: dict[str, str] | None = None, drop: set[str] | No
 # guard produces — a bare check name would let a neighbouring guard satisfy the case.
 
 CASES: list[tuple[str, str, dict, dict]] = [
+    # ── argfields: a payload compared field-by-field, not by the one key that carries it ──────────
+    #
+    # Every case below was INVISIBLE to this gate until 2026-08-25. Measured on HEAD's own auditor
+    # first, byte-for-byte against a frozen copy of the tree: renaming a field inside `ClauseRequest`,
+    # `PipeForgeOptions`, `EditTx` or `compose::Composition` left the verdict identical at 1 blocking,
+    # and the one drift that WAS caught (`RuleData.event`) was caught by the reply-side walks, because
+    # `RuleData` also comes back out of `list_rules` — not one `arguments` finding among the eight.
+    (
+        "a field the command REQUIRES that the caller's type does not declare at all",
+        r"`request\.label` is required by `MarkRequest`.*does not declare it",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       swap(BASE_PROTOCOL, "  label: string;\n  atFrame: number;\n",
+                            "  atFrame: number;\n")}},
+        {},
+    ),
+    (
+        "a field the command REQUIRES that the caller's type declares OPTIONAL",
+        r"`request\.label` is required by `MarkRequest`.*is declared optional",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       swap(BASE_PROTOCOL, "  label: string;", "  label?: string;")}},
+        {},
+    ),
+    (
+        "a key the caller declares that the struct has no field for — dropped in silence",
+        r"declares `request\.extra`.*has no such field.*DROPS it in silence",
+        {"overrides": {"editor/src/transport/protocol.ts":
+                       swap(BASE_PROTOCOL, "  atFrame: number;\n  note?",
+                            "  atFrame: number;\n  extra: string;\n  note?")}},
+        {},
+    ),
+    (
+        "a field drifts inside a struct that derives ONLY Deserialize",
+        r"`request\.atTick` is required by `MarkRequest`",
+        {"overrides": {"editor-shell/src/marks.rs":
+                       swap(MARKS_RS, "pub at_frame: u32,", "pub at_tick: u32,")}},
+        {},
+    ),
+    (
+        "a required field stops being defaulted, so the caller may no longer leave it out",
+        r"`request\.pinned` is required by `MarkRequest`",
+        {"overrides": {"editor-shell/src/marks.rs":
+                       swap(MARKS_RS, "    #[serde(default)]\n    pub pinned: bool,",
+                            "    pub pinned: bool,")}},
+        {},
+    ),
+    (
+        "the caller declares a LIST where the command takes one object",
+        r"one is a list and the other is not",
+        {"overrides": {"editor/src/transport/session.ts":
+                       swap(BASE_SESSION, "entityMark(request: MarkRequest)",
+                            "entityMark(request: MarkRequest[])")}},
+        {},
+    ),
     (
         "a command that never reaches generate_handler!",
         r"generate_handler.*never lists",
@@ -816,7 +944,64 @@ def _old_angle(src: str, i: int) -> bool:
     return True
 
 
+def _arg_struct_by_bare_name(rs, ty: str):
+    """`_arg_struct` as it was first written: the last `::` segment, looked up by name.
+
+    This is the real `Composition` bug, reduced. `compose(composition: metrocalk_core::compose::
+    Composition)` takes the struct in `core/src/compose.rs`; the bare-name winner is the unrelated
+    one in `core/src/variant.rs`, and comparing the caller against it reported `id` and `nodes`
+    "never sent" and `ops` "not accepted" — three confident findings about correct code, which is
+    the failure mode that gets a gate waived rather than read.
+    """
+    base, _ = audit._peel(ty)
+    bare = re.sub(r"<.*", "", base.split("::")[-1]).strip()
+    if not re.fullmatch(r"[A-Za-z_]\w*", bare):
+        return None, ""
+    if bare in audit._ARG_SCALARS or bare in audit._ARG_INJECTED:
+        return None, ""
+    d = rs.arg_dtos.get(bare)
+    return (d, "") if d else (None, "")
+
+
+#: `#[serde(default = "path")]` only — the bare `#[serde(default)]` form missed. A field serde fills
+#: in is then read as one the caller must send, and the tool reports correct code as a drift on every
+#: run. This is the UNDER-suppression direction, which is the one that gets a gate turned off.
+_DEFAULT_NEEDS_EQUALS = re.compile(r"(?:^|[\s,(])default(?=\s*=)")
+
+
+def _binding_ignoring_scope(bindings, name: str, at: int):
+    """The first annotation of that name anywhere in the file — "nearest declaration", not scope.
+
+    `session.ts` binds `request` twice: once as a parameter of `remember`, whose body the call is not
+    inside, and once as the parameter of the method that actually invokes. Reading the first compares
+    a real payload struct against an unrelated reply type and reports every field of both.
+    """
+    hits = [b for b in bindings if b[0] == name]
+    return hits[0][1] if hits else None
+
+
 READER_MUTATIONS: list[tuple[str, str, str, object, dict]] = [
+    (
+        "an argument type resolved by bare name picks the wrong struct of that name",
+        r"`request\.decoy_only` is required by `MarkRequest` \(core/src/lib\.rs",
+        "audit._arg_struct",
+        _arg_struct_by_bare_name,
+        {},
+    ),
+    (
+        "a bare #[serde(default)] missed makes a field the caller may omit look required",
+        r"`request\.pinned` is required by `MarkRequest`",
+        "rustipc._SERDE_DEFAULT",
+        _DEFAULT_NEEDS_EQUALS,
+        {},
+    ),
+    (
+        "an argument value's type read from the nearest binding rather than the enclosing scope",
+        r"declares `request\.parentId`.*has no such field",
+        "tsipc.binding_type",
+        _binding_ignoring_scope,
+        {},
+    ),
     (
         "serde's variant rule is not its field rule, and one table for both is wrong",
         r"`Facing` also sends \['FaceNorth', 'FaceSouth'\]",
@@ -1140,7 +1325,7 @@ def run() -> int:
     # A mutation names the module it patches, because the reader is no longer one file: the Rust
     # parser, the JavaScript reader and the comparison layer can each hold a wrong answer, and all
     # three are worth pinning.
-    modules = {"rustipc": rustipc, "audit": audit, "jsreads": jsreads}
+    modules = {"rustipc": rustipc, "audit": audit, "jsreads": jsreads, "tsipc": tsipc}
 
     for name, pattern, target, buggy, spec in READER_MUTATIONS:
         rx = re.compile(pattern, re.S)
@@ -1231,6 +1416,53 @@ def run() -> int:
             ok = False
         else:
             print(f"pass  {name}")
+
+    # ── the two universes, pinned by VALUE ────────────────────────────────────────────────────────
+    #
+    # `Serialize` says what the shell can SEND and `Deserialize` says what a command can READ, and
+    # they are not the same set of structs. No verdict-shaped case can hold this: if the argument map
+    # wrongly contained a send-only struct, or the reply map a read-only one, the result is a lookup
+    # answering out of the wrong population — which usually produces the same silence as a lookup
+    # that found nothing, and occasionally a confident finding about a wire shape that cannot occur.
+    # `Serialize` is also a SUBSTRING of `Deserialize`, so the test that separates them is the one
+    # thing here most likely to be rewritten into an `in` and pass every case above.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rs = rustipc.parse(audit.sweep_rust(build(tmp)))
+    for label, name, in_dtos, in_args in (
+        ("a Deserialize-only payload is an argument struct and never a reply one",
+         "MarkRequest", False, True),
+        ("a Serialize-only DTO is a reply struct and never an argument one",
+         "EntityInfo", True, False),
+        # A struct deriving BOTH belongs to both universes — asserted inside the `MarkRequest`
+        # branch below, where the decoy is the both-deriving one. A row here naming a
+        # Serialize-only struct and calling it "both" would be a label the assertion does not
+        # carry, which is how a pin comes to prove something other than what it says.
+    ):
+        got = (name in _rs.dtos, name in _rs.arg_dtos)
+        if name == "MarkRequest":
+            # `dtos` must hold the DECOY (which derives both) and not the payload — so ask the map
+            # that carries the file, not the one that carries the name.
+            got = (_rs.dtos["MarkRequest"].file == "core/src/lib.rs",
+                   _rs.arg_dtos["MarkRequest"].file == "core/src/lib.rs")
+            if got != (True, True):
+                print(f"FAIL  {label}: bare-name winners moved ({got})")
+                ok = False
+            else:
+                d = _rs.arg_dtos_local[("editor-shell/src/marks.rs", "MarkRequest")]
+                if ("editor-shell/src/marks.rs", "MarkRequest") in _rs.dtos_local:
+                    print("FAIL  a Deserialize-only struct reached the REPLY map")
+                    ok = False
+                elif sorted(f for f, _ in d.fields) != ["atFrame", "label", "note", "pinned"]:
+                    print(f"FAIL  the argument struct's wire keys are wrong: {d.fields}")
+                    ok = False
+                else:
+                    print(f"pass  {label}")
+            continue
+        if got != (in_dtos, in_args):
+            print(f"FAIL  {label}: in dtos={got[0]}, in arg_dtos={got[1]}")
+            ok = False
+        else:
+            print(f"pass  {label}")
 
     with tempfile.TemporaryDirectory() as tmp:
         base = audit.run(build(tmp))[0]

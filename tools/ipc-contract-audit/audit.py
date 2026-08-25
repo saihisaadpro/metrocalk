@@ -27,6 +27,13 @@ This runs the comparison at rest, with no toolchain, no WebView and no GPU:
   command       every `invoke("name")` names a command the shell registers
   arguments     every required argument is sent, and every key sent is one the command accepts
                 (under Tauri's camelCase argument convention)
+  argfields     and every field INSIDE such a key, wherever the caller declares a type for the value
+                it passes. `arguments` compares key SETS, so `author_rule({ rule, id })` agrees about
+                the word "rule" and about nothing in it. The direction is the mirror of `shape` and
+                so is the consequence: a field the command requires that the caller may omit fails
+                serde outright and the command rejects the call, and a key the caller sends that the
+                struct does not declare is dropped in SILENCE — no struct in this tree carries
+                `#[serde(deny_unknown_fields)]`, so nothing anywhere raises
   shape         every field the caller's `T` requires is one the reply actually carries, a list is
                 a list on both sides, and a fixed-length tuple has the same length on both. A field
                 typed `serde_json::Value` is reported by `coverage` rather than counted as agreed
@@ -68,10 +75,15 @@ This runs the comparison at rest, with no toolchain, no WebView and no GPU:
 Known and deliberate limits, so that "0 blocking" is read for what it is. Each is a place a future
 check goes, not a place this one silently claims success:
 
-  * argument STRUCTS — a `#[derive(Deserialize)]` payload handed over inside one key
-    (`author_rule({ rule: {..} })`) is compared by its KEY only; the 7 such keys in this tree hide
-    34 fields. This is the loudest of the three, which is why it is last: a drifted argument key
-    fails to deserialise and the command rejects the call;
+  * argument payloads the caller does NOT declare a type for. `argfields` opens a key when the value
+    is a shorthand (`{ request }`) whose name is bound by an annotated parameter or `const` — 13 of
+    the 15 argument keys carrying a struct, and 90 field pairs. The two it does not reach are the two
+    forms it deliberately refuses to guess at: `terrain_edit({ args: { entity, edit } })` passes an
+    inline object literal with no declared type anywhere, and `joint_author_batch` is invoked only
+    from the untyped E2E suite. 41 further call sites pass one of those keys without a declared type
+    and are still compared by key alone. The inline literal is where this check grows next: its keys
+    are syntactically visible, and a spread inside one is the same "absence proves nothing" refusal
+    `arguments` already makes;
   * the `nullable` check compares DECLARED optionality, so it reaches the typed transport and stops
     at the untyped E2E suite: `reads` proves a field EXISTS there, and nothing yet proves the spec
     survives it arriving as `null`;
@@ -449,6 +461,212 @@ def _argument_findings(rs: rustipc.RustIpc, ts: tsipc.TsIpc) -> list[Finding]:
                 )
             )
     return out
+
+
+#: Rust types that are not a struct, so an argument key holding one has nothing inside it to compare.
+#: Listed rather than inferred: "this is a scalar" and "this is a struct this reader failed to find"
+#: must never produce the same silence, and everything not named here that fails to resolve is
+#: reported as a gap in the check's own reach.
+_ARG_SCALARS = frozenset({
+    "String", "str", "bool", "char", "f32", "f64", "u8", "u16", "u32", "u64", "u128", "usize",
+    "i8", "i16", "i32", "i64", "i128", "isize", "Value", "PathBuf", "Uuid",
+})
+
+#: Tauri injects or owns these; they are not a payload struct. `Channel<T>` is the ipc channel the
+#: command writes back through, not something the caller fills in.
+_ARG_INJECTED = frozenset({
+    "State", "AppHandle", "Window", "WebviewWindow", "Runtime", "Channel", "Request", "Response",
+})
+
+
+def _peel(ty: str) -> tuple[str, bool]:
+    """A Rust type expression stripped of `Option`/`Vec`, and whether a `Vec` was among them."""
+    t, is_list = ty.strip(), False
+    while True:
+        m = re.fullmatch(r"(Option|Vec)\s*<(.+)>", t, re.S)
+        if not m:
+            return t, is_list
+        is_list = is_list or m.group(1) == "Vec"
+        t = m.group(2).strip()
+
+
+def _arg_struct(rs: rustipc.RustIpc, ty: str) -> tuple[rustipc.Dto | None, str]:
+    """The struct an argument's Rust type names — or why this reader will not name one.
+
+    `rs.arg_dtos` is keyed by BARE name and the last file parsed wins, which is exactly wrong here:
+    `compose(composition: metrocalk_core::compose::Composition)` takes the `Composition` in
+    `core/src/compose.rs` (`{ ops }`), while the bare-name winner is the unrelated `Composition` in
+    `core/src/variant.rs` (`{ id, nodes }`). A first draft of this check resolved by bare name and
+    reported THREE confident findings against the wrong struct on its very first run — `id` and
+    `nodes` "never sent" and `ops` "not accepted" — every one of them about code that is correct.
+
+    So the argument's own type expression is used for what it is: a path. Its second-to-last segment
+    is a module, and a module is a file. Where that does not settle it, this returns a REASON and the
+    caller counts a gap, because a gate that guesses is worse than one that says it cannot see.
+    """
+    base, _ = _peel(ty)
+    base = base.lstrip("&").replace("'static", "").strip()
+    segs = [p for p in base.split("::") if p]
+    if not segs:
+        return None, ""
+    bare = re.sub(r"<.*", "", segs[-1]).strip()
+    # A fixed-size array (`[f64; 3]`), a tuple (`(A, B)`) or a map is not a struct: there are no
+    # field NAMES inside it to compare, so it is not a gap in this check's reach and must not be
+    # counted as one. Counting them was this check's first wrong number — 103 "unresolvable
+    # argument types" of which 95 were `[f64; 3]`-shaped and never had fields in the first place,
+    # which is a header line arguing that the gate sees less than it does.
+    if not re.fullmatch(r"[A-Za-z_]\w*", bare):
+        return None, ""
+    if bare in _ARG_SCALARS or bare in _ARG_INJECTED or bare in ("HashMap", "BTreeMap"):
+        return None, ""
+    # An enum argument is a variant SET, not a field set — there is nothing inside it for this check
+    # to open, and `variants` is the check that compares it. Reporting it here as a struct this
+    # reader failed to find would be a gap that no repair could ever close.
+    if bare in rs.enums and bare not in rs.arg_dtos:
+        return None, ""
+    cands = [(rel, d) for (rel, n), d in rs.arg_dtos_local.items() if n == bare]
+    if not cands:
+        return None, (
+            f"`{base}` names no `Deserialize`-deriving struct in the swept trees, so the fields "
+            f"inside this key are not compared"
+        )
+    if len(cands) == 1:
+        return cands[0][1], ""
+    module = segs[-2] if len(segs) > 1 else ""
+    exact = [d for rel, d in cands if module and rel.rsplit("/", 1)[-1] == f"{module}.rs"]
+    if len(exact) == 1:
+        return exact[0], ""
+    where = ", ".join(f"{rel}:{d.line}" for rel, d in sorted(cands))
+    return None, (
+        f"`{base}` resolves to {len(cands)} different structs named `{bare}` ({where}) and its "
+        f"path does not say which, so the fields inside this key are not compared"
+    )
+
+
+def _argfields_findings(
+    rs: rustipc.RustIpc, ts: tsipc.TsIpc
+) -> tuple[list[Finding], int, int, int]:
+    """Compare an argument PAYLOAD field-by-field, not by the one key that carries it.
+
+    `arguments` above compares key SETS: `invoke("author_rule", { rule, id })` against
+    `fn author_rule(rule: RuleData, id: Option<String>)`. It agrees about the word "rule" and about
+    nothing inside it — the seven such keys in this tree hide 34 fields, and a drift in any of them
+    is a payload that fails to deserialise (the command rejects the call outright) or a value that is
+    silently dropped. `<test_and_ci_discipline>` 6b: a gate has a RESOLUTION, and these fields sat
+    below the one `arguments` works at. Measured on HEAD's own auditor before this was written:
+    renaming a field inside `ClauseRequest`, `PipeForgeOptions`, `EditTx` or `compose::Composition`
+    left the verdict **identical**, and the one drift that WAS caught (`RuleData.event`) was caught
+    by the reply-side `shape`/`nested`/`reads` walks, because `RuleData` also comes back out of
+    `list_rules` — not one `arguments` finding among the eight.
+
+    The direction is the mirror of `shape`, and so is the consequence, which is why the messages are
+    not shared. On a REPLY the shell sends and the UI reads: a field the UI requires and the shell
+    never sends arrives `undefined` and renders blank. On an ARGUMENT the UI sends and the shell
+    deserialises: a field the shell REQUIRES and the caller may omit fails serde outright, and a
+    field the caller sends that the struct does not declare is **dropped in silence** — no struct in
+    this tree carries `#[serde(deny_unknown_fields)]`, so nothing anywhere raises.
+
+    Required means `!Option` AND no `#[serde(default)]` — two different attributes for two different
+    questions. `skip_serializing_if` is the serialize direction and says nothing here: `RuleData.any_of`
+    carries both and `ClauseRequest.any` carries only `default`, so a reader that answered out of the
+    serialize flag would be right on the first by luck and report the second as a required field the
+    caller correctly leaves out.
+    """
+    out: list[Finding] = []
+    keys_compared = pairs = unresolved = 0
+    seen: set[tuple[str, str, str]] = set()
+    for inv in ts.invocations:
+        if inv.cmd is None or inv.cmd not in rs.commands:
+            continue
+        cmd = rs.commands[inv.cmd]
+        if cmd.unreadable:
+            continue
+        for wire, rty, _opt in cmd.args:
+            dto, why = _arg_struct(rs, rty)
+            t_name = inv.key_types.get(wire)
+            if dto is None:
+                if why and wire in inv.keys:
+                    unresolved += 1
+                continue
+            if wire not in inv.keys or t_name is None:
+                unresolved += 1
+                continue
+            t_base, t_is_list, _ = tsipc.unwrap(t_name, ts.aliases)
+            _, r_is_list = _peel(rty)
+            t_ty = ts.types.get(t_base.strip())
+            if t_ty is None:
+                unresolved += 1
+                continue
+            where = f"{inv.file}:{inv.line}"
+            if (wire, inv.cmd, where) in seen:
+                continue
+            seen.add((wire, inv.cmd, where))
+            if r_is_list != t_is_list:
+                out.append(Finding(
+                    "error", "argfields", where,
+                    f'"{inv.cmd}" — `{wire}` is `{rty}` ({cmd.file}:{cmd.line}) and the caller '
+                    f"declares it `{t_name}` ({t_ty.file}:{t_ty.line}): one is a list and the other "
+                    f"is not, so the payload cannot deserialise whichever way round it is sent",
+                    key=f"argfields@{inv.cmd}.{wire}",
+                ))
+                continue
+            # A flattened field splices in keys this reader cannot enumerate, so neither "the caller
+            # omitted a required field" nor "the caller sent one the struct has no room for" is
+            # provable. The same refusal `shape` makes, for the same reason.
+            if any(f.startswith("<flatten:") for f, _ in dto.fields):
+                unresolved += 1
+                continue
+            keys_compared += 1
+            declared = dict(t_ty.fields)
+            accepts = {f for f, _ in dto.fields}
+            for f_wire, _skip in dto.fields:
+                pairs += 1
+                omissible = (
+                    rustipc.type_head(dto.field_types.get(f_wire, "")) == "Option"
+                    or f_wire in dto.defaulted
+                )
+                if omissible:
+                    continue
+                if f_wire not in declared:
+                    out.append(Finding(
+                        "error", "argfields", where,
+                        f'"{inv.cmd}" — `{wire}.{f_wire}` is required by `{dto.name}` '
+                        f"({dto.file}:{dto.line}): it is `{dto.field_types.get(f_wire, '?')}`, not "
+                        f"`Option`, and carries no `#[serde(default)]`. `{t_ty.name}` "
+                        f"({t_ty.file}:{t_ty.line}) does not declare it, so the payload the caller "
+                        f"builds has no such key and fails to deserialise — the command rejects the "
+                        f"call before it runs",
+                        key=f"argfields@{inv.cmd}.{wire}.{f_wire}",
+                    ))
+                elif declared[f_wire]:
+                    out.append(Finding(
+                        "error", "argfields", where,
+                        f'"{inv.cmd}" — `{wire}.{f_wire}` is required by `{dto.name}` '
+                        f"({dto.file}:{dto.line}): it is `{dto.field_types.get(f_wire, '?')}`, not "
+                        f"`Option`, and carries no `#[serde(default)]`. `{t_ty.name}.{f_wire}` "
+                        f"({t_ty.file}:{t_ty.line}) is declared optional, so `tsc` blesses a caller "
+                        f"that leaves it out and the payload fails to deserialise at run time",
+                        key=f"argfields@{inv.cmd}.{wire}.{f_wire}",
+                    ))
+            for f_key, _t_opt in t_ty.fields:
+                if f_key in accepts:
+                    continue
+                pairs += 1
+                drop = (
+                    "the whole payload is rejected — the struct carries "
+                    "`#[serde(deny_unknown_fields)]`"
+                    if dto.deny_unknown
+                    else "serde DROPS it in silence: the value is sent, nothing anywhere raises, "
+                         "and the command runs on a payload that never contained it"
+                )
+                out.append(Finding(
+                    "error", "argfields", where,
+                    f'"{inv.cmd}" — the caller declares `{wire}.{f_key}` ({t_ty.file}:'
+                    f"{t_ty.line}) and `{dto.name}` ({dto.file}:{dto.line}) has no such field, so "
+                    f"{drop}",
+                    key=f"argfields@{inv.cmd}.{wire}.{f_key}",
+                ))
+    return out, keys_compared, pairs, unresolved
 
 
 #: How far past a reply's own keys the reader will follow it. Two levels of nesting is already past
@@ -1286,6 +1504,7 @@ def run(root: str) -> tuple[list[Finding], dict]:
 
     findings = _coverage_findings(root, missing, rs, ts)
     compared = fields_compared = nested_pairs = 0
+    argkeys = argpairs = argunres = 0
     read_steps = read_unresolved = tuples_compared = 0
     enum_pairs = enum_unres = null_pairs = option_reached = 0
     enum_names: list[str] = []
@@ -1294,6 +1513,8 @@ def run(root: str) -> tuple[list[Finding], dict]:
         findings += _registration_findings(rs)
         findings += _command_findings(rs, ts)
         findings += _argument_findings(rs, ts)
+        af, argkeys, argpairs, argunres = _argfields_findings(rs, ts)
+        findings += af
         (shape, compared, fields_compared, nested_pairs, enum_pairs, enum_unres,
          enum_names, null_pairs, option_reached) = _shape_findings(rs, ts)
         findings += shape
@@ -1314,6 +1535,18 @@ def run(root: str) -> tuple[list[Finding], dict]:
         "registered": len(rs.registered),
         "invocations": len(ts.invocations),
         "typed_invocations": len([i for i in ts.invocations if i.targ]),
+        # The ARGUMENT side's reach, in numbers, for the reason ADR-137 gives: a run that
+        # compared nothing and a run that agreed about everything are otherwise the same
+        # output. `argfields_unresolved` is the honest half — an argument key carrying a
+        # struct that could not be paired with a declared TypeScript type is a key still
+        # compared by its name alone, exactly as it was before this check existed.
+        "argfields_keys": argkeys,
+        "argfields_pairs": argpairs,
+        "argfields_unresolved": argunres,
+        "arg_struct_keys": len({
+            (n, w) for n, c in rs.commands.items() for w, t, _ in c.args
+            if _arg_struct(rs, t)[0] is not None
+        }),
         "shape_compared": compared,
         "shape_fields": fields_compared,
         "nested_pairs": nested_pairs,
@@ -1349,14 +1582,16 @@ def run(root: str) -> tuple[list[Finding], dict]:
         "dtos": len(rs.dtos),
         "ts_types": len(ts.types),
     }
-    order = {"registration": 0, "command": 1, "arguments": 2, "shape": 3, "nested": 4,
-             "variants": 5, "nullable": 6, "reads": 7, "coverage": 8}
+    order = {"registration": 0, "command": 1, "arguments": 2, "argfields": 3, "shape": 4,
+             "nested": 5, "variants": 6, "nullable": 7, "reads": 8, "coverage": 9}
     findings.sort(key=lambda f: (order.get(f.check, 9), f.where, f.message))
     return findings, stats
 
 
 SUCCESS = (
-    "every invoked command exists, every argument key is accepted, every reply field the UI reads "
+    "every invoked command exists, every argument key is accepted — and every field INSIDE an "
+    "argument key whose value the caller declares a type for is one the command's struct will "
+    "read, with nothing it requires left optional on the way in, every reply field the UI reads "
     "— at the top level and every level under it the reader can resolve — is one the shell sends, "
     "every enum reaching the UI sends exactly the strings the UI compares against, and no field "
     "can arrive `null` or absent in a way the caller's declared type does not admit."
@@ -1406,6 +1641,10 @@ def main() -> int:
             f"step(s) compared ({stats['read_unresolved']} walk(s) stopped early), and "
             f"{stats['tuples_compared']} of {stats['tuple_reads']} positional destructuring(s) "
             f"compared for arity; "
+            f"{stats['argfields_keys']} of {stats['arg_struct_keys']} argument key(s) carrying "
+            f"a struct were opened and {stats['argfields_pairs']} field pair(s) inside them "
+            f"compared, with {stats['argfields_unresolved']} further call site(s) passing "
+            f"one of those keys without a declared type and still compared by key alone; "
             f"{stats['enums_string_like']} of {stats['enums']} serde enum(s) are a bare string on "
             f"the wire, and {stats['enum_pairs']} enum/string-union pair(s) across "
             f"{len(stats['enum_names'])} distinct enum(s) had their variant sets compared "
