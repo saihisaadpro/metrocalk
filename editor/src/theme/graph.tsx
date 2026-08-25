@@ -192,7 +192,7 @@ function GraphRelationEdge({
 }
 
 /** One edge type, registered once — the same argument as `GRAPH_NODE_TYPES`. */
-export const GRAPH_EDGE_TYPES = { mtkRelation: GraphRelationEdge } as const;
+const GRAPH_EDGE_TYPES = { mtkRelation: GraphRelationEdge } as const;
 
 export interface GraphEdgeSpec {
   id: string;
@@ -243,7 +243,7 @@ export const GRAPH_CARD_WIDTH_COMPACT = 148;
  *  measurement. It is deliberately an estimate and deliberately not used for anything permanent: the
  *  real height depends on how many lines a title wraps to, which is a question only layout can
  *  answer, and `onNodesChange` replaces this the moment it does. */
-export const GRAPH_CARD_HEIGHT_ESTIMATE = 44;
+const GRAPH_CARD_HEIGHT_ESTIMATE = 44;
 
 /** How much clear horizontal run an edge needs between two cards for its relation label to sit in.
  *
@@ -362,7 +362,7 @@ const CHIP_TONE: Record<string, { fg: string; bg: string; bd: string }> = {
 };
 
 /** The shared node renderer. Registered once as `mtkCard`, consumed by every graph. */
-export function GraphNodeCard({ data, selected }: NodeProps<GraphCardNode>) {
+function GraphNodeCard({ data, selected }: NodeProps<GraphCardNode>) {
   const emphasis: GraphNodeEmphasis = selected ? "selected" : (data.emphasis ?? "default");
   const e = EMPHASIS[emphasis];
   const chip = e.chip ? CHIP_TONE[e.chip] : undefined;
@@ -403,7 +403,7 @@ export function GraphNodeCard({ data, selected }: NodeProps<GraphCardNode>) {
 /** The registry every graph passes to `nodeTypes`. Frozen at module scope on purpose: React Flow
  *  re-creates every node when this object's identity changes, and an inline `{{ mtkCard: … }}` in a
  *  render body changes identity on every render. */
-export const GRAPH_NODE_TYPES = { mtkCard: GraphNodeCard } as const;
+const GRAPH_NODE_TYPES = { mtkCard: GraphNodeCard } as const;
 
 // ── the canvas ────────────────────────────────────────────────────────────────────────────────────
 
@@ -493,7 +493,7 @@ function GraphControls({ ariaLabel, surface }: { ariaLabel: string; surface: Ref
 /** The mini map's own box. Small on purpose: React Flow's default is 200x150, and in the 726x330
  *  canvas a docked graph actually gets, that is 46% of the height reserved for a thumbnail — which
  *  pushed the graph itself out of the top of its own pane. */
-export const GRAPH_MINIMAP_SIZE = { width: 132, height: 96 } as const;
+const GRAPH_MINIMAP_SIZE = { width: 132, height: 96 } as const;
 
 /** The canvas below which a mini map is not navigation, it is furniture. Three times its own box on
  *  each axis: any less and the thumbnail is competing with the thing it is a thumbnail of. */

@@ -485,7 +485,7 @@
       "literal-motion": 0,
       "unitless-length": 0
     },
-    "src/theme/graph.ts": {
+    "src/theme/graph.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
