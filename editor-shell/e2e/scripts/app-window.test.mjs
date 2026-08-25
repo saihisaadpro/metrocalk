@@ -39,16 +39,37 @@ test("the shared host-window resolver exists and selects on window class", () =>
 });
 
 /**
- * PowerShell source with whole-line `#` comments removed, so this gate grades code rather than the
- * prose explaining why the code looks the way it does. (A comment-blind grep is exactly how a sibling
- * gate in this repo started reporting its own doc comment as a violation.)
+ * PowerShell source with comments removed, so this gate grades code rather than the prose explaining
+ * why the code looks the way it does. (A comment-blind grep is exactly how a sibling gate in this repo
+ * started reporting its own doc comment as a violation.)
+ *
+ * BOTH comment forms, and the second one is here because leaving it out would have left the same door
+ * open one shape over: `ole-drop-file.ps1` opens with a 45-line `<# … #>` block, and had
+ * `keep-display-awake.ps1` written its rationale as comment-based help rather than `#` lines, the
+ * repair below would not have worked at all. Line-oriented on purpose — a `<#` that is not the first
+ * thing on its line is left alone, because in PowerShell it may be inside a string, and a filter that
+ * corrupts the lines it is supposed to grade is worse than one that reads a comment.
+ *
+ * A `#` mid-line is likewise left alone for the same reason, which `trailing.ps1` in the fixtures pins:
+ * a line that calls and then comments is a call.
  */
 function executableSource(file) {
-  return fs
-    .readFileSync(file, "utf8")
-    .split(/\r?\n/)
-    .filter((line) => !/^\s*#/.test(line))
-    .join("\n");
+  const out = [];
+  let inBlock = false;
+  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+    if (inBlock) {
+      if (line.includes("#>")) inBlock = false;
+      continue;
+    }
+    if (/^\s*<#/.test(line)) {
+      // A one-line `<# … #>` opens and closes on the same line; only a block that stays open sets the flag.
+      if (!line.includes("#>")) inBlock = true;
+      continue;
+    }
+    if (/^\s*#/.test(line)) continue;
+    out.push(line);
+  }
+  return out.join("\n");
 }
 
 test("no harness script selects its target window via MainWindowHandle", () => {
@@ -64,8 +85,18 @@ test("no harness script selects its target window via MainWindowHandle", () => {
 /**
  * The window-targeting Win32 surface. A script that calls any of these has a HWND in its hands and
  * must have got it from the shared resolver.
+ *
+ * THE LIST IS THE GATE'S RESOLUTION, so it is written wider than the calls that happen to appear
+ * today. The first version named five, and the four scripts it caught were caught only because each
+ * of them *also* used one of those five — `window-client-rect.ps1` reaches for `ClientToScreen`,
+ * `WindowFromPoint`, `GetAncestor` and `GetWindowText`; `ole-drop-file.ps1` adds `IsWindowVisible`,
+ * `ShowWindow`, `SetForegroundWindow`, `PostMessage` and `EnumWindows`. A future script whose only
+ * HWND operation was `MoveWindow` would have walked straight past. Widening changes no verdict on the
+ * tree as it stands (the same four are selected, the other four score zero, and the three `.ps1` in
+ * `e2e/` itself score zero), which is the point: a reach extended while the answers stay put.
  */
-const WINDOW_TARGETING_CALLS = /GetWindowRect|SetWindowPos|PrintWindow|GetClientRect|BringWindowToTop/;
+const WINDOW_TARGETING_CALLS =
+  /GetWindowRect|SetWindowPos|PrintWindow|GetClientRect|BringWindowToTop|MoveWindow|ShowWindow|SetForegroundWindow|GetForegroundWindow|IsIconic|IsWindowVisible|ClientToScreen|WindowFromPoint|GetAncestor|GetWindowText|SetWindowText|PostMessage|EnumWindows/;
 
 /**
  * Whether `file` targets a window — judged on the code, never on the prose.
@@ -126,6 +157,24 @@ test("the targeting rule reads code, not the prose about the code", (t) => {
     false,
     "An indented comment is still a comment.",
   );
+  // The OTHER comment form. `ole-drop-file.ps1` opens with a 45-line one, so a filter that only knew
+  // about `#` would have left this exact door open one shape over.
+  assert.equal(
+    targetsAWindow(write("block.ps1", "<#\n  .DESCRIPTION\n  Unlike PrintWindow, this reads the desktop.\n#>\nStart-Sleep -Seconds 20\n")),
+    false,
+    "A `<# … #>` block is documentation too.",
+  );
+  assert.equal(
+    targetsAWindow(write("block-indent.ps1", "function F {\n  <#\n    GetClientRect is what window-client-rect.ps1 uses.\n  #>\n  Write-Output 'hi'\n}\n")),
+    false,
+    "An indented block comment is still a block comment.",
+  );
+  // …and the block must CLOSE, or everything after the first one would be invisible to the gate.
+  assert.equal(
+    targetsAWindow(write("after-block.ps1", "<#\n  prose\n#>\n$r = [Mtk.Win]::GetWindowRect($hwnd, [ref]$rect)\n")),
+    true,
+    "Code after a closed block comment is still code.",
+  );
   // And the predicate must still SEE a real call, or making it comment-blind would blind it entirely.
   assert.equal(
     targetsAWindow(write("targets.ps1", "# Resolve the host first.\n$rect = [Mtk.Win]::GetWindowRect($hwnd, [ref]$r)\n")),
@@ -136,6 +185,13 @@ test("the targeting rule reads code, not the prose about the code", (t) => {
     targetsAWindow(write("trailing.ps1", "[void][Mtk.Win]::PrintWindow($hwnd, $dc, 0)  # grade the pixels after\n")),
     true,
     "A line that calls and then comments is a call.",
+  );
+  // A HWND operation none of today's scripts happens to use ALONE. This is the case the first, narrower
+  // list would have missed entirely, and it is here so the widened reach is asserted rather than assumed.
+  assert.equal(
+    targetsAWindow(write("moveonly.ps1", "[void][Mtk.Win]::MoveWindow($hwnd, 0, 0, 1296, 839, $true)\n")),
+    true,
+    "A script whose only window call is MoveWindow is still targeting a window.",
   );
 
   // The rule, not just the predicate: a script that really does target a window is still caught…
