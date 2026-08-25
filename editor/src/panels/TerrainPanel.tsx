@@ -657,7 +657,17 @@ function DescribeBox({
       <TextArea
         value={text}
         rows={compact ? 2 : 3}
-        placeholder="a 4 km eroded alpine valley with a river and dense pine forest"
+        // AN EMPTY BOX THAT LOOKS FULL, BESIDE A LINE SAYING IT IS EMPTY. The placeholder was a bare
+        // complete sentence — the same shape, and nearly the same words, as the first `Try one` chip
+        // directly below it, which IS a value you can click into the box. So the panel showed what
+        // reads as a typed description, greyed out `Build it`, and explained the refusal with "Type a
+        // description first": the words are correct and the box contradicts them. `e.g.` is the
+        // cheapest thing that makes the field agree with its own status line, and it keeps the
+        // example, which is most of what a newcomer needs here. No test asserts this string and none
+        // is added — a gate keyed on user-facing prose breaks silently when the prose changes, which
+        // is the failure this repository has already paid for twice. The evidence is a before/after
+        // capture of the real panel in `progress/visual-acceptance-2026-08-25/`.
+        placeholder="e.g. a 4 km eroded alpine valley with a river and dense pine forest"
         aria-label="Describe the terrain"
         data-testid="terrain-describe-text"
         id="terrain-describe-text"
