@@ -99,9 +99,17 @@ function stripComments(source) {
 }
 
 /** The literal is an element id, not a class list. Anchored hard against the literal's opening quote —
- *  an earlier `aria-labelledby` on the same line must not swallow the `className` that follows it. */
+ *  an earlier `aria-labelledby` on the same line must not swallow the `className` that follows it.
+ *
+ *  THE THIRD ALTERNATIVE IS AN ID *FACTORY* (ADR-136): `const controlId = (path) => \`mtk-prop-${..}\``
+ *  — a one-line arrow, named for what it returns, whose body is the id. The first two alternatives
+ *  require the literal to sit immediately after the `=`, so an arrow head in between made this read as
+ *  a class hook and the inspector's row ids were reported as 169 missing rules' worth of one. It stays
+ *  ANCHORED: the arrow's `=>` must be the last thing before the quote, so an `aria-labelledby` earlier
+ *  on the line still cannot swallow a `className` after it — the false negative ADR-134 measured, and
+ *  the one both directions of this gate exist to keep measuring. */
 const ID_POSITION =
-  /(?:\bid|\bhtmlFor|\baria-labelledby|\baria-describedby|\baria-controls|\baria-owns)\s*=\s*\{?\s*$|\b(?:const|let|var)\s+[A-Za-z_$][\w$]*[Ii]d\s*=\s*(?:[A-Za-z_$][\w$]*\s*\?\?\s*)?$/;
+  /(?:\bid|\bhtmlFor|\baria-labelledby|\baria-describedby|\baria-controls|\baria-owns)\s*=\s*\{?\s*$|\b(?:const|let|var)\s+[A-Za-z_$][\w$]*[Ii]d\s*=\s*(?:[A-Za-z_$][\w$]*\s*\?\?\s*)?$|\b(?:const|let|var)\s+[A-Za-z_$][\w$]*[Ii]d\s*=\s*(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=]*)?=>\s*$/;
 
 /** Every `mtk-*` class name the TS/TSX claims, with where it is claimed and whether an interpolation
  *  immediately follows it. */
@@ -347,6 +355,24 @@ function selfTest() {
   run("an element id is not a class", 0, {
     "a.tsx": "export const A = ({ n }) => { const rowId = `mtk-row-${n}`; return <div id={rowId} className=\"mtk-card\" />; };\n",
     "a.css": ".mtk-card { color: red; }\n",
+  });
+  // AN ID FACTORY IS AN ID POSITION (ADR-136). The inspector derives one DOM id per property row so a
+  // `PropertyRow`'s visible label can point at the control it names, and it does it in the shortest
+  // honest way: a one-line arrow named for what it returns. The `mtk-card` beside it is the control —
+  // without it, deleting the third ID_POSITION alternative would still leave a green case.
+  run("an id built by a `…Id` arrow function is not a class", 0, {
+    "a.tsx":
+      "const rowId = (p: string) => `mtk-row-${p}`;\n" +
+      'export const A = ({ p }) => <div id={rowId(p)} className="mtk-card" />;\n',
+    "a.css": ".mtk-card { color: red; }\n",
+  });
+  // ...and it stays ANCHORED. The arrow alternative must not become a way for anything earlier on the
+  // line to reach past a `className`. This is the ADR-134 false negative restated against the new
+  // alternative: an `…Id` arrow declared earlier, and a real hook after it on the same line.
+  run("an `…Id` arrow earlier on the line does not hide the className after it",
+    { count: 1, kinds: ["unstyled-hook"], keys: ["mtk-missing"] }, {
+    "a.tsx": 'const rowId = (p) => p; export const A = () => <div className="mtk-missing mtk-ok" />;\n',
+    "a.css": ".mtk-ok { color: red; }\n",
   });
   // The regression the orphan direction found in this gate's own first draft. Pinned by KEY, not by
   // count: with a loose ID_POSITION the count is still 1, but the finding becomes an orphan-rule about

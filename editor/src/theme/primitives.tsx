@@ -422,6 +422,14 @@ export interface PropertyRowProps {
   children: ReactNode;
   help?: ReactNode;
   actions?: ReactNode;
+  /** The value's unit, in its own column (ADR-136) — `m`, `°`, `kg`, `m/s`.
+   *
+   *  A COLUMN, NOT A SUFFIX, and the first capture of the populated inspector is why. Rendered inside
+   *  the control cell it takes width from the input, so a `kg` row's box is narrower than a `×` row's
+   *  and the sheet's right edge goes ragged — visible in `inspector-real-vocabulary` before this, and
+   *  invisible to every assertion on that scene, because a ragged edge is a set of boxes that are each
+   *  exactly where their own row put them. */
+  unit?: ReactNode;
   /** Required control id: a visible inspector label must always name the value it edits. */
   htmlFor: string;
   className?: string;
@@ -439,6 +447,7 @@ export function PropertyRow({
   children,
   help,
   actions,
+  unit,
   htmlFor,
   className,
   style,
@@ -451,7 +460,14 @@ export function PropertyRow({
         {label}
       </label>
       <div className="mtk-property-row__control">{children}</div>
-      {actions != null && <div className="mtk-property-row__actions">{actions}</div>}
+      {/* Both trailing cells are ALWAYS emitted, empty when there is nothing to put in them. A cell
+          that appears only when it has content is a cell that changes the row's geometry when it does
+          — which is how four of nine Transform rows ended up with a narrower input than the other
+          five, purely because their value differed from its default and so offered a reset. */}
+      <div className="mtk-property-row__unit" aria-hidden={unit == null || undefined} data-testid={unit != null ? "prop-unit" : undefined}>
+        {unit}
+      </div>
+      <div className="mtk-property-row__actions">{actions}</div>
       {help != null && <div className="mtk-property-row__help">{help}</div>}
     </div>
   );
@@ -537,6 +553,36 @@ const TRANSPORT_PATHS = {
   pause: "M6 4h2.6v12H6zM11.4 4H14v12h-2.6z",
   stop: "M5 5h10v10H5z",
 } as const;
+
+/** The inspector row's inline reset (ADR-136) — a counter-clockwise arrow back to a declared default.
+ *
+ *  INLINE SVG FOR THE ADR-131 REASON, WHICH IS NOT A STYLE PREFERENCE. The obvious character here is
+ *  `↺` U+21BA, an Arrows-block glyph added in Unicode 1.1 and carried by almost none of the UI faces
+ *  this app declares — so on the Linux capture host it draws `.notdef` and on Windows it escapes to
+ *  Segoe UI Emoji and draws a colour pictograph in a monochrome row. Both are wrong and every
+ *  functional test stays green through either, because a button with an undrawable glyph still clicks.
+ *  `check-glyph-coverage.mjs` would have caught it; not adding the character at all is better. */
+export function RevertIcon({ size = 13 }: { size?: number }) {
+  return (
+    <svg
+      data-icon="revert"
+      aria-hidden
+      focusable="false"
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ display: "block", flex: "none" }}
+    >
+      <path d="M4.6 10a5.4 5.4 0 1 0 1.7-3.9" />
+      <path d="M3.2 4.4v3.4h3.4" />
+    </svg>
+  );
+}
 
 export type TransportIconName = keyof typeof TRANSPORT_PATHS;
 

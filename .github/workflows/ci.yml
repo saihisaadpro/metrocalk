@@ -462,6 +462,34 @@ jobs:
           node scripts/check-class-hooks.mjs --self-test
           node scripts/check-class-hooks.mjs
 
+      # The sixth, and ADR-134's rule one level up. A class name is one contract stated twice in two
+      # languages; so is a COMPONENT VOCABULARY — once as `ComponentMeta::builder(..)` in
+      # `core/src/stdlib.rs`, once as `componentSchemas` in `editor/src/schema/registry.ts`. Nothing
+      # compared them, and four of the table's five entries named components the core has NEVER
+      # registered: `Material`, `Provides`, `Targeting` (and `Socket`) are the dev MockCore's own
+      # vocabulary. That table exists solely to carry the `format` that makes a JSON-Forms tester fire,
+      # so `ColorControl` and `EntityRefControl` were both keyed on nothing and could not fire against
+      # the real core at all — while the core's own eight `format` fields and seven `ui_hint`
+      # vocabularies had no entry, and rendered as plain text boxes.
+      #
+      # Nothing here could see it either. `tsc` checks the table against `JsonSchema7`, which is a shape,
+      # not a vocabulary. vitest seeds MockCore's entities, so every test agrees with the mock BY
+      # CONSTRUCTION — the C6 failure, and one `registry.ts`'s own header denied in prose. And `shots`
+      # had never photographed a populated Inspector: 28 scenes, and in every one of them it reads
+      # "Select an entity to inspect." Meanwhile `rule_registry` (ADR-045) already ships the real table
+      # over IPC and two other panels already consume it.
+      #
+      # Both directions, and the second is the one that matters: a name the core does not have, AND a
+      # `format` or closed vocabulary the core publishes that the table stays SILENT about. Silence is
+      # the shape every real finding had. Self-test first — this gate's own first run was red for the
+      # wrong reason (a backtick in a comment truncated the table it was reading), which is why the
+      # self-test asserts kinds and keys and never a bare count. See ADR-136.
+      - name: registry vocab — the Inspector's typed fields exist in the core, and route what it publishes
+        working-directory: editor
+        run: |
+          node scripts/check-registry-vocab.mjs --self-test
+          node scripts/check-registry-vocab.mjs
+
       - name: Install (frozen lockfile)
         working-directory: editor
         run: pnpm install --frozen-lockfile

@@ -13,7 +13,8 @@
     "check:composite": "node scripts/check-composite.mjs",
     "check:glyph-coverage": "node scripts/check-glyph-coverage.mjs",
     "check:class-hooks": "node scripts/check-class-hooks.mjs",
-    "build:verify": "npm run check:ui-constitution && npm run check:palette-contrast && npm run check:first-paint && npm run check:glyph-coverage && npm run check:class-hooks && npm run build && node scripts/check-bundle.mjs",
+    "check:registry-vocab": "node scripts/check-registry-vocab.mjs",
+    "build:verify": "npm run check:ui-constitution && npm run check:palette-contrast && npm run check:first-paint && npm run check:glyph-coverage && npm run check:class-hooks && npm run check:registry-vocab && npm run build && node scripts/check-bundle.mjs",
     "test": "vitest run",
     "test:ui-constitution": "node scripts/check-ui-constitution.mjs --self-test",
     "test:palette-contrast": "node scripts/check-palette-contrast.mjs --self-test",
@@ -21,6 +22,7 @@
     "test:composite": "node scripts/check-composite.mjs --self-test",
     "test:glyph-coverage": "node scripts/check-glyph-coverage.mjs --self-test",
     "test:class-hooks": "node scripts/check-class-hooks.mjs --self-test",
+    "test:registry-vocab": "node scripts/check-registry-vocab.mjs --self-test",
     "test:watch": "vitest",
     "shots": "node scripts/shots/shoot.mjs"
   },

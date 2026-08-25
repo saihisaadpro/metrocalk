@@ -1,0 +1,24 @@
+{
+  "//": "Declared divergences between the Inspector's typed-field table (editor/src/schema/registry.ts) and the core's component registry (core/src/stdlib.rs). Same shape as class-hooks.json: a decision a human makes once and writes down, with the reason and the closing gate beside it. Anything not listed here fails check-registry-vocab.mjs. A declaration that stops matching anything is reported as stale on every run so this file cannot rot quietly.",
+
+  "phantom": {
+    "Provides": {
+      "reason": "The dev MockCore models a capability as a COMPONENT FIELD (`Provides.capability` / `Socket.accepts`, transport/session.ts) so that bind-by-intent has something to reject in `npm run dev` and in vitest. The core models the same thing as METADATA on ComponentMeta (`.provides(..)` / `.requires(..)`), which never appears in an entity's projected components at all. Keeping the schema entry is what lets the mock's own entities render an enum rather than a free-text box.",
+      "owner": "the M3.1/M5 capability lane",
+      "note": "`Socket`, the target half of the same mock pair (`Socket.accepts`), carries no curated entry and so needs no declaration here — it renders through the data-driven fallback as the free-text box it is. If it ever gains one, it belongs beside this line.",
+      "owner": "the M3.1/M5 capability lane",
+      "closingGate": "either the mock stops inventing a component and expresses capability the way the core does, or `Provides`/`Socket` become real registered components in core/src/stdlib.rs. Whichever happens, delete this entry and the gate proves it."
+    }
+  },
+
+  "typeDrift": {},
+  "unrouted": {},
+
+  "unreadEnum": {
+    "GameRole.role": {
+      "reason": "The core's hint for this field is a closed vocabulary, but the roles it lists are the GAMEPLAY role set, which the Roles section (panels/RolesSection.tsx) already renders as its own surface with descriptions and per-role tuning — a bare <select> in the Inspector would be a second, poorer statement of the same vocabulary.",
+      "owner": "the M12 gameplay lane",
+      "closingGate": "if the Roles section is ever removed or stops covering the whole vocabulary, delete this entry so the Inspector picks the vocabulary back up."
+    }
+  }
+}

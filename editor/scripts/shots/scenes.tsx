@@ -17,6 +17,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { App } from "../../src/app/App";
 import { STAGE_MIN } from "../../src/app/layout";
 import { BindingGraph } from "../../src/graph/BindingGraph";
+import { Inspector } from "../../src/inspector/Inspector";
 import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
 import { Diagnostics } from "../../src/panels/Diagnostics";
@@ -813,8 +814,252 @@ export const SCENES: Scene[] = [
   ...rigScenes(),
   ...poseScenes(),
   ...graphScenes(),
+  ...inspectorScenes(),
   ...shellScenes(),
 ];
+
+// ── the inspector ─────────────────────────────────────────────────────────────────────────────────
+
+/** THE PANEL THIS HARNESS HAD NEVER PHOTOGRAPHED (ADR-136).
+ *
+ *  Twenty-eight scenes, four of them the whole shell, and in every one of them the Inspector reads
+ *  "Select an entity to inspect." — so the editor's PRIMARY property surface, the one every other
+ *  panel's numbers eventually route through, had no capture at all. What the first one showed is why
+ *  that matters: three different row anatomies on one panel (a bespoke `.mtk-field-row` for numbers, a
+ *  `DisclosureSection` for groups, and `@jsonforms/vanilla-renderers`' unstyled `.control` for
+ *  everything else), and typed controls keyed on components the core has never registered.
+ *
+ *  THE ENTITY BELOW IS THE CORE'S OWN VOCABULARY, not the dev mock's. `Transform{px..sz}`,
+ *  `MeshRenderer{mesh,material,castShadows}`, `RigidBody{kind,mass}` and `Joint{kind,bodyA,bodyB}` are
+ *  exactly what `core/src/stdlib.rs` registers, down to the `format` on the two body references —
+ *  which is what makes this a capture of the real product rather than of the mock. A scene that seeded
+ *  `Material`/`Targeting` would photograph a payload the core cannot produce, which is the C6 failure
+ *  reached through a screenshot instead of a test. `check-registry-vocab.mjs` is the gate that keeps
+ *  the two in step; this is the picture of them being in step. */
+function inspectorSetup(open: string[], extra: Record<string, Record<string, unknown>> = {}) {
+  return () => {
+    // The disclosure remembers its own state, and only `Transform` opens by default — so a capture of
+    // the other groups needs them opened the way a returning user has them, through the same key the
+    // component reads. Clicking them instead would work and would also photograph a panel mid-
+    // interaction, with the pointer's own focus ring in the frame.
+    for (const label of open) {
+      window.localStorage.setItem(`metrocalk:disclosure:inspector-component:${encodeURIComponent(label)}`, "open");
+    }
+    projectionStore.getState().bulkLoad([
+      { id: "e-mast", name: "Mast", parentId: null, components: { Transform: { px: 0, py: 0, pz: 0 } } },
+      { id: "e-counterweight", name: "Counterweight", parentId: null, components: { Transform: { px: -4, py: 0, pz: 0 } } },
+      {
+        id: "e-boom",
+        name: "Boom Arm",
+        parentId: null,
+        components: {
+          Transform: { px: 2.5, py: 1.2, pz: -0.75, rx: 0, ry: 45, rz: 0, sx: 1, sy: 1, sz: 1 },
+          MeshRenderer: { mesh: "sha256:9f3c81aa4e07", material: "sha256:1ab77d5c90e2", castShadows: true },
+          RigidBody: { kind: "dynamic", mass: 1250 },
+          Joint: { kind: "revolute", bodyA: "e-mast", bodyB: "e-counterweight" },
+          ...extra,
+        },
+      },
+    ] as never);
+    projectionStore.getState().select("e-boom");
+  };
+}
+
+/** A client that records rather than sends. `setField` is the only method these scenes can reach. */
+function recordingClient(record: (entry: string) => void) {
+  return {
+    setField: (id: string, component: string, field: string, value: unknown) =>
+      record(`${id}.${component}.${field}=${JSON.stringify(value)}`),
+  } as unknown as EditorClient;
+}
+
+/** The dock track the Inspector actually lives in, at a window wide enough that the ≤760px stacking
+ *  rule is NOT in play — the two regimes are separate scenes because they are separate layouts, and a
+ *  capture that conflates them proves neither. The width is stated once, here. */
+function dockTrack(children: ReactNode) {
+  return (
+    <div data-testid="inspector-track" style={{ width: 320, borderLeft: "1px solid var(--mtk-border)" }}>
+      {children}
+    </div>
+  );
+}
+
+function inspectorScenes(): Scene[] {
+  return [
+    {
+      id: "inspector-real-vocabulary",
+      looking_for:
+        "the Inspector, populated, for the first time in this repository — and populated with the " +
+        "vocabulary `core/src/stdlib.rs` actually registers. Every row is one anatomy (label left, " +
+        "control right, unit after the number, reset only where the value differs from a declared " +
+        "default); `Joint.bodyA`/`bodyB` are ENTITY PICKERS naming Mast and Counterweight, which is " +
+        "the first time that control has ever been able to fire; `MeshRenderer.mesh` is a monospaced " +
+        "asset reference rather than a box inviting you to type a content hash; and `RigidBody.kind` " +
+        "and `Joint.kind` are the closed vocabularies the core states in `ui_hint`, not free text",
+      // TALL ENOUGH TO HOLD ALL FOUR GROUPS OPEN, because `unclipped` below is only worth asserting
+      // where the rows are actually on screen: the first run of this scene was 900px and the harness
+      // reported the Joint group 210px past the bottom edge, which is true and is about the WINDOW,
+      // not about the panel. In the shell the track scrolls; here the window is made to fit so that
+      // every row can be measured rather than half of them excused.
+      viewport: { width: 1200, height: 1200 },
+      setup: inspectorSetup(["MeshRenderer", "RigidBody", "Joint"]),
+      expect: {
+        present: [
+          // 9 Transform + 3 MeshRenderer + 2 RigidBody + 3 Joint.
+          ["[data-testid='prop-row']", 17],
+          // px/py/pz metres, rx/ry/rz degrees, sx/sy/sz multiples. A unit the core states in prose and
+          // the editor never showed: `Transform` is nine bare numbers without them.
+          ["[data-testid='prop-unit']", 9],
+          // THE THREE CONTROLS THAT COULD NOT FIRE BEFORE. Two entity references and one asset
+          // reference — the core declares eight such fields and the editor routed none of them.
+          ["#mtk-prop-Joint-bodyA", 1],
+          ["#mtk-prop-Joint-bodyB", 1],
+          ["#mtk-prop-MeshRenderer-mesh", 1],
+          ["#mtk-prop-RigidBody-kind", 1],
+          // px 2.5, py 1.2, pz -0.75 and ry 45 differ from their declared defaults; sx/sy/sz are 1,
+          // which IS the default, and must NOT offer one — a reset that is always there is furniture.
+          ["[data-testid='prop-reset']", 4],
+        ],
+        // ONE ANATOMY, STATED THE ONLY WAY A GATE CAN CHECK IT. These four are
+        // `@jsonforms/vanilla-renderers`' class names; every boolean, plain string and vocabulary
+        // field in this panel rendered through them, and `check-class-hooks.mjs` cannot see them at
+        // all because they are emitted from `node_modules`. `.mtk-field-row` is the inspector's own
+        // retired row. If any of the five comes back, so has the second design language.
+        absent: [".control", ".input", ".select", ".checkbox", ".mtk-field-row"],
+        // `Mast`, `Counterweight`, `dynamic` and `revolute` are `<option>` TEXT, so a claim about them
+        // is a claim about what a reader can see. The asset reference is an `<input value=…>` and is
+        // deliberately NOT claimed here: `text_present` reads `textContent`, which an input's value is
+        // not part of — so a scene can prove the asset CONTROL is present (`#mtk-prop-MeshRenderer-mesh`
+        // above) and cannot prove what it displays. That is a real limit of this harness rather than a
+        // limit of the panel. Closing gate: a `value_present` claim beside `text_present` in
+        // `shoot.mjs`; owner is whoever next has that file free, since a concurrent lane holds it.
+        text_present: [
+          "Position X", "Rotation Y", "Scale Z", "Cast shadows", "Mass",
+          "Mast", "Counterweight", "dynamic", "revolute",
+        ],
+        // A ROW IS A ROW at this width: the label and the control it names share a line. Anchored on
+        // one known control rather than "the first `.mtk-property-row__label`", because `same_line`
+        // reads the first match of each selector and two unrelated first-matches can overlap by luck.
+        same_line: [["label[for='mtk-prop-Transform-px']", "#mtk-prop-Transform-px"]],
+        // Every row whole inside a 320px track. The retired anatomy spent a fixed 92px on the label
+        // and had no actions column at all, so this is the measurement that says the new one fits.
+        unclipped: ["[data-testid='prop-row']"],
+        text_absent: ["null", "undefined", "NaN", "[object Object]"],
+      },
+      render: () => dockTrack(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-narrow-window",
+      looking_for:
+        "the SAME panel below 760px, where the design system's property row stacks its label above " +
+        "its control so the value keeps the full width. The inspector never had this rule — its own " +
+        "row was a flex line with a hard 92px label at every width — and inheriting it is most of " +
+        "what moving onto `PropertyRow` buys. The reset stays on the control's line, not the label's",
+      // The WINDOW is the subject here, not a frame width: `@media (max-width: 760px)` reads the
+      // viewport, so capping the frame inside a 620px window would photograph a panel that had already
+      // stacked for a reason the caption does not name. Tall for the same reason as the scene above —
+      // a stacked row is nearly twice the height of a side-by-side one, which is the trade.
+      viewport: { width: 620, height: 1400 },
+      setup: inspectorSetup(["MeshRenderer"]),
+      expect: {
+        // SCOPED TO THE OPEN GROUPS, and the scoping is the finding. `DisclosureSection` keeps its
+        // content MOUNTED when closed (`unmountOnClose={false}`, so a collapsed section costs no
+        // re-render and keeps scroll position), which means a bare `[data-testid='prop-row']` counts
+        // five rows nobody can see and then reports them as clipped — correctly, because they are.
+        // A claim about what a reader can reach has to say which rows those are.
+        present: [
+          ["[data-state='open'] [data-testid='prop-row']", 12],
+          ["[data-state='open'] [data-testid='prop-unit']", 9],
+        ],
+        absent: [".control", ".input", ".select", ".checkbox", ".mtk-field-row"],
+        // THE DUAL OF THE SCENE ABOVE, and the reason both exist. The same two elements that must
+        // share a line at 1200px must be on separate lines here, label first. A stylesheet that lost
+        // the media query passes one of these scenes and fails the other, which is exactly the
+        // discrimination a single capture cannot give.
+        stacked: [["label[for='mtk-prop-Transform-px']", "#mtk-prop-Transform-px"]],
+        unclipped: ["[data-state='open'] [data-testid='prop-row']"],
+        text_present: ["Position X", "Cast shadows"],
+        text_absent: ["null", "undefined", "NaN"],
+      },
+      render: () => <Inspector client={recordingClient(() => {})} />,
+    },
+    {
+      id: "inspector-mount-is-not-an-edit",
+      looking_for:
+        "MOUNTING THE INSPECTOR EMITS NOTHING. `emitChanges` diffs JSON Forms' data against the " +
+        "projection so the mount-time `onChange` is a no-op — a contract this panel has always " +
+        "claimed in a comment and never checked anywhere. It matters now because the curated schema " +
+        "declares `default` for the first time (that is what the row's reset reverts to), and " +
+        "JSON Forms' validator is entitled to fill a default into `data` before the first render. " +
+        "If it ever does, the panel writes a transaction nobody asked for, the document is dirty " +
+        "before it is touched, and the undo stack opens with an edit the user did not make",
+      viewport: { width: 620, height: 1100 },
+      setup: inspectorSetup([]),
+      expect: {
+        present: [["[data-testid='mount-edits']", 1]],
+        text_present: ["0 transactions since mount"],
+        // The failure states, spelled out: any non-zero count, and the specific fields whose declared
+        // defaults are the ones a validator would inject.
+        text_absent: ["1 transaction", "2 transactions", "3 transactions", "undefined", "NaN"],
+      },
+      render: () => <EditProbe />,
+    },
+    {
+      id: "inspector-reset-writes-the-default",
+      looking_for:
+        "THE RESET ACTUALLY RESETS. The same probe, with the first reset in the sheet clicked — " +
+        "`Position X`, which is 2.5 against a declared default of 0. One transaction, and it is " +
+        "`Transform.px=0`: the value the schema declares, on the field whose row was clicked, through " +
+        "the same `setField` path a typed edit takes. Without this scene the whole reset affordance " +
+        "is proven by the presence of a button, and a button that emits nothing photographs the same",
+      viewport: { width: 620, height: 1100 },
+      setup: inspectorSetup([]),
+      // The FIRST reset in the document is Position X's — Transform is the group that opens by
+      // default and `px` is its first field. Clicking by testid rather than by position in a list
+      // would be no more specific: they all carry the same one, which is why the assertion below
+      // names the field the click must have reached.
+      click: ["[data-testid='prop-reset']"],
+      expect: {
+        present: [["[data-testid='edit-log']", 1]],
+        text_present: ["1 transaction since mount", "e-boom.Transform.px=0"],
+        // Not two transactions, and not the wrong field: a reset that also nudged its neighbours, or
+        // one wired to the row below it, would still print "a transaction" and look right.
+        text_absent: ["2 transactions", "Transform.py", "Transform.ry", "undefined", "NaN"],
+      },
+      render: () => <EditProbe />,
+    },
+  ];
+}
+
+/** Mounts the real Inspector and RENDERS the transactions it emitted.
+ *
+ *  A scene cannot assert about a callback, so the callback's effect is put on screen — which also
+ *  makes it something a reader can check in the PNG, the bar this harness sets for everything else.
+ *  Two scenes use it and they are duals: one asserts the list is EMPTY after mounting, the other
+ *  clicks a reset and asserts exactly what it wrote. Without the second, "the row has a reset button"
+ *  is all that is ever proven, and a button that emits nothing looks identical in a screenshot. */
+function EditProbe() {
+  const [log, setLog] = useState<string[]>([]);
+  const [settled, setSettled] = useState(false);
+  // One frame after mount: JSON Forms validates and may fill defaults during its own first effect, so
+  // reading synchronously during render would report a number taken before the risk had happened.
+  useEffect(() => {
+    const t = setTimeout(() => setSettled(true), 0);
+    return () => clearTimeout(t);
+  }, []);
+  return (
+    <div style={{ width: 320 }}>
+      <div
+        data-testid="mount-edits"
+        style={{ padding: "8px 12px", font: "12px var(--mtk-font-ui)", color: "var(--mtk-text-secondary)" }}
+      >
+        {settled ? `${log.length === 1 ? "1 transaction" : `${log.length} transactions`} since mount` : "settling…"}
+        {log.length > 0 && <div data-testid="edit-log" style={{ fontFamily: "var(--mtk-font-mono)" }}>{log.join(" · ")}</div>}
+      </div>
+      <Inspector client={recordingClient((e) => setLog((l) => [...l, e]))} />
+    </div>
+  );
+}
 
 // ── the pose preview ──────────────────────────────────────────────────────────────────────────────
 

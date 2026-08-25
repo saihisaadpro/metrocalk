@@ -11,31 +11,51 @@
 //! a header names the object (icon + mono id), and a true empty-state replaces a blank pane.
 
 import { JsonForms } from "@jsonforms/react";
-import { vanillaCells, vanillaRenderers } from "@jsonforms/vanilla-renderers";
+import { vanillaCells } from "@jsonforms/vanilla-renderers";
 import { useSelectedId, useDisplayedEntity, useSummary } from "../store/projection";
 import { setStatus } from "../store/ui";
 import type { EditorClient } from "../transport/session";
 import type { Json } from "../transport/protocol";
 import { buildEntitySchema, buildEntityUiSchema } from "../schema/registry";
 import {
-  ColorControl,
-  colorTester,
+  AssetRefControl,
+  assetRefTester,
+  BooleanControl,
+  booleanTester,
   CollapsibleGroup,
   groupTester,
   EntityRefControl,
   entityRefTester,
+  EnumControl,
+  enumTester,
   NumberControl,
   numberTester,
+  StringControl,
+  stringTester,
+  VerticalLayout,
+  verticalLayoutTester,
 } from "./renderers";
 import { TypeIcon } from "../theme/primitives";
 import { color, font, fontSize, space } from "../theme/tokens";
 
+/** **`vanillaRenderers` IS DELIBERATELY NOT HERE (ADR-136).** It used to be spread in as the fallback,
+ *  and it is what every boolean, plain string and vocabulary field in the inspector actually rendered
+ *  through — emitting `.control`, `.input`, `.select` and `.checkbox`, generic class names this
+ *  repository's stylesheet has no rules for and that `check-class-hooks.mjs` cannot see, because they
+ *  come out of `node_modules` rather than out of the markup it reads. The set below covers every scalar
+ *  `FieldType` the core can register (Number · Integer · Boolean · String, plus the `format` and
+ *  vocabulary refinements), so there is nothing left for a fallback to catch — and its absence is what
+ *  lets a `shots` scene assert those four class names are not on the page. `vanillaCells` stays: cells
+ *  are the array/table path, which this inspector does not use, and JsonForms wants a non-empty list. */
 const renderers = [
-  ...vanillaRenderers,
-  { tester: colorTester, renderer: ColorControl },
-  { tester: entityRefTester, renderer: EntityRefControl },
+  { tester: stringTester, renderer: StringControl },
   { tester: numberTester, renderer: NumberControl },
+  { tester: booleanTester, renderer: BooleanControl },
+  { tester: enumTester, renderer: EnumControl },
+  { tester: assetRefTester, renderer: AssetRefControl },
+  { tester: entityRefTester, renderer: EntityRefControl },
   { tester: groupTester, renderer: CollapsibleGroup },
+  { tester: verticalLayoutTester, renderer: VerticalLayout },
 ];
 
 type Components = Record<string, Record<string, Json>>;

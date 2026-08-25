@@ -587,12 +587,41 @@ progress { accent-color: var(--mtk-accent-solid); }
 
 .mtk-property-row {
   display: grid;
-  grid-template-columns: minmax(84px, 0.72fr) minmax(0, 1.28fr) auto;
+  grid-template-columns: minmax(84px, 0.72fr) minmax(0, 1.28fr) auto auto;
   align-items: start;
   gap: var(--mtk-space-3) var(--mtk-space-4);
   min-width: 0;
   min-height: var(--mtk-control-default);
   padding-block: var(--mtk-space-2);
+}
+/* ── A PROPERTY SHEET IS ONE SET OF COLUMNS, NOT N ROWS THAT EACH GUESSED (ADR-136) ────────────────
+   Each `.mtk-property-row` is its own grid, so its tracks are sized from its OWN label, unit and
+   actions. Nine Transform rows therefore produced five different input widths — `Position X` has a
+   reset and `Rotation X` does not; `kg` is wider than `×` — and the sheet's right edge went ragged.
+   Every box was exactly where its own row put it, which is why no `shots` invariant objected and why
+   reading the capture is what found it: "label left, control right" is a claim about a COLUMN, and a
+   column is the one thing a row cannot see.
+   `subgrid` is the answer the platform already has: the sheet owns the tracks and every row adopts
+   them, so the widest label in a group sets the label column for all of them and the controls line up.
+   Where it is unsupported the declaration is dropped and the rule above still applies — the rows go
+   back to sizing themselves, which is exactly today's behaviour rather than a broken one. */
+.mtk-property-sheet {
+  display: grid;
+  /* The two trailing tracks are FIXED, not `auto`, and that is what aligns one sheet with the next.
+     Sized from content each sheet reserves a different amount — `Transform` has units and resets,
+     `Joint` has neither — so the groups' control columns end at different x and the panel's right edge
+     is ragged card by card. Wide enough for the longest unit the registry states (`m/s`) and for one
+     compact icon button. Base `.mtk-property-row` keeps `auto auto`, so a row used outside a sheet
+     (TerrainPanel) is unchanged. */
+  grid-template-columns: minmax(84px, 0.72fr) minmax(0, 1.28fr) 24px 22px;
+  align-items: start;
+  gap: 0 var(--mtk-space-4);
+  min-width: 0;
+}
+.mtk-property-sheet > .mtk-property-row {
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  gap: var(--mtk-space-3) var(--mtk-space-4);
 }
 .mtk-property-row__label {
   grid-column: 1;
@@ -606,13 +635,30 @@ progress { accent-color: var(--mtk-accent-solid); }
   min-width: 0;
 }
 .mtk-property-row__control > :is(.mtk-input, .mtk-select, .mtk-textarea, .mtk-search) { width: 100%; }
+/* The unit's own column. It reads the value beside it, so it is centred on the control's line rather
+   than on the row's, and it never takes width from the input (ADR-136). */
+.mtk-property-row__unit {
+  grid-column: 3;
+  align-self: center;
+  color: var(--mtk-text-muted);
+  font: 11px/1 var(--mtk-font-ui);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* The inspector's root stack — one component group per child. Owns the gap between groups so a
+   `DisclosureSection` does not have to know what it is stacked inside (ADR-136). */
+.mtk-inspector-stack { display: flex; flex-direction: column; gap: var(--mtk-space-3); min-width: 0; }
 .mtk-property-row__actions {
   display: inline-flex;
-  grid-column: 3;
+  grid-column: 4;
+  align-self: center;
   align-items: center;
   justify-content: flex-end;
   gap: var(--mtk-space-2);
   min-width: 0;
+  /* Reserved whether or not this row has an action, so a row that gains a reset does not resize the
+     one below it. `:empty` keeps the reservation and paints nothing. */
+  min-height: 1px;
 }
 .mtk-property-row__help {
   grid-column: 2 / -1;
@@ -712,8 +758,11 @@ body > [role="dialog"][aria-modal="true"] {
 }
 
 /* ── Inspector property rows + collapsible groups (M14.3 / ADR-059) ── */
-.mtk-field-row { display: flex; align-items: center; gap: var(--mtk-space-4); min-height: var(--mtk-control-default); padding: 2px 0; }
-.mtk-field-label { flex: none; width: 92px; color: var(--mtk-text-secondary); font-size: 12px; font-family: var(--mtk-font-ui); }
+/* `.mtk-field-row` and `.mtk-field-label` are gone (ADR-136). They were the inspector's own private
+   row anatomy — a flex line with a hard 92px label — carried by three renderers while every other
+   field in the panel fell through to `@jsonforms/vanilla-renderers`' unstyled `.control`. The design
+   system's `.mtk-property-row` above is the one row now, so the inspector inherits its stacking rule
+   at ≤760px and its coarse-pointer target floor instead of having neither. */
 /* `.mtk-group` and `.mtk-group-body` are gone: the container and body of the M14.3 collapsible group
    were superseded by `Disclosure` (`.mtk-disclosure*`) and no markup has emitted either since. The
    HEAD and CARET survive because `Diagnostics.tsx` still uses them as a bare expander. */
@@ -1124,8 +1173,22 @@ body > [role="dialog"][aria-modal="true"] {
   overflow: hidden;
   padding: 8px 12px 14px 28px;
   background: var(--mtk-bg-raised);
+  transition:
+    padding-block var(--mtk-motion-base) var(--mtk-ease-standard),
+    border-top-width var(--mtk-motion-base) var(--mtk-ease-standard);
 }
 .mtk-disclosure--card .mtk-disclosure__content { border-top: 1px solid var(--mtk-border-subtle); }
+/* A CLOSED SECTION IS 23px TALL AND THAT 23px IS PADDING (ADR-136). The `grid-template-rows: 0fr`
+   collapse above zeroes the CONTENT BOX; `min-height: 0` is already there so the box itself reaches 0.
+   Padding is not part of that box, so 8px + 14px + a 1px card hairline survive the collapse and every
+   closed card in the app paints a strip of empty raised surface under its own header. Measured, not
+   guessed: a closed `Terrain` disclosure reports the same 23px as a closed inspector group, so this is
+   the design system's, not the inspector's. Transitioned rather than switched so the section still
+   opens and closes as one movement. */
+.mtk-disclosure__region:not(.is-open) > .mtk-disclosure__content {
+  padding-block: 0;
+  border-top-width: 0;
+}
 
 .mtk-empty-panel {
   display: flex;
@@ -1196,10 +1259,15 @@ body > [role="dialog"][aria-modal="true"] {
   .mtk-workspace-panel__body.is-padded { padding: 6px; }
   .mtk-dock-tab { min-height: 36px; padding: 0 10px; }
   .mtk-disclosure__summary { display: none; }
-  .mtk-property-row { grid-template-columns: minmax(0, 1fr) auto; }
+  /* Stacked: the label takes its own line and the control keeps the full width, with the unit and the
+     reset still on the control's line — a reset that stacked under its own field would read as another
+     property. The sheet keeps three tracks here rather than four, and its rows keep adopting them. */
+  .mtk-property-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .mtk-property-sheet { grid-template-columns: minmax(0, 1fr) 24px 22px; }
   .mtk-property-row__label { grid-column: 1 / -1; }
   .mtk-property-row__control { grid-column: 1; }
-  .mtk-property-row__actions { grid-column: 2; }
+  .mtk-property-row__unit { grid-column: 2; }
+  .mtk-property-row__actions { grid-column: 3; }
   .mtk-property-row__help { grid-column: 1 / -1; }
   .mtk-dialog-surface { width: calc(100vw - 16px); max-height: calc(100vh - 16px); padding: 16px; }
 }
