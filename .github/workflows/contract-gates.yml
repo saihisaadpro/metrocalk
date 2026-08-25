@@ -2,13 +2,17 @@ name: contract-gates
 
 # The three checks that compare a contract stated TWICE, in two languages, that no compiler compares:
 #
-#   gpu-contract-audit   WGSL `@location`/`@group`/`struct` against the Rust `VertexBufferLayout`,
-#                        pipeline layout and `#[repr(C)]`. wgpu compares them at pipeline creation —
-#                        on a machine with a GPU, in a build that got that far.
+#   gpu-contract-audit   WGSL `@location`/`@group`/`@binding`/`struct` against the Rust
+#                        `VertexBufferLayout`, pipeline layout, bind group layout entries and
+#                        `#[repr(C)]`; plus each `BindGroupEntry`'s resource class against the layout
+#                        entry it answers, and the shader modules the host BUILDS at start-up by
+#                        marker substitution rather than includes. wgpu compares the first set at
+#                        pipeline creation and the second at `create_bind_group` — two different
+#                        moments, both on a machine with a GPU, in a build that got that far.
 #   ipc-contract-audit   every `#[tauri::command]` against every `invoke("name", { key })`, and every
 #                        reply field the UI reads — declared in TypeScript, or merely READ in the
 #                        untyped E2E suite — against what the shell actually sends.
-#   e2e-load-gate        does each of the 142 E2E specs still parse, and does every name it imports
+#   e2e-load-gate        does each of the 161 E2E specs still parse, and does every name it imports
 #                        from a relative module still get exported by it?
 #
 # WHY THIS IS ITS OWN WORKFLOW, AND WHY IT HAS NO PATH FILTER.
