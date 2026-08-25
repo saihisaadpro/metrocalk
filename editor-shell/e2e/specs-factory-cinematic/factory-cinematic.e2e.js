@@ -1576,6 +1576,31 @@ ${recordingHandle.stderr}`);
         `The capture hard limit truncated the directed film before camera handoff: ${JSON.stringify(completedCamera)}`);
       invariant(JSON.stringify(visitedSubjectIds) === JSON.stringify(expectedSubjectIds),
         `Runtime camera coverage missed directed subjects: ${JSON.stringify({ expectedSubjectIds, visitedSubjectIds, completedCamera })}`);
+
+      // WHERE THE CAMERA ACTUALLY STOOD.
+      //
+      // A shot is solved against its subject's bounds and nothing else, which in a 15,711-part assembly
+      // routinely resolves to a point inside the part next door -- the previous delivered film spent a
+      // quarter of its length looking at the inside of something. The runtime now negotiates each
+      // placement against the scene once, when the shot begins, and reports what it settled on.
+      //
+      // The assertion is that the negotiation RAN for every shot, not that it left every shot alone: a
+      // run in which nothing was re-aimed and a run in which the mechanism was never wired up look
+      // identical if you only check that the shots were filmed as directed.
+      const placements = completedCamera.shotPlacements ?? [];
+      invariant(placements.length === FACTORY_ACCEPTANCE.cinematicShots,
+        `The camera placement negotiation did not run for every shot: ${placements.length} of ${FACTORY_ACCEPTANCE.cinematicShots}`);
+      const reaimed = placements.filter((placement) => !placement.asDirected);
+      manifest.cinematography = {
+        shots: placements.length,
+        filmedAsDirected: placements.length - reaimed.length,
+        reaimed: reaimed.length,
+        reaimedFraction: Number((reaimed.length / placements.length).toFixed(4)),
+        widened: placements.filter((p) => p.directedSize !== p.filmedSize).length,
+        turned: placements.filter((p) => p.yawOffsetDeg !== 0).length,
+        placements,
+      };
+
       await invoke("stop");
       playing = false;
       recordingHandle = null;

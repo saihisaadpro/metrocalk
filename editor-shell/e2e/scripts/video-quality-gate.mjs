@@ -28,6 +28,8 @@ export const QUALITY_THRESHOLDS = Object.freeze({
   motionDeltaLumaThreshold: 0.25,
   minimumMovingTransitionFraction: 0.08,
   minimumPeakMotionDeltaLuma: 1,
+  minimumFrameInterdecileLuma: 40,
+  minimumLegibleFrameFraction: 0.8,
 });
 
 const DEFAULT_SAMPLE_COUNT = 12;
@@ -132,11 +134,17 @@ export function parseSignalStatsMetadata(output) {
 }
 
 export function evaluateVisualContent(
-  { luminanceSamples = [], motionSamples = [] },
+  { luminanceSamples = [], motionSamples = [], contrastSamples = [] },
   thresholds = QUALITY_THRESHOLDS,
 ) {
   const luminance = summarizeSamples(luminanceSamples);
   const motion = summarizeSamples(motionSamples);
+  const contrast = summarizeSamples(contrastSamples);
+  const legibleFrames = contrastSamples.filter(
+    (value) => Number.isFinite(value) && value >= thresholds.minimumFrameInterdecileLuma,
+  ).length;
+  const legibleFrameFraction =
+    contrast.count > 0 ? rounded(legibleFrames / contrast.count) : null;
   const movingTransitions = motionSamples.filter(
     (value) => Number.isFinite(value) && value >= thresholds.motionDeltaLumaThreshold,
   ).length;
@@ -183,6 +191,38 @@ export function evaluateVisualContent(
       },
       "A small minority of the clip must visibly change. Long legitimate holds remain allowed, while a duplicated still frame or token fade cannot pass.",
     ),
+    // WHY THIS EXISTS. The first delivered factory film passed every check above and roughly four of
+    // fifteen sampled frames were the camera inside or hard against geometry -- one solid dark red, two
+    // black, one featureless grey. Every one of those frames is bright enough, the film as a whole moves,
+    // and the defect is invisible to any measure of the clip's AVERAGE brightness or motion, because a
+    // wall 2 cm from the lens is a perfectly well-exposed, perfectly stable picture of a wall.
+    //
+    // What separates them is CONTRAST WITHIN one frame. `YHIGH - YLOW` is the interdecile range: the
+    // spread between the 10th and 90th percentile luma of that frame. A shot of machinery in a factory
+    // has bright metal and shadow in it; a shot of the inside of a machine housing does not.
+    //
+    // The floor is calibrated against the delivered film rather than chosen: measured over its own
+    // fifteen samples, the frames a viewer calls obscured scored 5, 12, 26, 29 and 39, and the worst
+    // frame anybody would accept scored 56. 40 is the gap between those two populations.
+    //
+    // It is deliberately a FRACTION, not every frame. A film is allowed a moment of transition or a
+    // legitimately dark, low-contrast beat; it is not allowed to spend a fifth of its length looking at
+    // the inside of something.
+    check(
+      "visual-frames-legible",
+      legibleFrameFraction !== null &&
+        contrast.count >= thresholds.minimumVisualSamples &&
+        legibleFrameFraction >= thresholds.minimumLegibleFrameFraction,
+      `>= ${thresholds.minimumLegibleFrameFraction * 100}% of sampled frames with YHIGH-YLOW >= ${thresholds.minimumFrameInterdecileLuma}`,
+      {
+        legibleFrames,
+        sampledFrames: contrast.count,
+        legibleFrameFraction,
+        medianInterdecileLuma: contrast.median,
+        minimumInterdecileLuma: contrast.minimum,
+      },
+      "Most sampled frames must contain readable structure. A frame filled by one surface -- the camera inside a machine, against a wall, or aimed into empty space -- is well exposed, stable, and not a shot of anything.",
+    ),
   ];
 
   return {
@@ -190,6 +230,7 @@ export function evaluateVisualContent(
     checks,
     luminance,
     motion: { ...motion, movingTransitions, movingTransitionFraction },
+    contrast: { ...contrast, legibleFrames, legibleFrameFraction },
   };
 }
 
@@ -491,7 +532,19 @@ export function analyzeVisualContent({
   const motionSamples = motionFrames
     .map((frame) => frame.metrics.YAVG)
     .filter(Number.isFinite);
-  const evaluation = evaluateVisualContent({ luminanceSamples, motionSamples }, thresholds);
+  // Free: the luminance pass already decodes and measures these frames, and signalstats already reports
+  // the percentiles. Nothing extra is decoded to learn whether each frame has anything in it.
+  const contrastSamples = luminanceFrames
+    .map((frame) =>
+      Number.isFinite(frame.metrics.YHIGH) && Number.isFinite(frame.metrics.YLOW)
+        ? frame.metrics.YHIGH - frame.metrics.YLOW
+        : null,
+    )
+    .filter(Number.isFinite);
+  const evaluation = evaluateVisualContent(
+    { luminanceSamples, motionSamples, contrastSamples },
+    thresholds,
+  );
   const commandChecks = [
     check(
       "visual-luminance-command",
@@ -518,6 +571,7 @@ export function analyzeVisualContent({
       analysisWidth: 320,
       luminanceMetric: "signalstats YAVG on uniformly sampled frames",
       motionMetric: "signalstats YAVG after tblend absolute frame difference",
+      frameLegibilityMetric: "signalstats YHIGH - YLOW (interdecile luma range) per sampled frame",
     },
     checks,
     luminance: {
@@ -527,6 +581,12 @@ export function analyzeVisualContent({
         frame: frame.frame,
         ptsTimeSeconds: frame.ptsTimeSeconds,
         yAverage: frame.metrics.YAVG ?? null,
+        // The per-frame contrast the legibility check reads, kept alongside its frame time so a failing
+        // run names WHICH seconds of the film were obscured instead of only how many.
+        interdecileLuma:
+          Number.isFinite(frame.metrics.YHIGH) && Number.isFinite(frame.metrics.YLOW)
+            ? rounded(frame.metrics.YHIGH - frame.metrics.YLOW)
+            : null,
       })),
     },
     motion: {
@@ -537,6 +597,25 @@ export function analyzeVisualContent({
         ptsTimeSeconds: frame.ptsTimeSeconds,
         deltaYAverage: frame.metrics.YAVG ?? null,
       })),
+    },
+    // Carried in its own right, not only inside the check: "how much of this film was a picture of
+    // something" is a number a run report should be able to quote, pass or fail. The per-frame readings
+    // live beside their frame times under `luminance.samples`.
+    contrast: {
+      summary: evaluation.contrast,
+      obscuredFrames: luminanceFrames
+        .map((frame) => ({
+          ptsTimeSeconds: frame.ptsTimeSeconds,
+          interdecileLuma:
+            Number.isFinite(frame.metrics.YHIGH) && Number.isFinite(frame.metrics.YLOW)
+              ? rounded(frame.metrics.YHIGH - frame.metrics.YLOW)
+              : null,
+        }))
+        .filter(
+          (frame) =>
+            frame.interdecileLuma !== null &&
+            frame.interdecileLuma < thresholds.minimumFrameInterdecileLuma,
+        ),
     },
   };
 }

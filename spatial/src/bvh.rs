@@ -468,6 +468,54 @@ impl SceneBvh {
             }
         }
     }
+
+    /// Whether the ray enters the bounds of **any** accepted object within `t_max`, stopping at the
+    /// first one it finds.
+    ///
+    /// [`Self::query_ray`] answers "which objects", and answering a yes/no question with it means
+    /// building the whole candidate list first. On a scene the size of an imported factory a single
+    /// long ray can cross hundreds of parts, and the cinematic camera asks this question thousands of
+    /// times while it decides where to stand — so the list is both the wrong answer and the expensive
+    /// one. `accept` runs on the object key, which is what lets a caller ignore the thing it is
+    /// deliberately looking AT while still noticing everything in the way.
+    pub fn ray_hits(
+        &self,
+        ray: &Ray,
+        t_max: f64,
+        scratch: &mut Vec<u32>,
+        accept: impl Fn(u32) -> bool,
+    ) -> bool {
+        if self.nodes.is_empty() {
+            return false;
+        }
+        scratch.clear();
+        scratch.push(0);
+        while let Some(index) = scratch.pop() {
+            let node = self.nodes[index as usize];
+            if !ray_aabb_hit(ray, &node.bounds, t_max) {
+                continue;
+            }
+            if node.is_leaf() {
+                for k in 0..node.count {
+                    let key = self.order[(node.offset + k) as usize];
+                    if !accept(key) {
+                        continue;
+                    }
+                    if self
+                        .object_bounds
+                        .get(key as usize)
+                        .is_some_and(|b| ray_aabb_hit(ray, b, t_max))
+                    {
+                        return true;
+                    }
+                }
+            } else {
+                scratch.push(index + 1);
+                scratch.push(node.offset);
+            }
+        }
+        false
+    }
 }
 
 /// Binned-SAH split of `prims[first..first+count]`, writing nodes into `nodes` at `node_index`.
@@ -850,6 +898,46 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(got, expected, "broad phase must not lose a candidate");
         assert!(!expected.is_empty(), "the test ray actually hits something");
+    }
+
+    /// `ray_hits` is an early-exiting `query_ray`, so its only contract is that it agrees with one —
+    /// including about the objects the caller asked it to ignore.
+    #[test]
+    fn ray_hits_agrees_with_the_candidate_list_it_short_circuits() {
+        let bounds: Vec<Aabb> = (0..64)
+            .map(|i| {
+                Aabb::from_center_half(
+                    [f64::from(i % 8) * 3.0, 0.0, f64::from(i / 8) * 3.0],
+                    [1.0; 3],
+                )
+            })
+            .collect();
+        let bvh = SceneBvh::build(&bounds);
+        let mut scratch = Vec::new();
+        let mut out = Vec::new();
+        let rays = [
+            Ray::new([0.0, 0.0, -20.0], [0.0, 0.0, 1.0]),
+            Ray::new([-20.0, 0.0, 6.0], [1.0, 0.0, 0.0]),
+            Ray::new([0.0, 40.0, 0.0], [0.0, 1.0, 0.0]),
+            Ray::new([3.0, 0.0, 3.0], [0.3, 0.2, 0.9]),
+        ];
+        for ray in &rays {
+            for t_max in [1.0_f64, 12.0, f64::INFINITY] {
+                for ignored in [u32::MAX, 0, 9, 27] {
+                    bvh.query_ray(ray, t_max, &mut scratch, &mut out);
+                    let expected = out.iter().any(|(key, _)| *key != ignored);
+                    let got = bvh.ray_hits(ray, t_max, &mut scratch, |key| key != ignored);
+                    assert_eq!(
+                        got, expected,
+                        "disagreement for {ray:?} t_max={t_max} ignoring {ignored}"
+                    );
+                }
+            }
+        }
+        // An empty tree hits nothing rather than panicking on a missing root.
+        assert!(!SceneBvh::build(&[]).ray_hits(&rays[0], f64::INFINITY, &mut scratch, |_| true));
+        // And a filter that accepts nothing reports nothing, however much is in the way.
+        assert!(!bvh.ray_hits(&rays[0], f64::INFINITY, &mut scratch, |_| false));
     }
 
     #[test]

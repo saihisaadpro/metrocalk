@@ -195,6 +195,285 @@ impl SceneState {
         (lo.is_finite() && hi.is_finite() && lo.cmple(hi).all())
             .then(|| (lo.to_array(), hi.to_array()))
     }
+
+    /// Build the cinematic occlusion broad phase if the instance set has moved on. Cheap and idempotent
+    /// when it has not, so the cutscene loop may call it whenever it plans a shot.
+    ///
+    /// Nothing else in the engine triggers this: the structure exists for one caller, and a scene that
+    /// is never filmed never builds it.
+    pub fn sync_occlusion(&mut self) {
+        if self.occlusion_revision == Some(self.ids_revision) {
+            return;
+        }
+        self.sync_mesh_bounds();
+        let bounds: Vec<metrocalk_spatial::Aabb> = (0..self.instances.len())
+            .map(|index| {
+                self.rendered_instance_bounds(index).map_or(
+                    metrocalk_spatial::Aabb::EMPTY,
+                    |(lo, hi)| {
+                        metrocalk_spatial::Aabb::new(
+                            [f64::from(lo[0]), f64::from(lo[1]), f64::from(lo[2])],
+                            [f64::from(hi[0]), f64::from(hi[1]), f64::from(hi[2])],
+                        )
+                    },
+                )
+            })
+            .collect();
+        self.occlusion = metrocalk_spatial::SceneBvh::build(&bounds);
+        self.occlusion_revision = Some(self.ids_revision);
+    }
+
+    /// What the world has to say about one candidate camera placement — the answer
+    /// `metrocalk_animation::shot::plan_shot` negotiates against.
+    ///
+    /// `subject` is the set of instance indices the shot is ABOUT; they are excluded from every
+    /// obstruction test, because a camera close enough to fill the frame with its subject is by
+    /// definition close to it, and the pure solver already guarantees it stays outside it.
+    ///
+    /// Tested against world bounding boxes rather than triangles. That is a deliberate
+    /// over-approximation: it is one BVH walk instead of a mesh raycast per candidate, it can only ever
+    /// report a view as *more* blocked than it is, and the planner's acceptance threshold is set below
+    /// 1.0 precisely so a handrail's generous box does not veto a shot a viewer would call clear.
+    #[must_use]
+    pub fn vantage(
+        &self,
+        eye: [f32; 3],
+        look_at: [f32; 3],
+        subject_center: [f32; 3],
+        subject_radius: f32,
+        subject: &std::collections::HashSet<u32>,
+    ) -> metrocalk_animation::shot::Vantage {
+        use metrocalk_animation::shot::Vantage;
+        if self.occlusion.is_empty() {
+            return Vantage::OPEN;
+        }
+        let eye64 = [f64::from(eye[0]), f64::from(eye[1]), f64::from(eye[2])];
+        let centre64 = [
+            f64::from(subject_center[0]),
+            f64::from(subject_center[1]),
+            f64::from(subject_center[2]),
+        ];
+        let radius = f64::from(subject_radius.abs().max(1.0e-3));
+        let range = {
+            let d = [
+                centre64[0] - eye64[0],
+                centre64[1] - eye64[1],
+                centre64[2] - eye64[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        if !range.is_finite() || range <= 1.0e-6 {
+            return Vantage::OPEN;
+        }
+        let mut scratch = Vec::new();
+
+        // ── Is the camera buried? ──────────────────────────────────────────────────────────────
+        // A box the size of the camera's own near clip, so "inside" means what the viewer sees: the
+        // solid-colour frame you get when a wall is closer than the near plane.
+        let probe = (range * 0.01).clamp(0.02, 0.35);
+        let cell = metrocalk_spatial::Aabb::new(
+            [eye64[0] - probe, eye64[1] - probe, eye64[2] - probe],
+            [eye64[0] + probe, eye64[1] + probe, eye64[2] + probe],
+        );
+        let mut inside_keys = Vec::new();
+        self.occlusion
+            .query_bounds(&cell, &mut scratch, &mut inside_keys);
+        let eye_inside = inside_keys.iter().any(|key| !subject.contains(key));
+
+        // ── Can it see the subject? ────────────────────────────────────────────────────────────
+        // Rays at the centre and at six points on the subject's bounding sphere, so a subject half
+        // behind a column reads as half blocked rather than as a binary yes.
+        let (right, up) = frame_basis(eye64, centre64);
+        let spread = radius * 0.6;
+        let mut targets = Vec::with_capacity(7);
+        targets.push(centre64);
+        for (rx, uy) in [
+            (1.0_f64, 0.0_f64),
+            (-1.0, 0.0),
+            (0.0, 1.0),
+            (0.0, -1.0),
+            (0.7, 0.7),
+            (-0.7, -0.7),
+        ] {
+            targets.push([
+                centre64[0] + (right[0] * rx + up[0] * uy) * spread,
+                centre64[1] + (right[1] * rx + up[1] * uy) * spread,
+                centre64[2] + (right[2] * rx + up[2] * uy) * spread,
+            ]);
+        }
+        let mut reached = 0usize;
+        for target in &targets {
+            let d = [
+                target[0] - eye64[0],
+                target[1] - eye64[1],
+                target[2] - eye64[2],
+            ];
+            let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if !length.is_finite() || length <= 1.0e-6 {
+                reached += 1;
+                continue;
+            }
+            // Stop short of the target: the subject's own neighbours count, the subject's own skin
+            // does not, and a ray that runs all the way in would be blocked by whatever it lands on.
+            let t_max = length * 0.98;
+            let ray = metrocalk_spatial::ray::Ray::new(eye64, d);
+            if !self
+                .occlusion
+                .ray_hits(&ray, t_max, &mut scratch, |key| !subject.contains(&key))
+            {
+                reached += 1;
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let clear = reached as f32 / targets.len() as f32;
+
+        // ── What fills the frame, in front of the subject and behind it ────────────────────────
+        // Nine directions spread across the frame answer both remaining questions at once.
+        let (look_right, look_up) = frame_basis(
+            eye64,
+            [
+                f64::from(look_at[0]),
+                f64::from(look_at[1]),
+                f64::from(look_at[2]),
+            ],
+        );
+        let forward = [
+            (centre64[0] - eye64[0]) / range,
+            (centre64[1] - eye64[1]) / range,
+            (centre64[2] - eye64[2]) / range,
+        ];
+        // Anything not the subject, this much nearer than the subject, is foreground rather than context.
+        let crowding_reach = range * 0.35;
+        // Backing is measured from the SUBJECT outwards, never from the lens. Measured from the lens, a
+        // wall twenty centimetres in front of the camera counts as a rich backdrop, and the frames that
+        // are nothing but that wall score as the best-composed in the film -- which is exactly what the
+        // second film's numbers said.
+        let backdrop = range * 5.0;
+        // The presentation ground is a quad, not an instance, so it is absent from the BVH; a downward
+        // shot would otherwise report a void it is in fact aimed straight at.
+        let ground_y = f64::from(GROUND_PLANE_Y);
+        let mut backed = 0usize;
+        let mut crowded_probes = 0usize;
+        let mut probes = 0usize;
+        for rx in [-0.55_f64, 0.0, 0.55] {
+            for uy in [-0.4_f64, 0.0, 0.4] {
+                probes += 1;
+                let dir = [
+                    forward[0] + look_right[0] * rx + look_up[0] * uy,
+                    forward[1] + look_right[1] * rx + look_up[1] * uy,
+                    forward[2] + look_right[2] * rx + look_up[2] * uy,
+                ];
+                let ray = metrocalk_spatial::ray::Ray::new(eye64, dir);
+                if self
+                    .occlusion
+                    .ray_hits(&ray, crowding_reach, &mut scratch, |key| {
+                        !subject.contains(&key)
+                    })
+                {
+                    crowded_probes += 1;
+                }
+                // Start the backdrop ray at the subject's own plane, so only what lies BEYOND the
+                // subject can back it. The subject is deliberately not excluded here: a shot of a whole
+                // assembly is legitimately backed by its own far side.
+                let beyond = [
+                    eye64[0] + ray.direction[0] * range,
+                    eye64[1] + ray.direction[1] * range,
+                    eye64[2] + ray.direction[2] * range,
+                ];
+                let behind = metrocalk_spatial::ray::Ray::new(beyond, ray.direction);
+                if self
+                    .occlusion
+                    .ray_hits(&behind, backdrop, &mut scratch, |_| true)
+                {
+                    backed += 1;
+                    continue;
+                }
+                // Falling toward the floor within the same reach counts as content.
+                let dy = behind.direction[1];
+                if dy < -1.0e-6 {
+                    let t = (ground_y - beyond[1]) / dy;
+                    if t > 0.0 && t <= backdrop {
+                        backed += 1;
+                    }
+                }
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let (backing, crowded) = if probes == 0 {
+            (0.0, 0.0)
+        } else {
+            (
+                backed as f32 / probes as f32,
+                crowded_probes as f32 / probes as f32,
+            )
+        };
+
+        Vantage {
+            eye_inside,
+            clear,
+            backing,
+            crowded,
+        }
+    }
+}
+
+/// Where the presentation ground sits. Slightly under the origin so a model resting exactly on `y = 0`
+/// does not z-fight with the floor it is standing on. Named because the cinematic camera's backdrop test
+/// has to know the floor is there: the ground is a quad the renderer draws directly, not an instance, so
+/// it is invisible to any broad phase built over the instance list.
+pub const GROUND_PLANE_Y: f32 = -0.02;
+
+/// One shot's negotiated camera placement — what was directed, and what was actually filmed.
+///
+/// A plain record rather than a serialisable type: this module has no serde dependency and does not need
+/// one, and the command that reports it already builds JSON by hand.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CinematicPlacement {
+    /// The shot's stable id.
+    pub shot: String,
+    /// The entity the shot frames.
+    pub subject: String,
+    /// The framing as authored.
+    pub directed_size: &'static str,
+    /// The framing as filmed. Different from `directed_size` means the close placement was buried and
+    /// the shot had to step back to find air.
+    pub filmed_size: &'static str,
+    /// Degrees the camera was swung around the subject to find a clear, backed view. Zero means none.
+    pub yaw_offset_deg: f32,
+    /// How many placements were rejected before this one. Zero means the direction was filmed as written.
+    pub rejected: u8,
+}
+
+/// A right/up pair for the plane facing `target` from `eye`, used to spread sample rays across a frame.
+///
+/// World up is the reference, with a sideways fallback for the degenerate case of looking straight down —
+/// a bird's-eye shot is exactly the one that would otherwise produce a zero-length cross product and
+/// silently collapse every sample ray onto the same direction.
+fn frame_basis(eye: [f64; 3], target: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let norm = |v: [f64; 3]| {
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if len.is_finite() && len > 1.0e-9 {
+            [v[0] / len, v[1] / len, v[2] / len]
+        } else {
+            [0.0, 0.0, 0.0]
+        }
+    };
+    let forward = norm([target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]]);
+    let mut right = norm(cross(forward, [0.0, 1.0, 0.0]));
+    if right == [0.0, 0.0, 0.0] {
+        right = norm(cross(forward, [0.0, 0.0, 1.0]));
+    }
+    if right == [0.0, 0.0, 0.0] {
+        return ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+    }
+    (right, norm(cross(right, forward)))
 }
 
 /// The presentation ground's albedo.
@@ -458,7 +737,7 @@ fn ground_placement(bounds: Option<(Vec3, Vec3)>) -> ([f32; 3], f32) {
     // non-representable positions into the vertex stream and take the device down with it. Any scene that
     // legitimately needs more than this is already far outside the depth precision the viewport has.
     const MAX_SCALE: f32 = 100_000.0;
-    let fallback = ([0.0, -0.02, 0.0], MIN_SCALE);
+    let fallback = ([0.0, GROUND_PLANE_Y, 0.0], MIN_SCALE);
     let Some((lo, hi)) = bounds else {
         return fallback;
     };
@@ -472,7 +751,7 @@ fn ground_placement(bounds: Option<(Vec3, Vec3)>) -> ([f32; 3], f32) {
         return fallback;
     }
     let scale = (half_extent * MARGIN).clamp(MIN_SCALE, MAX_SCALE);
-    ([centre.x, -0.02, centre.z], scale)
+    ([centre.x, GROUND_PLANE_Y, centre.z], scale)
 }
 
 /// M11.4 (ADR-043) — the active scene camera's look-through view parameters. A render PROJECTION (never
@@ -671,6 +950,23 @@ pub struct SceneState {
     pub cinema_subtree: std::collections::HashMap<String, Vec<usize>>,
     /// The `ids_revision` [`Self::cinema_subtree`] was built for.
     pub cinema_subtree_revision: u64,
+    /// A broad phase over every published instance's world bounds, for the cinematic camera's occlusion
+    /// queries — the structure that lets a shot ask "is anything between me and my subject?".
+    ///
+    /// Built lazily and ONLY when a cutscene asks for one, so a scene nobody is filming never pays for
+    /// it. Deliberately **not refitted while a mechanism animates**: a moving part's box goes stale by at
+    /// most its own stroke, which makes the camera very slightly more conservative about a place it was
+    /// already unwilling to stand, and refitting 17,793 boxes per animation frame to buy that back would
+    /// cost more than the whole query it serves.
+    pub occlusion: metrocalk_spatial::SceneBvh,
+    /// The [`Self::ids_revision`] [`Self::occlusion`] was built for; `None` until something asks.
+    pub occlusion_revision: Option<u64>,
+    /// Every camera placement this cutscene run has negotiated, in the order the shots were filmed.
+    ///
+    /// Recorded because "the film was directed well" and "the film quietly re-aimed half of it" look
+    /// identical from outside, and the difference is the whole point of the negotiation. Cleared when a
+    /// cutscene takes the camera, so it always describes the run being watched.
+    pub cinematic_placements: Vec<CinematicPlacement>,
     /// Entity key -> instance index, memoised against [`Self::ids_revision`].
     ///
     /// Publishing an animation pose used to scan all of `ids` looking for the handful of keys it had
@@ -848,6 +1144,14 @@ pub struct SceneState {
     /// restores this). `None` ⇒ not focused / nothing to restore. Saved once on enter so focusing a
     /// second entity without un-focusing first doesn't lose the original framing.
     pub pre_focus_distance: Option<f32>,
+    /// The orbit `cam_target` saved alongside [`Self::pre_focus_distance`], and restored with it.
+    ///
+    /// Focusing does two things — it moves the camera IN, and it points it AT the part. Only the first
+    /// was ever put back, so leaving focus returned the camera to its old distance while it went on
+    /// staring at the part: "everything comes back to normal" left the viewer looking at a speck from
+    /// across the factory, which reads as the camera having jumped somewhere arbitrary. Saved and taken
+    /// in lock-step with the distance, so the "saved once on enter" rule covers both.
+    pub pre_focus_target: Option<[f32; 3]>,
     /// M9.1 transform gizmo — its mode (W/E/R) + in-flight drag live here so the render loop can run the
     /// per-frame drag natively (0 per-frame IPC, like the orbit). The drawn geometry is regenerated each
     /// frame at the selected entity (constant pixel size); the gizmo shows whenever `selected` is `Some`.
@@ -1288,6 +1592,7 @@ impl SceneState {
             } else {
                 self.distance
             });
+            self.pre_focus_target = Some(self.cam_target);
         }
         // CM-SCALE floors (not the old 0.5 m / 6 m): focusing a centimetre-scale CAD part must get the
         // camera NEAR it (the old 6 m floor parked a 2 cm part sub-pixel — the same M15.9 defect family
@@ -1311,9 +1616,9 @@ impl SceneState {
     }
 
     /// Exit Focus mode ("everything comes back to normal"): clear the focus flag (the shader un-dims
-    /// every entity) and restore the orbit `distance` saved when focus was entered. Idempotent — a
-    /// no-op (no `revision` bump) when nothing is focused, so a stray Escape never disturbs the scene.
-    /// Selection is intentionally left as-is (only the dim + zoom revert).
+    /// every entity) and restore BOTH the orbit `distance` and the `cam_target` saved when focus was
+    /// entered. Idempotent — a no-op (no `revision` bump) when nothing is focused, so a stray Escape
+    /// never disturbs the scene. Selection is intentionally left as-is (only the dim + framing revert).
     pub fn clear_focus(&mut self) {
         if self.focused.is_none() {
             return;
@@ -1321,6 +1626,9 @@ impl SceneState {
         self.focused = None;
         if let Some(d) = self.pre_focus_distance.take() {
             self.distance = d;
+        }
+        if let Some(target) = self.pre_focus_target.take() {
+            self.cam_target = target;
         }
         self.revision = self.revision.wrapping_add(1);
     }
@@ -1367,15 +1675,22 @@ impl InstanceBuf {
     }
 
     /// Upload `data`, growing (and rebinding) the buffer if needed. Sets `n` to the count drawn.
+    /// Write `data` into the slot's storage buffer, growing it if it no longer fits.
+    ///
+    /// **Returns whether the underlying buffer was REPLACED.** A bind group holds a reference to a
+    /// specific buffer, so it survives any number of writes into that buffer and is invalidated only by
+    /// a reallocation. Reporting it is what lets the caller stop rebuilding every bind group in the
+    /// scene on every frame of an animation, where the instance COUNT never changes at all.
     fn upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
         data: &[Instance],
-    ) {
+    ) -> bool {
         let needed = data.len() as u64;
-        if needed > self.cap {
+        let reallocated = needed > self.cap;
+        if reallocated {
             self.cap = needed.next_power_of_two();
             self.buf = new_instance_storage(device, self.cap);
             self.bg = make_inst_bg(device, layout, &self.buf);
@@ -1384,6 +1699,7 @@ impl InstanceBuf {
             queue.write_buffer(&self.buf, 0, bytemuck::cast_slice(data));
         }
         self.n = data.len() as u32;
+        reallocated
     }
 }
 
@@ -3185,6 +3501,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     eprintln!("[viewport] sky={sky}");
     let lod_on = !matches!(std::env::var("MTK_LOD").ok().as_deref(), Some("off" | "0"));
     let mut cur_mesh_rev = u64::MAX;
+    /// The `meshes_revision` the per-submesh main-pass bind groups were built against. `u64::MAX - 1`
+    /// rather than `u64::MAX` so it cannot be equal to `cur_mesh_rev`'s own initial value: the very first
+    /// scene must build its bind groups even if the mesh table is somehow already current.
+    const BIND_GROUPS_UNBUILT: u64 = u64::MAX - 1;
+    let mut bind_groups_built_for = BIND_GROUPS_UNBUILT;
     let mut cube_scratch: Vec<Instance> = Vec::new();
     let mut mesh_scratch: Vec<Vec<Instance>> = Vec::new();
     // M19 (ADR-104) — terrain chunks. A separate slot table from the entity meshes above, because terrain
@@ -3542,9 +3863,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 }
                 cube.upload(&device, &queue, &inst_bgl, &cube_scratch);
                 entity_inst_len.clear();
+                // Did any slot's storage buffer actually move? That — and only that — invalidates the
+                // bind groups built against it.
+                let mut buffers_moved = false;
                 for (slot, group) in mesh_scratch.iter().enumerate() {
                     entity_inst_len.push(group.len());
-                    mesh_inst[slot].upload(&device, &queue, &inst_bgl, group);
+                    buffers_moved |= mesh_inst[slot].upload(&device, &queue, &inst_bgl, group);
                 }
                 // M11.1 — each slot's instance centroid (the camera-distance basis for LOD selection).
                 mesh_centroid.clear();
@@ -3572,38 +3896,32 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         mesh_extent.get(slot).copied().unwrap_or(1.0) * largest_instance.max(0.001),
                     );
                 }
-                // M11.2 follow-up — rebuild each mesh's main-pass group-1 bind groups, **one per submesh**
-                // (an instance upload may have grown → a new buffer), pairing the current instance buffer with
-                // that submesh's own textures. Few meshes/submeshes, only on scene-edit revisions (never per
-                // frame). `mesh_inst.len() ≥ gpu_meshes.len()` (the meshes_revision block grows it first).
-                mesh_main_bg.clear();
-                for slot in 0..gpu_meshes.len() {
-                    let groups = gpu_meshes[slot].as_ref().map_or_else(Vec::new, |mesh| {
-                        mesh.submeshes
-                            .iter()
-                            .map(|sm| {
-                                make_mesh_main_bg(
-                                    &device,
-                                    &mesh_inst_bgl,
-                                    &mesh_inst[slot].buf,
-                                    &sm.base_view,
-                                    &sm.mr_view,
-                                    &sm.normal_view,
-                                    &sm.ao_view,
-                                    &albedo_sampler,
-                                )
-                            })
-                            .collect()
-                    });
-                    mesh_main_bg.push(groups);
-                }
-                // M11.1 — per-LOD bind groups: same (current) instance buffer + that LOD's submesh textures.
-                lod_main_bg.clear();
-                for (slot, lods) in gpu_lods.iter().enumerate() {
-                    let per_lod: Vec<Vec<wgpu::BindGroup>> = lods
-                        .iter()
-                        .map(|lod| {
-                            lod.submeshes
+                // M11.2 follow-up — rebuild each mesh's main-pass group-1 bind groups, **one per submesh**,
+                // pairing the current instance buffer with that submesh's own textures.
+                // `mesh_inst.len() ≥ gpu_meshes.len()` (the meshes_revision block grows it first).
+                //
+                // GATED, because the comment that used to sit here — "only on scene-edit revisions, never
+                // per frame" — stopped being true the moment anything in the scene animated. A published
+                // pose bumps `revision`, so on the imported factory this rebuilt a bind group for every
+                // submesh of every one of 15,711 parts SIXTY TIMES A SECOND, while holding the scene lock
+                // the engine thread needs to publish the next pose. It was the measured reason playback
+                // ran at a quarter of real time.
+                //
+                // A bind group references a BUFFER, not its contents: writing new instance data into the
+                // same buffer leaves it perfectly valid. Only two things invalidate it — a storage buffer
+                // that was reallocated because the instance count grew, and a mesh table that was replaced
+                // underneath it (new textures, new submeshes). Both are scene edits, which is what the
+                // original comment meant.
+                let bind_groups_stale = buffers_moved
+                    || mesh_main_bg.len() != gpu_meshes.len()
+                    || lod_main_bg.len() != gpu_lods.len()
+                    || bind_groups_built_for != cur_mesh_rev;
+                if bind_groups_stale {
+                    bind_groups_built_for = cur_mesh_rev;
+                    mesh_main_bg.clear();
+                    for slot in 0..gpu_meshes.len() {
+                        let groups = gpu_meshes[slot].as_ref().map_or_else(Vec::new, |mesh| {
+                            mesh.submeshes
                                 .iter()
                                 .map(|sm| {
                                     make_mesh_main_bg(
@@ -3618,9 +3936,34 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                                     )
                                 })
                                 .collect()
-                        })
-                        .collect();
-                    lod_main_bg.push(per_lod);
+                        });
+                        mesh_main_bg.push(groups);
+                    }
+                    // M11.1 — per-LOD bind groups: same (current) instance buffer + that LOD's submesh textures.
+                    lod_main_bg.clear();
+                    for (slot, lods) in gpu_lods.iter().enumerate() {
+                        let per_lod: Vec<Vec<wgpu::BindGroup>> = lods
+                            .iter()
+                            .map(|lod| {
+                                lod.submeshes
+                                    .iter()
+                                    .map(|sm| {
+                                        make_mesh_main_bg(
+                                            &device,
+                                            &mesh_inst_bgl,
+                                            &mesh_inst[slot].buf,
+                                            &sm.base_view,
+                                            &sm.mr_view,
+                                            &sm.normal_view,
+                                            &sm.ao_view,
+                                            &albedo_sampler,
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        lod_main_bg.push(per_lod);
+                    }
                 }
                 // Tracking-line endpoints (rebuilt in lock-step with instances). Visibility is routed at
                 // the draw pass so switching modes cannot invalidate this scene-owned upload.
@@ -7548,6 +7891,248 @@ mod tests {
         }
     }
 
+    // ── the cinematic camera's occlusion broad phase ──────────────────────────────────────────────
+    //
+    // The pure planner in `metrocalk-animation` is tested against a stubbed world; these are the other
+    // half — that the ENGINE answers the three questions truthfully about real published instances.
+
+    /// A row of unit boxes along +X, plus one subject box at the origin. `1_1` is the subject; the rest
+    /// are the neighbours a close shot keeps ending up inside.
+    fn crowded_scene(neighbours: usize) -> SceneState {
+        let mut st = SceneState {
+            meshes: vec![mesh_of(0.5)],
+            meshes_revision: 1,
+            ids_revision: 1,
+            ..SceneState::default()
+        };
+        let box_at = |x: f32, z: f32| Instance {
+            center: [x, 0.0, z],
+            scale: 1.0,
+            color: [1.0, 1.0, 1.0],
+            selected: 0.0,
+            rotation: IDENTITY_QUAT,
+            material: [0.0; 4],
+        };
+        st.instances.push(box_at(0.0, 0.0));
+        st.ids.push("1_1".into());
+        st.mesh_slots.push(0);
+        for n in 0..neighbours {
+            #[allow(clippy::cast_precision_loss)]
+            let x = 3.0 + n as f32 * 2.0;
+            st.instances.push(box_at(x, 0.0));
+            st.ids.push(format!("1_{}", n + 2));
+            st.mesh_slots.push(0);
+        }
+        st
+    }
+
+    fn subject_only() -> std::collections::HashSet<u32> {
+        std::iter::once(0u32).collect()
+    }
+
+    #[test]
+    fn an_empty_occlusion_structure_reports_an_open_world() {
+        // Nothing built yet: the answer must be the one that changes no direction at all.
+        let st = SceneState::default();
+        let vantage = st.vantage(
+            [0.0, 0.0, -5.0],
+            [0.0; 3],
+            [0.0; 3],
+            1.0,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(vantage, metrocalk_animation::shot::Vantage::OPEN);
+        assert!(vantage.acceptable());
+    }
+
+    /// The frame that came back solid dark red: the camera standing inside a machine housing.
+    #[test]
+    fn a_camera_standing_inside_a_neighbour_is_reported_as_buried() {
+        let mut st = crowded_scene(3);
+        st.sync_occlusion();
+        // Dead centre of the first neighbour (a unit box at x = 3).
+        let buried = st.vantage([3.0, 0.0, 0.0], [0.0; 3], [0.0; 3], 0.87, &subject_only());
+        assert!(buried.eye_inside, "{buried:?}");
+        assert!(!buried.acceptable());
+        // And well clear of everything, on the far side, it is not.
+        let clear = st.vantage([0.0, 0.0, -8.0], [0.0; 3], [0.0; 3], 0.87, &subject_only());
+        assert!(!clear.eye_inside, "{clear:?}");
+        assert!(clear.acceptable(), "{clear:?}");
+    }
+
+    /// The subject is never its own obstruction — a close shot is by definition close to it, and the
+    /// pure solver already guarantees the camera stays outside it.
+    #[test]
+    fn the_subject_is_excluded_from_its_own_obstruction_test() {
+        let mut st = crowded_scene(0);
+        st.sync_occlusion();
+        // Inside the subject's own box, but not exactly at its centre: an eye AT the centre is a
+        // degenerate camera the query declines to answer about at all, which would make this pass for
+        // the wrong reason.
+        let eye = [0.2, 0.0, 0.0];
+        assert!(
+            !st.vantage(eye, [0.0; 3], [0.0; 3], 0.87, &subject_only())
+                .eye_inside,
+            "the subject must not veto its own shot"
+        );
+        // With nothing excluded, the very same point IS buried — so the exclusion is doing the work,
+        // and the test is not passing because the query found nothing at all.
+        assert!(
+            st.vantage(
+                eye,
+                [0.0; 3],
+                [0.0; 3],
+                0.87,
+                &std::collections::HashSet::new()
+            )
+            .eye_inside
+        );
+    }
+
+    /// A neighbour standing between the camera and its subject blocks the view, and the fraction is a
+    /// fraction — a wall reports far less clearance than open air.
+    #[test]
+    fn a_part_between_the_camera_and_its_subject_reduces_the_clear_fraction() {
+        let mut st = crowded_scene(1);
+        st.sync_occlusion();
+        // Behind the neighbour at x = 3, looking back at the subject at the origin.
+        let blocked = st.vantage([8.0, 0.0, 0.0], [0.0; 3], [0.0; 3], 0.87, &subject_only());
+        let open = st.vantage([0.0, 0.0, -8.0], [0.0; 3], [0.0; 3], 0.87, &subject_only());
+        assert!(
+            blocked.clear < open.clear,
+            "a part in the way must reduce clearance: blocked={blocked:?} open={open:?}"
+        );
+        assert!(
+            blocked.clear < metrocalk_animation::shot::MIN_CLEAR_FRACTION,
+            "a box squarely in the line of sight is not an acceptable view: {blocked:?}"
+        );
+        assert!((open.clear - 1.0).abs() < 1.0e-6, "{open:?}");
+    }
+
+    /// The other half of a good frame: something behind the subject to read it against. This is what
+    /// separates "a machine in a factory" from "a part floating in a void".
+    #[test]
+    fn backing_measures_what_is_behind_the_subject_not_what_is_in_front() {
+        let mut st = crowded_scene(6);
+        st.sync_occlusion();
+        // Looking along the row: the neighbours are all behind the subject.
+        let into_the_row = st.vantage([-6.0, 0.4, 0.0], [0.0; 3], [0.0; 3], 0.87, &subject_only());
+        // Looking the other way, level, from just past the far end of the row: nothing behind it, and
+        // the camera is high enough that the floor is not in the sample cone either.
+        let out_of_the_building = st.vantage(
+            [18.0, 40.0, 0.0],
+            [0.0, 40.0, 0.0],
+            [0.0, 40.0, 0.0],
+            0.87,
+            &subject_only(),
+        );
+        assert!(
+            into_the_row.backing > out_of_the_building.backing,
+            "shooting into the factory must back better than shooting out of it: \
+             {into_the_row:?} vs {out_of_the_building:?}"
+        );
+    }
+
+    /// The presentation ground is a quad the renderer draws directly, not an instance, so it is absent
+    /// from any structure built over the instance list. A bird's-eye shot is aimed straight at it.
+    #[test]
+    fn the_floor_counts_as_backing_even_though_it_is_not_an_instance() {
+        let mut st = crowded_scene(0);
+        st.sync_occlusion();
+        let looking_down = st.vantage([0.0, 12.0, 0.1], [0.0; 3], [0.0; 3], 0.87, &subject_only());
+        assert!(
+            looking_down.backing > 0.5,
+            "a shot aimed at the floor is not aimed at a void: {looking_down:?}"
+        );
+    }
+
+    /// The structure is built once for an instance SET and reused. A pose change (which is every
+    /// animation frame) must not trigger a rebuild, or the query would cost more than the film.
+    #[test]
+    fn the_occlusion_structure_is_built_once_per_instance_set() {
+        let mut st = crowded_scene(4);
+        assert_eq!(st.occlusion_revision, None);
+        st.sync_occlusion();
+        assert_eq!(st.occlusion_revision, Some(1));
+        let nodes = st.occlusion.node_count();
+        assert!(nodes > 0);
+
+        // A published pose moves `revision`, never `ids_revision` — no rebuild.
+        st.revision = st.revision.wrapping_add(1);
+        st.instances[1].center[0] += 1.5;
+        st.sync_occlusion();
+        assert_eq!(st.occlusion_revision, Some(1), "a pose must not rebuild it");
+
+        // Membership changing does.
+        st.ids_revision = 2;
+        st.sync_occlusion();
+        assert_eq!(st.occlusion_revision, Some(2));
+    }
+
+    /// End to end, through the real planner: a close shot whose directed placement is inside a
+    /// neighbour must come back re-aimed, and the re-aimed placement must actually be clear.
+    #[test]
+    fn the_planner_moves_a_close_shot_out_of_the_part_next_door() {
+        use metrocalk_animation::shot::{
+            plan_shot, solve_shot_adjusted, ShotAngle, ShotMove, ShotRecipe, ShotSize,
+            SubjectSample,
+        };
+        let mut st = crowded_scene(1);
+        // Put the neighbour exactly where a Profile close-up wants to stand, rather than guessing.
+        let subject = SubjectSample {
+            center: [0.0; 3],
+            half_extent: [0.5; 3],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let shot = ShotRecipe {
+            id: "s".into(),
+            subject: "1_1".into(),
+            size: ShotSize::Close,
+            angle: ShotAngle::Profile,
+            motion: ShotMove::Hold,
+            amount: 0.35,
+            seconds: 2.0,
+        };
+        let directed =
+            metrocalk_animation::shot::solve_shot_eased(&shot, subject, 0.0, 16.0 / 9.0, 50.0);
+        st.instances[1].center = directed.eye;
+        st.instances[1].scale = 2.0;
+        st.ids_revision += 1;
+        st.sync_occlusion();
+
+        let buried = st.vantage(
+            directed.eye,
+            directed.look_at,
+            subject.center,
+            subject.radius(),
+            &subject_only(),
+        );
+        assert!(buried.eye_inside, "fixture is wrong: {buried:?}");
+
+        let plan = plan_shot(&shot, subject, 16.0 / 9.0, 50.0, |pose, _| {
+            st.vantage(
+                pose.eye,
+                pose.look_at,
+                subject.center,
+                subject.radius(),
+                &subject_only(),
+            )
+        });
+        assert!(!plan.is_authored(&shot), "{plan:?}");
+        let rescued = solve_shot_adjusted(&shot, plan, subject, 0.0, 16.0 / 9.0, 50.0);
+        let after = st.vantage(
+            rescued.eye,
+            rescued.look_at,
+            subject.center,
+            subject.radius(),
+            &subject_only(),
+        );
+        assert!(
+            after.acceptable(),
+            "the planner returned a placement that is still no good: {after:?} from {plan:?}"
+        );
+    }
+
     #[test]
     fn the_mesh_bounds_memo_answers_exactly_what_walking_the_vertices_does() {
         let mut st = one_instance_scene(3.0);
@@ -8050,12 +8635,35 @@ mod tests {
         st.focus_on(1);
         assert!(st.focused.is_some() && st.distance < 60.0);
         st.clear_focus();
-        // "Everything comes back to normal": dim flag cleared + the saved distance restored.
+        // "Everything comes back to normal": dim flag cleared + the saved framing restored.
         assert_eq!(st.focused, None);
         assert_eq!(st.distance, 60.0);
         assert_eq!(st.pre_focus_distance, None);
-        // Selection is intentionally retained (only the dim + zoom revert).
+        // The AIM comes back too. Restoring only the distance left the camera at its old remove while
+        // still pointed at the part -- so leaving focus read as the camera jumping somewhere arbitrary
+        // rather than as going back to where the viewer was.
+        assert_eq!(st.cam_target, [0.0, 0.0, 0.0]);
+        assert_eq!(st.pre_focus_target, None);
+        // Selection is intentionally retained (only the dim + framing revert).
         assert_eq!(st.selected, Some(1));
+    }
+
+    /// The camera has to come back to WHERE IT WAS, not to the origin: a viewer working across a large
+    /// imported scene is rarely orbiting `[0, 0, 0]`, and a "restore" that lands there is a jump too.
+    #[test]
+    fn unfocus_returns_the_camera_to_the_view_the_author_left() {
+        let mut st = scene(4);
+        st.cam_target = [120.0, 3.5, -45.0];
+        st.distance = 88.0;
+        st.focus_on(2);
+        assert_ne!(
+            st.cam_target,
+            [120.0, 3.5, -45.0],
+            "focus must aim at the part"
+        );
+        st.clear_focus();
+        assert_eq!(st.cam_target, [120.0, 3.5, -45.0]);
+        assert_eq!(st.distance, 88.0);
     }
 
     #[test]
@@ -8067,6 +8675,8 @@ mod tests {
         assert_eq!(st.cam_target, [6.0, 1.0, 0.0]); // re-centered on the new entity
         st.clear_focus();
         assert_eq!(st.distance, 60.0); // back to the true original, not the intermediate focus distance
+                                       // Same rule for the aim: the view saved on the FIRST focus, not the second one's subject.
+        assert_eq!(st.cam_target, [0.0, 0.0, 0.0]);
     }
 
     #[test]

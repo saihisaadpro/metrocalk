@@ -145,9 +145,45 @@ test("rejects black, near-black, and essentially static sample series while allo
   const mostlyHeldCinematic = evaluateVisualContent({
     luminanceSamples: Array.from({ length: sampleCount }, (_, index) => 48 + (index % 5)),
     motionSamples: Array.from({ length: sampleCount - 1 }, (_, index) => (index < 10 ? 2.5 : 0)),
+    contrastSamples: Array(sampleCount).fill(95),
   });
   assert.equal(mostlyHeldCinematic.passed, true);
   assert.equal(mostlyHeldCinematic.motion.movingTransitionFraction > 0.08, true);
+});
+
+test("rejects a film whose frames are filled by one surface, and names how many", () => {
+  // The fifteen interdecile-luma readings measured on the first delivered factory film. Five of them
+  // are the camera inside or hard against geometry; the film passed every other check in this gate.
+  const deliveredFilm = [103, 26, 29, 5, 124, 132, 137, 105, 56, 62, 12, 123, 39, 90, 91];
+  const brightAndMoving = {
+    luminanceSamples: Array(deliveredFilm.length).fill(96),
+    motionSamples: Array(deliveredFilm.length - 1).fill(2.5),
+  };
+  const obscured = evaluateVisualContent({
+    ...brightAndMoving,
+    contrastSamples: deliveredFilm,
+  });
+  const legibility = obscured.checks.find((item) => item.id === "visual-frames-legible");
+  assert.equal(legibility.passed, false);
+  assert.equal(legibility.actual.legibleFrames, 10);
+  assert.equal(legibility.actual.sampledFrames, 15);
+  // Every other visual check still passes: a wall two centimetres from the lens is a well-exposed,
+  // perfectly stable picture, which is exactly why this check had to be added.
+  assert.equal(obscured.checks.find((item) => item.id === "visual-not-near-black").passed, true);
+  assert.equal(obscured.checks.find((item) => item.id === "visual-not-static").passed, true);
+
+  // The same film with its five obscured frames re-aimed passes.
+  const rescued = evaluateVisualContent({
+    ...brightAndMoving,
+    contrastSamples: deliveredFilm.map((value) => (value < 40 ? 88 : value)),
+  });
+  assert.equal(rescued.checks.find((item) => item.id === "visual-frames-legible").passed, true);
+  assert.equal(rescued.passed, true);
+
+  // Missing data is never a pass. A caller that does not measure contrast has not shown the film is
+  // legible, and this check reports that rather than waving it through.
+  const unmeasured = evaluateVisualContent(brightAndMoving);
+  assert.equal(unmeasured.checks.find((item) => item.id === "visual-frames-legible").passed, false);
 });
 
 function discoverFfmpeg() {

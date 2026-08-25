@@ -8254,6 +8254,17 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // The instance whose selection outline a cutscene borrowed, and its original flag. Restored the
     // moment the shot ends, so the author's selection is never actually changed - only hidden.
     let mut cinema_dimmed: Option<(String, f32)> = None;
+    // The camera placement in force for the LIVE shot: `(owner, shot index, adjustment)`.
+    //
+    // A shot's placement is negotiated against the scene once, when the shot begins, and then held for
+    // its whole length. Re-planning per tick would be the same query answered sixty times a second, and
+    // worse than that: the answer could change between two frames of one continuous move and the camera
+    // would visibly jump mid-shot — an obscured shot traded for a broken one. One slot is enough because
+    // `cinema_owner` guarantees exactly one cutscene holds the camera at a time.
+    let mut cinema_shot_plans: Option<(
+        EntityId,
+        HashMap<usize, metrocalk_animation::shot::ShotAdjustment>,
+    )> = None;
     // (entity, key, cutscene, start frame while running, ALREADY PLAYED).
     //
     // The last flag is what stops a cutscene re-arming itself. `Cinematic.playing` is authored true and
@@ -14678,6 +14689,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             st.cinematic_subject_id = None;
                             st.cinematic_shot_index = None;
                             st.cinematic_visited_subjects.clear();
+                            // Run-scoped, exactly like the visited list above it. A film is fifteen
+                            // separately armed cutscenes and the record has to span all of them; clearing
+                            // it when each one takes the camera would leave only the last one's shots.
+                            st.cinematic_placements.clear();
                             st.fx_peak_total = 0;
                             st.fx_bursts_fired = 0;
                             st.fx_peak_radiance = 0.0;
@@ -15184,7 +15199,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // the render projection ADR-021 already sanctions. On the falling edge — or when the
                 // shot list runs out — we hand the camera back exactly as we found it.
                 if play_mode && !play_cinematics.is_empty() {
-                    use metrocalk_animation::shot::{cinematic_clip_planes, solve_shot_eased};
+                    use metrocalk_animation::shot::{
+                        cinematic_clip_planes, solve_shot_adjusted, ShotAdjustment,
+                    };
                     for (entity, key, cut, started, played) in &mut play_cinematics {
                         let wants = rule_session.as_ref().is_some_and(|s| {
                             matches!(
@@ -15238,10 +15255,15 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 drop(st);
                                 cinema_owner = Some(*entity);
                                 *started = Some(frame);
+                                // A re-triggered cutscene re-negotiates. The scene it was planned
+                                // against may have been edited since, and a placement that was clear
+                                // then is only a guess now.
+                                cinema_shot_plans = None;
                             }
                             (false, Some(_)) => {
                                 *started = None;
                                 cinema_owner = None;
+                                cinema_shot_plans = None;
                                 let mut st = shared.lock().unwrap();
                                 if let Some(saved) = cinema_saved_cam.take() {
                                     st.cam_override = saved;
@@ -15269,6 +15291,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             *started = None;
                             *played = true;
                             cinema_owner = None;
+                            cinema_shot_plans = None;
                             let mut st = shared.lock().unwrap();
                             if let Some(saved) = cinema_saved_cam.take() {
                                 st.cam_override = saved;
@@ -15280,35 +15303,65 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         // Sample both sides of an intra-cutscene transition LIVE. A previous shot may
                         // film a different subject, so reusing the current bounds would make the blend
                         // aim between a correct pose and a pose solved around the wrong object.
-                        let (sample, previous_sample, aspect) = {
+                        let (sample, previous_sample, aspect, plan, previous_plan) = {
                             let mut st = shared.lock().unwrap();
                             // The subject sampler reads per-instance mesh bounds; make sure it reads
                             // them from the memo rather than re-walking every vertex of every part in
                             // the subject's subtree, once per tick, at 60 Hz.
                             st.sync_mesh_bounds();
-                            (
-                                cinematic_shot_subject_sample(&engine, &mut st, *entity, shot),
-                                playback.blend_from.map(|(previous, _)| {
-                                    cinematic_shot_subject_sample(
-                                        &engine,
-                                        &mut st,
-                                        *entity,
-                                        &cut.shots[previous],
-                                    )
-                                }),
-                                if st.surface_aspect.is_finite() && st.surface_aspect > 0.1 {
-                                    st.surface_aspect
-                                } else {
-                                    16.0 / 9.0
-                                },
-                            )
+                            let sample =
+                                cinematic_shot_subject_sample(&engine, &mut st, *entity, shot);
+                            let previous_sample = playback.blend_from.map(|(previous, _)| {
+                                cinematic_shot_subject_sample(
+                                    &engine,
+                                    &mut st,
+                                    *entity,
+                                    &cut.shots[previous],
+                                )
+                            });
+                            let aspect = if st.surface_aspect.is_finite() && st.surface_aspect > 0.1
+                            {
+                                st.surface_aspect
+                            } else {
+                                16.0 / 9.0
+                            };
+                            // Negotiate this shot's placement against the rest of the scene, ONCE,
+                            // the first tick it is live. Every later tick reads the answer back out.
+                            let plans = match &mut cinema_shot_plans {
+                                Some((owner, plans)) if owner == entity => plans,
+                                slot => {
+                                    *slot = Some((*entity, HashMap::new()));
+                                    &mut slot.as_mut().expect("just assigned").1
+                                }
+                            };
+                            let plan = *plans.entry(playback.index).or_insert_with(|| {
+                                plan_cinematic_shot(&engine, &mut st, *entity, shot, sample, aspect)
+                            });
+                            // The shot being blended FROM was live a moment ago, so its placement is
+                            // already decided; falling back to the authored one would make a blend
+                            // start from a pose the planner had rejected.
+                            let previous_plan = playback.blend_from.map(|(previous, _)| {
+                                plans.get(&previous).copied().unwrap_or_else(|| {
+                                    ShotAdjustment::authored(&cut.shots[previous])
+                                })
+                            });
+                            (sample, previous_sample, aspect, plan, previous_plan)
                         };
-                        let current_pose =
-                            solve_shot_eased(shot, sample, playback.progress, aspect, 50.0);
+                        let current_pose = solve_shot_adjusted(
+                            shot,
+                            plan,
+                            sample,
+                            playback.progress,
+                            aspect,
+                            50.0,
+                        );
                         let previous_pose = playback.blend_from.zip(previous_sample).map(
                             |((previous, _), previous_sample)| {
-                                solve_shot_eased(
+                                solve_shot_adjusted(
                                     &cut.shots[previous],
+                                    previous_plan.unwrap_or_else(|| {
+                                        ShotAdjustment::authored(&cut.shots[previous])
+                                    }),
                                     previous_sample,
                                     1.0,
                                     aspect,
@@ -15316,15 +15369,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 )
                             },
                         );
-                        let mut pose = playback.blend_camera(previous_pose, current_pose);
-                        // A low angle on a subject standing on the ground put the camera UNDER the
-                        // floor - below the ground body every run creates, and below the grid. Clamp
-                        // rather than forbid the angle: the shot still looks up, it just does it from
-                        // a place a camera could actually be.
-                        const CAMERA_FLOOR: f32 = 0.15;
-                        if pose.eye[1] < CAMERA_FLOOR {
-                            pose.eye[1] = CAMERA_FLOOR;
-                        }
+                        // Both endpoints already stand on or above `CAMERA_FLOOR` (`solve_shot_adjusted`
+                        // applies it), and a blend is a linear mix of two poses, so the blended eye
+                        // cannot be lower than the lower of them. The floor moved into the solve because
+                        // the shot PLANNER has to judge the pose that is actually filmed: clamping after
+                        // the fact meant a low-angle candidate was validated at a position under the
+                        // floor and then filmed from somewhere else.
+                        let pose = playback.blend_camera(previous_pose, current_pose);
                         let planes_for = |subject: metrocalk_animation::shot::SubjectSample| {
                             let camera_distance = pose
                                 .eye
@@ -21649,6 +21700,104 @@ fn cinematic_subject_sample(
     }
 }
 
+/// Which entity a shot is actually about: its named subject when that still exists, and the cutscene
+/// itself otherwise. Extracted so the sampler and the occlusion planner cannot drift apart about which
+/// object a shot is of — a planner that excluded the wrong subject would treat the thing being filmed as
+/// the obstruction and step away from it.
+fn cinematic_shot_subject(
+    engine: &Engine<FlecsWorld>,
+    cutscene_entity: EntityId,
+    shot: &metrocalk_animation::shot::ShotRecipe,
+) -> EntityId {
+    EntityId::from_loro_key(&shot.subject)
+        .filter(|entity| engine.entity_exists(*entity))
+        .unwrap_or(cutscene_entity)
+}
+
+/// Decide where this shot's camera will actually stand, by negotiating the authored placement against
+/// everything else in the scene.
+///
+/// The pure solver frames ONE object and knows nothing about the other 15,710 parts of an imported
+/// factory, so a close card routinely resolves to a point inside the machine next door: the first
+/// delivered film had a solid dark-red frame, two black ones and a louvre at arm's length among fifteen
+/// samples. Here the engine supplies the missing half — is the camera buried, can it see its subject,
+/// and is there anything behind the subject to read it against — and
+/// [`metrocalk_animation::shot::plan_shot`] walks a fixed ladder of alternatives until something is
+/// acceptable.
+///
+/// Called ONCE per shot. The occlusion structure it needs is built on first use and then reused for the
+/// whole film, so the cost lands on one tick near the start of a cutscene rather than on all of them.
+fn plan_cinematic_shot(
+    engine: &Engine<FlecsWorld>,
+    state: &mut render::SceneState,
+    cutscene_entity: EntityId,
+    shot: &metrocalk_animation::shot::ShotRecipe,
+    sample: metrocalk_animation::shot::SubjectSample,
+    aspect: f32,
+) -> metrocalk_animation::shot::ShotAdjustment {
+    let started = std::time::Instant::now();
+    state.sync_occlusion();
+    // The subject's own parts are never obstructions. `cinema_subtree` is the same memo the sampler
+    // filled a moment ago, keyed by the same entity, so this is a lookup rather than a second descent.
+    let key = cinematic_shot_subject(engine, cutscene_entity, shot).to_loro_key();
+    let subject: std::collections::HashSet<u32> = state
+        .cinema_subtree
+        .get(&key)
+        .map(|indices| {
+            indices
+                .iter()
+                .filter_map(|index| u32::try_from(*index).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let radius = sample.radius();
+    let plan =
+        metrocalk_animation::shot::plan_shot(shot, sample, aspect, 50.0, |pose, _progress| {
+            state.vantage(pose.eye, pose.look_at, sample.center, radius, &subject)
+        });
+    let name_of = |size: metrocalk_animation::shot::ShotSize| -> &'static str {
+        use metrocalk_animation::shot::ShotSize as S;
+        match size {
+            S::ExtremeWide => "extreme_wide",
+            S::Wide => "wide",
+            S::Full => "full",
+            S::Medium => "medium",
+            S::Close => "close",
+            S::ExtremeClose => "extreme_close",
+        }
+    };
+    // A record of a run, not a log that outlives one. Fifteen cutscenes of two shots is thirty entries;
+    // a rule that cycles a cue could re-arm a cutscene indefinitely, and this is diagnostic evidence, not
+    // something worth letting grow without bound inside the scene state.
+    const MAX_RECORDED_PLACEMENTS: usize = 256;
+    if state.cinematic_placements.len() >= MAX_RECORDED_PLACEMENTS {
+        state.cinematic_placements.remove(0);
+    }
+    state.cinematic_placements.push(render::CinematicPlacement {
+        shot: shot.id.clone(),
+        subject: key.clone(),
+        directed_size: name_of(shot.size),
+        filmed_size: name_of(plan.size),
+        yaw_offset_deg: plan.yaw_offset_deg,
+        rejected: plan.steps,
+    });
+    // NEVER SILENT. A film that quietly re-aimed half its shots and a film that was directed well are
+    // indistinguishable from the outside, and the difference is the whole point of the mechanism.
+    if !plan.is_authored(shot) {
+        diag_log!(
+            "cinematics: shot {} on {key} was obstructed as directed ({:?}) - filming it {:?} \
+             turned {:.0} degrees, after {} rejected placement(s) in {} ms",
+            shot.id,
+            shot.size,
+            plan.size,
+            plan.yaw_offset_deg,
+            plan.steps,
+            started.elapsed().as_millis(),
+        );
+    }
+    plan
+}
+
 /// Resolve one shot's live subject bounds and facing through the shared render projection. Keeping this
 /// lookup reusable is what lets an intra-cutscene blend solve two genuinely different subjects without
 /// duplicating the hierarchy/bounds policy in the playback loop.
@@ -21658,9 +21807,7 @@ fn cinematic_shot_subject_sample(
     cutscene_entity: EntityId,
     shot: &metrocalk_animation::shot::ShotRecipe,
 ) -> metrocalk_animation::shot::SubjectSample {
-    let subject = EntityId::from_loro_key(&shot.subject)
-        .filter(|entity| engine.entity_exists(*entity))
-        .unwrap_or(cutscene_entity);
+    let subject = cinematic_shot_subject(engine, cutscene_entity, shot);
     let transform = capscene::global_transform(engine, subject);
     let mut sample = cinematic_subject_sample(engine, state, subject, transform);
 
@@ -22291,6 +22438,25 @@ fn camera_probe(state: State<AppState>) -> serde_json::Value {
         "subjectId": st.cinematic_subject_id.clone(),
         "shotIndex": st.cinematic_shot_index,
         "visitedSubjects": st.cinematic_visited_subjects.clone(),
+        // How much of the direction survived contact with the scene. A shot solved against its subject
+        // alone often wants to stand inside the part next door, so the runtime negotiates each placement
+        // once and reports what it settled on; `rejected: 0` with no yaw is the shot as written.
+        "shotPlacements": st
+            .cinematic_placements
+            .iter()
+            .map(|placement| {
+                serde_json::json!({
+                    "shot": placement.shot,
+                    "subject": placement.subject,
+                    "directedSize": placement.directed_size,
+                    "filmedSize": placement.filmed_size,
+                    "yawOffsetDeg": placement.yaw_offset_deg,
+                    "rejected": placement.rejected,
+                    "asDirected": placement.directed_size == placement.filmed_size
+                        && placement.yaw_offset_deg == 0.0,
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
