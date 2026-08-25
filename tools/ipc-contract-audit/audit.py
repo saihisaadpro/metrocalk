@@ -1275,12 +1275,13 @@ def run(root: str) -> tuple[list[Finding], dict]:
     # because a read is only attributable to a reply within the block that bound it.
     reads: list[jsreads.Read] = []
     tuple_reads: list[jsreads.TupleRead] = []
-    bound = 0
+    bound = aliases = 0
     for rel, text in ts_call_src + e2e_src:
         r = jsreads.parse(tsipc.strip_comments(text), rel)
         reads += r.reads
         tuple_reads += r.tuples
         bound += r.bound
+        aliases += r.aliases
 
     findings = _coverage_findings(root, missing, rs, ts)
     compared = fields_compared = nested_pairs = 0
@@ -1316,6 +1317,7 @@ def run(root: str) -> tuple[list[Finding], dict]:
         "shape_fields": fields_compared,
         "nested_pairs": nested_pairs,
         "untyped_bound": bound,
+        "read_aliases": aliases,
         "read_paths": len(reads),
         "read_steps": read_steps,
         "read_unresolved": read_unresolved,
@@ -1383,7 +1385,8 @@ def main() -> int:
             f"type); {stats['shape_compared']} of {stats['typed_invocations']} replies compared, "
             f"{stats['shape_fields']} of those field-by-field, and {stats['nested_pairs']} nested "
             f"object pair(s) followed below the top level; "
-            f"{stats['untyped_bound']} untyped reply(s) bound in JavaScript, "
+            f"{stats['untyped_bound']} untyped reply(s) bound in JavaScript "
+            f"({stats['read_aliases']} sub-path(s) followed through an alias binding), "
             f"{stats['read_paths']} distinct field path(s) read off them, {stats['read_steps']} "
             f"step(s) compared ({stats['read_unresolved']} walk(s) stopped early), and "
             f"{stats['tuples_compared']} of {stats['tuple_reads']} positional destructuring(s) "

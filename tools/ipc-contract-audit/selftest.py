@@ -41,6 +41,7 @@ fn entity_info(state: State<AppState>, id: String) -> EntityInfo {
         id,
         parent_id: None,
         placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new(), nickname: None, alias_name: None, frozen_name: None },
+        tags: Vec::new(),
         seen_at: 0,
         tag_count: 0,
         facing: Facing::FaceNorth,
@@ -91,12 +92,23 @@ pub struct Placement {
     pub frozen_name: Option<String>,
 }
 
+// A LIST OF OBJECTS inside a reply — the shape the alias cases need, and the shape the real defect
+// had. Its own struct rather than a reuse of `Extra`, whose `kind` is the flatten pin: a case that
+// drifted a field two pins share would not say which mechanism caught it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tag {
+    pub tag_id: String,
+    pub as_directed: bool,
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EntityInfo {
     pub id: String,
     pub parent_id: Option<String>,
     pub placement: Placement,
+    pub tags: Vec<Tag>,
     pub seen_at: u64,
     pub tag_count: usize,
     pub facing: Facing,
@@ -141,6 +153,7 @@ fn entity_seen(state: State<AppState>) -> EntityInfo {
         id: String::new(),
         parent_id: None,
         placement: Placement { world_x: 0.0, label: String::new(), source_file: String::new(), nickname: None, alias_name: None, frozen_name: None },
+        tags: Vec::new(),
         seen_at: 0,
         tag_count: 0,
         facing: Facing::FaceNorth,
@@ -208,6 +221,29 @@ describe("what a spec reads without declaring it", () => {
   it("reads a key a flattened struct splices in, which cannot be called absent", async () => {
     const t = await invoke("entity_tagged");
     if (t.kind !== "thing") throw new Error("kind");
+  });
+
+  it("reads through a name given to a sub-path of the reply", async () => {
+    const seen = await invoke("entity_seen");
+    const where = seen.placement ?? {};
+    if (where.worldX !== 0) throw new Error("worldX");
+
+    const tags = seen.tags ?? [];
+    if (tags.some((t) => t.asDirected)) throw new Error("asDirected");
+
+    // NEGATIVE PINS, and the reason the alias rule has three conditions rather than one. Neither
+    // name holds the reply's shape, and following either would INVENT a finding — the failure mode
+    // that is worse than a missed one, because it gets the gate waived:
+    //   * `first` is an ELEMENT and not the list — the chain ended in a builtin, so `path` is one
+    //     step shorter than `steps` and following it would prefix the element's own fields with the
+    //     list's path, which is a claim about a shape neither side has;
+    //   * `fallback` defaults to another expression rather than to an empty literal, so what it
+    //     holds when the key is absent is a shape this reader has never seen;
+    //   * `shouted` is a string: the initializer does not end where the chain does.
+    const first = seen.tags.at(0);
+    const fallback = seen.placement ?? somethingElse;
+    const shouted = where.label + "!";
+    if (first.inventedElementKey || fallback.inventedKey || shouted === "") throw new Error("pins");
   });
 });
 """
@@ -515,6 +551,32 @@ CASES: list[tuple[str, str, dict, dict]] = [
                        .replace("tag_count: 0,", "label_count: 0,")}},
         {},
     ),
+    # ── the same reads check, one level of INDIRECTION out ────────────────────────────────────────
+    #
+    # Proved on the committed tree before either case was written (2026-08-25, ADR-140): renaming
+    # `camera_probe`'s top-level `shotPlacements` key was caught, and renaming `asDirected` INSIDE
+    # its elements — read through `const placements = completedCamera.shotPlacements ?? [];` — was
+    # `0 blocking`. A sub-path given a name of its own stopped being part of the reply, and the E2E
+    # house style gives sub-paths names constantly.
+    #
+    # The second case is the real one: the alias is a LIST, and the drifted field is read through a
+    # callback's element parameter, so it exercises the alias rule and the element rule composed.
+    # Nothing composed them before, and each was individually correct.
+    (
+        "a renamed field read through a name given to a sub-object of the reply",
+        r"is read as `seen`\.placement\.worldX, but `Placement` never sends `worldX`",
+        {"overrides": {"editor-shell/src-tauri/src/main.rs":
+                       swap(BASE_MAIN, "pub world_x: f64,", "pub easting: f64,")
+                       .replace("world_x: 0.0,", "easting: 0.0,")}},
+        {},
+    ),
+    (
+        "a renamed field read through a callback element of an ALIASED list",
+        r"is read as `seen`\.tags\[0\]\.asDirected, but `Tag` never sends `asDirected`",
+        {"overrides": {"editor-shell/src-tauri/src/main.rs":
+                       swap(BASE_MAIN, "pub as_directed: bool,", "pub filmed_as_directed: bool,")}},
+        {},
+    ),
     # ── nullable ─────────────────────────────────────────────────────────────────────────────────
     #
     # Four cases over ONE pair of facts, because the pair is the whole point: `Option<T>` is two
@@ -729,6 +791,51 @@ def _findings(tmp: str, spec: dict) -> list[audit.Finding]:
     return audit.run(root)[0]
 
 
+#: `(name, spec source, the exact field paths the reader must recover)`.
+#:
+#: Each pin holds ONE condition of the alias rule, and each is written so that removing the condition
+#: changes the recovered set — which is the only observable a silent failure leaves.
+ALIAS_PATH_PINS = [
+    (
+        "an alias of a sub-object carries the sub-path into every read made through it",
+        'const r = await invoke("c");\nconst p = r.placement;\nif (p.label) x();\n',
+        ["placement", "placement.label"],
+    ),
+    (
+        "an alias defaulted with an empty literal is still the sub-path, through a callback element",
+        'const r = await invoke("c");\nconst xs = r.tags ?? [];\nif (xs.some((t) => t.flag)) x();\n',
+        ["tags", "tags.[].flag"],
+    ),
+    (
+        "a chain ending in a builtin binds the BUILTIN's result, and its reads are not the list's",
+        # A PROPERTY builtin (`.length`), not a method call, and this pin was rewritten once for
+        # exactly that reason: written as `r.tags.at(0)` it passed while the guard it names was
+        # deleted, because the trailing `(0)` is a tail the NEXT condition already rejects. Two
+        # conditions, one observable, and the pin was holding the wrong one. `.length` leaves the
+        # initializer ending where the chain ends, so this is the only condition left to stop it.
+        # The read off `count` is synthetic — the realistic forms of this mistake read nothing at
+        # all, and a pin that recovers an empty set cannot tell a guard from a broken parser.
+        'const r = await invoke("c");\nconst count = r.tags.length;\nif (count.flag) x();\n',
+        ["tags"],
+    ),
+    (
+        "a default that is another expression leaves a shape this reader has never seen",
+        'const r = await invoke("c");\nconst p = r.placement ?? other;\nif (p.label) x();\n',
+        ["placement"],
+    ),
+    (
+        "an initializer that does not end at the chain is not the sub-path",
+        'const r = await invoke("c");\nconst s = r.placement.label + "!";\nif (s.label) x();\n',
+        ["placement.label"],
+    ),
+    (
+        "a bare reassignment is not an alias: its prior meaning is not this reader's to reason about",
+        'const r = await invoke("c");\nlet p;\np = r.placement;\nif (p.label) x();\n',
+        ["placement"],
+    ),
+]
+
+
 def run() -> int:
     ok = True
     for name, pattern, drifted, repaired in CASES:
@@ -796,6 +903,28 @@ def run() -> int:
         else:
             print(f"pass  reverting the fix brings the wrong answer back: {name}")
             print(f"        → {wrong.message[:150]}")
+
+    # ── the alias rule, pinned by VALUE rather than by verdict ────────────────────────────────────
+    #
+    # Two of the rule's three conditions cannot be shown with a fixture case, and saying so is the
+    # point. Their violation does not produce a WRONG FINDING that a case could catch — it produces
+    # a path the comparison layer then cannot resolve, and stops. A run that followed a bad alias and
+    # a run that followed nothing print the same silence, so the only way to hold these is to assert
+    # the recovered paths themselves. (The GPU audit's string-continuation decoder is pinned to its
+    # value for exactly this reason: no verdict-shaped case can see it.)
+    import jsreads as _jsreads
+
+    for name, snippet, expected in ALIAS_PATH_PINS:
+        got = sorted(
+            ".".join(rd.path) for rd in _jsreads.parse(snippet, "pin.e2e.js").reads
+        )
+        if got != sorted(expected):
+            print(f"FAIL  the alias rule recovers the wrong paths: {name}")
+            print(f"        expected {sorted(expected)}")
+            print(f"        got      {got}")
+            ok = False
+        else:
+            print(f"pass  {name}")
 
     with tempfile.TemporaryDirectory() as tmp:
         base = audit.run(build(tmp))[0]

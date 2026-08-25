@@ -151,6 +151,12 @@ class JsReads:
     #: `await invoke("undo")` binds nothing and reads nothing — but counted, because a parser change
     #: that silently stopped finding reads would look exactly like a clean tree.
     bound: int = 0
+    #: Sub-paths of a reply given a NAME of their own (`const xs = reply.items ?? [];`) and then
+    #: followed through that name. Counted separately because it is the reach that was missing: the
+    #: reads it recovers were invisible for as long as this reader tracked only the bound reply
+    #: itself, and a run that followed none and a run with no aliases to follow print the same
+    #: findings. See `_reads_of`'s alias branch for what is deliberately NOT followed.
+    aliases: int = 0
 
 
 # ── source scanning ───────────────────────────────────────────────────────────────────────────────
@@ -237,6 +243,44 @@ def block_end(src: str, i: int) -> int:
     return n
 
 
+#: `const xs = ` immediately before a tracked name — the alias form. Anchored by the caller against
+#: the exact start of the name it matched, so `const ys = other.xs` cannot be mistaken for it.
+_ALIAS_OF = re.compile(rf"(?:const|let|var)\s+({_IDENT})\s*=\s*")
+
+#: The only tail an alias initializer may carry and still hold the sub-path's shape. `?? []` and
+#: `?? {}` are the suite's idiom for "or nothing"; anything else — another expression, a ternary, an
+#: arithmetic operator — changes what the name holds, and following it would attribute a foreign
+#: shape's reads to this reply.
+_EMPTY_DEFAULT = re.compile(r"(?:\?\?|\|\|)\s*(?:\[\s*\]|\{\s*\})")
+
+
+def _statement_end(src: str, i: int, limit: int) -> int | None:
+    """The `;` ending the statement that is still open at `i`, or `None` if it does not simply end.
+
+    Depth-aware, so the brackets of a `?? []` default and the parens of anything else are stepped
+    over rather than mistaken for the end. Returning `None` when the statement does not close with a
+    plain `;` before `limit` — or when depth goes negative, meaning `i` was never inside a statement
+    at all — is the conservative half of the alias rule: an initializer this cannot delimit is one
+    whose tail cannot be checked, and an unchecked tail is not followed.
+    """
+    depth = 0
+    while i < limit and i < len(src):
+        c = src[i]
+        if c in "\"'`":
+            i = _skip_string(src, i)
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif c == ";" and depth == 0:
+            return i
+        i += 1
+    return None
+
+
 def _chain(src: str, i: int) -> tuple[list[str], int]:
     """Read the `.a`, `?.b`, `[expr]` steps starting at `i`. Returns (steps, index past them).
 
@@ -282,12 +326,22 @@ def _chain(src: str, i: int) -> tuple[list[str], int]:
 
 
 def _reads_of(src: str, start: int, end: int, name: str, prefix: list[str], out: list[Read],
-              line_of, rel: str, cmd: str, via: str, depth: int = 0) -> None:
+              line_of, rel: str, cmd: str, via: str, depth: int = 0,
+              tally: "JsReads | None" = None) -> None:
     """Every read of `name` in `src[start:end]`, recorded with `prefix` in front of its path.
 
     Recurses once per element-yielding callback (`xs.map((r) => r.a)`), which is how a read reached
     through an alias keeps its `[]` step — the thing that makes `rules.map(r => r.name)` and
     `rules[0].name` the same claim, as they are.
+
+    …and once per ALIAS BINDING (`const xs = reply.items ?? []; xs.filter((x) => x.flag)`), which is
+    the same idea one level out and was the reader's blind spot until 2026-08-25. Proved rather than
+    supposed, on the committed tree: renaming the reply's top-level `shotPlacements` key was caught,
+    and renaming `asDirected` INSIDE its elements — read through exactly that alias — was `0
+    blocking`. The failure is silent in the worst way, because the spec does not throw: the E2E's
+    `placements.filter((p) => !p.asDirected)` turns every element into a re-aimed one when the key
+    goes missing (`!undefined` is `true`), so the run passes and its manifest reports a false number
+    about the film.
     """
     if depth > 3:
         return
@@ -308,7 +362,7 @@ def _reads_of(src: str, start: int, end: int, name: str, prefix: list[str], out:
                 if param:
                     body_end = _call_end(src, k)
                     _reads_of(src, body_start, body_end, param, prefix + ["[]"], out, line_of,
-                              rel, cmd, via, depth + 1)
+                              rel, cmd, via, depth + 1, tally)
             continue
 
         # Trailing builtins end the path: `x.a.length` is a read of `a`, then of the language.
@@ -320,6 +374,39 @@ def _reads_of(src: str, start: int, end: int, name: str, prefix: list[str], out:
         if not path or all(s == "[]" for s in path):
             continue
         out.append(Read(cmd, prefix + path, line_of(at), rel, via))
+
+        # `const xs = reply.items ?? [];` — this read is also a BINDING, and everything read off the
+        # new name is a read of `items`. Followed under three conditions, each of which exists to
+        # keep the alias's shape the same as the sub-path's:
+        #
+        #   * the chain reached the end of the initializer, so `const n = r.items.length;` and
+        #     `const s = r.items.join(",");` do not qualify — `path` stopped at a builtin while
+        #     `steps` did not, and what `n` holds is a number;
+        #   * nothing follows it but an EMPTY default. `?? []` and `?? {}` are the house idiom for
+        #     "or nothing" and leave the shape intact; `?? somethingElse`, `+ 1`, a ternary or a call
+        #     do not, and following those would attribute a foreign shape's reads to this reply —
+        #     a FALSE finding, which is worse here than a missed one (the same reasoning that keeps
+        #     `reduce` out of ELEMENT_METHODS);
+        #   * the alias is a fresh `const`/`let`/`var`. A bare reassignment is not followed: its
+        #     prior meaning is not this reader's to reason about.
+        if len(path) != len(steps):
+            continue
+        am = _ALIAS_OF.search(src, max(start, at - len(name) - 40), at - len(name))
+        if not am or am.end() != at - len(name):
+            continue
+        rest_end = _statement_end(src, after, end)
+        if rest_end is None:
+            continue
+        rest = src[after:rest_end].strip()
+        if rest and not _EMPTY_DEFAULT.fullmatch(rest):
+            continue
+        alias = am.group(1)
+        if tally is not None:
+            tally.aliases += 1
+        alias_start = rest_end + 1
+        alias_end = _scope_end(src, alias, alias_start, min(end, block_end(src, alias_start)))
+        _reads_of(src, alias_start, alias_end, alias, prefix + path, out, line_of, rel, cmd, via,
+                  depth + 1, tally)
 
 
 def _callback_param(src: str, open_paren: int) -> tuple[str, int]:
@@ -497,7 +584,8 @@ def parse(src: str, rel: str) -> JsReads:
         scope_start = call_end + 1
         scope_end = _scope_end(scan, name, scope_start, block_end(scan, scope_start))
 
-        _reads_of(scan, scope_start, scope_end, name, [], out.reads, line_of, rel, cmd, f"`{name}`")
+        _reads_of(scan, scope_start, scope_end, name, [], out.reads, line_of, rel, cmd, f"`{name}`",
+                  tally=out)
 
         # (d) `for (const r of xs) r.a` — the loop variable is an element of the binding. The body's
         # scope starts at its own `{`, NOT at the `)`: counted from the `)`, the loop's own braces
@@ -512,7 +600,7 @@ def parse(src: str, rel: str) -> JsReads:
             if body < len(scan) and scan[body] == "{":
                 body += 1
             _reads_of(scan, body, block_end(scan, body), fm.group(1), ["[]"], out.reads, line_of,
-                      rel, cmd, f"`{name}`")
+                      rel, cmd, f"`{name}`", tally=out)
 
     # One defect, one finding. The pre-fix `if (r.error) throw new Error(`… ${r.error}`)` reads the
     # same field twice on one line and produced the identical finding twice, which inflates
