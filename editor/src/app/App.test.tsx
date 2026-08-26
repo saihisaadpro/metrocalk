@@ -1,10 +1,21 @@
 import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { projectionStore } from "../store/projection";
 import { playStore } from "../store/play";
 import { walletStore } from "../store/wallet";
 import { toastStore } from "../store/toasts";
+
+// THE TWO HEAVY FILES GET THEIR OWN NUMBER, AND HERE IS THE MEASUREMENT.
+//
+// A 5000ms per-test default is a wall-clock budget, and vitest runs 77 files in parallel on
+// whatever cores are left. Measured on this tree, 2026-08-26: run ALONE this file takes 12.8s,
+// its slowest test 3634ms; run inside the full suite — on an otherwise IDLE box — it
+// timed out at 5000ms, in different tests on different runs, which is the signature of
+// contention rather than of a hang. Raising the GLOBAL timeout would hide every real hang in
+// the suite; these are the files that need the room, so this is where the number lives. 20s is
+// ~5.5x this file's own worst case and still nothing like the forever a deadlock takes.
+vi.setConfig({ testTimeout: 20_000 });
 
 afterEach(() => {
   projectionStore.getState().reset();
