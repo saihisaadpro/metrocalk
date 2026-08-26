@@ -16,7 +16,19 @@
 // by its own signature. Both read tools answer from memory with nothing to await, so the generated
 // bodies carry no `.await` -- which is the trait contract, not a mistake. The attribute has to be
 // file-scoped because the code it applies to does not exist until the macro has run.
-#![allow(clippy::unused_async)]
+//
+// `unused_async_trait_impl` is the same finding under the name clippy 1.98 gave it, and it needs the
+// same file scope for a sharper reason: an item-level `#[allow]` on the annotated `impl` does NOT
+// reach it, because `#[tool_router(server_handler)]` emits the `ServerHandler` impl as a SIBLING
+// item rather than inside the one it is written on. That was tried first, and CI reported the same
+// error from the same macro with the attribute in place.
+// AND `unknown_lints` WITH THEM, because this repository is compiled by TWO clippy versions: CI
+// resolves `rust-toolchain.toml`'s `stable` (1.98, which HAS `unused_async_trait_impl`) and this
+// box has 1.92, which does not — and an allow for a lint the compiler has never heard of is
+// itself an error under `-D warnings`. Naming the newer lint without this turns one job's red
+// into the other's.
+#![allow(unknown_lints)]
+#![allow(clippy::unused_async, clippy::unused_async_trait_impl)]
 
 use std::path::PathBuf;
 
@@ -52,13 +64,6 @@ fn rejected(reason: &str) -> CallToolResult {
     )])
 }
 
-// THE `async` HERE IS THE MACRO'S, NOT OURS. `#[tool_router(server_handler)]` expands to rmcp's
-// `ServerHandler` impl, whose trait methods are `async fn` by contract; the ones this server does not
-// override expand to bodies with nothing to await. clippy 1.98 added `unused_async_trait_impl` and it
-// fires on generated code no edit here can reach — the workspace job has been red on `main` for it
-// since that toolchain landed (`15b43fc` and two runs before it). Allowed at the only place that can
-// carry the attribute, with the reason, rather than left as an ambient red nobody reads.
-#[allow(clippy::unused_async_trait_impl)]
 #[tool_router(server_handler)]
 impl Metrocalk {
     // `&self` is required by rmcp's `#[tool]` macro contract; these two read tools don't need it.
