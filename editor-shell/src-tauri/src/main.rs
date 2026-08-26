@@ -21413,7 +21413,9 @@ fn pipe_world_point_scene(
                 rotated[2] + inst.center[2],
             ]
         };
-        for triangle in mesh.indices.chunks_exact(3) {
+        // `as_chunks::<3>()` rather than `chunks_exact(3)`: it yields `&[u32; 3]`, so the compiler
+        // knows the length the code already assumed. `clippy::chunks_exact_to_as_chunks` (1.98).
+        for triangle in mesh.indices.as_chunks::<3>().0 {
             let [a, b, c] = [
                 triangle[0] as usize,
                 triangle[1] as usize,
@@ -22158,7 +22160,8 @@ fn step_parts_from_scene(
 
         let mut triangles = Vec::new();
         for prim in &mesh.primitives {
-            for tri in prim.indices.chunks_exact(3) {
+            // Same as above: a fixed-size chunk the type system can see.
+            for tri in prim.indices.as_chunks::<3>().0 {
                 let (Some(a), Some(b), Some(c)) = (
                     prim.positions.get(tri[0] as usize),
                     prim.positions.get(tri[1] as usize),
