@@ -178,6 +178,17 @@ export type Scene = {
    *  did nothing would photograph the default state under a caption claiming another, which is worse
    *  than no capture at all. */
   click?: string[];
+  /** Text typed into a control, after `click`, before anything is asserted or captured.
+   *
+   *  `click` can reach a state that a BUTTON produces; it cannot reach one that only exists after a
+   *  QUERY. The established way round that was a wrapper component holding the query as a prop
+   *  (`SearchedLibrary` for `asset-library-search`), which works while the query lives in the
+   *  scene's own component — and does not when it lives inside the thing under test. The command
+   *  palette's query is `useState` inside `CommandPalette`, so the only honest way to photograph a
+   *  result list is to type into the real input the way a user does.
+   *
+   *  Same failure rule as `click`: a selector that matches nothing FAILS the scene. */
+  type?: [selector: string, text: string][];
   setup?: () => void;
   render: () => ReactNode;
 };
