@@ -9,6 +9,7 @@ import {
   DockTabs,
   EmptyPanelState,
   MenuPopup,
+  NavRail,
   PopupMenuGroup,
   PopupMenuItem,
   ShortcutBadge,
@@ -260,4 +261,73 @@ test("MenuPopup owns trigger semantics, keyboard entry, selection dismissal, and
   await waitFor(() => expect(screen.queryByRole("menu", { name: "Choose workspace" })).toBeNull());
   expect(choose).toHaveBeenCalledTimes(1);
   expect(document.activeElement).toBe(trigger);
+});
+
+// ── NavRail (ADR-147) ─────────────────────────────────────────────────────────────────────────────
+
+const RAIL_ITEMS = [
+  { id: "inspect", label: "Inspect", icon: <Icon name="inspect" size="md" />, tooltip: "Measure before changing." },
+  { id: "repair", label: "Repair", icon: <Icon name="repair" size="md" /> },
+  { id: "export", label: "Export", icon: <Icon name="export" size="md" />, tooltip: "No verified export writer is connected." },
+];
+
+test("NavRail: a real tablist whose selected item is the only tab stop", () => {
+  render(<NavRail id="stages" label="Stages" items={RAIL_ITEMS} activeId="repair" onChange={vi.fn()} />);
+
+  expect(screen.getByRole("tablist", { name: "Stages" }).getAttribute("aria-orientation")).toBe("vertical");
+  // ONE stop in the tab order for the whole rail: seven stages must not become seven Tab presses
+  // between the panel header and its content.
+  const stops = screen.getAllByRole("tab").filter((tab) => tab.getAttribute("tabindex") === "0");
+  expect(stops).toHaveLength(1);
+  expect(stops[0].textContent).toContain("Repair");
+});
+
+test("NavRail: arrows move the selection AND the focus, and wrap at both ends", () => {
+  function Harness() {
+    const [active, setActive] = useState("inspect");
+    return <NavRail id="stages" label="Stages" items={RAIL_ITEMS} activeId={active} onChange={setActive} />;
+  }
+  render(<Harness />);
+
+  fireEvent.keyDown(screen.getByRole("tab", { name: "Inspect" }), { key: "ArrowDown" });
+  expect(screen.getByRole("tab", { name: "Repair" }).getAttribute("aria-selected")).toBe("true");
+  expect(document.activeElement).toBe(screen.getByRole("tab", { name: "Repair" }));
+
+  // Wrapping is the claim: a rail that stops at the last item strands a keyboard user at the end.
+  fireEvent.keyDown(screen.getByRole("tab", { name: "Repair" }), { key: "ArrowUp" });
+  expect(screen.getByRole("tab", { name: "Inspect" }).getAttribute("aria-selected")).toBe("true");
+  fireEvent.keyDown(screen.getByRole("tab", { name: "Inspect" }), { key: "ArrowUp" });
+  expect(screen.getByRole("tab", { name: "Export" }).getAttribute("aria-selected")).toBe("true");
+});
+
+test("NavRail: each tab names the panel it controls, so the pair is one relationship and not two ids", () => {
+  render(
+    <NavRail id="stages" label="Stages" items={RAIL_ITEMS} activeId="inspect" onChange={vi.fn()} panelIdPrefix="asset-lab-" />,
+  );
+  const tab = screen.getByRole("tab", { name: "Inspect" });
+  expect(tab.id).toBe("stages-inspect-tab");
+  expect(tab.getAttribute("aria-controls")).toBe("asset-lab-inspect");
+});
+
+test("NavRail: a disabled item is skipped by the arrows and states its reason in words", () => {
+  const onChange = vi.fn();
+  const items = [
+    RAIL_ITEMS[0],
+    { ...RAIL_ITEMS[1], disabled: true, disabledReason: "Run Inspect first." },
+    RAIL_ITEMS[2],
+  ];
+  render(<NavRail id="stages" label="Stages" items={items} activeId="inspect" onChange={onChange} />);
+
+  expect(screen.getByRole("tab", { name: "Repair" }).getAttribute("title")).toBe("Run Inspect first.");
+  fireEvent.keyDown(screen.getByRole("tab", { name: "Inspect" }), { key: "ArrowDown" });
+  // Straight past Repair — landing on a stage that refuses is a move that does nothing.
+  expect(onChange).toHaveBeenCalledWith("export");
+});
+
+test("NavRail: clicking an item reports it, and a tooltip is the item's plain-language hint", () => {
+  const onChange = vi.fn();
+  render(<NavRail id="stages" label="Stages" items={RAIL_ITEMS} activeId="inspect" onChange={onChange} />);
+  expect(screen.getByRole("tab", { name: "Inspect" }).getAttribute("title")).toBe("Measure before changing.");
+  fireEvent.click(screen.getByRole("tab", { name: "Export" }));
+  expect(onChange).toHaveBeenCalledWith("export");
 });

@@ -170,15 +170,8 @@
       "literal-motion": 0,
       "unitless-length": 0
     },
-    "src/panels/AssetLabPanel.css": {
-      "raw-native-control": 0,
-      "literal-ui-color": 0,
-      "first-party-css": 374,
-      "literal-motion": 0,
-      "unitless-length": 0
-    },
     "src/panels/AssetLabPanel.tsx": {
-      "raw-native-control": 2,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,

@@ -669,6 +669,216 @@ progress { accent-color: var(--mtk-accent-solid); }
 .mtk-property-row[data-invalid="true"] .mtk-property-row__help,
 .mtk-property-row[aria-invalid="true"] .mtk-property-row__help { color: var(--mtk-danger); }
 
+/* ── A SETTINGS SHEET IS COLUMNS, NOT ONE STACKED COLUMN (ADR-147) ─────────────────────────────────
+   `.mtk-property-row` is the INSPECTOR's anatomy: one control per line, label left, in a 300px track.
+   Applied to a wide short surface it is the wrong shape and the Model dock proved it — 1240 × 520,
+   and the Bake stage showed TWO of its eight controls above the fold with a `<select>` stretched
+   1160px wide to hold the word "1K". A field grid is the other half of the family: label above the
+   control, help below it, and as many columns as the surface has room for.
+
+   `--mtk-field-min` is the column floor. `auto-fit` + `minmax` means the number of columns is a
+   consequence of the width rather than a breakpoint anyone has to maintain, which is what lets one
+   panel serve a 1240px dock and a 320px drawer without a second layout. */
+.mtk-field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(var(--mtk-field-min, 210px), 1fr));
+  gap: var(--mtk-space-5) var(--mtk-space-5);
+  align-items: start;
+  min-width: 0;
+}
+.mtk-field { display: grid; gap: var(--mtk-space-3); min-width: 0; align-content: start; }
+.mtk-field--wide { grid-column: span 2; }
+.mtk-field--full { grid-column: 1 / -1; }
+.mtk-field__label {
+  display: flex;
+  align-items: baseline;
+  gap: var(--mtk-space-3);
+  min-width: 0;
+  color: var(--mtk-text);
+  font: 600 12px/1.3 var(--mtk-font-ui);
+}
+.mtk-field__control { display: flex; align-items: center; gap: var(--mtk-space-3); min-width: 0; }
+.mtk-field__control > :is(.mtk-input, .mtk-select, .mtk-textarea, .mtk-search, .mtk-slider) { flex: 1 1 auto; width: 100%; }
+.mtk-field__unit { flex: none; color: var(--mtk-text-muted); font: 11px/1 var(--mtk-font-ui); }
+.mtk-field__help {
+  margin: 0;
+  color: var(--mtk-text-muted);
+  /* 11px was the panel stylesheet's help size and 10px was its smallest. The type scale's floor is
+     `fontSize.micro` = 11, and help text is prose a beginner is expected to READ — the constitution
+     asks for "extremely readable" and lists "tiny controls" among the things to avoid. */
+  font: 11px/1.5 var(--mtk-font-ui);
+}
+/* A REFUSING FIELD KEEPS ITS WORDS. The first version of this rule greyed the label and the help to
+   `--mtk-text-faint` with the control, copying the `opacity: .64` the panel stylesheet used to put on
+   its whole fieldset — and the shots harness measured the result at 3.64:1 where 4.5:1 is required.
+   WCAG's exception is for "an inactive user interface COMPONENT", not for the prose beside it, and
+   the prose is the part that matters most while the control is off: it is how a reader learns what
+   the control would do and therefore whether the reason above is worth acting on. The disabled
+   control's own styling already says which one is refusing. */
+.mtk-field[data-disabled="true"] .mtk-field__unit { color: var(--mtk-text-faint); }
+
+/* ── The one checkbox (ADR-147) ────────────────────────────────────────────────────────────────────
+   `appearance: none` for the same reason `.mtk-select` takes it: `accent-color` yields the OS widget,
+   whose shape, radius and tick are the desktop theme's and match nothing else here. Three files drew
+   their own before this — the Model panel, the animation graph and the inspector — and the constitution
+   names "toggle" in the one component family every control belongs to.
+
+   The ROW is the hit target, not the 18px box: `min-height` on the label gives a comfortable target
+   without inflating the mark. */
+.mtk-check {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--mtk-space-1) var(--mtk-space-4);
+  align-items: start;
+  min-height: 28px;
+  padding: var(--mtk-space-2) 0;
+  min-width: 0;
+  color: var(--mtk-text);
+  font: 12px/1.4 var(--mtk-font-ui);
+  cursor: pointer;
+}
+.mtk-check__box {
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  width: 18px;
+  height: 18px;
+  margin: 1px 0 0;
+  flex: none;
+  border: 1px solid var(--mtk-border-strong);
+  border-radius: var(--mtk-radius-sm);
+  background: var(--mtk-bg-input);
+  box-shadow: inset 0 1px 2px rgba(21, 34, 50, 0.04);
+  cursor: pointer;
+  transition:
+    background var(--mtk-motion-fast) var(--mtk-ease-standard),
+    border-color var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-check__box:hover:not(:disabled) { border-color: var(--mtk-accent-border); }
+.mtk-check__box:checked {
+  border-color: var(--mtk-accent-solid);
+  background: var(--mtk-accent-solid)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='10' viewBox='0 0 12 10'%3E%3Cpath d='M1 5l3.4 3.4L11 1.6' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    no-repeat center / 12px 10px;
+}
+.mtk-check__box:focus-visible { outline: 2px solid var(--mtk-ring); outline-offset: 2px; }
+.mtk-check__box:disabled { border-color: var(--mtk-border-subtle); background-color: var(--mtk-bg-inset); cursor: not-allowed; }
+.mtk-check__box:disabled:checked { border-color: var(--mtk-border); background-color: var(--mtk-border); }
+.mtk-check__label { min-width: 0; color: inherit; }
+.mtk-check__description {
+  grid-column: 2;
+  margin: 0;
+  color: var(--mtk-text-muted);
+  font: 11px/1.45 var(--mtk-font-ui);
+}
+/* The cursor and the box say "off"; the WORDS stay readable, for the same reason `.mtk-field`'s do —
+   WCAG's exception covers an inactive component, not the prose that explains it, and greying both
+   measured 3.64:1 where 4.5:1 is required. */
+.mtk-check[data-disabled="true"] { cursor: not-allowed; }
+
+/* ── The one inline note (ADR-147) ─────────────────────────────────────────────────────────────────
+   Guidance, a warning, an all-clear and a "why this stage is refusing" were four bespoke boxes in one
+   panel, each with its own border colour, padding and type size. One object, five tones, and an icon
+   always — the house rule is that colour never carries a meaning on its own. */
+.mtk-callout {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--mtk-space-4);
+  min-width: 0;
+  padding: var(--mtk-space-4) var(--mtk-space-5);
+  border-radius: var(--mtk-radius-lg);
+  color: var(--mtk-text-secondary);
+  background: var(--mtk-bg-inset);
+  font: 12px/1.5 var(--mtk-font-ui);
+}
+.mtk-callout__icon { display: inline-flex; flex: none; margin-top: 1px; color: var(--mtk-text-muted); }
+.mtk-callout__body { min-width: 0; }
+.mtk-callout__title { display: block; color: var(--mtk-text); font-weight: 600; }
+.mtk-callout__title + * { margin-top: 2px; }
+.mtk-callout--info { color: var(--mtk-info); background: var(--mtk-info-bg); }
+.mtk-callout--info .mtk-callout__icon,
+.mtk-callout--info .mtk-callout__title { color: var(--mtk-info); }
+.mtk-callout--success { color: var(--mtk-success); background: var(--mtk-success-bg); }
+.mtk-callout--success .mtk-callout__icon,
+.mtk-callout--success .mtk-callout__title { color: var(--mtk-success); }
+.mtk-callout--warn { color: var(--mtk-warn); background: var(--mtk-warn-bg); }
+.mtk-callout--warn .mtk-callout__icon,
+.mtk-callout--warn .mtk-callout__title { color: var(--mtk-warn); }
+.mtk-callout--danger { color: var(--mtk-danger); background: var(--mtk-danger-bg); }
+.mtk-callout--danger .mtk-callout__icon,
+.mtk-callout--danger .mtk-callout__title { color: var(--mtk-danger); }
+
+/* ── A measurement, and the measurement it became (ADR-147) ────────────────────────────────────────
+   No border. Six numbers in six hairline boxes is six rectangles competing with the numbers inside
+   them, and the constitution's line is "minimal borders … accent colours only where interaction
+   requires attention". A measurement is not an interaction: it is a calm recessed tile whose VALUE is
+   the loudest thing on it, mono and tabular so a column of them stays aligned as it changes. */
+.mtk-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(var(--mtk-metric-min, 148px), 1fr));
+  gap: var(--mtk-space-3);
+  min-width: 0;
+}
+.mtk-metric {
+  display: grid;
+  gap: var(--mtk-space-2);
+  min-width: 0;
+  padding: var(--mtk-space-4) var(--mtk-space-5);
+  border-radius: var(--mtk-radius-lg);
+  background: var(--mtk-bg-inset);
+}
+.mtk-metric__label {
+  overflow: hidden;
+  color: var(--mtk-text-muted);
+  font: 11px/1.3 var(--mtk-font-ui);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mtk-metric__values { display: flex; align-items: baseline; gap: var(--mtk-space-3); min-width: 0; }
+.mtk-metric__value {
+  min-width: 0;
+  color: var(--mtk-text);
+  font: 600 15px/1.25 var(--mtk-font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.2px;
+  /* WRAPS, never ellipsises. A measurement is the whole point of the tile, and the first capture of
+     this grid rendered `1.24 × 0.83 × 0…` — an extent with its third axis cut off, which is not a
+     smaller version of the number, it is a different and wrong one. A count never wraps (they are
+     short); a composite value takes a second line, and the grid keeps the tiles equal height. */
+  overflow-wrap: anywhere;
+}
+.mtk-metric__value--after { color: var(--mtk-success); }
+.mtk-metric__arrow { flex: none; color: var(--mtk-text-muted); }
+
+/* ── Progress, drawn once ──────────────────────────────────────────────────────────────────────── */
+.mtk-progress {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: 6px;
+  border: none;
+  border-radius: 999px;
+  background: var(--mtk-bg-active);
+  overflow: hidden;
+}
+.mtk-progress::-webkit-progress-bar { background: var(--mtk-bg-active); }
+.mtk-progress::-webkit-progress-value { background: var(--mtk-accent-solid); transition: inline-size var(--mtk-motion-base) var(--mtk-ease-standard); }
+.mtk-progress::-moz-progress-bar { background: var(--mtk-accent-solid); }
+
+/* Text for assistive technology only. Was `.asset-lab__sr-only` in one panel's private stylesheet,
+   which is exactly the kind of thing that gets re-invented per subsystem until they disagree. */
+.mtk-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 .mtk-popover-surface {
   box-sizing: border-box;
   min-width: 180px;
@@ -1115,11 +1325,110 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-workspace-panel__body { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .mtk-workspace-panel__body.mtk-scroll { overflow: auto; overscroll-behavior: contain; }
 .mtk-workspace-panel__body.is-padded { padding: 12px; }
+/* A ROW, not a block. The footer had one consumer putting one `<span>` in it, so nothing had ever
+   asked it to hold two things — and the thing a task workspace most needs pinned there is its primary
+   action, which is a decision that belongs beside the sentence explaining it rather than under it.
+   A single child lays out identically, so the existing consumers are untouched. */
 .mtk-workspace-panel__footer {
+  display: flex;
   flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--mtk-space-4);
   padding: 8px 12px;
   border-top: 1px solid var(--mtk-border-subtle);
   background: var(--mtk-bg-raised);
+}
+/* The action end of that row. `margin-left: auto` rather than relying on `space-between`, because a
+   footer with only an action in it must still put it on the right. */
+.mtk-workspace-panel__footer > .mtk-action-bar { display: flex; align-items: center; gap: var(--mtk-space-4); margin-left: auto; min-width: 0; }
+
+/* ── A LABELLED VERTICAL RAIL (ADR-147) ────────────────────────────────────────────────────────────
+   `.mtk-dock-rail` is the icon-only capsule a COLLAPSED dock shows; there was no labelled form, so a
+   workspace with more stages than a tab strip can hold had only one answer — `overflow-x: auto` on the
+   strip, which is the pattern `Toolbar`'s own comment calls out for putting controls off screen with
+   nothing on screen to say they exist. The Model workspace had seven stages in one.
+
+   On a wide short surface the rail is the right shape twice over: all seven are visible at once, and
+   the width they cost is width that a 1240px dock has and 520px of height does not. Below 860px it
+   turns back into a horizontal strip, because at that width a 190px column is a third of the panel. */
+.mtk-nav-rail {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: var(--mtk-space-2);
+  align-self: stretch;
+  width: var(--mtk-nav-rail-width, 190px);
+  min-width: 0;
+  padding: var(--mtk-space-4);
+  overflow: hidden auto;
+  border-right: 1px solid var(--mtk-border-subtle);
+  background: var(--mtk-bg-panel);
+}
+.mtk-nav-rail__item {
+  display: flex;
+  align-items: center;
+  gap: var(--mtk-space-4);
+  flex: none;
+  min-width: 0;
+  min-height: var(--mtk-control-comfortable);
+  padding: var(--mtk-space-3) var(--mtk-space-4);
+  border: 1px solid transparent;
+  border-radius: var(--mtk-radius-lg);
+  color: var(--mtk-text-secondary);
+  background: transparent;
+  font: 500 13px/1.3 var(--mtk-font-ui);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--mtk-motion-fast) var(--mtk-ease-standard),
+    color var(--mtk-motion-fast) var(--mtk-ease-standard),
+    box-shadow var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-nav-rail__item:hover { color: var(--mtk-text); background: var(--mtk-bg-hover); }
+.mtk-nav-rail__item[aria-selected="true"] {
+  color: var(--mtk-text);
+  background: var(--mtk-bg-raised);
+  border-color: var(--mtk-border-subtle);
+  box-shadow: var(--mtk-shadow-1);
+  font-weight: 600;
+}
+.mtk-nav-rail__item[aria-selected="true"] .mtk-nav-rail__icon { color: var(--mtk-accent); }
+.mtk-nav-rail__item:disabled { color: var(--mtk-text-faint); cursor: not-allowed; }
+.mtk-nav-rail__icon { display: inline-flex; flex: none; color: var(--mtk-text-muted); }
+.mtk-nav-rail__label { overflow: hidden; min-width: 0; text-overflow: ellipsis; white-space: nowrap; }
+.mtk-nav-rail__badge { flex: none; margin-left: auto; }
+@media (max-width: 860px) {
+  .mtk-nav-rail {
+    flex-direction: row;
+    width: auto;
+    padding: var(--mtk-space-3) var(--mtk-space-4);
+    overflow: auto hidden;
+    border-right: none;
+    border-bottom: 1px solid var(--mtk-border-subtle);
+  }
+  .mtk-nav-rail__item { flex: 0 0 auto; }
+}
+
+/* The two-track body a rail needs: the rail, then everything else, each scrolling on its own. */
+.mtk-split { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; }
+/* The content track carries the panel's padding and the rhythm between its blocks, because that is
+   what "the region beside a rail" IS — a rail with an unpadded content track next to it is not a
+   composition, it is two elements. */
+.mtk-split__main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--mtk-space-6);
+  min-width: 0;
+  min-height: 0;
+  padding: var(--mtk-space-5) var(--mtk-space-6) var(--mtk-space-6);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+@media (max-width: 860px) {
+  .mtk-split { flex-direction: column; }
 }
 
 /* A SEGMENTED CONTROL, NOT A FILE-FOLDER TAB BAR. The selected tab used to carry three separate
@@ -1279,6 +1588,14 @@ body > [role="dialog"][aria-modal="true"] {
 
 .mtk-disclosure {
   overflow: hidden;
+  /* A DISCLOSURE MUST NEVER SHRINK BELOW ITS OWN HEADER, and until this line it did. The open/close
+     transition needs `overflow: hidden`; a flex item's default is `flex-shrink: 1`. Put one in any
+     flex column that has run out of room — which is every task workspace in a dock — and the browser
+     compresses the section and then clips the toggle it is hiding: measured at 26px cut off the
+     "Advanced projection controls" heading in the Model dock, so the control that opens the rest of
+     the stage was a sliver with no scrollbar and no way to reach it. The scroll belongs to the panel
+     body, which already has it; a section header is not a place to recover pixels from. */
+  flex: none;
   border-bottom: 1px solid var(--mtk-border-subtle);
   background: var(--mtk-bg-panel);
 }
@@ -1447,7 +1764,11 @@ body > [role="dialog"][aria-modal="true"] {
 
 @media (max-width: 760px) {
   .mtk-workspace-panel__header { min-height: 38px; padding: 6px 8px; }
-  .mtk-workspace-panel__subtitle { display: none; }
+  /* THE SUBTITLE STAYS. It used to be `display: none` here, which saves 16px of header and costs the
+     panel the name of the thing it is operating on: the Model workspace creates derivatives of a
+     selected mesh, and below 760px its header read "Model" and nothing else — there was no way to
+     tell WHICH asset a `Create repaired derivative` was about to run against. It is already one
+     ellipsised line, so the cost is bounded and the header simply grows to fit it. */
   .mtk-workspace-panel__actions { max-width: 52%; overflow-x: auto; }
   .mtk-workspace-panel__body.is-padded { padding: 6px; }
   .mtk-dock-tab { min-height: 36px; padding: 0 10px; }
@@ -1684,6 +2005,13 @@ body > [role="dialog"][aria-modal="true"] {
    panel that has obediently shrunk to nothing. Below that height the dock stops pretending it fits
    and scrolls, which is the same answer the tab strip gives one box over. */
 .mtk-bottom-workspace { height: 100%; min-height: var(--mtk-dock-content-min); overflow: auto; background: var(--mtk-bg-panel); }
+/* A PANEL IN A BOUNDED DOCK FILLS IT AND SCROLLS ITSELF — the rule `.mtk-dock-flyout` has had all
+   along, missing here. Without it the panel takes its CONTENT height, this track scrolls the whole
+   thing, and the parts `WorkspacePanel` declares as fixed — the header naming the asset, the tab row,
+   the footer holding the primary action — scroll away with the body. Measured: the Model dock's Bake
+   stage put its `Bake maps to derivative` button 0px on screen out of 34, in a container showing no
+   scrollbar. `overflow: auto` above stays as the escape hatch below `--mtk-dock-content-min`. */
+.mtk-bottom-workspace > .mtk-workspace-panel { height: 100%; }
 .mtk-bottom-workspace--split { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.3fr); gap: 1px; background: var(--mtk-border-subtle); }
 .mtk-bottom-workspace--split > div { min-width: 0; overflow: auto; background: var(--mtk-bg-panel); }
 .mtk-bottom-workspace--logic { display: flex; flex-direction: column; overflow: hidden; }

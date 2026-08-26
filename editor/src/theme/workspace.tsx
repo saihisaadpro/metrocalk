@@ -637,3 +637,101 @@ export function WorkspacePanel({
     </section>
   );
 }
+
+export interface NavRailItem {
+  id: string;
+  label: string;
+  icon?: ReactNode;
+  /** Plain-language hint — what this section is for. Becomes the item's `title`. */
+  tooltip?: string;
+  badge?: ReactNode;
+  disabled?: boolean;
+  /** Why it is refusing, in the user's words. Shown as the `title` while disabled. */
+  disabledReason?: string;
+}
+
+export interface NavRailProps {
+  id: string;
+  label: string;
+  items: readonly NavRailItem[];
+  activeId: string;
+  onChange: (id: string) => void;
+  /** Prefix of the id each item's panel carries, so the tab and its panel name each other. */
+  panelIdPrefix?: string;
+  className?: string;
+  style?: CSSProperties;
+  "data-testid"?: string;
+}
+
+/**
+ * A LABELLED VERTICAL RAIL — the shape a workspace with more sections than a tab strip can hold.
+ *
+ * `DockRail` above is the icon-only capsule a COLLAPSED dock shows; there was no labelled form, so a
+ * panel with seven stages had exactly one answer available to it: `DockTabs` with `overflow-x: auto`,
+ * which is the pattern `Toolbar`'s own comment calls out for putting controls off screen with nothing
+ * on screen to say they exist. On a wide, short surface the rail is the right shape twice over — every
+ * section is visible at once, and the width it costs is the axis that surface has to spare.
+ *
+ * It is a real tablist with roving arrow-key navigation, so the seven stages are one stop in the tab
+ * order rather than seven, and the stylesheet turns it back into a horizontal strip below 860px.
+ */
+export function NavRail({
+  id,
+  label,
+  items,
+  activeId,
+  onChange,
+  panelIdPrefix,
+  className,
+  style,
+  ...rest
+}: NavRailProps) {
+  const enabled = items.filter((item) => !item.disabled);
+
+  function move(delta: number) {
+    if (enabled.length === 0) return;
+    const at = enabled.findIndex((item) => item.id === activeId);
+    const next = enabled[(((at < 0 ? 0 : at) + delta) % enabled.length + enabled.length) % enabled.length];
+    onChange(next.id);
+    document.getElementById(`${id}-${next.id}-tab`)?.focus();
+  }
+
+  return (
+    <div
+      className={["mtk-nav-rail", className].filter(Boolean).join(" ")}
+      role="tablist"
+      aria-label={label}
+      aria-orientation="vertical"
+      style={style}
+      {...rest}
+    >
+      {items.map((item) => {
+        const active = item.id === activeId;
+        return (
+          <button
+            key={item.id}
+            id={`${id}-${item.id}-tab`}
+            type="button"
+            role="tab"
+            className="mtk-nav-rail__item"
+            aria-selected={active}
+            aria-controls={panelIdPrefix ? `${panelIdPrefix}${item.id}` : undefined}
+            // One stop in the tab order for the whole rail; the arrows move within it.
+            tabIndex={active ? 0 : -1}
+            disabled={item.disabled}
+            title={item.disabled ? item.disabledReason ?? item.tooltip : item.tooltip}
+            onClick={() => onChange(item.id)}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowDown" || event.key === "ArrowRight") { event.preventDefault(); move(1); }
+              else if (event.key === "ArrowUp" || event.key === "ArrowLeft") { event.preventDefault(); move(-1); }
+            }}
+          >
+            {item.icon != null && <span className="mtk-nav-rail__icon" aria-hidden="true">{item.icon}</span>}
+            <span className="mtk-nav-rail__label">{item.label}</span>
+            {item.badge != null && <span className="mtk-nav-rail__badge">{item.badge}</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}

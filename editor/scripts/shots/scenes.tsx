@@ -16,6 +16,11 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { App } from "../../src/app/App";
 import { AssetBrowser } from "../../src/panels/AssetBrowser";
+import {
+  AssetLabPanel,
+  type AssetLabReportView,
+  type AssetLabStage,
+} from "../../src/panels/AssetLabPanel";
 import { STAGE_MIN } from "../../src/app/layout";
 import { BindingGraph } from "../../src/graph/BindingGraph";
 import { Icon, iconTokens } from "../../src/theme/icons";
@@ -1010,6 +1015,7 @@ export const SCENES: Scene[] = [
   ...graphScenes(),
   ...inspectorScenes(),
   ...assetScenes(),
+  ...modelScenes(),
   ...shellScenes(),
 ];
 
@@ -1973,4 +1979,159 @@ function EmptySentinel({ client: c }: { client: EditorClient }) {
     };
   }, [c]);
   return ready ? <span data-testid="empty-sentinel" style={{ position: "fixed", left: -9999 }} /> : null;
+}
+
+// ── the Model workspace ───────────────────────────────────────────────────────────────────────────
+
+/** THE ONLY SUBSYSTEM IN THE EDITOR THAT STILL SHIPPED ITS OWN STYLESHEET (ADR-147).
+ *
+ *  `src/panels/AssetLabPanel.css` was 374 declarations — more first-party CSS outside `theme/` than
+ *  every other panel in the repository put together, and the constitution's flat prohibition is
+ *  *"No subsystem is allowed to invent its own styling."* It had never been photographed: no scene
+ *  in this registry mounted `AssetLabPanel`, so a stage rail, seven forms, a metric grid, an issue
+ *  list and a bake-evidence strip were all shaped by rules nothing but that one file ever read.
+ *
+ *  It is captured at the size the Model dock actually is — `.mtk-bottom-dock.is-open.is-asset` is
+ *  `clamp(320px, 48vh, 520px)` tall and the FULL window wide. That combination is the whole point:
+ *  every earlier judgement about this panel was made reading source, where a single stacked column
+ *  looks tidy, and it is exactly the shape a wide short band punishes hardest. */
+function modelScenes(): Scene[] {
+  const asset = {
+    id: "gun-7",
+    name: "Weld Gun 7",
+    source: "Imported STEP",
+    revision: "sha256:41c9e0",
+  };
+  const bakeSources = [
+    asset,
+    { id: "mdp", name: "Main Distribution Panel MDP-1", source: "Imported STEP" },
+    { id: "girder", name: "Overhead Crane Assembly Rev C — Long Travel Girder", source: "Imported STEP" },
+  ];
+  const inspected: AssetLabReportView = {
+    summary: "Audited 1 mesh with 148,204 triangles. Three findings need a decision before optimization.",
+    sourceMetrics: [
+      { id: "tri", label: "Triangles", value: 148_204, description: "Triangle count of the source mesh." },
+      { id: "vert", label: "Vertices", value: 81_930, description: "Unique vertex count after attribute splits." },
+      { id: "shells", label: "Connected shells", value: 37, description: "Disconnected surface components." },
+      { id: "uv", label: "UV coverage", value: 62.4, unit: "%", description: "Fraction of the UV page occupied by charts." },
+      { id: "mat", label: "Materials", value: 4, description: "Distinct bound material slots." },
+      { id: "bounds", label: "Bounding box", value: "1.24 × 0.83 × 0.41", unit: "m", description: "Axis-aligned extents in scene units." },
+    ],
+    issues: [
+      { id: "i1", severity: "error", status: "open", title: "Non-manifold edges", detail: "Two faces share an edge with inconsistent winding, which breaks normal repair and baking.", count: 12 },
+      { id: "i2", severity: "warning", status: "open", title: "Overlapping UV charts", detail: "Overlapping islands make a projected bake ambiguous over the affected texels.", count: 3 },
+      { id: "i3", severity: "info", status: "accepted", title: "Unused vertex colours", detail: "A colour attribute is present but no bound material reads it." },
+      { id: "i4", severity: "pass", status: "fixed", title: "Tangent basis", detail: "MikkTSpace tangents are present and consistent with UV0." },
+    ],
+    warnings: ["Two materials share one texture page; optimizing them separately will duplicate it."],
+  };
+
+  const scene = (
+    id: string,
+    stage: AssetLabStage,
+    report: AssetLabReportView | null,
+    looking_for: string,
+    expect: Expect,
+    viewport = { width: 1240, height: 520 },
+  ): Scene => ({
+    id,
+    looking_for,
+    expect,
+    viewport,
+    // The dock modelled as the dock actually is, because the shape is the finding. `.mtk-bottom-dock.
+    // is-open.is-asset` is `clamp(320px, 48vh, 520px)` tall with `overflow: hidden auto` on its
+    // content — a BOUNDED box the panel must lay itself out inside, not the unbounded column a
+    // `minHeight: 100vh` frame would hand it. Photographed unbounded, a panel that overflows its dock
+    // by 175px looks like a tidy stack; photographed bounded, the primary action is simply not there.
+    render: () => (
+      // `.mtk-bottom-dock__content` (bounded, `overflow: hidden auto`) wrapping `.mtk-bottom-workspace`
+      // (`height: 100%`, its own scroll) — the real two-element chain, because the panel's header, tab
+      // rail and footer are only pinned if the panel FILLS the workspace rather than growing past it.
+      <div style={{ height: "100vh", overflow: "hidden auto", background: "var(--mtk-bg-panel)" }}>
+        <div className="mtk-bottom-workspace mtk-scroll">
+        <AssetLabPanel
+          asset={asset}
+          report={report}
+          activeStage={stage}
+          bakeSources={bakeSources}
+          availability={report ? undefined : { inspect: { state: "available", reason: "Asset audit is available." } }}
+          onRun={() => {}}
+        />
+        </div>
+      </div>
+    ),
+  });
+
+  return [
+    scene(
+      "model-inspect-evidence",
+      "inspect",
+      inspected,
+      "the Model workspace at the size its dock really is — 1240 wide, 520 tall — showing the densest " +
+      "state it has: a measured source, six metrics, four findings and a warning. What a reader is " +
+      "checking is PROPORTION and DENSITY: whether the seven stages, the evidence and the primary " +
+      "action can be read at a glance in a wide short band, or whether the panel is one narrow column " +
+      "of 10px type stacked past the fold with the width unused",
+      {
+        present: [
+          ["[data-testid='asset-lab']", 1],
+          ["[data-testid='asset-lab-metrics']", 1],
+          ["[data-testid='asset-lab-inspect']", 1],
+        ],
+        text_present: ["Weld Gun 7", "Non-manifold edges", "148,204"],
+        text_absent: ["null", "undefined", "NaN"],
+        // The primary action is the whole point of the stage; a button below the fold of a 520px dock
+        // is a workflow with no visible verb.
+        unclipped: ["[data-testid='asset-lab-inspect']"],
+      },
+    ),
+    scene(
+      "model-bake-controls",
+      "bake",
+      inspected,
+      "the most control-heavy stage in the engine — two selects, a source list of three checkboxes, " +
+      "three map checkboxes, an advanced disclosure and a primary action — in a 520px band. Every " +
+      "control here should be the same component family the rest of the editor uses, at the same size, " +
+      "with the same hit target; the shipped version drew its checkboxes, its fieldsets and its notes " +
+      "from a stylesheet no other panel reads",
+      {
+        present: [
+          ["[data-testid='asset-lab']", 1],
+          ["[data-testid='asset-lab-bake']", 1],
+        ],
+        text_present: ["High-detail sources", "Ambient occlusion", "Texture resolution"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='asset-lab-bake']"],
+      },
+    ),
+    scene(
+      "model-narrow",
+      "inspect",
+      inspected,
+      "the SAME workspace below the 860px the rail is worth: the stage list turns back into a " +
+      "horizontal strip along the top and the evidence takes the whole width, because a 190px column " +
+      "is a fifth of a 760px panel. What a reader is checking is that nothing had to be given up for " +
+      "it — every stage still reachable, the metrics still readable rather than ellipsised, and the " +
+      "primary action still pinned where it was at 1240",
+      {
+        present: [
+          ["[data-testid='asset-lab-stages'] [role='tab']", 7],
+          ["[data-testid='asset-lab-metrics']", 1],
+        ],
+        text_present: ["148,204"],
+        text_absent: ["null", "undefined", "NaN"],
+        // NOT `text_present: ["Weld Gun 7"]`, and the difference matters: claims read `textContent`,
+        // which contains a `display: none` node's words in full. The shared narrow-width rule used to
+        // hide `.mtk-workspace-panel__subtitle` — so the asset name was in the DOM, in the claim, and
+        // nowhere on the screen. A MEASUREMENT is the claim that cannot be satisfied by hidden text.
+        min_height: [[".mtk-workspace-panel__subtitle", 12]],
+        // The claim the wide scene makes, at the width where a footer is most likely to lose it.
+        unclipped: ["[data-testid='asset-lab-inspect']"],
+        // Every stage reachable — a horizontal strip that scrolls past the edge is the pattern this
+        // redesign replaced, so it must not come back through the responsive door.
+        same_line: [["#asset-lab-stages-inspect-tab", "#asset-lab-stages-export-tab"]],
+      },
+      { width: 760, height: 560 },
+    ),
+  ];
 }
