@@ -1028,6 +1028,7 @@ export const SCENES: Scene[] = [
   ...assetScenes(),
   ...modelScenes(),
   ...shellScenes(),
+  ...paletteScenes(),
 ];
 
 // ── the inspector ─────────────────────────────────────────────────────────────────────────────────
@@ -2144,5 +2145,120 @@ function modelScenes(): Scene[] {
       },
       { width: 760, height: 560 },
     ),
+  ];
+}
+
+// -- the command palette, which nothing could photograph until the harness could see a portal ------
+//
+// `CommandPalette` renders through `theme/Popover`'s `Modal`, which portals to `document.body` BY
+// DESIGN. Every claim this harness makes used to be evaluated inside `[data-testid="shot-frame"]`, so
+// the palette was not merely unphotographed — it was UNASSERTABLE, along with every popover, context
+// menu and toast in the editor. Measured before it was repaired: a scene rendering the palette open
+// and claiming `absent: [".mtk-command-palette"]` printed `ok` and exited 0.
+//
+// Both scenes below mount the WHOLE `App` and reach the palette by clicking the header control a user
+// clicks. A scene that handed `CommandPalette` a hand-written `commands` array would prove the palette
+// renders an array — which was never in doubt — and say nothing about whether the shell supplies the
+// scene's own objects and the selected object's actions. That is the C6 distinction (green against the
+// mock, empty against the real core) applied one layer up: the mock here is MockCore, and what is
+// being checked is the WIRING between it and the palette, not the palette's rendering.
+function paletteScenes(): Scene[] {
+  // A CAD-import-shaped scene: a named folder tree, and enough parts sharing a word that the result
+  // cap has something to hide. Sizes and names echo the real bar file's vocabulary (ADR-077).
+  const weldCell = () => {
+    const s = projectionStore.getState();
+    const rows: { id: string; name: string; parentId: string | null }[] = [
+      { id: "cell", name: "Weld Cell 12", parentId: null },
+      { id: "cab", name: "Machine Cabinet", parentId: "cell" },
+      { id: "gun", name: "Weld Gun 7", parentId: "cab" },
+      { id: "w1", name: "Weld Tip Assembly", parentId: "cab" },
+      { id: "w2", name: "Weld Controller MDP-1", parentId: "cab" },
+      { id: "w3", name: "Weld Transformer 480V", parentId: "cab" },
+      { id: "w4", name: "Weld Cable Harness", parentId: "cab" },
+      { id: "w5", name: "Weld Fixture Plate", parentId: "cell" },
+      { id: "w6", name: "Weld Fume Extractor", parentId: "cell" },
+      { id: "w7", name: "Weld Cell HMI", parentId: "cell" },
+      { id: "w8", name: "Weld Cell Guarding", parentId: "cell" },
+      { id: "w9", name: "Weld Spatter Shield", parentId: "cell" },
+      { id: "rail", name: "Long Travel Girder", parentId: null },
+      { id: "hpu", name: "Hydraulic Power Unit", parentId: null },
+    ];
+    s.bulkLoad(rows.map((r) => ({ ...r, components: { Transform: { x: 0, y: 0, z: 0 } } })) as never);
+  };
+
+  return [
+    {
+      id: "command-palette-selection",
+      looking_for:
+        "THE PALETTE LEADS WITH THE SELECTED OBJECT. `Weld Gun 7` is selected, and the first group in " +
+        "the palette is named after it and holds the engine's OWN answer to \"what can I do to this\" " +
+        "— `actions_for`, the M3.3 action model, which until now was reachable only by right-clicking. " +
+        "What a reader is checking: the group is FIRST (before Workspaces, before View), the object is " +
+        "named rather than identified by id, and the one action that is refused says why IN PLAIN " +
+        "WORDS. The engine's own sentence for that refusal is \"no unmet requirement to bind\", which " +
+        "is a statement about the capability graph; the claim below requires it to be absent.",
+      viewport: { width: 1280, height: 860 },
+      setup: () => {
+        weldCell();
+        projectionStore.getState().select("gun");
+      },
+      click: ["[data-testid='command-palette-trigger']"],
+      expect: {
+        present: [
+          [".mtk-command-palette", 1],
+          // The five MockCore offers. The real core adds `makedynamic`; the shared dispatch handles
+          // all six, and which ones appear is the ENGINE's call, so the count is a floor not a total.
+          ["[data-command-id^='entity-']", 5],
+        ],
+        text_present: [
+          "Weld Gun 7",
+          "Remove",
+          "Duplicate",
+          "Focus",
+          "Inspect",
+          "nothing to bind yet",
+        ],
+        // The refusal is explained, and explained in the product's language. `<ux_quality>` 4.
+        text_absent: ["no unmet requirement to bind", "null", "undefined", "NaN"],
+        // The group heading is the object's NAME. A measurement rather than `text_present`, because
+        // `textContent` would be satisfied by the name sitting in a hidden node — the exact vacuous
+        // claim `model-narrow` was repaired for.
+        min_height: [[".mtk-command-palette__category", 10]],
+        // The first thing the palette offers must be reachable without scrolling: a contextual action
+        // ranked first and painted below the fold is ranked first for nobody.
+        unclipped: ["[data-command-id='entity-remove']"],
+      },
+      render: () => <App />,
+    },
+    {
+      id: "command-palette-goto",
+      looking_for:
+        "AND IT CAN FIND AN OBJECT. Typing `weld` lists matching scene objects UNDER THEIR FOLDER " +
+        "PATH — `Weld Cell 12 › Machine Cabinet` — which is what makes two similarly-named imported " +
+        "parts tellable apart at all. Ten match and eight are shown, and the row that says so is the " +
+        "point: a list that stops at eight and looks complete is the same lie as a gate reporting " +
+        "success over the scenes it did not open. Nothing is selected here, so the Go to object group " +
+        "is the whole of what the query produced.",
+      viewport: { width: 1280, height: 860 },
+      setup: weldCell,
+      click: ["[data-testid='command-palette-trigger']"],
+      type: [[".mtk-command-palette input[role='combobox']", "weld"]],
+      expect: {
+        present: [
+          [".mtk-command-palette", 1],
+          // Eight results, and the ninth row is the count of what was left out.
+          ["[data-command-id^='goto-']", 9],
+        ],
+        text_present: ["Go to object", "Weld Gun 7", "Machine Cabinet", "more objects match this"],
+        // Nothing is selected, so no entity-action group may appear — the palette must not invent a
+        // subject it does not have.
+        absent: ["[data-command-id^='entity-']"],
+        text_absent: ["null", "undefined", "NaN"],
+        // The path is the whole reason a result is distinguishable; hidden text would not be.
+        min_height: [[".mtk-command-palette__command-description", 10]],
+        unclipped: ["[data-command-id='goto-gun']"],
+      },
+      render: () => <App />,
+    },
   ];
 }

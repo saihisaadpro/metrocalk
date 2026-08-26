@@ -156,3 +156,43 @@ test("Escape and the explicit close button dismiss the palette", () => {
   fireEvent.click(screen.getByRole("button", { name: "Close command palette" }));
   expect(onClose).toHaveBeenCalledTimes(2);
 });
+
+test("`suggest` results are listed after the fixed commands and are NOT re-ranked by the palette", () => {
+  // The scene is the candidate set the palette cannot hold as an array (a CAD import lands hundreds
+  // to thousands of objects), so the parent computes it per keystroke and owns its own order. Two
+  // things are being pinned: that the provider's order survives, and that a provider cannot push the
+  // editor's own vocabulary off the top of the list.
+  const suggest = vi.fn((query: string) =>
+    query.startsWith("fr")
+      ? [
+          command({ id: "goto-b", label: "Fridge", category: "Go to object" }),
+          command({ id: "goto-a", label: "Frame rail", category: "Go to object" }),
+        ]
+      : [],
+  );
+  render(<CommandPalette open onClose={() => {}} commands={COMMANDS} suggest={suggest} />);
+
+  // Nothing typed: the provider was asked, said nothing, and no group appeared for it.
+  expect(suggest).toHaveBeenCalledWith("");
+  expect(screen.queryByText("Go to object")).toBeNull();
+
+  fireEvent.change(screen.getByRole("combobox", { name: "Search commands" }), { target: { value: "Fr" } });
+
+  // Normalized before the provider sees it — one definition of "the query", shared by both rankers.
+  expect(suggest).toHaveBeenCalledWith("fr");
+  const rows = screen.getAllByRole("option").map((el) => el.getAttribute("data-command-id"));
+  // "Frame selection" is a fixed command and stays above both objects; the two objects keep the
+  // order the provider returned them in, NOT alphabetical and NOT `commandRank`'s.
+  expect(rows).toEqual(["frame", "goto-b", "goto-a"]);
+});
+
+test("a suggested row runs its own execute, exactly like a fixed one", async () => {
+  const go = vi.fn();
+  const suggest = (query: string) =>
+    query ? [command({ id: "goto-a", label: "Weld Gun 7", category: "Go to object", execute: go })] : [];
+  render(<CommandPalette open onClose={() => {}} commands={COMMANDS} suggest={suggest} />);
+
+  fireEvent.change(screen.getByRole("combobox", { name: "Search commands" }), { target: { value: "weld" } });
+  fireEvent.click(screen.getByText("Weld Gun 7"));
+  await waitFor(() => expect(go).toHaveBeenCalledTimes(1));
+});

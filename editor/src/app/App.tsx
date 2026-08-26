@@ -8,7 +8,7 @@
 //! coloured border + an overlaid "● PLAYING — Esc / ⏹ to stop" badge + de-emphasised edit chrome (C2);
 //! feedback lands as **toasts over the stage** (C11); a fresh scene shows a real **empty state** (C10).
 
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createSession, isTauri, type EditorClient } from "../transport/session";
 import { projectionStore, useDisplayedEntity, useEntityOrder, useSelectedId } from "../store/projection";
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
@@ -31,7 +31,8 @@ import { ImportDropOverlay } from "./ImportDropOverlay";
 import { FocusBanner } from "../panels/FocusBanner";
 import type { EditorCommand } from "../panels/CommandPalette";
 import { ViewportToolRail, type ViewportTool } from "../panels/ViewportToolRail";
-import type { PipeForgeStatus } from "../transport/protocol";
+import type { ActionItem, PipeForgeStatus } from "../transport/protocol";
+import { plainReason, runEntityAction } from "../panels/entityActions";
 import { EditorHeader } from "./EditorHeader";
 import { LeftDock, InspectorDock, type LeftWorkspace, type InspectorWorkspace } from "./EditorDocks";
 import { EngineRail, ENGINES, engineById, type EngineId } from "./EngineRail";
@@ -527,6 +528,142 @@ export function App() {
     ...chromeDim,
   };
 
+  // -- WHAT THE PALETTE KNOWS ABOUT THE SCENE ------------------------------------------------------
+  //
+  // The list below used to be 26 fixed entries, identical whatever was selected and whatever the
+  // scene contained. Two things the engine already computes were missing from it, and both are the
+  // product's own north star rather than a nicety:
+  //
+  //  * `actions_for` -- "click anything, see what fits" (M3.3). The engine returns the valid actions
+  //    for an entity with every unavailable one EXPLAINED, and the only way to see them was to
+  //    right-click. A user who has an object selected and opens the palette -- the surface people go
+  //    to precisely because they cannot find a control -- got a generic list that did not mention it.
+  //  * the scene itself. `Hierarchy` can filter by name, but it filters a LIST: it does not select
+  //    and it does not frame, and reaching it costs opening the left dock and switching to Scene
+  //    first. After a CAD import there are 378 to 3,387 objects in a folder tree (ADR-077), and
+  //    "find that part" is the highest-frequency navigation act there is.
+  //
+  // Fetched only while the palette is OPEN. `entityActions` is an IPC round trip and the palette is
+  // shut for almost all of a session; asking on every selection change would put a request on the
+  // wire for a list nobody is looking at.
+  const [selectionActions, setSelectionActions] = useState<ActionItem[]>([]);
+  useEffect(() => {
+    if (!commandsOpen || !selectedId) {
+      setSelectionActions([]);
+      return;
+    }
+    let live = true;
+    client
+      .entityActions(selectedId)
+      .then((items) => {
+        if (live) setSelectionActions(items);
+      })
+      .catch((error) => {
+        console.error("entityActions failed", error);
+        if (live) setSelectionActions([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, [commandsOpen, selectedId, client]);
+
+  const selectedName = selectedId ? projectionStore.getState().summaries[selectedId]?.name || selectedId : null;
+
+  const selectionCommands = useMemo<EditorCommand[]>(() => {
+    if (!selectedId || !selectedName) return [];
+    return selectionActions.map((action): EditorCommand => {
+      const base = {
+        id: `entity-${action.action}`,
+        // The engine's own label, ellipsis included. `Bind…` means "this opens a further step",
+        // which is exactly the information scent a palette row is for; trimming it for tidiness
+        // would make a two-stage action look like a one-click one.
+        label: action.label,
+        category: selectedName,
+        keywords: [selectedName, "selection", "selected"],
+        execute: () => runEntityAction(client, action, selectedId, { onFocus: (id, dist) => setFocused({ id, dist }) }),
+      };
+      if (action.available) return base;
+      // The engine explains every "no" (`actions_for` carries the reason), and `EditorCommand` makes
+      // that a COMPILE-TIME requirement -- a disabled command without a reason does not typecheck, on
+      // purpose, because the fallback string that used to fill the gap made the next silent refusal
+      // look like a handled case. There is therefore no paraphrase here: if the engine said nothing,
+      // the row says that the engine said nothing, which is a different and actionable fact.
+      return {
+        ...base,
+        disabled: true,
+        disabledReason: action.reason
+          ? plainReason(action.reason)
+          : "The engine offers this but did not say why it is unavailable",
+      };
+    });
+  }, [selectionActions, selectedId, selectedName, client]);
+
+  // -- GO TO AN OBJECT -----------------------------------------------------------------------------
+  //
+  // Query-driven rather than a static list: see `CommandPalette`'s `suggest` for why a 3,387-entry
+  // scene cannot be handed over as an array. Ranked prefix-first, capped, and the cap is SAID rather
+  // than silently applied -- a list that stops at eight and looks complete is the same lie as a gate
+  // that reports success over the scenes it did not open.
+  const goToObject = useCallback(
+    (query: string): EditorCommand[] => {
+      if (query.length < 2) return [];
+      const { summaries } = projectionStore.getState();
+      const path = (id: string): string => {
+        const parts: string[] = [];
+        let p = summaries[id]?.parentId;
+        for (let guard = 0; p && guard < 4; guard++) {
+          const name = summaries[p]?.name;
+          if (!name) break;
+          parts.unshift(name);
+          p = summaries[p]?.parentId;
+        }
+        return parts.join(" › ");
+      };
+      const hits: { id: string; name: string; at: number }[] = [];
+      for (const id of order) {
+        const name = summaries[id]?.name;
+        if (!name) continue;
+        const at = name.toLocaleLowerCase().indexOf(query);
+        if (at >= 0) hits.push({ id, name, at });
+      }
+      // A name that STARTS with what was typed outranks one that merely contains it; ties keep scene
+      // order, which is the order the outliner shows and therefore the order the user can predict.
+      hits.sort((a, b) => (a.at === 0 ? 0 : 1) - (b.at === 0 ? 0 : 1));
+      const SHOWN = 8;
+      const out: EditorCommand[] = hits.slice(0, SHOWN).map(({ id, name }) => ({
+        id: `goto-${id}`,
+        label: name,
+        category: "Go to object",
+        description: path(id) || undefined,
+        execute: () => {
+          projectionStore.getState().select(id);
+          void client.gizmoSelect(id).catch((error) => console.error("gizmoSelect failed", error));
+          // SELECTED **AND** FRAMED. Selecting alone leaves the user looking at wherever the camera
+          // already was, having just asked to go somewhere -- the action-to-result loop left open in
+          // the one surface whose whole promise is that it closes it (`<ux_quality>` 1).
+          client.focusEntity(id);
+          void client
+            .focusDebug()
+            .then(([distance]) => setFocused({ id, dist: distance }))
+            .catch(() => setFocused({ id, dist: 0 }));
+        },
+      }));
+      if (hits.length > SHOWN) {
+        const rest = hits.length - SHOWN;
+        out.push({
+          id: "goto-more",
+          label: `${rest} more object${rest === 1 ? "" : "s"} match this`,
+          category: "Go to object",
+          disabled: true,
+          disabledReason: "Type more of the name to narrow the list",
+          execute: () => {},
+        });
+      }
+      return out;
+    },
+    [order, client],
+  );
+
   const selectCreated = (id: string | null) => {
     if (!id) return;
     projectionStore.getState().select(id);
@@ -541,6 +678,10 @@ export function App() {
   };
 
   const commands: EditorCommand[] = [
+    // The selected object's own actions lead. With an empty query every rank ties and source
+    // order decides, so "what can I do to this" is the first thing the palette says -- which is
+    // the whole reason someone with something selected opens it.
+    ...selectionCommands,
     // Generated from the SAME list the rail renders, so the palette can never drift out of sync with it.
     ...ENGINES.map((e) => ({
       id: `workspace-${e.id}`,
@@ -1081,6 +1222,7 @@ export function App() {
             open
             onClose={() => setCommandsOpen(false)}
             commands={commands}
+            suggest={goToObject}
             onCommandError={(error, command) => {
               console.error(`command ${command.id} failed`, error);
               setStatus(`${command.label} could not be completed`);

@@ -3,21 +3,11 @@
 //! native Enter/Space activation, and Escape dismissal.
 
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { projectionStore } from "../store/projection";
-import { setStatus } from "../store/ui";
-import { pushToast, type ToastKind } from "../store/toasts";
+import { plainReason, runEntityAction } from "./entityActions";
 import { PopoverSurface } from "../theme/Popover";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type { ActionItem } from "../transport/protocol";
-
-/** Soften engine-internal rejection language into concise user-facing guidance. */
-function plainReason(reason: string): string {
-  if (/no unmet requirement to bind/i.test(reason)) {
-    return "nothing to bind yet — this object already has what it needs";
-  }
-  return reason;
-}
 
 type LoadState = "loading" | "ready" | "error";
 
@@ -83,57 +73,12 @@ export function ContextMenu({
     itemRefs.current[0]?.focus();
   }, [actions, loadState]);
 
-  function feedback(message: string, kind: ToastKind = "info") {
-    setStatus(message);
-    pushToast(message, kind);
-  }
-
+  // The dispatch lives in `entityActions.ts`, not here. This surface and the command palette both
+  // offer `actions_for`'s result, and a `switch` over the engine's action vocabulary written once per
+  // surface is the same contract stated twice with nothing comparing the two.
   function dispatch(action: ActionItem) {
     if (!action.available) return;
-    switch (action.action) {
-      case "remove":
-        client.removeEntity(id);
-        feedback("removed " + id + " · Ctrl-Z to undo", "info");
-        break;
-      case "duplicate":
-        void client
-          .duplicateEntity(id)
-          .then((newId) => feedback(newId ? "duplicated " + id : "couldn't duplicate " + id, newId ? "success" : "error"))
-          .catch((error) => {
-            console.error("duplicate failed", error);
-            feedback("couldn't duplicate " + id, "error");
-          });
-        break;
-      case "focus":
-        client.focusEntity(id);
-        void client
-          .focusDebug()
-          .then(([distance]) => onFocus?.(id, distance))
-          .catch(() => onFocus?.(id, 0));
-        feedback("focused " + id, "info");
-        break;
-      case "inspect":
-        projectionStore.getState().select(id);
-        void client.gizmoSelect(id).catch((error) => console.error("gizmoSelect failed (engine selection may be out of sync)", error));
-        feedback("inspecting " + id, "info");
-        break;
-      case "bind":
-        projectionStore.getState().select(id);
-        void client.gizmoSelect(id).catch((error) => console.error("gizmoSelect failed (engine selection may be out of sync)", error));
-        feedback("binding " + id, "info");
-        break;
-      case "makedynamic":
-        void client
-          .makeDynamic(id)
-          .then((ok) => feedback(ok ? "made " + id + " dynamic" : "couldn't make " + id + " dynamic", ok ? "success" : "error"))
-          .catch((error) => {
-            console.error("make_dynamic failed", error);
-            feedback("couldn't make " + id + " dynamic", "error");
-          });
-        break;
-      default:
-        return;
-    }
+    runEntityAction(client, action, id, { onFocus });
     onClose();
   }
 

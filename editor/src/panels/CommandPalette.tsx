@@ -45,6 +45,20 @@ export interface CommandPaletteProps {
   placeholder?: string;
   /** Receives command failures after the palette has presented them to the user. */
   onCommandError?: (error: unknown, command: EditorCommand) => void;
+  /** Results the parent computes FROM THE QUERY, for a candidate set too large to hand over as an
+   *  array.
+   *
+   *  `commands` is the editor's fixed vocabulary — 26 entries, every one of them worth listing before
+   *  the user has typed anything. The scene is the opposite: a CAD import lands 378 to 3,387 entities
+   *  (ADR-077), so "go to an object by name" cannot be a static list without making the empty palette
+   *  a 3,387-row listbox, and cannot be left out without making the one thing the user is most often
+   *  looking for the one thing the palette cannot find.
+   *
+   *  Called with the normalized query and expected to return results ALREADY in the provider's own
+   *  relevance order — the palette does not re-rank them, because it does not know what they are.
+   *  They are appended after the ranked static commands, so a provider cannot push the editor's own
+   *  vocabulary off the top of the list. */
+  suggest?: (query: string) => readonly EditorCommand[];
 }
 
 interface RankedCommand {
@@ -88,6 +102,7 @@ export function CommandPalette({
   title = "Command palette",
   placeholder = "Search tools and actions…",
   onCommandError,
+  suggest,
 }: CommandPaletteProps) {
   const generatedId = useId();
   const paletteId = `command-palette-${safeId(generatedId)}`;
@@ -102,11 +117,19 @@ export function CommandPalette({
 
   const ranked = useMemo<RankedCommand[]>(() => {
     const needle = normalized(query);
-    return commands
+    const fixed = commands
       .map((command, sourceIndex) => ({ command, sourceIndex, rank: commandRank(command, needle) }))
       .filter((item): item is RankedCommand => item.rank != null)
       .sort((a, b) => a.rank - b.rank || a.sourceIndex - b.sourceIndex);
-  }, [commands, query]);
+    // Provider order is preserved verbatim and the whole block sits after `fixed`. Sorting these
+    // together would mean ranking a scene object by `commandRank`, which reads a label, a category
+    // and a description — none of which mean the same thing for an object as they do for a verb.
+    const offered = suggest?.(needle) ?? [];
+    return [
+      ...fixed,
+      ...offered.map((command, i) => ({ command, sourceIndex: fixed.length + i, rank: Number.MAX_SAFE_INTEGER })),
+    ];
+  }, [commands, query, suggest]);
 
   const groups = useMemo(() => {
     const result = new Map<string, EditorCommand[]>();
@@ -336,9 +359,12 @@ export function CommandPalette({
           )}
         </div>
 
+        {/* RESULTS, not commands. The list holds the editor's verbs AND whatever `suggest`
+            returned — scene objects, today — and "9 commands" over eight objects and a row
+            saying three more matched is wrong about both the number and the noun. */}
         <div className="mtk-command-palette__footer">
           <span role={failure ? "alert" : undefined} aria-live={failure ? "assertive" : "polite"}>
-            {failure ?? `${ranked.length} command${ranked.length === 1 ? "" : "s"}`}
+            {failure ?? `${ranked.length} result${ranked.length === 1 ? "" : "s"}`}
           </span>
           <span className="mtk-command-palette__help" aria-hidden="true">
             <Icon name="arrow-up" size="sm" /><Icon name="arrow-down" size="sm" /> navigate · Enter run · Esc close
