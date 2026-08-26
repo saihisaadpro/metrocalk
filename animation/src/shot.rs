@@ -423,6 +423,15 @@ impl Stage {
             }
             confined[axis] = confined[axis].clamp(lo[axis], hi[axis]);
         }
+        // EXACT, AND EXACT IS THE POINT. `clamp` returns its input BIT-IDENTICALLY when the value is
+        // already inside the range, so this asks "did any axis actually move?" — the one question an
+        // epsilon would answer wrongly, by discarding a real clamp of half a millimetre. Introduced
+        // with the room in `f557beb` and denied by `clippy::float_cmp` in the workspace job, which is
+        // the lint's escape hatch existing for exactly this case.
+        #[allow(
+            clippy::float_cmp,
+            reason = "clamp() is bit-identical when it does nothing; the question is whether it did"
+        )]
         if confined == eye {
             return eye;
         }
