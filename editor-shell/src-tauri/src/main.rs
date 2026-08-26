@@ -14,6 +14,7 @@
 //! transaction (north-star test #1).
 
 mod diag;
+mod hall;
 mod ibl;
 mod moba;
 mod native_drop_import;
@@ -822,12 +823,33 @@ fn restore_document_shape_assets(
         }
     }
     if restored > 0 {
-        eprintln!("[shell] rebuilt {restored} shape mesh(es) from their document recipes");
+        diag_log!("assets: rebuilt {restored} shape mesh(es) from their document recipes");
     }
     for e in &errors {
-        eprintln!("[shell] shape asset NOT restorable — {e}");
+        diag_log!("assets: shape asset NOT restorable - {e}");
     }
     (restored, errors)
+}
+
+/// What a document's CAD mesh references amounted to at the moment it was opened.
+///
+/// Three numbers rather than one, because a single "queued" count conflates the two ways it can be
+/// zero: a document with no CAD geometry in it at all, and a document whose every part happens to be
+/// resident already. That conflation is the same defect shape as a placement report whose `rejected: 0`
+/// meant both "nothing needed rejecting" and "everything was rejected" — one number answering two
+/// questions, read as whichever answer the reader expected.
+///
+/// Kept apart, they make an empty viewport legible: `referenced` large, `resident` zero, `queued`
+/// large, and a subsequent restore that prepares none of them says "the geometry cache is gone", which
+/// is a different repair from "this project has no geometry in it".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CadRestoreQueue {
+    /// Distinct `mtkcad:` handles the document's entities reference.
+    referenced: usize,
+    /// Of those, the ones already registered with the viewport, which need no restore.
+    resident: usize,
+    /// Of those, the ones handed to the background loader.
+    queued: usize,
 }
 
 /// Queue only the persisted CAD meshes referenced by the active document. Deserializing and preparing
@@ -838,8 +860,8 @@ fn queue_document_cad_assets(
     engine: &Engine<FlecsWorld>,
     assets: &AssetsRuntime,
     self_tx: &Sender<EngineCmd>,
-) -> usize {
-    let handles: BTreeSet<String> = engine
+) -> CadRestoreQueue {
+    let referenced: BTreeSet<String> = engine
         .entity_ids()
         .into_iter()
         .filter_map(|entity| {
@@ -850,13 +872,22 @@ fn queue_document_cad_assets(
             else {
                 return None;
             };
-            (handle.starts_with("mtkcad:") && !assets.handle_to_slot.contains_key(handle))
-                .then(|| handle.clone())
+            handle.starts_with("mtkcad:").then(|| handle.clone())
         })
         .collect();
+    let handles: BTreeSet<String> = referenced
+        .iter()
+        .filter(|handle| !assets.handle_to_slot.contains_key(*handle))
+        .cloned()
+        .collect();
     let expected = handles.len();
+    let tally = CadRestoreQueue {
+        referenced: referenced.len(),
+        resident: referenced.len() - expected,
+        queued: expected,
+    };
     if expected == 0 {
-        return 0;
+        return tally;
     }
 
     let directory = sidecar("metrocalk-cad-meshes");
@@ -878,10 +909,10 @@ fn queue_document_cad_assets(
             })
             .is_err()
         {
-            eprintln!("[shell] CAD asset restore finished after the engine closed");
+            diag_log!("assets: CAD mesh restore finished after the engine closed");
         }
     });
-    expected
+    tally
 }
 
 fn asset_lab_source<'a>(
@@ -8200,14 +8231,15 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
         );
     }
     for error in &pipe_restore_errors {
-        eprintln!("[shell] procedural asset recovery skipped {error}");
+        diag_log!("assets: procedural asset recovery skipped {error}");
     }
     let cad_assets_queued = queue_document_cad_assets(&engine, &assets, &self_tx);
-    if cad_assets_queued > 0 {
-        eprintln!(
-            "[shell] restoring {cad_assets_queued} CAD mesh(es) referenced by the active document in the background"
-        );
-    }
+    diag_log!(
+        "assets: active document references {} CAD mesh handle(s) - {} already resident, {} queued for restore",
+        cad_assets_queued.referenced,
+        cad_assets_queued.resident,
+        cad_assets_queued.queued
+    );
     // The Loro version vector at the last save/open/new (captured AFTER any open/seed, so a fresh session
     // starts "clean"): `dirty = current vv != saved_vv` needs no per-command instrumentation.
     let mut saved_vv: Vec<u8> = engine.version_vector();
@@ -8471,12 +8503,18 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
                 if restored == expected {
-                    eprintln!(
-                        "[shell] restored {restored} active-document CAD mesh(es) in {elapsed_ms:.1} ms"
+                    diag_log!(
+                        "assets: restored {restored} document CAD mesh(es) in {elapsed_ms:.1} ms"
                     );
                 } else {
-                    eprintln!(
-                        "[shell] restored {restored}/{expected} active-document CAD mesh(es) in {elapsed_ms:.1} ms — unresolved parts remain explicit placeholders"
+                    // Says what is true rather than what would be reassuring. The unresolved handles
+                    // are NOT drawn as placeholders — nothing is registered with the viewport for
+                    // them, so their entities are simply absent from the picture while the outliner
+                    // count and the import report both keep reporting them. An operator reading only
+                    // those two would conclude the scene loaded.
+                    diag_log!(
+                        "assets: restored {restored}/{expected} document CAD mesh(es) in {elapsed_ms:.1} ms - {} part(s) have NO geometry and will not be drawn; the persisted mesh cache beside the executable is missing or incomplete",
+                        expected - restored
                     );
                 }
             }
@@ -14421,11 +14459,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             );
                         }
                         let cad_queued = queue_document_cad_assets(&engine, &assets, &self_tx);
-                        if cad_queued > 0 {
-                            eprintln!(
-                                "[shell] restoring {cad_queued} CAD mesh(es) referenced by the opened project in the background"
-                            );
-                        }
+                        diag_log!(
+                            "assets: opened project references {} CAD mesh handle(s) - {} already resident, {} queued for restore",
+                            cad_queued.referenced,
+                            cad_queued.resident,
+                            cad_queued.queued
+                        );
                         rebuild(&engine, &shared, &mut positions, &assets);
                         if let Some(ch) = &channel {
                             send_proj!(ch, proj_full(&engine, &scene));
@@ -15393,6 +15432,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             far = far.max(previous_far);
                         }
                         let mut st = shared.lock().unwrap();
+                        // Let the shot see the room it is standing in. The planes above are fitted to
+                        // the subject, which clips a presentation hall out of every close shot and
+                        // slices a wall across every wide one; see `Hall::far_reach_from`. A scene with
+                        // no room keeps exactly the number it had.
+                        if let Some(hall) = st.hall {
+                            far = far.max(hall.far_reach_from(pose.eye));
+                        }
                         st.cinematic_subject_id = Some(key.clone());
                         st.cinematic_shot_index = Some(playback.index);
                         st.cam_override = Some(render::CamView {
@@ -21686,6 +21732,7 @@ fn cinematic_subject_sample(
             center,
             half_extent,
             forward: [0.0, 0.0, 1.0],
+            stage: state.camera_stage(),
         };
     }
 
@@ -21697,6 +21744,7 @@ fn cinematic_subject_sample(
         center: fallback_transform.translation,
         half_extent: [half; 3],
         forward: [0.0, 0.0, 1.0],
+        stage: state.camera_stage(),
     }
 }
 
@@ -21773,6 +21821,13 @@ fn plan_cinematic_shot(
     if state.cinematic_placements.len() >= MAX_RECORDED_PLACEMENTS {
         state.cinematic_placements.remove(0);
     }
+    // The oracle's own reading of the placement it settled on, taken at mid-shot. One extra ray budget
+    // (0-3 ms, the same cost the planner already pays per candidate) buys the ability to tell "the
+    // negotiation never ran" from "the negotiation ran and was satisfied by this" -- which are different
+    // faults with opposite fixes, and were indistinguishable in the previous record.
+    let filmed =
+        metrocalk_animation::shot::solve_shot_adjusted(shot, plan, sample, 0.5, aspect, 50.0);
+    let vantage = state.vantage(filmed.eye, filmed.look_at, sample.center, radius, &subject);
     state.cinematic_placements.push(render::CinematicPlacement {
         shot: shot.id.clone(),
         subject: key.clone(),
@@ -21780,6 +21835,7 @@ fn plan_cinematic_shot(
         filmed_size: name_of(plan.size),
         yaw_offset_deg: plan.yaw_offset_deg,
         rejected: plan.steps,
+        vantage,
     });
     // NEVER SILENT. A film that quietly re-aimed half its shots and a film that was directed well are
     // indistinguishable from the outside, and the difference is the whole point of the mechanism.
@@ -22456,6 +22512,17 @@ fn camera_probe(state: State<AppState>) -> serde_json::Value {
                     "rejected": placement.rejected,
                     "asDirected": placement.directed_size == placement.filmed_size
                         && placement.yaw_offset_deg == 0.0,
+                    // What the negotiation saw at the placement it settled on. `rejected: 0` with an
+                    // acceptable vantage and an illegible frame is the oracle disagreeing with the
+                    // picture, which is a different fault from the mechanism not running.
+                    "vantage": {
+                        "eyeInside": placement.vantage.eye_inside,
+                        "clear": placement.vantage.clear,
+                        "backing": placement.vantage.backing,
+                        "crowded": placement.vantage.crowded,
+                        "acceptable": placement.vantage.acceptable(),
+                        "score": placement.vantage.score(),
+                    },
                 })
             })
             .collect::<Vec<_>>(),
@@ -23091,6 +23158,83 @@ fn look_through_camera(state: State<AppState>, on: bool) -> bool {
     recv_reply(&rx).unwrap_or(false)
 }
 
+/// Stand the viewport camera at an explicit eye and aim it at an explicit target — a look-dev vantage.
+///
+/// Render-only, exactly like [`look_through_camera`]: it writes the camera override and creates no
+/// entity, changes no component and enters no undo. What it adds is the ability to say where to STAND
+/// and where to LOOK in one call.
+///
+/// # Why this did not already exist, and what its absence cost
+///
+/// Neither existing way to move a camera can express a vantage. `view_preset` and `frame_all` choose the
+/// vantage FOR you out of the scene's bounds. `add_camera` places a scene camera carrying a position, a
+/// field of view and **no aim at all** — [`render::CamView::look_at`] is left `None`, which means "keep
+/// aiming at the editor's orbit target". So every camera it creates looks at the same point, and only
+/// its position differs.
+///
+/// That is not a theoretical gap. The presentation lab places its four vantages with `add_camera`, and in
+/// its own recorded notes THREE of them report the same eye, the same target and the same distance; an
+/// earlier run wrote two of the stills as byte-identical files. The vantage described in that lab as
+/// "looking up: the half of the frame that is void in every film so far" — the only one that would show
+/// whether the room has a roof — has never once been captured, in any run, because it was not sayable.
+///
+/// # Clip planes
+///
+/// Near and far come from the same solver the cutscene uses rather than from a second opinion, so a
+/// look-dev frame has the cutscene's depth precision. At this scene's scale that is the difference
+/// between a clean floor and z-fighting across a 400 m slab.
+///
+/// Returns the pose actually adopted so a caller can ASSERT the camera went where it was sent. A lab that
+/// assumes its own camera moved is how three vantages became one.
+#[tauri::command]
+fn set_look_dev_camera(
+    state: State<AppState>,
+    eye: [f32; 3],
+    look_at: [f32; 3],
+    fov: f32,
+) -> serde_json::Value {
+    ipc();
+    if !eye.iter().chain(look_at.iter()).all(|v| v.is_finite()) || !fov.is_finite() {
+        return serde_json::json!({
+            "error": "a non-finite eye, target or field of view would put a NaN in the view matrix"
+        });
+    }
+    let offset = [
+        eye[0] - look_at[0],
+        eye[1] - look_at[1],
+        eye[2] - look_at[2],
+    ];
+    let distance = offset.iter().map(|c| c * c).sum::<f32>().sqrt();
+    if distance < 1.0e-4 {
+        return serde_json::json!({
+            "error": "the eye and the target are the same point, so there is no direction to look in"
+        });
+    }
+    let fov_deg = fov.clamp(5.0, 120.0);
+    // The clip solver's first argument is "how big is the thing being looked at". At look-dev the caller
+    // has not said, so the stand-off is the only scale available; a tenth of it is the radius a subject
+    // filling a normal frame at that distance would have.
+    let (near, far) = metrocalk_animation::shot::cinematic_clip_planes(distance * 0.1, distance);
+    {
+        let mut st = state.shared.lock().unwrap();
+        st.cam_override = Some(render::CamView {
+            pos: eye,
+            look_at: Some(look_at),
+            fov_deg,
+            near,
+            far,
+        });
+    }
+    serde_json::json!({
+        "eye": eye,
+        "lookAt": look_at,
+        "fovDeg": fov_deg,
+        "near": near,
+        "far": far,
+        "distance": distance,
+    })
+}
+
 /// M11.4 — non-mutating SCENE-camera read for the gate: (authored Camera entities, an active one present,
 /// the active fov in degrees or -1). Distinct from `camera_debug`, which reports the editor fly-cam state.
 #[tauri::command(async)]
@@ -23266,6 +23410,57 @@ fn set_working_space(state: State<AppState>, space: String) -> String {
     };
     state.shared.lock().unwrap().working_space = w;
     w.wire().to_string()
+}
+
+/// Choose the room the scene is presented in — open studio ground, or an industrial hall around it.
+///
+/// A presentation choice, with exactly the standing of the view transform beside it: it creates no
+/// entity, changes no component, moves no count in the import report, and never enters the document or
+/// undo. What it changes is what a camera standing in the scene can SEE, and on a large imported plant
+/// that turns out to be the difference between a well-presented machine in an empty field and an
+/// industrial visualisation.
+///
+/// Returns the wire name of the set that is now live, so a caller can tell "applied" from "the word I
+/// sent was not a set" without a second round trip. An unknown name is refused rather than defaulted:
+/// silently presenting the studio for a caller that asked for the hall would be a wrong picture
+/// reported as a right one.
+#[tauri::command]
+fn set_presentation_set(state: State<AppState>, set: String) -> String {
+    ipc();
+    let Some(chosen) = render::PresentationSet::parse(&set) else {
+        return format!("unknown: {set}");
+    };
+    let mut st = state.shared.lock().unwrap();
+    st.presentation_set = chosen;
+    // The room's memo is keyed on what is IN the scene, and this changed the answer without changing
+    // the scene — the one case that key cannot see.
+    st.invalidate_stage();
+    chosen.wire().to_string()
+}
+
+/// Which room the scene is being presented in, and how big it came out.
+///
+/// Reports the SIZED room rather than the setting, because those answer different questions: a scene
+/// with nothing in it yet is set to the hall and has no hall, and a report that said "factoryHall"
+/// with nothing on screen would be describing an intention as if it were a picture.
+#[tauri::command]
+fn presentation_set_state(state: State<AppState>) -> serde_json::Value {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.sync_stage();
+    let hall = st.hall;
+    serde_json::json!({
+        "set": st.presentation_set.wire(),
+        "label": st.presentation_set.label(),
+        "built": hall.is_some(),
+        "hall": hall.map(|h| serde_json::json!({
+            "lengthMetres": h.half_x * 2.0,
+            "widthMetres": h.half_z * 2.0,
+            "clearHeightMetres": h.height,
+            "bayMetres": h.bay,
+            "centre": h.centre,
+        })),
+    })
 }
 
 /// Declare what the loaded environment map's values MEAN — the per-asset colour override, for the one
@@ -25419,6 +25614,7 @@ fn main() {
             lighting_debug,
             add_camera,
             look_through_camera,
+            set_look_dev_camera,
             scene_camera_debug,
             rename_entity,
             group_entities,
@@ -25447,6 +25643,8 @@ fn main() {
             render_profile_debug,
             set_working_space,
             working_space_debug,
+            set_presentation_set,
+            presentation_set_state,
             set_environment_colour_space,
             environment_colour_space_debug,
             snap_ghost,

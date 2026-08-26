@@ -375,6 +375,68 @@ pub struct SubjectSample {
     pub half_extent: [f32; 3],
     /// The subject's forward (unit). Angles are relative to this, so "front" follows the subject.
     pub forward: [f32; 3],
+    /// The room this subject is standing in, when the scene has one.
+    ///
+    /// It rides on the sample rather than being a separate argument for the same reason
+    /// [`CAMERA_FLOOR`] is applied inside [`solve_shot_adjusted`]: the planner and the runtime have to
+    /// be looking at the same camera, and a value that reaches one of them by a different route than
+    /// the other is exactly how a pose gets validated at one place and filmed at another.
+    pub stage: Stage,
+}
+
+/// Where a camera is allowed to stand — what the world says about the room, not about the subject.
+///
+/// [`Stage::OPEN`] is a scene with no room at all, and is the whole of the old behaviour: an engine that
+/// has nothing to say here says this, and every placement is then exactly what the direction solved.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stage {
+    /// The interior box a camera may stand in, `(lo, hi)`, **already inset by whatever margin the room
+    /// wants off its own surfaces**. The solver keeps the eye inside it and does not reason about
+    /// thickness, cladding or clearance: that is the room's business, and a solver that had opinions
+    /// about it would be a second place where the margin is decided.
+    pub room: Option<([f32; 3], [f32; 3])>,
+}
+
+impl Stage {
+    /// A scene with no room — every camera position is reachable.
+    pub const OPEN: Self = Self { room: None };
+
+    /// Bring `eye` inside the room, or leave it exactly where it is.
+    ///
+    /// Returns the unchanged pose whenever honouring the room would put the lens inside the subject:
+    /// a wide card clamped against a near wall can end up closer to a large subject than the framing
+    /// solve ever allows, and a camera inside the thing it is filming is a worse frame than the
+    /// too-distant one it was trying to fix. Declining leaves the existing negotiation to handle it,
+    /// which is what happens today, so this can only ever improve a placement or leave it alone.
+    #[must_use]
+    fn confine(self, eye: [f32; 3], centre: [f32; 3], min_range: f32) -> [f32; 3] {
+        let Some((lo, hi)) = self.room else {
+            return eye;
+        };
+        if !lo.iter().chain(hi.iter()).all(|v| v.is_finite()) {
+            return eye;
+        }
+        let mut confined = eye;
+        for axis in 0..3 {
+            if lo[axis] > hi[axis] {
+                return eye; // a degenerate room is not a room
+            }
+            confined[axis] = confined[axis].clamp(lo[axis], hi[axis]);
+        }
+        if confined == eye {
+            return eye;
+        }
+        let d = [
+            confined[0] - centre[0],
+            confined[1] - centre[1],
+            confined[2] - centre[2],
+        ];
+        let range = d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt();
+        if !range.is_finite() || range < min_range {
+            return eye;
+        }
+        confined
+    }
 }
 
 impl SubjectSample {
@@ -773,6 +835,16 @@ pub fn solve_shot_adjusted(
     if pose.eye[1] < CAMERA_FLOOR {
         pose.eye[1] = CAMERA_FLOOR;
     }
+    // ...and then into the room, if the scene has one. Same reasoning as the floor, one scale up: a
+    // wide card on a 262 m assembly solves to a stand-off of hundreds of metres, which is outside any
+    // building, and a camera there films the outside of a shed. Confined, the same card becomes a view
+    // ALONG the hall with the line receding into it — the subject occupies less of the frame and the
+    // frame occupies more of the plant, which is the trade a factory establishing shot actually makes.
+    //
+    // Last, and inside the solve, for the same reason the floor is: the planner judges what is filmed.
+    pose.eye = subject
+        .stage
+        .confine(pose.eye, subject.center, subject.radius() * 1.05);
     pose
 }
 
@@ -821,6 +893,18 @@ pub fn plan_shot(
     }
 
     let mut best: Option<(f32, ShotAdjustment)> = None;
+    // THE LEAST BAD PLACEMENT THE SEARCH FOUND, for when nothing is acceptable at all.
+    //
+    // This used to be thrown away. Every unacceptable candidate was `continue`d past, and if the whole
+    // ladder failed the planner returned the authored placement — which is itself one of the candidates
+    // that just failed, and is not the least bad one, only the one that happened to be written down.
+    // The search evaluated fifty-four placements, scored every one of them, and then discarded all of
+    // that to fall back on an arbitrary member of the losing set.
+    //
+    // Measured on the production factory: nine of thirty shots were filmed at a placement the engine
+    // itself reported as `acceptable: false`, and those shots are where the film's remaining illegible
+    // seconds are.
+    let mut least_bad: Option<(f32, ShotAdjustment)> = None;
     let mut steps: u8 = 0;
     for (widened, size) in sizes.into_iter().enumerate() {
         #[allow(clippy::cast_precision_loss)] // at most five steps exist
@@ -845,6 +929,36 @@ pub fn plan_shot(
                 worst_backing = worst_backing.min(vantage.backing);
             }
             if !all_acceptable {
+                // Rank it anyway. A shot has to be filmed from somewhere, and "the best of a bad set"
+                // is a strictly better answer than "the first one somebody wrote down".
+                //
+                // The authored bonus does NOT apply: it exists to stop the planner shopping around when
+                // the direction as written is already fine, and on this path it is known not to be.
+                //
+                // ONE STEP OF WIDENING, AT MOST, ON THIS PATH.
+                //
+                // `WIDENING_PENALTY` (0.4) is set against `BACKING_WEIGHT` (0.35) so a richer background
+                // can never buy a wider frame. It does NOT bound `clear`, which carries weight 1.0. In
+                // the acceptable regime that is harmless, because every surviving candidate is already
+                // above `MIN_CLEAR_FRACTION` and the spread between them is small. Here the spread is
+                // the whole range: the placements this branch exists for measure clear 0.00 and crowded
+                // 1.00, so a candidate several steps wider can gain around 1.6 of score — enough to pay
+                // for three or four steps of widening and still win.
+                //
+                // The shots that reach this branch are the film's mechanism close-ups. Widening them to
+                // Wide would raise the legibility fraction by turning each into a distant view of a
+                // small part on an empty floor: the exact frame the authoring-time rule eliminates,
+                // re-created at runtime where that rule cannot see it. It would satisfy "camera paths do
+                // not clip geometry" by spending "professional industrial visualisation standard", and
+                // the fraction alone could not tell those two apart.
+                if widened <= 1 {
+                    let ranked = worst_score - widening_cost;
+                    if least_bad
+                        .is_none_or(|(least_bad_score, _)| ranked > least_bad_score + TIE_MARGIN)
+                    {
+                        least_bad = Some((ranked, candidate));
+                    }
+                }
                 continue;
             }
             let as_directed = candidate.size == shot.size && candidate.yaw_offset_deg == 0.0;
@@ -874,7 +988,17 @@ pub fn plan_shot(
         }
     }
     best.map_or_else(
-        || ShotAdjustment::authored(shot),
+        || {
+            least_bad.map_or_else(
+                || ShotAdjustment::authored(shot),
+                // `steps` carries the WHOLE count, so this case is legible in the record. It used to
+                // report zero — the same value as "the authored placement was fine and nothing was
+                // rejected before it" — which made a shot the planner could not place at all
+                // indistinguishable from a shot it never needed to touch. Those are opposite situations
+                // and a run report that renders them identically will be read as the happier one.
+                |(_, candidate)| ShotAdjustment { steps, ..candidate },
+            )
+        },
         |(_, candidate)| candidate,
     )
 }
@@ -888,6 +1012,7 @@ mod tests {
             center: [0.0, 0.0, 0.0],
             half_extent: [0.5, 0.5, 0.5],
             forward: [0.0, 0.0, 1.0],
+            stage: Stage::OPEN,
         }
     }
 
@@ -1651,8 +1776,14 @@ mod tests {
         assert!(buried.score().is_infinite() && buried.score().is_sign_negative());
     }
 
-    /// With everything blocked there is no good answer, and the planner must hand back the direction as
-    /// written rather than park the camera somewhere arbitrary.
+    /// With everything blocked EQUALLY there is no information to act on, and the planner must hand back
+    /// the direction as written rather than park the camera somewhere arbitrary.
+    ///
+    /// Note what this does and does not pin: the world here answers the same vantage for every
+    /// candidate, so all fifty-four tie and the first — the authored one — wins the tie. It is a test
+    /// about indifference. The case where the bad placements differ from each other is
+    /// [`Self::the_least_bad_placement_is_taken_when_nothing_is_acceptable`], and until that test
+    /// existed this one was read as covering both.
     #[test]
     fn a_hopeless_scene_returns_the_authored_shot_unchanged() {
         let s = shot(ShotSize::Close, ShotAngle::Behind, ShotMove::Orbit);
@@ -1666,6 +1797,63 @@ mod tests {
         assert_eq!(
             solve_shot_adjusted(&s, plan, cube(), 0.7, 16.0 / 9.0, 50.0),
             solve_shot_eased(&s, cube(), 0.7, 16.0 / 9.0, 50.0),
+        );
+    }
+
+    /// When nothing is acceptable, film from the least bad place the search found — not from the one
+    /// that happened to be written down.
+    ///
+    /// THE FAILURE THIS IS BUILT FROM. On the production factory, nine of thirty shots were filmed at a
+    /// placement the engine itself reported `acceptable: false` for, and those shots are where the
+    /// film's remaining illegible seconds are. The planner had evaluated fifty-four placements for each
+    /// of them, scored every one, found none acceptable — and then discarded all of that and returned
+    /// the authored placement, which is simply one arbitrary member of the losing set.
+    ///
+    /// The world here is hopeless everywhere but not equally so: the authored placement is buried, and
+    /// one yaw further round is merely crowded. A viewer would rather watch the crowded one.
+    #[test]
+    fn the_least_bad_placement_is_taken_when_nothing_is_acceptable() {
+        let s = shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold);
+        let authored_eye = solve_shot_eased(&s, cube(), 0.5, 16.0 / 9.0, 50.0).eye;
+        let plan = plan_shot(&s, cube(), 16.0 / 9.0, 50.0, |pose, _| {
+            // Anywhere near where the direction asked for, the camera is inside something. Elsewhere it
+            // is merely boxed in — bad, unacceptable, and visibly better than being buried.
+            if dist(pose.eye, authored_eye) < 0.05 {
+                Vantage {
+                    eye_inside: true,
+                    clear: 0.0,
+                    backing: 0.0,
+                    crowded: 1.0,
+                }
+            } else {
+                Vantage {
+                    eye_inside: false,
+                    clear: 0.5,
+                    backing: 0.5,
+                    crowded: 1.0,
+                }
+            }
+        });
+        assert!(
+            !plan.is_authored(&s),
+            "the authored placement was buried and something less bad existed: {plan:?}"
+        );
+        // And the record has to SAY the search failed. `steps` used to be zero here, which is the same
+        // value it reports when the authored placement was fine and nothing was rejected before it —
+        // so a shot the planner could not place at all read identically to one it never had to touch.
+        assert!(
+            plan.steps > 0,
+            "a shot filmed from the least bad of a losing set must not report zero rejections: {plan:?}"
+        );
+        // AND IT MUST NOT BUY LEGIBILITY WITH THE CLOSE VOCABULARY. On this path `clear` (weight 1.0) is
+        // unbounded by `WIDENING_PENALTY` (0.4), so an unconstrained search would happily step three or
+        // four sizes wider — turning the film's mechanism close-ups into distant views of small parts on
+        // an empty floor, which scores better and shows less.
+        assert!(
+            plan.size == s.size || plan.size == s.size.wider(),
+            "the fallback may step back at most one size: directed {:?}, filmed {:?}",
+            s.size,
+            plan.size
         );
     }
 

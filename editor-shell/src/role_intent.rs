@@ -77,14 +77,19 @@ impl std::error::Error for RoleError {}
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoleSpec {
-    /// Recipe kind (`GameRole.role`).
+    /// Recipe kind (`GameRole.role`) — AND the card's icon name (ADR-137).
+    ///
+    /// The catalog used to carry a separate `icon: &'static str` holding one character per entry, and
+    /// in all fifty-nine entries across the five catalogs that character was a per-`kind` constant:
+    /// the field was one contract stated twice, in two languages, which is exactly the drift ADR-134
+    /// is about. It was also thirty-five colour EMOJI, which a monochrome light workbench cannot
+    /// draw. `editor/src/theme/icons.tsx` keys its drawings on these kinds, so there is nothing left
+    /// to keep in sync — `check-icon-vocab.mjs` fails if a kind here has no mark there.
     pub kind: &'static str,
     /// Card label.
     pub label: &'static str,
     /// What it is for, one line.
     pub blurb: &'static str,
-    /// Card glyph.
-    pub icon: &'static str,
     /// Exactly what assigning it adds — the legible-cost line.
     pub adds: &'static str,
 }
@@ -97,35 +102,30 @@ pub fn role_specs() -> Vec<RoleSpec> {
             kind: "collectible",
             label: "Collectible",
             blurb: "Spins; vanishes and scores when something touches it",
-            icon: "✦",
             adds: "spin animation · touch trigger · pickup rule · +1 on the Score counter",
         },
         RoleSpec {
             kind: "solid",
             label: "Solid obstacle",
             blurb: "An immovable body other things collide with",
-            icon: "▦",
             adds: "fixed physics body · auto-fit collider",
         },
         RoleSpec {
             kind: "prop",
             label: "Physics prop",
             blurb: "Falls, rolls and collides under gravity",
-            icon: "◍",
             adds: "dynamic physics body · auto-fit collider",
         },
         RoleSpec {
             kind: "spinner",
             label: "Spinner",
             blurb: "Turns forever — ambient motion",
-            icon: "↻",
             adds: "looping spin animation",
         },
         RoleSpec {
             kind: "companion",
             label: "Companion",
             blurb: "Follows your props, patrols your waypoints, fights your enemies",
-            icon: "♥",
             adds:
                 "dynamic physics body · auto-fit collider · a live brain (follow / patrol / attack)",
         },
@@ -133,7 +133,6 @@ pub fn role_specs() -> Vec<RoleSpec> {
             kind: "enemy",
             label: "Enemy",
             blurb: "Companions attack it; it falls when struck",
-            icon: "☠",
             adds:
                 "dynamic physics body · auto-fit collider · the defeat rule · +1 Score when beaten",
         },
@@ -141,28 +140,24 @@ pub fn role_specs() -> Vec<RoleSpec> {
             kind: "waypoint",
             label: "Waypoint",
             blurb: "A patrol stop — companions with nothing to follow walk the chain in order",
-            icon: "⚑",
             adds: "a numbered patrol marker (no physics)",
         },
         RoleSpec {
             kind: "vanishing",
             label: "Vanishing",
             blurb: "Disappears a few seconds into the run — a crumbling platform, a fuse, a timed gate",
-            icon: "⏳",
             adds: "a countdown · the vanish rule (tune the seconds, and gate it with Only if…)",
         },
         RoleSpec {
             kind: "hazard",
             label: "Hazard",
             blurb: "Hurts whoever walks into it — spikes, lava, a falling rock",
-            icon: "⚡",
             adds: "the hurt rule — it damages the TOUCHER, not itself (tune the damage in Points)",
         },
         RoleSpec {
             kind: "player",
             label: "Player",
             blurb: "YOU, during Play — drive it with the arrow keys or WASD; companions follow you first",
-            icon: "🎮",
             adds: "dynamic physics body · auto-fit collider · live keyboard control while playing",
         },
     ]

@@ -12,6 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::diag_log;
 use glam::{Mat4, Quat, Vec3, Vec4};
 use metrocalk_assets::colour::TextureRole as Role;
 use metrocalk_assets::{MeshGpu, MeshVertex, Texture};
@@ -201,7 +202,54 @@ impl SceneState {
     ///
     /// Nothing else in the engine triggers this: the structure exists for one caller, and a scene that
     /// is never filmed never builds it.
+    /// Size the presentation room to whatever is currently in the scene.
+    ///
+    /// Memoised against the revisions that can change the answer, and called from both the draw pass
+    /// and the camera planner so those two can never be looking at different rooms. Cheap enough to
+    /// call every frame; the memo exists because the bounds walk behind it is not.
+    pub fn sync_stage(&mut self) {
+        let key = (self.ids_revision, self.meshes_revision);
+        if self.hall_revision == Some(key) {
+            return;
+        }
+        self.hall_revision = Some(key);
+        self.hall = match self.presentation_set {
+            PresentationSet::Studio => None,
+            PresentationSet::FactoryHall => {
+                scene_world_bounds(&self.instances, &self.mesh_slots, &self.meshes).and_then(
+                    |(lo, hi)| {
+                        crate::hall::Hall::around(lo.to_array(), hi.to_array(), GROUND_PLANE_Y)
+                    },
+                )
+            }
+        };
+    }
+
+    /// Forget the sized room, so the next [`Self::sync_stage`] rebuilds it.
+    ///
+    /// Needed because the memo is keyed on what is IN the scene, and switching the set changes the
+    /// answer without changing the scene — the one case the key cannot see.
+    pub fn invalidate_stage(&mut self) {
+        self.hall_revision = None;
+    }
+
+    /// Where a camera may stand, for the shot solver.
+    ///
+    /// The margin is applied here, once, rather than by the solver: the room knows how thick its own
+    /// walls are and how much clearance a lens needs off them, and a solver with a second opinion about
+    /// that would be a second place the number is decided.
+    #[must_use]
+    pub fn camera_stage(&self) -> metrocalk_animation::shot::Stage {
+        metrocalk_animation::shot::Stage {
+            room: self.hall.map(crate::hall::Hall::camera_room),
+        }
+    }
+
     pub fn sync_occlusion(&mut self) {
+        // The planner asks about the room in the same breath as it asks about obstruction, and a
+        // vantage judged against a room that has not been sized yet reports the void the scene used to
+        // be. Sized here, so no caller has to remember to.
+        self.sync_stage();
         if self.occlusion_revision == Some(self.ids_revision) {
             return;
         }
@@ -388,6 +436,18 @@ impl SceneState {
                     backed += 1;
                     continue;
                 }
+                // The presentation ROOM, for the same reason as the ground below it: the hall's slab,
+                // walls, columns and roof are drawn directly rather than published as instances, so
+                // they are absent from the BVH. Without this the planner keeps reporting the void the
+                // scene used to be — and the delivered films measured `backing` at 1/9 on every wide
+                // shot of the assembly for exactly that reason, while the frame the viewer would have
+                // seen was a wall.
+                if let Some(hall) = self.hall {
+                    if hall.shell_within(beyond, behind.direction, backdrop) {
+                        backed += 1;
+                        continue;
+                    }
+                }
                 // Falling toward the floor within the same reach counts as content.
                 let dy = behind.direction[1];
                 if dy < -1.0e-6 {
@@ -442,6 +502,14 @@ pub struct CinematicPlacement {
     pub yaw_offset_deg: f32,
     /// How many placements were rejected before this one. Zero means the direction was filmed as written.
     pub rejected: u8,
+    /// WHAT THE ORACLE SAW at the placement it settled on, mid-shot.
+    ///
+    /// Recorded because the first film measured with a sound legibility metric disagreed with it flatly:
+    /// fifteen frames were a picture of nothing, and every shot that produced them reported
+    /// `rejected: 0` -- the negotiation had looked at those placements and called them acceptable. A
+    /// record that says only "filmed as directed" cannot distinguish an oracle that was never consulted
+    /// from one that was consulted and was wrong, and those need opposite fixes.
+    pub vantage: metrocalk_animation::shot::Vantage,
 }
 
 /// A right/up pair for the plane facing `target` from `eye`, used to spread sample rays across a frame.
@@ -901,6 +969,61 @@ pub enum ThumbTake {
     StateMoved,
 }
 
+/// Which room a scene is presented in.
+///
+/// A presentation choice with the same standing as the view transform: it changes what a camera can
+/// see and nothing about what the project *is*. The default is deliberately the old behaviour, so no
+/// existing scene, baseline capture or viewport test changes because this type exists — the room is
+/// something a presentation asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PresentationSet {
+    /// A ground plane under the model and open air around it. Right for inspecting a part; it is what
+    /// every earlier film of the factory was shot in, and why those films measured mostly-empty frames.
+    #[default]
+    Studio,
+    /// An industrial hall around the model — slab, walkways, clad walls, a column grid and a roof.
+    FactoryHall,
+}
+
+impl PresentationSet {
+    /// The wire name, for the command and the sidecar. Round-trips through [`Self::parse`].
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Studio => "studio",
+            Self::FactoryHall => "factoryHall",
+        }
+    }
+
+    /// Read a wire name, accepting the spellings a caller is likely to type.
+    ///
+    /// `None` for anything else rather than a silent fall back to `Studio`: a command that quietly
+    /// ignores the word it was given would report success for a set it did not apply, and the operator
+    /// would be looking at the wrong room believing it was the right one.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_', ' '], "")
+            .as_str()
+        {
+            "studio" | "none" | "open" => Some(Self::Studio),
+            "factoryhall" | "hall" | "factory" | "industrial" => Some(Self::FactoryHall),
+            _ => None,
+        }
+    }
+
+    /// The author-facing name.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Studio => "Studio (open ground)",
+            Self::FactoryHall => "Factory hall",
+        }
+    }
+}
+
 /// Scene state shared between the app (writer, from core deltas + input) and the render loop (reader).
 #[derive(Default)]
 pub struct SceneState {
@@ -967,6 +1090,19 @@ pub struct SceneState {
     /// identical from outside, and the difference is the whole point of the negotiation. Cleared when a
     /// cutscene takes the camera, so it always describes the run being watched.
     pub cinematic_placements: Vec<CinematicPlacement>,
+    /// Which room the scene is presented in. A viewing choice, exactly like the tone curve: it changes
+    /// no entity, no component and no count, and it is not written into the document.
+    pub presentation_set: PresentationSet,
+    /// The room [`Self::presentation_set`] currently resolves to, sized to the live scene.
+    ///
+    /// Derived, memoised, and read by three separate consumers that must not disagree: the draw pass
+    /// (what is on screen), the camera planner's backdrop test (what a shot can be backed by) and the
+    /// shot solver's confinement (where a camera may stand). Three copies of "how big is the hall"
+    /// would be three chances for the picture, the verdict and the placement to describe different
+    /// rooms — which is the shape of every defect the last four passes of this work found.
+    pub hall: Option<crate::hall::Hall>,
+    /// The `(ids_revision, meshes_revision)` [`Self::hall`] was sized for.
+    pub hall_revision: Option<(u64, u64)>,
     /// Entity key -> instance index, memoised against [`Self::ids_revision`].
     ///
     /// Publishing an animation pose used to scan all of `ids` looking for the handful of keys it had
@@ -3145,6 +3281,36 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         &albedo_sampler,
     );
 
+    // The presentation hall (see `crate::hall`). Its vertices are built in WORLD space, so its single
+    // instance is the identity — unlike the ground quad, which is a unit quad the instance places and
+    // scales. Rebuilt only when the room's dimensions change, which is when the scene's bounds do.
+    let mut hall_inst = InstanceBuf::new(&device, &inst_bgl, 1);
+    hall_inst.upload(
+        &device,
+        &queue,
+        &inst_bgl,
+        &[Instance {
+            center: [0.0; 3],
+            scale: 1.0,
+            color: [1.0; 3],
+            selected: 0.0,
+            rotation: IDENTITY_QUAT,
+            material: [0.0; 4], // no override → the baked per-surface material is the material
+        }],
+    );
+    let hall_main_bg = make_mesh_main_bg(
+        &device,
+        &mesh_inst_bgl,
+        &hall_inst.buf,
+        &dummy_view,
+        &dummy_mr_view,
+        &dummy_normal_view,
+        &dummy_mr_view,
+        &albedo_sampler,
+    );
+    let mut hall_built: Option<crate::hall::Hall> = None;
+    let mut hall_buffers: Option<(wgpu::Buffer, wgpu::Buffer, u32)> = None;
+
     let depth_state = wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
         depth_write_enabled: Some(true),
@@ -4278,6 +4444,40 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             }
             let scene_bounds = bounds_cache.and_then(|(_, bounds)| bounds);
 
+            // Size the presentation room to the same bounds, and rebuild its mesh only when those
+            // bounds actually move it. `sync_stage` is the ONE place the room's dimensions are decided;
+            // the draw pass reads them rather than deriving a second set of its own.
+            st.sync_stage();
+            if st.hall != hall_built {
+                hall_built = st.hall;
+                hall_buffers = st.hall.map(|hall| {
+                    let mesh = hall.build();
+                    diag_log!(
+                        "presentation hall: {} x {} m, {:.1} m clear, {:.1} m bays, {} triangles",
+                        hall.half_x * 2.0,
+                        hall.half_z * 2.0,
+                        hall.height,
+                        hall.bay,
+                        mesh.triangle_count()
+                    );
+                    (
+                        create_init_buffer(
+                            &device,
+                            "hall-vbuf",
+                            bytemuck::cast_slice(&mesh.vertices),
+                            wgpu::BufferUsages::VERTEX,
+                        ),
+                        create_init_buffer(
+                            &device,
+                            "hall-ibuf",
+                            bytemuck::cast_slice(&mesh.indices),
+                            wgpu::BufferUsages::INDEX,
+                        ),
+                        mesh.indices.len() as u32,
+                    )
+                });
+            }
+
             // Stand the ground receiver under whatever is actually in the scene. Written straight into the
             // existing single-instance buffer (never reallocated), so `ground_main_bg` stays valid.
             {
@@ -4762,11 +4962,23 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // lake bed, a canyon floor. Leaving it in draws an opaque grey lid over exactly those places. On
             // the live app it hid the entire Rolling Hills sea floor and made the terrain look like it had
             // never streamed in. The grid goes with it: it describes a surface that is no longer there.
+            //
+            // The presentation HALL replaces the quad rather than joining it. Its own slab runs well
+            // past the wall line, so it is already the ground everywhere the ground was; drawing both
+            // would put two coplanar surfaces a centimetre apart across four hundred metres, which is
+            // z-fighting at exactly the grazing angles a floor is seen at.
             if !terrain_active && visibility.allows(ViewportLayer::GroundShadowReceiver) {
-                rp.set_bind_group(1, &ground_main_bg, &[]);
-                rp.set_vertex_buffer(0, ground_vbuf.slice(..));
-                rp.set_index_buffer(ground_ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                rp.draw_indexed(0..GROUND_IDX.len() as u32, 0, 0..1);
+                if let Some((vbuf, ibuf, indices)) = hall_buffers.as_ref() {
+                    rp.set_bind_group(1, &hall_main_bg, &[]);
+                    rp.set_vertex_buffer(0, vbuf.slice(..));
+                    rp.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..*indices, 0, 0..1);
+                } else {
+                    rp.set_bind_group(1, &ground_main_bg, &[]);
+                    rp.set_vertex_buffer(0, ground_vbuf.slice(..));
+                    rp.set_index_buffer(ground_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..GROUND_IDX.len() as u32, 0, 0..1);
+                }
             }
             if !terrain_active && visibility.allows(ViewportLayer::Grid) {
                 rp.set_pipeline(&grid_pipeline);
@@ -4957,9 +5169,20 @@ pub fn camera_matrix_with(
     );
     let eye = target + offset;
     let far = distance * 8.0 + 100.0;
+    // The near plane SCALES with the stand-off. A fixed one destroys depth precision at plant scale:
+    // this is a standard `perspective_rh` with no reversed-Z, so the resolvable depth step grows as
+    // z^2 / near, and at a 500 m stand-off the old fixed 0.1 m near plane resolved roughly 15 cm. Any
+    // two surfaces closer together than that - a floor and the lines painted on it, two faces of an
+    // imported assembly, a slab and its bay joints - became a per-pixel coin toss, which is exactly how
+    // a 400 m apron came to render as blocky grey wedges.
+    //
+    // One per cent of the distance is the rule `metrocalk_animation::shot::cinematic_clip_planes`
+    // already applies to the cutscene camera, so the editor viewport and the film now agree about depth
+    // instead of disagreeing by two orders of magnitude.
+    let near = (distance * 0.01).clamp(0.02, 50.0).min(far * 0.5);
     let proj = match projection {
         Projection::Perspective => {
-            Mat4::perspective_rh(CAMERA_FOV_DEG.to_radians(), aspect, 0.1, far)
+            Mat4::perspective_rh(CAMERA_FOV_DEG.to_radians(), aspect, near, far)
         }
         Projection::Orthographic => {
             let half_h = distance * (CAMERA_FOV_DEG.to_radians() * 0.5).tan();
@@ -8141,6 +8364,7 @@ mod tests {
             center: [0.0; 3],
             half_extent: [0.5; 3],
             forward: [0.0, 0.0, 1.0],
+            stage: metrocalk_animation::shot::Stage::OPEN,
         };
         let shot = ShotRecipe {
             id: "s".into(),

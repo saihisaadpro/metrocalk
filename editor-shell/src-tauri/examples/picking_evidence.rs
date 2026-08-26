@@ -30,6 +30,11 @@ use metrocalk_spatial::{Aabb, Camera, Transform};
 // to avoid.
 #[path = "../src/diag.rs"]
 mod diag;
+// `render` sizes and draws the presentation hall through `crate::hall`, so this list has to carry it
+// for the same reason it carries `diag`: an example that omits a module the binary supplies is not
+// compiling the same render.rs the .exe does.
+#[path = "../src/hall.rs"]
+mod hall;
 #[path = "../src/ibl.rs"]
 mod ibl;
 #[path = "../src/moba.rs"]

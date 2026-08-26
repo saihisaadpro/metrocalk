@@ -25,7 +25,15 @@ pub const CINEMA_COMPONENT: &str = "Cinematic";
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShotSpec {
-    /// Stable kind key.
+    /// Stable kind key — AND the card's icon name (ADR-137).
+    ///
+    /// The catalog used to carry a separate `icon: &'static str` holding one character per entry, and
+    /// in all fifty-nine entries across the five catalogs that character was a per-`kind` constant:
+    /// the field was one contract stated twice, in two languages, which is exactly the drift ADR-134
+    /// is about. It was also thirty-five colour EMOJI, which the editor is a monochrome light
+    /// workbench and cannot draw. `editor/src/theme/icons.tsx` keys its drawings on these kinds, so
+    /// there is nothing left to keep in sync — `check-icon-vocab.mjs` fails if a kind here has no
+    /// mark there.
     pub kind: &'static str,
     /// Card label.
     pub label: &'static str,
@@ -216,9 +224,22 @@ pub fn cutscene_of<W: World>(engine: &Engine<W>, entity: EntityId) -> Cutscene {
 )]
 fn recipe_for(kind: &str, subject: &str, index: usize) -> Option<ShotRecipe> {
     let (size, angle, motion, amount, seconds) = match kind {
+        // THREE-QUARTER, NOT FRONT — because perspective does what distance cannot.
+        //
+        // A wide card points the camera at whatever it frames and steps back until the subject fits.
+        // Broadside to a long subject, "fits" is a ribbon: the production weld line is ~262 m long and a
+        // few metres tall, so at any distance that fits its length it occupies a few per cent of the
+        // frame's height, with featureless ground below and empty background above. Measured on the
+        // delivered film, plant-framed wides read an interdecile luma range of 129-135 — the yellow
+        // floor against the dark void, which is real contrast and no information — and a mean edge
+        // energy of 0.31-0.38, near the bottom of the whole film.
+        //
+        // Every genuinely well-filled frame in either delivered film is a three-quarter or profile view
+        // with the line RECEDING into the picture (edge energy 3.5-5.1). Turning the camera is what puts
+        // a long subject into depth; there is no camera distance that does it.
         "establish" => (
             ShotSize::Wide,
-            ShotAngle::Front,
+            ShotAngle::ThreeQuarter,
             ShotMove::PullOut,
             0.3,
             2.5,
@@ -252,9 +273,11 @@ fn recipe_for(kind: &str, subject: &str, index: usize) -> Option<ShotRecipe> {
             3.0,
         ),
         "looming" => (ShotSize::Medium, ShotAngle::Low, ShotMove::PushIn, 0.3, 2.0),
+        // Three-quarter for the same reason as `establish`: the widest card in the vocabulary is the one
+        // that most needs the subject put into depth rather than laid flat across the frame.
         "vista" => (
             ShotSize::ExtremeWide,
-            ShotAngle::Front,
+            ShotAngle::ThreeQuarter,
             ShotMove::Hold,
             0.0,
             3.0,
@@ -571,6 +594,7 @@ mod tests {
             center: [0.0, 1.0, 0.0],
             half_extent: [0.5, 1.0, 0.5],
             forward: [0.0, 0.0, 1.0],
+            stage: metrocalk_animation::shot::Stage::OPEN,
         };
         // Solve each card at the same instant and require the resulting cameras to be genuinely
         // different places. Two cards that put the camera within 30cm of each other are one card with
@@ -608,6 +632,7 @@ mod tests {
             center: [0.0, 1.0, 0.0],
             half_extent: [0.5, 1.0, 0.5],
             forward: [0.0, 0.0, 1.0],
+            stage: metrocalk_animation::shot::Stage::OPEN,
         };
         let solve = |kind: &str, t: f32| {
             let r = recipe_for(kind, "1_1", 0).expect("recipe");
@@ -675,6 +700,7 @@ mod tests {
             center: [0.0, 1.0, 0.0],
             half_extent: [0.5, 1.0, 0.5],
             forward: [0.0, 0.0, 1.0],
+            stage: metrocalk_animation::shot::Stage::OPEN,
         };
         let d = |kind: &str| {
             let r = recipe_for(kind, "1_1", 0).expect("recipe");

@@ -31,14 +31,20 @@ pub const VFX_COMPONENT: &str = "Vfx";
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectSpec {
-    /// Stable kind key.
+    /// Stable kind key — AND the card's icon name (ADR-137).
+    ///
+    /// The catalog used to carry a separate `icon: &'static str` holding one character per entry, and
+    /// in all fifty-nine entries across the five catalogs that character was a per-`kind` constant:
+    /// the field was one contract stated twice, in two languages, which is exactly the drift ADR-134
+    /// is about. It was also thirty-five colour EMOJI, which the editor is a monochrome light
+    /// workbench and cannot draw. `editor/src/theme/icons.tsx` keys its drawings on these kinds, so
+    /// there is nothing left to keep in sync — `check-icon-vocab.mjs` fails if a kind here has no
+    /// mark there.
     pub kind: &'static str,
     /// Card label.
     pub label: &'static str,
     /// What it is for, one line.
     pub blurb: &'static str,
-    /// Card glyph.
-    pub icon: &'static str,
     /// What it will look like, spelled out — the legible-cost line.
     pub adds: &'static str,
     /// True when the card is a one-shot (fires at a moment, rather than running).
@@ -63,7 +69,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "fire",
             label: "Fire",
             blurb: "It burns — rising, flickering, warm",
-            icon: "🔥",
             adds: "a rising flame that cools from white-hot to ember red",
             burst: false,
         },
@@ -71,7 +76,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "smoke",
             label: "Smoke",
             blurb: "Dark, slow, expanding — pair it with fire",
-            icon: "💨",
             adds: "a slow dark plume that spreads as it climbs",
             burst: false,
         },
@@ -79,7 +83,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "sparkle",
             label: "Sparkle",
             blurb: "Magic, treasure, something worth walking toward",
-            icon: "✨",
             adds: "bright motes orbiting the object",
             burst: false,
         },
@@ -87,7 +90,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "explosion",
             label: "Explosion",
             blurb: "One shot — a violent outward burst",
-            icon: "💥",
             adds: "a one-shot blast of hot debris that falls away",
             burst: true,
         },
@@ -95,7 +97,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "sparks",
             label: "Sparks",
             blurb: "One shot — metal on metal, a hit landing",
-            icon: "⚡",
             adds: "a one-shot spray of fast sparks that arc and drop",
             burst: true,
         },
@@ -103,7 +104,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "pickup",
             label: "Pick-up pop",
             blurb: "One shot — the little flourish a collectible deserves",
-            icon: "🎉",
             adds: "a one-shot ring of bright motes rising and fading",
             burst: true,
         },
@@ -111,7 +111,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "fountain",
             label: "Fountain",
             blurb: "Arcing up and falling back — water, lava, coins",
-            icon: "⛲",
             adds: "an arcing jet that falls back under gravity",
             burst: false,
         },
@@ -119,7 +118,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "dust",
             label: "Dust",
             blurb: "Grounded and subtle — settled air, a dirt floor",
-            icon: "🍂",
             adds: "slow motes drifting near the base",
             burst: false,
         },
@@ -127,7 +125,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "aura",
             label: "Aura",
             blurb: "A healing, powered-up, or cursed glow",
-            icon: "💚",
             adds: "a soft rising column of light around the object",
             burst: false,
         },
@@ -135,7 +132,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "steam",
             label: "Steam",
             blurb: "Hot and wet — a vent, a kettle, a cooling engine",
-            icon: "♨",
             adds: "a pale plume that billows and thins as it climbs",
             burst: false,
         },
@@ -143,7 +139,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "embers",
             label: "Embers",
             blurb: "What is left after the fire — slow, drifting, orange",
-            icon: "🔶",
             adds: "sparse glowing motes rising slowly and fading",
             burst: false,
         },
@@ -151,7 +146,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "rain",
             label: "Rain",
             blurb: "Falling weather around the object",
-            icon: "🌧",
             adds: "fast pale streaks falling from above",
             burst: false,
         },
@@ -159,7 +153,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "snow",
             label: "Snow",
             blurb: "Slow falling weather that drifts sideways",
-            icon: "❄",
             adds: "slow white flakes drifting down and across",
             burst: false,
         },
@@ -167,7 +160,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "splash",
             label: "Splash",
             blurb: "One shot — something hit water",
-            icon: "💧",
             adds: "a one-shot crown of droplets thrown up and falling back",
             burst: true,
         },
@@ -175,7 +167,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "shockwave",
             label: "Shockwave",
             blurb: "One shot — a flat ring racing outward along the ground",
-            icon: "💫",
             adds: "a one-shot expanding ring at the base",
             burst: true,
         },
@@ -183,7 +174,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "confetti",
             label: "Confetti",
             blurb: "One shot — celebration, a level cleared",
-            icon: "🎊",
             adds: "a one-shot burst of coloured flecks thrown up and falling",
             burst: true,
         },
@@ -191,7 +181,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "poison",
             label: "Poison cloud",
             blurb: "A hazard you can see — pair it with the Hazard role",
-            icon: "☠",
             adds: "a low sickly-green cloud that spreads and lingers",
             burst: false,
         },
@@ -199,7 +188,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "bubbles",
             label: "Bubbles",
             blurb: "Underwater, a potion, something fermenting",
-            icon: "🫧",
             adds: "slow round motes rising and growing",
             burst: false,
         },
@@ -207,7 +195,6 @@ pub fn effect_specs() -> Vec<EffectSpec> {
             kind: "portal",
             label: "Portal",
             blurb: "Something otherworldly is open here",
-            icon: "🌀",
             adds: "a tight ring of motes circling fast, edge-lit violet",
             burst: false,
         },
@@ -726,7 +713,7 @@ pub fn describe_layer(layer: &EffectRecipe) -> String {
     let card = effect_specs()
         .into_iter()
         .find(|s| s.kind == layer.kind)
-        .map_or_else(|| layer.kind.clone(), |s| format!("{} {}", s.icon, s.label));
+        .map_or_else(|| layer.kind.clone(), |s| s.label.to_string());
     let when = if layer.burst {
         "one shot".to_string()
     } else {
