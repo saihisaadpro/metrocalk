@@ -39,11 +39,21 @@ import {
   setCameraFov,
 } from "./cameraActions";
 
+/**
+ * The three verbs, STACKED — one full-width control per row.
+ *
+ * They were a wrapping flex row, and it read fine at 380px in a real Chromium on this box. The Inspector
+ * track is 300px and gives this section a **234px** content box (measured in the packaged `.exe`), and
+ * CI's Chromium — different font, different metrics — wrapped `Point at this view` onto its own line
+ * while the other two stayed together. A row that is one line on one machine and two on another is not a
+ * layout, it is a coincidence: at 234px there is no font for which three labels this long fit, and the
+ * honest answer is to stop asking them to. Full-width rows also give each verb the whole hit target,
+ * which is what a 234px column is for.
+ */
 const rowStyle = {
-  display: "flex",
-  flexWrap: "wrap" as const,
+  display: "grid",
   gap: space.xs,
-  alignItems: "center",
+  justifyItems: "stretch" as const,
 };
 
 /**

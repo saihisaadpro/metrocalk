@@ -1071,10 +1071,14 @@ function cameraScenes(): Scene[] {
         "stands and what it AIMS AT, because those two are what the engine could not previously say. " +
         "The lens reads in millimetres as well as degrees: '34 degrees' is not the vocabulary of " +
         "anyone who has ever composed a shot, and a full-frame equivalent is. What a reader is " +
-        "checking is that the three buttons sit on ONE row at a dock's width rather than stacking " +
-        "into a column, that the pose read-out is a two-column definition list and not a run-on line " +
-        "of numbers, and that nothing in it renders as a raw id",
-      width: 380,
+        "checking is that each of the three verbs gets a whole row of the 300px Inspector track it " +
+        "actually ships in — they were a wrapping flex row, which read as one line on the author's " +
+        "machine and two on CI's — that the pose read-out is a two-column definition list and not a " +
+        "run-on line of numbers, and that nothing in it renders as a raw id",
+      // THE WIDTH THE INSPECTOR REALLY GIVES IT. 380 was a guess; the packaged `.exe` measures this
+      // section's content box at 234px inside the 300px Inspector track, and a scene photographed wider
+      // than the panel ships is a scene that cannot fail the way the panel fails.
+      width: 300,
       setup: seat(AIMED),
       expect: {
         present: [
@@ -1089,9 +1093,12 @@ function cameraScenes(): Scene[] {
         absent: ["[data-testid='cameraUnaimed']"],
         text_present: ["Look through", "Point at this view", "mm", "Stands at", "Aimed at"],
         text_absent: ["null", "undefined", "NaN", "cam-line"],
-        // The three verbs are ONE row of a toolbar, not a stack. At 380 px — the width of the
-        // Inspector dock — this is the claim that fails first if a label grows.
-        same_line: [
+        // THE THREE VERBS ARE A STACK, ONE PER ROW — and this is the SECOND claim written here. The
+        // first said they were one row; it passed in a real Chromium on the author's box at 380px and
+        // FAILED on CI's Chromium, which wrapped the third label onto its own line. At the Inspector's
+        // real 234px content box there is no font for which three labels this long share a line, so
+        // the claim now states the layout the panel actually has, in the order it has it.
+        stacked: [
           ["[data-testid='cameraLookThrough']", "[data-testid='cameraActivate']"],
           ["[data-testid='cameraActivate']", "[data-testid='cameraRecapture']"],
         ],
@@ -1101,7 +1108,7 @@ function cameraScenes(): Scene[] {
           "[data-testid='cameraRecapture']",
           "[data-testid='cameraPose']",
         ],
-        max_width: [[".mtk-slider-field", 380]],
+        max_width: [[".mtk-slider-field", 300]],
       },
       render: () => <CameraSection client={cameraClient(AIMED)} />,
     },
@@ -1114,7 +1121,7 @@ function cameraScenes(): Scene[] {
         "picture is indistinguishable from a camera that is aimed. Every project saved by an earlier " +
         "build has cameras like this. The row says so in words rather than printing a plausible " +
         "(0, 0, 0), and the control that repairs it is the button directly above",
-      width: 380,
+      width: 300,
       setup: seat({ ...AIMED, id: "cam-old", name: "Overview", lookAt: null, fovDeg: 55 }),
       expect: {
         present: [["[data-testid='cameraUnaimed']", 1], ["[data-testid='cameraRecapture']", 1]],
