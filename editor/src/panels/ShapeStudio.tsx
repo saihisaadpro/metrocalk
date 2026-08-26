@@ -372,8 +372,13 @@ function DrawSection({
     if (reply?.created) setPoints([]);
   }
 
+  // CLOSED on first run. Open, this section and `Combine` below it are ~900px of sketch pad and
+  // instructions between the Shapes grid and the Asset library, which is the common surface — so the
+  // Build column opened with the rare tool expanded and the everyday one below the fold at every
+  // window height (`progress/asset-library/after/shell-build.png`). `storageKey` means this only
+  // decides the FIRST run: anyone who opens it keeps it open.
   return (
-    <DisclosureSection title="Draw a shape" summary="Sketch an outline, get a solid" defaultOpen storageKey="build-draw">
+    <DisclosureSection title="Draw a shape" summary="Sketch an outline, get a solid" defaultOpen={false} storageKey="build-draw">
       <div style={{ display: "grid", gap: space.sm }}>
         <div style={{ display: "flex", gap: space.xs, alignItems: "center", flexWrap: "wrap" }}>
           <Button
@@ -580,7 +585,7 @@ function CombineSection({
   const why = two ? undefined : "Select two objects first — click one, then Ctrl-click another";
 
   return (
-    <DisclosureSection title="Combine" summary="Two objects become one" defaultOpen storageKey="build-combine">
+    <DisclosureSection title="Combine" summary="Two objects become one" defaultOpen={false} storageKey="build-combine">
       {!two && <div data-testid="combine-hint" style={hintStyle}>{why}</div>}
       <div style={{ display: "flex", gap: space.xs, flexWrap: "wrap", alignItems: "center" }}>
         <Button
