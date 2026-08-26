@@ -35,7 +35,7 @@ import type { PipeForgeStatus } from "../transport/protocol";
 import { EditorHeader } from "./EditorHeader";
 import { LeftDock, InspectorDock, type LeftWorkspace, type InspectorWorkspace } from "./EditorDocks";
 import { EngineRail, ENGINES, engineById, type EngineId } from "./EngineRail";
-import { BottomDock, type BottomWorkspace } from "./BottomDock";
+import { BottomDock, type AnimateWorkspace, type BottomWorkspace } from "./BottomDock";
 import { onStageSurface } from "./stageInput";
 import { normalizeSurfacePoint } from "./viewportCoordinates";
 
@@ -169,6 +169,9 @@ export function App() {
   const [engine, setEngine] = useState<EngineId>("scene");
   const [inspectorWorkspace, setInspectorWorkspace] = useState<InspectorWorkspace>("properties");
   const [bottomWorkspace, setBottomWorkspace] = useState<BottomWorkspace>("asset");
+  // Which of Animate's two timelines is showing. Lifted here so `openCutscene` can land on the one it
+  // names — see `BottomDockProps.animate`.
+  const [animateWorkspace, setAnimateWorkspace] = useState<AnimateWorkspace>("properties");
   const [bottomOpen, setBottomOpen] = useState(false);
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [vw, setVw] = useState(effectiveViewportWidth);
@@ -346,6 +349,12 @@ export function App() {
   function openBottom(workspace: BottomWorkspace) {
     setBottomWorkspace(workspace);
     setBottomOpen(true);
+  }
+
+  /** The Cinematics block's deep link: the Animate dock, open, on the Cutscene timeline. */
+  function openCutscene() {
+    setAnimateWorkspace("cutscene");
+    openEngine("animate");
   }
 
   /**
@@ -591,6 +600,7 @@ export function App() {
         setDockFlyout(null);
       }}
       onImport={importAsset}
+      onOpenCutscene={openCutscene}
       onContextMenu={(id, x, y) => {
         if (!playing) setCtx({ id, x, y });
       }}
@@ -950,6 +960,8 @@ export function App() {
           open={bottomOpen}
           form={dockShape}
           playing={playing}
+          animate={animateWorkspace}
+          onAnimateChange={setAnimateWorkspace}
           onChange={(w) => {
             setBottomWorkspace(w);
             // Keep the rail in step. Switching workspace from the dock's own strip and leaving the rail

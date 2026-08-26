@@ -11,7 +11,7 @@
 //! rule — which is why the closed action vocabulary never had to grow to gain cutscenes.
 
 use metrocalk_animation::shot::{
-    Cutscene, Mood, ShotAngle, ShotMove, ShotRecipe, ShotSize, MAX_SHOTS,
+    Cutscene, Mood, ShotAngle, ShotMove, ShotRecipe, ShotSize, MAX_SECONDS, MAX_SHOTS, MIN_SECONDS,
 };
 use metrocalk_core::{Engine, EntityId, FieldValue, Op};
 use metrocalk_ecs::World;
@@ -138,6 +138,191 @@ pub fn shot_specs() -> Vec<ShotSpec> {
     ]
 }
 
+/// One choice on one framing axis, in the author's language.
+///
+/// The shot inspector's three dropdowns are published by the side that VALIDATES them. The
+/// alternative — and what a first draft of the panel did — is a `const SIZES = [...]` in TypeScript
+/// mirroring a `match` in Rust, which is the same one-contract-stated-twice ADR-134 is about: rename
+/// a variant and the option list keeps offering a word the engine will refuse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FramingOption {
+    /// The wire value — the serde name of the enum variant.
+    pub value: &'static str,
+    /// The word the author reads.
+    pub label: &'static str,
+    /// What choosing it does, one line.
+    pub blurb: &'static str,
+}
+
+/// Everything the shot inspector may offer, and the bounds it must respect.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FramingCatalog {
+    /// How much of the frame the subject fills.
+    pub sizes: Vec<FramingOption>,
+    /// Where the camera stands, relative to the subject's facing.
+    pub angles: Vec<FramingOption>,
+    /// What the camera does over the shot's length.
+    pub motions: Vec<FramingOption>,
+    /// The shortest a shot may be authored, seconds.
+    pub min_seconds: f32,
+    /// The longest, seconds.
+    pub max_seconds: f32,
+    /// The most shots one cutscene may hold.
+    pub max_shots: usize,
+    /// The moves for which `amount` changes nothing. The strength control is disabled — with a
+    /// reason — on these, rather than offering a dial that silently does nothing.
+    pub still_motions: Vec<&'static str>,
+}
+
+/// The framing vocabulary, published once.
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "an eighteen-option data table; splitting it hides the vocabulary, as for `shot_specs`"
+)]
+pub fn framing_catalog() -> FramingCatalog {
+    FramingCatalog {
+        sizes: vec![
+            FramingOption {
+                value: "extreme_wide",
+                label: "Distant",
+                blurb: "The subject is a speck in its world — scale before anything else",
+            },
+            FramingOption {
+                value: "wide",
+                label: "Wide",
+                blurb: "The whole subject with generous air around it",
+            },
+            FramingOption {
+                value: "full",
+                label: "Full",
+                blurb: "The subject fills most of the height",
+            },
+            FramingOption {
+                value: "medium",
+                label: "Medium",
+                blurb: "Closer — detail starts to read",
+            },
+            FramingOption {
+                value: "close",
+                label: "Close",
+                blurb: "Tight on the subject",
+            },
+            FramingOption {
+                value: "extreme_close",
+                label: "Very close",
+                blurb: "Tighter than the subject — one thing, very large",
+            },
+        ],
+        angles: vec![
+            FramingOption {
+                value: "front",
+                label: "Front",
+                blurb: "Facing the subject head-on",
+            },
+            FramingOption {
+                value: "three_quarter",
+                label: "Three-quarter",
+                blurb: "The workhorse — off to one side, slightly above",
+            },
+            FramingOption {
+                value: "profile",
+                label: "Profile",
+                blurb: "Directly to the side",
+            },
+            FramingOption {
+                value: "behind",
+                label: "Behind",
+                blurb: "Over its shoulder, looking where it looks",
+            },
+            FramingOption {
+                value: "low",
+                label: "From below",
+                blurb: "The subject towers over the camera",
+            },
+            FramingOption {
+                value: "high",
+                label: "From above",
+                blurb: "Looking down — the subject is small",
+            },
+        ],
+        motions: vec![
+            FramingOption {
+                value: "hold",
+                label: "Hold",
+                blurb: "Locked off — the camera does not move",
+            },
+            FramingOption {
+                value: "push_in",
+                label: "Push in",
+                blurb: "Creep toward the subject",
+            },
+            FramingOption {
+                value: "pull_out",
+                label: "Pull out",
+                blurb: "Drift away to show what is around it",
+            },
+            FramingOption {
+                value: "orbit",
+                label: "Orbit",
+                blurb: "Circle the subject so every side reads",
+            },
+            FramingOption {
+                value: "crane_up",
+                label: "Crane up",
+                blurb: "Rise while holding the aim",
+            },
+            FramingOption {
+                value: "crane_down",
+                label: "Crane down",
+                blurb: "Descend while holding the aim",
+            },
+        ],
+        min_seconds: MIN_SECONDS,
+        max_seconds: MAX_SECONDS,
+        max_shots: MAX_SHOTS,
+        still_motions: vec!["hold"],
+    }
+}
+
+fn size_from_wire(value: &str) -> Option<ShotSize> {
+    Some(match value {
+        "extreme_wide" => ShotSize::ExtremeWide,
+        "wide" => ShotSize::Wide,
+        "full" => ShotSize::Full,
+        "medium" => ShotSize::Medium,
+        "close" => ShotSize::Close,
+        "extreme_close" => ShotSize::ExtremeClose,
+        _ => return None,
+    })
+}
+
+fn angle_from_wire(value: &str) -> Option<ShotAngle> {
+    Some(match value {
+        "front" => ShotAngle::Front,
+        "three_quarter" => ShotAngle::ThreeQuarter,
+        "profile" => ShotAngle::Profile,
+        "behind" => ShotAngle::Behind,
+        "low" => ShotAngle::Low,
+        "high" => ShotAngle::High,
+        _ => return None,
+    })
+}
+
+fn motion_from_wire(value: &str) -> Option<ShotMove> {
+    Some(match value {
+        "hold" => ShotMove::Hold,
+        "push_in" => ShotMove::PushIn,
+        "pull_out" => ShotMove::PullOut,
+        "orbit" => ShotMove::Orbit,
+        "crane_up" => ShotMove::CraneUp,
+        "crane_down" => ShotMove::CraneDown,
+        _ => return None,
+    })
+}
+
 /// Something the cinematics layer will not do, said in the author's language.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CinemaError {
@@ -149,6 +334,17 @@ pub enum CinemaError {
     MissingEntity,
     /// The shot list is full.
     TooMany(String),
+    /// The index does not name a shot in this cutscene.
+    NoSuchShot,
+    /// A number outside the bounds the engine states, said WITH the bounds.
+    OutOfRange(String),
+    /// A framing word this vocabulary does not have, named with the axis it was offered on.
+    UnknownFraming {
+        /// "shot size", "camera angle" or "camera move".
+        axis: &'static str,
+        /// What the caller sent.
+        value: String,
+    },
     /// The write failed.
     Blocked(String),
 }
@@ -161,12 +357,56 @@ impl std::fmt::Display for CinemaError {
                 write!(f, "there is no cinematic mood called \"{mood}\"")
             }
             Self::MissingEntity => write!(f, "that object is no longer in the scene"),
-            Self::TooMany(m) | Self::Blocked(m) => write!(f, "{m}"),
+            Self::NoSuchShot => write!(f, "that shot is already gone"),
+            Self::UnknownFraming { axis, value } => {
+                write!(f, "there is no {axis} called \"{value}\"")
+            }
+            Self::TooMany(m) | Self::OutOfRange(m) | Self::Blocked(m) => write!(f, "{m}"),
         }
     }
 }
 
 impl std::error::Error for CinemaError {}
+
+/// One shot as a TIMELINE can draw it — the structured form of the sentence.
+///
+/// The panel used to be handed `reads: Vec<String>` and a single total, so a cutscene could only ever
+/// render as a bulleted list: no per-shot length to show, no start time to lay a chip against, no
+/// framing to edit in place, and no way to say which of two shots the author was looking at. Every
+/// number here already existed inside [`Cutscene`] — [`Cutscene::effective_shot_seconds`] has been
+/// there since the first cutscene shipped. The reply simply never carried them across the boundary,
+/// so the engine knew what time it was and the editor did not.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShotRow {
+    /// The shot's stable id — a reorder moves it, never renumbers it.
+    pub id: String,
+    /// Its position in the list, 0-based, so a control can act on it without counting.
+    pub index: usize,
+    /// The sentence, unchanged from what the bulleted list used to show.
+    pub reads: String,
+    /// The AUTHORED length in seconds — the number the duration control edits.
+    pub seconds: f32,
+    /// What it actually runs for once the cutscene's mood has scaled it. `Calm` is 2.5x, so these
+    /// two are usually different numbers and only one of them is a duration on the timeline.
+    pub effective_seconds: f32,
+    /// Where the shot starts on the cutscene's own clock, seconds — the chip's left edge.
+    pub start_seconds: f32,
+    /// How much of the frame the subject fills.
+    pub size: ShotSize,
+    /// Where the camera stands, relative to the subject's facing.
+    pub angle: ShotAngle,
+    /// What the camera does over the shot.
+    pub motion: ShotMove,
+    /// How strong that move is, 0..1. Inert for `hold`.
+    pub amount: f32,
+    /// The object this shot FRAMES — not necessarily the one the cutscene hangs on.
+    pub subject: String,
+    /// That object's display name. Resolved per shot rather than per cutscene: a shot may frame
+    /// something other than its owner, and before this every line in the list was captioned with the
+    /// OWNER's name, so an establishing wide of the whole assembly read as a wide of the one part.
+    pub subject_name: String,
+}
 
 /// What a completed cinematics command answers with.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -181,7 +421,13 @@ pub struct CinemaReply {
     /// The authored pacing dial currently driving effective duration and transitions.
     pub mood: Mood,
     /// The whole cutscene read back as sentences — one line per shot.
+    ///
+    /// Derived from `rows` at construction, in one place, so the two cannot disagree. It stays on the
+    /// reply because three `.exe` E2E specs read it as the cheapest possible assertion that a shot
+    /// was authored at all.
     pub reads: Vec<String>,
+    /// The same shots with their numbers — what the timeline draws and the shot inspector edits.
+    pub rows: Vec<ShotRow>,
     /// Continuity warnings, in plain language (a jump cut, opening tight, a rushed shot).
     pub problems: Vec<String>,
     /// Friendly summary.
@@ -413,7 +659,7 @@ pub fn remove_shot_ops<W: World>(
 ) -> Result<(Vec<Op>, Cutscene), CinemaError> {
     let mut cut = cutscene_of(engine, entity);
     if index >= cut.shots.len() {
-        return Err(CinemaError::TooMany("that shot is already gone".into()));
+        return Err(CinemaError::NoSuchShot);
     }
     cut.shots.remove(index);
     if cut.shots.is_empty() {
@@ -428,6 +674,159 @@ pub fn remove_shot_ops<W: World>(
     Ok((write_ops(entity, &cut, false), cut))
 }
 
+/// A change to one shot's framing. Every axis is optional: the inspector edits one at a time, and an
+/// absent axis means "leave it alone", never "reset it".
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FramingEdit {
+    /// A [`FramingCatalog::sizes`] value.
+    pub size: Option<String>,
+    /// A [`FramingCatalog::angles`] value.
+    pub angle: Option<String>,
+    /// A [`FramingCatalog::motions`] value.
+    pub motion: Option<String>,
+    /// How strong the move is, 0..=1.
+    pub amount: Option<f32>,
+}
+
+/// The ops that set ONE shot's authored length.
+///
+/// Rounded to the tenth of a second the panel shows and the sentence reads back, so the number the
+/// author sees is the number that was stored — a slider that stores 2.4999998 and reads back "2.5s"
+/// is a control the user cannot return to a value they just left.
+///
+/// # Errors
+/// [`CinemaError::NoSuchShot`] for an index that is not there, [`CinemaError::OutOfRange`] outside
+/// the stated bounds (which the message names), [`CinemaError::MissingEntity`] if the object is gone.
+pub fn set_shot_seconds_ops<W: World>(
+    engine: &Engine<W>,
+    entity: EntityId,
+    index: usize,
+    seconds: f32,
+) -> Result<(Vec<Op>, Cutscene), CinemaError> {
+    if !engine.entity_exists(entity) {
+        return Err(CinemaError::MissingEntity);
+    }
+    if !seconds.is_finite() || seconds < MIN_SECONDS || seconds > MAX_SECONDS {
+        return Err(CinemaError::OutOfRange(format!(
+            "a shot runs between {MIN_SECONDS}s and {MAX_SECONDS}s — {seconds:.1}s is outside that"
+        )));
+    }
+    let mut cut = cutscene_of(engine, entity);
+    let shot = cut.shots.get_mut(index).ok_or(CinemaError::NoSuchShot)?;
+    shot.seconds = (seconds * 10.0).round() / 10.0;
+    Ok((write_ops(entity, &cut, false), cut))
+}
+
+/// The ops that move one shot to another position in the list.
+///
+/// Order IS the sequence, and until this existed the only way to change it was to delete a shot and
+/// add it again — which appends at the end, so "move shot 1 later" meant re-authoring everything
+/// after it.
+///
+/// # Errors
+/// [`CinemaError::NoSuchShot`] for an index that is not there; [`CinemaError::OutOfRange`] when the
+/// move would change nothing.
+pub fn move_shot_ops<W: World>(
+    engine: &Engine<W>,
+    entity: EntityId,
+    from: usize,
+    to: usize,
+) -> Result<(Vec<Op>, Cutscene), CinemaError> {
+    if !engine.entity_exists(entity) {
+        return Err(CinemaError::MissingEntity);
+    }
+    let mut cut = cutscene_of(engine, entity);
+    if from >= cut.shots.len() {
+        return Err(CinemaError::NoSuchShot);
+    }
+    // Clamped rather than refused: "move the last shot later" is a gesture with an obvious meaning
+    // and no destination, and the control that sends it is already disabled at the ends.
+    let to = to.min(cut.shots.len() - 1);
+    if from == to {
+        return Err(CinemaError::OutOfRange(
+            "that shot is already in that position".into(),
+        ));
+    }
+    let shot = cut.shots.remove(from);
+    cut.shots.insert(to, shot);
+    Ok((write_ops(entity, &cut, false), cut))
+}
+
+/// The ops that re-frame one shot in place.
+///
+/// The catalogue card is a whole framing decision so the FIRST click looks good; this is how the
+/// author disagrees with it afterwards without losing the shot's position, its length or its id.
+///
+/// # Errors
+/// [`CinemaError::NoSuchShot`], [`CinemaError::UnknownFraming`] naming the axis and the word, or
+/// [`CinemaError::OutOfRange`] for a strength outside 0..=1.
+pub fn set_shot_framing_ops<W: World>(
+    engine: &Engine<W>,
+    entity: EntityId,
+    index: usize,
+    edit: &FramingEdit,
+) -> Result<(Vec<Op>, Cutscene), CinemaError> {
+    if !engine.entity_exists(entity) {
+        return Err(CinemaError::MissingEntity);
+    }
+    // Every word is resolved BEFORE anything is written, so a request naming one good axis and one
+    // bad one changes neither — a half-applied edit is the kind of state an undo cannot describe.
+    let size = edit
+        .size
+        .as_deref()
+        .map(|v| {
+            size_from_wire(v).ok_or_else(|| CinemaError::UnknownFraming {
+                axis: "shot size",
+                value: v.to_string(),
+            })
+        })
+        .transpose()?;
+    let angle = edit
+        .angle
+        .as_deref()
+        .map(|v| {
+            angle_from_wire(v).ok_or_else(|| CinemaError::UnknownFraming {
+                axis: "camera angle",
+                value: v.to_string(),
+            })
+        })
+        .transpose()?;
+    let motion = edit
+        .motion
+        .as_deref()
+        .map(|v| {
+            motion_from_wire(v).ok_or_else(|| CinemaError::UnknownFraming {
+                axis: "camera move",
+                value: v.to_string(),
+            })
+        })
+        .transpose()?;
+    if let Some(amount) = edit.amount {
+        if !amount.is_finite() || !(0.0..=1.0).contains(&amount) {
+            return Err(CinemaError::OutOfRange(
+                "move strength runs from 0 to 1".into(),
+            ));
+        }
+    }
+
+    let mut cut = cutscene_of(engine, entity);
+    let shot = cut.shots.get_mut(index).ok_or(CinemaError::NoSuchShot)?;
+    if let Some(size) = size {
+        shot.size = size;
+    }
+    if let Some(angle) = angle {
+        shot.angle = angle;
+    }
+    if let Some(motion) = motion {
+        shot.motion = motion;
+    }
+    if let Some(amount) = edit.amount {
+        shot.amount = (amount * 100.0).round() / 100.0;
+    }
+    Ok((write_ops(entity, &cut, false), cut))
+}
+
 /// The ops that set the one global dial.
 ///
 /// # Errors
@@ -438,6 +837,15 @@ pub fn set_mood_ops<W: World>(
     mood: &str,
 ) -> Result<(Vec<Op>, Cutscene), CinemaError> {
     let mut cut = cutscene_of(engine, entity);
+    // PACING SCALES SHOT LENGTHS, AND THERE ARE NONE. Without this the mood control on an object with
+    // no cutscene wrote a `Cinematic` component holding an empty shot list — the exact husk
+    // `remove_shot_ops` goes out of its way to delete when the last shot is removed, arriving by the
+    // other door. It also made an undoable commit that changed nothing a user could see.
+    if cut.shots.is_empty() {
+        return Err(CinemaError::OutOfRange(
+            "pacing scales shot lengths, and this object has no shots yet — add one first".into(),
+        ));
+    }
     cut.mood = match mood {
         "calm" => Mood::Calm,
         "normal" => Mood::Normal,
@@ -517,26 +925,67 @@ fn describe_shot_with_seconds(
     format!("{size} shot of {subject_name} {angle}, {motion} — {effective_seconds:.1}s")
 }
 
+/// The rows a timeline draws: each shot with its own length, its start on the cutscene clock, its
+/// framing, and the name of whatever it films.
+fn rows_of(
+    cut: &Cutscene,
+    owner_name: &str,
+    subject_name: &dyn Fn(&str) -> Option<String>,
+) -> Vec<ShotRow> {
+    let mut start = 0.0_f32;
+    let mut rows = Vec::with_capacity(cut.shots.len());
+    for (index, shot) in cut.shots.iter().enumerate() {
+        let effective = cut.effective_shot_seconds(index).unwrap_or(shot.seconds);
+        // An unresolvable subject falls back to the cutscene's owner rather than to a raw loro key:
+        // "1_37" in a shot list is not a name, and the sentence is the thing the author reads.
+        let who = subject_name(&shot.subject).unwrap_or_else(|| owner_name.to_string());
+        rows.push(ShotRow {
+            id: shot.id.clone(),
+            index,
+            reads: describe_shot_with_seconds(shot, &who, effective),
+            seconds: shot.seconds,
+            effective_seconds: effective,
+            start_seconds: start,
+            size: shot.size,
+            angle: shot.angle,
+            motion: shot.motion,
+            amount: shot.amount,
+            subject: shot.subject.clone(),
+            subject_name: who,
+        });
+        start += effective;
+    }
+    rows
+}
+
 /// Build the reply for a cutscene, including the continuity warnings.
+///
+/// Every shot is captioned with the cutscene's owner. Correct only while every shot films its owner —
+/// see [`reply_with_names`], which the shell uses.
 #[must_use]
 pub fn reply_for(entity: EntityId, cut: &Cutscene, name: &str, message: String) -> CinemaReply {
+    reply_with_names(entity, cut, name, message, &|_| None)
+}
+
+/// The same reply, with each shot's own subject resolved to a display name by the caller.
+#[must_use]
+pub fn reply_with_names(
+    entity: EntityId,
+    cut: &Cutscene,
+    owner_name: &str,
+    message: String,
+    subject_name: &dyn Fn(&str) -> Option<String>,
+) -> CinemaReply {
+    let rows = rows_of(cut, owner_name, subject_name);
     CinemaReply {
         entity: Some(entity.to_loro_key()),
         shots: cut.shots.len(),
         seconds: cut.seconds(),
         mood: cut.mood,
-        reads: cut
-            .shots
-            .iter()
-            .enumerate()
-            .map(|(index, shot)| {
-                describe_shot_with_seconds(
-                    shot,
-                    name,
-                    cut.effective_shot_seconds(index).unwrap_or(shot.seconds),
-                )
-            })
-            .collect(),
+        // One producer. `reads` is the flattened projection of `rows`, never a second computation of
+        // the same sentences.
+        reads: rows.iter().map(|row| row.reads.clone()).collect(),
+        rows,
         problems: cut.problems(),
         message,
         reason: None,
@@ -786,6 +1235,301 @@ mod tests {
             set_mood_ops(&engine, hero, "dreamy"),
             Err(CinemaError::UnknownMood(value)) if value == "dreamy"
         ));
+    }
+
+    #[test]
+    fn pacing_on_an_object_with_no_shots_is_refused_rather_than_writing_an_empty_husk() {
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let msg = set_mood_ops(&engine, hero, "calm")
+            .expect_err("nothing to pace")
+            .to_string();
+        assert!(msg.contains("no shots yet"), "{msg}");
+        assert!(
+            !engine.components_of(hero).contains_key(CINEMA_COMPONENT),
+            "a refused mood must leave no component behind"
+        );
+    }
+
+    #[test]
+    fn a_shot_length_is_editable_between_the_stated_bounds_and_refused_outside_them() {
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let (ops, _) = add_shot_ops(&engine, hero, "hero", hero).expect("shot");
+        engine.commit("cinema-shot", ops).expect("commits");
+        assert!((cutscene_of(&engine, hero).shots[0].seconds - 2.5).abs() < 1.0e-5);
+
+        let (ops, cut) = set_shot_seconds_ops(&engine, hero, 0, 6.4).expect("in range");
+        engine.commit("cinema-seconds", ops).expect("commits");
+        assert!((cut.shots[0].seconds - 6.4).abs() < 1.0e-5);
+        assert!((cutscene_of(&engine, hero).seconds() - 6.4).abs() < 1.0e-5);
+        assert!(engine.undo(), "one Ctrl-Z restores the authored length");
+        assert!((cutscene_of(&engine, hero).shots[0].seconds - 2.5).abs() < 1.0e-5);
+
+        // Rounded to the tenth the panel reads back, so the number shown is the number stored.
+        let (ops, cut) = set_shot_seconds_ops(&engine, hero, 0, 3.333_333).expect("in range");
+        engine.commit("cinema-seconds", ops).expect("commits");
+        assert!(
+            (cut.shots[0].seconds - 3.3).abs() < 1.0e-5,
+            "{}",
+            cut.shots[0].seconds
+        );
+
+        // Both bounds refuse, and the refusal names them.
+        for bad in [0.05_f32, 25.0, f32::NAN] {
+            let msg = set_shot_seconds_ops(&engine, hero, 0, bad)
+                .expect_err("out of range")
+                .to_string();
+            assert!(msg.contains("0.2s") && msg.contains("20s"), "{msg}");
+        }
+        assert!(matches!(
+            set_shot_seconds_ops(&engine, hero, 7, 2.0),
+            Err(CinemaError::NoSuchShot)
+        ));
+    }
+
+    #[test]
+    fn a_shot_can_be_moved_along_the_sequence_and_keeps_its_own_id() {
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        for kind in ["establish", "hero", "closeup"] {
+            let (ops, _) = add_shot_ops(&engine, hero, kind, hero).expect("shot");
+            engine.commit("cinema-shot", ops).expect("commits");
+        }
+        let before: Vec<String> = cutscene_of(&engine, hero)
+            .shots
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+
+        let (ops, cut) = move_shot_ops(&engine, hero, 0, 2).expect("a real move");
+        engine.commit("cinema-move", ops).expect("commits");
+        let after: Vec<String> = cut.shots.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(
+            after,
+            vec![before[1].clone(), before[2].clone(), before[0].clone()]
+        );
+        // The ids TRAVELLED. A reorder that renumbered them would make every id in the document a
+        // statement about position rather than identity, and two peers editing at once would collide.
+        let mut sorted = after.clone();
+        sorted.sort();
+        let mut expected = before.clone();
+        expected.sort();
+        assert_eq!(sorted, expected);
+
+        assert!(engine.undo(), "one Ctrl-Z restores the order");
+        let restored: Vec<String> = cutscene_of(&engine, hero)
+            .shots
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(restored, before);
+
+        // A move that would change nothing is refused rather than committed as an empty undo step.
+        assert!(matches!(
+            move_shot_ops(&engine, hero, 1, 1),
+            Err(CinemaError::OutOfRange(_))
+        ));
+        // Past the end clamps to the end; past the start of the list does not exist.
+        let (_, clamped) = move_shot_ops(&engine, hero, 0, 99).expect("clamped, not refused");
+        assert_eq!(clamped.shots[2].id, before[0]);
+        assert!(matches!(
+            move_shot_ops(&engine, hero, 9, 0),
+            Err(CinemaError::NoSuchShot)
+        ));
+    }
+
+    #[test]
+    fn a_shot_is_re_framed_in_place_and_a_bad_word_changes_nothing() {
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let (ops, _) = add_shot_ops(&engine, hero, "hero", hero).expect("shot");
+        engine.commit("cinema-shot", ops).expect("commits");
+        let id = cutscene_of(&engine, hero).shots[0].id.clone();
+
+        let (ops, cut) = set_shot_framing_ops(
+            &engine,
+            hero,
+            0,
+            &FramingEdit {
+                size: Some("close".into()),
+                motion: Some("orbit".into()),
+                amount: Some(0.5),
+                ..FramingEdit::default()
+            },
+        )
+        .expect("known words");
+        engine.commit("cinema-framing", ops).expect("commits");
+        let shot = &cut.shots[0];
+        assert_eq!(shot.size, ShotSize::Close);
+        assert_eq!(shot.motion, ShotMove::Orbit);
+        assert!((shot.amount - 0.5).abs() < 1.0e-5);
+        // The axes NOT named are untouched, and the shot keeps its identity and its length.
+        assert_eq!(shot.angle, ShotAngle::ThreeQuarter);
+        assert!((shot.seconds - 2.5).abs() < 1.0e-5);
+        assert_eq!(shot.id, id);
+
+        // A request naming one good axis and one bad one writes NEITHER — a half-applied edit is a
+        // state no undo step can describe.
+        let err = set_shot_framing_ops(
+            &engine,
+            hero,
+            0,
+            &FramingEdit {
+                angle: Some("front".into()),
+                motion: Some("dolly_zoom".into()),
+                ..FramingEdit::default()
+            },
+        )
+        .expect_err("unknown move");
+        assert!(err.to_string().contains("dolly_zoom"), "{err}");
+        assert!(err.to_string().contains("camera move"), "{err}");
+        assert_eq!(
+            cutscene_of(&engine, hero).shots[0].angle,
+            ShotAngle::ThreeQuarter
+        );
+
+        assert!(matches!(
+            set_shot_framing_ops(
+                &engine,
+                hero,
+                0,
+                &FramingEdit {
+                    amount: Some(4.0),
+                    ..FramingEdit::default()
+                }
+            ),
+            Err(CinemaError::OutOfRange(_))
+        ));
+    }
+
+    #[test]
+    fn the_framing_catalogue_offers_exactly_the_words_the_commands_accept() {
+        // The catalogue and the validator are one contract stated in two `match` arms; this is the
+        // check that compares them, and it is the whole reason the catalogue is published from Rust
+        // rather than written out again in TypeScript.
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let (ops, _) = add_shot_ops(&engine, hero, "hero", hero).expect("shot");
+        engine.commit("cinema-shot", ops).expect("commits");
+
+        let catalog = framing_catalog();
+        assert_eq!(catalog.sizes.len(), 6);
+        assert_eq!(catalog.angles.len(), 6);
+        assert_eq!(catalog.motions.len(), 6);
+        for option in &catalog.sizes {
+            set_shot_framing_ops(
+                &engine,
+                hero,
+                0,
+                &FramingEdit {
+                    size: Some(option.value.into()),
+                    ..FramingEdit::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("size \"{}\" is offered and refused: {e}", option.value));
+        }
+        for option in &catalog.angles {
+            set_shot_framing_ops(
+                &engine,
+                hero,
+                0,
+                &FramingEdit {
+                    angle: Some(option.value.into()),
+                    ..FramingEdit::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("angle \"{}\" is offered and refused: {e}", option.value));
+        }
+        for option in &catalog.motions {
+            set_shot_framing_ops(
+                &engine,
+                hero,
+                0,
+                &FramingEdit {
+                    motion: Some(option.value.into()),
+                    ..FramingEdit::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("move \"{}\" is offered and refused: {e}", option.value));
+        }
+        // ...and the wire values really are the serde names, so a round-trip through the document
+        // reads back the option the user picked rather than a default.
+        let json = serde_json::to_string(&cutscene_of(&engine, hero)).expect("serialises");
+        assert!(
+            json.contains("\"three_quarter\"") || json.contains("\"high\""),
+            "{json}"
+        );
+        assert!(
+            catalog.still_motions.contains(&"hold"),
+            "the panel disables move strength from this list"
+        );
+        assert!((catalog.min_seconds - MIN_SECONDS).abs() < f32::EPSILON);
+        assert!((catalog.max_seconds - MAX_SECONDS).abs() < f32::EPSILON);
+        assert_eq!(catalog.max_shots, MAX_SHOTS);
+    }
+
+    #[test]
+    fn every_row_carries_its_own_start_and_length_and_the_name_of_what_it_films() {
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let other = spawn(&mut engine);
+        let (ops, _) =
+            add_shot_ops(&engine, hero, "establish", other).expect("frames the OTHER one");
+        engine.commit("cinema-shot", ops).expect("commits");
+        let (ops, _) = add_shot_ops(&engine, hero, "closeup", hero).expect("shot");
+        engine.commit("cinema-shot", ops).expect("commits");
+
+        let cut = cutscene_of(&engine, hero);
+        let other_key = other.to_loro_key();
+        let reply = reply_with_names(hero, &cut, "Weld Gun 7", String::new(), &|key| {
+            (key == other_key).then(|| "Assembly Hall".to_string())
+        });
+
+        assert_eq!(reply.rows.len(), 2);
+        // Laid end to end on the cutscene's own clock.
+        assert!((reply.rows[0].start_seconds - 0.0).abs() < 1.0e-5);
+        assert!((reply.rows[0].effective_seconds - 2.5).abs() < 1.0e-5);
+        assert!((reply.rows[1].start_seconds - 2.5).abs() < 1.0e-5);
+        assert!((reply.rows[1].effective_seconds - 1.8).abs() < 1.0e-5);
+        assert!(
+            (reply.rows[1].start_seconds + reply.rows[1].effective_seconds - reply.seconds).abs()
+                < 1.0e-5,
+            "the last row must end where the cutscene does"
+        );
+        // THE NAME IS PER SHOT. Every line used to be captioned with the cutscene's owner, so an
+        // establishing wide of the hall read as a wide of the one part inside it.
+        assert!(
+            reply.rows[0].reads.contains("Assembly Hall"),
+            "{}",
+            reply.rows[0].reads
+        );
+        assert!(
+            reply.rows[1].reads.contains("Weld Gun 7"),
+            "{}",
+            reply.rows[1].reads
+        );
+        assert_eq!(reply.rows[0].subject_name, "Assembly Hall");
+        // ...and `reads` is the flattened projection of the rows, never a second computation.
+        assert_eq!(
+            reply.reads,
+            reply
+                .rows
+                .iter()
+                .map(|r| r.reads.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Calm stretches every length by 2.5x, and the rows say so rather than the panel guessing.
+        let (ops, calm) = set_mood_ops(&engine, hero, "calm").expect("known mood");
+        engine.commit("cinema-mood", ops).expect("commits");
+        let calm_rows = reply_for(hero, &calm, "Weld Gun 7", String::new()).rows;
+        assert!(
+            (calm_rows[0].seconds - 2.5).abs() < 1.0e-5,
+            "authored is unchanged"
+        );
+        assert!((calm_rows[0].effective_seconds - 6.25).abs() < 1.0e-4);
+        assert!((calm_rows[1].start_seconds - 6.25).abs() < 1.0e-4);
     }
 
     #[test]

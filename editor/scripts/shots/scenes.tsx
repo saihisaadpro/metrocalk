@@ -27,6 +27,7 @@ import { Icon, iconTokens } from "../../src/theme/icons";
 import { Inspector } from "../../src/inspector/Inspector";
 import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
+import { CutscenePanel } from "../../src/panels/CutscenePanel";
 import { Diagnostics } from "../../src/panels/Diagnostics";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { Reveal } from "../../src/panels/Reveal";
@@ -44,7 +45,11 @@ import type {
   AnimationWorkspaceInfo,
   CadReport,
   CadReportPart,
+  CinemaReply,
+  FramingCatalog,
   RevealResponse,
+  ShotRow,
+  ShotSpec,
   StateMachine,
   TimelineTuple,
 } from "../../src/transport/protocol";
@@ -423,6 +428,111 @@ const physicsClient = () =>
     setSimRunning: () => undefined,
     physicsContacts: () => Promise.resolve([]),
     physicsCheck: () => Promise.resolve([]),
+  }) as unknown as EditorClient;
+
+/** A FIVE-SHOT CUT WITH FIVE DIFFERENT LENGTHS, one of which films something else.
+ *
+ *  The lengths are the point. A cutscene whose shots all run the same time draws five equal bars, and
+ *  five equal bars are a LIST — the exact thing this panel replaced, redrawn horizontally. 2.5s, 4.0s,
+ *  1.6s, 3.0s and 2.2s over 13.3s is a picture that can only be produced by a surface that reads
+ *  `effectiveSeconds`.
+ *
+ *  Shot 1 frames the hall rather than the gun, because that is ordinary film grammar (establish the
+ *  place, then cut in) and because until this session every line in a shot list was captioned with the
+ *  cutscene's OWNER — so a wide of the hall read back as a wide of the one part standing in it.
+ *
+ *  The jump-cut warning is real output, not a fixture string: shots 4 and 5 are framed identically
+ *  back to back, which is what `Cutscene::problems` says that about. */
+const CUTSCENE_SHOTS = [
+  { id: "sh-1", size: "wide", angle: "three_quarter", motion: "pull_out", amount: 0.3, seconds: 2.5, subject: "hall", subjectName: "Assembly Hall", reads: "a wide shot of Assembly Hall from three-quarters, pulling out — 2.5s" },
+  { id: "sh-2", size: "full", angle: "three_quarter", motion: "push_in", amount: 0.35, seconds: 4.0, subject: "rig", subjectName: "Weld Gun 7", reads: "a full shot of Weld Gun 7 from three-quarters, pushing in — 4.0s" },
+  { id: "sh-3", size: "extreme_close", angle: "profile", motion: "hold", amount: 0, seconds: 1.6, subject: "rig", subjectName: "Weld Gun 7", reads: "a very close shot of Weld Gun 7 in profile, holding still — 1.6s" },
+  { id: "sh-4", size: "medium", angle: "low", motion: "orbit", amount: 0.5, seconds: 3.0, subject: "rig", subjectName: "Weld Gun 7", reads: "a medium shot of Weld Gun 7 from below, orbiting — 3.0s" },
+  { id: "sh-5", size: "medium", angle: "low", motion: "crane_up", amount: 0.6, seconds: 2.2, subject: "rig", subjectName: "Weld Gun 7", reads: "a medium shot of Weld Gun 7 from below, craning up — 2.2s" },
+] as const;
+
+const CUTSCENE: CinemaReply = (() => {
+  let start = 0;
+  const rows: ShotRow[] = CUTSCENE_SHOTS.map((shot, index) => {
+    const row: ShotRow = {
+      id: shot.id,
+      index,
+      reads: shot.reads,
+      seconds: shot.seconds,
+      effectiveSeconds: shot.seconds,
+      startSeconds: start,
+      size: shot.size,
+      angle: shot.angle,
+      motion: shot.motion,
+      amount: shot.amount,
+      subject: shot.subject,
+      subjectName: shot.subjectName,
+    };
+    start += shot.seconds;
+    return row;
+  });
+  return {
+    entity: "rig",
+    shots: rows.length,
+    seconds: start,
+    mood: "normal",
+    reads: rows.map((row) => row.reads),
+    rows,
+    problems: [
+      'shots on "Weld Gun 7" are framed identically back to back — that reads as a jump cut; change the size or the angle',
+    ],
+    message: "",
+    reason: null,
+  };
+})();
+
+/** The framing vocabulary with the WIRE VALUES the Rust catalogue publishes. A scene that invented a
+ *  value would photograph a dropdown whose selected option the engine would refuse. */
+const FRAMING: FramingCatalog = {
+  sizes: [
+    { value: "extreme_wide", label: "Distant", blurb: "The subject is a speck in its world" },
+    { value: "wide", label: "Wide", blurb: "The whole subject with generous air around it" },
+    { value: "full", label: "Full", blurb: "The subject fills most of the height" },
+    { value: "medium", label: "Medium", blurb: "Closer — detail starts to read" },
+    { value: "close", label: "Close", blurb: "Tight on the subject" },
+    { value: "extreme_close", label: "Very close", blurb: "One thing, very large" },
+  ],
+  angles: [
+    { value: "front", label: "Front", blurb: "Facing the subject head-on" },
+    { value: "three_quarter", label: "Three-quarter", blurb: "Off to one side, slightly above" },
+    { value: "profile", label: "Profile", blurb: "Directly to the side" },
+    { value: "behind", label: "Behind", blurb: "Looking where it looks" },
+    { value: "low", label: "From below", blurb: "The subject towers" },
+    { value: "high", label: "From above", blurb: "The subject is small" },
+  ],
+  motions: [
+    { value: "hold", label: "Hold", blurb: "Locked off — the camera does not move" },
+    { value: "push_in", label: "Push in", blurb: "Creep toward the subject" },
+    { value: "pull_out", label: "Pull out", blurb: "Drift away" },
+    { value: "orbit", label: "Orbit", blurb: "Circle the subject" },
+    { value: "crane_up", label: "Crane up", blurb: "Rise while holding the aim" },
+    { value: "crane_down", label: "Crane down", blurb: "Descend while holding the aim" },
+  ],
+  minSeconds: 0.2,
+  maxSeconds: 20,
+  maxShots: 12,
+  stillMotions: ["hold"],
+};
+
+const CUTSCENE_CARDS: ShotSpec[] = [
+  { kind: "establish", label: "Establishing", blurb: "Show where we are before we look at anything closely", adds: "a wide, slowly pulling-out shot from the front" },
+  { kind: "hero", label: "Hero shot", blurb: "The workhorse — three-quarters on, pushing in", adds: "a full-body three-quarter shot that creeps closer" },
+  { kind: "closeup", label: "Close-up", blurb: "Tight and still — for the moment that matters", adds: "a close, locked-off shot in profile" },
+  { kind: "orbit", label: "Show it off", blurb: "Circle the object so every side reads", adds: "a medium shot orbiting a quarter turn" },
+  { kind: "reveal", label: "Crane reveal", blurb: "Lift away to show the world around it", adds: "a full shot craning upward" },
+  { kind: "vista", label: "The vista", blurb: "The subject is a speck in its world", adds: "an extreme-wide, locked-off shot from the front" },
+];
+
+const cutsceneClient = () =>
+  ({
+    cinemaCatalog: () => Promise.resolve(CUTSCENE_CARDS),
+    cinemaFramingCatalog: () => Promise.resolve(FRAMING),
+    cinemaList: () => Promise.resolve(CUTSCENE),
   }) as unknown as EditorClient;
 
 const selectAnimatedEntity = () => {
@@ -940,6 +1050,98 @@ export const SCENES: Scene[] = [
       text_absent: ["null", "undefined", "NaN"],
     },
     render: () => <AnimationWorkspace client={animationClient()} />,
+  },
+  {
+    id: "cutscene-timeline",
+    looking_for:
+      "A CUTSCENE AS A SEQUENCE IN TIME. What this panel replaced was a bulleted list of five " +
+      "sentences with a × beside each: no length on screen anywhere, no way to reorder, and no way " +
+      "to change a shot without deleting it and re-authoring everything after it — while the engine " +
+      "had carried a per-shot `seconds`, an ordered list and a six-by-six-by-six framing vocabulary " +
+      "the whole time. Check that the five bars are five DIFFERENT widths in the ratio 2.5 : 4.0 : " +
+      "1.6 : 3.0 : 2.2 — equal bars would mean the panel is drawing a list again — that each carries " +
+      "its own duration, and that the ruler above them is labelled in seconds with a playhead that " +
+      "has a handle. The first bar reads Assembly Hall, not Weld Gun 7: a shot may film something " +
+      "other than the object its cutscene hangs on, and every line in the old list was captioned " +
+      "with the owner. Below, the shot inspector: length, size, angle, move and strength, each one " +
+      "a control from the shared field family and each one edit landing as a single undoable commit. " +
+      "The jump-cut warning is the engine's own continuity check, shown where the shots are",
+    // The WINDOW, not a frame cap. `width` leaves the window at 620px and merely caps the frame, so
+    // a panel that measures its own container to decide how wide to draw a lane gets photographed
+    // fitting a 620px box under a caption about a full-window dock. Found by this scene: the last
+    // two shots of a five-shot cut were scrolled off the right-hand edge of the capture.
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    // Without the click this photographs the timeline with no shot inspector under it — a capture of
+    // half the panel under a caption describing all of it.
+    click: ["[data-testid='cutscene-clip']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-clip']", 5],
+        ["[data-testid='cutscene-shot-editor']", 1],
+        ["[data-testid='cutscene-problem']", 1],
+        // The framing vocabulary is on screen as three real selects, not as prose.
+        ["[data-testid='cutscene-size']", 1],
+        ["[data-testid='cutscene-angle']", 1],
+        ["[data-testid='cutscene-motion']", 1],
+        // ...and the catalogue is still one click away from the timeline it feeds.
+        ["[data-testid='shot-catalogue'] .mtk-btn", 6],
+      ],
+      text_present: [
+        "Assembly Hall",
+        "Weld Gun 7",
+        "Shot 1 of 5",
+        // The total, and the one number the old list could not show at all.
+        "13.3",
+        "jump cut",
+      ],
+      // The empty states this scene must NOT be photographing.
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      // A bar you cannot see is a shot you cannot select, and the shortest one here is 1.6s of 13.3.
+      min_width: [["[data-testid='cutscene-clip']", 24]],
+      unclipped: [
+        "[data-testid='cutscene-clip']",
+        "[data-testid='cutscene-shot-editor'] .mtk-select",
+        "[data-testid='cutscene-shot-editor'] .mtk-btn",
+        "[data-testid='cutscene-panel'] > .mtk-toolbar .mtk-btn",
+      ],
+      // The ruler labels sit ABOVE the lane they measure, and the inspector under the timeline.
+      stacked: [["[data-testid='cutscene-timeline']", "[data-testid='cutscene-shot-editor']"]],
+      // Earlier/Later/Remove are one row, not three: an order control that wrapped onto its own line
+      // is the toolbar having run out of width.
+      same_line: [["[data-testid='cutscene-earlier']", "[data-testid='cutscene-remove']"]],
+    },
+    render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-empty",
+    looking_for:
+      "THE STATE EVERY NEW CUTSCENE STARTS IN, and the one a capture is most likely to skip. An " +
+      "object is selected and has no shots: the panel says so in the object's own name, says what " +
+      "the first click will do, and puts the whole card catalogue right there. No timeline is drawn " +
+      "— a ruler over an empty lane is a clock with nothing on it — and no shot inspector, because " +
+      "there is no shot. Nothing here is a dark control waiting to be understood",
+    viewport: { width: 1000, height: 700 },
+    setup: selectAnimatedEntity,
+    expect: {
+      present: [["[data-testid='shot-catalogue'] .mtk-btn", 6]],
+      absent: ["[data-testid='cutscene-clip']", "[data-testid='cutscene-shot-editor']"],
+      text_present: ["Weld Gun 7 has no cutscene yet", "Add a shot"],
+      text_absent: ["null", "undefined", "NaN", "0.0s"],
+      unclipped: ["[data-testid='shot-catalogue'] .mtk-btn"],
+    },
+    render: () => (
+      <CutscenePanel
+        client={
+          ({
+            cinemaCatalog: () => Promise.resolve(CUTSCENE_CARDS),
+            cinemaFramingCatalog: () => Promise.resolve(FRAMING),
+            cinemaList: () =>
+              Promise.resolve({ ...CUTSCENE, shots: 0, seconds: 0, reads: [], rows: [], problems: [] }),
+          }) as unknown as EditorClient
+        }
+      />
+    ),
   },
   {
     id: "animation-curve-editor",

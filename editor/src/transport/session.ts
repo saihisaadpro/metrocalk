@@ -45,6 +45,8 @@ import type {
   ConditionSpec,
   ShotSpec,
   CinemaReply,
+  FramingCatalog,
+  FramingEdit,
   EffectSpec,
   VfxReply,
   VfxProbe,
@@ -308,6 +310,14 @@ export interface EditorClient {
   cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply>;
   /** The object's cutscene, read back as sentences plus continuity warnings. */
   cinemaList(id: string): Promise<CinemaReply>;
+  /** The framing vocabulary the shot inspector offers + the bounds it must respect (static data). */
+  cinemaFramingCatalog(): Promise<FramingCatalog>;
+  /** Set one shot's AUTHORED length in seconds (one undoable commit). */
+  cinemaSetShotSeconds(id: string, index: number, seconds: number): Promise<CinemaReply>;
+  /** Move one shot to another position in the list (one undoable commit). */
+  cinemaMoveShot(id: string, from: number, to: number): Promise<CinemaReply>;
+  /** Re-frame one shot in place — size, angle, move, strength (one undoable commit). */
+  cinemaSetShotFraming(id: string, index: number, edit: FramingEdit): Promise<CinemaReply>;
   /** Every "only if" card the Behaviour block can offer. */
   conditionCatalog(): Promise<ConditionSpec[]>;
   /** Add one clause to an object (one undoable commit). */
@@ -956,6 +966,18 @@ export class TauriClient implements EditorClient {
   }
   cinemaList(id: string): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_list", { id }).catch((e: unknown) => { console.error("cinema_list failed", e); throw e; });
+  }
+  cinemaFramingCatalog(): Promise<FramingCatalog> {
+    return this.core.invoke<FramingCatalog>("cinema_framing_catalog").catch((e: unknown) => { console.error("cinema_framing_catalog failed", e); throw e; });
+  }
+  cinemaSetShotSeconds(id: string, index: number, seconds: number): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_seconds", { id, index, seconds }).catch((e: unknown) => { console.error("cinema_set_shot_seconds failed", e); throw e; });
+  }
+  cinemaMoveShot(id: string, from: number, to: number): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_move_shot", { id, from, to }).catch((e: unknown) => { console.error("cinema_move_shot failed", e); throw e; });
+  }
+  cinemaSetShotFraming(id: string, index: number, edit: FramingEdit): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_framing", { id, index, edit }).catch((e: unknown) => { console.error("cinema_set_shot_framing failed", e); throw e; });
   }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return this.core.invoke<ConditionSpec[]>("condition_catalog").catch((e: unknown) => { console.error("condition_catalog failed", e); throw e; });
@@ -2793,16 +2815,32 @@ class MockClient implements EditorClient {
     return Promise.resolve([]);
   }
   cinemaAddShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaRemoveShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetMood(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaList(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: null });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: null });
+  }
+  /** Empty, like every other cinematics reply here. The vocabulary lives in ONE place — the Rust
+   *  catalogue that also validates it — and a copy of it in this file would be the same
+   *  one-contract-stated-twice the catalogue exists to remove. The dev build refuses every cinematics
+   *  command anyway, so there is no inspector here for the options to fill. */
+  cinemaFramingCatalog(): Promise<FramingCatalog> {
+    return Promise.resolve({ sizes: [], angles: [], motions: [], minSeconds: 0.2, maxSeconds: 20, maxShots: 12, stillMotions: [] });
+  }
+  cinemaSetShotSeconds(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaMoveShot(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetShotFraming(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return Promise.resolve([]);

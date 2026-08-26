@@ -22,9 +22,13 @@ const StateGraphPanel = lazy(() => import("../panels/StateGraphPanel").then((mod
 const ComposePanel = lazy(() => import("../panels/ComposePanel").then((module) => ({ default: module.ComposePanel })));
 const BindingGraph = lazy(() => import("../graph/BindingGraph").then((module) => ({ default: module.BindingGraph })));
 const AnimationWorkspace = lazy(() => import("../panels/AnimationWorkspace").then((module) => ({ default: module.AnimationWorkspace })));
+const CutscenePanel = lazy(() => import("../panels/CutscenePanel").then((module) => ({ default: module.CutscenePanel })));
 
 export type BottomWorkspace = "asset" | "animation" | "problems" | "import" | "logic" | "runtime" | "formats";
 type LogicWorkspace = "rules" | "states" | "graph" | "compose";
+/** Animate holds two timelines over the same clock: an object's own properties, and the camera
+ *  sequence that films it. Both need width, which is why they are here rather than in a 300px column. */
+export type AnimateWorkspace = "properties" | "cutscene";
 
 export interface BottomDockProps {
   client: EditorClient;
@@ -33,11 +37,16 @@ export interface BottomDockProps {
   /** A track below the stage, or — on a window too short for both — a sheet over it. See `dockForm`. */
   form?: DockForm;
   playing: boolean;
+  /** Which of Animate's two timelines is showing. Owned by `App` — unlike Logic's sub-tab, which is
+   *  local — because the Cinematics block deep-links to the Cutscene one, and a router that can open
+   *  a workspace but not the editor inside it leaves the user one unexplained click short. */
+  animate: AnimateWorkspace;
   onChange: (workspace: BottomWorkspace) => void;
+  onAnimateChange: (workspace: AnimateWorkspace) => void;
   onOpenChange: (open: boolean) => void;
 }
 
-export function BottomDock({ client, active, open, form = "docked", playing, onChange, onOpenChange }: BottomDockProps) {
+export function BottomDock({ client, active, open, form = "docked", playing, animate, onChange, onAnimateChange, onOpenChange }: BottomDockProps) {
   const selected = useSelectedId();
   const [logic, setLogic] = useState<LogicWorkspace>("rules");
   // Labels and icons match the Engines rail EXACTLY, and the sub-engines come first in the rail's order.
@@ -140,9 +149,7 @@ export function BottomDock({ client, active, open, form = "docked", playing, onC
             </div>
           )}
           {active === "animation" && (
-            <div id="bottom-workspaces-animation-panel" role="tabpanel" aria-labelledby="bottom-workspaces-animation-tab" className="mtk-bottom-workspace mtk-scroll">
-              <LazyWorkspace label="Animation"><AnimationWorkspace client={client} /></LazyWorkspace>
-            </div>
+            <AnimateWorkspacePanel client={client} active={animate} onChange={onAnimateChange} />
           )}
           {active === "problems" && (
             <div id="bottom-workspaces-problems-panel" role="tabpanel" aria-labelledby="bottom-workspaces-problems-tab" className="mtk-bottom-workspace mtk-scroll">
@@ -175,6 +182,27 @@ export function BottomDock({ client, active, open, form = "docked", playing, onC
         </div>
       )}
     </section>
+  );
+}
+
+/** The two timelines Animate holds. Same shape as `LogicWorkspacePanel` on purpose: one dock slot, a
+ *  strip naming the editors inside it, and one body that scrolls — the pattern already established
+ *  one workspace over, rather than a second answer to the same question. */
+function AnimateWorkspacePanel({ client, active, onChange }: { client: EditorClient; active: AnimateWorkspace; onChange: (workspace: AnimateWorkspace) => void }) {
+  const tabs = [
+    { id: "properties", label: "Properties", tooltip: "Keys, curves and events on the selected object" },
+    { id: "cutscene", label: "Cutscene", tooltip: "The camera sequence: shot order, length and framing" },
+  ] as const;
+  return (
+    <div id="bottom-workspaces-animation-panel" role="tabpanel" aria-labelledby="bottom-workspaces-animation-tab" className="mtk-bottom-workspace mtk-bottom-workspace--logic">
+      <DockTabs ariaLabel="Animation editors" tabs={tabs} activeId={active} onChange={(id) => onChange(id as AnimateWorkspace)} />
+      <div className="mtk-bottom-workspace__body mtk-scroll">
+        <LazyWorkspace label="Animation">
+          {active === "properties" && <AnimationWorkspace client={client} />}
+          {active === "cutscene" && <CutscenePanel client={client} />}
+        </LazyWorkspace>
+      </div>
+    </div>
   );
 }
 

@@ -3,18 +3,21 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, expect, test } from "vitest";
 import { projectionStore } from "../store/projection";
 import { fakeClient } from "../transport/test-client";
-import { BottomDock, type BottomWorkspace } from "./BottomDock";
+import { BottomDock, type AnimateWorkspace, type BottomWorkspace } from "./BottomDock";
 
-function Harness({ initialActive = "asset", initialOpen = false }: { initialActive?: BottomWorkspace; initialOpen?: boolean }) {
+function Harness({ initialActive = "asset", initialOpen = false, initialAnimate = "properties" }: { initialActive?: BottomWorkspace; initialOpen?: boolean; initialAnimate?: AnimateWorkspace }) {
   const [active, setActive] = useState<BottomWorkspace>(initialActive);
   const [open, setOpen] = useState(initialOpen);
+  const [animate, setAnimate] = useState<AnimateWorkspace>(initialAnimate);
   return (
     <BottomDock
       client={fakeClient()}
       active={active}
       open={open}
       playing={false}
+      animate={animate}
       onChange={setActive}
+      onAnimateChange={setAnimate}
       onOpenChange={setOpen}
     />
   );

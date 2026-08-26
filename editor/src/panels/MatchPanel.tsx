@@ -116,7 +116,13 @@ function Diagnostic({ diagnostic }: { diagnostic: CookDiagnostic }) {
   );
 }
 
-export function MatchPanel({ client }: { client: EditorClient }) {
+export interface MatchPanelProps {
+  client: EditorClient;
+  /** Open the Cutscene timeline in the Animate dock — handed down to the Cinematics block. */
+  onOpenTimeline?: () => void;
+}
+
+export function MatchPanel({ client, onOpenTimeline }: MatchPanelProps) {
   const [validation, setValidation] = useState<MatchValidation>(IDLE);
   const [status, setMatchStatus] = useState<MatchStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -226,7 +232,7 @@ export function MatchPanel({ client }: { client: EditorClient }) {
     return (
       <div data-testid="match-panel" style={{ padding: space.md, display: "flex", flexDirection: "column", gap: space.md }}>
         <RolesSection client={client} />
-        <CinemaSection client={client} />
+        <CinemaSection client={client} onOpenTimeline={onOpenTimeline} />
         <VfxSection client={client} />
         <EmptyPanelState
           icon={<Icon name="sword" size="xl" />}
@@ -276,7 +282,7 @@ export function MatchPanel({ client }: { client: EditorClient }) {
     // match, so nothing could name the state a user actually opens it in.
     <div data-testid="match-panel" style={{ padding: space.md, display: "flex", flexDirection: "column", gap: space.md }}>
       <RolesSection client={client} />
-      <CinemaSection client={client} />
+      <CinemaSection client={client} onOpenTimeline={onOpenTimeline} />
       <VfxSection client={client} />
       {/* ── the authored scene ─────────────────────────────────────────────────────────────────────── */}
       <section>

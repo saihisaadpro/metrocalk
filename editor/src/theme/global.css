@@ -2015,6 +2015,15 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-bottom-workspace--split { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.3fr); gap: 1px; background: var(--mtk-border-subtle); }
 .mtk-bottom-workspace--split > div { min-width: 0; overflow: auto; background: var(--mtk-bg-panel); }
 .mtk-bottom-workspace--logic { display: flex; flex-direction: column; overflow: hidden; }
+/* THE STRIP IS CHROME, AND CHROME DOES NOT SHRINK. A flex item's default `flex-shrink: 1` applies to
+   a tab strip exactly as it does to a body, and `.mtk-dock-tabs--horizontal` is `overflow-y: hidden`
+   — so in a dock too short for its content the strip compressed and cut its own tabs in half, with
+   no scrollbar and nothing on screen to say a control had been sliced. Measured on the Animate dock
+   at the two window sizes the layout gate photographs: a 36px tab showing 18px, and the same tab
+   showing 11px. This is the third instance of the same defect in this stylesheet — `.mtk-disclosure`
+   and `.mtk-workspace-panel` were the first two — and the pattern is always a fixed-size control
+   inside a flex container that ran out of room. */
+.mtk-bottom-workspace--logic > .mtk-dock-tabs { flex: 0 0 auto; }
 .mtk-bottom-workspace__body { flex: 1 1 auto; min-height: 0; overflow: auto; }
 
 @media (max-width: 1180px) {
@@ -2506,6 +2515,47 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-timeline__chip:hover .mtk-btn.mtk-timeline__chip-remove,
 .mtk-btn.mtk-timeline__chip-remove:focus-visible { opacity: 1; }
 .mtk-btn.mtk-timeline__chip-remove:hover:not(:disabled) { color: var(--mtk-danger); background: var(--mtk-bg-active); }
+
+/* A SPAN, not an instant. Every other mark on a lane is a point in time drawn at a fixed size; a clip
+   is a LENGTH, so its width is the document's data and only its floor is a design decision. That floor
+   lives here, next to the lane height it is measured against: a 0.2s shot inside a four-minute
+   sequence is a bar under a pixel wide, and a control nobody can hit is not a control. Below the
+   floor adjacent bars overlap, which is the honest picture of two shots too short to tell apart. */
+.mtk-btn.mtk-timeline__clip {
+  position: absolute;
+  top: 50%;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--mtk-space-2);
+  box-sizing: border-box;
+  min-width: 24px;
+  height: calc(var(--mtk-lane-height) - 8px);
+  min-height: 0;
+  padding: 0 var(--mtk-space-2);
+  overflow: hidden;
+  color: var(--mtk-text-secondary);
+  background: var(--mtk-bg-raised);
+  border: 1px solid var(--mtk-border);
+  border-radius: var(--mtk-radius-sm);
+  transform: translateY(-50%);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.mtk-btn.mtk-timeline__clip:hover:not(:disabled) { color: var(--mtk-accent); background: var(--mtk-bg-hover); }
+.mtk-btn.mtk-timeline__clip[data-selected] {
+  color: var(--mtk-accent);
+  background: var(--mtk-accent-subtle);
+  border-color: var(--mtk-accent);
+}
+/* LIVE is a different fact from SELECTED — one is where the playhead is, the other is what the
+   inspector below is editing — so it is a rule on the left edge rather than a second fill competing
+   with the accent. */
+.mtk-btn.mtk-timeline__clip.is-live { box-shadow: inset 3px 0 0 var(--mtk-accent); }
+.mtk-btn.mtk-timeline__clip.is-invalid { border-color: var(--mtk-warn-border); background: var(--mtk-warn-bg); }
+.mtk-timeline__clip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mtk-timeline__clip-meta { flex: 0 0 auto; margin-left: auto; color: var(--mtk-text-muted); }
 
 /* -- The transport --------------------------------------------------------------------------------
    A `Toolbar` with one extra class: the wrap policy, the group gap and the attached-segment radius

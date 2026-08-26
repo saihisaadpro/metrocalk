@@ -272,6 +272,103 @@ fn clearing_an_or_group_persists_as_cleared_rather_than_leaving_a_stale_slot() {
 }
 
 #[test]
+fn an_edited_cutscene_survives_save_and_open_down_to_the_second() {
+    // The sibling test above proves a cutscene AUTHORED FROM CARDS comes back. Everything a user can
+    // now change about one afterwards — a shot's length, its place in the sequence, its framing, and
+    // which object it films — is a different question, and it is the one requirement 10 of the
+    // capability brief names: "verify the result survives restart/reload". A length that reverts to
+    // its card's default on reopen is the worst kind of loss, because the project opens, the shot is
+    // there, and only the timing is quietly someone else's.
+    let path = temp_mtk("cinema-edited");
+    let _ = std::fs::remove_file(&path);
+
+    let (mut a, _scene) = engine_with_resolver();
+    let statue = spawn(&mut a, 2.0);
+    let hall = spawn(&mut a, 40.0);
+
+    // An establishing wide of the HALL, then two shots of the statue — ordinary film grammar, and the
+    // shape that had no user path at all before this pass.
+    for (kind, framed) in [("establish", hall), ("hero", statue), ("closeup", statue)] {
+        let (ops, _) =
+            metrocalk_editor_shell::add_shot_ops(&a, statue, kind, framed).expect("shot lands");
+        a.commit("shot", ops).expect("shot commits");
+    }
+
+    let (ops, _) =
+        metrocalk_editor_shell::set_shot_seconds_ops(&a, statue, 1, 7.4).expect("in range");
+    a.commit("seconds", ops).expect("length commits");
+    let (ops, _) = metrocalk_editor_shell::set_shot_framing_ops(
+        &a,
+        statue,
+        2,
+        &metrocalk_editor_shell::FramingEdit {
+            angle: Some("low".into()),
+            motion: Some("orbit".into()),
+            amount: Some(0.75),
+            ..metrocalk_editor_shell::FramingEdit::default()
+        },
+    )
+    .expect("known words");
+    a.commit("framing", ops).expect("framing commits");
+    let (ops, _) = metrocalk_editor_shell::move_shot_ops(&a, statue, 2, 0).expect("a real move");
+    a.commit("move", ops).expect("reorder commits");
+    let (ops, _) = metrocalk_editor_shell::set_mood_ops(&a, statue, "calm").expect("known mood");
+    a.commit("mood", ops).expect("mood commits");
+
+    let before = metrocalk_editor_shell::cutscene_of(&a, statue);
+    assert_eq!(before.shots.len(), 3);
+
+    project::save(&a, &path).expect("save");
+
+    let (mut b, _scene_b) = engine_with_resolver();
+    project::open_into(&mut b, &path).expect("open");
+    let after = metrocalk_editor_shell::cutscene_of(&b, statue);
+
+    // Not "roughly the same" — the SAME, as the sibling test puts it.
+    assert_eq!(after, before, "an edited cutscene changed across a reload");
+
+    // ...and then the specifics, so a refactor that guts one field still fails here rather than
+    // passing on a structural equality between two equally-wrong values.
+    assert_eq!(
+        after.mood,
+        metrocalk_animation::shot::Mood::Calm,
+        "the pacing dial"
+    );
+    // The re-framed close-up was moved to the FRONT, so the order is the authored one.
+    assert_eq!(
+        after.shots[0].angle,
+        metrocalk_animation::shot::ShotAngle::Low
+    );
+    assert_eq!(
+        after.shots[0].motion,
+        metrocalk_animation::shot::ShotMove::Orbit
+    );
+    assert!(
+        (after.shots[0].amount - 0.75).abs() < 1.0e-5,
+        "move strength"
+    );
+    // The 7.4s length is on the shot it was set on, which the reorder pushed one place later.
+    assert!(
+        (after.shots[2].seconds - 7.4).abs() < 1.0e-5,
+        "the authored length came back as {}",
+        after.shots[2].seconds
+    );
+    // Calm scales it 2.5x at playback and leaves the AUTHORED number alone — both halves survive.
+    assert!((after.effective_shot_seconds(2).expect("a shot") - 18.5).abs() < 1.0e-4);
+    // And the establishing shot still films the HALL, not its own cutscene's owner.
+    assert_eq!(after.shots[1].subject, hall.to_loro_key());
+    assert!(
+        after
+            .shots
+            .iter()
+            .any(|s| s.subject == statue.to_loro_key()),
+        "the statue's own shots are still its own"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn a_cutscene_and_its_effects_survive_save_and_open() {
     // The two newest pillars write canonical JSON into `Cinematic.source` / `Vfx.source`. A blob field
     // that does not round-trip fails in the worst possible way: the project opens, the object is there,

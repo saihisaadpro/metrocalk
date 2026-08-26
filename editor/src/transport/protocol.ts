@@ -1974,6 +1974,68 @@ export interface ShotSpec {
   adds: string;
 }
 
+/** How much of the frame the subject fills. */
+export type ShotSize = "extreme_wide" | "wide" | "full" | "medium" | "close" | "extreme_close";
+/** Where the camera stands, relative to the subject's own facing. */
+export type ShotAngle = "front" | "three_quarter" | "profile" | "behind" | "low" | "high";
+/** What the camera does over the shot's length. */
+export type ShotMove = "hold" | "push_in" | "pull_out" | "orbit" | "crane_up" | "crane_down";
+
+/** One choice on one framing axis, published by the side that validates it. */
+export interface FramingOption {
+  value: string;
+  label: string;
+  blurb: string;
+}
+
+/** The whole framing vocabulary plus the bounds a shot must respect. */
+export interface FramingCatalog {
+  sizes: FramingOption[];
+  angles: FramingOption[];
+  motions: FramingOption[];
+  /** The shortest a shot may be authored, seconds. */
+  minSeconds: number;
+  /** The longest, seconds. */
+  maxSeconds: number;
+  /** The most shots one cutscene may hold. */
+  maxShots: number;
+  /** Moves for which strength does nothing — the dial is disabled, with a reason, on these. */
+  stillMotions: string[];
+}
+
+/** One shot with its numbers — what the timeline draws and the shot inspector edits. */
+export interface ShotRow {
+  /** Stable across a reorder. */
+  id: string;
+  /** Position in the list, 0-based. */
+  index: number;
+  /** The sentence. */
+  reads: string;
+  /** The AUTHORED length in seconds — what the duration control edits. */
+  seconds: number;
+  /** What it runs for once the mood has scaled it. Calm is 2.5x, so these usually differ. */
+  effectiveSeconds: number;
+  /** Where the shot starts on the cutscene clock, seconds. */
+  startSeconds: number;
+  size: ShotSize;
+  angle: ShotAngle;
+  motion: ShotMove;
+  /** How strong the move is, 0..1. Inert for `hold`. */
+  amount: number;
+  /** The object this shot FRAMES — not necessarily the cutscene's owner. */
+  subject: string;
+  /** That object's display name. */
+  subjectName: string;
+}
+
+/** A change to one shot's framing. An absent axis means "leave it alone", never "reset it". */
+export interface FramingEdit {
+  size?: string;
+  angle?: string;
+  motion?: string;
+  amount?: number;
+}
+
 /** What a completed cinematics command answers with. */
 export interface CinemaReply {
   entity: string | null;
@@ -1981,8 +2043,10 @@ export interface CinemaReply {
   seconds: number;
   /** The authored pacing dial that drives effective shot duration and transition length. */
   mood: "calm" | "normal" | "tense";
-  /** The cutscene read back as sentences, one line per shot. */
+  /** The cutscene read back as sentences, one line per shot. Flattened from `rows`. */
   reads: string[];
+  /** The same shots with their numbers. */
+  rows: ShotRow[];
   /** Continuity warnings in plain language (a jump cut, opening tight, a rushed shot). */
   problems: string[];
   message: string;

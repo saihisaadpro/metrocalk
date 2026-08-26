@@ -127,8 +127,10 @@ pub use capscene::{
     CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
 };
 pub use cinema_intent::{
-    add_shot_ops, cutscene_of, describe_shot, remove_shot_ops, reply_for as cinema_reply,
-    set_mood_ops, shot_specs, CinemaError, CinemaReply, ShotSpec, CINEMA_COMPONENT,
+    add_shot_ops, cutscene_of, describe_shot, framing_catalog, move_shot_ops, remove_shot_ops,
+    reply_for as cinema_reply, reply_with_names as cinema_reply_named, set_mood_ops,
+    set_shot_framing_ops, set_shot_seconds_ops, shot_specs, CinemaError, CinemaReply,
+    FramingCatalog, FramingEdit, FramingOption, ShotRow, ShotSpec, CINEMA_COMPONENT,
 };
 pub use compose_ai::{ComposeAiError, Composer, DemoComposer, RemoteComposer};
 pub use constraint_intent::{

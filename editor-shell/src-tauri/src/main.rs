@@ -2855,6 +2855,27 @@ enum EngineCmd {
         mood: String,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
     },
+    /// Cinematics - set one shot's authored length (one undoable commit).
+    CinemaSetShotSeconds {
+        id: String,
+        index: usize,
+        seconds: f32,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - move one shot to another position in the list (one undoable commit).
+    CinemaMoveShot {
+        id: String,
+        from: usize,
+        to: usize,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - re-frame one shot in place (one undoable commit).
+    CinemaSetShotFraming {
+        id: String,
+        index: usize,
+        edit: metrocalk_editor_shell::FramingEdit,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
     /// Cinematics - read an object's cutscene back as sentences.
     CinemaList {
         id: String,
@@ -5615,6 +5636,17 @@ fn entity_display_name(engine: &Engine<FlecsWorld>, id: EntityId) -> String {
             _ => None,
         })
         .unwrap_or_else(|| id.to_loro_key())
+}
+
+/// The display name behind a shot's `subject` key, or `None` when it names nothing in this scene.
+///
+/// A shot may film something other than the object its cutscene hangs on, so the sentences in a shot
+/// list cannot all be captioned with the owner's name. `None` (rather than the raw loro key) lets the
+/// reply fall back to the owner, which is what the shot actually does.
+fn shot_subject_name(engine: &Engine<FlecsWorld>, key: &str) -> Option<String> {
+    EntityId::from_loro_key(key)
+        .filter(|e| engine.entity_exists(*e))
+        .map(|e| entity_display_name(engine, e))
 }
 
 fn refresh_animation_plan(engine: &Engine<FlecsWorld>, preview: &mut AnimationPreviewState) {
@@ -9772,6 +9804,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         log.append(&Record::CinemaShot {
                             id: id.clone(),
                             shot: kind.clone(),
+                            subject: (framed != entity).then(|| framed.to_loro_key()),
                         });
                         if let Some(ch) = &channel {
                             send_proj!(ch, proj_full(&engine, &scene));
@@ -9782,11 +9815,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             .last()
                             .map(|shot| metrocalk_editor_shell::describe_shot(shot, &name))
                             .unwrap_or_default();
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply(
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
                             entity,
                             &cut,
                             &name,
                             format!("Added {last}"),
+                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(e) => {
@@ -9828,11 +9862,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             send_proj!(ch, proj_full(&engine, &scene));
                         }
                         let name = entity_display_name(&engine, entity);
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply(
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
                             entity,
                             &cut,
                             &name,
                             "Shot removed".to_string(),
+                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(e) => {
@@ -9877,11 +9912,180 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             metrocalk_animation::shot::Mood::Normal => "Normal",
                             metrocalk_animation::shot::Mood::Tense => "Tense",
                         };
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply(
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
                             entity,
                             &cut,
                             &name,
                             format!("Cinematic pacing set to {label}"),
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSetShotSeconds {
+                id,
+                index,
+                seconds,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - shot length is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::set_shot_seconds_ops(&engine, entity, index, seconds) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-seconds", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the length change was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaShotSeconds {
+                            id: id.clone(),
+                            index,
+                            seconds,
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let shown = cut.effective_shot_seconds(index).unwrap_or_default();
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            format!("Shot {} now runs {shown:.1}s", index + 1),
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaMoveShot {
+                id,
+                from,
+                to,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - shot order is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::move_shot_ops(&engine, entity, from, to) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-move", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the reorder was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaMoveShot {
+                            id: id.clone(),
+                            from,
+                            to,
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let landed = to.min(cut.shots.len().saturating_sub(1)) + 1;
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            format!("Shot moved to position {landed}"),
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSetShotFraming {
+                id,
+                index,
+                edit,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - framing is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::set_shot_framing_ops(&engine, entity, index, &edit) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-framing", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the framing change was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaShotFraming {
+                            id: id.clone(),
+                            index,
+                            edit: edit.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let done = cut
+                            .shots
+                            .get(index)
+                            .map(|shot| {
+                                let who = shot_subject_name(&engine, &shot.subject)
+                                    .unwrap_or_else(|| name.clone());
+                                format!(
+                                    "Shot {} is now {}",
+                                    index + 1,
+                                    metrocalk_editor_shell::describe_shot(shot, &who)
+                                )
+                            })
+                            .unwrap_or_else(|| "Shot re-framed".to_string());
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            done,
+                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(error) => {
@@ -9895,7 +10099,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .map(|entity| {
                         let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
                         let name = entity_display_name(&engine, entity);
-                        metrocalk_editor_shell::cinema_reply(entity, &cut, &name, String::new())
+                        metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            String::new(),
+                            &|key| shot_subject_name(&engine, key),
+                        )
                     })
                     .unwrap_or_default();
                 let _ = reply.send(info);
@@ -22610,6 +22820,97 @@ fn cinema_set_mood(
     })
 }
 
+/// The framing vocabulary and the bounds a shot must respect. Static data.
+///
+/// Published by the side that VALIDATES it, so the shot inspector's three dropdowns cannot offer a
+/// word `set_shot_framing_ops` will refuse.
+#[tauri::command(async)]
+fn cinema_framing_catalog() -> metrocalk_editor_shell::FramingCatalog {
+    ipc();
+    metrocalk_editor_shell::framing_catalog()
+}
+
+/// Set one shot's authored length in seconds (one undoable commit).
+#[tauri::command(async)]
+fn cinema_set_shot_seconds(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+    seconds: f32,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetShotSeconds {
+            id,
+            index,
+            seconds,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The length change did not finish in time")
+    })
+}
+
+/// Move one shot to another position in the list (one undoable commit).
+#[tauri::command(async)]
+fn cinema_move_shot(
+    state: State<AppState>,
+    id: String,
+    from: usize,
+    to: usize,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaMoveShot {
+            id,
+            from,
+            to,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The reorder did not finish in time")
+    })
+}
+
+/// Re-frame one shot in place — size, angle, move, strength — without losing its place or its length.
+#[tauri::command(async)]
+fn cinema_set_shot_framing(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+    edit: metrocalk_editor_shell::FramingEdit,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetShotFraming {
+            id,
+            index,
+            edit,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The framing change did not finish in time")
+    })
+}
+
 /// An object's cutscene, read back as sentences plus any continuity warnings.
 #[tauri::command(async)]
 fn cinema_list(state: State<AppState>, id: String) -> metrocalk_editor_shell::CinemaReply {
@@ -25595,8 +25896,12 @@ fn main() {
             vfx_probe,
             camera_probe,
             cinema_catalog,
+            cinema_framing_catalog,
             cinema_add_shot,
             cinema_remove_shot,
+            cinema_set_shot_seconds,
+            cinema_move_shot,
+            cinema_set_shot_framing,
             cinema_set_mood,
             cinema_list,
             condition_catalog,

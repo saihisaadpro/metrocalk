@@ -4,7 +4,59 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type MatchStatus, type TerrainReply, type TerrainStats } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type FramingCatalog, type FramingEdit, type MatchStatus, type ShotRow, type TerrainReply, type TerrainStats } from "./protocol";
+
+/** One authored shot, with the numbers a timeline needs. Shaped like what `cinema_list` really
+ *  sends — a `startSeconds` of 0, an `effectiveSeconds` that is the authored length at Normal
+ *  pacing — so a test that renders it is rendering the same object the `.exe` produces. */
+const HERO_ROW: ShotRow = {
+  id: "shot-0000hero",
+  index: 0,
+  reads: "a full shot of Crate from three-quarters, pushing in — 2.5s",
+  seconds: 2.5,
+  effectiveSeconds: 2.5,
+  startSeconds: 0,
+  size: "full",
+  angle: "three_quarter",
+  motion: "push_in",
+  amount: 0.35,
+  subject: "e1",
+  subjectName: "Crate",
+};
+
+/** A framing vocabulary with the same WIRE VALUES the Rust catalogue publishes. The labels are the
+ *  shell's to choose and a test must not assert them; the values are the contract, and a stub that
+ *  invented one would make every framing test green against a word the engine refuses. */
+const FRAMING_CATALOG: FramingCatalog = {
+  sizes: [
+    { value: "extreme_wide", label: "Distant", blurb: "The subject is a speck in its world" },
+    { value: "wide", label: "Wide", blurb: "The whole subject with air around it" },
+    { value: "full", label: "Full", blurb: "The subject fills most of the height" },
+    { value: "medium", label: "Medium", blurb: "Closer - detail starts to read" },
+    { value: "close", label: "Close", blurb: "Tight on the subject" },
+    { value: "extreme_close", label: "Very close", blurb: "One thing, very large" },
+  ],
+  angles: [
+    { value: "front", label: "Front", blurb: "Facing the subject head-on" },
+    { value: "three_quarter", label: "Three-quarter", blurb: "Off to one side, slightly above" },
+    { value: "profile", label: "Profile", blurb: "Directly to the side" },
+    { value: "behind", label: "Behind", blurb: "Looking where it looks" },
+    { value: "low", label: "From below", blurb: "The subject towers" },
+    { value: "high", label: "From above", blurb: "The subject is small" },
+  ],
+  motions: [
+    { value: "hold", label: "Hold", blurb: "Locked off - the camera does not move" },
+    { value: "push_in", label: "Push in", blurb: "Creep toward the subject" },
+    { value: "pull_out", label: "Pull out", blurb: "Drift away" },
+    { value: "orbit", label: "Orbit", blurb: "Circle the subject" },
+    { value: "crane_up", label: "Crane up", blurb: "Rise while holding the aim" },
+    { value: "crane_down", label: "Crane down", blurb: "Descend while holding the aim" },
+  ],
+  minSeconds: 0.2,
+  maxSeconds: 20,
+  maxShots: 12,
+  stillMotions: ["hold"],
+};
 
 function emptyAnimationState(id: string | null): AnimationWorkspaceInfo {
   return {
@@ -244,15 +296,22 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     vfxAdd: vi.fn((id: string) => Promise.resolve({ entity: id, layers: 1, particles: 72, reads: ["\u{1F525} Fire - 72 particles, 1.0s per particle"], problems: [], message: "Added Fire", reason: null })),
     vfxRemove: vi.fn((id: string) => Promise.resolve({ entity: id, layers: 0, particles: 0, reads: [], problems: [], message: "Effect removed", reason: null })),
     vfxList: vi.fn((id: string) => Promise.resolve({ entity: id, layers: 0, particles: 0, reads: [], problems: [], message: "", reason: null })),
+    // The `icon` field these three carried was removed from `ShotSpec` on both sides by ADR-137 —
+    // `theme/icons.tsx` keys its drawings on `kind` — so the emoji here described a contract that no
+    // longer exists on either side of the boundary.
     cinemaCatalog: vi.fn(() => Promise.resolve([
-      { kind: "establish", label: "Establishing", blurb: "Show where we are before we look at anything closely", icon: "\u{1F304}", adds: "a wide, slowly pulling-out shot from the front" },
-      { kind: "hero", label: "Hero shot", blurb: "The workhorse - three-quarters on, pushing in", icon: "\u{1F3AC}", adds: "a full-body three-quarter shot that creeps closer" },
-      { kind: "closeup", label: "Close-up", blurb: "Tight and still - for the moment that matters", icon: "\u{1F50D}", adds: "a close, locked-off shot in profile" },
+      { kind: "establish", label: "Establishing", blurb: "Show where we are before we look at anything closely", adds: "a wide, slowly pulling-out shot from the front" },
+      { kind: "hero", label: "Hero shot", blurb: "The workhorse - three-quarters on, pushing in", adds: "a full-body three-quarter shot that creeps closer" },
+      { kind: "closeup", label: "Close-up", blurb: "Tight and still - for the moment that matters", adds: "a close, locked-off shot in profile" },
     ])),
-    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: ["a full shot of Crate, three-quarters on, pushing in over 2.5s"], problems: [], message: "Added a hero shot", reason: null })),
-    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], problems: [], message: "Shot removed", reason: null })),
-    cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, reads: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
-    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], problems: [], message: "", reason: null })),
+    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: "Added a hero shot", reason: null })),
+    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], rows: [], problems: [], message: "Shot removed", reason: null })),
+    cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, reads: [], rows: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
+    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], rows: [], problems: [], message: "", reason: null })),
+    cinemaFramingCatalog: vi.fn(() => Promise.resolve(FRAMING_CATALOG)),
+    cinemaSetShotSeconds: vi.fn((id: string, index: number, seconds: number) => Promise.resolve({ entity: id, shots: 1, seconds, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, seconds, effectiveSeconds: seconds }], problems: [], message: `Shot ${index + 1} now runs ${seconds.toFixed(1)}s`, reason: null })),
+    cinemaMoveShot: vi.fn((id: string, _from: number, to: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Shot moved to position ${to + 1}`, reason: null })),
+    cinemaSetShotFraming: vi.fn((id: string, index: number, edit: FramingEdit) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, size: (edit.size as ShotRow["size"]) ?? HERO_ROW.size, angle: (edit.angle as ShotRow["angle"]) ?? HERO_ROW.angle, motion: (edit.motion as ShotRow["motion"]) ?? HERO_ROW.motion, amount: edit.amount ?? HERO_ROW.amount }], problems: [], message: `Shot ${index + 1} is now re-framed`, reason: null })),
     conditionCatalog: vi.fn(() => Promise.resolve([
       { kind: "score_at_least", label: "The Score is at least…", blurb: "gate this behind points the player has already earned", needs: "number", reads: "the Score is at least {n}" },
       { kind: "still_active", label: "It hasn't been used yet", blurb: "this object has not been collected or beaten", needs: "none", reads: "it hasn't been used yet" },

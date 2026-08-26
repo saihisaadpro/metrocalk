@@ -18,6 +18,7 @@ import { Button } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { CinemaReply, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
+import { ShotCatalogue } from "./ShotCatalogue";
 
 const sectionH3 = {
   margin: `0 0 ${space.xs}px`,
@@ -37,6 +38,7 @@ const EMPTY: CinemaReply = {
   seconds: 0,
   mood: "normal",
   reads: [],
+  rows: [],
   problems: [],
   message: "",
   reason: null,
@@ -48,7 +50,18 @@ const MOODS = [
   { value: "tense", label: "Tense", title: "Urgent pacing — 0.75× the authored shot length" },
 ] as const;
 
-export function CinemaSection({ client }: { client: EditorClient }) {
+/** Why pacing refuses with nothing to pace — the engine's own sentence, stated once. */
+const EMPTY_PACING = "Pacing scales shot lengths, and this object has no shots yet — add one first.";
+
+export interface CinemaSectionProps {
+  client: EditorClient;
+  /** Open the Cutscene timeline in the Animate dock. Absent in surfaces that have no dock to open
+   *  (the shot harness renders this block on its own), and the link is then not offered — an
+   *  enabled control that goes nowhere is worse than no control. */
+  onOpenTimeline?: () => void;
+}
+
+export function CinemaSection({ client, onOpenTimeline }: CinemaSectionProps) {
   const selected = useSelectedId();
   const summary = useSummary(selected ?? "");
   const playing = usePlaying();
@@ -178,9 +191,20 @@ export function CinemaSection({ client }: { client: EditorClient }) {
                 data-testid={`cinema-mood-${mood.value}`}
                 variant={cut.mood === mood.value ? "primary" : "secondary"}
                 compact
-                disabled={busy || playing}
+                disabled={busy || playing || cut.shots === 0}
+                disabledReason={
+                  cut.shots === 0
+                    ? EMPTY_PACING
+                    : "Stop Play first — pacing is authored, not live-edited."
+                }
                 aria-pressed={cut.mood === mood.value}
-                title={playing ? "Stop Play first — pacing is authored, not live-edited" : mood.title}
+                title={
+                  cut.shots === 0
+                    ? EMPTY_PACING
+                    : playing
+                      ? "Stop Play first — pacing is authored, not live-edited"
+                      : mood.title
+                }
                 onClick={() => selected && void run(
                   () => client.cinemaSetMood(selected, mood.value),
                   `${mood.label} pacing`,
@@ -191,31 +215,19 @@ export function CinemaSection({ client }: { client: EditorClient }) {
             ))}
           </div>
 
-          <div
-            role="group"
-            aria-label="Add a shot"
-            style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: space.xs }}
-          >
-            {specs.map((spec) => (
-              <Button
-                key={spec.kind}
-                data-testid={`shot-${spec.kind}`}
-                variant="secondary"
-                compact
-                disabled={busy || playing}
-                title={
-                  playing
-                    ? "Stop Play first — shots are authored, not live-edited"
-                    : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it`
-                }
-                onClick={() => selected && void run(() => client.cinemaAddShot(selected, spec.kind), spec.label)}
-              >
-                <Icon name={spec.kind} size="md" fallback="camera" /> {spec.label}
-              </Button>
-            ))}
-          </div>
+          <ShotCatalogue
+            specs={specs}
+            minColumn={120}
+            disabled={busy || playing}
+            disabledReason={
+              playing
+                ? "Stop Play first — shots are authored, not live-edited."
+                : "Another edit is still in flight — this will be available in a moment."
+            }
+            onPick={(kind) => selected && void run(() => client.cinemaAddShot(selected, kind), "Add shot")}
+          />
 
-          {cut.reads.length > 0 && (
+          {cut.rows.length > 0 && (
             <ol
               data-testid="cinema-shots"
               style={{
@@ -227,24 +239,28 @@ export function CinemaSection({ client }: { client: EditorClient }) {
                 color: color.text.secondary,
               }}
             >
-              {cut.reads.map((line, i) => (
-                // eslint-disable-next-line react/no-array-index-key -- a shot list IS its order
+              {cut.rows.map((row) => (
                 <li
-                  key={`${line}-${i}`}
+                  key={row.id}
                   data-testid="cinema-shot-row"
                   style={{ display: "flex", justifyContent: "space-between", gap: space.xs }}
                 >
-                  <span>{line}</span>
+                  <span>{row.reads}</span>
                   <Button
-                    data-testid={`cinema-remove-${i}`}
+                    data-testid={`cinema-remove-${row.index}`}
                     variant="ghost"
                     compact
                     disabled={busy || playing}
-                    aria-label={`Remove shot ${i + 1}: ${line}`}
-                    title={`Remove: ${line}`}
+                    disabledReason={
+                      playing
+                        ? "Stop Play first — shots are authored, not live-edited."
+                        : "Another edit is still in flight — this will be available in a moment."
+                    }
+                    aria-label={`Remove shot ${row.index + 1}: ${row.reads}`}
+                    title={`Remove: ${row.reads}`}
                     onClick={() =>
                       selected &&
-                      void run(() => client.cinemaRemoveShot(selected, i), "Remove shot")
+                      void run(() => client.cinemaRemoveShot(selected, row.index), "Remove shot")
                     }
                   >
                     <Icon name="close" size="sm" />
@@ -282,6 +298,23 @@ export function CinemaSection({ client }: { client: EditorClient }) {
             <div data-testid="cinema-hint" style={metaText}>
               Press Play to watch it — the camera takes over, then hands back.
             </div>
+          )}
+
+          {/* THE LENGTHS AND THE ORDER ARE EDITED ON A CLOCK, and a clock does not fit in a 300px
+              column — `EditorDocks`'s own rule is that the wide workspaces open in the bottom dock
+              "because a timeline needs width". This block keeps the gesture that starts a cutscene;
+              the link is the rest of the loop rather than a sentence telling the user to go and find
+              it. */}
+          {cut.shots > 0 && onOpenTimeline && (
+            <Button
+              data-testid="cinema-open-timeline"
+              variant="secondary"
+              compact
+              title="Set each shot's length, its order and how it is framed, against the cutscene clock"
+              onClick={onOpenTimeline}
+            >
+              <Icon name="clapper" size="md" /> Edit on the cutscene timeline
+            </Button>
           )}
         </div>
       ) : (

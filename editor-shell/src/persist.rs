@@ -112,7 +112,32 @@ pub enum Record {
     /// VFX - one effect layer removed by index.
     VfxRemove { id: String, index: usize },
     /// Cinematics - one shot appended to an object's cutscene.
-    CinemaShot { id: String, shot: String },
+    ///
+    /// `subject` names the object the shot FRAMES when that is not the cutscene's own owner. It is
+    /// `#[serde(default)]` so every log written before shots could film anything else still reads —
+    /// and it had to be added because replay called `add_shot_ops(engine, e, &shot, e)`, which pins
+    /// the subject to the owner: an establishing wide of the whole assembly reopened as a wide of
+    /// the one part, silently, with the shot count unchanged.
+    CinemaShot {
+        id: String,
+        shot: String,
+        #[serde(default)]
+        subject: Option<String>,
+    },
+    /// Cinematics - one shot's authored length changed.
+    CinemaShotSeconds {
+        id: String,
+        index: usize,
+        seconds: f32,
+    },
+    /// Cinematics - one shot moved to another position in the list.
+    CinemaMoveShot { id: String, from: usize, to: usize },
+    /// Cinematics - one shot re-framed in place.
+    CinemaShotFraming {
+        id: String,
+        index: usize,
+        edit: crate::cinema_intent::FramingEdit,
+    },
     /// Conditionals — one "only if" clause added to an object.
     ConditionAdd {
         id: String,
@@ -502,12 +527,46 @@ impl Log {
                         crate::vfx_intent::remove_effect_ops(engine, e, index)
                             .is_ok_and(|(ops, _)| engine.commit("vfx-remove", ops).is_ok())
                     }),
-                Record::CinemaShot { id, shot } => metrocalk_core::EntityId::from_loro_key(&id)
-                    .filter(|e| engine.entity_exists(*e))
-                    .is_some_and(|e| {
-                        crate::cinema_intent::add_shot_ops(engine, e, &shot, e)
-                            .is_ok_and(|(ops, _)| engine.commit("cinema-shot", ops).is_ok())
-                    }),
+                Record::CinemaShot { id, shot, subject } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            // An unresolvable subject replays onto the owner rather than dropping the
+                            // shot: a reopened project with one mis-aimed shot is recoverable, a
+                            // reopened project one shot short is not obviously wrong at all.
+                            let framed = subject
+                                .as_deref()
+                                .and_then(metrocalk_core::EntityId::from_loro_key)
+                                .filter(|s| engine.entity_exists(*s))
+                                .unwrap_or(e);
+                            crate::cinema_intent::add_shot_ops(engine, e, &shot, framed)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-shot", ops).is_ok())
+                        })
+                }
+                Record::CinemaShotSeconds { id, index, seconds } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            crate::cinema_intent::set_shot_seconds_ops(engine, e, index, seconds)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-seconds", ops).is_ok())
+                        })
+                }
+                Record::CinemaMoveShot { id, from, to } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            crate::cinema_intent::move_shot_ops(engine, e, from, to)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-move", ops).is_ok())
+                        })
+                }
+                Record::CinemaShotFraming { id, index, edit } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            crate::cinema_intent::set_shot_framing_ops(engine, e, index, &edit)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-framing", ops).is_ok())
+                        })
+                }
                 Record::ConditionAdd { id, request } => {
                     metrocalk_core::EntityId::from_loro_key(&id)
                         .filter(|e| engine.entity_exists(*e))
