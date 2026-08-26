@@ -52,6 +52,13 @@ fn rejected(reason: &str) -> CallToolResult {
     )])
 }
 
+// THE `async` HERE IS THE MACRO'S, NOT OURS. `#[tool_router(server_handler)]` expands to rmcp's
+// `ServerHandler` impl, whose trait methods are `async fn` by contract; the ones this server does not
+// override expand to bodies with nothing to await. clippy 1.98 added `unused_async_trait_impl` and it
+// fires on generated code no edit here can reach — the workspace job has been red on `main` for it
+// since that toolchain landed (`15b43fc` and two runs before it). Allowed at the only place that can
+// carry the attribute, with the reason, rather than left as an ambient red nobody reads.
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_router(server_handler)]
 impl Metrocalk {
     // `&self` is required by rmcp's `#[tool]` macro contract; these two read tools don't need it.
