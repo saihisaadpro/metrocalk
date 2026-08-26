@@ -242,6 +242,16 @@ pub fn standard_components() -> Vec<ComponentMeta> {
             .field("near", Number, false)
             .field("far", Number, false)
             .field("active", Boolean, false)
+            // Where the camera AIMS, as a world POINT rather than a direction — the thing
+            // `Mat4::look_at_rh` and the cutscene solver both want, and the thing a saved viewpoint has
+            // to remember to be able to restore its own picture. Until these existed a Camera carried a
+            // position and a field of view and no aim, so the render override fell back to the editor's
+            // orbit target and every authored camera in a scene showed the same subject from a different
+            // distance. Optional, because a camera saved before they existed has none: absent means
+            // "keep the old fallback", never "aim at the world origin".
+            .field("aimX", Number, false)
+            .field("aimY", Number, false)
+            .field("aimZ", Number, false)
             .requires("Spatial")
             .provides("View")
             .tag("3d")

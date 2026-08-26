@@ -9,13 +9,32 @@
 //! apart. Stable `#vp*` ids for the prompt-40 gate.
 
 import { useEffect, useRef, useState } from "react";
+import { useStore } from "zustand";
+import { cameraStore } from "../store/cameras";
+import { useProjectSessionId } from "../store/project";
+import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { Icon } from "../theme/icons";
 import { MenuPopup, PopupMenuGroup, PopupMenuItem } from "../theme/workspace";
 import { color, elevation, font, fontSize, radius, space as sp, z } from "../theme/tokens";
+import {
+  focalLengthMm,
+  freeLook,
+  lookThrough,
+  refreshCameras,
+  saveCurrentView,
+} from "./cameraActions";
 import type { EditorClient, ViewportRenderProfile } from "../transport/session";
 
 type Mode = "translate" | "rotate" | "scale";
+
+/** How many saved cameras this menu lists before it says how many it is not listing.
+ *
+ *  A menu is a short list you scan, not a browser: the Cameras group already pushed the Rendering
+ *  group below the popover's fold on an 800px window, and an uncapped list would push it off a
+ *  taller one too. The cap is stated on screen rather than applied silently — a list that quietly
+ *  stops is indistinguishable from a scene that only has six cameras. */
+const MENU_CAMERAS = 6;
 
 /** A compact view label from the camera's [orbit, elevation] (the orientation readout). */
 function viewLabel(cam: number[] | null): string {
@@ -43,6 +62,11 @@ export function ViewportToolbar({ client, showTransformTools = true }: ViewportT
   const [cam, setCam] = useState<number[] | null>(null);
   const [snapOn, setSnapOn] = useState(true);
   const [renderProfile, setRenderProfile] = useState<ViewportRenderProfile>("cinematic");
+  // Read from the shared store rather than a local list: the Inspector's camera section edits the same
+  // cameras, and two lists refreshed on two schedules is two answers to "which one am I inside".
+  const cameras = useStore(cameraStore, (s) => s.cameras);
+  const lookingThroughId = useStore(cameraStore, (s) => s.lookingThroughId);
+  const projectSession = useProjectSessionId();
   const timer = useRef<number | null>(null);
   const mounted = useRef(false);
   const refreshInFlight = useRef<Promise<void> | null>(null);
@@ -80,6 +104,14 @@ export function ViewportToolbar({ client, showTransformTools = true }: ViewportT
     refreshInFlight.current = settled;
     return settled;
   }
+
+  // The camera list is read ONCE on mount, not on the 500 ms chrome poll: authored cameras change only
+  // when someone authors one, and every gesture that changes them refreshes the store itself
+  // (`cameraActions`). Polling a document read twice a second to watch for an edit only this UI can make
+  // is the per-frame-IPC habit at a slower clock.
+  useEffect(() => {
+    void refreshCameras(client);
+  }, [client, projectSession]);
 
   useEffect(() => {
     mounted.current = true;
@@ -290,7 +322,11 @@ export function ViewportToolbar({ client, showTransformTools = true }: ViewportT
                 onRequestClose={close}
               />
             </PopupMenuGroup>
-            <PopupMenuGroup label="Camera">
+            {/* ORIENTATION, not "Camera" — these are the editor view presets, and the readout below
+                them stands in for an orientation cube. It was called Camera until a group that is
+                really about cameras landed directly beneath it, and two adjacent headings one letter
+                apart meaning different things is worse than either name alone. */}
+            <PopupMenuGroup label="Orientation">
               <div style={cameraGridStyle}>
                 {[
                   ["vpTop", "Top", "top"],
@@ -329,6 +365,86 @@ export function ViewportToolbar({ client, showTransformTools = true }: ViewportT
                   <Icon name="view" size="sm" /> {viewName}
                 </span>
               </div>
+            </PopupMenuGroup>
+            {/* SAVED CAMERAS. Creating one lives here, at the viewport, because "save this view" is a
+                fact about where you are standing — the Inspector's camera section owns everything you
+                can do to a camera you have selected, and both call the same `cameraActions`.
+                The rows are `menuitemradio` because they are exclusive: you are looking through one
+                camera or through none, and Free look is the "none" option rather than a fourth verb. */}
+            <PopupMenuGroup label="Cameras">
+              <PopupMenuItem
+                id="vpSaveCamera"
+                data-testid="vpSaveCamera"
+                label="Save this view as a camera"
+                description="Keeps where you are standing and what you are looking at, so you can come back to it"
+                onSelect={() => {
+                  void saveCurrentView(client).then((created) => {
+                    // Select it, so the Inspector's camera section is already open on the thing that
+                    // was just made — the loop closed at the gesture rather than leaving the author to
+                    // go and find their new camera in the hierarchy.
+                    if (created) projectionStore.getState().select(created.id);
+                  });
+                }}
+                onRequestClose={close}
+              />
+              {cameras.length === 0 ? (
+                <PopupMenuItem
+                  id="vpNoCameras"
+                  data-testid="vpNoCameras"
+                  label="No cameras yet"
+                  description="Frame a view you like, then save it here"
+                  disabled
+                  disabledReason="This scene has no saved cameras"
+                  onSelect={() => undefined}
+                />
+              ) : (
+                cameras.slice(0, MENU_CAMERAS).map((camera) => (
+                  <PopupMenuItem
+                    key={camera.id}
+                    id={`vpCamera-${camera.id}`}
+                    data-testid="vpCamera"
+                    label={camera.name}
+                    description={
+                      camera.lookAt
+                        ? `${focalLengthMm(camera.fovDeg)} mm lens${camera.active ? " · Play renders from this one" : ""}`
+                        : "Saved before cameras could aim — it follows the editor's view"
+                    }
+                    meta={lookingThroughId === camera.id ? "Looking through" : undefined}
+                    role="menuitemradio"
+                    aria-checked={lookingThroughId === camera.id}
+                    variant="toggle"
+                    active={lookingThroughId === camera.id}
+                    onSelect={() => {
+                      projectionStore.getState().select(camera.id);
+                      void lookThrough(client, camera);
+                    }}
+                    onRequestClose={close}
+                  />
+                ))
+              )}
+              {cameras.length > MENU_CAMERAS && (
+                <PopupMenuItem
+                  id="vpMoreCameras"
+                  data-testid="vpMoreCameras"
+                  label={`${cameras.length - MENU_CAMERAS} more not shown here`}
+                  description="Pick any of them in the outliner to look through it"
+                  disabled
+                  disabledReason="This menu lists the most recent cameras; the outliner lists them all"
+                  onSelect={() => undefined}
+                />
+              )}
+              {lookingThroughId !== null && (
+                <PopupMenuItem
+                  id="vpFreeLook"
+                  data-testid="vpFreeLook"
+                  label="Free look"
+                  description="Back to the editor's own camera"
+                  role="menuitemradio"
+                  aria-checked={false}
+                  onSelect={() => void freeLook(client)}
+                  onRequestClose={close}
+                />
+              )}
             </PopupMenuGroup>
             <PopupMenuGroup label="Rendering">
               <PopupMenuItem

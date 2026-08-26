@@ -158,13 +158,35 @@ pub enum Record {
         color: [f32; 3],
         intensity: f32,
     },
-    /// M11.4 (ADR-043) — an authored scene Camera entity (Transform pos + fov + active). Replayed by id
-    /// (same alloc) so it survives close→reopen; the look-through view-proj is a render projection, never logged.
+    /// M11.4 (ADR-043) — an authored scene Camera entity (Transform pos + fov + aim + name + active).
+    /// Replayed by id (same alloc) so it survives close→reopen; the look-through view-proj is a render
+    /// projection, never logged.
+    ///
+    /// `look_at` and `name` are `#[serde(default)]` because a project saved before cameras could aim or
+    /// be named has neither, and such a record must still replay to exactly the camera it described —
+    /// `None` is the unaimed fallback, not "aim at the origin".
     AddCamera {
         pos: [f32; 3],
+        #[serde(default)]
+        look_at: Option<[f32; 3]>,
         fov: f32,
         active: bool,
+        #[serde(default)]
+        name: Option<String>,
     },
+    /// A camera re-placed, re-aimed and re-lensed — `set_camera_view`. Without this a saved project
+    /// reopened showing every camera back at the vantage it was first authored from.
+    CameraView {
+        id: String,
+        pos: [f32; 3],
+        look_at: Option<[f32; 3]>,
+        fov: f32,
+    },
+    /// A camera's field of view alone — `set_camera_fov`.
+    CameraFov { id: String, fov: f32 },
+    /// Which camera is the active one — `set_camera_active`. Exclusivity is re-established on replay by
+    /// the same commit that establishes it live, so a reopened project cannot end up with two.
+    CameraActive { id: String },
     /// M12.1 (ADR-045) — an authored rule (When/If/Then). The whole `RuleData` is kept so replay re-commits
     /// the same `SetRule` on the same id → the rule survives close→reopen (the Loro `rules` map is rebuilt
     /// from the replayed ops, same as every other doc state in the session-restore path).
@@ -599,9 +621,28 @@ impl Log {
                     color,
                     intensity,
                 } => capscene::add_light(engine, scene, &light_kind, pos, color, intensity).is_ok(),
-                Record::AddCamera { pos, fov, active } => {
-                    capscene::add_camera(engine, scene, pos, fov, active).is_ok()
+                Record::AddCamera {
+                    pos,
+                    look_at,
+                    fov,
+                    active,
+                    name,
+                } => {
+                    capscene::add_camera(engine, scene, pos, look_at, fov, active, name.as_deref())
+                        .is_ok()
                 }
+                Record::CameraView {
+                    id,
+                    pos,
+                    look_at,
+                    fov,
+                } => metrocalk_core::EntityId::from_loro_key(&id).is_some_and(|e| {
+                    capscene::set_camera_view(engine, e, pos, look_at, fov).is_ok()
+                }),
+                Record::CameraFov { id, fov } => metrocalk_core::EntityId::from_loro_key(&id)
+                    .is_some_and(|e| capscene::set_camera_fov(engine, e, fov).is_ok()),
+                Record::CameraActive { id } => metrocalk_core::EntityId::from_loro_key(&id)
+                    .is_some_and(|e| capscene::set_camera_active(engine, e).is_ok()),
                 Record::AuthorRule { id, rule } => engine
                     .commit(
                         "author rule",

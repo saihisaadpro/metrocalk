@@ -19,7 +19,7 @@ import { Button } from "../theme/primitives";
 import { Popover, PopoverSurface } from "../theme/Popover";
 import { DisclosureSection, DockTabs, EmptyPanelState, WorkspacePanel } from "../theme/workspace";
 import { color } from "../theme/tokens";
-import { useEntityOrder, useSelectedId } from "../store/projection";
+import { useEntityOrder, useSelectedId, useSummary } from "../store/projection";
 import type { EditorClient } from "../transport/session";
 import { LazyWorkspace } from "./LazyWorkspace";
 
@@ -33,6 +33,7 @@ const TerrainPanel = lazy(() => import("../panels/TerrainPanel").then((module) =
 const Diagnostics = lazy(() => import("../panels/Diagnostics").then((module) => ({ default: module.Diagnostics })));
 const AiEditPanel = lazy(() => import("../panels/AiEditPanel").then((module) => ({ default: module.AiEditPanel })));
 const JointPanel = lazy(() => import("../panels/JointPanel").then((module) => ({ default: module.JointPanel })));
+const CameraSection = lazy(() => import("../panels/CameraSection").then((module) => ({ default: module.CameraSection })));
 const PhysicsPanel = lazy(() => import("../panels/PhysicsPanel").then((module) => ({ default: module.PhysicsPanel })));
 const MatchPanel = lazy(() => import("../panels/MatchPanel").then((module) => ({ default: module.MatchPanel })));
 const TransformPanel = lazy(() => import("../panels/TransformPanel").then((module) => ({ default: module.TransformPanel })));
@@ -233,6 +234,7 @@ export interface InspectorDockProps {
 
 export function InspectorDock({ client, active, onChange, onCollapse, onPin, onJumpTo }: InspectorDockProps) {
   const selected = useSelectedId();
+  const selectedKind = useSummary(selected ?? "")?.kind;
   const tabs = [
     { id: "properties", label: "Properties", icon: "properties", tooltip: "Edit the selected object's components and material" },
     { id: "relations", label: "Relations", icon: "relations", tooltip: "Inspect compatible bindings and graph relationships" },
@@ -256,6 +258,22 @@ export function InspectorDock({ client, active, onChange, onCollapse, onPin, onJ
       >
         {active === "properties" && (
           <LazyWorkspace label="Properties inspector">
+            {/* FIRST, above the schema form — measured, not assumed. In the packaged `.exe` at its
+                1280x800 default this section rendered at y=907, a hundred pixels BELOW the window, under
+                nine Transform rows and a Behaviour block. A camera is selected for exactly one reason —
+                to look through it, re-aim it or change its lens — so an author who has just saved a view
+                and had it selected for them was shown a scroll bar instead of the verbs. `<ux_quality>`
+                1: the gesture that starts an action owns its outcome, and an outcome off the bottom of
+                the window is not owned. (The same shape as the Build column's asset library, `3012f64`.)
+                The SECTION is conditional, not just its body: a heading over an empty card is the inert
+                surface `<ux_quality>` 6 forbids, and `kind` is the projection's own vocabulary
+                (`deriveKind` in dev, `classify_kind` in `bridge.rs` on the real core), so this reads the
+                same signal the hierarchy draws the camera glyph from. */}
+            {selected && selectedKind === "camera" && (
+              <DisclosureSection title="Camera" summary="Look through it and aim it" defaultOpen storageKey="inspect-camera">
+                <CameraSection client={client} />
+              </DisclosureSection>
+            )}
             <Inspector client={client} />
             {selected ? (
               <>

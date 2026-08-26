@@ -768,18 +768,69 @@ pub fn add_light(
     Ok(id)
 }
 
-/// M11.4 (ADR-043) — author a scene Camera entity: a `Transform` position + a `Camera` component
-/// (fov/near/far + `active`). ONE undoable commit; replayed by id so it survives close→reopen. The active
-/// scene camera is what look-through / Play renders from; the editor fly-cam stays separate render state.
-pub fn add_camera(
-    engine: &mut Engine<FlecsWorld>,
-    scene: &CapScene,
+/// One authored scene camera, as every reader of them sees it.
+///
+/// A struct rather than the tuple this used to be because a camera now carries a thing a tuple made it
+/// easy to drop: [`SceneCamera::look_at`], the world POINT it aims at. The gap that closed is not
+/// cosmetic — see [`add_camera`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneCamera {
+    /// The camera entity's durable id (`EntityId::to_loro_key`), the handle every edit is addressed by.
+    pub id: String,
+    /// What the author calls it. Falls back to `Camera` for one authored before names were written.
+    pub name: String,
+    /// Where it stands, world space.
+    pub pos: [f32; 3],
+    /// The world point it aims at, or `None` for a camera authored before cameras could aim.
+    pub look_at: Option<[f32; 3]>,
+    pub fov_deg: f32,
+    pub near: f32,
+    pub far: f32,
+    /// Whether this is the one look-through and Play render from. Exactly one camera in a scene can be
+    /// active — see [`set_camera_active`].
+    pub active: bool,
+}
+
+/// The near and far planes for a camera standing at `pos` and aiming at `look_at`.
+///
+/// One rule, from one place: [`metrocalk_animation::shot::cinematic_clip_planes`], which is what the
+/// cutscene camera and the look-dev vantage already use. An authored camera used to be the only camera
+/// path in this engine with planes of its own — a hardcoded `0.1` / `500.0` — and both halves of that
+/// were wrong at plant scale. This viewport has no reversed-Z, so the resolvable depth step grows as
+/// `z^2 / near`: a 0.1 m near plane at a 300 m stand-off resolves roughly 15 cm, which is how a painted
+/// floor line and the slab under it become a per-pixel coin toss. And a 500 m far plane cuts the far end
+/// off a 320 m building seen from outside it.
+///
+/// An unaimed camera keeps the old pair exactly. There is no distance to solve from without an aim, and
+/// inventing one would silently re-frame a camera saved by an older build.
+#[must_use]
+pub fn camera_clip_planes(pos: [f32; 3], look_at: Option<[f32; 3]>) -> (f32, f32) {
+    let Some(target) = look_at else {
+        return (0.1, 500.0);
+    };
+    let distance = ((pos[0] - target[0]).powi(2)
+        + (pos[1] - target[1]).powi(2)
+        + (pos[2] - target[2]).powi(2))
+    .sqrt();
+    // The solver's first argument is "how big is the thing being looked at", which an author placing a
+    // camera has not said. A tenth of the stand-off is the radius a subject filling a normal frame at
+    // that distance would have — the same assumption `set_look_dev_camera` makes, kept identical so a
+    // saved camera and a look-dev vantage at the same place have the same depth precision.
+    metrocalk_animation::shot::cinematic_clip_planes(distance * 0.1, distance)
+}
+
+/// Every `SetField` op that writes a camera's pose — position, aim, field of view and the clip planes
+/// solved from them. Shared by authoring and by re-aiming so the two cannot drift into disagreeing
+/// about what a pose is.
+fn camera_pose_ops(
+    id: EntityId,
     pos: [f32; 3],
+    look_at: Option<[f32; 3]>,
     fov_deg: f32,
-    active: bool,
-) -> Result<EntityId, PipelineError> {
-    let id = engine.alloc_entity_id();
-    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    ops: &mut Vec<Op>,
+) {
+    let (near, far) = camera_clip_planes(pos, look_at);
     for (f, v) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
         ops.push(Op::SetField {
             entity: id,
@@ -788,7 +839,11 @@ pub fn add_camera(
             value: FieldValue::Number(f64::from(v)),
         });
     }
-    for (f, v) in [("fov", fov_deg), ("near", 0.1), ("far", 500.0)] {
+    let mut cam = vec![("fov", fov_deg), ("near", near), ("far", far)];
+    if let Some(a) = look_at {
+        cam.extend([("aimX", a[0]), ("aimY", a[1]), ("aimZ", a[2])]);
+    }
+    for (f, v) in cam {
         ops.push(Op::SetField {
             entity: id,
             component: "Camera".into(),
@@ -796,12 +851,80 @@ pub fn add_camera(
             value: FieldValue::Number(f64::from(v)),
         });
     }
+}
+
+/// The ops that make `keep` the one active camera: every OTHER camera goes explicitly inactive.
+///
+/// Exclusivity is written down rather than assumed. [`active_camera`] used to answer "the first entity
+/// carrying a Camera that is not explicitly inactive", so two cameras both authored active left the
+/// question of which one you were looking through to `entity_ids()` iteration order — an answer stable
+/// enough to pass a test and arbitrary enough to be a bug the first time a second camera exists.
+fn deactivate_other_cameras(engine: &Engine<FlecsWorld>, keep: EntityId, ops: &mut Vec<Op>) {
+    for other in engine.entity_ids() {
+        if other == keep || !engine.components_of(other).contains_key("Camera") {
+            continue;
+        }
+        ops.push(Op::SetField {
+            entity: other,
+            component: "Camera".into(),
+            field: "active".into(),
+            value: FieldValue::Bool(false),
+        });
+    }
+}
+
+/// M11.4 (ADR-043) — author a scene Camera entity: a `Transform` position + a `Camera` component
+/// (fov/near/far + an aim + `active`) + a name. ONE undoable commit; replayed by id so it survives
+/// close→reopen. The active scene camera is what look-through / Play renders from; the editor fly-cam
+/// stays separate render state.
+///
+/// # The aim, and why it was the whole feature
+///
+/// `look_at` is the world point the camera looks at. Before it, this function wrote a position and a
+/// field of view and nothing else, and the render override's aim was filled with `None` — which means
+/// "keep aiming at the editor's orbit target". So every camera in a scene pointed at the same place, and
+/// saving a viewpoint did not save the picture it was taken from. The presentation lab measured the
+/// consequence in its own notes: three vantages placed with this function reported the same eye and the
+/// same target, and it abandoned authored cameras for the render-only `set_look_dev_camera` — which
+/// creates no entity and does not persist. A camera that cannot remember what it was pointed at is not a
+/// camera.
+///
+/// `None` is still accepted and still means the old behaviour, because a project saved by an older build
+/// replays through here and must come back unchanged.
+///
+/// # Errors
+/// Propagates the commit's [`PipelineError`].
+pub fn add_camera(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    pos: [f32; 3],
+    look_at: Option<[f32; 3]>,
+    fov_deg: f32,
+    active: bool,
+    name: Option<&str>,
+) -> Result<EntityId, PipelineError> {
+    let id = engine.alloc_entity_id();
+    let label = name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map_or_else(|| default_camera_name(engine), ToOwned::to_owned);
+    let mut ops = vec![Op::CreateEntity { id, parent: None }];
+    camera_pose_ops(id, pos, look_at, fov_deg, &mut ops);
     ops.push(Op::SetField {
         entity: id,
         component: "Camera".into(),
         field: "active".into(),
         value: FieldValue::Bool(active),
     });
+    ops.push(Op::SetField {
+        entity: id,
+        component: INSTANCE_META.into(),
+        field: NAME_FIELD.into(),
+        value: FieldValue::Str(label),
+    });
+    if active {
+        deactivate_other_cameras(engine, id, &mut ops);
+    }
     if let Some(&c) = scene.caps.get(&canonical("View")) {
         ops.push(Op::AddPair {
             entity: id,
@@ -813,38 +936,159 @@ pub fn add_camera(
     Ok(id)
 }
 
-/// M11.4 — the active scene camera's `(position, fov_deg, near, far)` for look-through, or `None` if none
-/// is active. The first entity with a `Camera` component whose `active` isn't explicitly `false`. Read-only
-/// (a render projection: the look-through view-proj is never Loro/undo — ADR-021).
-#[must_use]
-pub fn active_camera(engine: &Engine<FlecsWorld>) -> Option<([f32; 3], f32, f32, f32)> {
-    let num = |m: &std::collections::HashMap<String, FieldValue>, f: &str, d: f32| -> f32 {
+/// `Camera 1`, `Camera 2`, … — the first number not already taken by a camera in this scene.
+///
+/// Counting cameras would reuse a name the moment one is deleted, and two things called `Camera 2` in
+/// one list is worse than a gap in the numbering.
+fn default_camera_name(engine: &Engine<FlecsWorld>) -> String {
+    let taken: std::collections::HashSet<String> = cameras(engine)
+        .into_iter()
+        .map(|c| c.name.to_lowercase())
+        .collect();
+    // BOUNDED BY PIGEONHOLE, not by faith. Among `taken.len() + 1` candidates at most `taken.len()`
+    // can be taken, so one is always free — and writing the bound down is what makes that argument
+    // checkable by a reader and by `clippy::maybe_infinite_iter`, which an open `(1..)` leaves to both.
+    (1..=taken.len() + 1)
+        .map(|n| format!("Camera {n}"))
+        .find(|candidate| !taken.contains(&candidate.to_lowercase()))
+        .unwrap_or_else(|| "Camera".to_owned())
+}
+
+/// Read one camera entity, or `None` if that entity is not a camera.
+fn read_camera(engine: &Engine<FlecsWorld>, id: EntityId) -> Option<SceneCamera> {
+    let comps = engine.components_of(id);
+    let cam = comps.get("Camera")?;
+    let num = |m: &HashMap<String, FieldValue>, f: &str| -> Option<f32> {
         match m.get(f) {
-            Some(FieldValue::Number(n)) => *n as f32,
-            Some(FieldValue::Integer(i)) => *i as f32,
-            _ => d,
+            Some(FieldValue::Number(n)) => Some(*n as f32),
+            // A whole number arrives from JSON as an Integer, and a read matching only ::Number would
+            // silently fall back to the default — the class of bug that made an authored scale of 2
+            // render at 1.
+            Some(FieldValue::Integer(i)) => Some(*i as f32),
+            _ => None,
         }
     };
-    for id in engine.entity_ids() {
-        let comps = engine.components_of(id);
-        let Some(cam) = comps.get("Camera") else {
-            continue;
-        };
-        if matches!(cam.get("active"), Some(FieldValue::Bool(false))) {
-            continue; // explicitly inactive
-        }
-        let t = comps.get("Transform");
-        let pos = t.map_or([0.0, 0.0, 0.0], |tm| {
-            [num(tm, "x", 0.0), num(tm, "y", 0.0), num(tm, "z", 0.0)]
-        });
-        return Some((
-            pos,
-            num(cam, "fov", 55.0),
-            num(cam, "near", 0.1),
-            num(cam, "far", 500.0),
-        ));
+    let t = comps.get("Transform");
+    let pos = t.map_or([0.0, 0.0, 0.0], |tm| {
+        [
+            num(tm, "x").unwrap_or(0.0),
+            num(tm, "y").unwrap_or(0.0),
+            num(tm, "z").unwrap_or(0.0),
+        ]
+    });
+    // All three or none: two axes of an aim is not an aim, and treating a missing one as 0.0 would
+    // silently point the camera at the world origin on that axis.
+    let look_at = match (num(cam, "aimX"), num(cam, "aimY"), num(cam, "aimZ")) {
+        (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+        _ => None,
+    };
+    let fov_deg = num(cam, "fov").unwrap_or(55.0);
+    let (default_near, default_far) = camera_clip_planes(pos, look_at);
+    let name = comps
+        .get(INSTANCE_META)
+        .and_then(|m| match m.get(NAME_FIELD) {
+            Some(FieldValue::Str(s)) if !s.trim().is_empty() => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "Camera".to_owned());
+    Some(SceneCamera {
+        id: id.to_loro_key(),
+        name,
+        pos,
+        look_at,
+        fov_deg,
+        near: num(cam, "near").unwrap_or(default_near),
+        far: num(cam, "far").unwrap_or(default_far),
+        active: !matches!(cam.get("active"), Some(FieldValue::Bool(false))),
+    })
+}
+
+/// Every authored scene camera, oldest first — the list the editor draws.
+///
+/// **Sorted by [`EntityId`], not left in `entity_ids()` order.** Ids are allocated monotonically, so
+/// sorting by one is creation order: the order an author added them in, and the only order that does not
+/// move under them while they work. `entity_ids()` is whatever order the ECS iterates its tables in,
+/// which for three cameras authored in a row came back *reversed* — a list whose rows renumber
+/// themselves is a list nobody can point at.
+#[must_use]
+pub fn cameras(engine: &Engine<FlecsWorld>) -> Vec<SceneCamera> {
+    let mut ids = engine.entity_ids();
+    ids.sort_unstable();
+    ids.into_iter()
+        .filter_map(|id| read_camera(engine, id))
+        .collect()
+}
+
+/// M11.4 — the active scene camera for look-through, or `None` if none is active. Read-only (a render
+/// projection: the look-through view-proj is never Loro/undo — ADR-021).
+#[must_use]
+pub fn active_camera(engine: &Engine<FlecsWorld>) -> Option<SceneCamera> {
+    cameras(engine).into_iter().find(|c| c.active)
+}
+
+/// Make `id` the one active camera — it goes active, every other camera goes inactive, in ONE undoable
+/// commit.
+///
+/// # Errors
+/// [`PipelineError::UnknownEntity`] if `id` is not a camera; otherwise the commit's error.
+pub fn set_camera_active(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+) -> Result<(), PipelineError> {
+    if read_camera(engine, id).is_none() {
+        return Err(PipelineError::UnknownEntity(id));
     }
-    None
+    let mut ops = vec![Op::SetField {
+        entity: id,
+        component: "Camera".into(),
+        field: "active".into(),
+        value: FieldValue::Bool(true),
+    }];
+    deactivate_other_cameras(engine, id, &mut ops);
+    engine.commit("activate-camera", ops)
+}
+
+/// Re-place, re-aim and re-lens an existing camera in ONE undoable commit — "this camera now shows what
+/// I am looking at".
+///
+/// The whole pose moves together because an author moving a camera means the picture, not the position:
+/// committing the eye without the target would leave the camera aimed where it used to be, which is the
+/// defect this feature exists to end.
+///
+/// # Errors
+/// [`PipelineError::UnknownEntity`] if `id` is not a camera; otherwise the commit's error.
+pub fn set_camera_view(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+    pos: [f32; 3],
+    look_at: Option<[f32; 3]>,
+    fov_deg: f32,
+) -> Result<(), PipelineError> {
+    if read_camera(engine, id).is_none() {
+        return Err(PipelineError::UnknownEntity(id));
+    }
+    let mut ops = Vec::new();
+    camera_pose_ops(id, pos, look_at, fov_deg, &mut ops);
+    engine.commit("re-aim camera", ops)
+}
+
+/// Change a camera's field of view, keeping where it stands and what it looks at. ONE undoable commit.
+///
+/// The clip planes are re-solved even though only the lens changed: they are a function of the stand-off
+/// and this writes them from the same helper, so a camera never carries planes solved by one rule and a
+/// pose written by another.
+///
+/// # Errors
+/// [`PipelineError::UnknownEntity`] if `id` is not a camera; otherwise the commit's error.
+pub fn set_camera_fov(
+    engine: &mut Engine<FlecsWorld>,
+    id: EntityId,
+    fov_deg: f32,
+) -> Result<(), PipelineError> {
+    let Some(cam) = read_camera(engine, id) else {
+        return Err(PipelineError::UnknownEntity(id));
+    };
+    set_camera_view(engine, id, cam.pos, cam.look_at, fov_deg)
 }
 
 /// Spawn a complete, simulatable physics body as ONE undoable transaction (M8.2): a `Transform` + a

@@ -13,6 +13,8 @@ import { createSession, isTauri, type EditorClient } from "../transport/session"
 import { projectionStore, useDisplayedEntity, useEntityOrder, useSelectedId } from "../store/projection";
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
+import { useLookingThrough } from "../store/cameras";
+import { freeLook } from "../panels/cameraActions";
 import { setStatus } from "../store/ui";
 import { Modal, Popover } from "../theme/Popover";
 import { Icon } from "../theme/icons";
@@ -140,6 +142,51 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
   );
 }
 
+/** The "you are inside a camera" badge, overlaid ON the stage.
+ *
+ *  Looking through a scene camera is a MODE: orbiting no longer moves what you see, and the frame you are
+ *  judging is the camera's, not yours. `<ux_quality>` 5 requires a mode change to be unmistakable on the
+ *  stage itself rather than only in a menu three clicks deep — and a look-through with no marker is worse
+ *  than Play with none, because Play at least animates. Bottom-left, so it never fights the PLAYING badge
+ *  at top-centre or the toolbar above it. */
+function LookThroughBadge({ name, onFreeLook }: { name: string; onFreeLook: () => void }) {
+  return (
+    <div
+      id="lookThroughBadge"
+      data-testid="lookThroughBadge"
+      // Same rule as PlayBadge: a DOM overlay ON the stage must not also DRIVE the stage, or pressing
+      // "Free look" also fires a pick at the badge's coordinates.
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+      style={{
+        position: "absolute",
+        bottom: space.lg,
+        left: space.lg,
+        zIndex: z.badge,
+        display: "flex",
+        alignItems: "center",
+        gap: space.md,
+        padding: `${space.xs}px ${space.lg}px`,
+        borderRadius: radius.pill,
+        background: color.accent.subtle,
+        border: `1px solid ${color.accent.border}`,
+        color: color.accent.base,
+        font: font.mono,
+        fontSize: fontSize.body,
+        boxShadow: elevation.e2,
+      }}
+    >
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <Icon name="camera" size={12} />
+        Looking through {name}
+      </span>
+      <Button data-testid="stageFreeLook" variant="secondary" compact onClick={onFreeLook}>
+        Free look
+      </Button>
+    </div>
+  );
+}
+
 function effectiveViewportWidth(): number {
   if (typeof window === "undefined" || typeof document === "undefined") return 1440;
   const cssZoom = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("zoom"));
@@ -180,6 +227,7 @@ export function App() {
 
   const playing = usePlaying();
   const paused = usePaused();
+  const insideCamera = useLookingThrough();
   const order = useEntityOrder();
   const selectedId = useSelectedId();
   const selectedEntity = useDisplayedEntity(selectedId ?? "");
@@ -898,6 +946,11 @@ export function App() {
             </Suspense>
           )}
           {playing && <PlayBadge paused={paused} onStop={stopPlay} />}
+          {/* Not while playing: Play already renders from the active camera and says so at top-centre,
+              so a second badge claiming you are "looking through" it would be two names for one state. */}
+          {!playing && insideCamera && (
+            <LookThroughBadge name={insideCamera.name} onFreeLook={() => void freeLook(client)} />
+          )}
           {/* NOT deferred, and the comment that said it could be was WRONG about its own code. This
               component owns the `subscribeNativeImportLifecycle` effect — the OS-drop listener IS this
               mount, not something beside it — so behind a `lazy` with a `null` fallback the shell is

@@ -2058,3 +2058,20 @@ export interface RoleStatusInfo {
   /** The most recent blocked rule during Play — the answer to "nothing happened". */
   blocked: BlockedInfo | null;
 }
+
+/** One authored scene camera — a real entity in the document, not a saved viewport preference.
+ *
+ *  `lookAt` is the world POINT the camera aims at, and it is the field the whole surface exists for: a
+ *  camera authored before it carries `null`, which means "aim wherever the editor is orbiting" and is why
+ *  several saved cameras in one scene used to show the same subject from different distances. */
+export interface SceneCameraInfo {
+  id: string;
+  name: string;
+  pos: [number, number, number];
+  lookAt: [number, number, number] | null;
+  fovDeg: number;
+  near: number;
+  far: number;
+  /** The one camera look-through and Play render from. Exactly one camera in a scene has this. */
+  active: boolean;
+}

@@ -74,6 +74,7 @@ import type {
   AssetLabProcessRequest,
   AssetLabResponse,
   SceneExportResponse,
+  SceneCameraInfo,
   AnimationWorkspaceInfo,
   AnimationClipInstanceSaveRequest,
   AnimationClipInstanceSaveResult,
@@ -327,6 +328,24 @@ export interface EditorClient {
   /** M11.3 — author a Light entity (kind = directional|point|spot) at a position with a linear RGB colour +
    *  intensity → its id. One undoable commit; the lit result is a render projection (not in the doc). */
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null>;
+  /** M11.4 — save what is on screen right now as a scene camera → its id. ONE undoable commit; the engine
+   *  reads the live view itself, so this saves the picture the author can SEE rather than a pose the UI
+   *  re-derived (and got wrong the moment the view was a look-through rather than the fly-cam). */
+  addCameraHere(name: string | null, active: boolean): Promise<string | null>;
+  /** M11.4 — every authored scene camera, oldest first. A read. */
+  sceneCameras(): Promise<SceneCameraInfo[]>;
+  /** M11.4 — make one camera the active one (every other stands down) → whether `id` named a camera.
+   *  One undoable commit. */
+  setActiveCamera(id: string): Promise<boolean>;
+  /** M11.4 — point an existing camera at what is on screen right now → whether `id` named a camera.
+   *  One undoable commit; the pose is read exactly as `addCameraHere` reads it. */
+  recaptureCamera(id: string): Promise<boolean>;
+  /** M11.4 — change one camera's lens, keeping where it stands and what it looks at → whether `id` named
+   *  a camera. One undoable commit; a live look-through through THAT camera updates on the next frame. */
+  setCameraFov(id: string, fov: number): Promise<boolean>;
+  /** M11.4 — render through the active scene camera (`on`) or back to the editor fly-cam. A render
+   *  projection, never the document → whether an active camera was found (when `on`). */
+  lookThroughCamera(on: boolean): Promise<boolean>;
   /** Rename an entity (`__meta__.name`) → applied; the projection re-reads it (inv. 1). */
   renameEntity(id: string, name: string): Promise<boolean>;
   /** Group a selection under a new parent node → the group id. */
@@ -983,6 +1002,24 @@ export class TauriClient implements EditorClient {
   }
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null> {
     return this.core.invoke<string | null>("add_light", { kind, x, y, z, r, g, b, intensity }).catch((e: unknown) => { console.error("add_light failed", e); throw e; });
+  }
+  addCameraHere(name: string | null, active: boolean): Promise<string | null> {
+    return this.core.invoke<string | null>("add_camera_here", { name, active }).catch((e: unknown) => { console.error("add_camera_here failed", e); throw e; });
+  }
+  sceneCameras(): Promise<SceneCameraInfo[]> {
+    return this.core.invoke<SceneCameraInfo[]>("scene_cameras").catch((e: unknown) => { console.error("scene_cameras failed", e); throw e; });
+  }
+  setActiveCamera(id: string): Promise<boolean> {
+    return this.core.invoke<boolean>("set_active_camera", { id }).catch((e: unknown) => { console.error("set_active_camera failed", e); throw e; });
+  }
+  recaptureCamera(id: string): Promise<boolean> {
+    return this.core.invoke<boolean>("recapture_camera", { id }).catch((e: unknown) => { console.error("recapture_camera failed", e); throw e; });
+  }
+  setCameraFov(id: string, fov: number): Promise<boolean> {
+    return this.core.invoke<boolean>("set_camera_fov", { id, fov }).catch((e: unknown) => { console.error("set_camera_fov failed", e); throw e; });
+  }
+  lookThroughCamera(on: boolean): Promise<boolean> {
+    return this.core.invoke<boolean>("look_through_camera", { on }).catch((e: unknown) => { console.error("look_through_camera failed", e); throw e; });
   }
   renameEntity(id: string, name: string): Promise<boolean> {
     return this.core.invoke<boolean>("rename_entity", { id, name }).catch((e: unknown) => { console.error("rename_entity failed", e); throw e; });
@@ -1660,6 +1697,14 @@ class MockClient implements EditorClient {
   // head); the canonical sword ignites at 4. This dev stub stores + projects; the real runtime + determinism
   // + scrub-replay are the live `.exe`/headless path (`core::rule_runtime`).
   private ruleKills = 0;
+  // M11.4 (dev MockCore): authored scene cameras are kept in-memory for the same reason the machines and
+  // rules above are — a mock that answers "saved" and then hands back an empty list gives the dev build
+  // and every `shots` capture a Save button over a list that never fills, and every list-side control
+  // (look through, activate, re-aim, the lens) unreachable. It stores and projects; the undoable commit,
+  // the exclusivity and the replay are the live `.exe` path.
+  private cameras: SceneCameraInfo[] = [];
+  private cameraSeq = 0;
+  private lookingThrough = false;
   constructor(
     private readonly inner: DeltaClient,
     private readonly core: MockCore,
@@ -2852,6 +2897,60 @@ class MockClient implements EditorClient {
   }
   addLight(): Promise<string | null> {
     return Promise.resolve(null);
+  }
+  addCameraHere(name: string | null, active: boolean): Promise<string | null> {
+    this.cameraSeq += 1;
+    const id = `cam-${this.cameraSeq}`;
+    // A plausible vantage that MOVES per camera, so the dev build and the captures show a list of
+    // different cameras rather than N rows of the same numbers. The real pose comes from the live view.
+    const angle = (this.cameraSeq - 1) * 0.8;
+    const pos: [number, number, number] = [
+      Number((18 * Math.cos(angle)).toFixed(2)),
+      Number((4 + this.cameraSeq).toFixed(2)),
+      Number((18 * Math.sin(angle)).toFixed(2)),
+    ];
+    const taken = new Set(this.cameras.map((c) => c.name.toLowerCase()));
+    let n = 1;
+    while (taken.has(`camera ${n}`)) n += 1;
+    const camera: SceneCameraInfo = {
+      id,
+      name: name?.trim() || `Camera ${n}`,
+      pos,
+      lookAt: [0, 1.5, 0],
+      fovDeg: 55,
+      near: 0.18,
+      far: 90,
+      active,
+    };
+    if (active) this.cameras = this.cameras.map((c) => ({ ...c, active: false }));
+    this.cameras = [...this.cameras, camera];
+    return Promise.resolve(id);
+  }
+  sceneCameras(): Promise<SceneCameraInfo[]> {
+    return Promise.resolve(this.cameras.map((c) => ({ ...c })));
+  }
+  setActiveCamera(id: string): Promise<boolean> {
+    if (!this.cameras.some((c) => c.id === id)) return Promise.resolve(false);
+    this.cameras = this.cameras.map((c) => ({ ...c, active: c.id === id }));
+    return Promise.resolve(true);
+  }
+  recaptureCamera(id: string): Promise<boolean> {
+    const found = this.cameras.find((c) => c.id === id);
+    if (!found) return Promise.resolve(false);
+    this.cameras = this.cameras.map((c) => (c.id === id ? { ...c, pos: [c.pos[0] + 1, c.pos[1], c.pos[2]] } : c));
+    return Promise.resolve(true);
+  }
+  setCameraFov(id: string, fov: number): Promise<boolean> {
+    if (!this.cameras.some((c) => c.id === id)) return Promise.resolve(false);
+    this.cameras = this.cameras.map((c) => (c.id === id ? { ...c, fovDeg: fov } : c));
+    return Promise.resolve(true);
+  }
+  lookThroughCamera(on: boolean): Promise<boolean> {
+    // Honest: without an active camera there is nothing to look through, and the real command says so
+    // by replying false. A mock that always said true would photograph a "Looking through" state the
+    // engine would have refused.
+    this.lookingThrough = on && this.cameras.some((c) => c.active);
+    return Promise.resolve(on ? this.lookingThrough : true);
   }
   renameEntity(): Promise<boolean> {
     return Promise.resolve(true);

@@ -2945,13 +2945,41 @@ enum EngineCmd {
     LightingDebug {
         reply: Sender<(usize, usize, i64, i64)>,
     },
-    /// M11.4 — author a scene Camera entity (Transform pos + Camera{fov,near,far,active}), one undoable
-    /// commit. Replies its id.
+    /// M11.4 — author a scene Camera entity (Transform pos + Camera{fov,near,far,aim,active} + a name),
+    /// one undoable commit. Replies its id.
     AddCamera {
         pos: [f32; 3],
+        look_at: Option<[f32; 3]>,
         fov: f32,
         active: bool,
+        name: Option<String>,
         reply: Sender<Option<String>>,
+    },
+    /// Every authored scene camera, for the editor's camera list. A read.
+    Cameras {
+        reply: Sender<Vec<capscene::SceneCamera>>,
+    },
+    /// Make one camera the active one — it goes active and every other goes inactive, in one undoable
+    /// commit. Replies whether `id` was a camera.
+    SetCameraActive {
+        id: String,
+        reply: Sender<bool>,
+    },
+    /// Re-place, re-aim and re-lens an existing camera in one undoable commit. Replies whether `id` was a
+    /// camera.
+    SetCameraView {
+        id: String,
+        pos: [f32; 3],
+        look_at: Option<[f32; 3]>,
+        fov: f32,
+        reply: Sender<bool>,
+    },
+    /// Change one camera's field of view, keeping its pose. One undoable commit. Replies whether `id` was
+    /// a camera.
+    SetCameraFov {
+        id: String,
+        fov: f32,
+        reply: Sender<bool>,
     },
     /// M11.4 — LOOK THROUGH the active scene camera (`on`) or back to the editor fly-cam (`!on`): snapshots
     /// the active Camera entity's view into the render override (a projection, never Loro). Replies whether
@@ -10807,14 +10835,31 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             }
             EngineCmd::AddCamera {
                 pos,
+                look_at,
                 fov,
                 active,
+                name,
                 reply,
             } => {
                 // M11.4 — author a scene Camera entity (one undoable commit, persisted).
-                let new = capscene::add_camera(&mut engine, &scene, pos, fov, active).ok();
+                let new = capscene::add_camera(
+                    &mut engine,
+                    &scene,
+                    pos,
+                    look_at,
+                    fov,
+                    active,
+                    name.as_deref(),
+                )
+                .ok();
                 if new.is_some() {
-                    log.append(&Record::AddCamera { pos, fov, active });
+                    log.append(&Record::AddCamera {
+                        pos,
+                        look_at,
+                        fov,
+                        active,
+                        name,
+                    });
                     if let Some(ch) = &channel {
                         send_proj!(ch, proj_full(&engine, &scene));
                     }
@@ -10822,18 +10867,74 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 }
                 let _ = reply.send(new.map(|n| n.to_loro_key()));
             }
+            EngineCmd::Cameras { reply } => {
+                let _ = reply.send(capscene::cameras(&engine));
+            }
+            EngineCmd::SetCameraActive { id, reply } => {
+                let ok = EntityId::from_loro_key(&id)
+                    .is_some_and(|e| capscene::set_camera_active(&mut engine, e).is_ok());
+                if ok {
+                    log.append(&Record::CameraActive { id });
+                    // Activating a camera does not by itself change what is on screen — you are still
+                    // wherever you were standing. It changes what look-through and Play render from, so
+                    // a LIVE look-through follows the new active camera (that is what "make this the
+                    // active one" means while you are looking through one) and flying does not move.
+                    refresh_look_through(&engine, &shared, None);
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, proj_full(&engine, &scene));
+                    }
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::SetCameraView {
+                id,
+                pos,
+                look_at,
+                fov,
+                reply,
+            } => {
+                let ok = EntityId::from_loro_key(&id).is_some_and(|e| {
+                    capscene::set_camera_view(&mut engine, e, pos, look_at, fov).is_ok()
+                });
+                if ok {
+                    log.append(&Record::CameraView {
+                        id: id.clone(),
+                        pos,
+                        look_at,
+                        fov,
+                    });
+                    refresh_look_through(&engine, &shared, Some(&id));
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, proj_full(&engine, &scene));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(ok);
+            }
+            EngineCmd::SetCameraFov { id, fov, reply } => {
+                let ok = EntityId::from_loro_key(&id)
+                    .is_some_and(|e| capscene::set_camera_fov(&mut engine, e, fov).is_ok());
+                if ok {
+                    log.append(&Record::CameraFov {
+                        id: id.clone(),
+                        fov,
+                    });
+                    // A lens change while looking through THIS camera has to be visible immediately — an
+                    // fov slider whose picture only moves after a look-through toggle is a control that
+                    // appears not to work.
+                    refresh_look_through(&engine, &shared, Some(&id));
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, proj_full(&engine, &scene));
+                    }
+                }
+                let _ = reply.send(ok);
+            }
             EngineCmd::LookThrough { on, reply } => {
                 // Snapshot the active scene camera's view into the render override (read every frame in the
                 // camera block) — a projection, never Loro/undo (ADR-021). `on=false` → back to the fly-cam.
                 let found = if on {
-                    if let Some((p, fov, near, far)) = capscene::active_camera(&engine) {
-                        shared.lock().unwrap().cam_override = Some(render::CamView {
-                            pos: p,
-                            look_at: None,
-                            fov_deg: fov,
-                            near,
-                            far,
-                        });
+                    if let Some(cam) = capscene::active_camera(&engine) {
+                        shared.lock().unwrap().cam_override = Some(cam_view_of(&cam));
                         true
                     } else {
                         false
@@ -10851,7 +10952,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .filter(|id| engine.components_of(**id).contains_key("Camera"))
                     .count();
                 let active = capscene::active_camera(&engine);
-                let fov = active.map_or(-1.0, |(_, f, _, _)| f);
+                let fov = active.as_ref().map_or(-1.0, |c| c.fov_deg);
                 let _ = reply.send((count, active.is_some(), fov));
             }
             EngineCmd::RenameEntity { id, name, reply } => {
@@ -14555,14 +14656,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     {
                         let mut st = shared.lock().unwrap();
                         pre_play_cam = st.cam_override;
-                        if let Some((p, fov, near, far)) = active {
-                            st.cam_override = Some(render::CamView {
-                                pos: p,
-                                look_at: None,
-                                fov_deg: fov,
-                                near,
-                                far,
-                            });
+                        if let Some(cam) = active {
+                            st.cam_override = Some(cam_view_of(&cam));
                         }
                     }
                     (recording, rec_entities, sim, body_of) =
@@ -18605,6 +18700,38 @@ fn apply_animation_binding_values<'a>(
         });
     }
     report
+}
+
+/// The render override that shows exactly what an authored scene camera sees.
+///
+/// One function, so look-through, Play and every camera edit put the SAME view on screen. They used to
+/// build the `CamView` inline and each filled `look_at` with `None` — "keep aiming at the editor's orbit
+/// target" — which is how a scene full of cameras came to show one subject from several distances.
+fn cam_view_of(cam: &capscene::SceneCamera) -> render::CamView {
+    render::CamView {
+        pos: cam.pos,
+        look_at: cam.look_at,
+        fov_deg: cam.fov_deg,
+        near: cam.near,
+        far: cam.far,
+    }
+}
+
+/// Re-point a LIVE look-through at the active scene camera after an edit changed what that camera sees.
+///
+/// Does nothing when no override is live (an edit while flying is an edit to a camera you are not
+/// looking through, and must not teleport the viewport), and nothing when `only` names a camera that is
+/// not the active one. The override is deliberately not distinguished from a cutscene preview's here:
+/// `only` is what keeps a lens edit on camera 2 from hijacking a picture that is showing camera 1.
+fn refresh_look_through(engine: &Engine<FlecsWorld>, shared: &Shared, only: Option<&str>) {
+    let mut st = shared.lock().unwrap();
+    if st.cam_override.is_none() {
+        return;
+    }
+    if let Some(cam) = capscene::active_camera(engine).filter(|c| only.is_none_or(|id| c.id == id))
+    {
+        st.cam_override = Some(cam_view_of(&cam));
+    }
 }
 
 fn rebuild(
@@ -23119,15 +23246,23 @@ fn lighting_debug(state: State<AppState>) -> (usize, usize, i64, i64) {
 }
 
 /// M11.4 — author a scene Camera entity (one undoable commit; survives reload). `pos` world position,
-/// `fov` degrees, `active` whether it's the look-through/Play camera. Replies its id.
+/// `lookAt` the world point it aims at, `fov` degrees, `active` whether it's the look-through/Play
+/// camera, `name` what the author calls it. Replies its id.
+///
+/// `lookAt` and `name` are optional so the callers that predate them keep working unchanged; omitting
+/// `lookAt` leaves the camera unaimed, which is the pre-aim behaviour and not a good camera. The gesture
+/// a person actually performs is [`add_camera_here`], which fills both from what is on screen.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 fn add_camera(
     state: State<AppState>,
     x: f32,
     y: f32,
     z: f32,
+    look_at: Option<[f32; 3]>,
     fov: f32,
     active: bool,
+    name: Option<String>,
 ) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -23135,8 +23270,10 @@ fn add_camera(
         .tx
         .send(EngineCmd::AddCamera {
             pos: [x, y, z],
+            look_at,
             fov,
             active,
+            name,
             reply,
         })
         .is_err()
@@ -23145,6 +23282,151 @@ fn add_camera(
     }
     recv_reply(&rx).unwrap_or(None)
 }
+
+/// What the author can SEE right now, as a camera pose: `(eye, aim, field of view)`.
+///
+/// One function, because [`add_camera_here`] and [`recapture_camera`] are the same gesture pointed at a
+/// new camera and an existing one, and "save this view" has to mean the same thing in both. It was two
+/// copies of this block first, under a doc comment claiming they could not disagree.
+///
+/// The override is read BEFORE the orbit camera: while looking through a scene camera (or a cutscene
+/// preview) the fly-cam state is stale, so reading it would save a view nobody is looking at. An override
+/// with no aim of its own is one of the pre-aim cameras, and its aim was the orbit target — which is what
+/// makes "point at this view" able to repair one.
+fn live_view(state: &State<AppState>) -> ([f32; 3], Option<[f32; 3]>, f32) {
+    let st = state.shared.lock().unwrap();
+    if let Some(ov) = st.cam_override {
+        return (
+            ov.pos,
+            Some(ov.look_at.unwrap_or(st.cam_target)),
+            ov.fov_deg,
+        );
+    }
+    let [orbit, elevation, distance, tx, ty, tz] = st.camera_state();
+    let target = [tx, ty, tz];
+    (
+        render::camera_eye(orbit, elevation, distance, target),
+        Some(target),
+        render::CAMERA_FOV_DEG,
+    )
+}
+
+/// Save what is on screen right now as a scene camera — the gesture this whole capability exists for.
+///
+/// # Why the engine reads the view instead of the editor sending one
+///
+/// The alternative is the UI asking for the orbit angles, the stand-off and the target, doing the
+/// spherical-to-cartesian conversion in TypeScript and sending back an eye — a second statement of a
+/// contract the renderer already owns, in another language, that no compiler compares to the first. It
+/// is also wrong the moment the view on screen is NOT the fly-cam: while looking through another camera
+/// the fly-cam state is stale, so "save this view" would save a view nobody was looking at. Reading
+/// [`render::SharedState::cam_override`] first and the orbit camera second means this command saves
+/// **what the author can see**, which is the only thing the words can honestly mean.
+///
+/// Replies the new camera's id, or `None` if the commit failed.
+#[tauri::command(async)]
+fn add_camera_here(state: State<AppState>, name: Option<String>, active: bool) -> Option<String> {
+    ipc();
+    let (pos, look_at, fov) = live_view(&state);
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::AddCamera {
+            pos,
+            look_at,
+            fov,
+            active,
+            name,
+            reply,
+        })
+        .is_err()
+    {
+        return None;
+    }
+    recv_reply(&rx).unwrap_or(None)
+}
+
+/// Every authored scene camera — the list the editor's camera controls draw. A read; no commit.
+#[tauri::command(async)]
+fn scene_cameras(state: State<AppState>) -> Vec<metrocalk_editor_shell::capscene::SceneCamera> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Cameras { reply }).is_err() {
+        return Vec::new();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
+/// Make one camera the active one — the one look-through and Play render from. ONE undoable commit that
+/// also stands every other camera down, so "which am I looking through" always has exactly one answer.
+/// Replies whether `id` named a camera.
+#[tauri::command(async)]
+fn set_active_camera(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SetCameraActive { id, reply })
+        .is_err()
+    {
+        return false;
+    }
+    recv_reply(&rx).unwrap_or(false)
+}
+
+/// Point an existing camera at what is on screen right now — "this camera now shows this".
+///
+/// The pose comes from [`live_view`] — the same function [`add_camera_here`] calls, not a copy of it, so
+/// the two gestures cannot disagree about what "this view" means. One undoable commit; replies whether
+/// `id` named a camera.
+#[tauri::command(async)]
+fn recapture_camera(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let (pos, look_at, fov) = live_view(&state);
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SetCameraView {
+            id,
+            pos,
+            look_at,
+            fov,
+            reply,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    recv_reply(&rx).unwrap_or(false)
+}
+
+/// Change one camera's lens, keeping where it stands and what it looks at. One undoable commit; a live
+/// look-through through THAT camera updates on the next frame. Replies whether `id` named a camera.
+#[tauri::command(async)]
+fn set_camera_fov(state: State<AppState>, id: String, fov: f32) -> bool {
+    ipc();
+    if !fov.is_finite() {
+        return false;
+    }
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SetCameraFov {
+            id,
+            fov: fov.clamp(FOV_MIN_DEG, FOV_MAX_DEG),
+            reply,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    recv_reply(&rx).unwrap_or(false)
+}
+
+/// The lens range a scene camera is allowed. The same clamp `set_look_dev_camera` applies, named once
+/// so the slider in the editor and the refusal in the engine cannot drift apart.
+const FOV_MIN_DEG: f32 = 5.0;
+const FOV_MAX_DEG: f32 = 120.0;
 
 /// M11.4 — look through the active scene camera (`on`) or back to the editor fly-cam (`!on`). Render-only
 /// (a projection, 0-IPC, never Loro). Replies whether an active camera was found (when `on`).
@@ -23210,7 +23492,7 @@ fn set_look_dev_camera(
             "error": "the eye and the target are the same point, so there is no direction to look in"
         });
     }
-    let fov_deg = fov.clamp(5.0, 120.0);
+    let fov_deg = fov.clamp(FOV_MIN_DEG, FOV_MAX_DEG);
     // The clip solver's first argument is "how big is the thing being looked at". At look-dev the caller
     // has not said, so the stand-off is the only scale available; a tenth of it is the radius a subject
     // filling a normal frame at that distance would have.
@@ -25613,6 +25895,11 @@ fn main() {
             add_light,
             lighting_debug,
             add_camera,
+            add_camera_here,
+            scene_cameras,
+            set_active_camera,
+            recapture_camera,
+            set_camera_fov,
             look_through_camera,
             set_look_dev_camera,
             scene_camera_debug,

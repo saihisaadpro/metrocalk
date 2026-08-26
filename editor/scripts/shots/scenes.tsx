@@ -24,6 +24,7 @@ import {
 import { STAGE_MIN } from "../../src/app/layout";
 import { BindingGraph } from "../../src/graph/BindingGraph";
 import { Icon, iconTokens } from "../../src/theme/icons";
+import { CameraSection } from "../../src/panels/CameraSection";
 import { Inspector } from "../../src/inspector/Inspector";
 import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
@@ -37,8 +38,10 @@ import { PhysicsPanel } from "../../src/panels/PhysicsPanel";
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { assetShelfStore } from "../../src/store/assetShelf";
+import { cameraStore } from "../../src/store/cameras";
 import { projectionStore } from "../../src/store/projection";
 import type {
+  SceneCameraInfo,
   AnimationPropertyInfo,
   AnimationTrackInfo,
   AnimationWorkspaceInfo,
@@ -1014,10 +1017,118 @@ export const SCENES: Scene[] = [
   ...poseScenes(),
   ...graphScenes(),
   ...inspectorScenes(),
+  ...cameraScenes(),
   ...assetScenes(),
   ...modelScenes(),
   ...shellScenes(),
 ];
+
+// ── scene cameras ─────────────────────────────────────────────────────────────────────────────────
+
+/** THE SURFACE FOR A CAPABILITY THAT SHIPPED WITHOUT ONE (M11.4, ADR-043).
+ *
+ *  `add_camera` has authored a Camera entity, `look_through_camera` has rendered from it and
+ *  `scene_camera_debug` has read it back since M11.4, and not one of the three was referenced anywhere
+ *  in `editor/src`: their only callers were e2e harness scripts. So a Metrocalk user could not create a
+ *  camera, aim one, or look through one, and the presentation lab's own notes record it routing AROUND
+ *  the authored camera — to the render-only `set_look_dev_camera`, which creates no entity and does not
+ *  persist — because `add_camera` could not aim.
+ *
+ *  Both scenes are the Inspector section. The View menu's Cameras group, which is where a camera is
+ *  CREATED, portals to `document.body` through `theme/Popover` and is therefore unassertable by this
+ *  harness on this branch (the standing tracked row); it is covered by `ViewportToolbar.test.tsx`
+ *  instead, and photographing it is owed once the portal fix lands. */
+function cameraScenes(): Scene[] {
+  const AIMED: SceneCameraInfo = {
+    id: "cam-line",
+    name: "Down the line",
+    pos: [-46, 6.5, 128],
+    lookAt: [0, 2.5, 0],
+    fovDeg: 34,
+    near: 1.4,
+    far: 190,
+    active: true,
+  };
+
+  /** Seat one camera in the store and select it, exactly as a refresh from the engine plus a pick do. */
+  const seat = (camera: SceneCameraInfo) => () => {
+    cameraStore.getState().reset();
+    cameraStore.getState().refresh([camera]);
+    projectionStore.getState().select(camera.id);
+  };
+
+  /** A client that answers the mount-time refresh with the same camera, so the panel does not blank
+   *  itself one tick after `setup` seated it. Everything else on it is unreachable from this section. */
+  const cameraClient = (camera: SceneCameraInfo) =>
+    ({ sceneCameras: () => Promise.resolve([camera]) }) as unknown as EditorClient;
+
+  return [
+    {
+      id: "camera-selected",
+      looking_for:
+        "A SAVED CAMERA, WITH THE THREE VERBS AND THE TWO NUMBERS THAT MAKE IT ONE. Look through it, " +
+        "make Play render from it, point it at what you are looking at now — and underneath, where it " +
+        "stands and what it AIMS AT, because those two are what the engine could not previously say. " +
+        "The lens reads in millimetres as well as degrees: '34 degrees' is not the vocabulary of " +
+        "anyone who has ever composed a shot, and a full-frame equivalent is. What a reader is " +
+        "checking is that the three buttons sit on ONE row at a dock's width rather than stacking " +
+        "into a column, that the pose read-out is a two-column definition list and not a run-on line " +
+        "of numbers, and that nothing in it renders as a raw id",
+      width: 380,
+      setup: seat(AIMED),
+      expect: {
+        present: [
+          ["[data-testid='cameraLookThrough']", 1],
+          ["[data-testid='cameraActivate']", 1],
+          ["[data-testid='cameraRecapture']", 1],
+          ["[data-testid='cameraFov']", 1],
+          ["[data-testid='cameraPose']", 1],
+        ],
+        // The unaimed warning belongs to the OTHER scene. Present here it would mean an aimed camera
+        // reported as unaimed, which is the defect wearing the fix's clothes.
+        absent: ["[data-testid='cameraUnaimed']"],
+        text_present: ["Look through", "Point at this view", "mm", "Stands at", "Aimed at"],
+        text_absent: ["null", "undefined", "NaN", "cam-line"],
+        // The three verbs are ONE row of a toolbar, not a stack. At 380 px — the width of the
+        // Inspector dock — this is the claim that fails first if a label grows.
+        same_line: [
+          ["[data-testid='cameraLookThrough']", "[data-testid='cameraActivate']"],
+          ["[data-testid='cameraActivate']", "[data-testid='cameraRecapture']"],
+        ],
+        unclipped: [
+          "[data-testid='cameraLookThrough']",
+          "[data-testid='cameraActivate']",
+          "[data-testid='cameraRecapture']",
+          "[data-testid='cameraPose']",
+        ],
+        max_width: [[".mtk-slider-field", 380]],
+      },
+      render: () => <CameraSection client={cameraClient(AIMED)} />,
+    },
+    {
+      id: "camera-unaimed",
+      looking_for:
+        "THE DEFECT THIS CAPABILITY EXISTS TO END, MADE VISIBLE. A camera authored before cameras " +
+        "could aim carries a position and a lens and NO target, so the renderer falls back to the " +
+        "editor's orbit point and the camera shows whatever you happen to be looking at — which in a " +
+        "picture is indistinguishable from a camera that is aimed. Every project saved by an earlier " +
+        "build has cameras like this. The row says so in words rather than printing a plausible " +
+        "(0, 0, 0), and the control that repairs it is the button directly above",
+      width: 380,
+      setup: seat({ ...AIMED, id: "cam-old", name: "Overview", lookAt: null, fovDeg: 55 }),
+      expect: {
+        present: [["[data-testid='cameraUnaimed']", 1], ["[data-testid='cameraRecapture']", 1]],
+        text_present: ["follows the editor", "Point at this view"],
+        // A zero triple here would be the panel inventing an aim for a camera that has none.
+        text_absent: ["null", "undefined", "NaN", "0.0, 0.0, 0.0"],
+        unclipped: ["[data-testid='cameraUnaimed']"],
+      },
+      render: () => (
+        <CameraSection client={cameraClient({ ...AIMED, id: "cam-old", name: "Overview", lookAt: null, fovDeg: 55 })} />
+      ),
+    },
+  ];
+}
 
 // ── the inspector ─────────────────────────────────────────────────────────────────────────────────
 
