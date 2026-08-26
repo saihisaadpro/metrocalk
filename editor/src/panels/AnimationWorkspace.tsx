@@ -38,10 +38,30 @@ import {
   Toolbar,
   ToolbarGroup,
   ToolbarSeparator,
-  TransportIcon,
 } from "../theme/primitives";
+import { Icon } from "../theme/icons";
 import { Modal } from "../theme/Popover";
 import { DisclosureSection, DockTabs, EmptyPanelState } from "../theme/workspace";
+import {
+  CURVE_VIEWBOX,
+  CurveCanvas,
+  TimelineChip,
+  TimelineEmpty,
+  TimelineHead,
+  TimelineKey,
+  TimelineLane,
+  TimelinePlayhead,
+  TimelineRow,
+  TimelineRuler,
+  TimelineSurface,
+  TimelineTrackHead,
+  Transport,
+  TransportButtons,
+  TransportScrub,
+  curvePoint,
+  timelineTickAt,
+  timelineTicks,
+} from "../theme/timeline";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import { AnimationGraphEditor } from "../graph/AnimationGraphEditor";
 import type {
@@ -85,19 +105,6 @@ const EMPTY: AnimationWorkspaceInfo = {
 };
 
 const CONTEXT_LABELS: Record<AnimationContext, string> = { "2d": "2D", "3d": "3D", ui: "UI" };
-/** The sticky ruler's height, and a lane's minimum — both were literals inside the two components
- *  that draw them, which is why nothing could state the timeline's own floor in terms of them. */
-const RULER_H = 32;
-const LANE_MIN_H = 30;
-/** A TIMELINE BELOW THIS IS NOT A TIMELINE, and it is not a new judgement — it is the ruler plus one
- *  lane under it, the smallest thing that still shows *when* something happens and *that* something
- *  does. The viewport was `minHeight: 0` — "be exactly as small as the box you are in" — and in the
- *  bottom dock at a 640px window that box is **9px**, holding 262px of timeline: a scroll container
- *  that can show neither its scrollbar nor one row of itself. It had been green in the layout gate
- *  since ADR-125 because R6's bar was "shows literally nothing" and 9px is not nothing.
- *  Named here so the floor and the parts it is made of cannot drift apart, exactly as
- *  `--mtk-dock-content-min` is the dock's smallest open height minus its bar. */
-const TIMELINE_MIN_H = RULER_H + LANE_MIN_H;
 const PROPERTY_DRAFT = "workspace:selected-property";
 const INTERPOLATION_DRAFT = "workspace:new-interpolation";
 const MARKER_NAME_DRAFT = "workspace:new-marker-name";
@@ -1433,9 +1440,11 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
 
   function scrubLane(event: ReactMouseEvent<HTMLDivElement>) {
     if (event.target !== event.currentTarget) return;
-    const bounds = event.currentTarget.getBoundingClientRect();
-    if (bounds.width <= 0) return;
-    const tick = ((event.clientX - bounds.left) / bounds.width) * duration;
+    // The same clamped arithmetic the ruler scrubs with. It was written out twice, unclamped both
+    // times, so a click on the lane's last pixel scrubbed PAST the end and the transport reconciled
+    // the playhead backwards a frame.
+    const tick = timelineTickAt(event, duration);
+    if (tick === null) return;
     void transport("scrub", snapTick(tick));
   }
 
@@ -1537,12 +1546,17 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
           where you are in the clip · how it repeats and what it is doing. The shortcut hints moved
           into the `title` of the control they belong to, which is where a hint is discoverable
           rather than in the way — and the arrow-key step is now a BUTTON as well, because a
-          keyboard-only affordance is not an affordance for someone who has not read the hint. */}
-      <Toolbar tight data-testid="animation-transport" role="group" aria-label="Animation transport">
+          keyboard-only affordance is not an affordance for someone who has not read the hint.
+
+          It is the SHARED `Transport` now (`theme/timeline.tsx`), which is the same four groups in
+          the references' floating pill rather than a full-bleed strip welded to the tab row above
+          it — and, more to the point, the same object `PhysicsPanel` scrubs its recorded simulation
+          with. Two subsystems had built a transport each and nothing compared them. */}
+      <Transport data-testid="animation-transport" aria-label="Animation transport">
         <ReadOut data-testid="animation-time" unit={`${displayTick}t`} title="Playhead position — clip time and absolute ticks">
           {timeLabel(displayTick, model.ticksPerSecond, contextView.timeDisplay)}
         </ReadOut>
-        <ToolbarGroup attached aria-label="Playback">
+        <TransportButtons aria-label="Playback">
           <Button
             compact
             icon
@@ -1551,7 +1565,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             data-testid="animation-step-back"
             onClick={() => stepFrame(-1)}
           >
-            <TransportIcon name="prev" />
+            <Icon name="prev" size="sm" />
           </Button>
           <Button
             compact
@@ -1563,7 +1577,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             data-testid="animation-play"
             onClick={() => void transport(model.playing ? "pause" : "play")}
           >
-            <TransportIcon name={model.playing ? "pause" : "play"} />
+            <Icon name={model.playing ? "pause" : "play"} size="sm" />
           </Button>
           <Button
             compact
@@ -1573,13 +1587,13 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             data-testid="animation-step-forward"
             onClick={() => stepFrame(1)}
           >
-            <TransportIcon name="next" />
+            <Icon name="next" size="sm" />
           </Button>
           <Button compact icon aria-label="Stop and rewind" title="Stop and rewind to the start" data-testid="animation-stop" onClick={stopAnimation}>
-            <TransportIcon name="stop" />
+            <Icon name="stop" size="sm" />
           </Button>
-        </ToolbarGroup>
-        <ToolbarGroup grow={180} aria-label="Scrub">
+        </TransportButtons>
+        <TransportScrub>
           <Slider
             aria-label="Animation timeline"
             data-testid="animation-scrub"
@@ -1589,7 +1603,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             value={Math.min(displayTick, duration)}
             onChange={(event) => void transport("scrub", snapTick(Number(event.target.value)))}
           />
-        </ToolbarGroup>
+        </TransportScrub>
         <ToolbarGroup aria-label="Repeat">
           <SelectField
             aria-label="Loop policy"
@@ -1604,7 +1618,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
           </SelectField>
           <Badge tone={model.playing ? "success" : "neutral"}>{model.playing ? "previewing" : "stopped"}</Badge>
         </ToolbarGroup>
-      </Toolbar>
+      </Transport>
 
       {activeSurface === "graph" ? (
         <AnimationGraphEditor client={client} sequenceId={model.sequenceId || "main"} workspaceKey={graphWorkspaceKey} />
@@ -1840,10 +1854,10 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
               onDelete={(track, key) => deleteSelectedKey({ track, key })}
             />
           ) : (
-            <div
-              ref={timelineRef}
-              className="mtk-scroll mtk-timeline"
+            <TimelineSurface
+              scrollRef={timelineRef}
               data-testid="animation-timeline-viewport"
+              laneWidth={timelineWidth}
               onScroll={(event) => {
                 const x = event.currentTarget.scrollLeft;
                 const y = event.currentTarget.scrollTop;
@@ -1855,97 +1869,112 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                   scrollCommitTimer.current = null;
                 }, 120);
               }}
-              style={{ minHeight: TIMELINE_MIN_H, overflow: "auto" }}
+              /* WHY THIS IS NOT INSIDE THE STRIP. It was, and `EmptyPanelState` centres itself in its
+                 container — which there is the 822px SCROLL width (178px of track headers + 644px of
+                 lanes), not the 634px the user can see. The result, captured: a lone empty-state mark
+                 adrift near the right edge with its title and its next step scrolled off the side of a
+                 viewport whose scrollbar is horizontal. As a child of the scroller a percentage width
+                 resolves against the visible box, and `sticky` keeps it there while the lanes pan. */
+              footer={visibleTracks.length === 0 ? (
+                <TimelineEmpty>
+                  <EmptyPanelState
+                    inline
+                    icon={<Icon name="animate" size="xl" />}
+                    title={contextTracks.length === 0 ? `No ${CONTEXT_LABELS[activeContext]} tracks yet` : "No matching tracks"}
+                    description={contextTracks.length === 0 ? "Choose a compatible property and add a key at the playhead." : `Clear “${contextView.search}” to show all context tracks.`}
+                    primaryAction={contextView.search ? <Button compact onClick={() => animationEditorStore.getState().setSearch(workspaceKey, activeContext, "")}>Clear filter</Button> : undefined}
+                  />
+                </TimelineEmpty>
+              ) : undefined}
             >
-              <div style={{ width: 178 + timelineWidth }}>
-                <Ruler
-                  duration={duration}
-                  currentTick={displayTick}
-                  ticksPerSecond={model.ticksPerSecond}
-                  display={contextView.timeDisplay}
-                  width={timelineWidth}
-                  onScrub={(tick) => void transport("scrub", snapTick(tick))}
-                />
-                <AnnotationLane
-                  label="Markers"
-                  duration={duration}
-                  width={timelineWidth}
-                  currentTick={displayTick}
-                  onLaneClick={scrubLane}
-                >
-                  {model.markers.map((marker) => (
-                    <span key={marker.id} style={{ position: "absolute", left: `${(marker.tick / duration) * 100}%`, top: 4, display: "inline-flex", transform: "translateX(-8px)", zIndex: 2 }}>
-                      <button
-                        type="button"
-                        data-testid="animation-marker"
-                        aria-label={`${marker.name} marker at ${marker.tick} ticks`}
-                        title={`${marker.name} · ${timeLabel(marker.tick, model.ticksPerSecond, contextView.timeDisplay)}`}
-                        onClick={() => void transport("scrub", marker.tick)}
-                        style={{ width: 16, height: 20, padding: 0, border: 0, color: markerColor(marker), background: "transparent", cursor: "pointer" }}
-                      >◆</button>
-                      <button
-                        type="button"
-                        aria-label={`Delete marker ${marker.name}`}
-                        disabled={busy}
-                        onClick={() => void runEdit(() => client.animationDeleteMarker(marker.ownerId, marker.id))}
-                        style={{ width: 14, height: 16, padding: 0, border: 0, color: color.text.muted, background: color.bg.raised, cursor: "pointer", fontSize: 10 }}
-                      >×</button>
-                    </span>
-                  ))}
-                </AnnotationLane>
-                <AnnotationLane label="Events" duration={duration} width={timelineWidth} currentTick={displayTick} onLaneClick={scrubLane}>
-                  {model.events.map((event) => (
-                    <span key={event.id} style={{ position: "absolute", left: `${(event.tick / duration) * 100}%`, top: 5, display: "inline-flex", transform: "translateX(-8px)", zIndex: 2 }}>
-                      <button
-                        type="button"
-                        data-testid="animation-event"
-                        aria-label={`${event.name} event at ${event.tick} ticks`}
-                        title={`${event.name} · ${valueLabel(event.payload)}`}
-                        onClick={() => void transport("scrub", event.tick)}
-                        style={{ minWidth: 18, height: 18, padding: "0 3px", border: `1px solid ${color.info.border}`, borderRadius: radius.sm, color: color.info.text, background: color.info.bg, cursor: "pointer", fontSize: 9 }}
-                      >E</button>
-                      <button
-                        type="button"
-                        aria-label={`Delete event ${event.name}`}
-                        disabled={busy}
-                        onClick={() => void runEdit(() => client.animationDeleteEvent(event.ownerId, event.id))}
-                        style={{ width: 14, height: 16, padding: 0, border: 0, color: color.text.muted, background: color.bg.raised, cursor: "pointer", fontSize: 10 }}
-                      >×</button>
-                    </span>
-                  ))}
-                </AnnotationLane>
+              <TimelineRuler
+                data-testid="animation-ruler"
+                label="Tracks"
+                duration={duration}
+                currentTick={displayTick}
+                ticks={timelineTicks(duration, (tick) => timeLabel(tick, model.ticksPerSecond, contextView.timeDisplay))}
+                onScrub={(tick) => void transport("scrub", snapTick(tick))}
+              />
 
-                {visibleTracks.length === 0 ? null : visibleTracks.map((track) => {
-                  const active = selectedTrack?.id === track.id;
-                  const state = bindingState(track);
-                  return (
-                    <div
-                      key={track.id}
-                      data-testid="animation-track"
-                      data-context={inferredContext(track)}
-                      data-enabled={track.enabled}
-                      data-locked={track.locked}
-                      data-binding-state={state}
-                      className={`mtk-timeline__row mtk-timeline__row--track${state === "invalid" ? " is-invalid" : ""}${track.enabled ? "" : " is-muted"}`}
-                      style={{ ["--mtk-timeline-width" as string]: `${timelineWidth}px` }}
+              <TimelineRow>
+                <TimelineHead>Markers</TimelineHead>
+                <TimelineLane alternate onClick={scrubLane}>
+                  <TimelinePlayhead tick={displayTick} duration={duration} />
+                  {model.markers.map((marker) => (
+                    <TimelineChip
+                      key={marker.id}
+                      data-testid="animation-marker"
+                      tick={marker.tick}
+                      duration={duration}
+                      tone="marker"
+                      markColor={markerColor(marker)}
+                      label={`${marker.name} marker at ${marker.tick} ticks`}
+                      title={`${marker.name} · ${timeLabel(marker.tick, model.ticksPerSecond, contextView.timeDisplay)}`}
+                      onClick={() => void transport("scrub", marker.tick)}
+                      removeLabel={`Delete marker ${marker.name}`}
+                      removeDisabled={busy}
+                      onRemove={() => void runEdit(() => client.animationDeleteMarker(marker.ownerId, marker.id))}
                     >
-                      <div className={`mtk-timeline__head${active ? " is-selected" : ""}`}>
-                        <button
-                          type="button"
-                          aria-pressed={active}
-                          aria-label={`Select track ${track.name}`}
-                          onClick={() => animationEditorStore.getState().setSelection(workspaceKey, activeContext, [track.id], [])}
-                          style={{ minWidth: 0, padding: 0, border: 0, textAlign: "left", color: "inherit", background: "transparent", cursor: "pointer" }}
-                        >
-                          <span className="mtk-timeline__track-name" title={`${track.targetName} / ${track.component}.${track.property}`} style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: fontSize.body }}>{track.name}</span>
-                        </button>
-                        {/* The metadata line. The badge, the key count and the track's own two
-                            controls share it, so the NAME above owns the full width of the header
-                            column instead of the 100px it had left over beside the buttons. */}
-                        <div className="mtk-timeline__track-meta">
-                          <Badge tone={bindingTone(state)}>{state.replace("_", " ")}</Badge>
-                          <span className="mtk-timeline__track-keys" style={{ color: color.text.muted, fontSize: fontSize.micro }}>{track.keys.length} keys</span>
-                          <div className="mtk-timeline__track-actions">
+                      <Icon name="diamond" size="md" />
+                    </TimelineChip>
+                  ))}
+                </TimelineLane>
+              </TimelineRow>
+
+              <TimelineRow>
+                <TimelineHead>Events</TimelineHead>
+                <TimelineLane onClick={scrubLane}>
+                  <TimelinePlayhead tick={displayTick} duration={duration} />
+                  {model.events.map((event) => (
+                    <TimelineChip
+                      key={event.id}
+                      data-testid="animation-event"
+                      tick={event.tick}
+                      duration={duration}
+                      tone="event"
+                      label={`${event.name} event at ${event.tick} ticks`}
+                      title={`${event.name} · ${valueLabel(event.payload)}`}
+                      onClick={() => void transport("scrub", event.tick)}
+                      removeLabel={`Delete event ${event.name}`}
+                      removeDisabled={busy}
+                      onRemove={() => void runEdit(() => client.animationDeleteEvent(event.ownerId, event.id))}
+                    >
+                      E
+                    </TimelineChip>
+                  ))}
+                </TimelineLane>
+              </TimelineRow>
+
+              {visibleTracks.map((track) => {
+                const active = selectedTrack?.id === track.id;
+                const state = bindingState(track);
+                const tone = bindingTone(state);
+                return (
+                  <TimelineRow
+                    key={track.id}
+                    variant="track"
+                    data-testid="animation-track"
+                    data-context={inferredContext(track)}
+                    data-enabled={track.enabled}
+                    data-locked={track.locked}
+                    data-binding-state={state}
+                    invalid={state === "invalid"}
+                    muted={!track.enabled}
+                  >
+                    <TimelineTrackHead
+                      name={track.name}
+                      /* The readiness word lives here now as well as on `data-binding-state`. A row
+                         whose state is healthy no longer prints a pill for it — see the badge note
+                         in `theme/timeline.tsx` — so the word has to stay reachable somewhere a
+                         person can get at, and the name's own tooltip is where the rest of this
+                         track's identity already is. */
+                      title={`${track.targetName} / ${track.component}.${track.property} · ${READINESS_BADGE[state]}`}
+                      selected={active}
+                      onSelect={() => animationEditorStore.getState().setSelection(workspaceKey, activeContext, [track.id], [])}
+                      meta={`${track.keys.length} keys`}
+                      attention={tone === "success" ? undefined : <Badge tone={tone}>{READINESS_BADGE[state]}</Badge>}
+                      actions={
+                        <>
                           <Button
                             compact
                             icon
@@ -1961,7 +1990,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                                   : "Unmute track"
                             }
                             onClick={(event) => { event.stopPropagation(); changeTrackEnabled(track); }}
-                          >{track.enabled ? "◉" : "◌"}</Button>
+                          ><Icon name={track.enabled ? "sound-on" : "sound-off"} size="sm" /></Button>
                           <Button
                             compact
                             icon
@@ -1971,62 +2000,43 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                             aria-label={`${track.locked ? "Unlock" : "Lock"} ${track.name}`}
                             title={track.locked ? "Unlock track editing" : "Protect track from editing"}
                             onClick={(event) => { event.stopPropagation(); changeTrackLocked(track); }}
-                          >{track.locked ? "▣" : "□"}</Button>
-                          </div>
-                        </div>
-                      </div>
-                      <div className="mtk-timeline__lane mtk-timeline__lane--gridded" onClick={scrubLane}>
-                        <Playhead />
-                        {track.keys.map((key) => {
-                          const identity = keySelectionId(track.id, key.id);
-                          const keyActive = contextView.selectedKeyIds.includes(identity);
-                          return (
-                            <button
-                              key={key.id}
-                              type="button"
-                              aria-label={`${track.name} key at ${key.seconds.toFixed(2)} seconds`}
-                              aria-pressed={keyActive}
-                              data-testid="animation-key"
-                              data-selected={keyActive || undefined}
-                              title={`${key.tick}t · ${valueLabel(key.value)}${track.locked ? " · locked" : ""}`}
-                              onClick={(event) => selectKey(track, key, event)}
-                              onKeyDown={(event) => {
-                                if ((event.key === "Delete" || event.key === "Backspace") && !track.locked) {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  deleteSelectedKey({ track, key });
-                                }
-                              }}
-                              style={{ position: "absolute", left: `clamp(0px, calc(${(key.tick / duration) * 100}% - 12px), calc(100% - 24px))`, top: 11, display: "grid", placeItems: "center", width: 24, height: 24, padding: 0, border: 0, background: "transparent", cursor: "pointer", zIndex: 3 }}
-                            >
-                              <span aria-hidden="true" style={{ width: 12, height: 12, transform: "rotate(45deg)", border: `1px solid ${keyActive ? color.accent.base : state === "invalid" ? color.danger.border : color.border.strong}`, background: keyActive ? color.accent.solid : track.locked ? color.bg.inset : color.bg.raised }} />
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-              {/* WHY THIS IS NOT INSIDE THE STRIP ABOVE. It was, and `EmptyPanelState` centres itself
-                  in its container — which there is the 822px SCROLL width (178px of track headers +
-                  644px of lanes), not the 634px the user can see. The result, captured: a lone "◇"
-                  glyph adrift near the right edge with its title and its next step scrolled off the
-                  side of a viewport whose scrollbar is horizontal. As a child of the scroller a
-                  percentage width resolves against the visible box, and `sticky` keeps it there while
-                  the lanes above it pan. */}
-              {visibleTracks.length === 0 && (
-                <div className="mtk-timeline__empty">
-                    <EmptyPanelState
-                      inline
-                      icon="◇"
-                      title={contextTracks.length === 0 ? `No ${CONTEXT_LABELS[activeContext]} tracks yet` : "No matching tracks"}
-                      description={contextTracks.length === 0 ? "Choose a compatible property and add a key at the playhead." : `Clear “${contextView.search}” to show all context tracks.`}
-                      primaryAction={contextView.search ? <Button compact onClick={() => animationEditorStore.getState().setSearch(workspaceKey, activeContext, "")}>Clear filter</Button> : undefined}
+                          ><Icon name={track.locked ? "lock" : "unlock"} size="sm" /></Button>
+                        </>
+                      }
                     />
-                </div>
-              )}
-            </div>
+                    <TimelineLane onClick={scrubLane}>
+                      <TimelinePlayhead />
+                      {track.keys.map((key) => {
+                        const identity = keySelectionId(track.id, key.id);
+                        const keyActive = contextView.selectedKeyIds.includes(identity);
+                        return (
+                          <TimelineKey
+                            key={key.id}
+                            tick={key.tick}
+                            duration={duration}
+                            selected={keyActive}
+                            invalid={state === "invalid"}
+                            locked={track.locked}
+                            aria-label={`${track.name} key at ${key.seconds.toFixed(2)} seconds`}
+                            aria-pressed={keyActive}
+                            data-testid="animation-key"
+                            title={`${key.tick}t · ${valueLabel(key.value)}${track.locked ? " · locked" : ""}`}
+                            onClick={(event) => selectKey(track, key, event)}
+                            onKeyDown={(event) => {
+                              if ((event.key === "Delete" || event.key === "Backspace") && !track.locked) {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                deleteSelectedKey({ track, key });
+                              }
+                            }}
+                          />
+                        );
+                      })}
+                    </TimelineLane>
+                  </TimelineRow>
+                );
+              })}
+            </TimelineSurface>
           )}
         </section>
 
@@ -2569,94 +2579,17 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
   );
 }
 
-/** The ruler, on the shared timeline classes. What it looked like before: a bare row with ten mono
- *  labels floating in it, a 1px accent hairline for a playhead, and the 178px header width written
- *  as a literal here, again in `AnnotationLane`, and a third time in the track rows — three
- *  statements of one number that nothing compared. `--mtk-track-header` is that number now, declared
- *  once on `.mtk-timeline`, and the graticule under the labels is what gives the eye anything to
- *  read between them. */
-function Ruler({
-  duration,
-  currentTick,
-  ticksPerSecond,
-  display,
-  width,
-  onScrub,
-}: {
-  duration: number;
-  currentTick: number;
-  ticksPerSecond: number;
-  display: "frames" | "seconds" | "ticks";
-  width: number;
-  onScrub: (tick: number) => void;
-}) {
-  const ticks = Array.from({ length: 11 }, (_, index) => Math.round((duration * index) / 10));
-  return (
-    <div className="mtk-timeline__row mtk-timeline__ruler" style={{ ["--mtk-timeline-width" as string]: `${width}px` }}>
-      <div className="mtk-timeline__head">Tracks</div>
-      <div
-        className="mtk-timeline__ruler-track"
-        data-testid="animation-ruler"
-        onClick={(event) => {
-          const bounds = event.currentTarget.getBoundingClientRect();
-          if (bounds.width > 0) onScrub(((event.clientX - bounds.left) / bounds.width) * duration);
-        }}
-      >
-        <Playhead tick={currentTick} duration={duration} handle />
-        {ticks.map((tick, index) => (
-          <span
-            key={tick}
-            className={`mtk-timeline__tick${index === 0 ? " mtk-timeline__tick--first" : ""}`}
-            style={{ left: `${(tick / duration) * 100}%` }}
-          >
-            {timeLabel(tick, ticksPerSecond, display)}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function AnnotationLane({
-  label,
-  duration,
-  width,
-  currentTick,
-  onLaneClick,
-  children,
-}: {
-  label: string;
-  duration: number;
-  width: number;
-  currentTick: number;
-  onLaneClick: (event: ReactMouseEvent<HTMLDivElement>) => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="mtk-timeline__row" style={{ ["--mtk-timeline-width" as string]: `${width}px` }}>
-      <div className="mtk-timeline__head">{label}</div>
-      <div className="mtk-timeline__lane mtk-timeline__lane--odd" onClick={onLaneClick}>
-        <Playhead tick={currentTick} duration={duration} />
-        {children}
-      </div>
-    </div>
-  );
-}
-
-/** A line you can SEE and aim at. The previous one was 1px wide with a 4px glow, which against the
- *  ruler's own background was neither visible at a glance nor a target for the pointer; `handle`
- *  puts a cap on it in the ruler, where the scrub gesture actually lives. */
-function Playhead({ tick, duration, handle = false }: { tick?: number; duration?: number; handle?: boolean }) {
-  const left = tick === undefined || duration === undefined ? "var(--animation-playhead, 0%)" : `${(tick / duration) * 100}%`;
-  return (
-    <div
-      aria-hidden="true"
-      className={`mtk-timeline__playhead${handle ? " mtk-timeline__playhead--handled" : ""}`}
-      style={{ left }}
-    />
-  );
-}
-
+/** The value curve, on the shared [[CurveCanvas]].
+ *
+ *  WHAT MOVED OUT OF HERE. The ruler, the annotation lane and the playhead used to be three private
+ *  components at the bottom of this file — which is precisely why `PhysicsPanel`, the engine's other
+ *  scrubbable timeline, had none of them and hand-rolled a bare `<input type="range">` with a mono
+ *  frame counter beside it. They are `theme/timeline.tsx` now. What is left here is the part that is
+ *  genuinely this subsystem's: sampling an authored track's interpolation into points.
+ *
+ *  The canvas itself — the graticule, the two named axes, the card — is shared, because "a curve on
+ *  an unruled rectangle" is not a curve editor in any of the references and would have been rebuilt
+ *  differently by whoever wrote the next one. */
 function CurveEditor({
   track,
   selectedKeyId,
@@ -2668,10 +2601,10 @@ function CurveEditor({
   onSelect: (track: AnimationTrackInfo, key: AnimationKeyInfo) => void;
   onDelete: (track: AnimationTrackInfo, key: AnimationKeyInfo) => void;
 }) {
-  if (!track) return <EmptyPanelState icon="⌁" title="Select a numeric track" description="The curve view shares the same keys and playhead as the timeline." />;
+  if (!track) return <EmptyPanelState icon={<Icon name="runtime" size="xl" />} title="Select a numeric track" description="The curve view shares the same keys and playhead as the timeline." />;
   const numeric = track.keys.filter((key): key is AnimationKeyInfo & { value: number } => typeof key.value === "number");
   if (numeric.length !== track.keys.length || numeric.length === 0) {
-    return <EmptyPanelState icon="⌁" title="This track has no numeric curve" description="Boolean, text, sprite-frame, and structured channels use the timeline and Step interpolation." />;
+    return <EmptyPanelState icon={<Icon name="runtime" size="xl" />} title="This track has no numeric curve" description="Boolean, text, sprite-frame, and structured channels use the timeline and Step interpolation." />;
   }
   const ordered = [...numeric].sort((left, right) => left.tick - right.tick || left.id.localeCompare(right.id));
   const minTick = Math.min(...ordered.map((key) => key.tick));
@@ -2706,11 +2639,8 @@ function CurveEditor({
   const padding = rawMaxValue === rawMinValue ? Math.max(1, Math.abs(rawMinValue) * 0.1) : (rawMaxValue - rawMinValue) * 0.08;
   const minValue = rawMinValue - padding;
   const maxValue = rawMaxValue + padding;
-  const valueSpan = maxValue - minValue;
-  const point = (item: { tick: number; value: number }) => ({
-    x: 40 + ((item.tick - minTick) / tickSpan) * 720,
-    y: 220 - ((item.value - minValue) / valueSpan) * 180,
-  });
+  const bounds = { minTick, tickSpan, minValue, valueSpan: maxValue - minValue };
+  const point = (item: { tick: number; value: number }) => curvePoint(item, bounds);
   const path = sampled.map((item, index) => `${index === 0 ? "M" : "L"} ${point(item).x} ${point(item).y}`).join(" ");
   const selectedKey = ordered.find((key) => keySelectionId(track.id, key.id) === selectedKeyId) ?? null;
   const tangentHandles = selectedKey && track.interpolation === "cubic"
@@ -2723,54 +2653,62 @@ function CurveEditor({
         return [{ kind, point: point({ tick: selectedKey.tick + direction * deltaTick, value: selectedKey.value + direction * tangent * deltaTick }) }];
       })
     : [];
+  /* A tangent handle is computed from an authored slope and can land anywhere, including off the
+     plot. Clamped to the drawable band so the line always has a visible end to aim at. */
+  const clampY = (y: number) => Math.max(CURVE_VIEWBOX.top - 8, Math.min(CURVE_VIEWBOX.bottom + 8, y));
   return (
-    <div data-testid="animation-curves" className="mtk-scroll" style={{ minHeight: 0, overflow: "auto", padding: space.md, background: color.bg.inset }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: space.sm, marginBottom: space.sm }}>
-        <div><strong>{track.name}</strong><div style={{ color: color.text.muted, fontSize: fontSize.meta }}>{track.interpolation} · {numeric.length} numeric keys</div></div>
-        <div style={{ color: color.text.muted, fontSize: fontSize.meta }}>Edit exact values and cubic tangents in the inspector.</div>
-      </div>
-      <svg viewBox="0 0 800 260" role="group" aria-label={`${track.name} animation curve editor`} style={{ minWidth: 620, width: "100%", height: "calc(100% - 45px)", minHeight: 190, border: `1px solid ${color.border.subtle}`, borderRadius: radius.md, background: color.bg.panel }}>
-        <path data-testid="animation-curve-path" data-interpolation={track.interpolation} d={path} fill="none" stroke={color.accent.base} strokeWidth={2} />
-        {selectedKey && tangentHandles.map((handle) => {
-          const origin = point(selectedKey);
-          return (
-            <g key={handle.kind} aria-hidden="true">
-              <line x1={origin.x} y1={origin.y} x2={handle.point.x} y2={Math.max(12, Math.min(248, handle.point.y))} stroke={color.warn.text} strokeWidth={1} />
-              <circle cx={handle.point.x} cy={Math.max(12, Math.min(248, handle.point.y))} r={4} fill={color.bg.raised} stroke={color.warn.text} />
-            </g>
-          );
-        })}
-        {ordered.map((key) => {
-          const position = point(key);
-          const selected = keySelectionId(track.id, key.id) === selectedKeyId;
-          return (
-            <g
-              key={key.id}
-              role="button"
-              tabIndex={0}
-              aria-pressed={selected}
-              aria-label={`${track.name} curve key at ${key.tick} ticks`}
-              onClick={() => onSelect(track, key)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  onSelect(track, key);
-                } else if ((event.key === "Delete" || event.key === "Backspace") && !track.locked) {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  onDelete(track, key);
-                }
-              }}
-              style={{ cursor: "pointer" }}
-            >
-              <circle cx={position.x} cy={position.y} r={14} fill="transparent" />
-              <circle cx={position.x} cy={position.y} r={selected ? 7 : 5} fill={selected ? color.accent.solid : color.bg.raised} stroke={color.accent.base} strokeWidth={2} pointerEvents="none" />
-            </g>
-          );
-        })}
-      </svg>
-    </div>
+    <CurveCanvas
+      aria-label={`${track.name} animation curve editor`}
+      valueAxis="value"
+      timeAxis="time"
+      caption={
+        <>
+          <strong>{track.name}</strong>
+          <div style={{ color: color.text.muted, fontSize: fontSize.meta }}>{track.interpolation} · {numeric.length} numeric keys</div>
+        </>
+      }
+      hint="Edit exact values and cubic tangents in the inspector."
+    >
+      <path data-testid="animation-curve-path" data-interpolation={track.interpolation} d={path} fill="none" stroke={color.accent.base} strokeWidth={2} />
+      {selectedKey && tangentHandles.map((handle) => {
+        const origin = point(selectedKey);
+        return (
+          <g key={handle.kind} aria-hidden="true">
+            <line x1={origin.x} y1={origin.y} x2={handle.point.x} y2={clampY(handle.point.y)} stroke={color.warn.text} strokeWidth={1} />
+            <circle cx={handle.point.x} cy={clampY(handle.point.y)} r={4} fill={color.bg.raised} stroke={color.warn.text} />
+          </g>
+        );
+      })}
+      {ordered.map((key) => {
+        const position = point(key);
+        const selected = keySelectionId(track.id, key.id) === selectedKeyId;
+        return (
+          <g
+            key={key.id}
+            role="button"
+            tabIndex={0}
+            aria-pressed={selected}
+            aria-label={`${track.name} curve key at ${key.tick} ticks`}
+            onClick={() => onSelect(track, key)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                event.stopPropagation();
+                onSelect(track, key);
+              } else if ((event.key === "Delete" || event.key === "Backspace") && !track.locked) {
+                event.preventDefault();
+                event.stopPropagation();
+                onDelete(track, key);
+              }
+            }}
+            style={{ cursor: "pointer" }}
+          >
+            <circle cx={position.x} cy={position.y} r={14} fill="transparent" />
+            <circle cx={position.x} cy={position.y} r={selected ? 7 : 5} fill={selected ? color.accent.solid : color.bg.raised} stroke={color.accent.base} strokeWidth={2} pointerEvents="none" />
+          </g>
+        );
+      })}
+    </CurveCanvas>
   );
 }
 

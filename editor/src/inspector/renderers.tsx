@@ -50,7 +50,8 @@ import { JsonFormsDispatch, withJsonFormsControlProps, withJsonFormsLayoutProps 
 import type { ReactNode } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
-import { Button, NumericField, PropertyRow, RevertIcon, SelectField, TextField } from "../theme/primitives";
+import { Icon } from "../theme/icons";
+import { Button, NumericField, PropertyRow, SelectField, TextField } from "../theme/primitives";
 import { DisclosureSection } from "../theme/workspace";
 
 const hasFormat = (fmt: string) =>
@@ -102,7 +103,7 @@ function Row({
             data-testid="prop-reset"
             onClick={() => handleChange(path, dflt)}
           >
-            <RevertIcon />
+            <Icon name="revert" size={13} />
           </Button>
         ) : undefined
       }

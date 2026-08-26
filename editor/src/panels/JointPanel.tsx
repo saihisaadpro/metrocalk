@@ -9,6 +9,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSelectedId, projectionStore } from "../store/projection";
 import { useStore } from "zustand";
 import { setStatus } from "../store/ui";
+import { Icon } from "../theme/icons";
 import { Badge, Slider } from "../theme/primitives";
 import { color, font, fontSize, space, text } from "../theme/tokens";
 import type { JointInfo } from "../transport/protocol";
@@ -75,10 +76,10 @@ export function JointPanel({ client }: { client: EditorClient }) {
         </div>
         <div style={{ display: "flex", gap: space.sm }}>
           <button type="button" className="mtk-card" data-testid="make-revolute" onClick={() => void makeJoint(true)} title="The part turns about an axis through its position (a wheel, an arm, a door).">
-            ⟳ Turns (revolute)
+            <Icon name="rotate" size="sm" /> Turns (revolute)
           </button>
           <button type="button" className="mtk-card" data-testid="make-prismatic" onClick={() => void makeJoint(false)} title="The part slides along an axis (a trolley, a slide, a piston).">
-            ⇄ Slides (prismatic)
+            <Icon name="swap" size="sm" /> Slides (prismatic)
           </button>
         </div>
       </div>
@@ -153,7 +154,7 @@ export function JointPanel({ client }: { client: EditorClient }) {
           }}
           title="Record the part's current pose at this time on the timeline."
         >
-          ◆ Key pose at
+          <Icon name="animate" size="sm" /> Key pose at
         </button>
         <input
           data-testid="joint-key-t"

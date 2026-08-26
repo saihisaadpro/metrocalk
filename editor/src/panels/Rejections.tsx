@@ -2,6 +2,7 @@
 //! edit, this panel restores the authoritative state and explains why the change could not be applied.
 
 import { projectionStore, useRejections } from "../store/projection";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { color, elevation, font, fontSize, radius, space, z } from "../theme/tokens";
 
@@ -57,7 +58,7 @@ export function Rejections() {
             title="Dismiss rejection"
             style={{ flex: "none", color: color.danger.text }}
           >
-            <span aria-hidden="true">×</span>
+            <Icon name="close" size="sm" />
           </Button>
         </div>
       ))}

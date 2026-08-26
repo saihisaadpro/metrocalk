@@ -12,6 +12,7 @@ import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import { projectionStore, useFieldValue, useMultiSelect, useSelectedId } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button, NumericField } from "../theme/primitives";
 import { DisclosureSection } from "../theme/workspace";
 import { color, fontSize, radius, space, text } from "../theme/tokens";
@@ -206,7 +207,7 @@ export function ShapeStudio({ client }: { client: EditorClient }) {
             onClick={() => void run(() => client.shapeSpawn(spec.kind), `Create ${spec.label}`)}
             style={{ flexDirection: "column", gap: 2, paddingTop: space.sm, paddingBottom: space.sm, minHeight: 52 }}
           >
-            <span aria-hidden style={{ fontSize: fontSize.title, lineHeight: 1 }}>{spec.icon}</span>
+            <Icon name={spec.kind} size="xl" fallback="shape" />
             <span style={{ fontSize: fontSize.meta }}>{spec.label}</span>
           </Button>
         ))}
@@ -383,7 +384,7 @@ function DrawSection({
             title="Draw the shape as seen from above; it rises straight up"
             onClick={() => setMode("extrude")}
           >
-            ⬒ Raise
+            <Icon name="extrude" size="sm" /> Raise
           </Button>
           <Button
             data-testid="draw-mode-revolve"
@@ -393,7 +394,7 @@ function DrawSection({
             title="Draw a side profile; it spins around the left edge into a round solid"
             onClick={() => setMode("revolve")}
           >
-            ◎ Spin
+            <Icon name="revolve" size="sm" /> Spin
           </Button>
           <span style={{ flex: 1 }} />
         </div>
@@ -470,7 +471,7 @@ function DrawSection({
             title="Snap placed and dragged points to a 0.25 m grid (freehand strokes stay free)"
             onClick={() => setSnap((s) => !s)}
           >
-            ⌗ Snap
+            <Icon name="grid" size="sm" /> Snap
           </Button>
         </div>
         <div style={{ display: "flex", gap: space.sm, alignItems: "center", flexWrap: "wrap" }}>
@@ -553,7 +554,7 @@ function DrawSection({
             title={canCreate ? "Turn the outline into a solid — one Ctrl-Z to undo" : "Draw at least three points first"}
             onClick={() => void create()}
           >
-            {mode === "extrude" ? "⬒ Raise it" : "◎ Spin it"}
+            <Icon name={mode === "extrude" ? "extrude" : "revolve"} size="sm" />{mode === "extrude" ? "Raise it" : "Spin it"}
           </Button>
         </div>
       </div>
@@ -590,7 +591,7 @@ function CombineSection({
           title={why ?? "Join the two objects into one solid — one Ctrl-Z brings both back"}
           onClick={() => a && b && void run(() => client.shapeCombine(a, b, "union"), "Join")}
         >
-          ⊕ Join
+          <Icon name="union" size="sm" /> Join
         </Button>
         <Button
           data-testid="combine-carve"
@@ -600,7 +601,7 @@ function CombineSection({
           title={why ?? "Carve the second object out of the first"}
           onClick={() => a && b && void run(() => client.shapeCombine(a, b, "carve"), "Carve")}
         >
-          ⊖ Carve
+          <Icon name="subtract" size="sm" /> Carve
         </Button>
         <Button
           data-testid="combine-intersect"
@@ -610,7 +611,7 @@ function CombineSection({
           title={why ?? "Keep only where the two objects overlap"}
           onClick={() => a && b && void run(() => client.shapeCombine(a, b, "intersect"), "Overlap")}
         >
-          ⊗ Overlap
+          <Icon name="intersect" size="sm" /> Overlap
         </Button>
         <span style={{ flex: 1 }} />
         <Button
@@ -621,7 +622,7 @@ function CombineSection({
           title={why ?? "Melt the two shapes together with a smooth blend (spheres, boxes and cylinders)"}
           onClick={() => a && b && void run(() => client.shapeMeld(a, b, blend), "Meld")}
         >
-          ✦ Meld
+          <Icon name="meld" size="sm" /> Meld
         </Button>
         <label
           title={why ?? "How far the meld melts the two shapes into each other"}

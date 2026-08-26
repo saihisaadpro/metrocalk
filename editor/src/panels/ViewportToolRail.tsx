@@ -1,7 +1,8 @@
 //! Primary viewport tool selection. The rail is intentionally controlled: it presents and navigates tools,
 //! while App decides what selecting each tool means and remains the single owner of engine state.
 
-import { useId, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode, type SyntheticEvent } from "react";
+import { useId, useRef, useState, type CSSProperties, type KeyboardEvent, type SyntheticEvent } from "react";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { ShortcutBadge } from "../theme/workspace";
 import { color, elevation, motion, radius, space, z } from "../theme/tokens";
@@ -52,30 +53,17 @@ const TOOL_ELEMENT_IDS: Partial<Record<ViewportTool, string>> = {
   pipe: "vpPipe",
 };
 
+/** THE TOOL RAIL DOES NOT DRAW ITS OWN ICONS ANY MORE.
+ *
+ *  It used to carry five hand-authored `<path>`s in a local `ToolIcon` — at viewBox 24, stroke 1.7,
+ *  round caps, which is to say it had independently arrived at the house conventions and there was no
+ *  way to know that except by reading both files. That is the shape the Constitution forbids: a
+ *  subsystem with its own icon component is one restyle away from being the odd one out, and the five
+ *  marks could not be reused by a command palette or a context menu that wanted the same tool. They
+ *  live in [`theme/icons.tsx`] now under `cursor`/`move`/`rotate`/`scale`/`pipe`, with `select` a
+ *  declared alias for `cursor`, so one tool means one picture everywhere it appears. */
 function ToolIcon({ tool }: { tool: ViewportTool }) {
-  let content: ReactNode;
-  switch (tool) {
-    case "select":
-      content = <path d="M5 3.5 17 13l-5.2 1.1-2.6 4.5L5 3.5Z" />;
-      break;
-    case "move":
-      content = <><path d="M12 3v18M3 12h18" /><path d="m9 6 3-3 3 3M18 9l3 3-3 3M9 18l3 3 3-3M6 9l-3 3 3 3" /></>;
-      break;
-    case "rotate":
-      content = <><path d="M18.8 8A8 8 0 1 0 20 14" /><path d="m16 4 3 4-5 .8" /></>;
-      break;
-    case "scale":
-      content = <><rect x="4" y="14" width="6" height="6" rx="1" /><rect x="15" y="4" width="5" height="5" rx="1" /><path d="m9 15 7-7M12 8h4v4" /></>;
-      break;
-    case "pipe":
-      content = <><path d="M5 4v9a6 6 0 0 0 6 6h8" /><path d="M3 4h4M17 17v4" /></>;
-      break;
-  }
-  return (
-    <svg className="mtk-tool-rail__icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-      {content}
-    </svg>
-  );
+  return <Icon name={tool} size="lg" className="mtk-tool-rail__icon" />;
 }
 
 /** Responsive vertical toolbar with roving keyboard focus and optional compact presentation. */

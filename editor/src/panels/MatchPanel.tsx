@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import { DisclosureSection, EmptyPanelState } from "../theme/workspace";
@@ -228,7 +229,7 @@ export function MatchPanel({ client }: { client: EditorClient }) {
         <CinemaSection client={client} />
         <VfxSection client={client} />
         <EmptyPanelState
-          icon="⚔"
+          icon={<Icon name="sword" size="xl" />}
           title="This scene doesn't have a match yet"
           description="A match is authored like anything else: a play area, a lane to walk, the actors that fight over it, and the waves that spawn. Create one to get a complete, playable starting point you can then edit."
         />

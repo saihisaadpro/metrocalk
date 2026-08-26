@@ -15,6 +15,7 @@ import { setStatus } from "../store/ui";
 import { setBalance } from "../store/wallet";
 import { pushToast } from "../store/toasts";
 import { GENERATE_COST } from "../transport/protocol";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { color, elevation, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
@@ -165,7 +166,7 @@ export function DescribeBar({ client }: { client: EditorClient }) {
   return (
     <div data-testid="describebar" style={{ padding: `${space.sm}px ${space.lg}px` }}>
       <div style={{ display: "flex", gap: space.sm, alignItems: "center" }}>
-        <span aria-hidden style={{ color: color.accent.base, fontSize: fontSize.title, lineHeight: 1 }}>✦</span>
+        <Icon name="sparkle" size="lg" style={{ color: color.accent.base }} />
         <input
           id="describe"
           data-testid="describe"
@@ -203,7 +204,7 @@ export function DescribeBar({ client }: { client: EditorClient }) {
         >
           {preview.kind === "match" ? (
             <>
-              <span style={{ color: color.success.text }}>✓ will place</span>
+              <span style={{ color: color.success.text }}><Icon name="check" size="sm" /> will place</span>
               <span style={{ color: color.text.secondary }}>{preview.label}</span>
               <span style={{ color: color.text.muted }}>· {preview.source}</span>
               <span data-testid="previewCost" style={{ color: preview.price ? color.token : color.success.text }}>
@@ -212,7 +213,7 @@ export function DescribeBar({ client }: { client: EditorClient }) {
             </>
           ) : (
             <>
-              <span style={{ color: color.accent.base }}>✦ no match — will generate</span>
+              <span style={{ color: color.accent.base }}><Icon name="sparkle" size="sm" /> no match — will generate</span>
               <span data-testid="previewCost" style={{ color: color.token }}>· ~{GENERATE_COST} tokens</span>
             </>
           )}
@@ -235,7 +236,7 @@ export function DescribeBar({ client }: { client: EditorClient }) {
               title={`Generate a new asset with AI — costs about ${GENERATE_COST} tokens`}
               onClick={() => void runGenerate(panel.query)}
             >
-              ✦ Generate with AI · ~{GENERATE_COST} tokens
+              <Icon name="sparkle" size="sm" /> Generate with AI · ~{GENERATE_COST} tokens
             </Button>
             <Button id="browseMarket" data-testid="browseMarket" variant="secondary" onClick={() => browseMarketplace(panel.query)}>
               Browse asset library

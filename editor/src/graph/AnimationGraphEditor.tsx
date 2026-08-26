@@ -36,6 +36,7 @@ import {
   type AnimationDraftValue,
   type AnimationWorkspaceKey,
 } from "../store/animation";
+import { Icon } from "../theme/icons";
 import { Badge, Button, NumericField, Slider } from "../theme/primitives";
 import { EmptyPanelState } from "../theme/workspace";
 import { graphEdgeStyle, graphNodeStyle, graphTheme } from "../theme/graph";
@@ -1159,7 +1160,7 @@ export function AnimationGraphEditor({
       {!draft ? (
         <div className="animation-graph-empty">
           <EmptyPanelState
-            icon="◇"
+            icon={<Icon name="logic" size="xl" />}
             title="No graph is authored for this sequence"
             description="Create an explicit editable graph. Nothing is persisted until Apply succeeds."
             primaryAction={<Button data-testid="animation-graph-locomotion-preset" disabled={!schemaSupported} onClick={() => authorPreset(createLocomotionGraphPreset(sequenceId))}>Locomotion preset</Button>}
@@ -1263,7 +1264,7 @@ export function AnimationGraphEditor({
                   {draft.edges.map((edge) => <li key={edge.id}>
                     <select aria-label={`Source node for ${edge.id}`} value={edge.fromNodeId} onChange={(event) => editConnection(edge.id, { fromNodeId: event.target.value })}>{draft.nodes.filter((node) => animationGraphPorts(node.kind).some((port) => port.direction === "output" && port.kind === "pose")).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select>
                     <select aria-label={`Source port for ${edge.id}`} value={edge.fromPortId} onChange={(event) => editConnection(edge.id, { fromPortId: event.target.value })}>{animationGraphPorts(draft.nodes.find((node) => node.id === edge.fromNodeId)?.kind ?? "reference_pose").filter((port) => port.direction === "output" && port.kind === "pose").map((port) => <option key={port.id} value={port.id}>{port.label}</option>)}</select>
-                    <span aria-hidden="true">→</span>
+                    <Icon name="arrow-right" size="sm" />
                     <select aria-label={`Target node for ${edge.id}`} value={edge.toNodeId} onChange={(event) => editConnection(edge.id, { toNodeId: event.target.value, toPortId: animationGraphPorts(draft.nodes.find((node) => node.id === event.target.value)?.kind ?? "output").find((port) => port.direction === "input" && port.kind === "pose")?.id ?? "pose" })}>{draft.nodes.filter((node) => animationGraphPorts(node.kind).some((port) => port.direction === "input" && port.kind === "pose")).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select>
                     <select aria-label={`Target port for ${edge.id}`} value={edge.toPortId} onChange={(event) => editConnection(edge.id, { toPortId: event.target.value })}>{animationGraphPorts(draft.nodes.find((node) => node.id === edge.toNodeId)?.kind ?? "output").filter((port) => port.direction === "input" && port.kind === "pose").map((port) => <option key={port.id} value={port.id}>{port.label}</option>)}</select>
                     <Button compact icon variant="ghost" aria-label={`Delete connection ${edge.id}`} onClick={() => removeConnectionById(edge.id)}>×</Button>

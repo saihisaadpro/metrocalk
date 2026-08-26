@@ -13,6 +13,7 @@ import { useSelectedId, useSummary } from "../store/projection";
 import { usePlaying } from "../store/play";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { CinemaReply, ShotSpec } from "../transport/protocol";
@@ -209,7 +210,7 @@ export function CinemaSection({ client }: { client: EditorClient }) {
                 }
                 onClick={() => selected && void run(() => client.cinemaAddShot(selected, spec.kind), spec.label)}
               >
-                {spec.icon} {spec.label}
+                <Icon name={spec.kind} size="md" fallback="camera" /> {spec.label}
               </Button>
             ))}
           </div>
@@ -246,7 +247,7 @@ export function CinemaSection({ client }: { client: EditorClient }) {
                       void run(() => client.cinemaRemoveShot(selected, i), "Remove shot")
                     }
                   >
-                    {"✕"}
+                    <Icon name="close" size="sm" />
                   </Button>
                 </li>
               ))}
@@ -271,7 +272,7 @@ export function CinemaSection({ client }: { client: EditorClient }) {
                 color: color.warn.text,
               }}
             >
-              ⚠ {problem}
+              <Icon name="warning" size="sm" /> {problem}
             </div>
               ))}
             </div>

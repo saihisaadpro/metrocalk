@@ -10,7 +10,8 @@
 import { useEffect } from "react";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
-import { Button, TransportIcon } from "../theme/primitives";
+import { Icon } from "../theme/icons";
+import { Button } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type { PlayInfo } from "../store/play";
@@ -45,7 +46,7 @@ export function PlayControls({ client }: { client: EditorClient }) {
     <div id="playControls" style={{ display: "flex", alignItems: "center", gap: space.sm }}>
       {!playing ? (
         <Button id="play" data-testid="play" variant="primary" compact onClick={() => void act(() => client.play(), () => "playing")}>
-          <TransportIcon name="play" />
+          <Icon name="play" size="sm" />
           Play
         </Button>
       ) : (
@@ -57,12 +58,12 @@ export function PlayControls({ client }: { client: EditorClient }) {
             compact
             onClick={() => void act(() => client.pause(), (i) => (i.paused ? "paused" : "resumed"))}
           >
-            <TransportIcon name={paused ? "play" : "pause"} />
+            <Icon name={paused ? "play" : "pause"} size="sm" />
             {paused ? "Resume" : "Pause"}
           </Button>
           {/* Stop is ALWAYS reachable while playing (the escape hatch). */}
           <Button id="stop" data-testid="stop" variant="danger" compact onClick={() => void act(() => client.stop(), () => "stopped")}>
-            <TransportIcon name="stop" />
+            <Icon name="stop" size="sm" />
             Stop
           </Button>
           <span
@@ -87,7 +88,7 @@ export function PlayControls({ client }: { client: EditorClient }) {
             {/* `data-state` above is what a test asserts — `<test_and_ci_discipline>` 3. The badge used to
                 carry U+23F8 in its text and PlayControls.test.tsx matched the literal string, which coupled
                 a state assertion to a character the UI font stack does not contain. */}
-            {paused ? <TransportIcon name="pause" size={11} /> : <span aria-hidden>●</span>}
+            {paused ? <Icon name="pause" size={11} /> : <span aria-hidden className="mtk-live-dot" />}
             {paused ? "PAUSED" : "PLAYING"}
           </span>
         </>

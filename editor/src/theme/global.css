@@ -773,8 +773,25 @@ body > [role="dialog"][aria-modal="true"] {
   font-family: var(--mtk-font-ui); transition: background var(--mtk-motion-fast) var(--mtk-ease-standard), color var(--mtk-motion-fast) var(--mtk-ease-standard);
 }
 .mtk-group-head:hover { background: var(--mtk-bg-hover); color: var(--mtk-text); }
-.mtk-group-caret { display: inline-block; transition: transform var(--mtk-motion-fast) var(--mtk-ease-standard); color: var(--mtk-text-muted); }
+.mtk-group-caret { display: inline-flex; transition: transform var(--mtk-motion-fast) var(--mtk-ease-standard); color: var(--mtk-text-muted); }
 .mtk-group-caret.is-open { transform: rotate(90deg); }
+
+/* ── The live dot (ADR-137) ──────────────────────────────────────────────────────────────────────
+ *  "● PLAYING" and "● fires" were the CHARACTER U+25CF, sized by whichever font answered and coloured
+ *  by inheritance — so the badge's dot and the rule debugger's dot were two different sizes of the
+ *  same idea, and neither could be measured. A status dot is not an icon (there is no drawing in it),
+ *  so it is not in the icon set: it is a shape, and a shape is CSS. `currentColor` keeps it inheriting
+ *  the state colour it always did. */
+.mtk-live-dot {
+  display: inline-block;
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--mtk-radius-pill);
+  background: currentColor;
+  vertical-align: 0.05em;
+}
+.mtk-live-dot.is-idle { background: transparent; box-shadow: inset 0 0 0 1.5px currentColor; }
 
 /* ── Cards (asset/component cards — M14.2/ADR-058): one card surface with real hover/selected/unavailable
  *    states inline styles can't express. The metadata (type · source · capability) is laid out in JS. ── */
@@ -827,6 +844,182 @@ body > [role="dialog"][aria-modal="true"] {
 }
 .mtk-thumb.is-selected { border-color: var(--mtk-accent-border); box-shadow: 0 0 0 2px var(--mtk-accent-subtle), 0 0 0 3px var(--mtk-accent-border); }
 .mtk-thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+
+/* ── Chips: one object for a FILTER and for a TAG (theme/assets.tsx) ───────────────────────────────
+ *    A pressed filter and the tag it matched must look alike, or a filtered view stops explaining
+ *    itself. Tone carries a second, quieter signal and never the only one — every chip states its
+ *    word, and the capability chips pair theirs with a mark. */
+.mtk-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--mtk-space-2);
+  max-width: 100%;
+  padding: 2px var(--mtk-space-3);
+  border: 1px solid var(--mtk-border);
+  border-radius: var(--mtk-radius-sm);
+  background: var(--mtk-bg-inset);
+  color: var(--mtk-text-secondary);
+  font-family: var(--mtk-font-ui);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: nowrap;
+  /* A chip may be narrower than its word — the note chip is capped to the preview it sits on — so it
+   * clips at its own border and its text ellipsises. `min-width: 0` on the text is what makes that
+   * possible at all: a flex item defaults to `min-width: auto` and refuses to shrink below its content,
+   * which is why `Companions (acme)` was cut 10px by the preview instead of ending in an ellipsis. */
+  overflow: hidden;
+}
+.mtk-chip__text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mtk-chip--accent { background: var(--mtk-accent-subtle); border-color: var(--mtk-accent-border); color: var(--mtk-accent); }
+.mtk-chip--success { background: var(--mtk-success-bg); border-color: var(--mtk-success-border); color: var(--mtk-success); }
+.mtk-chip--warn { background: var(--mtk-warn-bg); border-color: var(--mtk-warn-border); color: var(--mtk-warn); }
+.mtk-chip--tag { cursor: default; background: var(--mtk-bg-raised); }
+.mtk-chip--filter {
+  cursor: pointer;
+  min-height: var(--mtk-control-compact);
+  padding-inline: var(--mtk-space-4);
+  transition:
+    background var(--mtk-motion-fast) var(--mtk-ease-standard),
+    border-color var(--mtk-motion-fast) var(--mtk-ease-standard),
+    color var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-chip--filter:hover { background: var(--mtk-bg-hover); border-color: var(--mtk-border-strong); color: var(--mtk-text); }
+.mtk-chip--filter.is-on {
+  background: var(--mtk-accent-subtle);
+  border-color: var(--mtk-accent-border);
+  color: var(--mtk-accent);
+  box-shadow: inset 0 0 0 1px var(--mtk-accent-border);
+}
+
+/* ── The shared asset grid and tile (theme/assets.tsx) ─────────────────────────────────────────────
+ *    Large previews on a responsive grid: the browser decides the COLUMN COUNT from a minimum tile
+ *    width, so the same grid gives a 300px dock two columns and a wide drawer five without any caller
+ *    measuring a width it cannot see. */
+.mtk-asset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: var(--mtk-space-4);
+  align-items: start;
+}
+.mtk-asset-tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mtk-space-2);
+  min-width: 0;
+  padding: var(--mtk-space-3);
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-xl);
+  background: var(--mtk-bg-raised);
+  box-shadow: var(--mtk-shadow-1);
+  transition:
+    border-color var(--mtk-motion-fast) var(--mtk-ease-standard),
+    box-shadow var(--mtk-motion-fast) var(--mtk-ease-standard),
+    background var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-asset-tile:hover { border-color: var(--mtk-border-strong); box-shadow: var(--mtk-shadow-2); }
+.mtk-asset-tile.is-selected { border-color: var(--mtk-accent-border); background: var(--mtk-accent-subtle); box-shadow: 0 0 0 1px var(--mtk-accent-border); }
+.mtk-asset-tile.is-unavailable { box-shadow: none; background: var(--mtk-bg-panel); }
+.mtk-asset-tile.is-unavailable:hover { border-color: var(--mtk-border-subtle); box-shadow: none; }
+.mtk-asset-tile__main {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--mtk-space-3);
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.mtk-asset-tile__main:disabled { cursor: not-allowed; color: var(--mtk-text-faint); }
+/* The preview WELL. `aspect-ratio` keeps every tile in a row the same height whatever its name does,
+ * which is what makes a grid read as a grid rather than as a ragged stack of cards. */
+.mtk-asset-tile__preview {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1 / 1;
+  width: 100%;
+  overflow: hidden;
+  border-radius: var(--mtk-radius-lg);
+  background: var(--mtk-bg-inset);
+  color: var(--mtk-text-secondary);
+  transition: background var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-asset-tile__main:hover .mtk-asset-tile__preview { background: var(--mtk-bg-active); }
+.mtk-asset-tile__preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+/* The price, pinned to the preview it belongs to. A label, not a control — see the tile's own note on
+ * why that is what makes overlapping the preview legitimate. */
+.mtk-asset-tile__badge { position: absolute; inset-block-start: var(--mtk-space-2); inset-inline-end: var(--mtk-space-2); }
+/* The capability (or the item's own collection) along the bottom of the preview, where there are 110px
+ * rather than the ~70px a footer beside a star can spare. `max-width` keeps it inside the well. */
+.mtk-asset-tile__note {
+  position: absolute;
+  inset-block-end: var(--mtk-space-2);
+  /* BOTH insets, not a `max-width` on a shrink-to-fit box: with left and right set the width is
+   * definite, so the chip inside has a percentage to resolve against and ellipsises instead of
+   * reaching past the well. `Companions (acme)` was cut 10px by the preview with the max-width form. */
+  inset-inline-start: var(--mtk-space-2);
+  inset-inline-end: var(--mtk-space-2);
+  display: flex;
+}
+/* Two lines, then an ellipsis, and a reserved height for both: an asset name is content, cutting it at
+ * one line renames half the catalog, and a tile that shrinks when its name is short makes every row in
+ * the grid a different height. `overflow-wrap: anywhere` keeps a long unbroken id from spilling sideways. */
+.mtk-asset-tile__label {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  min-height: 34px;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  font-family: var(--mtk-font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  color: var(--mtk-text);
+}
+.mtk-asset-tile__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--mtk-space-2);
+  min-width: 0;
+}
+.mtk-asset-tile__meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mtk-font-ui);
+  font-size: 11px;
+  color: var(--mtk-text-muted);
+}
+.mtk-asset-tile__fav {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--mtk-radius-sm);
+  background: none;
+  color: var(--mtk-text-faint);
+  cursor: pointer;
+  transition:
+    background var(--mtk-motion-fast) var(--mtk-ease-standard),
+    color var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-asset-tile__fav:hover { background: var(--mtk-bg-hover); color: var(--mtk-text-secondary); }
+.mtk-asset-tile__fav.is-on { color: var(--mtk-token); }
+
 
 /* ── Keyframes ── */
 @keyframes mtk-toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
@@ -1673,21 +1866,35 @@ body > [role="dialog"][aria-modal="true"] {
    media queries do not describe the width actually available to that editor. */
 /* -- The timeline surface -------------------------------------------------------------------------
    ONE framework, per the constitution's "every timeline in every subsystem should share the same
-   implementation". These are the parts that are the same wherever a timeline appears: a track-header
-   column that stays put while the lanes scroll, a ruler band above them, alternating lane fills that
-   let the eye follow a row across, and a playhead that is a line WITH A HANDLE rather than a 1px
-   hairline you cannot grab. Every value is a token; the geometry (`--mtk-track-header`) is declared
-   once here so the ruler and the lanes cannot disagree about where the column ends.
+   implementation" (section 8, and gate 4 of section 13). These are the parts that are the same
+   wherever a timeline appears: a track-header column that stays put while the lanes scroll, a ruler
+   band above them, alternating lane fills that let the eye follow a row across, a graticule under
+   BOTH so a key lines up with a number, and a playhead that is a line WITH A HANDLE rather than a
+   1px hairline you cannot grab. Every value is a token; the geometry (`--mtk-track-header`) is
+   declared once here so the ruler, the lanes and the scroll strip cannot disagree about where the
+   column ends.
 
-   Why the header column repeated the same width as a literal in three components before this: there
-   was nowhere shared to put it. */
+   The React half is `theme/timeline.tsx`. Before it, these classes were reachable only from four
+   private functions at the bottom of `AnimationWorkspace.tsx`, which is why `PhysicsPanel` -- the
+   engine's other scrubbable timeline -- had none of it. */
 .mtk-timeline {
   --mtk-track-header: 178px;
   --mtk-ruler-height: 32px;
   --mtk-lane-height: 30px;
   min-width: 0;
-  background: var(--mtk-bg-inset);
+  /* THE FLOOR, beside the two heights it is made of. The scroller was `min-height: 0` and in the
+     bottom dock at a 640px window that box is 9px holding 262px of timeline — neither its scrollbar
+     nor one row of itself. Stating it here rather than in TypeScript is the point: the panel used to
+     add 32 and 30 in a `const` while the stylesheet declared them, and nothing compared the two. */
+  min-height: calc(var(--mtk-ruler-height) + var(--mtk-lane-height));
+  background: var(--mtk-bg-canvas);
 }
+/* The scroll strip is exactly the header column plus the lanes. Stated as a `calc` over the same two
+   custom properties the rows lay themselves out with, because the alternative -- and what was here --
+   is the number 178 written once in the stylesheet and again in the panel's inline `width`, with
+   nothing comparing them. `--mtk-timeline-width` is set once, on the strip, and inherited by every
+   row inside it. */
+.mtk-timeline__strip { width: calc(var(--mtk-track-header) + var(--mtk-timeline-width, 0px)); }
 .mtk-timeline__row {
   display: grid;
   /* Both carry a fallback on purpose: a row rendered outside a `.mtk-timeline` would otherwise
@@ -1714,16 +1921,17 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-timeline__lane {
   position: relative;
   min-width: 0;
+  background: var(--mtk-bg-panel);
   border-bottom: 1px solid var(--mtk-border-subtle);
   cursor: crosshair;
 }
 /* Zebra fill rather than a rule per lane: at 30px a row of hairlines reads as a spreadsheet. */
-.mtk-timeline__lane--odd { background: color-mix(in srgb, var(--mtk-bg-panel) 55%, transparent); }
+.mtk-timeline__lane--odd { background: var(--mtk-bg-inset); }
 .mtk-timeline__lane:hover { background: var(--mtk-bg-hover); }
 /* A TRACK row is taller than an annotation lane and its header holds controls, not just a name. */
 .mtk-timeline__row--track { min-height: 48px; }
 /* TWO ROWS, NOT TWO COLUMNS. As a 2-column grid the mute/lock pair sat on the NAME's line and left
-   it 100px of a 178px column, so three sibling tracks all rendered as "Transform . ..." — the
+   it 100px of a 178px column, so three sibling tracks all rendered as "Transform . ..." -- the
    distinguishing word was the part being ellipsised. The name gets the full width; the badge, the
    key count and the controls share the metadata line under it. */
 .mtk-timeline__row--track > .mtk-timeline__head {
@@ -1734,6 +1942,31 @@ body > [role="dialog"][aria-modal="true"] {
   gap: var(--mtk-space-1);
   padding: var(--mtk-space-3) var(--mtk-space-4);
 }
+/* The name is a real `Button` now (the constitution ratchet counts a bare `<button>` as debt), so
+   the button chrome is what has to go: a track name is a target, not a control surface. */
+.mtk-btn.mtk-timeline__track-select {
+  justify-content: flex-start;
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  min-height: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  font-weight: inherit;
+  text-align: left;
+}
+.mtk-btn.mtk-timeline__track-select:hover:not(:disabled) { color: var(--mtk-accent); background: transparent; }
+.mtk-timeline__track-name {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .mtk-timeline__track-meta {
   display: flex;
   align-items: center;
@@ -1743,7 +1976,7 @@ body > [role="dialog"][aria-modal="true"] {
 /* The count is two words and never wraps; the BADGE is the thing that gives way, because its word
    is also printed in full in the key inspector while "2 keys" is stated nowhere else. */
 .mtk-timeline__track-meta > .mtk-badge { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.mtk-timeline__track-keys { flex: 0 0 auto; white-space: nowrap; }
+.mtk-timeline__track-keys { flex: 0 0 auto; color: var(--mtk-text-muted); font-size: 11px; white-space: nowrap; }
 .mtk-timeline__track-actions { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; margin-left: auto; }
 .mtk-timeline__row--track > .mtk-timeline__head.is-selected {
   color: var(--mtk-accent);
@@ -1753,7 +1986,7 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-timeline__row--track > .mtk-timeline__lane { border-bottom-width: 0; border-top: 1px solid var(--mtk-border-subtle); }
 .mtk-timeline__row--track.is-invalid > .mtk-timeline__lane { border-top-color: var(--mtk-danger-border); }
 /* A MUTED TRACK, WITHOUT DIMMING ITS WORDS. This was `opacity: 0.52` on the whole row, which is a
-   state channel that also takes every label inside it under AA — measured at 2.13-2.45:1 on four
+   state channel that also takes every label inside it under AA -- measured at 2.13-2.45:1 on four
    of them the first time a capture contained a muted track. The row says muted with its SURFACES;
    its text is at full contrast, and the mute button beside it carries the state and the sentence. */
 .mtk-timeline__row--track.is-muted > .mtk-timeline__head { background: var(--mtk-bg-inset); }
@@ -1762,12 +1995,13 @@ body > [role="dialog"][aria-modal="true"] {
   text-decoration: line-through;
   text-decoration-color: var(--mtk-border-strong);
 }
+/* The hatch was 6px on 6px, which at a dock width reads as a barber pole competing with the keys
+   drawn on top of it. Twice the pitch says the same thing at a glance and stops shouting. */
 .mtk-timeline__row--track.is-muted > .mtk-timeline__lane { background: repeating-linear-gradient(
   135deg,
-  var(--mtk-bg-inset) 0 6px,
-  var(--mtk-bg-active) 6px 12px
+  var(--mtk-bg-inset) 0 12px,
+  var(--mtk-bg-active) 12px 24px
 ); }
-/* The lane graticule, at the same ten divisions the ruler labels, so a key lines up with a number. */
 /* The empty timeline. A percentage width here resolves against the SCROLLER's visible box, not
    its scroll width, and `sticky` holds it in place while the lanes pan under it. */
 .mtk-timeline__empty {
@@ -1778,8 +2012,11 @@ body > [role="dialog"][aria-modal="true"] {
   padding: var(--mtk-space-6) var(--mtk-space-5);
 }
 
+/* The lane graticule, at the same ten divisions the ruler labels, so a key lines up with a number.
+   `--mtk-border-subtle` on a near-white lane is under 2% of luminance apart and was invisible in
+   every capture; the grid is what makes a lane readable, so it gets the real border token. */
 .mtk-timeline__lane--gridded {
-  background-image: linear-gradient(to right, var(--mtk-border-subtle) 1px, transparent 1px);
+  background-image: linear-gradient(to right, var(--mtk-border) 1px, transparent 1px);
   background-size: 10% 100%;
 }
 
@@ -1798,16 +2035,24 @@ body > [role="dialog"][aria-modal="true"] {
   cursor: crosshair;
   /* The minute ticks. A ruler with only ten numbers on it gives the eye nothing between them, which
      is why every reference timeline draws a graticule under its labels. */
-  background-image: linear-gradient(to right, var(--mtk-border-subtle) 1px, transparent 1px);
+  background-image: linear-gradient(to right, var(--mtk-border) 1px, transparent 1px);
   background-size: 10% 100%;
   background-position: 0 60%;
   background-repeat: repeat-x;
 }
+/* THE LABEL SITS ABOVE THE PLAYHEAD AND KNOCKS OUT THE RULE BEHIND ITS OWN GLYPHS. Without the
+   `z-index` the accent line (which has one) paints over every tick regardless of DOM order, and the
+   captured ruler had the playhead struck through the "1" of "1.20s" -- at the one moment the reader
+   most wants to know what time it is. The background is what an NLE ruler does: the number wins the
+   pixels it occupies, the line keeps the rest. */
 .mtk-timeline__tick {
   position: absolute;
   top: 6px;
+  z-index: 4;
   transform: translateX(-50%);
+  padding-inline: 3px;
   color: var(--mtk-text-muted);
+  background: var(--mtk-bg-raised);
   font-family: var(--mtk-font-mono);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -1816,9 +2061,14 @@ body > [role="dialog"][aria-modal="true"] {
 }
 /* The leftmost label has nothing to its left to be centred against, so it starts at the edge
    instead. It carries its own class because :first-child matched the PLAYHEAD, which is the lane's
-   first child — so the rule had never applied to a tick at all and the label hung half under the
-   sticky track-header column, reading as ")0s". */
+   first child -- so the rule had never applied to a tick at all and the label hung half under the
+   sticky track-header column, reading as ")0s".
+
+   The RIGHTMOST had the mirror defect and no rule at all: centred on `left: 100%`, half of it lands
+   outside the track and is clipped by the scroller. The whole rightmost label in the first populated
+   capture of this timeline was the two characters "2." */
 .mtk-timeline__tick--first { transform: none; }
+.mtk-timeline__tick--last { transform: translateX(-100%); }
 
 /* The playhead. A 1px line with a glow was invisible against the ruler and impossible to aim at; the
    handle is what makes it an object. `top: -1px` puts the cap over the ruler's own bottom rule. */
@@ -1844,6 +2094,153 @@ body > [role="dialog"][aria-modal="true"] {
   background: var(--mtk-accent-solid);
   box-shadow: var(--mtk-shadow-1);
 }
+
+/* A KEY. It is a `Button` so it inherits the focus ring, the disabled semantics and the target size
+   the design system already owns; what it does not want is the button's surface, because a key is a
+   mark on a lane, not a control sitting on one. 24px of hit area around a 12px diamond is the
+   target-size floor met without drawing a 24px object. */
+.mtk-btn.mtk-timeline__key {
+  position: absolute;
+  top: 50%;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  min-width: 0;
+  height: 24px;
+  min-height: 0;
+  padding: 0;
+  transform: translateY(-50%);
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+.mtk-btn.mtk-timeline__key:hover:not(:disabled) { background: transparent; }
+.mtk-timeline__key-mark {
+  width: 12px;
+  height: 12px;
+  transform: rotate(45deg);
+  border: 1px solid var(--mtk-border-strong);
+  background: var(--mtk-bg-raised);
+  transition: background var(--mtk-motion-fast) var(--mtk-ease-standard),
+    border-color var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-btn.mtk-timeline__key:hover .mtk-timeline__key-mark { border-color: var(--mtk-accent); }
+.mtk-timeline__key-mark.is-locked { background: var(--mtk-bg-inset); }
+.mtk-timeline__key-mark.is-invalid { border-color: var(--mtk-danger-border); }
+.mtk-timeline__key-mark.is-selected {
+  border-color: var(--mtk-accent);
+  background: var(--mtk-accent-solid);
+}
+
+/* A MARKER OR AN EVENT, anchored at a time. The mark's centre is the tick, which is why the offset
+   is half the MARK rather than half the whole chip -- the remove control trails it and must not drag
+   the thing it belongs to off the moment it annotates. One custom property, two readers, so the two
+   cannot drift; before this the offset was a hand-written `translateX(-8px)` against a 16px mark. */
+.mtk-timeline__chip {
+  --mtk-chip-mark: 22px;
+  position: absolute;
+  top: 50%;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  transform: translate(calc(var(--mtk-chip-mark) / -2), -50%);
+}
+.mtk-btn.mtk-timeline__chip-mark {
+  min-width: var(--mtk-chip-mark);
+  height: var(--mtk-chip-mark);
+  min-height: 0;
+  padding: 0 var(--mtk-space-2);
+  border-radius: var(--mtk-radius-sm);
+  font-size: 10px;
+}
+.mtk-btn.mtk-timeline__chip-mark--marker { padding: 0; background: transparent; border-color: transparent; }
+.mtk-btn.mtk-timeline__chip-mark--event {
+  color: var(--mtk-info);
+  background: var(--mtk-info-bg);
+  border-color: var(--mtk-info-border);
+}
+.mtk-btn.mtk-timeline__chip-remove {
+  width: 18px;
+  min-width: 0;
+  height: 18px;
+  min-height: 0;
+  padding: 0;
+  color: var(--mtk-text-muted);
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  opacity: 0;
+}
+/* The remove control appears on hover or focus and never decides how wide a chip is -- it keeps its
+   place in the layout, so a chip does not jump sideways at the moment you reach for it. */
+.mtk-timeline__chip:hover .mtk-btn.mtk-timeline__chip-remove,
+.mtk-btn.mtk-timeline__chip-remove:focus-visible { opacity: 1; }
+.mtk-btn.mtk-timeline__chip-remove:hover:not(:disabled) { color: var(--mtk-danger); background: var(--mtk-bg-active); }
+
+/* -- The transport --------------------------------------------------------------------------------
+   A `Toolbar` with one extra class: the wrap policy, the group gap and the attached-segment radius
+   are already solved there, and a transport that re-solved them would drift the first time one of
+   them changed. What this adds is the reference's floating pill -- a raised surface with a soft
+   elevation and a margin, rather than a full-bleed strip with a bottom rule welded to the row above. */
+.mtk-transport {
+  margin: var(--mtk-space-3) var(--mtk-space-4);
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-xl);
+  background: var(--mtk-bg-raised);
+  box-shadow: var(--mtk-shadow-1);
+}
+.mtk-transport__scrub { min-width: 0; }
+
+/* -- The curve canvas -----------------------------------------------------------------------------
+   What the shipped curve editor was: a blue polyline and some circles on an unruled white rectangle.
+   That is a picture of a shape, not a reading of a value -- with no grid there is no way to see that
+   two keys are level, and with no axis words there is no way to know which way is "more". The
+   references label both axes of their easing panel over a light grid; so does this. */
+.mtk-curve {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mtk-space-3);
+  min-height: 0;
+  padding: var(--mtk-space-4);
+  overflow: auto;
+  background: var(--mtk-bg-canvas);
+}
+.mtk-curve__caption {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--mtk-space-4);
+  font-size: 13px;
+}
+.mtk-curve__hint { color: var(--mtk-text-muted); font-size: 11px; text-align: right; }
+.mtk-curve__plot {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: var(--mtk-space-2);
+  min-height: 0;
+}
+.mtk-curve__axis {
+  color: var(--mtk-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+}
+.mtk-curve__axis--value { writing-mode: vertical-rl; rotate: 180deg; place-self: center; }
+.mtk-curve__axis--time { grid-column: 2; text-align: center; }
+.mtk-curve__svg {
+  grid-column: 2;
+  width: 100%;
+  min-width: 0;
+  min-height: 190px;
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-lg);
+  background: var(--mtk-bg-panel);
+}
+.mtk-curve__grid line { stroke: var(--mtk-border-subtle); stroke-width: 1; }
 
 .animation-workspace-root {
   container-name: animationWorkspace;
@@ -2428,6 +2825,20 @@ body > [role="dialog"][aria-modal="true"] {
      short because the dock used to carry a 1px top border that is now a shadow. The bar is the
      token; the strip's inset is what makes the strip fill it — see `--mtk-tabstrip-inset` in the
      `:root` block above. */
+
+  /* A HOVER-REVEALED CONTROL DOES NOT EXIST ON A TOUCH DEVICE. The marker/event remove control
+     appears on hover, which is right for a pointer and unreachable for a finger, so here it is
+     always shown. It also grows — but to 28px rather than the 44px floor above, which is a
+     deliberate exception and not an oversight: a 44px control beside a 22px mark on a 30px
+     annotation lane overflows the lane and starts colliding with the neighbouring chip, and the
+     lane cannot be 44px tall without the timeline losing a row of tracks on every screen. 28
+     clears the WCAG 2.2 AA 24×24 minimum, which is the accessibility requirement; 44 is this
+     codebase's comfort target for chrome, and a mark ON a lane is not chrome.
+
+     The keys themselves are 24px of hit area around a 12px diamond for the same reason and meet the
+     same 24×24 bar exactly — two keys one frame apart cannot both be 44px wide without overlapping,
+     and two controls on the same pixels is the defect `shots` R3 exists to catch. */
+  .mtk-btn.mtk-timeline__chip-remove { width: 28px; height: 28px; opacity: 1; }
 }
 
 @media (forced-colors: active) {

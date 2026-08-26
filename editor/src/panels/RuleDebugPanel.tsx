@@ -12,6 +12,7 @@ import { useEffect, useState } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { usePlaying } from "../store/play";
+import { Icon } from "../theme/icons";
 import { Button, Slider } from "../theme/primitives";
 import { color, font, fontSize, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
@@ -100,7 +101,7 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
         <strong>Rule debugger</strong>
         <Button id="fireEnemyDied" data-testid="fireEnemyDied" compact onClick={() => void fireKill()} title="fire an EnemyDied event into the running rules">
-          ⚔ Kill an enemy
+          <Icon name="sword" size="sm" /> Kill an enemy
         </Button>
       </div>
 
@@ -110,18 +111,18 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
         <div>
           <div style={{ opacity: 0.7, marginBottom: 4 }}>truth-state for {selectedName} — debug by looking, not Debug.Log</div>
 
-          {/* The machines' live current state: "✅ state = FacingBoss". */}
+          {/* The machines live current state: a tick beside "state = FacingBoss". */}
           {truth.machines.map((m) => (
             <div key={m.machine} id={`truthMachine-${m.machine}`} data-testid={`truthMachine-${m.machine}`} style={{ marginBottom: 4 }}>
-              <span style={{ color: color.success.text }}>✅</span> {m.display}
+              <span style={{ color: color.success.text }}><Icon name="check" size="sm" /></span> {m.display}
             </div>
           ))}
 
-          {/* Each rule with its per-condition ✅/❌ — the why made visible. */}
+          {/* Each rule with its per-condition tick or cross — the why made visible. */}
           {truth.rules.map((r) => (
             <div key={r.rule} id={`truthRule-${r.rule}`} data-testid={`truthRule-${r.rule}`} style={{ marginTop: 6 }}>
               <div style={{ fontWeight: 600 }}>
-                {r.fires ? <span style={{ color: color.success.text }}>● fires</span> : <span style={{ color: color.text.muted }}>○ idle</span>} {r.name}{" "}
+                {r.fires ? <span style={{ color: color.success.text }}><span className="mtk-live-dot" aria-hidden /> fires</span> : <span style={{ color: color.text.muted }}><span className="mtk-live-dot is-idle" aria-hidden /> idle</span>} {r.name}{" "}
                 <span style={{ opacity: 0.5 }}>(When {r.event})</span>
               </div>
               {r.conditions.map((c, i) => (
@@ -143,7 +144,7 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
       {flagged.length > 0 && (
         <div data-testid="ruleFlagged" style={{ marginTop: space.md, color: color.warn.text }}>
           {flagged.map((f) => (
-            <div key={f.rule}>⚠ {f.reason}</div>
+            <div key={f.rule}><Icon name="warning" size="sm" /> {f.reason}</div>
           ))}
         </div>
       )}
@@ -185,7 +186,7 @@ export function RuleDebugPanel({ client }: { client: EditorClient }) {
 function Condition({ cond, rule, idx }: { cond: ConditionTruth; rule: string; idx: number }) {
   return (
     <div id={`truthCond-${rule}-${idx}`} data-testid={`truthCond-${rule}-${idx}`} data-satisfied={cond.satisfied} style={{ marginLeft: 12 }}>
-      <span style={{ color: cond.satisfied ? color.success.text : color.danger.text }}>{cond.satisfied ? "✅" : "❌"}</span> {cond.display}
+      <span style={{ color: cond.satisfied ? color.success.text : color.danger.text }}><Icon name={cond.satisfied ? "check" : "close"} size="sm" /></span> {cond.display}
     </div>
   );
 }

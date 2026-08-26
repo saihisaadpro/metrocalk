@@ -5,6 +5,7 @@
 
 import { expect, test, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
+import { Icon } from "./icons";
 import {
   Badge,
   Button,
@@ -68,7 +69,7 @@ test("Button: defaults to non-submitting semantics and defers to richer selectio
 test("Button: compact + icon modifiers add their classes", () => {
   render(
     <Button compact icon data-testid="c">
-      ▣
+      <Icon name="scene" size="sm" />
     </Button>,
   );
   const el = screen.getByTestId("c");

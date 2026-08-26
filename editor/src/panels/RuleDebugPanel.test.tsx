@@ -57,7 +57,7 @@ test("the debugger is hidden when not playing (it is a Play-time surface)", () =
   expect(container.querySelector("#ruleDebug")).toBeNull();
 });
 
-test("click the sword → the live truth-state is VISIBLE: ✅ FacingBoss, ❌ KillCounter 3 of 4", async () => {
+test("click the sword → the live truth-state is VISIBLE: FacingBoss satisfied, KillCounter 3 of 4 not", async () => {
   playStore.getState().refresh({ playing: true, paused: false });
   projectionStore.getState().select("1_0");
   const ruleDebug = vi.fn(() => Promise.resolve(threeKills()));

@@ -13,6 +13,7 @@ import { useSelectedId, useFieldValue, projectionStore } from "../store/projecti
 import { setStatus } from "../store/ui";
 import { setBalance } from "../store/wallet";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button, Badge } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
@@ -79,7 +80,7 @@ export function AiEditPanel({ client }: { client: EditorClient }) {
     >
       <div style={{ display: "flex", alignItems: "center", gap: space.sm, marginBottom: space.sm }}>
         <span style={{ ...textMeta }}>AI suggestion</span>
-        <Badge tone="accent">✦ validated patch</Badge>
+        <Badge tone="accent"><Icon name="sparkle" size="sm" /> validated patch</Badge>
       </div>
       {!confirming ? (
         <>
@@ -91,7 +92,7 @@ export function AiEditPanel({ client }: { client: EditorClient }) {
             title="Use AI to restyle the selected object — an undoable, validated patch (about 2 tokens)"
             style={{ width: "100%", justifyContent: "flex-start", color: color.accent.base, borderColor: color.accent.border, background: color.accent.subtle }}
           >
-            ✦ Add weathered-metal look · ~{AI_EDIT_COST} tokens
+            <Icon name="sparkle" size="sm" /> Add weathered-metal look · ~{AI_EDIT_COST} tokens
           </Button>
           <div style={{ ...textMeta, marginTop: space.xs }}>Changes this object’s material to a weathered metal finish — applied as an undoable patch.</div>
         </>
@@ -107,7 +108,7 @@ export function AiEditPanel({ client }: { client: EditorClient }) {
           <div style={{ display: "flex", alignItems: "center", gap: space.sm, marginBottom: space.md, ...textMeta }}>
             <span>Material</span>
             <Badge tone="neutral">{before}</Badge>
-            <span aria-hidden>→</span>
+            <Icon name="arrow-right" size="sm" />
             <Badge tone="accent">weathered metal</Badge>
           </div>
           <div style={{ display: "flex", gap: space.sm, justifyContent: "flex-end" }}>

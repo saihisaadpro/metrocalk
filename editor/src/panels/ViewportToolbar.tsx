@@ -10,6 +10,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { setStatus } from "../store/ui";
+import { Icon } from "../theme/icons";
 import { MenuPopup, PopupMenuGroup, PopupMenuItem } from "../theme/workspace";
 import { color, elevation, font, fontSize, radius, space as sp, z } from "../theme/tokens";
 import type { EditorClient, ViewportRenderProfile } from "../transport/session";
@@ -325,7 +326,7 @@ export function ViewportToolbar({ client, showTransformTools = true }: ViewportT
                     padding: `0 ${sp.xs}px`,
                   }}
                 >
-                  ▣ {viewName}
+                  <Icon name="view" size="sm" /> {viewName}
                 </span>
               </div>
             </PopupMenuGroup>

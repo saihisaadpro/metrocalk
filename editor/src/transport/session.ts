@@ -1531,41 +1531,41 @@ export function buildWorld(n: number): EntityProjection[] {
 /** The dev-mock mirror of the shell's shape catalog (same kinds/params, so the Build panel renders
  *  identically under `npm run dev`/Vitest; the .exe serves the authoritative list from Rust). */
 const MOCK_SHAPE_SPECS: ShapeSpec[] = [
-  { kind: "box", label: "Box", blurb: "A rectangular block", icon: "▧", params: [
+  { kind: "box", label: "Box", blurb: "A rectangular block", params: [
     { key: "width", label: "Width", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
     { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
     { key: "depth", label: "Depth", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
   ] },
-  { kind: "sphere", label: "Sphere", blurb: "A ball", icon: "●", params: [
+  { kind: "sphere", label: "Sphere", blurb: "A ball", params: [
     { key: "radius", label: "Radius", min: 0.05, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
     { key: "segments", label: "Smoothness", min: 8, max: 96, step: 4, default: 32, integer: true, unit: "" },
   ] },
-  { kind: "cylinder", label: "Cylinder", blurb: "A round column", icon: "⬤", params: [
+  { kind: "cylinder", label: "Cylinder", blurb: "A round column", params: [
     { key: "radius", label: "Radius", min: 0.05, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
     { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
     { key: "segments", label: "Smoothness", min: 3, max: 96, step: 1, default: 32, integer: true, unit: "" },
   ] },
-  { kind: "cone", label: "Cone", blurb: "A point over a round base", icon: "▲", params: [
+  { kind: "cone", label: "Cone", blurb: "A point over a round base", params: [
     { key: "radius", label: "Radius", min: 0.05, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
     { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
     { key: "segments", label: "Smoothness", min: 3, max: 96, step: 1, default: 32, integer: true, unit: "" },
   ] },
-  { kind: "torus", label: "Ring", blurb: "A doughnut", icon: "◍", params: [
+  { kind: "torus", label: "Ring", blurb: "A doughnut", params: [
     { key: "radius", label: "Ring radius", min: 0.1, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
     { key: "thickness", label: "Thickness", min: 0.02, max: 10, step: 0.02, default: 0.18, integer: false, unit: "m" },
     { key: "segments", label: "Smoothness", min: 8, max: 96, step: 4, default: 40, integer: true, unit: "" },
   ] },
-  { kind: "capsule", label: "Capsule", blurb: "A pill — a cylinder with round ends", icon: "▢", params: [
+  { kind: "capsule", label: "Capsule", blurb: "A pill — a cylinder with round ends", params: [
     { key: "radius", label: "Radius", min: 0.05, max: 10, step: 0.05, default: 0.3, integer: false, unit: "m" },
     { key: "height", label: "Height", min: 0.2, max: 50, step: 0.1, default: 1.2, integer: false, unit: "m" },
     { key: "segments", label: "Smoothness", min: 8, max: 96, step: 4, default: 32, integer: true, unit: "" },
   ] },
-  { kind: "wedge", label: "Wedge", blurb: "A ramp", icon: "◣", params: [
+  { kind: "wedge", label: "Wedge", blurb: "A ramp", params: [
     { key: "width", label: "Width", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
     { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
     { key: "depth", label: "Depth", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
   ] },
-  { kind: "prism", label: "Prism", blurb: "A column with flat sides", icon: "⬢", params: [
+  { kind: "prism", label: "Prism", blurb: "A column with flat sides", params: [
     { key: "radius", label: "Radius", min: 0.05, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
     { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
     { key: "sides", label: "Sides", min: 3, max: 12, step: 1, default: 6, integer: true, unit: "" },
@@ -2691,10 +2691,10 @@ class MockClient implements EditorClient {
   private mockRoles = new Map<string, string>();
   roleCatalog(): Promise<RoleSpec[]> {
     return Promise.resolve([
-      { kind: "collectible", label: "Collectible", blurb: "Spins; vanishes and scores when something touches it", icon: "✦", adds: "spin animation · touch trigger · pickup rule · +1 on the Score counter" },
-      { kind: "solid", label: "Solid obstacle", blurb: "An immovable body other things collide with", icon: "▦", adds: "fixed physics body · auto-fit collider" },
-      { kind: "prop", label: "Physics prop", blurb: "Falls, rolls and collides under gravity", icon: "◍", adds: "dynamic physics body · auto-fit collider" },
-      { kind: "spinner", label: "Spinner", blurb: "Turns forever — ambient motion", icon: "↻", adds: "looping spin animation" },
+      { kind: "collectible", label: "Collectible", blurb: "Spins; vanishes and scores when something touches it", adds: "spin animation · touch trigger · pickup rule · +1 on the Score counter" },
+      { kind: "solid", label: "Solid obstacle", blurb: "An immovable body other things collide with", adds: "fixed physics body · auto-fit collider" },
+      { kind: "prop", label: "Physics prop", blurb: "Falls, rolls and collides under gravity", adds: "dynamic physics body · auto-fit collider" },
+      { kind: "spinner", label: "Spinner", blurb: "Turns forever — ambient motion", adds: "looping spin animation" },
     ]);
   }
   roleAssign(id: string, role: string): Promise<RoleReply> {
@@ -2974,13 +2974,82 @@ class MockClient implements EditorClient {
   thumbnail(_id: string, _size: number): Promise<string | null> {
     return Promise.resolve(null);
   }
+  /** The dev stand-in for `metrocalk_core::catalog::grouped` — and it MIRRORS THAT PAYLOAD'S SHAPE, which
+   *  the previous two-entry version did not.
+   *
+   *  It returned `{ Health: [...], UI: [...] }`: keys that are display words rather than the CANONICAL
+   *  BUCKETS the real command sends (`std:Props`), items whose `provides`/`requires` were empty arrays, and
+   *  no marketplace tier at all — so every capability chip, every price, every tier filter and the whole
+   *  buy-confirm path were invisible in the dev build and in `shots`, which is exactly the
+   *  `<verification_states_and_convergence>` (b) trap: green against the mock, unexercised against `/core`.
+   *  The entries below are the ones the real core actually publishes — `core/src/stdlib.rs`'s components
+   *  under their real categories, and all three of `core/src/marketplace.rs`'s `builtin_catalog` entries
+   *  with their real prices, their aliased categories and the `Health (acme)` / `Health (brandx)` caps that
+   *  make the two-authors-one-bucket taxonomy visible. */
   catalog(): Promise<Record<string, CatalogItem[]>> {
-    const item = (id: string, label: string, category: string, source: string): CatalogItem => ({
-      id, label, bucket: category, category, source, provides: [], requires: [],
+    const local = (id: string, bucket: string, provides: string[], requires: string[]): CatalogItem => ({
+      id,
+      label: id,
+      bucket,
+      // `local_item` display-formats the item's own category from its bucket, so a stdlib kind's category
+      // and its bucket are the same string in two forms. Stating it here the same way keeps the tile's tag
+      // correctly SILENT for locals (it only speaks when it differs from the heading).
+      category: bucket.replace(/^std:/, ""),
+      source: "local",
+      provides,
+      requires,
     });
     return Promise.resolve({
-      Health: [item("HealthBar", "HealthBar", "Health", "local")],
-      UI: [item("Button", "Button", "UI", "local")],
+      "std:Props": [
+        local("Camera", "std:Props", ["View"], ["Spatial"]),
+        local("Light", "std:Props", ["Lighting"], ["Spatial"]),
+        local("Mesh", "std:Props", ["Renderable"], ["Spatial"]),
+        local("Sprite", "std:Props", ["Renderable"], ["Spatial"]),
+        local("Transform", "std:Props", ["Spatial"], []),
+        {
+          id: "forge:rusty-sword",
+          label: "Rusty Medieval Sword",
+          bucket: "std:Props",
+          category: "Props",
+          source: "marketplace",
+          provides: ["Renderable"],
+          requires: ["Spatial"],
+          asset: "prop",
+          price: 4,
+        },
+      ],
+      "std:Characters": [
+        {
+          id: "acme:companion-drone",
+          label: "Companion Drone",
+          bucket: "std:Characters",
+          category: "Companions (acme)",
+          source: "marketplace",
+          provides: ["Health (acme)", "Renderable"],
+          requires: ["Spatial"],
+          asset: "prop",
+          price: 3,
+        },
+        {
+          id: "brandx:spirit-familiar",
+          label: "Spirit Familiar",
+          bucket: "std:Characters",
+          category: "Familiars (brandx)",
+          source: "marketplace",
+          provides: ["Health (brandx)", "Renderable"],
+          requires: ["Spatial"],
+          asset: "prop",
+          price: 2,
+        },
+      ],
+      "std:Gameplay": [
+        local("Collider", "std:Gameplay", ["Collision"], ["Spatial", "Physics"]),
+        local("Health", "std:Gameplay", ["Health"], []),
+        local("RigidBody", "std:Gameplay", ["Physics"], ["Spatial"]),
+      ],
+      "std:UI": [local("HealthBar", "std:UI", ["UIElement"], ["Health"])],
+      "std:Audio": [local("AudioSource", "std:Audio", ["Audio"], ["Spatial"])],
+      "std:Logic": [local("Behavior", "std:Logic", ["Behavior"], [])],
     });
   }
   catalogSearch(query: string): Promise<CatalogSearch> {

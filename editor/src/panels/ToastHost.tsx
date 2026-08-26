@@ -5,6 +5,7 @@
 
 import { useEffect, useState } from "react";
 import { toastStore, useToasts, TOAST_TTL_MS, type Toast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { color, elevation, font, fontSize, radius, space, z } from "../theme/tokens";
 
@@ -73,7 +74,7 @@ function ToastRow({ toast }: { toast: Toast }) {
         onClick={() => toastStore.getState().dismiss(toast.id)}
         style={{ flex: "none", color: tone.foreground, pointerEvents: "auto" }}
       >
-        <span aria-hidden="true">×</span>
+        <Icon name="close" size="sm" />
       </Button>
     </div>
   );

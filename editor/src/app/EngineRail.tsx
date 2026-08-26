@@ -21,6 +21,7 @@
 //! "what is selected?", and it must stay the same wherever you are.
 
 import type { CSSProperties } from "react";
+import { Icon } from "../theme/icons";
 import { color, font, fontSize, radius, space, text } from "../theme/tokens";
 
 /** Where an engine's workspace opens. Decided by the shape of its content, not by taste. */
@@ -61,25 +62,25 @@ export const ENGINE_GROUPS: EngineGroup[] = [
   {
     title: "World",
     engines: [
-      { id: "scene", label: "Scene", icon: "▤", blurb: "Everything in this world", surface: "side" },
-      { id: "build", label: "Build", icon: "＋", blurb: "Place and create objects", surface: "side" },
-      { id: "terrain", label: "Terrain", icon: "▲", blurb: "Landscape, water and vegetation", surface: "side" },
+      { id: "scene", label: "Scene", icon: "scene", blurb: "Everything in this world", surface: "side" },
+      { id: "build", label: "Build", icon: "build", blurb: "Place and create objects", surface: "side" },
+      { id: "terrain", label: "Terrain", icon: "terrain", blurb: "Landscape, water and vegetation", surface: "side" },
     ],
   },
   {
     title: "Assets",
     engines: [
-      { id: "model", label: "Model", icon: "⬡", blurb: "Repair, optimise and export meshes", surface: "bottom" },
-      { id: "import", label: "Import", icon: "↓", blurb: "CAD fidelity and re-import", surface: "bottom" },
-      { id: "animate", label: "Animate", icon: "◆", blurb: "Timelines, rigs and motion", surface: "bottom" },
+      { id: "model", label: "Model", icon: "model", blurb: "Repair, optimise and export meshes", surface: "bottom" },
+      { id: "import", label: "Import", icon: "import", blurb: "CAD fidelity and re-import", surface: "bottom" },
+      { id: "animate", label: "Animate", icon: "animate", blurb: "Timelines, rigs and motion", surface: "bottom" },
     ],
   },
   {
     title: "Behaviour",
     engines: [
-      { id: "physics", label: "Physics", icon: "◉", blurb: "Simulation, collision and mechanisms", surface: "side" },
-      { id: "logic", label: "Logic", icon: "◇", blurb: "Rules, states and bindings", surface: "bottom" },
-      { id: "gameplay", label: "Gameplay", icon: "⚑", blurb: "Author and run this scene as a match", surface: "side" },
+      { id: "physics", label: "Physics", icon: "physics", blurb: "Simulation, collision and mechanisms", surface: "side" },
+      { id: "logic", label: "Logic", icon: "logic", blurb: "Rules, states and bindings", surface: "bottom" },
+      { id: "gameplay", label: "Gameplay", icon: "gameplay", blurb: "Author and run this scene as a match", surface: "side" },
     ],
   },
 ];
@@ -226,9 +227,7 @@ export function EngineRail({ active, onChange, badges = {}, compact = false, cla
                     minHeight: 30,
                   }}
                 >
-                  <span aria-hidden style={{ fontSize: fontSize.label, lineHeight: 1, width: 16, textAlign: "center" }}>
-                    {engine.icon}
-                  </span>
+                  <Icon name={engine.icon} size="md" />
                   {!compact && <span style={{ flex: 1, whiteSpace: "nowrap" }}>{engine.label}</span>}
                   {badge != null && (
                     <span

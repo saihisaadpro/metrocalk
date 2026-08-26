@@ -2,6 +2,7 @@
 //! The dock is one click away, collapsible, keyboard-tabbed, and remains interactive in Play mode.
 
 import { lazy, useState } from "react";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { DockTabs, EmptyPanelState, MenuPopup, PopupMenuItem } from "../theme/workspace";
 import { space } from "../theme/tokens";
@@ -44,13 +45,13 @@ export function BottomDock({ client, active, open, form = "docked", playing, onC
   // one capability, two names, two places. Problems and Runtime sit after a divider because they are
   // diagnostics, not sub-engines — they are about the state of the world, not a thing you author.
   const tabs = [
-    { id: "asset", label: "Model", icon: "⬡", tooltip: "Repair, optimise and export meshes" },
-    { id: "import", label: "Import", icon: "↓", tooltip: "CAD fidelity and re-import" },
-    { id: "formats", label: "Formats", icon: "⇄", tooltip: "What this build can read and write" },
-    { id: "animation", label: "Animate", icon: "◆", tooltip: "Timelines, rigs and motion" },
-    { id: "logic", label: "Logic", icon: "◇", tooltip: "Rules, states and bindings" },
-    { id: "problems", label: "Problems", icon: "!", tooltip: "Selection diagnostics and actionable issues" },
-    { id: "runtime", label: "Runtime", icon: "▶", badge: playing ? "live" : undefined, tooltip: "Live rule and simulation diagnostics during Play" },
+    { id: "asset", label: "Model", icon: "model", tooltip: "Repair, optimise and export meshes" },
+    { id: "import", label: "Import", icon: "import", tooltip: "CAD fidelity and re-import" },
+    { id: "formats", label: "Formats", icon: "meld", tooltip: "What this build can read and write" },
+    { id: "animation", label: "Animate", icon: "animate", tooltip: "Timelines, rigs and motion" },
+    { id: "logic", label: "Logic", icon: "logic", tooltip: "Rules, states and bindings" },
+    { id: "problems", label: "Problems", icon: "problems", tooltip: "Selection diagnostics and actionable issues" },
+    { id: "runtime", label: "Runtime", icon: "runtime", badge: playing ? "live" : undefined, tooltip: "Live rule and simulation diagnostics during Play" },
   ] as const;
   const activeTab = tabs.find((tab) => tab.id === active) ?? tabs[0];
 
@@ -67,7 +68,7 @@ export function BottomDock({ client, active, open, form = "docked", playing, onC
     <section className={`mtk-bottom-dock${open ? " is-open" : ""}${form === "sheet" ? " is-sheet" : ""}${active === "asset" ? " is-asset" : ""}${active === "animation" ? " is-animation" : ""}`} data-testid="bottom-dock" data-dock-form={form} aria-label="Task and output workspaces">
       <div className="mtk-bottom-dock__bar">
         {open ? (
-          <DockTabs id="bottom-workspaces" ariaLabel="Task workspaces" tabs={tabs} activeId={active} onChange={select} />
+          <DockTabs id="bottom-workspaces" ariaLabel="Task workspaces" tabs={tabs.map((tab) => ({ ...tab, icon: <Icon name={tab.icon} size="md" /> }))} activeId={active} onChange={select} />
         ) : (
           <MenuPopup
             id="bottom-workspaces-picker"
@@ -75,10 +76,10 @@ export function BottomDock({ client, active, open, form = "docked", playing, onC
             placement="top-start"
             trigger={(
               <>
-                <span aria-hidden="true">{activeTab.icon}</span>
+                <Icon name={activeTab.icon} size="md" />
                 <span>{activeTab.label}</span>
                 {"badge" in activeTab && activeTab.badge != null && <span className="mtk-dock-tab__badge">{activeTab.badge}</span>}
-                <span aria-hidden="true">^</span>
+                <Icon name="chevron-up" size="sm" />
               </>
             )}
             triggerProps={{
@@ -94,7 +95,7 @@ export function BottomDock({ client, active, open, form = "docked", playing, onC
                 data-testid={`bottom-workspace-option-${tab.id}`}
                 label={tab.label}
                 description={tab.tooltip}
-                leading={tab.icon}
+                leading={<Icon name={tab.icon} size="md" />}
                 meta={tab.id === active ? "Current" : ("badge" in tab ? tab.badge : undefined)}
                 variant={tab.id === active ? "toggle" : "ghost"}
                 active={tab.id === active}
@@ -116,7 +117,7 @@ export function BottomDock({ client, active, open, form = "docked", playing, onC
           onClick={() => onOpenChange(!open)}
           title={open ? "Collapse" : "Expand"}
         >
-          <span aria-hidden="true">{open ? "⌄" : "⌃"}</span>
+          <Icon name={open ? "chevron-down" : "chevron-up"} size="md" />
         </Button>
       </div>
       <div hidden>
@@ -145,7 +146,7 @@ export function BottomDock({ client, active, open, form = "docked", playing, onC
           )}
           {active === "problems" && (
             <div id="bottom-workspaces-problems-panel" role="tabpanel" aria-labelledby="bottom-workspaces-problems-tab" className="mtk-bottom-workspace mtk-scroll">
-              {selected ? <LazyWorkspace label="Problems"><Diagnostics client={client} /></LazyWorkspace> : <EmptyPanelState compact icon="✓" title="No selection-specific problems" description="Select an object to inspect actionable diagnostics." />}
+              {selected ? <LazyWorkspace label="Problems"><Diagnostics client={client} /></LazyWorkspace> : <EmptyPanelState compact icon={<Icon name="check" size="xl" />} title="No selection-specific problems" description="Select an object to inspect actionable diagnostics." />}
             </div>
           )}
           {active === "import" && (
@@ -168,7 +169,7 @@ export function BottomDock({ client, active, open, form = "docked", playing, onC
           )}
           {active === "runtime" && (
             <div id="bottom-workspaces-runtime-panel" role="tabpanel" aria-labelledby="bottom-workspaces-runtime-tab" className="mtk-bottom-workspace mtk-scroll">
-              {playing ? <LazyWorkspace label="Runtime diagnostics"><RuleDebugPanel client={client} /></LazyWorkspace> : <EmptyPanelState compact icon="▶" title="Runtime tools become live in Play" description="Press Play to inspect rule decisions without disabling this workspace." />}
+              {playing ? <LazyWorkspace label="Runtime diagnostics"><RuleDebugPanel client={client} /></LazyWorkspace> : <EmptyPanelState compact icon={<Icon name="runtime" size="xl" />} title="Runtime tools become live in Play" description="Press Play to inspect rule decisions without disabling this workspace." />}
             </div>
           )}
         </div>

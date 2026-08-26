@@ -12,6 +12,7 @@ import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { pushToast } from "../store/toasts";
 import { StateGraph } from "../graph/StateGraph";
+import { Icon } from "../theme/icons";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
 import type {
@@ -624,7 +625,7 @@ export function StateGraphPanel({ client }: { client: EditorClient }) {
                       </option>
                     ))}
                   </select>
-                  <span>→</span>
+                  <Icon name="arrow-right" size="sm" />
                   <select
                     aria-label={`Transition ${i + 1} destination state`}
                     data-testid="sm-trans-to"

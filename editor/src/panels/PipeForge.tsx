@@ -2,6 +2,7 @@
 //! React controls the transaction-sized commands; native state remains authoritative across refresh and rebake.
 
 import { useEffect, useMemo, useState } from "react";
+import { Icon } from "../theme/icons";
 import { Badge, Button, NumericField } from "../theme/primitives";
 import { color, elevation, font, fontSize, radius, space, text, z } from "../theme/tokens";
 import type {
@@ -259,7 +260,7 @@ export function PipeForge({
     >
       <header style={headerStyle}>
         <div style={{ display: "flex", alignItems: "center", gap: space.sm }}>
-          <span aria-hidden style={{ color: color.accent.base, fontSize: fontSize.title }}>⤴</span>
+          <Icon name="pipe" size="lg" style={{ color: color.accent.base }} />
           <span style={text.panelTitle}>Pipe Forge</span>
         </div>
         <Badge tone={drawing ? "success" : "neutral"}>{editing ? "Editing" : drawing ? "Drawing" : "Ready"}</Badge>

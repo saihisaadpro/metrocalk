@@ -17,6 +17,7 @@ import {
   type ReactNode,
 } from "react";
 import { Popover, PopoverSurface, type Placement } from "./Popover";
+import { Icon } from "./icons";
 import { Button, type ButtonProps } from "./primitives";
 
 export interface DockTabItem {
@@ -287,7 +288,7 @@ export function DisclosureSection({
       disabled={disabled}
       onClick={toggle}
     >
-      <span className={`mtk-disclosure__caret${expanded ? " is-open" : ""}`} aria-hidden="true">›</span>
+      <span className={`mtk-disclosure__caret${expanded ? " is-open" : ""}`} aria-hidden="true"><Icon name="chevron-right" size="sm" /></span>
       {icon != null && <span className="mtk-disclosure__icon" aria-hidden="true">{icon}</span>}
       <span className="mtk-disclosure__heading">
         <span id={titleId} className="mtk-disclosure__title">{title}</span>

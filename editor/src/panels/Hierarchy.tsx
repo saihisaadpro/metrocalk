@@ -28,6 +28,7 @@ import { thumbnailStore } from "../store/thumbnails";
 import type { EditorClient } from "../transport/session";
 import type { EntitySummary } from "../transport/protocol";
 import { Thumbnail } from "../theme/Thumbnail";
+import { Icon } from "../theme/icons";
 import { Badge, Button } from "../theme/primitives";
 import { EmptyPanelState } from "../theme/workspace";
 import { color, font, fontSize, space } from "../theme/tokens";
@@ -183,7 +184,7 @@ const Row = memo(function Row({
       )}
       {!deactivated && rel && rel.bound > 0 && (
         <Badge tone="success" title={`${rel.bound} active binding${rel.bound > 1 ? "s" : ""}`}>
-          ⛓ {rel.bound}
+          <Icon name="link" size="sm" /> {rel.bound}
         </Badge>
       )}
       {deactivated && <span style={{ ...text_hidden }}>hidden</span>}
@@ -322,7 +323,7 @@ export function Hierarchy({
           compact
           title="No objects in this scene"
           description="Add an entity above, or open Build in the Engines rail to draw, import or browse assets."
-          icon="◇"
+          icon={<Icon name="requirer" size="xl" />}
           style={{ margin: space.md }}
         />
       ) : filteredOrder.length === 0 ? (
@@ -330,7 +331,7 @@ export function Hierarchy({
           compact
           title="No matching objects"
           description={`Nothing matches “${query.trim()}”. Try a name or object ID.`}
-          icon="⌕"
+          icon={<Icon name="search" size="xl" />}
           primaryAction={<Button compact variant="secondary" onClick={() => setQuery("")}>Clear search</Button>}
           style={{ margin: space.md }}
         />

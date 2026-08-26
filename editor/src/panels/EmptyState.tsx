@@ -3,6 +3,7 @@
 //! asset"), never a blank canvas and never the 5k perf fixture. The CTA focuses the describe field so the
 //! front door is one click away.
 
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { color, elevation, font, fontSize, lineHeight, radius, space } from "../theme/tokens";
 
@@ -48,11 +49,11 @@ export function EmptyState({ onBrowseAssets, onDrawPipe, onImport }: EmptyStateP
           boxShadow: elevation.e3,
         }}
       >
-        <div aria-hidden style={{ fontSize: 34, color: color.accent.base, lineHeight: 1, opacity: 0.55 }}>✦</div>
+        <Icon name="sparkle" size={34} style={{ color: color.accent.base, opacity: 0.55 }} />
         <div style={{ fontSize: fontSize.heading, color: color.text.primary, fontWeight: 650, letterSpacing: "-0.2px" }}>Start with something tangible</div>
         <div style={{ color: color.text.muted, lineHeight: lineHeight.body }}>Draw procedural geometry, choose a local asset, or import your own file. Every result remains editable and undoable.</div>
         <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: space.sm, pointerEvents: "auto", marginTop: space.xs }}>
-          <Button data-testid="emptyPipe" variant="primary" onClick={onDrawPipe}>⌁ Draw a pipe</Button>
+          <Button data-testid="emptyPipe" variant="primary" onClick={onDrawPipe}><Icon name="pipe" size="sm" /> Draw a pipe</Button>
           <Button data-testid="emptyAssets" variant="secondary" onClick={onBrowseAssets}>Browse assets</Button>
           <Button data-testid="emptyImport" variant="secondary" onClick={onImport}>Import file…</Button>
         </div>

@@ -11,6 +11,7 @@ import { useSelectedId } from "../store/projection";
 import { useReveal } from "../store/reveal";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button, Surface } from "../theme/primitives";
 import { color, fontSize, space } from "../theme/tokens";
 import { EmptyPanelState } from "../theme/workspace";
@@ -29,7 +30,7 @@ export function Reveal({ client }: { client: EditorClient }) {
     return (
       <EmptyPanelState
         compact
-        icon="⌘"
+        icon={<Icon name="relations" size="xl" />}
         title="Select an object to find compatible targets"
         description="Ranked matches and clear incompatibility reasons will appear here."
       />

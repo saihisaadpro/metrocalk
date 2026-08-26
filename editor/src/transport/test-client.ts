@@ -156,12 +156,12 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     pipeForgeUpsertCatalog: (entry) => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "Catalog saved", handles: [], edges: [], fittings: [], fittingCatalog: [entry], branchFrom: null, editingEntity: null }),
     pipeForgeRemoveCatalog: () => Promise.resolve({ active: true, points: 1, lengthM: 0, previewTriangles: 0, canBake: false, message: "Catalog removed", handles: [], edges: [], fittings: [], fittingCatalog: [], branchFrom: null, editingEntity: null }),
     shapeCatalog: vi.fn(() => Promise.resolve([
-      { kind: "box", label: "Box", blurb: "A rectangular block", icon: "▧", params: [
+      { kind: "box", label: "Box", blurb: "A rectangular block", params: [
         { key: "width", label: "Width", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
         { key: "height", label: "Height", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
         { key: "depth", label: "Depth", min: 0.05, max: 50, step: 0.1, default: 1, integer: false, unit: "m" },
       ] },
-      { kind: "sphere", label: "Sphere", blurb: "A ball", icon: "●", params: [
+      { kind: "sphere", label: "Sphere", blurb: "A ball", params: [
         { key: "radius", label: "Radius", min: 0.05, max: 25, step: 0.05, default: 0.5, integer: false, unit: "m" },
         { key: "segments", label: "Smoothness", min: 8, max: 96, step: 4, default: 32, integer: true, unit: "" },
       ] },
@@ -176,14 +176,14 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
       : { created: `combined-${op}`, handle: "mtkasset:test-combined", triangles: 960, ms: 4, message: `Union · 960 triangles`, reason: null })),
     shapeMeld: vi.fn(() => Promise.resolve({ created: "melded-1", handle: "mtkasset:test-meld", triangles: 1400, ms: 6, message: "Melded into one shape · 1400 triangles", reason: null })),
     roleCatalog: vi.fn(() => Promise.resolve([
-      { kind: "collectible", label: "Collectible", blurb: "Spins; vanishes and scores when something touches it", icon: "✦", adds: "spin animation · touch trigger · pickup rule · +1 on the Score counter" },
-      { kind: "solid", label: "Solid obstacle", blurb: "An immovable body other things collide with", icon: "▦", adds: "fixed physics body · auto-fit collider" },
-      { kind: "prop", label: "Physics prop", blurb: "Falls, rolls and collides under gravity", icon: "◍", adds: "dynamic physics body · auto-fit collider" },
-      { kind: "spinner", label: "Spinner", blurb: "Turns forever — ambient motion", icon: "↻", adds: "looping spin animation" },
-      { kind: "companion", label: "Companion", blurb: "Follows your props, patrols your waypoints, fights your enemies", icon: "♥", adds: "dynamic physics body · auto-fit collider · a live brain (follow / patrol / attack)" },
-      { kind: "enemy", label: "Enemy", blurb: "Companions attack it; it falls when struck", icon: "☠", adds: "dynamic physics body · auto-fit collider · the defeat rule · +1 Score when beaten" },
-      { kind: "waypoint", label: "Waypoint", blurb: "A patrol stop — companions with nothing to follow walk the chain in order", icon: "⚑", adds: "a numbered patrol marker (no physics)" },
-      { kind: "player", label: "Player", blurb: "YOU, during Play — drive it with the arrow keys or WASD; companions follow you first", icon: "🎮", adds: "dynamic physics body · auto-fit collider · live keyboard control while playing" },
+      { kind: "collectible", label: "Collectible", blurb: "Spins; vanishes and scores when something touches it", adds: "spin animation · touch trigger · pickup rule · +1 on the Score counter" },
+      { kind: "solid", label: "Solid obstacle", blurb: "An immovable body other things collide with", adds: "fixed physics body · auto-fit collider" },
+      { kind: "prop", label: "Physics prop", blurb: "Falls, rolls and collides under gravity", adds: "dynamic physics body · auto-fit collider" },
+      { kind: "spinner", label: "Spinner", blurb: "Turns forever — ambient motion", adds: "looping spin animation" },
+      { kind: "companion", label: "Companion", blurb: "Follows your props, patrols your waypoints, fights your enemies", adds: "dynamic physics body · auto-fit collider · a live brain (follow / patrol / attack)" },
+      { kind: "enemy", label: "Enemy", blurb: "Companions attack it; it falls when struck", adds: "dynamic physics body · auto-fit collider · the defeat rule · +1 Score when beaten" },
+      { kind: "waypoint", label: "Waypoint", blurb: "A patrol stop — companions with nothing to follow walk the chain in order", adds: "a numbered patrol marker (no physics)" },
+      { kind: "player", label: "Player", blurb: "YOU, during Play — drive it with the arrow keys or WASD; companions follow you first", adds: "dynamic physics body · auto-fit collider · live keyboard control while playing" },
     ])),
     roleAssign: vi.fn((id: string, role: string) => Promise.resolve({ applied: role, entity: id, added: ["spin animation"], scoreEntity: role === "collectible" ? "score-1" : null, message: `Now a ${role}`, reason: null })),
     roleClear: vi.fn((id: string) => Promise.resolve({ applied: null, entity: id, added: [], scoreEntity: null, message: "Role cleared — the object keeps its mesh and transform", reason: null })),
@@ -254,9 +254,9 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, reads: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
     cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], problems: [], message: "", reason: null })),
     conditionCatalog: vi.fn(() => Promise.resolve([
-      { kind: "score_at_least", label: "The Score is at least…", blurb: "gate this behind points the player has already earned", icon: "★", needs: "number", reads: "the Score is at least {n}" },
-      { kind: "still_active", label: "It hasn't been used yet", blurb: "this object has not been collected or beaten", icon: "◆", needs: "none", reads: "it hasn't been used yet" },
-      { kind: "other_gone", label: "Another object is gone", blurb: "that collectible has been collected, or that enemy beaten", icon: "✧", needs: "object", reads: "{name} is gone" },
+      { kind: "score_at_least", label: "The Score is at least…", blurb: "gate this behind points the player has already earned", needs: "number", reads: "the Score is at least {n}" },
+      { kind: "still_active", label: "It hasn't been used yet", blurb: "this object has not been collected or beaten", needs: "none", reads: "it hasn't been used yet" },
+      { kind: "other_gone", label: "Another object is gone", blurb: "that collectible has been collected, or that enemy beaten", needs: "object", reads: "{name} is gone" },
     ])),
     conditionAdd: vi.fn((id: string) => Promise.resolve({ applied: "score_at_least", entity: id, added: ["the Score is at least 3"], scoreEntity: null, message: "Only if the Score is at least 3", reason: null })),
     conditionRemove: vi.fn((id: string) => Promise.resolve({ applied: null, entity: id, added: [], scoreEntity: null, message: "Condition removed", reason: null })),

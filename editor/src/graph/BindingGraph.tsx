@@ -37,6 +37,7 @@ import {
   type GraphEdgeState,
   type GraphLegendItem,
 } from "../theme/graph";
+import { Icon } from "../theme/icons";
 import { SearchField } from "../theme/primitives";
 import { EmptyPanelState } from "../theme/workspace";
 
@@ -196,7 +197,7 @@ export function BindingGraph() {
     return (
       <EmptyPanelState
         compact
-        icon="◇"
+        icon={<Icon name="relations" size="xl" />}
         title="Select an object to see what it is wired to"
         description="Its binding neighbourhood — what powers it, what it feeds, and what has been refused — appears here."
       />
@@ -207,7 +208,7 @@ export function BindingGraph() {
     return (
       <EmptyPanelState
         compact
-        icon="◇"
+        icon={<Icon name="relations" size="xl" />}
         title="Nothing is wired to this yet"
         description="Bind it from the Relations panel and the connection will appear on this canvas."
       />

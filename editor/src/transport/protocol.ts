@@ -1770,7 +1770,6 @@ export interface ShapeSpec {
   kind: string;
   label: string;
   blurb: string;
-  icon: string;
   params: ShapeParamSpec[];
 }
 
@@ -1802,7 +1801,6 @@ export interface RoleSpec {
   kind: string;
   label: string;
   blurb: string;
-  icon: string;
   adds: string;
 }
 
@@ -1947,7 +1945,6 @@ export interface EffectSpec {
   kind: string;
   label: string;
   blurb: string;
-  icon: string;
   /** What it will look like, spelled out. */
   adds: string;
   /** True when the card is a one-shot (fires at a moment rather than running). */
@@ -1973,7 +1970,6 @@ export interface ShotSpec {
   kind: string;
   label: string;
   blurb: string;
-  icon: string;
   /** What the shot will look like, spelled out — the legible-cost line. */
   adds: string;
 }
@@ -1997,7 +1993,6 @@ export interface ConditionSpec {
   kind: string;
   label: string;
   blurb: string;
-  icon: string;
   /** What the user must supply: "none" | "number" | "object". */
   needs: string;
   /** The sentence fragment, with {n} / {name} blanks. */

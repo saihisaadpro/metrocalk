@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
+import { Icon } from "./icons";
 import { Button } from "./primitives";
 import {
   DisclosureSection,
@@ -216,7 +217,7 @@ test("EmptyPanelState provides actionable guidance and ShortcutBadge has a spoke
     <EmptyPanelState
       title="Nothing selected"
       description="Select an object in the viewport to inspect it."
-      icon="◇"
+      icon={<Icon name="requirer" size="xl" />}
       primaryAction={<Button>Select all</Button>}
       secondaryAction={<ShortcutBadge keys={["Ctrl", "A"]} />}
     />,

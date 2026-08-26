@@ -9,6 +9,7 @@ import { useEffect, useRef, useState } from "react";
 import { useBalance, setBalance } from "../store/wallet";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { MenuPopup, PopupMenuGroup, PopupMenuItem } from "../theme/workspace";
 import { color, font, fontSize, motion, space } from "../theme/tokens";
@@ -64,7 +65,7 @@ export function Wallet({ client, compact = false }: { client: EditorClient; comp
           placement="bottom-end"
           trigger={(
             <>
-              <span aria-hidden="true">⊞</span>
+              <Icon name="tokens" size="md" />
               <span id="walletBal" data-testid="balance" style={{ transition: `color ${motion.base}`, color: flash ? color.text.primary : color.token, fontWeight: 650 }}>
                 {balance ?? "…"}
               </span>
@@ -85,7 +86,7 @@ export function Wallet({ client, compact = false }: { client: EditorClient; comp
                 data-testid="topup"
                 label={`${balance ?? "…"} tokens available`}
                 description="Add 100 sandbox development tokens — no purchase"
-                leading="⊞"
+                leading={<Icon name="tokens" size="md" />}
                 onSelect={onTopUp}
                 onRequestClose={close}
               />
@@ -102,7 +103,7 @@ export function Wallet({ client, compact = false }: { client: EditorClient; comp
       data-testid="wallet"
       style={{ padding: `0 ${space.xs}px`, fontSize: fontSize.body, color: color.token, display: "flex", alignItems: "center", gap: space.sm, whiteSpace: "nowrap", minWidth: 0, font: font.mono }}
     >
-      <span aria-hidden style={{ opacity: 0.85 }}>⊞</span>
+      <Icon name="tokens" size="md" style={{ opacity: 0.85 }} />
       <span id="walletBal" data-testid="balance" style={{ transition: `color ${motion.base}`, color: flash ? color.text.primary : color.token, fontWeight: 600 }}>
         {balance ?? "…"}
       </span>

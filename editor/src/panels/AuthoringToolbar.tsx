@@ -6,6 +6,7 @@ import { useRef, useState } from "react";
 import { projectionStore, useMultiSelect, useSelectedId } from "../store/projection";
 import { setStatus, setClipboard, useClipboardHasContent } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { type ButtonVariant } from "../theme/primitives";
 import { color, space } from "../theme/tokens";
 import { MenuPopup, PopupMenuGroup, PopupMenuItem } from "../theme/workspace";
@@ -99,7 +100,7 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
         <MenuPopup
           id="authAddPopup"
           label="Add scene object"
-          trigger={<><span aria-hidden="true">＋</span> Add <span aria-hidden="true">⌄</span></>}
+          trigger={<><Icon name="plus" size="sm" /> Add <Icon name="chevron-down" size="sm" /></>}
           triggerProps={{
             id: "authAdd",
             "data-testid": "authAdd",
@@ -159,7 +160,7 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
         <MenuPopup
           id="authActionsPopup"
           label="Selection and clipboard actions"
-          trigger={<>Actions{hasSelection ? ` · ${ids.length}` : ""} <span aria-hidden="true">⌄</span></>}
+          trigger={<>Actions{hasSelection ? ` · ${ids.length}` : ""} <Icon name="chevron-down" size="sm" /></>}
           triggerProps={{
             id: "authMore",
             "data-testid": "authoring-more",

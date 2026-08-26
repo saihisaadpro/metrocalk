@@ -8,7 +8,9 @@
 import { useEffect, useState } from "react";
 import { useSelectedId } from "../store/projection";
 import { setStatus } from "../store/ui";
-import { Button, Slider } from "../theme/primitives";
+import { Icon } from "../theme/icons";
+import { Button, ReadOut, Slider } from "../theme/primitives";
+import { Transport, TransportButtons, TransportScrub } from "../theme/timeline";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import { DisclosureSection, ShortcutBadge } from "../theme/workspace";
 import type { ContactInfo, PhysicsWarning, TimelineTuple } from "../transport/protocol";
@@ -176,6 +178,11 @@ export function PhysicsPanel({ client }: { client: EditorClient }) {
   }
 
   const hasFrames = tl[1] > 0;
+  /** Why each step control is refusing, or `null` when it is not — computed once so the boolean the
+   *  button disables on and the sentence it explains itself with cannot disagree. */
+  const noRecording = "Run the simulation to record frames before scrubbing.";
+  const stepBack = !hasFrames ? noRecording : tl[0] <= 0 ? "Already at the first recorded frame." : null;
+  const stepForward = !hasFrames ? noRecording : tl[0] >= tl[1] ? "Already at the last recorded frame." : null;
   const importHasError = importResult.startsWith("import failed") || importResult.startsWith("paste ");
 
   return (
@@ -209,23 +216,81 @@ export function PhysicsPanel({ client }: { client: EditorClient }) {
                 "Drop test ball"
               )}
             </Button>
-            <Button
-              id="simToggle"
-              data-testid="simToggle"
-              type="button"
-              variant="primary"
-              onClick={() => void toggleSim()}
-              aria-label={running ? "Pause simulation" : "Resume simulation"}
-            >
-              {running ? "Pause simulation" : "Resume simulation"}
-            </Button>
           </div>
 
-          <div>
-            <label htmlFor="scrub" style={fieldLabel}>
-              Recorded timeline
-            </label>
-            <div style={{ ...actionRow, flexWrap: "nowrap" }}>
+          {/* THE ENGINE'S SECOND TIMELINE, ON THE SAME TRANSPORT AS ITS FIRST.
+              What was here: a `<label>`, a bare `Slider` stretched across a nowrap flex row, and a
+              mono `frame 12/300` pinned to its right — a transport assembled by hand in a subsystem
+              that had no idea `AnimationWorkspace` had already assembled one, because that one was
+              built from private components inside a 2,700-line panel. The two were different in
+              every way two rows can be: the readout was 12px `font.mono` here and a 15px semibold
+              `ReadOut` there, the scrub had no keyboard step here and four transport buttons there,
+              and only one of them had a play control anywhere near its scrubber.
+
+              `Transport` is now one object, so the constitution's "users should never need to
+              relearn the UI between engines" is true of the one control that appears in both. The
+              step buttons are new here and are not decoration: `simScrub` has always accepted any
+              frame, so single-frame stepping was a capability the surface simply never offered —
+              and a drag is the wrong gesture for "show me the frame after the impact".
+
+              The stable ids `#simToggle`, `#scrub` and `#frameLbl` are load-bearing for the `.exe`
+              acceptance page-object (`e2e/pages/scaffold.js`) and are unchanged. */}
+          <Transport data-testid="sim-transport" aria-label="Recorded simulation transport">
+            <ReadOut
+              id="frameLbl"
+              data-testid="frameLbl"
+              unit={`/ ${tl[1]} frames${tl[3] ? " · debug" : ""}`}
+              title="The recorded frame the viewport is showing"
+            >
+              {tl[0]}
+            </ReadOut>
+            <TransportButtons aria-label="Playback">
+              <Button
+                compact
+                icon
+                type="button"
+                data-testid="simStepBack"
+                aria-label="Step back one recorded frame"
+                /* NO UNCONDITIONAL `title`. `Button` resolves `title ?? (refusing && disabledReason)`,
+                   so a title that names the ACTION silently outranks the sentence explaining why the
+                   action is unavailable — and R9 caught exactly that here: two controls refusing with
+                   a tooltip that described what they would do if they were not refusing. */
+                title={stepBack ? undefined : "Step back one recorded frame"}
+                disabled={stepBack !== null}
+                disabledReason={stepBack ?? undefined}
+                onClick={() => void scrub(tl[0] - 1)}
+              >
+                <Icon name="prev" size="sm" />
+              </Button>
+              <Button
+                id="simToggle"
+                data-testid="simToggle"
+                type="button"
+                compact
+                icon
+                variant={running ? "toggle" : "primary"}
+                active={running}
+                onClick={() => void toggleSim()}
+                aria-label={running ? "Pause simulation" : "Resume simulation"}
+                title={running ? "Pause simulation" : "Resume simulation"}
+              >
+                <Icon name={running ? "pause" : "play"} size="sm" />
+              </Button>
+              <Button
+                compact
+                icon
+                type="button"
+                data-testid="simStepForward"
+                aria-label="Step forward one recorded frame"
+                title={stepForward ? undefined : "Step forward one recorded frame"}
+                disabled={stepForward !== null}
+                disabledReason={stepForward ?? undefined}
+                onClick={() => void scrub(tl[0] + 1)}
+              >
+                <Icon name="next" size="sm" />
+              </Button>
+            </TransportButtons>
+            <TransportScrub>
               <Slider
                 id="scrub"
                 data-testid="scrub"
@@ -233,22 +298,22 @@ export function PhysicsPanel({ client }: { client: EditorClient }) {
                 max={Math.max(1, tl[1])}
                 value={tl[0]}
                 disabled={!hasFrames}
+                aria-label="Recorded timeline"
                 aria-describedby="frameLbl scrub-help"
                 aria-valuetext={`Frame ${tl[0]} of ${tl[1]}`}
                 title={hasFrames ? "Scrubbing pauses the simulation." : "Run the simulation to record frames before scrubbing."}
                 onChange={(e) => void scrub(Number(e.target.value))}
-                style={{ flex: "1 1 auto", minWidth: 0 }}
+                style={{ width: "100%", minWidth: 0 }}
               />
-              <span id="frameLbl" data-testid="frameLbl" style={{ color: color.text.secondary, font: font.mono, fontSize: fontSize.meta, whiteSpace: "nowrap" }}>
-                frame {tl[0]}/{tl[1]}{tl[3] ? " · debug" : ""}
-              </span>
-            </div>
-            <p id="scrub-help" style={{ ...helperText, marginTop: space.xs }}>
-              {hasFrames
-                ? "Scrubbing pauses playback and restores the selected recorded frame."
-                : "Run the simulation to record frames before scrubbing."}
-            </p>
-          </div>
+            </TransportScrub>
+          </Transport>
+          {/* The pill carries its own inline margin (it floats), so its description has to take the
+              same one or it hangs 8px to the left of the control it describes. */}
+          <p id="scrub-help" style={{ ...helperText, marginInline: space.md }}>
+            {hasFrames
+              ? "Scrubbing pauses playback and restores the selected recorded frame."
+              : "Run the simulation to record frames before scrubbing."}
+          </p>
         </div>
       </DisclosureSection>
 

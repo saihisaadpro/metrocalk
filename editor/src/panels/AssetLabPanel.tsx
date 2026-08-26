@@ -3,6 +3,7 @@
 //! action callback can be wired to native commands without importing the editor session or protocol.
 
 import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { Icon } from "../theme/icons";
 import { Badge, Button, NumericField } from "../theme/primitives";
 import { DisclosureSection, DockTabs, EmptyPanelState, WorkspacePanel } from "../theme/workspace";
 import "./AssetLabPanel.css";
@@ -180,16 +181,16 @@ export interface AssetLabPanelProps {
  *  state. Stated once here rather than three times inline, and deliberately NOT imported from
  *  `EngineRail`: a panel reaching into the shell's engine table to read a glyph is a
  *  dependency the wrong way round. */
-const MODEL_ICON = "⬡";
+const MODEL_ICON = <Icon name="model" size="xl" />;
 
 const STAGES: readonly { id: AssetLabStage; label: string; icon: string; guidance: string }[] = [
-  { id: "inspect", label: "Inspect", icon: "I", guidance: "Measure geometry, topology, UVs, materials, and readiness before changing anything." },
-  { id: "repair", label: "Repair", icon: "R", guidance: "Create a cleaned derivative with every change counted and reviewable." },
-  { id: "optimize", label: "Optimize", icon: "O", guidance: "Build a deterministic real-time derivative and compare it with the source." },
-  { id: "uv", label: "UV & Materials", icon: "UV", guidance: "Create chart UVs, pack a measured atlas, control texel density, and generate MikkTSpace tangents." },
-  { id: "bake", label: "Bake", icon: "B", guidance: "Project normal, ambient-occlusion, and signed-curvature maps from one or more high-detail scene sources." },
-  { id: "validate", label: "Validate", icon: "V", guidance: "Re-run measurable production checks on the current derivative." },
-  { id: "export", label: "Export", icon: "E", guidance: "Write a validated derivative in a supported interchange format." },
+  { id: "inspect", label: "Inspect", icon: "inspect", guidance: "Measure geometry, topology, UVs, materials, and readiness before changing anything." },
+  { id: "repair", label: "Repair", icon: "repair", guidance: "Create a cleaned derivative with every change counted and reviewable." },
+  { id: "optimize", label: "Optimize", icon: "optimize", guidance: "Build a deterministic real-time derivative and compare it with the source." },
+  { id: "uv", label: "UV & Materials", icon: "uv", guidance: "Create chart UVs, pack a measured atlas, control texel density, and generate MikkTSpace tangents." },
+  { id: "bake", label: "Bake", icon: "bake", guidance: "Project normal, ambient-occlusion, and signed-curvature maps from one or more high-detail scene sources." },
+  { id: "validate", label: "Validate", icon: "validate", guidance: "Re-run measurable production checks on the current derivative." },
+  { id: "export", label: "Export", icon: "export", guidance: "Write a validated derivative in a supported interchange format." },
 ];
 
 const REPAIR_PRESETS: Record<RepairPreset, Pick<AssetRepairConfig, "weldThreshold" | "removeComponentsSmallerThanTriangles" | "normalRepair"> & { note: string }> = {
@@ -345,7 +346,7 @@ export function AssetLabPanel({
   const tabs = STAGES.map((item) => ({
     id: item.id,
     label: item.label,
-    icon: item.icon,
+    icon: <Icon name={item.icon} size="md" />,
     tooltip: item.guidance,
     badge:
       effectiveAvailability[item.id].state === "unsupported" ? (
@@ -545,7 +546,7 @@ function InspectStage({
   return (
     <>
       <div className="asset-lab__source-card">
-        <span className="asset-lab__source-icon" aria-hidden="true">S</span>
+        <span className="asset-lab__source-icon" aria-hidden="true"><Icon name="validate" size="sm" /></span>
         <span><strong>{asset.name}</strong><small>{asset.revision ?? asset.id}</small></span>
         <Badge>Source</Badge>
       </div>
@@ -965,7 +966,7 @@ function Guidance({ children, id }: { children: ReactNode; id?: string }) {
 }
 
 function SourceSafety() {
-  return <div className="asset-lab__source-safety"><span aria-hidden="true">S</span><span><strong>Source stays unchanged</strong><small>Review the derivative before using it in the scene.</small></span></div>;
+  return <div className="asset-lab__source-safety"><Icon name="validate" size="md" /><span><strong>Source stays unchanged</strong><small>Review the derivative before using it in the scene.</small></span></div>;
 }
 
 function PrimaryAction({ label, busyLabel, busy, disabled, reason, onClick, testId }: { label: string; busyLabel: string; busy: boolean; disabled: boolean; reason: string; onClick: () => void; testId: string }) {

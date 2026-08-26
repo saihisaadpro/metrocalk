@@ -4,6 +4,7 @@
 
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { DialogSurface, Modal } from "../theme/Popover";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { ShortcutBadge } from "../theme/workspace";
 import { color, fontSize, space, text } from "../theme/tokens";
@@ -228,7 +229,7 @@ export function CommandPalette({
             </div>
           </div>
           <Button type="button" variant="ghost" icon compact aria-label="Close command palette" title="Close (Escape)" onClick={onClose} disabled={runningId != null}>
-            <span aria-hidden="true">×</span>
+            <Icon name="close" size="sm" />
           </Button>
         </header>
 
@@ -340,7 +341,7 @@ export function CommandPalette({
             {failure ?? `${ranked.length} command${ranked.length === 1 ? "" : "s"}`}
           </span>
           <span className="mtk-command-palette__help" aria-hidden="true">
-            ↑↓ navigate · Enter run · Esc close
+            <Icon name="arrow-up" size="sm" /><Icon name="arrow-down" size="sm" /> navigate · Enter run · Esc close
           </span>
         </div>
       </DialogSurface>

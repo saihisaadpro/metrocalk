@@ -1,6 +1,7 @@
 //! Focus-mode banner. Focus is a live editor state, so it is announced politely and the visible banner is
 //! a native button: pointer, keyboard, and assistive-technology users all get the same clear exit action.
 
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { color, elevation, font, fontSize, radius, space, z } from "../theme/tokens";
 
@@ -44,7 +45,7 @@ export function FocusBanner({ id, dist, onClear }: { id: string; dist: number; o
           boxShadow: elevation.e4,
         }}
       >
-        <span aria-hidden="true">◎</span>
+        <Icon name="detail" size="md" />
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           Focused: {id}
         </span>

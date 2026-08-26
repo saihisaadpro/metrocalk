@@ -11,6 +11,7 @@ import { useSelectedId, useSummary } from "../store/projection";
 import { useReveal } from "../store/reveal";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button, Badge } from "../theme/primitives";
 import { color, font, fontSize, radius, space, text } from "../theme/tokens";
 import type { EditorClient } from "../transport/session";
@@ -45,7 +46,7 @@ export function Diagnostics({ client }: { client: EditorClient }) {
       <div id="diagnostics" data-testid="diagnostics" style={{ padding: space.lg }}>
         {title}
         <div style={{ ...meta, display: "flex", alignItems: "center", gap: space.sm }} data-testid="diag-clear">
-          <Badge tone="success">✓</Badge> No issues — this object is fully wired.
+          <Badge tone="success"><Icon name="check" size="sm" /></Badge> No issues — this object is fully wired.
         </div>
       </div>
     );
@@ -120,7 +121,7 @@ export function Diagnostics({ client }: { client: EditorClient }) {
       {greyed.length > 0 && (
         <div data-testid="diag-greyed">
           <button type="button" className="mtk-group-head" style={{ borderRadius: radius.md }} aria-expanded={showWhy} onClick={() => setShowWhy((s) => !s)}>
-            <span className={"mtk-group-caret" + (showWhy ? " is-open" : "")}>▸</span>
+            <span className={"mtk-group-caret" + (showWhy ? " is-open" : "")}><Icon name="chevron-right" size="sm" /></span>
             Why {greyed.length} other{greyed.length > 1 ? "s" : ""} can’t bind
           </button>
           {showWhy && (

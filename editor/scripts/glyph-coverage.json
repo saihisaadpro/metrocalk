@@ -1,18 +1,18 @@
 {
-  "$comment": "Every non-ASCII character the editor DRAWS WITH, and whether the declared UI font stack can render it. See scripts/check-glyph-coverage.mjs for why this is declared rather than measured, and decisions/131 for the capture that forced it.",
+  "$comment": "Every non-ASCII character the editor DRAWS WITH, and whether the declared UI font stack can render it. See scripts/check-glyph-coverage.mjs for why this is declared rather than measured, and decisions/131 for the capture that forced it. ADR-137 then removed the whole class: the editor no longer draws CONTROLS with characters at all — `theme/icons.tsx` does, on one grid at one stroke weight — so the sixty-nine characters that used to be icons are `forbidden` here, each naming the icon that replaced it. What is left `allowed` is typography: arrows and a minus sign inside prose, comparison operators inside rule text, and one box-drawing rule in an ASCII table.",
   "fontStack": "Inter, Segoe UI, system-ui, -apple-system, Helvetica Neue, Arial, sans-serif",
   "glyphs": {
     "U+2190": {
       "char": "←",
       "name": "LEFTWARDS ARROW",
       "status": "allowed",
-      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+      "reason": "Arrows — Unicode 1.1 (1993); universal coverage. TYPOGRAPHY, not a control: it survives only inside prose (a comment naming the ←/→ frame-step keys), exactly like U+2192. The arrow BUTTONS are `<Icon name=\"arrow-left\">`."
     },
     "U+2191": {
       "char": "↑",
       "name": "UPWARDS ARROW",
-      "status": "allowed",
-      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"arrow-up\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2192": {
       "char": "→",
@@ -23,38 +23,38 @@
     "U+2193": {
       "char": "↓",
       "name": "DOWNWARDS ARROW",
-      "status": "allowed",
-      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"arrow-down\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+21B3": {
       "char": "↳",
       "name": "DOWNWARDS ARROW WITH TIP RIGHTWARDS",
-      "status": "allowed",
-      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"requirer\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+21B6": {
       "char": "↶",
       "name": "ANTICLOCKWISE TOP SEMICIRCLE ARROW",
-      "status": "allowed",
-      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"undo\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+21B7": {
       "char": "↷",
       "name": "CLOCKWISE TOP SEMICIRCLE ARROW",
-      "status": "allowed",
-      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"redo\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+21BB": {
       "char": "↻",
       "name": "CLOCKWISE OPEN CIRCLE ARROW",
-      "status": "allowed",
-      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"spinner (→ rotate)\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+21C4": {
       "char": "⇄",
       "name": "RIGHTWARDS ARROW OVER LEFTWARDS ARROW",
-      "status": "allowed",
-      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"swap\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+21D2": {
       "char": "⇒",
@@ -65,8 +65,8 @@
     "U+21E9": {
       "char": "⇩",
       "name": "DOWNWARDS WHITE ARROW",
-      "status": "allowed",
-      "reason": "Arrows — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"import\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2212": {
       "char": "−",
@@ -95,68 +95,68 @@
     "U+2295": {
       "char": "⊕",
       "name": "CIRCLED PLUS",
-      "status": "allowed",
-      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"union\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2296": {
       "char": "⊖",
       "name": "CIRCLED MINUS",
-      "status": "allowed",
-      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"subtract\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2297": {
       "char": "⊗",
       "name": "CIRCLED TIMES",
-      "status": "allowed",
-      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"intersect\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+229E": {
       "char": "⊞",
       "name": "SQUARED PLUS",
-      "status": "allowed",
-      "reason": "Mathematical Operators — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"tokens\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2301": {
       "char": "⌁",
       "name": "ELECTRIC ARROW",
-      "status": "allowed",
-      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"pipe\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2303": {
       "char": "⌃",
       "name": "UP ARROWHEAD",
-      "status": "allowed",
-      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"chevron-up\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2304": {
       "char": "⌄",
       "name": "DOWN ARROWHEAD",
-      "status": "allowed",
-      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"chevron-down\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2311": {
       "char": "⌑",
       "name": "SQUARE LOZENGE",
-      "status": "allowed",
-      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"pin\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2315": {
       "char": "⌕",
       "name": "TELEPHONE RECORDER",
-      "status": "allowed",
-      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"search\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2317": {
       "char": "⌗",
       "name": "VIEWDATA SQUARE",
-      "status": "allowed",
-      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"grid\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2318": {
       "char": "⌘",
       "name": "PLACE OF INTEREST SIGN",
-      "status": "allowed",
-      "reason": "Miscellaneous Technical, the pre-6.0 keyboard/UI subset Segoe UI and Arial carry."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"relations\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2500": {
       "char": "─",
@@ -167,302 +167,302 @@
     "U+25A1": {
       "char": "□",
       "name": "WHITE SQUARE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"shape\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25A2": {
       "char": "▢",
       "name": "WHITE SQUARE WITH ROUNDED CORNERS",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"capsule\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25A3": {
       "char": "▣",
       "name": "WHITE SQUARE CONTAINING BLACK SMALL SQUARE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"view\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25A4": {
       "char": "▤",
       "name": "SQUARE WITH HORIZONTAL FILL",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"scene\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25A6": {
       "char": "▦",
       "name": "SQUARE WITH ORTHOGONAL CROSSHATCH FILL",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"solid (→ wall)\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25A7": {
       "char": "▧",
       "name": "SQUARE WITH UPPER LEFT TO LOWER RIGHT FILL",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"box\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25B1": {
       "char": "▱",
       "name": "WHITE PARALLELOGRAM",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"scene\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25B2": {
       "char": "▲",
       "name": "BLACK UP-POINTING TRIANGLE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"terrain / cone\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25B6": {
       "char": "▶",
       "name": "BLACK RIGHT-POINTING TRIANGLE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"play / runtime\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25B8": {
       "char": "▸",
       "name": "BLACK RIGHT-POINTING SMALL TRIANGLE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"chevron-right\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25C6": {
       "char": "◆",
       "name": "BLACK DIAMOND",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"animate / diamond\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25C7": {
       "char": "◇",
       "name": "WHITE DIAMOND",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"requirer / logic\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25C9": {
       "char": "◉",
       "name": "FISHEYE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"physics / camera\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25CB": {
       "char": "○",
       "name": "WHITE CIRCLE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"the CSS live dot (.mtk-live-dot)\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25CC": {
       "char": "◌",
       "name": "DOTTED CIRCLE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"aura\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25CD": {
       "char": "◍",
       "name": "CIRCLE WITH VERTICAL FILL",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"prop / torus\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25CE": {
       "char": "◎",
       "name": "BULLSEYE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"detail / tube\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25CF": {
       "char": "●",
       "name": "BLACK CIRCLE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"the CSS live dot (.mtk-live-dot)\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25E3": {
       "char": "◣",
       "name": "BLACK LOWER LEFT TRIANGLE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"wedge\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25ED": {
       "char": "◭",
       "name": "UP-POINTING TRIANGLE WITH LEFT HALF BLACK",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"terrain\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+25FB": {
       "char": "◻",
       "name": "WHITE MEDIUM SQUARE",
-      "status": "allowed",
-      "reason": "Geometric Shapes — Unicode 1.1 (1993); universal coverage."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"shape\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2605": {
       "char": "★",
       "name": "BLACK STAR",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"star\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2617": {
       "char": "☗",
       "name": "BLACK SHOGI PIECE",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"character\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2620": {
       "char": "☠",
       "name": "SKULL AND CROSSBONES",
-      "status": "emoji",
-      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"skull\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2630": {
       "char": "☰",
       "name": "TRIGRAM FOR HEAVEN",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"menu\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+263C": {
       "char": "☼",
       "name": "WHITE SUN WITH RAYS",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"light\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2665": {
       "char": "♥",
       "name": "BLACK HEART SUIT",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"heart\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+266A": {
       "char": "♪",
       "name": "EIGHTH NOTE",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"audio\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2691": {
       "char": "⚑",
       "name": "BLACK FLAG",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"gameplay / waypoint\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2694": {
       "char": "⚔",
       "name": "CROSSED SWORDS",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"sword\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2699": {
       "char": "⚙",
       "name": "GEAR",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"settings / properties\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+26A0": {
       "char": "⚠",
       "name": "WARNING SIGN",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"warning\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+26D3": {
       "char": "⛓",
       "name": "CHAINS",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"link\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+26D4": {
       "char": "⛔",
       "name": "NO ENTRY",
-      "status": "emoji",
-      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"blocked\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2705": {
       "char": "✅",
       "name": "WHITE HEAVY CHECK MARK",
-      "status": "emoji",
-      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"check\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2713": {
       "char": "✓",
       "name": "CHECK MARK",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"check\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2715": {
       "char": "✕",
       "name": "MULTIPLICATION X",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"close\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2726": {
       "char": "✦",
       "name": "BLACK FOUR POINTED STAR",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"sparkle\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2727": {
       "char": "✧",
       "name": "WHITE FOUR POINTED STAR",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"other_gone (→ sparkle)\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2728": {
       "char": "✨",
       "name": "SPARKLES",
-      "status": "emoji",
-      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"sparkle\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+274C": {
       "char": "❌",
       "name": "CROSS MARK",
-      "status": "emoji",
-      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"close\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+27F3": {
       "char": "⟳",
       "name": "CLOCKWISE GAPPED CIRCLE ARROW",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"rotate\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2934": {
       "char": "⤴",
       "name": "ARROW POINTING RIGHTWARDS THEN CURVING UPWARDS",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"pipe\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2B12": {
       "char": "⬒",
       "name": "SQUARE WITH TOP HALF BLACK",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"extrude\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2B21": {
       "char": "⬡",
       "name": "WHITE HEXAGON",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"model / marketplace\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2B22": {
       "char": "⬢",
       "name": "BLACK HEXAGON",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"prism\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+2B24": {
       "char": "⬤",
       "name": "BLACK LARGE CIRCLE",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"cylinder\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+FF0B": {
       "char": "＋",
       "name": "FULLWIDTH PLUS SIGN",
-      "status": "unverified",
-      "reason": "in the source, and no capture has been checked for it. Not known-broken; not known-good either. Confirm against a shot or replace with an inline SVG icon."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"plus / build\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+1F3AE": {
       "char": "🎮",
       "name": "VIDEO GAME",
-      "status": "emoji",
-      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"player\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+1F3C6": {
       "char": "🏆",
       "name": "TROPHY",
-      "status": "emoji",
-      "reason": "renders, but Windows resolves it from Segoe UI Emoji as a COLOUR pictograph, not a monochrome UI glyph. Tracked design-consistency debt, not a blank control."
+      "status": "forbidden",
+      "reason": "an ICON, not a character — drawn by `<Icon name=\"trophy\">` (theme/icons.tsx, ADR-137). Sizing, weight and colour are tokens there and are nobody's guess here."
     },
     "U+23EE": {
       "char": "⏮",

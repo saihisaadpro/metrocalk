@@ -10,6 +10,7 @@ import { projectionStore, useSelectedId, useSummary } from "../store/projection"
 import { usePlaying } from "../store/play";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { RoleReply, RoleSpec, RoleStatusInfo } from "../transport/protocol";
@@ -112,7 +113,7 @@ export function RolesSection({ client }: { client: EditorClient }) {
           }}
         >
           <span style={{ fontSize: fontSize.title, fontWeight: 700, color: color.accent.base }}>
-            ★ {status.score}
+            <Icon name="star" size="sm" /> {status.score}
           </span>
           <span style={metaText}>
             {/* "all collected!" is only true if there was ever anything to collect. A scene with no
@@ -140,11 +141,11 @@ export function RolesSection({ client }: { client: EditorClient }) {
             color: color.accent.base,
           }}
         >
-          🏆 You won! Every enemy beaten, every crystal collected · Stop to keep building
+          <Icon name="trophy" size="md" /> You won! Every enemy beaten, every crystal collected · Stop to keep building
         </div>
       )}
 
-      {playing && status.health && (
+      {playing && status.health != null && (
         <div
           data-testid="roles-health"
           style={{
@@ -157,11 +158,15 @@ export function RolesSection({ client }: { client: EditorClient }) {
             color: color.text.secondary,
           }}
         >
-          <span style={{ fontSize: fontSize.body }}>
-            {"♥".repeat(Math.max(0, status.health.hp))}
-            <span style={{ opacity: 0.25 }}>
-              {"♥".repeat(Math.max(0, status.health.maxHp - status.health.hp))}
-            </span>
+          {/* A row of hearts, drawn rather than typed — the same reason the rest of the editor stopped
+              using characters: U+2665 BLACK HEART SUIT escapes to Segoe UI Emoji on Windows and paints a red
+              pictograph into a monochrome read-out, and `String.repeat` on a glyph cannot be styled
+              per-heart anyway. Spent hearts are the same mark at low opacity, so the bar reads as
+              "three of five" and not as two unrelated symbols. */}
+          <span style={{ display: "inline-flex", gap: 2, alignItems: "center" }} aria-hidden>
+            {Array.from({ length: Math.max(0, status.health!.maxHp) }, (_, i) => (
+              <Icon key={i} name="heart" size="sm" style={{ opacity: i < status.health!.hp ? 1 : 0.25 }} />
+            ))}
           </span>
           <span>
             {status.health.name} · {status.health.hp}/{status.health.maxHp}
@@ -184,7 +189,7 @@ export function RolesSection({ client }: { client: EditorClient }) {
             color: color.warn.text,
           }}
         >
-          ⛔ {status.blocked.name || "Something"} didn&apos;t respond — {status.blocked.why}
+          <Icon name="blocked" size="sm" /> {status.blocked.name || "Something"} didn&apos;t respond — {status.blocked.why}
         </div>
       )}
 
@@ -192,7 +197,7 @@ export function RolesSection({ client }: { client: EditorClient }) {
         <div data-testid="companion-status" style={{ display: "grid", gap: 2, marginBottom: space.sm }}>
           {status.companions.map((c) => (
             <div key={c.entity} style={metaText}>
-              ♥ {c.name} — {c.doing || "waking up"}
+              <Icon name="heart" size="sm" /> {c.name} — {c.doing || "waking up"}
             </div>
           ))}
         </div>
@@ -222,7 +227,7 @@ export function RolesSection({ client }: { client: EditorClient }) {
                 }
                 onClick={() => selected && void run(() => client.roleAssign(selected, spec.kind), `Make it a ${spec.label}`)}
               >
-                {spec.icon} {spec.label}
+                <Icon name={spec.kind} size="md" fallback="shape" /> {spec.label}
               </Button>
             ))}
           </div>

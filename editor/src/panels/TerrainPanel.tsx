@@ -41,6 +41,7 @@ import {
   TextArea,
   TextField,
 } from "../theme/primitives";
+import { Icon } from "../theme/icons";
 import { color, font, fontSize, motion, radius, space, text as textRole } from "../theme/tokens";
 import type {
   TerrainIssue,
@@ -391,7 +392,7 @@ export function TerrainPanel({ client, statsIntervalMs = 1000, style }: TerrainP
                     transform: open[section.id] ? "rotate(90deg)" : "rotate(0deg)",
                   }}
                 >
-                  ▶
+                  <Icon name="chevron-right" size="sm" />
                 </span>
               </Button>
             </SectionHeader>
@@ -940,7 +941,7 @@ function ShapeSection({
               disabled={busy || i === 0}
               onClick={() => void edit({ op: "moveLayer", index: i, delta: -1 }, "Couldn’t reorder that layer")}
             >
-              ↑
+              <Icon name="arrow-up" size="sm" />
             </Button>
             <Button
               variant="ghost"
@@ -949,7 +950,7 @@ function ShapeSection({
               disabled={busy || i === recipe.layers.length - 1}
               onClick={() => void edit({ op: "moveLayer", index: i, delta: 1 }, "Couldn’t reorder that layer")}
             >
-              ↓
+              <Icon name="arrow-down" size="sm" />
             </Button>
             <Button
               variant="ghost"
@@ -959,7 +960,7 @@ function ShapeSection({
               disabled={busy}
               onClick={() => void edit({ op: "removeLayer", index: i }, "Couldn’t remove that layer")}
             >
-              ✕
+              <Icon name="close" size="sm" />
             </Button>
           </div>
         ))}

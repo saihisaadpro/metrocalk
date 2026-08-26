@@ -15,7 +15,8 @@ import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
 import { Modal, Popover } from "../theme/Popover";
-import { Button, TransportIcon } from "../theme/primitives";
+import { Icon } from "../theme/icons";
+import { Button } from "../theme/primitives";
 import { DockRail } from "../theme/workspace";
 import { color, elevation, font, fontSize, motion, radius, space, z } from "../theme/tokens";
 import { STAGE_MIN, type DockForm, dockForm, dockGridColumns, panelLayout } from "./layout";
@@ -54,13 +55,13 @@ const ContextMenu = lazy(() => import("../panels/ContextMenu").then((module) => 
 // here — they live on the Engines rail, which is always visible, and listing them twice in different
 // orders is exactly the confusion this layout removes.
 const LEFT_RAIL_ITEMS = [
-  { id: "scene", label: "Scene", icon: "▱" },
-  { id: "build", label: "Build", icon: "+" },
-  { id: "terrain", label: "Terrain", icon: "◭" },
+  { id: "scene", label: "Scene", icon: <Icon name="scene" size="lg" /> },
+  { id: "build", label: "Build", icon: <Icon name="build" size="lg" /> },
+  { id: "terrain", label: "Terrain", icon: <Icon name="terrain" size="lg" /> },
 ] as const;
 const RIGHT_RAIL_ITEMS = [
-  { id: "properties", label: "Properties", icon: "⚙" },
-  { id: "relations", label: "Relations", icon: "⌘" },
+  { id: "properties", label: "Properties", icon: <Icon name="properties" size="lg" /> },
+  { id: "relations", label: "Relations", icon: <Icon name="relations" size="lg" /> },
 ] as const;
 
 /** Build the editor session once: the REAL Tauri shell transport inside the packaged `.exe` (the live
@@ -127,12 +128,12 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
       }}
     >
       <span data-state={paused ? "paused" : "playing"} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-        {paused ? <TransportIcon name="pause" size={12} /> : <span aria-hidden>●</span>}
+        {paused ? <Icon name="pause" size={12} /> : <span aria-hidden className="mtk-live-dot" />}
         {paused ? "PAUSED" : "PLAYING"}
       </span>
       <span style={{ color: color.text.muted }}>— Esc or</span>
       <Button data-testid="stageStop" variant="danger" compact onClick={onStop}>
-        <TransportIcon name="stop" />
+        <Icon name="stop" size="sm" />
         Stop
       </Button>
     </div>
@@ -691,7 +692,7 @@ export function App() {
             `tokens.ts` is the one ordering of this shell's layers, and a literal in the stylesheet
             would be a second one that drifts. The sheet is the bottom dock's drawer, so it takes the
             drawer's layer — BELOW `z.badge`, deliberately: a sheet that covers the stage in Play mode
-            must not also cover the "● PLAYING" badge, which `<ux_quality>` 5 requires to be
+            must not also cover the live PLAYING badge, which `<ux_quality>` 5 requires to be
             unmistakable on the stage itself. */}
         <div
           ref={stageColumn}

@@ -8,6 +8,7 @@
 import { FileMenu } from "../panels/FileMenu";
 import { PlayControls } from "../panels/PlayControls";
 import { Wallet } from "../panels/Wallet";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { ShortcutBadge } from "../theme/workspace";
 import { color, font, fontSize, space } from "../theme/tokens";
@@ -51,19 +52,19 @@ export function EditorHeader({
         <FileMenu client={client} />
         {compact && onOpenLeftDock && (
           <Button data-testid="header-scene" variant="ghost" compact icon aria-label="Open Scene and Assets" onClick={onOpenLeftDock} title="Open Scene and Assets">
-            <span aria-hidden="true">☰</span>
+            <Icon name="menu" size="md" />
           </Button>
         )}
         {compact && onOpenRightDock && (
           <Button data-testid="header-inspector" variant="ghost" compact icon aria-label="Open Inspector" onClick={onOpenRightDock} title="Open Inspector">
-            <span aria-hidden="true">⚙</span>
+            <Icon name="properties" size="md" />
           </Button>
         )}
         <Button data-testid="header-undo" variant="ghost" compact icon aria-label="Undo" onClick={() => void undo()} title="Undo the last scene change (Ctrl/Cmd+Z)">
-          <span aria-hidden="true">↶</span>
+          <Icon name="undo" size="md" />
         </Button>
         <Button data-testid="header-redo" variant="ghost" compact icon aria-label="Redo" onClick={() => void redo()} title="Redo the last undone scene change (Ctrl/Cmd+Shift+Z)">
-          <span aria-hidden="true">↷</span>
+          <Icon name="redo" size="md" />
         </Button>
         {compact && (
           <Button
@@ -76,7 +77,7 @@ export function EditorHeader({
             aria-label="Search editor commands"
             title="Search every editor command (Ctrl/Cmd+K)"
           >
-            <span aria-hidden="true">⌕</span><span className="mtk-header-label"> Commands</span>
+            <Icon name="search" size="md" /><span className="mtk-header-label">Commands</span>
           </Button>
         )}
       </div>
@@ -96,7 +97,7 @@ export function EditorHeader({
             title="Search every editor command"
             style={{ gap: space.sm }}
           >
-            <span aria-hidden="true">⌕</span>
+            <Icon name="search" size="md" />
             <span className="mtk-command-trigger__label">Commands</span>
             <ShortcutBadge keys={["Ctrl", "K"]} ariaLabel="Control plus K" />
           </Button>

@@ -14,6 +14,7 @@ import { useSelectedId, useSummary } from "../store/projection";
 import { usePlaying } from "../store/play";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button, SelectField } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { EffectSpec, VfxProbe, VfxReply } from "../transport/protocol";
@@ -229,7 +230,7 @@ export function VfxSection({ client }: { client: EditorClient }) {
                   void run(() => client.vfxAdd(selected, spec.kind, trigger), `Add ${spec.label}`)
                 }
               >
-                {spec.icon} {spec.label}
+                <Icon name={spec.kind} size="md" fallback="sparkle" /> {spec.label}
               </Button>
             ))}
           </div>
@@ -268,7 +269,7 @@ export function VfxSection({ client }: { client: EditorClient }) {
                       selected && void run(() => client.vfxRemove(selected, i), "Remove effect")
                     }
                   >
-                    {"✕"}
+                    <Icon name="close" size="sm" />
                   </Button>
                 </li>
               ))}
@@ -292,7 +293,7 @@ export function VfxSection({ client }: { client: EditorClient }) {
                 color: color.warn.text,
               }}
             >
-              {"⚠"} {problem}
+              <Icon name="warning" size="sm" /> {problem}
             </div>
               ))}
             </div>

@@ -15,6 +15,7 @@ import type {
   SelectHTMLAttributes,
   TextareaHTMLAttributes,
 } from "react";
+import { Icon } from "./icons";
 import { color, radius, space, font, fontSize, text } from "./tokens";
 
 /** A data-* / id passthrough the card/icon primitives accept for the stable e2e/Vitest hooks. */
@@ -527,109 +528,49 @@ export function Badge({ children, tone = "neutral", style, title }: { children: 
   );
 }
 
-/** THE FIVE TRANSPORT ICONS, AS GEOMETRY RATHER THAN TEXT — and the reason is a capture, not a theory.
+/** THE FIVE TRANSPORT ICONS AND THE INLINE RESET NOW LIVE IN [`theme/icons.tsx`] — WITH THE OTHER NINETY.
  *
- *  The transport used the Unicode media-control characters: U+23EE ⏮, U+23ED ⏭, U+23F8 ⏸, U+23F9 ⏹ and
- *  U+25B6 ▶. `animation-timeline-tracks.png` shows FOUR buttons of which THREE are empty boxes, and the
- *  one that renders is ▶ — which is the whole diagnosis. `--mtk-font-ui` is
- *  `Inter · Segoe UI · system-ui · -apple-system · Helvetica Neue · Arial · sans-serif`; ▶ lives in
- *  Geometric Shapes (Unicode 1.1, 1993) and every one of those fonts has it. The other four are
- *  Miscellaneous Technical media controls added in Unicode 6.0 (2010) and NOT ONE font in that stack
- *  carries them. So the browser leaves the declared stack entirely: on this Linux capture host it finds
- *  nothing and draws .notdef; on Windows it lands on Segoe UI Emoji and draws a COLOUR pictograph in a
- *  monochrome toolbar. Both are wrong, and the second is worse because it looks deliberate.
+ *  They were drawn here first, and for a good reason: the transport used the Unicode media-control
+ *  characters, `animation-timeline-tracks.png` photographed four buttons of which three were empty
+ *  boxes, and inline SVG has no font dependency at all. What that fix could not do from inside this
+ *  file was generalise — so `▤` stayed on the Scene tab, `⬡` on Model, `⌕` in the search field, and
+ *  thirty-five colour emoji kept arriving from the Rust catalogs, none of which is a coverage bug and
+ *  every one of which is the same design bug. `Icon` is the general answer: one named vocabulary, one
+ *  grid, one stroke weight, one size token. `TransportIcon`/`RevertIcon` are `<Icon name="play" />`
+ *  and `<Icon name="revert" />` now; keeping two icon components would have been the very duplication
+ *  the set exists to end.
+ */
+
+/** The semantic kind of an entity/asset → a deterministic hue. The MARK comes from the one icon set
+ *  under the same name (`mesh`, `light`, `camera`, …), which is why this table no longer carries a
+ *  character: a `kind` and an icon name are the same vocabulary, and stating it twice is how `◆` ended
+ *  up meaning both `mesh` and `local` while `◇` meant `requirer` here and `logic` on the rail.
  *
- *  Every functional test stayed green throughout, because each button carries an `aria-label` and a
- *  `data-testid` and a control with no visible glyph still clicks. This is `<visual_acceptance>` in one
- *  picture: state-only gates cannot see an empty button.
- *
- *  Inline SVG has no font dependency at all, inherits `currentColor` so the toggle/active variants keep
- *  working, and scales with the button rather than the text metrics. `aria-hidden` because the button
- *  above it already carries the label — the icon must not be announced twice. */
-const TRANSPORT_PATHS = {
-  prev: "M5 4h2.2v12H5zM16 4v12L8.4 10z",
-  next: "M12.8 4H15v12h-2.2zM4 4v12l7.6-6z",
-  play: "M5.5 4l10.5 6-10.5 6z",
-  pause: "M6 4h2.6v12H6zM11.4 4H14v12h-2.6z",
-  stop: "M5 5h10v10H5z",
-} as const;
-
-/** The inspector row's inline reset (ADR-136) — a counter-clockwise arrow back to a declared default.
- *
- *  INLINE SVG FOR THE ADR-131 REASON, WHICH IS NOT A STYLE PREFERENCE. The obvious character here is
- *  `↺` U+21BA, an Arrows-block glyph added in Unicode 1.1 and carried by almost none of the UI faces
- *  this app declares — so on the Linux capture host it draws `.notdef` and on Windows it escapes to
- *  Segoe UI Emoji and draws a colour pictograph in a monochrome row. Both are wrong and every
- *  functional test stays green through either, because a button with an undrawable glyph still clicks.
- *  `check-glyph-coverage.mjs` would have caught it; not adding the character at all is better. */
-export function RevertIcon({ size = 13 }: { size?: number }) {
-  return (
-    <svg
-      data-icon="revert"
-      aria-hidden
-      focusable="false"
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      style={{ display: "block", flex: "none" }}
-    >
-      <path d="M4.6 10a5.4 5.4 0 1 0 1.7-3.9" />
-      <path d="M3.2 4.4v3.4h3.4" />
-    </svg>
-  );
-}
-
-export type TransportIconName = keyof typeof TRANSPORT_PATHS;
-
-/** One transport control's glyph. `name` is the stable signal — a test keys on `data-icon`, never on a
- *  character that a font may or may not have. */
-export function TransportIcon({ name, size = 14 }: { name: TransportIconName; size?: number }) {
-  return (
-    <svg
-      data-icon={name}
-      aria-hidden
-      focusable="false"
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="currentColor"
-      style={{ display: "block", flex: "none" }}
-    >
-      <path d={TRANSPORT_PATHS[name]} />
-    </svg>
-  );
-}
-
-/** The semantic kind of an entity/asset → a glyph + a deterministic dark-theme hue. Keys off a stable
- *  `kind` string the caller derives from the **real** projection (the relational summary / salient
- *  component) or a catalog item's source/category — never a styled string a test would couple to. */
-const ICON_KINDS: Record<string, { glyph: string; hue: number }> = {
-  mesh: { glyph: "◆", hue: 210 },
-  group: { glyph: "▣", hue: 220 },
-  light: { glyph: "☼", hue: 45 },
-  camera: { glyph: "◉", hue: 190 },
-  requirer: { glyph: "◇", hue: 150 }, // hollow = a needed binding not yet filled
-  character: { glyph: "☗", hue: 15 },
-  physics: { glyph: "◍", hue: 270 },
-  rule: { glyph: "λ", hue: 30 },
-  audio: { glyph: "♪", hue: 330 },
-  marketplace: { glyph: "⬡", hue: 265 },
-  generated: { glyph: "✦", hue: 285 },
-  imported: { glyph: "▤", hue: 175 },
-  local: { glyph: "◆", hue: 210 },
-  default: { glyph: "◻", hue: 215 },
+ *  Keys off a stable `kind` string the caller derives from the **real** projection (the relational
+ *  summary / salient component) or a catalog item's source/category — never a styled string a test
+ *  would couple to. */
+const ICON_KIND_HUES: Record<string, number> = {
+  mesh: 210,
+  group: 220,
+  light: 45,
+  camera: 190,
+  requirer: 150, // the dashed outline = a needed binding not yet filled
+  character: 15,
+  physics: 270,
+  rule: 30,
+  audio: 330,
+  marketplace: 265,
+  generated: 285,
+  imported: 175,
+  local: 210,
+  default: 215,
 };
 
 /** A styled type-icon — the graceful fallback when a live thumbnail isn't available (over budget / offline /
- *  the dev/browser build / not yet rendered). A framed, hue-tinted glyph so the panel still reads at a glance.
- *  The `data-kind` is the structured signal a test keys on. */
+ *  the dev/browser build / not yet rendered). A framed, hue-tinted mark so the panel still reads at a glance.
+ *  The `data-kind` is the structured signal a test keys on; `data-icon` (inside) is the drawing's. */
 export function TypeIcon({ kind, size = 40, style }: { kind: string; size?: number; style?: CSSProperties }) {
-  const k = ICON_KINDS[kind] ?? ICON_KINDS.default;
+  const hue = ICON_KIND_HUES[kind] ?? ICON_KIND_HUES.default;
   return (
     <span
       data-testid="type-icon"
@@ -642,17 +583,14 @@ export function TypeIcon({ kind, size = 40, style }: { kind: string; size?: numb
         width: size,
         height: size,
         flex: "none",
-        fontFamily: font.mono,
-        fontSize: Math.round(size * 0.5),
-        lineHeight: 1,
-        color: `hsl(${k.hue} 46% 34%)`,
-        background: `hsl(${k.hue} 58% 95%)`,
-        border: `1px solid hsl(${k.hue} 34% 82%)`,
+        color: `hsl(${hue} 46% 34%)`,
+        background: `hsl(${hue} 58% 95%)`,
+        border: `1px solid hsl(${hue} 34% 82%)`,
         borderRadius: radius.md,
         ...style,
       }}
     >
-      {k.glyph}
+      <Icon name={kind} fallback="shape" size={Math.round(size * 0.52)} />
     </span>
   );
 }

@@ -32,6 +32,7 @@ import {
   type GraphCardNode,
   type GraphNodeEmphasis,
 } from "../theme/graph";
+import { Icon } from "../theme/icons";
 import { EmptyPanelState } from "../theme/workspace";
 
 /** Live beats initial: a machine parked in its own start state is *live* there, and saying "start"
@@ -104,7 +105,7 @@ export function StateGraph({
       <div data-testid="state-graph">
         <EmptyPanelState
           compact
-          icon="◇"
+          icon={<Icon name="logic" size="xl" />}
           title="Add a state to start the graph"
           description="States and their event-driven transitions will appear on this shared canvas."
         />

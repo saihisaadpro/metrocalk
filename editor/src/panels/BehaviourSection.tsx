@@ -10,6 +10,7 @@ import { useDisplayedEntity, useSelectedId, useSummary } from "../store/projecti
 import { usePlaying } from "../store/play";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button, NumericField } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import { OnlyIfBlock } from "./OnlyIfBlock";
@@ -172,11 +173,11 @@ export function BehaviourSection({ client, onJumpTo }: BehaviourSectionProps) {
     >
       <div style={{ display: "flex", alignItems: "baseline", gap: space.sm }}>
         <h3 style={{ margin: 0, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
-          ✨ Behaviour
+          <Icon name="sparkle" size="sm" style={{ display: "inline-block", verticalAlign: "-2px" }} /> Behaviour
         </h3>
         <span data-testid="behaviour-state" style={{ fontSize: fontSize.meta, color: color.text.muted }}>
           {held
-            ? `${held.icon} ${summary?.name ?? "This object"} is a ${held.label}`
+            ? `${summary?.name ?? "This object"} is a ${held.label}`
             : alsoDoes.length > 0
               ? `${summary?.name ?? "This object"} has ${alsoDoes.join(" and ")}, but no gameplay job yet:`
               : `${summary?.name ?? "This object"} doesn't do anything yet — give it a job:`}
@@ -205,7 +206,7 @@ export function BehaviourSection({ client, onJumpTo }: BehaviourSectionProps) {
               selected && void run(() => client.roleAssign(selected, spec.kind), spec.label)
             }
           >
-            {spec.icon} {spec.label}
+            <Icon name={spec.kind} size="md" fallback="shape" /> {spec.label}
           </Button>
         ))}
       </div>
@@ -276,7 +277,7 @@ export function BehaviourSection({ client, onJumpTo }: BehaviourSectionProps) {
               title="Open the Animate workspace for keyframe timelines on this object"
               onClick={() => onJumpTo("animate")}
             >
-              Animate ▸
+              Animate <Icon name="chevron-right" size="sm" />
             </Button>
             <Button
               data-testid="behaviour-jump-gameplay"
@@ -285,7 +286,7 @@ export function BehaviourSection({ client, onJumpTo }: BehaviourSectionProps) {
               title="Open the Gameplay workspace — the full roster, live score and match tools"
               onClick={() => onJumpTo("gameplay")}
             >
-              Gameplay ▸
+              Gameplay <Icon name="chevron-right" size="sm" />
             </Button>
           </>
         )}

@@ -16,6 +16,7 @@
 //! * **Every row states what it will not carry**, in the same sentence as what it will.
 
 import { useEffect, useState } from "react";
+import { Icon } from "../theme/icons";
 import { Button, SelectField } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { ColourStatus, FormatSpec } from "../transport/protocol";
@@ -225,7 +226,7 @@ function ColourCard({ client }: { client: EditorClient }) {
             }}
           >
             <span aria-hidden style={{ color: on ? color.accent.base : color.text.muted }}>
-              {on ? "✓" : "—"}
+              {on ? <Icon name="check" size="sm" /> : <Icon name="minus" size="sm" />}
             </span>
             <span>
               {CAPABILITY_COPY[key] ?? key}

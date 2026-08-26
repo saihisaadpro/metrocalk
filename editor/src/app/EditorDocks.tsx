@@ -14,6 +14,7 @@ import { AuthoringToolbar } from "../panels/AuthoringToolbar";
 import { Hierarchy } from "../panels/Hierarchy";
 import { Requirers } from "../panels/Requirers";
 import { Reveal } from "../panels/Reveal";
+import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { Popover, PopoverSurface } from "../theme/Popover";
 import { DisclosureSection, DockTabs, EmptyPanelState, WorkspacePanel } from "../theme/workspace";
@@ -68,7 +69,7 @@ function DockChromeAction({ onCollapse, onPin, label }: { onCollapse?: () => voi
       title={pinning ? "Pin this panel open" : "Collapse to a floating tool rail"}
       onClick={pinning ? onPin : onCollapse}
     >
-      <span aria-hidden="true">{pinning ? "⌑" : "‹"}</span>
+      <Icon name={pinning ? "pin" : "chevron-left"} size="md" />
     </Button>
   );
 }
@@ -90,7 +91,7 @@ function NeedsAttentionPopup() {
         title="Objects waiting for a compatible binding"
         onClick={() => setOpen((current) => !current)}
       >
-        <span aria-hidden="true">!</span>
+        <Icon name="problems" size="md" />
       </Button>
       <Popover
         open={open}
@@ -175,10 +176,10 @@ export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport,
             <div className="mtk-dock-section-heading">Other tools</div>
             <div className="mtk-quick-create" role="group" aria-label="Quick creation tools">
               <Button data-testid="create-pipe" variant="secondary" onClick={onStartPipe} title="Draw a production pipe asset directly in the viewport">
-                <span aria-hidden="true">⌁</span> Draw pipe
+                <Icon name="pipe" size="md" /> Draw pipe
               </Button>
               <Button data-testid="create-import" variant="secondary" onClick={onImport} title="Choose a supported local asset file">
-                <span aria-hidden="true">⇩</span> Import
+                <Icon name="import" size="md" /> Import
               </Button>
             </div>
             <DisclosureSection title="Describe" summary="Optional assisted creation" defaultOpen={false} storageKey="create-describe">
@@ -233,8 +234,8 @@ export interface InspectorDockProps {
 export function InspectorDock({ client, active, onChange, onCollapse, onPin, onJumpTo }: InspectorDockProps) {
   const selected = useSelectedId();
   const tabs = [
-    { id: "properties", label: "Properties", icon: "⚙", tooltip: "Edit the selected object's components and material" },
-    { id: "relations", label: "Relations", icon: "⌘", tooltip: "Inspect compatible bindings and graph relationships" },
+    { id: "properties", label: "Properties", icon: "properties", tooltip: "Edit the selected object's components and material" },
+    { id: "relations", label: "Relations", icon: "relations", tooltip: "Inspect compatible bindings and graph relationships" },
   ] as const;
   return (
     <WorkspacePanel
@@ -244,7 +245,7 @@ export function InspectorDock({ client, active, onChange, onCollapse, onPin, onJ
       actions={onCollapse || onPin ? <DockChromeAction label="Inspector" onCollapse={onCollapse} onPin={onPin} /> : undefined}
       actionsLabel="Inspector dock layout"
       scroll={false}
-      tabs={<DockTabs id="inspector-workspaces" ariaLabel="Inspector workspaces" tabs={tabs} activeId={active} onChange={(id) => onChange(id as InspectorWorkspace)} />}
+      tabs={<DockTabs id="inspector-workspaces" ariaLabel="Inspector workspaces" tabs={tabs.map((tab) => ({ ...tab, icon: <Icon name={tab.icon} size="md" /> }))} activeId={active} onChange={(id) => onChange(id as InspectorWorkspace)} />}
     >
       <div
         id="inspector-workspaces-properties-panel"
@@ -289,7 +290,7 @@ export function InspectorDock({ client, active, onChange, onCollapse, onPin, onJ
             <div className="mtk-dock-panel__fill" style={{ borderTop: `1px solid ${color.border.subtle}`, minHeight: 220 }}><LazyWorkspace label="Relationship graph"><BindingGraph /></LazyWorkspace></div>
           </>
         ) : (
-          <EmptyPanelState title="Select an object to inspect its relationships" description="Compatible bindings and the local relationship graph will appear here." icon="⌘" />
+          <EmptyPanelState title="Select an object to inspect its relationships" description="Compatible bindings and the local relationship graph will appear here." icon={<Icon name="relations" size="xl" />} />
         )}
       </div>
     </WorkspacePanel>

@@ -143,8 +143,8 @@
       "unitless-length": 0
     },
     "src/inspector/renderers.tsx": {
-      "raw-native-control": 2,
-      "literal-ui-color": 1,
+      "raw-native-control": 1,
+      "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
       "unitless-length": 0
@@ -157,14 +157,14 @@
       "unitless-length": 0
     },
     "src/panels/AnimationWorkspace.tsx": {
-      "raw-native-control": 10,
+      "raw-native-control": 4,
       "literal-ui-color": 9,
       "first-party-css": 0,
       "literal-motion": 0,
       "unitless-length": 0
     },
     "src/panels/AssetBrowser.tsx": {
-      "raw-native-control": 1,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
@@ -478,6 +478,13 @@
       "literal-motion": 0,
       "unitless-length": 0
     },
+    "src/theme/assets.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
     "src/theme/global.css": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
@@ -486,6 +493,13 @@
       "unitless-length": 0
     },
     "src/theme/graph.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
+    "src/theme/icons.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
@@ -507,6 +521,13 @@
       "unitless-length": 0
     },
     "src/theme/Thumbnail.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
+    "src/theme/timeline.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,

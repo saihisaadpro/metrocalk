@@ -15,6 +15,7 @@ import { useSelectedId } from "../store/projection";
 import { usePlaying } from "../store/play";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Icon } from "../theme/icons";
 import { Button, NumericField, SelectField } from "../theme/primitives";
 import { color, fontSize, radius, space } from "../theme/tokens";
 import type { ClauseRequest, ConditionListInfo, ConditionSpec, RoleRow } from "../transport/protocol";
@@ -171,7 +172,7 @@ export function OnlyIfBlock({ client, roster, blockedWhy, refreshKey = 0 }: Only
             color: color.warn.text,
           }}
         >
-          ⛔ Blocked just now — {blockedWhy}
+          <Icon name="blocked" size="sm" /> Blocked just now — {blockedWhy}
         </div>
       )}
 
@@ -199,7 +200,7 @@ export function OnlyIfBlock({ client, roster, blockedWhy, refreshKey = 0 }: Only
             <option value="">+ add a condition…</option>
             {specs.map((s) => (
               <option key={s.kind} value={s.kind} title={s.blurb}>
-                {s.icon} {s.label}
+                {s.label}
               </option>
             ))}
           </SelectField>

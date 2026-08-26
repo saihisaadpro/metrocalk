@@ -15,8 +15,10 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 import { App } from "../../src/app/App";
+import { AssetBrowser } from "../../src/panels/AssetBrowser";
 import { STAGE_MIN } from "../../src/app/layout";
 import { BindingGraph } from "../../src/graph/BindingGraph";
+import { Icon, iconTokens } from "../../src/theme/icons";
 import { Inspector } from "../../src/inspector/Inspector";
 import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
@@ -26,18 +28,22 @@ import { Reveal } from "../../src/panels/Reveal";
 import { RigPanel, type RigDocument } from "../../src/panels/RigPanel";
 import RIG_MIXAMO from "../../src/panels/__fixtures__/rig-characterization.json";
 import RIG_BLOCKED from "../../src/panels/__fixtures__/rig-not-retargetable.json";
+import { PhysicsPanel } from "../../src/panels/PhysicsPanel";
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
+import { assetShelfStore } from "../../src/store/assetShelf";
 import { projectionStore } from "../../src/store/projection";
 import type {
+  AnimationPropertyInfo,
   AnimationTrackInfo,
   AnimationWorkspaceInfo,
   CadReport,
   CadReportPart,
   RevealResponse,
   StateMachine,
+  TimelineTuple,
 } from "../../src/transport/protocol";
-import type { EditorClient } from "../../src/transport/session";
+import { createMockSession, type EditorClient } from "../../src/transport/session";
 
 /** What must be true of the rendered scene, checked by `shoot.mjs` in the page before it captures.
  *
@@ -317,6 +323,30 @@ function animTrack(
   };
 }
 
+function animProperty(
+  component: string,
+  property: string,
+  label: string,
+  value: number,
+  extra: Partial<AnimationPropertyInfo> = {},
+): AnimationPropertyInfo {
+  return {
+    component,
+    property,
+    label: `${component} · ${label}`,
+    valueKind: "float",
+    value,
+    animatable: true,
+    reason: null,
+    context: "3d",
+    editorKind: "scalar",
+    bindingState: "ready",
+    bindingReason: `Bound to ${component}.${property}`,
+    runtimeSink: "transform",
+    ...extra,
+  };
+}
+
 const ANIMATED: AnimationWorkspaceInfo = {
   revision: "rev-7",
   sequenceId: "main",
@@ -328,7 +358,24 @@ const ANIMATED: AnimationWorkspaceInfo = {
   loopPolicy: "loop",
   selectedId: "rig",
   selectedName: "Weld Gun 7",
-  properties: [],
+  /* THE FIXTURE CONTRADICTED ITSELF AND THE CAPTURE PRINTED BOTH HALVES. `contexts[3d]` claimed
+     `properties: 4` — which the readiness box renders as "4 properties · 4 tracks" — while this array
+     was EMPTY, so the Property select fell to its no-verified-properties option and `Add key at 68t`
+     rendered disabled, three inches below a line saying there were four of them. The real engine
+     cannot produce that pair: `contexts[].properties` is a count OF this array. So the four channels
+     the four tracks are keyed on are stated here as well, which is what the count was always about,
+     and the capture stops being evidence for a state the engine has no way to reach
+     (`<verification_states_and_convergence>` (b) — a mock that answers with a payload of its own). */
+  properties: [
+    animProperty("Transform", "position.y", "Position Y", 0.42),
+    animProperty("Transform", "rotation.z", "Rotation Z", 0),
+    animProperty("Transform", "scale", "Scale", 1),
+    animProperty("Emitter", "rate", "Rate", 120, {
+      bindingState: "preview_only",
+      bindingReason: "Preview only until the emitter is bound.",
+      runtimeSink: null,
+    }),
+  ],
   tracks: [
     animTrack("t1", "Transform · Position Y", "position.y", [0, 45, 96, 150]),
     animTrack("t2", "Transform · Rotation Z", "rotation.z", [0, 68, 180]),
@@ -359,6 +406,18 @@ const animationClient = () =>
     animationState: () => Promise.resolve(ANIMATED),
     animationPlaybackState: () =>
       Promise.resolve({ playing: false, currentTick: ANIMATED.currentTick, durationTick: ANIMATED.durationTick, loopPolicy: ANIMATED.loopPolicy, crossedEvents: [], eventsTruncated: false }),
+  }) as unknown as EditorClient;
+
+/** A simulation that has recorded 300 frames and is running — the state `#simToggle` pauses into, so
+ *  the scene reaches its subject through the panel's own transport rather than by injecting state.
+ *  `simTimeline` is `[frame, frames, running, debugOverlay, _]` (`TimelineTuple`). */
+const physicsClient = () =>
+  ({
+    simTimeline: () => Promise.resolve([128, 300, true, false, 0] as TimelineTuple),
+    simScrub: (frame: number) => Promise.resolve([frame, 300, false, false, 0] as TimelineTuple),
+    setSimRunning: () => undefined,
+    physicsContacts: () => Promise.resolve([]),
+    physicsCheck: () => Promise.resolve([]),
   }) as unknown as EditorClient;
 
 const selectAnimatedEntity = () => {
@@ -636,6 +695,63 @@ function graphScenes(): Scene[] {
 
 export const SCENES: Scene[] = [
   {
+    id: "icon-set-specimen",
+    looking_for:
+      "THE WHOLE ICON SET ON ONE SHEET — every mark the editor can draw, at the size a dock actually " +
+      "uses it, on one 24-unit grid at one stroke weight. This is the capture the character era could " +
+      "never produce: a glyph is sized by the text metrics of whichever font answered, so ninety marks " +
+      "had ninety weights and there was no sheet to look at. What a reader is checking here is " +
+      "FAMILY: no mark noticeably heavier or lighter than its neighbours, none clipped by the 24-box, " +
+      "none reading as a filled blob beside outlined siblings, and every one legible at 20 px rather " +
+      "than only at 2x. An empty cell is a blank control, which is the ADR-131 defect itself",
+    expect: {
+      // One tile per token, each holding a real drawing. `data-icon-missing` is what `Icon` stamps on
+      // a name it could not resolve, so its ABSENCE is the claim: the sheet is not quietly padded
+      // with holes. The count is not asserted as a number — a number goes stale the day someone adds
+      // a mark, and the interesting failure is a blank tile, not a different total.
+      present: [["[data-testid='icon-specimen']", 100], ["[data-testid='icon-specimen'] svg path, [data-testid='icon-specimen'] svg rect, [data-testid='icon-specimen'] svg circle, [data-testid='icon-specimen'] svg ellipse", 100]],
+      absent: ["[data-icon-missing]"],
+      text_absent: ["undefined", "null"],
+    },
+    viewport: { width: 1240, height: 1400 },
+    render: () => (
+      <div style={{ padding: 20, background: "var(--mtk-bg-base)", font: "var(--mtk-font-ui)" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(132px, 1fr))", gap: 8 }}>
+          {iconTokens().map((token) => (
+            <div
+              key={token}
+              data-testid="icon-specimen"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "8px 10px",
+                borderRadius: 10,
+                background: "var(--mtk-bg-panel)",
+                border: "1px solid var(--mtk-border-subtle)",
+                color: "var(--mtk-text)",
+                minWidth: 0,
+              }}
+            >
+              <Icon name={token} size="lg" />
+              <span
+                style={{
+                  fontSize: 11,
+                  color: "var(--mtk-text-muted)",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {token}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    ),
+  },
+  {
     id: "import-report-nulls",
     looking_for:
       "every row explains itself from its honesty class; NO provenance line anywhere; the word " +
@@ -774,11 +890,14 @@ export const SCENES: Scene[] = [
     id: "animation-timeline-tracks",
     looking_for:
       "the timeline with something on it: four track rows under the ruler, each with its name, its " +
-      "binding badge, its key count and its mute/lock pair in a header column that stays put, and " +
-      "its keys as diamonds on a zebra lane. The playhead is a line THROUGH the lanes with a handle " +
-      "on the ruler, the muted track is visibly muted and the locked one is visibly locked — none of " +
-      "which any capture in this repository has ever contained, because the only Animate scene has " +
-      "nothing selected and photographs an empty state",
+      "key count and its mute/lock pair in a header column that stays put, and its keys as diamonds " +
+      "on a gridded lane. The playhead is a line THROUGH the lanes with a handle on the ruler, the " +
+      "muted track is visibly muted and the locked one is visibly locked. EXACTLY ONE row carries a " +
+      "badge — the one that needs attention. Three green `ready` pills on three healthy rows is four " +
+      "accent colours inside a 178px column all saying that nothing is wrong, and the constitution " +
+      "spends accent only where interaction requires attention; the readiness word is still on the " +
+      "row as `data-binding-state` and in the track name's tooltip. The transport above is the shared " +
+      "floating pill, the same object PhysicsPanel scrubs its recording with",
     width: 1000,
     setup: selectAnimatedEntity,
     expect: {
@@ -787,7 +906,13 @@ export const SCENES: Scene[] = [
         ["[data-testid='animation-key']", 11],
         ["[data-testid='animation-marker']", 2],
         ["[data-testid='animation-event']", 1],
+        // The row that DOES need attention keeps its badge. Without this the rule above would be
+        // satisfied by a timeline that had simply stopped rendering badges at all.
+        ["[data-binding-state='preview_only'] .mtk-badge", 1],
       ],
+      // ...and no healthy row has one. `absent` is the only half of this claim a capture cannot make
+      // on its own: a missing pill and a pill that is merely off-screen photograph identically.
+      absent: ["[data-binding-state='ready'] .mtk-badge"],
       // The marker names are in their `title`/`aria-label`, not painted on the 30px lane, so the
       // claim is the count above plus the sequence and track names that ARE painted.
       text_present: ["Transform · Position Y", "Weld pass"],
@@ -811,10 +936,80 @@ export const SCENES: Scene[] = [
     },
     render: () => <AnimationWorkspace client={animationClient()} />,
   },
+  {
+    id: "animation-curve-editor",
+    looking_for:
+      "the curve view, which nothing in this repository had ever photographed. What it was: a blue " +
+      "polyline and some circles on an unruled white rectangle — a picture of a SHAPE, with no way " +
+      "to see that two keys are level and no way to know which direction is 'more'. What it is: the " +
+      "shared CurveCanvas, with a graticule at the same ten divisions the timeline ruler labels and " +
+      "both axes NAMED, exactly as the reference's easing panel labels acceleration against time. " +
+      "Four keys of Position Y, cubic, sampled through the same interpolation the engine plays back",
+    width: 1000,
+    setup: selectAnimatedEntity,
+    // Selecting a track first is not decoration: the curve view has nothing to draw without one, and
+    // a scene that skipped this would photograph the "Select a numeric track" empty state under a
+    // caption describing a curve.
+    click: ["[data-testid='animation-track'] .mtk-timeline__track-select", "#animation-surfaces-curves-tab"],
+    expect: {
+      present: [
+        ["[data-testid='animation-curves']", 1],
+        ["[data-testid='animation-curve-path']", 1],
+        // The graticule is the whole point of the change. Eleven columns and five rows.
+        [".mtk-curve__grid line", 16],
+        [".mtk-curve__axis", 2],
+      ],
+      // The empty states this scene must NOT be photographing.
+      text_absent: ["Select a numeric track", "no numeric curve", "null", "undefined", "NaN"],
+      text_present: ["value", "time", "Transform · Position Y"],
+      unclipped: [".mtk-curve__svg", ".mtk-curve__axis"],
+      // The vertical axis label is beside the plot, not above it — a rotated caption that has wrapped
+      // onto its own row is the grid having taken the width the label needed.
+      same_line: [[".mtk-curve__axis--value", ".mtk-curve__svg"]],
+      stacked: [[".mtk-curve__svg", ".mtk-curve__axis--time"]],
+    },
+    render: () => <AnimationWorkspace client={animationClient()} />,
+  },
+  {
+    id: "physics-recorded-transport",
+    looking_for:
+      "THE SECOND CONSUMER, and the reason the timeline framework is a framework rather than a " +
+      "rename. Physics records frames and lets you scrub them, and it had built that surface by " +
+      "hand: a `<label>`, a bare range stretched across a nowrap row, and a 12px mono `frame " +
+      "128/300` pinned to its right — no play control next to the scrubber, no keyboard step, and a " +
+      "read-out styled nothing like the 15px semibold one the animation transport uses for the same " +
+      "job. It is the SAME `Transport` pill now, with the same read-out rhythm and the same attached " +
+      "button run, plus single-frame stepping that `simScrub` has always been able to serve and the " +
+      "surface simply never offered",
+    width: 1000,
+    // `tl` starts at zero and only refreshes once the panel believes something is running, so the
+    // recording has to be reached the way a user reaches it rather than injected.
+    click: ["#simToggle"],
+    expect: {
+      present: [
+        ["[data-testid='sim-transport']", 1],
+        ["[data-testid='frameLbl']", 1],
+        ["[data-testid='simStepBack']", 1],
+        ["[data-testid='simStepForward']", 1],
+        ["[data-testid='scrub']", 1],
+      ],
+      text_present: ["128", "300 frames"],
+      text_absent: ["null", "undefined", "NaN"],
+      unclipped: ["[data-testid='sim-transport'] .mtk-btn", "[data-testid='frameLbl']"],
+      // The four parts of a transport are ONE row. This is the claim the hand-rolled version could
+      // not have made, because its play control was in a different block from its scrubber.
+      same_line: [
+        ["[data-testid='frameLbl']", "#simToggle"],
+        ["#simToggle", "[data-testid='scrub']"],
+      ],
+    },
+    render: () => <PhysicsPanel client={physicsClient()} />,
+  },
   ...rigScenes(),
   ...poseScenes(),
   ...graphScenes(),
   ...inspectorScenes(),
+  ...assetScenes(),
   ...shellScenes(),
 ];
 
@@ -1609,6 +1804,159 @@ function shellScenes(): Scene[] {
       [`[data-testid='engine-${engine}']`],
     ),
   ),
+  ];
+}
+
+// ── the asset library ─────────────────────────────────────────────────────────────────────────────
+
+/** THE OTHER PANEL THIS HARNESS HAD NEVER PHOTOGRAPHED (ADR-144), and the last of the constitution's
+ *  six migration gates.
+ *
+ *  These scenes render against `createMockSession()` — the SAME client the dev build and every shell
+ *  scene use — rather than a fixture written here. That is deliberate and it is the whole reason these
+ *  captures are worth anything: the dev mock used to answer `catalog()` with two items under the keys
+ *  `Health` and `UI`, which are neither the canonical buckets the real command sends nor a payload with
+ *  a price, a capability or a marketplace tier anywhere in it. A scene with its own fixture would have
+ *  photographed a beautiful library that nothing in the product could produce. The mock mirrors
+ *  `core/src/stdlib.rs` and `core/src/marketplace.rs`'s `builtin_catalog` now, so what is on screen is
+ *  what the engine actually publishes — and `text_absent: ["std:"]` is the standing assertion that the
+ *  canonical bucket key never reaches a reader again. */
+function assetScenes(): Scene[] {
+  const library = () => <AssetBrowser client={createMockSession()} />;
+
+  /** Types into the panel's REAL search field after mount, through the same `input` event a keystroke
+   *  produces, so the searched state is reached by the code path a user reaches it by. A scene cannot
+   *  type — `click` is the only gesture the driver has — and an `initialQuery` prop would be production
+   *  API shaped by the camera. Throwing when the field is missing is the point: a silent no-op would
+   *  photograph the browse view under a caption claiming a search. */
+  function SearchedLibrary({ query }: { query: string }) {
+    useEffect(() => {
+      const input = document.getElementById("assetSearch");
+      if (!(input instanceof HTMLInputElement)) throw new Error("no #assetSearch to type into");
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, query);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }, [query]);
+    return library();
+  }
+
+  return [
+    {
+      id: "asset-library",
+      looking_for:
+        "the asset library as LARGE PREVIEWS on a grid, at the 300px width the Build dock gives it. " +
+        "Six collections, each headed by a word a person would say — the shipped panel printed the " +
+        "canonical map key and filed things under `std:Props`. Every tile carries its tier, the " +
+        "capability that decides whether it will attach, and a price where there is one; the three " +
+        "marketplace entries are the real `builtin_catalog` ones, at their real prices",
+      width: 300,
+      expect: {
+        present: [
+          ["[data-testid='asset-tile']", 12],
+          ["[data-testid='asset-category']", 6],
+          ["[data-testid='asset-price']", 3],
+          ["[data-testid='asset-filter']", 2],
+          // THE MARK IS THE ITEM'S WHERE THE ICON SET KNOWS IT. Written as a claim rather than left to
+          // the eye, because the first build drew the SOURCE tier's icon and every local item in the
+          // library rendered the same glyph — a grid of "large previews" that previewed nothing, and a
+          // capture that looks perfectly fine until you notice all six marks are identical. Three
+          // distinct drawings on one screen is the smallest statement that the resolution is per-item.
+          ["[data-icon='camera']", 1],
+          ["[data-icon='light']", 1],
+          ["[data-icon='character']", 2],
+        ],
+        // The defect the rebuild exists to fix, as a standing claim: the engine's own namespace must
+        // not appear in user copy. `null`/`undefined` are the harness's standing pair.
+        text_absent: ["std:", "null", "undefined"],
+        text_present: ["Props", "Characters", "Marketplace", "Rusty Medieval Sword"],
+        // A "large preview" is a measurement, not an adjective. Two columns inside 300px minus the
+        // panel's own padding is ~124px a tile, and the preview is a square inside it — so a tile that
+        // has quietly gone back to being a 40px row fails here rather than being described as one.
+        min_width: [["[data-testid='asset-tile']", 110]],
+        min_height: [["[data-testid='asset-tile']", 150]],
+      },
+      render: library,
+    },
+    {
+      id: "asset-library-shelf",
+      looking_for:
+        "the two collections the catalog cannot supply: Favourites and Recently placed, above the " +
+        "buckets. Both are shortcuts into the same grid, so a starred item appears twice — once in " +
+        "its collection and once where it is filed — and the star on both instances is lit",
+      width: 300,
+      setup: () => {
+        // Through the store rather than through storage: the shelf reads `localStorage` when its module
+        // is evaluated, which has already happened by the time a scene's `setup` runs.
+        assetShelfStore.getState().toggleFavourite("marketplace:forge:rusty-sword");
+        assetShelfStore.getState().toggleFavourite("local:Light");
+        assetShelfStore.getState().recordPlacement("local:Transform");
+        assetShelfStore.getState().recordPlacement("marketplace:acme:companion-drone");
+      },
+      expect: {
+        present: [
+          ["[data-testid='asset-category'][data-category='favourites']", 1],
+          ["[data-testid='asset-category'][data-category='recent']", 1],
+        ],
+        text_present: ["Favourites", "Recently placed"],
+        text_absent: ["std:", "null", "undefined"],
+        // Shortcuts belong ABOVE the thing they are a shortcut into, or they are just more catalog.
+        stacked: [
+          ["[data-testid='asset-category'][data-category='favourites']", "[data-testid='asset-category'][data-category='recent']"],
+          ["[data-testid='asset-category'][data-category='recent']", "[data-testid='asset-category'][data-category='std:Props']"],
+        ],
+      },
+      render: library,
+    },
+    {
+      id: "asset-library-search",
+      looking_for:
+        "a search replaces the collections with ONE ranked Matches grid — the same resolver the " +
+        "describe bar uses, not a second search path. The filter chips stay, because a filter over a " +
+        "result set is the same question as a filter over the library",
+      width: 300,
+      expect: {
+        present: [["[data-testid='asset-results']", 1], ["[data-testid='asset-tile']", 1]],
+        absent: ["[data-testid='asset-collections']", "[data-testid='asset-seam']"],
+        text_present: ["Matches", "Rusty Medieval Sword"],
+        text_absent: ["std:", "null", "undefined"],
+      },
+      render: () => <SearchedLibrary query="sword" />,
+    },
+    {
+      id: "asset-library-no-match",
+      looking_for:
+        "nothing matches, and the panel offers a CONTROL rather than asking a question. The shipped " +
+        "version printed a coloured sentence ending in a question mark with nothing to press, which is " +
+        "`<ux_quality>` 1 exactly: the decisive step offloaded to a passive line. The empty state also " +
+        "says what generating costs before it is pressed",
+      width: 300,
+      expect: {
+        present: [["[data-testid='asset-seam']", 1], ["[data-testid='asset-generate']", 1]],
+        absent: ["[data-testid='asset-tile']"],
+        text_present: ["zzz", "costs tokens"],
+        text_absent: ["std:", "null", "undefined"],
+        // The offer is a real target, not a link-sized afterthought inside a sentence.
+        min_height: [["[data-testid='asset-generate']", 28]],
+      },
+      render: () => <SearchedLibrary query="zzz" />,
+    },
+    {
+      id: "asset-library-wide",
+      looking_for:
+        "the SAME grid given room: the column count is the browser's decision from a minimum tile " +
+        "width, so a wider surface gains columns instead of stretching two tiles into billboards. The " +
+        "failure this is written against is a preview that grows to half the panel because the grid " +
+        "was told how many columns to have instead of how narrow a tile may get",
+      width: 560,
+      expect: {
+        present: [["[data-testid='asset-tile']", 12]],
+        text_absent: ["std:", "null", "undefined"],
+        // A tile may not simply absorb the extra width: at 560 the grid must have added columns, so no
+        // tile is anywhere near half the frame.
+        max_width: [["[data-testid='asset-tile']", 200]],
+      },
+      render: library,
+    },
   ];
 }
 
