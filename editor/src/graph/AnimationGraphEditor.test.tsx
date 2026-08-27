@@ -11,6 +11,19 @@ import type {
 import { AnimationGraphEditor } from "./AnimationGraphEditor";
 import { animationGraphPorts, cloneAnimationGraph, createLocomotionGraphPreset } from "./animation-graph-model";
 
+// ONE BUDGET FOR THIS FILE, and the reason it is not vitest's 5s default.
+//
+// Every test here MOUNTS THE WHOLE ANIMATION GRAPH EDITOR — the largest authoring surface in the
+// engine — opens both of its drawers and drives it end to end, and vitest runs the repository's 76
+// test files in parallel workers. 5000ms is therefore a WALL-CLOCK budget shared with whatever else
+// is on the machine, not a statement about this code: measured alone the file is 14.4s of test time
+// (faster than the 18.1s it took before the ADR-156 migration), while under the full parallel run its
+// three heaviest tests land at 5.0–6.1s and fail. That is the same class as `330781a` ("a wall-clock
+// assertion inside a parallel test runner") and the same answer `App.test.tsx` already gives its own
+// heaviest case with an explicit `10_000`. A budget that a green machine passes and a busy one fails
+// is a flake, and a flake is a failure.
+vi.setConfig({ testTimeout: 20_000 });
+
 const workspaceKey = animationWorkspaceKey({ projectId: "test-project", scope: { kind: "sequence", id: "main" } });
 const pendingDebug = () => new Promise<AnimationGraphDebugInfo>(() => {});
 let queuedResponses: Array<() => void> = [];
@@ -409,4 +422,67 @@ test("keyboard list creates and deletes connections through explicit port contro
   expect(screen.getAllByLabelText(/Delete connection/)).toHaveLength(graph.edges.length + 1);
   fireEvent.click(screen.getAllByLabelText(/Delete connection/).at(-1)!);
   expect(screen.getAllByLabelText(/Delete connection/)).toHaveLength(graph.edges.length);
+});
+
+/** jsdom measures every box as 0x0, so a width has to be handed to the component the same way the
+ *  browser hands it one: through `getBoundingClientRect`. Restored by the caller. */
+function withMeasuredWidth(width: number): () => void {
+  const original = Element.prototype.getBoundingClientRect;
+  Element.prototype.getBoundingClientRect = function measured(this: Element) {
+    const rect = original.call(this);
+    if ((this as HTMLElement).dataset?.testid === "animation-graph-editor") {
+      return { ...rect, width, height: 600, toJSON: rect.toJSON } as DOMRect;
+    }
+    return rect;
+  };
+  return () => {
+    Element.prototype.getBoundingClientRect = original;
+  };
+}
+
+test("below its own track floors the panel becomes one drawer at a time, and above them it does not", async () => {
+  const graph = createLocomotionGraphPreset("main");
+  const client = () => fakeClient({ animationGraphState: () => response(graphState(graph)), animationGraphDebug: pendingDebug });
+
+  // WIDE: three tracks, and both drawers may be open together.
+  let restore = withMeasuredWidth(1280);
+  await mountEditor(<AnimationGraphEditor client={client()} sequenceId="main" workspaceKey={workspaceKey} />);
+  const wide = screen.getByTestId("animation-graph-editor");
+  expect(wide.getAttribute("data-layout")).toBe("tracks");
+  fireEvent.click(screen.getByRole("button", { name: "Palette" }));
+  fireEvent.click(screen.getByRole("button", { name: "Inspector" }));
+  expect(wide.getAttribute("data-palette-open")).toBe("true");
+  expect(wide.getAttribute("data-inspector-open")).toBe("true");
+  restore();
+  cleanup();
+  animationEditorStore.getState().reset();
+
+  // NARROW: a drawer takes the canvas's whole area, so opening one closes the other. Two open at once
+  // is two panels on one box — sixteen overlapping control pairs, in the capture that found this.
+  restore = withMeasuredWidth(460);
+  await mountEditor(<AnimationGraphEditor client={client()} sequenceId="main" workspaceKey={workspaceKey} />);
+  const narrow = screen.getByTestId("animation-graph-editor");
+  expect(narrow.getAttribute("data-layout")).toBe("drawer");
+  fireEvent.click(screen.getByRole("button", { name: "Palette" }));
+  expect(narrow.getAttribute("data-palette-open")).toBe("true");
+  fireEvent.click(screen.getByRole("button", { name: "Inspector" }));
+  expect(narrow.getAttribute("data-inspector-open")).toBe("true");
+  expect(narrow.getAttribute("data-palette-open")).toBe("false");
+  // …and closing the one that is open leaves the canvas, not the other drawer.
+  fireEvent.click(screen.getByRole("button", { name: "Inspector" }));
+  expect(narrow.getAttribute("data-inspector-open")).toBe("false");
+  expect(narrow.getAttribute("data-palette-open")).toBe("false");
+  restore();
+});
+
+test("an UNMEASURED panel is not a narrow one", async () => {
+  // 0 is what every element reports before first layout and what jsdom reports forever. Reading it as
+  // "narrow" costs a flash of the wrong layout on every mount in the browser, and in a test
+  // environment it makes the panel permanently narrow — which silently rewrote the assertion above
+  // about two drawers being open at once, in this very file, before the rule required a POSITIVE
+  // measurement.
+  const graph = createLocomotionGraphPreset("main");
+  const client = fakeClient({ animationGraphState: () => response(graphState(graph)), animationGraphDebug: pendingDebug });
+  await mountEditor(<AnimationGraphEditor client={client} sequenceId="main" workspaceKey={workspaceKey} />);
+  expect(screen.getByTestId("animation-graph-editor").getAttribute("data-layout")).toBe("tracks");
 });

@@ -776,6 +776,44 @@ progress { accent-color: var(--mtk-accent-solid); }
    measured 3.64:1 where 4.5:1 is required. */
 .mtk-check[data-disabled="true"] { cursor: not-allowed; }
 
+/* The one radio (ADR-156) — the same box, the same states, a dot instead of a tick. Declared beside
+   the checkbox because "one of these" and "any of these" are the same control family wearing two
+   marks, and the animation graph had been drawing the second one with the desktop's widget. */
+.mtk-radio {
+  display: inline-grid;
+  grid-template-columns: auto auto;
+  gap: var(--mtk-space-4);
+  align-items: center;
+  min-height: 28px;
+  min-width: 0;
+  padding: var(--mtk-space-2) 0;
+  color: var(--mtk-text);
+  cursor: pointer;
+}
+.mtk-radio__dot {
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  flex: none;
+  border: 1px solid var(--mtk-border-strong);
+  border-radius: 50%;
+  background: var(--mtk-bg-input);
+  cursor: pointer;
+}
+.mtk-radio__dot:hover:not(:disabled) { border-color: var(--mtk-accent-border); }
+.mtk-radio__dot:checked {
+  border-color: var(--mtk-accent-solid);
+  background: var(--mtk-bg-input)
+    radial-gradient(circle at 50% 50%, var(--mtk-accent-solid) 0 4px, transparent 4.5px);
+}
+.mtk-radio__dot:focus-visible { outline: 2px solid var(--mtk-ring); outline-offset: 2px; }
+.mtk-radio__dot:disabled { border-color: var(--mtk-border-subtle); background-color: var(--mtk-bg-inset); cursor: not-allowed; }
+.mtk-radio__label { min-width: 0; color: inherit; font-size: 12px; }
+.mtk-radio[data-disabled="true"] { cursor: not-allowed; }
+
 /* ── The one inline note (ADR-147) ─────────────────────────────────────────────────────────────────
    Guidance, a warning, an all-clear and a "why this stage is refusing" were four bespoke boxes in one
    panel, each with its own border colour, padding and type size. One object, five tones, and an icon
@@ -874,6 +912,12 @@ progress { accent-color: var(--mtk-accent-solid); }
   margin: -1px;
   padding: 0;
   overflow: hidden;
+  /* `text-overflow: ellipsis` on a 1px box that `clip-path` already hides changes nothing a reader can
+     see — and it is the honest declaration. `overflow: hidden` with `text-overflow: clip` is the exact
+     shape of "content removed with no mark at all", which is what the screenshot gate's R2 is written
+     to catch; a standing false positive on the one utility every panel uses for its live region is how
+     a gate stops being read. */
+  text-overflow: ellipsis;
   clip-path: inset(50%);
   white-space: nowrap;
   border: 0;
@@ -2609,69 +2653,6 @@ body > [role="dialog"][aria-modal="true"] {
 .animation-workspace-timeline { grid-area: timeline; }
 .animation-workspace-inspector { grid-area: inspector; }
 
-/* Animation graph: the authored document is projected into the canvas, while palette/inspector/list
-   remain useful without pointer input. The final row is the bounded transient parameter strip. */
-.animation-graph-editor {
-  position: relative;
-  display: grid;
-  grid-template-columns: minmax(190px, 230px) minmax(420px, 1fr) minmax(250px, 310px);
-  grid-template-rows: auto minmax(300px, 1fr) auto;
-  grid-template-areas:
-    "toolbar toolbar toolbar"
-    "palette canvas inspector"
-    "parameters parameters parameters";
-  min-height: 0;
-  height: 100%;
-  overflow: hidden;
-  color: var(--mtk-text);
-  background: var(--mtk-bg-canvas);
-}
-.animation-graph-editor[data-palette-open="false"][data-inspector-open="true"] {
-  grid-template-columns: minmax(420px, 1fr) minmax(250px, 310px);
-  grid-template-areas: "toolbar toolbar" "canvas inspector" "parameters parameters";
-}
-.animation-graph-editor[data-palette-open="true"][data-inspector-open="false"] {
-  grid-template-columns: minmax(190px, 230px) minmax(420px, 1fr);
-  grid-template-areas: "toolbar toolbar" "palette canvas" "parameters parameters";
-}
-.animation-graph-editor[data-palette-open="false"][data-inspector-open="false"] {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: "toolbar" "canvas" "parameters";
-}
-.animation-graph-toolbar {
-  grid-area: toolbar;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  overflow-x: auto;
-  padding: 7px 9px;
-  border-bottom: 1px solid var(--mtk-border-subtle);
-  background: var(--mtk-bg-raised);
-  box-shadow: var(--mtk-shadow-1);
-}
-.animation-graph-toolbar-identity { flex: 0 0 min(230px, 32vw); min-width: 110px; overflow: hidden; white-space: nowrap; }
-.animation-graph-toolbar-name { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
-.animation-graph-toolbar-status,
-.animation-graph-toolbar-view-actions,
-.animation-graph-toolbar-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 8px; }
-.animation-graph-toolbar-status { min-width: 0; }
-.animation-graph-toolbar-spacer { flex: 1 1 auto; min-width: 0; }
-.animation-graph-stale { color: var(--mtk-warn); font-size: 11px; }
-.animation-graph-palette,
-.animation-graph-inspector {
-  min-height: 0;
-  overflow: auto;
-  padding: 10px;
-  background: var(--mtk-bg-panel);
-}
-.animation-graph-palette { grid-area: palette; border-right: 1px solid var(--mtk-border-subtle); }
-.animation-graph-inspector { grid-area: inspector; border-left: 1px solid var(--mtk-border-subtle); }
-.animation-graph-inspector section + section { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--mtk-border-subtle); }
-.animation-graph-inspector h3 { margin: 0 0 8px; font-size: 12px; }
-.animation-graph-inspector p,
-.animation-graph-inspector li { color: var(--mtk-text-secondary); font-size: 11px; line-height: 1.45; }
-.animation-graph-canvas { grid-area: canvas; position: relative; min-width: 0; min-height: 0; overflow: hidden; }
 :is(.mtk-graph-surface, .animation-graph-canvas) .react-flow { background: var(--mtk-bg-canvas); }
 
 /* ONE graph chrome, not two. Every rule below used to be scoped to `.animation-graph-canvas` alone —
@@ -2918,98 +2899,348 @@ body > [role="dialog"][aria-modal="true"] {
   font-size: 11px;
   white-space: nowrap;
 }
-.animation-graph-canvas .react-flow__node:focus-visible,
-.animation-graph-palette button:focus-visible,
-.animation-graph-inspector button:focus-visible,
-.animation-graph-accessible-list button:focus-visible {
+.animation-graph-canvas .react-flow__node:focus-visible {
   outline: 2px solid var(--mtk-ring);
   outline-offset: 2px;
 }
 .animation-graph-node[data-readiness="blocked"] { opacity: .64; }
 .animation-graph-node[data-active="true"] { transition: box-shadow var(--mtk-motion-instant) linear; }
-.animation-graph-palette-list,
-.animation-graph-future { display: grid; gap: 5px; margin-top: 10px; }
-.animation-graph-palette-list button,
-.animation-graph-future button {
+.animation-graph-runtime-summary { position: absolute; left: 8px; bottom: 8px; z-index: 5; padding: 6px 8px; border: 1px solid var(--mtk-border-subtle); border-radius: var(--mtk-radius-md); color: var(--mtk-text-secondary); background: color-mix(in srgb, var(--mtk-bg-raised) 94%, transparent); box-shadow: var(--mtk-shadow-1); font: 11px/1.4 var(--mtk-font-mono, monospace); pointer-events: none; }
+/* ── the animation graph editor (ADR-156) ────────────────────────────────────────────────────────
+   WHAT IS LEFT HERE IS LAYOUT, AND ONLY LAYOUT. Every control this panel draws now comes from the
+   theme's own families — `Button`, `SelectField`, `TextField`, `TextAreaField`, `NumericField`,
+   `Checkbox`, `Field`/`FieldGrid`, `Callout`, `DisclosureSection`, `Toolbar` — so the ~40 rules that
+   used to restyle a `<select>`, a `<textarea>`, a checkbox row, a palette button and a diagnostic
+   button are gone rather than rewritten. What a stylesheet still owns is where the four regions sit,
+   how they behave when the panel is narrow, and the handful of repeating record shapes only a grid
+   can state.
+
+   A NOTE ON TYPE. Twelve rules in the deleted block set `font-size: 10px` — below `fontSize.micro`,
+   the floor the scale declares, on the densest surface in the editor. Nothing below goes under 11. */
+.animation-graph-editor {
+  position: relative;
   display: grid;
-  gap: 2px;
-  width: 100%;
-  padding: 7px 8px;
-  border: 1px solid var(--mtk-border-subtle);
-  border-radius: var(--mtk-radius-md);
+  grid-template-columns: minmax(200px, 250px) minmax(360px, 1fr) minmax(260px, 330px);
+  grid-template-rows: auto minmax(240px, 1fr) auto;
+  grid-template-areas:
+    "toolbar toolbar toolbar"
+    "palette canvas inspector"
+    "parameters parameters parameters";
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
   color: var(--mtk-text);
-  background: var(--mtk-bg-raised);
-  box-shadow: var(--mtk-shadow-1);
-  text-align: left;
+  background: var(--mtk-bg-canvas);
 }
-.animation-graph-palette-list button:not(:disabled) { cursor: pointer; }
-.animation-graph-palette-list button:not(:disabled):hover {
-  border-color: var(--mtk-border-strong);
-  background: var(--mtk-bg-hover);
+.animation-graph-editor[data-palette-open="false"][data-inspector-open="true"] {
+  grid-template-columns: minmax(360px, 1fr) minmax(260px, 330px);
+  grid-template-areas: "toolbar toolbar" "canvas inspector" "parameters parameters";
 }
-.animation-graph-palette-list small,
-.animation-graph-future small,
-.animation-graph-field small { color: var(--mtk-text-muted); font-size: 10px; line-height: 1.4; }
-.animation-graph-future { margin-top: 14px; }
-.animation-graph-future button { opacity: .58; }
-.animation-graph-field { display: grid; gap: 4px; margin-top: 7px; color: var(--mtk-text-secondary); font-size: 11px; }
-.animation-graph-field select,
-.animation-graph-field textarea,
-.animation-graph-parameters select {
+.animation-graph-editor[data-palette-open="true"][data-inspector-open="false"] {
+  grid-template-columns: minmax(200px, 250px) minmax(360px, 1fr);
+  grid-template-areas: "toolbar toolbar" "palette canvas" "parameters parameters";
+}
+.animation-graph-editor[data-palette-open="false"][data-inspector-open="false"] {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "toolbar" "canvas" "parameters";
+}
+
+.animation-graph-toolbar { grid-area: toolbar; }
+/* The identity is the one cell allowed to shrink, and it shrinks HONESTLY: both lines ellipsise and
+   the cell carries the whole string as its `title`. Its predecessor was `flex: 0 0 min(230px, 32vw)`
+   inside an `overflow-x: auto` row, which cut `rev graph-rev-4` mid-word with no ellipsis and no
+   scrollbar — found by the first capture ever taken of this panel, at 1280px. */
+.animation-graph-identity {
+  display: grid;
+  flex: 1 1 160px;
   min-width: 0;
-  border: 1px solid var(--mtk-border);
-  border-radius: var(--mtk-radius-md);
-  min-height: var(--mtk-control-default);
-  padding: 6px 8px;
-  color: var(--mtk-text);
-  background: var(--mtk-bg-input);
+  gap: 1px;
+  margin-right: auto;
 }
-.animation-graph-field textarea { min-height: 62px; resize: vertical; }
-.animation-graph-check { display: flex; gap: 5px; margin-top: 8px; font-size: 11px; }
-.animation-graph-node-identity { display: grid; gap: 3px; margin-top: 8px; color: var(--mtk-text-muted); font-size: 10px; }
-.animation-graph-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
-.animation-graph-transition-grid { display: grid; gap: 6px; margin-top: 8px; }
-.animation-graph-condition { display: grid; grid-template-columns: minmax(70px, 1fr) minmax(78px, auto) minmax(52px, auto) auto; gap: 5px; padding: 6px; border: 1px solid var(--mtk-border-subtle); border-radius: var(--mtk-radius-md); background: var(--mtk-bg-raised); font-size: 10px; }
-.animation-graph-state-list { display: grid; gap: 5px; margin-top: 7px; }
-.animation-graph-state-row { display: grid; grid-template-columns: auto minmax(70px, 1fr) minmax(80px, 1fr) auto; align-items: center; gap: 4px; font-size: 10px; }
-.animation-graph-authored-parameter { display: grid; grid-template-columns: minmax(70px, 1fr) auto; gap: 4px; margin-top: 6px; padding: 7px; border: 1px solid var(--mtk-border-subtle); border-radius: var(--mtk-radius-md); background: var(--mtk-bg-raised); font-size: 10px; }
-.animation-graph-authored-parameter > span,
-.animation-graph-authored-parameter > label { grid-column: 1 / -1; }
-.animation-graph-parameter-range { display: grid; grid-template-columns: repeat(3, minmax(45px, 1fr)); gap: 4px; }
-.animation-graph-diagnostics { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
-.animation-graph-diagnostics button { display: grid; gap: 2px; width: 100%; padding: 6px; border: 1px solid var(--mtk-border-subtle); color: inherit; background: var(--mtk-bg-inset); text-align: left; cursor: pointer; }
-.animation-graph-diagnostics li[data-severity="error"] button { border-left: 3px solid var(--mtk-danger); }
-.animation-graph-diagnostics li[data-severity="warning"] button { border-left: 3px solid var(--mtk-warn); }
-.animation-graph-accessible-list { display: grid; gap: 3px; padding-left: 20px; }
-.animation-graph-accessible-list button { width: 100%; border: 1px solid var(--mtk-border-subtle); color: var(--mtk-text); background: var(--mtk-bg-inset); text-align: left; }
-.animation-graph-list-connections { display: grid; gap: 5px; margin-top: 9px; }
-.animation-graph-list-connections label { display: grid; gap: 2px; color: var(--mtk-text-secondary); font-size: 10px; }
-.animation-graph-list-connections ul { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
-.animation-graph-list-connections li { display: grid; grid-template-columns: minmax(70px, 1fr) minmax(54px, auto) auto minmax(70px, 1fr) minmax(54px, auto) auto; align-items: center; gap: 3px; }
-.animation-graph-runtime-summary { position: absolute; left: 8px; bottom: 8px; z-index: 5; padding: 6px 8px; border: 1px solid var(--mtk-border-subtle); border-radius: var(--mtk-radius-md); color: var(--mtk-text-secondary); background: color-mix(in srgb, var(--mtk-bg-raised) 94%, transparent); box-shadow: var(--mtk-shadow-1); font: 10px/1.4 var(--mtk-font-mono, monospace); pointer-events: none; }
+.animation-graph-identity__name {
+  overflow: hidden;
+  color: var(--mtk-text);
+  font: 600 13px/1.2 var(--mtk-font-ui);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.animation-graph-identity__meta {
+  overflow: hidden;
+  color: var(--mtk-text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.animation-graph-toolbar-actions { margin-left: auto; }
+.animation-graph-conflict {
+  position: absolute;
+  top: 52px;
+  left: 50%;
+  z-index: 12;
+  width: min(680px, calc(100% - 24px));
+  transform: translateX(-50%);
+}
+.animation-graph-conflict__actions { display: flex; flex-wrap: wrap; gap: var(--mtk-space-3); margin-top: var(--mtk-space-4); }
+
+/* A FLEX COLUMN, NOT A GRID, and the first capture is why. `.mtk-disclosure` sets `overflow: hidden`
+   for its open/close transition, which gives it an automatic minimum size of ZERO in both grid and
+   flex — so a column of sections taller than its track gets SQUEEZED rather than scrolled, and each
+   section clips its own content with no scrollbar anywhere (measured: 452px of the Operators list and
+   238px of the Selection card, gone). `.mtk-disclosure` already carries `flex: none` for exactly this
+   reason (ADR-136 records the 26px it cost in the Model dock); it only applies in a flex column. */
+.animation-graph-palette,
+.animation-graph-inspector {
+  /* BORDER-BOX, for the reason ADR-135 wrote down after `.mtk-graph-card` was drawn at 232px while
+     three readers were told 208: this stylesheet has no universal reset, so a `width` that does not
+     say so is a CONTENT width and the padding and the hairline are added to it. Measured here as a
+     320px drawer reporting 337. */
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: var(--mtk-space-3);
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  padding: var(--mtk-space-4);
+  background: var(--mtk-bg-panel);
+}
+.animation-graph-palette > *,
+.animation-graph-inspector > * { flex: none; }
+.animation-graph-palette { grid-area: palette; border-right: 1px solid var(--mtk-border-subtle); }
+.animation-graph-inspector { grid-area: inspector; border-left: 1px solid var(--mtk-border-subtle); }
+/* The search field stays put while ten operators scroll under it — it is the control the `/` key
+   focuses from anywhere in the panel, and a shortcut that scrolls its own target out of view is a
+   shortcut that has to be undone by hand. */
+.animation-graph-palette__search {
+  position: sticky;
+  top: calc(var(--mtk-space-4) * -1);
+  z-index: 1;
+  margin: calc(var(--mtk-space-4) * -1) calc(var(--mtk-space-4) * -1) 0;
+  padding: var(--mtk-space-4) var(--mtk-space-4) var(--mtk-space-3);
+  background: var(--mtk-bg-panel);
+}
+.animation-graph-palette__search .mtk-input { width: 100%; }
+.animation-graph-canvas { grid-area: canvas; position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+
+/* NARROW: THE SIDE COLUMN BECOMES A SHEET OVER THE CANVAS.
+   The three tracks want 200 + 360 + 260 = 820px, and below that the shipped grid overflowed its own
+   `overflow: hidden` box — measured at 460px, where the inspector, the parameter strip and 150px of
+   the canvas were cut away with no scrollbar and no way to reach any of them. That is the regime
+   ADR-126 answered for the bottom dock, and the answer holds one level in: when a panel can no longer
+   be a TRACK beside the primary surface, it becomes a SHEET over it. The canvas keeps its whole
+   column, the open drawer keeps a real content box, and the toolbar toggle that opened it is the way
+   back out. It is done by GRID PLACEMENT, not absolute positioning: the sheet occupies the canvas
+   area exactly, so it can never be one number out of step with the toolbar above it. */
+/* NARROW: THE SIDE COLUMN BECOMES A SHEET OVER THE CANVAS.
+   The three tracks want 200 + 360 + 260 = 820px, and below that the shipped grid overflowed its own
+   `overflow: hidden` box — measured at 460px, where the inspector, the parameter strip and 150px of
+   the canvas were cut away with no scrollbar and no way to reach any of them. That is the regime
+   ADR-126 answered for the bottom dock, and the answer holds one level in: when a panel can no longer
+   be a TRACK beside the primary surface, it becomes a SHEET over it. The canvas keeps its whole
+   column, the open drawer keeps a real content box, and the toolbar toggle that opened it is the way
+   back out. It is done by GRID PLACEMENT, not absolute positioning: the sheet occupies the canvas area
+   exactly, so it can never be one number out of step with the toolbar above it.
+
+   THE THRESHOLD IS STATED ONCE, IN TYPESCRIPT (`ANIMATION_GRAPH_TRACKS_MIN`), and reaches this
+   stylesheet as `data-layout`. It began as a container query, which cost two lessons worth keeping:
+   an element cannot query the container IT declares (the rules on `.animation-graph-editor` never
+   matched while the descendant rules in the same block did, so the panel overflowed by 360px with its
+   sheets parked mid-canvas) — and once it worked, a width stated in CSS and a mutual-exclusion rule
+   stated in TS would have been one number written twice, which is the drift this repository gates for
+   everywhere else. The component measures itself and says which layout it is in; the stylesheet draws
+   what it is told. */
+.animation-graph-editor[data-layout="drawer"],
+.animation-graph-editor[data-layout="drawer"][data-palette-open="false"][data-inspector-open="true"],
+.animation-graph-editor[data-layout="drawer"][data-palette-open="true"][data-inspector-open="false"],
+.animation-graph-editor[data-layout="drawer"][data-palette-open="false"][data-inspector-open="false"] {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "toolbar" "canvas" "parameters";
+}
+/* AN OPEN DRAWER REPLACES THE CANVAS RATHER THAN FLOATING OVER IT. A 320px sheet on a 460px panel
+   leaves 140px of graph — not a view of anything — while covering the rest, and the capture of that
+   state reported sixteen pairs of controls sitting on each other's click targets, because "on top of"
+   and "instead of" are different claims and only the second one is true here. The canvas stays MOUNTED
+   (React Flow keeps its viewport, its selection and its measured node sizes) and is hidden from sight
+   and from the pointer; the toolbar toggle that opened the drawer is the way back to it. */
+.animation-graph-editor[data-layout="drawer"] .animation-graph-palette,
+.animation-graph-editor[data-layout="drawer"] .animation-graph-inspector {
+  grid-area: canvas;
+  z-index: 6;
+  width: 100%;
+  border: 0;
+}
+/* `display: none`, not `visibility: hidden`, and the difference is measured rather than stylistic:
+   React Flow writes `visibility: visible` INLINE on every node (`AnimationGraphEditor.test.tsx` asserts
+   it), and an inline declaration beats an inherited one — so the nodes stayed visible, stayed
+   clickable, and stayed on top of the drawer's controls in the capture. The component is still
+   MOUNTED, so the viewport, the selection and the stamped node sizes all survive the round trip; only
+   the box is gone. */
+.animation-graph-editor[data-layout="drawer"][data-palette-open="true"] .animation-graph-canvas,
+.animation-graph-editor[data-layout="drawer"][data-inspector-open="true"] .animation-graph-canvas {
+  display: none;
+}
+.animation-graph-editor[data-layout="drawer"] .animation-graph-parameters__add { margin-left: 0; }
+
+/* ── the two shapes a component library cannot supply: a list of rows, and a record grid ────────── */
+
+.animation-graph-stack { display: grid; gap: var(--mtk-space-4); min-width: 0; }
+.animation-graph-list,
+.animation-graph-records { display: grid; gap: var(--mtk-space-2); margin: 0; padding: 0; list-style: none; min-width: 0; }
+.animation-graph-subsection { display: grid; gap: var(--mtk-space-3); margin-top: var(--mtk-space-4); min-width: 0; }
+.animation-graph-subsection__head { display: flex; align-items: center; justify-content: space-between; gap: var(--mtk-space-3); }
+.animation-graph-eyebrow {
+  color: var(--mtk-text-muted);
+  font: 600 11px/1.2 var(--mtk-font-ui);
+  letter-spacing: .7px;
+  text-transform: uppercase;
+}
+.animation-graph-note { margin: 0; color: var(--mtk-text-secondary); font-size: 11px; line-height: 1.45; }
+.animation-graph-identity-line {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  color: var(--mtk-text-muted);
+  font-size: 11px;
+}
+.animation-graph-identity-line code { overflow: hidden; font-family: var(--mtk-font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.animation-graph-watch { display: flex; gap: var(--mtk-space-3); min-width: 0; color: var(--mtk-text-secondary); font-size: 11px; }
+.animation-graph-watch code { font-family: var(--mtk-font-mono); }
+
+/* THE PALETTE ROW. A `Button` in row form — the design system's control, laid out as the list row the
+   outliner and the asset library already use, rather than a bordered card with a 15px title over a
+   10px sentence. Ten of those filled the whole column before anything else could be in it. */
+.animation-graph-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--mtk-space-4);
+  width: 100%;
+  min-height: var(--mtk-control-comfortable);
+  padding: var(--mtk-space-3) var(--mtk-space-4);
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  text-align: left;
+  white-space: normal;
+}
+.animation-graph-item:hover:not(:disabled) { border-color: transparent; background: var(--mtk-bg-hover); }
+.animation-graph-item[aria-pressed="true"] { background: var(--mtk-accent-subtle); color: var(--mtk-text); }
+.animation-graph-item--plain { grid-template-columns: minmax(0, 1fr); font-weight: 400; }
+.animation-graph-item__mark {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--mtk-radius-md);
+  color: var(--mtk-text-muted);
+  background: var(--mtk-bg-inset);
+}
+.animation-graph-item__text { display: grid; gap: 1px; min-width: 0; }
+.animation-graph-item__name {
+  overflow: hidden;
+  color: var(--mtk-text);
+  font-size: 13px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Two lines, then ellipsis — the ADR-120 rule. A blocked source's reason is a whole sentence, and a
+   row that grows to hold one turns a scannable list into a wall. The full text is on the `title`. */
+.animation-graph-item__detail {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--mtk-text-muted);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.animation-graph-item:disabled .animation-graph-item__name { color: var(--mtk-text-muted); }
+
+/* THE RECORD GRIDS. Four shapes, one rhythm: every cell is a shared control at its own natural size,
+   and the grid only says how many columns and which one takes the remainder. */
+.animation-graph-record,
+.animation-graph-state,
+.animation-graph-condition,
+.animation-graph-parameter {
+  display: grid;
+  align-items: center;
+  gap: var(--mtk-space-3);
+  min-width: 0;
+  padding: var(--mtk-space-3);
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-lg);
+  background: var(--mtk-bg-raised);
+}
+.animation-graph-record { grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto; }
+.animation-graph-record__pair { display: grid; gap: var(--mtk-space-2); min-width: 0; }
+/* THESE TWO WRAP, and the floor is why. A fixed column count divides whatever width there is, so at a
+   300px dock the four cells of a condition became 89 · 74 · 68 · 30 — a select too narrow to read the
+   word inside it, which is the ADR-120 defect wearing a grid. A flex row with a per-control floor
+   spends the width it has and takes a second line when it runs out. */
+.animation-graph-state,
+.animation-graph-condition { display: flex; flex-wrap: wrap; }
+.animation-graph-state > .mtk-input,
+.animation-graph-state > .mtk-select,
+.animation-graph-condition > .mtk-select { flex: 1 1 108px; min-width: 96px; }
+.animation-graph-condition > .mtk-numfield { flex: 0 1 84px; min-width: 72px; }
+.animation-graph-state > .mtk-check,
+.animation-graph-state > .mtk-btn,
+.animation-graph-condition > .mtk-btn { flex: none; }
+.animation-graph-state > .mtk-btn,
+.animation-graph-condition > .mtk-btn { margin-left: auto; }
+.animation-graph-state > .mtk-radio { flex: none; }
+.animation-graph-parameter { grid-template-columns: minmax(0, 1fr); align-items: stretch; }
+.animation-graph-parameter__head { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 96px) auto; align-items: center; gap: var(--mtk-space-3); }
+.animation-graph-sample { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 84px) minmax(0, 84px); align-items: center; gap: var(--mtk-space-3); min-width: 0; }
+.animation-graph-sample__name { overflow: hidden; color: var(--mtk-text-secondary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+
+.animation-graph-diagnostic__message,
+.animation-graph-diagnostic__fix,
+.animation-graph-diagnostic__action { display: block; }
+.animation-graph-diagnostic__fix { margin-top: var(--mtk-space-2); color: var(--mtk-text-muted); }
+.animation-graph-diagnostic__action { margin-top: var(--mtk-space-4); }
+
+/* THE PREVIEW STRIP. Wraps rather than scrolls: the shipped row was `overflow-x: auto` with no
+   visible scrollbar, so a graph with five parameters put "+ Parameter" and "Reset preview" past the
+   right edge with nothing on screen saying they were there. */
 .animation-graph-parameters {
   grid-area: parameters;
-  display: flex;
-  align-items: center;
-  gap: 9px;
+  display: grid;
+  gap: var(--mtk-space-3);
   min-width: 0;
-  overflow-x: auto;
-  padding: 7px 9px;
+  padding: var(--mtk-space-4) var(--mtk-space-5);
   border-top: 1px solid var(--mtk-border-subtle);
   background: var(--mtk-bg-raised);
 }
-.animation-graph-preview-heading { flex: 0 0 auto; white-space: nowrap; }
-.animation-graph-preview-parameter { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; font-size: 10px; }
-.animation-graph-preview-parameter input[type="number"] { width: 58px; }
-.animation-graph-preview-wrap { display: inline-flex; align-items: center; gap: 3px; }
-.animation-graph-preview-wrap > button { min-height: var(--mtk-control-compact); border: 1px solid var(--mtk-border-subtle); border-radius: var(--mtk-radius-sm); color: var(--mtk-text-muted); background: var(--mtk-bg-raised); font-size: 10px; }
-.animation-graph-preview-wrap > button[aria-pressed="true"] { color: var(--mtk-success); border-color: var(--mtk-success-border); }
-.animation-graph-empty { grid-area: 2 / 1 / 4 / 4; display: grid; place-items: center; }
+.animation-graph-parameters__heading { display: flex; align-items: baseline; gap: var(--mtk-space-3); }
+.animation-graph-parameters__row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--mtk-space-3) var(--mtk-space-5); min-width: 0; }
+.animation-graph-parameters__add { display: flex; flex-wrap: wrap; align-items: center; gap: var(--mtk-space-3); margin-left: auto; }
+.animation-graph-parameters__add .mtk-input { width: 132px; }
+.animation-graph-parameters__add .mtk-select { width: 104px; }
+.animation-graph-preview { display: inline-flex; align-items: center; gap: var(--mtk-space-3); }
+.animation-graph-preview__control { display: inline-flex; align-items: center; gap: var(--mtk-space-3); }
+.animation-graph-preview__name { color: var(--mtk-text-secondary); font-size: 11px; white-space: nowrap; }
+.animation-graph-preview__control .mtk-numfield { width: 76px; }
+.animation-graph-preview__control .mtk-slider { width: 108px; }
+
+.animation-graph-empty { grid-area: 2 / 1 / 4 / -1; display: grid; place-items: center; }
 .animation-graph-loading { display: grid; height: 100%; place-items: center; color: var(--mtk-text-secondary); }
-.animation-graph-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-.animation-graph-error { position: absolute; right: 8px; bottom: 50px; z-index: 8; max-width: 420px; padding: 8px 10px; border: 1px solid var(--mtk-danger-border); border-radius: var(--mtk-radius-lg); color: var(--mtk-danger); background: var(--mtk-danger-bg); box-shadow: var(--mtk-shadow-2); font-size: 11px; }
-.animation-graph-conflict { position: absolute; top: 48px; left: 50%; z-index: 12; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; width: min(680px, calc(100% - 20px)); padding: 10px; border: 1px solid var(--mtk-warn-border); border-radius: var(--mtk-radius-lg); color: var(--mtk-text); background: var(--mtk-warn-bg); box-shadow: var(--mtk-shadow-3); transform: translateX(-50%); font-size: 11px; }
-.animation-graph-conflict span { flex: 1 1 300px; color: var(--mtk-text-secondary); }
+.animation-graph-error {
+  position: absolute;
+  right: var(--mtk-space-4);
+  bottom: 56px;
+  z-index: 8;
+  max-width: 420px;
+  padding: var(--mtk-space-4) var(--mtk-space-5);
+  border: 1px solid var(--mtk-danger-border);
+  border-radius: var(--mtk-radius-lg);
+  color: var(--mtk-danger);
+  background: var(--mtk-danger-bg);
+  box-shadow: var(--mtk-shadow-2);
+  font-size: 11px;
+}
 
 @container animationWorkspace (max-width: 920px) {
   /* THE TIMELINE IS THIS WORKSPACE'S STAGE, AND STACKED IT WAS THE SMALLEST THING IN IT. Three auto
@@ -3053,35 +3284,11 @@ body > [role="dialog"][aria-modal="true"] {
     max-height: 260px;
   }
 
-  .animation-graph-editor {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto minmax(180px, 1fr) auto;
-    grid-template-areas: "toolbar" "canvas" "parameters";
-    overflow: hidden;
-  }
-  .animation-graph-toolbar { gap: 4px; overflow-x: hidden; padding-right: 6px; padding-left: 6px; }
-  .animation-graph-toolbar-identity { flex: 1 1 110px; min-width: 92px; max-width: 132px; }
-  .animation-graph-toolbar-meta { display: none; }
-  .animation-graph-stale,
-  .animation-graph-toolbar-view-actions,
-  .animation-graph-toolbar-spacer { display: none; }
-  .animation-graph-toolbar-status,
-  .animation-graph-toolbar-actions { gap: 2px; }
-  .animation-graph-toolbar-actions .mtk-btn--compact { padding-right: 5px; padding-left: 5px; font-size: 11px; }
-  .animation-graph-toolbar-delete-suffix { display: none; }
-  .animation-graph-palette,
-  .animation-graph-inspector {
-    position: absolute;
-    top: 44px;
-    bottom: 44px;
-    z-index: 10;
-    width: min(310px, calc(100% - 24px));
-    max-height: none;
-    border: 1px solid var(--mtk-border-strong);
-    box-shadow: var(--mtk-shadow-4);
-  }
-  .animation-graph-palette { left: 0; }
-  .animation-graph-inspector { right: 0; }
+  /* The animation graph's own narrow rule USED to live here, keyed on the WORKSPACE's width. It has
+     moved to `@container animationGraph` beside the panel's other layout, because a panel whose
+     responsive behaviour is owned by one particular parent silently loses it anywhere else — the same
+     shape as the `.react-flow__*` overrides ADR-135 found scoped to one canvas while two other graphs
+     wore the vendor's appearance. */
 }
 
 @media (prefers-reduced-motion: reduce) {

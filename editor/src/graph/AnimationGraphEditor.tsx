@@ -10,7 +10,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type ChangeEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import {
@@ -36,9 +35,23 @@ import {
   type AnimationDraftValue,
   type AnimationWorkspaceKey,
 } from "../store/animation";
-import { Icon } from "../theme/icons";
-import { Badge, Button, NumericField, Slider } from "../theme/primitives";
-import { EmptyPanelState } from "../theme/workspace";
+import { Icon, type IconToken } from "../theme/icons";
+import {
+  Badge,
+  Button,
+  NumericField,
+  ReadOut,
+  SearchField,
+  SelectField,
+  Slider,
+  TextAreaField,
+  TextField,
+  Toolbar,
+  ToolbarGroup,
+  ToolbarSpacer,
+} from "../theme/primitives";
+import { Callout, Checkbox, Field, FieldGrid, ProgressBar, Radio, VisuallyHidden } from "../theme/fields";
+import { DisclosureSection, EmptyPanelState } from "../theme/workspace";
 import { graphEdgeStyle, graphNodeStyle, graphTheme } from "../theme/graph";
 import { color, elevation, fontSize, space } from "../theme/tokens";
 import {
@@ -103,6 +116,33 @@ const NODE_LABELS: ReadonlyArray<{ kind: AnimationGraphNodeKind; label: string; 
   { kind: "output", label: "Output", detail: "One final mixed property bundle" },
 ];
 
+/** The mark each palette row wears. A list of ten same-shaped rows is scanned by its icons, which is
+ *  why every other list in this editor has them and this one did not. */
+const NODE_ICON: Readonly<Record<AnimationGraphNodeKind, IconToken>> = {
+  reference_pose: "character",
+  sequence: "animate",
+  blend_normalized: "swap",
+  blend_direct: "swap",
+  blend_1d: "measure",
+  blend_2d_cartesian: "grid",
+  layer_override: "group",
+  layer_additive: "plus",
+  state_machine: "logic",
+  output: "export",
+};
+
+const SOURCE_ICON: Readonly<Record<string, IconToken>> = {
+  authored_sequence: "animate",
+  imported_clip: "imported",
+  reference_pose: "character",
+};
+
+/** The one sentence this panel says when the native schema is a version it cannot author against.
+ *  Stated once because three controls refuse for exactly this reason and all three used to say
+ *  nothing at all. */
+const SCHEMA_REFUSAL =
+  "This project's animation-graph schema is a version this editor cannot author against. Update the engine to edit graphs here.";
+
 const FUTURE_NODES = [
   ["Motion matching", "Requires a searchable pose database and deterministic feature extraction."],
   ["IK / constraints", "Requires the skeletal constraint and solver gate."],
@@ -120,6 +160,14 @@ const EMPTY_STATE = (sequenceId: string): AnimationGraphStateInfo => ({
   compile: { state: "missing", authoredRevision: "loading", compiledRevision: null, compiledHash: null, lastGoodRevision: null, lastGoodHash: null, message: "Loading graph…" },
   diagnostics: [],
 });
+
+/** The width below which the palette and the inspector stop being TRACKS beside the canvas and become
+ *  SHEETS over it: the three tracks' own floors, 200 + 360 + 260, plus their two hairlines.
+ *
+ *  ONE STATEMENT OF THE NUMBER. It drives the `data-layout` attribute the stylesheet keys on AND the
+ *  rule that the two drawers are mutually exclusive at that width — a CSS media/container query would
+ *  have made it two numbers that nothing compares, and the second one always goes stale. */
+const ANIMATION_GRAPH_TRACKS_MIN = 822;
 
 const GRAPH_COMPILE_POLL_INTERVAL_MS = 200;
 
@@ -265,6 +313,8 @@ export function AnimationGraphEditor({
   const flowRef = useRef<ReactFlowInstance<AnimationFlowNode, FlowEdge> | null>(null);
   const fitOnNextGraphRender = useRef(false);
   const paletteSearchRef = useRef<HTMLInputElement>(null);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const [sheetLayout, setSheetLayout] = useState(false);
   const focusPaletteSearchOnOpen = useRef(false);
   const loadEpoch = useRef(0);
   const compilePollEpoch = useRef(0);
@@ -441,6 +491,15 @@ export function AnimationGraphEditor({
     return [...state.diagnostics, ...preflight.filter((diagnostic) => !ids.has(diagnostic.id))];
   }, [preflight, state.diagnostics]);
   const dirty = graphJson(draft) !== graphJson(state.graph);
+  // WHY APPLY IS REFUSING, in the user's words. Apply has five reasons to be disabled and the shipped
+  // button gave none of them — a capture of this panel reported it as a control that refuses and says
+  // why nowhere. Computed once, beside the boolean that consumed it.
+  const applyRefusal = !schemaSupported ? SCHEMA_REFUSAL
+    : conflictRevision ? "Someone else saved a newer revision. Rebase or discard this draft first."
+    : saving ? "An apply is already in flight."
+    : !draft ? "There is no graph to apply yet."
+    : !dirty ? "Nothing has changed since the last apply."
+    : undefined;
   const presentation = useMemo(() => new Map(state.nodePresentation.map((item) => [item.nodeId, item])), [state.nodePresentation]);
   const activeNodes = useMemo(() => new Map(debug?.activeNodes.map((item) => [item.nodeId, item]) ?? []), [debug]);
   const activeEdges = useMemo(() => new Map(debug?.activeEdges.map((item) => [item.edgeId, item]) ?? []), [debug]);
@@ -1114,46 +1173,155 @@ export function AnimationGraphEditor({
     }
   };
 
+  // A ResizeObserver on the panel ITSELF, not a window listener: this editor is a dock workspace, so
+  // its width changes when a neighbouring dock opens and the window does not move at all.
+  useEffect(() => {
+    const el = frameRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    // A POSITIVE measurement, never merely a small one. A width of 0 means "not laid out yet", not
+    // "narrow": every element reports it before first layout, and jsdom reports it forever. Reading 0
+    // as narrow costs a flash of the wrong layout on every mount in the browser — and in a test
+    // environment it makes the panel PERMANENTLY narrow, which is how the drawer rule silently
+    // rewrote a passing assertion about two drawers being open at once.
+    const read = () => {
+      const width = el.getBoundingClientRect().width;
+      setSheetLayout(width > 0 && width < ANIMATION_GRAPH_TRACKS_MIN);
+    };
+    read();
+    const ro = new ResizeObserver(read);
+    ro.observe(el);
+    return () => ro.disconnect();
+    // The loading state renders a different element, so `frameRef` is null on the first pass and the
+    // observer has to be attached again once the editor itself is on screen. Keyed on the two facts
+    // the guard above reads, never on `draft` — that changes on every keystroke.
+  }, [loading, draft === null]);
+
+  // AT DRAWER WIDTH THE TWO ARE MUTUALLY EXCLUSIVE. A drawer takes the canvas's whole area there, so
+  // two open at once would be two panels on one box — photographed before this rule existed as sixteen
+  // pairs of controls sitting on each other's click targets. As tracks they coexist happily, so the
+  // rule is scoped to the layout that cannot hold both rather than applied everywhere.
+  const openDrawer = (drawer: "palette" | "inspector") => {
+    animationEditorStore.getState().updateGraph(workspaceKey, (current) => {
+      const opening = drawer === "palette" ? !current.paletteOpen : !current.inspectorOpen;
+      if (drawer === "palette") {
+        return { ...current, paletteOpen: opening, inspectorOpen: opening && sheetLayout ? false : current.inspectorOpen };
+      }
+      return { ...current, inspectorOpen: opening, paletteOpen: opening && sheetLayout ? false : current.paletteOpen };
+    });
+  };
+
   if (loading && !draft) {
     return <div className="animation-graph-loading" role="status">Loading the sequence graph…</div>;
   }
 
   return (
-    <div className="animation-graph-editor" data-testid="animation-graph-editor" data-palette-open={view.paletteOpen} data-inspector-open={view.inspectorOpen} onKeyDown={onKeyDownCapture}>
-      <header className="animation-graph-toolbar">
-        <div className="animation-graph-toolbar-identity">
-          <strong className="animation-graph-toolbar-name">{draft?.name ?? "Animation graph"}</strong>
-          <span className="animation-graph-toolbar-meta" style={{ marginLeft: space.sm, color: color.text.muted, fontSize: fontSize.micro }}>sequence {sequenceId} · rev {state.revision}</span>
+    <div
+      ref={frameRef}
+      className="animation-graph-editor"
+      data-layout={sheetLayout ? "drawer" : "tracks"}
+      data-testid="animation-graph-editor"
+      data-palette-open={view.paletteOpen}
+      data-inspector-open={view.inspectorOpen}
+      onKeyDown={onKeyDownCapture}
+    >
+      {/* ONE toolbar component, and its overflow policy is WRAP. The bespoke header this replaces was
+          `overflow-x: auto` over a fixed-basis identity cell, which cut `rev graph-rev-4` mid-word at
+          1280px with no scrollbar and no ellipsis — measured by the first capture this surface ever
+          had. A row that grows a second line is legible; a row that silently loses its end is not. */}
+      <Toolbar className="animation-graph-toolbar" aria-label="Animation graph">
+        <div
+          className="animation-graph-identity"
+          title={`${draft?.name ?? "Animation graph"} · sequence ${sequenceId} · revision ${state.revision}`}
+        >
+          <span className="animation-graph-identity__name">{draft?.name ?? "Animation graph"}</span>
+          <span className="animation-graph-identity__meta">sequence {sequenceId} · rev {state.revision}</span>
         </div>
-        <span className="animation-graph-toolbar-status">
+        <ToolbarGroup aria-label="Compile state">
           <Badge tone={compileTone(state.compile.state)}>{state.compile.state}</Badge>
           {dirty && <Badge tone="warn">unapplied draft</Badge>}
           {(state.compile.state === "invalid" || state.compile.state === "stale") && state.compile.lastGoodRevision && (
-            <span className="animation-graph-stale">Draft invalid · previewing revision {state.compile.lastGoodRevision}</span>
+            <Badge tone="warn" title={`Draft invalid — the preview is still playing revision ${state.compile.lastGoodRevision}.`}>
+              previewing rev {state.compile.lastGoodRevision}
+            </Badge>
           )}
-        </span>
-        <span className="animation-graph-toolbar-spacer" />
-        <span className="animation-graph-toolbar-view-actions">
-          <Button compact variant="ghost" active={view.showWeights} aria-pressed={view.showWeights} onClick={() => animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, showWeights: !current.showWeights }))}>Weights</Button>
-          {hasMeasuredCost && <Button compact variant="ghost" active={view.showCosts} aria-pressed={view.showCosts} onClick={() => animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, showCosts: !current.showCosts }))}>Costs</Button>}
-        </span>
-        <span className="animation-graph-toolbar-actions" data-testid="animation-graph-toolbar-actions">
-          <Button compact variant="ghost" active={view.paletteOpen} aria-pressed={view.paletteOpen} aria-expanded={view.paletteOpen} aria-controls="animation-graph-palette" onClick={() => animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, paletteOpen: !current.paletteOpen }))}>Palette</Button>
-          <Button compact variant="ghost" active={view.inspectorOpen} aria-pressed={view.inspectorOpen} aria-expanded={view.inspectorOpen} aria-controls="animation-graph-inspector" onClick={() => animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, inspectorOpen: !current.inspectorOpen }))}>Inspector</Button>
+        </ToolbarGroup>
+        <ToolbarSpacer />
+        <ToolbarGroup attached aria-label="Canvas overlays">
+          <Button
+            compact
+            variant="toggle"
+            active={view.showWeights}
+            title="Print each connection's weight on the wire that carries it"
+            onClick={() => animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, showWeights: !current.showWeights }))}
+          >Weights</Button>
+          {hasMeasuredCost && <Button
+            compact
+            variant="toggle"
+            active={view.showCosts}
+            title="Print each node's measured evaluation cost on its card"
+            onClick={() => animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, showCosts: !current.showCosts }))}
+          >Costs</Button>}
+        </ToolbarGroup>
+        <ToolbarGroup className="animation-graph-toolbar-actions" data-testid="animation-graph-toolbar-actions" aria-label="Graph actions">
+          <Button
+            compact
+            variant="toggle"
+            active={view.paletteOpen}
+            aria-expanded={view.paletteOpen}
+            aria-controls="animation-graph-palette"
+            onClick={() => openDrawer("palette")}
+          >Palette</Button>
+          <Button
+            compact
+            variant="toggle"
+            active={view.inspectorOpen}
+            aria-expanded={view.inspectorOpen}
+            aria-controls="animation-graph-inspector"
+            onClick={() => openDrawer("inspector")}
+          >Inspector</Button>
           {(dirty || saving) && <>
-            <Button compact variant="ghost" disabled={saving} onClick={discard}>Discard</Button>
-            <Button compact data-testid="animation-graph-apply" disabled={!draft || !dirty || saving || !schemaSupported || Boolean(conflictRevision)} onClick={() => void apply()}>{saving ? "Applying…" : "Apply"}</Button>
+            <Button compact variant="ghost" disabled={saving} disabledReason="An apply is already in flight." onClick={discard}>Discard</Button>
+            <Button
+              compact
+              variant="primary"
+              data-testid="animation-graph-apply"
+              disabled={!draft || !dirty || saving || !schemaSupported || Boolean(conflictRevision)}
+              disabledReason={applyRefusal}
+              onClick={() => void apply()}
+            >{saving ? "Applying…" : "Apply"}</Button>
           </>}
-          {state.graph && <Button compact variant="ghost" aria-label="Delete graph" disabled={saving} onClick={() => void deleteGraph()}><span>Delete<span className="animation-graph-toolbar-delete-suffix"> graph</span></span></Button>}
-        </span>
-      </header>
+          {state.graph && <Button
+            compact
+            variant="ghost"
+            aria-label="Delete graph"
+            disabled={saving}
+            disabledReason="An apply is already in flight."
+            onClick={() => void deleteGraph()}
+            // ONE TEXT NODE, chosen by the layout the component already measured. It was "Delete"
+            // plus a `<span>graph</span>` that a stylesheet hid when narrow — two flex children of a
+            // `Button`, so the button's own `gap` opened a second word space and it read "Delete
+            // graph" with a hole in it.
+          >{sheetLayout ? "Delete" : "Delete graph"}</Button>}
+        </ToolbarGroup>
+      </Toolbar>
 
       {conflictRevision && (
-        <div className="animation-graph-conflict" role="alert" data-testid="animation-graph-conflict">
-          <strong>Newer graph revision detected.</strong>
-          <span>Apply is locked so this draft cannot overwrite collaborator edits. Rebase safely merges non-overlapping stable-ID records; Discard shows the latest native revision.</span>
-          <Button compact onClick={() => void rebase()} disabled={saving}>Rebase local changes</Button>
-          <Button compact variant="ghost" onClick={discard} disabled={saving}>Discard local draft</Button>
+        <div className="animation-graph-conflict">
+          <Callout
+            tone="warn"
+            role="alert"
+            data-testid="animation-graph-conflict"
+            title="Newer graph revision detected"
+          >
+            <p className="animation-graph-note">
+              Apply is locked so this draft cannot overwrite a collaborator&apos;s edits. Rebase merges every
+              record neither of you changed; Discard replaces the draft with the latest saved revision.
+            </p>
+            <div className="animation-graph-conflict__actions">
+              <Button compact variant="primary" onClick={() => void rebase()} disabled={saving} disabledReason="An apply is already in flight.">Rebase local changes</Button>
+              <Button compact variant="ghost" onClick={discard} disabled={saving} disabledReason="An apply is already in flight.">Discard local draft</Button>
+            </div>
+          </Callout>
         </div>
       )}
 
@@ -1163,8 +1331,8 @@ export function AnimationGraphEditor({
             icon={<Icon name="logic" size="xl" />}
             title="No graph is authored for this sequence"
             description="Create an explicit editable graph. Nothing is persisted until Apply succeeds."
-            primaryAction={<Button data-testid="animation-graph-locomotion-preset" disabled={!schemaSupported} onClick={() => authorPreset(createLocomotionGraphPreset(sequenceId))}>Locomotion preset</Button>}
-            secondaryAction={<Button variant="ghost" disabled={!schemaSupported} onClick={() => authorPreset(createEmptyAnimationGraph(sequenceId))}>Empty graph</Button>}
+            primaryAction={<Button variant="primary" data-testid="animation-graph-locomotion-preset" disabled={!schemaSupported} disabledReason={SCHEMA_REFUSAL} onClick={() => authorPreset(createLocomotionGraphPreset(sequenceId))}>Locomotion preset</Button>}
+            secondaryAction={<Button variant="ghost" disabled={!schemaSupported} disabledReason={SCHEMA_REFUSAL} onClick={() => authorPreset(createEmptyAnimationGraph(sequenceId))}>Empty graph</Button>}
           />
         </div>
       ) : (
@@ -1175,52 +1343,85 @@ export function AnimationGraphEditor({
             aria-label="Animation graph node palette"
             onWheel={(event) => event.stopPropagation()}
           >
-            <label className="animation-graph-field">
-              Search nodes
-              <input
+            <div className="animation-graph-palette__search">
+              <SearchField
                 ref={paletteSearchRef}
-                className="mtk-input"
-                type="search"
+                aria-label="Search nodes"
                 value={view.search}
                 onChange={(event) => animationEditorStore.getState().setGraphSearch(workspaceKey, event.target.value)}
                 placeholder="Press / to focus"
               />
-            </label>
-            <div className="animation-graph-palette-list" role="list" aria-label="Animation graph sources">
-              <strong>Sources</strong>
-              {state.sources.map((source) => (
-                <div key={source.id} role="listitem">
-                  <button type="button" disabled={source.readiness === "blocked"} title={`${source.reason}${source.action ? ` Next: ${source.action}` : ""}`} onClick={() => addSourceNode(source)}>
-                    <span>{source.name}</span>
-                    <small>{source.kind.replaceAll("_", " ")} · {source.readiness} · {source.reason}</small>
-                  </button>
-                </div>
-              ))}
             </div>
-            <div role="list" aria-label="Supported graph nodes" className="animation-graph-palette-list">
-              <strong>Operators</strong>
-              {NODE_LABELS.filter((item) => !view.search || `${item.label} ${item.detail}`.toLocaleLowerCase().includes(view.search.toLocaleLowerCase())).map((item) => {
-                const duplicateOutput = item.kind === "output" && draft.nodes.some((node) => node.kind === "output");
-                return (
-                  <div key={item.kind} role="listitem">
-                    <button type="button" disabled={duplicateOutput} title={duplicateOutput ? "This graph already has an Output node." : item.detail} onClick={() => addNode(item.kind)}>
-                      <span>{item.label}</span><small>{duplicateOutput ? "Already present" : item.detail}</small>
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-            <div className="animation-graph-future" aria-label="Future graph nodes">
-              <strong>Later gates</strong>
-              {FUTURE_NODES.map(([label, reason]) => <button key={label} type="button" disabled title={reason}>{label}<small>{reason}</small></button>)}
-            </div>
-            <details open={view.listAlternativeOpen} onToggle={(event) => animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, listAlternativeOpen: event.currentTarget.open }))}>
-              <summary>Keyboard/list view</summary>
-              <ol className="animation-graph-accessible-list" aria-label="Animation graph nodes in document order">
+
+            <DisclosureSection title="Sources" summary={`${state.sources.length}`} density="compact" landmark={false} storageKey="animation-graph:sources">
+              <ul className="animation-graph-list" aria-label="Animation graph sources">
+                {state.sources.map((source) => (
+                  <li key={source.id}>
+                    <PaletteItem
+                      icon={SOURCE_ICON[source.kind] ?? "asset"}
+                      name={source.name}
+                      detail={source.readiness === "blocked" ? source.reason : source.kind.replaceAll("_", " ")}
+                      disabled={source.readiness === "blocked"}
+                      reason={`${source.reason}${source.action ? ` Next: ${source.action}` : ""}`}
+                      onClick={() => addSourceNode(source)}
+                    />
+                  </li>
+                ))}
+              </ul>
+            </DisclosureSection>
+
+            <DisclosureSection title="Operators" density="compact" landmark={false} storageKey="animation-graph:operators">
+              <ul className="animation-graph-list" aria-label="Supported graph nodes">
+                {NODE_LABELS.filter((item) => !view.search || `${item.label} ${item.detail}`.toLocaleLowerCase().includes(view.search.toLocaleLowerCase())).map((item) => {
+                  const duplicateOutput = item.kind === "output" && draft.nodes.some((node) => node.kind === "output");
+                  return (
+                    <li key={item.kind}>
+                      <PaletteItem
+                        icon={NODE_ICON[item.kind] ?? "logic"}
+                        name={item.label}
+                        detail={duplicateOutput ? "Already present" : item.detail}
+                        disabled={duplicateOutput}
+                        reason="This graph already has an Output node, and a graph has exactly one."
+                        onClick={() => addNode(item.kind)}
+                      />
+                    </li>
+                  );
+                })}
+              </ul>
+            </DisclosureSection>
+
+            <DisclosureSection title="Later gates" defaultOpen={false} unmountOnClose density="compact" landmark={false} storageKey="animation-graph:later">
+              <ul className="animation-graph-list" aria-label="Future graph nodes">
+                {FUTURE_NODES.map(([label, reason]) => (
+                  <li key={label}>
+                    <PaletteItem icon="hourglass" name={label} detail={reason} disabled reason={reason} onClick={() => undefined} />
+                  </li>
+                ))}
+              </ul>
+            </DisclosureSection>
+
+            {/* UNMOUNTED WHILE CLOSED, unlike every other section here, and it is a measurement rather
+                than a preference. `DisclosureSection` keeps closed content mounted so a half-typed
+                form survives a collapse — but this section holds no such state (its four `useState`s
+                live in the component, not in the DOM), it is closed by default, and it is the
+                heaviest thing in the panel: one select per connection endpoint, four per edge, plus
+                the four-field creator. On the locomotion preset that is 24 `<select>`s and their
+                whole option lists rendered, laid out and measured on every mount of a panel nobody
+                has opened this section in. */}
+            <DisclosureSection
+              title="Keyboard/list view"
+              density="compact"
+              landmark={false}
+              unmountOnClose
+              open={view.listAlternativeOpen}
+              onOpenChange={(open) => animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, listAlternativeOpen: open }))}
+            >
+              <ol className="animation-graph-list" aria-label="Animation graph nodes in document order">
                 {draft.nodes.map((node) => (
                   <li key={node.id}>
-                    <button
-                      type="button"
+                    <Button
+                      variant="ghost"
+                      className="animation-graph-item animation-graph-item--plain"
                       aria-pressed={view.selectedNodeIds.includes(node.id)}
                       onClick={() => animationEditorStore.getState().setGraphSelection(workspaceKey, [node.id], [])}
                       onKeyDown={(event) => {
@@ -1232,46 +1433,60 @@ export function AnimationGraphEditor({
                         const dy = event.key === "ArrowUp" ? -amount : event.key === "ArrowDown" ? amount : 0;
                         mutateDraft((graph) => ({ ...graph, nodes: graph.nodes.map((item) => item.id === node.id ? { ...item, position: { x: item.position.x + dx, y: item.position.y + dy } } : item) }));
                       }}
-                    >{node.name} · {nodeKindLabel(node.kind)}</button>
+                    >{node.name} · {nodeKindLabel(node.kind)}</Button>
                   </li>
                 ))}
               </ol>
-              <div className="animation-graph-list-connections" aria-label="Keyboard connection editor">
-                <strong>Create connection</strong>
-                <label>Source node
-                  <select aria-label="Connection source node" value={listSourceNodeId} onChange={(event) => {
-                    setListSourceNodeId(event.target.value);
-                    const node = draft.nodes.find((candidate) => candidate.id === event.target.value);
-                    setListSourcePortId(node ? animationGraphPorts(node.kind).find((port) => port.direction === "output" && port.kind === "pose")?.id ?? "pose" : "pose");
-                  }}><option value="">Choose source</option>{draft.nodes.filter((node) => animationGraphPorts(node.kind).some((port) => port.direction === "output" && port.kind === "pose")).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select>
-                </label>
-                <label>Source port
-                  <select aria-label="Connection source port" value={listSourcePortId} onChange={(event) => setListSourcePortId(event.target.value)}>{draft.nodes.find((node) => node.id === listSourceNodeId) ? animationGraphPorts(draft.nodes.find((node) => node.id === listSourceNodeId)!.kind).filter((port) => port.direction === "output" && port.kind === "pose").map((port) => <option key={port.id} value={port.id}>{port.label}</option>) : <option value="pose">Pose</option>}</select>
-                </label>
-                <label>Target node
-                  <select aria-label="Connection target node" value={listTargetNodeId} onChange={(event) => {
-                    setListTargetNodeId(event.target.value);
-                    const node = draft.nodes.find((candidate) => candidate.id === event.target.value);
-                    setListTargetPortId(node ? animationGraphPorts(node.kind).find((port) => port.direction === "input" && port.kind === "pose")?.id ?? "pose" : "pose");
-                  }}><option value="">Choose target</option>{draft.nodes.filter((node) => animationGraphPorts(node.kind).some((port) => port.direction === "input" && port.kind === "pose")).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select>
-                </label>
-                <label>Target port
-                  <select aria-label="Connection target port" value={listTargetPortId} onChange={(event) => setListTargetPortId(event.target.value)}>{draft.nodes.find((node) => node.id === listTargetNodeId) ? animationGraphPorts(draft.nodes.find((node) => node.id === listTargetNodeId)!.kind).filter((port) => port.direction === "input" && port.kind === "pose").map((port) => <option key={port.id} value={port.id}>{port.label}</option>) : <option value="pose">Pose</option>}</select>
-                </label>
-                <Button compact disabled={!listSourceNodeId || !listTargetNodeId} onClick={() => connect({ source: listSourceNodeId, sourceHandle: listSourcePortId, target: listTargetNodeId, targetHandle: listTargetPortId })}>Add connection</Button>
-                <strong>Connections</strong>
-                <ul aria-label="Animation graph connections">
-                  {draft.edges.map((edge) => <li key={edge.id}>
-                    <select aria-label={`Source node for ${edge.id}`} value={edge.fromNodeId} onChange={(event) => editConnection(edge.id, { fromNodeId: event.target.value })}>{draft.nodes.filter((node) => animationGraphPorts(node.kind).some((port) => port.direction === "output" && port.kind === "pose")).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select>
-                    <select aria-label={`Source port for ${edge.id}`} value={edge.fromPortId} onChange={(event) => editConnection(edge.id, { fromPortId: event.target.value })}>{animationGraphPorts(draft.nodes.find((node) => node.id === edge.fromNodeId)?.kind ?? "reference_pose").filter((port) => port.direction === "output" && port.kind === "pose").map((port) => <option key={port.id} value={port.id}>{port.label}</option>)}</select>
+
+              <div className="animation-graph-subsection" aria-label="Keyboard connection editor">
+                <span className="animation-graph-eyebrow">Create connection</span>
+                <FieldGrid minColumn={104}>
+                  <Field label="Source node" htmlFor="ag-connect-source-node">
+                    <SelectField id="ag-connect-source-node" aria-label="Connection source node" value={listSourceNodeId} onChange={(event) => {
+                      setListSourceNodeId(event.target.value);
+                      const node = draft.nodes.find((candidate) => candidate.id === event.target.value);
+                      setListSourcePortId(node ? animationGraphPorts(node.kind).find((port) => port.direction === "output" && port.kind === "pose")?.id ?? "pose" : "pose");
+                    }}><option value="">Choose source</option>{draft.nodes.filter((node) => animationGraphPorts(node.kind).some((port) => port.direction === "output" && port.kind === "pose")).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</SelectField>
+                  </Field>
+                  <Field label="Source port" htmlFor="ag-connect-source-port">
+                    <SelectField id="ag-connect-source-port" aria-label="Connection source port" value={listSourcePortId} onChange={(event) => setListSourcePortId(event.target.value)}>{draft.nodes.find((node) => node.id === listSourceNodeId) ? animationGraphPorts(draft.nodes.find((node) => node.id === listSourceNodeId)!.kind).filter((port) => port.direction === "output" && port.kind === "pose").map((port) => <option key={port.id} value={port.id}>{port.label}</option>) : <option value="pose">Pose</option>}</SelectField>
+                  </Field>
+                  <Field label="Target node" htmlFor="ag-connect-target-node">
+                    <SelectField id="ag-connect-target-node" aria-label="Connection target node" value={listTargetNodeId} onChange={(event) => {
+                      setListTargetNodeId(event.target.value);
+                      const node = draft.nodes.find((candidate) => candidate.id === event.target.value);
+                      setListTargetPortId(node ? animationGraphPorts(node.kind).find((port) => port.direction === "input" && port.kind === "pose")?.id ?? "pose" : "pose");
+                    }}><option value="">Choose target</option>{draft.nodes.filter((node) => animationGraphPorts(node.kind).some((port) => port.direction === "input" && port.kind === "pose")).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</SelectField>
+                  </Field>
+                  <Field label="Target port" htmlFor="ag-connect-target-port">
+                    <SelectField id="ag-connect-target-port" aria-label="Connection target port" value={listTargetPortId} onChange={(event) => setListTargetPortId(event.target.value)}>{draft.nodes.find((node) => node.id === listTargetNodeId) ? animationGraphPorts(draft.nodes.find((node) => node.id === listTargetNodeId)!.kind).filter((port) => port.direction === "input" && port.kind === "pose").map((port) => <option key={port.id} value={port.id}>{port.label}</option>) : <option value="pose">Pose</option>}</SelectField>
+                  </Field>
+                </FieldGrid>
+                <Button
+                  compact
+                  variant="primary"
+                  disabled={!listSourceNodeId || !listTargetNodeId}
+                  disabledReason="Choose both a source node and a target node first."
+                  onClick={() => connect({ source: listSourceNodeId, sourceHandle: listSourcePortId, target: listTargetNodeId, targetHandle: listTargetPortId })}
+                >Add connection</Button>
+
+                <span className="animation-graph-eyebrow">Connections</span>
+                <ul className="animation-graph-records" aria-label="Animation graph connections">
+                  {draft.edges.map((edge) => <li key={edge.id} className="animation-graph-record">
+                    <div className="animation-graph-record__pair">
+                      <SelectField aria-label={`Source node for ${edge.id}`} value={edge.fromNodeId} onChange={(event) => editConnection(edge.id, { fromNodeId: event.target.value })}>{draft.nodes.filter((node) => animationGraphPorts(node.kind).some((port) => port.direction === "output" && port.kind === "pose")).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</SelectField>
+                      <SelectField aria-label={`Source port for ${edge.id}`} value={edge.fromPortId} onChange={(event) => editConnection(edge.id, { fromPortId: event.target.value })}>{animationGraphPorts(draft.nodes.find((node) => node.id === edge.fromNodeId)?.kind ?? "reference_pose").filter((port) => port.direction === "output" && port.kind === "pose").map((port) => <option key={port.id} value={port.id}>{port.label}</option>)}</SelectField>
+                    </div>
                     <Icon name="arrow-right" size="sm" />
-                    <select aria-label={`Target node for ${edge.id}`} value={edge.toNodeId} onChange={(event) => editConnection(edge.id, { toNodeId: event.target.value, toPortId: animationGraphPorts(draft.nodes.find((node) => node.id === event.target.value)?.kind ?? "output").find((port) => port.direction === "input" && port.kind === "pose")?.id ?? "pose" })}>{draft.nodes.filter((node) => animationGraphPorts(node.kind).some((port) => port.direction === "input" && port.kind === "pose")).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select>
-                    <select aria-label={`Target port for ${edge.id}`} value={edge.toPortId} onChange={(event) => editConnection(edge.id, { toPortId: event.target.value })}>{animationGraphPorts(draft.nodes.find((node) => node.id === edge.toNodeId)?.kind ?? "output").filter((port) => port.direction === "input" && port.kind === "pose").map((port) => <option key={port.id} value={port.id}>{port.label}</option>)}</select>
-                    <Button compact icon variant="ghost" aria-label={`Delete connection ${edge.id}`} onClick={() => removeConnectionById(edge.id)}>×</Button>
+                    <div className="animation-graph-record__pair">
+                      <SelectField aria-label={`Target node for ${edge.id}`} value={edge.toNodeId} onChange={(event) => editConnection(edge.id, { toNodeId: event.target.value, toPortId: animationGraphPorts(draft.nodes.find((node) => node.id === event.target.value)?.kind ?? "output").find((port) => port.direction === "input" && port.kind === "pose")?.id ?? "pose" })}>{draft.nodes.filter((node) => animationGraphPorts(node.kind).some((port) => port.direction === "input" && port.kind === "pose")).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</SelectField>
+                      <SelectField aria-label={`Target port for ${edge.id}`} value={edge.toPortId} onChange={(event) => editConnection(edge.id, { toPortId: event.target.value })}>{animationGraphPorts(draft.nodes.find((node) => node.id === edge.toNodeId)?.kind ?? "output").filter((port) => port.direction === "input" && port.kind === "pose").map((port) => <option key={port.id} value={port.id}>{port.label}</option>)}</SelectField>
+                    </div>
+                    <Button compact icon variant="ghost" aria-label={`Delete connection ${edge.id}`} onClick={() => removeConnectionById(edge.id)}><Icon name="close" size="sm" /></Button>
                   </li>)}
                 </ul>
               </div>
-            </details>
+            </DisclosureSection>
           </aside>}
 
           <main className="animation-graph-canvas" aria-label="Animation graph canvas">
@@ -1318,23 +1533,39 @@ export function AnimationGraphEditor({
           </main>
 
           {view.inspectorOpen && <aside id="animation-graph-inspector" className="animation-graph-inspector" aria-label="Animation graph inspector">
-            <section>
-              <h3>Selection</h3>
-              {!selectedNode && !selectedEdge ? <p>Select a node, connection, or diagnostic.</p> : selectedEdge ? (
-                <>
-                  <div className="animation-graph-node-identity"><code>{selectedEdge.id}</code><span>{draft.nodes.find((node) => node.id === selectedEdge.fromNodeId)?.name ?? selectedEdge.fromNodeId} → {draft.nodes.find((node) => node.id === selectedEdge.toNodeId)?.name ?? selectedEdge.toNodeId}</span></div>
-                  <label className="animation-graph-check"><input type="checkbox" checked={selectedEdge.enabled} onChange={(event) => updateSelectedEdge({ enabled: event.target.checked })} /> Enabled</label>
-                  {selectedEdgeWeightSupport?.explicit && <label className="animation-graph-field">Explicit weight
-                    <input className="mtk-input" type="number" min={0} step={0.01} value={selectedEdge.weight ?? ""} placeholder="destination policy" onChange={(event) => updateSelectedEdge({ weight: event.target.value === "" ? null : Math.max(0, Number(event.target.value)), weightParameterId: null })} />
-                  </label>}
-                  {selectedEdgeWeightSupport?.parameter && <label className="animation-graph-field">Weight parameter
-                    <select value={selectedEdge.weightParameterId ?? ""} onChange={(event) => updateSelectedEdge({ weightParameterId: event.target.value || null, weight: null })}>
-                      <option value="">Use explicit/default weight</option>
-                      {draft.parameters.filter((parameter) => parameter.kind === "float").map((parameter) => <option key={parameter.id} value={parameter.id}>{parameter.name}</option>)}
-                    </select>
-                    <small>The stable connection ID retains this binding when inputs are reordered.</small>
-                  </label>}
-                  {selectedEdgeWeightSupport && <small>{selectedEdgeWeightSupport.reason}</small>}
+            <DisclosureSection title="Selection" density="compact" landmark={false} storageKey="animation-graph:selection">
+              {!selectedNode && !selectedEdge ? <p className="animation-graph-note">Select a node, a connection or a diagnostic to edit it here.</p> : selectedEdge ? (
+                <div className="animation-graph-stack">
+                  <RecordIdentity
+                    id={selectedEdge.id}
+                    caption={`${draft.nodes.find((node) => node.id === selectedEdge.fromNodeId)?.name ?? selectedEdge.fromNodeId} → ${draft.nodes.find((node) => node.id === selectedEdge.toNodeId)?.name ?? selectedEdge.toNodeId}`}
+                  />
+                  <Checkbox label="Enabled" checked={selectedEdge.enabled} onChange={(checked) => updateSelectedEdge({ enabled: checked })} />
+                  {selectedEdgeWeightSupport?.explicit && (
+                    <Field label="Explicit weight" htmlFor="ag-edge-weight">
+                      <NumericField
+                        id="ag-edge-weight"
+                        ariaLabel="Explicit weight"
+                        value={selectedEdge.weight ?? 0}
+                        min={0}
+                        step={0.01}
+                        onCommit={(value) => updateSelectedEdge({ weight: Math.max(0, value), weightParameterId: null })}
+                      />
+                    </Field>
+                  )}
+                  {selectedEdgeWeightSupport?.parameter && (
+                    <Field
+                      label="Weight parameter"
+                      htmlFor="ag-edge-weight-parameter"
+                      help="The stable connection ID keeps this binding when inputs are reordered."
+                    >
+                      <SelectField id="ag-edge-weight-parameter" value={selectedEdge.weightParameterId ?? ""} onChange={(event) => updateSelectedEdge({ weightParameterId: event.target.value || null, weight: null })}>
+                        <option value="">Use explicit/default weight</option>
+                        {draft.parameters.filter((parameter) => parameter.kind === "float").map((parameter) => <option key={parameter.id} value={parameter.id}>{parameter.name}</option>)}
+                      </SelectField>
+                    </Field>
+                  )}
+                  {selectedEdgeWeightSupport && <Callout tone="info">{selectedEdgeWeightSupport.reason}</Callout>}
                   {selectedEdgeWeightSupport && !selectedEdgeWeightSupport.explicit && !selectedEdgeWeightSupport.parameter
                     && (selectedEdge.weight !== null || selectedEdge.weightParameterId !== null)
                     && <Button compact variant="ghost" onClick={() => updateSelectedEdge({ weight: null, weightParameterId: null })}>Clear unsupported weight data</Button>}
@@ -1344,177 +1575,398 @@ export function AnimationGraphEditor({
                     && selectedEdgeTarget.parameterIds.length > 0
                     && <Button compact variant="ghost" onClick={() => updateSelectedEdge({ weight: 1, weightParameterId: null })}>Use edge constant instead</Button>}
                   <Button compact variant="danger" onClick={removeSelection}>Remove connection</Button>
-                </>
+                </div>
               ) : selectedNode ? (
-                <>
-                  <label className="animation-graph-field">Name<input className="mtk-input" value={selectedNode.name} onChange={(event) => updateSelectedNode({ name: event.target.value })} /></label>
-                  <label className="animation-graph-check"><input type="checkbox" checked={selectedNode.enabled} onChange={(event) => updateSelectedNode({ enabled: event.target.checked })} /> Enabled</label>
-                  <div className="animation-graph-node-identity"><code>{selectedNode.id}</code><span>{nodeKindLabel(selectedNode.kind)}</span></div>
+                <div className="animation-graph-stack">
+                  <Field label="Name" htmlFor="ag-node-name">
+                    <TextField id="ag-node-name" value={selectedNode.name} onChange={(event) => updateSelectedNode({ name: event.target.value })} />
+                  </Field>
+                  <Checkbox label="Enabled" checked={selectedNode.enabled} onChange={(checked) => updateSelectedNode({ enabled: checked })} />
+                  <RecordIdentity id={selectedNode.id} caption={nodeKindLabel(selectedNode.kind)} />
                   {selectedNode.kind === "sequence" && (
-                    <label className="animation-graph-field">Source
-                      <select value={selectedNode.sourceId ?? ""} onChange={(event) => updateSelectedNode({ sourceId: event.target.value || null })}>
+                    <Field
+                      label="Source"
+                      htmlFor="ag-node-source"
+                      help={state.sources.find((source) => source.id === selectedNode.sourceId)?.reason}
+                    >
+                      <SelectField id="ag-node-source" value={selectedNode.sourceId ?? ""} onChange={(event) => updateSelectedNode({ sourceId: event.target.value || null })}>
                         <option value="">Choose a ready source</option>
                         {state.sources.filter((source) => source.kind !== "reference_pose").map((source) => <option key={source.id} value={source.id} disabled={source.readiness === "blocked"}>{source.name}{source.readiness === "blocked" ? " — unavailable" : ""}</option>)}
-                      </select>
-                      {state.sources.find((source) => source.id === selectedNode.sourceId)?.reason && <small>{state.sources.find((source) => source.id === selectedNode.sourceId)?.reason}</small>}
-                    </label>
+                      </SelectField>
+                    </Field>
                   )}
                   {(["blend_1d", "blend_2d_cartesian", "layer_override", "layer_additive"] as AnimationGraphNodeKind[]).includes(selectedNode.kind) && (
-                    <label className="animation-graph-field">Parameter
-                      <select value={selectedNode.parameterIds[0] ?? ""} onChange={(event) => updateSelectedNodeParameter(event.target.value)}>
+                    <Field
+                      label="Parameter"
+                      htmlFor="ag-node-parameter"
+                      help={(selectedNode.kind === "layer_override" || selectedNode.kind === "layer_additive")
+                        ? "A node-level layer parameter owns the runtime weight. Clear any constant on the layer input edge; both cannot be authored together."
+                        : undefined}
+                    >
+                      <SelectField id="ag-node-parameter" value={selectedNode.parameterIds[0] ?? ""} onChange={(event) => updateSelectedNodeParameter(event.target.value)}>
                         <option value="">No parameter</option>
                         {draft.parameters.filter((parameter) => animationGraphCompatibleParameterKinds(selectedNode.kind).includes(parameter.kind)).map((parameter) => <option key={parameter.id} value={parameter.id}>{parameter.name} · {parameter.kind}</option>)}
-                      </select>
-                      {(selectedNode.kind === "layer_override" || selectedNode.kind === "layer_additive") && <small>A node-level layer parameter owns the runtime weight. Clear any constant on the layer input edge; both cannot be authored together.</small>}
-                    </label>
+                      </SelectField>
+                    </Field>
                   )}
                   {(selectedNode.kind === "blend_1d" || selectedNode.kind === "blend_2d_cartesian") && (
                     <>
-                      <div className="animation-graph-field" role="group" aria-label="Stable blend samples">
-                        <strong>Keyed samples</strong>
+                      <div className="animation-graph-subsection" role="group" aria-label="Stable blend samples">
+                        <span className="animation-graph-eyebrow">Keyed samples</span>
                         {selectedNode.samples.map((sample) => {
                           const edge = draft.edges.find((candidate) => candidate.id === sample.edgeId);
                           const source = draft.nodes.find((candidate) => candidate.id === edge?.fromNodeId);
-                          return <div key={sample.id} className="animation-graph-inline">
-                            <code title={`${sample.id} · ${sample.edgeId}`}>{source?.name ?? sample.edgeId}</code>
-                            <input className="mtk-input" aria-label={`${source?.name ?? sample.id} sample X`} type="number" value={sample.position[0]} onChange={(event) => updateSelectedNode({ samples: selectedNode.samples.map((candidate) => candidate.id === sample.id ? { ...candidate, position: [Number(event.target.value), candidate.position[1]] } : candidate) })} />
-                            {selectedNode.kind === "blend_2d_cartesian" && <input className="mtk-input" aria-label={`${source?.name ?? sample.id} sample Y`} type="number" value={sample.position[1]} onChange={(event) => updateSelectedNode({ samples: selectedNode.samples.map((candidate) => candidate.id === sample.id ? { ...candidate, position: [candidate.position[0], Number(event.target.value)] } : candidate) })} />}
+                          return <div key={sample.id} className="animation-graph-sample" title={`${sample.id} · ${sample.edgeId}`}>
+                            <span className="animation-graph-sample__name">{source?.name ?? sample.edgeId}</span>
+                            <NumericField
+                              ariaLabel={`${source?.name ?? sample.id} sample X`}
+                              value={sample.position[0]}
+                              onCommit={(value) => updateSelectedNode({ samples: selectedNode.samples.map((candidate) => candidate.id === sample.id ? { ...candidate, position: [value, candidate.position[1]] } : candidate) })}
+                            />
+                            {selectedNode.kind === "blend_2d_cartesian" && <NumericField
+                              ariaLabel={`${source?.name ?? sample.id} sample Y`}
+                              value={sample.position[1]}
+                              onCommit={(value) => updateSelectedNode({ samples: selectedNode.samples.map((candidate) => candidate.id === sample.id ? { ...candidate, position: [candidate.position[0], value] } : candidate) })}
+                            />}
                           </div>;
                         })}
-                        <small>Each coordinate is attached to a durable sample and connection ID, never list position.</small>
+                        <p className="animation-graph-note">Each coordinate is attached to a durable sample and connection ID, never list position.</p>
                       </div>
-                      {selectedNode.kind === "blend_2d_cartesian" && <label className="animation-graph-field">Authored triangles
-                        <textarea className="mtk-input" value={selectedNode.triangles.map((triangle) => triangle.join(", ")).join("\n")} onChange={(event) => updateSelectedNode({ triangles: event.target.value.split(/\r?\n/).map((line) => line.split(",").map((id) => id.trim()).filter(Boolean)).filter((ids) => ids.length === 3).map((ids) => [ids[0], ids[1], ids[2]] as const) })} placeholder="sample-left, sample-right, sample-forward" />
-                        <small>Three distinct connected sample IDs per triangle. Triangulation is compiled, never rebuilt per frame.</small>
-                      </label>}
+                      {selectedNode.kind === "blend_2d_cartesian" && (
+                        <Field
+                          label="Authored triangles"
+                          htmlFor="ag-node-triangles"
+                          help="Three distinct connected sample IDs per triangle, one triangle per line. Triangulation is compiled, never rebuilt per frame."
+                        >
+                          <TextAreaField
+                            id="ag-node-triangles"
+                            rows={3}
+                            value={selectedNode.triangles.map((triangle) => triangle.join(", ")).join("\n")}
+                            placeholder="sample-left, sample-right, sample-forward"
+                            onChange={(event) => updateSelectedNode({ triangles: event.target.value.split(/\r?\n/).map((line) => line.split(",").map((id) => id.trim()).filter(Boolean)).filter((ids) => ids.length === 3).map((ids) => [ids[0], ids[1], ids[2]] as const) })}
+                          />
+                        </Field>
+                      )}
                     </>
                   )}
                   {(selectedNode.kind === "layer_override" || selectedNode.kind === "layer_additive") && (
-                    <label className="animation-graph-field">Mask bindings
-                      <textarea className="mtk-input" value={selectedNode.maskBindings.join("\n")} placeholder="**/Transform/rotation" onChange={(event) => updateSelectedNode({ maskBindings: event.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) })} />
-                      <small>Full slash paths are target/component/property[/subpath]. <code>*</code> matches one complete segment; <code>**</code> matches any depth. Example: <code>**/Transform/rotation</code>.</small>
-                      {selectedNode.maskBindings.map((selector) => animationGraphMaskSelectorError(selector) && <span key={selector} role="alert">{selector}: {animationGraphMaskSelectorError(selector)}</span>)}
-                    </label>
+                    <>
+                      <Field
+                        label="Mask bindings"
+                        htmlFor="ag-node-mask"
+                        help="One slash path per line — target/component/property. * matches one segment, ** any depth. Example: **/Transform/rotation"
+                      >
+                        <TextAreaField
+                          id="ag-node-mask"
+                          rows={3}
+                          value={selectedNode.maskBindings.join("\n")}
+                          placeholder="**/Transform/rotation"
+                          onChange={(event) => updateSelectedNode({ maskBindings: event.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) })}
+                        />
+                      </Field>
+                      {selectedNode.maskBindings.map((selector) => animationGraphMaskSelectorError(selector) && (
+                        <Callout key={selector} tone="danger" role="alert">{selector}: {animationGraphMaskSelectorError(selector)}</Callout>
+                      ))}
+                    </>
                   )}
-                  {selectedNode.kind === "blend_2d_cartesian" && <p>{selectedNode.triangles.length} authored triangles. Native compilation validates stable point membership and hull coverage.</p>}
-                </>
+                  {selectedNode.kind === "blend_2d_cartesian" && (
+                    <p className="animation-graph-note">{selectedNode.triangles.length} authored triangles. Native compilation validates stable point membership and hull coverage.</p>
+                  )}
+                </div>
               ) : null}
-            </section>
+            </DisclosureSection>
 
             {selectedMachine && (
-              <section data-testid="animation-graph-state-inspector">
-                <h3>States and transitions</h3>
-                <div className="animation-graph-inline"><strong>{selectedMachine.name}</strong><Button compact variant="ghost" onClick={addState}>+ State</Button><Button compact variant="ghost" onClick={addTransition}>+ Transition</Button></div>
-                <div className="animation-graph-state-list">{selectedMachine.states.map((graphState) => (
-                  <div key={graphState.id} className="animation-graph-state-row">
-                    <label title="Entry state"><input type="radio" name={`entry-${selectedMachine.id}`} checked={selectedMachine.entryStateId === graphState.id} onChange={() => mutateDraft((graph) => ({ ...graph, stateMachines: graph.stateMachines.map((machine) => machine.id === selectedMachine.id ? { ...machine, entryStateId: graphState.id } : machine) }))} /> entry</label>
-                    <input className="mtk-input" aria-label={`State name ${graphState.name}`} value={graphState.name} onChange={(event) => updateMachineState(graphState.id, { name: event.target.value })} />
-                    <select aria-label={`Pose for ${graphState.name}`} value={graphState.poseNodeId} onChange={(event) => updateMachineState(graphState.id, { poseNodeId: event.target.value })}>
-                      {draft.nodes.filter((node) => ["reference_pose", "sequence", "blend_normalized", "blend_direct", "blend_1d", "blend_2d_cartesian", "layer_override", "layer_additive"].includes(node.kind)).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}
-                    </select>
-                    <label title="Restart local source time on entry"><input type="checkbox" checked={graphState.resetOnEntry} onChange={(event) => updateMachineState(graphState.id, { resetOnEntry: event.target.checked })} /> reset</label>
-                    <Button compact icon variant="ghost" aria-label={`Remove state ${graphState.name}`} onClick={() => removeMachineState(graphState.id)}>×</Button>
-                  </div>
-                ))}</div>
-                {selectedMachine.transitions.length > 0 && (
-                  <label className="animation-graph-field">Transition
-                    <select value={selectedTransition?.id ?? ""} onChange={(event) => setSelectedTransitionId(event.target.value)}>{selectedMachine.transitions.map((transition) => <option key={transition.id} value={transition.id}>{selectedMachine.states.find((item) => item.id === transition.fromStateId)?.name} → {selectedMachine.states.find((item) => item.id === transition.toStateId)?.name}</option>)}</select>
-                  </label>
-                )}
-                {selectedTransition && (
-                  <div className="animation-graph-transition-grid">
-                    <label className="animation-graph-field">From<select value={selectedTransition.fromStateId} onChange={(event) => updateTransition({ fromStateId: event.target.value })}>{selectedMachine.states.map((graphState) => <option key={graphState.id} value={graphState.id}>{graphState.name}</option>)}</select></label>
-                    <label className="animation-graph-field">To<select value={selectedTransition.toStateId} onChange={(event) => updateTransition({ toStateId: event.target.value })}>{selectedMachine.states.map((graphState) => <option key={graphState.id} value={graphState.id}>{graphState.name}</option>)}</select></label>
-                    <label className="animation-graph-field">Priority<NumericField ariaLabel="Transition priority" integer value={selectedTransition.priority} onCommit={(value) => updateTransition({ priority: Math.trunc(value) })} /></label>
-                    <label className="animation-graph-field">Duration (ticks)<NumericField ariaLabel="Transition duration in ticks" integer value={selectedTransition.durationTick} min={0} onCommit={(value) => updateTransition({ durationTick: Math.max(0, Math.trunc(value)) })} /></label>
-                    <label className="animation-graph-field">Curve<select value={selectedTransition.curve} onChange={(event) => updateTransition({ curve: event.target.value as AnimationGraphTransition["curve"] })}><option value="linear">Linear</option><option value="ease_in">Ease in</option><option value="ease_out">Ease out</option><option value="ease_in_out">Ease in/out</option><option value="smoothstep">Smoothstep</option></select></label>
-                    <label className="animation-graph-field">Interruption<select value={selectedTransition.interruption} onChange={(event) => updateTransition({ interruption: event.target.value as AnimationGraphTransition["interruption"] })}><option value="none">None</option><option value="source">Source</option><option value="destination">Destination</option><option value="both">Both</option></select></label>
-                    <label className="animation-graph-field">Exit time · future runtime gate<input className="mtk-input" type="number" min={0} max={1} step={0.01} value={selectedTransition.exitTime ?? ""} placeholder="condition only" onChange={(event) => updateTransition({ exitTime: event.target.value === "" ? null : Math.max(0, Math.min(1, Number(event.target.value))) })} /><small>Persisted for forward compatibility. Native schema v2 reports a compile diagnostic and keeps the last-good preview when exit time is set.</small></label>
-                    <div><Button compact variant="ghost" onClick={addCondition}>+ Condition</Button></div>
-                    {selectedTransition.conditions.map((condition) => {
-                      const conditionParameter = draft.parameters.find((parameter) => parameter.id === condition.parameterId);
-                      const booleanLike = conditionParameter?.kind === "boolean" || conditionParameter?.kind === "trigger";
-                      return (
-                        <div key={condition.id} className="animation-graph-condition">
-                          <select aria-label="Condition parameter" value={condition.parameterId} onChange={(event) => { const parameter = draft.parameters.find((item) => item.id === event.target.value); if (parameter) updateCondition(condition.id, { parameterId: parameter.id, operator: parameter.kind === "boolean" ? "is_true" : parameter.kind === "trigger" ? "triggered" : "greater", value: parameter.kind === "boolean" || parameter.kind === "trigger" ? null : parameter.defaultValue }); }}>{draft.parameters.map((parameter) => <option key={parameter.id} value={parameter.id}>{parameter.name}</option>)}</select>
-                          <select aria-label="Condition operator" value={condition.operator} onChange={(event) => updateCondition(condition.id, { operator: event.target.value as AnimationGraphCondition["operator"] })}>
-                            {booleanLike ? <><option value="is_true">is true</option><option value="is_false">is false</option>{conditionParameter?.kind === "trigger" && <option value="triggered">triggered</option>}</> : <><option value="greater">greater</option><option value="greater_equal">greater/equal</option><option value="less">less</option><option value="less_equal">less/equal</option><option value="equal">equal</option><option value="not_equal">not equal</option></>}
-                          </select>
-                          {!booleanLike && <input className="mtk-input" aria-label="Condition value" type="number" value={typeof condition.value === "number" ? condition.value : 0} onChange={(event) => updateCondition(condition.id, { value: Number(event.target.value) })} />}
-                          <Button compact icon variant="ghost" aria-label="Remove condition" onClick={() => removeCondition(condition.id)}>×</Button>
+              <DisclosureSection
+                title="States and transitions"
+                summary={selectedMachine.name}
+                density="compact"
+                landmark={false}
+                data-testid="animation-graph-state-inspector"
+                storageKey="animation-graph:states"
+                actions={<>
+                  <Button compact variant="ghost" onClick={addState}>+ State</Button>
+                  <Button compact variant="ghost" onClick={addTransition}>+ Transition</Button>
+                </>}
+              >
+                <div className="animation-graph-stack">
+                  <ul className="animation-graph-records">{selectedMachine.states.map((graphState) => (
+                    <li key={graphState.id} className="animation-graph-state">
+                      <Radio
+                        label=""
+                        aria-label={`Entry state ${graphState.name}`}
+                        title="The state this machine starts in"
+                        name={`entry-${selectedMachine.id}`}
+                        checked={selectedMachine.entryStateId === graphState.id}
+                        onChange={() => mutateDraft((graph) => ({ ...graph, stateMachines: graph.stateMachines.map((machine) => machine.id === selectedMachine.id ? { ...machine, entryStateId: graphState.id } : machine) }))}
+                      />
+                      <TextField aria-label={`State name ${graphState.name}`} value={graphState.name} onChange={(event) => updateMachineState(graphState.id, { name: event.target.value })} />
+                      <SelectField aria-label={`Pose for ${graphState.name}`} value={graphState.poseNodeId} onChange={(event) => updateMachineState(graphState.id, { poseNodeId: event.target.value })}>
+                        {draft.nodes.filter((node) => ["reference_pose", "sequence", "blend_normalized", "blend_direct", "blend_1d", "blend_2d_cartesian", "layer_override", "layer_additive"].includes(node.kind)).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}
+                      </SelectField>
+                      <Checkbox
+                        label="reset"
+                        checked={graphState.resetOnEntry}
+                        onChange={(checked) => updateMachineState(graphState.id, { resetOnEntry: checked })}
+                      />
+                      <Button compact icon variant="ghost" aria-label={`Remove state ${graphState.name}`} onClick={() => removeMachineState(graphState.id)}><Icon name="close" size="sm" /></Button>
+                    </li>
+                  ))}</ul>
+
+                  {selectedMachine.transitions.length > 0 && (
+                    <Field label="Transition" htmlFor="ag-transition">
+                      <SelectField id="ag-transition" value={selectedTransition?.id ?? ""} onChange={(event) => setSelectedTransitionId(event.target.value)}>{selectedMachine.transitions.map((transition) => <option key={transition.id} value={transition.id}>{selectedMachine.states.find((item) => item.id === transition.fromStateId)?.name} → {selectedMachine.states.find((item) => item.id === transition.toStateId)?.name}</option>)}</SelectField>
+                    </Field>
+                  )}
+
+                  {selectedTransition && (
+                    <>
+                      <FieldGrid minColumn={120}>
+                        <Field label="From" htmlFor="ag-transition-from">
+                          <SelectField id="ag-transition-from" value={selectedTransition.fromStateId} onChange={(event) => updateTransition({ fromStateId: event.target.value })}>{selectedMachine.states.map((graphState) => <option key={graphState.id} value={graphState.id}>{graphState.name}</option>)}</SelectField>
+                        </Field>
+                        <Field label="To" htmlFor="ag-transition-to">
+                          <SelectField id="ag-transition-to" value={selectedTransition.toStateId} onChange={(event) => updateTransition({ toStateId: event.target.value })}>{selectedMachine.states.map((graphState) => <option key={graphState.id} value={graphState.id}>{graphState.name}</option>)}</SelectField>
+                        </Field>
+                        <Field label="Priority" htmlFor="ag-transition-priority">
+                          <NumericField id="ag-transition-priority" ariaLabel="Transition priority" integer value={selectedTransition.priority} onCommit={(value) => updateTransition({ priority: Math.trunc(value) })} />
+                        </Field>
+                        <Field label="Duration" unit="ticks" htmlFor="ag-transition-duration">
+                          <NumericField id="ag-transition-duration" ariaLabel="Transition duration in ticks" integer value={selectedTransition.durationTick} min={0} onCommit={(value) => updateTransition({ durationTick: Math.max(0, Math.trunc(value)) })} />
+                        </Field>
+                        <Field label="Curve" htmlFor="ag-transition-curve">
+                          <SelectField id="ag-transition-curve" value={selectedTransition.curve} onChange={(event) => updateTransition({ curve: event.target.value as AnimationGraphTransition["curve"] })}><option value="linear">Linear</option><option value="ease_in">Ease in</option><option value="ease_out">Ease out</option><option value="ease_in_out">Ease in/out</option><option value="smoothstep">Smoothstep</option></SelectField>
+                        </Field>
+                        <Field label="Interruption" htmlFor="ag-transition-interruption">
+                          <SelectField id="ag-transition-interruption" value={selectedTransition.interruption} onChange={(event) => updateTransition({ interruption: event.target.value as AnimationGraphTransition["interruption"] })}><option value="none">None</option><option value="source">Source</option><option value="destination">Destination</option><option value="both">Both</option></SelectField>
+                        </Field>
+                        <Field
+                          label="Exit time"
+                          span="full"
+                          htmlFor="ag-transition-exit"
+                          help="A future runtime gate, persisted for forward compatibility. Schema v2 reports a compile diagnostic and keeps the last-good preview when exit time is set."
+                        >
+                          <NumericField
+                            id="ag-transition-exit"
+                            ariaLabel="Transition exit time"
+                            value={selectedTransition.exitTime ?? 0}
+                            min={0}
+                            max={1}
+                            step={0.01}
+                            onCommit={(value) => updateTransition({ exitTime: Math.max(0, Math.min(1, value)) })}
+                          />
+                        </Field>
+                      </FieldGrid>
+
+                      <div className="animation-graph-subsection">
+                        <div className="animation-graph-subsection__head">
+                          <span className="animation-graph-eyebrow">Conditions</span>
+                          <Button compact variant="ghost" onClick={addCondition}>+ Condition</Button>
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
+                        {selectedTransition.conditions.length === 0 && <p className="animation-graph-note">No conditions — this transition is taken on exit time alone.</p>}
+                        <ul className="animation-graph-records">
+                          {selectedTransition.conditions.map((condition) => {
+                            const conditionParameter = draft.parameters.find((parameter) => parameter.id === condition.parameterId);
+                            const booleanLike = conditionParameter?.kind === "boolean" || conditionParameter?.kind === "trigger";
+                            return (
+                              <li key={condition.id} className="animation-graph-condition">
+                                <SelectField aria-label="Condition parameter" value={condition.parameterId} onChange={(event) => { const parameter = draft.parameters.find((item) => item.id === event.target.value); if (parameter) updateCondition(condition.id, { parameterId: parameter.id, operator: parameter.kind === "boolean" ? "is_true" : parameter.kind === "trigger" ? "triggered" : "greater", value: parameter.kind === "boolean" || parameter.kind === "trigger" ? null : parameter.defaultValue }); }}>{draft.parameters.map((parameter) => <option key={parameter.id} value={parameter.id}>{parameter.name}</option>)}</SelectField>
+                                <SelectField aria-label="Condition operator" value={condition.operator} onChange={(event) => updateCondition(condition.id, { operator: event.target.value as AnimationGraphCondition["operator"] })}>
+                                  {booleanLike ? <><option value="is_true">is true</option><option value="is_false">is false</option>{conditionParameter?.kind === "trigger" && <option value="triggered">triggered</option>}</> : <><option value="greater">greater</option><option value="greater_equal">greater/equal</option><option value="less">less</option><option value="less_equal">less/equal</option><option value="equal">equal</option><option value="not_equal">not equal</option></>}
+                                </SelectField>
+                                {!booleanLike && <NumericField ariaLabel="Condition value" value={typeof condition.value === "number" ? condition.value : 0} onCommit={(value) => updateCondition(condition.id, { value })} />}
+                                <Button compact icon variant="ghost" aria-label="Remove condition" onClick={() => removeCondition(condition.id)}><Icon name="close" size="sm" /></Button>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </DisclosureSection>
             )}
 
-            <section aria-label="Authored graph parameters">
-              <h3>Typed parameters</h3>
-              {draft.parameters.length === 0 ? <p>Add a parameter from the preview strip below.</p> : draft.parameters.map((parameter) => (
-                <div key={parameter.id} className="animation-graph-authored-parameter">
-                  <input className="mtk-input" aria-label={`Parameter name ${parameter.name}`} value={parameter.name} onChange={(event) => updateParameter(parameter.id, { name: event.target.value })} />
-                  <select aria-label={`Parameter type ${parameter.name}`} value={parameter.kind} onChange={(event) => { const kind = event.target.value as AnimationGraphParameter["kind"]; updateParameter(parameter.id, { kind, defaultValue: defaultAnimationGraphValue(kind), min: kind === "float" || kind === "integer" ? 0 : null, max: kind === "float" || kind === "integer" ? 1 : null }); }}><option value="float">Float</option><option value="integer">Integer</option><option value="boolean">Boolean</option><option value="trigger">Trigger</option><option value="vec2">Vector 2</option></select>
-                  {parameter.kind === "trigger" ? (
-                    <span>momentary · authored default is always false{parameter.defaultValue === true && <Button compact variant="ghost" onClick={() => updateParameter(parameter.id, { defaultValue: false })}>Reset invalid default</Button>}</span>
-                  ) : parameter.kind === "boolean" ? (
-                    <label><input type="checkbox" aria-label={`Default ${parameter.name}`} checked={parameter.defaultValue === true} onChange={(event) => updateParameter(parameter.id, { defaultValue: event.target.checked })} /> default</label>
-                  ) : parameter.kind === "vec2" ? (
-                    <span className="animation-graph-inline"><input className="mtk-input" aria-label={`Default ${parameter.name} X`} type="number" value={Array.isArray(parameter.defaultValue) ? parameter.defaultValue[0] : 0} onChange={(event) => updateParameter(parameter.id, { defaultValue: [Number(event.target.value), Array.isArray(parameter.defaultValue) ? parameter.defaultValue[1] : 0] })} /><input className="mtk-input" aria-label={`Default ${parameter.name} Y`} type="number" value={Array.isArray(parameter.defaultValue) ? parameter.defaultValue[1] : 0} onChange={(event) => updateParameter(parameter.id, { defaultValue: [Array.isArray(parameter.defaultValue) ? parameter.defaultValue[0] : 0, Number(event.target.value)] })} /></span>
-                  ) : (
-                    <span className="animation-graph-parameter-range"><input className="mtk-input" aria-label={`Default ${parameter.name}`} type="number" step={parameter.kind === "integer" ? 1 : 0.01} value={typeof parameter.defaultValue === "number" ? parameter.defaultValue : 0} onChange={(event) => updateParameter(parameter.id, { defaultValue: parameter.kind === "integer" ? Math.round(Number(event.target.value)) : Number(event.target.value) })} /><input className="mtk-input" aria-label={`Minimum ${parameter.name}`} type="number" value={parameter.min ?? ""} placeholder="min" onChange={(event) => updateParameter(parameter.id, { min: event.target.value === "" ? null : Number(event.target.value) })} /><input className="mtk-input" aria-label={`Maximum ${parameter.name}`} type="number" value={parameter.max ?? ""} placeholder="max" onChange={(event) => updateParameter(parameter.id, { max: event.target.value === "" ? null : Number(event.target.value) })} /></span>
-                  )}
-                  <Button compact icon variant="ghost" aria-label={`Remove parameter ${parameter.name}`} onClick={() => removeParameter(parameter.id)}>×</Button>
-                </div>
-              ))}
-            </section>
-
-            <section>
-              <h3>Diagnostics</h3>
-              {diagnostics.length === 0 ? <p>No graph diagnostics.</p> : <ul className="animation-graph-diagnostics">{diagnostics.map((diagnostic) => (
-                <li key={diagnostic.id} data-severity={diagnostic.severity}>
-                  <button type="button" onClick={() => navigateDiagnostic(diagnostic)}><strong>{diagnostic.code.replaceAll("_", " ")}</strong><span>{diagnostic.message}</span>{diagnostic.fix && <small>{diagnostic.fix}</small>}</button>
-                </li>
-              ))}</ul>}
-            </section>
-
-            <section>
-              <h3>Runtime trace</h3>
-              {!debug ? <p>{state.compile.state === "ready" ? "Waiting for a matching runtime instance…" : state.compile.message}</p> : (
-                <>
-                  <p>instance <code>{debug.instanceId}</code> · graph <code>{debug.compiledHash}</code></p>
-                  <p>{debug.activeNodes.length} active nodes · {debug.activeEdges.length} active paths · {debug.evaluationCostMicros ?? "unmeasured"} μs</p>
-                  {debug.transition && <progress aria-label="Active transition progress" max={1} value={debug.transition.progress} />}
-                  {debug.watches.map((watch) => <div key={watch.id}><code>{watch.id}</code> {JSON.stringify(watch.value)} · {watch.source}</div>)}
-                  {(debug.eventsTruncated || debug.truncated) && <p role="alert">Runtime trace is incomplete or safety-limited; events or ambiguous edge provenance may be omitted.</p>}
-                </>
+            <DisclosureSection
+              title="Typed parameters"
+              summary={`${draft.parameters.length}`}
+              density="compact"
+              landmark={false}
+              storageKey="animation-graph:parameters"
+              actions={<Button compact variant="ghost" onClick={addParameter}>+ Parameter</Button>}
+            >
+              {draft.parameters.length === 0 ? <p className="animation-graph-note">No parameters yet. Add one to drive a blend or gate a transition.</p> : (
+                <ul className="animation-graph-records">
+                  {draft.parameters.map((parameter) => (
+                    <li key={parameter.id} className="animation-graph-parameter">
+                      <div className="animation-graph-parameter__head">
+                        <TextField aria-label={`Parameter name ${parameter.name}`} value={parameter.name} onChange={(event) => updateParameter(parameter.id, { name: event.target.value })} />
+                        <SelectField aria-label={`Parameter type ${parameter.name}`} value={parameter.kind} onChange={(event) => { const kind = event.target.value as AnimationGraphParameter["kind"]; updateParameter(parameter.id, { kind, defaultValue: defaultAnimationGraphValue(kind), min: kind === "float" || kind === "integer" ? 0 : null, max: kind === "float" || kind === "integer" ? 1 : null }); }}><option value="float">Float</option><option value="integer">Integer</option><option value="boolean">Boolean</option><option value="trigger">Trigger</option><option value="vec2">Vector 2</option></SelectField>
+                        <Button compact icon variant="ghost" aria-label={`Remove parameter ${parameter.name}`} onClick={() => removeParameter(parameter.id)}><Icon name="close" size="sm" /></Button>
+                      </div>
+                      {parameter.kind === "trigger" ? (
+                        <p className="animation-graph-note">
+                          Momentary — an authored default is always false.
+                          {parameter.defaultValue === true && <> <Button compact variant="ghost" onClick={() => updateParameter(parameter.id, { defaultValue: false })}>Reset invalid default</Button></>}
+                        </p>
+                      ) : parameter.kind === "boolean" ? (
+                        <Checkbox label={`Default ${parameter.name}`} checked={parameter.defaultValue === true} onChange={(checked) => updateParameter(parameter.id, { defaultValue: checked })} />
+                      ) : parameter.kind === "vec2" ? (
+                        <FieldGrid minColumn={72}>
+                          <Field label="Default X" htmlFor={`ag-param-${parameter.id}-x`}>
+                            <NumericField id={`ag-param-${parameter.id}-x`} ariaLabel={`Default ${parameter.name} X`} value={Array.isArray(parameter.defaultValue) ? parameter.defaultValue[0] : 0} onCommit={(value) => updateParameter(parameter.id, { defaultValue: [value, Array.isArray(parameter.defaultValue) ? parameter.defaultValue[1] : 0] })} />
+                          </Field>
+                          <Field label="Default Y" htmlFor={`ag-param-${parameter.id}-y`}>
+                            <NumericField id={`ag-param-${parameter.id}-y`} ariaLabel={`Default ${parameter.name} Y`} value={Array.isArray(parameter.defaultValue) ? parameter.defaultValue[1] : 0} onCommit={(value) => updateParameter(parameter.id, { defaultValue: [Array.isArray(parameter.defaultValue) ? parameter.defaultValue[0] : 0, value] })} />
+                          </Field>
+                        </FieldGrid>
+                      ) : (
+                        // THREE UNLABELLED BOXES, WHICH IS WHAT THE CAPTURE SHOWED. Default, minimum
+                        // and maximum were three bare number inputs in a row with nothing but an
+                        // `aria-label` between them, so a sighted reader had to infer which was which
+                        // from the numbers inside them. They are named rows now, like every other
+                        // number in the editor.
+                        <FieldGrid minColumn={72}>
+                          <Field label="Default" htmlFor={`ag-param-${parameter.id}-default`}>
+                            <NumericField id={`ag-param-${parameter.id}-default`} ariaLabel={`Default ${parameter.name}`} integer={parameter.kind === "integer"} step={parameter.kind === "integer" ? 1 : 0.01} value={typeof parameter.defaultValue === "number" ? parameter.defaultValue : 0} onCommit={(value) => updateParameter(parameter.id, { defaultValue: parameter.kind === "integer" ? Math.round(value) : value })} />
+                          </Field>
+                          <Field label="Minimum" htmlFor={`ag-param-${parameter.id}-min`}>
+                            <NumericField id={`ag-param-${parameter.id}-min`} ariaLabel={`Minimum ${parameter.name}`} value={parameter.min ?? 0} onCommit={(value) => updateParameter(parameter.id, { min: value })} />
+                          </Field>
+                          <Field label="Maximum" htmlFor={`ag-param-${parameter.id}-max`}>
+                            <NumericField id={`ag-param-${parameter.id}-max`} ariaLabel={`Maximum ${parameter.name}`} value={parameter.max ?? 1} onCommit={(value) => updateParameter(parameter.id, { max: value })} />
+                          </Field>
+                        </FieldGrid>
+                      )}
+                    </li>
+                  ))}
+                </ul>
               )}
-            </section>
+            </DisclosureSection>
+
+            <DisclosureSection title="Diagnostics" summary={diagnostics.length ? `${diagnostics.length}` : undefined} density="compact" landmark={false} storageKey="animation-graph:diagnostics">
+              {diagnostics.length === 0 ? <p className="animation-graph-note">No graph diagnostics.</p> : (
+                <ul className="animation-graph-records">{diagnostics.map((diagnostic) => (
+                  <li key={diagnostic.id}>
+                    <Callout tone={diagnostic.severity === "error" ? "danger" : diagnostic.severity === "warning" ? "warn" : "info"} title={diagnostic.code.replaceAll("_", " ")}>
+                      <span className="animation-graph-diagnostic__message">{diagnostic.message}</span>
+                      {diagnostic.fix && <span className="animation-graph-diagnostic__fix">{diagnostic.fix}</span>}
+                      {/* A CONTROL, not a clickable card. The whole callout used to be one bare
+                          `<button>` — an affordance with no mark on it, which `<ux_quality>` 1 is
+                          written against: the step that resolves the complaint has to be a thing you
+                          can see. It also names WHERE it goes, so pressing it is not a gamble. */}
+                      <span className="animation-graph-diagnostic__action">
+                        <Button compact variant="ghost" onClick={() => navigateDiagnostic(diagnostic)}>
+                          Show {diagnostic.edgeId ? "connection" : "node"}
+                        </Button>
+                      </span>
+                    </Callout>
+                  </li>
+                ))}</ul>
+              )}
+            </DisclosureSection>
+
+            <DisclosureSection title="Runtime trace" density="compact" landmark={false} defaultOpen={false} storageKey="animation-graph:runtime">
+              {!debug ? <p className="animation-graph-note">{state.compile.state === "ready" ? "Waiting for a matching runtime instance…" : state.compile.message}</p> : (
+                <div className="animation-graph-stack">
+                  <RecordIdentity id={debug.instanceId} caption={`graph ${debug.compiledHash}`} />
+                  <p className="animation-graph-note">{debug.activeNodes.length} active nodes · {debug.activeEdges.length} active paths · {debug.evaluationCostMicros ?? "unmeasured"} μs</p>
+                  {debug.transition && <ProgressBar label="Active transition progress" value={debug.transition.progress} />}
+                  {debug.watches.map((watch) => (
+                    <div key={watch.id} className="animation-graph-watch"><code>{watch.id}</code> <span>{JSON.stringify(watch.value)} · {watch.source}</span></div>
+                  ))}
+                  {(debug.eventsTruncated || debug.truncated) && (
+                    <Callout tone="warn" role="alert">Runtime trace is incomplete or safety-limited; events or ambiguous edge provenance may be omitted.</Callout>
+                  )}
+                </div>
+              )}
+            </DisclosureSection>
           </aside>}
 
           <section className="animation-graph-parameters" aria-label="Transient animation graph parameters">
-            <div className="animation-graph-preview-heading"><strong>Preview parameters</strong><small> transient · never saved</small></div>
-            {draft.parameters.map((parameter) => (
-              <ParameterPreview
-                key={parameter.id}
-                parameter={parameter}
-                value={previewValues[parameter.id] ?? parameter.defaultValue}
-                watched={view.watches.includes(parameter.id)}
-                onWatch={(watched) => animationEditorStore.getState().setGraphWatches(workspaceKey, watched ? [...view.watches, parameter.id] : view.watches.filter((id) => id !== parameter.id))}
-                onChange={(value) => void setPreviewParameter(parameter, value)}
-              />
-            ))}
-            <input className="mtk-input" aria-label="New graph parameter name" placeholder="Parameter name" value={newParameterName} onChange={(event) => setNewParameterName(event.target.value)} />
-            <select aria-label="New graph parameter type" value={newParameterKind} onChange={(event) => setNewParameterKind(event.target.value as AnimationGraphParameter["kind"])}><option value="float">Float</option><option value="integer">Integer</option><option value="boolean">Boolean</option><option value="trigger">Trigger</option><option value="vec2">Vector 2</option></select>
-            <Button compact variant="ghost" onClick={addParameter}>+ Parameter</Button>
-            <Button compact variant="ghost" disabled={Object.keys(previewValues).length === 0} onClick={() => void clearPreview()}>Reset preview</Button>
+            <div className="animation-graph-parameters__heading">
+              <span className="animation-graph-eyebrow">Preview parameters</span>
+              <span className="animation-graph-note">transient · never saved</span>
+            </div>
+            <div className="animation-graph-parameters__row">
+              {draft.parameters.map((parameter) => (
+                <ParameterPreview
+                  key={parameter.id}
+                  parameter={parameter}
+                  value={previewValues[parameter.id] ?? parameter.defaultValue}
+                  watched={view.watches.includes(parameter.id)}
+                  onWatch={(watched) => animationEditorStore.getState().setGraphWatches(workspaceKey, watched ? [...view.watches, parameter.id] : view.watches.filter((id) => id !== parameter.id))}
+                  onChange={(value) => void setPreviewParameter(parameter, value)}
+                />
+              ))}
+              <span className="animation-graph-parameters__add" data-testid="animation-graph-add-parameter">
+                <TextField aria-label="New graph parameter name" placeholder="Parameter name" value={newParameterName} onChange={(event) => setNewParameterName(event.target.value)} />
+                <SelectField aria-label="New graph parameter type" value={newParameterKind} onChange={(event) => setNewParameterKind(event.target.value as AnimationGraphParameter["kind"])}><option value="float">Float</option><option value="integer">Integer</option><option value="boolean">Boolean</option><option value="trigger">Trigger</option><option value="vec2">Vector 2</option></SelectField>
+                <Button compact variant="secondary" onClick={addParameter}>+ Parameter</Button>
+                <Button
+                  compact
+                  variant="ghost"
+                  disabled={Object.keys(previewValues).length === 0}
+                  disabledReason="Nothing is being previewed — no parameter has been moved away from its authored default."
+                  onClick={() => void clearPreview()}
+                >Reset preview</Button>
+              </span>
+            </div>
           </section>
         </>
       )}
 
-      <div className="animation-graph-live" role="status" aria-live="polite">{error ?? liveMessage}</div>
+      <VisuallyHidden role="status" aria-live="polite">{error ?? liveMessage}</VisuallyHidden>
       {error && <div className="animation-graph-error" role="alert">{error}</div>}
+    </div>
+  );
+}
+
+/** One palette row, and there is only one. Icon chip · name · one line of consequence — the list-row
+ *  anatomy the outliner and the asset library already use, at the density they use it. The shipped
+ *  version drew a 15px title over a 10px sentence inside a bordered card, so eight operators filled a
+ *  column that also has to hold the sources, the later gates and the keyboard list. */
+function PaletteItem({
+  icon,
+  name,
+  detail,
+  disabled = false,
+  reason,
+  onClick,
+}: {
+  icon: IconToken;
+  name: string;
+  detail: string;
+  disabled?: boolean;
+  reason: string;
+  onClick: () => void;
+}) {
+  return (
+    <Button
+      variant="ghost"
+      className="animation-graph-item"
+      disabled={disabled}
+      disabledReason={reason}
+      title={disabled ? reason : detail}
+      onClick={onClick}
+    >
+      <span className="animation-graph-item__mark"><Icon name={icon} size="sm" /></span>
+      <span className="animation-graph-item__text">
+        <span className="animation-graph-item__name">{name}</span>
+        <span className="animation-graph-item__detail">{detail}</span>
+      </span>
+    </Button>
+  );
+}
+
+/** The id line every record in this panel carries: the durable id in mono, and what the thing IS
+ *  beside it. It was three different shapes — a bare `<code>`, a `<code>` inside a `<p>`, and a
+ *  two-cell grid — none of which agreed on size or colour. */
+function RecordIdentity({ id, caption }: { id: string; caption: string }) {
+  return (
+    <div className="animation-graph-identity-line" title={id}>
+      <code>{id}</code>
+      <span>{caption}</span>
     </div>
   );
 }
@@ -1534,19 +1986,46 @@ function ParameterPreview({
 }) {
   let control;
   if (parameter.kind === "trigger") {
-    control = <button type="button" className="animation-graph-preview-parameter" aria-label={`Fire ${parameter.name} trigger`} onClick={() => onChange(true)}>Fire {parameter.name}</button>;
+    control = <Button compact variant="secondary" aria-label={`Fire ${parameter.name} trigger`} onClick={() => onChange(true)}>Fire {parameter.name}</Button>;
   } else if (parameter.kind === "boolean") {
-    control = <label className="animation-graph-preview-parameter"><input type="checkbox" checked={value === true} onChange={(event) => onChange(event.target.checked)} /> {parameter.name}</label>;
+    control = <Checkbox label={parameter.name} checked={value === true} onChange={(checked) => onChange(checked)} />;
   } else if (parameter.kind === "vec2") {
     const tuple = Array.isArray(value) ? value : [0, 0];
-    const change = (index: 0 | 1, event: ChangeEvent<HTMLInputElement>) => {
-      const next: [number, number] = [tuple[0], tuple[1]];
-      next[index] = Number(event.target.value);
-      onChange(next);
-    };
-    control = <label className="animation-graph-preview-parameter">{parameter.name}<input aria-label={`${parameter.name} X`} type="number" value={tuple[0]} onChange={(event) => change(0, event)} /><input aria-label={`${parameter.name} Y`} type="number" value={tuple[1]} onChange={(event) => change(1, event)} /></label>;
+    control = (
+      <span className="animation-graph-preview__control">
+        <span className="animation-graph-preview__name">{parameter.name}</span>
+        <NumericField ariaLabel={`${parameter.name} X`} value={tuple[0]} onCommit={(next) => onChange([next, tuple[1]])} />
+        <NumericField ariaLabel={`${parameter.name} Y`} value={tuple[1]} onCommit={(next) => onChange([tuple[0], next])} />
+      </span>
+    );
   } else {
-    control = <label className="animation-graph-preview-parameter">{parameter.name}<Slider min={parameter.min ?? 0} max={parameter.max ?? 1} step={parameter.kind === "integer" ? 1 : 0.01} value={typeof value === "number" ? value : 0} onChange={(event) => onChange(parameter.kind === "integer" ? Math.round(Number(event.target.value)) : Number(event.target.value))} /><output>{typeof value === "number" ? value.toFixed(parameter.kind === "integer" ? 0 : 2) : "0"}</output></label>;
+    control = (
+      <span className="animation-graph-preview__control">
+        <span className="animation-graph-preview__name">{parameter.name}</span>
+        <Slider
+          aria-label={parameter.name}
+          min={parameter.min ?? 0}
+          max={parameter.max ?? 1}
+          step={parameter.kind === "integer" ? 1 : 0.01}
+          value={typeof value === "number" ? value : 0}
+          onChange={(event) => onChange(parameter.kind === "integer" ? Math.round(Number(event.target.value)) : Number(event.target.value))}
+        />
+        <ReadOut>{typeof value === "number" ? value.toFixed(parameter.kind === "integer" ? 0 : 2) : "0"}</ReadOut>
+      </span>
+    );
   }
-  return <span className="animation-graph-preview-wrap">{control}<button type="button" aria-pressed={watched} title={watched ? "Remove from bounded runtime watches" : "Add to bounded runtime watches"} onClick={() => onWatch(!watched)}>{watched ? "watching" : "watch"}</button></span>;
+  return (
+    <span className="animation-graph-preview">
+      {control}
+      <Button
+        compact
+        icon
+        variant="toggle"
+        active={watched}
+        aria-label={`Watch ${parameter.name}`}
+        title={watched ? "Remove from bounded runtime watches" : "Add to bounded runtime watches"}
+        onClick={() => onWatch(!watched)}
+      ><Icon name="view" size="sm" /></Button>
+    </span>
+  );
 }

@@ -369,21 +369,25 @@ export function TextArea({
 
 /** A small, neutral pill/badge (for live readouts — view label, counts). Not a button. The `title`
  *  carries the plain-language explanation (a requirer's needed cap, a price) — never colour-alone. */
-/** Search is a first-class editor interaction with one shared focus, density and clearing contract. */
-export function SearchField({
-  className,
-  style,
-  ...rest
-}: Omit<InputHTMLAttributes<HTMLInputElement>, "type">) {
-  return (
-    <input
-      type="search"
-      className={["mtk-input", "mtk-search", className].filter(Boolean).join(" ")}
-      style={style}
-      {...rest}
-    />
-  );
-}
+/** Search is a first-class editor interaction with one shared focus, density and clearing contract.
+ *
+ *  IT FORWARDS ITS REF, and that is not housekeeping: a search field is the standard target of a
+ *  one-key shortcut (`/` in the animation graph, `Ctrl+K` in the palette), and a control the shortcut
+ *  cannot focus is a control the panel has to hand-roll instead — which is exactly why the animation
+ *  graph still had a raw `<input type="search">` after every other field in it had moved. */
+export const SearchField = forwardRef<HTMLInputElement, Omit<InputHTMLAttributes<HTMLInputElement>, "type">>(
+  function SearchField({ className, style, ...rest }, ref) {
+    return (
+      <input
+        ref={ref}
+        type="search"
+        className={["mtk-input", "mtk-search", className].filter(Boolean).join(" ")}
+        style={style}
+        {...rest}
+      />
+    );
+  },
+);
 
 /** Shared native select styling preserves platform semantics while removing subsystem-specific controls. */
 export function SelectField({

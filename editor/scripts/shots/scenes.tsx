@@ -22,6 +22,8 @@ import {
   type AssetLabStage,
 } from "../../src/panels/AssetLabPanel";
 import { STAGE_MIN } from "../../src/app/layout";
+import { AnimationGraphEditor } from "../../src/graph/AnimationGraphEditor";
+import { animationGraphPorts, createLocomotionGraphPreset } from "../../src/graph/animation-graph-model";
 import { BindingGraph } from "../../src/graph/BindingGraph";
 import { Icon, iconTokens } from "../../src/theme/icons";
 import { Inspector } from "../../src/inspector/Inspector";
@@ -36,9 +38,14 @@ import RIG_BLOCKED from "../../src/panels/__fixtures__/rig-not-retargetable.json
 import { PhysicsPanel } from "../../src/panels/PhysicsPanel";
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
+import { animationEditorStore, animationWorkspaceKey } from "../../src/store/animation";
 import { assetShelfStore } from "../../src/store/assetShelf";
 import { projectionStore } from "../../src/store/projection";
+import {
+  ANIMATION_GRAPH_SCHEMA_VERSION,
+} from "../../src/transport/protocol";
 import type {
+  AnimationGraphStateInfo,
   AnimationPropertyInfo,
   AnimationTrackInfo,
   AnimationWorkspaceInfo,
@@ -698,6 +705,173 @@ function graphScenes(): Scene[] {
   ];
 }
 
+/** THE ANIMATION GRAPH EDITOR — the surface ADR-135 left as its standing gap ("it has no capture").
+ *
+ *  It is the largest authoring surface in the editor and the only one whose whole appearance came out
+ *  of a private stylesheet, so it is also the one whose appearance nothing has ever compared to the
+ *  design system's. Both drawers are opened and a node is selected, because the state worth
+ *  photographing is the DENSE one: palette, canvas, inspector and the preview strip at once. */
+const GRAPH_WORKSPACE_KEY = animationWorkspaceKey({
+  projectId: "shots",
+  scope: { kind: "sequence", id: "main" },
+});
+
+function animationGraphState(): AnimationGraphStateInfo {
+  const graph = createLocomotionGraphPreset("main");
+  return {
+    schemaVersion: ANIMATION_GRAPH_SCHEMA_VERSION,
+    sequenceId: "main",
+    revision: "graph-rev-4",
+    graph,
+    nodePresentation: graph.nodes.map((node) => ({
+      nodeId: node.id,
+      ports: animationGraphPorts(node.kind),
+      readiness: "ready",
+      readinessReason: "Compiled and ready.",
+    })),
+    sources: [
+      { id: "main", name: "Main authored sequence", kind: "authored_sequence", logicalAssetId: null, revisionId: "sequence-rev-1", durationTick: 60_000, readiness: "ready", reason: "Authored source is playable.", action: null },
+      { id: "sprint", name: "Sprint cycle", kind: "authored_sequence", logicalAssetId: null, revisionId: "sequence-rev-2", durationTick: 42_000, readiness: "ready", reason: "Authored source is playable.", action: null },
+      { id: "blocked-clip", name: "Imported clip", kind: "imported_clip", logicalAssetId: "asset-1", revisionId: "asset-rev-1", durationTick: 60_000, readiness: "blocked", reason: "Clip is decoded only; source-node instancing is unavailable.", action: "Use an authored sequence." },
+    ],
+    compile: {
+      state: "ready",
+      authoredRevision: "graph-rev-4",
+      compiledRevision: "graph-rev-4",
+      compiledHash: "compiled-4",
+      lastGoodRevision: "graph-rev-4",
+      lastGoodHash: "compiled-4",
+      message: "Graph compiled.",
+    },
+    diagnostics: [
+      {
+        id: "diagnostic-mask",
+        severity: "warning",
+        code: "mask_selector_unmatched",
+        message: "The mask selector **/Transform/rotation matched no binding on the bound rig.",
+        fix: "Check the selector against the rig's own property paths, or clear the mask.",
+        nodeId: "node-locomotion-blend",
+        edgeId: null,
+        portId: null,
+      },
+    ],
+  };
+}
+
+/** A client that answers the three reads this editor makes and never resolves the runtime trace —
+ *  there is no live instance behind a screenshot, and a fabricated one would photograph a state the
+ *  engine cannot produce. */
+const animationGraphClient = () =>
+  ({
+    animationGraphState: () => Promise.resolve(animationGraphState()),
+    animationGraphDebug: () => new Promise<never>(() => {}),
+    animationGraphSave: () => new Promise<never>(() => {}),
+    animationGraphDelete: () => new Promise<never>(() => {}),
+    animationGraphSetPreviewParameters: () => Promise.resolve({ ok: true }),
+    animationGraphClearPreviewParameters: () => Promise.resolve({ ok: true }),
+  }) as unknown as EditorClient;
+
+function seedAnimationGraphView(selectedNodeIds: string[], drawers: { palette: boolean; inspector: boolean }) {
+  return () => {
+    animationEditorStore.getState().reset();
+    animationEditorStore.getState().updateGraph(GRAPH_WORKSPACE_KEY, (current) => ({
+      ...current,
+      paletteOpen: drawers.palette,
+      inspectorOpen: drawers.inspector,
+      selectedNodeIds,
+      selectedEdgeIds: [],
+    }));
+  };
+}
+
+/** The graph editor is a DOCK WORKSPACE, so it is photographed in a box the size of the dock — it
+ *  paints its own background and lays itself out to `height: 100%`, and given an auto-height parent it
+ *  simply grows past the window instead of scrolling its own columns. A capture of that is a capture of
+ *  the harness, not of the panel. */
+function dockFrame(height: number, children: ReactNode) {
+  return <div style={{ height, display: "grid", minHeight: 0 }}>{children}</div>;
+}
+
+function animationGraphScenes(): Scene[] {
+  return [
+    {
+      id: "animation-graph-editor",
+      looking_for:
+        "the animation graph editor — the biggest authoring surface in the engine, and until now the " +
+        "one nothing had ever photographed (ADR-135 named it as the standing gap). All four of its " +
+        "regions at once: the node palette, the canvas, the selection inspector and the preview " +
+        "parameter strip. What a reader is checking is FAMILY: every select, every checkbox, every " +
+        "text field and every note here should be indistinguishable from the same control in the " +
+        "Inspector or the Model workspace, at the same size, on the same type scale — and the panel " +
+        "should read as three calm columns rather than a wall of boxes",
+      viewport: { width: 1280, height: 760 },
+      setup: seedAnimationGraphView(["node-locomotion-blend"], { palette: true, inspector: true }),
+      expect: {
+        present: [
+          ["[data-testid='animation-graph-editor']", 1],
+          ["#animation-graph-palette", 1],
+          ["#animation-graph-inspector", 1],
+          [".react-flow__node", 7],
+        ],
+        // THE CLAIM THIS SCENE EXISTS FOR. Every one of these is a control the design system owns;
+        // a raw `<select>`/`<input type=checkbox>`/`<textarea>` renders the desktop's widget instead,
+        // and the whole point of the migration is that this surface stopped drawing those.
+        absent: [
+          // ADR-131's defect, as a standing claim: `Icon` draws an empty, still-sized placeholder for a
+          // name the set does not have, so a blank control photographs exactly like a working one.
+          "[data-icon-missing]",
+          "#animation-graph-palette select:not(.mtk-select)",
+          "#animation-graph-inspector select:not(.mtk-select)",
+          "#animation-graph-inspector input[type='checkbox']:not(.mtk-check__box)",
+          "#animation-graph-inspector textarea:not(.mtk-input)",
+          "#animation-graph-inspector input[type='text']:not(.mtk-input)",
+        ],
+        text_present: ["Speed blend", "Preview parameters", "Sources", "Operators"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: [
+          "[data-testid='animation-graph-toolbar-actions'] button",
+          "[data-testid='animation-graph-add-parameter']",
+        ],
+      },
+      render: () => dockFrame(700, (
+        <AnimationGraphEditor client={animationGraphClient()} sequenceId="main" workspaceKey={GRAPH_WORKSPACE_KEY} />
+      )),
+    },
+    {
+      id: "animation-graph-inspector-fields",
+      looking_for:
+        "the graph inspector at the width where this panel stops being three tracks — 460px, below " +
+        "the 822px its own floors add up to. The drawer REPLACES the canvas rather than floating over " +
+        "it, so the densest column of controls in the engine gets the whole panel: names, pose " +
+        "pickers, entry radios, transition curves, conditions and typed parameters. This is where the " +
+        "old surface put nine control shapes in one 10px column; every row here is one anatomy from " +
+        "one family, no control is squeezed under a readable floor, and no type goes under 11px",
+      viewport: { width: 460, height: 900 },
+      setup: seedAnimationGraphView(["node-locomotion-machine"], { palette: false, inspector: true }),
+      expect: {
+        present: [
+          ["#animation-graph-inspector", 1],
+          ["#animation-graph-inspector .mtk-select", 3],
+          ["#animation-graph-inspector .mtk-check", 1],
+        ],
+        absent: ["[data-icon-missing]", "#animation-graph-inspector select:not(.mtk-select)"],
+        text_present: ["Locomotion", "Idle", "Moving"],
+        text_absent: ["null", "undefined", "NaN"],
+        // NOT `unclipped` ON THE CONTROLS. This column SCROLLS by design, so "every input is fully on
+        // screen" is a claim no scrolling panel can satisfy and asserting it would only teach the next
+        // reader to waive the rule. The two questions a narrow width actually asks are whether the
+        // panel stayed inside the window and whether the controls inside it got squeezed, and both are
+        // measurements: the sheet is 320px wide + its hairline, and a select still has a usable box.
+        max_width: [["#animation-graph-inspector", 460]],
+        min_width: [["#animation-graph-inspector .mtk-select", 96]],
+      },
+      render: () => dockFrame(840, (
+        <AnimationGraphEditor client={animationGraphClient()} sequenceId="main" workspaceKey={GRAPH_WORKSPACE_KEY} />
+      )),
+    },
+  ];
+}
+
 export const SCENES: Scene[] = [
   {
     id: "icon-set-specimen",
@@ -1013,6 +1187,7 @@ export const SCENES: Scene[] = [
   ...rigScenes(),
   ...poseScenes(),
   ...graphScenes(),
+  ...animationGraphScenes(),
   ...inspectorScenes(),
   ...assetScenes(),
   ...modelScenes(),

@@ -161,6 +161,77 @@ export function Checkbox({
   );
 }
 
+export interface RadioProps {
+  label: ReactNode;
+  /** The group this option belongs to — exactly one member of a `name` can be chosen. */
+  name: string;
+  checked: boolean;
+  onChange: () => void;
+  disabled?: boolean;
+  disabledReason?: string;
+  /** What choosing this option means, in plain words. */
+  title?: string;
+  /** Shown when the label is a mark rather than words (a row that is already named beside it). */
+  "aria-label"?: string;
+  id?: string;
+  className?: string;
+  style?: CSSProperties;
+  "data-testid"?: string;
+}
+
+/**
+ * The one radio — a one-of-many choice, where [`Checkbox`] is an independent on/off.
+ *
+ * It exists for the same reason `Checkbox` does (ADR-136/155): the animation graph's entry-state
+ * control was the last raw `<input type="radio">` in the editor, drawing the operating system's dot at
+ * the operating system's size next to a design-system checkbox on the same row. `appearance: none` and
+ * a painted dot, over the native input, so keyboard arrow-cycling, the group semantics and the screen
+ * reader's announcement all stay the platform's.
+ */
+export function Radio({
+  label,
+  name,
+  checked,
+  onChange,
+  disabled = false,
+  disabledReason,
+  title,
+  id,
+  className,
+  style,
+  "aria-label": ariaLabel,
+  ...rest
+}: RadioProps) {
+  const generatedId = useId();
+  const inputId = id ?? `mtk-radio-${generatedId}`;
+  // A refusal outranks an explanation: while the option is unavailable, the reason is what the tooltip
+  // has to say. `Button` resolves the same pair the same way.
+  const tip = disabled ? disabledReason ?? title : title;
+  return (
+    <label
+      className={["mtk-radio", className].filter(Boolean).join(" ")}
+      htmlFor={inputId}
+      data-disabled={disabled || undefined}
+      title={tip}
+      style={style}
+      {...rest}
+    >
+      <input
+        id={inputId}
+        type="radio"
+        name={name}
+        className="mtk-radio__dot"
+        checked={checked}
+        disabled={disabled}
+        aria-label={ariaLabel}
+        title={tip}
+        onChange={onChange}
+      />
+      <span className="mtk-radio__label">{label}</span>
+    </label>
+  );
+}
+
 export type CalloutTone = "neutral" | "info" | "success" | "warn" | "danger";
 
 const CALLOUT_ICON: Record<CalloutTone, string> = {
@@ -279,7 +350,19 @@ export function ProgressBar({ value, label, className, style }: {
   );
 }
 
-/** Text for assistive technology only. */
-export function VisuallyHidden({ children }: { children: ReactNode }) {
-  return <span className="mtk-visually-hidden">{children}</span>;
+/** Text for assistive technology only — including the standard use, a live region.
+ *
+ *  `role`/`aria-live` land on THIS span rather than on a child, because the child of a 1x1 clipped box
+ *  is an element painted entirely outside its parent, which is a genuine defect everywhere else and is
+ *  reported as one by the screenshot gate. */
+export function VisuallyHidden({
+  children,
+  role,
+  "aria-live": ariaLive,
+}: {
+  children: ReactNode;
+  role?: AriaRole;
+  "aria-live"?: "off" | "polite" | "assertive";
+}) {
+  return <span className="mtk-visually-hidden" role={role} aria-live={ariaLive}>{children}</span>;
 }
