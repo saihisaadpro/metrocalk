@@ -1,5 +1,5 @@
 import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { projectionStore } from "../store/projection";
 import { playStore } from "../store/play";
@@ -17,6 +17,13 @@ afterEach(() => {
   Object.defineProperty(window, "innerWidth", { value: 1024, configurable: true });
 });
 
+// ONE BUDGET FOR THIS FILE. Every test here mounts the ENTIRE editor shell — nine engines, both
+// docks, the lazily-loaded workspaces — and vitest runs the repository's 76 files in parallel workers,
+// so the default 5s is a wall-clock budget shared with whatever else is on the machine rather than a
+// statement about this code. The file's own heaviest case already carried an explicit `10_000` for
+// exactly this reason; this states it once for all of them instead.
+vi.setConfig({ testTimeout: 30_000 });
+
 describe("editor app — end-to-end wiring", () => {
   it("projects the first-run SAMPLE scene (named, not the 5k fixture) and renders an inspector form on select", async () => {
     render(<App />);
@@ -29,11 +36,24 @@ describe("editor app — end-to-end wiring", () => {
     // selecting it renders the schema-driven inspector header (≥2: the hierarchy row + the inspector)
     act(() => projectionStore.getState().select("player"));
     fireEvent.click(screen.getByTestId("rail-right-properties"));
+    await act(async () => { await vi.dynamicImportSettled(); });
+    // THE ELEMENT FIRST, THEN ITS TEXT, and both inside the wait. `getElementById(...)?.textContent`
+    // is `undefined` before the lazily-loaded dock mounts, and `expect(undefined).toContain(...)`
+    // reports "the given combination of arguments (undefined and string) is invalid" — a complaint
+    // about the assertion's own types, printed in place of the only fact a reader needs, which is that
+    // the inspector never appeared.
     await waitFor(
-      () => expect(document.getElementById("inspector")?.textContent).toContain("Player"),
+      () => {
+        const inspector = document.getElementById("inspector");
+        expect(inspector, "the inspector never mounted").toBeTruthy();
+        expect(inspector?.textContent ?? "").toContain("Player");
+      },
       { timeout: 10_000 },
     );
-  }, 10_000);
+    // The per-test `10_000` that used to be here is gone: the file-level budget above covers it, and
+    // a number written twice is the one that goes stale — this one already had, silently capping the
+    // test below the budget the file had just declared.
+  });
 
   it("Play is unmistakable ON THE STAGE: a persistent badge appears only while playing (C2)", () => {
     render(<App />);
@@ -67,6 +87,7 @@ describe("editor app — end-to-end wiring", () => {
     // at once and hid five — a testid you can query from a workspace you are not in is not evidence that
     // a user can reach it.)
     fireEvent.click(screen.getByTestId("engine-build"));
+    await act(async () => { await vi.dynamicImportSettled(); });
     fireEvent.change(await screen.findByTestId("describe"), { target: { value: "a nonexistent thingamajig" } });
     fireEvent.click(screen.getByTestId("describeBtn"));
     fireEvent.click(await screen.findByTestId("genBtn"));
@@ -217,6 +238,7 @@ describe("editor app — end-to-end wiring", () => {
   it("opens the searchable command palette from Ctrl/Cmd+K", async () => {
     render(<App />);
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    await act(async () => { await vi.dynamicImportSettled(); });
     expect(await screen.findByTestId("command-palette")).toBeTruthy();
     expect(await screen.findByRole("combobox", { name: /search commands/i })).toBeTruthy();
   });

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { fakeClient } from "../transport/test-client";
 import { ViewportToolbar } from "./ViewportToolbar";
@@ -63,12 +63,20 @@ test("centres two persistent triggers and can defer transform modes to the prima
   expect(screen.getByTestId("vpPivot")).toBeTruthy();
   expect(screen.getByTestId("vpSnap")).toBeTruthy();
 
-  await act(async () => {
-    fireEvent.click(screen.getByTestId("vpSpace"));
-    await Promise.resolve();
-    await Promise.resolve();
-  });
-  expect(screen.getByTestId("vpTransform").textContent).toContain("Local");
+  // `waitFor`, not a COUNT of microtasks. `gizmoSpaceToggle()` is a promise whose `.then` sets state,
+  // and "two `await Promise.resolve()`" is a guess about how many ticks that takes — right on a quiet
+  // machine and wrong on a loaded one, which is why this assertion failed in isolation while passing
+  // inside the full parallel run. Same class as `330781a`: an assertion about the clock wearing the
+  // shape of an assertion about behaviour.
+  fireEvent.click(screen.getByTestId("vpSpace"));
+  // A TASK BOUNDARY, then wait for the VALUE. What was here counted microtasks — "two
+  // `await Promise.resolve()`" — and this control's update does not land inside them: the reply
+  // resolves, `PopupMenuItem` chains a `.finally()` to dismiss the menu, and React commits after that.
+  // The count was right on a quiet machine and wrong on a loaded one, which is why the assertion
+  // failed when this file was run on its own. Same class as `330781a`: an assertion about the clock
+  // wearing the shape of an assertion about behaviour.
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  await waitFor(() => expect(screen.getByTestId("vpTransform").textContent).toContain("Local"));
 });
 
 test("progressively discloses framing, camera, and rendering controls", async () => {
