@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { fakeClient } from "../transport/test-client";
 import { ViewportToolbar } from "./ViewportToolbar";
@@ -68,15 +68,23 @@ test("centres two persistent triggers and can defer transform modes to the prima
   // machine and wrong on a loaded one, which is why this assertion failed in isolation while passing
   // inside the full parallel run. Same class as `330781a`: an assertion about the clock wearing the
   // shape of an assertion about behaviour.
-  fireEvent.click(screen.getByTestId("vpSpace"));
-  // A TASK BOUNDARY, then wait for the VALUE. What was here counted microtasks — "two
-  // `await Promise.resolve()`" — and this control's update does not land inside them: the reply
-  // resolves, `PopupMenuItem` chains a `.finally()` to dismiss the menu, and React commits after that.
-  // The count was right on a quiet machine and wrong on a loaded one, which is why the assertion
-  // failed when this file was run on its own. Same class as `330781a`: an assertion about the clock
-  // wearing the shape of an assertion about behaviour.
-  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-  await waitFor(() => expect(screen.getByTestId("vpTransform").textContent).toContain("Local"));
+  // THE CLICK AND THE SETTLE INSIDE ONE `act`, then a plain assertion.
+  //
+  // What was here counted microtasks — "two `await Promise.resolve()`" — for an update that does not
+  // land in them: the reply resolves, `PopupMenuItem` chains a `.finally()` to dismiss the menu, and
+  // React commits after that. A count is right on a quiet machine and wrong on a busy one, which is
+  // why this file passed inside the full parallel run and failed on its own (`330781a`'s class).
+  //
+  // `waitFor` is not the fix either, and that is worth recording: its wrapper turns the act
+  // environment OFF, so React schedules through the real scheduler and the polling races a starved
+  // task queue — it made the flake rarer and inverted it (green alone, red under load) rather than
+  // removing it. Inside `act` the queue is flushed when the scope exits, and the macrotask is what
+  // lets the promise chain settle before that happens. No clock left in the assertion.
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("vpSpace"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  expect(screen.getByTestId("vpTransform").textContent).toContain("Local");
 });
 
 test("progressively discloses framing, camera, and rendering controls", async () => {
