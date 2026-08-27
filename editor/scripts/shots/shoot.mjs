@@ -254,7 +254,17 @@ function layoutInvariants(windowIsTheSubject) {
   const visible = (el, r) => {
     if (r.width < 1 && r.height < 1) return false;
     const cs = getComputedStyle(el);
-    return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
+    if (cs.visibility === "hidden" || cs.display === "none" || cs.opacity === "0") return false;
+    // TEXT THE AUTHOR REMOVED FROM THE VISUAL PRESENTATION ON PURPOSE. The screen-reader-only idiom is
+    // a 1x1 absolutely-positioned box clipped to nothing (`clip-path: inset(50%)`, or the legacy
+    // `clip: rect(...)`): it carries a sentence for assistive technology and paints nothing at all.
+    // Every invariant here is a claim about what a READER can see, so none of them apply to it — and
+    // R2 read it as the opposite, "23px of text hidden with no sign that anything was cut", which is
+    // the one thing this element is guaranteed NOT to be doing. Detected by GEOMETRY, never by class
+    // name: a bespoke copy of the idiom is the same thing and must be treated the same way.
+    const clipped = cs.clipPath.startsWith("inset(") || (cs.clip !== "auto" && cs.clip !== "");
+    if (clipped && cs.position === "absolute" && r.width <= 1 && r.height <= 1) return false;
+    return true;
   };
 
   // THE SECOND SCROLLING MECHANISM THIS EDITOR USES, WHICH R1/R2/R7 HAD NEVER HEARD OF.
