@@ -14,6 +14,7 @@ import { projectionStore, useDisplayedEntity, useEntityOrder, useSelectedId } fr
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
+import { pushToast } from "../store/toasts";
 import { Modal, Popover } from "../theme/Popover";
 import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
@@ -38,6 +39,9 @@ import { EngineRail, ENGINES, engineById, type EngineId } from "./EngineRail";
 import { BottomDock, type BottomWorkspace } from "./BottomDock";
 import { onStageSurface } from "./stageInput";
 import { normalizeSurfacePoint } from "./viewportCoordinates";
+import { isMarqueeDrag, marqueeBox, marqueeMode, marqueeResult } from "./marquee";
+import { StageMarquee } from "./StageMarquee";
+import { selectionSentence, entityLabel } from "../store/selectionText";
 
 // WHAT MAY BE DEFERRED, AND WHY THE LIST IS SHORT. A chunk that loads on demand is absent until the
 // gesture that needs it — so the only safe candidates are surfaces a user REACHES FOR: Pipe Forge
@@ -159,6 +163,23 @@ export function App() {
   // M9 gizmo handle-drag: set by a left-press that HIT a gizmo handle (so the click doesn't re-pick + the
   // release commits). A ref (not state) so the click/up guards read it synchronously off the hot path.
   const gizmoHit = useRef(false);
+  // Box selection. The PRESS is a ref (read synchronously in the move handler, off the hot path) and only
+  // the drawn rectangle is state — so a press that turns out to be a click costs no render at all, and a
+  // real marquee re-renders one absolutely-positioned div and nothing else.
+  const marqueePress = useRef<{ x: number; y: number } | null>(null);
+  const [marqueeDrag, setMarqueeDrag] = useState<{
+    start: { x: number; y: number };
+    current: { x: number; y: number };
+    /** The stage's top-left in client coordinates, read ONCE when the box starts. The rectangle is an
+     *  absolutely-positioned child of the stage, so it needs stage-relative pixels; measuring the
+     *  element on every move would put a layout read on a pointer handler for a number that cannot
+     *  change while a pointer is captured. */
+    origin: { left: number; top: number };
+  } | null>(null);
+  // A completed marquee must not also arrive as a pick: `click` fires after `pointerup`, and without
+  // this the release of a box that selected fourteen objects would immediately re-select the one under
+  // the cursor. Cleared by the click it suppresses.
+  const marqueeConsumedClick = useRef(false);
   const [pipeStatus, setPipeStatus] = useState<PipeForgeStatus | null>(null);
   const pipeActive = pipeStatus?.active === true;
   const [pipeBusy, setPipeBusy] = useState(false);
@@ -724,17 +745,34 @@ export function App() {
               // the normal pick. The hit flag resolves async, so a WebDriver synthetic click (which fires
               // immediately) still picks normally — the suppression is for real human-timed drags.
               gizmoHit.current = false;
+              // A left-press on bare stage is the start of a box selection until it turns out to be a
+              // click. Recorded even when a gizmo probe is in flight: if the probe comes back HIT, the
+              // press is withdrawn below, because dragging a handle and dragging a box are the same
+              // gesture until the engine answers which one it was.
+              if (!playing) marqueePress.current = { x: e.clientX, y: e.clientY };
               if (projectionStore.getState().selectedId) {
                 const { x: nx, y: ny } = normalizeSurfacePoint(e.clientX, e.clientY);
                 void client
                   .gizmoPickDrag(nx, ny, e.ctrlKey || e.metaKey)
-                  .then((hit) => (gizmoHit.current = hit))
+                  .then((hit) => {
+                    gizmoHit.current = hit;
+                    if (hit) {
+                      marqueePress.current = null;
+                      setMarqueeDrag(null);
+                    }
+                  })
                   .catch(() => {});
               }
             }
           }}
           onClick={(e) => {
             if (!onStageSurface(e)) return;
+            // A drag that drew a box is not a pick either. `click` fires after `pointerup`, so without
+            // this the release would re-select whatever is under the cursor and throw the box away.
+            if (marqueeConsumedClick.current) {
+              marqueeConsumedClick.current = false;
+              return;
+            }
             // A left-press that grabbed a gizmo handle is a DRAG, not a pick — don't re-select.
             if (gizmoHit.current && !pipeActive) {
               gizmoHit.current = false;
@@ -756,12 +794,29 @@ export function App() {
                 .catch((err) => console.error("pipe_forge_point failed", err));
               return;
             }
+            // What the keyboard was doing is part of the gesture, and the engine has understood these
+            // three since picking was rebuilt — the front end simply never sent them. Shift extends,
+            // Ctrl/Cmd toggles, Alt takes the NEXT object under the cursor so the part behind the part
+            // you can see is reachable without hiding anything.
+            const mods = { extend: e.shiftKey, toggle: e.ctrlKey || e.metaKey, cycle: e.altKey };
+            const modified = mods.extend || mods.toggle;
             void client
-              .viewportPick(nx, ny)
-              .then((picked) => {
+              .viewportPick(nx, ny, mods)
+              .then(async (picked) => {
+                if (modified) {
+                  // A toggle that DESELECTED still hit something, so the hit cannot say what is
+                  // selected now. Read the set back rather than predicting it — the one extra round
+                  // trip happens on a modified click and never on a plain one.
+                  const ids = await client.selectionIds().catch(() => null);
+                  if (ids) {
+                    projectionStore.getState().setSelection(ids);
+                    setStatus(selectionSentence(ids.length));
+                    return;
+                  }
+                }
                 if (picked) {
                   projectionStore.getState().select(picked);
-                  setStatus(`picked ${picked}`);
+                  setStatus(entityLabel(picked));
                 } else {
                   setStatus("nothing here");
                 }
@@ -777,10 +832,67 @@ export function App() {
           onPointerMove={(e) => {
             const rd = rightDrag.current;
             if (rd && (Math.abs(e.clientX - rd.x) > 6 || Math.abs(e.clientY - rd.y) > 6)) rd.moved = true;
+            const press = marqueePress.current;
+            if (!press || gizmoHit.current || pipeActive) return;
+            const current = { x: e.clientX, y: e.clientY };
+            if (!marqueeDrag && !isMarqueeDrag(press, current)) return;
+            // Capture on the FIRST move that qualifies, not on the press: a plain click must not
+            // redirect events away from the overlays it might have landed on, and a real box drag must
+            // keep receiving moves after the cursor leaves the window — otherwise letting go outside
+            // the stage strands a rectangle on screen with no release to clear it.
+            // `try` because pointer capture is not universal: jsdom has no implementation at all, and a
+            // synthetic event carries no live pointer for a real browser to capture. Neither is a reason
+            // to abandon the box — capture is an improvement to a drag that already works without it.
+            if (!marqueeDrag) {
+              try {
+                e.currentTarget.setPointerCapture(e.pointerId);
+              } catch {
+                /* the drag still tracks through the element's own move events */
+              }
+            }
+            const origin = marqueeDrag?.origin ?? (({ left, top }) => ({ left, top }))(e.currentTarget.getBoundingClientRect());
+            setMarqueeDrag({ start: press, current, origin });
           }}
           onPointerUp={(e) => {
             if (e.button === 2 && rightDrag.current) client.dragEnd();
             if (e.button === 0 && gizmoHit.current) client.gizmoDragEnd(); // commit the gizmo move (one tx)
+            const drag = marqueeDrag;
+            marqueePress.current = null;
+            if (!drag || e.button !== 0) {
+              setMarqueeDrag(null);
+              return;
+            }
+            setMarqueeDrag(null);
+            marqueeConsumedClick.current = true;
+            try {
+              if (e.currentTarget.hasPointerCapture?.(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+            } catch {
+              /* nothing was captured */
+            }
+            // The corners go over IN THE ORDER THEY WERE DRAGGED. The engine reads the policy from the
+            // direction (`ScreenRect::from_drag`), so normalizing them here would silently make every
+            // marquee an enclose — and the caption on screen would be lying about what just happened.
+            const mode = marqueeMode(drag.start.x, drag.current.x);
+            const extend = e.shiftKey || e.ctrlKey || e.metaKey;
+            const from = normalizeSurfacePoint(drag.start.x, drag.start.y);
+            const to = normalizeSurfacePoint(drag.current.x, drag.current.y);
+            void client
+              .viewportPickRegion(from.x, from.y, to.x, to.y, extend)
+              .then((ids) => {
+                projectionStore.getState().setSelection(ids);
+                setStatus(selectionSentence(ids.length, ids));
+                // At the gesture, not only in the gutter (`<ux_quality>` 2): the box is gone by the
+                // time the answer arrives, and a count that only appears in the status bar is a count
+                // nobody looking at the stage will read.
+                pushToast(marqueeResult(ids.length, mode, extend), ids.length ? "success" : "info");
+              })
+              .catch((err) => console.error("viewport_pick_region failed", err));
+          }}
+          onPointerCancel={() => {
+            // A cancelled pointer (the OS took it, a touch was interrupted) must not leave a rectangle
+            // painted over the stage with no release coming to clear it.
+            marqueePress.current = null;
+            setMarqueeDrag(null);
           }}
           onWheel={(e) => {
             // A wheel over a panel floating on the stage scrolls THAT PANEL. Before this line every
@@ -938,6 +1050,13 @@ export function App() {
               onDrawPipe={() => setActiveTool("pipe")}
               onBrowseAssets={() => openEngine("build")}
               onImport={importAsset}
+            />
+          )}
+          {marqueeDrag && (
+            <StageMarquee
+              box={marqueeBox(marqueeDrag.start, marqueeDrag.current)}
+              origin={marqueeDrag.origin}
+              mode={marqueeMode(marqueeDrag.start.x, marqueeDrag.current.x)}
             />
           )}
           {/* Keep transient feedback below the authoring toolbar; passive toasts must not cover tools. */}

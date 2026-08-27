@@ -1977,21 +1977,46 @@ pub fn delete_deactivate(
     scene: &CapScene,
     id: EntityId,
 ) -> Result<(), PipelineError> {
-    let id_ecs = engine.ecs_entity(id);
-    let mut ops = vec![Op::SetActive {
-        entity: id,
-        active: false,
-    }];
-    // Free dependents (the M3.3 rule): drop every binding `id` participates in, and — when `id` is the
-    // requirer — the provider's consumed-marker `(BindsTo, id)` pair, so the freed provider re-enters the
-    // reveal. Undo restores them with the re-activation.
+    delete_deactivate_many(engine, scene, &[id])
+}
+
+/// **DELETE A WHOLE SELECTION** — the same rule as [`delete_deactivate`], over many entities, in
+/// **one** transaction.
+///
+/// One commit rather than a loop of them because the selection is what the user acted on: deleting
+/// fourteen objects and then pressing Ctrl-Z fourteen times to get them back is not undo, it is
+/// punishment. The editor's own toolbar had been reading a multi-selection, saying `Actions · 14`,
+/// and deleting exactly one of them.
+///
+/// The bindings are swept **once for the whole set**, not once per entity, which is also what keeps
+/// the op list free of duplicates when two selected objects are bound to each other — the pair would
+/// otherwise be removed twice in one transaction.
+///
+/// # Errors
+/// [`PipelineError`] if the commit fails.
+pub fn delete_deactivate_many(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    ids: &[EntityId],
+) -> Result<(), PipelineError> {
+    let mut ops: Vec<Op> = ids
+        .iter()
+        .map(|&entity| Op::SetActive {
+            entity,
+            active: false,
+        })
+        .collect();
+    // Free dependents (the M3.3 rule): drop every binding a deleted entity participates in, and — when
+    // it is the requirer — the provider's consumed-marker `(BindsTo, id)` pair, so the freed provider
+    // re-enters the reveal. Undo restores them with the re-activation.
     for (from, kind, to) in engine.bindings() {
-        if from != id && to != id {
+        let from_deleted = ids.contains(&from);
+        if !from_deleted && !ids.contains(&to) {
             continue;
         }
         ops.push(Op::RemoveBinding { from, kind, to });
-        if from == id {
-            if let Some(e) = id_ecs {
+        if from_deleted {
+            if let Some(e) = engine.ecs_entity(from) {
                 ops.push(Op::RemovePair {
                     entity: to,
                     rel: scene.rels.binds_to,

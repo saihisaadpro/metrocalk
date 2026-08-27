@@ -3,7 +3,7 @@
 //! row carries a thumbnail (the icon fallback in jsdom), and clicking a row selects it (cross-panel
 //! coherence). Asserts behaviour, not styled copy.
 
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { Hierarchy } from "./Hierarchy";
 import { projectionStore } from "../store/projection";
@@ -37,6 +37,32 @@ test("clicking a row selects it (cross-panel coherence: the engine selection fol
   expect(projectionStore.getState().selectedId).toBeNull();
   fireEvent.click(screen.getByTestId("hrow"));
   expect(projectionStore.getState().selectedId).toBe("e1");
+});
+
+test("the WHOLE multi-selection reaches the engine, not just the row last clicked", () => {
+  // This used to send `gizmoSelect(id)` — ONE id — after building a multi-selection in the store, so
+  // ctrl-clicking three rows highlighted three rows in the list and outlined exactly one object in the
+  // 3D view. The list and the stage were two selections that never compared notes, and the stage's
+  // answer was the one the user was looking at.
+  const selectEntities = vi.fn((ids: string[]) => Promise.resolve(ids));
+  projectionStore.getState().bulkLoad([
+    { id: "a", name: "A", parentId: null, components: {} },
+    { id: "b", name: "B", parentId: null, components: {} },
+    { id: "c", name: "C", parentId: null, components: {} },
+  ]);
+  render(<Hierarchy client={fakeClient({ selectEntities })} />);
+  const rows = Object.fromEntries(
+    screen.getAllByTestId("hrow").map((r) => [r.getAttribute("data-id"), r]),
+  );
+
+  fireEvent.click(rows.a!);
+  expect(selectEntities).toHaveBeenLastCalledWith(["a"]);
+  fireEvent.click(rows.c!, { ctrlKey: true });
+  expect(selectEntities).toHaveBeenLastCalledWith(["a", "c"]);
+  fireEvent.click(rows.b!, { shiftKey: true });
+  // Shift is a RANGE over the visible order, anchored on the PRIMARY — which the ctrl-click above
+  // moved to `c`. So it takes `c`..`b`, and `a` is dropped: a range replaces, it does not accumulate.
+  expect(selectEntities).toHaveBeenLastCalledWith(["b", "c"]);
 });
 
 test("exposes a searchable semantic tree with result and no-result states", () => {

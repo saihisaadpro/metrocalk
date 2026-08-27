@@ -22,6 +22,7 @@ import {
   type AssetLabStage,
 } from "../../src/panels/AssetLabPanel";
 import { STAGE_MIN } from "../../src/app/layout";
+import { StageMarquee } from "../../src/app/StageMarquee";
 import { BindingGraph } from "../../src/graph/BindingGraph";
 import { Icon, iconTokens } from "../../src/theme/icons";
 import { Inspector } from "../../src/inspector/Inspector";
@@ -1017,7 +1018,55 @@ export const SCENES: Scene[] = [
   ...assetScenes(),
   ...modelScenes(),
   ...shellScenes(),
+  ...selectionScenes(),
 ];
+
+// ── selecting more than one thing ──────────────────────────────────────────────────────────────────
+
+/** The box you drag on the stage, in both of the modes the engine has and nothing ever showed.
+ *
+ *  A marquee is a gesture, and this harness photographs states — so what is on trial here is the one
+ *  thing a state CAN answer: whether a reader can tell the two modes apart, and read the word that
+ *  names the one they are in, at the size it is actually drawn. The engine has always had
+ *  crossing-versus-enclosing; two identical-looking rectangles selecting different sets is exactly
+ *  the confusion this caption exists to remove, and a caption that is illegible removes nothing. */
+function selectionScenes(): Scene[] {
+  return [
+    {
+      id: "stage-marquee-modes",
+      looking_for:
+        "TWO BOXES, TWO RULES, TOLD APART WITHOUT READING. Left is a left-to-right drag — solid edge, " +
+        "'Fully inside'. Right is a right-to-left drag — dashed edge, 'Touched'. What a reader checks: " +
+        "the two edges are distinguishable at a glance (the border style carries the mode as well as the " +
+        "word does, so the rule survives peripheral vision during a drag); the caption is legible at the " +
+        "12px it is drawn at and sits OUTSIDE the box on the corner the drag is heading towards, not " +
+        "under the hand; and neither caption is clipped by its own box",
+      expect: {
+        present: [["[data-testid='stage-marquee']", 2]],
+        text_present: ["Fully inside", "Touched"],
+        text_absent: ["null", "undefined", "NaN", "enclose", "touch"],
+        // The caption is the point. If it is clipped, the rule it names is unreadable exactly when it
+        // matters — mid-drag, at a glance.
+        unclipped: ["[data-testid='stage-marquee'] span"],
+      },
+      viewport: { width: 760, height: 320 },
+      render: () => (
+        <div style={{ position: "relative", width: 760, height: 320, background: "var(--mtk-bg-inset)" }}>
+          <StageMarquee
+            box={{ left: 60, top: 60, width: 260, height: 160 }}
+            origin={{ left: 0, top: 0 }}
+            mode="enclose"
+          />
+          <StageMarquee
+            box={{ left: 430, top: 60, width: 260, height: 160 }}
+            origin={{ left: 0, top: 0 }}
+            mode="touch"
+          />
+        </div>
+      ),
+    },
+  ];
+}
 
 // ── the inspector ─────────────────────────────────────────────────────────────────────────────────
 

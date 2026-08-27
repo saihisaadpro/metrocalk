@@ -976,12 +976,28 @@ fn normalize_or(v: Vec3, fallback: Vec3) -> Vec3 {
 /// Order is preserved because it carries meaning: the **active** object is the one the inspector
 /// shows and the one an "active object" pivot mode uses, and it is the most recently added, not an
 /// arbitrary member of a set.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SelectionModel {
-    entries: Vec<(u64, u32)>,
+///
+/// **The key is a parameter because the right key is not the picker's to choose.** A picker names an
+/// object by whatever it indexes — here a slot in the render instance list — and that name is only
+/// valid until the next structural change renumbers it. A selection outlives structural changes by
+/// definition, so a caller that has a *stable* name for an object (an entity id) must be able to hold
+/// the selection in that name instead. `K = u64` keeps the picker's own vocabulary the default; the
+/// editor shell instantiates `SelectionModel<String>` over entity ids. Which key is in use is then a
+/// type, not a comment — and the click semantics below are written once for both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionModel<K = u64> {
+    entries: Vec<(K, u32)>,
 }
 
-impl SelectionModel {
+impl<K> Default for SelectionModel<K> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<K: Clone + PartialEq> SelectionModel<K> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -999,29 +1015,29 @@ impl SelectionModel {
 
     /// Selection order, oldest first.
     #[must_use]
-    pub fn entries(&self) -> &[(u64, u32)] {
+    pub fn entries(&self) -> &[(K, u32)] {
         &self.entries
     }
 
     /// The primary object: the most recently added. `None` when nothing is selected.
     #[must_use]
-    pub fn active(&self) -> Option<(u64, u32)> {
-        self.entries.last().copied()
+    pub fn active(&self) -> Option<(K, u32)> {
+        self.entries.last().cloned()
     }
 
     #[must_use]
-    pub fn contains(&self, key: u64, instance: u32) -> bool {
-        self.entries.contains(&(key, instance))
+    pub fn contains(&self, key: &K, instance: u32) -> bool {
+        self.entries.iter().any(|(k, i)| k == key && *i == instance)
     }
 
     /// Whether any instance of `key` is selected — what the outliner highlights a row on.
     #[must_use]
-    pub fn contains_key(&self, key: u64) -> bool {
-        self.entries.iter().any(|(k, _)| *k == key)
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.entries.iter().any(|(k, _)| k == key)
     }
 
     /// Replace the selection with one object.
-    pub fn set(&mut self, key: u64, instance: u32) {
+    pub fn set(&mut self, key: K, instance: u32) {
         self.entries.clear();
         self.entries.push((key, instance));
     }
@@ -1031,14 +1047,18 @@ impl SelectionModel {
     }
 
     /// Add, promoting an already-selected object to active — Shift-click.
-    pub fn add(&mut self, key: u64, instance: u32) {
-        self.entries.retain(|e| *e != (key, instance));
+    pub fn add(&mut self, key: K, instance: u32) {
+        self.entries.retain(|(k, i)| !(k == &key && *i == instance));
         self.entries.push((key, instance));
     }
 
     /// Add or remove — Ctrl/Cmd-click. Returns whether the object ended up selected.
-    pub fn toggle(&mut self, key: u64, instance: u32) -> bool {
-        if let Some(pos) = self.entries.iter().position(|e| *e == (key, instance)) {
+    pub fn toggle(&mut self, key: K, instance: u32) -> bool {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|(k, i)| k == &key && *i == instance)
+        {
             self.entries.remove(pos);
             false
         } else {
@@ -1047,8 +1067,21 @@ impl SelectionModel {
         }
     }
 
-    pub fn remove(&mut self, key: u64, instance: u32) {
-        self.entries.retain(|e| *e != (key, instance));
+    pub fn remove(&mut self, key: &K, instance: u32) {
+        self.entries.retain(|(k, i)| !(k == key && *i == instance));
+    }
+
+    /// Replace the whole selection, in the given order — the list-driven surfaces (the outliner's
+    /// range-select, a search result, "select all of this kind") state the answer outright rather
+    /// than replaying clicks to reach it.
+    ///
+    /// Duplicates are dropped keeping the LAST occurrence, so the active object is the last one named
+    /// exactly as it is after a sequence of shift-clicks.
+    pub fn set_all(&mut self, entries: impl IntoIterator<Item = (K, u32)>) {
+        self.entries.clear();
+        for (key, instance) in entries {
+            self.add(key, instance);
+        }
     }
 
     /// Drop every entry whose key is no longer in the scene.
@@ -1056,9 +1089,9 @@ impl SelectionModel {
     /// Called after any structural change. Without it a selection outlives the object it names, and
     /// the inspector shows a phantom while the gizmo edits nothing — the exact failure of an
     /// index-based selection after an undo.
-    pub fn retain_live(&mut self, is_live: impl Fn(u64, u32) -> bool) -> bool {
+    pub fn retain_live(&mut self, is_live: impl Fn(&K, u32) -> bool) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|(k, i)| is_live(*k, *i));
+        self.entries.retain(|(k, i)| is_live(k, *i));
         before != self.entries.len()
     }
 
@@ -1067,7 +1100,7 @@ impl SelectionModel {
     /// `hit` is `None` for a click on empty space, which **clears** the selection unless a modifier
     /// says otherwise — the behaviour that was impossible before, because the old picker could never
     /// report empty space.
-    pub fn apply_click(&mut self, hit: Option<(u64, u32)>, modifiers: ClickModifiers) -> bool {
+    pub fn apply_click(&mut self, hit: Option<(K, u32)>, modifiers: ClickModifiers) -> bool {
         let before = self.entries.clone();
         match hit {
             Some((key, instance)) => {
@@ -1755,7 +1788,7 @@ mod tests {
 
     #[test]
     fn selection_model_is_one_ordered_source_of_truth() {
-        let mut s = SelectionModel::new();
+        let mut s: SelectionModel<u64> = SelectionModel::new();
         assert!(s.is_empty() && s.active().is_none());
 
         s.apply_click(Some((1, 0)), ClickModifiers::default());
@@ -1790,7 +1823,7 @@ mod tests {
             },
         );
         assert_eq!(s.len(), 1);
-        assert!(!s.contains(1, 0));
+        assert!(!s.contains(&1, 0));
 
         // A plain click on empty space clears; a modified one does not.
         s.apply_click(
@@ -1815,11 +1848,11 @@ mod tests {
     fn selection_drops_entries_whose_objects_are_gone() {
         // The dangling-selection bug: after an undo or a delete, an index- or id-based selection
         // outlives its object and the inspector shows a phantom.
-        let mut s = SelectionModel::new();
+        let mut s: SelectionModel<u64> = SelectionModel::new();
         s.add(1, 0);
         s.add(2, 0);
         s.add(3, 0);
-        assert!(s.retain_live(|k, _| k != 2), "reports that it changed");
+        assert!(s.retain_live(|k, _| *k != 2), "reports that it changed");
         assert_eq!(s.entries(), &[(1, 0), (3, 0)]);
         assert_eq!(
             s.active(),
@@ -1832,5 +1865,47 @@ mod tests {
         );
         s.retain_live(|_, _| false);
         assert!(s.is_empty() && s.active().is_none());
+    }
+
+    /// The reason the key is a type parameter: the same click semantics, held in a name that
+    /// survives the renumbering a picker's own key does not.
+    #[test]
+    fn the_same_selection_can_be_held_in_a_stable_key() {
+        let mut s: SelectionModel<String> = SelectionModel::new();
+        s.apply_click(Some(("1_a".to_string(), 0)), ClickModifiers::default());
+        s.apply_click(
+            Some(("1_b".to_string(), 0)),
+            ClickModifiers {
+                extend: true,
+                toggle: false,
+            },
+        );
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.active(), Some(("1_b".to_string(), 0)));
+        assert!(s.contains_key(&"1_a".to_string()));
+
+        // The object named `1_a` is deleted. An index key would silently start naming whatever slid
+        // into its slot; a stable key simply stops matching, which is what `retain_live` needs.
+        assert!(s.retain_live(|k, _| k != "1_a"));
+        assert_eq!(s.entries(), &[("1_b".to_string(), 0)]);
+    }
+
+    /// A list surface states the whole answer rather than replaying clicks to reach it.
+    #[test]
+    fn set_all_replaces_the_selection_and_keeps_the_last_named_active() {
+        let mut s: SelectionModel<String> = SelectionModel::new();
+        s.add("old".to_string(), 0);
+        s.set_all(["a", "b", "a", "c"].into_iter().map(|k| (k.to_string(), 0)));
+        assert_eq!(
+            s.entries(),
+            &[
+                ("b".to_string(), 0),
+                ("a".to_string(), 0),
+                ("c".to_string(), 0)
+            ],
+            "the earlier duplicate is dropped, not the later one"
+        );
+        assert_eq!(s.active(), Some(("c".to_string(), 0)));
+        assert!(!s.contains_key(&"old".to_string()), "it REPLACES");
     }
 }

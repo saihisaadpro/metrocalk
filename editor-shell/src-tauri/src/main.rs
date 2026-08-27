@@ -2964,6 +2964,11 @@ enum EngineCmd {
         id: String,
         reply: Sender<bool>,
     },
+    /// Delete a whole SELECTION in one transaction → the ids actually deactivated.
+    DeleteDeactivateMany {
+        ids: Vec<String>,
+        reply: Sender<Vec<String>>,
+    },
     /// Copy a sub-tree to the clipboard (a read → fills the thread clipboard).
     CopySubtree {
         id: String,
@@ -6816,7 +6821,7 @@ struct AppState {
     picking: Mutex<scene_pick::PickCache>,
     /// The one selection. The renderer's `selected` index and the front end's ids are both projections
     /// of this; previously each kept its own copy and they drifted apart on any structural change.
-    selection: Mutex<metrocalk_spatial::SelectionModel>,
+    selection: Mutex<scene_pick::Selection>,
 }
 
 fn inactive_pipe_status(message: impl Into<String>) -> PipeForgeStatus {
@@ -10896,6 +10901,33 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
                 let _ = reply.send(ok);
+            }
+            EngineCmd::DeleteDeactivateMany { ids, reply } => {
+                // Only ids the document actually knows; a stale row in a list must not turn the whole
+                // gesture into a refusal, and the caller is told exactly which ones went.
+                let targets: Vec<(String, EntityId)> = ids
+                    .into_iter()
+                    .filter_map(|s| EntityId::from_loro_key(&s).map(|e| (s, e)))
+                    .filter(|(_, e)| engine.ecs_entity(*e).is_some())
+                    .collect();
+                let entities: Vec<EntityId> = targets.iter().map(|(_, e)| *e).collect();
+                let ok = !entities.is_empty()
+                    && capscene::delete_deactivate_many(&mut engine, &scene, &entities).is_ok();
+                let done: Vec<String> = if ok {
+                    // One record per id: the log is a REPLAY log, not the undo stack, and replaying
+                    // fourteen deactivations reaches the same document as replaying one of fourteen.
+                    for (key, _) in &targets {
+                        log.append(&Record::DeleteDeactivate { id: key.clone() });
+                    }
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, proj_full(&engine, &scene));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                    targets.into_iter().map(|(key, _)| key).collect()
+                } else {
+                    Vec::new()
+                };
+                let _ = reply.send(done);
             }
             EngineCmd::CopySubtree { id } => {
                 clipboard = EntityId::from_loro_key(&id)
@@ -19946,18 +19978,26 @@ fn viewport_pick(
     let mut selection = state.selection.lock().unwrap();
     let filter = scene_pick::click_filter();
     let hit = if cycle.unwrap_or(false) {
-        cache.cycle(&camera, &viewport, &ray, &filter, selection.active())
+        // Alt-click walks the objects under the cursor from nearest to furthest, so the thing BEHIND
+        // the thing you can see is reachable without hiding, isolating or orbiting to find an angle
+        // where it is on top. The cursor is the same; only the starting point moves — which is why
+        // this needs the current active object and cannot be derived from the ray alone.
+        let previous = selection.active().and_then(|(id, instance)| {
+            scene_pick::slot_of_id(&st, &id).map(|s| (s as u64, instance))
+        });
+        cache.cycle(&camera, &viewport, &ray, &filter, previous)
     } else {
         cache.nearest(&camera, &viewport, &ray, &filter)
     };
 
     scene_pick::apply_click(
+        &st,
         &mut selection,
         hit.as_ref(),
         scene_pick::modifiers(shift.unwrap_or(false), ctrl.unwrap_or(false)),
     );
 
-    scene_pick::apply_selection_highlight(&mut st, &selection);
+    scene_pick::reconcile(&mut st, &mut selection);
     let resolved = hit.as_ref().and_then(|h| scene_pick::entity_of(&st, h));
     drop(selection);
     drop(cache);
@@ -20021,12 +20061,16 @@ fn viewport_pick_region(
     if !shift.unwrap_or(false) {
         selection.clear();
     }
+    // Resolve to entity ids at the boundary, exactly as a click does: the pick key is a slot in the
+    // instance list and is renumbered by the next structural change.
     for (key, instance) in &picked {
-        selection.add(*key, *instance);
+        if let Some(id) = scene_pick::entity_of_key(&st, *key) {
+            selection.add(id, *instance);
+        }
     }
     // Project onto the renderer's highlight flags through the same helper a click uses.
-    scene_pick::apply_selection_highlight(&mut st, &selection);
-    let ids = scene_pick::selected_ids(&st, &selection);
+    scene_pick::reconcile(&mut st, &mut selection);
+    let ids = scene_pick::selected_ids(&selection);
     drop(selection);
     drop(cache);
     ids
@@ -20741,24 +20785,70 @@ fn gizmo_pivot_toggle(state: State<AppState>) -> String {
 }
 
 /// M9.1 — select an entity by its loro-key (so the gizmo shows on it). Returns whether it was found.
+///
+/// **This used to write the highlight flag and `st.selected` directly**, which made it a second
+/// selection beside `AppState::selection` — and since every React panel reaches the engine's
+/// selection through here and not through a viewport click, it was the one that usually won. The
+/// symptom was that ctrl-clicking forty rows in the outliner outlined exactly one object in 3D.
+/// Routed through the same seam as a click, "what is selected" has one answer again.
 #[tauri::command]
 fn gizmo_select(state: State<AppState>, id: String) -> bool {
     ipc();
     let mut st = state.shared.lock().unwrap();
-    let Some(i) = st.ids.iter().position(|k| *k == id) else {
+    if scene_pick::slot_of_id(&st, &id).is_none() {
         return false;
-    };
-    if let Some(p) = st.selected {
-        if p < st.instances.len() {
-            st.instances[p].selected = 0.0;
-        }
     }
-    st.selected = Some(i);
-    if i < st.instances.len() {
-        st.instances[i].selected = 1.0;
-    }
-    st.revision = st.revision.wrapping_add(1);
+    let mut selection = state.selection.lock().unwrap();
+    selection.set(id, 0);
+    scene_pick::reconcile(&mut st, &mut selection);
     true
+}
+
+/// **State the whole selection at once** — the list surfaces' entry point.
+///
+/// The outliner's range-select, a search result and "select every object of this kind" all know the
+/// answer outright; replaying them as a sequence of clicks would be a second implementation of the
+/// click semantics, in another language, that no compiler compares to the first. `mode` is
+/// `"replace"` (the default), `"add"` or `"toggle"`, named after what the user did rather than after
+/// a modifier key, because the platform mapping belongs at the input boundary.
+///
+/// Returns the resulting selection, in selection order — so the caller never has to predict what the
+/// engine did with ids it does not have. Ids the scene cannot name are dropped rather than refused:
+/// a list can hold a row the render state has not caught up with yet, and refusing the whole gesture
+/// over one of them would make multi-select fail intermittently.
+#[tauri::command]
+fn select_entities(state: State<AppState>, ids: Vec<String>, mode: Option<String>) -> Vec<String> {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    let mut selection = state.selection.lock().unwrap();
+    match mode.as_deref().unwrap_or("replace") {
+        "add" => {
+            for id in ids {
+                selection.add(id, 0);
+            }
+        }
+        "toggle" => {
+            for id in ids {
+                selection.toggle(id, 0);
+            }
+        }
+        _ => selection.set_all(ids.into_iter().map(|id| (id, 0))),
+    }
+    scene_pick::reconcile(&mut st, &mut selection);
+    scene_pick::selected_ids(&selection)
+}
+
+/// Everything currently selected, in selection order — the read the front end mirrors after a
+/// gesture whose result it cannot predict (a modified click, a marquee, a delete).
+///
+/// Reconciles first, so a caller never sees an id the scene has already lost.
+#[tauri::command]
+fn selection_ids(state: State<AppState>) -> Vec<String> {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    let mut selection = state.selection.lock().unwrap();
+    scene_pick::reconcile(&mut st, &mut selection);
+    scene_pick::selected_ids(&selection)
 }
 
 /// M9 (React port) — the currently gizmo-selected entity's loro-key, so a React inspector button can act on
@@ -22892,6 +22982,37 @@ fn delete_deactivate(state: State<AppState>, id: String) -> bool {
         return false;
     }
     recv_reply(&rx).unwrap_or(false)
+}
+
+/// **Delete a whole selection**, in ONE undoable transaction → the ids that actually went.
+///
+/// The editor has read a multi-selection since M10.6 and its toolbar has been saying `Actions · 14`
+/// for as long as it has had one, while `Delete` called the single-id command on the primary and
+/// silently left the other thirteen. Returning the ids rather than a bool is what lets the front end
+/// dim exactly the rows that went, instead of guessing that its own list is what happened.
+#[tauri::command(async)]
+fn delete_deactivate_many(state: State<AppState>, ids: Vec<String>) -> Vec<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::DeleteDeactivateMany { ids, reply })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let deleted: Vec<String> = recv_reply(&rx).unwrap_or_default();
+    // The selection cannot survive the objects it names. Pruning here rather than waiting for the next
+    // gesture is what stops the inspector showing a phantom and the gizmo editing nothing.
+    if !deleted.is_empty() {
+        let mut st = state.shared.lock().unwrap();
+        let mut selection = state.selection.lock().unwrap();
+        for id in &deleted {
+            selection.remove(id, 0);
+        }
+        scene_pick::reconcile(&mut st, &mut selection);
+    }
+    deleted
 }
 
 /// M10.6 — copy a sub-tree to the clipboard (a read → fills the thread clipboard).
@@ -25182,7 +25303,7 @@ fn main() {
         native_imports,
         moba: Mutex::new(None),
         picking: Mutex::new(scene_pick::PickCache::new()),
-        selection: Mutex::new(metrocalk_spatial::SelectionModel::new()),
+        selection: Mutex::new(scene_pick::Selection::new()),
     };
 
     tauri::Builder::default()
@@ -25260,6 +25381,9 @@ fn main() {
             viewport_pick,
             viewport_peek,
             viewport_pick_region,
+            select_entities,
+            selection_ids,
+            delete_deactivate_many,
             pick_diagnostics,
             focus_entity,
             set_viewport_rect,

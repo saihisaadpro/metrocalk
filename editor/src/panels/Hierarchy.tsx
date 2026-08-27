@@ -92,14 +92,22 @@ const Row = memo(function Row({
   const depth = s?.parentId ? depthOf(id) : 0;
   const named = !!s?.name && s.name !== id;
 
-  // Selection: shift = range, ctrl/cmd = toggle, else single. The engine gizmo selection follows the
-  // primary so the inspector/gizmo/viewport track it (cross-panel coherence, no desync).
+  // Selection: shift = range, ctrl/cmd = toggle, else single.
+  //
+  // THE WHOLE SELECTION GOES TO THE ENGINE, not just the primary. This used to send `gizmoSelect(id)`
+  // — one id — after building a multi-selection in the store, so ctrl-clicking forty rows highlighted
+  // forty rows in the list and outlined exactly ONE object in the 3D view. The list and the stage were
+  // two selections that never compared notes, and the stage's answer was the one the user was looking
+  // at. `selectEntities` states the whole set through the same seam a viewport click uses.
   function click(e: React.MouseEvent) {
     const st = projectionStore.getState();
     if (e.shiftKey) st.selectRange(id);
     else if (e.ctrlKey || e.metaKey) st.toggleSelect(id);
     else st.select(id);
-    void client.gizmoSelect(id).catch((e) => console.error("gizmoSelect failed (engine selection may be out of sync)", e));
+    const ids = projectionStore.getState().multiSelect;
+    void client
+      .selectEntities(ids.length ? ids : [id])
+      .catch((e) => console.error("selectEntities failed (engine selection may be out of sync)", e));
   }
 
   const cls = ["mtk-hrow", primary && "is-selected", !primary && inMulti && "is-multi", dropTarget && "is-drop"].filter(Boolean).join(" ");

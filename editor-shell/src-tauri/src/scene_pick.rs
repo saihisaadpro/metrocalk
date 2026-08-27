@@ -23,6 +23,8 @@
 //! what you see, by construction rather than by coincidence — and answers with the canonical
 //! [`HitResult`].
 
+use std::collections::{HashMap, HashSet};
+
 use metrocalk_assets::MeshGpu;
 use metrocalk_spatial::bvh::TriangleSource;
 use metrocalk_spatial::{
@@ -380,49 +382,126 @@ pub fn viewport_for(state: &SceneState, dpi_scale: f64) -> Viewport {
 /// Resolve a hit back to the entity id the rest of the editor speaks.
 #[must_use]
 pub fn entity_of(state: &SceneState, hit: &HitResult) -> Option<String> {
-    let key = hit.key as usize;
+    entity_of_key(state, hit.key)
+}
+
+/// The entity a raw pick key names — the marquee's half of [`entity_of`], which reports keys rather
+/// than full hits. One implementation, so a click and a marquee can never resolve the same key to
+/// two different objects.
+#[must_use]
+pub fn entity_of_key(state: &SceneState, key: u64) -> Option<String> {
+    let key = key as usize;
     if key < state.ids.len() {
         return state.ids.get(key).cloned();
     }
     state
         .marker_entities
-        .get(key - state.instances.len())
+        .get(key.saturating_sub(state.instances.len()))
         .map(|m| m.id.clone())
 }
 
-/// Whether a pick key refers to a renderable instance (as opposed to a marker), and its index.
-#[must_use]
-pub fn instance_index_of(state: &SceneState, key: u64) -> Option<usize> {
-    usize::try_from(key)
-        .ok()
-        .filter(|index| *index < state.instances.len())
-}
+// `instance_index_of` (pick key -> instance index) went with the index-keyed selection: the only
+// thing that ever held a pick key long enough to need resolving later was the selection, and it now
+// holds entity ids. `slot_of_id` is its replacement and answers the question in the stable name.
 
 /// Whether two instances describe a different placement — the refit trigger.
 fn instance_moved(a: &Instance, b: &Instance) -> bool {
     a.center != b.center || a.scale != b.scale || a.rotation != b.rotation
 }
 
-/// **Project the canonical selection onto the renderer's per-instance highlight flag.**
+/// **The editor's selection**, held in the one name that survives a structural change.
 ///
-/// The flag is a *view* of the selection, never a second copy of it. Both selection entry points call
-/// this, so the viewport outline, the gizmo target and the reported ids cannot disagree — the failure
-/// where a structural change left an outline lit on an object that was no longer selected came from
-/// each of those keeping its own idea of what was selected.
+/// The picker names an object by the slot it indexes — `build_objects` hands each render instance
+/// `index as u64` — and that name is valid only until the next add, delete, undo or reimport
+/// renumbers the instance list. A selection outlives all four by definition. Keyed on the *entity
+/// id*, "what is selected" means the same thing to the renderer, the outliner, the inspector and a
+/// saved project, and `retain_live` can actually tell a dead entry from a live one instead of
+/// finding a stranger in the same slot.
 ///
-/// Returns the primary (active) instance index, which is what the gizmo attaches to.
-pub fn apply_selection_highlight(
-    state: &mut SceneState,
-    selection: &SelectionModel,
-) -> Option<usize> {
+/// The click semantics are `metrocalk_spatial`'s, not a second copy of them — the model is generic
+/// over its key for exactly this reason.
+pub type Selection = SelectionModel<String>;
+
+/// Every entity id the scene can name, mapped to the slot it occupies.
+///
+/// Built once per selection change rather than scanned per entry: a 15,711-part assembly with a
+/// hundred objects selected is a million string comparisons done the naive way, on a gesture that
+/// must feel instant.
+fn slot_index(state: &SceneState) -> HashMap<&str, usize> {
+    let mut map: HashMap<&str, usize> =
+        HashMap::with_capacity(state.ids.len() + state.marker_entities.len());
+    for (index, id) in state.ids.iter().enumerate() {
+        map.insert(id.as_str(), index);
+    }
+    for (offset, marker) in state.marker_entities.iter().enumerate() {
+        map.insert(marker.id.as_str(), state.instances.len() + offset);
+    }
+    map
+}
+
+/// The instance index — or marker index, offset past the instances — an entity id resolves to.
+///
+/// One lookup for both, because a light and a mesh are equally selectable and a caller that has to
+/// remember which list an id lives in will eventually forget. For one id; a whole selection goes
+/// through [`reconcile`], which builds the index once.
+#[must_use]
+pub fn slot_of_id(state: &SceneState, id: &str) -> Option<usize> {
+    if let Some(index) = state.ids.iter().position(|k| k == id) {
+        return Some(index);
+    }
+    state
+        .marker_entities
+        .iter()
+        .position(|m| m.id == id)
+        .map(|offset| state.instances.len() + offset)
+}
+
+/// **Bring the scene and the selection back into agreement — the ONE seam every selection change
+/// passes through.**
+///
+/// Two things happen here and they are deliberately not separable. Ids the scene can no longer name
+/// are dropped, because a selection that outlives its object shows the inspector a phantom while the
+/// gizmo edits nothing. And the renderer's per-instance highlight flag is rewritten from what
+/// remains, because the flag is a *view* of the selection and never a second copy of it.
+///
+/// **Every** entry point calls this — the viewport click, the marquee, and the list surfaces through
+/// `select_entities` — so the viewport outline, the gizmo target and the reported ids cannot
+/// disagree. The failure where a structural change left an outline lit on an object that was no
+/// longer selected came from each of those keeping its own idea of what was selected; `gizmo_select`
+/// writing `state.selected` directly was the last surviving instance of it, and it was the one every
+/// React panel called.
+///
+/// Returns the primary (active) *instance* index, which is what the gizmo attaches to. A marker — a
+/// light or a camera glyph — is not in the instance list, so it can be the selection's active object
+/// without being the gizmo's; that is why this returns an `Option` rather than the selection's own
+/// emptiness.
+pub fn reconcile(state: &mut SceneState, selection: &mut Selection) -> Option<usize> {
+    // Resolve every id against ONE index, then let go of the borrow before mutating the state.
+    let slots: Vec<(String, Option<usize>)> = {
+        let index = slot_index(state);
+        selection
+            .entries()
+            .iter()
+            .map(|(id, _)| (id.clone(), index.get(id.as_str()).copied()))
+            .collect()
+    };
+    if slots.iter().any(|(_, slot)| slot.is_none()) {
+        let live: HashSet<&str> = slots
+            .iter()
+            .filter(|(_, slot)| slot.is_some())
+            .map(|(id, _)| id.as_str())
+            .collect();
+        selection.retain_live(|id, _| live.contains(id.as_str()));
+    }
+
     for instance in &mut state.instances {
         instance.selected = 0.0;
     }
     let mut primary = None;
-    for (key, _) in selection.entries() {
-        if let Some(index) = instance_index_of(state, *key) {
-            state.instances[index].selected = 1.0;
-            primary = Some(index);
+    for slot in slots.iter().filter_map(|(_, slot)| *slot) {
+        if slot < state.instances.len() {
+            state.instances[slot].selected = 1.0;
+            primary = Some(slot);
         }
     }
     state.selected = primary;
@@ -432,21 +511,11 @@ pub fn apply_selection_highlight(
 
 /// The entity ids of everything currently selected, in selection order.
 #[must_use]
-pub fn selected_ids(state: &SceneState, selection: &SelectionModel) -> Vec<String> {
+pub fn selected_ids(selection: &Selection) -> Vec<String> {
     selection
         .entries()
         .iter()
-        .filter_map(|(key, _)| {
-            instance_index_of(state, *key).map_or_else(
-                || {
-                    state
-                        .marker_entities
-                        .get((*key as usize).saturating_sub(state.instances.len()))
-                        .map(|m| m.id.clone())
-                },
-                |index| state.ids.get(index).cloned(),
-            )
-        })
+        .map(|(id, _)| id.clone())
         .collect()
 }
 
@@ -469,12 +538,19 @@ pub fn modifiers(shift: bool, ctrl: bool) -> ClickModifiers {
 }
 
 /// Apply a click to the canonical selection and report whether it changed anything.
+///
+/// The hit is resolved to an entity id **here**, at the input boundary, so nothing downstream of a
+/// click ever holds a pick index: the transient name the picker answers in never outlives the call
+/// that produced it. A hit on geometry the scene cannot name is treated as a click on empty space,
+/// which is the honest answer — a selection entry nothing can resolve is a phantom.
 pub fn apply_click(
-    selection: &mut SelectionModel,
+    state: &SceneState,
+    selection: &mut Selection,
     hit: Option<&HitResult>,
     modifiers: ClickModifiers,
 ) -> bool {
-    selection.apply_click(hit.map(|h| (h.key, h.instance)), modifiers)
+    let target = hit.and_then(|h| entity_of(state, h).map(|id| (id, h.instance)));
+    selection.apply_click(target, modifiers)
 }
 
 #[cfg(test)]
@@ -784,24 +860,72 @@ mod tests {
     #[test]
     fn the_selection_highlight_is_a_projection_of_one_selection_model() {
         let mut state = scene_with(|i| ([f32::from(i as u8) * 6.0, 0.0, 0.0], 1.0));
-        let mut selection = SelectionModel::new();
-        selection.add(0, 0);
-        selection.add(2, 0);
-        let primary = apply_selection_highlight(&mut state, &selection);
+        let mut selection = Selection::new();
+        selection.add("entity:0".to_string(), 0);
+        selection.add("entity:2".to_string(), 0);
+        let primary = reconcile(&mut state, &mut selection);
         assert_eq!(primary, Some(2), "the most recently added is active");
         assert_eq!(state.instances[0].selected, 1.0);
         assert_eq!(state.instances[1].selected, 0.0);
         assert_eq!(state.instances[2].selected, 1.0);
-        assert_eq!(
-            selected_ids(&state, &selection),
-            vec!["entity:0", "entity:2"]
-        );
+        assert_eq!(selected_ids(&selection), vec!["entity:0", "entity:2"]);
 
         // Clearing the model clears every highlight — there is no second copy to go stale.
         selection.clear();
-        assert_eq!(apply_selection_highlight(&mut state, &selection), None);
+        assert_eq!(reconcile(&mut state, &mut selection), None);
         assert!(state.instances.iter().all(|i| i.selected == 0.0));
         assert_eq!(state.selected, None);
+    }
+
+    /// The reason the selection is keyed on an entity id and not on the pick key: the pick key is a
+    /// slot in the instance list, and the next structural change renumbers it.
+    #[test]
+    fn a_selection_survives_the_renumbering_a_pick_key_does_not() {
+        let mut state = scene_with(|i| ([f32::from(i as u8) * 6.0, 0.0, 0.0], 1.0));
+        let mut selection = Selection::new();
+        selection.add("entity:2".to_string(), 0);
+        assert_eq!(reconcile(&mut state, &mut selection), Some(2));
+
+        // Delete the FIRST object. Every later instance slides down one slot, so the pick key 2 now
+        // names what used to be `entity:3` — an index-keyed selection silently starts editing a
+        // different object here, which is the bug this key change exists to make impossible.
+        state.instances.remove(0);
+        state.ids.remove(0);
+        state.mesh_slots.remove(0);
+        assert_eq!(state.ids[1], "entity:2", "it moved from slot 2 to slot 1");
+
+        assert_eq!(
+            reconcile(&mut state, &mut selection),
+            Some(1),
+            "the same OBJECT, at its new slot"
+        );
+        assert_eq!(selected_ids(&selection), vec!["entity:2"]);
+        assert_eq!(state.instances[1].selected, 1.0);
+    }
+
+    /// A selection that outlives its object shows the inspector a phantom while the gizmo edits
+    /// nothing. `reconcile` is the only thing that runs on every selection change, so it is where
+    /// the pruning has to happen.
+    #[test]
+    fn reconcile_drops_ids_the_scene_can_no_longer_name() {
+        let mut state = scene_with(|i| ([f32::from(i as u8) * 6.0, 0.0, 0.0], 1.0));
+        let mut selection = Selection::new();
+        selection.add("entity:0".to_string(), 0);
+        selection.add("entity:1".to_string(), 0);
+        reconcile(&mut state, &mut selection);
+
+        let gone = state.ids[1].clone();
+        state.instances.remove(1);
+        state.ids.remove(1);
+        state.mesh_slots.remove(1);
+
+        reconcile(&mut state, &mut selection);
+        assert_eq!(
+            selected_ids(&selection),
+            vec!["entity:0"],
+            "{gone} left the scene and left the selection with it"
+        );
+        assert_eq!(state.selected, Some(0), "the survivor is active");
     }
 
     #[test]

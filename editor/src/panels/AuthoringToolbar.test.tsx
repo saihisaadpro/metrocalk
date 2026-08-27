@@ -106,3 +106,52 @@ test("shows immediate progress, prevents duplicate authoring commands, and resto
   expect(screen.getByTestId("authCreate").getAttribute("aria-disabled")).toBeNull();
   expect(screen.getByTestId("authLight").getAttribute("aria-disabled")).toBeNull();
 });
+
+test("Delete acts on the WHOLE selection, in one transaction, and dims exactly what went", async () => {
+  // The trigger has always counted the selection — `Actions · 3` — while `Delete` called the
+  // single-id command on the primary and left the other two in the scene, reporting "deactivated".
+  const deleteDeactivateMany = vi.fn((ids: string[]) => Promise.resolve(ids.slice(0, 2)));
+  const deleteDeactivate = vi.fn(() => Promise.resolve(true));
+  act(() => {
+    projectionStore.getState().bulkLoad([
+      { id: "a", name: "Bolt", parentId: null, components: {} },
+      { id: "b", name: "Nut", parentId: null, components: {} },
+      { id: "c", name: "Washer", parentId: null, components: {} },
+    ]);
+    projectionStore.getState().setSelection(["a", "b", "c"]);
+  });
+  render(<AuthoringToolbar client={fakeClient({ deleteDeactivateMany, deleteDeactivate })} />);
+
+  expect(screen.getByRole("button", { name: /^actions/i }).textContent).toContain("· 3");
+  fireEvent.click(screen.getByRole("button", { name: /^actions/i }));
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("authDelete"));
+  });
+
+  expect(deleteDeactivate).not.toHaveBeenCalled();
+  expect(deleteDeactivateMany).toHaveBeenCalledWith(["a", "b", "c"]);
+  // The ENGINE says which ids went. Dimming the list we sent would badge a row that is still there
+  // the moment one id is stale — which is the whole reason the command returns ids and not a bool.
+  await waitFor(() => expect(projectionStore.getState().deactivated).toEqual({ a: true, b: true }));
+  expect(projectionStore.getState().multiSelect).toEqual([]);
+  expect(uiStore.getState().status).toContain("2 objects");
+});
+
+test("a verb that only acts on one says which one, rather than counting three beside it", async () => {
+  act(() => {
+    projectionStore.getState().bulkLoad([
+      { id: "a", name: "Bolt", parentId: null, components: {} },
+      { id: "b", name: "Nut", parentId: null, components: {} },
+    ]);
+    projectionStore.getState().setSelection(["a", "b"]);
+  });
+  render(<AuthoringToolbar client={fakeClient()} />);
+  fireEvent.click(screen.getByRole("button", { name: /^actions/i }));
+
+  // `<ux_quality>` 4 + 6: an enabled control that quietly narrows its own scope is the same defect
+  // Delete had; naming the object is the honest version until duplicate is batched too.
+  expect(screen.getByTestId("authDuplicate").textContent).toContain("Nut");
+  expect(screen.getByTestId("authDuplicate").textContent).toContain("the other 1 are left alone");
+  // …and the refusal that used to name a gesture the stage did not have now names one it does.
+  expect(screen.getByTestId("authGroup").getAttribute("aria-disabled")).not.toBe("true");
+});

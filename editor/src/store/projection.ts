@@ -71,6 +71,11 @@ export interface ProjectionState {
   toggleSelect(id: string): void;
   /** Shift-click — extend the selection from the current primary to `id` over the visible `order`. */
   selectRange(id: string): void;
+  /** **Mirror a selection the ENGINE decided** — a marquee, a modified viewport click, a delete that
+   *  pruned what it removed. The order is the engine's selection order, so the primary is the LAST id:
+   *  the front end never has to predict what a gesture did, which is the only way the outline in 3D and
+   *  the highlighted rows in the list can be guaranteed to agree. */
+  setSelection(ids: string[]): void;
   dismissRejection(clientOpId: string): void;
   /** Mark entities deactivated (Delete/Cut/deactivate-part) so the hierarchy reflects it immediately. */
   markDeactivated(ids: string[]): void;
@@ -320,6 +325,13 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
     }
     const [lo, hi] = ai <= bi ? [ai, bi] : [bi, ai];
     set({ multiSelect: s.order.slice(lo, hi + 1), selectedId: id });
+  },
+
+  setSelection(ids) {
+    // Deduplicate keeping the LAST occurrence, exactly as the engine's model does, so "the primary is
+    // the last one named" means the same thing on both sides of the boundary.
+    const multiSelect = ids.filter((id, i) => ids.lastIndexOf(id) === i);
+    set({ multiSelect, selectedId: multiSelect[multiSelect.length - 1] ?? null });
   },
 
   dismissRejection(clientOpId) {

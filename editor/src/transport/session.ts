@@ -113,6 +113,22 @@ import { inProcessPair } from "./transport";
 /** The one client surface the React UI talks to (the real shell transport + the dev MockCore both satisfy it). */
 export type ViewportRenderProfile = "cinematic" | "cad";
 
+/** What the keyboard was doing during a viewport pick, named by **intent** rather than by key.
+ *
+ *  The platform mapping (Cmd on macOS, Ctrl everywhere else) belongs at the one boundary that reads a
+ *  DOM event, not in the selection logic — which is why the engine's own `ClickModifiers` is spelled
+ *  the same way. `cycle` is the odd one out and is not a selection mode at all: it moves the HIT,
+ *  walking the objects under the cursor from nearest to furthest so the part behind the part you can
+ *  see is reachable without hiding, isolating, or orbiting to find an angle where it is on top. */
+export interface PickModifiers {
+  /** Shift — add to the selection, promoting an already-selected object to primary. */
+  extend?: boolean;
+  /** Ctrl/Cmd — add or remove. */
+  toggle?: boolean;
+  /** Alt — take the NEXT object under the cursor rather than the nearest. */
+  cycle?: boolean;
+}
+
 export interface EditorClient {
   /** Optimistic field edit → a JSON-Patch `EditTx` (the same language the AI layer emits). */
   setField(id: string, component: string, field: string, value: Json): string;
@@ -337,6 +353,10 @@ export interface EditorClient {
   multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean>;
   /** Delete = deactivate (non-destructive; frees dependents) — undo restores → applied. */
   deleteDeactivate(id: string): Promise<boolean>;
+  /** Delete a whole SELECTION in ONE undoable transaction → the ids that actually went. Returning the
+   *  ids rather than a count is what lets the caller dim exactly those rows instead of assuming its own
+   *  list is what happened. */
+  deleteDeactivateMany(ids: string[]): Promise<string[]>;
   /** Copy a sub-tree to the clipboard (cross-project = the serde Composition). */
   copySubtree(id: string): void;
   /** Cut = copy + delete(deactivate) → applied. */
@@ -423,8 +443,26 @@ export interface EditorClient {
   // ── native viewport input (Tauri-only; the dev MockCore has no viewport) — the M10.1 composite closeout ─
   /** Pick over the native wgpu region at NORMALIZED viewport coords (x,y ∈ [0,1]) → the picked entity id
    *  (or null). Computed synchronously in the command from the camera ray (no per-frame race, no OS-cursor
-   *  dependency — so a synthetic click works too). */
-  viewportPick(x: number, y: number): Promise<string | null>;
+   *  dependency — so a synthetic click works too).
+   *
+   *  `mods` carries what the keyboard was doing, named by intent rather than by key so the platform
+   *  mapping (Cmd on macOS, Ctrl elsewhere) stays at this boundary: `extend` adds, `toggle` adds or
+   *  removes, `cycle` walks the objects UNDER the one already selected — the way to reach the part
+   *  behind the part you can see without hiding anything. The reply is still the object the ray hit;
+   *  after a modified click the resulting SET is `selectionIds()`, because a toggle that deselected
+   *  still hit something and the hit alone cannot say what is selected now. */
+  viewportPick(x: number, y: number, mods?: PickModifiers): Promise<string | null>;
+  /** Marquee (box) selection over the native region. The two corners are normalized `[0,1]` surface
+   *  fractions **in the order they were dragged**, because the direction IS the policy: left-to-right
+   *  takes only what the rectangle encloses, right-to-left takes everything it touches. `extend` keeps
+   *  the existing selection. → the whole resulting selection, in selection order. */
+  viewportPickRegion(x0: number, y0: number, x1: number, y1: number, extend?: boolean): Promise<string[]>;
+  /** State the whole selection outright — the list surfaces' entry point (range-select, a search
+   *  result, "select all of this kind"). → the resulting selection, in selection order. */
+  selectEntities(ids: string[], mode?: "replace" | "add" | "toggle"): Promise<string[]>;
+  /** Everything the ENGINE currently has selected, in selection order — read after a gesture whose
+   *  result the front end cannot predict. */
+  selectionIds(): Promise<string[]>;
   /** Begin a right-drag orbit — the native render loop then polls the OS cursor and orbits with **0 IPC per
    *  frame** (invariant 4); only this call + `dragEnd` cross the boundary, once per gesture. */
   dragStart(): void;
@@ -999,6 +1037,9 @@ export class TauriClient implements EditorClient {
   deleteDeactivate(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("delete_deactivate", { id }).catch((e: unknown) => { console.error("delete_deactivate failed", e); throw e; });
   }
+  deleteDeactivateMany(ids: string[]): Promise<string[]> {
+    return this.core.invoke<string[]>("delete_deactivate_many", { ids }).catch((e: unknown) => { console.error("delete_deactivate_many failed", e); throw e; });
+  }
   copySubtree(id: string): void {
     void this.core.invoke("copy_subtree", { id }).catch((e: unknown) => console.error("copy_subtree failed", e));
   }
@@ -1124,8 +1165,23 @@ export class TauriClient implements EditorClient {
     });
   }
 
-  viewportPick(x: number, y: number): Promise<string | null> {
-    return this.core.invoke<string | null>("viewport_pick", { x, y }).catch((e: unknown) => { console.error("viewport_pick failed", e); throw e; });
+  viewportPick(x: number, y: number, mods?: PickModifiers): Promise<string | null> {
+    return this.core
+      .invoke<string | null>("viewport_pick", { x, y, shift: !!mods?.extend, ctrl: !!mods?.toggle, cycle: !!mods?.cycle })
+      .catch((e: unknown) => { console.error("viewport_pick failed", e); throw e; });
+  }
+  viewportPickRegion(x0: number, y0: number, x1: number, y1: number, extend?: boolean): Promise<string[]> {
+    return this.core
+      .invoke<string[]>("viewport_pick_region", { x0, y0, x1, y1, shift: !!extend })
+      .catch((e: unknown) => { console.error("viewport_pick_region failed", e); throw e; });
+  }
+  selectEntities(ids: string[], mode?: "replace" | "add" | "toggle"): Promise<string[]> {
+    return this.core
+      .invoke<string[]>("select_entities", { ids, mode: mode ?? "replace" })
+      .catch((e: unknown) => { console.error("select_entities failed", e); throw e; });
+  }
+  selectionIds(): Promise<string[]> {
+    return this.core.invoke<string[]>("selection_ids").catch((e: unknown) => { console.error("selection_ids failed", e); throw e; });
   }
   dragStart(): void {
     void this.core.invoke("drag_start").catch((e: unknown) => console.error("drag_start failed", e));
@@ -1601,6 +1657,8 @@ interface MockAnimationClipInstance {
  *  `npm run dev` still renders the reveal/describe surfaces without a live core. (Vitest tests inject
  *  their own stubbed `EditorClient`; the real reveal/describe come from the shell commands under Tauri.) */
 class MockClient implements EditorClient {
+  /** The one selection, in selection order — the mock's mirror of the engine's `SelectionModel`. */
+  private selection: string[] = [];
   private balance = 100;
   private project: ProjectInfo = { path: null, dirty: false, recents: [], error: null };
   private playInfo: PlayInfo = { playing: false, paused: false };
@@ -2868,6 +2926,10 @@ class MockClient implements EditorClient {
   deleteDeactivate(): Promise<boolean> {
     return Promise.resolve(true);
   }
+  deleteDeactivateMany(ids: string[]): Promise<string[]> {
+    this.selection = this.selection.filter((id) => !ids.includes(id));
+    return Promise.resolve(ids);
+  }
   copySubtree(): void {}
   cutSubtree(): Promise<boolean> {
     return Promise.resolve(true);
@@ -2905,11 +2967,14 @@ class MockClient implements EditorClient {
     return Promise.resolve({ ok: false, format: "", bodies: 0, joints: 0, meters_per_unit: 1, kilograms_per_unit: 1, reconciled: false, notes: [], error: "import is live-only (the .exe)" });
   }
   gizmoMode(): void {}
-  gizmoSelect(): Promise<boolean> {
-    return Promise.resolve(false);
+  gizmoSelect(id: string): Promise<boolean> {
+    // The engine routes `gizmo_select` through the ONE selection; the mock has to as well, or the dev
+    // build's outliner would report a multi-selection the mock's own `selectionIds` denies.
+    this.selection = [id];
+    return Promise.resolve(true);
   }
   gizmoSelected(): Promise<string | null> {
-    return Promise.resolve(null);
+    return Promise.resolve(this.selection[this.selection.length - 1] ?? null);
   }
   gizmoDebug(): Promise<[string, boolean, boolean, string, string]> {
     return Promise.resolve(["translate", false, false, "world", "origin"]);
@@ -2963,8 +3028,25 @@ class MockClient implements EditorClient {
     return Promise.resolve("cinematic");
   }
   // The dev MockCore has no native viewport — these are inert (the real wgpu input is Tauri-only).
-  viewportPick(_x: number, _y: number): Promise<string | null> {
+  viewportPick(_x: number, _y: number, _mods?: PickModifiers): Promise<string | null> {
     return Promise.resolve(null);
+  }
+  viewportPickRegion(_x0: number, _y0: number, _x1: number, _y1: number, _extend?: boolean): Promise<string[]> {
+    return Promise.resolve([]);
+  }
+  // …but the SELECTION is not a viewport fact, so the mock keeps a real one: the dev build's outliner,
+  // palette and toolbar all read it back, and a mock that always answered `[]` would make every
+  // multi-select surface look broken in the only build most of their tests run against.
+  selectEntities(ids: string[], mode?: "replace" | "add" | "toggle"): Promise<string[]> {
+    if (mode === "add") for (const id of ids) this.selection = [...this.selection.filter((s) => s !== id), id];
+    else if (mode === "toggle")
+      for (const id of ids)
+        this.selection = this.selection.includes(id) ? this.selection.filter((s) => s !== id) : [...this.selection, id];
+    else this.selection = ids.filter((id, i) => ids.lastIndexOf(id) === i);
+    return Promise.resolve([...this.selection]);
+  }
+  selectionIds(): Promise<string[]> {
+    return Promise.resolve([...this.selection]);
   }
   dragStart(): void {}
   dragEnd(): void {}
