@@ -15,12 +15,19 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { pushToast } from "../store/toasts";
-import { Button, NumericField, SelectField, TextField } from "../theme/primitives";
+import { Button, SelectField, TextField } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
+import {
+  ClauseRow,
+  TargetPicker,
+  ValueInput,
+  defaultOp,
+  defaultValue,
+  fieldTy,
+  grow,
+} from "./ruleClause";
 import type { EditorClient } from "../transport/session";
 import type {
-  CompareOp,
-  FieldValue,
   RuleAction,
   RuleCondition,
   RuleData,
@@ -28,265 +35,13 @@ import type {
   RuleSummary,
 } from "../transport/protocol";
 
-const EQUALITY: { op: CompareOp; label: string }[] = [
-  { op: "eq", label: "=" },
-  { op: "ne", label: "≠" },
-];
-const ORDERING: { op: CompareOp; label: string }[] = [
-  { op: "lt", label: "<" },
-  { op: "le", label: "≤" },
-  { op: "gt", label: ">" },
-  { op: "ge", label: "≥" },
-];
-
-/** The operators that can **mean** something about a field of this type.
- *
- *  `CompareOp::eval` orders every scalar kind — `false < true`, strings lexicographically — so the core
- *  accepts all six on anything. Accepting is not the same as being worth offering, and this builder's
- *  whole claim is that a clause assembled by clicks is a clause worth having:
- *
- *  * **boolean** — on a two-valued totally-ordered domain every ordering comparison collapses to an
- *    equality or to a constant. `lit > false` *is* `lit = true`; `lit ≥ false` is true of every value the
- *    field can hold, so it is a clause that can never fail. Nothing is lost by removing them, and a
- *    guaranteed-true If stops being one click away.
- *  * **string** — ordering is alphabetical, and no string field the registry defines is a quantity. The
- *    27 declared in `stdlib::standard_components()` are categorical names (`state`, `role`, `kind`,
- *    `shape`, `preset`, `join`, `anchor`, `kit`, `current`), asset paths (`texture`, `mesh`, `material`,
- *    `clip`, `controller`, `source`), entity references (`bodyA`, `bodyB`) and one serialised payload
- *    (`strokes`). "the state's name sorts before `idle`" is not a thing an author means; on an entity
- *    reference it is worse than useless, because `1_10` sorts before `1_2`. The bare `<` never said
- *    alphabetical was the question.
- *
- *  Numeric fields keep all six. This narrows what is *offered*, never what the core can evaluate: a rule
- *  authored elsewhere with `lit ≥ false` still loads, still runs, and still means what it meant. */
-function opsFor(ty: string): { op: CompareOp; label: string }[] {
-  return ty === "boolean" || ty === "string" ? EQUALITY : [...EQUALITY, ...ORDERING];
-}
-/** Why an operator list is short, said in the row rather than left as a mystery (`<ux_quality>` 4). */
-function opsHint(ty: string): string {
-  if (ty === "boolean") return "A true/false field is either equal or not — ordering one always answers the same way.";
-  if (ty === "string") return "A name is either equal or not — ordering names would compare them alphabetically.";
-  return "How to compare the field with the value.";
-}
-/** Keep a clause's operator legal for the field it now points at. Re-targeting a clause from `hp` to
- *  `visible` used to leave `>` selected on a list that no longer offers it — a select showing a value it
- *  has no option for renders as though nothing is chosen. Same coercion the value already does. */
-function coerceOp(op: CompareOp, ty: string): CompareOp {
-  return opsFor(ty).some((o) => o.op === op) ? op : "eq";
-}
-/** A new clause opens on an operator that suits its field, rather than on whichever one happened to be
- *  legal for the registry's first component. */
-function defaultOp(ty: string): CompareOp {
-  return ty === "boolean" || ty === "string" ? "eq" : "ge";
-}
+/** The stable hooks this builder's clause rows carry. The state-machine guard editor renders the same
+ *  component under `sm-cond-*`; the vocabulary is shared, the test surface is each panel's own. */
+const RULE_CLAUSE_IDS = { prefix: "rule" } as const;
 
 const box: React.CSSProperties = { font: `${fontSize.meta}px ${font.mono}`, padding: space.lg };
 /** One clause/action row: the controls wrap rather than overflow the dock at narrow widths. */
 const row: React.CSSProperties = { display: "flex", gap: 4, flexWrap: "wrap", margin: "3px 0", alignItems: "center" };
-/** The pickers SHARE the row instead of each claiming an intrinsic width — otherwise the shared control
- *  sizing pushes the row past the dock and the remove button wraps onto a line of its own, which reads as
- *  a broken row rather than a dense one. They grow into whatever the dock gives them and shrink to these
- *  floors before the row is allowed to wrap. */
-const grow = (basis: number): React.CSSProperties => ({ flex: `1 1 ${basis}px`, minWidth: 64 });
-const fixed = (w: number): React.CSSProperties => ({ flex: `0 0 ${w}px` });
-
-function fieldTy(reg: RuleRegistryInfo, component: string, field: string): string {
-  return reg.components.find((c) => c.name === component)?.fields.find((f) => f.name === field)?.ty ?? "string";
-}
-function defaultValue(ty: string): FieldValue {
-  if (ty === "integer") return { Integer: 0 };
-  if (ty === "number") return { Number: 0 };
-  if (ty === "boolean") return { Bool: false };
-  return { Str: "" };
-}
-/** Read the scalar out of an externally-tagged FieldValue for an input's `value`. */
-function rawValue(v: FieldValue): string {
-  if ("Integer" in v) return String(v.Integer);
-  if ("Number" in v) return String(v.Number);
-  if ("Bool" in v) return String(v.Bool);
-  return v.Str;
-}
-
-/** A value input whose KIND is dictated by the field's registry type (typo-proof: an integer field gets a
- *  number input, a boolean a true/false select) — the value can never be the wrong shape for the field. */
-function ValueInput({
-  ty,
-  value,
-  onChange,
-  ariaLabel,
-}: {
-  ty: string;
-  value: FieldValue;
-  onChange: (v: FieldValue) => void;
-  ariaLabel: string;
-}) {
-  if (ty === "boolean") {
-    return (
-      <SelectField
-        aria-label={ariaLabel}
-        data-testid="rule-value"
-        style={fixed(84)}
-        value={"Bool" in value ? String(value.Bool) : "false"}
-        onChange={(e) => onChange({ Bool: e.target.value === "true" })}
-      >
-        <option value="true">true</option>
-        <option value="false">false</option>
-      </SelectField>
-    );
-  }
-  if (ty === "integer" || ty === "number") {
-    return (
-      <NumericField
-        ariaLabel={ariaLabel}
-        data-testid="rule-value"
-        value={Number(rawValue(value)) || 0}
-        integer={ty === "integer"}
-        style={{ width: 72, ...fixed(72) }}
-        onCommit={(n) => onChange(ty === "integer" ? { Integer: Math.trunc(n) } : { Number: n })}
-      />
-    );
-  }
-  return (
-    <TextField
-      aria-label={ariaLabel}
-      data-testid="rule-value"
-      style={fixed(96)}
-      value={rawValue(value)}
-      onChange={(e) => onChange({ Str: e.target.value })}
-    />
-  );
-}
-
-/** A `component.field` picker fed by the registry (only real components + their real fields are offerable). */
-function TargetPicker({
-  reg,
-  entityOptions,
-  entity,
-  component,
-  field,
-  contextLabel,
-  onChange,
-}: {
-  reg: RuleRegistryInfo;
-  entityOptions: { id: string; name: string }[];
-  entity: string;
-  component: string;
-  field: string;
-  contextLabel: string;
-  onChange: (patch: { entity?: string; component?: string; field?: string }) => void;
-}) {
-  const fields = reg.components.find((c) => c.name === component)?.fields ?? [];
-  return (
-    <>
-      <SelectField
-        aria-label={`${contextLabel} entity`}
-        data-testid="rule-entity"
-        style={grow(88)}
-        value={entity}
-        onChange={(e) => onChange({ entity: e.target.value })}
-      >
-        <option value="">— entity —</option>
-        {entityOptions.map((o) => (
-          <option key={o.id} value={o.id}>
-            {o.name}
-          </option>
-        ))}
-      </SelectField>
-      <SelectField
-        aria-label={`${contextLabel} component`}
-        data-testid="rule-component"
-        style={grow(88)}
-        value={component}
-        onChange={(e) => {
-          const c = reg.components.find((x) => x.name === e.target.value);
-          onChange({ component: e.target.value, field: c?.fields[0]?.name ?? "" });
-        }}
-      >
-        {reg.components.map((c) => (
-          <option key={c.name} value={c.name}>
-            {c.name}
-          </option>
-        ))}
-      </SelectField>
-      <SelectField
-        aria-label={`${contextLabel} field`}
-        data-testid="rule-field"
-        style={grow(72)}
-        value={field}
-        onChange={(e) => onChange({ field: e.target.value })}
-      >
-        {fields.map((f) => (
-          <option key={f.name} value={f.name}>
-            {f.name}
-          </option>
-        ))}
-      </SelectField>
-    </>
-  );
-}
-
-/** One **If** clause — `<entity>.<component>.<field> <op> <value>`, plus its remove control.
- *
- *  The AND list and the OR group render through this one component on purpose: an alternative is exactly a
- *  condition that happens to be joined differently, so a divergence between "a condition row" and "an
- *  alternative row" could only ever be a bug. `label` ("Condition 1" / "Alternative 1") is what makes the
- *  repeated controls tell an assistive reader — and a black-box test — which row they belong to. */
-function ClauseRow({
-  reg,
-  entityOptions,
-  clause,
-  label,
-  onChange,
-  onRemove,
-}: {
-  reg: RuleRegistryInfo;
-  entityOptions: { id: string; name: string }[];
-  clause: RuleCondition;
-  label: string;
-  onChange: (next: RuleCondition) => void;
-  onRemove: () => void;
-}) {
-  const ty = fieldTy(reg, clause.component, clause.field);
-  return (
-    <div style={row}>
-      <TargetPicker
-        reg={reg}
-        entityOptions={entityOptions}
-        entity={clause.entity}
-        component={clause.component}
-        field={clause.field}
-        contextLabel={label}
-        onChange={(p) => {
-          const next = { ...clause, ...p };
-          if (p.component || p.field) {
-            const t = fieldTy(reg, next.component, next.field);
-            next.value = defaultValue(t);
-            next.op = coerceOp(next.op, t);
-          }
-          onChange(next);
-        }}
-      />
-      <SelectField
-        aria-label={`${label} comparison operator`}
-        data-testid="rule-op"
-        title={opsHint(ty)}
-        style={fixed(68)}
-        value={clause.op}
-        onChange={(e) => onChange({ ...clause, op: e.target.value as CompareOp })}
-      >
-        {opsFor(ty).map((o) => (
-          <option key={o.op} value={o.op}>
-            {o.label}
-          </option>
-        ))}
-      </SelectField>
-      <ValueInput ariaLabel={`${label} value`} ty={ty} value={clause.value} onChange={(v) => onChange({ ...clause, value: v })} />
-      <Button variant="ghost" compact icon aria-label={`Remove ${label.toLowerCase()}`} onClick={onRemove}>
-        ×
-      </Button>
-    </div>
-  );
-}
 
 /** The registry-fed builder (test #5, the clicks path). `onDone` carries the engine-offered mirror
  *  "cleanup" rule (or `null`) up to the panel, which surfaces an explicit accept control. */
@@ -411,6 +166,7 @@ function RuleBuilder({
             entityOptions={entityOptions}
             clause={c}
             label={`Condition ${i + 1}`}
+            testIds={RULE_CLAUSE_IDS}
             onChange={(next) => patchAt(conditions, setConditions, i, next)}
             onRemove={() => setConditions(conditions.filter((_, j) => j !== i))}
           />
@@ -430,6 +186,7 @@ function RuleBuilder({
                 entityOptions={entityOptions}
                 clause={c}
                 label={`Alternative ${i + 1}`}
+                testIds={RULE_CLAUSE_IDS}
                 onChange={(next) => patchAt(anyOf, setAnyOf, i, next)}
                 onRemove={() => setAnyOf(anyOf.filter((_, j) => j !== i))}
               />
@@ -469,6 +226,7 @@ function RuleBuilder({
               component={a.component}
               field={a.field}
               contextLabel={`Action ${i + 1}`}
+              testIds={RULE_CLAUSE_IDS}
               onChange={(p) => {
                 const next = [...actions];
                 next[i] = { ...a, ...p };
@@ -479,6 +237,7 @@ function RuleBuilder({
             <span>=</span>
             <ValueInput
               ariaLabel={`Action ${i + 1} value`}
+              testId="rule-value"
               ty={fieldTy(reg, a.component, a.field)}
               value={a.value}
               onChange={(v) => {

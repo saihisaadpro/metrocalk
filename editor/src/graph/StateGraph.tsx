@@ -118,7 +118,11 @@ export function StateGraph({
       label={`${machine.name} state graph`}
       nodes={nodes}
       edges={rfEdges}
-      height={260}
+      // FILLS the cell it is given rather than declaring a fixed 260. Where the caller hands it a
+      // definite box — the editor's canvas track, which is `minmax(200px, 260px)` — it is 260 with
+      // room and 200 without, so a warning above the graph costs the graph height rather than the
+      // editor beneath it. Where the caller hands it a fixed frame it is that frame, unchanged.
+      height="100%"
       minHeight={200}
       legend={[
         { label: "reachable now", state: "active" },

@@ -185,10 +185,17 @@ function LogicWorkspacePanel({ client, active, onChange }: { client: EditorClien
     { id: "graph", label: "Binding graph" },
     { id: "compose", label: "Compose", tooltip: "Optional assisted composition" },
   ] as const;
+  const fullBleed = active === "states";
   return (
     <div id="bottom-workspaces-logic-panel" role="tabpanel" aria-labelledby="bottom-workspaces-logic-tab" className="mtk-bottom-workspace mtk-bottom-workspace--logic">
       <DockTabs ariaLabel="Logic editors" tabs={tabs} activeId={active} onChange={(id) => onChange(id as LogicWorkspace)} />
-      <div className="mtk-bottom-workspace__body mtk-scroll" style={{ padding: space.sm }}>
+      {/* An editor that owns the whole panel anatomy — header, rail, fixed footer — fills the body
+          itself: the wrapper stops padding and stops scrolling, so ITS footer stays pinned instead of
+          scrolling away inside a second scroll region. The other three are content in a padded well. */}
+      <div
+        className={fullBleed ? "mtk-bottom-workspace__body is-bleed" : "mtk-bottom-workspace__body mtk-scroll"}
+        style={fullBleed ? undefined : { padding: space.sm }}
+      >
         <LazyWorkspace label="Logic editor">
           {active === "rules" && <RulesPanel client={client} />}
           {active === "states" && <StateGraphPanel client={client} />}

@@ -426,7 +426,7 @@ export function AssetLabPanel({
       }
       footer={
         <>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: space.sm, color: color.text.muted, font: font.ui, fontSize: fontSize.micro }}>
+          <span className="mtk-workspace-panel__note">
             <Icon name="lock" size="sm" />
             Source protected — every operation creates or validates a derivative
           </span>

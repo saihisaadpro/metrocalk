@@ -776,6 +776,123 @@ progress { accent-color: var(--mtk-accent-solid); }
    measured 3.64:1 where 4.5:1 is required. */
 .mtk-check[data-disabled="true"] { cursor: not-allowed; }
 
+/* ── The one radio ─────────────────────────────────────────────────────────────────────────────────
+   `Checkbox` answered "is this on"; nothing answered "which ONE of these", so the two surfaces that
+   needed a single choice among a list — the state machine's initial state and the animation graph's
+   entry state — each drew a bare `<input type="radio">`. That is the OS widget: the desktop's own
+   dot, radius and scale, beside a control family that was taken off `accent-color` on purpose. Same
+   anatomy, states and 28px row target as `.mtk-check`; a circle instead of a tick. */
+.mtk-radio-group { display: flex; flex-direction: column; gap: var(--mtk-space-1); min-width: 0; }
+.mtk-radio-group__help {
+  margin: 0 0 var(--mtk-space-2);
+  color: var(--mtk-text-muted);
+  font: 11px/1.45 var(--mtk-font-ui);
+}
+.mtk-radio {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--mtk-space-1) var(--mtk-space-4);
+  align-items: center;
+  min-height: 28px;
+  min-width: 0;
+  color: var(--mtk-text);
+  font: 12px/1.4 var(--mtk-font-ui);
+  cursor: pointer;
+}
+.mtk-radio__dot {
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex: none;
+  border: 1px solid var(--mtk-border-strong);
+  border-radius: 50%;
+  background: var(--mtk-bg-input);
+  box-shadow: inset 0 1px 2px rgba(21, 34, 50, 0.04);
+  cursor: pointer;
+  transition:
+    background var(--mtk-motion-fast) var(--mtk-ease-standard),
+    border-color var(--mtk-motion-fast) var(--mtk-ease-standard),
+    box-shadow var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-radio__dot:hover:not(:disabled) { border-color: var(--mtk-accent-border); }
+/* The dot is an INSET ring, not a child element: one box, so the mark cannot drift off centre. */
+.mtk-radio__dot:checked {
+  border-color: var(--mtk-accent-solid);
+  background: var(--mtk-accent-solid);
+  box-shadow: inset 0 0 0 3px var(--mtk-bg-input);
+}
+.mtk-radio__dot:focus-visible { outline: 2px solid var(--mtk-ring); outline-offset: 2px; }
+.mtk-radio__dot:disabled { border-color: var(--mtk-border-subtle); background-color: var(--mtk-bg-inset); cursor: not-allowed; }
+.mtk-radio__dot:disabled:checked { border-color: var(--mtk-border); background-color: var(--mtk-border); }
+.mtk-radio__label { min-width: 0; color: inherit; }
+.mtk-radio__description {
+  grid-column: 2;
+  margin: 0;
+  color: var(--mtk-text-muted);
+  font: 11px/1.45 var(--mtk-font-ui);
+}
+.mtk-radio[data-disabled="true"] { cursor: not-allowed; }
+
+/* ── One row of an editable list ───────────────────────────────────────────────────────────────────
+   A lead mark, a body that grows, trailing metadata and actions. Every authoring list in the editor
+   was writing this by hand as `display: flex; gap: 4px; margin: 3px 0`, which is why a delete button
+   sat at a different distance from its row's edge in each one. The ROW is the hover surface, so a
+   list reads as rows rather than as loose controls that happen to be near each other. */
+.mtk-list-row {
+  display: flex;
+  align-items: center;
+  /* The controls WRAP rather than overflow the dock at narrow widths — the ADR-120 defect class. A row
+     that keeps its width by leaving the panel has not fitted, it has escaped. */
+  flex-wrap: wrap;
+  gap: var(--mtk-space-3);
+  min-width: 0;
+  padding: var(--mtk-space-2) var(--mtk-space-3);
+  border: 1px solid transparent;
+  border-radius: var(--mtk-radius-lg);
+  transition: background var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-list-row:hover { background: var(--mtk-bg-hover); }
+/* A row holding a nested editor is a surface of its own, so the guard rows inside it read as being
+   inside something rather than as more siblings of the row above. */
+.mtk-list-row--card {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--mtk-space-3);
+  padding: var(--mtk-space-4);
+  border-color: var(--mtk-border-subtle);
+  background: var(--mtk-bg-panel);
+  box-shadow: var(--mtk-shadow-1);
+}
+.mtk-list-row--card:hover { background: var(--mtk-bg-panel); }
+/* One line of controls INSIDE a card row — `from → to` on one, `when <event>` on the next, so a
+   transition reads as the sentence it is rather than as five controls in a heap. */
+.mtk-list-row__line { display: flex; flex-wrap: wrap; align-items: center; gap: var(--mtk-space-3); min-width: 0; }
+/* The small word that leads a line ("when", "only if …"). It orients; it does not compete. */
+.mtk-list-row__lead { flex: none; color: var(--mtk-text-muted); font: 11px/1.4 var(--mtk-font-ui); }
+/* A nested group inside a card row: a heading line and its own rows, separated from the line above by
+   a hairline rather than by a guessed margin. */
+.mtk-list-row__group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mtk-space-2);
+  min-width: 0;
+  padding-top: var(--mtk-space-3);
+  border-top: 1px solid var(--mtk-border-subtle);
+}
+.mtk-list-row__group-head { display: flex; align-items: center; justify-content: space-between; gap: var(--mtk-space-3); min-width: 0; }
+.mtk-list-row__meta {
+  /* Pushed to the end of the row: a measurement belongs against the row's edge, in a column, not
+     wherever the growing body happened to stop. */
+  flex: none;
+  margin-left: auto;
+  color: var(--mtk-text-muted);
+  font: 11px/1.4 var(--mtk-font-ui);
+  white-space: nowrap;
+}
+
 /* ── The one inline note (ADR-147) ─────────────────────────────────────────────────────────────────
    Guidance, a warning, an all-clear and a "why this stage is refusing" were four bespoke boxes in one
    panel, each with its own border colour, padding and type size. One object, five tones, and an icon
@@ -1343,6 +1460,22 @@ body > [role="dialog"][aria-modal="true"] {
 /* The action end of that row. `margin-left: auto` rather than relying on `space-between`, because a
    footer with only an action in it must still put it on the right. */
 .mtk-workspace-panel__footer > .mtk-action-bar { display: flex; align-items: center; gap: var(--mtk-space-4); margin-left: auto; min-width: 0; }
+/* The quiet standing sentence a footer carries beside its action — "source protected", "every edit is
+   one undoable step". Two panels had written the same six inline declarations for it. */
+.mtk-workspace-panel__note {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--mtk-space-3);
+  min-width: 0;
+  color: var(--mtk-text-muted);
+  font: 11px/1.4 var(--mtk-font-ui);
+}
+/* A quiet explanatory line inside a section, above the thing it explains. */
+.mtk-section-note {
+  margin: 0 0 var(--mtk-space-3);
+  color: var(--mtk-text-muted);
+  font: 11px/1.45 var(--mtk-font-ui);
+}
 
 /* ── A LABELLED VERTICAL RAIL (ADR-147) ────────────────────────────────────────────────────────────
    `.mtk-dock-rail` is the icon-only capsule a COLLAPSED dock shows; there was no labelled form, so a
@@ -1429,6 +1562,68 @@ body > [role="dialog"][aria-modal="true"] {
 }
 @media (max-width: 860px) {
   .mtk-split { flex-direction: column; }
+}
+
+/* A CANVAS AND THE CONTROLS THAT SHAPE IT. "Viewport centre, properties right" is stated for the shell
+   and then owed by every editor inside it. A workspace dock is a wide, SHORT band, so an editor that
+   stacks its subject above its controls puts the controls below the fold — which is what the
+   state-machine editor did with its own states and transitions. */
+.mtk-canvas-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 340px);
+  /* The SUBJECT gives up height first. Between 200 and 260 it takes what it can get, so a callout
+     appearing above it costs the graph 60px rather than cutting the editor underneath in half; below
+     that the whole column scrolls, because a graph under 200px is a diagram nobody can read. */
+  grid-template-rows: minmax(200px, 240px) minmax(112px, 1fr);
+  gap: var(--mtk-space-5) var(--mtk-space-6);
+  align-items: stretch;
+  /* Fills the column it is given, so the two tracks can scroll independently of each other. */
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+/* The subject is PINNED and what sits under it scrolls, for the same reason the side track does: an
+   editor whose rows are wide sentences belongs under the wide column, not wrapped three-deep into a
+   340px one — and reading down it must not drag the subject off the screen. */
+.mtk-canvas-split__subject { grid-column: 1; grid-row: 1; min-width: 0; min-height: 0; }
+/* The subject put away: its row collapses and everything it was holding goes to the editor under it. */
+.mtk-canvas-split.is-canvas-hidden { grid-template-rows: 0 minmax(112px, 1fr); }
+.mtk-canvas-split__side { grid-column: 2; grid-row: 1 / -1; }
+.mtk-canvas-split__below { grid-column: 1; grid-row: 2; }
+.mtk-canvas-split__below {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* A FLOOR, not zero. `min-height: 0` is what lets a flex child be squeezed, and the day a callout
+     appeared above the subject this box went to 3px — an `overflow: auto` region too short to show
+     one line of its own content or a scrollbar to reach it, which is the R6 invariant exactly. Below
+     this it stops absorbing and the column it is in scrolls instead. */
+  min-height: 112px;
+  overflow: hidden auto;
+  overscroll-behavior: contain;
+}
+/* The CONTROLS scroll; the canvas does not. Reading down a property column must not drag the subject
+   off the screen — that is the whole reason the two are side by side rather than stacked. */
+.mtk-canvas-split__side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mtk-space-5);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden auto;
+  overscroll-behavior: contain;
+}
+@media (max-width: 980px) {
+  /* Stacked, the page is one scroll again — a nested scroll region inside a scrolling column is two
+     scrollbars answering the same gesture. */
+  /* STACKED, THE PAGE IS ONE SCROLL AGAIN. Two nested scroll regions inside a scrolling column are
+     two scrollbars answering the same gesture — but a box that stops scrolling must also stop being
+     squeezed, or `overflow: visible` paints its content straight over the section beneath it (the
+     Transitions heading landed on top of the States rows, 547x24px of overlap). So the split takes
+     its natural height here and the panel's own column does the scrolling. */
+  .mtk-canvas-split { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; flex: 0 0 auto; }
+  .mtk-canvas-split__subject,
+  .mtk-canvas-split__side,
+  .mtk-canvas-split__below { grid-column: auto; grid-row: auto; min-height: auto; overflow: visible; }
 }
 
 /* A SEGMENTED CONTROL, NOT A FILE-FOLDER TAB BAR. The selected tab used to carry three separate
@@ -2015,7 +2210,17 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-bottom-workspace--split { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.3fr); gap: 1px; background: var(--mtk-border-subtle); }
 .mtk-bottom-workspace--split > div { min-width: 0; overflow: auto; background: var(--mtk-bg-panel); }
 .mtk-bottom-workspace--logic { display: flex; flex-direction: column; overflow: hidden; }
+/* THE STRIP IS NOT NEGOTIABLE HEIGHT. `.mtk-dock-tabs` carries `min-width: 0` so it can shrink along
+   the axis it is laid out on — right for a toolbar row, wrong for a flex COLUMN, where the default
+   `flex-shrink: 1` let the body squeeze all four Logic tabs to zero height while they stayed in the
+   DOM, focusable, and completely invisible. Measured at 1240x520: 24px of tab cut to 0. */
+.mtk-bottom-workspace--logic > .mtk-dock-tabs { flex: none; }
 .mtk-bottom-workspace__body { flex: 1 1 auto; min-height: 0; overflow: auto; }
+/* An editor that owns its own panel anatomy fills this body rather than sitting inside it: no padding
+   and no scroll here, so the editor's OWN fixed footer stays pinned instead of scrolling away inside
+   a second scroll region — the ADR-124 "the verb was 127px below the dock" defect, one level down. */
+.mtk-bottom-workspace__body.is-bleed { display: flex; padding: 0; overflow: hidden; }
+.mtk-bottom-workspace__body.is-bleed > * { flex: 1 1 auto; min-width: 0; min-height: 0; }
 
 @media (max-width: 1180px) {
   .mtk-editor-header__credits, .mtk-editor-header__end > [data-testid="header-review"] { display: none; }
