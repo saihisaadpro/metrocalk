@@ -126,6 +126,46 @@ fn undo_in_the_log_nets_out_on_replay() {
     log.clear();
 }
 
+/// **A selection deleted and then undone must come back after a reopen too.**
+///
+/// This is the defect the live `.exe` run found on its SECOND launch, and no test that existed then
+/// could have seen it: writing one `DeleteDeactivate` record per id replays as one commit per id, so
+/// the single `Record::Undo` that follows a live Ctrl-Z reverts exactly ONE of them. Twenty-seven
+/// objects the user had restored were gone on reopen. Undo granularity is part of a record's
+/// contract, not an implementation detail of it — which is why the batch has a record of its own.
+#[test]
+fn a_deleted_selection_that_was_undone_comes_back_on_replay() {
+    let log = Log::open(tmp("persist-delete-many"), fp());
+    log.clear();
+    let (engine, scene, bar, _) = make();
+    // Three real entities from the deterministic seed, so the ids mean the same thing after a
+    // relaunch. `bar` plus its two neighbours by allocation order is enough to tell "one" from "all".
+    let mut victims = vec![bar];
+    for id in engine.entity_ids() {
+        if id != bar && victims.len() < 3 {
+            victims.push(id);
+        }
+    }
+    drop(engine);
+    drop(scene);
+    assert_eq!(victims.len(), 3);
+
+    log.append(&Record::DeleteDeactivateMany {
+        ids: victims.iter().map(EntityId::to_loro_key).collect(),
+    });
+    log.append(&Record::Undo);
+
+    let (e, applied, _) = relaunch(&log);
+    assert_eq!(applied, 2, "the batch delete and the undo both replay");
+    for id in &victims {
+        assert!(
+            e.is_active(*id),
+            "ONE undo record restored the whole batch — {id} came back"
+        );
+    }
+    log.clear();
+}
+
 #[test]
 fn redo_in_the_log_restores_the_undone_action_on_replay() {
     let log = Log::open(tmp("persist-redo"), fp());

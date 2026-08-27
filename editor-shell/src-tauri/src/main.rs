@@ -10914,11 +10914,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let ok = !entities.is_empty()
                     && capscene::delete_deactivate_many(&mut engine, &scene, &entities).is_ok();
                 let done: Vec<String> = if ok {
-                    // One record per id: the log is a REPLAY log, not the undo stack, and replaying
-                    // fourteen deactivations reaches the same document as replaying one of fourteen.
-                    for (key, _) in &targets {
-                        log.append(&Record::DeleteDeactivate { id: key.clone() });
-                    }
+                    // ONE record, because one transaction. N `DeleteDeactivate` records replay as N
+                    // commits, and the `Record::Undo` that follows a live Ctrl-Z then reverts exactly
+                    // one of them — so a selection the user deleted and restored comes back deleted
+                    // after a close and reopen. Found by the live `.exe` run, on its second launch.
+                    log.append(&Record::DeleteDeactivateMany {
+                        ids: targets.iter().map(|(key, _)| key.clone()).collect(),
+                    });
                     if let Some(ch) = &channel {
                         send_proj!(ch, proj_full(&engine, &scene));
                     }
