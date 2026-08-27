@@ -34,6 +34,7 @@ import { RigPanel, type RigDocument } from "../../src/panels/RigPanel";
 import RIG_MIXAMO from "../../src/panels/__fixtures__/rig-characterization.json";
 import RIG_BLOCKED from "../../src/panels/__fixtures__/rig-not-retargetable.json";
 import { PhysicsPanel } from "../../src/panels/PhysicsPanel";
+import { PipeForge } from "../../src/panels/PipeForge";
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { assetShelfStore } from "../../src/store/assetShelf";
@@ -44,6 +45,8 @@ import type {
   AnimationWorkspaceInfo,
   CadReport,
   CadReportPart,
+  PipeBakeReport,
+  PipeForgeStatus,
   RevealResponse,
   StateMachine,
   TimelineTuple,
@@ -1016,6 +1019,7 @@ export const SCENES: Scene[] = [
   ...inspectorScenes(),
   ...assetScenes(),
   ...modelScenes(),
+  ...pipeForgeScenes(),
   ...shellScenes(),
 ];
 
@@ -2134,4 +2138,296 @@ function modelScenes(): Scene[] {
       { width: 760, height: 560 },
     ),
   ];
+}
+
+// ── Pipe Forge: the stage's own floating workspace ────────────────────────────────────────────────
+
+/** THE ONLY WORKSPACE THAT FLOATS ON THE STAGE, AND THE LAST ONE NOTHING HAD EVER PHOTOGRAPHED.
+ *
+ *  Every other sub-engine opens in a dock — a track with a width the shell owns. Pipe Forge is
+ *  `position: absolute` INSIDE the viewport, 336px wide, `max-height: calc(100% - 104px)`, floating
+ *  beside the tool rail while the user clicks route points into the 3D behind it. That shape is the
+ *  whole reason it needs captures rather than a unit test: a panel whose height is a percentage of a
+ *  box it does not own is a panel that can run out of room, and nothing in the repository had ever
+ *  measured it against that box.
+ *
+ *  The frame reproduces the real chain — the stage's `position: relative` box with `overflow: hidden`
+ *  — and passes the exact `left`/`width` override `App.tsx` passes, so the capture is the panel where
+ *  it actually lives rather than a component on a blank page.
+ */
+function pipeForgeScenes(): Scene[] {
+  const noopClient = {} as unknown as EditorClient;
+
+  const status = (over: Partial<PipeForgeStatus> = {}): PipeForgeStatus => ({
+    active: true,
+    kit: "galvanized",
+    diameterCm: 5,
+    quality: "production",
+    autoFittings: true,
+    points: 4,
+    lengthM: 12.84,
+    previewTriangles: 18_240,
+    canBake: true,
+    message: "Click again to extend the run.",
+    handles: [
+      { nodeId: 1, position: [0, 0, 0], connectedEdges: [1], fittingIds: [] },
+      { nodeId: 2, position: [3.5, 0, 0], connectedEdges: [1, 2], fittingIds: [1] },
+      { nodeId: 3, position: [3.5, 2.25, 0], connectedEdges: [2, 3], fittingIds: [] },
+      { nodeId: 4, position: [9.4, 2.25, -1.2], connectedEdges: [3], fittingIds: [] },
+    ],
+    edges: [
+      { id: 1, from: 1, to: 2, diameterM: 0.05 },
+      { id: 2, from: 2, to: 3, diameterM: 0.05 },
+      { id: 3, from: 3, to: 4, diameterM: 0.05 },
+    ],
+    fittings: [
+      { id: 1, nodeId: 2, kind: "elbow", catalogId: null, automatic: true },
+      { id: 2, nodeId: 3, kind: "valve", catalogId: "isolation-valve", automatic: false },
+    ],
+    fittingCatalog: [
+      { id: "isolation-valve", label: "Isolation valve", kind: "valve", assetHandle: "mtkasset:valve-dn50", diameterScale: 1.4, lengthScale: 1 },
+      { id: "weld-neck-flange", label: "Weld neck flange DN50", kind: "flange", assetHandle: null, diameterScale: 1.8, lengthScale: 0.4 },
+    ],
+    branchFrom: null,
+    editingEntity: null,
+    ...over,
+  });
+
+  const bake: PipeBakeReport = {
+    entityId: "e-pipe-1",
+    handle: "mtkasset:pipe-run-a",
+    vertices: 9_612,
+    triangles: 18_240,
+    lodTriangles: [18_240, 7_100, 2_050],
+    textureResolution: 2048,
+    collisionHulls: 6,
+    collisionKind: "convex",
+    collisionTriangles: 640,
+    watertight: true,
+    warnings: ["Two branches share one collar; the shared collar is exported once."],
+    message: "Pipe run baked.",
+  };
+
+  /** The stage: a `position: relative` box with `overflow: hidden`, which is what `App.tsx` gives it,
+   *  and the ONLY reason `max-height: calc(100% - 104px)` resolves to anything at all. */
+  const stage = (node: ReactNode): ReactNode => (
+    <div
+      data-testid="stage-frame"
+      style={{ position: "relative", height: "100vh", overflow: "hidden", background: "var(--mtk-bg-inset)" }}
+    >
+      {node}
+    </div>
+  );
+
+  const scene = (
+    id: string,
+    looking_for: string,
+    expect: Expect,
+    node: ReactNode,
+    click?: string[],
+    // The panel's height is `calc(100% - 104px)` of the STAGE, so a scene that has to prove something
+    // about a control deep inside an open section needs a stage tall enough to hold it. Anything less
+    // photographs the panel's own scrollbar doing its job and calls it a defect.
+    viewport = { width: 1180, height: 820 },
+  ): Scene => ({
+    id,
+    looking_for,
+    click,
+    viewport,
+    expect: {
+      ...expect,
+      present: [["[data-testid='pipe-forge']", 1], ...(expect.present ?? [])],
+      // A blank control photographs exactly like a working one: `Icon` draws an empty, still-sized
+      // box for a name the set does not have.
+      absent: ["[data-icon-missing]", ...(expect.absent ?? [])],
+      text_absent: ["undefined", "NaN", ...(expect.text_absent ?? [])],
+      // The panel is 336px of a 720px stage and it must be WHOLE — a floating workspace that runs off
+      // its own container has no dock to yield into.
+      unclipped: ["[data-testid='pipe-forge-title']", ...(expect.unclipped ?? [])],
+    },
+    render: () => stage(node),
+  });
+
+  return [
+    scene(
+      "pipe-forge-setup",
+      "the first thing a user meets after clicking Draw pipe: four recipe choices and one primary " +
+      "action, floating beside the tool rail at the 336px the shell gives it. Four `PropertyRow`s " +
+      "share ONE set of tracks, so what a reader is checking is a single label column, four control " +
+      "cells ending at the same x, and the unit in a column of its own rather than hanging off the " +
+      "end of the number. The panel used to draw its own row with a hard 144px control, which is why " +
+      "its right edge went ragged and could not narrow when the tool rail is minimised",
+      {
+        present: [
+          ["[data-testid='pipe-forge-setup']", 1],
+          ["[data-testid='pipe-forge-start']", 1],
+        ],
+        text_present: ["Material kit", "Build quality", "Draw new pipe"],
+        unclipped: ["[data-testid='pipe-forge-start']", "[data-testid='pipe-forge-kit']"],
+      },
+      <PipeForge client={noopClient} status={null} onStatus={() => {}} onBaked={() => {}} style={{ left: 138, width: 336 }} />,
+    ),
+    scene(
+      "pipe-forge-editable",
+      "the same setup with an editable pipe selected — the state that offers a SECOND primary action " +
+      "in a panel that already has one. What a reader is checking is the hierarchy: which of the two " +
+      "the eye lands on first, and whether the shared `Callout` reads as an offer rather than as an " +
+      "alarm. It is `tone=\"info\"` and carries the tone mark every note in the editor carries, " +
+      "because colour alone must not be what separates an offer from a warning",
+      {
+        present: [["[data-testid='pipe-forge-edit']", 1]],
+        text_present: ["This pipe can be reopened", "Edit selected pipe"],
+        unclipped: ["[data-testid='pipe-forge-edit']", "[data-testid='pipe-forge-start']"],
+      },
+      <PipeForge client={noopClient} status={null} editableEntityId="e-pipe-1" onStatus={() => {}} onBaked={() => {}} style={{ left: 138, width: 336 }} />,
+    ),
+    scene(
+      "pipe-forge-drawing",
+      "a live route: four points, three runs, the recipe echoed back as badges and the two actions the " +
+      "gesture needs. This is the state the user spends the most time in — the panel is beside their " +
+      "hand while every click lands in the 3D behind it — so what a reader is checking is whether the " +
+      "three numbers can be read WITHOUT stopping, and whether the line under the badges admits that " +
+      "the four settings above it are now READ-ONLY. They are: `SetupControls` is unmounted the moment " +
+      "drawing starts, and until this pass nothing anywhere said so",
+      {
+        present: [
+          ["[data-testid='pipe-forge-active']", 1],
+          ["[data-testid='pipe-forge-bake']", 1],
+          ["[data-testid='pipe-forge-undo']", 1],
+        ],
+        text_present: ["Points", "Length", "Triangles", "12.84 m"],
+        same_line: [["[data-testid='pipe-forge-undo']", "[data-testid='pipe-forge-bake']"]],
+        unclipped: ["[data-testid='pipe-forge-bake']", "[data-testid='pipe-forge-points']"],
+      },
+      <PipeForge client={noopClient} status={status()} onStatus={() => {}} onBaked={() => {}} style={{ left: 138, width: 336 }} />,
+    ),
+    scene(
+      "pipe-forge-network",
+      "the route-network section opened: a point picker, the three-axis position editor and the three " +
+      "actions on the selected point. The axes are the shared `VectorField` — one property, three " +
+      "cells, the axis mark drawn INSIDE each cell — where they used to be a `<fieldset>`, a " +
+      "`<legend>` and three 11px monospace letters in columns of their own that made the three boxes " +
+      "start at three different x positions. A reader is checking that they read as ONE value, and " +
+      "that Apply, Draw branch and Remove are the same control family at the same size",
+      {
+        present: [
+          ["[data-testid='pipe-forge-handle']", 1],
+          ["[data-testid='pipe-forge-move-handle']", 1],
+          ["[data-testid='pipe-forge-remove-handle']", 1],
+        ],
+        text_present: ["Point on the route", "Position", "Branch diameter"],
+        unclipped: [
+          "[data-testid='pipe-forge-handle-position-x']",
+          "[data-testid='pipe-forge-handle-position-y']",
+          "[data-testid='pipe-forge-handle-position-z']",
+          "[data-testid='pipe-forge-move-handle']",
+        ],
+        same_line: [["[data-testid='pipe-forge-handle-position-x']", "[data-testid='pipe-forge-handle-position-z']"]],
+      },
+      <PipeForge client={noopClient} status={status()} onStatus={() => {}} onBaked={() => {}} style={{ left: 138, width: 336 }} />,
+      ["[data-testid='pipe-forge-network'] .mtk-disclosure__toggle"],
+    ),
+    scene(
+      "pipe-forge-catalog",
+      "the saved-fittings editor — the deepest the panel goes, and a six-field form nothing in the " +
+      "repository had ever seen. It is the SAME form the Model workspace and the inspector use " +
+      "(`FieldGrid`/`Field`: label above, control, help below), and its rows are the shared " +
+      "`ListRow`, which WRAPS instead of overflowing. That is the measured defect this scene was " +
+      "written against: at this exact width every row used to lose 53px of its name and 49px of its " +
+      "Remove button off an `overflow-x: hidden` edge, with no scrollbar and no way to reach either",
+      {
+        present: [
+          ["[data-testid='pipe-forge-catalog-label']", 1],
+          ["[data-testid='pipe-forge-save-catalog']", 1],
+          ["[data-testid='pipe-forge-remove-fitting-2']", 1],
+        ],
+        text_present: ["Name", "Reference", "Isolation valve", "Weld neck flange DN50"],
+        // THE ROWS ARE THE POINT. Every one of these lost pixels off the right edge of an
+        // `overflow-x: hidden` panel before `ListRow`; asserting they are whole is asserting the fix.
+        unclipped: [
+          "[data-testid='pipe-forge-catalog-label']",
+          "[data-testid='pipe-forge-save-catalog']",
+          "[data-testid='pipe-forge-remove-catalog-isolation-valve']",
+          "[data-testid='pipe-forge-remove-catalog-weld-neck-flange']",
+        ],
+        min_height: [["[data-testid='pipe-forge-catalog-label']", 28]],
+      },
+      <PipeForge client={noopClient} status={status()} onStatus={() => {}} onBaked={() => {}} style={{ left: 138, width: 336 }} />,
+      ["[data-testid='pipe-forge-catalog'] .mtk-disclosure__toggle"],
+      { width: 1180, height: 1240 },
+    ),
+    scene(
+      "pipe-forge-baked",
+      "the end of the loop: the asset is built and the panel reports what it actually produced — " +
+      "triangles, LODs, texture resolution, watertightness, collision — plus a warning and the two " +
+      "ways onward. The ux_quality rules 1 and 3 are the subject: the action that started this owns " +
+      "its outcome, the outcome says what it BOUGHT, and the next step is a control, not a sentence",
+      {
+        present: [["[data-testid='pipe-forge-report']", 1]],
+        text_present: ["Asset ready", "18,240", "Detail levels", "Watertight", "Draw another pipe"],
+        unclipped: ["[data-testid='pipe-forge-report']", "[data-testid='pipe-forge-start']"],
+      },
+      <PipeForgeBaked report={bake} />,
+    ),
+  ];
+}
+
+/** The baked state needs the panel's own `lastReport`, which only a bake sets — so the scene drives
+ *  the real `onBaked` path through a stub client rather than faking a prop the component does not
+ *  have. A capture of a state reached differently from how a user reaches it is a capture of a
+ *  different state. */
+function PipeForgeBaked({ report }: { report: PipeBakeReport }) {
+  const [status, setStatus] = useState<PipeForgeStatus | null>(null);
+  const [baked, setBaked] = useState(false);
+  const client = {
+    pipeForgeStart: () => Promise.resolve(startedStatus()),
+    pipeForgeBake: () => Promise.resolve(report),
+    pipeForgeStatus: () => Promise.resolve(status as PipeForgeStatus),
+  } as unknown as EditorClient;
+  useEffect(() => {
+    if (baked) return;
+    setBaked(true);
+    // Drive the two real transitions in order: start a session, then bake it. Reaching the report by
+    // any other route would photograph a state the component can hold but a user cannot produce.
+    const button = document.querySelector<HTMLButtonElement>("[data-testid='pipe-forge-start']");
+    button?.click();
+  }, [baked]);
+  useEffect(() => {
+    if (!status?.active) return;
+    document.querySelector<HTMLButtonElement>("[data-testid='pipe-forge-bake']")?.click();
+  }, [status]);
+  return (
+    <PipeForge
+      client={client}
+      status={status}
+      editableEntityId="e-pipe-1"
+      onStatus={setStatus}
+      onBaked={() => {}}
+      style={{ left: 138, width: 336 }}
+    />
+  );
+}
+
+function startedStatus(): PipeForgeStatus {
+  return {
+    active: true,
+    kit: "galvanized",
+    diameterCm: 5,
+    quality: "production",
+    autoFittings: true,
+    points: 4,
+    lengthM: 12.84,
+    previewTriangles: 18_240,
+    canBake: true,
+    message: "Click again to extend the run.",
+    handles: [
+      { nodeId: 1, position: [0, 0, 0], connectedEdges: [1], fittingIds: [] },
+      { nodeId: 2, position: [3.5, 0, 0], connectedEdges: [1], fittingIds: [] },
+    ],
+    edges: [{ id: 1, from: 1, to: 2, diameterM: 0.05 }],
+    fittings: [],
+    fittingCatalog: [],
+    branchFrom: null,
+    editingEntity: null,
+  };
 }

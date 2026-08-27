@@ -161,6 +161,34 @@ export function Checkbox({
   );
 }
 
+export interface ListRowProps {
+  children: ReactNode;
+  /** Lifts the row onto its own surface — for a row that holds a nested editor rather than one line. */
+  tone?: "plain" | "card";
+  role?: AriaRole;
+  className?: string;
+  style?: CSSProperties;
+  id?: string;
+  "data-testid"?: string;
+  "data-id"?: string;
+}
+
+/**
+ * ONE ROW OF AN EDITABLE LIST: a lead mark, a body that grows, trailing metadata and actions.
+ *
+ * The shape every authoring list in the editor is made of, and the one every such list had been
+ * writing by hand as `display: flex; gap: 4; margin: 3px 0` — which is why a delete button lands at a
+ * different distance from its row's edge in each of them. The row is the hit target and the hover
+ * surface; the controls inside it are the shared field family, never a bespoke one.
+ */
+export function ListRow({ children, tone = "plain", className, ...rest }: ListRowProps) {
+  return (
+    <div className={["mtk-list-row", tone === "card" && "mtk-list-row--card", className].filter(Boolean).join(" ")} {...rest}>
+      {children}
+    </div>
+  );
+}
+
 export type CalloutTone = "neutral" | "info" | "success" | "warn" | "danger";
 
 const CALLOUT_ICON: Record<CalloutTone, string> = {
