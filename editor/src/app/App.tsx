@@ -178,7 +178,11 @@ export function App() {
   } | null>(null);
   // A completed marquee must not also arrive as a pick: `click` fires after `pointerup`, and without
   // this the release of a box that selected fourteen objects would immediately re-select the one under
-  // the cursor. Cleared by the click it suppresses.
+  // the cursor. Consumed by the click it suppresses — and CLEARED AT THE NEXT PRESS, which is what
+  // bounds it to one gesture. Relying on the click alone was wrong and the live `.exe` run proved it:
+  // a drag whose release does not produce a click on the stage (the pointer left the window, or a
+  // synthetic sequence) left the flag standing, and the user's NEXT click on the stage was silently
+  // eaten. One lost click is indistinguishable from a dead viewport.
   const marqueeConsumedClick = useRef(false);
   const [pipeStatus, setPipeStatus] = useState<PipeForgeStatus | null>(null);
   const pipeActive = pipeStatus?.active === true;
@@ -419,6 +423,17 @@ export function App() {
       const editing = !!el && !!el.closest(
         "input, textarea, select, button, [contenteditable='true'], [role='button'], [role='slider'], [role='listbox'], [role='menu'], [data-command-scope]",
       );
+      // **UNDO AND REDO ARE CHORDS, AND A BUTTON DOES NOT OWN A CHORD.** The guard above exists for the
+      // BARE-LETTER shortcuts — W/E/R/F must not switch viewport tools while a control has the
+      // keyboard — and applying it to Ctrl-Z as well made the editor refuse the one promise it prints
+      // out loud. Found live in the packaged `.exe`: delete a selection from the Actions menu, focus
+      // returns to the trigger BUTTON, the toast and the status line both say "recoverable with
+      // Ctrl-Z", and Ctrl-Z does nothing at all until you click somewhere else first. A control that
+      // states a way out and then refuses it is worse than one that never offered.
+      //
+      // What genuinely owns Ctrl-Z is a TEXT-EDITING context, because that is where the browser's own
+      // undo stack lives and stealing it would lose typing. Nothing else.
+      const editingText = !!el && !!el.closest("input, textarea, [contenteditable='true']");
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setCommandsOpen(true);
@@ -428,7 +443,7 @@ export function App() {
         (e.ctrlKey || e.metaKey) &&
         (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"));
       if (redoGesture) {
-        if (editing) return;
+        if (editingText) return;
         e.preventDefault();
         if (pipeActive) {
           setStatus("Finish or cancel the active route before redoing scene changes");
@@ -439,7 +454,7 @@ export function App() {
       }
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
         // Don't hijack TEXT undo while the user is typing in a field — only undo the SCENE otherwise.
-        if (editing) return;
+        if (editingText) return;
         e.preventDefault();
         if (pipeActive && !pipeBusy) {
           void client.pipeForgeUndo().then((status) => {
@@ -739,6 +754,9 @@ export function App() {
               return;
             }
             if (e.button === 0) {
+              // A new press begins a new gesture, so nothing the LAST one left behind may still be
+              // suppressing this one's click.
+              marqueeConsumedClick.current = false;
               if (pipeActive) return; // drawing owns the click; do not start a gizmo drag underneath it
               // M9 gizmo handle-grab: only when an entity is selected; if a handle is HIT the render loop
               // drags it natively (0 IPC/frame, like orbit) and the release commits. A miss falls through to

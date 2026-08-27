@@ -23,6 +23,7 @@ interface Spies {
   pick: ReturnType<typeof vi.fn>;
   region: ReturnType<typeof vi.fn>;
   selectionIds: ReturnType<typeof vi.fn>;
+  undo: ReturnType<typeof vi.fn>;
 }
 const sessions: Spies[] = [];
 
@@ -35,10 +36,12 @@ vi.mock("../transport/session", async (importOriginal) => {
       const pick = vi.fn(() => Promise.resolve("hit-1" as string | null));
       const region = vi.fn(() => Promise.resolve(["a", "b", "c"]));
       const selectionIds = vi.fn(() => Promise.resolve(["a", "b"]));
+      const undo = vi.fn(() => Promise.resolve(true));
+      client.undo = undo as unknown as typeof client.undo;
       client.viewportPick = pick as unknown as typeof client.viewportPick;
       client.viewportPickRegion = region as unknown as typeof client.viewportPickRegion;
       client.selectionIds = selectionIds as unknown as typeof client.selectionIds;
-      sessions.push({ pick, region, selectionIds });
+      sessions.push({ pick, region, selectionIds, undo });
       return client;
     },
   };
@@ -47,6 +50,7 @@ vi.mock("../transport/session", async (importOriginal) => {
 const { App } = await import("./App");
 
 const spies = () => sessions[sessions.length - 1];
+const undoSpy = () => spies().undo;
 
 /** A pointer event that actually carries coordinates.
  *
@@ -170,6 +174,28 @@ describe("box selection on the stage", () => {
     // fourteen objects are gone before the user's hand leaves the mouse.
   });
 
+  it("the suppression lasts ONE gesture: the click after the NEXT press still picks", async () => {
+    // Found by the live `.exe` run, not by this suite. A drag whose release produces no click on the
+    // stage — the pointer left the window, or a driver dispatched pointerup without one — used to
+    // leave the flag standing, and the user's next click was silently eaten. A viewport that ignores
+    // one click is indistinguishable from a dead viewport.
+    render(<App />);
+    const viewport = screen.getByTestId("viewport");
+    const { release } = dragBox({ x: 100, y: 100 }, { x: 400, y: 300 });
+    await act(async () => {
+      release();
+    });
+    // No click follows the release — that is the whole point.
+    expect(spies().pick).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400 });
+      pointer(viewport, "pointerup", { button: 0, clientX: 500, clientY: 400 });
+      fireEvent.click(viewport, { clientX: 500, clientY: 400 });
+    });
+    expect(spies().pick).toHaveBeenCalledTimes(1);
+  });
+
   it("shift-drag ADDS to the selection rather than replacing it", async () => {
     render(<App />);
     const { release } = dragBox({ x: 100, y: 100 }, { x: 400, y: 300 }, { shiftKey: true });
@@ -177,6 +203,35 @@ describe("box selection on the stage", () => {
       release();
     });
     expect(spies().region.mock.calls[0]?.[4]).toBe(true);
+  });
+});
+
+describe("the way out the editor promises out loud", () => {
+  it("Ctrl-Z undoes with a BUTTON focused, because a button does not own a chord", async () => {
+    // Found live in the packaged `.exe`, not here: delete a selection from the Actions menu, focus
+    // returns to the trigger BUTTON, the toast and the status line both say "recoverable with Ctrl-Z",
+    // and Ctrl-Z did nothing — the guard that keeps W/E/R/F from switching tools while a control has
+    // the keyboard was applied to the undo chord too.
+    render(<App />);
+    const button = screen.getByTestId("authoring-more");
+    button.focus();
+    expect(document.activeElement).toBe(button);
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    });
+    expect(undoSpy()).toHaveBeenCalledTimes(1);
+  });
+
+  it("…and still keeps its hands off a text field's own undo stack", async () => {
+    render(<App />);
+    const search = screen.getByPlaceholderText(/search objects/i);
+    search.focus();
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    });
+    expect(undoSpy()).not.toHaveBeenCalled();
   });
 });
 
