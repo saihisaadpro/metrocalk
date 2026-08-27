@@ -12,16 +12,10 @@ import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
-import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { color, fontSize, radius, space } from "../theme/tokens";
+import { DisclosureSection, useSubjectDisclosure } from "../theme/workspace";
 import type { RoleReply, RoleSpec, RoleStatusInfo } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
-
-const sectionH3 = {
-  margin: `0 0 ${space.xs}px`,
-  font: font.ui,
-  fontSize: fontSize.body,
-  color: color.text.primary,
-} as const;
 
 const metaText = {
   fontSize: fontSize.meta,
@@ -94,10 +88,35 @@ export function RolesSection({ client }: { client: EditorClient }) {
 
   const currentRole = selected ? status.roster.find((r) => r.entity === selected)?.role ?? null : null;
 
-  return (
-    <section data-testid="roles-section">
-      <h3 style={sectionH3}>Roles</h3>
+  // The group's CONDITION, on the group's own header line — the shared status slot every other
+  // workspace section already uses ("Ready", "Selection required", "Advanced"). This is what the three
+  // stacked sentences became: a reader learns the same thing from the strip without opening anything.
+  const subject = summary?.name ?? selected;
+  const condition = playing
+    ? `score ${status.score}`
+    : selected
+      ? currentRole
+        ? `${subject} · ${currentRole}`
+        : String(subject)
+      : status.roster.length > 0
+        ? `${status.roster.length} assigned`
+        : "needs a selection";
 
+  const disclosure = useSubjectDisclosure(selected);
+
+  return (
+    <DisclosureSection
+      data-testid="roles-section"
+      title="Roles"
+      summary={condition}
+      density="compact"
+      landmark={false}
+      // Forced open during Play, because the live read-outs below (score, health, blocked, companions)
+      // are the loop this whole feature exists to close, and a folded section is a scoreboard nobody
+      // can see. The user's own fold is still remembered for when Play stops.
+      open={playing || disclosure.open}
+      onOpenChange={disclosure.onOpenChange}
+    >
       {playing && (
         <div
           data-testid="role-score"
@@ -203,52 +222,55 @@ export function RolesSection({ client }: { client: EditorClient }) {
         </div>
       )}
 
-      {selected ? (
-        <div style={{ display: "grid", gap: space.xs }}>
-          <div style={{ fontSize: fontSize.meta, color: color.text.secondary }}>
-            {summary?.name ?? selected}
-            {currentRole && (
-              <span style={{ color: color.accent.base }}> · {currentRole}</span>
-            )}
-          </div>
-          <div role="group" aria-label="Assign a role" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: space.xs }}>
-            {specs.map((spec) => (
-              <Button
-                key={spec.kind}
-                data-testid={`role-${spec.kind}`}
-                variant={currentRole === spec.kind ? "toggle" : "secondary"}
-                active={currentRole === spec.kind}
-                compact
-                disabled={busy || playing}
-                title={
-                  playing
-                    ? "Stop Play first — roles are authored, not live-edited"
-                    : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it all`
-                }
-                onClick={() => selected && void run(() => client.roleAssign(selected, spec.kind), `Make it a ${spec.label}`)}
-              >
-                <Icon name={spec.kind} size="md" fallback="shape" /> {spec.label}
-              </Button>
-            ))}
-          </div>
-          {currentRole && (
+      {/* The subject is named in the section's own HEADER, not again here: three groups each
+          re-printing "Crystal" under its own title is what a 340px column looked like before. */}
+      <div style={{ display: "grid", gap: space.xs }}>
+        {/* THE CARDS ARE ALWAYS HERE — disabled, with the reason, when there is nothing to apply them
+            to. `<ux_quality>` 1 and 6: the control that starts the action owns it, and a disabled
+            control explains itself in plain words. The version this replaces removed the four cards
+            entirely and left a sentence telling the reader to go and select something, so the one
+            question this group exists to answer — *what can a role even be?* — could not be asked
+            without first guessing that the answer was here. */}
+        <div role="group" aria-label="Assign a role" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: space.xs }}>
+          {specs.map((spec) => (
             <Button
-              data-testid="role-clear"
-              variant="ghost"
+              key={spec.kind}
+              data-testid={`role-${spec.kind}`}
+              variant={currentRole === spec.kind ? "toggle" : "secondary"}
+              active={currentRole === spec.kind}
               compact
-              disabled={busy || playing}
-              title={playing ? "Stop Play first" : "Remove the role and what it added (mesh and transform stay)"}
-              onClick={() => selected && void run(() => client.roleClear(selected), "Clear role")}
+              disabled={busy || playing || !selected}
+              title={
+                playing
+                  ? "Stop Play first — roles are authored, not live-edited"
+                  : !selected
+                    ? `Select an object first, then ${spec.label} applies to it. ${spec.blurb}`
+                    : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it all`
+              }
+              onClick={() => selected && void run(() => client.roleAssign(selected, spec.kind), `Make it a ${spec.label}`)}
             >
-              Clear role
+              <Icon name={spec.kind} size="md" fallback="shape" /> {spec.label}
             </Button>
-          )}
+          ))}
         </div>
-      ) : (
-        <div data-testid="roles-hint" style={metaText}>
-          Select an object, then give it a role — it becomes part of the game in one click.
-        </div>
-      )}
+        {selected && currentRole && (
+          <Button
+            data-testid="role-clear"
+            variant="ghost"
+            compact
+            disabled={busy || playing}
+            title={playing ? "Stop Play first" : "Remove the role and what it added (mesh and transform stay)"}
+            onClick={() => selected && void run(() => client.roleClear(selected), "Clear role")}
+          >
+            Clear role
+          </Button>
+        )}
+        {!selected && (
+          <div data-testid="roles-hint" style={metaText}>
+            Select an object, then give it a role — it becomes part of the game in one click.
+          </div>
+        )}
+      </div>
 
       {status.roster.length > 0 && (
         <div data-testid="roles-roster" style={{ marginTop: space.sm, display: "grid", gap: 2 }}>
@@ -287,7 +309,7 @@ export function RolesSection({ client }: { client: EditorClient }) {
           {refusal}
         </div>
       )}
-    </section>
+    </DisclosureSection>
   );
 }
 

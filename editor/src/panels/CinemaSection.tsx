@@ -15,16 +15,10 @@ import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
-import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { color, fontSize, radius, space } from "../theme/tokens";
+import { DisclosureSection, useSubjectDisclosure } from "../theme/workspace";
 import type { CinemaReply, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
-
-const sectionH3 = {
-  margin: `0 0 ${space.xs}px`,
-  font: font.ui,
-  fontSize: fontSize.body,
-  color: color.text.primary,
-} as const;
 
 const metaText = {
   fontSize: fontSize.meta,
@@ -132,9 +126,28 @@ export function CinemaSection({ client }: { client: EditorClient }) {
     }
   }
 
+  // The group's CONDITION on its own header line — the shared status slot, not a sentence underneath.
+  const subject = summary?.name ?? selected;
+  const condition = selected
+    ? cut.shots > 0
+      ? `${subject} · ${cut.shots} shot${cut.shots === 1 ? "" : "s"} · ${cut.seconds.toFixed(1)}s`
+      : String(subject)
+    : "needs a selection";
+
+  const disclosure = useSubjectDisclosure(selected);
+
   return (
-    <section data-testid="cinema-section">
-      <h3 style={sectionH3}>Cinematics</h3>
+    <DisclosureSection
+      data-testid="cinema-section"
+      title="Cinematics"
+      summary={condition}
+      density="compact"
+      landmark={false}
+      // Open during Play: `cinema-live` says whether a cutscene has the camera right now, and that
+      // read-out answers "why did the view just move" — a question a folded section cannot answer.
+      open={playing || disclosure.open}
+      onOpenChange={disclosure.onOpenChange}
+    >
 
       {playing && (
         <div
@@ -155,18 +168,9 @@ export function CinemaSection({ client }: { client: EditorClient }) {
         </div>
       )}
 
-      {selected ? (
-        <div style={{ display: "grid", gap: space.xs }}>
-          <div style={{ fontSize: fontSize.meta, color: color.text.secondary }}>
-            {summary?.name ?? selected}
-            {cut.shots > 0 && (
-              <span style={{ color: color.accent.base }}>
-                {" "}
-                · {cut.shots} shot{cut.shots === 1 ? "" : "s"} · {cut.seconds.toFixed(1)}s
-              </span>
-            )}
-          </div>
-
+      {/* The subject and the shot count are in the section's own header now — printing them again
+          here is what made three groups in one column read as three restatements of the selection. */}
+      <div style={{ display: "grid", gap: space.xs }}>
           <div
             role="group"
             aria-label="Cinematic pacing"
@@ -178,9 +182,15 @@ export function CinemaSection({ client }: { client: EditorClient }) {
                 data-testid={`cinema-mood-${mood.value}`}
                 variant={cut.mood === mood.value ? "primary" : "secondary"}
                 compact
-                disabled={busy || playing}
+                disabled={busy || playing || !selected}
                 aria-pressed={cut.mood === mood.value}
-                title={playing ? "Stop Play first — pacing is authored, not live-edited" : mood.title}
+                title={
+                  playing
+                    ? "Stop Play first — pacing is authored, not live-edited"
+                    : !selected
+                      ? `Select an object first, then this sets its pacing. ${mood.title}`
+                      : mood.title
+                }
                 onClick={() => selected && void run(
                   () => client.cinemaSetMood(selected, mood.value),
                   `${mood.label} pacing`,
@@ -191,6 +201,17 @@ export function CinemaSection({ client }: { client: EditorClient }) {
             ))}
           </div>
 
+          {/* AN EMPTY CATALOGUE MUST NOT RENDER AN EMPTY GROUP — the same defect as `VfxSection`'s,
+              in the section directly beneath it, because a group that draws its own controls draws
+              its own empty state too. `cinema_catalog` answers with nothing wherever the cinematics
+              sub-engine is not present (the browser build is exactly that case), and this section
+              then showed a pacing row above a labelled group containing no cards: three controls
+              that set the pacing of a cutscene there is no way to add. Say so instead. */}
+          {specs.length === 0 ? (
+            <div data-testid="cinema-unavailable" style={metaText}>
+              No shots are available here — the cinematics sub-engine runs in the desktop editor.
+            </div>
+          ) : (
           <div
             role="group"
             aria-label="Add a shot"
@@ -202,11 +223,13 @@ export function CinemaSection({ client }: { client: EditorClient }) {
                 data-testid={`shot-${spec.kind}`}
                 variant="secondary"
                 compact
-                disabled={busy || playing}
+                disabled={busy || playing || !selected}
                 title={
                   playing
                     ? "Stop Play first — shots are authored, not live-edited"
-                    : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it`
+                    : !selected
+                      ? `Select an object first, then ${spec.label} frames it. ${spec.blurb}`
+                      : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it`
                 }
                 onClick={() => selected && void run(() => client.cinemaAddShot(selected, spec.kind), spec.label)}
               >
@@ -214,6 +237,7 @@ export function CinemaSection({ client }: { client: EditorClient }) {
               </Button>
             ))}
           </div>
+          )}
 
           {cut.reads.length > 0 && (
             <ol
@@ -278,17 +302,17 @@ export function CinemaSection({ client }: { client: EditorClient }) {
             </div>
           )}
 
-          {cut.shots > 0 && (
+          {selected && cut.shots > 0 && (
             <div data-testid="cinema-hint" style={metaText}>
               Press Play to watch it — the camera takes over, then hands back.
             </div>
           )}
-        </div>
-      ) : (
-        <div data-testid="cinema-empty" style={metaText}>
-          Select an object, then pick a shot — the camera frames it for you.
-        </div>
-      )}
+          {!selected && (
+            <div data-testid="cinema-empty" style={metaText}>
+              Select an object, then pick a shot — the camera frames it for you.
+            </div>
+          )}
+      </div>
 
       {refusal && (
         <div
@@ -307,7 +331,7 @@ export function CinemaSection({ client }: { client: EditorClient }) {
           {refusal}
         </div>
       )}
-    </section>
+    </DisclosureSection>
   );
 }
 

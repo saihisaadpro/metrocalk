@@ -33,6 +33,7 @@ import { Reveal } from "../../src/panels/Reveal";
 import { RigPanel, type RigDocument } from "../../src/panels/RigPanel";
 import RIG_MIXAMO from "../../src/panels/__fixtures__/rig-characterization.json";
 import RIG_BLOCKED from "../../src/panels/__fixtures__/rig-not-retargetable.json";
+import { MatchPanel } from "../../src/panels/MatchPanel";
 import { PhysicsPanel } from "../../src/panels/PhysicsPanel";
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
@@ -1016,8 +1017,161 @@ export const SCENES: Scene[] = [
   ...inspectorScenes(),
   ...assetScenes(),
   ...modelScenes(),
+  ...gameplayScenes(),
   ...shellScenes(),
 ];
+
+// ── the Gameplay sub-engine workspace ──────────────────────────────────────────────────────────────
+
+/** THE WORKSPACE THAT WAS A DOCUMENT.
+ *
+ *  `shell-gameplay` photographs this column inside the whole editor, and its own caption already
+ *  names what it found — "roles, cinema and VFX stacked in a column narrower than any of them" — but
+ *  nothing has ever photographed the panel ITSELF, at the width of the dock it ships in, with a claim
+ *  attached. So what the capture shows had never been anyone's defect: three headings, each followed
+ *  by a sentence telling the reader to go and do something somewhere else, then a centred empty state
+ *  with a 43-word paragraph, then the primary button, then ONE MORE paragraph below the button. Six
+ *  blocks of prose and one control, in a 340px column — while `PhysicsPanel`, its neighbour in the
+ *  same dock, folds its groups and reports each one's state in its own header.
+ *
+ *  These three scenes are written as the claim the panel must satisfy, not as a description of what
+ *  it does: they were added BEFORE the change and went red, which is what turns a restyle into a
+ *  defect list. */
+function gameplayScenes(): Scene[] {
+  /** The dev mock, not a fixture — the same client the Gameplay dock is wired to in the dev build, so
+   *  a role card, a shot card and an effect card here are the ones the product can actually offer. */
+  const gameplay = () => <MatchPanel client={createMockSession()} />;
+
+  /** Put an object in the document and select it. Roles/Cinematics/Effects each key off the selection,
+   *  and their unselected branch is the one that had become a paragraph. */
+  const selectSubject = () => {
+    const s = projectionStore.getState();
+    s.bulkLoad([{ id: "crystal", name: "Crystal", parentId: null, components: { Transform: {} } }] as never);
+    s.select("crystal");
+  };
+
+  const clearSelection = () => {
+    const s = projectionStore.getState();
+    s.bulkLoad([{ id: "crystal", name: "Crystal", parentId: null, components: { Transform: {} } }] as never);
+    s.select(null as never);
+  };
+
+  /** Every scene here shares the same three structural claims, because they are the whole point:
+   *  the workspace's groups are the SHARED section, there is no hand-rolled heading left in it, and
+   *  each group states its own condition in its own header rather than in a sentence underneath. */
+  const structure = (extra: Expect): Expect => ({
+    ...extra,
+    present: [
+      ["[data-testid='match-panel']", 1],
+      // Roles · Cinematics · Effects, each one `DisclosureSection` — the component `PhysicsPanel`,
+      // `AssetBrowser`, `ShapeStudio` and the inspector already share.
+      ["[data-testid='match-panel'] .mtk-disclosure", 3],
+      // …and each one carrying a summary, which is where its condition belongs: a header that says
+      // "3 assigned" or "needs a selection" is the sentence, in the place a reader is already looking.
+      //
+      // COUNTED HERE AND MEASURED BELOW, because counting alone is the blind spot this harness's own
+      // notes warn about and this claim walked straight into it: `present` reads the DOM, and the
+      // three summaries were in the DOM and `display: none` at exactly this width — a window media
+      // query hid them under 760px while the dock they live in is 340px at every width above 980.
+      // Green claim, invisible condition, and the capture is what showed it.
+      ["[data-testid='match-panel'] .mtk-disclosure__summary", 3],
+      ...(extra.present ?? []),
+    ],
+    absent: [
+      // The defect, stated as a selector. `DisclosureSection` renders its own `h3` INSIDE
+      // `.mtk-disclosure__heading-wrap`; a heading anywhere else in this panel is a group that drew
+      // its own header, which is exactly what made four groups look like four different products.
+      "[data-testid='match-panel'] h3:not(.mtk-disclosure__heading-wrap)",
+      "[data-testid='match-panel'] h4",
+      // `Icon` paints an empty, still-sized box for a name the set lacks, so a blank control
+      // photographs like a working one.
+      "[data-icon-missing]",
+      ...(extra.absent ?? []),
+    ],
+    text_absent: ["null", "undefined", "NaN", ...(extra.text_absent ?? [])],
+  });
+
+  return [
+    {
+      id: "gameplay-nothing-selected",
+      looking_for:
+        "the state a user opens this workspace in, at the 340px the left dock really is. Roles, " +
+        "Cinematics and Effects must be three folded sections whose HEADERS say what each one needs " +
+        "— not three headings each trailed by a sentence sending the reader elsewhere — and the one " +
+        "action the panel can offer with nothing selected has to be reachable without scrolling past " +
+        "them. The shipped version answered a 620px column with 1,000px of prose",
+      viewport: { width: 340, height: 620 },
+      setup: clearSelection,
+      expect: structure({
+        present: [["[data-testid='match-create']", 1]],
+        // THE MEASUREMENT THE PROSE COSTS. Six paragraphs and a centred empty state in a column that
+        // is 620px tall: the primary action was below the fold of its own dock. A ceiling is the only
+        // claim that can fail for that reason — `present` cannot, and `unclipped` cannot either,
+        // because a bare panel in this harness has no scroll parent to be clipped by.
+        max_height: [["[data-testid='match-panel']", 620]],
+        // A section with nothing to act on is FOLDED, not deleted: the index of what this sub-engine
+        // can do must survive the empty state, or the workspace teaches nothing about itself.
+        text_present: ["Roles", "Cinematics", "Effects"],
+        // The measurement that a count cannot make. Re-add `display: none` to
+        // `.mtk-disclosure__summary` and this goes red; `present` above stays green.
+        min_height: [["[data-testid='match-panel'] .mtk-disclosure__summary", 10]],
+      }),
+      render: gameplay,
+    },
+    {
+      id: "gameplay-object-selected",
+      looking_for:
+        "the same workspace with an object selected — the gesture all three groups are waiting for. " +
+        "Roles opens on its four cards, and the claim is that they are the SAME control family the " +
+        "rest of the editor uses at the same width: four role cards in a 340px column, none of them " +
+        "cut, each still naming what it adds. The sections' summaries must have changed with the " +
+        "selection, which is the whole argument for putting the condition in the header",
+      // NO `click`. The section opening is the BEHAVIOUR being photographed — a group whose subject is
+      // the selection opens when the selection arrives — so scripting the toggle here would have
+      // photographed the harness pressing a button rather than the panel answering a gesture. The
+      // first version of this scene did exactly that and went red for it: the click landed on a
+      // section `useSubjectDisclosure` had already opened, closed it, and the four role cards
+      // measured 140×0 with every `present` claim still green.
+      width: 340,
+      setup: selectSubject,
+      expect: structure({
+        present: [["[data-testid='role-collectible']", 1], ["[data-testid='role-spinner']", 1]],
+        text_present: ["Crystal", "Collectible", "Spinner"],
+        // Four cards in one column at 340px: the failure this is written against is a grid that keeps
+        // two columns until the labels are cut in half.
+        unclipped: ["[data-testid='role-collectible']", "[data-testid='role-spinner']"],
+      }),
+      render: gameplay,
+    },
+    {
+      id: "gameplay-authored",
+      looking_for:
+        "the authored state, reached the way a user reaches it — by pressing the panel's own primary " +
+        "button. `Your match` is a fourth group and it must be the same section as the other three, " +
+        "with its four read-outs inside it rather than a bare heading over a tile grid. This is the " +
+        "state the panel is FOR, and no capture in the repository has ever contained it",
+      width: 340,
+      setup: clearSelection,
+      click: ["[data-testid='match-create']"],
+      expect: {
+        present: [
+          ["[data-testid='match-panel']", 1],
+          // Four now: Roles · Cinematics · Effects · Your match.
+          ["[data-testid='match-panel'] .mtk-disclosure", 4],
+          ["[data-testid='match-summary']", 1],
+        ],
+        absent: [
+          "[data-testid='match-panel'] h3:not(.mtk-disclosure__heading-wrap)",
+          "[data-testid='match-panel'] h4",
+          "[data-icon-missing]",
+        ],
+        text_present: ["Actors", "Waves", "Lane"],
+        text_absent: ["null", "undefined", "NaN"],
+      },
+      render: gameplay,
+    },
+  ];
+}
 
 // ── the inspector ─────────────────────────────────────────────────────────────────────────────────
 

@@ -16,16 +16,10 @@ import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
 import { Button, SelectField } from "../theme/primitives";
-import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { color, fontSize, radius, space } from "../theme/tokens";
+import { DisclosureSection, useSubjectDisclosure } from "../theme/workspace";
 import type { EffectSpec, VfxProbe, VfxReply } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
-
-const sectionH3 = {
-  margin: `0 0 ${space.xs}px`,
-  font: font.ui,
-  fontSize: fontSize.body,
-  color: color.text.primary,
-} as const;
 
 const metaText = {
   fontSize: fontSize.meta,
@@ -146,9 +140,30 @@ export function VfxSection({ client }: { client: EditorClient }) {
     }
   }
 
+  // The group's CONDITION on its own header line — the shared status slot, not a sentence underneath.
+  const subject = summary?.name ?? selected;
+  const condition = playing && live
+    ? `${live.total} particle${live.total === 1 ? "" : "s"}`
+    : selected
+      ? fx.layers > 0
+        ? `${subject} · ${fx.layers} effect${fx.layers === 1 ? "" : "s"}`
+        : String(subject)
+      : "needs a selection";
+
+  const disclosure = useSubjectDisclosure(selected);
+
   return (
-    <section data-testid="vfx-section">
-      <h3 style={sectionH3}>Effects</h3>
+    <DisclosureSection
+      data-testid="vfx-section"
+      title="Effects"
+      summary={condition}
+      density="compact"
+      landmark={false}
+      // Open during Play: `vfx-live` is the particle read-out, and a budget warning nobody can see is
+      // the "legible cost" clause failing in the one state where the cost is actually being paid.
+      open={playing || disclosure.open}
+      onOpenChange={disclosure.onOpenChange}
+    >
 
       {playing && live && (
         <div
@@ -179,25 +194,26 @@ export function VfxSection({ client }: { client: EditorClient }) {
         </div>
       )}
 
-      {selected ? (
-        <div style={{ display: "grid", gap: space.xs }}>
-          <div style={{ fontSize: fontSize.meta, color: color.text.secondary }}>
-            {summary?.name ?? selected}
-            {fx.layers > 0 && (
-              <span style={{ color: color.accent.base }}>
-                {" · "}
-                {fx.layers} effect{fx.layers === 1 ? "" : "s"} {"·"} {fx.particles} particles
-              </span>
-            )}
-          </div>
-
+      {/* Subject and layer count live in this section's header now. */}
+      <div style={{ display: "grid", gap: space.xs }}>
+          {/* AN EMPTY CATALOGUE MUST NOT RENDER A PICKER. `vfx_catalog` answers with nothing wherever
+              the particle sub-engine is not present — the browser dev build is exactly that case — and
+              the section then drew "Run the next effect" over a live dropdown with an empty grid
+              underneath it: a labelled control that cannot lead anywhere, which is `<ux_quality>` 6
+              exactly. Photographed in `gameplay-object-selected` before this line existed. */}
+          {specs.length === 0 ? (
+            <div data-testid="vfx-unavailable" style={metaText}>
+              No effects are available here — the particle sub-engine runs in the desktop editor.
+            </div>
+          ) : (
+          <>
           <label style={{ ...metaText, display: "grid", gap: space.xxs }}>
             Run the next effect
             <SelectField
               data-testid="vfx-trigger"
               aria-label="When the next effect you add should run"
               value={trigger}
-              disabled={busy || playing}
+              disabled={busy || playing || !selected}
               onChange={(e) => setTrigger(e.target.value)}
             >
               {TRIGGERS.map((t) => (
@@ -219,11 +235,13 @@ export function VfxSection({ client }: { client: EditorClient }) {
                 data-testid={`fx-${spec.kind}`}
                 variant="secondary"
                 compact
-                disabled={busy || playing}
+                disabled={busy || playing || !selected}
                 title={
                   playing
                     ? "Stop Play first — effects are authored, not live-edited"
-                    : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it`
+                    : !selected
+                      ? `Select an object first, then ${spec.label} plays on it. ${spec.blurb}`
+                      : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it`
                 }
                 onClick={() =>
                   selected &&
@@ -234,6 +252,8 @@ export function VfxSection({ client }: { client: EditorClient }) {
               </Button>
             ))}
           </div>
+          </>
+          )}
 
           {fx.reads.length > 0 && (
             <ul
@@ -299,19 +319,19 @@ export function VfxSection({ client }: { client: EditorClient }) {
             </div>
           )}
 
-          {fx.layers > 0 && (
+          {selected && fx.layers > 0 && (
             <div data-testid="vfx-hint" style={metaText}>
               Press Play to see it {"—"} effects run during Play and leave nothing behind on
               Stop.
             </div>
           )}
-        </div>
-      ) : (
-        <div data-testid="vfx-empty" style={metaText}>
-          Select an object, then give it an effect {"—"} it catches fire, sparks when hit, or
-          pops when taken.
-        </div>
-      )}
+          {!selected && (
+            <div data-testid="vfx-empty" style={metaText}>
+              Select an object, then give it an effect {"—"} it catches fire, sparks when hit, or
+              pops when taken.
+            </div>
+          )}
+      </div>
 
       {refusal && (
         <div
@@ -330,7 +350,7 @@ export function VfxSection({ client }: { client: EditorClient }) {
           {refusal}
         </div>
       )}
-    </section>
+    </DisclosureSection>
   );
 }
 

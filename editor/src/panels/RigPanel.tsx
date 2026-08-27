@@ -22,7 +22,8 @@
 //! produces (the C6 failure the shots harness was built to stop).
 
 import { useMemo, useState } from "react";
-import { Badge, Button, Panel, PanelHeader, SectionHeader } from "../theme/primitives";
+import { Badge, Button, Panel, PanelHeader } from "../theme/primitives";
+import { DisclosureSection } from "../theme/workspace";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 
 // ── the document (mirrors `metrocalk_skeleton`'s serde output exactly) ────────────────────────────
@@ -240,8 +241,19 @@ export function RigPanel({ doc }: { doc: RigDocument }) {
         const rows = group.bones.filter((b) => showUnmapped || ch.profile.bones[b] !== undefined);
         if (rows.length === 0) return null;
         return (
-          <div key={group.title} data-testid="rig-group">
-            <SectionHeader>{group.title}</SectionHeader>
+          // OPEN BY DEFAULT, and the fold is the only thing that is new: a 55-row mapping table is
+          // exactly the shape progressive disclosure exists for, and it had a label that could not be
+          // collapsed. The group's own summary carries the count, so a reader can close `Spine` and
+          // still know what is inside it.
+          <DisclosureSection
+            key={group.title}
+            data-testid="rig-group"
+            title={group.title}
+            summary={`${rows.length} bone${rows.length === 1 ? "" : "s"}`}
+            density="compact"
+            landmark={false}
+            storageKey={`rig-group-${group.title}`}
+          >
             {rows.map((bone) => {
               const joint = ch.profile.bones[bone];
               const mapped = joint !== undefined;
@@ -308,15 +320,22 @@ export function RigPanel({ doc }: { doc: RigDocument }) {
                 </div>
               );
             })}
-          </div>
+          </DisclosureSection>
         );
       })}
 
       {/* THE PRESERVATION CLAIM, ON SCREEN. Unity discards every bone outside its humanoid enum and
           says nothing. Naming them here is the difference between a promise and a feature. */}
       {extraJoints.length > 0 && (
-        <div data-testid="rig-extras" style={{ marginTop: space.sm }}>
-          <SectionHeader>Kept as authored ({extraJoints.length})</SectionHeader>
+        <DisclosureSection
+          data-testid="rig-extras"
+          title="Kept as authored"
+          summary={`${extraJoints.length} joint${extraJoints.length === 1 ? "" : "s"}`}
+          density="compact"
+          landmark={false}
+          storageKey="rig-extras"
+          style={{ marginTop: space.sm }}
+        >
           <div
             style={{
               padding: `${space.xs}px ${space.md}px ${space.md}px`,
@@ -349,7 +368,7 @@ export function RigPanel({ doc }: { doc: RigDocument }) {
               ))}
             </div>
           </div>
-        </div>
+        </DisclosureSection>
       )}
 
       <div style={{ padding: `${space.sm}px ${space.md}px ${space.md}px` }}>

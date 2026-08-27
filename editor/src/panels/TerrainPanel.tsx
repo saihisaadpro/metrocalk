@@ -42,7 +42,8 @@ import {
   TextField,
 } from "../theme/primitives";
 import { Icon } from "../theme/icons";
-import { color, font, fontSize, motion, radius, space, text as textRole } from "../theme/tokens";
+import { color, font, fontSize, radius, space, text as textRole } from "../theme/tokens";
+import { DisclosureSection } from "../theme/workspace";
 import type {
   TerrainIssue,
   TerrainPlan,
@@ -364,40 +365,32 @@ export function TerrainPanel({ client, statsIntervalMs = 1000, style }: TerrainP
           </p>
         ) : null}
 
+        {/* THE PANEL'S STRUCTURE IS THE SHARED SECTION NOW.
+            This strip used to be a `SectionHeader` wrapping a ghost `Button` that carried its own
+            `aria-expanded`, its own rotating chevron on the RIGHT, and its own comment explaining that
+            the title rendered quieter than the sub-headings inside it. Every one of those is something
+            `DisclosureSection` already decides once for the whole editor — caret on the left, a title
+            at section weight, a summary slot, the animated open/close, the keyboard semantics — and
+            the complaint in that comment was true of the shared component too until the same change
+            raised `.mtk-disclosure__title` to body size.
+            `toggleTestId` keeps `terrain-section-*` on the CONTROL, which is what `TerrainPanel.test`
+            reads `aria-expanded` from and what the packaged-`.exe` terrain spec clicks. */}
         {SECTIONS.map((section) => (
-          <div key={section.id}>
-            <SectionHeader>
-              <Button
-                variant="ghost"
-                compact
-                aria-expanded={open[section.id]}
-                data-testid={`terrain-section-${section.id}`}
-                onClick={() => toggle(section.id)}
-                style={{ width: "100%", justifyContent: "space-between" }}
-              >
-                {/* The section's own title, at section weight. As bare ghost-button text it rendered
-                    QUIETER than the plain sub-headings inside it ("Layers", "Sculpt") — so the thing that
-                    contained the group looked less important than the group, and the strip read as a row of
-                    disabled controls rather than the panel's structure. */}
-                <span style={{ ...textRole.sectionTitle, padding: 0 }}>{section.title}</span>
-                {/* A chevron that ROTATES, not a +/− glyph. "+" and "−" are the vocabulary of add and
-                    remove, which this strip sits directly above rows that really do add and remove. */}
-                <span
-                  aria-hidden
-                  style={{
-                    color: color.text.muted,
-                    fontSize: fontSize.micro,
-                    lineHeight: 1,
-                    transition: `transform ${motion.fast}`,
-                    transform: open[section.id] ? "rotate(90deg)" : "rotate(0deg)",
-                  }}
-                >
-                  <Icon name="chevron-right" size="sm" />
-                </span>
-              </Button>
-            </SectionHeader>
-            {open[section.id] ? (
-              <div style={{ display: "grid", gap: space.sm, paddingTop: space.xs, minWidth: 0 }}>
+          <DisclosureSection
+            key={section.id}
+            title={section.title}
+            toggleTestId={`terrain-section-${section.id}`}
+            open={open[section.id]}
+            onOpenChange={() => toggle(section.id)}
+            density="compact"
+            landmark={false}
+            // The contents were only ever mounted while open, and several of them are heavy (a stats
+            // poll, a route editor, a materials list). Keeping that is not an optimisation, it is the
+            // existing behaviour — the default would have mounted all seven at once.
+            unmountOnClose
+          >
+            {(
+              <div style={{ display: "grid", gap: space.sm, minWidth: 0 }}>
                 {section.id === "describe" ? (
                   <>
                     <DescribeBox client={client} busy={busy} run={run} compact />
@@ -466,8 +459,8 @@ export function TerrainPanel({ client, statsIntervalMs = 1000, style }: TerrainP
                   </>
                 ) : null}
               </div>
-            ) : null}
-          </div>
+            )}
+          </DisclosureSection>
         ))}
 
         {issues.length > 0 ? (

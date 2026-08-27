@@ -1642,11 +1642,23 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-disclosure__caret.is-open { transform: rotate(90deg); }
 .mtk-disclosure__icon { display: inline-flex; flex: none; color: var(--mtk-text-muted); }
 .mtk-disclosure__heading { display: flex; flex: 1 1 auto; align-items: baseline; gap: 8px; min-width: 0; }
+/* A SECTION TITLE WAS SMALLER THAN THE ROWS INSIDE IT. At 12px against a 13px body it was, literally,
+   the quietest text in its own group — so the thing that CONTAINS a set of properties read as less
+   important than any one of them, and every panel that wanted its structure to be visible reached past
+   this component and drew its own heading instead (11 files had, at 13px/`--mtk-text`, which is exactly
+   what this rule now is). `TerrainPanel` had already written the complaint down in a comment beside its
+   own hand-rolled version: "it rendered QUIETER than the plain sub-headings inside it … so the strip
+   read as a row of disabled controls rather than the panel's structure."
+
+   `color` is stated rather than inherited for the same reason: the toggle is `--mtk-text-secondary` so
+   that its CARET and its hover read as a control, and a heading that inherits that is a heading dimmed
+   by the affordance wrapped around it. The summary beside it stays muted, so the header carries one
+   step of hierarchy on its own line — the title, then its condition. */
 .mtk-disclosure__title {
   flex: none;
   overflow: hidden;
-  color: inherit;
-  font-size: 12px;
+  color: var(--mtk-text);
+  font-size: 13px;
   font-weight: 650;
   line-height: 1.2;
   text-overflow: ellipsis;
@@ -1772,7 +1784,17 @@ body > [role="dialog"][aria-modal="true"] {
   .mtk-workspace-panel__actions { max-width: 52%; overflow-x: auto; }
   .mtk-workspace-panel__body.is-padded { padding: 6px; }
   .mtk-dock-tab { min-height: 36px; padding: 0 10px; }
-  .mtk-disclosure__summary { display: none; }
+  /* THE SECTION SUMMARY STAYS TOO, and for the same reason as the subtitle three rules above — the
+     argument written there was simply never applied to the sibling that had the identical defect.
+     A summary is where a group states its own CONDITION ("needs a selection", "Crystal · collectible",
+     "3 to fix"), which is the whole reason a reader can learn what a workspace is waiting for without
+     opening any of it. Hiding it deletes that.
+
+     And the query was keyed on the wrong box. This is a WINDOW media query; a section lives in a dock
+     whose track is 300–340px at EVERY window width at or above 980. So the summary was visible in a
+     340px column on a 1440px desktop and hidden in the same 340px column on a 700px one — the width
+     that decides was never the width being measured. It is one ellipsised nowrap line either way, so
+     the cost is bounded and the header simply carries it. */
   /* Stacked: the label takes its own line and the control keeps the full width, with the unit and the
      reset still on the control's line — a reset that stacked under its own field would read as another
      property. The sheet keeps three tracks here rather than four, and its rows keep adopting them. */
