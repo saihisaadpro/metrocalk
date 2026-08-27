@@ -320,9 +320,26 @@ body {
   box-shadow: none;
   cursor: not-allowed;
 }
-.mtk-input:read-only,
+/* A `<select>` IS ALWAYS `:read-only`, AND THAT ERASED EVERY DROPDOWN ARROW IN THE EDITOR.
+   `:read-only` matches any element the user cannot type into — which is every `<select>`, always, by
+   definition — and `SelectField` puts `mtk-input` on the element beside `mtk-select`. So this rule
+   matched every dropdown in the editor at specificity (0,2,0), beating `.mtk-select` at (0,1,0), and
+   it did two things it never meant to: it painted the control in the READ-ONLY fill, and — because
+   `background` is a SHORTHAND — it reset `background-image` to `none`, deleting the chevron three
+   rules below. With `appearance: none` already having removed the platform's own arrow, the result is
+   a dropdown with NO affordance of any kind: measured on the live page as
+   `background-image: none` while the `.mtk-select` rule declaring it was matched and parsed.
+   Invisible to every gate here — `check-class-hooks` sees both classes emitted and both rules
+   present, and no invariant asks whether a control still looks like the control it is.
+
+   Two changes, and both are load-bearing. `:not(.mtk-select)` because a select is not read-only in
+   the sense this rule means, and `background-color` because the fill is the only thing it ever wanted
+   to change — a shorthand here silently owns five longhands it has no opinion about. The same
+   shorthand trap is already documented four rules down, where `.mtk-select:disabled` has to restate
+   `background-repeat`/`-position`/`-size` after the `:disabled` shorthand tiled the chevron. */
+.mtk-input:read-only:not(.mtk-select),
 .mtk-textarea:read-only,
-.mtk-search:read-only { background: var(--mtk-bg-panel); }
+.mtk-search:read-only { background-color: var(--mtk-bg-panel); }
 /* The chevron is OURS, not the platform's. A native `<select>` paints an OS arrow that changes with
    the desktop theme and matches nothing else in the editor -- in the animate dock it was the only
    Windows widget on a row of design-system controls. `appearance: none` removes it; the replacement
