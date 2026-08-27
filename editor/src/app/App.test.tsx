@@ -48,11 +48,11 @@ describe("editor app — end-to-end wiring", () => {
         expect(inspector, "the inspector never mounted").toBeTruthy();
         expect(inspector?.textContent ?? "").toContain("Player");
       },
-      { timeout: 10_000 },
     );
-    // The per-test `10_000` that used to be here is gone: the file-level budget above covers it, and
-    // a number written twice is the one that goes stale — this one already had, silently capping the
-    // test below the budget the file had just declared.
+    // Both bounds that used to be written here — a `waitFor` timeout and a per-test one — are gone.
+    // The file-level budget above covers the test, and `test-setup.ts` covers the wait, once, for
+    // every file. A number written twice is the one that goes stale, and this pair already had:
+    // the per-test `10_000` silently capped the test below the budget the file had just declared.
   });
 
   it("Play is unmistakable ON THE STAGE: a persistent badge appears only while playing (C2)", () => {
