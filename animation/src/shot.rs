@@ -417,13 +417,23 @@ impl Stage {
             return eye;
         }
         let mut confined = eye;
+        // ORDERING, NOT EQUALITY. "Did the clamp move anything" was written as `confined == eye` — an
+        // exact float-array comparison, which `clippy::float_cmp` rejects and CI was red on. The
+        // question being asked is whether the eye was OUTSIDE the room, and that answers itself with
+        // the same two comparisons the clamp is already making. A NaN axis satisfies neither, so it
+        // takes the unchanged-pose path exactly as it did before (the old `==` was false for NaN and
+        // the later `range.is_finite()` guard sent it back).
+        let mut outside = false;
         for axis in 0..3 {
             if lo[axis] > hi[axis] {
                 return eye; // a degenerate room is not a room
             }
+            if eye[axis] < lo[axis] || eye[axis] > hi[axis] {
+                outside = true;
+            }
             confined[axis] = confined[axis].clamp(lo[axis], hi[axis]);
         }
-        if confined == eye {
+        if !outside {
             return eye;
         }
         let d = [
