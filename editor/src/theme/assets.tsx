@@ -47,17 +47,28 @@ export interface AssetChipProps extends DataAttrs {
   /** Present ⇒ the chip is a FILTER (a real toggle carrying `aria-pressed`). Absent ⇒ a static TAG. */
   onToggle?: () => void;
   pressed?: boolean;
+  /** Present ⇒ the chip is an ACTION: it does something once and has no on/off state. Mutually
+   *  exclusive with `onToggle` — a control cannot both latch and not latch. */
+  onSelect?: () => void;
   title?: string;
   tone?: "neutral" | "accent" | "success" | "warn";
 }
 
-/** One chip: a filter when it can be toggled, a tag when it cannot.
+/** One chip: a filter when it toggles, an action when it fires once, a tag when it does neither.
  *
- *  Both spellings live in the same component on purpose. A filter chip and a category tag are the same
- *  object visually — that is what makes a filtered view legible, because the chip you pressed looks like
- *  the tag it matched — and splitting them into two components is how the two drift apart. */
-export function AssetChip({ children, icon, onToggle, pressed = false, title, tone = "neutral", ...rest }: AssetChipProps) {
-  const cls = ["mtk-chip", `mtk-chip--${tone}`, onToggle ? "mtk-chip--filter" : "mtk-chip--tag", pressed && "is-on"]
+ *  All three spellings live in the same component on purpose. A filter chip and a category tag are the
+ *  same object visually — that is what makes a filtered view legible, because the chip you pressed looks
+ *  like the tag it matched — and splitting them into separate components is how the three drift apart.
+ *
+ *  THE ACTION FORM EXISTS BECAUSE THE ALTERNATIVE WAS A LIE. A suggestion pill — "Alpine valley", which
+ *  fills a describe box — is not a toggle, and rendering it as one puts `aria-pressed="false"` on a
+ *  control that never becomes pressed: a screen reader announces a switch that is permanently off. The
+ *  only other route was a bare `Button`, which every panel then re-dresses inline until there are five
+ *  spellings of a pill. */
+export function AssetChip({ children, icon, onToggle, pressed = false, onSelect, title, tone = "neutral", ...rest }: AssetChipProps) {
+  const action = onToggle ?? onSelect;
+  const form = onToggle ? "filter" : onSelect ? "action" : "tag";
+  const cls = ["mtk-chip", `mtk-chip--${tone}`, `mtk-chip--${form}`, pressed && "is-on"]
     .filter(Boolean)
     .join(" ");
   const body = (
@@ -66,7 +77,7 @@ export function AssetChip({ children, icon, onToggle, pressed = false, title, to
       <span className="mtk-chip__text">{children}</span>
     </>
   );
-  if (!onToggle) {
+  if (!action) {
     return (
       <span className={cls} title={title} {...rest}>
         {body}
@@ -74,7 +85,16 @@ export function AssetChip({ children, icon, onToggle, pressed = false, title, to
     );
   }
   return (
-    <button type="button" className={cls} aria-pressed={pressed} title={title} onClick={onToggle} {...rest}>
+    <button
+      type="button"
+      className={cls}
+      // Only a latching control carries a pressed state. An action chip omits the attribute entirely
+      // rather than reporting `false` forever.
+      aria-pressed={onToggle ? pressed : undefined}
+      title={title}
+      onClick={action}
+      {...rest}
+    >
       {body}
     </button>
   );
@@ -251,5 +271,87 @@ export function AssetTile({
         )}
       </div>
     </div>
+  );
+}
+
+// ── Swatch ────────────────────────────────────────────────────────────────────────────────────────
+
+export interface SwatchGridProps extends DataAttrs {
+  children: ReactNode;
+  /** Accessible name for the set being chosen from. */
+  label: string;
+  style?: CSSProperties;
+}
+
+/** The picker's grid: smaller cells than the library's, because a swatch is a CHOICE from a closed set
+ *  rather than an item in an open catalogue, and a closed set should be readable in one glance without
+ *  scrolling a 300px dock. Column count is still the browser's decision from a minimum width. */
+export function SwatchGrid({ children, label, style, ...rest }: SwatchGridProps) {
+  return (
+    <div className="mtk-swatch-grid" role="group" aria-label={label} style={style} {...rest}>
+      {children}
+    </div>
+  );
+}
+
+export interface SwatchTileProps extends DataAttrs {
+  /** The name of this option. Always shown — a preview carries the feel, the word carries the meaning,
+   *  and the constitution does not allow the appearance to be the only carrier. */
+  label: string;
+  /** The rendered option: a shaded material sphere, a terrain thumbnail, a gradient ramp. */
+  preview: ReactNode;
+  /** The accessible name of the button — the ACTION, so a reader hears what pressing it does. */
+  actionLabel: string;
+  /** The current choice. Carried as `aria-pressed`, drawn as a ring AND a tick — never colour alone. */
+  selected?: boolean;
+  disabled?: boolean;
+  /** Why it cannot be pressed, in plain words. Becomes the tooltip when disabled. */
+  disabledReason?: string;
+  title?: string;
+  onSelect: () => void;
+}
+
+/** One option in a closed visual set.
+ *
+ *  UNLIKE `AssetTile` THIS IS A SINGLE CONTROL, and that is the whole difference. A library tile carries
+ *  a favourite star, a price and a tier beside its action, so it has to be a composition with siblings
+ *  that share no pixels (see the tile's own note on `shoot.mjs` R3). A swatch has exactly one thing you
+ *  can do to it, so it is one button — which also means the entire tile, preview included, is the hit
+ *  target rather than a strip of it. */
+export function SwatchTile({
+  label,
+  preview,
+  actionLabel,
+  selected = false,
+  disabled = false,
+  disabledReason,
+  title,
+  onSelect,
+  ...rest
+}: SwatchTileProps) {
+  const cls = ["mtk-swatch", selected && "is-selected", disabled && "is-unavailable"]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <button
+      type="button"
+      className={cls}
+      aria-pressed={selected}
+      aria-label={actionLabel}
+      title={disabled ? disabledReason : (title ?? actionLabel)}
+      disabled={disabled}
+      onClick={disabled ? undefined : onSelect}
+      {...rest}
+    >
+      <span className="mtk-swatch__preview">
+        {preview}
+        {selected && (
+          <span className="mtk-swatch__tick" aria-hidden="true">
+            <Icon name="check" size="sm" />
+          </span>
+        )}
+      </span>
+      <span className="mtk-swatch__label">{label}</span>
+    </button>
   );
 }

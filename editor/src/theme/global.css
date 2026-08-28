@@ -263,6 +263,15 @@ body {
 .mtk-btn--ghost { background: transparent; border-color: transparent; color: var(--mtk-text-secondary); }
 .mtk-btn--ghost { box-shadow: none; }
 .mtk-btn--ghost:hover { border-color: transparent; background: var(--mtk-bg-hover); color: var(--mtk-text); }
+/* A GHOST STAYS A GHOST WHEN IT REFUSES. `.mtk-btn:disabled` paints an inset well and a hairline —
+ * right for a solid button going quiet, and exactly backwards for a ghost, which has no chrome to
+ * quieten. In a terrain layer row the pair of reorder arrows made it obvious: the one you CANNOT press
+ * was the only one of the two with a box drawn round it, so the refusal read as the emphasis. Order
+ * does not fix this and never did — `.mtk-btn:disabled` is specificity (0,2,0) against the ghost's
+ * (0,1,0) — so the ghost has to state its refusal at the same weight. The colour still changes to
+ * `--mtk-text-faint` from the rule above, and `disabledReason` still says why. */
+.mtk-btn--ghost:disabled,
+.mtk-btn--ghost[aria-disabled="true"] { border-color: transparent; background: transparent; }
 
 .mtk-btn--danger { background: var(--mtk-danger-bg); color: var(--mtk-danger); border-color: var(--mtk-danger-border); box-shadow: none; }
 .mtk-btn--danger:hover { background: color-mix(in srgb, var(--mtk-danger-bg) 72%, var(--mtk-danger-border)); color: var(--mtk-danger); border-color: var(--mtk-danger-solid); }
@@ -1084,7 +1093,11 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-chip--success { background: var(--mtk-success-bg); border-color: var(--mtk-success-border); color: var(--mtk-success); }
 .mtk-chip--warn { background: var(--mtk-warn-bg); border-color: var(--mtk-warn-border); color: var(--mtk-warn); }
 .mtk-chip--tag { cursor: default; background: var(--mtk-bg-raised); }
-.mtk-chip--filter {
+/* A filter and an action are the same OBJECT under the finger — same height, same padding, same hover —
+ * and differ only in whether they latch, which `.is-on` carries and an action never sets. Sharing the
+ * declarations rather than copying them is what keeps the two from drifting into two pill designs. */
+.mtk-chip--filter,
+.mtk-chip--action {
   cursor: pointer;
   min-height: var(--mtk-control-compact);
   padding-inline: var(--mtk-space-4);
@@ -1093,7 +1106,8 @@ body > [role="dialog"][aria-modal="true"] {
     border-color var(--mtk-motion-fast) var(--mtk-ease-standard),
     color var(--mtk-motion-fast) var(--mtk-ease-standard);
 }
-.mtk-chip--filter:hover { background: var(--mtk-bg-hover); border-color: var(--mtk-border-strong); color: var(--mtk-text); }
+.mtk-chip--filter:hover,
+.mtk-chip--action:hover { background: var(--mtk-bg-hover); border-color: var(--mtk-border-strong); color: var(--mtk-text); }
 .mtk-chip--filter.is-on {
   background: var(--mtk-accent-subtle);
   border-color: var(--mtk-accent-border);
@@ -1229,6 +1243,84 @@ body > [role="dialog"][aria-modal="true"] {
 }
 .mtk-asset-tile__fav:hover { background: var(--mtk-bg-hover); color: var(--mtk-text-secondary); }
 .mtk-asset-tile__fav.is-on { color: var(--mtk-token); }
+
+/* ── Swatches (theme/assets.tsx) ──
+ * The picker form of a tile: one control, a rendered preview and its word. 84px is what lets three
+ * columns fit the 234px content box a 300px Inspector track gives a section, which is the width these
+ * are actually read at. */
+.mtk-swatch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: var(--mtk-space-2);
+  align-items: start;
+}
+.mtk-swatch {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--mtk-space-2);
+  min-width: 0;
+  padding: var(--mtk-space-2);
+  border: 1px solid transparent;
+  border-radius: var(--mtk-radius-lg);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    border-color var(--mtk-motion-fast) var(--mtk-ease-standard),
+    background var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-swatch:hover { border-color: var(--mtk-border); background: var(--mtk-bg-hover); }
+.mtk-swatch.is-selected { border-color: var(--mtk-accent-border); background: var(--mtk-accent-subtle); }
+.mtk-swatch.is-unavailable { cursor: not-allowed; color: var(--mtk-text-faint); }
+.mtk-swatch.is-unavailable:hover { border-color: transparent; background: none; }
+.mtk-swatch.is-unavailable .mtk-swatch__preview { opacity: 0.4; }
+/* The well. `aspect-ratio` keeps every cell in a row the same height whatever its name does. */
+.mtk-swatch__preview {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1 / 1;
+  width: 100%;
+  overflow: hidden;
+  border-radius: var(--mtk-radius-md);
+  background: var(--mtk-bg-inset);
+  transition: background var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+/* A preview that is a drawing fills the well; one that is a glyph centres in it. Stated here rather
+ * than by a class the caller has to remember, so a preview cannot be half-sized by omission — and so
+ * the rule reads the same for a shaded sphere, a landform silhouette or a gradient ramp. The tick is
+ * inside its own span and is therefore not a direct child. */
+.mtk-swatch__preview > svg { display: block; width: 100%; height: 100%; }
+/* The tick is what makes "which one is set" survive a greyscale print, a colour-blind reader and the
+ * accent being the same hue as a swatch. The ring alone was not enough on the metals. */
+.mtk-swatch__tick {
+  position: absolute;
+  inset-block-start: 2px;
+  inset-inline-end: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--mtk-accent-solid);
+  color: var(--mtk-on-accent);
+}
+.mtk-swatch__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mtk-font-ui);
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--mtk-text-secondary);
+}
+.mtk-swatch.is-selected .mtk-swatch__label { color: var(--mtk-text); font-weight: 500; }
 
 
 /* ── Keyframes ── */

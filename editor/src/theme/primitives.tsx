@@ -160,10 +160,18 @@ export function PanelHeader({ title, right, style }: { title: ReactNode; right?:
   );
 }
 
-/** A lighter in-panel section label (denser than a PanelHeader; for grouping inside a panel). */
+/** A lighter in-panel section label (denser than a PanelHeader; for grouping inside a panel).
+ *
+ *  IT USED TO CARRY ITS OWN 12px INLINE PADDING, and every one of its ten call sites is inside a
+ *  container that already insets its content — a `DisclosureSection` body, a padded `ScrollArea`, a
+ *  padded column. So the heading always started 12px to the RIGHT of the rows it labelled, which is
+ *  the arrangement that makes a heading read as belonging to something else. Two things could have
+ *  been done about it: pass `padding: 0` at ten call sites, which is one value invented ten times and
+ *  the constitution's root-cause rule verbatim; or decide it once here. The label now states only its
+ *  own vertical rhythm and takes its indent from whatever it is inside, like every other block does. */
 export function SectionHeader({ children, style }: { children: ReactNode; style?: CSSProperties }) {
   return (
-    <div style={{ ...text.sectionTitle, padding: `${space.xs}px ${space.lg}px`, ...style }}>{children}</div>
+    <div style={{ ...text.sectionTitle, paddingBlock: space.xs, ...style }}>{children}</div>
   );
 }
 

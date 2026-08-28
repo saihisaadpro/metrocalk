@@ -41,6 +41,7 @@ import {
   TextArea,
   TextField,
 } from "../theme/primitives";
+import { AssetChip, SwatchGrid, SwatchTile } from "../theme/assets";
 import { Icon } from "../theme/icons";
 import { color, font, fontSize, radius, space, text as textRole } from "../theme/tokens";
 import { DisclosureSection } from "../theme/workspace";
@@ -103,11 +104,126 @@ const SECTIONS: Section[] = [
  * subscription exists to fix. */
 const TERRAIN_COMPONENT = "TerrainRecipe";
 
+/** WHY EVERY CONTROL HERE GOES DARK WHILE A COMMAND IS IN FLIGHT, in the user's words.
+ *
+ *  One sentence, one constant. Eleven controls in this panel are `disabled={busy}` and, until the
+ *  `terrain-authored` capture ran R9 over them, not one of them said so: a control that goes dark for
+ *  a reason it will not state is the "every no explained" failure, and it is the same no eleven times.
+ *  Writing it eleven times is how ten of them end up saying something slightly different. */
+const BUSY_REASON = "The engine is still working on the last change";
+
 const SEVERITY_TONE: Record<TerrainIssue["severity"], "warn" | "accent" | "neutral"> = {
   blocking: "warn",
   warning: "warn",
   info: "neutral",
 };
+
+// ── Preset marks ──────────────────────────────────────────────────────────────────────────────────
+
+/** A landform silhouette per preset, drawn in the swatch's well.
+ *
+ *  WHAT THIS IS AND, MORE IMPORTANTLY, WHAT IT IS NOT. It is a MARK — the same honest position
+ *  `AssetTile` already takes when it draws a kind's icon rather than a render: real preview pixels for
+ *  a terrain would have to come from the renderer, and the browser build has none. So this never
+ *  pretends to be a thumbnail of the world you will get; it says which of six shapes of ground the name
+ *  refers to, which is the whole question a picker has to answer, and it answers it before the name is
+ *  read. The alternative shipped for two milestones: six headings with a sentence under each, in a
+ *  column, with no tile, no image and no affordance — text that happened to be clickable.
+ *
+ *  Monochrome, two tones, no hue. Six coloured tiles is six competing accents, and the constitution asks
+ *  for one disciplined accent rather than a palette per collection (the same argument `AssetTile`'s
+ *  `preview` makes). Depth comes from a receding range behind a nearer mass, which survives greyscale,
+ *  a colour-blind reader and the high-contrast palette — where both tones are redefined and the drawing
+ *  still reads.
+ *
+ *  Keyed by the preset ID the engine publishes (`terrain/src/preset.rs::all()`). An id with no entry
+ *  draws the generic ground plate rather than an empty box, because a preset the engine adds tomorrow
+ *  must arrive looking like a preset, not like a bug. */
+interface PresetMark {
+  /** The far range: lighter, behind. */
+  back?: string;
+  /** The near mass: the silhouette that carries the landform. */
+  front: string;
+  /** A third element in the panel tone — snow on a peak, water in a lagoon. */
+  highlight?: string;
+  /** The highlight is a set of LINES rather than a mass, so it is stroked instead of filled. */
+  highlightStroke?: boolean;
+}
+
+// ONE GRAMMAR FOR ALL SIX, AND THE FIRST DRAFT DID NOT HAVE IT. Far ground is the lighter tone, near
+// ground the darker one, panel-white is the accent on top — that is what makes a set of six read as a
+// set rather than as six drawings. The first pass broke it three times and the capture said so at a
+// glance: `flat` was a floating outlined diamond among five landscapes anchored to the bottom of their
+// well; `archipelago` had painted the SEA in the near tone and the islands in the far one, so the water
+// advanced and the land receded; and `canyon`'s notch was a 6px gap in a wall. Depth is the only thing
+// these two greys are carrying, so getting the two the wrong way round does not make a worse picture,
+// it makes the opposite picture.
+const PRESET_MARKS: Record<string, PresetMark> = {
+  // Deliberately the calmest of the six: a level far plain over level near ground. There is no shape to
+  // draw here and inventing one would misdescribe the preset — a plate is what it is.
+  flat: {
+    back: "M0 40 H64 V50 H0 Z",
+    front: "M0 50 H64 V64 H0 Z",
+  },
+  "rolling-hills": {
+    back: "M0 42 Q12 28 24 40 Q38 53 52 36 Q59 30 64 34 V64 H0 Z",
+    front: "M0 52 Q14 39 27 50 Q41 62 64 45 V64 H0 Z",
+  },
+  alpine: {
+    back: "M0 46 L13 21 L24 37 L37 14 L50 39 L64 27 V64 H0 Z",
+    front: "M0 54 L16 34 L30 52 L44 31 L58 51 L64 46 V64 H0 Z",
+    highlight: "M37 14 L43 25 L37 23 L31 27 Z",
+  },
+  // Asymmetric on purpose — a long windward back and a short slip face — or it is Rolling Hills again
+  // in a set where the two sit side by side.
+  dunes: {
+    back: "M0 46 C8 36 16 36 24 46 C32 56 40 36 48 42 C55 47 60 44 64 42 V64 H0 Z",
+    front: "M0 58 C6 50 12 48 18 54 C24 60 30 48 38 52 C44 55 48 58 54 54 C58 51 61 53 64 55 V64 H0 Z",
+  },
+  // Land in the near tone, sea in the far one, ripples in white ON the sea. The islands sit on the
+  // waterline rather than behind it, which is what makes it an archipelago and not a cliff.
+  archipelago: {
+    back: "M0 46 H64 V64 H0 Z",
+    front: "M4 46 Q16 26 28 46 Z M34 46 Q47 32 60 46 Z",
+    highlight: "M6 53 H24 M34 55 H54 M14 59 H44",
+    highlightStroke: true,
+  },
+  // The cut is drawn as ABSENCE: the near mesa simply is not there between x=24 and x=42, so the lighter
+  // far wall shows through it, terraced by the step profile at its foot. A notch painted as a line would
+  // have been a scratch on a wall — which is what the first version looked like.
+  canyon: {
+    back: "M0 28 H64 V64 H0 Z",
+    front: "M0 28 H16 L22 40 H30 L34 52 H40 L44 40 H52 L58 28 H64 V64 H0 Z",
+  },
+};
+
+/** The mark for a preset id, with the level-ground plate as the fallback for one we have never seen. */
+function presetMark(id: string): PresetMark {
+  return PRESET_MARKS[id] ?? PRESET_MARKS.flat;
+}
+
+function PresetArt({ id }: { id: string }) {
+  const mark = presetMark(id);
+  return (
+    // Decorative: the tile already states the preset's name, and `SwatchTile` gives the button its
+    // accessible name. A second reading of the same fact is noise in a screen reader, not help.
+    <svg viewBox="0 0 64 64" role="presentation" aria-hidden focusable="false" preserveAspectRatio="xMidYMid slice">
+      {mark.back ? <path d={mark.back} fill={color.border.strong} /> : null}
+      <path d={mark.front} fill={color.text.muted} />
+      {mark.highlight ? (
+        // Filled for a mass (snow), stroked for a line set (the lagoon's water marks) — declared by the
+        // mark rather than inferred from its path data, so adding a preset is one table row.
+        <path
+          d={mark.highlight}
+          fill={mark.highlightStroke ? "none" : color.bg.panel}
+          stroke={mark.highlightStroke ? color.bg.panel : "none"}
+          strokeWidth={2}
+          strokeLinecap="round"
+        />
+      ) : null}
+    </svg>
+  );
+}
 
 /** A layer's kind name, whatever shape serde gave it. */
 function layerKind(kind: TerrainLayerKind): string {
@@ -268,36 +384,47 @@ export function TerrainPanel({ client, statsIntervalMs = 1000, style }: TerrainP
         {/* No PanelHeader: the dock that hosts this panel already carries the title and subtitle, and a
             second "Terrain" heading directly beneath the first is the kind of duplication that makes an
             interface feel unowned. */}
-        <div style={{ padding: space.lg, display: "grid", gap: space.md, minWidth: 0 }}>
-          <p style={{ margin: 0, color: color.text.secondary, fontSize: fontSize.body, lineHeight: 1.5 }}>
-            Describe the landscape you want, or pick a starting point. Either way you get a{" "}
-            <em>recipe</em> — a seed, a stack of layers and the strokes you paint on top — and every value
-            stays editable afterwards. Nothing is baked in.
-          </p>
-          <DescribeBox client={client} busy={busy} run={run} />
-          <div style={{ height: 1, background: color.border.subtle, margin: `${space.xs}px 0` }} aria-hidden />
-          <SectionHeader>Or start from a preset</SectionHeader>
-          <div style={{ display: "grid", gap: space.sm }} data-testid="terrain-presets">
-            {presets.map((p) => (
-              <Button
-                key={p.id}
-                variant="ghost"
-                disabled={busy}
-                data-testid={`terrain-preset-${p.id}`}
-                onClick={() => void run(() => client.terrainCreate(p.id), `Couldn’t create ${p.name}`)}
-                // Ghost, not bordered: six outlined cards in a column is more chrome than a list of six
-                // choices needs. The hover state carries the affordance.
-                style={{ justifyContent: "flex-start", textAlign: "left", height: "auto", padding: `${space.sm}px ${space.md}px`, minWidth: 0, whiteSpace: "normal" }}
-              >
-                <span style={{ display: "grid", gap: space.xxs, minWidth: 0 }}>
-                  <span style={{ fontSize: fontSize.label }}>{p.name}</span>
-                  <span style={{ fontSize: fontSize.meta, color: color.text.secondary, fontWeight: 400 }}>
-                    {p.description}
-                  </span>
-                </span>
-              </Button>
-            ))}
+        {/* TWO WAYS IN, EACH A LABELLED GROUP, AND NO ESSAY.
+            This surface used to open with a five-line paragraph explaining what a recipe is, above a
+            description box, above six headings-with-a-sentence that were `Button`s and read as body
+            copy. Three problems, one cause — the panel was explaining itself in prose where the
+            reference sheets show a grid. The prose is gone (a recipe explains itself the moment there
+            IS one, and the panel below is that explanation), and the presets are what the constitution's
+            asset-browser section already asks for and `SwatchGrid` already implements: large previews on
+            a responsive grid. Six choices now fit in the space two of them used, and each one shows the
+            shape of the ground it makes before its name is read.
+
+            The headings sit flush with what they label. `SectionHeader` used to carry its own 12px
+            inline padding on top of whatever container it was in, which is why the old preset heading
+            started 12px to the right of the choices below it; that indent now lives in one place. */}
+        <div style={{ padding: space.lg, display: "grid", gap: space.xl, minWidth: 0 }}>
+          <div style={{ display: "grid", gap: space.sm, minWidth: 0 }}>
+            <SectionHeader>Describe it</SectionHeader>
+            <DescribeBox client={client} busy={busy} run={run} />
           </div>
+
+          <div style={{ display: "grid", gap: space.sm, minWidth: 0 }}>
+            <SectionHeader>Or start from a preset</SectionHeader>
+            <SwatchGrid label="Terrain presets" data-testid="terrain-presets">
+              {presets.map((p) => (
+                <SwatchTile
+                  key={p.id}
+                  label={p.name}
+                  preview={<PresetArt id={p.id} />}
+                  // The description is the tooltip rather than a third line under every tile. It is one
+                  // sentence about what the preset produces and what it is good for — worth having, and
+                  // not worth six copies of it turning a grid back into the column this replaced.
+                  title={p.description}
+                  actionLabel={`Create ${p.name}`}
+                  disabled={busy}
+                  disabledReason={BUSY_REASON}
+                  onSelect={() => void run(() => client.terrainCreate(p.id), `Couldn’t create ${p.name}`)}
+                  data-testid={`terrain-preset-${p.id}`}
+                />
+              ))}
+            </SwatchGrid>
+          </div>
+
           {message ? (
             <p role="alert" style={{ margin: 0, color: color.warn.text, fontSize: fontSize.meta }}>
               {message}
@@ -394,9 +521,14 @@ export function TerrainPanel({ client, statsIntervalMs = 1000, style }: TerrainP
                 {section.id === "describe" ? (
                   <>
                     <DescribeBox client={client} busy={busy} run={run} compact />
+                    {/* ONE LINE, NOT A PARAGRAPH. This was 33 words across five lines in a 276px column,
+                        and it said three things: rebuilding is one undo step; the sections below are what
+                        the description wrote; they are editable. The second and third are demonstrated by
+                        the sections themselves being right there and being ordinary controls — a panel
+                        that has to tell you its fields are editable has a different problem. What is left
+                        is the one fact the surface cannot show you: what pressing Rebuild costs. */}
                     <span style={{ fontSize: fontSize.meta, color: color.text.secondary, lineHeight: 1.5 }}>
-                      Rebuilding replaces this world in one undo step. Your layers, materials and rules below
-                      are whatever the last description wrote — edit them freely; describing again starts over.
+                      Rebuilding replaces this world, in one undo step.
                     </span>
                   </>
                 ) : null}
@@ -554,6 +686,9 @@ function RouteCrossingCheck({
           compact
           data-testid="terrain-crossing-check"
           disabled={busy || checking || !ends}
+          disabledReason={
+            busy ? BUSY_REASON : checking ? "Still tracing the last route" : "Pick two ends first — this checks whether a path exists between them"
+          }
           onClick={() => {
             if (!ends) return;
             setChecking(true);
@@ -586,14 +721,22 @@ function RouteCrossingCheck({
 }
 
 
-/** Descriptions offered as buttons, so the feature is discoverable without a blank-page problem. */
-const EXAMPLES = [
-  "a 4 km eroded alpine valley with a river and dense conifer forest",
-  "a lush tropical archipelago with beaches and palms",
+/** Descriptions offered as one-click pills, so the feature is discoverable without a blank-page problem.
+ *
+ *  A SHORT LABEL AND THE FULL SENTENCE ARE TWO DIFFERENT JOBS, and printing the sentence was doing
+ *  neither. Five complete descriptions, stacked full-width in a 276px column, took five wrapped rows —
+ *  more vertical space than the description box, the button and the status line together — to say the
+ *  same thing a pill says in two words. What a reader needs here is *that there are examples and roughly
+ *  what kinds*; what the box needs is the sentence. So the pill shows the kind, the tooltip shows the
+ *  sentence, and clicking puts the sentence in the box unchanged. Nothing was shortened — the text
+ *  field still receives every word the old row carried. */
+const EXAMPLES: { label: string; text: string; mode: "create" | "change" }[] = [
+  { label: "Alpine valley", text: "a 4 km eroded alpine valley with a river and dense conifer forest", mode: "create" },
+  { label: "Tropical islands", text: "a lush tropical archipelago with beaches and palms", mode: "create" },
   // The second half of the feature: refining the world you already have.
-  "raise this mountain by 150 m",
-  "widen the river and make this valley traversable",
-  "plant a dense forest here",
+  { label: "Raise a mountain", text: "raise this mountain by 150 m", mode: "change" },
+  { label: "Widen the river", text: "widen the river and make this valley traversable", mode: "change" },
+  { label: "Plant a forest", text: "plant a dense forest here", mode: "change" },
 ];
 
 /**
@@ -681,17 +824,23 @@ function DescribeBox({
           relationship at all, because there is none (WCAG 2.2 SC 1.3.1 — a relationship conveyed by
           visual arrangement alone). `aria-describedby` states it, and the sentence itself now names
           the refusal rather than only inviting the action. */}
-      <div style={{ display: "flex", gap: space.xs, alignItems: "center" }}>
-        <span id={DESCRIBE_STATUS_ID} data-testid="terrain-describe-status" style={{ flex: 1, fontSize: fontSize.meta, color: color.text.secondary }}>
+      {/* THE STATUS LINE STOPPED CARRYING THE EXAMPLES, BECAUSE THE EXAMPLES ARE NOW ON SCREEN.
+          Two of its four sentences ended in `“raise this mountain”, “widen the river”` — the same two
+          descriptions the pills directly below offer as one click each. At the 276px this column really
+          is, that made a 79-character sentence wrap to three lines beside the button and shove the "Try
+          one" heading into it. The refusal itself is unchanged and still reaches a screen reader through
+          `aria-describedby`; the button's `disabledReason` still carries the longer form on hover. */}
+      <div style={{ display: "flex", gap: space.sm, alignItems: "center" }}>
+        <span id={DESCRIBE_STATUS_ID} data-testid="terrain-describe-status" style={{ flex: 1, minWidth: 0, fontSize: fontSize.meta, color: color.text.secondary }}>
           {plan
             ? plan.kind === "create"
               ? "builds a new world"
               : `${plan.steps.length} change${plan.steps.length === 1 ? "" : "s"} to this world`
             : busy
-              ? "Building — the world is being rebuilt from this description."
+              ? "Building…"
               : text.trim()
-                ? "Describe a world, or change this one — “raise this mountain”, “widen the river”."
-                : "Type a description first — “raise this mountain”, “widen the river”."}
+                ? "Builds a new world, or changes this one."
+                : "Type a description first."}
         </span>
         <Button
           variant="primary"
@@ -776,41 +925,32 @@ function DescribeBox({
         </div>
       ) : null}
 
-      {compact ? null : (
-        <div style={{ display: "grid", gap: space.xxs, minWidth: 0 }} data-testid="terrain-examples">
-          <span style={{ ...textRole.eyebrow, paddingBottom: space.xxs }}>Try one</span>
-          {EXAMPLES.map((ex) => (
-            <Button
-              key={ex}
-              variant="ghost"
-              compact
-              disabled={busy}
-              onClick={() => setText(ex)}
-              // A resting surface and a leading mark. As bare ghost buttons these read as body copy, so the
-              // quickest way into the whole feature looked like a paragraph nobody could click.
-              style={{
-                justifyContent: "flex-start",
-                textAlign: "left",
-                height: "auto",
-                padding: `${space.sm}px ${space.md}px`,
-                minWidth: 0,
-                whiteSpace: "normal",
-                background: color.bg.inset,
-                borderRadius: radius.md,
-                gap: space.sm,
-                alignItems: "flex-start",
-              }}
+      {/* THE EXAMPLES USED TO BE HIDDEN IN THE ONE STATE THEY APPLIED TO.
+          All five showed on the empty surface — including "raise this mountain", which needs a mountain
+          — and `compact`, the form used once a world exists, showed none at all. So the three examples
+          about CHANGING a world were offered only where there was nothing to change, and withheld
+          everywhere else. Same list, filtered by which half of the feature this instance is for. */}
+      <div style={{ display: "grid", gap: space.xs, minWidth: 0 }} data-testid="terrain-examples">
+        <span style={textRole.eyebrow}>Try one</span>
+        {/* A WRAPPED ROW OF PILLS, NOT A COLUMN OF SENTENCES. The shared action chip is the editor's
+            one spelling of "a small thing you press once"; before it existed this was five ghost
+            buttons re-dressed inline with a background, a radius, a leading chevron and a wrap
+            override — a pill design invented in this file, which is exactly what the constitution's
+            root-cause rule forbids. */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: space.xs, minWidth: 0 }}>
+          {EXAMPLES.filter((ex) => ex.mode === (compact ? "change" : "create")).map((ex) => (
+            <AssetChip
+              key={ex.label}
+              tone="neutral"
+              title={ex.text}
+              data-testid="terrain-example"
+              onSelect={() => setText(ex.text)}
             >
-              <span aria-hidden style={{ color: color.accent.base, fontSize: fontSize.meta, lineHeight: 1.5 }}>
-                ›
-              </span>
-              <span style={{ fontSize: fontSize.meta, color: color.text.secondary, fontWeight: 400, lineHeight: 1.5 }}>
-                {ex}
-              </span>
-            </Button>
+              {ex.label}
+            </AssetChip>
           ))}
         </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -921,6 +1061,7 @@ function ShapeSection({
               aria-label={`${layer.enabled ? "Disable" : "Enable"} ${layer.name}`}
               data-testid={`terrain-layer-toggle-${i}`}
               disabled={busy}
+              disabledReason={BUSY_REASON}
               onClick={() => void edit({ op: "toggleLayer", index: i, enabled: !layer.enabled }, "Couldn’t toggle that layer")}
             >
               {layer.enabled ? "On" : "Off"}
@@ -932,6 +1073,7 @@ function ShapeSection({
               compact
               aria-label={`Move ${layer.name} down the stack`}
               disabled={busy || i === 0}
+              disabledReason={busy ? BUSY_REASON : `${layer.name} is already at the bottom of the stack`}
               onClick={() => void edit({ op: "moveLayer", index: i, delta: -1 }, "Couldn’t reorder that layer")}
             >
               <Icon name="arrow-up" size="sm" />
@@ -941,6 +1083,7 @@ function ShapeSection({
               compact
               aria-label={`Move ${layer.name} up the stack`}
               disabled={busy || i === recipe.layers.length - 1}
+              disabledReason={busy ? BUSY_REASON : `${layer.name} is already at the top of the stack`}
               onClick={() => void edit({ op: "moveLayer", index: i, delta: 1 }, "Couldn’t reorder that layer")}
             >
               <Icon name="arrow-down" size="sm" />
@@ -951,6 +1094,7 @@ function ShapeSection({
               aria-label={`Remove ${layer.name}`}
               data-testid={`terrain-layer-remove-${i}`}
               disabled={busy}
+              disabledReason={BUSY_REASON}
               onClick={() => void edit({ op: "removeLayer", index: i }, "Couldn’t remove that layer")}
             >
               <Icon name="close" size="sm" />
@@ -968,9 +1112,10 @@ function ShapeSection({
       >
         {tool === "sculpt" ? "Sculpting — click the viewport to paint" : "Sculpt in the viewport"}
       </Button>
+      {/* Same cut as the describe box's note. The ring under the cursor explains itself the instant the
+          tool is armed; what a reader cannot discover by looking is the undo granularity. */}
       <span style={{ fontSize: fontSize.meta, color: color.text.secondary, lineHeight: 1.5 }}>
-        Drag on the terrain to paint. The ring under the cursor is the brush; the ground follows it live and
-        the whole drag lands as one undo step.
+        A whole drag lands as one undo step.
       </span>
       <PropertyRow label="Brush" htmlFor="terrain-brush-kind">
         <SelectField
@@ -1017,7 +1162,11 @@ function ShapeSection({
           compact
           data-testid="terrain-sculpt-test"
           disabled={busy}
-          title="Paint one dab at the world centre — the same operation a viewport drag records."
+          // CONDITIONAL, on the same predicate as `disabled`. `Button` resolves `title ?? reason`, so an
+          // unconditional title is a permanent block on the refusal ever speaking — the control would
+          // keep explaining what it does while going dark for a reason it could not state.
+          title={busy ? undefined : "Paint one dab at the world centre — the same operation a viewport drag records."}
+          disabledReason={BUSY_REASON}
           onClick={() =>
             void edit(
               {
@@ -1044,6 +1193,7 @@ function ShapeSection({
           compact
           data-testid="terrain-clear-strokes"
           disabled={busy || strokeCount === 0}
+          disabledReason={busy ? BUSY_REASON : "Nothing has been sculpted yet, so there are no strokes to clear"}
           onClick={() => void edit({ op: "clearStrokes" }, "Couldn’t clear the strokes")}
         >
           Clear
@@ -1147,6 +1297,7 @@ function LifeSection({ recipe, busy, edit }: { recipe: TerrainRecipe; busy: bool
                 variant="secondary"
                 compact
                 disabled={busy}
+                disabledReason={BUSY_REASON}
                 data-testid={`terrain-proto-bind-${i}`}
                 onClick={() =>
                   void edit(
@@ -1279,6 +1430,7 @@ function RoutesSection({
           compact
           data-testid="terrain-route-undo"
           disabled={busy || route.points === 0}
+          disabledReason={busy ? BUSY_REASON : "No route points placed yet, so there is nothing to undo"}
           onClick={() => void client.terrainRouteClear(true).then((n) => setRoute({ ...route, points: n }))}
         >
           Undo point
@@ -1288,6 +1440,7 @@ function RoutesSection({
           compact
           data-testid="terrain-route-commit"
           disabled={busy || route.points < 2}
+          disabledReason={busy ? BUSY_REASON : "A route needs at least two points — click the ground to place them"}
           onClick={() => {
             const material = recipe.materials.findIndex((m) => /road|gravel|path/i.test(m.name));
             void client
@@ -1315,6 +1468,7 @@ function RoutesSection({
         aria-pressed={water.enabled}
         data-testid="terrain-water-enabled"
         disabled={busy}
+        disabledReason={BUSY_REASON}
         onClick={() =>
           void edit(
             { op: "setWater", water: { ...water, enabled: !water.enabled } },

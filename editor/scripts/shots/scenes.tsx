@@ -35,6 +35,7 @@ import RIG_MIXAMO from "../../src/panels/__fixtures__/rig-characterization.json"
 import RIG_BLOCKED from "../../src/panels/__fixtures__/rig-not-retargetable.json";
 import { MatchPanel } from "../../src/panels/MatchPanel";
 import { PhysicsPanel } from "../../src/panels/PhysicsPanel";
+import { TerrainPanel } from "../../src/panels/TerrainPanel";
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { assetShelfStore } from "../../src/store/assetShelf";
@@ -1018,8 +1019,132 @@ export const SCENES: Scene[] = [
   ...assetScenes(),
   ...modelScenes(),
   ...gameplayScenes(),
+  ...terrainScenes(),
   ...shellScenes(),
 ];
+
+// ── the Terrain sub-engine's way in ───────────────────────────────────────────────────────────────
+
+/** THE PANEL THAT EXPLAINED ITSELF IN PROSE WHERE THE REFERENCES SHOW A GRID.
+ *
+ *  `shell-terrain` has photographed this column inside the editor since ADR-124, and its caption names
+ *  the width problem — "the widest workspace in the dock, and the one that has already overflowed it
+ *  once" — but no claim has ever been attached to what is INSIDE it before a terrain exists, which is
+ *  the first thing every author sees. What the capture shows: a 43-word paragraph about what a recipe
+ *  is; a description box; a status line whose two long sentences ended in the same two examples printed
+ *  again directly below it; five of those examples as full-width rows of body copy; then a heading
+ *  indented 12px past the choices it labels, over six presets drawn as a name and a sentence each, with
+ *  no tile, no preview and no affordance. Six choices, and only three of them existed — the browser
+ *  mock published half the engine's catalogue, so the grid that wraps at six had never been seen.
+ *
+ *  Written as the claims the panel must satisfy, and added BEFORE the change so they went red first —
+ *  the same discipline `gameplayScenes` records. The claim that matters most is `max_height`: prose is
+ *  cheap to write and expensive to scroll, and the only honest way to say "this stopped being an essay"
+ *  is to measure it. */
+function terrainScenes(): Scene[] {
+  const terrain = () => <TerrainPanel client={createMockSession()} statsIntervalMs={0} />;
+  return [
+    {
+      id: "terrain-start",
+      looking_for:
+        "the two ways into the Terrain sub-engine, at the 300px the left dock really is between 980 " +
+        "and 1199. A description box with its examples as a WRAPPED ROW OF PILLS, and every one of " +
+        "the engine's six presets as a tile whose drawing says which shape of ground it makes before " +
+        "its name is read. What a reader is checking: no paragraph anywhere; the two group headings " +
+        "flush with the content they label, not indented past it; the status line and Build it " +
+        "sharing one line; and six tiles in a grid rather than six sentences in a column",
+      width: 300,
+      expect: {
+        // Every preset the engine publishes, each with a drawing in it. The `svg path` count is the
+        // part that cannot be satisfied by an empty well — a tile with no mark photographs as a tile.
+        present: [
+          ["[data-testid^='terrain-preset-']", 6],
+          ["[data-testid^='terrain-preset-'] svg path", 6],
+          // TWO, not five. The other three describe CHANGES to a world, and this is the surface whose
+          // whole condition is that there is no world — they belong to the compact box, which is what
+          // `terrain-authored` photographs.
+          ["[data-testid='terrain-example']", 2],
+        ],
+        // `Icon` draws an empty, still-sized box for a name the set lacks, so a blank control
+        // photographs like a working one.
+        absent: ["[data-icon-missing]"],
+        text_present: ["Describe it", "Or start from a preset", "Desert Dunes", "Canyon Mesa"],
+        // The paragraph this pass deleted, by its most distinctive phrase. A prose block is the one
+        // thing that grows back by accident, because writing one always feels like helping.
+        text_absent: ["null", "undefined", "NaN", "Nothing is baked in", "raise this mountain”, “widen the river"],
+        // THE MEASUREMENT, and the reason this scene exists rather than a `text_absent` alone. The
+        // whole way in has to fit the dock without scrolling: 6 tiles + 5 pills + a box + two
+        // headings. The old surface needed 1,180px of column for the same two choices.
+        max_height: [["[data-testid='terrain-panel']", 620]],
+        // A heading indented past its own content reads as belonging to something else. Both group
+        // headings start on the same x as the things they label.
+        stacked: [
+          ["[data-testid='terrain-describe']", "[data-testid='terrain-presets']"],
+        ],
+        // The status line and its button share a row — the defect the shortened status fixes is that
+        // it wrapped to three lines and shoved the "Try one" heading into itself.
+        same_line: [["[data-testid='terrain-describe-status']", "[data-testid='terrain-describe-build']"]],
+        // Nothing may be cut at the width the dock really is. The tiles are the new thing and the
+        // pills are the new thing; both are claimed.
+        unclipped: [
+          "[data-testid='terrain-presets']",
+          "[data-testid='terrain-example']",
+          "[data-testid='terrain-describe-build']",
+        ],
+      },
+      render: terrain,
+    },
+    {
+      id: "terrain-start-wide",
+      looking_for:
+        "the SAME surface in the 340px track the dock takes above 1200px. The grid's column count is " +
+        "the browser's decision from a minimum tile width, so what is being checked is that the extra " +
+        "40px goes into the tiles rather than into a ragged row: still six tiles, still nothing cut, " +
+        "and the pills still on a row rather than a column",
+      width: 340,
+      expect: {
+        present: [["[data-testid^='terrain-preset-']", 6], ["[data-testid='terrain-example']", 2]],
+        absent: ["[data-icon-missing]"],
+        text_absent: ["null", "undefined", "NaN", "Nothing is baked in"],
+        max_height: [["[data-testid='terrain-panel']", 620]],
+        same_line: [
+          ["[data-testid='terrain-describe-status']", "[data-testid='terrain-describe-build']"],
+          // Three columns at 340 as at 300 — the tiles absorb the width. A row that broke to two
+          // would mean the grid's minimum is doing the deciding, not the design.
+          ["[data-testid='terrain-preset-flat']", "[data-testid='terrain-preset-alpine']"],
+        ],
+        unclipped: ["[data-testid='terrain-presets']", "[data-testid='terrain-example']"],
+      },
+      render: terrain,
+    },
+    {
+      id: "terrain-authored",
+      looking_for:
+        "the surface a preset leads to, reached by pressing one — the folding sections, and the " +
+        "compact describe box at the top of them. What a reader is checking is the half of " +
+        "describe-to-build that used to be invisible: the three examples about CHANGING a world are " +
+        "offered here, on a wrapped row, where they are the only ones that can work — and were shown " +
+        "only on the empty surface, where none of them could",
+      width: 300,
+      // Pressing a tile is the way an author reaches this state, so the scene reaches it that way too
+      // rather than by handing the panel a fixture no gesture produces.
+      click: ["[data-testid='terrain-preset-rolling-hills']"],
+      expect: {
+        present: [
+          ["[data-testid='terrain-section-describe']", 1],
+          ["[data-testid='terrain-example']", 3],
+        ],
+        absent: ["[data-icon-missing]", "[data-testid='terrain-presets']"],
+        text_present: ["Raise a mountain", "Widen the river", "Rebuild"],
+        // The create-side examples are for the other box. Seeing one here means the filter is gone.
+        text_absent: ["null", "undefined", "NaN", "Alpine valley", "Tropical islands"],
+        same_line: [["[data-testid='terrain-describe-status']", "[data-testid='terrain-describe-build']"]],
+        unclipped: ["[data-testid='terrain-example']", "[data-testid='terrain-describe-build']"],
+      },
+      render: terrain,
+    },
+  ];
+}
 
 // ── the Gameplay sub-engine workspace ──────────────────────────────────────────────────────────────
 
@@ -1945,18 +2070,24 @@ function shellScenes(): Scene[] {
   // the Inspector, and the repair was to widen the track by hand after a human noticed.
   ...(
     [
-      ["build", "Build — place and create: the toolbar, the asset browser and the describe bar stacked in one 300 px column", "[data-testid='authbar']"],
+      // TWO MARKERS, and the second one is the asset library rather than a second reading of the
+      // toolbar. `authbar` mounts the instant the workspace does; the library's tiles arrive from a
+      // `catalog()` promise afterwards and take the frame from 35 controls to 104. A claim satisfied
+      // by the first of those photographs the second one arriving — which is exactly what the
+      // post-capture drift check kept reporting. The caption already named three things in this
+      // column; now it can only pass with two of them on screen.
+      ["build", "Build — place and create: the toolbar, the asset browser and the describe bar stacked in one 300 px column", "[data-testid='authbar']", "[data-testid='asset-item']"],
       ["terrain", "Terrain — the widest workspace in the dock, and the one that has already overflowed it once", "[data-testid='terrain-presets']"],
       ["physics", "Physics — numeric read-outs and a contact list, the shape most likely to demand width", "[data-testid='dropBall']"],
       ["gameplay", "Gameplay — roles, cinema and VFX stacked in a column narrower than any of them", "[data-testid='match-panel']"],
     ] as const
-  ).map(([engine, blurb, marker]) =>
+  ).map(([engine, blurb, ...markers]) =>
     shell(
       `shell-${engine}`,
       1000,
       `${blurb}. Photographed at 1000 px, where the dock is at its narrowest that is still open`,
       {
-        present: [[marker, 1]],
+        present: markers.map((m) => [m, 1] as [string, number]),
         // The stage floor is the point: a dock that will not yield takes the difference out of the
         // viewport, and this is the width where it has the least room to hide.
         min_width: [["[data-testid='left-dock']", 1]],
