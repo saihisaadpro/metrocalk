@@ -943,6 +943,116 @@ if (scenes.length === 0) {
   process.exit(1);
 }
 
+/** The cap on `settle`, and it is a CAP rather than a budget: nothing waits for it when the page has
+ *  settled, and when it expires the scene's own claim decides the verdict and prints its own message. */
+const SETTLE_CAP_MS = 8_000;
+
+/** Runs IN THE PAGE. A cheap, stable fingerprint of the layout: how wide the frame is, and where every
+ *  visible control sits inside it.
+ *
+ *  ONE DEFINITION, THREE READERS, and the third is why it moved to `window`. It was written for the
+ *  post-capture comparison — did the screenshot move the page it photographed — and `settle` needs the
+ *  SAME reading, because "has this page stopped moving" and "did it move" are the same question asked
+ *  a moment apart. `settle`'s first version sampled `innerHTML.length` instead, which is a different
+ *  question: markup can be final while three controls are still sliding into place, and `shell-build`
+ *  failed on exactly that in three consecutive full runs — every assertion green, the capture reporting
+ *  that the layout had moved underneath it. Settling on the thing the gate measures makes the two agree
+ *  by construction rather than by a margin someone has to keep guessing at.
+ *
+ *  Installed on `window` rather than closed over because the readers are separate `page.evaluate` /
+ *  `waitForFunction` calls, which serialize a function and not its scope. */
+/** The first real difference between two fingerprints, in words. Runs in NODE, on the two strings the
+ *  page produced, so it costs nothing until something has already gone wrong. */
+function describeDrift(before, after) {
+  const [beforeBox, beforeCount, ...beforeRest] = before.split("|");
+  const [afterBox, afterCount, ...afterRest] = after.split("|");
+  if (beforeBox !== afterBox) return `the frame went from ${beforeBox} to ${afterBox}`;
+  if (beforeCount !== afterCount) {
+    return `the frame held ${beforeCount} control(s) before the capture and ${afterCount} after it`;
+  }
+  const a = (beforeRest.join("|") || "").split(" ");
+  const b = (afterRest.join("|") || "").split(" ");
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return `control #${i} moved from \`${a[i] ?? "(absent)"}\` to \`${b[i] ?? "(absent)"}\` (TAG:left,top,width)`;
+  }
+  return "the two readings differ in a way this summary cannot name, which is itself a defect in it";
+}
+
+function installFingerprint() {
+  window.__mtkFingerprint = () => {
+    const frame = document.querySelector('[data-testid="shot-frame"]');
+    if (!frame) return "no frame";
+    const box = frame.getBoundingClientRect();
+    const sel = 'button, a[href], input, select, textarea, [role="button"]';
+    const rows = [...frame.querySelectorAll(sel)].map((el) => {
+      const r = el.getBoundingClientRect();
+      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
+    });
+    return `${Math.round(box.width)}×${Math.round(box.height)}|${rows.length}|${rows.join(" ")}`;
+  };
+}
+
+/** Wait for the page to be FINISHED, not for a length of time to have passed.
+ *
+ *  WHAT WAS HERE AND WHY IT WAS WRONG. Two `setTimeout`s — 250 ms after `goto` "because the panels
+ *  fetch their report in an effect", and 300 ms after each click "because the workspace is lazy-loaded
+ *  behind Suspense". Both are a WALL-CLOCK BUDGET STANDING IN FOR A CONDITION, which is a bug this
+ *  repository has now paid for in four separate places. The budget is not wrong on an idle machine; it
+ *  is wrong on a busy one, and a gate that passes when the machine is quiet and fails when it is not
+ *  has stopped being a gate and become a coin.
+ *
+ *  MEASURED HERE: `shell-dock-model` passed twice in isolation and failed inside the 53-scene run,
+ *  reporting the Model workspace's content box as 0px tall with 188px of content in it. That is not a
+ *  layout defect, it is a photograph taken while a dynamic `import()` was still in flight.
+ *
+ *  THE CONDITION IS THE SCENE'S OWN CLAIM, and the first attempt at this file got that wrong in an
+ *  instructive way. Waiting for the markup to stop changing is NOT the condition: while a lazy chunk is
+ *  in flight the DOM is perfectly stable — it is showing the Suspense fallback — so a stability poll
+ *  reports "settled" and the capture happens anyway. Five scenes went red on that version. `present`
+ *  and `text_present` already say what has to be on screen, so those are what is waited for, and
+ *  stability is kept only as the second half of the condition (a lazy panel that mounts in pieces can
+ *  satisfy a selector one frame before it finishes laying out).
+ *
+ *  `want === null` asks for stability alone. That is right before the gesture that brings the claim's
+ *  subject into existence, and wrong after it. */
+async function settle(page, want) {
+  await page.evaluate(() => {
+    window.__mtkSettle = { last: null, same: 0 };
+  });
+  await page
+    .waitForFunction(
+      (w) => {
+        const frame = document.querySelector('[data-testid="shot-frame"]');
+        if (!frame) return false;
+        if (w) {
+          for (const [sel, atLeast] of w.present) {
+            if (frame.querySelectorAll(sel).length < atLeast) return false;
+          }
+          const text = frame.textContent ?? "";
+          for (const s of w.text) if (!text.includes(s)) return false;
+        }
+        const now = window.__mtkFingerprint();
+        const state = window.__mtkSettle;
+        state.same = now === state.last ? state.same + 1 : 0;
+        state.last = now;
+        // Four consecutive identical readings at the fixed cadence below — ~400 ms of a page whose
+        // controls have all stopped moving, paid whether or not anything was ever pending. That is
+        // the price of the whole suite being a gate rather than a coin, and on 53 scenes it is ~30 s.
+        return state.same >= 4;
+      },
+      // A FIXED 100 ms CADENCE, NOT `raf`. Two reasons, and the second is the one that cost a run.
+      // rAF is throttled by whatever else the page is doing, so the sampling interval — and therefore
+      // what "four identical readings" means in milliseconds — varies with load, which is the property
+      // this whole rewrite exists to remove. And 4 rAF frames is ~65 ms of quiet, which is not enough
+      // to outlast an async reply already in flight: `shell-build`'s asset catalogue arrives from a
+      // `catalog()` promise and takes the frame from 35 controls to 104, and the gap between the
+      // toolbar mounting and the library landing is a perfectly stable page. 4 × 100 ms is.
+      { polling: 100, timeout: SETTLE_CAP_MS },
+      want,
+    )
+    .catch(() => {});
+}
+
 let failed = 0;
 for (const scene of scenes) {
   const { id, looking_for, expect, viewport, click } = scene;
@@ -977,8 +1087,15 @@ for (const scene of scenes) {
   page.on("pageerror", (e) => problems.push(`pageerror: ${e}`));
   page.on("console", (m) => m.type() === "error" && problems.push(`console.error: ${m.text()}`));
 
+  // What the claim says must be on screen — the positive half of it, which is the only half a wait can
+  // be satisfied by. `absent` and `text_absent` are true of an empty page, so waiting on them would
+  // wait for nothing.
+  const positives = { present: expect.present ?? [], text: expect.text_present ?? [] };
   await page.goto(`${href}?scene=${id}`, { waitUntil: "networkidle0" });
-  await new Promise((r) => setTimeout(r, 250)); // the panels fetch their report in an effect
+  await page.evaluate(installFingerprint);
+  // Before the gesture, only stability: a scene WITH a `click` reaches its subject through that click,
+  // so requiring the claim here would burn the cap waiting for something no one has asked for yet.
+  await settle(page, click?.length ? null : positives);
 
   // Drive the scene to the state it claims to photograph. A selector that matches nothing is a
   // FAILURE: silently skipping it would capture the default state under a caption describing
@@ -990,8 +1107,12 @@ for (const scene of scenes) {
       break;
     }
     await el.click();
-    await new Promise((r) => setTimeout(r, 300)); // the workspace is lazy-loaded behind Suspense
+    await settle(page, null);
   }
+
+  // The gestures are done, so the claim's subject is now something to WAIT for rather than something
+  // to hope arrived — this is the wait that covers a workspace lazy-loaded behind Suspense.
+  if (click?.length) await settle(page, positives);
 
   // MEASURE BEFORE CAPTURING, because capturing MOVES THINGS. `screenshot({ fullPage: true })`
   // resizes the page to the content box and puts it back, and a shell that lays itself out from
@@ -1302,20 +1423,7 @@ for (const scene of scenes) {
   const notes = evaluated.filter((l) => l.startsWith("NOTE "));
   const layout = evaluated.filter((l) => !l.startsWith("NOTE "));
 
-  // A cheap, stable fingerprint of the layout that was just judged: how wide the frame is, and where
-  // every visible control sits inside it. Compared against the same reading taken after the capture.
-  const fingerprint = () => {
-    const frame = document.querySelector('[data-testid="shot-frame"]');
-    if (!frame) return "no frame";
-    const box = frame.getBoundingClientRect();
-    const sel = 'button, a[href], input, select, textarea, [role="button"]';
-    const rows = [...frame.querySelectorAll(sel)].map((el) => {
-      const r = el.getBoundingClientRect();
-      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
-    });
-    return `${Math.round(box.width)}×${Math.round(box.height)}|${rows.length}|${rows.join(" ")}`;
-  };
-  const before = await page.evaluate(fingerprint);
+  const before = await page.evaluate(() => window.__mtkFingerprint());
 
   // `fullPage` exists so a panel taller than the window is captured whole. A scene that set its own
   // `viewport` has declared the window to BE the subject — there is nothing beyond it to reach for —
@@ -1331,14 +1439,13 @@ for (const scene of scenes) {
   // again afterwards and must be unchanged: whatever the capture does, the picture and the verdict
   // are about the same thing, and any future capture path that starts moving the page fails here
   // instead of quietly making every screenshot a lie.
-  const after = await page.evaluate(fingerprint);
-  const disturbed =
-    before === after
-      ? []
-      : [
-          "the capture DISTURBED the layout it captured — the assertions above were checked against " +
-            "one layout and the PNG shows another, so the picture is not evidence of the verdict",
-        ];
+  const after = await page.evaluate(() => window.__mtkFingerprint());
+  // NAME WHAT MOVED. The first version of this check asserted that the two readings differed and
+  // stopped there, which is a verdict with no lead in it: three consecutive full runs reported that
+  // `shell-build`'s layout had moved and nothing in the output said which of its 30-odd controls, by
+  // how much, or in which direction — so the only way to act on it was to guess. A gate that can
+  // detect a difference can afford to print it.
+  const disturbed = before === after ? [] : [`the capture DISTURBED the layout it captured — ${describeDrift(before, after)}. The assertions above were checked against one layout and the PNG shows another, so the picture is not evidence of the verdict`];
 
   const bad = [...problems, ...claim, ...layout, ...disturbed];
   if (colours === null) bad.push("the capture is not an 8-bit RGB/RGBA PNG, so it was not checked");
