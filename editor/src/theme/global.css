@@ -1230,6 +1230,160 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-asset-tile__fav:hover { background: var(--mtk-bg-hover); color: var(--mtk-text-secondary); }
 .mtk-asset-tile__fav.is-on { color: var(--mtk-token); }
 
+/* ── Swatches (theme/assets.tsx) ──
+ * The picker form of a tile: one control, a rendered preview and its word. 84px is what lets three
+ * columns fit the 234px content box a 300px Inspector track gives a section, which is the width these
+ * are actually read at. */
+.mtk-swatch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: var(--mtk-space-2);
+  align-items: start;
+}
+.mtk-swatch {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--mtk-space-2);
+  min-width: 0;
+  padding: var(--mtk-space-2);
+  border: 1px solid transparent;
+  border-radius: var(--mtk-radius-lg);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    border-color var(--mtk-motion-fast) var(--mtk-ease-standard),
+    background var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-swatch:hover { border-color: var(--mtk-border); background: var(--mtk-bg-hover); }
+.mtk-swatch.is-selected { border-color: var(--mtk-accent-border); background: var(--mtk-accent-subtle); }
+.mtk-swatch.is-unavailable { cursor: not-allowed; color: var(--mtk-text-faint); }
+.mtk-swatch.is-unavailable:hover { border-color: transparent; background: none; }
+.mtk-swatch.is-unavailable .mtk-swatch__preview { opacity: 0.4; }
+/* The well. `aspect-ratio` keeps every cell in a row the same height whatever its name does. */
+.mtk-swatch__preview {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1 / 1;
+  width: 100%;
+  overflow: hidden;
+  border-radius: var(--mtk-radius-md);
+  background: var(--mtk-bg-inset);
+  transition: background var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-swatch__sphere { display: block; width: 100%; height: 100%; }
+/* The tick is what makes "which one is set" survive a greyscale print, a colour-blind reader and the
+ * accent being the same hue as a swatch. The ring alone was not enough on the metals. */
+.mtk-swatch__tick {
+  position: absolute;
+  inset-block-start: 2px;
+  inset-inline-end: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--mtk-accent-solid);
+  color: var(--mtk-on-accent);
+}
+.mtk-swatch__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mtk-font-ui);
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--mtk-text-secondary);
+}
+.mtk-swatch.is-selected .mtk-swatch__label { color: var(--mtk-text); font-weight: 500; }
+/* The cleared option's mark. Not a sphere: "no override" has no colour, and drawing a grey ball for it
+ * would claim the object is grey — which is the one thing it is definitely not. */
+.mtk-swatch__none {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--mtk-text-muted);
+}
+
+/* ── Material picker (panels/MaterialPanel.tsx) ── */
+.mtk-material {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mtk-space-3);
+}
+.mtk-material__handle {
+  font-family: var(--mtk-font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.mtk-material__note {
+  margin: 0;
+  font-family: var(--mtk-font-ui);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--mtk-text-muted);
+}
+
+/* ── AI suggestion (panels/AiEditPanel.tsx) ── */
+.mtk-ai-edit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mtk-space-2);
+  padding-block-start: var(--mtk-space-3);
+  border-block-start: 1px solid var(--mtk-border-subtle);
+}
+.mtk-ai-edit__head { display: flex; align-items: center; gap: var(--mtk-space-2); }
+.mtk-ai-edit__label {
+  font-family: var(--mtk-font-ui);
+  font-size: 11px;
+  color: var(--mtk-text-muted);
+}
+/* One accent, and it is a tint rather than a fill: the assisted row is optional and priced, so it must
+ * read as available without competing with the primary action of whatever panel hosts it.
+ *
+ * AND IT WRAPS. `.mtk-btn` is `white-space: nowrap`, which is right for a toolbar and wrong for a
+ * full-width row whose label is a sentence with a price on the end: at the Inspector's real 234px
+ * content box this button needed 242px and painted its own text outside its box. That was true of the
+ * shipped panel too and no capture had ever contained it, because the Material section was collapsed
+ * by default and no scene photographed it — the `material-picker` scene found it on its first run.
+ * The price stays ON the control rather than moving to the note below it: `<ux_quality>` 3 wants the
+ * cost legible at the thing that spends it. */
+.mtk-ai-edit__trigger {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: start;
+  white-space: normal;
+  line-height: 1.35;
+  color: var(--mtk-accent);
+  border-color: var(--mtk-accent-border);
+  background: var(--mtk-accent-subtle);
+}
+/* The mark must not shrink when the label beside it takes two lines, and it belongs on the FIRST one. */
+.mtk-ai-edit__trigger > svg { flex: none; align-self: flex-start; margin-block-start: 1px; }
+.mtk-ai-edit__note {
+  margin: 0;
+  font-family: var(--mtk-font-ui);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--mtk-text-muted);
+}
+.mtk-ai-edit__question { margin-block-end: var(--mtk-space-2); color: var(--mtk-text); }
+.mtk-ai-edit__diff {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--mtk-space-2);
+  margin-block-end: var(--mtk-space-3);
+}
+.mtk-ai-edit__actions { display: flex; gap: var(--mtk-space-2); justify-content: flex-end; }
+
 
 /* ── Keyframes ── */
 @keyframes mtk-toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }

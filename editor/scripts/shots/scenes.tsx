@@ -28,6 +28,8 @@ import { Inspector } from "../../src/inspector/Inspector";
 import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
 import { Diagnostics } from "../../src/panels/Diagnostics";
+import { MaterialPanel } from "../../src/panels/MaterialPanel";
+import { MATERIAL_PRESETS, MaterialSphere } from "../../src/theme/materials";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { Reveal } from "../../src/panels/Reveal";
 import { RigPanel, type RigDocument } from "../../src/panels/RigPanel";
@@ -1014,6 +1016,7 @@ export const SCENES: Scene[] = [
   ...poseScenes(),
   ...graphScenes(),
   ...inspectorScenes(),
+  ...materialScenes(),
   ...assetScenes(),
   ...modelScenes(),
   ...shellScenes(),
@@ -1271,6 +1274,209 @@ function inspectorScenes(): Scene[] {
         text_absent: ["2 transactions", "Transform.py", "Transform.ry", "undefined", "NaN"],
       },
       render: () => <EditProbe />,
+    },
+  ];
+}
+
+// -- materials ------------------------------------------------------------------------------------
+
+/** Selects an object that CAN take a finish, with an optional stored one. `MeshRenderer.mesh` is what
+ *  makes it shadeable - the picker refuses on the COMPONENT, not on the field it is about to write. */
+function materialSetup(material?: string) {
+  return () => {
+    const MeshRenderer: Record<string, unknown> = { mesh: "sha256:9f3c81aa4e07", castShadows: true };
+    if (material !== undefined) MeshRenderer.material = material;
+    projectionStore.getState().bulkLoad([
+      { id: "e-boom", name: "Boom Arm", parentId: null, components: { Transform: { px: 0 }, MeshRenderer } },
+    ] as never);
+    projectionStore.getState().select("e-boom");
+  };
+}
+
+function materialScenes(): Scene[] {
+  /** THE WIDTH THESE ARE READ AT, AND WHY IT IS NOT A COMFORTABLE ONE. The Inspector track is 300px
+   *  and a section inside it has ~234px of content box, measured in the packaged `.exe`. A swatch
+   *  grid photographed at 560 would fit six columns and prove nothing about the column count a user
+   *  gets.
+   *
+   *  INSIDE the function, not beside it, and that is not a style choice: `SCENES` calls this during
+   *  module evaluation, so a module-level `const` here is still in its temporal dead zone when the
+   *  call happens. The bundle then throws on load and the driver reports ZERO scenes — the exact
+   *  hoisting trap `shell()`'s own header records, reproduced within an hour of reading it. */
+  const MATERIAL_TRACK = 234;
+  return [
+    {
+      id: "material-specimen",
+      looking_for:
+        "EVERY FINISH THE RENDERER KNOWS, ON ONE SHEET, AT A SIZE A HUMAN CAN JUDGE — the material " +
+        "twin of `icon-set-specimen`, and it exists because the 56px swatch in the picker is too " +
+        "small to see a shading regression in. What a reader is checking is DISCRIMINATION: no two " +
+        "spheres alike, and each one recognisable as the surface its numbers describe. Chrome " +
+        "(roughness 0.06) must be visibly higher-contrast than Metal (0.35) — a small blown cap, a " +
+        "dark body, a bright floor bounce — and Plastic, a dielectric, must be the FLATTEST of the " +
+        "seven rather than the shiniest, which is precisely what the first version of this shading " +
+        "got backwards. Gold and Copper must read warm, Rust dark and dry. Every sphere must look " +
+        "ROUND: a gradient with no rim term photographs as a disc",
+      viewport: { width: 900, height: 560 },
+      expect: {
+        present: [
+          ["[data-testid='material-specimen']", 6],
+          ["[data-testid='material-specimen'] .mtk-swatch__sphere circle", 6],
+          // Three gradients per sphere: body, hotspot, contact shadow. Sharing ids across instances is
+          // the "all my materials are grey" bug, and the count is what makes it visible here.
+          ["[data-testid='material-specimen'] radialGradient", 18],
+        ],
+        // The numbers are on the sheet, because a specimen that does not say what it is showing
+        // cannot be checked against the renderer's table by the person reading it.
+        text_present: ["Chrome", "roughness 0.06", "metalness 1", "Plastic", "roughness 0.55"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='material-specimen']"],
+      },
+      render: () => (
+        <div style={{ padding: 20, background: "var(--mtk-bg-base)", font: "var(--mtk-font-ui)" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
+            {MATERIAL_PRESETS.map((preset) => (
+              <div
+                key={preset.id}
+                data-testid="material-specimen"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 14,
+                  padding: 12,
+                  borderRadius: 12,
+                  background: "var(--mtk-bg-panel)",
+                  border: "1px solid var(--mtk-border-subtle)",
+                  minWidth: 0,
+                }}
+              >
+                <span
+                  style={{
+                    flex: "none",
+                    display: "flex",
+                    width: 104,
+                    height: 104,
+                    borderRadius: 10,
+                    background: "var(--mtk-bg-inset)",
+                  }}
+                >
+                  <MaterialSphere preset={preset} size={104} />
+                </span>
+                <span style={{ minWidth: 0 }}>
+                  <span style={{ display: "block", fontSize: 14, fontWeight: 600, color: "var(--mtk-text)" }}>
+                    {preset.label}
+                  </span>
+                  <span style={{ display: "block", fontSize: 11, color: "var(--mtk-text-muted)" }}>
+                    metalness {preset.metallic}
+                  </span>
+                  <span style={{ display: "block", fontSize: 11, color: "var(--mtk-text-muted)" }}>
+                    roughness {preset.roughness}
+                  </span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ),
+    },
+    {
+      id: "material-picker",
+      looking_for:
+        "THE FINISH AS A PICTURE, at the width the Inspector actually gives it. Seven swatches - " +
+        "Default plus the six the renderer knows - each a SHADED SPHERE rather than a word: gold " +
+        "warm with a dark side, chrome high-contrast with a tight hotspot, plastic a pale matte " +
+        "ball, rust dark and barely reflective. They must be visibly DIFFERENT from one another, " +
+        "because the whole argument for drawing them is that a reader can tell metal from plastic " +
+        "without reading. Chrome is the one that is set, and it says so twice - a ring AND a tick - " +
+        "so the answer survives greyscale. The one priced control is BELOW the free grid",
+      width: MATERIAL_TRACK,
+      setup: materialSetup("chrome"),
+      expect: {
+        present: [
+          ["[data-testid='materialPicker']", 1],
+          // Seven tiles, and six DRAWINGS. A tile whose sphere failed to render is still a tile, and
+          // it photographs as a well-formed control with an empty well - the `[data-icon-missing]`
+          // failure one level down. Default's mark is an Icon, not a gradient, so six spheres carry
+          // three gradients each.
+          ["[data-testid^='material-'][aria-pressed]", 7],
+          [".mtk-swatch__sphere", 6],
+          [".mtk-swatch__sphere radialGradient", 18],
+          // The selection, stated as a SHAPE and not only as a colour.
+          [".mtk-swatch.is-selected .mtk-swatch__tick", 1],
+          ["#rustier", 1],
+        ],
+        absent: ["[data-icon-missing]"],
+        // Every finish names itself. A grid of unlabelled spheres is prettier and unusable.
+        text_present: ["Default", "Metal", "Chrome", "Gold", "Copper", "Rust", "Plastic", "tokens"],
+        // The refusal and the imported-handle note belong to the OTHER two scenes; either one here
+        // would mean the panel mis-read a perfectly ordinary shadeable object.
+        text_absent: ["null", "undefined", "NaN", "no mesh to shade", "Imported finish"],
+        // NOTHING ELLIPSISES AND NOTHING IS CUT. 234px is where a three-column grid either fits or
+        // starts eating its own labels, which is the failure this width exists to catch.
+        unclipped: [".mtk-swatch", ".mtk-swatch__label", "#rustier"],
+        // A swatch small enough to be decorative is not a preview. 48px is the floor at which the
+        // difference between satin and mirror is still visible in the well.
+        min_height: [[".mtk-swatch__preview", 48]],
+        // The free grid comes FIRST. If the priced row ever floats above it, the panel is telling a
+        // beginner that changing a material costs money, which is the defect this panel repaired.
+        stacked: [[".mtk-swatch-grid", "#rustier"]],
+      },
+      render: () => <MaterialPanel client={createMockSession()} />,
+    },
+    {
+      id: "material-no-mesh",
+      looking_for:
+        "THE REFUSAL, BEFORE THE CLICK. An object with no MeshRenderer cannot take a finish - the " +
+        "field write has no component to land on - so every swatch is disabled and the panel says " +
+        "why in one plain sentence. What this replaces is a grid of live buttons that each produce " +
+        "an error after you press them",
+      width: MATERIAL_TRACK,
+      setup: () => {
+        projectionStore.getState().bulkLoad([
+          { id: "e-trigger", name: "Trigger Volume", parentId: null, components: { Transform: { px: 0 } } },
+        ] as never);
+        projectionStore.getState().select("e-trigger");
+      },
+      expect: {
+        present: [
+          ["[data-testid='material-unavailable']", 1],
+          // Disabled, all seven - `present` is at-least, so this is the claim that none of them is
+          // live rather than that one of them is dead.
+          ["[data-testid^='material-'][aria-pressed][disabled]", 7],
+          // AND THE PRICED ONE TOO. `ai_edit` patches the same component through the same validator,
+          // so it cannot land here either - and it was the one control on this panel still offering
+          // to spend two tokens on an edit that must fail. Found by reading this capture.
+          ["#rustier[disabled]", 1],
+        ],
+        text_present: ["no mesh to shade"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='material-unavailable']"],
+        // NOTHING IS SET, and nothing claims to be. A lit `Default` tile under a sentence saying no
+        // finish is possible is two statements disagreeing inside one column.
+        absent: [".mtk-swatch.is-selected"],
+      },
+      render: () => <MaterialPanel client={createMockSession()} />,
+    },
+    {
+      id: "material-imported",
+      looking_for:
+        "AN IMPORTED FINISH, NAMED. The stored value is a content handle the renderer has no preset " +
+        "for, so no swatch can carry the selection - and the honest reading of that is NOT 'nothing " +
+        "is set', which is what an unmarked grid would say. The note names the handle and says what " +
+        "Default would do; Default itself is NOT drawn as the current state",
+      width: MATERIAL_TRACK,
+      setup: materialSetup("mtkasset:9f3c81aa4e07"),
+      expect: {
+        present: [["[data-testid='material-foreign']", 1]],
+        // NOT ONE selected swatch. This is the assertion the scene exists for: the failure mode is a
+        // panel that silently lights up Default and tells the user their imported material is gone.
+        absent: [".mtk-swatch.is-selected"],
+        text_present: ["Imported finish", "mtkasset:9f3c81aa4e07", "Default"],
+        text_absent: ["null", "undefined", "NaN"],
+        // A handle is long and the column is 234px - it wraps, it does not run out of the panel.
+        unclipped: ["[data-testid='material-foreign']"],
+      },
+      render: () => <MaterialPanel client={createMockSession()} />,
     },
   ];
 }

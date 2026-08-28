@@ -253,3 +253,85 @@ export function AssetTile({
     </div>
   );
 }
+
+// ── Swatch ────────────────────────────────────────────────────────────────────────────────────────
+
+export interface SwatchGridProps extends DataAttrs {
+  children: ReactNode;
+  /** Accessible name for the set being chosen from. */
+  label: string;
+  style?: CSSProperties;
+}
+
+/** The picker's grid: smaller cells than the library's, because a swatch is a CHOICE from a closed set
+ *  rather than an item in an open catalogue, and a closed set should be readable in one glance without
+ *  scrolling a 300px dock. Column count is still the browser's decision from a minimum width. */
+export function SwatchGrid({ children, label, style, ...rest }: SwatchGridProps) {
+  return (
+    <div className="mtk-swatch-grid" role="group" aria-label={label} style={style} {...rest}>
+      {children}
+    </div>
+  );
+}
+
+export interface SwatchTileProps extends DataAttrs {
+  /** The name of this option. Always shown — a preview carries the feel, the word carries the meaning,
+   *  and the constitution does not allow the appearance to be the only carrier. */
+  label: string;
+  /** The rendered option: a shaded material sphere, a terrain thumbnail, a gradient ramp. */
+  preview: ReactNode;
+  /** The accessible name of the button — the ACTION, so a reader hears what pressing it does. */
+  actionLabel: string;
+  /** The current choice. Carried as `aria-pressed`, drawn as a ring AND a tick — never colour alone. */
+  selected?: boolean;
+  disabled?: boolean;
+  /** Why it cannot be pressed, in plain words. Becomes the tooltip when disabled. */
+  disabledReason?: string;
+  title?: string;
+  onSelect: () => void;
+}
+
+/** One option in a closed visual set.
+ *
+ *  UNLIKE `AssetTile` THIS IS A SINGLE CONTROL, and that is the whole difference. A library tile carries
+ *  a favourite star, a price and a tier beside its action, so it has to be a composition with siblings
+ *  that share no pixels (see the tile's own note on `shoot.mjs` R3). A swatch has exactly one thing you
+ *  can do to it, so it is one button — which also means the entire tile, preview included, is the hit
+ *  target rather than a strip of it. */
+export function SwatchTile({
+  label,
+  preview,
+  actionLabel,
+  selected = false,
+  disabled = false,
+  disabledReason,
+  title,
+  onSelect,
+  ...rest
+}: SwatchTileProps) {
+  const cls = ["mtk-swatch", selected && "is-selected", disabled && "is-unavailable"]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <button
+      type="button"
+      className={cls}
+      aria-pressed={selected}
+      aria-label={actionLabel}
+      title={disabled ? disabledReason : (title ?? actionLabel)}
+      disabled={disabled}
+      onClick={disabled ? undefined : onSelect}
+      {...rest}
+    >
+      <span className="mtk-swatch__preview">
+        {preview}
+        {selected && (
+          <span className="mtk-swatch__tick" aria-hidden="true">
+            <Icon name="check" size="sm" />
+          </span>
+        )}
+      </span>
+      <span className="mtk-swatch__label">{label}</span>
+    </button>
+  );
+}
