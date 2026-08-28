@@ -574,6 +574,37 @@ fn classify_by_capability(provides: &[String]) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// The whole-number arm is the one a second copy of this mapping gets wrong, and it has already
+    /// cost this repository a bug: a JSON `2` is an `Integer`, not a `Number`, so a component read
+    /// matching only `FieldValue::Number` fell silently to its default. ADR-169 gave the function a
+    /// second consumer (`multi_edit`, which now carries any scalar), which is exactly when a mapping
+    /// stated once and tested nowhere becomes a mapping stated twice.
+    #[test]
+    fn json_to_field_maps_every_scalar_the_editor_can_put_in_a_property_row() {
+        use serde_json::json;
+        assert_eq!(json_to_field(&json!(true)), Some(FieldValue::Bool(true)));
+        assert_eq!(
+            json_to_field(&json!("bay")),
+            Some(FieldValue::Str("bay".into()))
+        );
+        // A whole number written as an INTEGER token is an `Integer` -- and that is every whole number
+        // the editor can send, because JavaScript has one number type and `JSON.stringify(2.0)` is
+        // `"2"`. This is the arm the scale=2 bug came out of: a component read matching only
+        // `FieldValue::Number` never sees a value a user typed.
+        assert_eq!(json_to_field(&json!(2)), Some(FieldValue::Integer(2)));
+        assert_eq!(json_to_field(&json!(-7)), Some(FieldValue::Integer(-7)));
+        // THE DISCRIMINATOR IS THE TOKEN, NOT THE VALUE, and that asymmetry is worth pinning: a
+        // Rust-authored `2.0` stays a `Number` because serde_json keeps it f64-backed. Only the
+        // wire from the editor is guaranteed to be integral here.
+        assert_eq!(json_to_field(&json!(2.0)), Some(FieldValue::Number(2.0)));
+        assert_eq!(json_to_field(&json!(2.5)), Some(FieldValue::Number(2.5)));
+        // And everything a property row cannot hold is refused rather than coerced, so the caller can
+        // say WHY instead of writing something the user did not ask for.
+        assert_eq!(json_to_field(&json!(null)), None);
+        assert_eq!(json_to_field(&json!([1, 2])), None);
+        assert_eq!(json_to_field(&json!({ "a": 1 })), None);
+    }
+
     #[test]
     fn classify_kind_keys_off_the_real_component_vocabulary() {
         assert_eq!(classify_kind(&["Transform", "HealthBar"]), "requirer");
