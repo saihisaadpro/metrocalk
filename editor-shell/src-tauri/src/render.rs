@@ -1192,6 +1192,57 @@ pub enum ThumbTake {
     StateMoved,
 }
 
+/// A request to keep the picture this viewport is about to present, as a file rather than a frame.
+///
+/// There is exactly one render path in this shell, and a still has to come out of THAT one — a second
+/// offscreen renderer would be a second grade, the divergence [`render_thumbnail`]'s own comment names
+/// and avoids. So a capture is a read of the swapchain texture between the submit and the present: the
+/// same instances, the same lights, the same post route, the same final resolve, the same bars.
+///
+/// **`min_epoch` is the whole correctness argument.** A capture is nearly always asked for by something
+/// that has just moved the camera — a render job stepping a cutscene a frame at a time — and the frame
+/// already in flight when the request lands was drawn with the pose BEFORE it. Servicing that frame
+/// would write shot 1's picture into shot 2's file, silently, and every file after it would be off by
+/// one. [`SceneState::pose_epoch`] counts camera publications; a request records the epoch current when
+/// it was made, and only a frame drawn at that epoch or later may answer it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameRequest {
+    /// Unique and monotonic, from the same counter the thumbnails use. The answer quotes it back.
+    pub req: u64,
+    /// The lowest [`SceneState::pose_epoch`] a frame may have been drawn at and still answer this.
+    pub min_epoch: u64,
+}
+
+/// A serviced frame capture: the PNG, or the sentence saying why there is none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameResult {
+    /// The request this answers.
+    pub req: u64,
+    /// The image, in the delivery frame's own pixels.
+    pub png: Option<Vec<u8>>,
+    /// The written size. Reported even on failure as `0 x 0`, so a caller never has to infer it.
+    pub width: u32,
+    pub height: u32,
+    /// Why there is no image. `None` when there is one — never both.
+    pub reason: Option<String>,
+}
+
+/// The three honest outcomes of asking for a frame, for the same reason [`ThumbTake`] has four: "not
+/// yet" and "never, because …" are different answers and an `Option` collapses them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameTake {
+    /// No frame has been drawn at the requested pose yet. Keep polling.
+    Pending,
+    /// The picture, and the pixel size it was written at.
+    Ready {
+        png: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    /// It cannot be produced, and this is why. A sentence, not a silence.
+    Failed(String),
+}
+
 /// Which room a scene is presented in.
 ///
 /// A presentation choice with the same standing as the view transform: it changes what a camera can
@@ -1572,8 +1623,24 @@ pub struct SceneState {
     pub thumb_results: Vec<ThumbResult>,
     /// The next request id to hand out. Monotonic for the life of the process; the counter lives here
     /// rather than in a global atomic because every producer and consumer already holds this lock, so
-    /// there is exactly one place the ordering can be reasoned about.
+    /// there is exactly one place the ordering can be reasoned about. Shared with the frame captures
+    /// below — one id space, so a result can never be mistaken for the other kind's.
     pub next_thumb_req: u64,
+    /// ADR-175 — pending frame captures: "write down the picture you are about to present". Drained by
+    /// the render thread AFTER its submit and BEFORE its present, so what lands in the file is the frame
+    /// the viewer would have seen, produced by the one render path rather than a second one.
+    pub frame_requests: Vec<FrameRequest>,
+    /// Serviced captures. Polled by the engine thread, which owns the file writing — the render thread
+    /// never touches the disk, so a slow or failing write cannot stall a frame.
+    pub frame_results: Vec<FrameResult>,
+    /// How many times the camera has been PUBLISHED — bumped by every writer of [`Self::cam_override`]
+    /// that wants a capture to wait for its pose. See [`FrameRequest::min_epoch`]: without it a render
+    /// job writes each shot's picture into the next shot's file.
+    pub pose_epoch: u64,
+    /// Whether this adapter's surface can be read back at all (`COPY_SRC` in its capabilities), decided
+    /// once at start-up and published here so a refusal can name the real reason instead of the request
+    /// timing out. `false` until the render thread has configured a surface.
+    pub frame_capture_supported: bool,
     /// M19 (ADR-104) — terrain chunks the runtime wants uploaded, drained by the render thread a few per
     /// frame. Geometry and textures are separate `Option`s: a LOD switch re-sends only the vertices, because
     /// the chunk's half-megabyte splat texture has not changed.
@@ -1785,6 +1852,51 @@ impl SceneState {
             Some(png) => ThumbTake::Ready(png),
             None => ThumbTake::NoImage,
         }
+    }
+
+    /// Publish a new camera pose to the render loop, so that captures asked for from here on wait for a
+    /// frame that was drawn with it.
+    ///
+    /// Every writer of [`Self::cam_override`] that a capture could follow goes through this rather than
+    /// assigning the field: an epoch that is bumped *most* of the time is worse than none, because the
+    /// one path that forgot is the one that silently writes the previous pose's picture.
+    pub fn publish_camera(&mut self, view: Option<CamView>) {
+        self.cam_override = view;
+        self.pose_epoch = self.pose_epoch.wrapping_add(1);
+    }
+
+    /// Ask for the next frame drawn at the current pose, as a PNG. Returns the request id to poll with.
+    pub fn request_frame(&mut self) -> u64 {
+        let req = self.next_request();
+        let min_epoch = self.pose_epoch;
+        self.frame_requests.push(FrameRequest { req, min_epoch });
+        req
+    }
+
+    /// Take the answer to capture `req`, if it has arrived. A result belongs to exactly one request.
+    pub fn take_frame(&mut self, req: u64) -> FrameTake {
+        let Some(pos) = self.frame_results.iter().position(|r| r.req == req) else {
+            return FrameTake::Pending;
+        };
+        let got = self.frame_results.remove(pos);
+        match (got.png, got.reason) {
+            (Some(png), _) => FrameTake::Ready {
+                png,
+                width: got.width,
+                height: got.height,
+            },
+            (None, Some(why)) => FrameTake::Failed(why),
+            // Unreachable by construction (the render thread writes one or the other), and a sentence
+            // rather than an `expect` because the two producers are 2,000 lines apart.
+            (None, None) => FrameTake::Failed("the frame came back empty".into()),
+        }
+    }
+
+    /// Abandon a capture: drop its pending request and any result already waiting for it. Called when a
+    /// render job is cancelled, so a finished job cannot be answered by the one before it.
+    pub fn forget_frame(&mut self, req: u64) {
+        self.frame_requests.retain(|r| r.req != req);
+        self.frame_results.retain(|r| r.req != req);
     }
 
     /// The visible rectangle actually in force, after sanitisation -- what a caller reporting one gets
@@ -3063,8 +3175,23 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         .copied()
         .find(|f| !f.is_srgb())
         .unwrap_or(caps.formats[0]);
+    // ADR-175 — a still has to come out of the ONE render path, which means reading back the swapchain
+    // texture itself. That needs `COPY_SRC` on the surface, which every desktop backend offers and none
+    // is obliged to; asking for it where it is unavailable makes `configure` fail and the viewport never
+    // appears, so the capability decides and the answer is published for the refusal to quote.
+    let can_capture = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+    if !can_capture {
+        crate::diag::log(
+            "viewport: this surface cannot be copied from - rendering a frame to a file is unavailable on this adapter",
+        );
+    }
+    shared.lock().unwrap().frame_capture_supported = can_capture;
     let mut config = wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: if can_capture {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        },
         format,
         width: w,
         height: h,
@@ -3998,6 +4125,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             env_source_space,
             working_space,
             letterbox,
+            capture_rect,
+            drawn_epoch,
         ) = {
             // The real surface aspect, so the very first framing fits the lens the user is looking
             // through rather than an assumed one.
@@ -4654,6 +4783,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // with no command, no poll and no second copy of the inset rule to drift. And they are the
             // only honest way to author a shot for a frame the author's stage is not the shape of.
             let letterbox = st.delivery_aspect.map(|_| frame_pixels(frame.rect(), w, h));
+            // WHAT A CAPTURE WOULD KEEP: the composed frame, in pixels, whether or not there are bars.
+            // Not `letterbox`, which is `None` when nothing is delivering — and the whole window is the
+            // wrong answer there, because the window includes the strips behind the docks that the
+            // camera was never composed for. This is the same rectangle the projection is sheared to,
+            // which is what makes the file and the picture agree at every aspect.
+            let capture_rect = frame_pixels(frame.rect(), w, h);
             let mut cam = camera_matrix_with(
                 st.orbit,
                 st.elevation,
@@ -4873,6 +5008,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 // the mixed-state frame the atomicity requirement exists to forbid.
                 st.working_space,
                 letterbox,
+                capture_rect,
+                // The camera generation THIS frame is being drawn at, read under the same lock as the
+                // camera itself. A capture asked for at a later epoch must not be answered by it.
+                st.pose_epoch,
             )
         };
         queue.write_buffer(
@@ -5374,6 +5513,60 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             fullscreen(label, target, pipeline, bg, scissor);
         }
         queue.submit([enc.finish()]);
+        // ADR-175 — KEEP THIS FRAME, if anybody asked for it while it was being drawn.
+        //
+        // Between the submit and the present, because those are the only two lines with a swapchain
+        // texture in hand that already holds the finished picture. Reading it back here — rather than
+        // re-rendering the scene into an offscreen target — is what makes the file and the viewport the
+        // same image by construction: same instance list, same lights, same post route, same final
+        // resolve, same scissored bars. A second renderer would be a second grade, which is precisely
+        // the drift `render_thumbnail`'s own comment records paying for.
+        //
+        // Cropped to the delivery rectangle when there is one, so the FILE is the frame the shot was
+        // composed for and the bars are absent from it rather than baked into it. A capture is rare,
+        // explicit, and stalls this thread while it maps — which is correct: an author who asked for a
+        // still is not orbiting, and a render job wants the frames more than it wants the frame rate.
+        {
+            let due: Vec<FrameRequest> = {
+                let mut st = shared.lock().unwrap();
+                let (mine, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.frame_requests)
+                    .into_iter()
+                    .partition(|r| r.min_epoch <= drawn_epoch);
+                st.frame_requests = later;
+                mine
+            };
+            if !due.is_empty() {
+                let rect = capture_rect;
+                let captured = if can_capture {
+                    capture_presented_frame(&device, &queue, &frame.texture, format, rect)
+                } else {
+                    Err("this graphics adapter does not allow the viewport to be copied, so a frame cannot be written to a file".to_string())
+                };
+                let mut st = shared.lock().unwrap();
+                for request in due {
+                    let result = match &captured {
+                        Ok(png) => FrameResult {
+                            req: request.req,
+                            png: Some(png.clone()),
+                            width: rect[2],
+                            height: rect[3],
+                            reason: None,
+                        },
+                        Err(why) => FrameResult {
+                            req: request.req,
+                            png: None,
+                            width: 0,
+                            height: 0,
+                            reason: Some(why.clone()),
+                        },
+                    };
+                    st.frame_results.push(result);
+                }
+                // A caller that timed out or was cancelled must not be able to grow this without bound.
+                let excess = st.frame_results.len().saturating_sub(16);
+                st.frame_results.drain(0..excess);
+            }
+        }
         frame.present();
 
         let cpu_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
@@ -6508,24 +6701,10 @@ fn render_thumbnail(
     }
     let data = slice.get_mapped_range();
 
-    // De-pad rows + reorder to RGBA8 (the swapchain format is BGRA on the Windows/Vulkan path). Then PNG.
-    let bgra = matches!(
-        format,
-        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-    );
-    let mut rgba = Vec::with_capacity((unpadded * size) as usize);
-    for row in 0..size {
-        let start = (row * padded) as usize;
-        let line = &data[start..start + unpadded as usize];
-        if bgra {
-            // `as_chunks::<4>()`: one BGRA pixel is four bytes and the type now says so.
-            for px in line.as_chunks::<4>().0 {
-                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-            }
-        } else {
-            rgba.extend_from_slice(line);
-        }
-    }
+    // De-pad rows + reorder to RGBA8 (the swapchain format is BGRA on the Windows/Vulkan path). Then
+    // PNG. Shared with the frame capture (ADR-175): two readbacks disagreeing about channel order would
+    // put a red-and-blue-swapped still beside a correct thumbnail of the same scene.
+    let rgba = depad_to_rgba(&data, format, padded, unpadded, size);
     drop(data);
     buf.unmap();
 
@@ -6538,6 +6717,120 @@ fn render_thumbnail(
         w.write_image_data(&rgba).ok()?;
     }
     Some(png_bytes)
+}
+
+/// ADR-175 — read the picture just submitted for `texture` back off the GPU, cropped to `rect`
+/// (`[x, y, width, height]` in surface pixels), and PNG-encode it.
+///
+/// Called between the frame's submit and its present, so `texture` is the swapchain image with the
+/// finished frame already in it — nothing is re-rendered and nothing is graded a second time. Every
+/// failure is a sentence rather than a `None`, because the caller's whole job is telling an author why
+/// a file they asked for does not exist.
+fn capture_presented_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    format: wgpu::TextureFormat,
+    rect: [u32; 4],
+) -> Result<Vec<u8>, String> {
+    let [x, y, width, height] = rect;
+    if width == 0 || height == 0 {
+        return Err("the viewport has no visible area to capture".into());
+    }
+    // 256-byte row alignment, exactly as the thumbnail readback does it.
+    let unpadded = width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("frame-readback"),
+        size: u64::from(padded) * u64::from(height),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("frame-capture"),
+    });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x, y, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([enc.finish()]);
+
+    let slice = buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r.is_ok());
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    if rx.recv().ok() != Some(true) {
+        return Err("the graphics driver did not hand the finished frame back".into());
+    }
+    let data = slice.get_mapped_range();
+    let rgba = depad_to_rgba(&data, format, padded, unpadded, height);
+    drop(data);
+    buf.unmap();
+
+    let mut png_bytes: Vec<u8> = Vec::new();
+    {
+        let mut pe = png::Encoder::new(&mut png_bytes, width, height);
+        pe.set_color(png::ColorType::Rgba);
+        pe.set_depth(png::BitDepth::Eight);
+        let mut w = pe
+            .write_header()
+            .map_err(|e| format!("the PNG header could not be written: {e}"))?;
+        w.write_image_data(&rgba)
+            .map_err(|e| format!("the image data could not be encoded: {e}"))?;
+    }
+    Ok(png_bytes)
+}
+
+/// Drop the row padding a GPU readback carries and put the channels in the order PNG expects.
+///
+/// The swapchain is BGRA on the Windows/Vulkan path and RGBA elsewhere, and the two are the same bytes
+/// in a different order — a capture that skipped this swaps every red and blue in the file, which looks
+/// like a colour-management bug and is not one. Extracted from `render_thumbnail`'s copy so the two
+/// readbacks cannot disagree about it, and so it is testable without a GPU.
+fn depad_to_rgba(
+    data: &[u8],
+    format: wgpu::TextureFormat,
+    padded: u32,
+    unpadded: u32,
+    rows: u32,
+) -> Vec<u8> {
+    let bgra = matches!(
+        format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    );
+    let mut rgba = Vec::with_capacity((unpadded * rows) as usize);
+    for row in 0..rows {
+        let start = (row * padded) as usize;
+        let line = &data[start..start + unpadded as usize];
+        if bgra {
+            for px in line.as_chunks::<4>().0 {
+                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        } else {
+            rgba.extend_from_slice(line);
+        }
+    }
+    rgba
 }
 
 /// The non-size-dependent resources the thumbnail RTT borrows from the render loop. Grouped so the
