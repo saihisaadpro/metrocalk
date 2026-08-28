@@ -51,6 +51,7 @@ import type {
   ShotRow,
   ShotSpec,
   StateMachine,
+  SubjectCatalog,
   TimelineTuple,
 } from "../../src/transport/protocol";
 import { createMockSession, type EditorClient } from "../../src/transport/session";
@@ -541,10 +542,49 @@ const CUTSCENE_CARDS: ShotSpec[] = [
   { kind: "vista", label: "The vista", blurb: "The subject is a speck in its world", adds: "an extreme-wide, locked-off shot from the front" },
 ];
 
+/** WHAT A SHOT CAN BE POINTED AT, ranked by the scene's own hierarchy — the engine's own answer,
+ *  headings and all.
+ *
+ *  The `parts` counts are the reason the list is worth reading rather than scrolling: 378 and 1 are
+ *  how the whole line and the one bracket inside it tell themselves apart when their names do not.
+ *  `Datum A` has none, which is the row that proves the picker warns BEFORE the shot is aimed — a
+ *  subject with no drawn geometry is composed by the solver on its own origin, and from outside that
+ *  looks like a camera that went somewhere plausible and filmed nothing. */
+const SUBJECT_CATALOG: SubjectCatalog = {
+  owner: "rig",
+  ownerName: "Weld Gun 7",
+  current: "hall",
+  candidates: [
+    { id: "rig", name: "Weld Gun 7", group: "This object", parts: 1, framable: true, current: false },
+    { id: "cell", name: "Weld Cell A", group: "What it is part of", parts: 46, framable: true, current: false },
+    { id: "hall", name: "Assembly Hall", group: "What it is part of", parts: 378, framable: true, current: true },
+    { id: "nozzle", name: "Nozzle", group: "What it is made of", parts: 1, framable: true, current: false },
+    { id: "loom", name: "Cable Loom", group: "What it is made of", parts: 3, framable: true, current: false },
+    { id: "fixture", name: "Fixture 3", group: "Beside it", parts: 9, framable: true, current: false },
+    { id: "datum", name: "Datum A", group: "Beside it", parts: 0, framable: false, current: false },
+  ],
+  query: "",
+  matches: 7,
+  truncated: true,
+};
+
 const cutsceneClient = () =>
   ({
     cinemaCatalog: () => Promise.resolve(CUTSCENE_CARDS),
     cinemaFramingCatalog: () => Promise.resolve(FRAMING),
+    cinemaSubjectCatalog: (_id: string, _index: number | null, query: string) =>
+      Promise.resolve(
+        query
+          ? {
+              ...SUBJECT_CATALOG,
+              query,
+              truncated: false,
+              candidates: SUBJECT_CATALOG.candidates
+                .filter((c) => c.name.toLowerCase().includes(query.toLowerCase()))
+                .map((c) => ({ ...c, group: "Matches" })),
+            }
+          : SUBJECT_CATALOG,
+      ),
     cinemaList: () => Promise.resolve(CUTSCENE),
     // The pose a shot solver would answer with. A capture cannot show the wgpu frame — the harness
     // runs on a box with no GPU — so what is photographed here is the AUTHORING surface around it:
@@ -1152,6 +1192,53 @@ export const SCENES: Scene[] = [
       // Earlier/Later/Remove are one row, not three: an order control that wrapped onto its own line
       // is the toolbar having run out of width.
       same_line: [["[data-testid='cutscene-earlier']", "[data-testid='cutscene-remove']"]],
+    },
+    render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-shot-subject",
+    looking_for:
+      "WHAT THIS SHOT FRAMES — the control that was missing while the engine already had the " +
+      "capability. A `ShotRecipe` has carried its own `subject` since cutscenes shipped, and the " +
+      "runtime resolves it as the union of every rendered instance in that object's HIERARCHY " +
+      "SUBTREE — so 'film the whole assembly' was always solvable, the editor simply sent no " +
+      "subject and offered no way to change one, which made the most ordinary cinematic sequence " +
+      "there is (hold on the whole line, then cut in to one machine) impossible to author. Shot 1 " +
+      "here films the hall the gun stands in. Check that the LANE says so — clip 1 carries " +
+      "'Assembly Hall' beside its duration and the other four carry only a duration, because " +
+      "captioning all five with the same name is the heading repeated five times — and that the " +
+      "shot inspector's first framing control is 'Frames', reading back Assembly Hall with a help " +
+      "line naming the difference. Frames sits before Size, Angle and Move because all three of " +
+      "those are stated RELATIVE to the subject, so every one of them means something else once it " +
+      "changes. THE OPEN LIST IS NOT ASSERTED HERE: it is a `theme/Popover`, portalled to " +
+      "`document.body` by design, and this gate evaluates claims inside the scene's own frame. Its " +
+      "contents — the ranked groups, the parts counts, the nothing-drawn warning — are measured on " +
+      "the packaged .exe by `specs-subjectpicker`, against the real engine's own ranking",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    // Open shot 1 — the one that films something other than the object its cutscene hangs on.
+    click: ["[data-testid='cutscene-clip']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-shot-editor']", 1],
+        ["[data-testid='cutscene-subject']", 1],
+        ["[data-testid='cutscene-subject-name']", 1],
+        ["[data-testid='cutscene-clip']", 5],
+      ],
+      text_present: [
+        "Frames",
+        "Assembly Hall",
+        // The help line under the control, which is where the difference is explained.
+        "This shot films Assembly Hall, not Weld Gun 7",
+      ],
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      // A control whose value is ellipsised is a control that does not answer its own question.
+      unclipped: ["[data-testid='cutscene-subject']", "[data-testid='cutscene-subject-name']"],
+      // The sentence names the subject, and the control that changes it is under the sentence.
+      stacked: [["[data-testid='cutscene-shot-reads']", "[data-testid='cutscene-subject']"]],
+      // Frames and Size are one row of the framing grid: what a shot is OF and how it is framed
+      // belong to the same decision and are read together.
+      same_line: [["[data-testid='cutscene-subject']", "[data-testid='cutscene-size']"]],
     },
     render: () => <CutscenePanel client={cutsceneClient()} />,
   },

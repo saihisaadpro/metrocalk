@@ -52,6 +52,7 @@ import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { CinemaPreviewReply, CinemaReply, DeliveryFrame, FramingCatalog, FramingEdit, ShotRow, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 import { ShotCatalogue } from "./ShotCatalogue";
+import { SubjectPicker } from "./SubjectPicker";
 
 const EMPTY: CinemaReply = {
   entity: null,
@@ -317,6 +318,15 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
     void run(() => client.cinemaSetShotFraming(selected, row.index, edit), label);
   };
 
+  // RE-AIMING IS THE SAME KIND OF EDIT AS RE-FRAMING, and goes through the same one-undo commit —
+  // which is what makes "try it on the whole assembly" a decision the author can take back. `run`
+  // re-poses the preview at the current playhead afterwards, so the consequence of the choice is on
+  // the stage before the picker has finished closing.
+  const editSubject = (row: ShotRow, subject: string) => {
+    if (!selected || subject === row.subject) return;
+    void run(() => client.cinemaSetShotSubject(selected, row.index, subject), "What the shot frames");
+  };
+
   if (!selected) {
     return (
       <div data-testid="cutscene-panel" style={{ padding: space.md }}>
@@ -502,7 +512,16 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
                   duration={duration}
                   label={`${row.index + 1} · ${labelOf(catalog?.sizes ?? [], row.size)} ${labelOf(catalog?.motions ?? [], row.motion).toLowerCase()}`}
                   title={row.reads}
-                  meta={`${row.effectiveSeconds.toFixed(1)}s`}
+                  // ONLY WHEN IT IS NOT THE OWNER. Every clip in an ordinary cutscene films the
+                  // object the cutscene hangs on, and captioning all five of them with the same
+                  // name is five repetitions of the heading above them. The moment one shot films
+                  // something else, the difference is the thing worth reading — and the lane is
+                  // where a reader is looking when they ask "which of these is the wide?".
+                  meta={
+                    row.subject === selected
+                      ? `${row.effectiveSeconds.toFixed(1)}s`
+                      : `${row.effectiveSeconds.toFixed(1)}s · ${row.subjectName}`
+                  }
                   selected={row.id === activeId}
                   live={row.id === live?.id}
                   onClick={() => {
@@ -669,6 +688,34 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
               >
                 {(draftSeconds ?? active.seconds).toFixed(1)}
               </output>
+            </Field>
+
+            {/* WHAT THE SHOT IS OF COMES BEFORE HOW IT IS FRAMED. Size, angle and move are all
+                stated RELATIVE to the subject — "how much of the frame the subject fills", "where
+                the camera stands relative to the subject's facing" — so the subject is the first
+                decision the four of them share, and every one of the other three means something
+                different once it changes. */}
+            <Field
+              label="Frames"
+              htmlFor={`${fieldId}-subject`}
+              help={
+                active.subject === selected
+                  ? "The object this cutscene belongs to. Point the shot at the assembly it is part of for an establishing wide, or at one of its parts to cut in."
+                  : `This shot films ${active.subjectName}, not ${name}.`
+              }
+              disabled={locked}
+            >
+              <SubjectPicker
+                id={`${fieldId}-subject`}
+                client={client}
+                owner={selected}
+                shotIndex={active.index}
+                value={active.subject}
+                valueName={active.subjectName}
+                disabled={locked}
+                disabledReason={lockReason}
+                onPick={(subject) => editSubject(active, subject)}
+              />
             </Field>
 
             <Field
@@ -889,7 +936,22 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
               ? `A cutscene holds at most ${catalog.maxShots} shots — remove one first.`
               : lockReason
           }
-          onPick={(kind) => void run(() => client.cinemaAddShot(selected, kind), "Add shot")}
+          // THE NEW SHOT OPENS. A card is a whole framing decision, and the first thing an author
+          // does with one is aim it — an establishing wide is a wide of the ASSEMBLY, not of the
+          // part its cutscene hangs on. Leaving the new shot closed made that a hunt for the clip
+          // that had just appeared; opening it puts the Frames picker one click away, which is why
+          // "what a shot films" needs no sticky mode above the card grid to be reachable.
+          onPick={(kind) =>
+            void run(async () => {
+              const reply = await client.cinemaAddShot(selected, kind);
+              const last = reply.rows[reply.rows.length - 1];
+              if (last && !reply.reason) {
+                setActiveId(last.id);
+                setPlayhead(last.openSeconds);
+              }
+              return reply;
+            }, "Add shot")
+          }
         />
         <p style={{ margin: 0, fontSize: fontSize.meta, color: color.text.muted }}>
           Turn on Preview to stand the viewport camera on the playhead as you edit, or press Play to

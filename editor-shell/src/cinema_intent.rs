@@ -873,6 +873,229 @@ pub fn set_shot_framing_ops<W: World>(
     Ok((write_ops(entity, &cut, false), cut))
 }
 
+/// The ops that point ONE shot at a different object, keeping its place, its length and its framing.
+///
+/// WHY THIS IS A COMMAND AND NOT A FIELD ON `FramingEdit`. Size, angle, move and strength are words
+/// from a closed vocabulary this module validates against a catalogue. A subject is an entity — the
+/// thing that can be deleted between the picker listing it and the author clicking it — so it is
+/// checked against the live scene, and refused rather than silently redirected at the owner. A wide
+/// establishing shot that quietly became a close-up of one bracket is the kind of failure nobody
+/// notices until the film is watched.
+///
+/// # Errors
+/// [`CinemaError::MissingEntity`] when the cutscene's own object is gone, [`CinemaError::NoSuchShot`]
+/// for an index that is not there, and [`CinemaError::Blocked`] when the subject itself has left the
+/// scene.
+pub fn set_shot_subject_ops<W: World>(
+    engine: &Engine<W>,
+    entity: EntityId,
+    index: usize,
+    subject: EntityId,
+) -> Result<(Vec<Op>, Cutscene), CinemaError> {
+    if !engine.entity_exists(entity) {
+        return Err(CinemaError::MissingEntity);
+    }
+    if !engine.entity_exists(subject) {
+        return Err(CinemaError::Blocked(
+            "the object that shot should frame is no longer in the scene".into(),
+        ));
+    }
+    let mut cut = cutscene_of(engine, entity);
+    let shot = cut.shots.get_mut(index).ok_or(CinemaError::NoSuchShot)?;
+    shot.subject = subject.to_loro_key();
+    Ok((write_ops(entity, &cut, false), cut))
+}
+
+/// How many candidates one group of the picker may offer before the search box is the way to the rest.
+///
+/// A CAD assembly has no useful upper bound: the production weld line imports as 15,711 parts, and an
+/// unbounded "beside it" group would be a fifteen-thousand-row dropdown. The cap is per group so a
+/// short list is never padded and a long one is never the whole scene.
+const MAX_PER_GROUP: usize = 12;
+
+/// How many search hits are returned. Bounded for the same reason, and the total is reported beside
+/// them so the count under the box can say how many were NOT listed rather than implying the list is
+/// all of them.
+const MAX_MATCHES: usize = 40;
+
+/// The heading the object the cutscene hangs on is listed under.
+pub const GROUP_SELF: &str = "This object";
+/// The heading its ancestors are listed under — the establishing wide.
+pub const GROUP_ANCESTOR: &str = "What it is part of";
+/// The heading its children are listed under — cutting in.
+pub const GROUP_CHILD: &str = "What it is made of";
+/// The heading its siblings are listed under — the reverse.
+pub const GROUP_SIBLING: &str = "Beside it";
+/// The heading search hits are listed under.
+pub const GROUP_MATCH: &str = "Matches";
+
+/// One object a shot could be pointed at, with the two facts that decide whether it is the right one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubjectCandidate {
+    /// The entity key `set_shot_subject_ops` takes.
+    pub id: String,
+    /// What the outliner calls it.
+    pub name: String,
+    /// The heading it is listed under, in the author's language.
+    pub group: String,
+    /// How many DRAWN parts are under it — what the camera will actually be fitted to.
+    ///
+    /// The single most useful number in the list: it is how the whole assembly (378 parts) tells
+    /// itself apart from one bracket (1) when the scene calls both of them some variation on
+    /// `Skid Weld Line A.1`.
+    pub parts: usize,
+    /// `false` when nothing under it is drawn. The shot solver frames such a subject at its ORIGIN
+    /// inside a metre-ish fallback box — a plausible camera pointed at nothing — so the picker says
+    /// so before the choice is made rather than leaving it to be found in the film.
+    pub framable: bool,
+    /// This is the object the shot frames right now.
+    pub current: bool,
+}
+
+/// What the subject picker draws: a ranked, bounded list of objects this shot could frame.
+///
+/// Content-aware by construction. The ranking IS the scene's own hierarchy — the object itself, what
+/// it is part of (an establishing wide), what it is made of (cutting in), and what stands beside it
+/// (the reverse) — so the four shots a person actually wants are the first four rows and the search
+/// box exists for the fifth.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubjectCatalog {
+    /// The cutscene's own object — the default a shot frames, and the row headed "This object".
+    pub owner: String,
+    /// Its display name.
+    pub owner_name: String,
+    /// The object the shot being edited frames right now, when one was named.
+    pub current: Option<String>,
+    /// The rows, already in the order they should be drawn.
+    pub candidates: Vec<SubjectCandidate>,
+    /// The query these rows answer, trimmed. Empty for the ranked default list.
+    pub query: String,
+    /// How many objects the query matched in total — `candidates.len()` is how many fitted.
+    pub matches: usize,
+    /// `true` when the list was cut short, so the UI can say so instead of implying completeness.
+    pub truncated: bool,
+}
+
+/// Build the picker's list: the ranked default when `query` is empty, a scene-wide search otherwise.
+///
+/// `name_of` and `parts_under` are supplied by the shell because only it can answer them — display
+/// names come from the instance metadata the outliner reads, and how many drawn parts are under an
+/// object is a question about the RENDER list, which this crate cannot see. Both are passed rather
+/// than reimplemented, so the picker cannot disagree with the outliner about what an object is called
+/// or with the shot solver about what it will frame.
+#[must_use]
+pub fn subject_catalog<W: World>(
+    engine: &Engine<W>,
+    owner: EntityId,
+    current: Option<EntityId>,
+    query: &str,
+    name_of: &dyn Fn(EntityId) -> String,
+    parts_under: &dyn Fn(EntityId) -> usize,
+) -> SubjectCatalog {
+    let query = query.trim();
+    let mut catalog = SubjectCatalog {
+        owner: owner.to_loro_key(),
+        owner_name: name_of(owner),
+        current: current.map(|c| c.to_loro_key()),
+        query: query.to_string(),
+        ..SubjectCatalog::default()
+    };
+    if !engine.entity_exists(owner) {
+        return catalog;
+    }
+    let current_key = catalog.current.clone();
+    let row = |id: EntityId, group: &str| {
+        let key = id.to_loro_key();
+        let parts = parts_under(id);
+        SubjectCandidate {
+            current: current_key.as_deref() == Some(key.as_str()),
+            id: key,
+            name: name_of(id),
+            group: group.to_string(),
+            parts,
+            framable: parts > 0,
+        }
+    };
+
+    if !query.is_empty() {
+        let needle = query.to_lowercase();
+        let mut hits: Vec<SubjectCandidate> = Vec::new();
+        for id in engine.entity_ids() {
+            if !engine.entity_exists(id) {
+                continue;
+            }
+            let name = name_of(id);
+            if !name.to_lowercase().contains(&needle) {
+                continue;
+            }
+            catalog.matches += 1;
+            if hits.len() < MAX_MATCHES {
+                hits.push(row(id, GROUP_MATCH));
+            }
+        }
+        // Biggest first. A search for "weld" on the production line matches the assembly AND its 378
+        // parts, and the assembly is the one a shot is usually about — where a name-alphabetical sort
+        // would bury it under Weld Gun 1..99.
+        hits.sort_by(|a, b| {
+            b.parts
+                .cmp(&a.parts)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        catalog.truncated = catalog.matches > hits.len();
+        catalog.candidates = hits;
+        return catalog;
+    }
+
+    let mut seen: Vec<EntityId> = vec![owner];
+    catalog.candidates.push(row(owner, GROUP_SELF));
+
+    // Outward, nearest first: the assembly this part belongs to, then the one THAT belongs to. This is
+    // the establishing shot — hold on the whole line, then cut in to this gun — and until a picker
+    // existed it was a shot the engine could solve and no user could ask for.
+    let mut walker = engine.parent_of(owner);
+    let mut ancestors = 0;
+    while let Some(ancestor) = walker {
+        if seen.contains(&ancestor) || !engine.entity_exists(ancestor) || ancestors >= MAX_PER_GROUP
+        {
+            break;
+        }
+        seen.push(ancestor);
+        catalog.candidates.push(row(ancestor, GROUP_ANCESTOR));
+        ancestors += 1;
+        walker = engine.parent_of(ancestor);
+    }
+
+    let mut group_of = |ids: Vec<EntityId>, group: &str, seen: &mut Vec<EntityId>| {
+        let mut taken = 0;
+        let mut total = 0;
+        for id in ids {
+            if seen.contains(&id) || !engine.entity_exists(id) {
+                continue;
+            }
+            total += 1;
+            if taken >= MAX_PER_GROUP {
+                continue;
+            }
+            seen.push(id);
+            catalog.candidates.push(row(id, group));
+            taken += 1;
+        }
+        if total > taken {
+            catalog.truncated = true;
+        }
+    };
+
+    group_of(engine.children_of(owner), GROUP_CHILD, &mut seen);
+    if let Some(parent) = engine.parent_of(owner) {
+        group_of(engine.children_of(parent), GROUP_SIBLING, &mut seen);
+    }
+    catalog.matches = catalog.candidates.len();
+    catalog
+}
+
 /// The ops that set the one global dial.
 ///
 /// # Errors
@@ -1183,6 +1406,306 @@ mod tests {
             engine.commit("cinema-shot", ops).expect("commits");
         }
         cutscene_of(engine, owner)
+    }
+
+    /// Spawn `child` under `parent`, the way an imported assembly arrives.
+    fn spawn_under(engine: &mut Engine<FlecsWorld>, parent: EntityId) -> EntityId {
+        let id = engine.alloc_entity_id();
+        engine
+            .commit(
+                "spawn",
+                vec![Op::CreateEntity {
+                    id,
+                    parent: Some(parent),
+                }],
+            )
+            .expect("spawns");
+        id
+    }
+
+    /// A three-level assembly: line > cell > (gun, fixture), with the gun holding two parts.
+    struct Rig {
+        line: EntityId,
+        cell: EntityId,
+        gun: EntityId,
+        fixture: EntityId,
+        nozzle: EntityId,
+        bracket: EntityId,
+    }
+
+    fn assembly(engine: &mut Engine<FlecsWorld>) -> Rig {
+        let line = spawn(engine);
+        let cell = spawn_under(engine, line);
+        let gun = spawn_under(engine, cell);
+        let fixture = spawn_under(engine, cell);
+        let nozzle = spawn_under(engine, gun);
+        let bracket = spawn_under(engine, gun);
+        Rig {
+            line,
+            cell,
+            gun,
+            fixture,
+            nozzle,
+            bracket,
+        }
+    }
+
+    /// Names as the outliner would give them, so the catalogue is read the way a person reads it.
+    fn namer(rig: &Rig) -> impl Fn(EntityId) -> String + '_ {
+        move |id| {
+            if id == rig.line {
+                "Skid Weld Line".to_string()
+            } else if id == rig.cell {
+                "Weld Cell A".to_string()
+            } else if id == rig.gun {
+                "Weld Gun 7".to_string()
+            } else if id == rig.fixture {
+                "Fixture 3".to_string()
+            } else if id == rig.nozzle {
+                "Nozzle".to_string()
+            } else if id == rig.bracket {
+                "Bracket".to_string()
+            } else {
+                id.to_loro_key()
+            }
+        }
+    }
+
+    #[test]
+    fn re_aiming_a_shot_keeps_its_place_its_length_and_its_framing() {
+        let (mut engine, _scene) = world();
+        let gun = spawn(&mut engine);
+        let hall = spawn(&mut engine);
+        for _ in 0..3 {
+            let (ops, _) = add_shot_ops(&engine, gun, "hero", gun).expect("shot");
+            engine.commit("cinema-shot", ops).expect("commits");
+        }
+        let (ops, _) = set_shot_seconds_ops(&engine, gun, 1, 4.2).expect("length");
+        engine.commit("cinema-seconds", ops).expect("commits");
+        let before = cutscene_of(&engine, gun).shots[1].clone();
+
+        let (ops, cut) = set_shot_subject_ops(&engine, gun, 1, hall).expect("re-aim");
+        engine.commit("cinema-subject", ops).expect("commits");
+
+        let after = &cut.shots[1];
+        assert_eq!(after.subject, hall.to_loro_key(), "it films the hall now");
+        // Everything a re-aim must NOT disturb. A picker that reset the length or the framing would
+        // make "try it on the whole assembly" a decision the author cannot take back cheaply.
+        assert_eq!(after.id, before.id, "the id is stable, so the clip is too");
+        assert!((after.seconds - 4.2).abs() < 1e-6, "{}", after.seconds);
+        assert_eq!(after.size, before.size);
+        assert_eq!(after.angle, before.angle);
+        assert_eq!(after.motion, before.motion);
+        assert_eq!(cut.shots.len(), 3, "no shot was added or lost");
+        assert_eq!(
+            cut.shots[0].subject,
+            gun.to_loro_key(),
+            "the others are untouched"
+        );
+
+        assert!(engine.undo(), "one Ctrl-Z");
+        assert_eq!(
+            cutscene_of(&engine, gun).shots[1].subject,
+            gun.to_loro_key()
+        );
+    }
+
+    #[test]
+    fn re_aiming_at_an_object_that_left_the_scene_is_refused_not_redirected() {
+        let (mut engine, _scene) = world();
+        let gun = spawn(&mut engine);
+        let (ops, _) = add_shot_ops(&engine, gun, "hero", gun).expect("shot");
+        engine.commit("cinema-shot", ops).expect("commits");
+        // An id that was never allocated stands in for one deleted between the picker listing it and
+        // the click landing. THE FAILURE THIS EXISTS TO STOP: falling back to the owner would turn an
+        // establishing wide into a close-up of one part, with no refusal and no visible difference in
+        // the shot list.
+        let ghost = EntityId {
+            peer: 9_999,
+            counter: 7,
+        };
+        let refused = set_shot_subject_ops(&engine, gun, 0, ghost);
+        assert!(
+            matches!(refused, Err(CinemaError::Blocked(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            cutscene_of(&engine, gun).shots[0].subject,
+            gun.to_loro_key()
+        );
+
+        assert!(matches!(
+            set_shot_subject_ops(&engine, gun, 9, gun),
+            Err(CinemaError::NoSuchShot)
+        ));
+    }
+
+    #[test]
+    fn the_picker_ranks_the_scenes_own_hierarchy_so_the_establishing_shot_is_one_row_away() {
+        let (mut engine, _scene) = world();
+        let rig = assembly(&mut engine);
+        let name = namer(&rig);
+        let catalog = subject_catalog(&engine, rig.gun, Some(rig.gun), "", &name, &|_| 1);
+
+        assert_eq!(catalog.owner_name, "Weld Gun 7");
+        assert_eq!(
+            catalog.current.as_deref(),
+            Some(rig.gun.to_loro_key().as_str())
+        );
+
+        let by_group = |group: &str| -> Vec<String> {
+            catalog
+                .candidates
+                .iter()
+                .filter(|c| c.group == group)
+                .map(|c| c.name.clone())
+                .collect()
+        };
+        assert_eq!(by_group(GROUP_SELF), vec!["Weld Gun 7"]);
+        // Nearest first. "Weld Cell A" is the cut-in-from; "Skid Weld Line" is the establishing wide,
+        // and the whole point of the picker is that both are one click away from a shot of the gun.
+        assert_eq!(
+            by_group(GROUP_ANCESTOR),
+            vec!["Weld Cell A", "Skid Weld Line"]
+        );
+        assert_eq!(by_group(GROUP_CHILD), vec!["Nozzle", "Bracket"]);
+        assert_eq!(by_group(GROUP_SIBLING), vec!["Fixture 3"]);
+
+        // The owner is offered once, under its own heading — never again as its parent's child.
+        let owner_key = rig.gun.to_loro_key();
+        assert_eq!(
+            catalog
+                .candidates
+                .iter()
+                .filter(|c| c.id == owner_key)
+                .count(),
+            1
+        );
+        assert!(catalog.candidates.iter().any(|c| c.current));
+        assert!(!catalog.truncated);
+    }
+
+    #[test]
+    fn a_subject_with_nothing_drawn_under_it_is_offered_and_labelled_unframable() {
+        let (mut engine, _scene) = world();
+        let rig = assembly(&mut engine);
+        let name = namer(&rig);
+        // Only the gun's own two parts are drawn; the line and the cell are identity/group nodes with
+        // geometry, and `fixture` is a marker with none. THE SILENT FAILURE: a shot solver hands an
+        // undrawn subject a metre-ish box at its origin, so the camera goes somewhere plausible and
+        // frames nothing. The picker has the render list; it can say so first.
+        let drawn = |id: EntityId| -> usize {
+            if id == rig.nozzle || id == rig.bracket {
+                1
+            } else if id == rig.gun || id == rig.cell || id == rig.line {
+                // The gun's two parts are the only drawn things in the scene, so every ancestor of
+                // theirs counts the same two — which is exactly what a subtree count means.
+                2
+            } else {
+                0
+            }
+        };
+        let catalog = subject_catalog(&engine, rig.gun, None, "", &name, &drawn);
+        let find = |n: &str| {
+            catalog
+                .candidates
+                .iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("no row for {n}"))
+        };
+        assert_eq!(find("Skid Weld Line").parts, 2);
+        assert!(find("Skid Weld Line").framable);
+        assert_eq!(find("Fixture 3").parts, 0);
+        assert!(
+            !find("Fixture 3").framable,
+            "the picker warns before the film does"
+        );
+        assert_eq!(catalog.current, None);
+    }
+
+    #[test]
+    fn searching_finds_what_the_hierarchy_did_not_offer_and_puts_the_assembly_first() {
+        let (mut engine, _scene) = world();
+        let rig = assembly(&mut engine);
+        let name = namer(&rig);
+        let drawn = |id: EntityId| -> usize {
+            if id == rig.line {
+                378
+            } else if id == rig.cell {
+                46
+            } else {
+                1
+            }
+        };
+        // Searched from the NOZZLE, whose ranked list cannot reach the line at all: its ancestors stop
+        // being interesting long before, and "Skid Weld Line" is two levels above its own parent.
+        let catalog = subject_catalog(&engine, rig.nozzle, None, " weld ", &name, &drawn);
+        assert_eq!(catalog.query, "weld", "the query is trimmed once, here");
+        let names: Vec<&str> = catalog.candidates.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Skid Weld Line", "Weld Cell A", "Weld Gun 7"]);
+        assert!(catalog.candidates.iter().all(|c| c.group == GROUP_MATCH));
+        assert_eq!(catalog.matches, 3);
+        assert!(!catalog.truncated);
+
+        // Case-insensitive, and a query nothing answers says so with an empty list rather than by
+        // quietly falling back to the ranked one — which would look like a search that found the
+        // wrong things.
+        assert_eq!(
+            subject_catalog(&engine, rig.nozzle, None, "NOZZ", &name, &drawn)
+                .candidates
+                .len(),
+            1
+        );
+        let nothing = subject_catalog(&engine, rig.nozzle, None, "zzzz", &name, &drawn);
+        assert!(nothing.candidates.is_empty());
+        assert_eq!(nothing.matches, 0);
+    }
+
+    #[test]
+    fn a_group_of_a_thousand_siblings_is_cut_short_and_says_so() {
+        let (mut engine, _scene) = world();
+        let hall = spawn(&mut engine);
+        let mut first = None;
+        for _ in 0..40 {
+            let id = spawn_under(&mut engine, hall);
+            first.get_or_insert(id);
+        }
+        let owner = first.expect("at least one part");
+        let catalog = subject_catalog(&engine, owner, None, "", &|id| id.to_loro_key(), &|_| 1);
+        let siblings = catalog
+            .candidates
+            .iter()
+            .filter(|c| c.group == GROUP_SIBLING)
+            .count();
+        assert_eq!(siblings, MAX_PER_GROUP, "bounded, not the whole assembly");
+        assert!(
+            catalog.truncated,
+            "and the UI is told, so it can point at the search box instead of implying this is all"
+        );
+    }
+
+    #[test]
+    fn a_re_aimed_shot_reads_back_as_a_shot_of_the_thing_it_films() {
+        let (mut engine, _scene) = world();
+        let gun = spawn(&mut engine);
+        let hall = spawn(&mut engine);
+        let (ops, _) = add_shot_ops(&engine, gun, "establish", gun).expect("shot");
+        engine.commit("cinema-shot", ops).expect("commits");
+        let (ops, cut) = set_shot_subject_ops(&engine, gun, 0, hall).expect("re-aim");
+        engine.commit("cinema-subject", ops).expect("commits");
+
+        let hall_key = hall.to_loro_key();
+        let reply = reply_with_names(gun, &cut, "Weld Gun 7", String::new(), &|key| {
+            (key == hall_key).then(|| "Assembly Hall".to_string())
+        });
+        assert_eq!(reply.rows[0].subject, hall_key);
+        assert_eq!(reply.rows[0].subject_name, "Assembly Hall");
+        assert!(
+            reply.rows[0].reads.contains("Assembly Hall"),
+            "the sentence names what is on screen: {}",
+            reply.rows[0].reads
+        );
+        assert!(!reply.rows[0].reads.contains("Weld Gun 7"));
     }
 
     #[test]

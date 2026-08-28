@@ -370,20 +370,19 @@ export function TextArea({
 /** A small, neutral pill/badge (for live readouts — view label, counts). Not a button. The `title`
  *  carries the plain-language explanation (a requirer's needed cap, a price) — never colour-alone. */
 /** Search is a first-class editor interaction with one shared focus, density and clearing contract. */
-export function SearchField({
-  className,
-  style,
-  ...rest
-}: Omit<InputHTMLAttributes<HTMLInputElement>, "type">) {
-  return (
-    <input
-      type="search"
-      className={["mtk-input", "mtk-search", className].filter(Boolean).join(" ")}
-      style={style}
-      {...rest}
-    />
-  );
-}
+export const SearchField = forwardRef<HTMLInputElement, Omit<InputHTMLAttributes<HTMLInputElement>, "type">>(
+  function SearchField({ className, style, ...rest }, ref) {
+    return (
+      <input
+        ref={ref}
+        type="search"
+        className={["mtk-input", "mtk-search", className].filter(Boolean).join(" ")}
+        style={style}
+        {...rest}
+      />
+    );
+  },
+);
 
 /** Shared native select styling preserves platform semantics while removing subsystem-specific controls. */
 export function SelectField({

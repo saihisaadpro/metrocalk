@@ -2882,6 +2882,24 @@ enum EngineCmd {
         edit: metrocalk_editor_shell::FramingEdit,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
     },
+    /// Cinematics - point one shot at a different object (one undoable commit).
+    CinemaSetShotSubject {
+        id: String,
+        index: usize,
+        /// The object the shot should FRAME, as a loro key.
+        subject: String,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - the ranked, bounded list of objects a shot could frame. A read; changes nothing.
+    CinemaSubjectCatalog {
+        id: String,
+        /// The shot whose subject is being edited, so its current object can be marked. `None` while
+        /// the picker is being used to aim a shot that does not exist yet.
+        index: Option<usize>,
+        /// A name filter. Empty means the ranked default list.
+        query: String,
+        reply: Sender<metrocalk_editor_shell::SubjectCatalog>,
+    },
     /// Cinematics - read an object's cutscene back as sentences.
     CinemaList {
         id: String,
@@ -5661,6 +5679,36 @@ fn entity_display_name(engine: &Engine<FlecsWorld>, id: EntityId) -> String {
 /// A shot may film something other than the object its cutscene hangs on, so the sentences in a shot
 /// list cannot all be captioned with the owner's name. `None` (rather than the raw loro key) lets the
 /// reply fall back to the owner, which is what the shot actually does.
+/// How many DRAWN parts sit under each entity, answered for the whole scene in one pass.
+///
+/// The subject picker needs this number for every row it offers, and asking per row is
+/// `O(rows x instances)`: the imported production line publishes 15,711 instances, so a twenty-row
+/// list would re-scan a quarter of a million keys to draw one dropdown. Walking each instance UP its
+/// ancestor chain instead visits every instance once and answers for every one of its ancestors at
+/// the same time — which is exactly the set the picker offers.
+///
+/// This is the same question [`cinematic_subject_sample`] asks when it decides what the camera is
+/// fitted to, asked of the same published render list, so a row that says "378 parts" is a promise
+/// about what the shot solver will actually see.
+fn drawn_parts_by_entity(engine: &Engine<FlecsWorld>, ids: &[String]) -> HashMap<EntityId, usize> {
+    let mut counts: HashMap<EntityId, usize> = HashMap::new();
+    let mut parents: HashMap<EntityId, Option<EntityId>> = HashMap::new();
+    for key in ids {
+        let Some(leaf) = EntityId::from_loro_key(key) else {
+            continue;
+        };
+        let mut walker = Some(leaf);
+        // A tree cannot contain a cycle; a corrupt document is still not worth hanging the engine
+        // thread for, and 64 is far deeper than any CAD assembly this has met.
+        for _ in 0..64 {
+            let Some(id) = walker else { break };
+            *counts.entry(id).or_default() += 1;
+            walker = *parents.entry(id).or_insert_with(|| engine.parent_of(id));
+        }
+    }
+    counts
+}
+
 fn shot_subject_name(engine: &Engine<FlecsWorld>, key: &str) -> Option<String> {
     EntityId::from_loro_key(key)
         .filter(|e| engine.entity_exists(*e))
@@ -10163,6 +10211,118 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         let _ = reply.send(CinemaReply::refusal(error.to_string()));
                     }
                 }
+            }
+            EngineCmd::CinemaSetShotSubject {
+                id,
+                index,
+                subject,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - what a shot frames is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                let Some(framed) =
+                    EntityId::from_loro_key(&subject).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "the object that shot should frame is no longer in the scene",
+                    ));
+                    continue;
+                };
+                match metrocalk_editor_shell::set_shot_subject_ops(&engine, entity, index, framed) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-subject", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the change was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaShotSubject {
+                            id: id.clone(),
+                            index,
+                            subject: framed.to_loro_key(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let done = cut
+                            .shots
+                            .get(index)
+                            .map(|shot| {
+                                let who = shot_subject_name(&engine, &shot.subject)
+                                    .unwrap_or_else(|| name.clone());
+                                format!(
+                                    "Shot {} is now {}",
+                                    index + 1,
+                                    metrocalk_editor_shell::describe_shot(shot, &who)
+                                )
+                            })
+                            .unwrap_or_else(|| "Shot re-aimed".to_string());
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            done,
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSubjectCatalog {
+                id,
+                index,
+                query,
+                reply,
+            } => {
+                let catalog = EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .map(|entity| {
+                        // Marked "current" from the SHOT, not from the panel's own idea of it: the
+                        // picker's tick has to agree with what the document says the shot films, or
+                        // it will show a choice that was undone as still made.
+                        let current = index
+                            .and_then(|i| {
+                                metrocalk_editor_shell::cutscene_of(&engine, entity)
+                                    .shots
+                                    .get(i)
+                                    .map(|shot| shot.subject.clone())
+                            })
+                            .and_then(|key| EntityId::from_loro_key(&key))
+                            .filter(|e| engine.entity_exists(*e))
+                            .or(index.map(|_| entity));
+                        // CLONED, AND HELD FOR AS SHORT A TIME AS POSSIBLE. The alternative is
+                        // holding the render state's lock across a walk of every published
+                        // instance's ancestor chain, which on the imported production line is
+                        // 15,711 chains — with the renderer waiting behind it for a dropdown.
+                        let ids = shared.lock().unwrap().ids.clone();
+                        let drawn = drawn_parts_by_entity(&engine, &ids);
+                        metrocalk_editor_shell::subject_catalog(
+                            &engine,
+                            entity,
+                            current,
+                            &query,
+                            &|e| entity_display_name(&engine, e),
+                            &|e| drawn.get(&e).copied().unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or_default();
+                let _ = reply.send(catalog);
             }
             EngineCmd::CinemaList { id, reply } => {
                 let info = EntityId::from_loro_key(&id)
@@ -23227,6 +23387,69 @@ fn cinema_set_shot_framing(
     })
 }
 
+/// Point one shot at a different object, without losing its place, its length or its framing.
+///
+/// The command the subject picker commits through. Separate from `cinema_set_shot_framing` because a
+/// subject is an entity that can leave the scene, not a word from a closed vocabulary: it is checked
+/// against the live document and refused by name rather than silently redirected at the cutscene's
+/// own owner.
+#[tauri::command(async)]
+fn cinema_set_shot_subject(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+    subject: String,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetShotSubject {
+            id,
+            index,
+            subject,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The subject change did not finish in time")
+    })
+}
+
+/// The objects a shot could frame, ranked by the scene's own hierarchy — or searched by name.
+///
+/// A READ. Published by the side that validates the choice, and carrying the two facts the author
+/// needs to make it: what each candidate is called, and how many DRAWN parts are under it. The second
+/// is why this cannot be computed in the editor from the projection: whether a subject has geometry
+/// under it is a question about the render list, and a subject with none is framed by the solver at
+/// its own origin — a plausible camera pointed at nothing.
+#[tauri::command(async)]
+fn cinema_subject_catalog(
+    state: State<AppState>,
+    id: String,
+    index: Option<usize>,
+    query: Option<String>,
+) -> metrocalk_editor_shell::SubjectCatalog {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSubjectCatalog {
+            id,
+            index,
+            query: query.unwrap_or_default(),
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::SubjectCatalog::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
 /// An object's cutscene, read back as sentences plus any continuity warnings.
 #[tauri::command(async)]
 fn cinema_list(state: State<AppState>, id: String) -> metrocalk_editor_shell::CinemaReply {
@@ -26250,6 +26473,8 @@ fn main() {
             cinema_set_shot_seconds,
             cinema_move_shot,
             cinema_set_shot_framing,
+            cinema_set_shot_subject,
+            cinema_subject_catalog,
             cinema_set_mood,
             cinema_set_delivery,
             cinema_list,

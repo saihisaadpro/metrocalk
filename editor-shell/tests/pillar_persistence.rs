@@ -314,6 +314,16 @@ fn an_edited_cutscene_survives_save_and_open_down_to_the_second() {
     a.commit("move", ops).expect("reorder commits");
     let (ops, _) = metrocalk_editor_shell::set_mood_ops(&a, statue, "calm").expect("known mood");
     a.commit("mood", ops).expect("mood commits");
+    // RE-AIMED AFTER THE FACT, which is what the subject picker actually does: the hero shot was
+    // authored on the statue and is then pointed at the hall. Different from authoring it framed
+    // that way, and it has to survive on its own — a re-aim that reverted on reopen would leave the
+    // project opening with the right number of shots, the right lengths, and one of them quietly
+    // filming something else.
+    // Index 2: the reorder above put the close-up first, so the hero shot the length was set on is
+    // now the third, and it is the one being re-aimed.
+    let (ops, _) =
+        metrocalk_editor_shell::set_shot_subject_ops(&a, statue, 2, hall).expect("a live object");
+    a.commit("subject", ops).expect("subject commits");
 
     let before = metrocalk_editor_shell::cutscene_of(&a, statue);
     assert_eq!(before.shots.len(), 3);
@@ -347,7 +357,9 @@ fn an_edited_cutscene_survives_save_and_open_down_to_the_second() {
         (after.shots[0].amount - 0.75).abs() < 1.0e-5,
         "move strength"
     );
-    // The 7.4s length is on the shot it was set on, which the reorder pushed one place later.
+    // The 7.4s length is on the shot it was set on, which the reorder pushed one place later — and
+    // which the picker then re-aimed, so this is also the assertion that a re-aim leaves a length
+    // alone.
     assert!(
         (after.shots[2].seconds - 7.4).abs() < 1.0e-5,
         "the authored length came back as {}",
@@ -355,8 +367,15 @@ fn an_edited_cutscene_survives_save_and_open_down_to_the_second() {
     );
     // Calm scales it 2.5x at playback and leaves the AUTHORED number alone — both halves survive.
     assert!((after.effective_shot_seconds(2).expect("a shot") - 18.5).abs() < 1.0e-4);
-    // And the establishing shot still films the HALL, not its own cutscene's owner.
+    // And the establishing shot still films the HALL, not its own cutscene's owner — as does the
+    // hero shot the picker re-aimed at it after the fact. The reorder moved the close-up to the
+    // front, so the two hall shots are now at 1 and 2.
     assert_eq!(after.shots[1].subject, hall.to_loro_key());
+    assert_eq!(
+        after.shots[2].subject,
+        hall.to_loro_key(),
+        "a shot re-aimed after it was authored came back aimed somewhere else"
+    );
     assert!(
         after
             .shots

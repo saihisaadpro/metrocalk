@@ -140,6 +140,18 @@ pub enum Record {
         index: usize,
         edit: crate::cinema_intent::FramingEdit,
     },
+    /// Cinematics - one shot pointed at a different object.
+    ///
+    /// Replayed rather than folded into [`Self::CinemaShot`] because the two are different moments:
+    /// the shot was added framing one thing and later re-aimed at another, and a log that only knew
+    /// the final answer could not describe an undo between them. An unresolvable subject leaves the
+    /// shot where it was, for the same reason a re-aimed shot is never silently redirected at the
+    /// owner - a wide that quietly became a close-up is not visible until the film is watched.
+    CinemaShotSubject {
+        id: String,
+        index: usize,
+        subject: String,
+    },
     /// Conditionals — one "only if" clause added to an object.
     ConditionAdd {
         id: String,
@@ -575,6 +587,18 @@ impl Log {
                         .is_some_and(|e| {
                             crate::cinema_intent::set_shot_framing_ops(engine, e, index, &edit)
                                 .is_ok_and(|(ops, _)| engine.commit("cinema-framing", ops).is_ok())
+                        })
+                }
+                Record::CinemaShotSubject { id, index, subject } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .zip(
+                            metrocalk_core::EntityId::from_loro_key(&subject)
+                                .filter(|s| engine.entity_exists(*s)),
+                        )
+                        .is_some_and(|(e, s)| {
+                            crate::cinema_intent::set_shot_subject_ops(engine, e, index, s)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-subject", ops).is_ok())
                         })
                 }
                 Record::ConditionAdd { id, request } => {

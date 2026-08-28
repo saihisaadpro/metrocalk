@@ -48,6 +48,7 @@ import type {
   CinemaReply,
   DeliveryFrame,
   FramingCatalog,
+  SubjectCatalog,
   FramingEdit,
   EffectSpec,
   VfxReply,
@@ -304,7 +305,12 @@ export interface EditorClient {
   vfxList(id: string): Promise<VfxReply>;
   /** Every shot card the Cinematics block can offer. */
   cinemaCatalog(): Promise<ShotSpec[]>;
-  /** Append one shot to an object's cutscene (one undoable commit). */
+  /** Append one shot to an object's cutscene (one undoable commit).
+   *
+   *  A new shot always frames its own owner. What it films is then a property of the SHOT, changed
+   *  through `cinemaSetShotSubject` on the shot the add just opened — rather than a sticky choice
+   *  made before the card is clicked, which is the same decision stated in two places and a mode the
+   *  next card would silently inherit. */
   cinemaAddShot(id: string, kind: string): Promise<CinemaReply>;
   /** Remove one shot by index (one undoable commit). */
   cinemaRemoveShot(id: string, index: number): Promise<CinemaReply>;
@@ -322,6 +328,12 @@ export interface EditorClient {
   cinemaMoveShot(id: string, from: number, to: number): Promise<CinemaReply>;
   /** Re-frame one shot in place — size, angle, move, strength (one undoable commit). */
   cinemaSetShotFraming(id: string, index: number, edit: FramingEdit): Promise<CinemaReply>;
+  /** Point one shot at a different object, keeping its place, its length and its framing
+   *  (one undoable commit). */
+  cinemaSetShotSubject(id: string, index: number, subject: string): Promise<CinemaReply>;
+  /** The objects a shot could frame — ranked by the scene's own hierarchy, or searched by name.
+   *  A read. `index` marks the shot being edited so its current subject comes back ticked. */
+  cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog>;
   /** Pose the viewport camera at one moment of a cutscene, or (`active: false`) hand it back.
    *  A render projection, never a document edit — moving a playhead is not something to undo. */
   cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply>;
@@ -963,7 +975,7 @@ export class TauriClient implements EditorClient {
     return this.core.invoke<ShotSpec[]>("cinema_catalog").catch((e: unknown) => { console.error("cinema_catalog failed", e); throw e; });
   }
   cinemaAddShot(id: string, kind: string): Promise<CinemaReply> {
-    return this.core.invoke<CinemaReply>("cinema_add_shot", { id, kind }).catch((e: unknown) => { console.error("cinema_add_shot failed", e); throw e; });
+    return this.core.invoke<CinemaReply>("cinema_add_shot", { id, kind, subject: null }).catch((e: unknown) => { console.error("cinema_add_shot failed", e); throw e; });
   }
   cinemaRemoveShot(id: string, index: number): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_remove_shot", { id, index }).catch((e: unknown) => { console.error("cinema_remove_shot failed", e); throw e; });
@@ -988,6 +1000,12 @@ export class TauriClient implements EditorClient {
   }
   cinemaSetShotFraming(id: string, index: number, edit: FramingEdit): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_set_shot_framing", { id, index, edit }).catch((e: unknown) => { console.error("cinema_set_shot_framing failed", e); throw e; });
+  }
+  cinemaSetShotSubject(id: string, index: number, subject: string): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_subject", { id, index, subject }).catch((e: unknown) => { console.error("cinema_set_shot_subject failed", e); throw e; });
+  }
+  cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog> {
+    return this.core.invoke<SubjectCatalog>("cinema_subject_catalog", { id, index, query }).catch((e: unknown) => { console.error("cinema_subject_catalog failed", e); throw e; });
   }
   cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply> {
     return this.core.invoke<CinemaPreviewReply>("cinema_preview", { id, seconds, active }).catch((e: unknown) => { console.error("cinema_preview failed", e); throw e; });
@@ -2857,6 +2875,15 @@ class MockClient implements EditorClient {
   }
   cinemaSetShotFraming(): Promise<CinemaReply> {
     return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetShotSubject(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  /** An EMPTY list, not an invented one. The picker's whole value is the two facts only the native
+   *  scene can answer — what each object is called and how many drawn parts are under it — and a
+   *  browser stub offering plausible rows would be a picker that aims shots at nothing. */
+  cinemaSubjectCatalog(id: string): Promise<SubjectCatalog> {
+    return Promise.resolve({ owner: id, ownerName: "", current: null, candidates: [], query: "", matches: 0, truncated: false });
   }
   /** Refused rather than faked. A preview's whole content is a camera pose solved against real mesh
    *  bounds in the native scene; a browser-shell stub could only invent three numbers, and a picture

@@ -350,6 +350,139 @@ describe("CutscenePanel", () => {
     );
   });
 
+  describe("what the shot frames", () => {
+    it("offers the scene's own hierarchy, headed by the engine's words, with the parts count that tells two similar names apart", async () => {
+      const client = loaded();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+
+      // Closed, it reads what the shot films — no fetch needed for that, it is on the row.
+      expect((await screen.findByTestId("cutscene-subject-name")).textContent).toBe("Weld Gun 7");
+      fireEvent.click(screen.getByTestId("cutscene-subject"));
+
+      // The picker asks about the shot BEING EDITED, so the engine can tick its current subject.
+      await waitFor(() => expect(client.cinemaSubjectCatalog).toHaveBeenCalledWith("e1", 0, ""));
+      const list = await screen.findByTestId("cutscene-subject-list");
+      // The headings are the ENGINE's ranking, read back in its order — not a re-sort here.
+      expect(list.textContent).toContain("This object");
+      expect(list.textContent).toContain("What it is part of");
+      expect(list.textContent).toContain("What it is made of");
+      // The number is the decision: 46 parts is an assembly, 1 part is the thing inside it.
+      expect(screen.getByTestId("cutscene-subject-option-e9").getAttribute("data-parts")).toBe("46");
+      expect(screen.getByTestId("cutscene-subject-option-e9").textContent).toContain("46 parts");
+      expect(screen.getByTestId("cutscene-subject-option-e2").textContent).toContain("1 part");
+    });
+
+    it("says a subject has nothing drawn under it BEFORE the shot is aimed at it", async () => {
+      selectSomething();
+      render(<CutscenePanel client={loaded()} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-subject"));
+
+      // THE SILENT FAILURE THIS EXISTS TO STOP: the solver frames a subject with no drawn geometry
+      // at its own origin inside a metre-ish box, so the camera goes somewhere plausible and points
+      // at nothing. It is invisible from outside — unless the picker says so first.
+      const empty = await screen.findByTestId("cutscene-subject-option-e3");
+      expect(empty.textContent).toContain("nothing drawn");
+      expect(empty.textContent).toMatch(/composed on its origin/i);
+      // And it is still OFFERED, not hidden: a marker is a legitimate thing to point a camera at,
+      // and a picker that silently omitted objects would be a scene the user cannot fully reach.
+      expect(empty).toBeTruthy();
+    });
+
+    it("searches the whole scene when the ranked list does not have it", async () => {
+      const client = loaded();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-subject"));
+      await screen.findByTestId("cutscene-subject-option-e1");
+
+      fireEvent.change(screen.getByTestId("cutscene-subject-search"), { target: { value: "hall" } });
+      await waitFor(() => expect(client.cinemaSubjectCatalog).toHaveBeenCalledWith("e1", 0, "hall"));
+      // The search ANSWERS: one row, under the engine's "Matches" heading, and the four ranked rows
+      // are gone. A picker that ignored its own box would still show all four here.
+      await waitFor(() =>
+        expect(screen.queryByTestId("cutscene-subject-option-e1")).toBeNull(),
+      );
+      expect(screen.getByTestId("cutscene-subject-option-e9")).toBeTruthy();
+      expect(screen.getByTestId("cutscene-subject-list").textContent).toContain("Matches");
+    });
+
+    it("re-aims the shot through the one validated command, and only when the choice changed", async () => {
+      const client = loaded();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-subject"));
+
+      // Picking the object it ALREADY films commits nothing. Re-writing the same subject would be an
+      // undo step that changes nothing a user can see — the failure `set_mood_ops` refuses for the
+      // same reason.
+      fireEvent.click(await screen.findByTestId("cutscene-subject-option-e1"));
+      expect(client.cinemaSetShotSubject).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByTestId("cutscene-subject"));
+      fireEvent.click(await screen.findByTestId("cutscene-subject-option-e9"));
+      await waitFor(() => expect(client.cinemaSetShotSubject).toHaveBeenCalledWith("e1", 0, "e9"));
+      // One command, one undo — not a framing edit carrying a subject in a spare field.
+      expect(client.cinemaSetShotFraming).not.toHaveBeenCalled();
+    });
+
+    it("names what a clip films on the lane, and only when it is not the cutscene's own object", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() =>
+        Promise.resolve({
+          ...FOUR_SHOTS,
+          rows: [
+            // An establishing wide of the whole assembly, then the ordinary shots of the owner.
+            { ...FOUR_SHOTS.rows[0], subject: "e9", subjectName: "Assembly Hall" },
+            ...FOUR_SHOTS.rows.slice(1),
+          ],
+        }),
+      );
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      const clips = await screen.findAllByTestId("cutscene-clip");
+      // The one that differs says so; the three that do not are not captioned four times with the
+      // name in the heading above them.
+      expect(clips[0].textContent).toContain("Assembly Hall");
+      expect(clips[1].textContent).not.toContain("Weld Gun 7");
+      expect(clips[2].textContent).not.toContain("Weld Gun 7");
+    });
+
+    it("opens the shot a card just added, so aiming it is the next click and not a hunt", async () => {
+      const client = fakeClient();
+      // The list AGREES with what the add returns, because it is the same cutscene read twice — the
+      // panel re-reads after every commit, and a fixture whose two answers disagree would close the
+      // editor the add had just opened for a reason no engine produces.
+      const added = await client.cinemaAddShot("e1", "establish");
+      client.cinemaList = vi.fn(() => Promise.resolve(added));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      await screen.findAllByTestId("cutscene-clip");
+      // Nothing is open until a shot is chosen — the panel says so rather than guessing.
+      expect(screen.queryByTestId("cutscene-shot-editor")).toBeNull();
+
+      fireEvent.click(screen.getByTestId("shot-establish"));
+      const editor = await screen.findByTestId("cutscene-shot-editor");
+      expect(editor.textContent).toMatch(/Shot 1 of 1/);
+      // …and the aiming control is right there, which is the whole reason the shot opens.
+      expect(screen.getByTestId("cutscene-subject")).toBeTruthy();
+    });
+
+    it("refuses to re-aim during Play, and says why", async () => {
+      selectSomething();
+      render(<CutscenePanel client={loaded()} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      act(() => playStore.getState().refresh({ playing: true, paused: false }));
+      const trigger = await screen.findByTestId("cutscene-subject");
+      await waitFor(() => expect(trigger.hasAttribute("disabled")).toBe(true));
+      expect(trigger.getAttribute("title")).toMatch(/Stop Play first/i);
+    });
+  });
+
   it("refuses a thirteenth shot with the ceiling and the way out, from the engine's own number", async () => {
     const client = loaded();
     client.cinemaList = vi.fn(() =>

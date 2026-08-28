@@ -2055,6 +2055,43 @@ export interface ShotRow {
   subjectName: string;
 }
 
+/** One object a shot could be pointed at, with the two facts that decide whether it is the right one. */
+export interface SubjectCandidate {
+  /** The entity key `cinemaSetShotSubject` takes. */
+  id: string;
+  /** What the outliner calls it. */
+  name: string;
+  /** The heading it is listed under, in the author's language — `"This object"`, `"What it is part
+   *  of"`, `"What it is made of"`, `"Beside it"`, or `"Matches"` for a search. Sent by the engine
+   *  rather than derived here, so the ranking and its headings cannot drift apart. */
+  group: string;
+  /** How many DRAWN parts are under it — what the camera will actually be fitted to. The number that
+   *  tells a 378-part assembly apart from the one bracket that shares most of its name. */
+  parts: number;
+  /** `false` when nothing under it is drawn: the shot would be composed on its ORIGIN inside a
+   *  metre-ish fallback box — a plausible camera pointed at nothing. */
+  framable: boolean;
+  /** This is the object the shot frames right now. */
+  current: boolean;
+}
+
+/** The subject picker's list — ranked by the scene's own hierarchy, or the answer to a search. */
+export interface SubjectCatalog {
+  /** The cutscene's own object, and the default a shot frames. */
+  owner: string;
+  ownerName: string;
+  /** What the shot being edited frames right now. */
+  current: string | null;
+  /** The rows, already in the order they should be drawn. */
+  candidates: SubjectCandidate[];
+  /** The query these rows answer, trimmed by the engine. Empty for the ranked default list. */
+  query: string;
+  /** How many objects matched in total — `candidates.length` is how many fitted. */
+  matches: number;
+  /** `true` when the list was cut short, so the UI says so instead of implying completeness. */
+  truncated: boolean;
+}
+
 /** A change to one shot's framing. An absent axis means "leave it alone", never "reset it". */
 export interface FramingEdit {
   size?: string;

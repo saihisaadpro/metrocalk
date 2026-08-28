@@ -4,7 +4,7 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type MatchStatus, type ShotRow, type TerrainReply, type TerrainStats } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type MatchStatus, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
 
 /** One authored shot, with the numbers a timeline needs. Shaped like what `cinema_list` really
  *  sends — a `startSeconds` of 0, an `effectiveSeconds` that is the authored length at Normal
@@ -24,6 +24,28 @@ const HERO_ROW: ShotRow = {
   amount: 0.35,
   subject: "e1",
   subjectName: "Crate",
+};
+
+/** A subject catalogue shaped like the one `cinema_subject_catalog` really sends: the owner under
+ *  its own heading, the assembly it belongs to, one part and one neighbour — with the `parts` counts
+ *  that are the whole reason the list is worth reading. `Empty Marker` has none, which is the row a
+ *  test needs to prove the picker warns before the film does.
+ *
+ *  The GROUP STRINGS are the engine's, not the shell's: the headings are sent, so a stub that
+ *  invented one would make a grouping test green against a word the engine never says. */
+const SUBJECTS: SubjectCatalog = {
+  owner: "e1",
+  ownerName: "Crate",
+  current: "e1",
+  candidates: [
+    { id: "e1", name: "Crate", group: "This object", parts: 1, framable: true, current: true },
+    { id: "e9", name: "Assembly Hall", group: "What it is part of", parts: 46, framable: true, current: false },
+    { id: "e2", name: "Lid", group: "What it is made of", parts: 1, framable: true, current: false },
+    { id: "e3", name: "Empty Marker", group: "Beside it", parts: 0, framable: false, current: false },
+  ],
+  query: "",
+  matches: 4,
+  truncated: false,
 };
 
 /** A framing vocabulary with the same WIRE VALUES the Rust catalogue publishes. The labels are the
@@ -320,6 +342,17 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     cinemaSetDelivery: vi.fn((id: string, delivery: DeliveryFrame) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Composing for ${delivery}`, reason: null })),
     cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, reads: [], rows: [], problems: [], message: "", reason: null })),
     cinemaFramingCatalog: vi.fn(() => Promise.resolve(FRAMING_CATALOG)),
+    cinemaSetShotSubject: vi.fn((id: string, index: number, subject: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, subject, subjectName: SUBJECTS.candidates.find((c) => c.id === subject)?.name ?? subject }], problems: [], message: `Shot ${index + 1} now frames ${subject}`, reason: null })),
+    // The stub SEARCHES, rather than returning the same four rows to every query: a picker that
+    // ignored its own search box would otherwise pass every assertion about having one.
+    cinemaSubjectCatalog: vi.fn((_id: string, _index: number | null, query: string) => {
+      const needle = query.trim().toLowerCase();
+      if (!needle) return Promise.resolve(SUBJECTS);
+      const hits = SUBJECTS.candidates
+        .filter((c) => c.name.toLowerCase().includes(needle))
+        .map((c) => ({ ...c, group: "Matches" }));
+      return Promise.resolve({ ...SUBJECTS, candidates: hits, query: query.trim(), matches: hits.length });
+    }),
     cinemaSetShotSeconds: vi.fn((id: string, index: number, seconds: number) => Promise.resolve({ entity: id, shots: 1, seconds, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, seconds, effectiveSeconds: seconds }], problems: [], message: `Shot ${index + 1} now runs ${seconds.toFixed(1)}s`, reason: null })),
     cinemaMoveShot: vi.fn((id: string, _from: number, to: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Shot moved to position ${to + 1}`, reason: null })),
     cinemaSetShotFraming: vi.fn((id: string, index: number, edit: FramingEdit) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, size: (edit.size as ShotRow["size"]) ?? HERO_ROW.size, angle: (edit.angle as ShotRow["angle"]) ?? HERO_ROW.angle, motion: (edit.motion as ShotRow["motion"]) ?? HERO_ROW.motion, amount: edit.amount ?? HERO_ROW.amount }], problems: [], message: `Shot ${index + 1} is now re-framed`, reason: null })),
