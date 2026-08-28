@@ -2993,6 +2993,14 @@ enum EngineCmd {
         value: FieldValue,
         reply: Sender<Result<usize, String>>,
     },
+    /// Set a rotation (ADR-172) — a normalised quaternion onto N entities as ONE batched, atomic,
+    /// undoable tx → reply how many were written, or the plain-language refusal. Four stored numbers
+    /// are ONE property; this is the only path that can write them together.
+    SetRotation {
+        ids: Vec<String>,
+        quat: [f64; 4],
+        reply: Sender<Result<usize, String>>,
+    },
     /// Delete = deactivate (M10.6, non-destructive; frees dependents) — N entities as ONE undoable
     /// transaction (ADR-169), so one Ctrl-Z restores the whole selection → reply applied.
     DeleteDeactivate {
@@ -10933,6 +10941,41 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         .map_err(|e| e.to_string())
                 };
                 if outcome.is_ok() {
+                    // ADR-172 — PERSIST IT. `Record::Edit` covers the one-object path; the batched
+                    // one had no record, so a selection edit survived a `.mtk` save and was lost by
+                    // the session replay a crash recovers through.
+                    log.append(&Record::MultiEdit {
+                        ids: ids.clone(),
+                        component: component.clone(),
+                        field: field.clone(),
+                        value: value.clone(),
+                    });
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, proj_full(&engine, &scene));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(outcome);
+            }
+            EngineCmd::SetRotation { ids, quat, reply } => {
+                let targets: Vec<EntityId> = ids
+                    .iter()
+                    .filter_map(|s| EntityId::from_loro_key(s))
+                    .collect();
+                let outcome = if targets.is_empty() {
+                    Err("nothing is selected".to_owned())
+                } else if targets.len() != ids.len() {
+                    Err("part of the selection is no longer in the scene".to_owned())
+                } else {
+                    capscene::set_rotation(&mut engine, &targets, quat)
+                        .map(|()| targets.len())
+                        .map_err(|e| e.to_string())
+                };
+                if outcome.is_ok() {
+                    log.append(&Record::SetRotation {
+                        ids: ids.clone(),
+                        quat,
+                    });
                     if let Some(ch) = &channel {
                         send_proj!(ch, proj_full(&engine, &scene));
                     }
@@ -23034,6 +23077,38 @@ fn multi_edit(
     }
 }
 
+/// ADR-172 — **set a rotation**: a quaternion onto N entities as ONE batched, atomic, undoable tx.
+///
+/// The Inspector rendered `qx`/`qy`/`qz`/`qw` as four independent number boxes, so a rotation could
+/// only be typed one component at a time — four transactions, four undo steps, and a quaternion of
+/// length ≠ 1 in between (and after, if the user stopped). `multi_edit` could not stand in for this:
+/// it writes ONE field to N entities, and a rotation is FOUR fields to N entities. The engine
+/// normalises, so no caller — panel, AI patch, MCP tool or script — can leave a non-rotation behind.
+#[tauri::command(async)]
+fn set_rotation(state: State<AppState>, ids: Vec<String>, quat: Vec<f64>) -> MultiEditResult {
+    ipc();
+    let Ok(quat) = <[f64; 4]>::try_from(quat.as_slice()) else {
+        return MultiEditResult::refused("a rotation is four numbers (qx, qy, qz, qw)");
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SetRotation { ids, quat, reply })
+        .is_err()
+    {
+        return MultiEditResult::refused("the engine is not accepting edits");
+    }
+    match recv_reply(&rx) {
+        Ok(Ok(changed)) => MultiEditResult {
+            ok: true,
+            changed,
+            reason: None,
+        },
+        Ok(Err(reason)) => MultiEditResult::refused(reason),
+        Err(_) => MultiEditResult::refused("the engine did not answer"),
+    }
+}
+
 /// M10.6 — delete = deactivate (non-destructive; frees dependents); reply applied.
 /// The one-entity form of [`delete_deactivate_many`], through the same engine arm.
 #[tauri::command(async)]
@@ -25727,6 +25802,7 @@ fn main() {
             group_entities,
             ungroup_entity,
             multi_edit,
+            set_rotation,
             delete_deactivate_many,
             duplicate_entities,
             delete_deactivate,

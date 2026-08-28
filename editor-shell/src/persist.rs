@@ -63,6 +63,20 @@ pub enum Record {
     Edit(EditTx),
     /// A binding-by-intent (HealthBar → provider).
     Bind { from: String, to: String },
+    /// **A whole-selection field edit** (ADR-169's `multi_edit`), replayed as the same batched
+    /// transaction. ADR-172 added it: `Record::Edit` covers the ONE-object path and the batched path
+    /// had no record at all, so a selection edit survived a `.mtk` save (it is in the document) and
+    /// was silently lost by a session replay, which is the recovery path a crash uses.
+    MultiEdit {
+        ids: Vec<String>,
+        component: String,
+        field: String,
+        value: metrocalk_core::FieldValue,
+    },
+    /// **A whole-selection rotation** (ADR-172's `set_rotation`) — the quaternion as authored; replay
+    /// re-normalises it through the same verb, so a replayed document can no more hold a non-rotation
+    /// than a live one can.
+    SetRotation { ids: Vec<String>, quat: [f64; 4] },
     /// A describe-to-create (M3.2): a free-text query resolved + instantiated at a position. Replayed
     /// deterministically (same resolve + same id allocation) so the described entity is recreated.
     /// With the asset tier (M4) the resolved kind may also carry a mesh handle — re-derived from the
@@ -729,6 +743,25 @@ impl Log {
                     .is_some_and(|e| capscene::set_part_active(engine, e, active).is_ok()),
                 Record::DeleteDeactivate { id } => EntityId::from_loro_key(&id)
                     .is_some_and(|e| capscene::delete_deactivate(engine, scene, e).is_ok()),
+                Record::MultiEdit {
+                    ids,
+                    component,
+                    field,
+                    value,
+                } => {
+                    let targets: Vec<EntityId> =
+                        ids.iter().filter_map(|s| EntityId::from_loro_key(s)).collect();
+                    targets.len() == ids.len()
+                        && !targets.is_empty()
+                        && capscene::multi_edit(engine, &targets, &component, &field, &value).is_ok()
+                }
+                Record::SetRotation { ids, quat } => {
+                    let targets: Vec<EntityId> =
+                        ids.iter().filter_map(|s| EntityId::from_loro_key(s)).collect();
+                    targets.len() == ids.len()
+                        && !targets.is_empty()
+                        && capscene::set_rotation(engine, &targets, quat).is_ok()
+                }
                 Record::Deform { id, handles } => EntityId::from_loro_key(&id)
                     .is_some_and(|e| capscene::set_part_deform(engine, e, &handles).is_ok()),
                 Record::ApplyMarketplace {

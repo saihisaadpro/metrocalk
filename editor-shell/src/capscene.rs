@@ -2074,6 +2074,107 @@ pub fn multi_edit(
     Ok(())
 }
 
+/// Why a rotation was refused, in words a panel can print.
+#[derive(Debug)]
+pub enum RotationError {
+    /// The four numbers are not a rotation — non-finite, or of zero length, so no normalisation exists.
+    NotARotation,
+    /// At least one target carries no `Transform`. Writing the quaternion there would INVENT one
+    /// holding a rotation and no position, which `local_transform` would then read as a pose at the
+    /// world origin.
+    NoTransform {
+        /// How many of the targets lack a `Transform`.
+        missing: usize,
+        /// How many targets were asked for.
+        total: usize,
+    },
+    /// The transaction itself was refused (an unknown id, a Loro failure).
+    Pipeline(PipelineError),
+}
+
+impl std::fmt::Display for RotationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotARotation => write!(
+                f,
+                "those four numbers are not a rotation (a quaternion must be finite and non-zero)"
+            ),
+            Self::NoTransform { missing, total } => write!(
+                f,
+                "{missing} of {total} selected objects have no position in the world, so they cannot be rotated"
+            ),
+            Self::Pipeline(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RotationError {}
+
+impl From<PipelineError> for RotationError {
+    fn from(e: PipelineError) -> Self {
+        Self::Pipeline(e)
+    }
+}
+
+/// **SET A ROTATION** (ADR-172) — write a **normalised** quaternion onto N entities as **ONE** undoable
+/// transaction.
+///
+/// A rotation is four stored numbers and **one** property, and until this verb existed the editor had
+/// no way to say so: the Inspector rendered `qx`/`qy`/`qz`/`qw` as four independent number boxes, so
+/// typing in one of them committed a quaternion of length ≠ 1 — not a rotation at all, and four undo
+/// steps to get back from. The normalisation is here rather than in the caller for the reason every
+/// other guard in this file is here: `Op::SetField` will write whatever it is handed, and the AI
+/// layer, an MCP tool and a script all arrive through the same door as the panel.
+///
+/// It refuses a target with **no** `Transform`, which is stricter than [`multi_edit`]'s
+/// disagreement rule, deliberately: seeding a component uniformly across a selection is that verb's
+/// normal use, but a `Transform` holding a rotation and no position is not a pose — `local_transform`
+/// would read it as "rotated, at the world origin", which is a placement nobody asked for.
+///
+/// # Errors
+/// [`RotationError::NotARotation`] for a non-finite or zero-length quaternion;
+/// [`RotationError::NoTransform`] when a target has no `Transform`; [`RotationError::Pipeline`] if the
+/// transaction is refused.
+pub fn set_rotation(
+    engine: &mut Engine<FlecsWorld>,
+    ids: &[EntityId],
+    quat: [f64; 4],
+) -> Result<(), RotationError> {
+    let length = quat.iter().map(|c| c * c).sum::<f64>().sqrt();
+    if !quat.iter().all(|c| c.is_finite()) || !length.is_finite() || length < 1.0e-9 {
+        return Err(RotationError::NotARotation);
+    }
+    let unit = quat.map(|c| c / length);
+
+    let missing = ids
+        .iter()
+        .filter(|&&id| !engine.components_of(id).contains_key("Transform"))
+        .count();
+    if missing > 0 {
+        return Err(RotationError::NoTransform {
+            missing,
+            total: ids.len(),
+        });
+    }
+
+    let ops = ids
+        .iter()
+        .flat_map(|&id| {
+            ["qx", "qy", "qz", "qw"]
+                .into_iter()
+                .zip(unit)
+                .map(move |(field, value)| Op::SetField {
+                    entity: id,
+                    component: "Transform".into(),
+                    field: field.into(),
+                    value: FieldValue::Number(value),
+                })
+        })
+        .collect();
+    engine.commit("set-rotation", ops)?;
+    Ok(())
+}
+
 /// **DELETE** (M10.6) — **deactivate, not destroy** (ADR-026): set `id` inactive (so undo restores it and a
 /// concurrent editor's field edits are never lost to a destructive delete) AND **free any dependents**
 /// tracking it (the M3.3 Remove rule — the requirement re-opens), ONE undoable transaction. Distinct from

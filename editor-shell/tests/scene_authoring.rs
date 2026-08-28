@@ -685,3 +685,104 @@ fn the_authoring_verbs_survive_an_mtk_save_and_reopen() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+// ── SET A ROTATION (ADR-172) — four stored numbers, one property, one transaction ──────────────────────
+
+/// Read a Transform field as an `f64` (the four quaternion components are all `Number`s on the wire).
+fn tf(engine: &Engine<FlecsWorld>, id: EntityId, field: &str) -> Option<f64> {
+    match engine
+        .components_of(id)
+        .get("Transform")
+        .and_then(|t| t.get(field))
+    {
+        Some(FieldValue::Number(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+#[test]
+fn set_rotation_writes_four_fields_across_n_entities_as_one_undoable_tx() {
+    let (mut e, _scene) = engine_with_resolver();
+    let ids: Vec<EntityId> = (0..3).map(|i| spawn_at(&mut e, i as f32)).collect();
+
+    // 90° about Y.
+    let s = std::f64::consts::FRAC_1_SQRT_2;
+    capscene::set_rotation(&mut e, &ids, [0.0, s, 0.0, s]).expect("rotate the selection");
+    for &id in &ids {
+        assert!((tf(&e, id, "qy").unwrap() - s).abs() < 1e-9);
+        assert!((tf(&e, id, "qw").unwrap() - s).abs() < 1e-9);
+    }
+
+    // ONE undo takes all twelve field writes back, not the last one.
+    assert!(e.undo(), "the rotation is ONE undoable transaction");
+    for &id in &ids {
+        assert_eq!(tf(&e, id, "qy"), None, "one undo reverted every entity");
+        assert_eq!(tf(&e, id, "qw"), None);
+    }
+}
+
+#[test]
+fn set_rotation_normalises_so_the_document_can_never_hold_a_non_rotation() {
+    // THE DEFECT THIS CLOSES: the Inspector rendered qx/qy/qz/qw as four independent number boxes, so
+    // typing 5 into one of them committed a quaternion of length 5 — which is not a rotation, and
+    // which every reader downstream (`local_transform` → the renderer, picking, framing, export)
+    // would nevertheless use.
+    let (mut e, _scene) = engine_with_resolver();
+    let id = spawn_at(&mut e, 0.0);
+
+    capscene::set_rotation(&mut e, &[id], [0.0, 5.0, 0.0, 5.0]).expect("a scaled quaternion is a rotation, once normalised");
+    let length = ["qx", "qy", "qz", "qw"]
+        .iter()
+        .map(|f| tf(&e, id, f).unwrap().powi(2))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        (length - 1.0).abs() < 1e-9,
+        "the stored quaternion is a UNIT quaternion, whatever length the caller passed: {length}"
+    );
+}
+
+#[test]
+fn set_rotation_refuses_four_numbers_that_are_not_a_rotation() {
+    let (mut e, _scene) = engine_with_resolver();
+    let id = spawn_at(&mut e, 0.0);
+
+    for bad in [[0.0, 0.0, 0.0, 0.0], [f64::NAN, 0.0, 0.0, 1.0]] {
+        let err = capscene::set_rotation(&mut e, &[id], bad).expect_err("refused");
+        assert!(
+            err.to_string().contains("not a rotation"),
+            "the refusal says what is wrong, in words a panel can print: {err}"
+        );
+    }
+    assert_eq!(tf(&e, id, "qw"), None, "and nothing was written");
+}
+
+#[test]
+fn set_rotation_refuses_an_object_with_no_place_in_the_world_and_says_how_many() {
+    // Stricter than `multi_edit`'s disagreement rule, on purpose: a `Transform` carrying a rotation
+    // and no position is not a pose — `local_transform` reads it as "rotated, at the world origin".
+    let (mut e, _scene) = engine_with_resolver();
+    let placed = spawn_at(&mut e, 0.0);
+    let bare = e.alloc_entity_id();
+    e.commit(
+        "bare",
+        vec![Op::CreateEntity {
+            id: bare,
+            parent: None,
+        }],
+    )
+    .unwrap();
+
+    let err = capscene::set_rotation(&mut e, &[placed, bare], [0.0, 0.0, 0.0, 1.0])
+        .expect_err("a selection with a non-spatial object is refused");
+    let said = err.to_string();
+    assert!(
+        said.contains("1 of 2"),
+        "the refusal names how many, not just 'no': {said}"
+    );
+    assert!(
+        !e.components_of(bare).contains_key("Transform"),
+        "the bare entity did NOT silently gain a Transform"
+    );
+    assert_eq!(tf(&e, placed, "qw"), None, "and the placed one was not half-rotated");
+}
