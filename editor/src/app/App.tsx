@@ -50,6 +50,9 @@ import { normalizeSurfacePoint } from "./viewportCoordinates";
 const PipeForge = lazy(() => import("../panels/PipeForge").then((module) => ({ default: module.PipeForge })));
 const CommandPalette = lazy(() => import("../panels/CommandPalette").then((module) => ({ default: module.CommandPalette })));
 const ContextMenu = lazy(() => import("../panels/ContextMenu").then((module) => ({ default: module.ContextMenu })));
+// The export dialog reads the format catalogue and holds the fidelity ledger; a session that never
+// exports should not pay for either at boot (ADR-174).
+const ExportDialog = lazy(() => import("../panels/ExportDialog").then((module) => ({ default: module.ExportDialog })));
 
 // The collapsed side rails carry only what that dock actually holds. The sub-engines are NOT repeated
 // here — they live on the Engines rail, which is always visible, and listing them twice in different
@@ -171,6 +174,7 @@ export function App() {
   const [bottomWorkspace, setBottomWorkspace] = useState<BottomWorkspace>("asset");
   const [bottomOpen, setBottomOpen] = useState(false);
   const [commandsOpen, setCommandsOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
   const [vw, setVw] = useState(effectiveViewportWidth);
   const [leftDockCollapsed, setLeftDockCollapsed] = useRememberedBoolean("left-collapsed", false);
   const [rightDockCollapsed, setRightDockCollapsed] = useRememberedBoolean("right-collapsed", vw < 1200);
@@ -561,6 +565,9 @@ export function App() {
     { id: "create-entity", label: "Create empty entity", category: "Create", description: "Add a named object at the origin", execute: async () => selectCreated(await client.createEntity(0, 1, 0, "Entity")) },
     { id: "create-light", label: "Add point light", category: "Create", description: "Add a warm point light above the origin", execute: async () => selectCreated(await client.addLight("point", 0, 4, 0, 1, 0.96, 0.9, 60)) },
     { id: "import-asset", label: "Import asset…", category: "Create", description: "Choose a supported 3D, image, or CAD file", execute: async () => selectCreated(await client.importAssetDialog()) },
+    // The palette had no File category at all, so the one command with a real cost attached — writing
+    // the scene out — was reachable only by finding the menu it lived in.
+    { id: "file-export", label: "Export scene…", category: "File", description: "Choose a format, see what it carries, and write the scene", keywords: ["glb", "gltf", "usd", "usda", "step", "save as", "write"], execute: () => setExportOpen(true) },
     { id: "view-frame-all", label: "Frame all", category: "View", description: "Fit the whole scene in the viewport", execute: () => client.frameAll() },
     { id: "view-top", label: "Top view", category: "View", execute: () => client.viewPreset("top") },
     { id: "view-front", label: "Front view", category: "View", execute: () => client.viewPreset("front") },
@@ -631,6 +638,7 @@ export function App() {
         client={client}
         compact={layout.collapsed}
         onOpenCommands={() => setCommandsOpen(true)}
+        onExport={() => setExportOpen(true)}
         onOpenLeftDock={() => setDrawer("left")}
         onOpenRightDock={() => setDrawer("right")}
       />
@@ -1086,6 +1094,20 @@ export function App() {
               setStatus(`${command.label} could not be completed`);
             }}
           />
+        </Suspense>
+      )}
+      {exportOpen && (
+        <Suspense
+          fallback={(
+            <Modal open onClose={() => setExportOpen(false)} ariaLabel="Export dialog loading">
+              <div className="mtk-workspace-state" role="status" aria-live="polite">
+                <span className="mtk-spinner" aria-hidden="true" />
+                <span>Loading export…</span>
+              </div>
+            </Modal>
+          )}
+        >
+          <ExportDialog open client={client} onClose={() => setExportOpen(false)} />
         </Suspense>
       )}
       <StatusBar />

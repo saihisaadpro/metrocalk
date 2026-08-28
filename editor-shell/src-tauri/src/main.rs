@@ -13454,7 +13454,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 reply,
             } => {
                 let normalized = format.to_ascii_lowercase();
-                if !matches!(normalized.as_str(), "glb" | "usda" | "usd" | "step" | "stp") {
+                // The accepted set lives in `formats::EXPORT_ARGS` because the export dialog also
+                // has to know it — it derives its argument from each writable format's canonical
+                // extension, and a second copy here is what would let the two drift apart.
+                if !metrocalk_editor_shell::formats::export_arg_accepted(&normalized) {
                     let _ = reply.send(SceneExportResponse {
                         message: format!(
                             "Unsupported scene format '{format}'; choose GLB, ASCII USDA, or STEP"

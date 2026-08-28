@@ -74,6 +74,7 @@ import type {
   UserFittingCatalogEntry,
   AssetLabProcessRequest,
   AssetLabResponse,
+  SceneExportFormat,
   SceneExportResponse,
   AnimationWorkspaceInfo,
   AnimationClipInstanceSaveRequest,
@@ -327,7 +328,7 @@ export interface EditorClient {
   /** Export a selected canonical mesh as an embedded-texture GLB. `path` is for automation. */
   assetLabExport(id: string, path?: string): Promise<AssetLabResponse>;
   /** Export the authoritative hierarchy, reusable meshes, skins and representable animation. */
-  sceneExport(format: "glb" | "usda" | "step", path?: string): Promise<SceneExportResponse>;
+  sceneExport(format: SceneExportFormat, path?: string): Promise<SceneExportResponse>;
   /** M11.3 — author a Light entity (kind = directional|point|spot) at a position with a linear RGB colour +
    *  intensity → its id. One undoable commit; the lit result is a render projection (not in the doc). */
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null>;
@@ -994,7 +995,7 @@ export class TauriClient implements EditorClient {
   assetLabExport(id: string, path?: string): Promise<AssetLabResponse> {
     return this.core.invoke<AssetLabResponse>("asset_lab_export", { id, path: path ?? null }).catch((e: unknown) => { console.error("asset_lab_export failed", e); throw e; });
   }
-  sceneExport(format: "glb" | "usda" | "step", path?: string): Promise<SceneExportResponse> {
+  sceneExport(format: SceneExportFormat, path?: string): Promise<SceneExportResponse> {
     return this.core.invoke<SceneExportResponse>("scene_export", { format, path: path ?? null }).catch((e: unknown) => { console.error("scene_export failed", e); throw e; });
   }
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null> {
@@ -1549,6 +1550,129 @@ export function buildWorld(n: number): EntityProjection[] {
   }
   return out;
 }
+
+/**
+ * The dev-mock mirror of `editor-shell/src/formats.rs::format_catalog()` — the one list the engine has
+ * an opinion about, so the Formats panel and the Export dialog render the same rows under
+ * `npm run dev`/Vitest as they do in the `.exe` (which serves the authoritative list from Rust).
+ *
+ * It was `[]` before, and an empty catalogue is not a neutral placeholder: every surface built on it
+ * looks finished and says the engine can read and write nothing. `available` mirrors the PACKAGED
+ * build's feature set (`editor-shell/src-tauri/Cargo.toml` forwards `assets-fbx`, `assets-ktx2` and
+ * `interchange-3dxml`), because that is the build this mock stands in for.
+ */
+const MOCK_FORMATS: FormatSpec[] = [
+  {
+    id: "gltf",
+    label: "glTF 2.0 / GLB",
+    extensions: ["glb", "gltf"],
+    domain: "Real-time",
+    direction: "both",
+    fidelity: "full",
+    carries: { geometry: true, hierarchy: true, materials: true, textures: true, skinning: true, animation: true, cameras: false, metadata: false, physics: false },
+    note: "The engine's best-supported path, both directions. Metallic-roughness PBR with embedded textures on export.",
+    available: true,
+  },
+  {
+    id: "obj",
+    label: "Wavefront OBJ",
+    extensions: ["obj"],
+    domain: "Real-time",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: false, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "Geometry only. OBJ has no hierarchy, no animation and no PBR; a companion .mtl is not read.",
+    available: true,
+  },
+  {
+    id: "fbx",
+    label: "Autodesk FBX",
+    extensions: ["fbx"],
+    domain: "Real-time",
+    direction: "import",
+    fidelity: "seam",
+    carries: { geometry: true, hierarchy: true, materials: true, textures: false, skinning: true, animation: true, cameras: false, metadata: false, physics: false },
+    note: "Read through the native ufbx reader.",
+    available: true,
+  },
+  {
+    id: "image",
+    label: "PNG / JPEG",
+    extensions: ["png", "jpg", "jpeg"],
+    domain: "Textures",
+    direction: "import",
+    fidelity: "full",
+    carries: { geometry: true, hierarchy: false, materials: false, textures: true, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "Placed as a textured quad. Treated as sRGB colour data.",
+    available: true,
+  },
+  {
+    id: "ktx2",
+    label: "KTX2 / Basis Universal",
+    extensions: ["ktx2"],
+    domain: "Textures",
+    direction: "import",
+    fidelity: "seam",
+    carries: { geometry: false, hierarchy: false, materials: false, textures: true, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "Supercompressed GPU texture, transcoded on import.",
+    available: true,
+  },
+  {
+    id: "hdr",
+    label: "Radiance HDR (equirectangular)",
+    extensions: ["hdr"],
+    domain: "Textures",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: false, hierarchy: false, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "An environment map for image-based lighting. Equirectangular layout only.",
+    available: true,
+  },
+  {
+    id: "step",
+    label: "STEP AP242",
+    extensions: ["stp", "step"],
+    domain: "CAD",
+    direction: "both",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: true, materials: true, textures: false, skinning: false, animation: false, cameras: false, metadata: true, physics: false },
+    note: "Pure-Rust reader and writer. Planar faces plus analytic cylinders, cones, spheres and tori tessellate exactly; trimmed NURBS and freeform faces are reported per face and left to a licensed kernel. Semantic PMI (GD&T) round-trips machine-readable, never downgraded to a graphical annotation.",
+    available: true,
+  },
+  {
+    id: "3dxml",
+    label: "CATIA 3DXML",
+    extensions: ["3dxml"],
+    domain: "CAD",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: true, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: true, physics: false },
+    note: "Product structure, assembly tree and instance transforms are read in full. CATIA's proprietary .3DRep tessellation is not decodable here — if a sibling STEP file is present it is used automatically for the geometry, otherwise each affected part is reported as a placed proxy.",
+    available: true,
+  },
+  {
+    id: "urdf",
+    label: "URDF",
+    extensions: ["urdf", "xml"],
+    domain: "Simulation",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: false, hierarchy: true, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: true },
+    note: "Links, joints and collision shapes with forward kinematics resolved to world poses. Visual geometry, inertia tensors and actuation are not read. Prismatic, floating and planar joints are declined with a reason rather than approximated.",
+    available: true,
+  },
+  {
+    id: "usd",
+    label: "OpenUSD (USD-Physics)",
+    extensions: ["usda", "usd"],
+    domain: "Simulation",
+    direction: "both",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: true, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: true },
+    note: "Export writes a USDA scene. Import reads ASCII .usda only, and only the USD-Physics subset: units, rigid bodies and primitive colliders. Binary .usdc, zipped .usdz and USD's composition system (references, payloads, variants, layers) are a declared seam — and composition, not geometry, is what USD is actually for, so this is an interop path and not a claim to speak USD.",
+    available: true,
+  },
+];
 
 /** The dev-mock mirror of the shell's shape catalog (same kinds/params, so the Build panel renders
  *  identically under `npm run dev`/Vitest; the .exe serves the authoritative list from Rust). */
@@ -2742,7 +2866,7 @@ class MockClient implements EditorClient {
     return Promise.resolve();
   }
   formatCatalog(): Promise<FormatSpec[]> {
-    return Promise.resolve([]);
+    return Promise.resolve(MOCK_FORMATS.map((spec) => ({ ...spec, carries: { ...spec.carries } })));
   }
   colourStatus(): Promise<ColourStatus> {
     return Promise.resolve({
@@ -2862,7 +2986,7 @@ class MockClient implements EditorClient {
   assetLabExport(id: string): Promise<AssetLabResponse> {
     return this.assetLabAudit(id);
   }
-  sceneExport(format: "glb" | "usda" | "step"): Promise<SceneExportResponse> {
+  sceneExport(format: SceneExportFormat): Promise<SceneExportResponse> {
     return Promise.resolve({
       ok: false,
       message: "Complete-scene export is available in the packaged desktop editor.",

@@ -1443,6 +1443,17 @@ export interface AssetLabResponse {
   bakeEvidence: AssetLabBakeEvidence | null;
 }
 
+/**
+ * Every `format` argument `scene_export` acts on — the mirror of `formats::EXPORT_ARGS`.
+ *
+ * It is the full set, not the three spellings the File menu used to hardcode, because the export
+ * dialog addresses a format by its CANONICAL EXTENSION (`extensions[0]` of its `FormatSpec`) rather
+ * than by a second hand-written mapping — and two of those canonical extensions (`stp`, `usda`) are
+ * spellings the old union did not name. `every_writable_format_is_addressable_by_its_canonical_extension`
+ * in `editor-shell/src/formats.rs` is the test that keeps the two sides of that derivation paired.
+ */
+export type SceneExportFormat = "glb" | "usda" | "usd" | "step" | "stp";
+
 /** One machine-readable fidelity decision from complete-scene export. */
 export interface SceneExportFidelity {
   status: "preserved" | "converted" | "omitted";

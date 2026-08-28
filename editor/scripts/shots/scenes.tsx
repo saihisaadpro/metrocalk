@@ -28,6 +28,7 @@ import { Inspector } from "../../src/inspector/Inspector";
 import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
 import { Diagnostics } from "../../src/panels/Diagnostics";
+import { ExportDialog } from "../../src/panels/ExportDialog";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { Reveal } from "../../src/panels/Reveal";
 import { RigPanel, type RigDocument } from "../../src/panels/RigPanel";
@@ -38,6 +39,7 @@ import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { assetShelfStore } from "../../src/store/assetShelf";
 import { projectionStore } from "../../src/store/projection";
+import { projectStore } from "../../src/store/project";
 import type {
   AnimationPropertyInfo,
   AnimationTrackInfo,
@@ -45,6 +47,7 @@ import type {
   CadReport,
   CadReportPart,
   RevealResponse,
+  SceneExportResponse,
   StateMachine,
   TimelineTuple,
 } from "../../src/transport/protocol";
@@ -705,6 +708,201 @@ function graphScenes(): Scene[] {
   ];
 }
 
+/** === The export task dialog (ADR-174) ==========================================================
+ *
+ *  The workflow that used to be three items on a menu, each firing a write on click. There was
+ *  nothing to photograph before: the whole surface was a `PopupMenuGroup` and the answer arrived in
+ *  the status bar. These four are its first captures, and the reason they can exist at all is the
+ *  driver reaching a PORTALLED root — a `Modal` renders into `document.body`, so every claim below
+ *  would have found nothing a day ago.
+ *
+ *  The catalogue comes from `createMockSession()` rather than a fixture of its own: the dialog's
+ *  membership rule reads `direction` and `available`, so a hand-written list here could photograph a
+ *  rail the real registry cannot produce — the C6 failure reached through a screenshot. */
+const exportCatalogue = createMockSession().formatCatalog();
+
+const exportClient = (reply?: SceneExportResponse): EditorClient =>
+  ({
+    formatCatalog: () => exportCatalogue,
+    sceneExport: () => Promise.resolve(reply ?? {
+      ok: false,
+      message: "Complete-scene export is available in the packaged desktop editor.",
+      format: "glb",
+      exportedPath: null,
+      nodes: 0,
+      meshes: 0,
+      skins: 0,
+      animations: 0,
+      fidelity: [],
+    }),
+  }) as unknown as EditorClient;
+
+/** A weld cell holding the three things the scene outline can see a format drop: a camera, an
+ *  animated rig and two physics objects. Component names are the core's own (`core/src/stdlib.rs`). */
+const exportSetup = () => {
+  projectStore.getState().refresh({ path: "C:/work/weld-cell-12.mtk", dirty: true, recents: [], error: null });
+  projectionStore.getState().bulkLoad([
+    { id: "e-cam", name: "Shot Camera", parentId: null, components: { Transform: {}, Camera: {} } },
+    { id: "e-gun", name: "Weld Gun 7", parentId: null, components: { Transform: {}, MeshRenderer: {}, Animator: {} } },
+    { id: "e-girder", name: "Long Travel Girder", parentId: null, components: { Transform: {}, MeshRenderer: {} } },
+    { id: "e-crate", name: "Crate", parentId: null, components: { Transform: {}, MeshRenderer: {}, RigidBody: {} } },
+    { id: "e-pad", name: "Safety Pad", parentId: null, components: { Transform: {}, Collider: {} } },
+  ] as never);
+};
+
+const EXPORTED: SceneExportResponse = {
+  ok: true,
+  message: "Wrote 5 objects to weld-cell-12.glb",
+  format: "glb",
+  exportedPath: "C:/work/export/weld-cell-12.glb",
+  nodes: 5,
+  meshes: 3,
+  skins: 0,
+  animations: 1,
+  fidelity: [
+    { status: "preserved", feature: "hierarchy", count: 5, detail: "Every node kept its parent and its local transform." },
+    { status: "converted", feature: "authored_visibility", count: 1, detail: "Stored in node extras — glTF has no visibility flag, so a reader that ignores extras will show the object." },
+    { status: "omitted", feature: "physics", count: 2, detail: "glTF has no rigid-body or collider representation. Re-author these in the target application." },
+  ],
+};
+
+/** The dialog is a `Modal`: it portals to `document.body`, so the frame itself stays empty by design
+ *  and every claim below is evaluated against the portalled root. The window is the subject in all
+ *  four, so each states a `viewport` rather than a frame `width`. */
+const exportScene = (
+  id: string,
+  looking_for: string,
+  expect: Expect,
+  viewport: { width: number; height: number },
+  extra: { click?: string[]; reply?: SceneExportResponse } = {},
+): Scene => ({
+  id,
+  looking_for,
+  expect: {
+    ...expect,
+    // `Icon` draws an empty, still-sized box for a name the set lacks, so a blank control
+    // photographs like a working one. Standing claim on every scene here, not a per-scene choice.
+    absent: ["[data-icon-missing]", ...(expect.absent ?? [])],
+    text_absent: ["null", "undefined", "NaN", ...(expect.text_absent ?? [])],
+  },
+  viewport,
+  click: extra.click,
+  setup: exportSetup,
+  render: () => <ExportDialog open client={exportClient(extra.reply)} onClose={() => { /* a capture never closes it */ }} />,
+});
+
+function exportScenes(): Scene[] {
+  return [
+    exportScene(
+      "export-dialog",
+      "THE EXPORT WORKFLOW AS ONE SURFACE. What a reader is checking is that the decision is legible " +
+      "BEFORE the click: a rail of every format this build can write (not the three a menu once " +
+      "hardcoded), the chosen one's declared fidelity beside its name, the registry's honest sentence " +
+      "about what it does not do, and a nine-row checklist where carried and not-carried differ by " +
+      "MARK before they differ by colour. The primary action names the project it will write and sits " +
+      "in a footer that does not scroll — the old version's entire answer was a status line",
+      {
+        present: [
+          ["[data-testid='exportDialog']", 1],
+          ["[role='tablist'][aria-label='Export formats'] [role='tab']", 3],
+          ["[data-testid='exportCarries'] li", 9],
+          ["[data-testid='exportConfirm']", 1],
+        ],
+        text_present: ["glTF 2.0 / GLB", "Full", "Export weld-cell-12", "5 objects in this scene"],
+        unclipped: [
+          "[data-testid='exportConfirm']",
+          "[data-testid='exportSubject']",
+          "[role='tablist'][aria-label='Export formats'] [role='tab']",
+        ],
+        // The rail is a COLUMN at this width — the pane sits BESIDE it, not under it. (Claimed on
+        // the two regions, not on the tablist and the heading: the rail's box starts below its own
+        // title, so those two never shared a line and never should have been asked to.)
+        same_line: [[".mtk-export__rail", ".mtk-export__pane"]],
+      },
+      { width: 1100, height: 760 },
+    ),
+    exportScene(
+      "export-dialog-cost",
+      "THE SENTENCE THE OLD MENU COULD NOT SAY. STEP AP242 carries geometry, hierarchy, materials and " +
+      "engineering data — and none of the camera, animation or physics this scene contains. So the " +
+      "cost of choosing it is counted from the scene outline and stated in words, above the button " +
+      "that would pay it. A reader should be checking that the count is of OBJECTS (the crate carries " +
+      "a rigid body, the pad a collider: two physics bodies, not four components), that the block does " +
+      "not claim to have checked what it cannot see, and that it is inside the pane rather than in a " +
+      "gutter somewhere else",
+      {
+        present: [["[data-testid='exportCost']", 1]],
+        text_present: [
+          "STEP AP242",
+          "1 camera",
+          "1 animated object",
+          "2 physics bodies",
+          "Counted from the scene outline",
+        ],
+        stacked: [
+          ["[data-testid='exportCarries']", "[data-testid='exportCost']"],
+          ["[data-testid='exportCost']", "[data-testid='exportConfirm']"],
+        ],
+        unclipped: ["[data-testid='exportCost']", "[data-testid='exportConfirm']"],
+      },
+      { width: 1100, height: 760 },
+      { click: ["#exportFormats-step-tab"] },
+    ),
+    exportScene(
+      "export-dialog-ledger",
+      "WHAT IT BOUGHT, IN THE PLACE THE GESTURE HAPPENED. After the write the options are replaced by " +
+      "the exporter's own fidelity ledger — three decisions, each tagged preserved / converted / " +
+      "omitted, each with the sentence explaining it — plus the counts and the destination path in " +
+      "mono. The old flow put a truncated version of this in a toast that overwrites itself and a " +
+      "status line that is gone by the next action. A reader is checking that nothing here is a " +
+      "summary of something the user can no longer reach, and that the footer now offers finishing " +
+      "rather than repeating the action just taken",
+      {
+        present: [
+          ["[data-testid='exportResult']", 1],
+          ["[data-testid='exportFidelity'] li", 3],
+          ["[data-testid='exportDone']", 1],
+        ],
+        absent: ["[data-testid='exportCarries']", "[data-testid='exportCost']"],
+        text_present: [
+          "weld-cell-12.glb",
+          "authored_visibility",
+          "no rigid-body or collider representation",
+          "omitted",
+        ],
+        unclipped: ["[data-testid='exportPath']", "[data-testid='exportDone']"],
+        stacked: [["[data-testid='exportPath']", "[data-testid='exportFidelity']"]],
+      },
+      { width: 1100, height: 820 },
+      { click: ["[data-testid='exportConfirm']"], reply: EXPORTED },
+    ),
+    exportScene(
+      "export-dialog-narrow",
+      "THE SAME DIALOG BELOW THE 860px THE RAIL IS WORTH: the format list turns back into the " +
+      "horizontal strip `.mtk-nav-rail` already becomes elsewhere, and the pane takes the full width " +
+      "under it. What must survive the fold is everything the wide scene claims — every format still " +
+      "reachable in one glance rather than behind a scroll, the checklist unclipped however many " +
+      "columns it settles on, and the primary action still pinned to the footer",
+      {
+        present: [
+          ["[role='tablist'][aria-label='Export formats'] [role='tab']", 3],
+          ["[data-testid='exportCarries'] li", 9],
+        ],
+        text_present: ["Export weld-cell-12"],
+        // Every format on one row: a strip that scrolls past the edge is the pattern the rail exists
+        // to replace, and it must not come back through the responsive door.
+        same_line: [["#exportFormats-gltf-tab", "#exportFormats-usd-tab"]],
+        unclipped: [
+          "[role='tablist'][aria-label='Export formats'] [role='tab']",
+          "[data-testid='exportConfirm']",
+          "[data-testid='exportCarries'] li",
+        ],
+      },
+      { width: 720, height: 800 },
+    ),
+  ];
+}
+
 export const SCENES: Scene[] = [
   {
     id: "icon-set-specimen",
@@ -1024,6 +1222,7 @@ export const SCENES: Scene[] = [
   ...assetScenes(),
   ...modelScenes(),
   ...shellScenes(),
+  ...exportScenes(),
 ];
 
 // ── the inspector ─────────────────────────────────────────────────────────────────────────────────
