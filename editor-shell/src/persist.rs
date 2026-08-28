@@ -749,15 +749,20 @@ impl Log {
                     field,
                     value,
                 } => {
-                    let targets: Vec<EntityId> =
-                        ids.iter().filter_map(|s| EntityId::from_loro_key(s)).collect();
+                    let targets: Vec<EntityId> = ids
+                        .iter()
+                        .filter_map(|s| EntityId::from_loro_key(s))
+                        .collect();
                     targets.len() == ids.len()
                         && !targets.is_empty()
-                        && capscene::multi_edit(engine, &targets, &component, &field, &value).is_ok()
+                        && capscene::multi_edit(engine, &targets, &component, &field, &value)
+                            .is_ok()
                 }
                 Record::SetRotation { ids, quat } => {
-                    let targets: Vec<EntityId> =
-                        ids.iter().filter_map(|s| EntityId::from_loro_key(s)).collect();
+                    let targets: Vec<EntityId> = ids
+                        .iter()
+                        .filter_map(|s| EntityId::from_loro_key(s))
+                        .collect();
                     targets.len() == ids.len()
                         && !targets.is_empty()
                         && capscene::set_rotation(engine, &targets, quat).is_ok()

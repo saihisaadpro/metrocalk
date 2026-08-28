@@ -730,7 +730,8 @@ fn set_rotation_normalises_so_the_document_can_never_hold_a_non_rotation() {
     let (mut e, _scene) = engine_with_resolver();
     let id = spawn_at(&mut e, 0.0);
 
-    capscene::set_rotation(&mut e, &[id], [0.0, 5.0, 0.0, 5.0]).expect("a scaled quaternion is a rotation, once normalised");
+    capscene::set_rotation(&mut e, &[id], [0.0, 5.0, 0.0, 5.0])
+        .expect("a scaled quaternion is a rotation, once normalised");
     let length = ["qx", "qy", "qz", "qw"]
         .iter()
         .map(|f| tf(&e, id, f).unwrap().powi(2))
@@ -784,5 +785,9 @@ fn set_rotation_refuses_an_object_with_no_place_in_the_world_and_says_how_many()
         !e.components_of(bare).contains_key("Transform"),
         "the bare entity did NOT silently gain a Transform"
     );
-    assert_eq!(tf(&e, placed, "qw"), None, "and the placed one was not half-rotated");
+    assert_eq!(
+        tf(&e, placed, "qw"),
+        None,
+        "and the placed one was not half-rotated"
+    );
 }
