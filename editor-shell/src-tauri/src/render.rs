@@ -6274,7 +6274,8 @@ fn render_thumbnail(
         let start = (row * padded) as usize;
         let line = &data[start..start + unpadded as usize];
         if bgra {
-            for px in line.chunks_exact(4) {
+            // `as_chunks::<4>()`: one BGRA pixel is four bytes and the type now says so.
+            for px in line.as_chunks::<4>().0 {
                 rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
             }
         } else {

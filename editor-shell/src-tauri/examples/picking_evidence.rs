@@ -290,7 +290,8 @@ struct Canvas {
 impl Canvas {
     fn new() -> Self {
         let mut px = vec![0u8; IMG_W * IMG_H * 3];
-        for c in px.chunks_exact_mut(3) {
+        // `as_chunks_mut::<3>()`: one RGB pixel is three bytes, and the type now says so.
+        for c in px.as_chunks_mut::<3>().0 {
             c.copy_from_slice(&BG);
         }
         Self { px }
