@@ -1346,11 +1346,32 @@ body > [role="dialog"][aria-modal="true"] {
 }
 
 /* ── Workspace composition (theme/workspace.tsx) ─────────────────────────────────────────────── */
+/* A PANEL FILLS THE BOX IT IS DOCKED IN. That sentence was already written down twice in this
+   stylesheet — `.mtk-dock-flyout > .mtk-workspace-panel { height: 100% }` and, later and with a
+   paragraph explaining why, `.mtk-bottom-workspace > .mtk-workspace-panel { height: 100% }` — and the
+   third place, the two SHELL DOCKS that are on screen at every desktop width, never got it. So it is
+   stated once here and the per-container copies are gone: one decision, one rule, which is the whole
+   of the constitution's root-cause clause.
+
+   MEASURED ON HEAD at 1440x900, with `App`'s own `dockContent` (`display:flex; flex-direction:column;
+   height:100%`) around it: the shell card is **804px** tall and the panel inside it was **369px**
+   (left) and **409px** (Inspector) — shrink-wrapped to its content with ~400px of blank card under
+   it, in BOTH docks. Three things follow from that, and all three were live:
+     • `.mtk-dock-panel__fill` (`flex: 1 1 auto`) — which is how the Hierarchy's VIRTUALISED tree is
+       given its height — had nothing to fill, so the tree was sized by its own content.
+     • `.mtk-dock-panel.mtk-scroll { overflow: hidden auto }` could never scroll: a panel that grows
+       to its content never overflows anything. The scrollbar that repair added was unreachable.
+     • `WorkspacePanel`'s `footer` slot, and any body that distributes space (an empty state that
+       centres, a list above a pinned action), had no space to distribute.
+   `flex` for the flex parents and `height` for the block ones — the panel does not know which kind of
+   container it has been put in, and it must fill either. */
 .mtk-workspace-panel {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  height: 100%;
   overflow: hidden;
   isolation: isolate;
   color: var(--mtk-text);
@@ -1676,7 +1697,6 @@ body > [role="dialog"][aria-modal="true"] {
   background: var(--mtk-bg-panel);
   box-shadow: var(--mtk-shadow-4);
 }
-.mtk-dock-flyout > .mtk-workspace-panel { height: 100%; }
 
 .mtk-disclosure {
   overflow: hidden;
@@ -2018,7 +2038,12 @@ body > [role="dialog"][aria-modal="true"] {
    the panel needs no radius of its own. `isolation: isolate` on `.mtk-workspace-panel` already
    keeps its stacking context local; this only removes the square background it would otherwise
    paint into the rounded corners on browsers that resolve `overflow: hidden` after the paint. */
-.mtk-shell-card > .mtk-workspace-panel { border-radius: inherit; }
+/* A DESCENDANT SELECTOR, BECAUSE THE CHILD ONE HAS NEVER MATCHED: `App` puts its own `dockContent`
+   div between the card and the panel, so `>` skipped straight over the only element this rule was
+   written for. Nothing looked wrong — the card clips its own corners — which is exactly why a dead
+   selector can sit in a stylesheet indefinitely: `check-class-hooks` reads class NAMES, and both of
+   these are emitted. */
+.mtk-shell-card .mtk-workspace-panel { border-radius: inherit; }
 
 /* `position: relative` is the containing block for the dock's SHEET form (see `.is-sheet` below):
    the sheet is anchored to the bottom of the stage column, not to the window, for the same reason
@@ -2119,13 +2144,13 @@ body > [role="dialog"][aria-modal="true"] {
    panel that has obediently shrunk to nothing. Below that height the dock stops pretending it fits
    and scrolls, which is the same answer the tab strip gives one box over. */
 .mtk-bottom-workspace { height: 100%; min-height: var(--mtk-dock-content-min); overflow: auto; background: var(--mtk-bg-panel); }
-/* A PANEL IN A BOUNDED DOCK FILLS IT AND SCROLLS ITSELF — the rule `.mtk-dock-flyout` has had all
-   along, missing here. Without it the panel takes its CONTENT height, this track scrolls the whole
-   thing, and the parts `WorkspacePanel` declares as fixed — the header naming the asset, the tab row,
-   the footer holding the primary action — scroll away with the body. Measured: the Model dock's Bake
-   stage put its `Bake maps to derivative` button 0px on screen out of 34, in a container showing no
-   scrollbar. `overflow: auto` above stays as the escape hatch below `--mtk-dock-content-min`. */
-.mtk-bottom-workspace > .mtk-workspace-panel { height: 100%; }
+/* A PANEL IN A BOUNDED DOCK FILLS IT AND SCROLLS ITSELF. Without it the panel takes its CONTENT
+   height, this track scrolls the whole thing, and the parts `WorkspacePanel` declares as fixed — the
+   header naming the asset, the tab row, the footer holding the primary action — scroll away with the
+   body. Measured: the Model dock's Bake stage put its `Bake maps to derivative` button 0px on screen
+   out of 34, in a container showing no scrollbar. The rule now lives on `.mtk-workspace-panel` itself
+   (see the paragraph there); `overflow: auto` above stays as the escape hatch below
+   `--mtk-dock-content-min`. */
 .mtk-bottom-workspace--split { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.3fr); gap: 1px; background: var(--mtk-border-subtle); }
 .mtk-bottom-workspace--split > div { min-width: 0; overflow: auto; background: var(--mtk-bg-panel); }
 .mtk-bottom-workspace--logic { display: flex; flex-direction: column; overflow: hidden; }

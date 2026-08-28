@@ -1364,6 +1364,41 @@ function dockTrack(children: ReactNode) {
   );
 }
 
+/** THE SAME TRACK, WITH THE PANEL'S REAL HEIGHT CHAIN UNDER IT.
+ *
+ *  `dockTrack` above photographs a panel at the dock's WIDTH; it has no height, so a component that
+ *  fills the column it is given — which is what an empty state does — photographs at its natural size
+ *  in it and the arrangement being claimed is not in the frame. The chain reproduced here is the one
+ *  `EditorDocks` builds: a bounded column -> `.mtk-dock-panel.mtk-scroll` (whose `> * { flex: none }`
+ *  is exactly what `InspectorEmpty` has to override) -> the panel. 300px, not 320: that is the width
+ *  the Inspector track actually ships at. */
+function inspectorColumn(children: ReactNode) {
+  return (
+    <div
+      data-testid="inspector-track"
+      style={{ width: 300, height: "100vh", display: "flex", flexDirection: "column", boxSizing: "border-box", borderLeft: "1px solid var(--mtk-border)", background: "var(--mtk-bg-panel)" }}
+    >
+      <div className="mtk-dock-panel mtk-scroll">{children}</div>
+    </div>
+  );
+}
+
+/** A scene with objects in it and NOTHING SELECTED — the state the Inspector is in most of the time
+ *  and the one it had never been photographed in. `HealthBar` is what makes an entity a requirer
+ *  (`deriveRel`), so this seeds the real signal rather than a hand-set flag. */
+function idleScene(withRequirer: boolean) {
+  return () => {
+    projectionStore.getState().bulkLoad([
+      { id: "e-player", name: "Player", parentId: null, components: { Transform: { px: 0, py: 0, pz: 0 } } },
+      { id: "e-ground", name: "Ground", parentId: null, components: { Transform: { px: 0, py: -1, pz: 0 } } },
+      ...(withRequirer
+        ? [{ id: "e-health", name: "Health Bar", parentId: null, components: { HealthBar: { width: 1 } } }]
+        : []),
+    ] as never);
+    // No `select()`. That is the whole point of the scene.
+  };
+}
+
 function inspectorScenes(): Scene[] {
   return [
     {
@@ -1522,7 +1557,7 @@ function inspectorScenes(): Scene[] {
         // defaults are the ones a validator would inject.
         text_absent: [
           "1 transaction", "2 transactions", "3 transactions", "undefined", "NaN",
-          "No applicable renderer found", "No editable properties yet",
+          "No applicable renderer found", "No editable properties",
         ],
       },
       render: () => <EditProbe />,
@@ -1550,6 +1585,91 @@ function inspectorScenes(): Scene[] {
         text_absent: ["2 transactions", "Transform.py", "Transform.ry", "undefined", "NaN"],
       },
       render: () => <EditProbe />,
+    },
+
+    // -- the three absences (ADR-170) -------------------------------------------------------------
+    //
+    // The Inspector has three states in which it has nothing to show, and until this pass they were
+    // three different things: a grey sentence in the top-left corner, a second grey sentence, and —
+    // one tab over, in the same dock — a properly composed `EmptyPanelState`. None of the three had
+    // ever been photographed, which is how two of them stayed sentences through four UI milestones.
+    {
+      id: "inspector-nothing-selected",
+      looking_for:
+        "THE STATE THIS PANEL IS IN MOST OF THE TIME. Nothing is selected, and instead of `Select an " +
+        "entity to inspect.` pinned to the top-left of a 300x900 column, the panel says what will " +
+        "appear here and how to get there — centred in the column, in the same `EmptyPanelState` " +
+        "anatomy the Relations tab next door has always used. Under it, and ONLY when there is one, " +
+        "the one list that is useful with no selection and is not a second copy of something already " +
+        "on screen: the objects waiting for a binding. Clicking one makes the selection the panel is " +
+        "missing. The column is not filled — it is composed",
+      viewport: { width: 320, height: 900 },
+      setup: idleScene(true),
+      expect: {
+        present: [
+          ["[data-testid='inspectorNoSelection']", 1],
+          // The SHARED anatomy, asserted as the class and not as the testid — a bare `<div>` carrying
+          // the same hook would satisfy a testid-only claim, and a bare `<div>` is what was there.
+          ["[data-testid='inspectorEmpty'].mtk-empty-panel", 1],
+          ["[data-testid='requirer']", 1],
+          // The shared card surface. `Requirers` used to spell `.mtk-card` out by hand on a raw
+          // `<button>` because `Card` could not carry its `cand` hook.
+          ["button.mtk-card.cand", 1],
+        ],
+        absent: ["[data-testid='inspectorNoFields']", "[data-icon-missing]"],
+        text_present: ["Select an object to edit its properties", "Needs binding", "Health Bar"],
+        text_absent: ["Select an entity to inspect", "none found", "undefined", "NaN"],
+        unclipped: ["[data-testid='inspectorEmpty']", "[data-testid='requirer']"],
+        // THE CENTRING, MEASURED. `.mtk-dock-panel.mtk-scroll > *` sets `flex: none` on this element,
+        // so without the inline `flex: 1 0 auto` the composition is ~250px tall at the top of a 900px
+        // column with 650px of nothing under it — which is the defect, and it photographs as "a small
+        // tidy block" unless the height is claimed.
+        min_height: [["[data-testid='inspectorNoSelection']", 700]],
+      },
+      render: () => inspectorColumn(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-nothing-selected-quiet",
+      looking_for:
+        "THE SAME STATE WITH NOTHING WAITING — the common one, and the reason the list below the " +
+        "empty state is a guest rather than a fixture. No heading, no `none found`, no hairline: a " +
+        "section that renders `none found` into a column that is already empty is noise added to " +
+        "answer noise. One centred statement, and quiet",
+      viewport: { width: 320, height: 900 },
+      setup: idleScene(false),
+      expect: {
+        present: [["[data-testid='inspectorEmpty'].mtk-empty-panel", 1]],
+        absent: ["[data-testid='requirers']", "[data-testid='requirer']", "[data-icon-missing]"],
+        text_present: ["Select an object to edit its properties"],
+        text_absent: ["Needs binding", "none found", "Select an entity to inspect", "undefined", "NaN"],
+        unclipped: ["[data-testid='inspectorEmpty']"],
+      },
+      render: () => inspectorColumn(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-no-editable-fields",
+      looking_for:
+        "THE PANEL'S OTHER ABSENCE: an object IS selected — it is named in the header, with its id " +
+        "under it — and nothing on it exposes an editable field. Same anatomy as the state above, and " +
+        "the sentence no longer names a control that does not exist. `add a component to this object` " +
+        "instructed the reader to press something no surface in this editor offers and no `/core` op " +
+        "stands behind; the entity's own action list, which is a right-click away, is what can " +
+        "actually give it fields",
+      viewport: { width: 320, height: 900 },
+      setup: () => {
+        projectionStore.getState().bulkLoad([
+          { id: "e-marker", name: "Marker", parentId: null, components: {} },
+        ] as never);
+        projectionStore.getState().select("e-marker");
+      },
+      expect: {
+        present: [["[data-testid='inspectorNoFields'].mtk-empty-panel", 1]],
+        absent: ["[data-testid='inspectorNoSelection']", "[data-icon-missing]"],
+        text_present: ["Marker", "No editable properties", "Right-click it"],
+        text_absent: ["add a component", "undefined", "NaN"],
+        unclipped: ["[data-testid='inspectorNoFields']"],
+      },
+      render: () => inspectorColumn(<Inspector client={recordingClient(() => {})} />),
     },
   ];
 }
@@ -1848,16 +1968,35 @@ function shellScenes(): Scene[] {
     1440,
     "the whole editor at a desktop width: Engines rail · left dock · stage · Inspector, all four " +
       "tracks open at once. This is the first capture in the repository that contains two panels, " +
-      "so it is the first one where a panel can be caught colliding with its neighbour",
+      "so it is the first one where a panel can be caught colliding with its neighbour. AND EACH " +
+      "DOCK FILLS THE CARD IT IS IN — the Inspector's empty state is centred in the column rather " +
+      "than sitting at the top of it, which is only possible because the panel owns the column",
     {
       present: [
         ["[data-testid='engine-rail']", 1],
         ["[data-testid='hierarchy']", 1],
         ["[data-testid='editor-header']", 1],
+        // The Inspector's no-selection state, in the shell, at the width it ships at (ADR-170).
+        ["[data-testid='inspectorNoSelection']", 1],
       ],
       // Wide open: the docks are panels, not rails. If this ever flips, the layout collapsed at a
       // width where it had room — the opposite defect to the stage being squeezed.
       absent: ["[data-testid='rail-left']"],
+      // A PANEL FILLS THE CARD IT IS DOCKED IN, MEASURED (ADR-170). Both shell docks were
+      // shrink-wrapped to their content inside a full-height card — 369px and 409px inside 804px,
+      // ~400px of blank card under each — and nothing here could see it, because every claim in this
+      // suite is about a panel's own box and both panels were perfectly well-formed. `fills` is the
+      // one claim that compares a child to the container it was given: the panel accounts for the
+      // whole card or it does not.
+      //
+      // It is the gate on the ROOT-CAUSE fix (`.mtk-workspace-panel { flex: 1 1 auto; height: 100% }`),
+      // and it is what everything downstream needs — the Hierarchy's virtualised tree gets its height
+      // from `.mtk-dock-panel__fill`, `.mtk-dock-panel.mtk-scroll` can only scroll a panel that is
+      // bounded, and an empty state can only be centred in a column that exists.
+      fills: [
+        [".mtk-shell-track--left > .mtk-shell-card", ["[data-testid='left-dock']"]],
+        [".mtk-shell-track--right > .mtk-shell-card", ["[data-testid='inspector-dock']"]],
+      ],
     },
   ),
   shell(

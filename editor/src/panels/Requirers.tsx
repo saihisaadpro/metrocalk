@@ -8,21 +8,41 @@
 //! The summary is the single source of truth (invariant 1; this panel holds NO state of its own), so a
 //! successful bind flips `needsBinding` and the row leaves this list live. The `.cand` / `data-id` hooks
 //! mirror the vanilla scaffold's stable signals so the prompt-40 page-object keys on the same selectors.
+//!
+//! **ADR-170 — two homes, one definition.** It answers "what is waiting for me?", which is a question with
+//! no selection in it, so it now also fills the Inspector's no-selection state (`InspectorEmpty`) as well as
+//! the left dock's `Needs attention` popover. `hideWhenEmpty` is what makes that safe: a panel that is only
+//! ever shown when it has something to say must be able to render nothing, and the popover — which the user
+//! opened deliberately and is owed an answer — must still say "none found".
 
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { Thumbnail } from "../theme/Thumbnail";
-import { Badge } from "../theme/primitives";
+import { Badge, Card } from "../theme/primitives";
 import { color, font, fontSize, space, text } from "../theme/tokens";
 
-export function Requirers() {
+export interface RequirersProps {
+  /** Render nothing at all when no entity is waiting — for a surface this list is a GUEST on. */
+  hideWhenEmpty?: boolean;
+}
+
+/** THE REQUIRER RULE, STATED ONCE. A caller that has to decide whether to draw a heading, a hairline or
+ *  a whole section around this list needs the count *before* it renders — and the moment it re-derives
+ *  `rel.needsBinding` itself there are two answers to "what is waiting?" that can disagree. */
+export function useRequirers() {
   // Subscribe to the summary map so a relational FLIP (a bind → needsBinding false) updates the list live.
   // Reads structured `rel.needsBinding` — the authoritative requirer signal off the projection (C6).
   const summaries = useStore(projectionStore, (s) => s.summaries);
-  const requirers = Object.values(summaries)
+  return Object.values(summaries)
     .filter((s) => s.rel?.needsBinding)
     .slice(0, 60); // rare in the scene; cap the quick-pick list (the scaffold's bound)
+}
+
+export function Requirers({ hideWhenEmpty = false }: RequirersProps = {}) {
+  const requirers = useRequirers();
+
+  if (requirers.length === 0 && hideWhenEmpty) return null;
 
   return (
     <div id="requirers" data-testid="requirers" style={{ padding: `${space.md}px ${space.lg}px` }}>
@@ -34,10 +54,9 @@ export function Requirers() {
         <div style={{ color: color.text.muted, fontSize: fontSize.body }}>none found</div>
       ) : (
         requirers.map((s) => (
-          <button
+          <Card
             key={s.id}
-            type="button"
-            className="cand mtk-card"
+            className="cand"
             data-testid="requirer"
             data-id={s.id}
             onClick={() => {
@@ -52,7 +71,7 @@ export function Requirers() {
               {s.name}
             </span>
             <Badge tone="accent">needs {s.rel?.requires[0] ?? "binding"}</Badge>
-          </button>
+          </Card>
         ))
       )}
     </div>

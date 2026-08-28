@@ -1,7 +1,13 @@
 //! Inspector (M10.10 / C6) — verified headless: a selected entity WITH schema-backed components renders a
 //! JSON Forms property form (real, editable properties); an entity with NO editable properties renders a
-//! real EMPTY-STATE ("No editable properties yet — add a component"), never a blank pane beside the header.
-//! (Whether the LIVE core populates real properties is the `.exe`-owed half of C6.)
+//! real EMPTY-STATE, never a blank pane beside the header. (Whether the LIVE core populates real
+//! properties is the `.exe`-owed half of C6.)
+//!
+//! **ADR-170 — the panel has THREE absences and they are now one anatomy.** No selection
+//! (`inspectorNoSelection` → `InspectorEmpty`), a selection with no editable field (`inspectorNoFields`),
+//! and the Relations tab next door. All three are `EmptyPanelState`. The no-fields copy also stopped
+//! naming a control that does not exist: `/core` has `RemoveComponent` and no `AddComponent`, so "add a
+//! component to this object" was an instruction nothing in this product could carry out.
 
 import { afterEach, expect, test } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
@@ -34,7 +40,44 @@ test("an entity with NO editable properties shows a real empty-state, not a blan
   projectionStore.getState().select("e2");
   render(<Inspector client={fakeClient()} />);
   expect(screen.getByText("Marker")).toBeTruthy(); // still names the entity
-  expect(screen.getByTestId("inspectorEmpty").textContent).toMatch(/no editable properties yet/i);
+  const empty = screen.getByTestId("inspectorNoFields");
+  expect(empty.className).toContain("mtk-empty-panel"); // the shared anatomy, not a bare sentence
+  expect(empty.textContent).toMatch(/no editable properties/i);
+  // AND IT NO LONGER INSTRUCTS AN IMPOSSIBLE ACTION. There is no add-component control anywhere in this
+  // editor, and there is no core op behind one either.
+  expect(empty.textContent).not.toMatch(/add a component/i);
+});
+
+test("no selection renders the composed empty state — not a sentence, and not the no-fields one", () => {
+  projectionStore.getState().bulkLoad([{ id: "e3", name: "Lamp", parentId: null, components: { Transform: { x: 1 } } }]);
+  render(<Inspector client={fakeClient()} />);
+  const empty = screen.getByTestId("inspectorEmpty");
+  expect(empty.className).toContain("mtk-empty-panel");
+  expect(screen.getByTestId("inspectorNoSelection")).toBeTruthy();
+  expect(screen.queryByTestId("inspectorNoFields")).toBeNull();
+  expect(empty.textContent).toMatch(/select an object to edit its properties/i);
+  // Nothing is waiting for a binding in this scene, so the guest list renders nothing at all.
+  expect(screen.queryByTestId("requirers")).toBeNull();
+});
+
+test("with no selection the objects waiting for a binding are offered, and clicking one selects it", () => {
+  projectionStore.getState().applyDelta({
+    ops: [
+      { op: "upsert", id: "e-health", name: "Health Bar", parentId: null, kind: "requirer", rel: { requires: ["Health"], provides: [], bound: 0, needsBinding: true, isGroup: false } },
+      { op: "upsert", id: "e-player", name: "Player", parentId: null, kind: "mesh" },
+    ],
+  });
+  render(<Inspector client={fakeClient()} />);
+  const row = screen.getByTestId("requirer");
+  expect(row.getAttribute("data-id")).toBe("e-health");
+  // The SHARED card surface, not a hand-written twin of it.
+  expect(row.className).toContain("mtk-card");
+  expect(row.className).toContain("cand");
+  fireEvent.click(row);
+  expect(projectionStore.getState().selectedId).toBe("e-health");
+  // …and the panel has left the empty state for the object that was waiting.
+  expect(screen.queryByTestId("inspectorNoSelection")).toBeNull();
+  expect(screen.getByText("Health Bar")).toBeTruthy();
 });
 
 test("component groups use remembered shared disclosures: Transform opens first and other content stays mounted", () => {

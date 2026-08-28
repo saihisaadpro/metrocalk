@@ -605,13 +605,20 @@ export function TypeIcon({ kind, size = 40, style }: { kind: string; size?: numb
 
 /** One card surface — asset/component cards (M14.2 / ADR-058). Real hover/selected/unavailable/warning
  *  states come from the `.mtk-card` classes (global.css); the metadata layout is the caller's. Renders a
- *  `<button>` so it's keyboard-reachable; `disabled`/`tone:"unavailable"` explains *why it can't* via `title`. */
+ *  `<button>` so it's keyboard-reachable; `disabled`/`tone:"unavailable"` explains *why it can't* via `title`.
+ *
+ *  IT HAD NO CALLERS AND A HAND-WRITTEN TWIN. `Requirers` — the quick-pick list this component's own ADR
+ *  was written for — spelt `<button type="button" className="cand mtk-card">` out by hand, because the
+ *  shared version could not carry the `cand` hook the prompt-40 page object keys on. That is the whole
+ *  reason `className` is here: a shared control that cannot take the caller's stable hook is a shared
+ *  control the caller cannot use, and the copy that replaces it is where the states then drift. */
 export function Card({
   selected = false,
   tone = "default",
   disabled = false,
   onClick,
   children,
+  className,
   style,
   ...rest
 }: {
@@ -620,6 +627,8 @@ export function Card({
   disabled?: boolean;
   onClick?: () => void;
   children: ReactNode;
+  /** Caller-owned hooks/modifiers, composed AFTER the state classes so a stable selector survives. */
+  className?: string;
   style?: CSSProperties;
 } & DataAttrs) {
   const cls = [
@@ -627,6 +636,7 @@ export function Card({
     selected && "is-selected",
     tone === "warn" && "is-warn",
     (tone === "unavailable" || disabled) && "is-unavailable",
+    className,
   ]
     .filter(Boolean)
     .join(" ");

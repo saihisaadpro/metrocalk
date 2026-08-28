@@ -1014,7 +1014,24 @@ function installFingerprint() {
  *  satisfy a selector one frame before it finishes laying out).
  *
  *  `want === null` asks for stability alone. That is right before the gesture that brings the claim's
- *  subject into existence, and wrong after it. */
+ *  subject into existence, and wrong after it.
+ *
+ *  AND A STABLE FINGERPRINT IS NOT THE SAME AS A FINISHED PAGE (ADR-170). `shell-dock-short` failed
+ *  once inside a 56-scene run — `.mtk-bottom-dock__content measures 0px tall` — and passed twice in
+ *  isolation immediately afterwards, with the post-capture drift check naming the cause in one line:
+ *  a control moved 32px between the assertions and the shutter. The dock's height is a CSS
+ *  `transition`, so the page is not "changing" in any way the DOM can be polled for: it is animating,
+ *  and an animation that has not STARTED yet — the class lands in one frame, the transition begins in
+ *  the next — presents four perfectly identical fingerprints in a row before it moves anything.
+ *  Sampling harder cannot fix that; sampling is the wrong question. `getAnimations()` is the right
+ *  one: it asks the engine what is still in flight and is the only reading here that distinguishes
+ *  "nothing has moved for 400 ms" from "nothing is going to move".
+ *
+ *  ONLY TRANSITIONS ARE WAITED FOR, and that is not a hedge. The Suspense fallback's spinner is
+ *  `animation: mtk-spin 800ms linear INFINITE` — it is running by design and will never finish, so a
+ *  settle that waited for `getAnimations()` to empty would burn the whole cap on every lazy workspace
+ *  and then capture the fallback. A `CSSTransition` is exactly the class of movement that takes the
+ *  layout out from under a settled fingerprint, and every one of them ends. */
 async function settle(page, want) {
   await page.evaluate(() => {
     window.__mtkSettle = { last: null, same: 0 };
@@ -1030,6 +1047,13 @@ async function settle(page, want) {
           }
           const text = frame.textContent ?? "";
           for (const s of w.text) if (!text.includes(s)) return false;
+        }
+        // Nothing still moving. A running CSS transition is invisible to a DOM poll, and a transition
+        // that has been declared but has not begun is invisible to everything else.
+        if (typeof CSSTransition !== "undefined" && typeof document.getAnimations === "function") {
+          for (const animation of document.getAnimations()) {
+            if (animation instanceof CSSTransition && animation.playState === "running") return false;
+          }
         }
         const now = window.__mtkFingerprint();
         const state = window.__mtkSettle;

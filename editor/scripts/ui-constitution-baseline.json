@@ -161,6 +161,14 @@
       "unitless-length": 0,
       "hand-rolled-section": 0
     },
+    "src/inspector/InspectorEmpty.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
     "src/inspector/renderers.tsx": {
       "raw-native-control": 1,
       "literal-ui-color": 0,
@@ -410,7 +418,7 @@
       "hand-rolled-section": 0
     },
     "src/panels/Requirers.tsx": {
-      "raw-native-control": 1,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
