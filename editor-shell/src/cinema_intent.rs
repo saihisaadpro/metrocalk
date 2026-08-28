@@ -1426,6 +1426,225 @@ pub fn preview_time(cut: &Cutscene, seconds: f32) -> f32 {
     }
 }
 
+// ── ADR-175: rendering a cut to files ────────────────────────────────────────────────────────────
+
+/// The frame rates a render offers. Not free text: 24 is cinema, 25 is PAL/broadcast, 30 is the web's
+/// default and 60 is what a screen recording of the engine already runs at. A box the author can type
+/// `0` or `1000` into is a box that has to refuse, and every one of those refusals is a sentence
+/// nobody needed to read.
+pub const RENDER_RATES: [u32; 4] = [24, 25, 30, 60];
+
+/// The default: the rate the rest of the world calls "film", and the one the mood's blend seconds were
+/// chosen against.
+pub const DEFAULT_RENDER_FPS: u32 = 24;
+
+/// The ceiling on one render job, in frames. A twelve-shot cut at the 20 s-per-shot maximum and the
+/// slowest mood is 600 s, which at 60 fps is 36,000 frames — an hour of rendering and several
+/// gigabytes, started by one click. The cap is not a technical limit; it is the point past which the
+/// answer should be "that is more than you meant", said before anything is written.
+pub const MAX_RENDER_FRAMES: u32 = 12_000;
+
+/// What to film: the whole cut, or one shot of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RenderScope {
+    /// Every shot, in order, from `0` to the end of the cut.
+    #[default]
+    WholeCut,
+    /// One shot's own span, including the transition that opens it — because that transition is part
+    /// of how the shot arrives, and a shot rendered without it starts in the middle of a movement.
+    Shot(usize),
+}
+
+/// A render, planned but not started: which instants will be filmed and how many files that is.
+///
+/// PURE, and separate from the job that runs it, because everything a user needs to decide with — how
+/// many frames, how long, what it will be called — is knowable before a single pixel is drawn. That is
+/// what lets the dialog state the cost above the button that pays it (`<ux_quality>` 3) instead of
+/// reporting it afterwards.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderPlan {
+    /// The first instant filmed, on the cutscene clock.
+    pub start_seconds: f32,
+    /// How much of the clock this render covers.
+    pub seconds: f32,
+    /// Frames per second.
+    pub fps: u32,
+    /// How many files will be written.
+    pub frames: u32,
+    /// What is being filmed.
+    pub scope: RenderScope,
+}
+
+impl RenderPlan {
+    /// The instant frame `index` is filmed at, on the cutscene clock.
+    ///
+    /// The frames divide the span EVENLY from its start; the last one lands a frame short of the end
+    /// rather than on it, which is what a frame *rate* means — a frame is an interval, not a point, and
+    /// filming the closing instant as well would play the cut back one frame long.
+    #[must_use]
+    pub fn instant(&self, index: u32) -> f32 {
+        self.start_seconds + index as f32 / self.fps.max(1) as f32
+    }
+}
+
+/// Plan a render of `cut`, or explain in one sentence why there is nothing to render.
+///
+/// # Errors
+/// When the cutscene is empty, the rate is not one this build offers, the named shot is not in the
+/// cut, or the job would exceed [`MAX_RENDER_FRAMES`].
+pub fn plan_render(cut: &Cutscene, fps: u32, scope: RenderScope) -> Result<RenderPlan, String> {
+    if cut.shots.is_empty() {
+        return Err("There is nothing to render — this object has no shots yet.".into());
+    }
+    if !RENDER_RATES.contains(&fps) {
+        return Err(format!(
+            "{fps} frames per second is not a rate this build renders at — choose {}.",
+            RENDER_RATES
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let (start_seconds, seconds) = match scope {
+        RenderScope::WholeCut => (0.0, cut.seconds()),
+        RenderScope::Shot(index) => {
+            let Some(duration) = cut.effective_shot_seconds(index) else {
+                return Err(format!(
+                    "Shot {} is not in this cutscene any more.",
+                    index + 1
+                ));
+            };
+            let start: f32 = (0..index)
+                .filter_map(|i| cut.effective_shot_seconds(i))
+                .sum();
+            (start, duration)
+        }
+    };
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err("That shot has no length to render.".into());
+    }
+    // Round rather than truncate: a 2.5 s shot at 24 fps is 60 frames, and `as u32` on 59.999994 is 59
+    // — one frame of the shot silently missing, which is exactly the kind of arithmetic that is only
+    // ever noticed when somebody counts the files.
+    let frames = (seconds * fps as f32).round().max(1.0) as u32;
+    if frames > MAX_RENDER_FRAMES {
+        return Err(format!(
+            "That is {frames} frames — more than the {MAX_RENDER_FRAMES} one render writes at once. Render a single shot, or choose a lower frame rate."
+        ));
+    }
+    Ok(RenderPlan {
+        start_seconds,
+        seconds,
+        fps,
+        frames,
+        scope,
+    })
+}
+
+/// The file name for frame `index` of a sequence called `stem`.
+///
+/// Zero-padded to four digits, `.` separated, which is the convention every compositor, `ffmpeg` and
+/// image viewer already globs — `shot.0000.png`. Padding matters for a reason that has nothing to do
+/// with taste: without it `frame10.png` sorts before `frame2.png` in every file manager there is, and
+/// the sequence plays back scrambled.
+#[must_use]
+pub fn render_frame_name(stem: &str, index: u32) -> String {
+    format!("{}.{index:04}.png", sanitise_stem(stem))
+}
+
+/// Reduce a name the user typed to something a file system will actually accept, without silently
+/// producing an empty name.
+///
+/// Not a validation: refusing a name because it has a slash in it teaches nothing. Every character
+/// that cannot be in a Windows or POSIX file name becomes `-`, runs collapse, and a name that had
+/// nothing usable in it falls back to `frame` rather than to `.0000.png`.
+#[must_use]
+pub fn sanitise_stem(stem: &str) -> String {
+    let mut out = String::with_capacity(stem.len());
+    for ch in stem.chars() {
+        if ch.is_alphanumeric() || matches!(ch, '-' | '_' | ' ') {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches(|c: char| c == '-' || c == ' ');
+    if trimmed.is_empty() {
+        "frame".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// What a render job answers with, whether it is being started, polled or cancelled.
+///
+/// ONE reply shape for all three, because a progress bar and a ledger are the same six numbers at
+/// different moments, and a surface that had to switch between two shapes would be a surface that can
+/// show a stale one.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderReply {
+    /// Whether a job is running right now.
+    pub running: bool,
+    /// Whether the job this reply describes has finished — successfully or not.
+    pub done: bool,
+    /// The object whose cutscene is being filmed.
+    pub entity: Option<String>,
+    /// How many frames the plan holds.
+    pub frames: u32,
+    /// How many files exist on disk so far.
+    pub written: u32,
+    /// The pixel size the frames are being written at, from the first one actually captured. `0 x 0`
+    /// until then — a size guessed from the window would be a claim the files may not honour.
+    pub width: u32,
+    pub height: u32,
+    /// The rate the sequence is timed at.
+    pub fps: u32,
+    /// The span of the cutscene clock being filmed.
+    pub seconds: f32,
+    /// Where the files are going. Shown in full, in mono: a render whose output the author cannot find
+    /// has not been delivered.
+    pub folder: String,
+    /// The name the frames share, before the number.
+    pub stem: String,
+    /// Total bytes written.
+    pub bytes: u64,
+    /// Wall clock since the job started.
+    pub elapsed_ms: u32,
+    /// Frames that could not be written, each with its own sentence. A render that lost three frames
+    /// and said "done" is the failure this list exists to make impossible.
+    pub failures: Vec<String>,
+    /// Friendly summary.
+    pub message: String,
+    /// Set iff the request was refused, and says why.
+    pub reason: Option<String>,
+}
+
+impl RenderReply {
+    /// A refusal that started nothing, explained.
+    #[must_use]
+    pub fn refusal(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            message: reason.clone(),
+            reason: Some(reason),
+            ..Self::default()
+        }
+    }
+
+    /// The reply for "nothing is rendering", which is a state and not an error.
+    #[must_use]
+    pub fn idle() -> Self {
+        Self {
+            message: "No render is running.".into(),
+            ..Self::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2503,5 +2722,140 @@ mod tests {
             "{:?}",
             reply.problems
         );
+    }
+
+    // ── ADR-175: planning a render ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_render_plan_covers_the_whole_cut_and_one_frame_per_tick_of_it() {
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let cut = three_shot_cut(&mut engine, hero);
+        let plan = plan_render(&cut, 24, RenderScope::WholeCut).expect("plans");
+        assert!(exactly(plan.start_seconds, 0.0), "the cut starts at zero");
+        assert!(
+            (plan.seconds - cut.seconds()).abs() < 1.0e-4,
+            "the plan covers the cut's own running time: {} vs {}",
+            plan.seconds,
+            cut.seconds()
+        );
+        // ROUNDED, not truncated. The count is the one number a user can check by listing a folder,
+        // and `as u32` on 179.99999 writes 179 files for a 180-frame cut with nothing saying so.
+        assert_eq!(plan.frames, (cut.seconds() * 24.0).round() as u32);
+        // The LAST frame lands inside the cut, a frame short of its end — a frame is an interval, and
+        // filming the closing instant as well plays back one frame long.
+        let last = plan.instant(plan.frames - 1);
+        assert!(
+            last < cut.seconds(),
+            "the last frame {last} must be inside the {}s cut",
+            cut.seconds()
+        );
+        assert!(
+            cut.playback_at(preview_time(&cut, last)).is_some(),
+            "and it must resolve to a shot"
+        );
+    }
+
+    #[test]
+    fn rendering_one_shot_films_that_shots_own_span_and_nothing_else() {
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let cut = three_shot_cut(&mut engine, hero);
+        let second = plan_render(&cut, 30, RenderScope::Shot(1)).expect("plans");
+        let one = cut.effective_shot_seconds(0).expect("shot 0");
+        assert!(
+            (second.start_seconds - one).abs() < 1.0e-4,
+            "shot 2 starts where shot 1 ends: {} vs {one}",
+            second.start_seconds
+        );
+        assert!(
+            (second.seconds - cut.effective_shot_seconds(1).expect("shot 1")).abs() < 1.0e-4,
+            "and lasts exactly its own length"
+        );
+        // Every instant it films belongs to that shot — the arithmetic, checked against the solver's
+        // own lookup rather than against itself.
+        for index in 0..second.frames {
+            let at = preview_time(&cut, second.instant(index));
+            let playback = cut.playback_at(at).expect("inside the cut");
+            assert_eq!(
+                playback.index,
+                1,
+                "frame {index} at {at}s landed in shot {}",
+                playback.index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn a_render_refuses_what_it_cannot_produce_and_says_why() {
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let empty = Cutscene::default();
+        assert!(plan_render(&empty, 24, RenderScope::WholeCut)
+            .expect_err("an empty cut has nothing to render")
+            .contains("no shots"));
+        let cut = three_shot_cut(&mut engine, hero);
+        // A rate this build does not offer. Refused rather than clamped: a render that quietly became
+        // 24 fps would produce a sequence timed against a rate nobody chose.
+        let refused = plan_render(&cut, 23, RenderScope::WholeCut).expect_err("23 is not a rate");
+        assert!(refused.contains("23"), "{refused}");
+        assert!(
+            refused.contains("24"),
+            "and names what is offered: {refused}"
+        );
+        // A shot that is not there.
+        assert!(plan_render(&cut, 24, RenderScope::Shot(9))
+            .expect_err("shot 10 of 3")
+            .contains("Shot 10"));
+        // And the ceiling. NEGATIVE CONTROL beside it: the same cut at 24 fps is well inside, so this
+        // asserts the ceiling and not merely that some rate somewhere refuses.
+        assert!(
+            plan_render(&cut, 24, RenderScope::WholeCut).is_ok(),
+            "a three-shot cut at 24 fps is nowhere near the ceiling"
+        );
+        let long = Cutscene {
+            shots: (0..MAX_SHOTS)
+                .map(|i| ShotRecipe {
+                    id: format!("shot-{i}"),
+                    subject: "$subject".into(),
+                    size: ShotSize::Full,
+                    angle: ShotAngle::ThreeQuarter,
+                    motion: ShotMove::Hold,
+                    amount: 0.0,
+                    seconds: MAX_SECONDS,
+                })
+                .collect(),
+            mood: Mood::Calm,
+            ..Cutscene::default()
+        };
+        let over = plan_render(&long, 60, RenderScope::WholeCut).expect_err("over the ceiling");
+        assert!(
+            over.contains(&MAX_RENDER_FRAMES.to_string()),
+            "the refusal names the ceiling: {over}"
+        );
+    }
+
+    #[test]
+    fn frame_names_sort_in_the_order_they_play() {
+        // The whole reason for the padding: without it every file manager and every glob puts frame
+        // 10 before frame 2, and the sequence plays back scrambled.
+        let mut names: Vec<String> = (0..12).map(|i| render_frame_name("skid", i)).collect();
+        let played = names.clone();
+        names.sort();
+        assert_eq!(names, played, "lexical order must be playback order");
+        assert_eq!(render_frame_name("skid", 0), "skid.0000.png");
+        assert_eq!(render_frame_name("skid", 1234), "skid.1234.png");
+    }
+
+    #[test]
+    fn a_name_a_user_typed_becomes_one_a_file_system_accepts() {
+        assert_eq!(sanitise_stem("Skid Weld Line"), "Skid Weld Line");
+        // A path separator cannot survive: it would silently write into another folder, or fail.
+        assert_eq!(sanitise_stem(r"a/b\c"), "a-b-c");
+        assert_eq!(sanitise_stem("weld:gun*7?"), "weld-gun-7");
+        // A name with nothing usable in it falls back rather than producing `.0000.png`.
+        assert_eq!(sanitise_stem("///"), "frame");
+        assert_eq!(sanitise_stem(""), "frame");
+        assert!(!render_frame_name("///", 3).starts_with('.'));
     }
 }

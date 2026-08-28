@@ -2931,6 +2931,48 @@ enum EngineCmd {
         active: bool,
         reply: Sender<metrocalk_editor_shell::CinemaPreviewReply>,
     },
+    /// Cinematics (ADR-175) — start writing a cutscene out as a numbered PNG sequence.
+    ///
+    /// The job then advances on the engine's own heartbeat, one frame per capture round-trip, and is
+    /// polled with [`EngineCmd::CinemaRenderStatus`]. It is NOT a blocking command: a render of a
+    /// twelve-shot cut is minutes of work, and a reply that arrives at the end of it is a frozen editor
+    /// with a spinner in it.
+    CinemaRenderStart {
+        id: String,
+        /// Frames per second — one of [`metrocalk_editor_shell::RENDER_RATES`].
+        fps: u32,
+        /// `Some(index)` renders that shot alone; `None` renders the whole cut.
+        shot: Option<usize>,
+        /// The folder the user chose. Already picked by the time this arrives, because a native dialog
+        /// must not be opened from the engine thread.
+        folder: String,
+        /// The name the frames share, before the number.
+        stem: String,
+        reply: Sender<metrocalk_editor_shell::RenderReply>,
+    },
+    /// Cinematics — what a render WOULD produce, without producing it.
+    ///
+    /// The dialog's cost sentence is this reply, not a second copy of the arithmetic in TypeScript.
+    /// Frames-per-second times seconds is exactly the kind of one-line relation that gets restated
+    /// and then rounds differently on the two sides, and the first symptom is a user counting files.
+    CinemaRenderPlan {
+        id: String,
+        fps: u32,
+        shot: Option<usize>,
+        reply: Sender<metrocalk_editor_shell::RenderReply>,
+    },
+    /// Cinematics — how far the running render has got. The one read a progress bar polls.
+    CinemaRenderStatus {
+        reply: Sender<metrocalk_editor_shell::RenderReply>,
+    },
+    /// Cinematics — stop the running render and keep the frames already written.
+    ///
+    /// Keeping them is deliberate: half a sequence is a usable thing (it is the first half of the cut),
+    /// and deleting an author's files because they changed their mind is a bigger surprise than leaving
+    /// them. The ledger says how many there are.
+    CinemaRenderCancel {
+        reply: Sender<metrocalk_editor_shell::RenderReply>,
+    },
     /// Conditionals - add one "only if" clause to an object (one undoable commit).
     ConditionAdd {
         id: String,
@@ -8490,6 +8532,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // The cutscene timeline's viewport preview: the editor holding the CUTSCENE camera at a chosen
     // moment, with Play stopped. `None` means the author has the viewport.
     let mut cinema_preview: Option<CinemaPreviewState> = None;
+    // ADR-175 — the cutscene currently being written out to files, if any. Holds the LAST job as well
+    // as the running one: the ledger a render produces is the answer to "where did my frames go", and a
+    // status poll arriving after the final frame must still find it.
+    let mut cinema_render: Option<CinemaRenderJob> = None;
     let mut cinema_shot_plans: Option<(
         EntityId,
         HashMap<usize, metrocalk_animation::shot::ShotAdjustment>,
@@ -10539,52 +10585,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // Take the camera if this is a new preview, and re-plan if the cutscene changed
                 // under one already running. A placement is negotiated against the scene per shot;
                 // holding a plan across an edit would preview the shot as it used to be framed.
-                let preview = match &mut cinema_preview {
-                    Some(state) if state.owner == entity => {
-                        if state.cut != cut {
-                            state.cut = cut.clone();
-                            state.plans.clear();
-                        }
-                        state
-                    }
-                    slot => {
-                        // A different object: hand the first one's camera back before taking a
-                        // second, so the saved view stays the AUTHOR's view rather than a shot.
-                        end_cinema_preview(&shared, slot);
-                        let (saved_cam, dimmed) = {
-                            let mut st = shared.lock().unwrap();
-                            let saved_cam = st.cam_override;
-                            // The viewport stops being a workspace: editor helpers and the selection
-                            // outline are exactly what a shot must not contain.
-                            st.cinematic = true;
-                            st.revision = st.revision.wrapping_add(1);
-                            let dimmed = st
-                                .instances
-                                .iter()
-                                .position(|i| {
-                                    render::highlight_has(i.highlight, render::HIGHLIGHT_SELECTED)
-                                })
-                                .and_then(|i| {
-                                    let was = st.instances[i].highlight;
-                                    st.instances[i].highlight = render::highlight_with(
-                                        was,
-                                        render::HIGHLIGHT_SELECTED,
-                                        false,
-                                    );
-                                    st.ids.get(i).map(|k| (k.clone(), was))
-                                });
-                            (saved_cam, dimmed)
-                        };
-                        *slot = Some(CinemaPreviewState {
-                            owner: entity,
-                            cut: cut.clone(),
-                            saved_cam,
-                            dimmed,
-                            plans: HashMap::new(),
-                        });
-                        slot.as_mut().expect("just assigned")
-                    }
-                };
+                let preview = hold_cinema_preview(&shared, &mut cinema_preview, entity, &cut);
                 let cam = present_cinematic_moment(
                     &engine,
                     &shared,
@@ -10623,6 +10624,166 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     ),
                     reason: None,
                 });
+            }
+            EngineCmd::CinemaRenderStart {
+                id,
+                fps,
+                shot,
+                folder,
+                stem,
+                reply,
+            } => {
+                use metrocalk_editor_shell::{plan_render, RenderReply, RenderScope};
+                if matches!(cinema_render.as_ref(), Some(job) if !job.finished) {
+                    let _ = reply.send(RenderReply::refusal(
+                        "A render is already running — wait for it, or stop it first.",
+                    ));
+                    continue;
+                }
+                if play_mode {
+                    let _ = reply.send(RenderReply::refusal(
+                        "Play is driving the camera — stop Play to render a cutscene.",
+                    ));
+                    continue;
+                }
+                // Asked BEFORE anything is created on disk, so a machine that cannot produce a single
+                // frame says so instead of leaving an empty folder and a stalled progress bar.
+                if !shared.lock().unwrap().frame_capture_supported {
+                    let _ = reply.send(RenderReply::refusal(
+                        "This graphics adapter does not let the viewport be copied, so frames cannot be written to files.",
+                    ));
+                    continue;
+                }
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(RenderReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
+                let scope = shot.map_or(RenderScope::WholeCut, RenderScope::Shot);
+                let plan = match plan_render(&cut, fps, scope) {
+                    Ok(plan) => plan,
+                    Err(why) => {
+                        let _ = reply.send(RenderReply::refusal(why));
+                        continue;
+                    }
+                };
+                let folder = std::path::PathBuf::from(&folder);
+                if let Err(e) = std::fs::create_dir_all(&folder) {
+                    let _ = reply.send(RenderReply::refusal(format!(
+                        "{} could not be opened for writing: {e}",
+                        folder.display()
+                    )));
+                    continue;
+                }
+                // Take the camera through the SAME door the timeline preview uses, and pose the first
+                // instant immediately — so the viewport shows frame 1 the moment the render starts
+                // rather than staying on the editor view until the first capture returns.
+                let state = hold_cinema_preview(&shared, &mut cinema_preview, entity, &cut);
+                let first = metrocalk_editor_shell::preview_time(&state.cut, plan.instant(0));
+                let Some(playback) = state.cut.playback_at(first) else {
+                    let _ = reply.send(RenderReply::refusal(
+                        "the first frame of that render is past the end of the cutscene",
+                    ));
+                    continue;
+                };
+                present_cinematic_moment(
+                    &engine,
+                    &shared,
+                    entity,
+                    &id,
+                    &state.cut,
+                    playback,
+                    &mut state.plans,
+                );
+                let pending = shared.lock().unwrap().request_frame();
+                let job = CinemaRenderJob {
+                    owner: entity,
+                    key: id.clone(),
+                    plan,
+                    folder,
+                    stem: metrocalk_editor_shell::sanitise_stem(&stem),
+                    next: 0,
+                    written: 0,
+                    bytes: 0,
+                    width: 0,
+                    height: 0,
+                    pending: Some(pending),
+                    failures: Vec::new(),
+                    consecutive_failures: 0,
+                    started: std::time::Instant::now(),
+                    finished: false,
+                    outcome: None,
+                };
+                diag_log!(
+                    "cinema: rendering {} frame(s) of {id} at {} fps into {}",
+                    job.plan.frames,
+                    job.plan.fps,
+                    job.folder.display()
+                );
+                let _ = reply.send(job.reply());
+                cinema_render = Some(job);
+            }
+            EngineCmd::CinemaRenderPlan {
+                id,
+                fps,
+                shot,
+                reply,
+            } => {
+                use metrocalk_editor_shell::{plan_render, RenderReply, RenderScope};
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(RenderReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
+                let scope = shot.map_or(RenderScope::WholeCut, RenderScope::Shot);
+                let answer = match plan_render(&cut, fps, scope) {
+                    Ok(plan) => RenderReply {
+                        entity: Some(id),
+                        frames: plan.frames,
+                        fps: plan.fps,
+                        seconds: plan.seconds,
+                        message: format!(
+                            "{} frames · {:.1}s at {} fps",
+                            plan.frames, plan.seconds, plan.fps
+                        ),
+                        ..RenderReply::default()
+                    },
+                    Err(why) => RenderReply::refusal(why),
+                };
+                let _ = reply.send(answer);
+            }
+            EngineCmd::CinemaRenderStatus { reply } => {
+                let _ = reply.send(
+                    cinema_render
+                        .as_ref()
+                        .map_or_else(metrocalk_editor_shell::RenderReply::idle, |job| job.reply()),
+                );
+            }
+            EngineCmd::CinemaRenderCancel { reply } => {
+                let answer = match cinema_render.as_mut() {
+                    Some(job) if !job.finished => {
+                        let written = job.written;
+                        job.finish(
+                            &shared,
+                            format!("Render stopped — {written} frame(s) kept."),
+                        );
+                        end_cinema_preview(&shared, &mut cinema_preview);
+                        job.reply()
+                    }
+                    // Cancelling a finished job is not an error: it is the ledger being dismissed, and
+                    // the honest answer is the ledger it dismissed.
+                    Some(job) => job.reply(),
+                    None => metrocalk_editor_shell::RenderReply::idle(),
+                };
+                let _ = reply.send(answer);
             }
             EngineCmd::ConditionAdd { id, request, reply } => {
                 use metrocalk_editor_shell::RoleReply;
@@ -11551,19 +11712,19 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // camera block) — a projection, never Loro/undo (ADR-021). `on=false` → back to the fly-cam.
                 let found = if on {
                     if let Some((p, fov, near, far)) = capscene::active_camera(&engine) {
-                        shared.lock().unwrap().cam_override = Some(render::CamView {
+                        shared.lock().unwrap().publish_camera(Some(render::CamView {
                             pos: p,
                             look_at: None,
                             fov_deg: fov,
                             near,
                             far,
-                        });
+                        }));
                         true
                     } else {
                         false
                     }
                 } else {
-                    shared.lock().unwrap().cam_override = None;
+                    shared.lock().unwrap().publish_camera(None);
                     true
                 };
                 let _ = reply.send(found);
@@ -15284,13 +15445,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         let mut st = shared.lock().unwrap();
                         pre_play_cam = st.cam_override;
                         if let Some((p, fov, near, far)) = active {
-                            st.cam_override = Some(render::CamView {
+                            st.publish_camera(Some(render::CamView {
                                 pos: p,
                                 look_at: None,
                                 fov_deg: fov,
                                 near,
                                 far,
-                            });
+                            }));
                         }
                     }
                     (recording, rec_entities, sim, body_of) =
@@ -15606,7 +15767,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         st.fx_revision = st.fx_revision.wrapping_add(1);
                     }
                     if let Some(saved) = cinema_saved_cam.take() {
-                        shared.lock().unwrap().cam_override = saved;
+                        shared.lock().unwrap().publish_camera(saved);
                     }
                     player_axis = [0.0, 0.0];
                     dying_enemies.clear();
@@ -15618,7 +15779,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     animation_preview.loop_policy = AnimationLoopPolicy::Once;
                     ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
                     // M11.4 — leave look-through: restore the pre-Play editor view (fly-cam or manual).
-                    shared.lock().unwrap().cam_override = pre_play_cam.take();
+                    shared.lock().unwrap().publish_camera(pre_play_cam.take());
                     recency.clear(); // ECS handles changed on the restore swap — drop stale ranking state
                     touch = 0;
                     rebuild(&engine, &shared, &mut positions, &assets);
@@ -15648,6 +15809,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             EngineCmd::Tick => {
                 pending_ticks.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 let tick_started = std::time::Instant::now();
+                // ADR-175 — a render advances on the heartbeat, before anything else this tick does.
+                // First because it is the one thing here that is waiting on ANOTHER thread: the sooner
+                // the next pose is published, the sooner the render thread can draw the frame this job
+                // is going to spend the next tick waiting for.
+                advance_cinema_render(&engine, &shared, &mut cinema_render, &mut cinema_preview);
                 // One fixed-`dt` step + a delta sync of the moved bodies' transforms to the viewport, and
                 // (only if the debugger is open) a refresh of the read-only overlay. A no-op until a body
                 // exists + the sim runs. NEVER a commit/Loro write (ADR-021). Off the JS hot path (inv. 4).
@@ -16040,7 +16206,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 cinema_shot_plans = None;
                                 let mut st = shared.lock().unwrap();
                                 if let Some(saved) = cinema_saved_cam.take() {
-                                    st.cam_override = saved;
+                                    st.publish_camera(saved);
                                 }
                                 restore_editor_chrome(&mut st, &mut cinema_dimmed);
                             }
@@ -16068,7 +16234,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             cinema_shot_plans = None;
                             let mut st = shared.lock().unwrap();
                             if let Some(saved) = cinema_saved_cam.take() {
-                                st.cam_override = saved;
+                                st.publish_camera(saved);
                             }
                             restore_editor_chrome(&mut st, &mut cinema_dimmed);
                             continue;
@@ -22590,7 +22756,7 @@ fn present_cinematic_moment(
     // bind group - a per-frame cost the render loop explicitly documents as never
     // happening per frame. `cam_override` is read outside that gate, so a camera
     // move needs nothing here at all.
-    st.cam_override = Some(cam);
+    st.publish_camera(Some(cam));
     cam
 }
 
@@ -22739,9 +22905,62 @@ fn end_cinema_preview(shared: &render::Shared, slot: &mut Option<CinemaPreviewSt
         return false;
     };
     let mut st = shared.lock().unwrap();
-    st.cam_override = preview.saved_cam;
+    st.publish_camera(preview.saved_cam);
     restore_editor_chrome(&mut st, &mut preview.dimmed);
     true
+}
+
+/// Take the viewport camera for `entity`'s cutscene, or keep the one already held for it.
+///
+/// THE ONE PLACE THE CAMERA IS TAKEN. Both callers — the timeline's preview and a render job — need
+/// the same four things done together (hand back whoever had it, remember the author's view, turn the
+/// viewport from a workspace into a picture, and suppress the selection outline a shot must not
+/// contain), and a second copy of that sequence is a second chance to leave the author inside a shot.
+fn hold_cinema_preview<'a>(
+    shared: &render::Shared,
+    slot: &'a mut Option<CinemaPreviewState>,
+    entity: EntityId,
+    cut: &metrocalk_animation::shot::Cutscene,
+) -> &'a mut CinemaPreviewState {
+    if matches!(slot.as_ref(), Some(state) if state.owner == entity) {
+        let state = slot.as_mut().expect("just matched");
+        // An edit while previewing must re-plan, or the preview shows the shot as it USED to be framed.
+        if state.cut != *cut {
+            state.cut = cut.clone();
+            state.plans.clear();
+        }
+        return state;
+    }
+    // A different object: hand the first one's camera back before taking a second, so the saved view
+    // stays the AUTHOR's view rather than a shot.
+    end_cinema_preview(shared, slot);
+    let (saved_cam, dimmed) = {
+        let mut st = shared.lock().unwrap();
+        let saved_cam = st.cam_override;
+        // The viewport stops being a workspace: editor helpers and the selection outline are exactly
+        // what a shot must not contain.
+        st.cinematic = true;
+        st.revision = st.revision.wrapping_add(1);
+        let dimmed = st
+            .instances
+            .iter()
+            .position(|i| render::highlight_has(i.highlight, render::HIGHLIGHT_SELECTED))
+            .and_then(|i| {
+                let was = st.instances[i].highlight;
+                st.instances[i].highlight =
+                    render::highlight_with(was, render::HIGHLIGHT_SELECTED, false);
+                st.ids.get(i).map(|k| (k.clone(), was))
+            });
+        (saved_cam, dimmed)
+    };
+    *slot = Some(CinemaPreviewState {
+        owner: entity,
+        cut: cut.clone(),
+        saved_cam,
+        dimmed,
+        plans: HashMap::new(),
+    });
+    slot.as_mut().expect("just assigned")
 }
 
 fn restore_editor_chrome(st: &mut render::SceneState, dimmed: &mut Option<(String, f32)>) {
@@ -22767,6 +22986,233 @@ fn restore_editor_chrome(st: &mut render::SceneState, dimmed: &mut Option<(Strin
     // The delivery frame belongs to the shot, not to the editor. Leaving it set would letterbox the
     // author's own viewport after the preview handed the camera back.
     st.delivery_aspect = None;
+}
+
+/// ADR-175 — a cutscene being written out to files, one frame at a time.
+///
+/// It is a state machine and not a loop for one reason: a frame is only real once the render thread has
+/// DRAWN it, and the render thread runs on its own clock. So the job poses frame *n*, asks for a
+/// capture, and then does nothing at all until that capture comes back — which is what makes a render
+/// of 600 frames cost one IPC to start, one to finish, and however many the progress bar polls, rather
+/// than one per frame (invariant 4, product principle 2).
+///
+/// It borrows the PREVIEW's camera rather than taking its own. There is one viewport camera and one way
+/// to hold it; a second holder would need its own release-on-Play, release-on-selection-change and
+/// release-on-panel-close, and the day one of those was missed the author's view would be stuck inside
+/// a shot with no way out.
+struct CinemaRenderJob {
+    /// The object whose cutscene is being filmed.
+    owner: EntityId,
+    /// Its Loro key, for the reply and for `present_cinematic_moment`.
+    key: String,
+    /// What is being filmed, decided once, before anything was written.
+    plan: metrocalk_editor_shell::RenderPlan,
+    /// Where the frames go.
+    folder: std::path::PathBuf,
+    /// The name they share.
+    stem: String,
+    /// The next frame index to pose. Advances on a written frame AND on a failed one, so a job can
+    /// never sit on one bad frame forever.
+    next: u32,
+    /// How many files exist.
+    written: u32,
+    bytes: u64,
+    /// The size the frames are actually being written at, from the first capture that arrived.
+    width: u32,
+    height: u32,
+    /// The capture this job is waiting on, if any.
+    pending: Option<u64>,
+    /// Every frame that did not make it, each with its own sentence.
+    failures: Vec<String>,
+    /// Consecutive failures. A render whose every frame fails must stop and say so rather than write
+    /// twelve thousand sentences about the same broken adapter.
+    consecutive_failures: u32,
+    started: std::time::Instant,
+    /// Set when the job is over. The job STAYS in its slot after this, because the ledger is the whole
+    /// point of the thing and a status poll a second later must still be able to read it.
+    finished: bool,
+    /// The closing sentence, once there is one.
+    outcome: Option<String>,
+}
+
+/// How many frames in a row may fail before the render gives up.
+const RENDER_FAILURE_LIMIT: u32 = 5;
+
+impl CinemaRenderJob {
+    /// This job as the one reply shape every render command answers with.
+    fn reply(&self) -> metrocalk_editor_shell::RenderReply {
+        metrocalk_editor_shell::RenderReply {
+            running: !self.finished,
+            done: self.finished,
+            entity: Some(self.key.clone()),
+            frames: self.plan.frames,
+            written: self.written,
+            width: self.width,
+            height: self.height,
+            fps: self.plan.fps,
+            seconds: self.plan.seconds,
+            folder: self.folder.display().to_string(),
+            stem: self.stem.clone(),
+            bytes: self.bytes,
+            elapsed_ms: u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            failures: self.failures.clone(),
+            message: self.outcome.clone().unwrap_or_else(|| {
+                format!(
+                    "Rendering frame {} of {}",
+                    (self.written + 1).min(self.plan.frames),
+                    self.plan.frames
+                )
+            }),
+            reason: None,
+        }
+    }
+
+    /// Close the job with a sentence, and let go of the capture it was waiting on.
+    fn finish(&mut self, shared: &render::Shared, outcome: String) {
+        if let Some(req) = self.pending.take() {
+            shared.lock().unwrap().forget_frame(req);
+        }
+        self.finished = true;
+        self.outcome = Some(outcome);
+    }
+}
+
+/// Move a render on by at most one frame. Called from the engine's heartbeat, so a job progresses
+/// whether or not anybody is polling it.
+///
+/// Returns `true` if this call did any work, so the caller can tell an idle tick from a rendering one.
+fn advance_cinema_render(
+    engine: &Engine<FlecsWorld>,
+    shared: &render::Shared,
+    job: &mut Option<CinemaRenderJob>,
+    preview: &mut Option<CinemaPreviewState>,
+) -> bool {
+    let Some(active) = job.as_mut() else {
+        return false;
+    };
+    if active.finished {
+        return false;
+    }
+    // THE CAMERA IS THE PREVIEW'S. If something took it — Play started, the author selected another
+    // object, the panel closed — the frames from here on would be of whatever is on screen now, which
+    // is a sequence that looks nearly right and is not the cut. Stop, and say why.
+    let holding = matches!(preview.as_ref(), Some(state) if state.owner == active.owner);
+    if !holding {
+        let written = active.written;
+        active.finish(
+            shared,
+            format!(
+                "Render stopped after {written} frame(s) — something else took the viewport camera."
+            ),
+        );
+        return true;
+    }
+    // 1. Collect the frame asked for last time, if it has been drawn yet.
+    //
+    // The take is BOUND before the match rather than being its scrutinee, so the lock is released
+    // before the disk write below. A `match shared.lock()…` holds the guard for the whole statement,
+    // and the render thread takes that same lock at the top of every frame — so writing half a
+    // megabyte of PNG inside the arm would stall the very thread this job is waiting on.
+    if let Some(req) = active.pending {
+        let taken = shared.lock().unwrap().take_frame(req);
+        match taken {
+            render::FrameTake::Pending => return false,
+            render::FrameTake::Ready { png, width, height } => {
+                active.pending = None;
+                active.width = width;
+                active.height = height;
+                let path = active
+                    .folder
+                    .join(metrocalk_editor_shell::render_frame_name(
+                        &active.stem,
+                        active.next,
+                    ));
+                match std::fs::write(&path, &png) {
+                    Ok(()) => {
+                        active.written += 1;
+                        active.bytes += png.len() as u64;
+                        active.consecutive_failures = 0;
+                    }
+                    Err(e) => {
+                        active.failures.push(format!(
+                            "frame {} could not be written to {}: {e}",
+                            active.next + 1,
+                            path.display()
+                        ));
+                        active.consecutive_failures += 1;
+                    }
+                }
+                active.next += 1;
+            }
+            render::FrameTake::Failed(why) => {
+                active.pending = None;
+                active
+                    .failures
+                    .push(format!("frame {}: {why}", active.next + 1));
+                active.consecutive_failures += 1;
+                active.next += 1;
+            }
+        }
+        if active.consecutive_failures >= RENDER_FAILURE_LIMIT {
+            let last = active
+                .failures
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "the frames could not be captured".into());
+            let written = active.written;
+            active.finish(
+                shared,
+                format!("Render stopped after {written} frame(s) — {last}"),
+            );
+            return true;
+        }
+    }
+    // 2. Every frame accounted for: close the ledger and hand the camera back.
+    if active.next >= active.plan.frames {
+        let written = active.written;
+        let lost = active.failures.len();
+        let seconds = active.started.elapsed().as_secs_f32();
+        let outcome = if lost == 0 {
+            format!(
+                "Rendered {written} frames at {}x{} in {seconds:.1}s",
+                active.width, active.height
+            )
+        } else {
+            format!(
+                "Rendered {written} of {} frames — {lost} could not be written",
+                active.plan.frames
+            )
+        };
+        active.finish(shared, outcome);
+        end_cinema_preview(shared, preview);
+        return true;
+    }
+    // 3. Pose the next instant and ask for its picture. The order matters and is the whole reason
+    //    `pose_epoch` exists: the request must record the camera it is asking about, so the frame
+    //    already in flight — drawn at the PREVIOUS instant — cannot answer it.
+    let Some(state) = preview.as_mut() else {
+        return false;
+    };
+    let at = metrocalk_editor_shell::preview_time(&state.cut, active.plan.instant(active.next));
+    let Some(playback) = state.cut.playback_at(at) else {
+        let written = active.written;
+        active.finish(
+            shared,
+            format!("Render stopped after {written} frame(s) — the cutscene changed while it ran."),
+        );
+        return true;
+    };
+    present_cinematic_moment(
+        engine,
+        shared,
+        active.owner,
+        &active.key,
+        &state.cut,
+        playback,
+        &mut state.plans,
+    );
+    active.pending = Some(shared.lock().unwrap().request_frame());
+    true
 }
 
 /// Fire an object's ONE-SHOT effect layers as a detached burst, anchored where the object currently is.
@@ -23722,6 +24168,193 @@ fn cinema_preview(
     })
 }
 
+/// ADR-175 — the folder a rendered sequence goes into, chosen by the author.
+///
+/// A folder and not a file, because a render writes a numbered SEQUENCE: asking for one file name and
+/// then writing 600 files beside it is the surprise a picker exists to prevent. `None` means the dialog
+/// was dismissed, which is a decision and not an error.
+fn pick_render_folder(app: &tauri::AppHandle) -> Option<String> {
+    app.dialog()
+        .file()
+        .set_title("Choose a folder for the rendered frames")
+        .blocking_pick_folder()
+        .and_then(|folder| folder.into_path().ok())
+        .map(|path| path.display().to_string())
+}
+
+/// ADR-175 — start writing a cutscene out as a numbered PNG sequence.
+///
+/// Returns as soon as the job is accepted, carrying the plan it accepted: how many frames, at what
+/// rate, into which folder. The progress is read with [`cinema_render_status`], because a render is
+/// minutes of work and a command that returned at the end of it would be a frozen editor.
+#[tauri::command(async)]
+fn cinema_render_start(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    id: String,
+    fps: u32,
+    shot: Option<usize>,
+    folder: Option<String>,
+    stem: String,
+) -> metrocalk_editor_shell::RenderReply {
+    ipc();
+    use metrocalk_editor_shell::RenderReply;
+    let Some(folder) = folder.or_else(|| pick_render_folder(&app)) else {
+        return RenderReply::refusal("Render canceled — no folder was chosen.");
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaRenderStart {
+            id,
+            fps,
+            shot,
+            folder,
+            stem,
+            reply,
+        })
+        .is_err()
+    {
+        return RenderReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| RenderReply::refusal("The render did not start in time"))
+}
+
+/// ADR-175 — what a render would produce, without producing it. The dialog's cost sentence.
+#[tauri::command(async)]
+fn cinema_render_plan(
+    state: State<AppState>,
+    id: String,
+    fps: u32,
+    shot: Option<usize>,
+) -> metrocalk_editor_shell::RenderReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaRenderPlan {
+            id,
+            fps,
+            shot,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::RenderReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::RenderReply::refusal("The render plan did not arrive in time")
+    })
+}
+
+/// ADR-175 — how far the running render has got, or the ledger of the last one.
+#[tauri::command(async)]
+fn cinema_render_status(state: State<AppState>) -> metrocalk_editor_shell::RenderReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaRenderStatus { reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::RenderReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::RenderReply::refusal("The render did not answer in time")
+    })
+}
+
+/// ADR-175 — stop the running render. The frames already written stay.
+#[tauri::command(async)]
+fn cinema_render_cancel(state: State<AppState>) -> metrocalk_editor_shell::RenderReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaRenderCancel { reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::RenderReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::RenderReply::refusal("The render did not answer in time")
+    })
+}
+
+/// ADR-175 — write the picture currently on the stage to a PNG the author names.
+///
+/// The engine thread is not involved at all: this asks the RENDER thread for its next frame and writes
+/// what comes back. Nothing is posed, so what lands in the file is what was on screen — including a
+/// held cutscene preview, which is what makes "get me a still of this shot" one click rather than a
+/// render of one frame into a folder.
+#[tauri::command(async)]
+fn viewport_capture(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    path: Option<String>,
+) -> metrocalk_editor_shell::RenderReply {
+    ipc();
+    use metrocalk_editor_shell::RenderReply;
+    if !state.shared.lock().unwrap().frame_capture_supported {
+        return RenderReply::refusal(
+            "This graphics adapter does not let the viewport be copied, so a frame cannot be saved.",
+        );
+    }
+    let Some(path) = path.or_else(|| {
+        app.dialog()
+            .file()
+            .add_filter("PNG image", &["png"])
+            .set_file_name("frame.png")
+            .blocking_save_file()
+            .and_then(|file| file.into_path().ok())
+            .map(|p| p.display().to_string())
+    }) else {
+        return RenderReply::refusal("Save canceled — no file was chosen.");
+    };
+    let started = std::time::Instant::now();
+    let req = state.shared.lock().unwrap().request_frame();
+    // Poll rather than block on a condvar: the render thread may be mid-frame, and at 60 Hz the answer
+    // is at most two frames away. The deadline is generous because a first frame after a large import
+    // can take much longer than a steady-state one — and it is a DEADLINE, so a stalled surface
+    // produces a sentence instead of a command that never returns.
+    let deadline = std::time::Duration::from_secs(10);
+    loop {
+        // Bound, not a scrutinee: the guard would otherwise live across the `fs::write` below, and the
+        // render thread takes that same lock at the top of every frame.
+        let taken = state.shared.lock().unwrap().take_frame(req);
+        match taken {
+            render::FrameTake::Ready { png, width, height } => {
+                let bytes = png.len() as u64;
+                if let Err(e) = std::fs::write(&path, &png) {
+                    return RenderReply::refusal(format!("{path} could not be written: {e}"));
+                }
+                return RenderReply {
+                    done: true,
+                    frames: 1,
+                    written: 1,
+                    width,
+                    height,
+                    folder: path.clone(),
+                    bytes,
+                    elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+                    message: format!("Saved {width}x{height} to {path}"),
+                    ..RenderReply::default()
+                };
+            }
+            render::FrameTake::Failed(why) => return RenderReply::refusal(why),
+            render::FrameTake::Pending => {
+                if started.elapsed() > deadline {
+                    state.shared.lock().unwrap().forget_frame(req);
+                    return RenderReply::refusal(
+                        "The viewport did not produce a frame to save — it may be minimised or hidden.",
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        }
+    }
+}
+
 /// The conditional catalogue: every "only if" card the Behaviour block offers. Static data.
 #[tauri::command(async)]
 fn condition_catalog() -> Vec<metrocalk_editor_shell::ConditionSpec> {
@@ -24318,13 +24951,13 @@ fn set_look_dev_camera(
     let (near, far) = metrocalk_animation::shot::cinematic_clip_planes(distance * 0.1, distance);
     {
         let mut st = state.shared.lock().unwrap();
-        st.cam_override = Some(render::CamView {
+        st.publish_camera(Some(render::CamView {
             pos: eye,
             look_at: Some(look_at),
             fov_deg,
             near,
             far,
-        });
+        }));
     }
     serde_json::json!({
         "eye": eye,
@@ -26710,6 +27343,11 @@ fn main() {
             cinema_set_delivery,
             cinema_list,
             cinema_preview,
+            cinema_render_plan,
+            cinema_render_start,
+            cinema_render_status,
+            cinema_render_cancel,
+            viewport_capture,
             condition_catalog,
             condition_add,
             condition_remove,
