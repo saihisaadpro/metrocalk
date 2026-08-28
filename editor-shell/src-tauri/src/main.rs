@@ -10715,6 +10715,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     failures: Vec::new(),
                     consecutive_failures: 0,
                     started: std::time::Instant::now(),
+                    last_progress: std::time::Instant::now(),
                     finished: false,
                     outcome: None,
                 };
@@ -23028,6 +23029,14 @@ struct CinemaRenderJob {
     /// twelve thousand sentences about the same broken adapter.
     consecutive_failures: u32,
     started: std::time::Instant,
+    /// When this job last did anything at all — collected a frame, or asked for one.
+    ///
+    /// A capture is answered by a DRAWN frame, and a minimised or occluded window can stop vending
+    /// swapchain textures entirely (`get_current_texture` returns `Outdated`, the loop `continue`s and
+    /// nothing is drawn). Without a deadline the job then waits forever, the progress bar holds at the
+    /// frame it reached, and nothing anywhere says why — the inert state `<ux_quality>` 6 forbids,
+    /// wearing a spinner.
+    last_progress: std::time::Instant,
     /// Set when the job is over. The job STAYS in its slot after this, because the ledger is the whole
     /// point of the thing and a status poll a second later must still be able to read it.
     finished: bool,
@@ -23037,6 +23046,14 @@ struct CinemaRenderJob {
 
 /// How many frames in a row may fail before the render gives up.
 const RENDER_FAILURE_LIMIT: u32 = 5;
+
+/// How long a render may wait for one frame before it stops and says why.
+///
+/// Generous, because a single frame of a large imported assembly can genuinely take seconds on the
+/// low-end target, and a deadline that fires on a slow machine is a worse failure than no deadline at
+/// all. It is not a performance budget — it is the difference between "this is taking a while" and "no
+/// frame is ever going to arrive".
+const RENDER_STALL_SECONDS: u64 = 30;
 
 impl CinemaRenderJob {
     /// This job as the one reply shape every render command answers with.
@@ -23057,9 +23074,12 @@ impl CinemaRenderJob {
             elapsed_ms: u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX),
             failures: self.failures.clone(),
             message: self.outcome.clone().unwrap_or_else(|| {
+                // `next`, not `written`: the frame being worked on, which is what a progress line
+                // names. The BAR is `written / frames` — files that exist — and with a lost frame the
+                // two differ by exactly the number the failures list explains.
                 format!(
                     "Rendering frame {} of {}",
-                    (self.written + 1).min(self.plan.frames),
+                    (self.next + 1).min(self.plan.frames),
                     self.plan.frames
                 )
             }),
@@ -23116,7 +23136,24 @@ fn advance_cinema_render(
     if let Some(req) = active.pending {
         let taken = shared.lock().unwrap().take_frame(req);
         match taken {
-            render::FrameTake::Pending => return false,
+            render::FrameTake::Pending => {
+                // NOT FOREVER. A window that has stopped vending swapchain textures never draws the
+                // frame this is waiting for, and a job with no deadline holds its progress bar at the
+                // frame it reached with nothing anywhere saying why.
+                if active.last_progress.elapsed()
+                    >= std::time::Duration::from_secs(RENDER_STALL_SECONDS)
+                {
+                    let written = active.written;
+                    active.finish(
+                        shared,
+                        format!(
+                            "Render stopped after {written} frame(s) — the viewport produced no frame for {RENDER_STALL_SECONDS}s. It may be minimised or hidden."
+                        ),
+                    );
+                    return true;
+                }
+                return false;
+            }
             render::FrameTake::Ready { png, width, height } => {
                 active.pending = None;
                 active.width = width;
@@ -23143,6 +23180,7 @@ fn advance_cinema_render(
                     }
                 }
                 active.next += 1;
+                active.last_progress = std::time::Instant::now();
             }
             render::FrameTake::Failed(why) => {
                 active.pending = None;
@@ -23151,6 +23189,7 @@ fn advance_cinema_render(
                     .push(format!("frame {}: {why}", active.next + 1));
                 active.consecutive_failures += 1;
                 active.next += 1;
+                active.last_progress = std::time::Instant::now();
             }
         }
         if active.consecutive_failures >= RENDER_FAILURE_LIMIT {
@@ -23212,6 +23251,7 @@ fn advance_cinema_render(
         &mut state.plans,
     );
     active.pending = Some(shared.lock().unwrap().request_frame());
+    active.last_progress = std::time::Instant::now();
     true
 }
 
