@@ -243,7 +243,9 @@ export function TransformSection({
                 value={value}
                 mixed={mixed}
                 step={0.1}
-                min={0}
+                // The floor is the curated schema's, not a second opinion: the table is where this
+                // editor states what a field may hold, and `check-registry-vocab.mjs` gates it.
+                min={schema.scale.minimum}
                 ariaLabel={`${title} (x)`}
                 data-testid="num-Transform.scale"
                 title={

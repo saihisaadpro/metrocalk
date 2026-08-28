@@ -85,7 +85,7 @@ export const componentSchemas: Record<string, ComponentSchema> = {
       // Declared for completeness and for the gate; `qw` has no degree row of its own — the three
       // above are the Euler angles the panel shows, and all four are written together.
       qw: { type: "number", title: "Rotation W", default: 1 },
-      scale: { type: "number", title: "Scale", unit: "×", default: 1 },
+      scale: { type: "number", title: "Scale", unit: "×", default: 1, minimum: 0 },
     },
   },
   Health: {
