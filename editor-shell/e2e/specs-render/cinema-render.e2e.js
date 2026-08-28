@@ -190,7 +190,11 @@ describe("Rendering a cutscene to files — the engine delivers a picture", () =
 
   it("writes one PNG per planned frame, and every one of them is a real image", async () => {
     const folder = path.join(shots, "viewport-cut");
-    const ledger = await render(statue, { fps: 24, shot: 0, stem: "hero", folder });
+    // Shot 2 is the HERO card — a full three-quarter that pushes in, so the camera is moving through
+    // every frame of it. Shot 1 (the establishing wide) also moves, but a push-in against a subject
+    // that fills the frame is the largest per-frame difference this fixture can produce, which is what
+    // the distinct-hash assertion below is measuring.
+    const ledger = await render(statue, { fps: 24, shot: 1, stem: "hero", folder });
     console.log(`[render] ${ledger.message}`);
     expect(ledger.reason).toBe(null);
     expect(ledger.failures).toEqual([]);
@@ -236,7 +240,7 @@ describe("Rendering a cutscene to files — the engine delivers a picture", () =
     );
 
     const folder = path.join(shots, "scope-cut");
-    const ledger = await render(statue, { fps: 24, shot: 0, stem: "scope", folder });
+    const ledger = await render(statue, { fps: 24, shot: 1, stem: "scope", folder });
     expect(ledger.failures).toEqual([]);
     const files = frames(folder);
     expect(files.length).toBe(ledger.frames);
