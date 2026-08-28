@@ -16,6 +16,8 @@ const HERO_ROW: ShotRow = {
   seconds: 2.5,
   effectiveSeconds: 2.5,
   startSeconds: 0,
+  openSeconds: 0,
+  blendSeconds: 0,
   size: "full",
   angle: "three_quarter",
   motion: "push_in",

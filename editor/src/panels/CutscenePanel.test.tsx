@@ -18,6 +18,10 @@ function row(over: Partial<ShotRow> & Pick<ShotRow, "id" | "index" | "startSecon
     reads: `shot ${over.index + 1}`,
     seconds: 2,
     effectiveSeconds: 2,
+    // The engine's own `Mood::Normal` window (0.6s, capped at half the shot), and 0 on the first —
+    // a fixture that always said 0 would make "opening a shot seeks past its blend" untestable.
+    blendSeconds: over.index === 0 ? 0 : 0.5,
+    openSeconds: over.index === 0 ? over.startSeconds : over.startSeconds + 0.5,
     size: "full",
     angle: "three_quarter",
     motion: "push_in",
@@ -168,9 +172,10 @@ describe("CutscenePanel", () => {
     const panel = await screen.findByTestId("cutscene-panel");
     // 0s is inside shot 1 before anything is touched.
     expect(panel.textContent).toMatch(/0\.0s · shot 1 of 4/);
-    // Clicking the third clip moves the playhead to where that shot starts.
+    // Clicking the third clip opens THAT shot — which is its start PLUS its opening blend, because
+    // at the start itself the transition weight is zero and the frame is the end of shot 2.
     fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[2]);
-    await waitFor(() => expect(panel.textContent).toMatch(/6\.0s · shot 3 of 4/));
+    await waitFor(() => expect(panel.textContent).toMatch(/6\.5s · shot 3 of 4/));
   });
 
   it("locks every authoring control during Play, each with the same plain reason", async () => {
@@ -223,12 +228,13 @@ describe("CutscenePanel", () => {
 
     fireEvent.click(await screen.findByTestId("cutscene-preview"));
     await waitFor(() => expect(cinemaPreviewStore.getState().active).toBe(true));
-    // The playhead is at 6s - where shot 3 starts - so turning preview on stands there, not at 0.
-    expect(client.cinemaPreview).toHaveBeenCalledWith("e1", 6, true);
+    // The playhead is at 6.5s - inside shot 3, past its opening blend - so turning preview on stands
+    // there, not at 0 and not at the 6.0s instant where shot 3 is not yet what you see.
+    expect(client.cinemaPreview).toHaveBeenCalledWith("e1", 6.5, true);
 
-    // ...and now a clip click DOES move the camera, to that shot's own start.
+    // ...and now a clip click DOES move the camera, to the moment that shot becomes itself.
     fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[3]);
-    await waitFor(() => expect(client.cinemaPreview).toHaveBeenCalledWith("e1", 7, true));
+    await waitFor(() => expect(client.cinemaPreview).toHaveBeenCalledWith("e1", 7.5, true));
   });
 
   it("re-poses at the same moment after an edit, so changing a framing shows the new framing", async () => {
@@ -254,9 +260,26 @@ describe("CutscenePanel", () => {
     );
     expect((client.cinemaPreview as ReturnType<typeof vi.fn>).mock.calls.at(-1)).toEqual([
       "e1",
-      2,
+      2.5,
       true,
     ]);
+  });
+
+  it("opening a shot seeks past its blend, because at its start it is not what you see", async () => {
+    const client = loaded();
+    selectSomething();
+    render(<CutscenePanel client={client} />);
+    const panel = await screen.findByTestId("cutscene-panel");
+
+    // Shot 1 never blends: opening it is its start, exactly.
+    fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+    await waitFor(() => expect(panel.textContent).toMatch(/0\.0s · shot 1 of 4/));
+
+    // Shot 2 starts at 2.0s and opens over 0.5s. Landing on 2.0 would show the END OF SHOT 1 —
+    // measured on the packaged .exe, where re-framing from that position moved the camera 0.0000
+    // units and the panel's own read-out said "Transition into shot 3".
+    fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[1]);
+    await waitFor(() => expect(panel.textContent).toMatch(/2\.5s · shot 2 of 4/));
   });
 
   it("refuses to preview a cutscene with no shots, and says what to do instead", async () => {

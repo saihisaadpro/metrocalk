@@ -392,6 +392,17 @@ pub struct ShotRow {
     pub effective_seconds: f32,
     /// Where the shot starts on the cutscene's own clock, seconds — the chip's left edge.
     pub start_seconds: f32,
+    /// The first instant this shot is on screen ALONE, seconds on the cutscene clock — what a UI
+    /// seeks to when the user opens this shot. Absolute, so no caller does arithmetic on a boundary
+    /// the solver owns.
+    pub open_seconds: f32,
+    /// How long this shot takes to become itself, seconds — its opening blend, `0.0` on the first.
+    ///
+    /// On the wire because `start_seconds` is the one instant of a shot at which that shot is NOT
+    /// what you see: the transition weight there is zero, so the frame is the END of the shot
+    /// before. "Open shot 3" has to mean `start_seconds + blend_seconds`, and the number that
+    /// defines the window comes from the side that draws it.
+    pub blend_seconds: f32,
     /// How much of the frame the subject fills.
     pub size: ShotSize,
     /// Where the camera stands, relative to the subject's facing.
@@ -946,6 +957,8 @@ fn rows_of(
             seconds: shot.seconds,
             effective_seconds: effective,
             start_seconds: start,
+            open_seconds: cut.opens_at(index),
+            blend_seconds: cut.blend_into(index),
             size: shot.size,
             angle: shot.angle,
             motion: shot.motion,
@@ -1144,6 +1157,48 @@ mod tests {
 
         // Far past the end clamps to the same instant — one end, not a scale of them.
         assert!(exactly(preview_time(&cut, total + 500.0), at));
+    }
+
+    #[test]
+    fn opening_a_shot_means_the_instant_it_becomes_itself_not_the_instant_it_starts() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        let cut = three_shot_cut(&mut engine, owner);
+        let rows = rows_of(&cut, "Owner", &|_| None);
+
+        // The first shot never blends: opening it IS its start.
+        assert!(exactly(rows[0].blend_seconds, 0.0));
+        let opening = cut.playback_at(rows[0].start_seconds).expect("inside");
+        assert_eq!(opening.index, 0);
+        assert!(opening.blend_from.is_none());
+
+        for row in &rows[1..] {
+            assert!(
+                row.blend_seconds > 0.0,
+                "shot {} opens over nothing",
+                row.index
+            );
+            // THE DEFECT THIS PINS, measured on the packaged `.exe` before it was fixed: at a shot's
+            // START the transition weight is zero, so `blend_camera` returns the PREVIOUS shot's
+            // pose in full. Clicking clip 3 showed the end of shot 2, and re-framing shot 3 from
+            // there moved the camera 0.0000 units.
+            let at_start = cut.playback_at(row.start_seconds).expect("inside");
+            assert_eq!(at_start.index, row.index);
+            assert_eq!(
+                at_start.blend_from,
+                Some((row.index - 1, 0.0)),
+                "the start of a shot is entirely the shot before it"
+            );
+
+            // ...and at the instant the engine calls its opening, it is the shot, alone.
+            let opened = cut.playback_at(row.open_seconds).expect("inside");
+            assert_eq!(opened.index, row.index);
+            assert_eq!(
+                opened.blend_from, None,
+                "shot {} is still blending after its own blend window",
+                row.index
+            );
+        }
     }
 
     #[test]

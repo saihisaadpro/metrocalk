@@ -2017,6 +2017,18 @@ export interface ShotRow {
   effectiveSeconds: number;
   /** Where the shot starts on the cutscene clock, seconds. */
   startSeconds: number;
+  /** The first instant this shot is on screen ALONE, seconds on the cutscene clock — what the
+   *  timeline seeks to when the user opens this shot. Absolute, so no caller does arithmetic on a
+   *  boundary the solver owns: `startSeconds + blendSeconds` lands a hair BELOW the strict `local <
+   *  blend` test in f32 and reports a 99.99999% transition rather than the shot. */
+  openSeconds: number;
+  /** How long this shot takes to become itself, seconds — its opening blend, `0` on the first.
+   *
+   *  `startSeconds` is the one instant of a shot at which that shot is NOT what you see: the
+   *  transition weight there is zero, so the frame is the END of the shot before. "Open shot 3"
+   *  means `startSeconds + blendSeconds`, and the number that defines the window comes from the
+   *  side that draws it. */
+  blendSeconds: number;
   size: ShotSize;
   angle: ShotAngle;
   motion: ShotMove;

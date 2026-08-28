@@ -461,6 +461,10 @@ const CUTSCENE: CinemaReply = (() => {
       seconds: shot.seconds,
       effectiveSeconds: shot.seconds,
       startSeconds: start,
+      // `Mood::Normal.blend_seconds()` is 0.6s, capped at half the shot; the first never blends,
+      // and a shot opens one 60Hz tick past its own window (`Cutscene::opens_at`).
+      blendSeconds: index === 0 ? 0 : Math.min(0.6, shot.seconds * 0.5),
+      openSeconds: index === 0 ? start : start + Math.min(0.6, shot.seconds * 0.5) + 1 / 60,
       size: shot.size,
       angle: shot.angle,
       motion: shot.motion,
@@ -1144,7 +1148,7 @@ export const SCENES: Scene[] = [
       "(filled, not outlined — an accent border alone would be a toggle whose state you have to " +
       "know already), that it sits in its own toolbar group rather than crowding the pacing run, " +
       "and that the playhead read-out beside it names the same shot the timeline is highlighting: " +
-      "2.5s, shot 2 of 5 — where shot 2 STARTS, not how long it runs. This is the toggle's whole job — the author says WHEN, and the viewport " +
+      "3.1s, shot 2 of 5 — where shot 2 BECOMES ITSELF (its 2.5s start plus its 0.6s opening blend), not where it starts and not how long it runs. This is the toggle's whole job — the author says WHEN, and the viewport " +
       "answers with the frame Play would film at that moment",
     viewport: { width: 1400, height: 900 },
     setup: selectAnimatedEntity,
@@ -1162,7 +1166,7 @@ export const SCENES: Scene[] = [
       ],
       text_present: [
         "Preview",
-        "2.5s · shot 2 of 5",
+        "3.1s · shot 2 of 5",
         "Weld Gun 7",
         // Three world coordinates, not a promise of them.
         "6.20, 3.10, 9.40",

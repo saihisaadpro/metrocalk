@@ -238,6 +238,10 @@ impl Default for Cutscene {
     }
 }
 
+/// One tick of the engine's clock, seconds. Playback advances on the replay-stamped frame counter at
+/// 60 Hz, so this is the finest step any moment of a cutscene can differ by.
+pub const TICK_SECONDS: f32 = 1.0 / 60.0;
+
 /// The most shots one cutscene may hold — the stated ceiling, refused with a reason rather than
 /// silently truncated.
 pub const MAX_SHOTS: usize = 12;
@@ -267,6 +271,45 @@ impl Cutscene {
             .sum()
     }
 
+    /// How long the shot at `index` takes to become itself, seconds.
+    ///
+    /// A cutscene's first shot never blends — separately directed cutscenes stay hard cuts — and no
+    /// blend may eat more than half the shot it opens. `playback_at` reads this rather than
+    /// recomputing it, so "when is this shot on screen" has one answer: a UI that seeks past the
+    /// window and the solver that draws it cannot disagree about where the window ends.
+    #[must_use]
+    pub fn blend_into(&self, index: usize) -> f32 {
+        if index == 0 {
+            return 0.0;
+        }
+        let Some(duration) = self.effective_shot_seconds(index) else {
+            return 0.0;
+        };
+        self.mood.blend_seconds().min(duration * 0.5).max(0.0)
+    }
+
+    /// The first instant at which the shot at `index` is on screen ALONE, seconds on the cutscene
+    /// clock — what "open shot 3" has to mean.
+    ///
+    /// Not the shot's start: at its start the transition weight is zero, so the frame there is
+    /// entirely the shot BEFORE. And not the end of the blend window either, because
+    /// `start + blend_into(index)` is computed in `f32` and lands a hair BELOW the strict `local <
+    /// blend_span` test — measured, `Some((0, 0.9999998))` rather than `None`. One frame past it is
+    /// the honest answer and needs no epsilon: `TICK_SECONDS` is the engine's own clock, so this is
+    /// literally the first frame playback draws the shot by itself.
+    #[must_use]
+    pub fn opens_at(&self, index: usize) -> f32 {
+        let start: f32 = (0..index)
+            .filter_map(|i| self.effective_shot_seconds(i))
+            .sum();
+        let blend = self.blend_into(index);
+        if blend > 0.0 {
+            start + blend + TICK_SECONDS
+        } else {
+            start
+        }
+    }
+
     /// Resolve playback timing once, including the within-cutscene incoming blend window.
     #[must_use]
     pub fn playback_at(&self, t: f32) -> Option<ShotPlayback> {
@@ -277,13 +320,9 @@ impl Cutscene {
             if t < end {
                 let local = (t - start).max(0.0);
                 let progress = (local / duration.max(1.0e-6)).clamp(0.0, 1.0);
-                let blend_from = if index == 0 {
-                    None
-                } else {
-                    let blend_span = self.mood.blend_seconds().min(duration * 0.5);
-                    (blend_span > 1.0e-6 && local < blend_span)
-                        .then(|| (index - 1, (local / blend_span).clamp(0.0, 1.0)))
-                };
+                let blend_span = self.blend_into(index);
+                let blend_from = (index > 0 && blend_span > 1.0e-6 && local < blend_span)
+                    .then(|| (index - 1, (local / blend_span).clamp(0.0, 1.0)));
                 return Some(ShotPlayback {
                     index,
                     progress,

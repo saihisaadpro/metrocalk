@@ -196,6 +196,8 @@ describe("CinemaSection", () => {
       reads: "a full shot of e1, three-quarters on, pushing in",
       seconds: 2.5,
       effectiveSeconds: seconds,
+      openSeconds: 0,
+      blendSeconds: 0,
       startSeconds: 0,
       size: "full",
       angle: "three_quarter",

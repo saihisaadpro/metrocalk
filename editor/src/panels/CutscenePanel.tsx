@@ -468,9 +468,18 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
                   selected={row.id === activeId}
                   live={row.id === live?.id}
                   onClick={() => {
+                    // OPENING a shot is not the same instant as where it STARTS. Every shot after
+                    // the first opens with a transition, and at its start the transition weight is
+                    // zero — the frame there is the END of the shot before. Clicking clip 3 and
+                    // being shown shot 2 is not a subtlety: measured on the packaged `.exe`,
+                    // re-framing shot 3 from that position moved the camera 0.0000 units, because
+                    // shot 3 contributed nothing to the picture. `openSeconds` is ABSOLUTE and comes
+                    // from `Cutscene::opens_at` — no arithmetic here, because `start + blend` lands
+                    // a hair inside the window in f32 and reports a 99.99999% transition.
+                    const at = row.openSeconds;
                     setActiveId(row.id);
-                    setPlayhead(row.startSeconds);
-                    if (previewing) void poseAt(selected, row.startSeconds);
+                    setPlayhead(at);
+                    if (previewing) void poseAt(selected, at);
                   }}
                 />
               ))}
