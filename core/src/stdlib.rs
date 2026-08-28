@@ -14,20 +14,42 @@ pub fn standard_components() -> Vec<ComponentMeta> {
     let asset = Some("asset");
 
     vec![
+        // ADR-172 — THE FIELDS THE ENGINE ACTUALLY STORES. This block declared `px/py/pz` +
+        // Euler `rx/ry/rz` + non-uniform `sx/sy/sz` from M1.3 until 2026-08-28, and **no writer in
+        // this repository has ever produced one of those on a `Transform`**: every creator goes
+        // through `capscene::transform_ops` / `set_transform` (x·y·z + a quaternion + a uniform
+        // scale) and every reader is `capscene::local_transform`, which reads the same eight names.
+        // A component registry that describes storage nothing writes is not a schema, and the cost
+        // was not theoretical: the Inspector's curated table (ADR-136) and its vector rows (ADR-155)
+        // were both written against this list, so neither has ever fired on a real entity, and
+        // `check-registry-vocab.mjs` compared the two statements that were wrong while the one that
+        // was right — the dev mock, which seeds `Transform{x,y,z}` — was compared to nothing.
+        // `stdlib_transform_matches_the_stored_transform` (editor-shell) now compares this
+        // declaration to the reader, so the two cannot drift again.
         ComponentMeta::builder("Transform")
             .category("Props")
-            .field("px", Number, true)
-            .field("py", Number, true)
-            .field("pz", Number, true)
-            .field("rx", Number, false)
-            .field("ry", Number, false)
-            .field("rz", Number, false)
-            .field("sx", Number, false)
-            .field("sy", Number, false)
-            .field("sz", Number, false)
+            .field("x", Number, true)
+            .field("y", Number, true)
+            .field("z", Number, true)
+            .field("qx", Number, false)
+            .field("qy", Number, false)
+            .field("qz", Number, false)
+            .field("qw", Number, false)
+            .field("scale", Number, false)
             .provides("Spatial")
             .tag("core")
             .tag("transform")
+            .ui_hint("x", "world position along X, metres")
+            .ui_hint("y", "world position along Y (up), metres")
+            .ui_hint("z", "world position along Z, metres")
+            // The four together are ONE unit quaternion. They are declared separately because
+            // `FieldType` is scalar-only, and named as one property here so a surface that edits
+            // them knows it may not edit one alone — an un-normalised quaternion is not a rotation.
+            .ui_hint("qx", "rotation quaternion X (edit as one property with qy/qz/qw)")
+            .ui_hint("qy", "rotation quaternion Y (edit as one property with qx/qz/qw)")
+            .ui_hint("qz", "rotation quaternion Z (edit as one property with qx/qy/qw)")
+            .ui_hint("qw", "rotation quaternion W (edit as one property with qx/qy/qz)")
+            .ui_hint("scale", "uniform display scale, x1 = unscaled")
             .build(),
         ComponentMeta::builder("Health")
             .category("Gameplay")
