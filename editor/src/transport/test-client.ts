@@ -4,7 +4,53 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type MatchStatus, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type MatchStatus, type RenderReply, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
+
+/** The render a test drives. MUTABLE and module-scoped on purpose: a render is the one thing in this
+ *  client with a life longer than a single call — start, poll, poll, done — and a stub that answered
+ *  each call independently could not express that. `resetTestClientRender()` puts it back, because a
+ *  fixture that leaks between tests decides verdicts by run order. */
+const RENDER_FIXTURE: RenderReply = {
+  running: false,
+  done: false,
+  entity: null,
+  frames: 0,
+  written: 0,
+  width: 0,
+  height: 0,
+  fps: 24,
+  seconds: 0,
+  folder: "",
+  stem: "",
+  bytes: 0,
+  elapsedMs: 0,
+  failures: [],
+  message: "",
+  reason: null,
+};
+
+/** Put the render fixture back to "nothing has been rendered". Call it in a `beforeEach` of any test
+ *  file that starts a render. */
+export function resetTestClientRender(): void {
+  Object.assign(RENDER_FIXTURE, {
+    running: false,
+    done: false,
+    entity: null,
+    frames: 0,
+    written: 0,
+    width: 0,
+    height: 0,
+    fps: 24,
+    seconds: 0,
+    folder: "",
+    stem: "",
+    bytes: 0,
+    elapsedMs: 0,
+    failures: [],
+    message: "",
+    reason: null,
+  });
+}
 
 /** One authored shot, with the numbers a timeline needs. Shaped like what `cinema_list` really
  *  sends — a `startSeconds` of 0, an `effectiveSeconds` that is the authored length at Normal
@@ -405,6 +451,70 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
               reason: null,
             },
       ),
+    ),
+    // A render that ACTUALLY ADVANCES. A stub answering one fixed row would let a panel that never
+    // polls pass every assertion about progress, which is the one thing these tests exist to catch:
+    // each `cinemaRenderStatus` call writes one more frame until the plan is full, then goes `done`.
+    cinemaRenderPlan: vi.fn((id: string, fps: number, shot: number | null) => {
+      const seconds = shot === null ? 12.5 : 2.5;
+      const frames = Math.max(1, Math.round(seconds * fps));
+      return Promise.resolve({ ...RENDER_FIXTURE, entity: id, fps, frames, seconds, message: `${frames} frames · ${seconds.toFixed(1)}s at ${fps} fps` });
+    }),
+    cinemaRenderStart: vi.fn((id: string, fps: number, shot: number | null, stem: string) => {
+      RENDER_FIXTURE.running = true;
+      RENDER_FIXTURE.done = false;
+      RENDER_FIXTURE.entity = id;
+      RENDER_FIXTURE.fps = fps;
+      RENDER_FIXTURE.stem = stem;
+      RENDER_FIXTURE.frames = shot === null ? 60 : 24;
+      RENDER_FIXTURE.seconds = RENDER_FIXTURE.frames / Math.max(1, fps);
+      RENDER_FIXTURE.written = 0;
+      RENDER_FIXTURE.bytes = 0;
+      RENDER_FIXTURE.width = 0;
+      RENDER_FIXTURE.height = 0;
+      RENDER_FIXTURE.folder = "C:/renders/skid-weld-line";
+      RENDER_FIXTURE.failures = [];
+      RENDER_FIXTURE.message = `Rendering frame 1 of ${RENDER_FIXTURE.frames}`;
+      RENDER_FIXTURE.reason = null;
+      return Promise.resolve({ ...RENDER_FIXTURE });
+    }),
+    cinemaRenderStatus: vi.fn(() => {
+      if (RENDER_FIXTURE.running) {
+        RENDER_FIXTURE.written = Math.min(RENDER_FIXTURE.frames, RENDER_FIXTURE.written + 20);
+        RENDER_FIXTURE.width = 1920;
+        RENDER_FIXTURE.height = 803;
+        RENDER_FIXTURE.bytes = RENDER_FIXTURE.written * 512_000;
+        RENDER_FIXTURE.elapsedMs = RENDER_FIXTURE.written * 40;
+        if (RENDER_FIXTURE.written >= RENDER_FIXTURE.frames) {
+          RENDER_FIXTURE.running = false;
+          RENDER_FIXTURE.done = true;
+          RENDER_FIXTURE.message = `Rendered ${RENDER_FIXTURE.frames} frames at 1920x803 in 2.4s`;
+        } else {
+          RENDER_FIXTURE.message = `Rendering frame ${RENDER_FIXTURE.written + 1} of ${RENDER_FIXTURE.frames}`;
+        }
+      }
+      return Promise.resolve({ ...RENDER_FIXTURE });
+    }),
+    cinemaRenderCancel: vi.fn(() => {
+      RENDER_FIXTURE.running = false;
+      RENDER_FIXTURE.done = true;
+      RENDER_FIXTURE.message = `Render stopped — ${RENDER_FIXTURE.written} frame(s) kept.`;
+      return Promise.resolve({ ...RENDER_FIXTURE });
+    }),
+    viewportCapture: vi.fn(() =>
+      Promise.resolve({
+        ...RENDER_FIXTURE,
+        running: false,
+        done: true,
+        frames: 1,
+        written: 1,
+        width: 1920,
+        height: 803,
+        folder: "C:/renders/frame.png",
+        bytes: 512_000,
+        message: "Saved 1920x803 to C:/renders/frame.png",
+        reason: null,
+      }),
     ),
     conditionCatalog: vi.fn(() => Promise.resolve([
       { kind: "score_at_least", label: "The Score is at least…", blurb: "gate this behind points the player has already earned", needs: "number", reads: "the Score is at least {n}" },

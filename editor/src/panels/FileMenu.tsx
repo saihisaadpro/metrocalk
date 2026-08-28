@@ -114,6 +114,27 @@ export function FileMenu({ client }: { client: EditorClient }) {
     }
   }
 
+  /** ADR-175 — keep the picture currently on the stage as a PNG.
+   *
+   *  Under Export and not under Project, because that is what it is: the scene leaving the engine in a
+   *  form something else can read. It needs no selection and no cutscene — a still of an imported
+   *  assembly is the most ordinary thing an engineer wants out of a viewer, and until this existed the
+   *  answer was the operating system's screenshot key and a crop. */
+  async function saveFrame() {
+    setOpen(false);
+    setStatus("Saving the viewport frame…");
+    try {
+      const result = await client.viewportCapture();
+      setStatus(result.message);
+      if (result.reason === null) pushToast(result.message, "success");
+      else if (!/cancel/i.test(result.message)) pushToast(result.message, "error");
+    } catch (cause) {
+      const message = cause instanceof Error && cause.message ? cause.message : "Saving the frame failed";
+      setStatus(message);
+      pushToast(message, "error");
+    }
+  }
+
   /** Export the authoritative scene without requiring a mesh selection or opening Asset Lab. */
   async function exportScene(format: "glb" | "usda" | "step") {
     setOpen(false);
@@ -186,6 +207,7 @@ export function FileMenu({ client }: { client: EditorClient }) {
             <MenuItem id="fileExportGlb" label="GLB…" title="Self-contained hierarchy, reusable meshes, materials, textures, skins and standard animation" onClick={() => void exportScene("glb")} />
             <MenuItem id="fileExportUsda" label="USDA…" title="Readable hierarchy-focused USD with an explicit fidelity report; not binary USDC or packaged USDZ" onClick={() => void exportScene("usda")} />
             <MenuItem id="fileExportStep" label="STEP AP242…" title="Faceted STEP for CAD, CAM and fabrication — exact tessellated geometry with no materials or animation; trimmed surfaces are not invented" onClick={() => void exportScene("step")} />
+            <MenuItem id="fileSaveFrame" label="Viewport frame (PNG)…" title="Save the picture on the stage right now — the viewport's own frame, composed for whatever delivery frame is in force, with none of the editor over it" onClick={() => void saveFrame()} />
           </PopupMenuGroup>
           <PopupMenuGroup label={<span id="fileRecentHeading">Recent</span>}>
             <div id="fileRecent" data-testid="fileRecent" role="group" aria-labelledby="fileRecentHeading">

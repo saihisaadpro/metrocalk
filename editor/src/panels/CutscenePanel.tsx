@@ -52,6 +52,7 @@ import {
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { CinemaPreviewReply, CinemaReply, DeliveryFrame, FramingCatalog, FramingEdit, ShotRow, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
+import { RenderDialog } from "./RenderDialog";
 import { ShotCatalogue } from "./ShotCatalogue";
 import { SubjectPicker } from "./SubjectPicker";
 
@@ -85,6 +86,10 @@ const EMPTY_DELIVERY =
 /** Why Preview refuses on an object with no cutscene. Same shape as `EMPTY_PACING`, and the same
  *  reason: a control that is enabled and does nothing is worse than one that says why not. */
 const EMPTY_PREVIEW = "There is nothing to preview — add a shot first.";
+
+/** Why Render refuses on an object with no cutscene. Same shape, same reason: there is nothing to
+ *  film, and the control says so rather than opening a dialog whose every number would be zero. */
+const EMPTY_RENDER = "There is nothing to render — add a shot first.";
 
 /** The floor, in px per second. Below this a shot stops being a bar and becomes a line.
  *
@@ -137,6 +142,8 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
   const [revision, setRevision] = useState(0);
   // The value a slider currently reads while the pointer is down, before it becomes a commit.
   const [draftSeconds, setDraftSeconds] = useState<number | null>(null);
+  /** Whether the render dialog is open. ADR-175. */
+  const [rendering, setRendering] = useState(false);
   const [draftAmount, setDraftAmount] = useState<number | null>(null);
   const scroller = useRef<HTMLDivElement | null>(null);
   const [laneRoom, setLaneRoom] = useState(0);
@@ -500,8 +507,42 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
           >
             <Icon name="camera" size="md" /> Preview
           </Button>
+          {/* RENDER SITS BESIDE PREVIEW because they are the same verb at two commitments: one poses
+              the camera for a look, the other keeps what it sees. Putting the render in the File menu
+              instead would have separated the decision (which shot, how long, what frame) from the
+              only surface that knows any of it. */}
+          <Button
+            data-testid="cutscene-render"
+            variant="secondary"
+            compact
+            disabled={locked || rows.length === 0}
+            disabledReason={rows.length === 0 ? EMPTY_RENDER : lockReason}
+            title={
+              rows.length === 0
+                ? EMPTY_RENDER
+                : locked
+                  ? lockReason
+                  : "Write this cutscene out as a numbered sequence of PNG files"
+            }
+            onClick={() => setRendering(true)}
+          >
+            <Icon name="clapper" size="md" /> Render…
+          </Button>
         </ToolbarGroup>
       </Toolbar>
+
+      {rendering && (
+        <RenderDialog
+          open
+          onClose={() => setRendering(false)}
+          client={client}
+          entity={selected}
+          name={name}
+          cut={cut}
+          activeShotIndex={active?.index ?? null}
+          deliveryLabel={labelOf(catalog?.deliveries ?? [], cut.delivery)}
+        />
+      )}
 
       {rows.length === 0 ? (
         <EmptyPanelState

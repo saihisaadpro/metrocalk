@@ -45,6 +45,7 @@ import type {
   ConditionSpec,
   ShotSpec,
   CinemaPreviewReply,
+  RenderReply,
   CinemaReply,
   DeliveryFrame,
   FramingCatalog,
@@ -344,6 +345,27 @@ export interface EditorClient {
   /** Pose the viewport camera at one moment of a cutscene, or (`active: false`) hand it back.
    *  A render projection, never a document edit — moving a playhead is not something to undo. */
   cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply>;
+  /** ADR-175 — what a render would produce, without producing it: the frame count, the span and the
+   *  rate, computed by the ENGINE from the same `plan_render` the job runs. The dialog's cost
+   *  sentence is this answer rather than a second copy of the arithmetic. */
+  cinemaRenderPlan(id: string, fps: number, shot: number | null): Promise<RenderReply>;
+  /** ADR-175 — start writing a cutscene out as a numbered PNG sequence. Returns as soon as the job
+   *  is accepted, carrying the plan it accepted; progress is read with `cinemaRenderStatus`.
+   *  `shot` is `null` for the whole cut. `folder` is `null` to let the engine ask the author. */
+  cinemaRenderStart(
+    id: string,
+    fps: number,
+    shot: number | null,
+    stem: string,
+    folder?: string | null,
+  ): Promise<RenderReply>;
+  /** How far the running render has got, or the ledger of the last one. */
+  cinemaRenderStatus(): Promise<RenderReply>;
+  /** Stop the running render. Every frame already written stays. */
+  cinemaRenderCancel(): Promise<RenderReply>;
+  /** ADR-175 — save the picture currently on the stage as a PNG. Nothing is posed, so what lands in
+   *  the file is what was on screen, held cutscene preview included. */
+  viewportCapture(path?: string | null): Promise<RenderReply>;
   /** Every "only if" card the Behaviour block can offer. */
   conditionCatalog(): Promise<ConditionSpec[]>;
   /** Add one clause to an object (one undoable commit). */
@@ -1037,6 +1059,21 @@ export class TauriClient implements EditorClient {
   cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply> {
     return this.core.invoke<CinemaPreviewReply>("cinema_preview", { id, seconds, active }).catch((e: unknown) => { console.error("cinema_preview failed", e); throw e; });
   }
+  cinemaRenderPlan(id: string, fps: number, shot: number | null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_plan", { id, fps, shot }).catch((e: unknown) => { console.error("cinema_render_plan failed", e); throw e; });
+  }
+  cinemaRenderStart(id: string, fps: number, shot: number | null, stem: string, folder: string | null = null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_start", { id, fps, shot, stem, folder }).catch((e: unknown) => { console.error("cinema_render_start failed", e); throw e; });
+  }
+  cinemaRenderStatus(): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_status").catch((e: unknown) => { console.error("cinema_render_status failed", e); throw e; });
+  }
+  cinemaRenderCancel(): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_cancel").catch((e: unknown) => { console.error("cinema_render_cancel failed", e); throw e; });
+  }
+  viewportCapture(path: string | null = null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("viewport_capture", { path }).catch((e: unknown) => { console.error("viewport_capture failed", e); throw e; });
+  }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return this.core.invoke<ConditionSpec[]>("condition_catalog").catch((e: unknown) => { console.error("condition_catalog failed", e); throw e; });
   }
@@ -1566,6 +1603,27 @@ function mockTerrainStats(active: boolean): TerrainStats {
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
+/** The zero row every browser-shell render answer is built from. Written once so the four refusals
+ *  cannot disagree about what "nothing was rendered" looks like. */
+const MOCK_RENDER_IDLE: RenderReply = {
+  running: false,
+  done: false,
+  entity: null,
+  frames: 0,
+  written: 0,
+  width: 0,
+  height: 0,
+  fps: 0,
+  seconds: 0,
+  folder: "",
+  stem: "",
+  bytes: 0,
+  elapsedMs: 0,
+  failures: [],
+  message: "",
+  reason: null,
+};
+
 const CAPS = ["Health", "Shield", "Click", "Damage", "Light"];
 
 /** The dev/test **first-run** scene (M10.10 / C10) — a small, *named*, meaningful starter scene (NOT the
@@ -2929,6 +2987,29 @@ class MockClient implements EditorClient {
    *  of a shot nothing filmed is worse than the refusal that says where to get one. */
   cinemaPreview(): Promise<CinemaPreviewReply> {
     return Promise.resolve({ active: false, entity: null, seconds: 0, shotIndex: null, shots: 0, reads: "", subjectName: "", progress: 0, blending: false, eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 50, message: "", reason: "Shot preview is available in the packaged desktop editor." });
+  }
+  /** Refused, for the same reason the preview is: a render reads back the native wgpu swapchain, and
+   *  there is no swapchain in a browser tab. The dialog still opens, still counts the frames the cut
+   *  would produce and still names the frame it is composed for — every one of which is arithmetic
+   *  over the document — so what the browser build cannot do is exactly the one step that writes. */
+  /** Refused, like every other cinematics call here — and deliberately NOT re-implemented. The frame
+   *  count is `plan_render`'s answer, stated once, in Rust; a browser copy of that multiplication is
+   *  exactly the one-contract-twice this command exists to remove. The dev build has no cutscene to
+   *  plan a render of anyway: `cinemaList` above answers with an empty cut. */
+  cinemaRenderPlan(id: string, fps: number): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, entity: id, fps, reason: "Rendering to files is available in the packaged desktop editor.", message: "Rendering to files is available in the packaged desktop editor." });
+  }
+  cinemaRenderStart(id: string, fps: number, _shot: number | null, stem: string): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, entity: id, fps, stem, reason: "Rendering to files is available in the packaged desktop editor.", message: "Rendering to files is available in the packaged desktop editor." });
+  }
+  cinemaRenderStatus(): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, message: "No render is running." });
+  }
+  cinemaRenderCancel(): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, message: "No render is running." });
+  }
+  viewportCapture(): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, reason: "Saving a frame is available in the packaged desktop editor.", message: "Saving a frame is available in the packaged desktop editor." });
   }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return Promise.resolve([]);

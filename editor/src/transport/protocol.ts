@@ -2156,6 +2156,44 @@ export interface CinemaPreviewReply {
   reason: string | null;
 }
 
+/** ADR-175 — a render, in progress or finished.
+ *
+ *  ONE shape for start, poll and cancel: a progress bar and a ledger are the same six numbers read at
+ *  different moments, and a surface that had to switch between two shapes is a surface that can show
+ *  the stale one. */
+export interface RenderReply {
+  /** Whether a job is running right now. */
+  running: boolean;
+  /** Whether the job this describes has finished — successfully or not. */
+  done: boolean;
+  entity: string | null;
+  /** How many frames the plan holds. */
+  frames: number;
+  /** How many files exist on disk so far. */
+  written: number;
+  /** The pixel size the frames are written at, from the first one actually captured. `0` until then —
+   *  a size guessed from the window would be a claim the files may not honour. */
+  width: number;
+  height: number;
+  fps: number;
+  /** The span of the cutscene clock being filmed. */
+  seconds: number;
+  /** Where the files are going — or, for a single still, the file itself. */
+  folder: string;
+  /** The name the frames share, before the number. */
+  stem: string;
+  bytes: number;
+  elapsedMs: number;
+  /** Frames that could not be written, each with its own sentence. */
+  failures: string[];
+  message: string;
+  /** Set iff the request was refused, and says why. */
+  reason: string | null;
+}
+
+/** What a render is asked to film: the whole cut, or one shot of it. `null` is the whole cut. */
+export type RenderScopeIndex = number | null;
+
 export interface ConditionSpec {
   kind: string;
   label: string;
