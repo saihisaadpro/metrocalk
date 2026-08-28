@@ -739,15 +739,15 @@ mod tests {
         // The second copy of a 3-up pattern at spacing [5, 0, 0].
         let copy = commit_solid_with_handle(&mut engine, [5.0, 0.0, 0.0], "h").unwrap();
 
-        let seen = crate::capscene::local_transform(&engine, copy);
+        let read_copy = crate::capscene::local_transform(&engine, copy);
         assert!(
-            (seen.translation[0] - 5.0).abs() < 1e-6,
+            (read_copy.translation[0] - 5.0).abs() < 1e-6,
             "the reader sees the offset the pattern committed, not 0 — got {:?}",
-            seen.translation
+            read_copy.translation
         );
-        let seed_seen = crate::capscene::local_transform(&engine, seed);
+        let read_seed = crate::capscene::local_transform(&engine, seed);
         assert!(
-            (seen.translation[0] - seed_seen.translation[0]).abs() > 1e-6,
+            (read_copy.translation[0] - read_seed.translation[0]).abs() > 1e-6,
             "a patterned copy is somewhere the seed is not"
         );
     }
