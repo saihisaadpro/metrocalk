@@ -1387,10 +1387,15 @@ export class TauriClient implements EditorClient {
 
 /** A believable recipe for the dev shell and the panel tests — the same shape the engine emits. */
 function mockRecipe(preset: string): TerrainRecipe {
+  // Same six ids and the same display names as `terrain/src/preset.rs::all()`, so a preset created in
+  // the dev build is named what the engine would have named it rather than falling to "Terrain".
   const named: Record<string, string> = {
     flat: "Flat Ground",
     "rolling-hills": "Rolling Hills",
     alpine: "Alpine Peaks",
+    dunes: "Desert Dunes",
+    archipelago: "Archipelago",
+    canyon: "Canyon Mesa",
   };
   return {
     version: 1,
@@ -3346,11 +3351,45 @@ class MockClient implements EditorClient {
   matchCooked(): Promise<CookedMatch | null> {
     return Promise.resolve(null);
   }
+  /** The SIX presets the engine publishes, in `terrain/src/preset.rs::all()`'s order and its words.
+   *
+   *  It answered with three, each carrying a shortened description, and every dev session and every
+   *  screenshot of this panel therefore photographed a catalogue the product does not have — half of
+   *  it missing and the rest paraphrased. That is the C6 failure reached through a mock: a grid that
+   *  looks balanced at three tiles and wraps at six, and prose reviewed here that no user ever reads.
+   *  The mock's job is to mirror what the engine sends, not to stand in for it. */
   terrainPresets(): Promise<TerrainPreset[]> {
     return Promise.resolve([
-      { id: "flat", name: "Flat Ground", description: "A level plate with one material." },
-      { id: "rolling-hills", name: "Rolling Hills", description: "Gentle warped hills." },
-      { id: "alpine", name: "Alpine Peaks", description: "Eroded ridged mountains." },
+      {
+        id: "flat",
+        name: "Flat Ground",
+        description: "A level plate with one material — the fastest thing to sculpt on, and the cheapest to render.",
+      },
+      {
+        id: "rolling-hills",
+        name: "Rolling Hills",
+        description: "Gentle warped hills with grass, dry slopes and rock, plus scattered trees and clutter.",
+      },
+      {
+        id: "alpine",
+        name: "Alpine Peaks",
+        description: "Eroded ridged mountains with scree, exposed rock and a snow line. The heaviest preset.",
+      },
+      {
+        id: "dunes",
+        name: "Desert Dunes",
+        description: "Billowed dune fields over a broad basin, with rock outcrops where the sand thins.",
+      },
+      {
+        id: "archipelago",
+        name: "Archipelago",
+        description: "Islands in a shallow sea with beaches and lagoons — flattened lowlands, steep interiors.",
+      },
+      {
+        id: "canyon",
+        name: "Canyon Mesa",
+        description: "A high plateau cut by terraced canyons, eroded so the benches read as sedimentary.",
+      },
     ]);
   }
 
