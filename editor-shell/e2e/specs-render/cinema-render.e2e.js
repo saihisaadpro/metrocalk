@@ -212,12 +212,17 @@ describe("Rendering a cutscene to files — the engine delivers a picture", () =
     }
     console.log(`[render] every frame is ${ledger.width}x${ledger.height}, ${ledger.bytes} bytes total`);
 
-    // AND THE CAMERA MOVED. A hero shot pushes in, so the first frame and the last cannot be the same
-    // picture — 60 copies of one frame would satisfy every count above.
-    const first = sha(path.join(folder, files[0]));
-    const last = sha(path.join(folder, files[files.length - 1]));
-    console.log(`[render] first ${files[0]} ${first} · last ${files[files.length - 1]} ${last}`);
-    expect(first).not.toBe(last);
+    // AND THE CAMERA MOVED. A hero shot pushes in, so the frames cannot all be the same picture —
+    // N copies of one frame satisfy every count above, and so does a sequence of blank ones. Distinct
+    // hashes across the whole run is the claim; first-vs-last alone would pass on a two-state flicker.
+    const hashes = new Set(files.map((f) => sha(path.join(folder, f))));
+    console.log(`[render] ${hashes.size} distinct frame(s) of ${files.length}`);
+    expect(hashes.size).toBeGreaterThan(files.length / 2);
+
+    // AND IT GAVE THE CAMERA BACK. A render that left the viewport inside a shot would look like a
+    // successful render and leave the author unable to see their own scene.
+    const after = await invoke("camera_probe");
+    expect(after.cinematic).toBe(false);
   });
 
   it("the file is the frame the shot was COMPOSED for, not the shape of the window", async () => {
