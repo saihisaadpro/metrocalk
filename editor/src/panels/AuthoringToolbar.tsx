@@ -174,45 +174,57 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
               <PopupMenuGroup label={<span id="auth-selection-heading">Selection</span>}>
                 {action(
                   "authDuplicate",
-                  "Duplicate",
+                  hasMultiple ? `Duplicate ${ids.length}` : "Duplicate",
                   async () => {
-                    if (!primary) return;
-                    const duplicate = await client.duplicateEntity(primary);
-                    if (!duplicate) {
+                    if (!ids.length) return;
+                    // ADR-169 — ONE transaction for the whole selection. This trigger has printed
+                    // "Actions · 12" since M10.6 while this verb cloned the primary alone, so the menu
+                    // counted twelve and did one; N calls would have fixed the count and left twelve
+                    // undo steps behind a toast that promises one.
+                    const clones = await client.duplicateEntities(ids);
+                    if (!clones.length) {
                       setStatus("couldn't duplicate the selection");
                       pushToast("couldn't duplicate the selection", "error");
                       return;
                     }
-                    select(duplicate);
-                    setStatus("duplicated · Ctrl-Z to undo");
-                    pushToast("duplicated", "success");
+                    select(clones[0]);
+                    const what = clones.length === 1 ? "duplicated" : `duplicated ${clones.length}`;
+                    setStatus(`${what} · Ctrl-Z to undo`);
+                    pushToast(`${what} · Ctrl-Z to undo`, "success");
                   },
                   close,
-                  !!primary,
-                  "Clone the selected object",
+                  hasSelection,
+                  hasMultiple
+                    ? `Clone all ${ids.length} selected objects in one undoable edit`
+                    : "Clone the selected object",
                   "Select an object to duplicate",
                   "ghost",
                   "Duplicating…",
                 )}
                 {action(
                   "authDelete",
-                  "Delete",
+                  hasMultiple ? `Delete ${ids.length}` : "Delete",
                   async () => {
-                    if (!primary) return;
-                    const ok = await client.deleteDeactivate(primary);
+                    if (!ids.length) return;
+                    // ADR-169 — the whole selection, in ONE transaction, so the "Ctrl-Z restores it"
+                    // this control promises is true for all of it and not only for the last object.
+                    const ok = await client.deleteDeactivateMany(ids);
                     if (!ok) {
                       setStatus("couldn't delete the selection");
                       pushToast("couldn't delete the selection", "error");
                       return;
                     }
-                    projectionStore.getState().markDeactivated([primary]);
+                    projectionStore.getState().markDeactivated(ids);
                     projectionStore.getState().select(null);
-                    setStatus("deactivated — recoverable with Ctrl-Z");
-                    pushToast("deleted (recoverable) · Ctrl-Z", "info");
+                    const what = ids.length === 1 ? "deactivated" : `deactivated ${ids.length}`;
+                    setStatus(`${what} — recoverable with Ctrl-Z`);
+                    pushToast(`${what} (recoverable) · Ctrl-Z`, "info");
                   },
                   close,
-                  !!primary,
-                  "Deactivate the selection; Ctrl-Z restores it",
+                  hasSelection,
+                  hasMultiple
+                    ? `Deactivate all ${ids.length} selected objects; one Ctrl-Z restores them`
+                    : "Deactivate the selection; Ctrl-Z restores it",
                   "Select an object to delete",
                   "danger",
                   "Deleting…",
@@ -261,21 +273,28 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
                 )}
                 {action(
                   "authNudge",
-                  "Move up 5 m",
+                  "Set height to 5 m",
                   async () => {
                     if (!ids.length) return;
-                    const ok = await client.multiEdit(ids, "Transform", "y", 5);
-                    if (!ok) {
-                      setStatus("couldn't move the selection");
-                      pushToast("couldn't move the selection", "error");
+                    const r = await client.multiEdit(ids, "Transform", "y", 5);
+                    if (!r.ok) {
+                      // The engine's own sentence, not a generic one: a batch can be refused because
+                      // the selection disagrees about the component, and "couldn't move" says none of
+                      // that (ADR-169 / `<ux_quality>` 4).
+                      const said = r.reason ?? "couldn't move the selection";
+                      setStatus(said);
+                      pushToast(said, "error");
                       return;
                     }
-                    setStatus(`moved ${ids.length} (batched) · Ctrl-Z to undo`);
-                    pushToast(`moved ${ids.length} together`, "success");
+                    setStatus(`moved ${r.changed} (batched) · Ctrl-Z to undo`);
+                    pushToast(`moved ${r.changed} together`, "success");
                   },
                   close,
                   hasSelection,
-                  "Move every selected object in one undoable edit",
+                  // IT SETS, IT DOES NOT MOVE. `multiEdit` writes ONE value to N entities, so this
+                  // assigns y = 5 — it always did, and the label read "Move up 5 m", which is true
+                  // only for an object that happens to be at y = 0 and is a DOWNWARD move above it.
+                  "Set every selected object to 5 m high, in one undoable edit",
                   "Select one or more objects",
                   "ghost",
                   "Moving…",

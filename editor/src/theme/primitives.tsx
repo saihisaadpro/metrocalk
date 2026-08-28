@@ -192,6 +192,11 @@ export interface NumericFieldProps {
   disabled?: boolean;
   /** Externally-marked invalid/unbound/default state (a red ring — never colour-alone, paired with a title). */
   invalid?: boolean;
+  /** The field is showing a MULTI-SELECTION whose objects disagree about this value (ADR-169). The box
+   *  reads "Mixed" rather than one object's number dressed up as everyone's; typing a number
+   *  commits it to all of them. Nothing about the commit path changes — only what is displayed
+   *  while the user has not typed. */
+  mixed?: boolean;
   /** Value units per drag pixel (defaults to `step`); Shift = ×10 (coarse), Alt = ×0.1 (fine). */
   scrubSpeed?: number;
   ariaLabel?: string;
@@ -217,6 +222,7 @@ export function NumericField({
   max,
   disabled = false,
   invalid = false,
+  mixed = false,
   scrubSpeed,
   ariaLabel,
   id,
@@ -233,7 +239,7 @@ export function NumericField({
     if (max != null) v = Math.min(max, v);
     return v;
   };
-  const [textVal, setTextVal] = useState(() => fmt(value));
+  const [textVal, setTextVal] = useState(() => (mixed ? "" : fmt(value)));
   const [scrubbing, setScrubbing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const editing = useRef(false); // focused OR scrubbing — don't resync the field out from under the user
@@ -241,9 +247,9 @@ export function NumericField({
   const cleanup = useRef<(() => void) | null>(null);
   // Resync to the authoritative value when not actively editing/scrubbing (an external delta / undo / reselect).
   useEffect(() => {
-    if (!editing.current) setTextVal(fmt(value));
+    if (!editing.current) setTextVal(mixed ? "" : fmt(value));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [value, scrubbing]);
+  }, [value, scrubbing, mixed]);
   // Remove any in-flight drag listeners if we unmount mid-scrub (the inspector swaps on reselect).
   useEffect(() => () => cleanup.current?.(), []);
 
@@ -298,7 +304,10 @@ export function NumericField({
       return; // a scrub already committed this — don't double-commit on the trailing blur
     }
     if (validText && parsed !== null) onCommit(clampSnap(parsed));
-    else setTextVal(fmt(value)); // invalid → revert to the committed value (no silent zeroing)
+    // invalid → revert to the committed value (no silent zeroing). On a MIXED field there is no
+    // committed value to revert to, and printing `fmt(value)` would turn a blurred empty box into a
+    // claim that all N objects are 0 — so it goes back to reading "Mixed".
+    else setTextVal(mixed ? "" : fmt(value));
   }
 
   return (
@@ -309,9 +318,11 @@ export function NumericField({
       inputMode={integer ? "numeric" : "decimal"}
       role="spinbutton"
       aria-label={ariaLabel}
-      aria-valuenow={value}
+      aria-valuenow={mixed ? undefined : value}
       disabled={disabled}
       title={title ?? (textVal.trim() !== "" && !validText ? `Enter a ${integer ? "whole number" : "number"} — not applied` : undefined)}
+      placeholder={mixed ? "Mixed" : undefined}
+      data-mixed={mixed ? "1" : undefined}
       className={"mtk-input mtk-input--mono mtk-numfield" + (invalid || (!validText && textVal.trim() !== "") ? " is-invalid" : "")}
       data-testid={testid}
       data-scrubbing={scrubbing ? "1" : "0"}

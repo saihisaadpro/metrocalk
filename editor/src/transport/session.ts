@@ -33,6 +33,7 @@ import type {
   GenerateResponse,
   ImportResult,
   Json,
+  MultiEditResult,
   JsonPatch,
   PhysicsWarning,
   ProjectionDelta,
@@ -207,6 +208,9 @@ export interface EditorClient {
   removeEntity(id: string): void;
   /** Duplicate an entity (M3.3) — one undoable transaction; resolves to the clone's id. */
   duplicateEntity(id: string): Promise<string | null>;
+  /** Duplicate a whole SELECTION as ONE undoable transaction (ADR-169) → the clones' ids in source
+   *  order. One Ctrl-Z removes all of them; N calls to `duplicateEntity` would need N. */
+  duplicateEntities(ids: string[]): Promise<string[]>;
   /** Frame the camera on an entity (M3.3) — no mutation. */
   focusEntity(id: string): void;
   /**
@@ -333,10 +337,14 @@ export interface EditorClient {
   groupEntities(ids: string[], name: string): Promise<string | null>;
   /** Ungroup — dissolve a group (children to its parent, delete the group) → applied. */
   ungroupEntity(id: string): Promise<boolean>;
-  /** Multi-edit — set one numeric field on N entities as ONE batched, atomic, undoable tx → applied. */
-  multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean>;
+  /** Multi-edit — set one field (ANY scalar, ADR-169) on N entities as ONE batched, atomic, undoable
+   *  transaction. Resolves to what it did, or to the sentence explaining why it refused. */
+  multiEdit(ids: string[], component: string, field: string, value: Json): Promise<MultiEditResult>;
   /** Delete = deactivate (non-destructive; frees dependents) — undo restores → applied. */
   deleteDeactivate(id: string): Promise<boolean>;
+  /** Delete a whole SELECTION as ONE undoable transaction (ADR-169) → applied. One Ctrl-Z restores
+   *  all of it; N calls to `deleteDeactivate` would need N. */
+  deleteDeactivateMany(ids: string[]): Promise<boolean>;
   /** Copy a sub-tree to the clipboard (cross-project = the serde Composition). */
   copySubtree(id: string): void;
   /** Cut = copy + delete(deactivate) → applied. */
@@ -816,6 +824,9 @@ export class TauriClient implements EditorClient {
   duplicateEntity(id: string): Promise<string | null> {
     return this.core.invoke<string | null>("duplicate_entity", { id }).catch((e: unknown) => { console.error("duplicate_entity failed", e); throw e; });
   }
+  duplicateEntities(ids: string[]): Promise<string[]> {
+    return this.core.invoke<string[]>("duplicate_entities", { ids }).catch((e: unknown) => { console.error("duplicate_entities failed", e); throw e; });
+  }
   focusEntity(id: string): void {
     void this.core.invoke("focus_entity", { id }).catch((e: unknown) => console.error("focus_entity failed", e));
   }
@@ -993,11 +1004,14 @@ export class TauriClient implements EditorClient {
   ungroupEntity(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("ungroup_entity", { id }).catch((e: unknown) => { console.error("ungroup_entity failed", e); throw e; });
   }
-  multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean> {
-    return this.core.invoke<boolean>("multi_edit", { ids, component, field, value }).catch((e: unknown) => { console.error("multi_edit failed", e); throw e; });
+  multiEdit(ids: string[], component: string, field: string, value: Json): Promise<MultiEditResult> {
+    return this.core.invoke<MultiEditResult>("multi_edit", { ids, component, field, value }).catch((e: unknown) => { console.error("multi_edit failed", e); throw e; });
   }
   deleteDeactivate(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("delete_deactivate", { id }).catch((e: unknown) => { console.error("delete_deactivate failed", e); throw e; });
+  }
+  deleteDeactivateMany(ids: string[]): Promise<boolean> {
+    return this.core.invoke<boolean>("delete_deactivate_many", { ids }).catch((e: unknown) => { console.error("delete_deactivate_many failed", e); throw e; });
   }
   copySubtree(id: string): void {
     void this.core.invoke("copy_subtree", { id }).catch((e: unknown) => console.error("copy_subtree failed", e));
@@ -2408,6 +2422,9 @@ class MockClient implements EditorClient {
   duplicateEntity(_id: string): Promise<string | null> {
     return Promise.resolve(null);
   }
+  duplicateEntities(_ids: string[]): Promise<string[]> {
+    return Promise.resolve([]);
+  }
   focusEntity(_id: string): void {}
   reportViewportRect(_rect: { x: number; y: number; width: number; height: number }): void {}
   makeDynamic(_id: string): Promise<boolean> {
@@ -2862,10 +2879,13 @@ class MockClient implements EditorClient {
   ungroupEntity(): Promise<boolean> {
     return Promise.resolve(true);
   }
-  multiEdit(): Promise<boolean> {
-    return Promise.resolve(true);
+  multiEdit(ids: string[]): Promise<MultiEditResult> {
+    return Promise.resolve({ ok: true, changed: ids.length, reason: null });
   }
   deleteDeactivate(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  deleteDeactivateMany(): Promise<boolean> {
     return Promise.resolve(true);
   }
   copySubtree(): void {}

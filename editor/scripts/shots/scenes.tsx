@@ -1066,12 +1066,70 @@ function inspectorSetup(open: string[], extra: Record<string, Record<string, unk
   };
 }
 
-/** A client that records rather than sends. `setField` is the only method these scenes can reach. */
+/** A client that records rather than sends. `setField` and `multiEdit` are the two methods these
+ *  scenes can reach — the single-object and the whole-selection edit paths (ADR-169). */
 function recordingClient(record: (entry: string) => void) {
   return {
     setField: (id: string, component: string, field: string, value: unknown) =>
       record(`${id}.${component}.${field}=${JSON.stringify(value)}`),
+    multiEdit: (ids: string[], component: string, field: string, value: unknown) => {
+      record(`${ids.length}x.${component}.${field}=${JSON.stringify(value)}`);
+      return Promise.resolve({ ok: true, changed: ids.length, reason: null });
+    },
   } as unknown as EditorClient;
+}
+
+/** A SELECTION of lights, loaded and selected the way a user builds one — click, then ctrl-click.
+ *
+ *  Two of the three agree about `intensity` and the third does not, which is the state the whole
+ *  feature is about: the panel may not print one object's 60 as though it were everyone's.
+ *  `Light{kind,intensity,r,g,b}` is the core's own vocabulary (`core/src/stdlib.rs`), so this is a
+ *  capture of the real product rather than of a shape only the mock can produce. */
+function multiSelectionSetup(extra: Record<string, Record<string, unknown>> = {}) {
+  return () => {
+    window.localStorage.setItem(
+      "metrocalk:disclosure:inspector-component:Light",
+      "open",
+    );
+    projectionStore.getState().bulkLoad([
+      {
+        id: "e-key",
+        name: "Key Light",
+        parentId: null,
+        components: {
+          Transform: { px: 0, py: 4, pz: 0 },
+          Light: { kind: "point", intensity: 60, r: 1, g: 1, b: 1 },
+        },
+      },
+      {
+        id: "e-fill",
+        name: "Fill Light",
+        parentId: null,
+        components: {
+          Transform: { px: 3, py: 4, pz: 0 },
+          Light: { kind: "point", intensity: 60, r: 1, g: 1, b: 1 },
+        },
+      },
+      {
+        id: "e-rim",
+        name: "Rim Light",
+        parentId: null,
+        components: {
+          Transform: { px: -3, py: 4, pz: 2 },
+          Light: { kind: "point", intensity: 12, r: 1, g: 1, b: 1 },
+        },
+      },
+      {
+        id: "e-crate",
+        name: "Crate",
+        parentId: null,
+        components: { Transform: { px: 0, py: 0, pz: 0 }, ...extra },
+      },
+    ] as never);
+    projectionStore.getState().select("e-key");
+    projectionStore.getState().toggleSelect("e-fill");
+    projectionStore.getState().toggleSelect("e-rim");
+  };
 }
 
 /** The dock track the Inspector actually lives in, at a window wide enough that the ≤760px stacking
@@ -1269,6 +1327,91 @@ function inspectorScenes(): Scene[] {
         // Not two transactions, and not the wrong field: a reset that also nudged its neighbours, or
         // one wired to the row below it, would still print "a transaction" and look right.
         text_absent: ["2 transactions", "Transform.py", "Transform.ry", "undefined", "NaN"],
+      },
+      render: () => <EditProbe />,
+    },
+    {
+      id: "inspector-multi-selection",
+      looking_for:
+        "THE PANEL THIS REPOSITORY DID NOT HAVE. Three lights are selected and the Inspector is " +
+        "about the SELECTION, not about whichever one was clicked last: `3 lights selected` over " +
+        "the three names, and one form. `Intensity` reads MIXED and is empty, because 60, 60 and 12 " +
+        "are not one value and printing the primary's 60 would be a claim about all three; `Kind` " +
+        "shows `point`, because that one IS true of all three. Before this, the panel named one " +
+        "light, showed its numbers, and editing them moved one object out of three",
+      viewport: { width: 1200, height: 900 },
+      setup: multiSelectionSetup(),
+      expect: {
+        present: [
+          // The Transform group (3 rows, all mixed) plus the Light group opened by the setup.
+          ["[data-testid='prop-row']", 8],
+          // MIXED IS A STATE OF THE CONTROL, not a banner over the panel: the box that cannot show
+          // one value shows none, and says so where the value would be.
+          ["#mtk-prop-Light-intensity[data-mixed='1']", 1],
+          ["#mtk-prop-Transform-px[data-mixed='1']", 1],
+          // AND THE AGREED FIELD IS NOT MIXED. Without this the scene passes for a panel that gave
+          // up and marked everything mixed, which would be exactly as useless as the old one.
+          ["#mtk-prop-Light-kind:not([data-mixed])", 1],
+        ],
+        // The single-object header is gone: no mono entity id, because there is no single entity.
+        absent: [".control", ".input", ".select", ".checkbox", "[data-testid='inspectorEmpty']"],
+        // `Light.kind`'s curated title is "Light" (the vocabulary row), not "Kind" — the claim names
+        // what the panel actually prints, which is the whole reason a scene states its text.
+        text_present: ["3 lights selected", "Key Light", "Rim Light", "Intensity", "point"],
+        // `e-key` is the primary. A panel that printed it would be the OLD panel wearing a new count.
+        text_absent: ["e-key", "e-rim", "null", "undefined", "NaN", "No applicable renderer found"],
+        same_line: [["label[for='mtk-prop-Light-intensity']", "#mtk-prop-Light-intensity"]],
+        unclipped: ["[data-testid='prop-row']", "[data-testid='multiTitle']"],
+      },
+      render: () => dockTrack(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-multi-partial",
+      looking_for:
+        "WHAT THE PANEL WILL NOT OFFER, AND WHY, IN A SENTENCE. Two lights and a crate are " +
+        "selected. `Transform` is shared so its rows are there; `Light` is not, so its five fields " +
+        "are withheld — and the panel says how many and names the component, rather than quietly " +
+        "showing a shorter form. It is not politeness: `Op::SetField` CREATES a component it does " +
+        "not find, so offering `Light.intensity` here would give the crate a one-field Light in an " +
+        "undoable transaction that reported itself as a success",
+      viewport: { width: 1200, height: 900 },
+      setup: () => {
+        multiSelectionSetup()();
+        projectionStore.getState().toggleSelect("e-crate");
+      },
+      expect: {
+        present: [
+          ["[data-testid='multiPartial']", 1],
+          ["#mtk-prop-Transform-px", 1],
+        ],
+        // The withheld control is ABSENT, not disabled: a greyed row invites a click that can never
+        // work, and this panel already has a sentence for the same information.
+        absent: ["#mtk-prop-Light-intensity", "#mtk-prop-Light-kind", "[data-testid='multiEmpty']"],
+        text_present: ["4 objects selected", "3 lights", "5 properties are on only some of these", "Light", "select one object"],
+        text_absent: ["null", "undefined", "NaN", "No applicable renderer found"],
+        unclipped: ["[data-testid='multiPartial']"],
+      },
+      render: () => dockTrack(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-multi-edit-writes-to-all",
+      looking_for:
+        "ONE GESTURE, ONE TRANSACTION, THREE OBJECTS. The same probe that proves a single-object " +
+        "edit, with the first reset in the sheet clicked on a three-light selection - `Position X`, " +
+        "which is 0, 3 and -3 and therefore MIXED. Two claims in one click: a mixed row still offers " +
+        "its reset (setting them all back to the declared default is exactly what a reset is for, " +
+        "and an unbound single field offering none is a different case), and the write goes through " +
+        "the BATCHED path - the log reads `3x.Transform.px=0`, ONE entry, not three `setField`s " +
+        "that would have been three undo steps behind a toast promising one",
+      viewport: { width: 620, height: 1000 },
+      setup: multiSelectionSetup(),
+      click: ["[data-testid='prop-reset']"],
+      expect: {
+        present: [["[data-testid='edit-log']", 1]],
+        text_present: ["1 transaction since mount", "3x.Transform.px=0"],
+        // Not three transactions, and never the single-entity path - `e-key.Transform.px` is what
+        // the old panel would have written, and it would have looked like a success too.
+        text_absent: ["2 transactions", "3 transactions", "e-key.Transform", "undefined", "NaN"],
       },
       render: () => <EditProbe />,
     },

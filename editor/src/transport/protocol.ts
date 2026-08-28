@@ -55,6 +55,18 @@ export type ProjectionOp =
   | { op: "addEdge"; from: string; rel: string; to: string }
   | { op: "removeEdge"; from: string; rel: string; to: string };
 
+/** What a batched multi-entity edit did — or, when it refused, the one sentence that says why
+ *  (ADR-169). A property control that edits a whole selection must be able to answer "nothing
+ *  happened" with a reason; `boolean` could not, and this path is the one the Inspector now uses for
+ *  every field on a multi-selection. */
+export interface MultiEditResult {
+  ok: boolean;
+  /** How many entities the transaction wrote. `0` on a refusal — the pipeline is all-or-nothing. */
+  changed: number;
+  /** Plain-language refusal, `null` on success. */
+  reason: string | null;
+}
+
 /** A merge-validation rejection — the north-star "every 'no' explained". */
 export interface RejectInfo {
   clientOpId: string;
