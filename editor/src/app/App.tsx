@@ -15,6 +15,7 @@ import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { cinemaPreviewStore, useCinemaPreview } from "../store/cinemaPreview";
 import { subjectAimStore, useSubjectAim, type AimRung } from "../store/subjectAim";
+import { highlightKey, stageHighlightStore, useStageHighlight } from "../store/stageHighlight";
 import { setStatus } from "../store/ui";
 import { Modal, Popover } from "../theme/Popover";
 import { Icon } from "../theme/icons";
@@ -506,8 +507,16 @@ export function App() {
           if (!id) {
             aimHoverAt.current = null;
             subjectAimStore.getState().hover([]);
+            // Over empty space is an ANSWER, not a missing one: the cue goes out with the rungs, so
+            // the picture and the badge never disagree about whether the cursor is on something.
+            stageHighlightStore.getState().show("stage", []);
             return;
           }
+          // The stage lights the LEAF, because that is what a click on the stage takes. A rung the
+          // pointer is on overrides it (`show("rung", …)`), which is what makes the ladder legible:
+          // the badge offers `Box · 1 part` in `Assembly Hall · 7 parts`, and now the seven are
+          // visible before the shot is committed to them.
+          stageHighlightStore.getState().show("stage", [id]);
           if (aimHoverAt.current === id) {
             subjectAimStore.getState().look(false);
             return;
@@ -544,7 +553,29 @@ export function App() {
     aimHoverSeq.current += 1;
     aimHoverAt.current = null;
     aimLadder.current.clear();
+    // The cue belongs to the gesture. A highlight surviving the mode would leave the stage claiming
+    // the cursor is over something in a viewport that has gone back to selecting.
+    stageHighlightStore.getState().reset();
   }, [aimActive]);
+
+  // THE ONE PLACE THE STAGE HIGHLIGHT CROSSES THE BOUNDARY. Every surface that points at something
+  // writes to `store/stageHighlight`; this sends the result once, when the ANSWER changes — not per
+  // frame, not per mouse move, not once per surface (invariant 4). `highlightKey` is what makes the
+  // dependency the answer rather than the array identity.
+  const stageHighlight = useStageHighlight();
+  const stageHighlightKey = highlightKey(stageHighlight);
+  useEffect(() => {
+    void client.viewportHover(stageHighlight.ids);
+    // The cleanup does NOT clear: it runs on every change of the key, and clearing there would send
+    // `[]` between every two hovers — twice the IPC, and a visible flicker between two rungs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client, stageHighlightKey]);
+
+  // The stage is not lit while Play owns the camera: the cue is editor chrome, and a shot must not
+  // contain it — the same rule the cinema preview applies to the selection outline.
+  useEffect(() => {
+    if (playing) stageHighlightStore.getState().reset();
+  }, [playing]);
 
   // Ctrl-Z / ⌘-Z → undo; Escape closes the context menu, then a drawer, then STOPS Play (the badge says
   // "Esc … to stop"). A discrete event — never the per-frame hot path (invariant 4).
@@ -1098,6 +1129,17 @@ export function App() {
               rungs={aim.rungs}
               looking={aim.looking}
               onPick={(rung) => subjectAimStore.getState().pick(rung.id, rung.name)}
+              // LEAVING A RUNG HANDS THE STAGE BACK, it does not go dark: the cursor is still over
+              // the leaf the badge's first rung names, and a cue that blanked between two rungs
+              // would flicker exactly while the author was comparing them. The store deliberately
+              // keeps no stack — what the stage is over is `aim.rungs[0]`, and it is the caller
+              // that knows that, not a store remembering a peek that may have gone stale.
+              onPreview={(rung) => {
+                const back = aim.rungs[0];
+                stageHighlightStore
+                  .getState()
+                  .show(rung ? "rung" : "stage", rung ? [rung.id] : back ? [back.id] : []);
+              }}
               onCancel={() => {
                 subjectAimStore.getState().cancel();
                 setStatus("Aiming cancelled — the shot still frames what it did");

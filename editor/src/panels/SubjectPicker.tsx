@@ -36,11 +36,19 @@ import { Icon } from "../theme/icons";
 import { color, fontSize, space } from "../theme/tokens";
 import type { SubjectCandidate, SubjectCatalog } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
+import { stageHighlightStore } from "../store/stageHighlight";
 
 /** How long a keystroke waits before it becomes a scene-wide scan. The engine's search walks every
  *  entity in the document, so typing "weld" unthrottled is four full scans of a 15,711-part import
  *  for three answers nobody read. */
 const SEARCH_DEBOUNCE_MS = 140;
+
+/** How long the pointer rests on a row before the STAGE lights what it names. Sweeping down a list is
+ *  a gesture, not a series of questions: without a settle, dragging past twelve rows would ask the
+ *  engine to walk every drawn instance twelve times and re-upload the instance buffer as many. Shorter
+ *  than the search debounce because this answers where a thing IS, and an answer that arrives after
+ *  the eye has moved on is not one. */
+const ROW_HOVER_MS = 90;
 
 const EMPTY: SubjectCatalog = {
   owner: "",
@@ -114,6 +122,18 @@ export function SubjectPicker({
   const anchor = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const search = useRef<HTMLInputElement>(null);
+  const rowHoverTimer = useRef<number | null>(null);
+
+  // Lighting the stage from a list ROW is what makes the list navigable at 15 711 parts: the names
+  // repeat, and "which of these is the one by the door" is a question about the picture. Settled, and
+  // owned by `"picker"` so the row the pointer LEFT cannot blank the cue the row it ARRIVED on set.
+  const previewRow = useCallback((id: string | null) => {
+    if (rowHoverTimer.current !== null) window.clearTimeout(rowHoverTimer.current);
+    rowHoverTimer.current = window.setTimeout(() => {
+      if (id) stageHighlightStore.getState().show("picker", [id]);
+      else stageHighlightStore.getState().clear("picker");
+    }, ROW_HOVER_MS);
+  }, []);
 
   const close = useCallback(() => {
     setOpen(false);
@@ -159,6 +179,23 @@ export function SubjectPicker({
   useEffect(() => {
     if (open) search.current?.focus();
   }, [open]);
+
+  // The cue belongs to the open picker. A closed popover still lighting a row is the stage claiming a
+  // question is being asked that nobody is asking any more.
+  useEffect(() => {
+    if (open) return;
+    if (rowHoverTimer.current !== null) window.clearTimeout(rowHoverTimer.current);
+    rowHoverTimer.current = null;
+    stageHighlightStore.getState().clear("picker");
+  }, [open]);
+
+  useEffect(
+    () => () => {
+      if (rowHoverTimer.current !== null) window.clearTimeout(rowHoverTimer.current);
+      stageHighlightStore.getState().clear("picker");
+    },
+    [],
+  );
 
   const rows = catalog.candidates;
   const searching = catalog.query.length > 0;
@@ -279,6 +316,9 @@ export function SubjectPicker({
                           ? `Frame ${row.name} — ${partsLabel(row.parts)} under it`
                           : `${row.name} has no drawn geometry under it, so the camera would be fitted to its origin rather than to anything you can see.`
                       }
+                      onPointerEnter={() => previewRow(row.id)}
+                      onPointerLeave={() => previewRow(null)}
+                      onFocus={() => previewRow(row.id)}
                       onSelect={() => onPick(row.id)}
                       onRequestClose={close}
                     />

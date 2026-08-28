@@ -166,7 +166,7 @@ fn push(state: &mut SceneState, id: &str, center: [f32; 3], scale: f32, slot: i3
         center,
         scale,
         color: [0.55, 0.6, 0.68],
-        selected: 0.0,
+        highlight: 0.0,
         rotation: [0.0, 0.0, 0.0, 1.0],
         material: [0.0; 4],
     });

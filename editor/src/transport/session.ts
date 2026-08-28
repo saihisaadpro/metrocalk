@@ -469,6 +469,15 @@ export interface EditorClient {
    *  object it is naming would switch which cutscene is on screen and throw away the shot being aimed.
    *  Called on hover-settle and on the aiming click — never per frame (invariant 4). */
   viewportPeek(x: number, y: number): Promise<string | null>;
+  /** Say what the cursor is over, so the STAGE answers as well as the badge. Every DRAWN part under one
+   *  of `ids` lights up — so pointing at an assembly lights the assembly, which is what turns the aim
+   *  badge's `Assembly Hall · 7 parts` from a number into something you can see before you commit a shot
+   *  to it. `[]` clears it. Resolves with how many instances are lit: `0` on a subject with no geometry
+   *  is a real answer, not a failure.
+   *
+   *  A render projection — no transaction, no undo entry, nothing saved. Called only when the hovered
+   *  SUBJECT changes, never per frame (invariant 4). */
+  viewportHover(ids: string[]): Promise<number>;
   /** Begin a right-drag orbit — the native render loop then polls the OS cursor and orbits with **0 IPC per
    *  frame** (invariant 4); only this call + `dragEnd` cross the boundary, once per gesture. */
   dragStart(): void;
@@ -1200,6 +1209,11 @@ export class TauriClient implements EditorClient {
   }
   viewportPeek(x: number, y: number): Promise<string | null> {
     return this.core.invoke<string | null>("viewport_peek", { x, y }).catch((e: unknown) => { console.error("viewport_peek failed", e); throw e; });
+  }
+  viewportHover(ids: string[]): Promise<number> {
+    // Resolves 0 rather than rejecting: a hover cue that throws would take the gesture down with it, and
+    // a stage that failed to light is a missing cue, not a failed edit.
+    return this.core.invoke<number>("viewport_hover", { ids }).catch((e: unknown) => { console.error("viewport_hover failed", e); return 0; });
   }
   dragStart(): void {
     void this.core.invoke("drag_start").catch((e: unknown) => console.error("drag_start failed", e));
@@ -3080,6 +3094,9 @@ class MockClient implements EditorClient {
   }
   viewportPeek(_x: number, _y: number): Promise<string | null> {
     return Promise.resolve(null);
+  }
+  viewportHover(_ids: string[]): Promise<number> {
+    return Promise.resolve(0);
   }
   dragStart(): void {}
   dragEnd(): void {}

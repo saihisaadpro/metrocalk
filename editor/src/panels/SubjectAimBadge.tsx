@@ -38,10 +38,14 @@ export interface SubjectAimBadgeProps {
   looking: boolean;
   /** Take this rung instead of whatever the stage is over. */
   onPick: (rung: AimRung) => void;
+  /** Point the STAGE at this rung — `null` when the pointer leaves it. What makes the ladder
+   *  legible: `Assembly Hall · 7 parts` is a claim about the picture, and hovering the rung is how
+   *  the author checks it before spending a shot on it. */
+  onPreview: (rung: AimRung | null) => void;
   onCancel: () => void;
 }
 
-export function SubjectAimBadge({ shotIndex, shots, rungs, looking, onPick, onCancel }: SubjectAimBadgeProps) {
+export function SubjectAimBadge({ shotIndex, shots, rungs, looking, onPick, onPreview, onCancel }: SubjectAimBadgeProps) {
   return (
     <div
       id="subjectAimBadge"
@@ -112,6 +116,13 @@ export function SubjectAimBadge({ shotIndex, shots, rungs, looking, onPick, onCa
                     : `Frame ${rung.name} — ${partsLabel(rung.parts)} under it · ${rung.group.toLowerCase()}`
                 }
                 onClick={() => onPick(rung)}
+                // POINTER, not mouse: the same events a touch or a pen produces, so a stylus user
+                // gets the cue too. `onFocus`/`onBlur` because these are buttons and Tab reaches
+                // them — a keyboard author is asking the same question and deserves the same answer.
+                onPointerEnter={() => onPreview(rung)}
+                onPointerLeave={() => onPreview(null)}
+                onFocus={() => onPreview(rung)}
+                onBlur={() => onPreview(null)}
               >
                 {rung.name}
                 {/* THE MUTED TOKEN IS A CONTRAST CLAIM ABOUT A NEUTRAL BACKGROUND, and the first

@@ -15,6 +15,7 @@ import { playStore } from "../store/play";
 import { cinemaPreviewStore } from "../store/cinemaPreview";
 import { projectionStore } from "../store/projection";
 import { subjectAimStore } from "../store/subjectAim";
+import { stageHighlightStore } from "../store/stageHighlight";
 import { toastStore } from "../store/toasts";
 import { walletStore } from "../store/wallet";
 import type { SubjectCatalog } from "../transport/protocol";
@@ -38,6 +39,7 @@ interface Spies {
   pick: ReturnType<typeof vi.fn>;
   peek: ReturnType<typeof vi.fn>;
   chain: ReturnType<typeof vi.fn>;
+  hover: ReturnType<typeof vi.fn>;
 }
 const sessions: Spies[] = [];
 
@@ -53,10 +55,12 @@ vi.mock("../transport/session", async (importOriginal) => {
       const pick = vi.fn(client.viewportPick.bind(client));
       const peek = vi.fn(() => Promise.resolve<string | null>("e-bracket"));
       const chain = vi.fn(() => Promise.resolve(CHAIN));
+      const hover = vi.fn((_ids: string[]) => Promise.resolve(0));
       client.viewportPick = pick as typeof client.viewportPick;
       client.viewportPeek = peek as typeof client.viewportPeek;
       client.cinemaSubjectChain = chain as typeof client.cinemaSubjectChain;
-      sessions.push({ pick, peek, chain });
+      client.viewportHover = hover as typeof client.viewportHover;
+      sessions.push({ pick, peek, chain, hover });
       return client;
     },
   };
@@ -69,10 +73,12 @@ const spies = () => sessions[sessions.length - 1];
 beforeEach(() => {
   sessions.length = 0;
   act(() => subjectAimStore.getState().cancel());
+  act(() => stageHighlightStore.getState().reset());
 });
 
 afterEach(() => {
   act(() => subjectAimStore.getState().cancel());
+  act(() => stageHighlightStore.getState().reset());
   projectionStore.getState().reset();
   playStore.getState().reset();
   cinemaPreviewStore.getState().reset();
@@ -185,5 +191,68 @@ describe("a shot is aimed by pointing at the object, and the selection never mov
     expect(subjectAimStore.getState().picked).toBeNull();
     expect(spies().peek).not.toHaveBeenCalled();
     expect(spies().pick).not.toHaveBeenCalled();
+  });
+});
+
+describe("the stage answers as well as the badge", () => {
+  /** Every subject list the editor has asked the stage to light, oldest first. */
+  const asked = () => spies().hover.mock.calls.map((call) => call[0] as string[]);
+
+  it("what the cursor is over lights up on the stage, not only in the badge", async () => {
+    render(<App />);
+    act(() => subjectAimStore.getState().begin("e1", 0, 2));
+
+    fireEvent.pointerMove(screen.getByTestId("viewport"), { clientX: 400, clientY: 300 });
+
+    // The LEAF, because that is what a click on the stage takes. The badge names the same object in
+    // the same breath, so a capture where they disagree is a bug either way round.
+    await waitFor(() => expect(asked()).toContainEqual(["e-bracket"]));
+    await screen.findByTestId("subjectAimRung-e-bracket");
+  });
+
+  it("hovering the assembly rung lights the assembly — the part count stops being a claim", async () => {
+    render(<App />);
+    act(() => subjectAimStore.getState().begin("e1", 0, 2));
+    fireEvent.pointerMove(screen.getByTestId("viewport"), { clientX: 400, clientY: 300 });
+    const gun = await screen.findByTestId("subjectAimRung-e-gun");
+
+    fireEvent.pointerEnter(gun);
+    await waitFor(() => expect(asked().at(-1)).toEqual(["e-gun"]));
+
+    // And leaving it hands the stage back to what the cursor is actually over, rather than going
+    // dark: the author is still pointing at the bracket.
+    fireEvent.pointerLeave(gun);
+    await waitFor(() => expect(asked().at(-1)).toEqual(["e-bracket"]));
+  });
+
+  it("the same answer twice is one crossing of the boundary", async () => {
+    render(<App />);
+    act(() => subjectAimStore.getState().begin("e1", 0, 2));
+    const viewport = screen.getByTestId("viewport");
+    fireEvent.pointerMove(viewport, { clientX: 400, clientY: 300 });
+    await waitFor(() => expect(asked()).toContainEqual(["e-bracket"]));
+    const sofar = spies().hover.mock.calls.length;
+
+    // A sweep across one object re-peeks and gets the same id. Re-sending it would re-walk every
+    // drawn instance and re-upload the whole instance buffer for a picture that has not changed.
+    fireEvent.pointerMove(viewport, { clientX: 410, clientY: 305 });
+    await waitFor(() => expect(spies().peek.mock.calls.length).toBeGreaterThan(1));
+    expect(spies().hover.mock.calls.length).toBe(sofar);
+  });
+
+  it("the cue dies with the mode", async () => {
+    render(<App />);
+    act(() => subjectAimStore.getState().begin("e1", 0, 2));
+    fireEvent.pointerMove(screen.getByTestId("viewport"), { clientX: 400, clientY: 300 });
+    await waitFor(() => expect(asked()).toContainEqual(["e-bracket"]));
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+
+    // A highlight that outlived the aim would leave the stage claiming the cursor is over something
+    // in a viewport that has gone back to selecting.
+    await waitFor(() => expect(asked().at(-1)).toEqual([]));
+    expect(stageHighlightStore.getState().source).toBeNull();
   });
 });

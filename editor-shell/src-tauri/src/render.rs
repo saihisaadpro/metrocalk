@@ -44,7 +44,20 @@ pub struct Instance {
     pub center: [f32; 3],
     pub scale: f32,
     pub color: [f32; 3],
-    pub selected: f32,
+    /// What the viewport is saying about this instance right now — a small integer CODE, not a
+    /// boolean: bit 0 ([`HIGHLIGHT_SELECTED`]) is the committed selection, bit 1
+    /// ([`HIGHLIGHT_HOVERED`]) is what the cursor is over. They are independent facts and an object
+    /// is routinely both, which is exactly why one flag could not carry them: a hover that wrote
+    /// `1.0` would report a selection the selection model does not have, and clearing it would
+    /// silently deselect.
+    ///
+    /// A code rather than a second field because this is an `array<Instance>` STRIDE — a 15 711-part
+    /// import re-uploads 1 MB of it whenever the highlight changes, and growing the struct to carry
+    /// one more bit would make that 1.25 MB on every hover.
+    ///
+    /// The particle pass reuses this lane as OPACITY, the same way it reuses `color` as HDR radiance
+    /// and `scale` as a radius — `Instance` is a carrier there, not an entity.
+    pub highlight: f32,
     pub rotation: [f32; 4],
     /// M11.2 per-entity PBR material override `[metallic, roughness, has_override, _pad]`. When
     /// `has_override > 0.5` the mesh shader uses these (with `color` as the override base color) instead of
@@ -67,6 +80,42 @@ pub struct LightGpu {
     pub color_intensity: [f32; 4],
     /// `xyz` = direction (directional/spot); `w` = range (point/spot falloff, 0 = infinite).
     pub dir_range: [f32; 4],
+}
+
+/// [`Instance::highlight`] bit 0 — this instance is in the committed selection.
+pub const HIGHLIGHT_SELECTED: u32 = 1;
+/// [`Instance::highlight`] bit 1 — the cursor is over this instance, or over an assembly it belongs
+/// to. Transient: a render projection of a hover, never document state, and it survives a rebuild no
+/// longer than the hover does.
+pub const HIGHLIGHT_HOVERED: u32 = 2;
+
+/// Read one bit out of an [`Instance::highlight`] code.
+#[must_use]
+pub fn highlight_has(code: f32, bit: u32) -> bool {
+    (highlight_code(code) & bit) != 0
+}
+
+/// The code as an integer. Written from these constants and read back through `+ 0.5` rounding, so
+/// the float never has to be compared for equality.
+#[must_use]
+pub fn highlight_code(code: f32) -> u32 {
+    if code <= 0.0 {
+        return 0;
+    }
+    (code + 0.5) as u32
+}
+
+/// The code with `bit` set or cleared, leaving every other bit alone. This is the whole reason the
+/// field is a code: the selection writes bit 0 and a hover writes bit 1, and neither may erase the
+/// other's answer.
+#[must_use]
+pub fn highlight_with(code: f32, bit: u32, on: bool) -> f32 {
+    let next = if on {
+        highlight_code(code) | bit
+    } else {
+        highlight_code(code) & !bit
+    };
+    next as f32
 }
 
 /// The identity quaternion (no rotation) — the default for `Instance::rotation`.
@@ -1408,6 +1457,15 @@ pub struct SceneState {
     pub moba_structure_slot: i32,
     /// Currently-selected instance index (drives the highlight).
     pub selected: Option<usize>,
+    /// What the cursor is over, as the loro keys of the SUBJECTS being pointed at — a leaf part, or
+    /// an assembly whose whole subtree lights up. Kept as keys rather than instance indices for the
+    /// same reason the cinema preview keeps its suppressed outline by key: indices are stable only
+    /// between rebuilds, and a rebuild mid-hover would otherwise light an unrelated object.
+    ///
+    /// The RESOLVED half lives in `Instance::highlight`'s [`HIGHLIGHT_HOVERED`] bit. Empty is the
+    /// normal state — a hover is a transient render projection, never document state, and nothing
+    /// persists it.
+    pub hovered: Vec<String>,
     /// Bump when `instances` changes so the loop re-uploads the buffer.
     pub revision: u64,
     /// Orbit/zoom driven by drag input (stays in Rust — invariant 4).
@@ -1883,11 +1941,13 @@ impl SceneState {
         // focus dims the rest) — clear any prior highlight first.
         if let Some(p) = self.selected {
             if p < self.instances.len() {
-                self.instances[p].selected = 0.0;
+                self.instances[p].highlight =
+                    highlight_with(self.instances[p].highlight, HIGHLIGHT_SELECTED, false);
             }
         }
         self.selected = Some(i);
-        self.instances[i].selected = 1.0;
+        self.instances[i].highlight =
+            highlight_with(self.instances[i].highlight, HIGHLIGHT_SELECTED, true);
         // Center and size come from the real authored geometry. This is essential for offset meshes and for
         // CAD whose vertices are in millimetres while its instance scale is 0.001.
         let local_bounds = self
@@ -3435,7 +3495,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             center: [0.0, -0.02, 0.0], // a hair below the grid so the grid lines read on top
             scale: 60.0,
             color: [0.30, 0.31, 0.34],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4], // no override → use the baked matte vertex material
         }],
@@ -3465,7 +3525,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             center: [0.0; 3],
             scale: 1.0,
             color: [1.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4], // no override → the baked per-surface material is the material
         }],
@@ -4690,7 +4750,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                             center: wanted.0,
                             scale: wanted.1,
                             color: GROUND_ALBEDO,
-                            selected: 0.0,
+                            highlight: 0.0,
                             rotation: IDENTITY_QUAT,
                             material: [0.0; 4],
                         }),
@@ -4745,7 +4805,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                                 center: gv.pos,
                                 scale: 0.0,
                                 color: gv.color,
-                                selected: 0.0,
+                                highlight: 0.0,
                                 rotation: IDENTITY_QUAT,
                                 material: [0.0; 4],
                             })
@@ -4768,7 +4828,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                             center: [g[0] + ax[0] * o, g[1] + ax[1] * o, g[2] + ax[2] * o],
                             scale: 0.0,
                             color: GHOST,
-                            selected: 0.0,
+                            highlight: 0.0,
                             rotation: IDENTITY_QUAT,
                             material: [0.0; 4],
                         };
@@ -6191,7 +6251,7 @@ fn thumbnail_framing(instance: &Instance, local_bounds: LocalBounds) -> (Instanc
         center: (-offset).to_array(),
         scale: instance.scale,
         color: instance.color,
-        selected: 0.0,
+        highlight: 0.0,
         rotation: rotation.to_array(),
         material: instance.material,
     };
@@ -6697,7 +6757,7 @@ fn push_brush_ring(
                 center: p,
                 scale: 0.0,
                 color: COLOR,
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: IDENTITY_QUAT,
                 material: [0.0; 4],
             });
@@ -6714,7 +6774,7 @@ fn push_route_preview(out: &mut Vec<Instance>, points: &[[f32; 3]], cursor: Opti
         center: p,
         scale: 0.0,
         color: c,
-        selected: 0.0,
+        highlight: 0.0,
         rotation: IDENTITY_QUAT,
         material: [0.0; 4],
     };
@@ -6748,7 +6808,7 @@ fn pipe_graph_preview_vertices(
         center,
         scale: 0.0,
         color,
-        selected: 0.0,
+        highlight: 0.0,
         rotation: IDENTITY_QUAT,
         material: [0.0; 4],
     };
@@ -6882,7 +6942,7 @@ mod shadow_framing_tests {
             center,
             scale,
             color: [0.5; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4],
         }
@@ -8255,7 +8315,7 @@ mod tests {
             center: [x, 0.0, 0.0],
             scale: 1.0,
             color: [1.0, 1.0, 1.0],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0, 0.5, 0.0, 0.0],
         };
@@ -8304,7 +8364,7 @@ mod tests {
                 center: [10.0, 0.0, -4.0],
                 scale: 2.0,
                 color: [1.0, 1.0, 1.0],
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: IDENTITY_QUAT,
                 material: [0.0; 4],
             }],
@@ -8331,7 +8391,7 @@ mod tests {
             center: [x, 0.0, z],
             scale: 1.0,
             color: [1.0, 1.0, 1.0],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4],
         };
@@ -8471,7 +8531,7 @@ mod tests {
                 center: [x, 0.0, -6.0],
                 scale: 2.0,
                 color: [1.0; 3],
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: IDENTITY_QUAT,
                 material: [0.0; 4],
             });
@@ -8680,7 +8740,7 @@ mod tests {
             center: [x, 0.0, 0.0],
             scale: 1.0,
             color: [1.0, 1.0, 1.0],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0, 0.5, 0.0, 0.0],
         };
@@ -9190,7 +9250,7 @@ mod tests {
             center: [1.0, 2.0, 3.0],
             scale: 0.001,
             color: [1.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4],
         };
@@ -9211,7 +9271,7 @@ mod tests {
             center: [75.0, -20.0, 9.0], // world placement must not leak into a portrait
             scale: 0.001,
             color: [0.7, 0.8, 0.9],
-            selected: 1.0,
+            highlight: 1.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4],
         };
@@ -9226,7 +9286,7 @@ mod tests {
         );
         assert!((Vec3::from(framed.center) - Vec3::new(-1.0, 0.0, 0.0)).length() < 1.0e-6);
         assert_eq!(
-            framed.selected, 0.0,
+            framed.highlight, 0.0,
             "portrait selection must not tint the source material"
         );
         assert!(
@@ -9338,7 +9398,7 @@ mod tests {
                 center: [i as f32 * 2.0, 1.0, 0.0],
                 scale: 1.0,
                 color: [0.5, 0.5, 0.5],
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: IDENTITY_QUAT,
                 material: [0.0; 4],
             });
@@ -9361,7 +9421,7 @@ mod tests {
         // Selected + focused are the same entity; the shader keeps it lit while dimming the rest.
         assert_eq!(st.selected, Some(2));
         assert_eq!(st.focused, Some(2));
-        assert_eq!(st.instances[2].selected, 1.0);
+        assert_eq!(st.instances[2].highlight, 1.0);
         // The framing was saved for restore, and the revision bumped so the new flags upload.
         assert_eq!(st.pre_focus_distance, Some(60.0));
         assert_ne!(st.revision, rev0);

@@ -256,6 +256,12 @@ const DIM_TARGET = vec3<f32>(0.06, 0.07, 0.10); // the viewport clear colour —
 const DIM_AMOUNT = 0.86;
 // The selection accent, AUTHORED sRGB (matches the panel's selection yellow).
 const SELECTION_TINT = vec3<f32>(1.0, 0.82, 0.16);
+// The HOVER accent, AUTHORED sRGB. A different HUE, not a different strength: hover and selection are
+// on screen at the same time constantly — you hover one part of an assembly you have already selected —
+// and two brightnesses of one yellow is a reader guessing which is which. Cyan is the far side of the
+// wheel from the selection yellow, so the two never read as degrees of each other, and it survives the
+// grey a CAD import mostly is. Matches `color.accent.hover` in the editor's palette.
+const HOVER_TINT = vec3<f32>(0.30, 0.80, 1.0);
 // The grid line colour, AUTHORED sRGB. Written PREMULTIPLIED by coverage (see `fs_grid`).
 const GRID_COLOR = vec3<f32>(0.10, 0.12, 0.17);
 fn apply_focus_dim(col: vec3<f32>, is_focused: bool) -> vec3<f32> {
@@ -282,8 +288,24 @@ fn apply_focus_dim_linear(col: vec3<f32>, is_focused: bool) -> vec3<f32> {
 // (Said 48 until 2026-08-17 — stale since `material` landed.)
 // `material` (M11.2) = per-entity PBR override [metallic, roughness, has_override, _]; when has_override>0.5
 // the mesh path uses it (+ `color` as the override base color) instead of the asset's baked vertex material.
-struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, selected: f32, rotation: vec4<f32>, material: vec4<f32> };
+struct Instance { center: vec3<f32>, scale: f32, color: vec3<f32>, highlight: f32, rotation: vec4<f32>, material: vec4<f32> };
 @group(1) @binding(0) var<storage, read> instances: array<Instance>;
+
+// `highlight` is a small integer CODE, not a boolean — bit 0 = the committed selection, bit 1 = what
+// the cursor is over. Two INDEPENDENT facts: an object is routinely both, and a hover that wrote 1.0
+// would claim a selection the selection model does not have. Read back through `+ 0.5` rounding so
+// the float is never compared for equality. Matches render.rs's `HIGHLIGHT_SELECTED`/`HIGHLIGHT_HOVERED`.
+const HIGHLIGHT_SELECTED: u32 = 1u;
+const HIGHLIGHT_HOVERED: u32 = 2u;
+fn highlight_code(code: f32) -> u32 {
+    return u32(max(code, 0.0) + 0.5);
+}
+fn is_selected(code: f32) -> bool {
+    return (highlight_code(code) & HIGHLIGHT_SELECTED) != 0u;
+}
+fn is_hovered(code: f32) -> bool {
+    return (highlight_code(code) & HIGHLIGHT_HOVERED) != 0u;
+}
 // M11.2 follow-up — the per-mesh base-color (albedo) texture rides the already-per-mesh instance group
 // (group 1), staying within the 4-bind-group cap. An untextured mesh binds a 1×1 WHITE dummy, so sampling
 // is always valid (white × the baked factor = the factor → an untextured mesh looks exactly as before).
@@ -322,10 +344,16 @@ fn vs_cube(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let nrm = quat_rotate(inst.rotation, normalize(local)); // rotate the face normal so lighting follows
     let shade = 0.55 + 0.45 * clamp(dot(nrm, normalize(vec3<f32>(0.4, 0.8, 0.3))), 0.0, 1.0);
     var col = inst.color * shade;
-    if (inst.selected > 0.5) {
+    if (is_selected(inst.highlight)) {
         col = mix(col, vec3<f32>(1.0, 0.85, 0.2), 0.7); // selection highlight
     }
-    out.color = apply_focus_dim(col, inst.selected > 0.5);
+    col = apply_focus_dim(col, is_selected(inst.highlight));
+    // AFTER the focus dim, deliberately — see `fs_mesh`. Pointing at something is a question being
+    // asked right now, and an answer that is itself faded out is not one.
+    if (is_hovered(inst.highlight)) {
+        col = mix(col, HOVER_TINT, 0.45);
+    }
+    out.color = col;
     return out;
 }
 
@@ -411,7 +439,7 @@ fn vs_overlay(@builtin(vertex_index) vi: u32) -> VsOut {
 // particle out of the shared instance storage buffer and `% 6` picks the corner. The `Instance` slots are
 // reused as a particle carrier exactly the way the line/overlay passes reuse them as a point carrier:
 // `center` = world position, `scale` = world radius, `color` = LINEAR HDR colour (deliberately allowed
-// above 1.0 — the excess is what the bloom pass picks up), `selected` = opacity.
+// above 1.0 — the excess is what the bloom pass picks up), `highlight` = opacity.
 //
 // The billboard basis is read straight out of the view-projection matrix. For M = P·V the first two ROWS
 // of the 3×3 part are the camera's world right/up scaled by the projection terms, so normalising them
@@ -443,7 +471,7 @@ fn vs_particle(@builtin(vertex_index) vi: u32) -> FxOut {
     out.pos = vp * vec4<f32>(world, 1.0);
     out.color = p.color;
     out.uv = vec2<f32>(cx, cy);
-    out.alpha = p.selected;
+    out.alpha = p.highlight;
     return out;
 }
 
@@ -481,7 +509,7 @@ struct MeshVsOut {
     @location(1) world_pos: vec3<f32>,
     @location(2) world_normal: vec3<f32>,
     @location(3) mr: vec2<f32>,       // metallic, roughness
-    @location(4) selected: f32,
+    @location(4) highlight: f32,
     @location(5) uv: vec2<f32>,
     @location(6) world_tangent: vec4<f32>,
 };
@@ -494,7 +522,7 @@ fn vs_mesh(v: MeshIn, @builtin(instance_index) ii: u32) -> MeshVsOut {
     out.pos = cam.view_proj * vec4<f32>(world, 1.0);
     out.world_pos = world;
     out.world_normal = quat_rotate(inst.rotation, normalize(v.normal));
-    out.selected = inst.selected;
+    out.highlight = inst.highlight;
     // Per-entity material override (M11.2): a "make it metal/rusty/gold" intent recolors ONLY this entity;
     // absent → the asset's baked vertex material.
     let has_override = inst.material.z > 0.5;
@@ -769,11 +797,20 @@ fn fs_mesh(in: MeshVsOut) -> @location(0) vec4<f32> {
     // Selection is a subtle wash plus a strong rim, so selected materials remain inspectable. The tint is
     // an AUTHORED colour, converted once so it renders back as the same yellow the UI shows; the blend
     // itself now happens in linear light, which is what keeps the rim from banding against bright metal.
-    if (in.selected > 0.5) {
+    if (is_selected(in.highlight)) {
         let rim = smoothstep(0.12, 0.72, pow(1.0 - n_dot_v_amb, 2.2));
         col = mix(col, unlit_srgb_to_scene_linear(SELECTION_TINT), 0.08 + 0.52 * rim);
     }
-    col = apply_focus_dim_linear(col, in.selected > 0.5);
+    col = apply_focus_dim_linear(col, is_selected(in.highlight));
+    // HOVER IS LAST, and that ordering is the rule: it is applied after the selection wash so a part
+    // you point at inside something already selected still answers, and after the focus dim so the
+    // answer is not itself greyed out. The wash is heavier than the selection's (0.22 vs 0.08) because
+    // it has to be legible at a glance on ONE part of a 15 711-part import, where the selection has a
+    // gizmo and an outliner row saying the same thing.
+    if (is_hovered(in.highlight)) {
+        let rim = smoothstep(0.05, 0.65, pow(1.0 - n_dot_v_amb, 1.6));
+        col = mix(col, unlit_srgb_to_scene_linear(HOVER_TINT), 0.22 + 0.50 * rim);
+    }
     return vec4<f32>(col, 1.0);
 }
 

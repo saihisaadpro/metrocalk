@@ -556,7 +556,7 @@ impl MobaSession {
                 ],
                 scale,
                 color: colour,
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: IDENTITY_QUAT,
                 material: [0.15, 0.55, 1.0, 0.0],
             });

@@ -1311,6 +1311,7 @@ export const SCENES: Scene[] = [
             { id: "hall", name: "Assembly Hall", parts: 378, group: "What it is part of" },
           ]}
           onPick={() => {}}
+          onPreview={() => {}}
           onCancel={() => {}}
         />
       </div>

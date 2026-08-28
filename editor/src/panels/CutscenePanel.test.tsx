@@ -12,6 +12,7 @@ import { projectionStore } from "../store/projection";
 import { playStore } from "../store/play";
 import { cinemaPreviewStore } from "../store/cinemaPreview";
 import { subjectAimStore } from "../store/subjectAim";
+import { stageHighlightStore } from "../store/stageHighlight";
 import { toastStore } from "../store/toasts";
 import type { CinemaReply, ShotRow } from "../transport/protocol";
 
@@ -394,6 +395,33 @@ describe("CutscenePanel", () => {
       // And it is still OFFERED, not hidden: a marker is a legitimate thing to point a camera at,
       // and a picker that silently omitted objects would be a scene the user cannot fully reach.
       expect(empty).toBeTruthy();
+    });
+
+    it("resting on a row lights it on the stage, so a list of 15,711 names is navigable", async () => {
+      vi.useFakeTimers();
+      try {
+        selectSomething();
+        render(<CutscenePanel client={loaded()} />);
+        fireEvent.click((await vi.waitFor(() => screen.findAllByTestId("cutscene-clip")))[0]);
+        fireEvent.click(await vi.waitFor(() => screen.findByTestId("cutscene-subject")));
+        const row = await vi.waitFor(() => screen.findByTestId("cutscene-subject-option-e9"));
+
+        // SETTLED, not per event: sweeping the pointer down a list is one gesture, and asking the
+        // engine to walk every drawn instance once per row is the stall this delay exists to stop.
+        fireEvent.pointerEnter(row);
+        expect(stageHighlightStore.getState().ids).toEqual([]);
+        act(() => void vi.advanceTimersByTime(120));
+        expect(stageHighlightStore.getState().ids).toEqual(["e9"]);
+        expect(stageHighlightStore.getState().source).toBe("picker");
+
+        // And closing the picker takes the cue with it — a closed popover still lighting a row is
+        // the stage answering a question nobody is asking.
+        fireEvent.keyDown(window, { key: "Escape" });
+        act(() => void vi.advanceTimersByTime(120));
+        expect(stageHighlightStore.getState().source).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("searches the whole scene when the ranked list does not have it", async () => {

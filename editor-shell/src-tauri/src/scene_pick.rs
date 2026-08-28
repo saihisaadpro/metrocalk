@@ -434,12 +434,17 @@ pub fn apply_selection_highlight(
     selection: &SelectionModel,
 ) -> Option<usize> {
     for instance in &mut state.instances {
-        instance.selected = 0.0;
+        instance.highlight =
+            render::highlight_with(instance.highlight, render::HIGHLIGHT_SELECTED, false);
     }
     let mut primary = None;
     for (key, _) in selection.entries() {
         if let Some(index) = instance_index_of(state, *key) {
-            state.instances[index].selected = 1.0;
+            state.instances[index].highlight = render::highlight_with(
+                state.instances[index].highlight,
+                render::HIGHLIGHT_SELECTED,
+                true,
+            );
             primary = Some(index);
         }
     }
@@ -563,7 +568,7 @@ mod tests {
             center: [3.0, -2.0, 5.0],
             scale: 2.0,
             color: [1.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: [0.0, HALF_TURN_Y, 0.0, HALF_TURN_Y], // 90° about Y
             material: [0.0; 4],
         };
@@ -602,7 +607,7 @@ mod tests {
                 center,
                 scale,
                 color: [1.0; 3],
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: [0.0, 0.0, 0.0, 1.0],
                 material: [0.0; 4],
             });
@@ -716,7 +721,7 @@ mod tests {
             center: [0.0; 3],
             scale: 5.0,
             color: [1.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: [0.0, 0.0, 0.0, 1.0],
             material: [0.0; 4],
         });
@@ -727,7 +732,7 @@ mod tests {
             center: [4.2, 4.2, 0.0],
             scale: 0.15,
             color: [1.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: [0.0, 0.0, 0.0, 1.0],
             material: [0.0; 4],
         });
@@ -859,9 +864,9 @@ mod tests {
         selection.add(2, 0);
         let primary = apply_selection_highlight(&mut state, &selection);
         assert_eq!(primary, Some(2), "the most recently added is active");
-        assert_eq!(state.instances[0].selected, 1.0);
-        assert_eq!(state.instances[1].selected, 0.0);
-        assert_eq!(state.instances[2].selected, 1.0);
+        assert_eq!(state.instances[0].highlight, 1.0);
+        assert_eq!(state.instances[1].highlight, 0.0);
+        assert_eq!(state.instances[2].highlight, 1.0);
         assert_eq!(
             selected_ids(&state, &selection),
             vec!["entity:0", "entity:2"]
@@ -870,7 +875,7 @@ mod tests {
         // Clearing the model clears every highlight — there is no second copy to go stale.
         selection.clear();
         assert_eq!(apply_selection_highlight(&mut state, &selection), None);
-        assert!(state.instances.iter().all(|i| i.selected == 0.0));
+        assert!(state.instances.iter().all(|i| i.highlight == 0.0));
         assert_eq!(state.selected, None);
     }
 
@@ -880,7 +885,7 @@ mod tests {
             center: [0.0; 3],
             scale: 0.0,
             color: [1.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: [f32::NAN; 4],
             material: [0.0; 4],
         };

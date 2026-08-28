@@ -2906,6 +2906,14 @@ enum EngineCmd {
         id: String,
         reply: Sender<metrocalk_editor_shell::SubjectCatalog>,
     },
+    /// What the cursor is over, as a render projection. Never document state and never undoable —
+    /// the same class as the camera pose, and it is gone the moment the cursor leaves.
+    ViewportHover {
+        /// The subjects being pointed at. Every DRAWN instance under one of them lights up, so a rung
+        /// naming an assembly lights the whole assembly. Empty clears the hover.
+        ids: Vec<String>,
+        reply: Sender<usize>,
+    },
     /// Cinematics - read an object's cutscene back as sentences.
     CinemaList {
         id: String,
@@ -5713,6 +5721,88 @@ fn drawn_parts_by_entity(engine: &Engine<FlecsWorld>, ids: &[String]) -> HashMap
         }
     }
     counts
+}
+
+/// Which drawn instances are under `hovered` — one bool per entry of `ids`, in the same order.
+///
+/// WHY A SUBTREE AND NOT A ROW. Picking is a hit test against drawn triangles, so what the cursor is
+/// over is always a LEAF — one bolt, of one weld gun, of a line that imports as 15 711 parts. The
+/// author is usually pointing at the machine, and the aim badge already offers both: `Box · 1 part`
+/// **in** `Assembly Hall · 7 parts`. Those counts were an abstraction until now — hovering the second
+/// rung lights all seven, so "7 parts" is a thing you can SEE before committing the shot to it.
+///
+/// The walk is [`drawn_parts_by_entity`]'s, memoised the same way and bounded the same way: a corrupt
+/// document is not worth hanging the engine thread for.
+///
+/// Takes no lock, on purpose. It is asked on hover-settle while the author sweeps the cursor over the
+/// scene, and 15 711 ancestor chains under the render mutex is the renderer stalling behind a read-out
+/// — the same discipline `CinemaSubjectChain` states for the same walk.
+fn hover_mask(engine: &Engine<FlecsWorld>, ids: &[String], hovered: &[String]) -> Vec<bool> {
+    if hovered.is_empty() {
+        return vec![false; ids.len()];
+    }
+    let wanted: HashSet<EntityId> = hovered
+        .iter()
+        .filter_map(|k| EntityId::from_loro_key(k))
+        .collect();
+    if wanted.is_empty() {
+        return vec![false; ids.len()];
+    }
+    // `under` memoises the ANSWER for every id the walk passes through, so the second bolt of the same
+    // weld gun is one lookup rather than a second walk to the root.
+    let mut under: HashMap<EntityId, bool> = HashMap::new();
+    ids.iter()
+        .map(|key| {
+            EntityId::from_loro_key(key)
+                .is_some_and(|leaf| entity_is_under(engine, leaf, &wanted, &mut under))
+        })
+        .collect()
+}
+
+/// Write a [`hover_mask`] into [`render::HIGHLIGHT_HOVERED`], leaving every other bit alone. Returns
+/// how many instances now carry it — the number the caller reports, and the one a test can assert on
+/// without a GPU.
+fn write_hover_mask(st: &mut render::SceneState, mask: &[bool]) -> usize {
+    let mut lit = 0usize;
+    for (index, instance) in st.instances.iter_mut().enumerate() {
+        let on = mask.get(index).copied().unwrap_or(false);
+        if on {
+            lit += 1;
+        }
+        instance.highlight =
+            render::highlight_with(instance.highlight, render::HIGHLIGHT_HOVERED, on);
+    }
+    st.revision = st.revision.wrapping_add(1);
+    lit
+}
+
+/// Is `leaf` one of `wanted`, or a descendant of one? Memoises every id on the way up.
+fn entity_is_under(
+    engine: &Engine<FlecsWorld>,
+    leaf: EntityId,
+    wanted: &HashSet<EntityId>,
+    memo: &mut HashMap<EntityId, bool>,
+) -> bool {
+    let mut chain: Vec<EntityId> = Vec::new();
+    let mut walker = Some(leaf);
+    let mut answer = false;
+    for _ in 0..64 {
+        let Some(id) = walker else { break };
+        if let Some(known) = memo.get(&id) {
+            answer = *known;
+            break;
+        }
+        chain.push(id);
+        if wanted.contains(&id) {
+            answer = true;
+            break;
+        }
+        walker = engine.parent_of(id);
+    }
+    for id in chain {
+        memo.insert(id, answer);
+    }
+    answer
 }
 
 fn shot_subject_name(engine: &Engine<FlecsWorld>, key: &str) -> Option<String> {
@@ -10350,6 +10440,29 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .unwrap_or_default();
                 let _ = reply.send(chain);
             }
+            EngineCmd::ViewportHover { ids, reply } => {
+                // Clone and release, then walk, then take the lock again to write: the walk is over
+                // every drawn instance and the render loop must not queue behind it.
+                let (drawn, hovered, at) = {
+                    let mut st = shared.lock().unwrap();
+                    st.hovered = ids;
+                    (st.ids.clone(), st.hovered.clone(), st.ids_revision)
+                };
+                let mask = hover_mask(&engine, &drawn, &hovered);
+                let lit = {
+                    let mut st = shared.lock().unwrap();
+                    if st.ids_revision == at {
+                        write_hover_mask(&mut st, &mask)
+                    } else {
+                        // A rebuild landed inside the walk, so this mask indexes a list that no
+                        // longer exists. Dropped rather than written at the wrong rows — the rebuild
+                        // re-derived the hover from `st.hovered`, which this set before releasing the
+                        // lock, so the answer on screen is already the right one.
+                        mask.iter().filter(|on| **on).count()
+                    }
+                };
+                let _ = reply.send(lit);
+            }
             EngineCmd::CinemaList { id, reply } => {
                 let info = EntityId::from_loro_key(&id)
                     .filter(|e| engine.entity_exists(*e))
@@ -10448,10 +10561,16 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             let dimmed = st
                                 .instances
                                 .iter()
-                                .position(|i| i.selected > 0.5)
+                                .position(|i| {
+                                    render::highlight_has(i.highlight, render::HIGHLIGHT_SELECTED)
+                                })
                                 .and_then(|i| {
-                                    let was = st.instances[i].selected;
-                                    st.instances[i].selected = 0.0;
+                                    let was = st.instances[i].highlight;
+                                    st.instances[i].highlight = render::highlight_with(
+                                        was,
+                                        render::HIGHLIGHT_SELECTED,
+                                        false,
+                                    );
                                     st.ids.get(i).map(|k| (k.clone(), was))
                                 });
                             (saved_cam, dimmed)
@@ -15888,14 +16007,24 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 // rebuilds, and a rebuild during a cutscene (an undo, a delete, a door
                                 // reopening) would otherwise re-outline an unrelated object when the
                                 // shot ended.
-                                cinema_dimmed =
-                                    st.instances.iter().position(|i| i.selected > 0.5).and_then(
-                                        |i| {
-                                            let was = st.instances[i].selected;
-                                            st.instances[i].selected = 0.0;
-                                            st.ids.get(i).map(|k| (k.clone(), was))
-                                        },
-                                    );
+                                cinema_dimmed = st
+                                    .instances
+                                    .iter()
+                                    .position(|i| {
+                                        render::highlight_has(
+                                            i.highlight,
+                                            render::HIGHLIGHT_SELECTED,
+                                        )
+                                    })
+                                    .and_then(|i| {
+                                        let was = st.instances[i].highlight;
+                                        st.instances[i].highlight = render::highlight_with(
+                                            was,
+                                            render::HIGHLIGHT_SELECTED,
+                                            false,
+                                        );
+                                        st.ids.get(i).map(|k| (k.clone(), was))
+                                    });
                                 st.revision = st.revision.wrapping_add(1);
                                 drop(st);
                                 cinema_owner = Some(*entity);
@@ -16047,7 +16176,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 center: p.position,
                                 scale: p.radius,
                                 color: p.color,
-                                selected: p.alpha,
+                                // The particle carrier reuses this lane as OPACITY, exactly as it reuses `color`
+                                // as HDR radiance and `scale` as a radius.
+                                highlight: p.alpha,
                                 rotation: render::IDENTITY_QUAT,
                                 material: [0.0; 4],
                             };
@@ -16091,7 +16222,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 center: p.position,
                                 scale: p.radius,
                                 color: p.color,
-                                selected: p.alpha,
+                                // The particle carrier reuses this lane as OPACITY, exactly as it reuses `color`
+                                // as HDR radiance and `scale` as a radius.
+                                highlight: p.alpha,
                                 rotation: render::IDENTITY_QUAT,
                                 material: [0.0; 4],
                             };
@@ -17455,7 +17588,7 @@ fn push_overlay(
             center: a,
             scale: 0.0,
             color,
-            selected: 0.0,
+            highlight: 0.0,
             rotation: render::IDENTITY_QUAT,
             material: [0.0; 4],
         });
@@ -17463,7 +17596,7 @@ fn push_overlay(
             center: b,
             scale: 0.0,
             color,
-            selected: 0.0,
+            highlight: 0.0,
             rotation: render::IDENTITY_QUAT,
             material: [0.0; 4],
         });
@@ -18098,7 +18231,7 @@ fn glyph_pt(center: [f32; 3], color: [f32; 3]) -> Instance {
         center,
         scale: 0.0,
         color,
-        selected: 0.0,
+        highlight: 0.0,
         rotation: render::IDENTITY_QUAT,
         material: [0.0; 4],
     }
@@ -19310,7 +19443,7 @@ fn rebuild(
             center: p,
             scale,
             color: c,
-            selected: 0.0,
+            highlight: 0.0,
             rotation: rot,
             material: mat_override,
         });
@@ -19333,7 +19466,7 @@ fn rebuild(
             center,
             scale: 0.0,
             color: TRACK_LINE_COLOR,
-            selected: 0.0,
+            highlight: 0.0,
             rotation: render::IDENTITY_QUAT,
             material: [0.0; 4],
         })
@@ -19365,8 +19498,14 @@ fn rebuild(
     st.lights_revision = st.lights_revision.wrapping_add(1);
     st.selected = prev_sel_id.and_then(|id| st.ids.iter().position(|k| *k == id));
     if let Some(i) = st.selected {
-        st.instances[i].selected = 1.0;
+        st.instances[i].highlight =
+            render::highlight_with(st.instances[i].highlight, render::HIGHLIGHT_SELECTED, true);
     }
+    // A hover is a fact about the CURSOR, and a rebuild is a fact about the DOCUMENT: the instance
+    // list has just been rewritten, so every hover bit on it names a row that may no longer exist.
+    // Re-applied from the surviving hover set rather than carried by index.
+    let mask = hover_mask(engine, &st.ids, &st.hovered);
+    write_hover_mask(&mut st, &mask);
     // Keep an active gizmo drag pinned to its entity by ID; if the dragged entity is gone (deleted
     // elsewhere), end the drag cleanly rather than freezing it on a stale index.
     st.gizmo_sel = prev_gizmo_id.and_then(|id| st.ids.iter().position(|k| *k == id));
@@ -20549,6 +20688,35 @@ fn viewport_peek(
     hit.as_ref().and_then(|h| scene_pick::entity_of(&st, h))
 }
 
+/// Say what the cursor is over, so the STAGE can answer as well as the badge.
+///
+/// The gap this closes: `viewport_peek` has named the object under the cursor since M3.3, and nothing
+/// on screen ever lit up. Aiming a shot on an imported line therefore read as `Box · 1 part` **in**
+/// `Assembly Hall · 7 parts` over a picture in which nothing distinguished either — the author had to
+/// take the badge's word for which of 15 711 parts the click was about.
+///
+/// Each id lights its whole DRAWN SUBTREE, which is what makes an assembly rung mean something you can
+/// see. Empty clears it. Returns how many instances are lit, so the caller can tell "you are pointing
+/// at 378 parts" from "that subject has no geometry" — the same distinction the picker's rows make.
+///
+/// A RENDER PROJECTION, never document state: no transaction, no undo entry, nothing persisted, and a
+/// rebuild re-derives it from the same subjects rather than carrying stale indices. `async` because it
+/// walks the drawn set on the engine thread, and the JS only calls it when the hovered subject CHANGES
+/// (invariant 4 — never per frame).
+#[tauri::command(async)]
+fn viewport_hover(state: State<AppState>, ids: Vec<String>) -> usize {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ViewportHover { ids, reply })
+        .is_err()
+    {
+        return 0;
+    }
+    recv_reply(&rx).unwrap_or(0)
+}
+
 /// Marquee (box) selection. The two corners are normalized `[0,1]` surface fractions, **in the order
 /// they were dragged** — the direction is the policy: left-to-right takes only objects fully enclosed,
 /// right-to-left takes everything the rectangle touches. Returns the selected entity ids.
@@ -21313,12 +21481,17 @@ fn gizmo_select(state: State<AppState>, id: String) -> bool {
     };
     if let Some(p) = st.selected {
         if p < st.instances.len() {
-            st.instances[p].selected = 0.0;
+            st.instances[p].highlight = render::highlight_with(
+                st.instances[p].highlight,
+                render::HIGHLIGHT_SELECTED,
+                false,
+            );
         }
     }
     st.selected = Some(i);
     if i < st.instances.len() {
-        st.instances[i].selected = 1.0;
+        st.instances[i].highlight =
+            render::highlight_with(st.instances[i].highlight, render::HIGHLIGHT_SELECTED, true);
     }
     st.revision = st.revision.wrapping_add(1);
     true
@@ -22575,7 +22748,13 @@ fn restore_editor_chrome(st: &mut render::SceneState, dimmed: &mut Option<(Strin
     if let Some((key, was)) = dimmed.take() {
         if let Some(i) = st.ids.iter().position(|k| *k == key) {
             if let Some(inst) = st.instances.get_mut(i) {
-                inst.selected = was;
+                // Only the bit that was suppressed. Restoring the whole code would resurrect a hover
+                // the cursor left while the shot was playing.
+                inst.highlight = render::highlight_with(
+                    inst.highlight,
+                    render::HIGHLIGHT_SELECTED,
+                    render::highlight_has(was, render::HIGHLIGHT_SELECTED),
+                );
             }
         }
     }
@@ -26376,6 +26555,7 @@ fn main() {
             thumbnail,
             viewport_pick,
             viewport_peek,
+            viewport_hover,
             viewport_pick_region,
             pick_diagnostics,
             focus_entity,
@@ -26879,7 +27059,7 @@ mod cinematic_subject_tests {
             center,
             scale,
             color: [1.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: render::IDENTITY_QUAT,
             material: [0.0; 4],
         }
@@ -27057,7 +27237,7 @@ mod pipe_viewport_tests {
             center: [0.0, 1.0, 0.0],
             scale: 2.0,
             color: [0.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: [0.0, 0.0, 0.0, 1.0],
             material: [0.0; 4],
         };
@@ -27095,7 +27275,7 @@ mod pipe_viewport_tests {
             center: [2.0, 0.0, 0.0],
             scale: 2.0,
             color: [0.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: [0.0, 0.0, 0.0, 1.0],
             material: [0.0; 4],
         };
@@ -29808,6 +29988,225 @@ mod imported_assembly_pose_publication_tests {
             neutral.scale,
             restored.center,
             restored.scale
+        );
+    }
+}
+
+#[cfg(test)]
+mod stage_hover_tests {
+    use super::{entity_display_name, hover_mask, write_hover_mask};
+    use crate::render;
+    use metrocalk_core::{Engine, EntityId, Op};
+    use metrocalk_ecs::FlecsWorld;
+
+    fn engine() -> Engine<FlecsWorld> {
+        Engine::new(FlecsWorld::new(), 0x40E)
+    }
+
+    fn spawn(engine: &mut Engine<FlecsWorld>, parent: Option<EntityId>) -> EntityId {
+        let id = engine.alloc_entity_id();
+        engine
+            .commit("spawn", vec![Op::CreateEntity { id, parent }])
+            .expect("spawns");
+        id
+    }
+
+    /// The shape a CAD import has, small enough to assert on: a line, one cell, one gun with two
+    /// drawn parts, and a fixture beside it. Only the LEAVES are drawn — which is the whole reason a
+    /// pick lands on a bolt and the shot the author meant is the machine.
+    struct Rig {
+        line: EntityId,
+        cell: EntityId,
+        gun: EntityId,
+        fixture: EntityId,
+        nozzle: EntityId,
+        bracket: EntityId,
+    }
+
+    fn assembly(engine: &mut Engine<FlecsWorld>) -> Rig {
+        let line = spawn(engine, None);
+        let cell = spawn(engine, Some(line));
+        let gun = spawn(engine, Some(cell));
+        let fixture = spawn(engine, Some(cell));
+        let nozzle = spawn(engine, Some(gun));
+        let bracket = spawn(engine, Some(gun));
+        Rig {
+            line,
+            cell,
+            gun,
+            fixture,
+            nozzle,
+            bracket,
+        }
+    }
+
+    /// The published render list: the drawn leaves, in draw order.
+    fn drawn(rig: &Rig) -> Vec<String> {
+        vec![
+            rig.nozzle.to_loro_key(),
+            rig.bracket.to_loro_key(),
+            rig.fixture.to_loro_key(),
+        ]
+    }
+
+    fn scene(count: usize) -> render::SceneState {
+        render::SceneState {
+            instances: (0..count)
+                .map(|_| render::Instance {
+                    center: [0.0; 3],
+                    scale: 1.0,
+                    color: [1.0; 3],
+                    highlight: 0.0,
+                    rotation: render::IDENTITY_QUAT,
+                    material: [0.0; 4],
+                })
+                .collect(),
+            ..render::SceneState::default()
+        }
+    }
+
+    #[test]
+    fn pointing_at_a_leaf_lights_that_leaf_and_nothing_else() {
+        let mut e = engine();
+        let rig = assembly(&mut e);
+        let ids = drawn(&rig);
+        let mask = hover_mask(&e, &ids, &[rig.bracket.to_loro_key()]);
+        assert_eq!(mask, vec![false, true, false]);
+    }
+
+    #[test]
+    fn pointing_at_an_assembly_lights_its_whole_drawn_subtree() {
+        // THE CLAIM THE BADGE MAKES, MADE VISIBLE. A rung reading `Weld Gun 7 · 2 parts` is a promise
+        // about the picture; hovering it lights exactly those two and leaves the fixture beside them
+        // alone. Without this the count is a number the author has to take on trust.
+        let mut e = engine();
+        let rig = assembly(&mut e);
+        let ids = drawn(&rig);
+        assert_eq!(
+            hover_mask(&e, &ids, &[rig.gun.to_loro_key()]),
+            vec![true, true, false],
+        );
+        // And the rung above it takes everything, which is what "the establishing wide" means here.
+        assert_eq!(
+            hover_mask(&e, &ids, &[rig.line.to_loro_key()]),
+            vec![true, true, true],
+        );
+        assert_eq!(
+            hover_mask(&e, &ids, &[rig.cell.to_loro_key()]),
+            vec![true, true, true],
+        );
+    }
+
+    #[test]
+    fn nothing_hovered_lights_nothing_and_an_unknown_subject_is_not_everything() {
+        let mut e = engine();
+        let rig = assembly(&mut e);
+        let ids = drawn(&rig);
+        assert_eq!(hover_mask(&e, &ids, &[]), vec![false; 3]);
+        // An id no key parses is the empty answer, NOT a wildcard: a hover that lit the whole scene
+        // because the editor sent a stale key would read as "you are pointing at everything".
+        assert_eq!(
+            hover_mask(&e, &ids, &["not-a-key".to_string()]),
+            vec![false; 3],
+        );
+        // A real entity with nothing drawn under it lights nothing — the same fact the picker's
+        // "nothing drawn" row states in words.
+        let empty = spawn(&mut e, None);
+        assert_eq!(hover_mask(&e, &ids, &[empty.to_loro_key()]), vec![false; 3]);
+    }
+
+    #[test]
+    fn two_subjects_light_the_union() {
+        let mut e = engine();
+        let rig = assembly(&mut e);
+        let ids = drawn(&rig);
+        assert_eq!(
+            hover_mask(
+                &e,
+                &ids,
+                &[rig.nozzle.to_loro_key(), rig.fixture.to_loro_key()],
+            ),
+            vec![true, false, true],
+        );
+    }
+
+    #[test]
+    fn the_hover_bit_and_the_selection_bit_do_not_erase_each_other() {
+        // THE REASON `highlight` IS A CODE AND NOT A FLAG. An author routinely points at one part of
+        // an assembly they have already selected; with one flag, the hover's clear would deselect and
+        // the selection's clear would blank the hover. Both are asserted in both directions.
+        let mut st = scene(3);
+        st.instances[1].highlight =
+            render::highlight_with(st.instances[1].highlight, render::HIGHLIGHT_SELECTED, true);
+
+        assert_eq!(write_hover_mask(&mut st, &[false, true, true]), 2);
+        assert!(render::highlight_has(
+            st.instances[1].highlight,
+            render::HIGHLIGHT_SELECTED
+        ));
+        assert!(render::highlight_has(
+            st.instances[1].highlight,
+            render::HIGHLIGHT_HOVERED
+        ));
+        assert!(!render::highlight_has(
+            st.instances[2].highlight,
+            render::HIGHLIGHT_SELECTED
+        ));
+
+        // The hover goes; the selection stays.
+        assert_eq!(write_hover_mask(&mut st, &[false, false, false]), 0);
+        assert!(render::highlight_has(
+            st.instances[1].highlight,
+            render::HIGHLIGHT_SELECTED
+        ));
+        assert!(st
+            .instances
+            .iter()
+            .all(|i| !render::highlight_has(i.highlight, render::HIGHLIGHT_HOVERED)));
+    }
+
+    #[test]
+    fn a_write_bumps_the_revision_so_the_loop_re_uploads() {
+        // The instance buffer is uploaded on revision change. A hover that changed the bits without
+        // saying so would be a cue that appears on the next unrelated edit, or never.
+        let mut st = scene(2);
+        let before = st.revision;
+        write_hover_mask(&mut st, &[true, false]);
+        assert_ne!(st.revision, before);
+    }
+
+    #[test]
+    fn a_mask_shorter_than_the_instance_list_clears_the_rest() {
+        // The mask is built from `ids` and written to `instances`, and a rebuild between the two
+        // would leave them different lengths. The safe reading is "not hovered", never a panic and
+        // never a stale bit left lit on a row nobody asked about.
+        let mut st = scene(4);
+        write_hover_mask(&mut st, &[true, true, true, true]);
+        assert_eq!(write_hover_mask(&mut st, &[true]), 1);
+        assert!(st
+            .instances
+            .iter()
+            .skip(1)
+            .all(|i| !render::highlight_has(i.highlight, render::HIGHLIGHT_HOVERED)));
+    }
+
+    #[test]
+    fn the_named_rung_and_the_lit_subtree_come_from_one_hierarchy() {
+        // The badge names a rung with `entity_display_name` and this lights it. Reading the name from
+        // one source and the geometry from another is how a cue ends up highlighting an object the
+        // badge is not talking about.
+        let mut e = engine();
+        let rig = assembly(&mut e);
+        let ids = drawn(&rig);
+        let name = entity_display_name(&e, rig.gun);
+        assert!(!name.is_empty());
+        assert_eq!(
+            hover_mask(&e, &ids, &[rig.gun.to_loro_key()])
+                .iter()
+                .filter(|on| **on)
+                .count(),
+            2,
+            "{name} has two drawn parts, and both light",
         );
     }
 }

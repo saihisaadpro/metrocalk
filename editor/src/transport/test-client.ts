@@ -466,6 +466,9 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     // Nothing under the cursor by default — the honest answer for a client with no viewport. A test
     // that drives the aim gesture overrides it with the id it means to be pointing at.
     viewportPeek: vi.fn((): Promise<string | null> => Promise.resolve(null)),
+    // The lit count the real engine answers with. A test that cares asserts on the ARGUMENT — which
+    // subjects the editor asked the stage to light — because the count is the engine's to produce.
+    viewportHover: vi.fn((_ids: string[]): Promise<number> => Promise.resolve(0)),
     dragStart: vi.fn(),
     dragEnd: vi.fn(),
     zoom: vi.fn(),
