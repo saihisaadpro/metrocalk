@@ -13,6 +13,7 @@ import { createSession, isTauri, type EditorClient } from "../transport/session"
 import { projectionStore, useDisplayedEntity, useEntityOrder, useSelectedId } from "../store/projection";
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
+import { cinemaPreviewStore, useCinemaPreview } from "../store/cinemaPreview";
 import { setStatus } from "../store/ui";
 import { Modal, Popover } from "../theme/Popover";
 import { Icon } from "../theme/icons";
@@ -102,12 +103,12 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
     <div
       id="playStageBadge"
       data-testid="playStageBadge"
-      // A DOM overlay ON the stage must not also DRIVE the stage. The viewport's own handlers pick,
-      // orbit and start gizmo drags on pointerdown/click, and this badge is inside it — so without
-      // this, pressing ⏹ Stop also fires a pick at the badge's coordinates. Found while moving the
-      // onboarding card onto the stage; the exposure is the same one and is fixed in both places.
-      onPointerDown={(e) => e.stopPropagation()}
-      onClick={(e) => e.stopPropagation()}
+      // A DOM overlay ON the stage must not also DRIVE the stage — and that is decided ONCE, at the
+      // seam, by `stageInput.ts`'s `onStageSurface`. The two `stopPropagation` handlers that used to
+      // sit here were the superseded per-overlay idiom, kept alive by a comment claiming they were
+      // load-bearing; they were not, and the claim is what made the next author copy them onto a new
+      // badge. Measured both ways: removing them changes no assertion, and defeating `onStageSurface`
+      // turns all three `StageOverlays.test.tsx` cases red — with them present, only one went red.
       style={{
         position: "absolute",
         top: space.lg,
@@ -140,6 +141,71 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
   );
 }
 
+/** The "◉ PREVIEW" badge overlaid ON the stage while the cutscene camera holds the viewport.
+ *
+ *  The same rule `PlayBadge` exists for: a mode that changes what the viewport MEANS has to be
+ *  unmistakable where the user is looking, and the way out has to be one click from there. A held
+ *  preview is easy to miss — the picture is a good picture, it just is not the author's camera, and
+ *  orbiting will not move it. Without this the only control that could release it lives in the
+ *  bottom dock, which the author may have closed. */
+function PreviewBadge({
+  shotIndex,
+  shots,
+  subjectName,
+  blending,
+  onExit,
+}: {
+  shotIndex: number | null;
+  shots: number;
+  subjectName: string;
+  blending: boolean;
+  onExit: () => void;
+}) {
+  return (
+    <div
+      id="cinemaPreviewBadge"
+      data-testid="cinemaPreviewBadge"
+      // NO `stopPropagation` here, deliberately. A DOM overlay on the stage must not also DRIVE the
+      // stage, and `stageInput.ts` decides that once for every overlay from the browser's own hit
+      // test — a per-overlay guard is the superseded idiom whose whole failure mode was five
+      // overlays stopping five different subsets of six events. Proven, not assumed: adding the two
+      // handlers back changes no assertion in `StageOverlays.test.tsx`, and defeating
+      // `onStageSurface` turns it red.
+      style={{
+        position: "absolute",
+        top: space.lg,
+        left: "50%",
+        transform: "translateX(-50%)",
+        zIndex: z.badge,
+        display: "flex",
+        alignItems: "center",
+        gap: space.md,
+        padding: `${space.xs}px ${space.lg}px`,
+        borderRadius: radius.pill,
+        background: color.info.bg,
+        border: `1px solid ${color.info.border}`,
+        color: color.info.text,
+        font: font.mono,
+        fontSize: fontSize.body,
+        boxShadow: elevation.e2,
+      }}
+    >
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <Icon name="camera" size={12} />
+        PREVIEW
+      </span>
+      <span data-testid="cinemaPreviewBadgeShot" style={{ color: color.text.secondary }}>
+        {shotIndex === null
+          ? subjectName
+          : `${blending ? "transition into shot" : "shot"} ${shotIndex + 1} of ${shots} · ${subjectName}`}
+      </span>
+      <Button data-testid="stageExitPreview" variant="secondary" compact onClick={onExit}>
+        Exit
+      </Button>
+    </div>
+  );
+}
+
 function effectiveViewportWidth(): number {
   if (typeof window === "undefined" || typeof document === "undefined") return 1440;
   const cssZoom = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("zoom"));
@@ -150,6 +216,9 @@ export function App() {
   const client = useEditorSession();
   usePlayerDrive(client); // arrows / WASD move the Player role while Play runs
   const native = isTauri(); // inside the packaged .exe the viewport is the real wgpu region (composite)
+  // Read here rather than inside the badge so the badge stays a pure presentation component that a
+  // test can render with any state, including the ones the store cannot reach on its own.
+  const cinemaPreview = useCinemaPreview();
   // The M3.3 right-click context menu, opened for an entity at a cursor position.
   const [ctx, setCtx] = useState<{ id: string; x: number; y: number } | null>(null);
   // M3.3 focus mode — the framed entity + its camera distance (read from `focus_debug`); drives the banner.
@@ -908,6 +977,21 @@ export function App() {
             </Suspense>
           )}
           {playing && <PlayBadge paused={paused} onStop={stopPlay} />}
+          {/* Never both: Play takes the camera itself, and the shell hands a held preview back
+              before it does, so a badge for each would be two claims about one viewport. */}
+          {!playing && cinemaPreview.active && (
+            <PreviewBadge
+              shotIndex={cinemaPreview.shotIndex}
+              shots={cinemaPreview.shots}
+              subjectName={cinemaPreview.subjectName}
+              blending={cinemaPreview.blending}
+              onExit={() => {
+                const target = cinemaPreview.entity;
+                cinemaPreviewStore.getState().reset();
+                if (target) void client.cinemaPreview(target, 0, false);
+              }}
+            />
+          )}
           {/* NOT deferred, and the comment that said it could be was WRONG about its own code. This
               component owns the `subscribeNativeImportLifecycle` effect — the OS-drop listener IS this
               mount, not something beside it — so behind a `lazy` with a `null` fallback the shell is

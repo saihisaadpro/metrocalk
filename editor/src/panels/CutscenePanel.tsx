@@ -14,6 +14,14 @@
 //! that starts a cutscene — pick an object, pick a card — and this is where it is edited against a
 //! clock.
 //!
+//! AND THE PLAYHEAD ANSWERS WITH A PICTURE. `solve_shot` has been pure in `(recipe, subject, t)`
+//! since cutscenes shipped, so the engine could always produce the camera at ANY instant — and the
+//! only way a user could see one was to press Play and watch the cut from its start. Preview poses
+//! the viewport at the playhead through `present_cinematic_moment`, the SAME function Play runs each
+//! tick, so what is composed here is the frame that gets filmed rather than an approximation of it.
+//! Every framing edit re-poses at the same moment, which is what makes this an authoring loop and
+//! not a viewer: change the angle and the viewport is already showing the new angle.
+//!
 //! ONE EDIT IS ONE UNDO. Every control here commits through the same validated command the card
 //! grid does, so a length, a reorder and a re-frame are each one Ctrl-Z. That is also why the two
 //! sliders hold a local draft while they are being dragged and commit once on release: a slider that
@@ -22,6 +30,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useSelectedId, useSummary } from "../store/projection";
 import { usePlaying } from "../store/play";
+import { cinemaPreviewStore, useCinemaPreview } from "../store/cinemaPreview";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
@@ -39,8 +48,8 @@ import {
   TimelineTrackHead,
   timelineTicks,
 } from "../theme/timeline";
-import { color, font, fontSize, space } from "../theme/tokens";
-import type { CinemaReply, FramingCatalog, FramingEdit, ShotRow, ShotSpec } from "../transport/protocol";
+import { color, font, fontSize, radius, space } from "../theme/tokens";
+import type { CinemaPreviewReply, CinemaReply, FramingCatalog, FramingEdit, ShotRow, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 import { ShotCatalogue } from "./ShotCatalogue";
 
@@ -66,6 +75,10 @@ const MOODS = [
  *  back, so the disabled reason and the refusal cannot drift into two different explanations. */
 const EMPTY_PACING = "Pacing scales shot lengths, and this object has no shots yet — add one first.";
 
+/** Why Preview refuses on an object with no cutscene. Same shape as `EMPTY_PACING`, and the same
+ *  reason: a control that is enabled and does nothing is worse than one that says why not. */
+const EMPTY_PREVIEW = "There is nothing to preview — add a shot first.";
+
 /** The floor, in px per second. Below this a shot stops being a bar and becomes a line.
  *
  *  A CUT IS READ WHOLE. The property timeline is scrubbed one keyframe at a time and so is laid out
@@ -86,6 +99,13 @@ const MIN_PX_PER_SECOND = 40;
 function laneWidthFor(seconds: number, available: number): number {
   const fitted = available > 0 ? available : 620;
   return Math.max(fitted, Math.min(12_000, seconds * MIN_PX_PER_SECOND));
+}
+
+/** Three world coordinates, at the precision a person can hold in their head against an
+ *  inspector's Transform row. Centimetres: a shot camera stands metres away, and a fourth decimal
+ *  is noise dressed as precision. */
+function xyz(v: readonly [number, number, number]): string {
+  return v.map((n) => n.toFixed(2)).join(", ");
 }
 
 /** The word a framing value reads as, from the catalogue that also validates it. Falls back to the
@@ -113,6 +133,22 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
   const [draftAmount, setDraftAmount] = useState<number | null>(null);
   const scroller = useRef<HTMLDivElement | null>(null);
   const [laneRoom, setLaneRoom] = useState(0);
+  const previewInfo = useCinemaPreview();
+  // The solved pose, kept locally rather than in the store: the stage badge names the SHOT, and
+  // three coordinates are a reading for the person editing the shot, not for someone glancing at
+  // the viewport. Cleared with the preview so a stale camera cannot outlive the frame it describes.
+  const [pose, setPose] = useState<CinemaPreviewReply | null>(null);
+  // Previewing THIS object. The store is one state for two surfaces (this toggle and the stage
+  // badge), so it can legitimately be holding a different object's cutscene while this panel is
+  // looking at something else — in which case this panel's control is off, which is the truth.
+  const previewing = previewInfo.active && previewInfo.entity === selected;
+  // Read by `run`'s success path, which fires long after the click that started it. A ref rather
+  // than a dependency because re-posing must use where the playhead IS, not where it was when the
+  // edit's callback closed over it.
+  const previewingRef = useRef(false);
+  const playheadRef = useRef(0);
+  previewingRef.current = previewing;
+  playheadRef.current = playhead;
 
   // How much lane the panel actually has, re-read whenever the dock is resized. Without this the
   // strip is a fixed width and the last shots of an ordinary cut sit off the right-hand edge of a
@@ -189,6 +225,54 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
     [rows, playhead],
   );
 
+  /** Stand the viewport camera at `t` on this cutscene's clock. The one place a preview starts or
+   *  moves, so the store, the status line and the refusal cannot be updated by three callers in
+   *  three different ways. */
+  const poseAt = useCallback(
+    async (id: string, t: number) => {
+      const reply = await client.cinemaPreview(id, t, true).catch((e: unknown) => {
+        console.error("cinema_preview failed", e);
+        return null;
+      });
+      if (!reply) return;
+      cinemaPreviewStore.getState().from(reply);
+      setPose(reply.reason ? null : reply);
+      if (reply.reason) {
+        setRefusal(reply.reason);
+        pushToast(reply.reason, "error");
+      }
+      setStatus(reply.message);
+    },
+    [client],
+  );
+
+  /** Hand the viewport back. The store is cleared FIRST and unconditionally: the badge offering the
+   *  only way out must not survive a command that failed to send. */
+  const endPreview = useCallback(
+    async (id: string | null) => {
+      const target = id ?? cinemaPreviewStore.getState().entity;
+      cinemaPreviewStore.getState().reset();
+      setPose(null);
+      if (!target) return;
+      await client.cinemaPreview(target, 0, false).catch((e: unknown) => {
+        console.error("cinema_preview failed", e);
+        return null;
+      });
+    },
+    [client],
+  );
+
+  // Play takes the camera itself, and the shell hands a held preview back before it does — so the
+  // store must stop claiming otherwise, or the stage carries a badge for a preview that has ended.
+  useEffect(() => {
+    if (playing) cinemaPreviewStore.getState().reset();
+  }, [playing]);
+
+  // A preview belongs to the object it was started on. Changing selection — or closing this panel —
+  // ends it, because the alternative is a viewport locked into a shot of something the author is no
+  // longer editing, with the control that would release it now unmounted.
+  useEffect(() => () => void endPreview(null), [selected, endPreview]);
+
   const run = useCallback(
     async (action: () => Promise<CinemaReply>, label: string) => {
       setBusy(true);
@@ -203,6 +287,12 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
           setCut(reply);
           pushToast(`${reply.message} · Ctrl-Z to undo`, "success");
           setStatus(reply.message);
+          // THE LOOP. An edit that does not move the picture is an edit the author has to imagine.
+          // Re-solving at the same moment is what makes changing an angle feel like turning a
+          // camera rather than filling in a form and pressing Play to find out.
+          if (previewingRef.current && reply.entity) {
+            void poseAt(reply.entity, playheadRef.current);
+          }
         }
         setRevision((r) => r + 1);
       } catch (e) {
@@ -214,7 +304,7 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
         setDraftAmount(null);
       }
     },
-    [],
+    [poseAt],
   );
 
   const editFraming = (row: ShotRow, edit: FramingEdit, label: string) => {
@@ -295,6 +385,32 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
             </ToolbarGroup>
           </>
         )}
+        <ToolbarSeparator />
+        <ToolbarGroup aria-label="Shot preview">
+          <Button
+            data-testid="cutscene-preview"
+            variant={previewing ? "primary" : "secondary"}
+            compact
+            aria-pressed={previewing}
+            disabled={locked || rows.length === 0}
+            disabledReason={rows.length === 0 ? EMPTY_PREVIEW : lockReason}
+            title={
+              rows.length === 0
+                ? EMPTY_PREVIEW
+                : locked
+                  ? lockReason
+                  : previewing
+                    ? "Give the viewport back to the editor camera"
+                    : "Stand the viewport camera where the playhead is — the same frame Play films"
+            }
+            onClick={() => {
+              if (previewing) void endPreview(selected);
+              else void poseAt(selected, playhead);
+            }}
+          >
+            <Icon name="camera" size="md" /> Preview
+          </Button>
+        </ToolbarGroup>
       </Toolbar>
 
       {rows.length === 0 ? (
@@ -325,6 +441,10 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
                 (row) => tick >= row.startSeconds && tick < row.startSeconds + row.effectiveSeconds,
               );
               if (under) setActiveId(under.id);
+              // Only while previewing. A ruler click is a reading gesture as often as a camera one,
+              // and taking the viewport from an author who did not ask for it is the surprise this
+              // toggle exists to prevent.
+              if (previewing) void poseAt(selected, tick);
             }}
             data-testid="cutscene-ruler"
           />
@@ -350,6 +470,7 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
                   onClick={() => {
                     setActiveId(row.id);
                     setPlayhead(row.startSeconds);
+                    if (previewing) void poseAt(selected, row.startSeconds);
                   }}
                 />
               ))}
@@ -357,6 +478,57 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
             </TimelineLane>
           </TimelineRow>
         </TimelineSurface>
+      )}
+
+      {/* WHERE THE CAMERA ACTUALLY IS, and only while something is standing there.
+          Progressive disclosure in its plainest form: authoring a shot needs five words, and
+          checking one sometimes needs three coordinates — a lens height that reads wrong, a target
+          that is not on the part, a near plane about to clip. The numbers exist (the solver hands
+          them back with every pose) and until now they crossed the boundary and stopped. They are
+          `font.mono` because they are read digit by digit against an inspector's Transform, and
+          they are not editable: the pose is SOLVED from the five framing words, and a nudgeable eye
+          would be a second, contradictory way to say where the camera goes. */}
+      {previewing && pose && (
+        <div
+          data-testid="cutscene-preview-pose"
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "baseline",
+            gap: `${space.xxs}px ${space.md}px`,
+            padding: `${space.xxs}px ${space.sm}px`,
+            borderRadius: radius.sm,
+            background: color.info.bg,
+            border: `1px solid ${color.info.border}`,
+            fontSize: fontSize.meta,
+            color: color.text.secondary,
+          }}
+        >
+          {/* THE SENTENCE ONLY WHEN IT SAYS SOMETHING NEW. What the playhead is over and what the
+              inspector is editing are different facts, and clicking a clip makes them the same one —
+              so repeating the shot's sentence here printed it twice, forty pixels apart, under a
+              heading that already names the shot. It comes back the moment they diverge, which is
+              exactly when a reader needs to be told the picture is not the shot they are editing.
+              Found by READING the capture; no selector assertion can see a stutter. */}
+          <span style={{ color: color.info.text }}>
+            {pose.blending
+              ? `Transition into shot ${(pose.shotIndex ?? 0) + 1}`
+              : pose.shotIndex === active?.index
+                ? "On screen"
+                : `On screen: ${pose.reads}`}
+          </span>
+          <span title="Where the camera stands, in world units">
+            eye <span style={{ font: font.mono }}>{xyz(pose.eye)}</span>
+          </span>
+          <span aria-hidden style={{ color: color.text.faint }}>{"·"}</span>
+          <span title="The point it is aimed at, in world units">
+            looking at <span style={{ font: font.mono }}>{xyz(pose.lookAt)}</span>
+          </span>
+          <span aria-hidden style={{ color: color.text.faint }}>{"·"}</span>
+          <span title="Vertical field of view">
+            <span style={{ font: font.mono }}>{pose.fovDeg.toFixed(0)}°</span> lens
+          </span>
+        </div>
       )}
 
       {rows.length > 0 && !active && (
@@ -660,7 +832,8 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
           onPick={(kind) => void run(() => client.cinemaAddShot(selected, kind), "Add shot")}
         />
         <p style={{ margin: 0, fontSize: fontSize.meta, color: color.text.muted }}>
-          Press Play to watch it in the viewport — the camera takes over, then hands back.
+          Turn on Preview to stand the viewport camera on the playhead as you edit, or press Play to
+          watch the whole cut — either way the camera hands back when you are done.
         </p>
       </section>
     </div>

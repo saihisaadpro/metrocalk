@@ -2053,6 +2053,43 @@ export interface CinemaReply {
   reason: string | null;
 }
 
+/** What the cutscene timeline's viewport preview answers with — the frame now on the stage.
+ *
+ *  `eye` / `lookAt` / `fovDeg` are on the wire deliberately. They are the only externally checkable
+ *  evidence that the preview posed the camera at a PARTICULAR place rather than at any place, which
+ *  is what turns "the preview is the frame Play films" into an assertion instead of a hope. */
+export interface CinemaPreviewReply {
+  /** Whether the cutscene camera is holding the viewport right now. `false` after a successful exit
+   *  AND after any refusal, so one field answers "who has the camera" in every case. */
+  active: boolean;
+  entity: string | null;
+  /** Where on the cutscene clock this frame is, seconds — clamped into the cut, so what comes back
+   *  is the moment actually filmed rather than the moment asked for. */
+  seconds: number;
+  /** Which shot is on screen, 0-based. `null` when nothing is being previewed. */
+  shotIndex: number | null;
+  /** How many shots the cutscene holds, so a surface that never read the shot list can still say
+   *  "shot 2 of 5" — the stage badge is a long way from the panel that did. */
+  shots: number;
+  /** That shot's sentence. */
+  reads: string;
+  /** The display name of the object the shot FRAMES — not necessarily the cutscene's owner. */
+  subjectName: string;
+  /** How far through the shot this moment is, 0..1. */
+  progress: number;
+  /** True while the frame is a transition between two shots. */
+  blending: boolean;
+  /** Where the camera stands, world units. */
+  eye: [number, number, number];
+  /** The point it is aimed at. */
+  lookAt: [number, number, number];
+  /** Vertical field of view, degrees. */
+  fovDeg: number;
+  message: string;
+  /** Set iff the camera did not move, and says why. */
+  reason: string | null;
+}
+
 export interface ConditionSpec {
   kind: string;
   label: string;

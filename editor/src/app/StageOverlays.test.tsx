@@ -20,6 +20,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { playStore } from "../store/play";
+import { cinemaPreviewStore } from "../store/cinemaPreview";
 import { projectionStore } from "../store/projection";
 import { toastStore } from "../store/toasts";
 import { walletStore } from "../store/wallet";
@@ -58,6 +59,7 @@ beforeEach(() => {
 afterEach(() => {
   projectionStore.getState().reset();
   playStore.getState().reset();
+  cinemaPreviewStore.getState().reset();
   walletStore.getState().reset();
   toastStore.getState().reset();
   window.localStorage.clear();
@@ -87,6 +89,41 @@ describe("controls overlaid on the stage do not also click the stage", () => {
     fireEvent.click(stop);
 
     expect(lastPick()).not.toHaveBeenCalled();
+  });
+
+  it("the PREVIEW badge's Exit does not fire a viewport pick underneath it", () => {
+    render(<App />);
+    act(() =>
+      cinemaPreviewStore.getState().from({
+        active: true,
+        entity: "e1",
+        seconds: 4.2,
+        shotIndex: 1,
+        shots: 4,
+        reads: "a close shot of Weld Gun 7 from three-quarters, holding still",
+        subjectName: "Weld Gun 7",
+        progress: 0.5,
+        blending: false,
+        eye: [3, 2, 6],
+        lookAt: [0, 1, 0],
+        fovDeg: 50,
+        message: "Previewing shot 2 of 4 at 4.2s",
+        reason: null,
+      }),
+    );
+    // A pre-assertion: the badge has to be THERE, or "no pick fired" would be true of an empty stage.
+    expect(screen.getByTestId("cinemaPreviewBadgeShot").textContent).toBe(
+      "shot 2 of 4 · Weld Gun 7",
+    );
+    const exit = screen.getByTestId("stageExitPreview");
+    expect(lastPick()).not.toHaveBeenCalled();
+
+    fireEvent.click(exit);
+
+    // The badge is INSIDE `#viewport`, whose `onClick` picks — the same exposure the two above
+    // document, arriving on a third overlay. Exiting a preview must not also deselect.
+    expect(lastPick()).not.toHaveBeenCalled();
+    expect(cinemaPreviewStore.getState().active).toBe(false);
   });
 
   it("and the guard is not a blanket one: a click on the bare viewport still picks", () => {

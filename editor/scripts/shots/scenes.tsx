@@ -533,6 +533,27 @@ const cutsceneClient = () =>
     cinemaCatalog: () => Promise.resolve(CUTSCENE_CARDS),
     cinemaFramingCatalog: () => Promise.resolve(FRAMING),
     cinemaList: () => Promise.resolve(CUTSCENE),
+    // The pose a shot solver would answer with. A capture cannot show the wgpu frame — the harness
+    // runs on a box with no GPU — so what is photographed here is the AUTHORING surface around it:
+    // the toggle in its pressed state and the read-out naming the moment. The live composite is the
+    // `.exe` run's job, and these two pieces of evidence answer different questions.
+    cinemaPreview: (id: string, seconds: number, active: boolean) =>
+      Promise.resolve({
+        active,
+        entity: active ? id : null,
+        seconds,
+        shotIndex: active ? 1 : null,
+        shots: CUTSCENE.rows.length,
+        reads: CUTSCENE.rows[1].reads,
+        subjectName: CUTSCENE.rows[1].subjectName,
+        progress: 0.25,
+        blending: false,
+        eye: [6.2, 3.1, 9.4] as [number, number, number],
+        lookAt: [0, 1.4, 0] as [number, number, number],
+        fovDeg: 50,
+        message: active ? `Previewing shot 2 of 5 at ${seconds.toFixed(1)}s` : "Preview off",
+        reason: null,
+      }),
   }) as unknown as EditorClient;
 
 const selectAnimatedEntity = () => {
@@ -1110,6 +1131,58 @@ export const SCENES: Scene[] = [
       // Earlier/Later/Remove are one row, not three: an order control that wrapped onto its own line
       // is the toolbar having run out of width.
       same_line: [["[data-testid='cutscene-earlier']", "[data-testid='cutscene-remove']"]],
+    },
+    render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-preview",
+    looking_for:
+      "THE PLAYHEAD ANSWERING WITH A PICTURE. `solve_shot` has been pure in (recipe, subject, t) " +
+      "since cutscenes shipped, so the engine could always produce the camera at any instant — and " +
+      "the only way to see one was to press Play and watch the cut from its start. Here the second " +
+      "clip has been clicked and Preview turned on. Check that the Preview control reads as PRESSED " +
+      "(filled, not outlined — an accent border alone would be a toggle whose state you have to " +
+      "know already), that it sits in its own toolbar group rather than crowding the pacing run, " +
+      "and that the playhead read-out beside it names the same shot the timeline is highlighting: " +
+      "2.5s, shot 2 of 5 — where shot 2 STARTS, not how long it runs. This is the toggle's whole job — the author says WHEN, and the viewport " +
+      "answers with the frame Play would film at that moment",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    // In order: open the second shot, then take the camera. Clicking the toggle first would preview
+    // 0.0s and photograph a caption that disagrees with its own picture.
+    click: ["[data-testid='cutscene-clip']:nth-of-type(2)", "[data-testid='cutscene-preview']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-clip']", 5],
+        ["[data-testid='cutscene-preview']", 1],
+        ["[data-testid='cutscene-shot-editor']", 1],
+        // The pose read-out is the expert half of this control and appears ONLY while a preview is
+        // standing somewhere - a scene that did not assert it would photograph the beginner half.
+        ["[data-testid='cutscene-preview-pose']", 1],
+      ],
+      text_present: [
+        "Preview",
+        "2.5s · shot 2 of 5",
+        "Weld Gun 7",
+        // Three world coordinates, not a promise of them.
+        "6.20, 3.10, 9.40",
+        "0.00, 1.40, 0.00",
+        "50° lens",
+      ],
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      unclipped: [
+        "[data-testid='cutscene-preview']",
+        "[data-testid='cutscene-preview-pose']",
+        "[data-testid='cutscene-panel'] > .mtk-toolbar .mtk-btn",
+      ],
+      // The read-out sits between the lane it describes and the inspector for the selected shot.
+      stacked: [
+        ["[data-testid='cutscene-timeline']", "[data-testid='cutscene-preview-pose']"],
+        ["[data-testid='cutscene-preview-pose']", "[data-testid='cutscene-shot-editor']"],
+      ],
+      // The control that takes the viewport is on the same row as the pacing it sits beside; a
+      // Preview button that wrapped onto its own line is the toolbar having run out of width.
+      same_line: [["[data-testid='cutscene-mood-calm']", "[data-testid='cutscene-preview']"]],
     },
     render: () => <CutscenePanel client={cutsceneClient()} />,
   },

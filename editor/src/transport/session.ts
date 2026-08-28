@@ -44,6 +44,7 @@ import type {
   RuleSummary,
   ConditionSpec,
   ShotSpec,
+  CinemaPreviewReply,
   CinemaReply,
   FramingCatalog,
   FramingEdit,
@@ -318,6 +319,9 @@ export interface EditorClient {
   cinemaMoveShot(id: string, from: number, to: number): Promise<CinemaReply>;
   /** Re-frame one shot in place — size, angle, move, strength (one undoable commit). */
   cinemaSetShotFraming(id: string, index: number, edit: FramingEdit): Promise<CinemaReply>;
+  /** Pose the viewport camera at one moment of a cutscene, or (`active: false`) hand it back.
+   *  A render projection, never a document edit — moving a playhead is not something to undo. */
+  cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply>;
   /** Every "only if" card the Behaviour block can offer. */
   conditionCatalog(): Promise<ConditionSpec[]>;
   /** Add one clause to an object (one undoable commit). */
@@ -978,6 +982,9 @@ export class TauriClient implements EditorClient {
   }
   cinemaSetShotFraming(id: string, index: number, edit: FramingEdit): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_set_shot_framing", { id, index, edit }).catch((e: unknown) => { console.error("cinema_set_shot_framing failed", e); throw e; });
+  }
+  cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply> {
+    return this.core.invoke<CinemaPreviewReply>("cinema_preview", { id, seconds, active }).catch((e: unknown) => { console.error("cinema_preview failed", e); throw e; });
   }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return this.core.invoke<ConditionSpec[]>("condition_catalog").catch((e: unknown) => { console.error("condition_catalog failed", e); throw e; });
@@ -2841,6 +2848,12 @@ class MockClient implements EditorClient {
   }
   cinemaSetShotFraming(): Promise<CinemaReply> {
     return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  /** Refused rather than faked. A preview's whole content is a camera pose solved against real mesh
+   *  bounds in the native scene; a browser-shell stub could only invent three numbers, and a picture
+   *  of a shot nothing filmed is worse than the refusal that says where to get one. */
+  cinemaPreview(): Promise<CinemaPreviewReply> {
+    return Promise.resolve({ active: false, entity: null, seconds: 0, shotIndex: null, shots: 0, reads: "", subjectName: "", progress: 0, blending: false, eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 50, message: "", reason: "Shot preview is available in the packaged desktop editor." });
   }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return Promise.resolve([]);

@@ -312,6 +312,46 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     cinemaSetShotSeconds: vi.fn((id: string, index: number, seconds: number) => Promise.resolve({ entity: id, shots: 1, seconds, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, seconds, effectiveSeconds: seconds }], problems: [], message: `Shot ${index + 1} now runs ${seconds.toFixed(1)}s`, reason: null })),
     cinemaMoveShot: vi.fn((id: string, _from: number, to: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Shot moved to position ${to + 1}`, reason: null })),
     cinemaSetShotFraming: vi.fn((id: string, index: number, edit: FramingEdit) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, size: (edit.size as ShotRow["size"]) ?? HERO_ROW.size, angle: (edit.angle as ShotRow["angle"]) ?? HERO_ROW.angle, motion: (edit.motion as ShotRow["motion"]) ?? HERO_ROW.motion, amount: edit.amount ?? HERO_ROW.amount }], problems: [], message: `Shot ${index + 1} is now re-framed`, reason: null })),
+    // A pose that MOVES WITH THE CLOCK. A stub returning one fixed camera would let a panel that
+    // ignored `seconds` entirely pass every assertion about previewing, which is the one thing these
+    // tests exist to catch; the push-in here is the same shape `push_in` solves for, at fixture scale.
+    cinemaPreview: vi.fn((id: string, seconds: number, active: boolean) =>
+      Promise.resolve(
+        active
+          ? {
+              active: true,
+              entity: id,
+              seconds,
+              shotIndex: 0,
+              shots: 1,
+              reads: HERO_ROW.reads,
+              subjectName: HERO_ROW.subjectName,
+              progress: Math.min(1, seconds / HERO_ROW.effectiveSeconds),
+              blending: false,
+              eye: [3, 2, 8 - seconds] as [number, number, number],
+              lookAt: [0, 1, 0] as [number, number, number],
+              fovDeg: 50,
+              message: `Previewing shot 1 of 1 at ${seconds.toFixed(1)}s`,
+              reason: null,
+            }
+          : {
+              active: false,
+              entity: null,
+              seconds: 0,
+              shotIndex: null,
+              shots: 0,
+              reads: "",
+              subjectName: "",
+              progress: 0,
+              blending: false,
+              eye: [0, 0, 0] as [number, number, number],
+              lookAt: [0, 0, 0] as [number, number, number],
+              fovDeg: 50,
+              message: "Preview off \u2014 the editor camera is back.",
+              reason: null,
+            },
+      ),
+    ),
     conditionCatalog: vi.fn(() => Promise.resolve([
       { kind: "score_at_least", label: "The Score is at least…", blurb: "gate this behind points the player has already earned", needs: "number", reads: "the Score is at least {n}" },
       { kind: "still_active", label: "It hasn't been used yet", blurb: "this object has not been collected or beaten", needs: "none", reads: "it hasn't been used yet" },

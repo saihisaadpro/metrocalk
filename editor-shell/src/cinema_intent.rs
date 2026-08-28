@@ -992,6 +992,87 @@ pub fn reply_with_names(
     }
 }
 
+/// What the cutscene timeline's viewport preview answers with: the frame that is now on the stage.
+///
+/// WHY THE POSE IS ON THE WIRE. `eye`/`look_at`/`fov_deg` are not decoration and not a debug read —
+/// they are the only externally checkable evidence that the preview moved the camera to a *particular*
+/// place rather than to any place. A screenshot proves something is drawn; these three numbers are
+/// what a test can assert against the same solver Play runs, which is what makes "the preview is the
+/// frame Play films" a claim rather than a hope.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CinemaPreviewReply {
+    /// Whether the cutscene camera is holding the viewport right now. `false` after a successful
+    /// exit AND after any refusal, so one field answers "who has the camera" in every case.
+    pub active: bool,
+    /// The object whose cutscene is on screen.
+    pub entity: Option<String>,
+    /// Where on the cutscene clock this frame is, seconds — clamped into the cut, so the number the
+    /// panel echoes back is the number that was actually filmed rather than the one asked for.
+    pub seconds: f32,
+    /// Which shot is on screen, 0-based. `None` when nothing is being previewed.
+    pub shot_index: Option<usize>,
+    /// How many shots the cutscene holds, so "shot 2 of 5" can be said by a surface that never read
+    /// the shot list — the stage badge is 700px from the panel that did.
+    pub shots: usize,
+    /// That shot's sentence, from the same producer the timeline's clips are labelled by.
+    pub reads: String,
+    /// The display name of the object the shot FRAMES — not necessarily the cutscene's owner.
+    pub subject_name: String,
+    /// How far through the shot this moment is, 0..1.
+    pub progress: f32,
+    /// True while this frame is a transition between two shots, so the read-out can say so instead of
+    /// naming one shot and drawing the other.
+    pub blending: bool,
+    /// Where the camera stands, world units.
+    pub eye: [f32; 3],
+    /// The point it is aimed at.
+    pub look_at: [f32; 3],
+    /// Vertical field of view, degrees.
+    pub fov_deg: f32,
+    /// Friendly summary.
+    pub message: String,
+    /// Set iff the camera did not move, and says why.
+    pub reason: Option<String>,
+}
+
+impl CinemaPreviewReply {
+    /// A refusal that moved nothing, explained. `active: false` is part of the contract: a refusal
+    /// must never leave a control believing the viewport is held.
+    #[must_use]
+    pub fn refusal(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            message: reason.clone(),
+            reason: Some(reason),
+            ..Self::default()
+        }
+    }
+}
+
+/// The last instant of a cutscene that is still INSIDE one of its shots.
+///
+/// [`Cutscene::playback_at`] is a half-open lookup — `t < end` — so the total running time is the
+/// first moment that belongs to no shot, and asking for it answers `None`. Play never notices,
+/// because that is exactly how it learns the cut is over. A scrubbed playhead does: dragging it to
+/// the right-hand end of the lane is the most ordinary gesture there is, and it would have gone dark.
+/// One epsilon, defined once, so the panel and the shell cannot disagree about where the end is.
+#[must_use]
+pub fn preview_time(cut: &Cutscene, seconds: f32) -> f32 {
+    let total = cut.seconds();
+    if !total.is_finite() || total <= 0.0 {
+        return 0.0;
+    }
+    // A millisecond is finer than any frame the engine draws and coarser than f32 noise at the
+    // durations a cut can hold (12 shots x 20 s x 2.5 = 600 s, where an ulp is ~6e-5).
+    let last = (total - 1.0e-3).max(0.0);
+    if seconds.is_finite() {
+        seconds.clamp(0.0, last)
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1093,102 @@ mod tests {
             .commit("spawn", vec![Op::CreateEntity { id, parent: None }])
             .expect("spawns");
         id
+    }
+
+    /// Exact float equality, stated as BITS.
+    ///
+    /// `clippy::float_cmp` is right about what it usually catches — a value accumulated through
+    /// arithmetic compared with `==` — and wrong about this: `preview_time` RETURNS these constants
+    /// on the branches under test, it does not compute toward them. An epsilon would accept a clamp
+    /// that missed the end of the cut by a hair, which is the whole failure the tests exist for.
+    /// Bits rather than `==` also refuses `-0.0`, which `==` would wave through.
+    fn exactly(actual: f32, expected: f32) -> bool {
+        actual.to_bits() == expected.to_bits()
+    }
+
+    /// A cutscene of three hero shots, authored through the same command the panel uses.
+    fn three_shot_cut(engine: &mut Engine<FlecsWorld>, owner: EntityId) -> Cutscene {
+        for _ in 0..3 {
+            let (ops, _) = add_shot_ops(engine, owner, "hero", owner).expect("shot");
+            engine.commit("cinema-shot", ops).expect("commits");
+        }
+        cutscene_of(engine, owner)
+    }
+
+    #[test]
+    fn a_playhead_dragged_to_the_very_end_still_lands_inside_a_shot() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        let cut = three_shot_cut(&mut engine, owner);
+        let total = cut.seconds();
+        assert!(total > 0.0);
+
+        // The failure this exists to stop: `playback_at` is half-open, so the total running time is
+        // the first instant belonging to NO shot. Play never notices because that is exactly how it
+        // learns the cut is over; a playhead dragged to the right-hand end of the lane would have
+        // gone dark on the most ordinary gesture the timeline has.
+        assert!(
+            cut.playback_at(total).is_none(),
+            "the premise: the end of the cut is past the last shot"
+        );
+        let at = preview_time(&cut, total);
+        assert!(at < total, "clamped inside: {at} vs {total}");
+        let playback = cut
+            .playback_at(at)
+            .expect("the clamped moment is inside a shot");
+        assert_eq!(
+            playback.index,
+            cut.shots.len() - 1,
+            "and it is inside the LAST shot, not wherever rounding landed"
+        );
+
+        // Far past the end clamps to the same instant — one end, not a scale of them.
+        assert!(exactly(preview_time(&cut, total + 500.0), at));
+    }
+
+    #[test]
+    fn preview_time_refuses_to_produce_a_moment_that_is_not_on_the_clock() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        let cut = three_shot_cut(&mut engine, owner);
+
+        assert!(
+            exactly(preview_time(&cut, -4.0), 0.0),
+            "before the start is the start"
+        );
+        assert!(
+            exactly(preview_time(&cut, f32::NAN), 0.0),
+            "NaN is not a moment"
+        );
+        assert!(
+            exactly(preview_time(&cut, f32::NEG_INFINITY), 0.0),
+            "nor is negative infinity"
+        );
+        assert!(
+            preview_time(&cut, f32::INFINITY) < cut.seconds(),
+            "nor is infinity"
+        );
+        // A moment genuinely inside the cut is handed back UNCHANGED: a clamp that quietly rounded
+        // every request would make the panel's read-out disagree with the frame on the stage.
+        let inside = cut.seconds() * 0.5;
+        assert!((preview_time(&cut, inside) - inside).abs() < 1.0e-6);
+
+        // An empty cutscene has no moments at all, and answers with the only number it can.
+        assert!(exactly(preview_time(&Cutscene::default(), 3.0), 0.0));
+    }
+
+    #[test]
+    fn a_refused_preview_never_claims_the_viewport() {
+        // `active` is the field every surface keys off. A refusal that left it true would leave a
+        // stage badge offering an exit from a preview that never started.
+        let refusal = CinemaPreviewReply::refusal("Play is driving the camera");
+        assert!(!refusal.active);
+        assert_eq!(refusal.shot_index, None);
+        assert_eq!(
+            refusal.reason.as_deref(),
+            Some("Play is driving the camera")
+        );
+        assert_eq!(refusal.message, "Play is driving the camera");
     }
 
     #[test]

@@ -2881,6 +2881,18 @@ enum EngineCmd {
         id: String,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
     },
+    /// Cinematics - pose the viewport camera at one moment of a cutscene, or hand it back.
+    ///
+    /// Changes NOTHING in the document: this is the render projection ADR-021 already sanctions, and
+    /// it is deliberately not an undoable commit because moving a preview playhead is not an edit.
+    CinemaPreview {
+        id: String,
+        /// Where on the cutscene clock to stand, seconds. Clamped into the cut.
+        seconds: f32,
+        /// `false` gives the editor its camera back.
+        active: bool,
+        reply: Sender<metrocalk_editor_shell::CinemaPreviewReply>,
+    },
     /// Conditionals - add one "only if" clause to an object (one undoable commit).
     ConditionAdd {
         id: String,
@@ -8325,6 +8337,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // worse than that: the answer could change between two frames of one continuous move and the camera
     // would visibly jump mid-shot — an obscured shot traded for a broken one. One slot is enough because
     // `cinema_owner` guarantees exactly one cutscene holds the camera at a time.
+    // The cutscene timeline's viewport preview: the editor holding the CUTSCENE camera at a chosen
+    // moment, with Play stopped. `None` means the author has the viewport.
+    let mut cinema_preview: Option<CinemaPreviewState> = None;
     let mut cinema_shot_plans: Option<(
         EntityId,
         HashMap<usize, metrocalk_animation::shot::ShotAdjustment>,
@@ -9946,7 +9961,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     ));
                     continue;
                 }
-                match metrocalk_editor_shell::set_shot_seconds_ops(&engine, entity, index, seconds) {
+                match metrocalk_editor_shell::set_shot_seconds_ops(&engine, entity, index, seconds)
+                {
                     Ok((ops, cut)) => {
                         if let Err(error) = engine.commit("cinema-seconds", ops) {
                             let _ = reply.send(CinemaReply::refusal(format!(
@@ -10109,6 +10125,144 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     })
                     .unwrap_or_default();
                 let _ = reply.send(info);
+            }
+            EngineCmd::CinemaPreview {
+                id,
+                seconds,
+                active,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaPreviewReply;
+                // Leaving is unconditional and always succeeds. It has to be: the ONE way out of a
+                // held camera cannot itself be refusable, or a preview that started before some
+                // other refusal condition arose would strand the viewport.
+                if !active {
+                    let released = end_cinema_preview(&shared, &mut cinema_preview);
+                    let _ = reply.send(CinemaPreviewReply {
+                        message: if released {
+                            "Preview off — the editor camera is back.".into()
+                        } else {
+                            "Preview was already off.".into()
+                        },
+                        ..CinemaPreviewReply::default()
+                    });
+                    continue;
+                }
+                if play_mode {
+                    let _ = reply.send(CinemaPreviewReply::refusal(
+                        "Play is driving the camera — stop Play to preview a shot.",
+                    ));
+                    continue;
+                }
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    end_cinema_preview(&shared, &mut cinema_preview);
+                    let _ = reply.send(CinemaPreviewReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
+                if cut.shots.is_empty() {
+                    end_cinema_preview(&shared, &mut cinema_preview);
+                    let _ = reply.send(CinemaPreviewReply::refusal(
+                        "There is nothing to preview — this object has no shots yet.",
+                    ));
+                    continue;
+                }
+                let at = metrocalk_editor_shell::preview_time(&cut, seconds);
+                let Some(playback) = cut.playback_at(at) else {
+                    // Unreachable while `preview_time` holds `at` inside the cut, which is exactly
+                    // why it is a refusal with a sentence rather than an `expect`: the two live in
+                    // different crates and only this line notices if they ever stop agreeing.
+                    end_cinema_preview(&shared, &mut cinema_preview);
+                    let _ = reply.send(CinemaPreviewReply::refusal(
+                        "that moment is past the end of the cutscene",
+                    ));
+                    continue;
+                };
+                // Take the camera if this is a new preview, and re-plan if the cutscene changed
+                // under one already running. A placement is negotiated against the scene per shot;
+                // holding a plan across an edit would preview the shot as it used to be framed.
+                let preview = match &mut cinema_preview {
+                    Some(state) if state.owner == entity => {
+                        if state.cut != cut {
+                            state.cut = cut.clone();
+                            state.plans.clear();
+                        }
+                        state
+                    }
+                    slot => {
+                        // A different object: hand the first one's camera back before taking a
+                        // second, so the saved view stays the AUTHOR's view rather than a shot.
+                        end_cinema_preview(&shared, slot);
+                        let (saved_cam, dimmed) = {
+                            let mut st = shared.lock().unwrap();
+                            let saved_cam = st.cam_override;
+                            // The viewport stops being a workspace: editor helpers and the selection
+                            // outline are exactly what a shot must not contain.
+                            st.cinematic = true;
+                            st.revision = st.revision.wrapping_add(1);
+                            let dimmed = st
+                                .instances
+                                .iter()
+                                .position(|i| i.selected > 0.5)
+                                .and_then(|i| {
+                                    let was = st.instances[i].selected;
+                                    st.instances[i].selected = 0.0;
+                                    st.ids.get(i).map(|k| (k.clone(), was))
+                                });
+                            (saved_cam, dimmed)
+                        };
+                        *slot = Some(CinemaPreviewState {
+                            owner: entity,
+                            cut: cut.clone(),
+                            saved_cam,
+                            dimmed,
+                            plans: HashMap::new(),
+                        });
+                        slot.as_mut().expect("just assigned")
+                    }
+                };
+                let cam = present_cinematic_moment(
+                    &engine,
+                    &shared,
+                    entity,
+                    &id,
+                    &preview.cut,
+                    playback,
+                    &mut preview.plans,
+                );
+                let name = entity_display_name(&engine, entity);
+                let listing = metrocalk_editor_shell::cinema_reply_named(
+                    entity,
+                    &cut,
+                    &name,
+                    String::new(),
+                    &|key| shot_subject_name(&engine, key),
+                );
+                let row = listing.rows.get(playback.index);
+                let _ = reply.send(CinemaPreviewReply {
+                    active: true,
+                    entity: Some(id),
+                    seconds: at,
+                    shot_index: Some(playback.index),
+                    shots: cut.shots.len(),
+                    reads: row.map(|r| r.reads.clone()).unwrap_or_default(),
+                    subject_name: row.map(|r| r.subject_name.clone()).unwrap_or_default(),
+                    progress: playback.progress,
+                    blending: playback.blend_from.is_some(),
+                    eye: cam.pos,
+                    look_at: cam.look_at.unwrap_or(cam.pos),
+                    fov_deg: cam.fov_deg,
+                    message: format!(
+                        "Previewing shot {} of {} at {at:.1}s",
+                        playback.index + 1,
+                        cut.shots.len()
+                    ),
+                    reason: None,
+                });
             }
             EngineCmd::ConditionAdd { id, request, reply } => {
                 use metrocalk_editor_shell::RoleReply;
@@ -14762,6 +14916,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     // pre-Play editor view so Stop restores it; if no camera is active, keep the current
                     // view (fly-cam or a manual look-through). Render-only — never touches the doc.
                     let active = capscene::active_camera(&engine);
+                    // Hand back a held preview FIRST. `pre_play_cam` is what Stop restores, and a
+                    // preview pose captured there would end Play by putting the author back inside
+                    // a shot they were only looking at.
+                    end_cinema_preview(&shared, &mut cinema_preview);
                     {
                         let mut st = shared.lock().unwrap();
                         pre_play_cam = st.cam_override;
@@ -15448,9 +15606,6 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // the render projection ADR-021 already sanctions. On the falling edge — or when the
                 // shot list runs out — we hand the camera back exactly as we found it.
                 if play_mode && !play_cinematics.is_empty() {
-                    use metrocalk_animation::shot::{
-                        cinematic_clip_planes, solve_shot_adjusted, ShotAdjustment,
-                    };
                     for (entity, key, cut, started, played) in &mut play_cinematics {
                         let wants = rule_session.as_ref().is_some_and(|s| {
                             matches!(
@@ -15548,121 +15703,25 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             restore_editor_chrome(&mut st, &mut cinema_dimmed);
                             continue;
                         };
-                        let shot = &cut.shots[playback.index];
-                        // Sample both sides of an intra-cutscene transition LIVE. A previous shot may
-                        // film a different subject, so reusing the current bounds would make the blend
-                        // aim between a correct pose and a pose solved around the wrong object.
-                        let (sample, previous_sample, aspect, plan, previous_plan) = {
-                            let mut st = shared.lock().unwrap();
-                            // The subject sampler reads per-instance mesh bounds; make sure it reads
-                            // them from the memo rather than re-walking every vertex of every part in
-                            // the subject's subtree, once per tick, at 60 Hz.
-                            st.sync_mesh_bounds();
-                            let sample =
-                                cinematic_shot_subject_sample(&engine, &mut st, *entity, shot);
-                            let previous_sample = playback.blend_from.map(|(previous, _)| {
-                                cinematic_shot_subject_sample(
-                                    &engine,
-                                    &mut st,
-                                    *entity,
-                                    &cut.shots[previous],
-                                )
-                            });
-                            let aspect = if st.surface_aspect.is_finite() && st.surface_aspect > 0.1
-                            {
-                                st.surface_aspect
-                            } else {
-                                16.0 / 9.0
-                            };
-                            // Negotiate this shot's placement against the rest of the scene, ONCE,
-                            // the first tick it is live. Every later tick reads the answer back out.
-                            let plans = match &mut cinema_shot_plans {
-                                Some((owner, plans)) if owner == entity => plans,
-                                slot => {
-                                    *slot = Some((*entity, HashMap::new()));
-                                    &mut slot.as_mut().expect("just assigned").1
-                                }
-                            };
-                            let plan = *plans.entry(playback.index).or_insert_with(|| {
-                                plan_cinematic_shot(&engine, &mut st, *entity, shot, sample, aspect)
-                            });
-                            // The shot being blended FROM was live a moment ago, so its placement is
-                            // already decided; falling back to the authored one would make a blend
-                            // start from a pose the planner had rejected.
-                            let previous_plan = playback.blend_from.map(|(previous, _)| {
-                                plans.get(&previous).copied().unwrap_or_else(|| {
-                                    ShotAdjustment::authored(&cut.shots[previous])
-                                })
-                            });
-                            (sample, previous_sample, aspect, plan, previous_plan)
+                        // ONE SOLVER, TWO CALLERS — see `present_cinematic_moment`. The cutscene
+                        // timeline's preview runs the same function at the playhead, so the frame an
+                        // author composes before pressing Play is the frame Play films.
+                        let plans = match &mut cinema_shot_plans {
+                            Some((owner, plans)) if owner == entity => plans,
+                            slot => {
+                                *slot = Some((*entity, HashMap::new()));
+                                &mut slot.as_mut().expect("just assigned").1
+                            }
                         };
-                        let current_pose = solve_shot_adjusted(
-                            shot,
-                            plan,
-                            sample,
-                            playback.progress,
-                            aspect,
-                            50.0,
+                        present_cinematic_moment(
+                            &engine,
+                            &shared,
+                            *entity,
+                            key.as_str(),
+                            cut,
+                            playback,
+                            plans,
                         );
-                        let previous_pose = playback.blend_from.zip(previous_sample).map(
-                            |((previous, _), previous_sample)| {
-                                solve_shot_adjusted(
-                                    &cut.shots[previous],
-                                    previous_plan.unwrap_or_else(|| {
-                                        ShotAdjustment::authored(&cut.shots[previous])
-                                    }),
-                                    previous_sample,
-                                    1.0,
-                                    aspect,
-                                    50.0,
-                                )
-                            },
-                        );
-                        // Both endpoints already stand on or above `CAMERA_FLOOR` (`solve_shot_adjusted`
-                        // applies it), and a blend is a linear mix of two poses, so the blended eye
-                        // cannot be lower than the lower of them. The floor moved into the solve because
-                        // the shot PLANNER has to judge the pose that is actually filmed: clamping after
-                        // the fact meant a low-angle candidate was validated at a position under the
-                        // floor and then filmed from somewhere else.
-                        let pose = playback.blend_camera(previous_pose, current_pose);
-                        let planes_for = |subject: metrocalk_animation::shot::SubjectSample| {
-                            let camera_distance = pose
-                                .eye
-                                .iter()
-                                .zip(subject.center)
-                                .map(|(eye, center)| (eye - center).powi(2))
-                                .sum::<f32>()
-                                .sqrt();
-                            cinematic_clip_planes(subject.radius(), camera_distance)
-                        };
-                        let (mut near, mut far) = planes_for(sample);
-                        if let Some(previous_sample) = previous_sample {
-                            let (previous_near, previous_far) = planes_for(previous_sample);
-                            near = near.min(previous_near);
-                            far = far.max(previous_far);
-                        }
-                        let mut st = shared.lock().unwrap();
-                        // Let the shot see the room it is standing in. The planes above are fitted to
-                        // the subject, which clips a presentation hall out of every close shot and
-                        // slices a wall across every wide one; see `Hall::far_reach_from`. A scene with
-                        // no room keeps exactly the number it had.
-                        if let Some(hall) = st.hall {
-                            far = far.max(hall.far_reach_from(pose.eye));
-                        }
-                        st.cinematic_subject_id = Some(key.clone());
-                        st.cinematic_shot_index = Some(playback.index);
-                        st.cam_override = Some(render::CamView {
-                            pos: pose.eye,
-                            look_at: Some(pose.look_at),
-                            fov_deg: pose.fov_deg,
-                            near,
-                            far,
-                        });
-                        // NOT a revision bump. `revision` means "the scene changed": it re-partitions
-                        // every instance, re-uploads every buffer and RECREATES every submesh and LOD
-                        // bind group - a per-frame cost the render loop explicitly documents as never
-                        // happening per frame. `cam_override` is read outside that gate, so a camera
-                        // move needs nothing here at all.
                     }
                 }
                 // ── VFX: resolve every live effect into the render projection ───────────────────
@@ -21987,6 +22046,133 @@ fn cinematic_shot_subject(
 ///
 /// Called ONCE per shot. The occlusion structure it needs is built on first use and then reused for the
 /// whole film, so the cost lands on one tick near the start of a cutscene rather than on all of them.
+/// Pose the viewport camera for ONE moment of ONE cutscene, and hand that pose back.
+///
+/// ONE SOLVER, TWO CALLERS. This is the entire camera solve: subject sampling on both sides of a
+/// transition, the once-per-shot placement negotiation, the eased pose, the blend, and clip planes
+/// fitted to the subject and then widened for the room it is standing in. Play calls it every tick
+/// from the replay-stamped frame counter; the cutscene timeline's preview calls it at the playhead.
+/// It is one function because a preview that solved the frame a second way would be a picture of a
+/// shot the engine does not film — the one thing a preview must never be.
+///
+/// `plans` is the caller's per-shot placement cache. A shot's placement is negotiated against the
+/// scene ONCE and then held for the shot's whole length: re-planning per tick is the same query
+/// answered sixty times a second, and worse, its answer can change between two frames of one
+/// continuous move, which the camera would show as a jump.
+///
+/// Writes `cam_override` and the two diagnostic identity fields, and deliberately does NOT bump
+/// `revision`: `revision` means "the scene changed", and re-partitioning every instance for a camera
+/// move is a per-frame cost the render loop documents as never happening.
+fn present_cinematic_moment(
+    engine: &Engine<FlecsWorld>,
+    shared: &render::Shared,
+    entity: EntityId,
+    key: &str,
+    cut: &metrocalk_animation::shot::Cutscene,
+    playback: metrocalk_animation::shot::ShotPlayback,
+    plans: &mut HashMap<usize, metrocalk_animation::shot::ShotAdjustment>,
+) -> render::CamView {
+    use metrocalk_animation::shot::{cinematic_clip_planes, solve_shot_adjusted, ShotAdjustment};
+
+    let shot = &cut.shots[playback.index];
+    // Sample both sides of an intra-cutscene transition LIVE. A previous shot may
+    // film a different subject, so reusing the current bounds would make the blend
+    // aim between a correct pose and a pose solved around the wrong object.
+    let (sample, previous_sample, aspect, plan, previous_plan) = {
+        let mut st = shared.lock().unwrap();
+        // The subject sampler reads per-instance mesh bounds; make sure it reads
+        // them from the memo rather than re-walking every vertex of every part in
+        // the subject's subtree, once per tick, at 60 Hz.
+        st.sync_mesh_bounds();
+        let sample = cinematic_shot_subject_sample(engine, &mut st, entity, shot);
+        let previous_sample = playback.blend_from.map(|(previous, _)| {
+            cinematic_shot_subject_sample(engine, &mut st, entity, &cut.shots[previous])
+        });
+        let aspect = if st.surface_aspect.is_finite() && st.surface_aspect > 0.1 {
+            st.surface_aspect
+        } else {
+            16.0 / 9.0
+        };
+        // Negotiate this shot's placement against the rest of the scene, ONCE,
+        // the first tick it is live. Every later tick reads the answer back out.
+        let plan = *plans
+            .entry(playback.index)
+            .or_insert_with(|| plan_cinematic_shot(engine, &mut st, entity, shot, sample, aspect));
+        // The shot being blended FROM was live a moment ago, so its placement is
+        // already decided; falling back to the authored one would make a blend
+        // start from a pose the planner had rejected.
+        let previous_plan = playback.blend_from.map(|(previous, _)| {
+            plans
+                .get(&previous)
+                .copied()
+                .unwrap_or_else(|| ShotAdjustment::authored(&cut.shots[previous]))
+        });
+        (sample, previous_sample, aspect, plan, previous_plan)
+    };
+    let current_pose = solve_shot_adjusted(shot, plan, sample, playback.progress, aspect, 50.0);
+    let previous_pose =
+        playback
+            .blend_from
+            .zip(previous_sample)
+            .map(|((previous, _), previous_sample)| {
+                solve_shot_adjusted(
+                    &cut.shots[previous],
+                    previous_plan.unwrap_or_else(|| ShotAdjustment::authored(&cut.shots[previous])),
+                    previous_sample,
+                    1.0,
+                    aspect,
+                    50.0,
+                )
+            });
+    // Both endpoints already stand on or above `CAMERA_FLOOR` (`solve_shot_adjusted`
+    // applies it), and a blend is a linear mix of two poses, so the blended eye
+    // cannot be lower than the lower of them. The floor moved into the solve because
+    // the shot PLANNER has to judge the pose that is actually filmed: clamping after
+    // the fact meant a low-angle candidate was validated at a position under the
+    // floor and then filmed from somewhere else.
+    let pose = playback.blend_camera(previous_pose, current_pose);
+    let planes_for = |subject: metrocalk_animation::shot::SubjectSample| {
+        let camera_distance = pose
+            .eye
+            .iter()
+            .zip(subject.center)
+            .map(|(eye, center)| (eye - center).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        cinematic_clip_planes(subject.radius(), camera_distance)
+    };
+    let (mut near, mut far) = planes_for(sample);
+    if let Some(previous_sample) = previous_sample {
+        let (previous_near, previous_far) = planes_for(previous_sample);
+        near = near.min(previous_near);
+        far = far.max(previous_far);
+    }
+    let mut st = shared.lock().unwrap();
+    // Let the shot see the room it is standing in. The planes above are fitted to
+    // the subject, which clips a presentation hall out of every close shot and
+    // slices a wall across every wide one; see `Hall::far_reach_from`. A scene with
+    // no room keeps exactly the number it had.
+    if let Some(hall) = st.hall {
+        far = far.max(hall.far_reach_from(pose.eye));
+    }
+    let cam = render::CamView {
+        pos: pose.eye,
+        look_at: Some(pose.look_at),
+        fov_deg: pose.fov_deg,
+        near,
+        far,
+    };
+    st.cinematic_subject_id = Some(key.to_string());
+    st.cinematic_shot_index = Some(playback.index);
+    // NOT a revision bump. `revision` means "the scene changed": it re-partitions
+    // every instance, re-uploads every buffer and RECREATES every submesh and LOD
+    // bind group - a per-frame cost the render loop explicitly documents as never
+    // happening per frame. `cam_override` is read outside that gate, so a camera
+    // move needs nothing here at all.
+    st.cam_override = Some(cam);
+    cam
+}
+
 fn plan_cinematic_shot(
     engine: &Engine<FlecsWorld>,
     state: &mut render::SceneState,
@@ -22106,6 +22292,37 @@ fn cinematic_shot_subject_sample(
 /// Hand the viewport back to the author: the selection outline returns and the gizmo/binding-line
 /// suppression lifts. Idempotent, because a cutscene can end down several paths (its shots run out, a
 /// rule turns it off, or the user presses Stop) and every one of them must leave the same editor.
+/// The editor holding a cutscene's camera at one chosen moment, with Play stopped.
+///
+/// Everything here exists so the preview can be UNDONE without an undo: the author's own view, the
+/// selection outline the shot suppressed, and the per-shot placements — which are cached for the
+/// same reason Play caches them, and cleared when the cutscene under them is edited.
+struct CinemaPreviewState {
+    /// The object whose cutscene is on screen.
+    owner: EntityId,
+    /// The cutscene as it was when these placements were negotiated. Compared, not trusted: an edit
+    /// while previewing must re-plan, or the preview shows the shot as it USED to be framed.
+    cut: metrocalk_animation::shot::Cutscene,
+    /// The author's camera, restored on the way out.
+    saved_cam: Option<render::CamView>,
+    /// The selection outline suppressed for the shot, and the value to put back.
+    dimmed: Option<(String, f32)>,
+    /// Per-shot placements, exactly as Play caches them.
+    plans: HashMap<usize, metrocalk_animation::shot::ShotAdjustment>,
+}
+
+/// Hand the viewport back to the author. Idempotent, and it answers whether it had anything to give
+/// back so the reply can tell the truth about which of two things happened.
+fn end_cinema_preview(shared: &render::Shared, slot: &mut Option<CinemaPreviewState>) -> bool {
+    let Some(mut preview) = slot.take() else {
+        return false;
+    };
+    let mut st = shared.lock().unwrap();
+    st.cam_override = preview.saved_cam;
+    restore_editor_chrome(&mut st, &mut preview.dimmed);
+    true
+}
+
 fn restore_editor_chrome(st: &mut render::SceneState, dimmed: &mut Option<(String, f32)>) {
     if let Some((key, was)) = dimmed.take() {
         if let Some(i) = st.ids.iter().position(|k| *k == key) {
@@ -22923,6 +23140,38 @@ fn cinema_list(state: State<AppState>, id: String) -> metrocalk_editor_shell::Ci
         return metrocalk_editor_shell::CinemaReply::default();
     }
     recv_reply(&rx).unwrap_or_default()
+}
+
+/// Pose the viewport camera at one moment of a cutscene, or hand it back.
+///
+/// The single largest distance this closes: `solve_shot` has always been pure in
+/// `(recipe, subject, t)`, so the engine could produce the camera at ANY instant, and the only way a
+/// user could see one was to press Play and watch the cut from its start. The playhead now answers
+/// "what does this look like" as well as "which shot is this".
+#[tauri::command(async)]
+fn cinema_preview(
+    state: State<AppState>,
+    id: String,
+    seconds: f32,
+    active: bool,
+) -> metrocalk_editor_shell::CinemaPreviewReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaPreview {
+            id,
+            seconds,
+            active,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaPreviewReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaPreviewReply::refusal("The preview did not finish in time")
+    })
 }
 
 /// The conditional catalogue: every "only if" card the Behaviour block offers. Static data.
@@ -25907,6 +26156,7 @@ fn main() {
             cinema_set_shot_framing,
             cinema_set_mood,
             cinema_list,
+            cinema_preview,
             condition_catalog,
             condition_add,
             condition_remove,
