@@ -2012,7 +2012,19 @@ body > [role="dialog"][aria-modal="true"] {
    stage put its `Bake maps to derivative` button 0px on screen out of 34, in a container showing no
    scrollbar. `overflow: auto` above stays as the escape hatch below `--mtk-dock-content-min`. */
 .mtk-bottom-workspace > .mtk-workspace-panel { height: 100%; }
-.mtk-bottom-workspace--split { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.3fr); gap: 1px; background: var(--mtk-border-subtle); }
+/* THE COLUMNS SHRINK; THEY DO NOT PUSH THE DOCK OFF ITS OWN EDGE. The minima were `280px` and `320px`
+   — 601px with the gap — and the dock is not the window: it is the STAGE column, so on an ordinary
+   1296px window with both side docks open it is about 510px. The split therefore laid out 601px inside
+   510px, and the Import workspace was CUT: measured on the packaged `.exe` with the real 15,711-part
+   assembly, the summary read "235 tessell", the third class chip and the pager were off the right edge
+   with the row's Frame control, and the only way to them was a horizontal scrollbar under the dock.
+   The single-column fallback below could not help — it keys on a **760px WINDOW**, and the window here
+   is 1296px while the box it is about is 510px, which is the wrong axis rather than the wrong number.
+   `minmax(0, …)` lets both halves shrink instead, so the ratio still favours the report and neither
+   panel ever leaves the dock. (The container query that would collapse this to one column at the
+   dock's own width, rather than the window's, is tracked — it needs a container on
+   `.mtk-bottom-dock__content`, since an element cannot query itself.) */
+.mtk-bottom-workspace--split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: 1px; background: var(--mtk-border-subtle); }
 .mtk-bottom-workspace--split > div { min-width: 0; overflow: auto; background: var(--mtk-bg-panel); }
 .mtk-bottom-workspace--logic { display: flex; flex-direction: column; overflow: hidden; }
 .mtk-bottom-workspace__body { flex: 1 1 auto; min-height: 0; overflow: auto; }
