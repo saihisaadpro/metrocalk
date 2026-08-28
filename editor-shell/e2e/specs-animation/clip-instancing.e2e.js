@@ -334,12 +334,13 @@ describe("native imported clip -> preview -> graph playback", () => {
     expect(typeof secondaryEntityId).toBe("string");
     expect(secondaryEntityId.length).toBeGreaterThan(0);
     expect(secondaryEntityId).not.toBe(entityId);
-    expect(await invoke("multi_edit", {
+    // ADR-169: the reply is `{ok, changed, reason}` — a batch that refuses now says why.
+    expect((await invoke("multi_edit", {
       ids: [secondaryEntityId],
       component: "Transform",
       field: "x",
       value: 3,
-    })).toBe(true);
+    })).ok).toBe(true);
 
     const row = await $(`[data-testid="hrow"][data-id="${entityId}"]`);
     const secondaryRow = await $(`[data-testid="hrow"][data-id="${secondaryEntityId}"]`);

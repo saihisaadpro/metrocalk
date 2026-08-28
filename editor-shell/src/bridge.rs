@@ -386,7 +386,13 @@ fn reject(client_op_id: &str, reason: String) -> ProjectionDelta {
 
 /// Map a JSON scalar to a `/core` [`FieldValue`]. JSON has no int/float distinction, so an integral
 /// number becomes `Integer`, otherwise `Number`.
-fn json_to_field(v: &Json) -> Option<FieldValue> {
+///
+/// **Public because the shell's own commands need the same mapping.** `multi_edit` (ADR-169) accepts
+/// any scalar the editor can put in a property row, and a second hand-written JSON→`FieldValue`
+/// conversion beside this one is exactly the "same contract stated twice" the orchestrator's rule 6
+/// is about — starting with the whole-number arm, which must produce `Integer` and not `Number`.
+#[must_use]
+pub fn json_to_field(v: &Json) -> Option<FieldValue> {
     match v {
         Json::Bool(b) => Some(FieldValue::Bool(*b)),
         Json::String(s) => Some(FieldValue::Str(s.clone())),
