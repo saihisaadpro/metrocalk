@@ -178,6 +178,30 @@ describe("RenderDialog", () => {
     expect(screen.getByTestId("render-cost").textContent).toContain("no shots yet");
   });
 
+  it("reopening onto a render already in flight shows THAT render, not a button it would refuse", async () => {
+    // The job lives on the engine, so closing the dialog does not stop it. A reopen that always
+    // started fresh would offer to start a second one and be refused — an enabled control that cannot
+    // act. A FINISHED job is not adopted: its ledger belongs to the moment it was read.
+    const client = fakeClient();
+    await client.cinemaRenderStart("e1", 24, null, "Skid Weld Line");
+    render(
+      <RenderDialog
+        open
+        onClose={vi.fn()}
+        client={client}
+        entity="e1"
+        name="Skid Weld Line"
+        cut={CUT}
+        activeShotIndex={null}
+        deliveryLabel="2.39:1 scope"
+      />,
+    );
+    await waitFor(() => expect(screen.getByLabelText("Render progress")).toBeTruthy());
+    expect(screen.queryByTestId("render-start")).toBeNull();
+    // ...and the author is not held hostage by it: the dialog can be put away while it runs.
+    expect(screen.getByTestId("render-hide")).toBeTruthy();
+  });
+
   it("names the frame it is composed for, because that is what decides the shape of the files", async () => {
     open({ deliveryLabel: "2.39:1 scope" });
     expect((await screen.findByTestId("render-dialog")).textContent).toContain("2.39:1 scope");

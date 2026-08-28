@@ -90,19 +90,35 @@ export function RenderDialog({
   const running = job?.running === true;
   const finished = job?.done === true;
 
-  // Reopening is a fresh dialog. Without this, closing a finished render and opening it again shows
-  // the previous ledger under a button that says "Render" — the surface claiming a result for work
-  // that has not started.
+  // Reopening is a fresh dialog — UNLESS a render is still going, in which case it is that render.
+  //
+  // The job lives on the engine, not in this component, so closing the dialog does not stop it. A
+  // reopen that always started fresh would therefore offer a "Render 319 frames" button over a render
+  // already in flight, and the engine would refuse the click — a control that is enabled and cannot
+  // act, which is exactly what `<ux_quality>` 6 forbids. A FINISHED job is not adopted: its ledger
+  // belongs to the moment it was read, and a dialog opened an hour later reporting it as news is a
+  // different lie.
   useEffect(() => {
     if (!open) return;
-    setJob(null);
     setStarting(false);
     setStem(name);
     // ALWAYS the whole cut, even with a shot open. The headline offer is the film; rendering one shot
     // is the narrower second choice, and a dialog that opened on it would quietly make "Render" mean
     // two seconds of a thirteen-second cut for anybody who had clicked a clip first.
     setScope("cut");
-  }, [open, name]);
+    let live = true;
+    void client
+      .cinemaRenderStatus()
+      .then((reply) => {
+        if (live) setJob(reply.running ? reply : null);
+      })
+      .catch(() => {
+        if (live) setJob(null);
+      });
+    return () => {
+      live = false;
+    };
+  }, [open, name, client]);
 
   // THE COST, FROM THE ENGINE. Asked again whenever the choice changes, because the frame count is
   // `plan_render`'s answer and not this component's arithmetic — the same function the job runs, so
@@ -161,7 +177,10 @@ export function RenderDialog({
   return (
     <Modal
       open
-      onClose={running ? () => undefined : onClose}
+      // Closable while it runs. The job is the engine's, not this component's — it keeps going, and
+      // reopening finds it again — so trapping the author in a progress bar for five minutes would be
+      // a modal holding them hostage to a thing it does not own.
+      onClose={onClose}
       initialFocusRef={startButton}
       ariaLabelledBy={headingId}
       ariaDescribedBy={describedId}
@@ -400,6 +419,9 @@ export function RenderDialog({
         <footer style={{ display: "flex", gap: space.sm, justifyContent: "flex-end" }}>
           {running ? (
             <>
+              <Button data-testid="render-hide" variant="secondary" onClick={onClose}>
+                Keep rendering
+              </Button>
               <Button data-testid="render-stop" variant="danger" onClick={() => void stop()}>
                 <Icon name="stop" size="sm" /> Stop
               </Button>
