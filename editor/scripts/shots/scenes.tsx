@@ -185,6 +185,13 @@ export type Scene = {
    *  did nothing would photograph the default state under a caption claiming another, which is worse
    *  than no capture at all. */
   click?: string[];
+  /** Text typed into a control the clicks reached, as `[selector, value]` pairs, after every click.
+   *
+   *  `page.$` searches the whole document rather than the frame, so this reaches a field inside a
+   *  PORTALLED dialog — which is where a command palette's query and a dialog's search have always
+   *  lived. The driver selects the field's existing contents first, so two scenes typing into the
+   *  same selector cannot depend on which ran before. */
+  type?: [selector: string, value: string][];
   setup?: () => void;
   render: () => ReactNode;
 };

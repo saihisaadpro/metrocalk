@@ -21,6 +21,7 @@ declare global {
       width?: number;
       viewport?: { width: number; height: number };
       click?: string[];
+      type?: [string, string][];
     }[];
   }
 }
@@ -36,6 +37,7 @@ window.__MTK_SHOTS__ = SCENES.map((s) => ({
   width: s.width,
   viewport: s.viewport,
   click: s.click,
+  type: s.type,
 }));
 
 const id = new URLSearchParams(location.search).get("scene") ?? SCENES[0].id;
