@@ -49,7 +49,7 @@ import {
   timelineTicks,
 } from "../theme/timeline";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
-import type { CinemaPreviewReply, CinemaReply, FramingCatalog, FramingEdit, ShotRow, ShotSpec } from "../transport/protocol";
+import type { CinemaPreviewReply, CinemaReply, DeliveryFrame, FramingCatalog, FramingEdit, ShotRow, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 import { ShotCatalogue } from "./ShotCatalogue";
 
@@ -58,6 +58,7 @@ const EMPTY: CinemaReply = {
   shots: 0,
   seconds: 0,
   mood: "normal",
+  delivery: "viewport",
   reads: [],
   rows: [],
   problems: [],
@@ -74,6 +75,10 @@ const MOODS = [
 /** Why the pacing control refuses on an object with no cutscene — the same sentence the engine sends
  *  back, so the disabled reason and the refusal cannot drift into two different explanations. */
 const EMPTY_PACING = "Pacing scales shot lengths, and this object has no shots yet — add one first.";
+
+/** Why the delivery frame refuses on an object with no cutscene. Same sentence as the engine's. */
+const EMPTY_DELIVERY =
+  "A delivery frame is what the shots are composed for, and this object has no shots yet — add one first.";
 
 /** Why Preview refuses on an object with no cutscene. Same shape as `EMPTY_PACING`, and the same
  *  reason: a control that is enabled and does nothing is worse than one that says why not. */
@@ -375,6 +380,39 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
             </Button>
           ))}
         </ToolbarGroup>
+        {/* THE FRAME THE SHOTS ARE COMPOSED FOR. Beside pacing because it is the other property of
+            the whole cut, and because it changes every shot at once: the solver fits the subject
+            against an aspect ratio, so "Wide" means a different distance in scope than in vertical.
+            Until this control existed the only aspect ratio available was the author's stage — so
+            opening a dock silently re-composed the film. */}
+        <ToolbarSeparator />
+        <ToolbarGroup aria-label="Delivery frame">
+          <SelectField
+            data-testid="cutscene-delivery"
+            aria-label="Delivery frame"
+            value={cut.delivery}
+            disabled={locked || rows.length === 0 || !catalog}
+            title={
+              rows.length === 0
+                ? EMPTY_DELIVERY
+                : locked
+                  ? lockReason
+                  : "The frame this cutscene is delivered in. The stage draws its bars while a shot is on screen."
+            }
+            onChange={(event) =>
+              void run(
+                () => client.cinemaSetDelivery(selected, event.currentTarget.value as DeliveryFrame),
+                "Delivery frame",
+              )
+            }
+          >
+            {(catalog?.deliveries ?? []).map((option) => (
+              <option key={option.value} value={option.value} title={option.blurb}>
+                {option.label}
+              </option>
+            ))}
+          </SelectField>
+        </ToolbarGroup>
         {live && (
           <>
             <ToolbarSeparator />
@@ -537,6 +575,19 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
           <span title="Vertical field of view">
             <span style={{ font: font.mono }}>{pose.fovDeg.toFixed(0)}°</span> lens
           </span>
+          {/* Only when the frame is not the stage. "Match viewport" is the absence of a delivery
+              frame, and printing it would be a fourth measurement of nothing. */}
+          {cut.delivery !== "viewport" && (
+            <>
+              <span aria-hidden style={{ color: color.text.faint }}>{"·"}</span>
+              <span title="The frame these numbers were solved for — the bars on the stage are its edges">
+                composed for{" "}
+                <span style={{ font: font.mono }}>
+                  {labelOf(catalog?.deliveries ?? [], cut.delivery)}
+                </span>
+              </span>
+            </>
+          )}
         </div>
       )}
 

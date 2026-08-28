@@ -46,6 +46,7 @@ import type {
   ShotSpec,
   CinemaPreviewReply,
   CinemaReply,
+  DeliveryFrame,
   FramingCatalog,
   FramingEdit,
   EffectSpec,
@@ -309,6 +310,8 @@ export interface EditorClient {
   cinemaRemoveShot(id: string, index: number): Promise<CinemaReply>;
   /** Set the cutscene's one pacing mood (one undoable commit). */
   cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply>;
+  /** Set the frame the cutscene is composed and delivered in (one undoable commit). */
+  cinemaSetDelivery(id: string, delivery: DeliveryFrame): Promise<CinemaReply>;
   /** The object's cutscene, read back as sentences plus continuity warnings. */
   cinemaList(id: string): Promise<CinemaReply>;
   /** The framing vocabulary the shot inspector offers + the bounds it must respect (static data). */
@@ -942,7 +945,7 @@ export class TauriClient implements EditorClient {
     return this.core.invoke<VfxProbe>("vfx_probe").catch(() => ({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 }));
   }
   cameraProbe(): Promise<CameraProbe> {
-    return this.core.invoke<CameraProbe>("camera_probe").catch(() => ({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0 }));
+    return this.core.invoke<CameraProbe>("camera_probe").catch(() => ({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0, frame: [0, 0, 1, 1] as [number, number, number, number], visibleRect: [0, 0, 1, 1] as [number, number, number, number] }));
   }
   vfxCatalog(): Promise<EffectSpec[]> {
     return this.core.invoke<EffectSpec[]>("vfx_catalog").catch((e: unknown) => { console.error("vfx_catalog failed", e); throw e; });
@@ -967,6 +970,9 @@ export class TauriClient implements EditorClient {
   }
   cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_set_mood", { id, mood }).catch((e: unknown) => { console.error("cinema_set_mood failed", e); throw e; });
+  }
+  cinemaSetDelivery(id: string, delivery: DeliveryFrame): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_delivery", { id, delivery }).catch((e: unknown) => { console.error("cinema_set_delivery failed", e); throw e; });
   }
   cinemaList(id: string): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_list", { id }).catch((e: unknown) => { console.error("cinema_list failed", e); throw e; });
@@ -2804,7 +2810,7 @@ class MockClient implements EditorClient {
     return Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 });
   }
   cameraProbe(): Promise<CameraProbe> {
-    return Promise.resolve({ eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 45, cinematic: false, distance: 0 });
+    return Promise.resolve({ eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 45, cinematic: false, distance: 0, frame: [0, 0, 1, 1] as [number, number, number, number], visibleRect: [0, 0, 1, 1] as [number, number, number, number] });
   }
   vfxCatalog(): Promise<EffectSpec[]> {
     return Promise.resolve([]);
@@ -2822,32 +2828,35 @@ class MockClient implements EditorClient {
     return Promise.resolve([]);
   }
   cinemaAddShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaRemoveShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetMood(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetDelivery(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaList(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: null });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: null });
   }
   /** Empty, like every other cinematics reply here. The vocabulary lives in ONE place — the Rust
    *  catalogue that also validates it — and a copy of it in this file would be the same
    *  one-contract-stated-twice the catalogue exists to remove. The dev build refuses every cinematics
    *  command anyway, so there is no inspector here for the options to fill. */
   cinemaFramingCatalog(): Promise<FramingCatalog> {
-    return Promise.resolve({ sizes: [], angles: [], motions: [], minSeconds: 0.2, maxSeconds: 20, maxShots: 12, stillMotions: [] });
+    return Promise.resolve({ sizes: [], angles: [], motions: [], minSeconds: 0.2, maxSeconds: 20, maxShots: 12, stillMotions: [], deliveries: [] });
   }
   cinemaSetShotSeconds(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaMoveShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetShotFraming(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   /** Refused rather than faked. A preview's whole content is a camera pose solved against real mesh
    *  bounds in the native scene; a browser-shell stub could only invent three numbers, and a picture

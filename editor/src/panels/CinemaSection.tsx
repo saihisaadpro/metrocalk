@@ -37,6 +37,7 @@ const EMPTY: CinemaReply = {
   shots: 0,
   seconds: 0,
   mood: "normal",
+  delivery: "viewport",
   reads: [],
   rows: [],
   problems: [],

@@ -480,6 +480,7 @@ const CUTSCENE: CinemaReply = (() => {
     shots: rows.length,
     seconds: start,
     mood: "normal",
+    delivery: "viewport",
     reads: rows.map((row) => row.reads),
     rows,
     problems: [
@@ -521,6 +522,14 @@ const FRAMING: FramingCatalog = {
   maxSeconds: 20,
   maxShots: 12,
   stillMotions: ["hold"],
+  deliveries: [
+    { value: "viewport", label: "Match viewport", blurb: "Compose for the stage as it is now - no bars" },
+    { value: "widescreen", label: "16:9 widescreen", blurb: "The broadcast and web default" },
+    { value: "scope", label: "2.39:1 scope", blurb: "Anamorphic scope - the widest frame" },
+    { value: "academy", label: "4:3 academy", blurb: "Classic" },
+    { value: "square", label: "1:1 square", blurb: "Square" },
+    { value: "vertical", label: "9:16 vertical", blurb: "Vertical" },
+  ],
 };
 
 const CUTSCENE_CARDS: ShotSpec[] = [
@@ -558,6 +567,14 @@ const cutsceneClient = () =>
         message: active ? `Previewing shot 2 of 5 at ${seconds.toFixed(1)}s` : "Preview off",
         reason: null,
       }),
+  }) as unknown as EditorClient;
+
+/** The same cutscene, delivered in scope. One field differs, and it changes what every shot in the
+ *  list is composed for — which is why it belongs to the CUT and not to a shot. */
+const deliveredCutsceneClient = () =>
+  ({
+    ...cutsceneClient(),
+    cinemaList: () => Promise.resolve({ ...CUTSCENE, delivery: "scope" as const }),
   }) as unknown as EditorClient;
 
 const selectAnimatedEntity = () => {
@@ -1189,6 +1206,39 @@ export const SCENES: Scene[] = [
       same_line: [["[data-testid='cutscene-mood-calm']", "[data-testid='cutscene-preview']"]],
     },
     render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-delivery-frame",
+    looking_for:
+      "THE FRAME THE SHOTS ARE COMPOSED FOR. A shot solver fits a subject against an ASPECT RATIO — " +
+      "it is how far back the camera stands — and until this control the only ratio available was " +
+      "whatever shape the author's stage happened to be, so opening a dock silently re-composed the " +
+      "film. Check that the delivery picker sits in the toolbar beside pacing (both are properties " +
+      "of the whole cut, not of one shot), that it reads '2.39:1 scope' rather than a number, and " +
+      "that the pose read-out under the lane now ends with the frame those three coordinates were " +
+      "solved for. Match viewport is the ABSENCE of a delivery frame and prints nothing there: this " +
+      "capture is the one where it is on",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-clip']:nth-of-type(2)", "[data-testid='cutscene-preview']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-delivery']", 1],
+        ["[data-testid='cutscene-preview-pose']", 1],
+      ],
+      text_present: ["2.39:1 scope", "composed for"],
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      unclipped: [
+        "[data-testid='cutscene-delivery']",
+        "[data-testid='cutscene-preview-pose']",
+      ],
+      // The frame is chosen in the toolbar and reported under the lane - a control and its
+      // consequence, in that order down the panel.
+      stacked: [["[data-testid='cutscene-delivery']", "[data-testid='cutscene-preview-pose']"]],
+      // ...and it is on the pacing row, not on a line of its own.
+      same_line: [["[data-testid='cutscene-mood-calm']", "[data-testid='cutscene-delivery']"]],
+    },
+    render: () => <CutscenePanel client={deliveredCutsceneClient()} />,
   },
   {
     id: "cutscene-empty",

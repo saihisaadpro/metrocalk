@@ -360,11 +360,14 @@ pub fn camera_for(state: &SceneState) -> Camera {
 /// again here is what let a pick during a resize disagree with the image on screen.
 #[must_use]
 pub fn viewport_for(state: &SceneState, dpi_scale: f64) -> Viewport {
-    let aspect = if state.surface_aspect.is_finite() && state.surface_aspect > 0.0 {
-        f64::from(state.surface_aspect)
-    } else {
-        16.0 / 9.0
-    };
+    // The COMPOSED frame's aspect, not the window's. The projection is sheared to the rectangle the
+    // viewer can see (`render::framed_projection`), so NDC spans that rectangle: a ray built against
+    // the window's shape describes a frustum that was never rasterised. Fractions handed to this
+    // viewport must therefore be frame fractions - see [`frame_fraction`].
+    let aspect = f64::from(render::frame_aspect(
+        state.surface_aspect,
+        state.composition_rect(),
+    ));
     // Height is nominal; only the ratio and the pixel count matter, and the pixel count is what turns
     // a pixel tolerance into world units.
     let height = 1080.0;
@@ -375,6 +378,21 @@ pub fn viewport_for(state: &SceneState, dpi_scale: f64) -> Viewport {
         origin_y: 0.0,
         dpi_scale,
     }
+}
+
+/// Remap a SURFACE fraction - what the shell reports, the pointer's position over the whole window -
+/// into a fraction of the rectangle the picture is composed in.
+///
+/// The identity while the composed frame is the whole surface, which is every case that existed before
+/// a viewport rectangle was reported. With a dock open it is the difference between the object under
+/// the cursor and the object a click selects.
+#[must_use]
+pub fn frame_fraction(state: &SceneState, x: f64, y: f64) -> (f64, f64) {
+    let [fx, fy, fw, fh] = state.composition_rect();
+    (
+        (x - f64::from(fx)) / f64::from(fw).max(1.0e-6),
+        (y - f64::from(fy)) / f64::from(fh).max(1.0e-6),
+    )
 }
 
 /// Resolve a hit back to the entity id the rest of the editor speaks.
@@ -600,6 +618,58 @@ mod tests {
         let viewport = viewport_for(state, 1.0);
         let ray = camera.ray_through_fraction(&viewport, x, y);
         (camera, viewport, ray)
+    }
+
+    #[test]
+    fn a_click_is_measured_against_the_frame_the_picture_is_composed_in() {
+        // The seam that keeps the ray and the image describing one frustum. The projection is sheared
+        // to the composed rectangle (`render::framed_projection`), so a fraction of the WINDOW is not a
+        // fraction of the picture. The rectangle here is the bottom-right quarter — a deliberately
+        // large offset, because the point of the second half is to SEPARATE two rays, and a hole near
+        // the window's own centre separates them by less than a cube is wide.
+        let mut state = scene_with(|i| ([0.0, 0.0, f32::from(i as u8) * 4.0 - 4.0], 1.0));
+        state.surface_aspect = 1296.0 / 839.0;
+        state.visible_rect = [0.55, 0.55, 0.40, 0.40];
+        state.frame_all();
+
+        let mut cache = PickCache::new();
+        cache.sync(&state);
+        let centre = state.composition_rect();
+        let (cx, cy) = (
+            f64::from(centre[2].mul_add(0.5, centre[0])),
+            f64::from(centre[3].mul_add(0.5, centre[1])),
+        );
+
+        // Through the seam: the centre of the visible stage hits the scene that was framed into it.
+        let camera = camera_for(&state);
+        let viewport = viewport_for(&state, 1.0);
+        let (fx, fy) = frame_fraction(&state, cx, cy);
+        assert!((fx - 0.5).abs() < 1.0e-6 && (fy - 0.5).abs() < 1.0e-6);
+        let ray = camera.ray_through_fraction(&viewport, fx, fy);
+        assert!(
+            cache
+                .nearest(&camera, &viewport, &ray, &click_filter())
+                .is_some(),
+            "the centre of the composed frame must hit the framed scene"
+        );
+
+        // And WITHOUT it — the window fraction handed straight to the viewport, which is what this
+        // file did before the projection carried the frame — the same click misses entirely. That is
+        // the defect itself: the cursor and the thing under it drift apart by the distance between the
+        // window's centre and the picture's.
+        let stale = camera.ray_through_fraction(&viewport, cx, cy);
+        assert!(
+            cache
+                .nearest(&camera, &viewport, &stale, &click_filter())
+                .is_none(),
+            "a ray built from the window's fraction is aimed somewhere the picture is not"
+        );
+
+        // The identity when the picture owns the whole surface, which is every case that existed
+        // before a viewport rectangle was reported.
+        let mut whole = scene_with(|i| ([0.0, 0.0, f32::from(i as u8) * 4.0 - 4.0], 1.0));
+        whole.surface_aspect = 1296.0 / 839.0;
+        assert_eq!(frame_fraction(&whole, 0.37, 0.62), (0.37, 0.62));
     }
 
     #[test]

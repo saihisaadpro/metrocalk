@@ -628,7 +628,7 @@ fn main() {
             scene.state.orbit,
             scene.state.elevation,
             scene.state.distance,
-            scene.state.surface_aspect,
+            render::ViewFrame::new(scene.state.surface_aspect, scene.state.composition_rect()),
             scene.state.cam_target.into(),
             scene.state.projection,
         );

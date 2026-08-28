@@ -1938,6 +1938,12 @@ export interface CameraProbe {
   /** True only while a cutscene owns the view. */
   cinematic: boolean;
   distance: number;
+  /** The rectangle the picture is COMPOSED for, in surface fractions `[x, y, width, height]` from
+   *  the top-left: the visible viewport, inset to the delivery frame while a cutscene composes for
+   *  one. */
+  frame: [number, number, number, number];
+  /** The rectangle the viewer can SEE. Its difference from `frame` is the letterbox. */
+  visibleRect: [number, number, number, number];
 }
 
 /** One effect card in the VFX catalogue. */
@@ -1988,6 +1994,13 @@ export interface FramingOption {
   blurb: string;
 }
 
+/** The frame a cutscene is composed and DELIVERED in.
+ *
+ *  Not a ratio on the wire: the author picked a frame, and a float would lose which one. The ratios
+ *  live in Rust, beside the solver that fits against them; the words the picker shows come from
+ *  `FramingCatalog.deliveries`, which is published by the same side that validates them. */
+export type DeliveryFrame = "viewport" | "widescreen" | "scope" | "academy" | "square" | "vertical";
+
 /** The whole framing vocabulary plus the bounds a shot must respect. */
 export interface FramingCatalog {
   sizes: FramingOption[];
@@ -2001,6 +2014,8 @@ export interface FramingCatalog {
   maxShots: number;
   /** Moves for which strength does nothing — the dial is disabled, with a reason, on these. */
   stillMotions: string[];
+  /** The frames a cutscene may be delivered in — the shape its shots are composed for. */
+  deliveries: FramingOption[];
 }
 
 /** One shot with its numbers — what the timeline draws and the shot inspector edits. */
@@ -2055,6 +2070,8 @@ export interface CinemaReply {
   seconds: number;
   /** The authored pacing dial that drives effective shot duration and transition length. */
   mood: "calm" | "normal" | "tense";
+  /** The frame this cutscene is composed and delivered in. */
+  delivery: DeliveryFrame;
   /** The cutscene read back as sentences, one line per shot. Flattened from `rows`. */
   reads: string[];
   /** The same shots with their numbers. */

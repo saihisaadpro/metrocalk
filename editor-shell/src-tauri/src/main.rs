@@ -2855,6 +2855,12 @@ enum EngineCmd {
         mood: String,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
     },
+    /// Cinematics - set the frame the cutscene is composed and delivered in (one undoable commit).
+    CinemaSetDelivery {
+        id: String,
+        delivery: String,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
     /// Cinematics - set one shot's authored length (one undoable commit).
     CinemaSetShotSeconds {
         id: String,
@@ -9932,6 +9938,55 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             &cut,
                             &name,
                             format!("Cinematic pacing set to {label}"),
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSetDelivery {
+                id,
+                delivery,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - the delivery frame is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::set_delivery_ops(&engine, entity, &delivery) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-delivery", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the delivery frame was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaDelivery {
+                            id: id.clone(),
+                            delivery: delivery.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            format!("Composing for {}", cut.delivery.label()),
                             &|key| shot_subject_name(&engine, key),
                         ));
                     }
@@ -20254,7 +20309,8 @@ fn viewport_pick(
     }
     let camera = scene_pick::camera_for(&st);
     let viewport = scene_pick::viewport_for(&st, dpi);
-    let ray = camera.ray_through_fraction(&viewport, f64::from(x), f64::from(y));
+    let (fx, fy) = scene_pick::frame_fraction(&st, f64::from(x), f64::from(y));
+    let ray = camera.ray_through_fraction(&viewport, fx, fy);
 
     let mut cache = state.picking.lock().unwrap();
     cache.sync(&st);
@@ -20299,7 +20355,8 @@ fn viewport_peek(
     // object and selecting another.
     let camera = scene_pick::camera_for(&st);
     let viewport = scene_pick::viewport_for(&st, dpi);
-    let ray = camera.ray_through_fraction(&viewport, f64::from(x), f64::from(y));
+    let (fx, fy) = scene_pick::frame_fraction(&st, f64::from(x), f64::from(y));
+    let ray = camera.ray_through_fraction(&viewport, fx, fy);
     let mut cache = state.picking.lock().unwrap();
     cache.sync(&st);
     let hit = cache.nearest(&camera, &viewport, &ray, &scene_pick::click_filter());
@@ -20324,8 +20381,12 @@ fn viewport_pick_region(
     let mut st = state.shared.lock().unwrap();
     let camera = scene_pick::camera_for(&st);
     let viewport = scene_pick::viewport_for(&st, dpi);
-    let start = viewport.fraction_to_ndc(f64::from(x0), f64::from(y0));
-    let end = viewport.fraction_to_ndc(f64::from(x1), f64::from(y1));
+    let corner = |x: f32, y: f32| {
+        let (fx, fy) = scene_pick::frame_fraction(&st, f64::from(x), f64::from(y));
+        viewport.fraction_to_ndc(fx, fy)
+    };
+    let start = corner(x0, y0);
+    let end = corner(x1, y1);
     let rect = metrocalk_spatial::ScreenRect::from_drag([start.0, start.1], [end.0, end.1]);
 
     let mut cache = state.picking.lock().unwrap();
@@ -20366,7 +20427,8 @@ fn pick_diagnostics(
     let st = state.shared.lock().unwrap();
     let camera = scene_pick::camera_for(&st);
     let viewport = scene_pick::viewport_for(&st, dpi);
-    let ray = camera.ray_through_fraction(&viewport, f64::from(x), f64::from(y));
+    let (fx, fy) = scene_pick::frame_fraction(&st, f64::from(x), f64::from(y));
+    let ray = camera.ray_through_fraction(&viewport, fx, fy);
     let mut cache = state.picking.lock().unwrap();
     cache.sync(&st);
     let started = std::time::Instant::now();
@@ -21112,7 +21174,7 @@ fn gizmo_pick_drag(
         st.orbit,
         st.elevation,
         st.distance,
-        aspect,
+        st.view_frame(aspect),
         st.cam_target,
         st.projection,
     );
@@ -21187,7 +21249,7 @@ fn gizmo_grab(window: tauri::WebviewWindow, state: State<AppState>, axis: String
         st.orbit,
         st.elevation,
         st.distance,
-        aspect,
+        st.view_frame(aspect),
         st.cam_target,
         st.projection,
     );
@@ -21214,7 +21276,7 @@ fn gizmo_set_target(
         st.orbit,
         st.elevation,
         st.distance,
-        aspect,
+        st.view_frame(aspect),
         st.cam_target,
         st.projection,
     );
@@ -21255,7 +21317,7 @@ fn gizmo_handle_screen(
         st.orbit,
         st.elevation,
         st.distance,
-        aspect,
+        st.view_frame(aspect),
         st.cam_target,
         st.projection,
     )
@@ -21294,7 +21356,7 @@ fn gizmo_drag_end(window: tauri::WebviewWindow, state: State<AppState>) {
                         st.orbit,
                         st.elevation,
                         st.distance,
-                        aspect,
+                        st.view_frame(aspect),
                         st.cam_target,
                         st.projection,
                     );
@@ -21665,7 +21727,7 @@ fn pipe_forge_point(
             st.orbit,
             elevation,
             distance,
-            aspect,
+            st.view_frame(aspect),
             st.cam_target,
             st.projection,
         );
@@ -22088,11 +22150,11 @@ fn present_cinematic_moment(
         let previous_sample = playback.blend_from.map(|(previous, _)| {
             cinematic_shot_subject_sample(engine, &mut st, entity, &cut.shots[previous])
         });
-        let aspect = if st.surface_aspect.is_finite() && st.surface_aspect > 0.1 {
-            st.surface_aspect
-        } else {
-            16.0 / 9.0
-        };
+        // THE FRAME THIS CUTSCENE IS DELIVERED IN, before anything reads an aspect ratio from the
+        // state. Published here because it is the same tick that poses the camera: the solver's fit,
+        // the projection the render loop shears and the bars it scissors are then all one answer.
+        st.delivery_aspect = cut.delivery.ratio();
+        let aspect = st.composition_aspect();
         // Negotiate this shot's placement against the rest of the scene, ONCE,
         // the first tick it is live. Every later tick reads the answer back out.
         let plan = *plans
@@ -22337,6 +22399,9 @@ fn restore_editor_chrome(st: &mut render::SceneState, dimmed: &mut Option<(Strin
     }
     st.cinematic_subject_id = None;
     st.cinematic_shot_index = None;
+    // The delivery frame belongs to the shot, not to the editor. Leaving it set would letterbox the
+    // author's own viewport after the preview handed the camera back.
+    st.delivery_aspect = None;
 }
 
 /// Fire an object's ONE-SHOT effect layers as a detached burst, anchored where the object currently is.
@@ -22923,6 +22988,12 @@ fn camera_probe(state: State<AppState>) -> serde_json::Value {
         "fovDeg": fov,
         "cinematic": cinematic,
         "distance": distance,
+        // THE RECTANGLE THE PICTURE IS COMPOSED FOR, and the one the viewer can see, in surface
+        // fractions. Two rectangles rather than one because their DIFFERENCE is the letterbox: a
+        // reader (or a test) can say both "the framing followed the dock" and "the bars are real"
+        // from the same probe, without either being a claim about a screenshot.
+        "frame": st.composition_rect(),
+        "visibleRect": st.adopted_visible_rect(),
         "subjectId": st.cinematic_subject_id.clone(),
         "shotIndex": st.cinematic_shot_index,
         "visitedSubjects": st.cinematic_visited_subjects.clone(),
@@ -23037,6 +23108,31 @@ fn cinema_set_mood(
     }
     recv_reply(&rx).unwrap_or_else(|_| {
         metrocalk_editor_shell::CinemaReply::refusal("The pacing change did not finish in time")
+    })
+}
+
+/// Set the frame the cutscene is composed and delivered in (one undoable commit).
+#[tauri::command(async)]
+fn cinema_set_delivery(
+    state: State<AppState>,
+    id: String,
+    delivery: String,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetDelivery {
+            id,
+            delivery,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The delivery frame did not finish in time")
     })
 }
 
@@ -26155,6 +26251,7 @@ fn main() {
             cinema_move_shot,
             cinema_set_shot_framing,
             cinema_set_mood,
+            cinema_set_delivery,
             cinema_list,
             cinema_preview,
             condition_catalog,

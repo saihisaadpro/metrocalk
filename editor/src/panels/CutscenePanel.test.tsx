@@ -39,6 +39,7 @@ const FOUR_SHOTS: CinemaReply = {
   shots: 4,
   seconds: 10,
   mood: "normal",
+  delivery: "viewport",
   reads: [],
   rows: [
     row({ id: "s1", index: 0, startSeconds: 0, seconds: 2, effectiveSeconds: 2, size: "wide", motion: "pull_out", reads: "a wide shot of Weld Gun 7 from three-quarters, pulling out — 2.0s" }),
@@ -308,6 +309,45 @@ describe("CutscenePanel", () => {
     act(() => playStore.getState().refresh({ playing: true, paused: false }));
     await waitFor(() => expect(cinemaPreviewStore.getState().active).toBe(false));
     act(() => playStore.getState().refresh({ playing: false, paused: false }));
+  });
+
+  it("offers the delivery frames the ENGINE publishes, and sends the one that was picked", async () => {
+    // The picker is filled from `FramingCatalog.deliveries`, not from a list in this file. A second
+    // list here would be free to offer a word the engine refuses — the whole reason the catalogue is
+    // published by the side that validates it.
+    const client = loaded();
+    selectSomething();
+    render(<CutscenePanel client={client} />);
+    const picker = (await screen.findByTestId("cutscene-delivery")) as HTMLSelectElement;
+    const catalogue = await client.cinemaFramingCatalog();
+    await waitFor(() =>
+      expect([...picker.options].map((o) => o.value)).toEqual(
+        catalogue.deliveries.map((d) => d.value),
+      ),
+    );
+    expect(picker.value).toBe("viewport");
+
+    fireEvent.change(picker, { target: { value: "scope" } });
+    await waitFor(() => expect(client.cinemaSetDelivery).toHaveBeenCalledWith("e1", "scope"));
+  });
+
+  it("names the frame the previewed pose was solved for, and only when it is not the stage", async () => {
+    // "Match viewport" is the ABSENCE of a delivery frame; printing it beside three coordinates would
+    // be a fourth measurement of nothing.
+    const client = loaded();
+    selectSomething();
+    render(<CutscenePanel client={client} />);
+    fireEvent.click(await screen.findByTestId("cutscene-preview"));
+    const pose = await screen.findByTestId("cutscene-preview-pose");
+    expect(pose.textContent).not.toMatch(/composed for/i);
+
+    client.cinemaList = vi.fn(() => Promise.resolve({ ...FOUR_SHOTS, delivery: "scope" as const }));
+    act(() => projectionStore.getState().select(null));
+    act(() => projectionStore.getState().select("e1"));
+    fireEvent.click(await screen.findByTestId("cutscene-preview"));
+    await waitFor(() =>
+      expect(screen.getByTestId("cutscene-preview-pose").textContent).toMatch(/composed for.*scope/i),
+    );
   });
 
   it("refuses a thirteenth shot with the ceiling and the way out, from the engine's own number", async () => {

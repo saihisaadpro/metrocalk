@@ -201,9 +201,103 @@ pub struct Cutscene {
     /// Pacing + weight.
     #[serde(default)]
     pub mood: Mood,
-    /// Black bars, because a cutscene should look like one.
+    /// The shape of the frame this cutscene is DELIVERED in.
+    ///
+    /// A shot is composed against an aspect ratio -- [`solve_shot`] takes one, and it decides how far
+    /// back the camera must stand for the subject to fill the frame. Before this field the only aspect
+    /// anyone could supply was the editor window's, so every shot was composed for whatever shape the
+    /// author's stage happened to be at that instant: open the bottom dock and the same shot was
+    /// composed for a different film. `Viewport` keeps that behaviour and says so; every other value
+    /// pins the composition to a delivery frame and lets the stage draw the bars around it.
     #[serde(default)]
-    pub letterbox: bool,
+    pub delivery: Delivery,
+}
+
+/// The frame a cutscene is composed and delivered in.
+///
+/// Serialised as its camelCase name, so a stored cutscene carries the author's choice rather than a
+/// float nobody can read back. `Viewport` is not a ratio at all: it means "whatever the author is
+/// looking through", which is the only honest answer before a delivery frame has been chosen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Delivery {
+    /// Compose for the visible stage, whatever shape it currently is. No bars.
+    #[default]
+    Viewport,
+    /// 16:9 - broadcast and web.
+    Widescreen,
+    /// 2.39:1 - anamorphic scope.
+    Scope,
+    /// 4:3 - academy.
+    Academy,
+    /// 1:1 - square.
+    Square,
+    /// 9:16 - vertical.
+    Vertical,
+}
+
+impl Delivery {
+    /// The delivery frame's aspect ratio (width / height), or `None` for [`Delivery::Viewport`], whose
+    /// ratio is a property of the author's window rather than of the cutscene.
+    #[must_use]
+    pub fn ratio(self) -> Option<f32> {
+        match self {
+            Self::Viewport => None,
+            Self::Widescreen => Some(16.0 / 9.0),
+            Self::Scope => Some(2.39),
+            Self::Academy => Some(4.0 / 3.0),
+            Self::Square => Some(1.0),
+            Self::Vertical => Some(9.0 / 16.0),
+        }
+    }
+
+    /// What a user calls this frame. Plain enough to put in a control and in a read-out.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Viewport => "Match viewport",
+            Self::Widescreen => "16:9 widescreen",
+            Self::Scope => "2.39:1 scope",
+            Self::Academy => "4:3 academy",
+            Self::Square => "1:1 square",
+            Self::Vertical => "9:16 vertical",
+        }
+    }
+
+    /// The wire name, matching the serde representation. One list, so the catalogue a UI renders and
+    /// the value it sends back cannot drift apart.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Viewport => "viewport",
+            Self::Widescreen => "widescreen",
+            Self::Scope => "scope",
+            Self::Academy => "academy",
+            Self::Square => "square",
+            Self::Vertical => "vertical",
+        }
+    }
+
+    /// Every delivery frame, in the order a picker should offer them.
+    #[must_use]
+    pub fn all() -> [Self; 6] {
+        [
+            Self::Viewport,
+            Self::Widescreen,
+            Self::Scope,
+            Self::Academy,
+            Self::Square,
+            Self::Vertical,
+        ]
+    }
+
+    /// Parse a wire name. Unknown names are refused rather than silently defaulted: a cutscene whose
+    /// delivery frame quietly became "viewport" would be composed for a different film than the one
+    /// the author asked for, and nothing would say so.
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::all().into_iter().find(|d| d.key() == key)
+    }
 }
 
 /// One stable playback lookup: the live shot, its local progress, and an optional transition from the
@@ -233,7 +327,7 @@ impl Default for Cutscene {
             version: one(),
             shots: Vec::new(),
             mood: Mood::default(),
-            letterbox: false,
+            delivery: Delivery::default(),
         }
     }
 }
@@ -1283,7 +1377,7 @@ mod tests {
                 },
             ],
             mood: Mood::Normal,
-            letterbox: true,
+            delivery: Delivery::Scope,
         };
         assert!((cut.seconds() - 5.0).abs() < 1.0e-6);
         assert_eq!(cut.shot_at(0.0).map(|(i, _)| i), Some(0));
@@ -1308,7 +1402,7 @@ mod tests {
                 })
                 .collect(),
             mood,
-            letterbox: true,
+            delivery: Delivery::Scope,
         };
         let normal = ten_shot_act(Mood::Normal);
         let calm = ten_shot_act(Mood::Calm);
@@ -1336,7 +1430,7 @@ mod tests {
                 },
             ],
             mood: Mood::Normal,
-            letterbox: true,
+            delivery: Delivery::Scope,
         };
         assert_eq!(cut.playback_at(0.0).unwrap().blend_from, None);
         let boundary = cut.playback_at(2.0).expect("second shot starts");
@@ -1379,7 +1473,7 @@ mod tests {
                 },
             ],
             mood: Mood::Normal,
-            letterbox: true,
+            delivery: Delivery::Scope,
         };
         let camera_at = |time| {
             let playback = cut.playback_at(time).expect("inside cutscene");
@@ -1429,7 +1523,7 @@ mod tests {
                 },
             ],
             mood: Mood::Normal,
-            letterbox: false,
+            delivery: Delivery::Viewport,
         };
         let problems = jump.problems();
         assert!(
@@ -1455,7 +1549,7 @@ mod tests {
                 },
             ],
             mood: Mood::Normal,
-            letterbox: true,
+            delivery: Delivery::Scope,
         };
         assert!(good.problems().is_empty(), "{:?}", good.problems());
     }

@@ -4,7 +4,7 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type FramingCatalog, type FramingEdit, type MatchStatus, type ShotRow, type TerrainReply, type TerrainStats } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type MatchStatus, type ShotRow, type TerrainReply, type TerrainStats } from "./protocol";
 
 /** One authored shot, with the numbers a timeline needs. Shaped like what `cinema_list` really
  *  sends — a `startSeconds` of 0, an `effectiveSeconds` that is the authored length at Normal
@@ -58,6 +58,14 @@ const FRAMING_CATALOG: FramingCatalog = {
   maxSeconds: 20,
   maxShots: 12,
   stillMotions: ["hold"],
+  deliveries: [
+    { value: "viewport", label: "Match viewport", blurb: "Compose for the stage as it is now" },
+    { value: "widescreen", label: "16:9 widescreen", blurb: "The broadcast and web default" },
+    { value: "scope", label: "2.39:1 scope", blurb: "Anamorphic scope" },
+    { value: "academy", label: "4:3 academy", blurb: "Classic" },
+    { value: "square", label: "1:1 square", blurb: "Square" },
+    { value: "vertical", label: "9:16 vertical", blurb: "Vertical" },
+  ],
 };
 
 function emptyAnimationState(id: string | null): AnimationWorkspaceInfo {
@@ -290,7 +298,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     setWorkingSpace: vi.fn((space: string) => Promise.resolve(space)),
     setEnvironmentColourSpace: vi.fn((space: string) => Promise.resolve(space)),
     vfxProbe: vi.fn(() => Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 })),
-    cameraProbe: vi.fn(() => Promise.resolve({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0 })),
+    cameraProbe: vi.fn(() => Promise.resolve({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0, frame: [0, 0, 1, 1] as [number, number, number, number], visibleRect: [0, 0, 1, 1] as [number, number, number, number] })),
     vfxCatalog: vi.fn(() => Promise.resolve([
       { kind: "fire", label: "Fire", blurb: "It burns", icon: "\u{1F525}", adds: "a rising flame", burst: false },
       { kind: "sparks", label: "Sparks", blurb: "A hit landing", icon: "\u26A1", adds: "a one-shot spray of sparks", burst: true },
@@ -306,14 +314,15 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
       { kind: "hero", label: "Hero shot", blurb: "The workhorse - three-quarters on, pushing in", adds: "a full-body three-quarter shot that creeps closer" },
       { kind: "closeup", label: "Close-up", blurb: "Tight and still - for the moment that matters", adds: "a close, locked-off shot in profile" },
     ])),
-    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: "Added a hero shot", reason: null })),
-    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], rows: [], problems: [], message: "Shot removed", reason: null })),
-    cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, reads: [], rows: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
-    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], rows: [], problems: [], message: "", reason: null })),
+    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: "Added a hero shot", reason: null })),
+    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, reads: [], rows: [], problems: [], message: "Shot removed", reason: null })),
+    cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, delivery: "viewport" as const, reads: [], rows: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
+    cinemaSetDelivery: vi.fn((id: string, delivery: DeliveryFrame) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Composing for ${delivery}`, reason: null })),
+    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, reads: [], rows: [], problems: [], message: "", reason: null })),
     cinemaFramingCatalog: vi.fn(() => Promise.resolve(FRAMING_CATALOG)),
-    cinemaSetShotSeconds: vi.fn((id: string, index: number, seconds: number) => Promise.resolve({ entity: id, shots: 1, seconds, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, seconds, effectiveSeconds: seconds }], problems: [], message: `Shot ${index + 1} now runs ${seconds.toFixed(1)}s`, reason: null })),
-    cinemaMoveShot: vi.fn((id: string, _from: number, to: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Shot moved to position ${to + 1}`, reason: null })),
-    cinemaSetShotFraming: vi.fn((id: string, index: number, edit: FramingEdit) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, size: (edit.size as ShotRow["size"]) ?? HERO_ROW.size, angle: (edit.angle as ShotRow["angle"]) ?? HERO_ROW.angle, motion: (edit.motion as ShotRow["motion"]) ?? HERO_ROW.motion, amount: edit.amount ?? HERO_ROW.amount }], problems: [], message: `Shot ${index + 1} is now re-framed`, reason: null })),
+    cinemaSetShotSeconds: vi.fn((id: string, index: number, seconds: number) => Promise.resolve({ entity: id, shots: 1, seconds, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, seconds, effectiveSeconds: seconds }], problems: [], message: `Shot ${index + 1} now runs ${seconds.toFixed(1)}s`, reason: null })),
+    cinemaMoveShot: vi.fn((id: string, _from: number, to: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Shot moved to position ${to + 1}`, reason: null })),
+    cinemaSetShotFraming: vi.fn((id: string, index: number, edit: FramingEdit) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, size: (edit.size as ShotRow["size"]) ?? HERO_ROW.size, angle: (edit.angle as ShotRow["angle"]) ?? HERO_ROW.angle, motion: (edit.motion as ShotRow["motion"]) ?? HERO_ROW.motion, amount: edit.amount ?? HERO_ROW.amount }], problems: [], message: `Shot ${index + 1} is now re-framed`, reason: null })),
     // A pose that MOVES WITH THE CLOCK. A stub returning one fixed camera would let a panel that
     // ignored `seconds` entirely pass every assertion about previewing, which is the one thing these
     // tests exist to catch; the push-in here is the same shape `push_in` solves for, at fixture scale.

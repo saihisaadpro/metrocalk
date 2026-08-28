@@ -156,6 +156,8 @@ describe("CinemaSection", () => {
         fovDeg: 50,
         cinematic: true,
         distance: 6,
+        frame: [0, 0, 1, 1] as [number, number, number, number],
+        visibleRect: [0, 0, 1, 1] as [number, number, number, number],
       }),
     );
     selectSomething();
@@ -211,6 +213,7 @@ describe("CinemaSection", () => {
       shots: 1,
       seconds: mood === "calm" ? 6.25 : 2.5,
       mood,
+      delivery: "viewport" as const,
       reads: [shot(2.5).reads],
       rows: [shot(mood === "calm" ? 6.25 : 2.5)],
       problems: [],
@@ -223,6 +226,7 @@ describe("CinemaSection", () => {
         entity: id,
         shots: 1,
         seconds: next === "calm" ? 6.25 : 2.5,
+        delivery: "viewport" as const,
         mood: next,
         reads: [shot(2.5).reads],
         rows: [shot(next === "calm" ? 6.25 : 2.5)],

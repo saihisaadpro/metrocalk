@@ -11,7 +11,8 @@
 //! rule — which is why the closed action vocabulary never had to grow to gain cutscenes.
 
 use metrocalk_animation::shot::{
-    Cutscene, Mood, ShotAngle, ShotMove, ShotRecipe, ShotSize, MAX_SECONDS, MAX_SHOTS, MIN_SECONDS,
+    Cutscene, Delivery, Mood, ShotAngle, ShotMove, ShotRecipe, ShotSize, MAX_SECONDS, MAX_SHOTS,
+    MIN_SECONDS,
 };
 use metrocalk_core::{Engine, EntityId, FieldValue, Op};
 use metrocalk_ecs::World;
@@ -174,6 +175,25 @@ pub struct FramingCatalog {
     /// The moves for which `amount` changes nothing. The strength control is disabled — with a
     /// reason — on these, rather than offering a dial that silently does nothing.
     pub still_motions: Vec<&'static str>,
+    /// The frames a cutscene may be DELIVERED in — the shape the shots are composed for.
+    ///
+    /// Published from [`Delivery::all`] rather than listed here, so the picker, the parser and the
+    /// aspect ratio the solver fits against are one list. A second copy in TypeScript is how an option
+    /// comes to offer a word the engine refuses.
+    pub deliveries: Vec<FramingOption>,
+}
+
+/// One line of what choosing a delivery frame does. Beside `Delivery::label`, not inside it, because
+/// this sentence is authoring guidance and the label is the name of a thing.
+fn delivery_blurb(delivery: Delivery) -> &'static str {
+    match delivery {
+        Delivery::Viewport => "Compose for the stage as it is now — no bars, and the framing follows the panels you open",
+        Delivery::Widescreen => "The broadcast and web default",
+        Delivery::Scope => "Anamorphic scope — the widest frame, and the most bar",
+        Delivery::Academy => "Classic 4:3, taller than it is wide is not",
+        Delivery::Square => "Square, for feeds that crop everything else",
+        Delivery::Vertical => "Vertical, for a phone held upright",
+    }
 }
 
 /// The framing vocabulary, published once.
@@ -284,6 +304,14 @@ pub fn framing_catalog() -> FramingCatalog {
         max_seconds: MAX_SECONDS,
         max_shots: MAX_SHOTS,
         still_motions: vec!["hold"],
+        deliveries: Delivery::all()
+            .into_iter()
+            .map(|delivery| FramingOption {
+                value: delivery.key(),
+                label: delivery.label(),
+                blurb: delivery_blurb(delivery),
+            })
+            .collect(),
     }
 }
 
@@ -330,6 +358,8 @@ pub enum CinemaError {
     UnknownShot(String),
     /// No such pacing mood.
     UnknownMood(String),
+    /// No such delivery frame.
+    UnknownDelivery(String),
     /// The object is gone.
     MissingEntity,
     /// The shot list is full.
@@ -355,6 +385,9 @@ impl std::fmt::Display for CinemaError {
             Self::UnknownShot(k) => write!(f, "there is no shot called \"{k}\""),
             Self::UnknownMood(mood) => {
                 write!(f, "there is no cinematic mood called \"{mood}\"")
+            }
+            Self::UnknownDelivery(frame) => {
+                write!(f, "there is no delivery frame called \"{frame}\"")
             }
             Self::MissingEntity => write!(f, "that object is no longer in the scene"),
             Self::NoSuchShot => write!(f, "that shot is already gone"),
@@ -431,6 +464,8 @@ pub struct CinemaReply {
     pub seconds: f32,
     /// The authored pacing dial currently driving effective duration and transitions.
     pub mood: Mood,
+    /// The frame this cutscene is composed and delivered in.
+    pub delivery: Delivery,
     /// The whole cutscene read back as sentences — one line per shot.
     ///
     /// Derived from `rows` at construction, in one place, so the two cannot disagree. It stays on the
@@ -866,6 +901,27 @@ pub fn set_mood_ops<W: World>(
     Ok((write_ops(entity, &cut, false), cut))
 }
 
+/// Set the frame the cutscene is composed and DELIVERED in (one undoable commit).
+///
+/// Refused on an empty cutscene for the same reason pacing is: the delivery frame is an instruction to
+/// the shot solver, so setting one where there are no shots writes a `Cinematic` husk and changes
+/// nothing a user can see.
+pub fn set_delivery_ops<W: World>(
+    engine: &Engine<W>,
+    entity: EntityId,
+    delivery: &str,
+) -> Result<(Vec<Op>, Cutscene), CinemaError> {
+    let mut cut = cutscene_of(engine, entity);
+    if cut.shots.is_empty() {
+        return Err(CinemaError::OutOfRange(
+            "a delivery frame is what the shots are composed for, and this object has no shots yet — add one first".into(),
+        ));
+    }
+    cut.delivery = Delivery::from_key(delivery)
+        .ok_or_else(|| CinemaError::UnknownDelivery(delivery.into()))?;
+    Ok((write_ops(entity, &cut, false), cut))
+}
+
 /// Write the cutscene back.
 ///
 /// `arm` says whether this write should also set `playing = true`. Only ADDING a shot arms a cutscene:
@@ -995,6 +1051,7 @@ pub fn reply_with_names(
         shots: cut.shots.len(),
         seconds: cut.seconds(),
         mood: cut.mood,
+        delivery: cut.delivery,
         // One producer. `reads` is the flattened projection of `rows`, never a second computation of
         // the same sentences.
         reads: rows.iter().map(|row| row.reads.clone()).collect(),
