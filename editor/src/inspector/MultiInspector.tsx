@@ -75,7 +75,11 @@ export function MultiInspector({ client, ids }: { client: EditorClient; ids: str
           .multiEdit(present, component, field, value as Json)
           .then((r) => {
             if (r.ok) {
-              pushToast(`${component}.${field} on ${r.changed} objects · Ctrl-Z to undo`, "success");
+              // NO TOAST ON SUCCESS, and the reason is the keyboard. An arrow-key nudge on a numeric
+              // field commits on every press, so a toast per write would stack one per keystroke —
+              // and the result is already visible in the rows themselves, which is where feedback for
+              // a direct manipulation belongs. The status line carries the count and the undo.
+              setStatus(`${component}.${field} on ${r.changed} · Ctrl-Z to undo`);
               return;
             }
             // AT THE GESTURE, NOT IN THE GUTTER: the sentence lands under the header of the panel the

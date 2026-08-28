@@ -8,10 +8,14 @@ import { afterEach, expect, test, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Inspector } from "./Inspector";
 import { projectionStore } from "../store/projection";
+import { toastStore } from "../store/toasts";
+import { uiStore } from "../store/ui";
 import { fakeClient } from "../transport/test-client";
 
 afterEach(() => {
   projectionStore.getState().reset();
+  uiStore.getState().setStatus("");
+  toastStore.getState().reset();
   window.localStorage.clear();
 });
 
@@ -73,6 +77,13 @@ test("editing a shared field writes to EVERY selected object, in ONE transaction
   expect(value).toBe(24);
   // And NOT through the single-entity path, which would have been three transactions and three undos.
   expect(client.setField).not.toHaveBeenCalled();
+
+  // THE RESULT IS REPORTED ON THE STATUS LINE AND NOT AS A TOAST, and the reason is the keyboard: an
+  // arrow-key nudge commits on every press, so a toast per write stacks one per keystroke over a panel
+  // whose rows already show the new value.
+  await waitFor(() => expect(uiStore.getState().status).toContain("Light.intensity on 3"));
+  expect(uiStore.getState().status).toContain("Ctrl-Z");
+  expect(toastStore.getState().toasts).toHaveLength(0);
 });
 
 test("mounting the multi panel emits nothing — a mixed field must not commit a default nobody typed", async () => {
