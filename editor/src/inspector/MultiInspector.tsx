@@ -26,6 +26,8 @@ import type { Json } from "../transport/protocol";
 import { buildEntitySchema, buildEntityUiSchema } from "../schema/registry";
 import { inspectorRenderers, MixedPaths } from "./renderers";
 import { describeKind, selectionMakeup, sharedShape, type Components } from "./shared";
+import { TransformSection } from "./TransformSection";
+import { readTransform, withoutTransform } from "./transform";
 import { TypeIcon } from "../theme/primitives";
 import { color, font, fontSize, space } from "../theme/tokens";
 
@@ -44,7 +46,12 @@ export function MultiInspector({ client, ids }: { client: EditorClient; ids: str
 
   const present = ids.filter((id) => displayed[id]);
   const entities: Components[] = present.map((id) => displayed[id].components);
-  const shape = sharedShape(entities);
+  // ADR-172 — the Transform is drawn by its own section when EVERY selected object carries one.
+  // When only some do it stays in the intersection, so the existing partial-field count reports it
+  // honestly rather than a second mechanism saying the same thing in different words.
+  const allPlaced = present.length > 0 && entities.every((c) => !!c.Transform);
+  const transforms = allPlaced ? entities.map((c) => readTransform(c.Transform)) : [];
+  const shape = sharedShape(allPlaced ? entities.map(withoutTransform) : entities);
   const makeup = selectionMakeup(present.map((id) => summaries[id]?.kind));
   const names = present.map((id) => displayed[id].name || id);
 
@@ -96,6 +103,30 @@ export function MultiInspector({ client, ids }: { client: EditorClient; ids: str
           });
       }
     }
+  }
+
+  /** The whole selection turned to one rotation — ONE transaction, the same refusal grammar as a
+   *  batched field edit. `multiEdit` cannot stand in for this: it writes one field to N entities and
+   *  a rotation is four fields to N entities. */
+  function rotateAll(quat: [number, number, number, number]) {
+    setRefusal(null);
+    setStatus(`edit ${present.length}x Transform.rotation`);
+    void client
+      .setRotation(present, quat)
+      .then((r) => {
+        if (r.ok) {
+          setStatus(`rotation on ${r.changed} - Ctrl-Z to undo`);
+          return;
+        }
+        const said = r.reason ?? "the engine refused that rotation";
+        setRefusal(said);
+        setStatus(said);
+        pushToast(said, "error");
+      })
+      .catch((e: unknown) => {
+        console.error("setRotation failed", e);
+        setRefusal("that rotation could not be sent to the engine");
+      });
   }
 
   const title =
@@ -161,8 +192,22 @@ export function MultiInspector({ client, ids }: { client: EditorClient; ids: str
         </div>
       )}
 
-      {hasFields ? (
+      {allPlaced && (
+        <TransformSection
+          transforms={transforms}
+          selectionKey={present.join(",")}
+          onSetPosition={(field, value) => emit({}, { Transform: { [field]: value } } as Components)}
+          onSetScale={(value) => emit({}, { Transform: { scale: value } } as Components)}
+          onSetRotation={rotateAll}
+        />
+      )}
+      {/* SOMETHING IS EDITABLE when the selection shares fields OR shares a place in the world — the
+          Transform section is drawn from its own resolved values, not from the intersection, so
+          `hasFields` alone stopped being the question the moment it existed (ADR-172). The partial
+          count belongs to this branch and not to the form: it is a statement about the SELECTION. */}
+      {hasFields || allPlaced ? (
         <>
+          {hasFields && (
           <MixedPaths.Provider value={shape.mixed}>
             <JsonForms
               schema={schema}
@@ -175,6 +220,7 @@ export function MultiInspector({ client, ids }: { client: EditorClient; ids: str
               }
             />
           </MixedPaths.Provider>
+          )}
           {shape.partialFields > 0 && (
             // PROGRESSIVE DISCLOSURE, AND AN HONEST COUNT. The fields only part of the selection
             // carries are not editable here — `engine.commit` is all-or-nothing and `Op::SetField`

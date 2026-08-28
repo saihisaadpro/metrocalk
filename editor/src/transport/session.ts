@@ -340,6 +340,11 @@ export interface EditorClient {
   /** Multi-edit — set one field (ANY scalar, ADR-169) on N entities as ONE batched, atomic, undoable
    *  transaction. Resolves to what it did, or to the sentence explaining why it refused. */
   multiEdit(ids: string[], component: string, field: string, value: Json): Promise<MultiEditResult>;
+  /** Set a ROTATION on N entities as ONE batched, atomic, undoable transaction (ADR-172). A rotation
+   *  is four stored fields and one property, so `multiEdit` — one field to N entities — cannot express
+   *  it; the engine normalises the quaternion, so no caller can leave a non-rotation in the document.
+   *  Resolves to what it did, or to the sentence explaining why it refused. */
+  setRotation(ids: string[], quat: [number, number, number, number]): Promise<MultiEditResult>;
   /** Delete = deactivate (non-destructive; frees dependents) — undo restores → applied. */
   deleteDeactivate(id: string): Promise<boolean>;
   /** Delete a whole SELECTION as ONE undoable transaction (ADR-169) → applied. One Ctrl-Z restores
@@ -1006,6 +1011,9 @@ export class TauriClient implements EditorClient {
   }
   multiEdit(ids: string[], component: string, field: string, value: Json): Promise<MultiEditResult> {
     return this.core.invoke<MultiEditResult>("multi_edit", { ids, component, field, value }).catch((e: unknown) => { console.error("multi_edit failed", e); throw e; });
+  }
+  setRotation(ids: string[], quat: [number, number, number, number]): Promise<MultiEditResult> {
+    return this.core.invoke<MultiEditResult>("set_rotation", { ids, quat }).catch((e: unknown) => { console.error("set_rotation failed", e); throw e; });
   }
   deleteDeactivate(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("delete_deactivate", { id }).catch((e: unknown) => { console.error("delete_deactivate failed", e); throw e; });
@@ -2880,6 +2888,32 @@ class MockClient implements EditorClient {
     return Promise.resolve(true);
   }
   multiEdit(ids: string[]): Promise<MultiEditResult> {
+    return Promise.resolve({ ok: true, changed: ids.length, reason: null });
+  }
+  /** UNLIKE the scene-authoring stubs around it, this one really writes. `set_rotation` is the only
+   *  path a rotation can be typed through, so an inert stub would leave the dev build (and every
+   *  `shots` scene over it) unable to demonstrate the one gesture ADR-172 exists for. It pushes the
+   *  four fields down the SAME `MockCore.push` delta path the real core's re-projection uses, so the
+   *  Inspector's degree rows resolve from the committed quaternion exactly as they do under Tauri.
+   *  The engine's normalisation is mirrored here for the same reason it exists there: a projection
+   *  the panel reads back must be a rotation. */
+  setRotation(ids: string[], quat: [number, number, number, number]): Promise<MultiEditResult> {
+    const length = Math.hypot(...quat);
+    if (!Number.isFinite(length) || length < 1e-9) {
+      return Promise.resolve({
+        ok: false,
+        changed: 0,
+        reason: "those four numbers are not a rotation (a quaternion must be finite and non-zero)",
+      });
+    }
+    const unit = quat.map((c) => c / length);
+    const ops: ProjectionOp[] = [];
+    for (const id of ids) {
+      (["qx", "qy", "qz", "qw"] as const).forEach((field, i) => {
+        ops.push({ op: "setField", id, component: "Transform", field, value: unit[i] });
+      });
+    }
+    this.core.push(ops);
     return Promise.resolve({ ok: true, changed: ids.length, reason: null });
   }
   deleteDeactivate(): Promise<boolean> {

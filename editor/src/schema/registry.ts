@@ -57,21 +57,35 @@ export interface ComponentSchema {
  *  second lookup table to drift. `default` is what the row's inline reset reverts to; it is declared
  *  only where the engine genuinely has one (an unrotated transform is 0, an unscaled one is 1). */
 export const componentSchemas: Record<string, ComponentSchema> = {
-  // Position/rotation/scale. Nine flat scalars, because `FieldType` is scalar-only — which is exactly
-  // why the units matter: `px` alone does not say metres, and the engine is metric everywhere
-  // (`unit_from_bounds`, `worldSizeM`, `diameterCm`).
+  // POSITION / ROTATION / SCALE — the eight scalars an entity's `Transform` ACTUALLY holds.
+  //
+  // **ADR-172.** This block used to read `px/py/pz` + Euler `rx/ry/rz` + non-uniform `sx/sy/sz`,
+  // because `core/src/stdlib.rs` declared those and `check-registry-vocab.mjs` compares this table to
+  // that one. Neither described any entity in this product: every writer in the shell commits
+  // `x`/`y`/`z` + a rotation QUATERNION + a uniform `scale`, and `capscene::local_transform` — the
+  // reader behind the renderer, picking, framing and export — reads the same eight names. So the
+  // curated entry for the one component every object carries had **never once fired**: every position
+  // row fell to the data-driven inference and drew a bare `x` with no title, no unit and no reset,
+  // and the dev mock, which seeds the real `Transform{x,y,z}`, agreed with the panel while both
+  // disagreed with the two statements the gate was comparing.
+  //
+  // `TransformSection` (inspector/TransformSection.tsx) reads the titles, units and defaults BELOW —
+  // this stays the one place the editor states them — and renders the four quaternion components as
+  // one **Rotation, in degrees**, because four independent number boxes on a unit quaternion is a
+  // control that can put the document in a state that is not a rotation at all.
   Transform: {
     type: "object",
     properties: {
-      px: { type: "number", title: "Position X", unit: "m", default: 0 },
-      py: { type: "number", title: "Position Y", unit: "m", default: 0 },
-      pz: { type: "number", title: "Position Z", unit: "m", default: 0 },
-      rx: { type: "number", title: "Rotation X", unit: "°", default: 0 },
-      ry: { type: "number", title: "Rotation Y", unit: "°", default: 0 },
-      rz: { type: "number", title: "Rotation Z", unit: "°", default: 0 },
-      sx: { type: "number", title: "Scale X", unit: "×", default: 1 },
-      sy: { type: "number", title: "Scale Y", unit: "×", default: 1 },
-      sz: { type: "number", title: "Scale Z", unit: "×", default: 1 },
+      x: { type: "number", title: "Position X", unit: "m", default: 0 },
+      y: { type: "number", title: "Position Y", unit: "m", default: 0 },
+      z: { type: "number", title: "Position Z", unit: "m", default: 0 },
+      qx: { type: "number", title: "Rotation X", unit: "°", default: 0 },
+      qy: { type: "number", title: "Rotation Y", unit: "°", default: 0 },
+      qz: { type: "number", title: "Rotation Z", unit: "°", default: 0 },
+      // Declared for completeness and for the gate; `qw` has no degree row of its own — the three
+      // above are the Euler angles the panel shows, and all four are written together.
+      qw: { type: "number", title: "Rotation W", default: 1 },
+      scale: { type: "number", title: "Scale", unit: "×", default: 1 },
     },
   },
   Health: {
@@ -99,7 +113,12 @@ export const componentSchemas: Record<string, ComponentSchema> = {
   RigidBody: {
     type: "object",
     properties: {
-      kind: { type: "string", title: "Body", enum: ["dynamic", "fixed", "kinematicPosition", "kinematicVelocity"] },
+      // A ROW IS TITLED BY THE PROPERTY IT EDITS, NEVER BY THE COMPONENT IT SITS INSIDE (ADR-172).
+      // The section header already names the component, so `Joint: Joint` and `Light: Light` spent a
+      // row saying the same word twice and answered nothing; `Body` was a synonym doing the same. The
+      // rule holds for all four vocabulary rows: `Type` where the field is `kind`, and the field's own
+      // word where it has one (`Collider.shape` -> Shape, `PlayIf.join` -> Match).
+      kind: { type: "string", title: "Type", enum: ["dynamic", "fixed", "kinematicPosition", "kinematicVelocity"] },
       mass: { type: "number", title: "Mass", unit: "kg", minimum: 0 },
       linearDamping: { type: "number", title: "Linear damping", minimum: 0 },
       angularDamping: { type: "number", title: "Angular damping", minimum: 0 },
@@ -131,7 +150,7 @@ export const componentSchemas: Record<string, ComponentSchema> = {
   Joint: {
     type: "object",
     properties: {
-      kind: { type: "string", title: "Joint", enum: ["revolute", "fixed", "spherical"] },
+      kind: { type: "string", title: "Type", enum: ["revolute", "fixed", "spherical"] },
       bodyA: { type: "string", title: "Body A", format: "entity-ref" },
       bodyB: { type: "string", title: "Body B", format: "entity-ref" },
     },
@@ -147,7 +166,7 @@ export const componentSchemas: Record<string, ComponentSchema> = {
   Light: {
     type: "object",
     properties: {
-      kind: { type: "string", title: "Light", enum: ["directional", "point", "spot"] },
+      kind: { type: "string", title: "Type", enum: ["directional", "point", "spot"] },
       intensity: { type: "number", title: "Intensity", minimum: 0 },
       // The core models colour as three separate Numbers, not one string, so there is no `format:
       // color` field anywhere in the registry and nothing for a colour picker to fire on. Naming the

@@ -25,6 +25,9 @@ import type { Json } from "../transport/protocol";
 import { buildEntitySchema, buildEntityUiSchema } from "../schema/registry";
 import { inspectorRenderers } from "./renderers";
 import { MultiInspector } from "./MultiInspector";
+import { TransformSection } from "./TransformSection";
+import { readTransform, withoutTransform } from "./transform";
+import { pushToast } from "../store/toasts";
 import { TypeIcon } from "../theme/primitives";
 import { color, font, fontSize, space } from "../theme/tokens";
 
@@ -74,7 +77,12 @@ function SingleInspector({ client }: { client: EditorClient }) {
       </div>
     );
   }
-  const schema = buildEntitySchema(entity.components);
+  // ADR-172 — `Transform` is drawn by its own section, not by the data-driven form. It is the one
+  // component whose STORAGE and whose PROPERTIES are different shapes: eight sparse scalars on the
+  // wire, three properties on screen, one of them (rotation) a quaternion nobody types.
+  const rest = withoutTransform(entity.components);
+  const schema = buildEntitySchema(rest);
+  const transform = entity.components.Transform ? readTransform(entity.components.Transform) : null;
   // A real empty-state (C6) — never a blank pane: when the entity carries no *editable* (schema-backed)
   // properties, say so + name the next step, rather than rendering nothing beside the header.
   const hasFields = !!schema.properties && Object.keys(schema.properties).length > 0;
@@ -91,19 +99,53 @@ function SingleInspector({ client }: { client: EditorClient }) {
           <div style={{ font: font.mono, fontSize: fontSize.micro, color: color.text.muted }}>{id}</div>
         </div>
       </div>
+      {transform && (
+        <TransformSection
+          transforms={[transform]}
+          selectionKey={id}
+          onSetPosition={(field, value) => {
+            client.setField(id, "Transform", field, value);
+            setStatus(`edit Transform.${field}`);
+          }}
+          onSetScale={(value) => {
+            client.setField(id, "Transform", "scale", value);
+            setStatus("edit Transform.scale");
+          }}
+          onSetRotation={(quat) => {
+            setStatus("edit Transform.rotation");
+            void client
+              .setRotation([id], quat)
+              .then((r) => {
+                if (r.ok) {
+                  setStatus("rotation set · Ctrl-Z to undo");
+                  return;
+                }
+                // The engine's own sentence, at the control — a rotation can be refused (a target
+                // with no place in the world, four numbers that are not a rotation) and "nothing
+                // happened" is the one answer a property field must never give.
+                const said = r.reason ?? "the engine refused that rotation";
+                setStatus(said);
+                pushToast(said, "error");
+              })
+              .catch((e: unknown) => console.error("setRotation failed", e));
+          }}
+        />
+      )}
       {hasFields ? (
         <JsonForms
           schema={schema}
-          uischema={buildEntityUiSchema(entity.components)}
-          data={entity.components}
+          uischema={buildEntityUiSchema(rest)}
+          data={rest}
           renderers={inspectorRenderers}
           cells={vanillaCells}
-          onChange={({ data }) => emitChanges(client, id, entity.components, data as Components)}
+          onChange={({ data }) => emitChanges(client, id, rest, data as Components)}
         />
       ) : (
-        <div data-testid="inspectorEmpty" style={{ color: color.text.muted, fontSize: fontSize.body, padding: `${space.md}px 0` }}>
-          No editable properties yet — add a component to this object.
-        </div>
+        !transform && (
+          <div data-testid="inspectorEmpty" style={{ color: color.text.muted, fontSize: fontSize.body, padding: `${space.md}px 0` }}>
+            No editable properties yet — add a component to this object.
+          </div>
+        )
       )}
     </div>
   );

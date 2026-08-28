@@ -1030,13 +1030,17 @@ export const SCENES: Scene[] = [
  *  `DisclosureSection` for groups, and `@jsonforms/vanilla-renderers`' unstyled `.control` for
  *  everything else), and typed controls keyed on components the core has never registered.
  *
- *  THE ENTITY BELOW IS THE CORE'S OWN VOCABULARY, not the dev mock's. `Transform{px..sz}`,
+ *  THE ENTITY BELOW IS THE VOCABULARY THE ENGINE ACTUALLY STORES — and for two milestones it was not.
  *  `MeshRenderer{mesh,material,castShadows}`, `RigidBody{kind,mass}` and `Joint{kind,bodyA,bodyB}` are
- *  exactly what `core/src/stdlib.rs` registers, down to the `format` on the two body references —
- *  which is what makes this a capture of the real product rather than of the mock. A scene that seeded
- *  `Material`/`Targeting` would photograph a payload the core cannot produce, which is the C6 failure
- *  reached through a screenshot instead of a test. `check-registry-vocab.mjs` is the gate that keeps
- *  the two in step; this is the picture of them being in step. */
+ *  exactly what `core/src/stdlib.rs` registers, down to the `format` on the two body references. The
+ *  `Transform` was `{px..sz}`, seeded here **to prove this was a capture of the real product rather
+ *  than of the mock** — and it was the one component where that reasoning failed: no writer in this
+ *  repository has ever committed a `Transform.px`. Every creator writes `x`/`y`/`z` + a rotation
+ *  quaternion + a uniform `scale`, `capscene::local_transform` reads the same eight names, and the dev
+ *  mock — the thing this comment was guarding against — was the only one of the three that had it
+ *  right. So this scene photographed a payload the engine cannot produce, in the caption's own words,
+ *  for the whole of ADR-136 and ADR-155 (ADR-172). It is the stored vocabulary now, and
+ *  `stdlib_transform_matches_the_stored_transform` is the test that keeps it so. */
 function inspectorSetup(open: string[], extra: Record<string, Record<string, unknown>> = {}) {
   return () => {
     // The disclosure remembers its own state, and only `Transform` opens by default — so a capture of
@@ -1047,14 +1051,16 @@ function inspectorSetup(open: string[], extra: Record<string, Record<string, unk
       window.localStorage.setItem(`metrocalk:disclosure:inspector-component:${encodeURIComponent(label)}`, "open");
     }
     projectionStore.getState().bulkLoad([
-      { id: "e-mast", name: "Mast", parentId: null, components: { Transform: { px: 0, py: 0, pz: 0 } } },
-      { id: "e-counterweight", name: "Counterweight", parentId: null, components: { Transform: { px: -4, py: 0, pz: 0 } } },
+      { id: "e-mast", name: "Mast", parentId: null, components: { Transform: { x: 0, y: 0, z: 0 } } },
+      { id: "e-counterweight", name: "Counterweight", parentId: null, components: { Transform: { x: -4, y: 0, z: 0 } } },
       {
         id: "e-boom",
         name: "Boom Arm",
         parentId: null,
         components: {
-          Transform: { px: 2.5, py: 1.2, pz: -0.75, rx: 0, ry: 45, rz: 0, sx: 1, sy: 1, sz: 1 },
+          // 45 degrees about Y, as a quaternion — which is how the engine stores a rotation and why
+          // the panel converts it to degrees rather than printing four numbers nobody types.
+          Transform: { x: 2.5, y: 1.2, z: -0.75, qx: 0, qy: YAW_45[1], qz: 0, qw: YAW_45[3], scale: 1 },
           MeshRenderer: { mesh: "sha256:9f3c81aa4e07", material: "sha256:1ab77d5c90e2", castShadows: true },
           RigidBody: { kind: "dynamic", mass: 1250 },
           Joint: { kind: "revolute", bodyA: "e-mast", bodyB: "e-counterweight" },
@@ -1066,14 +1072,29 @@ function inspectorSetup(open: string[], extra: Record<string, Record<string, unk
   };
 }
 
-/** A client that records rather than sends. `setField` and `multiEdit` are the two methods these
- *  scenes can reach — the single-object and the whole-selection edit paths (ADR-169). */
+/** A 45-degree yaw as the engine stores it: `[qx, qy, qz, qw]` for a rotation about +Y. Stated once
+ *  so the two scenes that need a rotated object cannot disagree about what "rotated" means. */
+const YAW_45: [number, number, number, number] = [
+  0,
+  Math.sin(Math.PI / 8),
+  0,
+  Math.cos(Math.PI / 8),
+];
+
+/** A client that records rather than sends. `setField`, `multiEdit` and `setRotation` are the methods
+ *  these scenes can reach — the single-object, whole-selection and rotation edit paths (ADR-169,
+ *  ADR-172). The rotation is recorded as ONE entry however many entities it carries, because that is
+ *  the claim: four stored fields on N objects, one transaction. */
 function recordingClient(record: (entry: string) => void) {
   return {
     setField: (id: string, component: string, field: string, value: unknown) =>
       record(`${id}.${component}.${field}=${JSON.stringify(value)}`),
     multiEdit: (ids: string[], component: string, field: string, value: unknown) => {
       record(`${ids.length}x.${component}.${field}=${JSON.stringify(value)}`);
+      return Promise.resolve({ ok: true, changed: ids.length, reason: null });
+    },
+    setRotation: (ids: string[], quat: number[]) => {
+      record(`${ids.length}x.Transform.rotation=[${quat.map((c) => c.toFixed(3)).join(",")}]`);
       return Promise.resolve({ ok: true, changed: ids.length, reason: null });
     },
   } as unknown as EditorClient;
@@ -1097,7 +1118,7 @@ function multiSelectionSetup(extra: Record<string, Record<string, unknown>> = {}
         name: "Key Light",
         parentId: null,
         components: {
-          Transform: { px: 0, py: 4, pz: 0 },
+          Transform: { x: 0, y: 4, z: 0 },
           Light: { kind: "point", intensity: 60, r: 1, g: 1, b: 1 },
         },
       },
@@ -1106,7 +1127,7 @@ function multiSelectionSetup(extra: Record<string, Record<string, unknown>> = {}
         name: "Fill Light",
         parentId: null,
         components: {
-          Transform: { px: 3, py: 4, pz: 0 },
+          Transform: { x: 3, y: 4, z: 0 },
           Light: { kind: "point", intensity: 60, r: 1, g: 1, b: 1 },
         },
       },
@@ -1115,7 +1136,7 @@ function multiSelectionSetup(extra: Record<string, Record<string, unknown>> = {}
         name: "Rim Light",
         parentId: null,
         components: {
-          Transform: { px: -3, py: 4, pz: 2 },
+          Transform: { x: -3, y: 4, z: 2 },
           Light: { kind: "point", intensity: 12, r: 1, g: 1, b: 1 },
         },
       },
@@ -1123,12 +1144,43 @@ function multiSelectionSetup(extra: Record<string, Record<string, unknown>> = {}
         id: "e-crate",
         name: "Crate",
         parentId: null,
-        components: { Transform: { px: 0, py: 0, pz: 0 }, ...extra },
+        components: { Transform: { x: 0, y: 0, z: 0 }, ...extra },
       },
     ] as never);
     projectionStore.getState().select("e-key");
     projectionStore.getState().toggleSelect("e-fill");
     projectionStore.getState().toggleSelect("e-rim");
+  };
+}
+
+/** WHAT `capscene::create_entity` ACTUALLY COMMITS — three position fields and nothing else.
+ *
+ *  This is the entity a user makes with Add > Entity, and it is why ADR-172 exists: a data-driven
+ *  form over these components offers three rows, so until this scene the editor could not rotate or
+ *  scale a fresh object by typing at all, while the renderer was already drawing it with an identity
+ *  rotation and a scale of 1. */
+function sparseTransformSetup() {
+  return () => {
+    projectionStore.getState().bulkLoad([
+      { id: "e-crate", name: "Crate", parentId: null, components: { Transform: { x: 1.5, y: 0, z: -2 } } },
+    ] as never);
+    projectionStore.getState().select("e-crate");
+  };
+}
+
+/** An object whose ONLY non-default property is its rotation, so the single reset in the sheet is the
+ *  rotation's and a click on it is unambiguous. */
+function rotatedOnlySetup() {
+  return () => {
+    projectionStore.getState().bulkLoad([
+      {
+        id: "e-boom",
+        name: "Boom Arm",
+        parentId: null,
+        components: { Transform: { x: 0, y: 0, z: 0, qx: YAW_45[0], qy: YAW_45[1], qz: YAW_45[2], qw: YAW_45[3], scale: 1 } },
+      },
+    ] as never);
+    projectionStore.getState().select("e-boom");
   };
 }
 
@@ -1164,13 +1216,16 @@ function inspectorScenes(): Scene[] {
       setup: inspectorSetup(["MeshRenderer", "RigidBody", "Joint"]),
       expect: {
         present: [
-          // 9 Transform + 3 MeshRenderer + 2 RigidBody + 3 Joint.
-          ["[data-testid='prop-row']", 17],
-          // px/py/pz metres, rx/ry/rz degrees, sx/sy/sz multiples, and `RigidBody.mass` in kilograms —
+          // 7 Transform + 3 MeshRenderer + 2 RigidBody + 3 Joint. SEVEN, not nine: the Transform is
+          // drawn as three PROPERTIES - position, rotation, scale - over the eight scalars it is
+          // stored as, and the fourth quaternion component has no row because it is not an angle
+          // (ADR-172).
+          ["[data-testid='prop-row']", 15],
+          // x/y/z metres, three degree rows, one scale multiple, and `RigidBody.mass` in kilograms —
           // TEN, not nine. An adversarial review caught the miscount, and it matters more than an
           // off-by-one: `present` is at-least, so a scene that under-counts is a scene that would stay
           // green with a unit deleted. A unit the core states in prose and the editor never showed.
-          ["[data-testid='prop-unit']", 10],
+          ["[data-testid='prop-unit']", 8],
           // THE THREE CONTROLS THAT COULD NOT FIRE BEFORE. Two entity references and one asset
           // reference — the core declares eight such fields and the editor routed none of them.
           //
@@ -1186,7 +1241,7 @@ function inspectorScenes(): Scene[] {
           ["#mtk-prop-MeshRenderer-mesh.mtk-input--mono", 1],
           ["#mtk-prop-MeshRenderer-material.mtk-input--mono", 1],
           ["#mtk-prop-RigidBody-kind", 1],
-          // px 2.5, py 1.2, pz -0.75 and ry 45 differ from their declared defaults, so four rows offer a
+          // x 2.5, y 1.2, z -0.75 and a 45-degree yaw differ from their declared defaults, so four rows offer a
           // reset. The COUNT cannot say the other five must not, because `present` is at-least — an
           // unconditional reset on all seventeen rows satisfies it. The two `absent` entries below are
           // what actually state it, and they are stated per row, on values that ARE their default.
@@ -1211,7 +1266,10 @@ function inspectorScenes(): Scene[] {
         absent: [
           ".control", ".input", ".select", ".checkbox", ".mtk-field-row",
           "[aria-label='Reset Rotation X to 0']",
-          "[aria-label='Reset Scale X to 1']",
+          "[aria-label='Reset Scale to 1']",
+          // The fourth quaternion component had a box of its own until ADR-172 - one a user could
+          // type into and leave the document holding four numbers that are not a rotation.
+          "#mtk-prop-Transform-qw",
         ],
         // `Mast`, `Counterweight`, `dynamic` and `revolute` are `<option>` TEXT, so a claim about them
         // is a claim about what a reader can see. The asset reference is an `<input value=…>` and is
@@ -1221,13 +1279,13 @@ function inspectorScenes(): Scene[] {
         // limit of the panel. Closing gate: a `value_present` claim beside `text_present` in
         // `shoot.mjs`; owner is whoever next has that file free, since a concurrent lane holds it.
         text_present: [
-          "Position X", "Rotation Y", "Scale Z", "Cast shadows", "Mass",
+          "Position X", "Rotation Y", "Scale", "Cast shadows", "Mass",
           "Mast", "Counterweight", "dynamic", "revolute",
         ],
         // A ROW IS A ROW at this width: the label and the control it names share a line. Anchored on
         // one known control rather than "the first `.mtk-property-row__label`", because `same_line`
         // reads the first match of each selector and two unrelated first-matches can overlap by luck.
-        same_line: [["label[for='mtk-prop-Transform-px']", "#mtk-prop-Transform-px"]],
+        same_line: [["label[for='mtk-prop-Transform-x']", "#mtk-prop-Transform-x"]],
         // Every row whole inside a 320px track. The retired anatomy spent a fixed 92px on the label
         // and had no actions column at all, so this is the measurement that says the new one fits.
         unclipped: ["[data-testid='prop-row']"],
@@ -1259,15 +1317,15 @@ function inspectorScenes(): Scene[] {
         // five rows nobody can see and then reports them as clipped — correctly, because they are.
         // A claim about what a reader can reach has to say which rows those are.
         present: [
-          ["[data-state='open'] [data-testid='prop-row']", 12],
-          ["[data-state='open'] [data-testid='prop-unit']", 9],
+          ["[data-state='open'] [data-testid='prop-row']", 10],
+          ["[data-state='open'] [data-testid='prop-unit']", 7],
         ],
         absent: [".control", ".input", ".select", ".checkbox", ".mtk-field-row"],
         // THE DUAL OF THE SCENE ABOVE, and the reason both exist. The same two elements that must
         // share a line at 1200px must be on separate lines here, label first. A stylesheet that lost
         // the media query passes one of these scenes and fails the other, which is exactly the
         // discrimination a single capture cannot give.
-        stacked: [["label[for='mtk-prop-Transform-px']", "#mtk-prop-Transform-px"]],
+        stacked: [["label[for='mtk-prop-Transform-x']", "#mtk-prop-Transform-x"]],
         unclipped: ["[data-state='open'] [data-testid='prop-row']"],
         text_present: ["Position X", "Cast shadows"],
         text_absent: ["null", "undefined", "NaN", "No applicable renderer found"],
@@ -1294,7 +1352,7 @@ function inspectorScenes(): Scene[] {
         // when paired with "it did render", so the nine open Transform rows are claimed here too.
         present: [
           ["[data-testid='mount-edits']", 1],
-          ["[data-state='open'] [data-testid='prop-row']", 9],
+          ["[data-state='open'] [data-testid='prop-row']", 7],
         ],
         text_present: ["0 transactions since mount", "Position X"],
         // The failure states, spelled out: any non-zero count, and the specific fields whose declared
@@ -1311,22 +1369,22 @@ function inspectorScenes(): Scene[] {
       looking_for:
         "THE RESET ACTUALLY RESETS. The same probe, with the first reset in the sheet clicked — " +
         "`Position X`, which is 2.5 against a declared default of 0. One transaction, and it is " +
-        "`Transform.px=0`: the value the schema declares, on the field whose row was clicked, through " +
+        "`Transform.x=0`: the value the schema declares, on the field whose row was clicked, through " +
         "the same `setField` path a typed edit takes. Without this scene the whole reset affordance " +
         "is proven by the presence of a button, and a button that emits nothing photographs the same",
       viewport: { width: 620, height: 1100 },
       setup: inspectorSetup([]),
       // The FIRST reset in the document is Position X's — Transform is the group that opens by
-      // default and `px` is its first field. Clicking by testid rather than by position in a list
+      // default and `x` is its first row. Clicking by testid rather than by position in a list
       // would be no more specific: they all carry the same one, which is why the assertion below
       // names the field the click must have reached.
       click: ["[data-testid='prop-reset']"],
       expect: {
         present: [["[data-testid='edit-log']", 1]],
-        text_present: ["1 transaction since mount", "e-boom.Transform.px=0"],
+        text_present: ["1 transaction since mount", "e-boom.Transform.x=0"],
         // Not two transactions, and not the wrong field: a reset that also nudged its neighbours, or
         // one wired to the row below it, would still print "a transaction" and look right.
-        text_absent: ["2 transactions", "Transform.py", "Transform.ry", "undefined", "NaN"],
+        text_absent: ["2 transactions", "Transform.y", "Transform.rotation", "undefined", "NaN"],
       },
       render: () => <EditProbe />,
     },
@@ -1343,20 +1401,25 @@ function inspectorScenes(): Scene[] {
       setup: multiSelectionSetup(),
       expect: {
         present: [
-          // The Transform group (3 rows, all mixed) plus the Light group opened by the setup.
-          ["[data-testid='prop-row']", 8],
+          // The Transform section (7 rows - position mixed on x/z, agreed on y; rotation and scale
+          // agreed) plus the 5-row Light group opened by the setup.
+          ["[data-testid='prop-row']", 12],
           // MIXED IS A STATE OF THE CONTROL, not a banner over the panel: the box that cannot show
           // one value shows none, and says so where the value would be.
           ["#mtk-prop-Light-intensity[data-mixed='1']", 1],
-          ["#mtk-prop-Transform-px[data-mixed='1']", 1],
+          ["#mtk-prop-Transform-x[data-mixed='1']", 1],
+          // AND THE ROTATION THE THREE AGREE ABOUT IS NOT MIXED - they are all unrotated, which is a
+          // fact the panel could not state at all before it read an absent quaternion as identity.
+          ["#mtk-prop-Transform-qy:not([data-mixed])", 1],
           // AND THE AGREED FIELD IS NOT MIXED. Without this the scene passes for a panel that gave
           // up and marked everything mixed, which would be exactly as useless as the old one.
           ["#mtk-prop-Light-kind:not([data-mixed])", 1],
         ],
         // The single-object header is gone: no mono entity id, because there is no single entity.
         absent: [".control", ".input", ".select", ".checkbox", "[data-testid='inspectorEmpty']"],
-        // `Light.kind`'s curated title is "Light" (the vocabulary row), not "Kind" — the claim names
-        // what the panel actually prints, which is the whole reason a scene states its text.
+        // `Light.kind`'s curated title is "Type" (ADR-172 — a row is titled by the property it edits,
+        // never by the component it sits inside; it used to read `Light: Light`). The claim names what
+        // the panel actually prints, which is the whole reason a scene states its text.
         text_present: ["3 lights selected", "Key Light", "Rim Light", "Intensity", "point"],
         // `e-key` is the primary. A panel that printed it would be the OLD panel wearing a new count.
         text_absent: ["e-key", "e-rim", "null", "undefined", "NaN", "No applicable renderer found"],
@@ -1382,7 +1445,7 @@ function inspectorScenes(): Scene[] {
       expect: {
         present: [
           ["[data-testid='multiPartial']", 1],
-          ["#mtk-prop-Transform-px", 1],
+          ["#mtk-prop-Transform-x", 1],
         ],
         // The withheld control is ABSENT, not disabled: a greyed row invites a click that can never
         // work, and this panel already has a sentence for the same information.
@@ -1401,17 +1464,106 @@ function inspectorScenes(): Scene[] {
         "which is 0, 3 and -3 and therefore MIXED. Two claims in one click: a mixed row still offers " +
         "its reset (setting them all back to the declared default is exactly what a reset is for, " +
         "and an unbound single field offering none is a different case), and the write goes through " +
-        "the BATCHED path - the log reads `3x.Transform.px=0`, ONE entry, not three `setField`s " +
+        "the BATCHED path - the log reads `3x.Transform.x=0`, ONE entry, not three `setField`s " +
         "that would have been three undo steps behind a toast promising one",
-      viewport: { width: 620, height: 1000 },
+      // 1120, not 1000: the Transform section is seven rows where the data-driven form drew three,
+      // so the same panel is ~120px taller. A window that cuts the log off the bottom is a fact about
+      // the window (the harness reports it correctly), not about the panel.
+      viewport: { width: 620, height: 1160 },
       setup: multiSelectionSetup(),
       click: ["[data-testid='prop-reset']"],
       expect: {
         present: [["[data-testid='edit-log']", 1]],
-        text_present: ["1 transaction since mount", "3x.Transform.px=0"],
+        text_present: ["1 transaction since mount", "3x.Transform.x=0"],
         // Not three transactions, and never the single-entity path - `e-key.Transform.px` is what
         // the old panel would have written, and it would have looked like a success too.
         text_absent: ["2 transactions", "3 transactions", "e-key.Transform", "undefined", "NaN"],
+      },
+      render: () => <EditProbe />,
+    },
+    {
+      id: "inspector-transform-is-a-property",
+      looking_for:
+        "THE OBJECT A USER ACTUALLY MAKES. `Add > Entity` commits `Transform{x, y, z}` and nothing " +
+        "else, so the data-driven form drew three rows labelled `x`, `y` and `z` - no titles, no " +
+        "units, no resets - and offered no way to rotate or scale it by typing at all. The renderer " +
+        "was drawing that same object with an identity rotation and a scale of 1 the whole time, " +
+        "because `capscene::local_transform` reads an absent field as the identity. Seven rows now: " +
+        "Position in metres, Rotation in DEGREES, Scale as a multiple - the property, not the storage",
+      viewport: { width: 1200, height: 900 },
+      setup: sparseTransformSetup(),
+      expect: {
+        present: [
+          ["[data-testid='prop-row']", 7],
+          ["[data-testid='prop-unit']", 7],
+          // The rows that did not exist for this entity before ADR-172, named individually: a scene
+          // that only counted seven would stay green if the seven were the wrong seven.
+          ["#mtk-prop-Transform-qx", 1],
+          ["#mtk-prop-Transform-qy", 1],
+          ["#mtk-prop-Transform-qz", 1],
+          ["#mtk-prop-Transform-scale", 1],
+          // Position X is 1.5 and Z is -2, so exactly two rows differ from their declared default.
+          // Rotation and scale are AT the identity, which is the point: they are shown, and they do
+          // not pretend to be edits.
+          ["[aria-label='Reset Position X to 0']", 1],
+        ],
+        absent: [
+          ".control", ".input", ".select", ".checkbox", ".mtk-field-row",
+          // Not a fourth quaternion box, and not the empty state either - an object carrying only a
+          // Transform used to be one row short of nothing.
+          "#mtk-prop-Transform-qw",
+          "[data-testid='inspectorEmpty']",
+          "[aria-label='Reset Rotation Y to 0']",
+          "[aria-label='Reset Scale to 1']",
+        ],
+        text_present: ["Position X", "Position Z", "Rotation X", "Rotation Y", "Rotation Z", "Scale", "Crate"],
+        // The raw wire names are what the panel printed for two milestones. A label reading exactly
+        // `qw` or `qx` is the old behaviour returning.
+        text_absent: ["null", "undefined", "NaN", "No applicable renderer found", "No editable properties yet"],
+        same_line: [["label[for='mtk-prop-Transform-qy']", "#mtk-prop-Transform-qy"]],
+        unclipped: ["[data-testid='prop-row']"],
+      },
+      render: () => dockTrack(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-rotation-is-one-transaction",
+      looking_for:
+        "A ROTATION IS ONE PROPERTY AND ONE TRANSACTION. The object below is rotated 45 degrees " +
+        "about Y and is otherwise at its defaults, so the single reset in the sheet is the " +
+        "rotation's. Clicking it writes ONE entry - a normalised quaternion carrying all four stored " +
+        "components - through `set_rotation`. The path it replaces wrote `qx`, `qy`, `qz` and `qw` as " +
+        "four independent boxes: four transactions, four undo steps, and a quaternion of length not " +
+        "equal to 1 in between, which is not a rotation at all",
+      viewport: { width: 620, height: 1000 },
+      setup: rotatedOnlySetup(),
+      click: ["[data-testid='prop-reset']"],
+      expect: {
+        present: [
+          ["[data-testid='edit-log']", 1],
+          // AND THE BOX SHOWS WHAT WAS COMMITTED, WHICH IS A SEPARATE CLAIM AND THE ONE THAT CAUGHT A
+          // REAL DEFECT. `set_rotation` is a command, not the optimistic `setField` echo, so the
+          // projection answers a round trip later and the panel holds the angle the user asked for in
+          // the meantime. The first capture of this scene showed `45` under a log that said the
+          // identity had been written: the pending angle was keyed on an object `readTransform`
+          // rebuilds every render, so the click's own re-render threw it away. `aria-valuenow` is the
+          // committed value the control is showing, so this is a claim about the number on screen.
+          //
+          // jsdom cannot see this one - measured, not assumed: `TransformSection.test.tsx` asserts the
+          // same behaviour and stays green with the defect reintroduced, because a store update in a
+          // separate `act` does not reproduce the click's own synchronous re-render. This scene is the
+          // gate for it.
+          ["#mtk-prop-Transform-qy[aria-valuenow='0']", 1],
+        ],
+        // The 45 degrees that were there before the click, and the reset that offered to remove them:
+        // both are gone because the value IS the default now.
+        absent: [
+          "#mtk-prop-Transform-qy[aria-valuenow='45']",
+          "[aria-label='Reset Rotation Y to 0']",
+        ],
+        // The identity quaternion, to three decimals, on one entity.
+        text_present: ["1 transaction since mount", "1x.Transform.rotation=[0.000,0.000,0.000,1.000]"],
+        // Never the per-field path: `Transform.qy` in this log is the defect this scene exists for.
+        text_absent: ["2 transactions", "4 transactions", "Transform.qy", "Transform.qw", "undefined", "NaN"],
       },
       render: () => <EditProbe />,
     },

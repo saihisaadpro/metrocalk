@@ -271,6 +271,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     groupEntities: () => Promise.resolve("group-1"),
     ungroupEntity: () => Promise.resolve(true),
     multiEdit: vi.fn((ids: string[]) => Promise.resolve({ ok: true, changed: ids.length, reason: null })),
+    setRotation: vi.fn((ids: string[]) => Promise.resolve({ ok: true, changed: ids.length, reason: null })),
     deleteDeactivate: vi.fn(() => Promise.resolve(true)),
     deleteDeactivateMany: vi.fn(() => Promise.resolve(true)),
     copySubtree: vi.fn(),
