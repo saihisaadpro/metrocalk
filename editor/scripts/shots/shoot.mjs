@@ -291,7 +291,13 @@ function layoutInvariants({ rootIndex, windowIsTheSubject }) {
     return `<${el.tagName.toLowerCase()}${cls}>` + (txt ? ` "${txt}"` : "");
   };
   const visible = (el, r) => {
-    if (r.width < 1 && r.height < 1) return false;
+    // ONE PIXEL IN BOTH AXES IS NOT A SURFACE A READER CAN BE SHOWN ANYTHING ON. The bound used to be
+    // `< 1`, which is off by exactly the size the screen-reader-only pattern uses: `.mtk-visually-
+    // hidden` is `width: 1px; height: 1px; overflow: hidden`, so every one of them was judged visible
+    // and R2 reported each as text truncated with nothing to say so — a confident finding about a
+    // sentence written to be unseen. Nothing legible fits in a 1x1 box, so excluding it costs no
+    // coverage; the rules keep judging anything larger on either axis.
+    if (r.width <= 1 && r.height <= 1) return false;
     const cs = getComputedStyle(el);
     return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
   };
