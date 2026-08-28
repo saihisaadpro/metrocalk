@@ -182,7 +182,16 @@ export type Scene = {
   render: () => ReactNode;
 };
 
-const client = (cadReport: () => Promise<CadReport>) => ({ cadReport }) as unknown as EditorClient;
+// `cadReportPage` returns the fixture UNFILTERED and on purpose: re-implementing the shell's query here
+// would make the harness a second statement of a contract that already has two (ADR-163). A scene that
+// wants to photograph a searched or filtered state hands over the payload that state produces.
+const client = (cadReport: () => Promise<CadReport>) =>
+  ({
+    cadReport,
+    cadReportPage: cadReport,
+    gizmoSelect: () => Promise.resolve(true),
+    focusEntity: () => {},
+  }) as unknown as EditorClient;
 
 const revealClient = (r: RevealResponse) =>
   ({ revealTargets: () => Promise.resolve(r), bind: () => "op-1" }) as unknown as EditorClient;
@@ -204,6 +213,8 @@ const report = (parts: CadReportPart[]): CadReport => ({
   proxy: parts.filter((p) => p.fidelity === "proxy").length,
   accessDenied: parts.filter((p) => p.fidelity === "access-denied").length,
   failed: parts.filter((p) => p.fidelity === "failed").length,
+  matched: parts.length,
+  offset: 0,
   parts,
 });
 
@@ -237,6 +248,32 @@ const DETAILED = [
     reason: "Reconstructed from the mesh at 0.82 confidence.",
   }),
 ];
+
+/** The assembly this panel exists for, at its real size (ADR-163). The Skid Weld Line lands 15,711
+ *  parts of which 412 resolve to nothing, and the panel's OLD shape photographed that as a header
+ *  reading "412 proxy" over a body of 500 alphabetically-first rows containing none of them, with no
+ *  sentence anywhere saying which rows were on screen. This is the shell's first page of it — byte for
+ *  byte what `cad_report_page(query: "", fidelity: "", offset: 0, limit: 10)` returns. The limit is 10
+ *  rather than the panel's own 200 for one reason: the gate requires every asserted element to be ON
+ *  SCREEN, and 200 rows is a 11,600px column. The claim being photographed is the SENTENCE and the
+ *  PAGER over a list of 15,711, and neither of those changes with the page length. */
+const HUGE_ASSEMBLY: CadReport = {
+  total: 15_711,
+  exactBrep: 15_299,
+  tessellationOnly: 0,
+  aiReconstructed: 0,
+  proxy: 412,
+  accessDenied: 0,
+  failed: 0,
+  matched: 15_711,
+  offset: 0,
+  parts: Array.from({ length: 10 }, (_, i) =>
+    part(`0_${i + 1}`, `Skid Weld Line A.1 — Bracket ${String(i + 1).padStart(5, "0")}`, "exact-brep", {
+      reference: `PRODUCT_${String(i + 1).padStart(4, "0")}`,
+      sourceFormat: "3DXML",
+    }),
+  ),
+};
 
 /** The reveal, with names of the length the product actually produces. `<visual_acceptance>` §2 is
  *  explicit that a fixture hides the bugs real content exposes, and here "real content" is not a
@@ -790,11 +827,21 @@ export const SCENES: Scene[] = [
   {
     id: "import-report-narrow",
     looking_for:
-      "at 360 px the badge stays on the header row and the provenance line ellipsises — nothing " +
-      "wraps onto a line of its own (the ADR-120 defect class)",
-    width: 360,
+      "THE WIDTH IT ACTUALLY SHIPS IN, measured rather than chosen: the Import workspace is a two-" +
+      "column split inside the bottom dock, the dock is the STAGE column, and the report's share of it " +
+      "is 260 px — read off `getBoundingClientRect` in a live `.exe` run against the real assembly, " +
+      "not estimated from the layout string. The badge " +
+      "stays on the header row, the provenance line ellipsises, and nothing — chip, pager, or Frame " +
+      "control — is painted outside the panel. 360 px was a comfortable width, and a panel photographed " +
+      "at a width it never ships at cannot fail the way it fails.",
+    width: 260,
     expect: {
-      present: [["[data-testid='import-row']", 3], ["[data-testid='import-row-provenance']", 3]],
+      present: [
+        ["[data-testid='import-row']", 3],
+        ["[data-testid='import-row-provenance']", 3],
+        ["[data-testid='import-frame']", 3],
+        ["[data-testid='import-search']", 1],
+      ],
       text_absent: ["null", "undefined"],
     },
     setup: seedScene,
@@ -819,6 +866,30 @@ export const SCENES: Scene[] = [
         <EmptySentinel client={client(() => Promise.resolve(report([])))} />
       </>
     ),
+  },
+  {
+    id: "import-report-paged",
+    looking_for:
+      "the 15,711-part assembly: a search box above the chips, and a sentence that names exactly " +
+      "which rows are on screen — 'Showing 1–10 of 15,711 parts' — with Previous refusing in words " +
+      "and Next live. Every number on screen came back with the rows under it; the panel makes no " +
+      "claim it cannot see. Each row carries a Frame control that is legible beside the part name.",
+    // A ten-row page, so every element this scene asserts is genuinely on screen (a 200-row page is
+    // an 11,600px column, and a claim about pixels below the fold is not a claim about a capture).
+    viewport: { width: 560, height: 900 },
+    expect: {
+      present: [
+        ["[data-testid='import-row']", 10],
+        ["[data-testid='import-search']", 1],
+        ["[data-testid='import-next']", 1],
+        ["[data-testid='import-prev']", 1],
+      ],
+      absent: ["[data-testid='import-empty']"],
+      text_present: ["Showing 1–10 of 15,711 parts", "412 proxy"],
+      text_absent: ["null", "undefined"],
+    },
+    setup: seedScene,
+    render: () => <ImportReport client={client(() => Promise.resolve(HUGE_ASSEMBLY))} />,
   },
   {
     id: "reveal-cad-names",

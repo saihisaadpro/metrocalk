@@ -1968,6 +1968,14 @@ struct CadReportPart {
 /// The per-part import report aggregated from the ECS: the fidelity breakdown (the header line) + a capped
 /// list of parts (the queryable body). Built from `CadPart` components, so it reflects whatever CAD is in
 /// the scene right now — never-empty + never-silent made visible.
+///
+/// **`total` and the six class counts describe the QUERY, `matched` describes the LIST, `offset` says
+/// where the list starts.** Three separate numbers because the panel makes three separate claims and
+/// they are not the same claim: a 15,711-part assembly answered "412 proxy" in its header while its body
+/// held 500 alphabetically-first rows, none of them proxy, and the panel said nothing about either fact
+/// (`ADR-163`). With these on the wire the panel can only ever state what it is actually showing —
+/// `parts.len()` rows, starting at `offset`, out of `matched` — and every number it prints comes from
+/// the single query that produced the rows beside it.
 #[derive(Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct CadReportResp {
@@ -1978,6 +1986,12 @@ struct CadReportResp {
     proxy: usize,
     access_denied: usize,
     failed: usize,
+    /// Rows passing the query AND the honesty-class filter — the size of the list being paged.
+    /// Equals `total` whenever no class filter is applied.
+    matched: usize,
+    /// Where `parts` starts inside `matched`. Echoed from the request so "showing 501–1000 of 15,711"
+    /// is read off one payload rather than reconstructed from client-side bookkeeping that can drift.
+    offset: usize,
     parts: Vec<CadReportPart>,
 }
 
@@ -2391,6 +2405,7 @@ enum EngineCmd {
     /// M15.7 (ADR-077) — the per-part CAD import report, aggregated from the ECS `CadPart` components (a read).
     CadReport {
         query: Option<String>,
+        fidelity: Option<String>,
         offset: usize,
         limit: usize,
         reply: Sender<CadReportResp>,
@@ -8468,7 +8483,17 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
 
     // Rate limiter for the slow-tick report at the end of the `Tick` arm.
     let mut slow_tick_reported = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    // The CAD report's SCAN, held between reads (ADR-163). Search is a per-keystroke read of a list
+    // that changes only when the scene does, and the scan of a 15,000-part assembly is ~0.5 s against
+    // ~1.6 ms to answer a query over its result — so the rows are collected once and every subsequent
+    // letter typed pages over them. Invalidated below by ANY other command: over-invalidating costs one
+    // scan, and deciding per-variant which commands can move a `CadPart` is a list that goes stale the
+    // first time someone adds a command and does not think about this cache.
+    let mut cad_rows: Option<Vec<CadRow>> = None;
     while let Ok(cmd) = rx.recv() {
+        if !matches!(cmd, EngineCmd::CadReport { .. }) {
+            cad_rows = None;
+        }
         match cmd {
             EngineCmd::Connect(ch) => {
                 send_proj!(ch, proj_full(&engine, &scene)); // initial full-scene load
@@ -11212,13 +11237,16 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             }
             EngineCmd::CadReport {
                 query,
+                fidelity,
                 offset,
                 limit,
                 reply,
             } => {
-                let _ = reply.send(build_cad_report_page(
-                    &engine,
+                let rows = cad_rows.get_or_insert_with(|| collect_cad_rows(&engine));
+                let _ = reply.send(page_over_cad_rows(
+                    rows,
                     query.as_deref(),
+                    fidelity.as_deref(),
                     offset,
                     limit,
                 ));
@@ -17099,14 +17127,94 @@ fn sync_out(
 /// the counts are always the true totals.
 #[cfg(test)]
 fn build_cad_report(engine: &Engine<FlecsWorld>) -> CadReportResp {
-    build_cad_report_page(engine, None, 0, 500)
+    build_cad_report_page(engine, None, None, 0, 500)
 }
 
-/// Deterministic, bounded page over the live CAD report. The default panel still requests the first 500
-/// rows; QA/director tooling can search or page without asking React to hold a 15k-row payload.
-fn build_cad_report_page(
-    engine: &Engine<FlecsWorld>,
+/// **The expensive half: one pass over the scene, producing every live CAD part as a sorted row.**
+///
+/// Split from the paging below because the two halves have wildly different costs and wildly different
+/// rates. Measured on this box, release, 20 samples, a 15,000-part scene: this scan is **p50 536 ms**;
+/// answering a query over its result is **p50 0.4–1.6 ms** (p99 2.4 ms). A search box calls the second
+/// one per keystroke and the first one never — the engine loop keeps the rows until something commits
+/// (see `cad_rows` there). Doing both per keystroke, which is what the shape before this did, measured
+/// **p50 421 ms of engine thread per letter typed**, against a sub-16 ms interaction budget the product
+/// treats as sacred.
+///
+/// Each row also carries the lower-cased text the search runs against, folded ONCE at scan time. It is
+/// not on the wire and it is not a second copy of the truth — it is `name` and `reference` of the row
+/// beside it, and it exists because folding 15,000 names per keystroke costs 15,000 allocations and
+/// measured 12 ms of engine thread per letter; with it, 1.4 ms.
+///
+/// (`get_field` per field was tried and is WORSE — 1,174 ms for the same scan against 421 ms — because
+/// each call re-resolves the document's `components` map and re-allocates the entity's Loro key. One
+/// deep read per entity beats seven shallow ones.)
+struct CadRow {
+    part: CadReportPart,
+    haystack: String,
+}
+
+fn collect_cad_rows(engine: &Engine<FlecsWorld>) -> Vec<CadRow> {
+    let mut rows: Vec<CadRow> = engine
+        .entity_ids()
+        .into_iter()
+        .filter(|id| engine.is_active(*id))
+        .filter_map(|id| {
+            let comps = engine.components_of(id);
+            let cad = comps.get(metrocalk_editor_shell::CAD_PART)?;
+            // `fidelity` is the gate: an entity without one is not a CAD part.
+            let Some(FieldValue::Str(fidelity)) = cad.get("fidelity") else {
+                return None;
+            };
+            let name = match cad.get("name") {
+                Some(FieldValue::Str(n)) if !n.is_empty() => n.clone(),
+                _ => label_of(engine, id),
+            };
+            let reference = cad.get("reference").and_then(nonempty_field_string);
+            let mut haystack = name.to_lowercase();
+            if let Some(reference) = reference.as_deref() {
+                haystack.push('\u{0}');
+                haystack.push_str(&reference.to_lowercase());
+            }
+            Some(CadRow {
+                part: CadReportPart {
+                    id: id.to_loro_key(),
+                    name,
+                    fidelity: fidelity.clone(),
+                    reference,
+                    strategy: cad.get("strategy").and_then(nonempty_field_string),
+                    reason: cad.get("reason").and_then(nonempty_field_string),
+                    fix: cad.get("fix").and_then(nonempty_field_string),
+                    source_format: cad.get("sourceFormat").and_then(nonempty_field_string),
+                },
+                haystack,
+            })
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        left.part
+            .name
+            .to_lowercase()
+            .cmp(&right.part.name.to_lowercase())
+            .then_with(|| left.part.name.cmp(&right.part.name))
+            .then_with(|| left.part.id.cmp(&right.part.id))
+    });
+    rows
+}
+
+/// **The cheap half: the one query behind every number the import panel prints.**
+///
+/// `query` is matched case-insensitively against the part's display name AND its source `reference`,
+/// because those are two names for the same part and a CAD user has only ever been given one of them:
+/// a 3DXML instance is called `Skid Weld Line A.1_(1)` in the tree and `PRODUCT_0042` in the drawing,
+/// and searching for the one you were handed must find the part either way.
+///
+/// `fidelity_filter` narrows the LIST only, never the counts — so the class chips keep showing what
+/// else the current search contains while you are looking inside one class. That is the whole reason
+/// `matched` exists separately from `total`.
+fn page_over_cad_rows(
+    rows: &[CadRow],
     query: Option<&str>,
+    fidelity_filter: Option<&str>,
     offset: usize,
     limit: usize,
 ) -> CadReportResp {
@@ -17116,30 +17224,19 @@ fn build_cad_report_page(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_lowercase);
-    let mut rows = Vec::new();
-    for id in engine.entity_ids() {
-        if !engine.is_active(id) {
-            continue;
-        }
-        let comps = engine.components_of(id);
-        let Some(cad) = comps.get(metrocalk_editor_shell::CAD_PART) else {
-            continue;
-        };
-        let Some(FieldValue::Str(fidelity)) = cad.get("fidelity") else {
-            continue;
-        };
-        let name = match cad.get("name") {
-            Some(FieldValue::Str(n)) if !n.is_empty() => n.clone(),
-            _ => label_of(engine, id),
-        };
+    let fidelity_filter = fidelity_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "all");
+    let take = limit.clamp(1, MAX_PAGE_ROWS);
+    for row in rows {
         if query
             .as_ref()
-            .is_some_and(|needle| !name.to_lowercase().contains(needle))
+            .is_some_and(|needle| !row.haystack.contains(needle))
         {
             continue;
         }
         r.total += 1;
-        match fidelity.as_str() {
+        match row.part.fidelity.as_str() {
             "exact-brep" => r.exact_brep += 1,
             "tessellation-only" => r.tessellation_only += 1,
             "ai-reconstructed" => r.ai_reconstructed += 1,
@@ -17147,30 +17244,36 @@ fn build_cad_report_page(
             "access-denied" => r.access_denied += 1,
             _ => r.failed += 1, // "failed" + any future token → the honest catch-all
         }
-        rows.push(CadReportPart {
-            id: id.to_loro_key(),
-            name,
-            fidelity: fidelity.clone(),
-            reference: cad.get("reference").and_then(nonempty_field_string),
-            strategy: cad.get("strategy").and_then(nonempty_field_string),
-            reason: cad.get("reason").and_then(nonempty_field_string),
-            fix: cad.get("fix").and_then(nonempty_field_string),
-            source_format: cad.get("sourceFormat").and_then(nonempty_field_string),
-        });
+        if fidelity_filter.is_some_and(|want| want != row.part.fidelity.as_str()) {
+            continue;
+        }
+        r.matched += 1;
+        // `rows` is already in the display order, so the page is a window over the match sequence.
+        if r.matched > offset && r.parts.len() < take {
+            r.parts.push(row.part.clone());
+        }
     }
-    rows.sort_by(|left, right| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    r.parts = rows
-        .into_iter()
-        .skip(offset)
-        .take(limit.clamp(1, MAX_PAGE_ROWS))
-        .collect();
+    // An offset past the end returns an empty page — and `offset` is echoed as ASKED, never clamped to
+    // something that would let the panel print "showing 1–0 of 412" while it is in fact showing nothing.
+    r.offset = offset;
     r
+}
+
+#[cfg(test)]
+fn build_cad_report_page(
+    engine: &Engine<FlecsWorld>,
+    query: Option<&str>,
+    fidelity_filter: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> CadReportResp {
+    page_over_cad_rows(
+        &collect_cad_rows(engine),
+        query,
+        fidelity_filter,
+        offset,
+        limit,
+    )
 }
 
 fn nonempty_field_string(value: &FieldValue) -> Option<String> {
@@ -23595,6 +23698,7 @@ fn cad_report(state: State<AppState>) -> CadReportResp {
         .tx
         .send(EngineCmd::CadReport {
             query: None,
+            fidelity: None,
             offset: 0,
             limit: 500,
             reply,
@@ -23606,12 +23710,16 @@ fn cad_report(state: State<AppState>) -> CadReportResp {
     recv_reply(&rx).unwrap_or_default()
 }
 
-/// Search/page the live CAD report for diagnostics and high-volume authoring tools without changing the
-/// established no-argument `cad_report` IPC contract used by the editor.
+/// Search/page/filter the live CAD report — **what the import panel calls, and the only way to reach a
+/// part past the 500th in a real assembly.** `cad_report` above is the no-argument whole-scene summary
+/// the e2e suites and the shots harness read; this is the same query with its three knobs exposed, so
+/// the panel's list, its class chips and its "showing X–Y of N" line are all one answer to one question
+/// rather than three claims nothing reconciles (ADR-163).
 #[tauri::command(async)]
 fn cad_report_page(
     state: State<AppState>,
     query: Option<String>,
+    fidelity: Option<String>,
     offset: usize,
     limit: usize,
 ) -> CadReportResp {
@@ -23621,6 +23729,7 @@ fn cad_report_page(
         .tx
         .send(EngineCmd::CadReport {
             query,
+            fidelity,
             offset,
             limit,
             reply,
@@ -26633,7 +26742,7 @@ mod cad_report_tests {
         cad_part(&mut e, "motor A", "proxy");
         cad_part(&mut e, "Motor B", "exact-brep");
 
-        let first = build_cad_report_page(&e, Some("MOTOR"), 0, 2);
+        let first = build_cad_report_page(&e, Some("MOTOR"), None, 0, 2);
         assert_eq!(
             first.total, 3,
             "counts describe all query matches, not just the page"
@@ -26648,9 +26757,13 @@ mod cad_report_tests {
         );
         assert_eq!(first.exact_brep, 2);
         assert_eq!(first.proxy, 1);
+        // With no class filter the list IS the match set — the panel's two numbers agree by construction.
+        assert_eq!(first.matched, first.total);
+        assert_eq!(first.offset, 0);
 
-        let second = build_cad_report_page(&e, Some("motor"), 2, 2);
+        let second = build_cad_report_page(&e, Some("motor"), None, 2, 2);
         assert_eq!(second.total, 3);
+        assert_eq!(second.offset, 2, "the page says where it starts");
         assert_eq!(
             second
                 .parts
@@ -26659,9 +26772,147 @@ mod cad_report_tests {
                 .collect::<Vec<_>>(),
             ["Motor Z"]
         );
-        assert!(build_cad_report_page(&e, Some("robot"), 0, 10)
+        assert!(build_cad_report_page(&e, Some("robot"), None, 0, 10)
             .parts
             .is_empty());
+    }
+
+    /// The defect ADR-163 closes, stated as an assertion: a class filter must narrow the LIST while the
+    /// counts keep describing the whole query, and the number the panel prints beside the list
+    /// (`matched`) must be the number of rows that filter can actually produce. The old shape had no
+    /// `matched` at all — a chip reading "412 proxy" over a page of 500 alphabetically-first rows
+    /// containing none, and nothing on the wire able to say so.
+    #[test]
+    fn a_class_filter_narrows_the_list_and_matched_is_what_the_list_can_hold() {
+        let mut e = Engine::new(FlecsWorld::new(), 4);
+        cad_part(&mut e, "Motor Z", "exact-brep");
+        cad_part(&mut e, "Clamp", "tessellation-only");
+        cad_part(&mut e, "motor A", "proxy");
+        cad_part(&mut e, "Motor B", "exact-brep");
+
+        let proxies = build_cad_report_page(&e, None, Some("proxy"), 0, 500);
+        assert_eq!(
+            proxies.total, 4,
+            "the counts still describe the whole scene"
+        );
+        assert_eq!(proxies.exact_brep, 2);
+        assert_eq!(proxies.proxy, 1);
+        assert_eq!(proxies.matched, 1, "and `matched` describes the list");
+        assert_eq!(
+            proxies
+                .parts
+                .iter()
+                .map(|part| part.name.as_str())
+                .collect::<Vec<_>>(),
+            ["motor A"]
+        );
+
+        // Query AND class compose: 3 motors, of which 2 are exact.
+        let exact_motors = build_cad_report_page(&e, Some("motor"), Some("exact-brep"), 0, 500);
+        assert_eq!(exact_motors.total, 3);
+        assert_eq!(exact_motors.matched, 2);
+        assert_eq!(exact_motors.parts.len(), 2);
+
+        // A class nothing in the query matches is an EMPTY list with an honest count beside it — the
+        // state the panel now has to render a sentence for, rather than an unexplained blank.
+        let denied = build_cad_report_page(&e, Some("motor"), Some("access-denied"), 0, 500);
+        assert_eq!(denied.total, 3);
+        assert_eq!(denied.matched, 0);
+        assert!(denied.parts.is_empty());
+
+        // "all" is the chip's own token for "no filter" and must not be read as a fidelity nobody has.
+        assert_eq!(
+            build_cad_report_page(&e, None, Some("all"), 0, 500).matched,
+            4
+        );
+    }
+
+    /// The scale the panel actually meets. A real CATIA cell lands 13k–16k parts, and every number the
+    /// import panel prints has to survive that: the counts describe all 15,000, the list is bounded by
+    /// the requested limit no matter what is asked for, and a query into the middle of it still says
+    /// exactly how many rows it found. No wall-clock assertion here on purpose — the runner is parallel
+    /// and a timing bound inside it measures the machine's load, not this function (`330781a`); the
+    /// measurement lives in the session report.
+    #[test]
+    fn fifteen_thousand_parts_page_without_the_panel_ever_holding_them_all() {
+        let mut e = Engine::new(FlecsWorld::new(), 6);
+        for i in 0..15_000 {
+            // A third of them tessellation-only, and 12 carry "weld" in the name — a needle whose size
+            // is known, so the search assertion cannot pass by accident.
+            let fidelity = if i % 3 == 0 {
+                "tessellation-only"
+            } else {
+                "exact-brep"
+            };
+            let name = if i % 1_250 == 0 {
+                format!("Weld Gun {i:05}")
+            } else {
+                format!("Bracket {i:05}")
+            };
+            cad_part(&mut e, &name, fidelity);
+        }
+
+        let page = build_cad_report_page(&e, None, None, 0, 200);
+        assert_eq!(page.total, 15_000);
+        assert_eq!(page.matched, 15_000);
+        assert_eq!(page.parts.len(), 200, "the list is bounded by the request");
+
+        // The 501st part is reachable — the whole point. The old panel could not ask for it.
+        let deep = build_cad_report_page(&e, None, None, 14_900, 200);
+        assert_eq!(deep.offset, 14_900);
+        assert_eq!(deep.parts.len(), 100, "the last page is short, not empty");
+
+        // A limit larger than the hard cap is clamped, never honoured into a 15k-row IPC payload.
+        assert_eq!(
+            build_cad_report_page(&e, None, None, 0, 1_000_000)
+                .parts
+                .len(),
+            2_000
+        );
+
+        let welds = build_cad_report_page(&e, Some("weld"), None, 0, 200);
+        assert_eq!(welds.total, 12, "12 needles in 15,000");
+        assert_eq!(welds.matched, 12);
+        assert_eq!(welds.parts.len(), 12);
+        let welds_tess = build_cad_report_page(&e, Some("weld"), Some("tessellation-only"), 0, 200);
+        assert_eq!(welds_tess.total, 12, "the counts still describe the query");
+        assert_eq!(welds_tess.matched, 4, "and the list is the class inside it");
+    }
+
+    /// A CAD part has two names and the user was handed exactly one of them: the tree label, or the
+    /// source reference off the drawing / the BOM. Searching must find it either way.
+    #[test]
+    fn search_reaches_the_source_reference_not_only_the_display_name() {
+        let mut e = Engine::new(FlecsWorld::new(), 5);
+        let id = cad_part(&mut e, "Weld Gun", "tessellation-only");
+        e.commit(
+            "reference",
+            vec![Op::SetField {
+                entity: id,
+                component: CAD_PART.into(),
+                field: "reference".into(),
+                value: FieldValue::Str("PRODUCT_0042".into()),
+            }],
+        )
+        .expect("commit the source reference");
+        cad_part(&mut e, "Clamp", "exact-brep");
+
+        let by_reference = build_cad_report_page(&e, Some("product_00"), None, 0, 10);
+        assert_eq!(by_reference.matched, 1);
+        assert_eq!(by_reference.parts[0].name, "Weld Gun");
+        assert_eq!(
+            by_reference.parts[0].reference.as_deref(),
+            Some("PRODUCT_0042")
+        );
+        // And the display name still works, so neither name is privileged.
+        assert_eq!(
+            build_cad_report_page(&e, Some("weld"), None, 0, 10).matched,
+            1
+        );
+        assert_eq!(
+            build_cad_report_page(&e, Some("zzz"), None, 0, 10).matched,
+            0
+        );
     }
 
     #[test]

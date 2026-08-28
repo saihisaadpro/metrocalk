@@ -143,8 +143,12 @@ export interface EditorClient {
   entityActions(id: string): Promise<ActionItem[]>;
   /** The hover-tooltip details for an entity (M3.3) — name + components + caps + bound. */
   entityDetails(id: string): Promise<EntityDetails | null>;
-  /** The per-part CAD import report (M15.7) — the fidelity breakdown + a capped part list, off the ECS. */
+  /** The per-part CAD import report (M15.7) — the fidelity breakdown + the first page, off the ECS. */
   cadReport(): Promise<CadReport>;
+  /** The same report, asked a question (ADR-163): `query` matches a part's display name OR its source
+   *  reference, `fidelity` narrows to one honesty class, and `offset`/`limit` page. This is what the
+   *  import panel calls — the no-argument form above cannot reach the 501st part of an assembly. */
+  cadReportPage(query: string, fidelity: string, offset: number, limit: number): Promise<CadReport>;
   /** M15.10 — the last import's re-import diff (matched/added/removed/adjudicate + orphans + held matches). */
   cadReimportReport(): Promise<ReimportReport>;
   /** M15.10 — resolve a held low-confidence match: accept re-binds its overrides onto the matched new entity
@@ -713,6 +717,9 @@ export class TauriClient implements EditorClient {
 
   cadReport(): Promise<CadReport> {
     return this.core.invoke<CadReport>("cad_report").catch((e: unknown) => { console.error("cad_report failed", e); throw e; });
+  }
+  cadReportPage(query: string, fidelity: string, offset: number, limit: number): Promise<CadReport> {
+    return this.core.invoke<CadReport>("cad_report_page", { query, fidelity, offset, limit }).catch((e: unknown) => { console.error("cad_report_page failed", e); throw e; });
   }
   setJoint(id: string, revolute: boolean, axis: [number, number, number], pivot: [number, number, number], min: number, max: number, source: string): Promise<boolean> {
     return this.core.invoke<boolean>("set_joint", { id, revolute, axis, pivot, min, max, source }).catch((e: unknown) => { console.error("set_joint failed", e); return false; });
@@ -2376,25 +2383,43 @@ class MockClient implements EditorClient {
     return Promise.resolve({ ok: true, message: "Transient graph parameters reset.", accepted: {} });
   }
   cadReport(): Promise<CadReport> {
+    return this.cadReportPage("", "", 0, 500);
+  }
+  cadReportPage(query: string, fidelity: string, offset: number, limit: number): Promise<CadReport> {
     // Dev stand-in: derive the report from the projection's persisted CadPart components (empty until a
-    // CAD file is imported, which only happens under the real Tauri core — so this is normally all zeros).
-    const r: CadReport = { total: 0, exactBrep: 0, tessellationOnly: 0, aiReconstructed: 0, proxy: 0, accessDenied: 0, failed: 0, parts: [] };
-    for (const [id, e] of Object.entries(projectionStore.getState().displayed)) {
-      const fidelity = e.components["CadPart"]?.["fidelity"];
-      if (typeof fidelity !== "string") continue;
+    // CAD file is imported, which only happens under the real Tauri core — so this is normally all
+    // zeros). Written as ONE paging function that `cadReport` calls with no question, exactly like the
+    // shell, so the dev path cannot answer a search differently from `/core`.
+    const needle = query.trim().toLowerCase();
+    const wantClass = fidelity.trim() && fidelity !== "all" ? fidelity.trim() : null;
+    const take = Math.min(Math.max(limit, 1), 2000);
+    const r: CadReport = { total: 0, exactBrep: 0, tessellationOnly: 0, aiReconstructed: 0, proxy: 0, accessDenied: 0, failed: 0, matched: 0, offset, parts: [] };
+    const rows = Object.entries(projectionStore.getState().displayed)
+      .flatMap(([id, e]) => {
+        const cls = e.components["CadPart"]?.["fidelity"];
+        if (typeof cls !== "string") return [];
+        const raw = e.components["CadPart"]?.["reference"];
+        const reference = typeof raw === "string" && raw.trim() ? raw : null;
+        return [{ id, name: e.name, fidelity: cls, reference }];
+      })
+      .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+    for (const row of rows) {
+      if (needle && !row.name.toLowerCase().includes(needle) && !row.reference?.toLowerCase().includes(needle)) continue;
       r.total++;
-      if (fidelity === "exact-brep") r.exactBrep++;
-      else if (fidelity === "tessellation-only") r.tessellationOnly++;
-      else if (fidelity === "ai-reconstructed") r.aiReconstructed++;
-      else if (fidelity === "proxy") r.proxy++;
-      else if (fidelity === "access-denied") r.accessDenied++;
+      if (row.fidelity === "exact-brep") r.exactBrep++;
+      else if (row.fidelity === "tessellation-only") r.tessellationOnly++;
+      else if (row.fidelity === "ai-reconstructed") r.aiReconstructed++;
+      else if (row.fidelity === "proxy") r.proxy++;
+      else if (row.fidelity === "access-denied") r.accessDenied++;
       else r.failed++;
+      if (wantClass && wantClass !== row.fidelity) continue;
+      r.matched++;
       // `null`, not omitted: the shell's `CadReportPart` is bare `Option<String>` with no
       // `skip_serializing_if`, so every one of these keys IS on the wire holding null. A mock that
       // omits them builds a part the real core cannot produce — the C6 shape, where a panel is green
       // against MockCore and wrong against `/core`.
-      if (r.parts.length < 500)
-        r.parts.push({ id, name: e.name, fidelity, reference: null, strategy: null, reason: null, fix: null, sourceFormat: null });
+      if (r.matched > offset && r.parts.length < take)
+        r.parts.push({ id: row.id, name: row.name, fidelity: row.fidelity, reference: row.reference, strategy: null, reason: null, fix: null, sourceFormat: null });
     }
     return Promise.resolve(r);
   }

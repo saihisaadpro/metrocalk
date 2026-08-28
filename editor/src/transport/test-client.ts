@@ -87,6 +87,21 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
         proxy: 0,
         accessDenied: 0,
         failed: 0,
+        matched: 0,
+        offset: 0,
+        parts: [],
+      }),
+    cadReportPage: () =>
+      Promise.resolve({
+        total: 0,
+        exactBrep: 0,
+        tessellationOnly: 0,
+        aiReconstructed: 0,
+        proxy: 0,
+        accessDenied: 0,
+        failed: 0,
+        matched: 0,
+        offset: 0,
         parts: [],
       }),
     cadReimportReport: () =>

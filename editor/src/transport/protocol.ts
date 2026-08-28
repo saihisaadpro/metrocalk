@@ -755,9 +755,15 @@ export interface CadReportPart {
   sourceFormat: string | null;
 }
 
-/** The per-part CAD import report aggregated from the ECS — the fidelity breakdown (the header) + a capped
- *  part list (the queryable body). "Explain every no" applied to import; nothing silent. Mirrors
- *  `CadReportResp`. */
+/** The per-part CAD import report aggregated from the ECS — the fidelity breakdown (the header) + a
+ *  paged, searchable part list (the queryable body). "Explain every no" applied to import; nothing
+ *  silent. Mirrors `CadReportResp`.
+ *
+ *  **Three numbers, three different claims, and the panel must not confuse them** (ADR-163). `total`
+ *  and the six class counts describe everything the QUERY matched; `matched` describes the list the
+ *  class filter left; `parts.length` is what this page is actually holding, starting at `offset`. The
+ *  shape before this had only the first of the three, which is how a header could read "412 proxy" over
+ *  a body of 500 alphabetically-first rows containing none of them, with nothing able to say so. */
 export interface CadReport {
   total: number;
   exactBrep: number;
@@ -766,6 +772,8 @@ export interface CadReport {
   proxy: number;
   accessDenied: number;
   failed: number;
+  matched: number;
+  offset: number;
   parts: CadReportPart[];
 }
 
