@@ -353,6 +353,16 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
         .map((c) => ({ ...c, group: "Matches" }));
       return Promise.resolve({ ...SUBJECTS, candidates: hits, query: query.trim(), matches: hits.length });
     }),
+    // The chain a click could mean: the object, then what it is part of. Built from the same fixture
+    // the picker's list uses, so a rung and a row can never disagree about a name or a count.
+    cinemaSubjectChain: vi.fn((id: string) => {
+      const self = SUBJECTS.candidates.find((c) => c.id === id);
+      const chain = self
+        ? [{ ...self, group: "This object", current: false },
+           ...SUBJECTS.candidates.filter((c) => c.group === "What it is part of").map((c) => ({ ...c, current: false }))]
+        : [];
+      return Promise.resolve({ ...SUBJECTS, owner: id, ownerName: self?.name ?? "", current: null, candidates: chain, matches: chain.length });
+    }),
     cinemaSetShotSeconds: vi.fn((id: string, index: number, seconds: number) => Promise.resolve({ entity: id, shots: 1, seconds, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, seconds, effectiveSeconds: seconds }], problems: [], message: `Shot ${index + 1} now runs ${seconds.toFixed(1)}s`, reason: null })),
     cinemaMoveShot: vi.fn((id: string, _from: number, to: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Shot moved to position ${to + 1}`, reason: null })),
     cinemaSetShotFraming: vi.fn((id: string, index: number, edit: FramingEdit) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, size: (edit.size as ShotRow["size"]) ?? HERO_ROW.size, angle: (edit.angle as ShotRow["angle"]) ?? HERO_ROW.angle, motion: (edit.motion as ShotRow["motion"]) ?? HERO_ROW.motion, amount: edit.amount ?? HERO_ROW.amount }], problems: [], message: `Shot ${index + 1} is now re-framed`, reason: null })),
@@ -453,6 +463,9 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     setRenderProfile: (profile) => Promise.resolve(profile),
     renderProfileDebug: () => Promise.resolve("cinematic"),
     viewportPick: () => Promise.resolve(null),
+    // Nothing under the cursor by default — the honest answer for a client with no viewport. A test
+    // that drives the aim gesture overrides it with the id it means to be pointing at.
+    viewportPeek: vi.fn((): Promise<string | null> => Promise.resolve(null)),
     dragStart: vi.fn(),
     dragEnd: vi.fn(),
     zoom: vi.fn(),

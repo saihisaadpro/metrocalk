@@ -14,6 +14,7 @@ import { projectionStore, useDisplayedEntity, useEntityOrder, useSelectedId } fr
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { cinemaPreviewStore, useCinemaPreview } from "../store/cinemaPreview";
+import { subjectAimStore, useSubjectAim, type AimRung } from "../store/subjectAim";
 import { setStatus } from "../store/ui";
 import { Modal, Popover } from "../theme/Popover";
 import { Icon } from "../theme/icons";
@@ -30,6 +31,7 @@ import { EmptyState } from "../panels/EmptyState";
 import { Onboarding } from "../panels/Onboarding";
 import { ImportDropOverlay } from "./ImportDropOverlay";
 import { FocusBanner } from "../panels/FocusBanner";
+import { SubjectAimBadge } from "../panels/SubjectAimBadge";
 import type { EditorCommand } from "../panels/CommandPalette";
 import { ViewportToolRail, type ViewportTool } from "../panels/ViewportToolRail";
 import type { PipeForgeStatus } from "../transport/protocol";
@@ -76,6 +78,11 @@ function useEditorSession(): EditorClient {
 }
 
 const SHELL_LAYOUT_STORAGE_PREFIX = "metrocalk:shell-layout:v1:";
+
+/** How long the cursor rests before the stage is asked what is under it, while aiming a shot. The
+ *  same 140ms the subject picker's search waits, and for the same reason: the read behind it counts
+ *  DRAWN PARTS for every rung of the chain, which walks every published instance in the scene. */
+const AIM_HOVER_MS = 140;
 
 function useRememberedBoolean(key: string, fallback: boolean) {
   const [value, setValue] = useState(() => {
@@ -230,6 +237,20 @@ export function App() {
   const gizmoHit = useRef(false);
   const [pipeStatus, setPipeStatus] = useState<PipeForgeStatus | null>(null);
   const pipeActive = pipeStatus?.active === true;
+  // AIMING A SHOT BY POINTING AT THE THING (`store/subjectAim`). Started from a shot's Frames picker
+  // in the bottom dock, lived here: while it is on, a left click on the stage names an object for a
+  // shot to film instead of selecting it — which it MUST NOT do, because the Cutscene panel is bound
+  // to the selection and selecting the object would switch which cutscene is on screen.
+  const aim = useSubjectAim();
+  const aimActive = aim.active;
+  // The ladder for an object, kept for the length of one aim. A sweep back and forth over the same
+  // two parts is one read each, not one per settle — and the read is a scene-wide count of drawn
+  // parts, which on the imported production line walks 15,711 instances.
+  const aimLadder = useRef<Map<string, AimRung[]>>(new Map());
+  const aimHoverTimer = useRef<number | null>(null);
+  // Replies can land out of order once the cursor has moved on. Only the newest is allowed to speak.
+  const aimHoverSeq = useRef(0);
+  const aimHoverAt = useRef<string | null>(null);
   const [pipeBusy, setPipeBusy] = useState(false);
   const [activeTool, setActiveTool] = useState<ViewportTool>("select");
   const [leftWorkspace, setLeftWorkspace] = useState<LeftWorkspace>("scene");
@@ -466,6 +487,65 @@ export function App() {
     }
   }
 
+  // WHAT THE CURSOR IS OVER, ON HOVER-SETTLE - never per frame (invariant 4). Two reads, and the
+  // second is skipped whenever the peek names the same object as last time, or one already read
+  // during this aim: `viewport_peek` is a ray against the scene BVH, but the chain read counts drawn
+  // parts for every rung, which on the imported production line walks 15,711 instances.
+  const aimHover = (clientX: number, clientY: number) => {
+    if (aimHoverTimer.current !== null) window.clearTimeout(aimHoverTimer.current);
+    const { x, y } = normalizeSurfacePoint(clientX, clientY);
+    aimHoverTimer.current = window.setTimeout(() => {
+      const seq = ++aimHoverSeq.current;
+      const aiming = () => seq === aimHoverSeq.current && subjectAimStore.getState().active;
+      if (!aiming()) return;
+      subjectAimStore.getState().look(true);
+      void client
+        .viewportPeek(x, y)
+        .then(async (id) => {
+          if (!aiming()) return;
+          if (!id) {
+            aimHoverAt.current = null;
+            subjectAimStore.getState().hover([]);
+            return;
+          }
+          if (aimHoverAt.current === id) {
+            subjectAimStore.getState().look(false);
+            return;
+          }
+          aimHoverAt.current = id;
+          const cached = aimLadder.current.get(id);
+          if (cached) {
+            subjectAimStore.getState().hover(cached);
+            return;
+          }
+          const chain = await client.cinemaSubjectChain(id);
+          if (!aiming()) return;
+          // The rungs are the ENGINE's rows, in the engine's order, under the engine's headings -
+          // read, never re-ranked, so the badge cannot offer a chain the scene does not have.
+          const rungs: AimRung[] = chain.candidates.map((row) => ({
+            id: row.id,
+            name: row.name,
+            parts: row.parts,
+            group: row.group,
+          }));
+          aimLadder.current.set(id, rungs);
+          subjectAimStore.getState().hover(rungs);
+        })
+        .catch(() => subjectAimStore.getState().look(false));
+    }, AIM_HOVER_MS);
+  };
+
+  // The pending hover dies with the mode: a settle that lands after a Cancel would otherwise repaint
+  // a badge that is no longer on screen, and the ladder cache belongs to one aim, not to the session.
+  useEffect(() => {
+    if (aimActive) return;
+    if (aimHoverTimer.current !== null) window.clearTimeout(aimHoverTimer.current);
+    aimHoverTimer.current = null;
+    aimHoverSeq.current += 1;
+    aimHoverAt.current = null;
+    aimLadder.current.clear();
+  }, [aimActive]);
+
   // Ctrl-Z / ⌘-Z → undo; Escape closes the context menu, then a drawer, then STOPS Play (the badge says
   // "Esc … to stop"). A discrete event — never the per-frame hot path (invariant 4).
   useEffect(() => {
@@ -528,6 +608,13 @@ export function App() {
         });
       }
       if (e.key === "Escape") {
+        // FIRST, because it is the most recently entered mode and the badge promises it by name. An
+        // aim is also the only one of these the user is holding the mouse for.
+        if (subjectAimStore.getState().active) {
+          subjectAimStore.getState().cancel();
+          setStatus("Aiming cancelled — the shot still frames what it did");
+          return;
+        }
         if (pipeActive && !pipeBusy) {
           void client.pipeForgeCancel().then((status) => {
             setPipeStatus(status);
@@ -797,6 +884,7 @@ export function App() {
               return;
             }
             if (e.button === 0) {
+              if (aimActive) return; // aiming owns the click; do not grab a gizmo handle underneath it
               if (pipeActive) return; // drawing owns the click; do not start a gizmo drag underneath it
               // M9 gizmo handle-grab: only when an entity is selected; if a handle is HIT the render loop
               // drags it natively (0 IPC/frame, like orbit) and the release commits. A miss falls through to
@@ -824,6 +912,25 @@ export function App() {
             // synthesized pointerdown). Pick at normalized FULL-SURFACE coordinates (the native camera rays
             // across the whole wgpu/WebView surface, while DOM docks only crop its visible area).
             const { x: nx, y: ny } = normalizeSurfacePoint(e.clientX, e.clientY);
+            // AIMING TAKES THE CLICK, AND PEEKS RATHER THAN PICKS. `viewport_peek` names what is
+            // under the cursor without touching the selection - which is the whole reason this can
+            // be a click at all: the Cutscene panel is bound to the selection, so selecting the
+            // object being named would switch which cutscene is on screen and lose the shot.
+            if (aimActive) {
+              void client
+                .viewportPeek(nx, ny)
+                .then((id) => {
+                  if (!subjectAimStore.getState().active) return;
+                  if (!id) {
+                    setStatus("Nothing there — click the object this shot should film");
+                    return;
+                  }
+                  const rungs = aimLadder.current.get(id);
+                  subjectAimStore.getState().pick(id, rungs?.[0]?.name ?? id);
+                })
+                .catch((err) => console.error("viewport_peek failed", err));
+              return;
+            }
             if (pipeActive) {
               if (pipeBusy) return;
               void client
@@ -856,6 +963,10 @@ export function App() {
           onPointerMove={(e) => {
             const rd = rightDrag.current;
             if (rd && (Math.abs(e.clientX - rd.x) > 6 || Math.abs(e.clientY - rd.y) > 6)) rd.moved = true;
+            // The one INITIATING read on this handler, so it takes the stage-surface gate the other
+            // two lines deliberately do not: moving the cursor OFF the stage and onto the aim badge
+            // must leave the ladder standing - the rungs are what the pointer is travelling to.
+            if (aimActive && !rd && onStageSurface(e)) aimHover(e.clientX, e.clientY);
           }}
           onPointerUp={(e) => {
             if (e.button === 2 && rightDrag.current) client.dragEnd();
@@ -977,6 +1088,22 @@ export function App() {
             </Suspense>
           )}
           {playing && <PlayBadge paused={paused} onStop={stopPlay} />}
+          {/* Bottom-centre, and it coexists with the preview badge on purpose: re-aiming a shot
+              WHILE previewing it is the loop this closes - point at something else, and the frame
+              on the stage is already the new one by the time the badge has gone. */}
+          {aimActive && (
+            <SubjectAimBadge
+              shotIndex={aim.shotIndex}
+              shots={aim.shots}
+              rungs={aim.rungs}
+              looking={aim.looking}
+              onPick={(rung) => subjectAimStore.getState().pick(rung.id, rung.name)}
+              onCancel={() => {
+                subjectAimStore.getState().cancel();
+                setStatus("Aiming cancelled — the shot still frames what it did");
+              }}
+            />
+          )}
           {/* Never both: Play takes the camera itself, and the shell hands a held preview back
               before it does, so a badge for each would be two claims about one viewport. */}
           {!playing && cinemaPreview.active && (
@@ -1026,7 +1153,12 @@ export function App() {
               in — on exactly the machines product principle 3 targets, where the extra request costs
               most. A surface whose entire job is to be there when you first look cannot be the surface
               that loads last. */}
-          <Onboarding show={!sceneEmpty && !playing && !stageSheet} onStart={() => openEngine("build")} />
+          {/* AND IT YIELDS TO AN AIM, for the same reason it yields to Play and to the dock sheet: a
+              mode that owns the stage owns what is painted on it. The first-run card is anchored
+              `bottom: space.lg, left: 50%` — the SAME anchor the aim badge takes — so with both up
+              the badge sits on the card's headline, which is `<ux_quality>` 4's overlap exactly.
+              Caught on the `.exe` capture, where a fresh project had brought the card back. */}
+          <Onboarding show={!sceneEmpty && !playing && !stageSheet && !aimActive} onStart={() => openEngine("build")} />
           {sceneEmpty && !playing && !stageSheet && (
             <EmptyState
               onDrawPipe={() => setActiveTool("pipe")}

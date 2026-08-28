@@ -15,6 +15,12 @@
 //! part of, what it is made of, what stands beside it — so the four subjects a person actually wants
 //! are the first four rows, and the search box is for the fifth.
 //!
+//! AND THE FIRST ROW IS NOT A ROW. A list is how you reach something you can NAME. The most common
+//! thing an author wants to film is the one they are looking at — so the picker opens on "Click it in
+//! the viewport", which hands the choice to the stage (`store/subjectAim`), where the object under
+//! the cursor is named with its part count and its whole ancestor chain is one click each. The list
+//! below it is for everything that is off screen, behind something, or easier to name than to find.
+//!
 //! THE NUMBER BESIDE EACH ROW IS THE POINT. `parts` is how many DRAWN instances sit under a
 //! candidate, counted off the same published render list the shot solver fits its camera to. It is
 //! what tells a 378-part assembly apart from the one bracket that shares most of its name — and a row
@@ -81,6 +87,9 @@ export interface SubjectPickerProps {
   /** Ties the trigger to its `Field` label. */
   id?: string;
   onPick: (subject: string) => void;
+  /** Hand the choice to the stage: close the picker, and let the next click on the viewport aim the
+   *  shot. Optional so this control can be rendered without the stage behind it. */
+  onAimInViewport?: () => void;
 }
 
 /**
@@ -96,6 +105,7 @@ export function SubjectPicker({
   disabledReason,
   id,
   onPick,
+  onAimInViewport,
 }: SubjectPickerProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -199,6 +209,23 @@ export function SubjectPicker({
           className="mtk-popup-menu"
           style={{ minWidth: 320, maxWidth: 460 }}
         >
+          {/* POINTING BEFORE NAMING. The gesture that needs no vocabulary comes first, and it is
+              separated from the search rather than sitting in it: they answer different questions —
+              "that one, there" and "the one called X" — and a control that reads as a search result
+              would be a search result nobody typed. */}
+          {onAimInViewport && (
+            <div style={{ borderBottom: `1px solid ${color.border.subtle}` }}>
+              <PopupMenuItem
+                data-testid="cutscene-subject-aim"
+                label="Click it in the viewport"
+                description="Point at the object on the stage. What you hover is named before you click, with what it is part of one click away."
+                leading={<Icon name="cursor" size="sm" />}
+                onSelect={() => onAimInViewport()}
+                onRequestClose={close}
+              />
+            </div>
+          )}
+
           <div style={{ padding: space.xs }}>
             <SearchField
               ref={search}

@@ -28,6 +28,7 @@ import { Inspector } from "../../src/inspector/Inspector";
 import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
 import { CutscenePanel } from "../../src/panels/CutscenePanel";
+import { SubjectAimBadge } from "../../src/panels/SubjectAimBadge";
 import { Diagnostics } from "../../src/panels/Diagnostics";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { Reveal } from "../../src/panels/Reveal";
@@ -1241,6 +1242,79 @@ export const SCENES: Scene[] = [
       same_line: [["[data-testid='cutscene-subject']", "[data-testid='cutscene-size']"]],
     },
     render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-aim-badge",
+    looking_for:
+      "AIMING A SHOT BY POINTING AT THE THING. The stage while an aim is in flight. Three engine " +
+      "capabilities existed and had never met: `viewport_peek` names what is under the cursor " +
+      "WITHOUT changing the selection (and was called by nothing in the editor), " +
+      "`cinema_subject_chain` answers with the object and every assembly it belongs to, and " +
+      "`cinema_set_shot_subject` re-aims a shot as one undoable edit. What a user could reach was a " +
+      "search box, so in a 15,711-part import 'film THAT one' meant knowing its name. Check that " +
+      "the badge says which shot is being aimed (shot 2 of 5), that the cursor's object and the " +
+      "machine it belongs to are BOTH offered as buttons with their drawn-part counts — 1 part vs " +
+      "42 vs 378 is the whole reason a click on one bolt does not have to become a shot of one " +
+      "bolt — that the first rung is the emphasised one because it is what the stage click itself " +
+      "would take, and that the way out is named on the badge (Esc, and a Cancel beside it). It " +
+      "sits at the BOTTOM of the stage on purpose: the preview badge holds the top, and re-aiming a " +
+      "shot while previewing it is the loop this closes",
+    viewport: { width: 1400, height: 620 },
+    expect: {
+      present: [
+        ["[data-testid='subjectAimBadge']", 1],
+        ["[data-testid='subjectAimRungs']", 1],
+        ["[data-testid='subjectAimRung-bolt']", 1],
+        ["[data-testid='subjectAimRung-rig']", 1],
+        ["[data-testid='subjectAimRung-hall']", 1],
+        ["[data-testid='subjectAimCancel']", 1],
+      ],
+      text_present: [
+        "AIMING",
+        "shot 2 of 5",
+        "Bolt M8",
+        "1 part",
+        "Weld Gun 7",
+        "42 parts",
+        "Assembly Hall",
+        "378 parts",
+        "Esc",
+      ],
+      // The badge is the read-out for a gesture in progress; a hint left standing beside a named
+      // ladder would be two answers to the same question.
+      text_absent: ["click what this shot should film", "looking", "null", "undefined", "NaN"],
+      unclipped: [
+        "[data-testid='subjectAimRung-bolt']",
+        "[data-testid='subjectAimRung-rig']",
+        "[data-testid='subjectAimRung-hall']",
+        "[data-testid='subjectAimCancel']",
+      ],
+      // One pill. A ladder that wrapped its rungs onto a second line under the word AIMING is a
+      // badge that has run out of width, and the widen-to-the-assembly choice is the half that goes.
+      same_line: [
+        ["[data-testid='subjectAimShot']", "[data-testid='subjectAimRung-bolt']"],
+        ["[data-testid='subjectAimRung-bolt']", "[data-testid='subjectAimRung-hall']"],
+        ["[data-testid='subjectAimRung-hall']", "[data-testid='subjectAimCancel']"],
+      ],
+    },
+    render: () => (
+      // The stage, at the size the badge actually stands in: absolutely positioned against the
+      // viewport region, bottom-centre.
+      <div style={{ position: "relative", height: 560, background: "var(--mtk-bg-inset)" }}>
+        <SubjectAimBadge
+          shotIndex={1}
+          shots={5}
+          looking={false}
+          rungs={[
+            { id: "bolt", name: "Bolt M8", parts: 1, group: "This object" },
+            { id: "rig", name: "Weld Gun 7", parts: 42, group: "What it is part of" },
+            { id: "hall", name: "Assembly Hall", parts: 378, group: "What it is part of" },
+          ]}
+          onPick={() => {}}
+          onCancel={() => {}}
+        />
+      </div>
+    ),
   },
   {
     id: "cutscene-preview",

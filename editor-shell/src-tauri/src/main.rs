@@ -2900,6 +2900,12 @@ enum EngineCmd {
         query: String,
         reply: Sender<metrocalk_editor_shell::SubjectCatalog>,
     },
+    /// Cinematics - the object under the cursor and the chain it hangs from. A read; changes nothing.
+    CinemaSubjectChain {
+        /// The object a viewport peek resolved to.
+        id: String,
+        reply: Sender<metrocalk_editor_shell::SubjectCatalog>,
+    },
     /// Cinematics - read an object's cutscene back as sentences.
     CinemaList {
         id: String,
@@ -10323,6 +10329,26 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     })
                     .unwrap_or_default();
                 let _ = reply.send(catalog);
+            }
+            EngineCmd::CinemaSubjectChain { id, reply } => {
+                let chain = EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .map(|entity| {
+                        // Same clone-and-release discipline as the catalog above, and for the same
+                        // reason: this is asked on hover-settle while the author sweeps the cursor
+                        // over the scene, and holding the render lock across 15,711 ancestor chains
+                        // would stall the renderer behind a read-out.
+                        let ids = shared.lock().unwrap().ids.clone();
+                        let drawn = drawn_parts_by_entity(&engine, &ids);
+                        metrocalk_editor_shell::subject_chain(
+                            &engine,
+                            entity,
+                            &|e| entity_display_name(&engine, e),
+                            &|e| drawn.get(&e).copied().unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or_default();
+                let _ = reply.send(chain);
             }
             EngineCmd::CinemaList { id, reply } => {
                 let info = EntityId::from_loro_key(&id)
@@ -23450,6 +23476,30 @@ fn cinema_subject_catalog(
     recv_reply(&rx).unwrap_or_default()
 }
 
+/// The object under the cursor and the chain it hangs from — what a click on the stage could mean.
+///
+/// A READ, and the second half of aiming a shot by pointing at it. `viewport_peek` answers WHICH
+/// object without touching the selection; this answers what that object IS — its name, how many drawn
+/// parts sit under it, and the same for every assembly it belongs to. A click on an imported line
+/// lands on one bolt, and the shot the author meant is usually the machine that bolt is part of; the
+/// chain is what lets the badge offer both without guessing.
+#[tauri::command(async)]
+fn cinema_subject_chain(
+    state: State<AppState>,
+    id: String,
+) -> metrocalk_editor_shell::SubjectCatalog {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSubjectChain { id, reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::SubjectCatalog::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
 /// An object's cutscene, read back as sentences plus any continuity warnings.
 #[tauri::command(async)]
 fn cinema_list(state: State<AppState>, id: String) -> metrocalk_editor_shell::CinemaReply {
@@ -26475,6 +26525,7 @@ fn main() {
             cinema_set_shot_framing,
             cinema_set_shot_subject,
             cinema_subject_catalog,
+            cinema_subject_chain,
             cinema_set_mood,
             cinema_set_delivery,
             cinema_list,

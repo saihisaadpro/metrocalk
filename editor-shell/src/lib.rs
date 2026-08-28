@@ -130,9 +130,9 @@ pub use cinema_intent::{
     add_shot_ops, cutscene_of, describe_shot, framing_catalog, move_shot_ops, preview_time,
     remove_shot_ops, reply_for as cinema_reply, reply_with_names as cinema_reply_named,
     set_delivery_ops, set_mood_ops, set_shot_framing_ops, set_shot_seconds_ops,
-    set_shot_subject_ops, shot_specs, subject_catalog, CinemaError, CinemaPreviewReply,
-    CinemaReply, FramingCatalog, FramingEdit, FramingOption, ShotRow, ShotSpec, SubjectCandidate,
-    SubjectCatalog, CINEMA_COMPONENT,
+    set_shot_subject_ops, shot_specs, subject_catalog, subject_chain, CinemaError,
+    CinemaPreviewReply, CinemaReply, FramingCatalog, FramingEdit, FramingOption, ShotRow, ShotSpec,
+    SubjectCandidate, SubjectCatalog, CINEMA_COMPONENT,
 };
 pub use compose_ai::{ComposeAiError, Composer, DemoComposer, RemoteComposer};
 pub use constraint_intent::{

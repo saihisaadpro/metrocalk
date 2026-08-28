@@ -11,6 +11,8 @@ import { fakeClient } from "../transport/test-client";
 import { projectionStore } from "../store/projection";
 import { playStore } from "../store/play";
 import { cinemaPreviewStore } from "../store/cinemaPreview";
+import { subjectAimStore } from "../store/subjectAim";
+import { toastStore } from "../store/toasts";
 import type { CinemaReply, ShotRow } from "../transport/protocol";
 
 function row(over: Partial<ShotRow> & Pick<ShotRow, "id" | "index" | "startSeconds">): ShotRow {
@@ -67,6 +69,9 @@ beforeEach(() => {
   // Shared state between two surfaces is shared state between two TESTS. Without this a run that
   // left the preview on decides whether the next one's scrub poses the camera.
   act(() => cinemaPreviewStore.getState().reset());
+  // An aim left in flight by one test decides whether the next one's click aims or selects.
+  act(() => subjectAimStore.getState().cancel());
+  act(() => toastStore.getState().reset());
 });
 
 describe("CutscenePanel", () => {
@@ -428,6 +433,96 @@ describe("CutscenePanel", () => {
       await waitFor(() => expect(client.cinemaSetShotSubject).toHaveBeenCalledWith("e1", 0, "e9"));
       // One command, one undo — not a framing edit carrying a subject in a spare field.
       expect(client.cinemaSetShotFraming).not.toHaveBeenCalled();
+    });
+
+    it("offers pointing at it before naming it, and the aim names the shot that is open", async () => {
+      selectSomething();
+      render(<CutscenePanel client={loaded()} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[1]);
+      fireEvent.click(await screen.findByTestId("cutscene-subject"));
+
+      // FIRST in the picker, above the search. In a 15,711-part import the list is how you reach
+      // something you can NAME; the most common thing an author wants to film is the one they are
+      // already looking at.
+      const aim = await screen.findByTestId("cutscene-subject-aim");
+      expect(aim.textContent).toContain("Click it in the viewport");
+
+      fireEvent.click(aim);
+      const state = subjectAimStore.getState();
+      expect(state.active).toBe(true);
+      expect(state.owner).toBe("e1");
+      expect(state.shotIndex).toBe(1);
+      expect(state.shots).toBe(4);
+    });
+
+    it("commits a choice made on the stage through the SAME command the list uses", async () => {
+      const client = loaded();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[2]);
+      fireEvent.click(await screen.findByTestId("cutscene-subject"));
+      fireEvent.click(await screen.findByTestId("cutscene-subject-aim"));
+
+      // What the stage does when the user clicks the object: the choice, and nothing else.
+      act(() => subjectAimStore.getState().pick("e9", "Assembly Hall"));
+
+      // One command, one undo, one toast — the same path the list commits through, so pointing at
+      // an object and choosing it from a list cannot drift into two different edits.
+      await waitFor(() => expect(client.cinemaSetShotSubject).toHaveBeenCalledWith("e1", 2, "e9"));
+      expect(client.cinemaSetShotFraming).not.toHaveBeenCalled();
+      // And the choice is consumed exactly once — a second commit would be a second undo step.
+      expect(subjectAimStore.getState().picked).toBeNull();
+      expect(client.cinemaSetShotSubject).toHaveBeenCalledTimes(1);
+    });
+
+    it("lands on the shot the aim STARTED on, not on whichever card is open when it finishes", async () => {
+      const client = loaded();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      const clips = await screen.findAllByTestId("cutscene-clip");
+      fireEvent.click(clips[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-subject"));
+      fireEvent.click(await screen.findByTestId("cutscene-subject-aim"));
+
+      // Lining a camera up takes orbiting, and the shot list is right there. Opening another card
+      // mid-aim must not re-frame THAT one.
+      fireEvent.click(clips[3]);
+      act(() => subjectAimStore.getState().pick("e9", "Assembly Hall"));
+
+      await waitFor(() => expect(client.cinemaSetShotSubject).toHaveBeenCalledWith("e1", 0, "e9"));
+    });
+
+    it("pointing at what the shot already films says so instead of writing an empty undo step", async () => {
+      const client = loaded();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-subject"));
+      fireEvent.click(await screen.findByTestId("cutscene-subject-aim"));
+
+      act(() => subjectAimStore.getState().pick("e1", "Weld Gun 7"));
+
+      await waitFor(() => expect(subjectAimStore.getState().picked).toBeNull());
+      expect(client.cinemaSetShotSubject).not.toHaveBeenCalled();
+      // NOT SILENT, THOUGH. A click that produced nothing at all reads as a click that missed.
+      expect(toastStore.getState().toasts.map((t) => t.text).join(" ")).toContain(
+        "already frames Weld Gun 7",
+      );
+    });
+
+    it("Play takes the stage back, and an aim in flight goes with it", async () => {
+      selectSomething();
+      render(<CutscenePanel client={loaded()} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-subject"));
+      fireEvent.click(await screen.findByTestId("cutscene-subject-aim"));
+      expect(subjectAimStore.getState().active).toBe(true);
+
+      act(() => playStore.getState().refresh({ playing: true, paused: false }));
+
+      // Otherwise the stage keeps intercepting clicks for an edit the engine refuses anyway, and
+      // the badge stands over a running game promising a re-frame that cannot happen.
+      expect(subjectAimStore.getState().active).toBe(false);
     });
 
     it("names what a clip films on the lane, and only when it is not the cutscene's own object", async () => {

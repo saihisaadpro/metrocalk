@@ -1096,6 +1096,66 @@ pub fn subject_catalog<W: World>(
     catalog
 }
 
+/// The object under the cursor and the chain it hangs from — what a click on the viewport could mean.
+///
+/// WHY A CLICK IS NOT A CHOICE ON ITS OWN. Picking is a hit test against drawn triangles, so a click
+/// on an imported assembly lands on a LEAF: one bolt, of one weld gun, of a production line that
+/// imports as 15,711 parts. "Film the bolt" is almost never the shot the author meant, and the
+/// difference is not something the editor can guess — so the reply carries the whole chain, each rung
+/// with the same DRAWN-PART count [`subject_catalog`]'s rows carry, and the choice stays the author's
+/// with every rung one click away.
+///
+/// The same rows, in the same order, under the same headings as the picker's first two groups: this
+/// is that list restricted to what a click can be about, not a second ranking that could disagree
+/// with it.
+#[must_use]
+pub fn subject_chain<W: World>(
+    engine: &Engine<W>,
+    id: EntityId,
+    name_of: &dyn Fn(EntityId) -> String,
+    parts_under: &dyn Fn(EntityId) -> usize,
+) -> SubjectCatalog {
+    let mut catalog = SubjectCatalog {
+        owner: id.to_loro_key(),
+        owner_name: name_of(id),
+        ..SubjectCatalog::default()
+    };
+    if !engine.entity_exists(id) {
+        return catalog;
+    }
+    let row = |id: EntityId, group: &str| {
+        let parts = parts_under(id);
+        SubjectCandidate {
+            id: id.to_loro_key(),
+            name: name_of(id),
+            group: group.to_string(),
+            parts,
+            framable: parts > 0,
+            current: false,
+        }
+    };
+    catalog.candidates.push(row(id, GROUP_SELF));
+
+    let mut seen: Vec<EntityId> = vec![id];
+    let mut walker = engine.parent_of(id);
+    while let Some(ancestor) = walker {
+        if seen.contains(&ancestor) || !engine.entity_exists(ancestor) {
+            break;
+        }
+        if catalog.candidates.len() > MAX_PER_GROUP {
+            // A chain deeper than the badge can hold is reported as cut short rather than quietly
+            // ending: "and more above this" is a different fact from "this is the top of the scene".
+            catalog.truncated = true;
+            break;
+        }
+        seen.push(ancestor);
+        catalog.candidates.push(row(ancestor, GROUP_ANCESTOR));
+        walker = engine.parent_of(ancestor);
+    }
+    catalog.matches = catalog.candidates.len();
+    catalog
+}
+
 /// The ops that set the one global dial.
 ///
 /// # Errors
@@ -1583,6 +1643,89 @@ mod tests {
         );
         assert!(catalog.candidates.iter().any(|c| c.current));
         assert!(!catalog.truncated);
+    }
+
+    #[test]
+    fn a_click_lands_on_a_leaf_and_the_chain_offers_the_machine_it_belongs_to() {
+        let (mut engine, _scene) = world();
+        let rig = assembly(&mut engine);
+        let name = namer(&rig);
+        // The counts a real import produces: one bolt, the gun it is part of, the cell, the line.
+        let drawn = |id: EntityId| -> usize {
+            if id == rig.line {
+                378
+            } else if id == rig.cell {
+                46
+            } else if id == rig.gun {
+                42
+            } else {
+                1
+            }
+        };
+        // A viewport pick is a hit test against DRAWN TRIANGLES, so it lands on the bracket — never
+        // on the gun, which has no geometry of its own, and never on the line, which has none either.
+        let chain = subject_chain(&engine, rig.bracket, &name, &drawn);
+
+        assert_eq!(chain.owner_name, "Bracket");
+        let rungs: Vec<(&str, &str, usize)> = chain
+            .candidates
+            .iter()
+            .map(|c| (c.name.as_str(), c.group.as_str(), c.parts))
+            .collect();
+        // THE WHOLE POINT: the thing clicked, then outward, with the number that tells them apart.
+        // Without the ancestors a click on an imported assembly can only ever film one bolt.
+        assert_eq!(
+            rungs,
+            vec![
+                ("Bracket", GROUP_SELF, 1),
+                ("Weld Gun 7", GROUP_ANCESTOR, 42),
+                ("Weld Cell A", GROUP_ANCESTOR, 46),
+                ("Skid Weld Line", GROUP_ANCESTOR, 378),
+            ]
+        );
+        // Siblings and children are NOT here. This answers "what could that click have meant", and
+        // the bracket next to the one you clicked is not one of the answers.
+        assert!(chain.candidates.iter().all(|c| c.group != GROUP_SIBLING));
+        assert!(chain.candidates.iter().all(|c| c.group != GROUP_CHILD));
+        assert!(chain.candidates.iter().all(|c| c.framable));
+        assert_eq!(chain.matches, 4);
+        assert!(!chain.truncated);
+    }
+
+    #[test]
+    fn a_chain_over_an_undrawn_marker_says_so_on_the_rung_rather_than_hiding_it() {
+        let (mut engine, _scene) = world();
+        let rig = assembly(&mut engine);
+        let name = namer(&rig);
+        let drawn = |id: EntityId| -> usize { usize::from(id == rig.nozzle) };
+        // `fixture` has nothing drawn under it. A pick cannot reach it, but a chain read of one is
+        // still asked for by the badge whenever the peek resolves a marker — and the honest answer
+        // is the rung with its count, not an empty reply that reads as "there is nothing there".
+        let chain = subject_chain(&engine, rig.fixture, &name, &drawn);
+        assert_eq!(chain.candidates[0].name, "Fixture 3");
+        assert_eq!(chain.candidates[0].parts, 0);
+        assert!(!chain.candidates[0].framable, "warned before the choice");
+        assert_eq!(chain.candidates.len(), 3, "and its two assemblies above it");
+    }
+
+    #[test]
+    fn a_chain_for_an_object_that_left_the_scene_is_empty_not_a_row_naming_nothing() {
+        let (mut engine, _scene) = world();
+        let rig = assembly(&mut engine);
+        let name = namer(&rig);
+        let gone = EntityId {
+            peer: 9_999,
+            counter: 7,
+        };
+        let chain = subject_chain(&engine, gone, &name, &|_| 1);
+        assert!(
+            chain.candidates.is_empty(),
+            "an object the document does not have cannot be offered as a rung"
+        );
+        // And the root itself is a chain of exactly one — there is nothing above it to widen to.
+        let root = subject_chain(&engine, rig.line, &name, &|_| 378);
+        assert_eq!(root.candidates.len(), 1);
+        assert_eq!(root.candidates[0].group, GROUP_SELF);
     }
 
     #[test]

@@ -31,6 +31,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { useSelectedId, useSummary } from "../store/projection";
 import { usePlaying } from "../store/play";
 import { cinemaPreviewStore, useCinemaPreview } from "../store/cinemaPreview";
+import { subjectAimStore, useSubjectAim } from "../store/subjectAim";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
@@ -140,6 +141,10 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
   const scroller = useRef<HTMLDivElement | null>(null);
   const [laneRoom, setLaneRoom] = useState(0);
   const previewInfo = useCinemaPreview();
+  // The aim in flight, if any. Started here, LIVED on the stage, and committed back here — this
+  // panel owns the transaction so a re-aim by pointing and a re-aim by list are the same one-undo
+  // edit rather than two paths that can drift apart.
+  const aim = useSubjectAim();
   // The solved pose, kept locally rather than in the store: the stage badge names the SHOT, and
   // three coordinates are a reading for the person editing the shot, not for someone glancing at
   // the viewport. Cleared with the preview so a stale camera cannot outlive the frame it describes.
@@ -326,6 +331,43 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
     if (!selected || subject === row.subject) return;
     void run(() => client.cinemaSetShotSubject(selected, row.index, subject), "What the shot frames");
   };
+
+  // AND POINTING AT IT IS THE SAME EDIT. `store/subjectAim` carries only the CHOICE a click on the
+  // stage made; the commit is this panel's own `run`, so aiming by pointing and aiming from the list
+  // are one transaction, one toast, one re-pose and one Ctrl-Z rather than two paths that drift.
+  //
+  // The shot is the one the aim STARTED on, not whichever card is open now: an aim can take several
+  // seconds of orbiting to line up, and landing it on a different shot because the author clicked
+  // another card meanwhile is a re-frame nobody asked for.
+  useEffect(() => {
+    const picked = aim.picked;
+    if (!picked || aim.owner !== selected || aim.shotIndex === null || !selected) return;
+    const index = aim.shotIndex;
+    subjectAimStore.getState().taken(picked.seq);
+    const row = cut.rows.find((shot) => shot.index === index);
+    if (row && row.subject === picked.subject) {
+      // NOT A NO-OP SILENTLY. Pointing at what the shot already films is a legitimate gesture with a
+      // legitimate answer, and a click that produced nothing at all reads as a click that missed.
+      pushToast(`Shot ${index + 1} already frames ${picked.name}`, "info");
+      setStatus(`Shot ${index + 1} already frames ${picked.name}`);
+      return;
+    }
+    void run(() => client.cinemaSetShotSubject(selected, index, picked.subject), "What the shot frames");
+  }, [aim.picked, aim.owner, aim.shotIndex, selected, cut.rows, client, run]);
+
+  // AN AIM BELONGS TO THE PANEL THAT STARTED IT. Selecting something else switches which cutscene is
+  // on screen, and Play takes editing away entirely — in both cases the stage would be left
+  // intercepting clicks for a shot nobody is looking at any more. Same shape as the preview's own
+  // teardown directly above, and for the same reason.
+  useEffect(() => {
+    if (playing && subjectAimStore.getState().active) subjectAimStore.getState().cancel();
+  }, [playing]);
+  useEffect(
+    () => () => {
+      if (subjectAimStore.getState().active) subjectAimStore.getState().cancel();
+    },
+    [selected],
+  );
 
   if (!selected) {
     return (
@@ -715,6 +757,7 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
                 disabled={locked}
                 disabledReason={lockReason}
                 onPick={(subject) => editSubject(active, subject)}
+                onAimInViewport={() => subjectAimStore.getState().begin(selected, active.index, cut.shots)}
               />
             </Field>
 

@@ -334,6 +334,13 @@ export interface EditorClient {
   /** The objects a shot could frame — ranked by the scene's own hierarchy, or searched by name.
    *  A read. `index` marks the shot being edited so its current subject comes back ticked. */
   cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog>;
+  /** The object under the cursor and the chain it hangs from — itself, then what it is part of,
+   *  outward — each rung with the drawn-part count the picker's rows carry. A read.
+   *
+   *  Picking is a hit test against drawn triangles, so a click on an imported assembly lands on a
+   *  LEAF: one bolt, of one weld gun, of a line that imports as 15,711 parts. The chain is what lets
+   *  the author take the machine instead, without the editor guessing which rung they meant. */
+  cinemaSubjectChain(id: string): Promise<SubjectCatalog>;
   /** Pose the viewport camera at one moment of a cutscene, or (`active: false`) hand it back.
    *  A render projection, never a document edit — moving a playhead is not something to undo. */
   cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply>;
@@ -454,6 +461,14 @@ export interface EditorClient {
    *  (or null). Computed synchronously in the command from the camera ray (no per-frame race, no OS-cursor
    *  dependency — so a synthetic click works too). */
   viewportPick(x: number, y: number): Promise<string | null>;
+  /** Identify the entity under NORMALIZED viewport coords **without changing the selection** — the same
+   *  ray, the same BVH and the same filter a click uses, so what this names is what a click would take.
+   *
+   *  The non-mutating half of picking, and the reason aiming a shot at an object can be a click on the
+   *  stage at all: the Cutscene panel is bound to the editor selection, so a gesture that SELECTED the
+   *  object it is naming would switch which cutscene is on screen and throw away the shot being aimed.
+   *  Called on hover-settle and on the aiming click — never per frame (invariant 4). */
+  viewportPeek(x: number, y: number): Promise<string | null>;
   /** Begin a right-drag orbit — the native render loop then polls the OS cursor and orbits with **0 IPC per
    *  frame** (invariant 4); only this call + `dragEnd` cross the boundary, once per gesture. */
   dragStart(): void;
@@ -1007,6 +1022,9 @@ export class TauriClient implements EditorClient {
   cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog> {
     return this.core.invoke<SubjectCatalog>("cinema_subject_catalog", { id, index, query }).catch((e: unknown) => { console.error("cinema_subject_catalog failed", e); throw e; });
   }
+  cinemaSubjectChain(id: string): Promise<SubjectCatalog> {
+    return this.core.invoke<SubjectCatalog>("cinema_subject_chain", { id }).catch((e: unknown) => { console.error("cinema_subject_chain failed", e); throw e; });
+  }
   cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply> {
     return this.core.invoke<CinemaPreviewReply>("cinema_preview", { id, seconds, active }).catch((e: unknown) => { console.error("cinema_preview failed", e); throw e; });
   }
@@ -1179,6 +1197,9 @@ export class TauriClient implements EditorClient {
 
   viewportPick(x: number, y: number): Promise<string | null> {
     return this.core.invoke<string | null>("viewport_pick", { x, y }).catch((e: unknown) => { console.error("viewport_pick failed", e); throw e; });
+  }
+  viewportPeek(x: number, y: number): Promise<string | null> {
+    return this.core.invoke<string | null>("viewport_peek", { x, y }).catch((e: unknown) => { console.error("viewport_peek failed", e); throw e; });
   }
   dragStart(): void {
     void this.core.invoke("drag_start").catch((e: unknown) => console.error("drag_start failed", e));
@@ -2885,6 +2906,10 @@ class MockClient implements EditorClient {
   cinemaSubjectCatalog(id: string): Promise<SubjectCatalog> {
     return Promise.resolve({ owner: id, ownerName: "", current: null, candidates: [], query: "", matches: 0, truncated: false });
   }
+  /** Empty for the same reason: there is no native scene to have clicked on. */
+  cinemaSubjectChain(id: string): Promise<SubjectCatalog> {
+    return Promise.resolve({ owner: id, ownerName: "", current: null, candidates: [], query: "", matches: 0, truncated: false });
+  }
   /** Refused rather than faked. A preview's whole content is a camera pose solved against real mesh
    *  bounds in the native scene; a browser-shell stub could only invent three numbers, and a picture
    *  of a shot nothing filmed is worse than the refusal that says where to get one. */
@@ -3051,6 +3076,9 @@ class MockClient implements EditorClient {
   }
   // The dev MockCore has no native viewport — these are inert (the real wgpu input is Tauri-only).
   viewportPick(_x: number, _y: number): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  viewportPeek(_x: number, _y: number): Promise<string | null> {
     return Promise.resolve(null);
   }
   dragStart(): void {}
