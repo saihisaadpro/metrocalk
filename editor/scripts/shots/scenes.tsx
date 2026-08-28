@@ -617,6 +617,76 @@ const cutsceneClient = () =>
       }),
   }) as unknown as EditorClient;
 
+/** Nothing rendered yet - the zero row every render answer in this file is built from. */
+const RENDER_IDLE = {
+  running: false,
+  done: false,
+  entity: "rig",
+  frames: 0,
+  written: 0,
+  width: 0,
+  height: 0,
+  fps: 24,
+  seconds: 0,
+  folder: "",
+  stem: "Skid Weld Line",
+  bytes: 0,
+  elapsedMs: 0,
+  failures: [] as string[],
+  message: "",
+  reason: null as string | null,
+};
+
+/** A finished render, with the numbers a real one produces: the composed frame of a 2.39:1 delivery
+ *  on a 1920-wide stage is 1920x803, which is where the ledger's size comes from. */
+const RENDER_DONE = {
+  ...RENDER_IDLE,
+  done: true,
+  frames: 319,
+  written: 319,
+  width: 1920,
+  height: 803,
+  seconds: 13.3,
+  folder: "C:/renders/skid-weld-line",
+  bytes: 319 * 486_000,
+  elapsedMs: 41_800,
+  message: "Rendered 319 frames at 1920x803 in 41.8s",
+};
+
+/** ADR-175 - the same cutscene with a render PLAN behind it. Delivered in scope, because the frame a
+ *  cut is composed for decides the shape of every file the render writes, and a capture of the dialog
+ *  over a viewport-shaped cut could not show that.
+ *
+ *  The plan's numbers are the fixture's, and computing them is the ENGINE's job in the product: 13.3s
+ *  at 24 fps is 319 frames. A stub answering a different count would photograph a dialog whose cost
+ *  sentence and whose button disagreed - the defect the plan command exists to make impossible. */
+const renderingCutsceneClient = () =>
+  ({
+    ...cutsceneClient(),
+    cinemaList: () => Promise.resolve({ ...CUTSCENE, delivery: "scope" as const }),
+    cinemaRenderPlan: (id: string, fps: number, shot: number | null) => {
+      const seconds = shot === null ? CUTSCENE.seconds : (CUTSCENE.rows[shot]?.effectiveSeconds ?? 0);
+      const frames = Math.max(1, Math.round(seconds * fps));
+      return Promise.resolve({
+        ...RENDER_IDLE,
+        entity: id,
+        fps,
+        frames,
+        seconds,
+        message: `${frames} frames \u00b7 ${seconds.toFixed(1)}s at ${fps} fps`,
+      });
+    },
+    cinemaRenderStatus: () => Promise.resolve(RENDER_DONE),
+    cinemaRenderCancel: () => Promise.resolve(RENDER_DONE),
+  }) as unknown as EditorClient;
+
+/** The same client, one click further on: the render has finished and the dialog is its ledger. */
+const renderedCutsceneClient = () =>
+  ({
+    ...renderingCutsceneClient(),
+    cinemaRenderStart: () => Promise.resolve(RENDER_DONE),
+  }) as unknown as EditorClient;
+
 /** The same cutscene, delivered in scope. One field differs, and it changes what every shot in the
  *  list is composed for — which is why it belongs to the CUT and not to a shot. */
 const deliveredCutsceneClient = () =>
@@ -1202,6 +1272,84 @@ export const SCENES: Scene[] = [
       same_line: [["[data-testid='cutscene-earlier']", "[data-testid='cutscene-remove']"]],
     },
     render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-render",
+    looking_for:
+      "THE WAY A PICTURE GETS OUT OF THIS ENGINE. Until this dialog existed there was none: the " +
+      "shell wrote no image file anywhere, and every still of this project's own benchmark film was " +
+      "an operating-system screenshot taken by a script outside the engine - while the renderer had " +
+      "been reading its own frames back to PNG since M14.2 and the shot solver could pose the " +
+      "camera at any instant. Check that all three moments of the task are here and in this order: " +
+      "WHAT will be written (the scope, the rate, the name), WHAT IT COSTS stated above the button " +
+      "that pays it - a frame count that is the ENGINE's own plan, not this dialog's arithmetic - " +
+      "and the one thing the dialog cannot change, said before the click rather than discovered " +
+      "after it: a frame is written at the size of the composed picture on screen. The description " +
+      "names the delivery frame the cut is composed for, because that is what decides the SHAPE of " +
+      "every file. The primary button says the number: 'Render 319 frames', never a bare 'Render'",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-render']"],
+    expect: {
+      present: [
+        ["[data-testid='render-dialog']", 1],
+        ["[data-testid='render-scope']", 1],
+        ["[data-testid='render-fps']", 1],
+        ["[data-testid='render-stem']", 1],
+        ["[data-testid='render-cost']", 1],
+        ["[data-testid='render-start']", 1],
+      ],
+      text_present: [
+        // The frame the cut is composed for - the fixture delivers in scope, and the shape of every
+        // written file follows from it.
+        "2.39:1 scope",
+        // The cost, and the fact that it is a count of FILES.
+        "319 frames",
+        "PNG files",
+        // The limit, before the click.
+        "Frame size",
+      ],
+      text_absent: ["null", "undefined", "NaN", "0 frames"],
+      unclipped: [
+        "[data-testid='render-start']",
+        "[data-testid='render-cost']",
+        "[data-testid='render-scope']",
+      ],
+      // The cost sits ABOVE the button that pays it. Below it, it is a receipt.
+      stacked: [["[data-testid='render-cost']", "[data-testid='render-start']"]],
+      // Cancel and Render share the footer row rather than stacking into two full-width bars.
+      same_line: [["[data-testid='render-cancel']", "[data-testid='render-start']"]],
+    },
+    render: () => <CutscenePanel client={renderingCutsceneClient()} />,
+  },
+  {
+    id: "cutscene-render-ledger",
+    looking_for:
+      "WHERE THE FRAMES WENT. A render is 319 files in a folder, and 'done' is not an answer to " +
+      "'where are they' - which is exactly what a status-bar toast could say and no more. The " +
+      "options are GONE and their space is the ledger: how many frames exist, the pixel size they " +
+      "were actually written at (measured from the first captured frame, never guessed from the " +
+      "window), what they weigh, how long it took, and the destination path in mono, whole, " +
+      "wrapping rather than truncating. Check that the reader can answer 'where are my files' " +
+      "without leaving this dialog, and that no settings control is still on screen asking a " +
+      "question the reader has stopped having",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-render']", "[data-testid='render-start']"],
+    expect: {
+      present: [
+        ["[data-testid='render-ledger']", 1],
+        ["[data-testid='render-ledger-frames']", 1],
+        ["[data-testid='render-ledger-folder']", 1],
+        ["[data-testid='render-done']", 1],
+      ],
+      // The settings are gone, not merely disabled.
+      absent: ["[data-testid='render-fps']", "[data-testid='render-scope']"],
+      text_present: ["319", "1920", "Rendered", "renders"],
+      text_absent: ["null", "undefined", "NaN"],
+      unclipped: ["[data-testid='render-ledger-folder']", "[data-testid='render-done']"],
+    },
+    render: () => <CutscenePanel client={renderedCutsceneClient()} />,
   },
   {
     id: "cutscene-shot-subject",
