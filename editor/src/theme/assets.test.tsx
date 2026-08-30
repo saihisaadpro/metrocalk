@@ -4,7 +4,7 @@
 
 import { expect, test, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { AssetChip, AssetGrid, AssetTile } from "./assets";
+import { AssetChip, AssetGrid, AssetTile, SwatchTile } from "./assets";
 
 const base = {
   label: "Rusty Medieval Sword",
@@ -87,6 +87,64 @@ test("a chip is a real toggle when it can be toggled and inert text when it cann
   // A tag that renders as a button is a promise of an action it does not have.
   expect(tag.tagName).toBe("SPAN");
   expect(tag.getAttribute("aria-pressed")).toBeNull();
+});
+
+test("an action chip is a button that does NOT report a pressed state it can never reach", () => {
+  const onSelect = vi.fn();
+  render(
+    <AssetChip onSelect={onSelect} title="a 4 km eroded alpine valley" data-testid="action">
+      Alpine valley
+    </AssetChip>,
+  );
+  const action = screen.getByTestId("action");
+  expect(action.tagName).toBe("BUTTON");
+  // The whole reason this form exists. `aria-pressed="false"` on a chip that fills a text box announces
+  // a switch that is permanently off — a control lying about its own state to every screen reader.
+  expect(action.getAttribute("aria-pressed")).toBeNull();
+  action.click();
+  expect(onSelect).toHaveBeenCalledTimes(1);
+});
+
+test("a swatch is ONE control, and says which one is chosen by more than a colour", () => {
+  const onSelect = vi.fn();
+  const { unmount } = render(
+    <SwatchTile
+      label="Alpine Peaks"
+      preview={<svg data-testid="art" />}
+      actionLabel="Create Alpine Peaks"
+      selected
+      onSelect={onSelect}
+      data-testid="swatch"
+    />,
+  );
+  const swatch = screen.getByTestId("swatch");
+  // Unlike `AssetTile` there is nothing beside the action, so the whole tile — preview included — is the
+  // hit target rather than a strip of it. A nested control would be `shoot.mjs` R3 in DOM form.
+  expect(swatch.tagName).toBe("BUTTON");
+  expect(swatch.querySelectorAll("button").length).toBe(0);
+  expect(swatch.getAttribute("aria-pressed")).toBe("true");
+  // The ring is a colour; the tick is a shape. A reader who cannot see the ring still learns the answer.
+  expect(swatch.querySelector(".mtk-swatch__tick")).toBeTruthy();
+  expect(screen.getByTestId("art")).toBeTruthy();
+  unmount();
+
+  render(
+    <SwatchTile
+      label="Canyon Mesa"
+      preview={<svg />}
+      actionLabel="Create Canyon Mesa"
+      disabled
+      disabledReason="The engine is still working on the last change"
+      onSelect={onSelect}
+      data-testid="off"
+    />,
+  );
+  const off = screen.getByTestId("off");
+  expect(off.hasAttribute("disabled")).toBe(true);
+  // `<ux_quality>` 4 / R9 again: a refusal that only greys out is a refusal nobody can act on.
+  expect(off.getAttribute("title")).toBe("The engine is still working on the last change");
+  off.click();
+  expect(onSelect).not.toHaveBeenCalled();
 });
 
 test("the grid is a named group, so a screen reader hears which collection it is in", () => {

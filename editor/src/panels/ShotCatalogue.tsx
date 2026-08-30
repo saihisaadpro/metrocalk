@@ -8,7 +8,7 @@
 
 import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
-import { space } from "../theme/tokens";
+import { color, space, text } from "../theme/tokens";
 import type { ShotSpec } from "../transport/protocol";
 
 export interface ShotCatalogueProps {
@@ -28,6 +28,19 @@ export function ShotCatalogue({
   disabledReason,
   onPick,
 }: ShotCatalogueProps) {
+  // AN EMPTY CATALOGUE MUST NOT RENDER AN EMPTY GROUP. `cinema_catalog` answers with nothing wherever
+  // the cinematics sub-engine is absent — the browser build is exactly that case — and both call sites
+  // then drew a labelled group containing no cards, under a pacing row that sets the pacing of a
+  // cutscene there is no way to add. Say why instead. The guard lives here rather than in either
+  // caller because both callers had it wrong for the same reason.
+  if (specs.length === 0) {
+    return (
+      <div data-testid="cinema-unavailable" style={{ ...text.itemLabel, color: color.text.muted }}>
+        No shots are available here — the cinematics sub-engine runs in the desktop editor.
+      </div>
+    );
+  }
+
   return (
     <div
       role="group"

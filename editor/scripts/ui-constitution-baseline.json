@@ -13,7 +13,8 @@
     "literal-ui-color": "literal UI colours outside the colour token authorities",
     "first-party-css": "first-party CSS outside the shared theme",
     "literal-motion": "literal motion timing outside the motion authority",
-    "unitless-length": "a spacing token interpolated into a length with no unit, which the browser drops"
+    "unitless-length": "a spacing token interpolated into a length with no unit, which the browser drops",
+    "hand-rolled-section": "a panel group drawing its own heading instead of the shared section"
   },
   "files": {
     "src/app/App.tsx": {
@@ -21,525 +22,616 @@
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/BottomDock.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/EditorDocks.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/EditorHeader.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/EngineRail.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/ImportDropOverlay.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/layout.ts": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/LazyWorkspace.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/nativeImportLifecycle.ts": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/RootBoundary.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/stageInput.ts": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/usePlayerDrive.ts": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/app/viewportCoordinates.ts": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/graph/animation-graph-model.ts": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/graph/AnimationGraphEditor.tsx": {
       "raw-native-control": 53,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 5
     },
     "src/graph/BindingGraph.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/graph/StateGraph.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/inspector/Inspector.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/inspector/InspectorEmpty.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/inspector/renderers.tsx": {
       "raw-native-control": 1,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/AiEditPanel.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/AnimationWorkspace.tsx": {
       "raw-native-control": 4,
       "literal-ui-color": 9,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 1
     },
     "src/panels/AssetBrowser.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/AssetLabPanel.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 1
     },
     "src/panels/AssetLabWorkspace.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/AuthoringToolbar.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/BehaviourSection.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 1
     },
     "src/panels/CinemaSection.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/CommandPalette.tsx": {
       "raw-native-control": 2,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 1
     },
     "src/panels/ComposePanel.tsx": {
       "raw-native-control": 1,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/ContextMenu.tsx": {
       "raw-native-control": 1,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/DescribeBar.tsx": {
       "raw-native-control": 1,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/Diagnostics.tsx": {
       "raw-native-control": 1,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/EmptyState.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/FileMenu.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/FocusBanner.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/FormatsPanel.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 2
     },
     "src/panels/Hierarchy.tsx": {
       "raw-native-control": 1,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 1
     },
     "src/panels/HoverTooltip.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/ImportReport.tsx": {
       "raw-native-control": 2,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/JointPanel.tsx": {
       "raw-native-control": 4,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/MatchPanel.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/Onboarding.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/OnlyIfBlock.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/PhysicsPanel.tsx": {
       "raw-native-control": 1,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/PipeForge.tsx": {
       "raw-native-control": 10,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/PlayControls.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/PosePreview.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/ReimportPanel.tsx": {
       "raw-native-control": 3,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/Rejections.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/Requirers.tsx": {
-      "raw-native-control": 1,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/Reveal.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/RigPanel.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/RolesSection.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/RuleDebugPanel.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/RulesPanel.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/ShapeStudio.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/StateGraphPanel.tsx": {
       "raw-native-control": 25,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/StatusBar.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/TerrainPanel.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/ToastHost.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/TransformPanel.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/VfxSection.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/ViewportToolbar.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/ViewportToolRail.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/panels/Wallet.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/theme/assets.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/theme/fields.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/theme/global.css": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/theme/graph.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/theme/icons.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/theme/Popover.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/theme/primitives.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 3,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/theme/Thumbnail.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/theme/timeline.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/theme/tokens.ts": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     },
     "src/theme/workspace.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
-      "unitless-length": 0
+      "unitless-length": 0,
+      "hand-rolled-section": 0
     }
   }
 }

@@ -214,6 +214,16 @@ export interface DisclosureSectionProps extends Omit<HTMLAttributes<HTMLElement>
   /** Removes closed content from the tree. By default it stays mounted so draft form state is preserved. */
   unmountOnClose?: boolean;
   id?: string;
+  /** A stable hook on the TOGGLE BUTTON, not on the section root.
+   *
+   *  `data-testid` on this component lands on the `<section>`, which is the right default: a scene or
+   *  a test asking "is this group here" wants the group. But a black-box gate that *drives* a
+   *  disclosure needs the control — it clicks it and reads its `aria-expanded`, and neither of those
+   *  is true of the section. `TerrainPanel` had that contract already, on the ghost button of its own
+   *  hand-rolled version, in a unit test and in the packaged-`.exe` terrain spec; without this the
+   *  migration onto the shared component would have moved the hook under the contract's feet and
+   *  broken a gate to tidy a stylesheet. */
+  toggleTestId?: string;
   headingLevel?: 2 | 3 | 4 | 5 | 6;
   tone?: "plain" | "card";
   density?: "compact" | "default";
@@ -235,6 +245,7 @@ export function DisclosureSection({
   storageKey,
   unmountOnClose = false,
   id,
+  toggleTestId,
   headingLevel = 3,
   tone = "plain",
   density = "default",
@@ -285,6 +296,7 @@ export function DisclosureSection({
       aria-controls={contentId}
       aria-labelledby={titleId}
       aria-describedby={summary != null ? summaryId : undefined}
+      data-testid={toggleTestId}
       disabled={disabled}
       onClick={toggle}
     >
@@ -321,6 +333,42 @@ export function DisclosureSection({
       )}
     </section>
   );
+}
+
+/**
+ * **A section whose subject is the selection: closed until there is one, open the moment there is.**
+ *
+ * The Gameplay workspace had three groups that each waited for an object to be selected, and each one
+ * answered the wait with a sentence — *"Select an object, then give it a role"*, *"…then pick a shot"*,
+ * *"…then give it an effect"* — stacked one above another in a 340px dock. Three instructions telling
+ * the reader to go and do something elsewhere is not a workspace; it is a page of a manual, and it
+ * pushed the one control the panel could actually offer off the bottom of a 620px column (measured:
+ * 40px below the window, with the paragraph *underneath* the primary button 32px below it).
+ *
+ * The rule that replaces the three sentences is one line of behaviour, so it is written once here
+ * rather than three times in three panels: **the group states its condition in its own header and
+ * folds itself away; a selection opens it.** Re-selecting a DIFFERENT subject opens it again — that is
+ * the gesture asking "what can I do with this?" — but closing it and staying on the same subject is
+ * respected, because a section that springs back open is a section fighting its user.
+ *
+ * Pass the result straight through to `DisclosureSection`'s controlled props.
+ */
+export function useSubjectDisclosure(subjectId: string | null | undefined): {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+} {
+  const [open, setOpen] = useState(false);
+  // The subject the current open/closed decision was made about. `undefined` is "no decision yet", which
+  // is why this is not seeded with `subjectId`: mounting with something already selected must still
+  // count as the selection arriving, or the panel opens on nothing the first time it is used.
+  const decidedFor = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const subject = subjectId ?? null;
+    if (decidedFor.current === subject) return;
+    decidedFor.current = subject;
+    setOpen(subject != null);
+  }, [subjectId]);
+  return { open, onOpenChange: setOpen };
 }
 
 export interface MenuPopupProps {

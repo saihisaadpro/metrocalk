@@ -47,6 +47,7 @@ const RULES = Object.freeze({
   "first-party-css": "first-party CSS outside the shared theme",
   "literal-motion": "literal motion timing outside the motion authority",
   "unitless-length": "a spacing token interpolated into a length with no unit, which the browser drops",
+  "hand-rolled-section": "a panel group drawing its own heading instead of the shared section",
 });
 const RULE_IDS = Object.freeze(Object.keys(RULES));
 
@@ -71,6 +72,33 @@ const MOTION_PROPERTY =
 // JSX intrinsic controls are lowercase. Keep this case-sensitive so shared `Button`, `SelectField`,
 // `TextField`, and future design-system components are not misclassified as raw browser controls.
 const NATIVE_CONTROL = /<\s*(?:button|input|select|textarea)\b/g;
+
+// A TITLED GROUP OF PROPERTIES is the most repeated structure in this editor, and it had three
+// vocabularies: `DisclosureSection` (`theme/workspace.tsx` — it folds, persists, states its condition
+// in a summary slot, animates, and is keyboard-native), the older non-folding `SectionHeader`
+// (`theme/primitives.tsx`), and a bare `<h3>` written by hand in eleven files. Whether a group in this
+// product folds, remembers, or says anything at all about its own state was therefore decided per
+// panel, by whoever wrote it — which is how the Gameplay workspace came to be four unfoldable headings
+// beside a Physics workspace, in the same dock, that folds all four of its groups and reports each
+// one's state in its own header.
+//
+// The rule is deliberately blunt: ANY heading element outside the theme authorities counts. It is a
+// ratchet, not a judge — a legitimate heading (the command palette's dialog title, say) simply sits in
+// the baseline and can never grow. The alternative, deciding statically which headings are "really"
+// panel groups, is a rule that argues with its reader; a number that can only go down is one that
+// does not.
+//
+// WHAT IT DELIBERATELY DOES NOT CATCH, said out loud so nobody reads a clean run as more than it is —
+// a gate that quietly resolves less than its name suggests is the failure `gpu-contract-audit` was
+// rebuilt to stop:
+//  • `SectionHeader` is NOT flagged. It is a shared authority too — the non-folding label above a
+//    list, which is a real and different thing from a group that folds. Nine of `TerrainPanel`'s ten
+//    uses were exactly that, and correct.
+//  • A hand-rolled DISCLOSURE has no honest static signal. `TerrainPanel` built one by putting a
+//    `Button` carrying `aria-expanded` and a rotating chevron inside a `SectionHeader`, and every
+//    pattern that would catch that (`aria-expanded`, a chevron icon) is also how tabs, menus and
+//    comboboxes are written. That form is held by the `shots` captures and by review, not here.
+const HAND_ROLLED_HEADING = /<\s*h[1-6]\b/g;
 const WAIVER =
   /ui-constitution-allow\s+([a-z][a-z0-9-]*)\s*:\s*(.*?)(?=\*\/|-->|}\s*$|$)/gi;
 
@@ -345,6 +373,9 @@ function analyseFile(path, source) {
     findAll(NATIVE_CONTROL, masked, (match) => {
       addFinding("raw-native-control", match.index, match[0].trim());
     });
+    findAll(HAND_ROLLED_HEADING, masked, (match) => {
+      addFinding("hand-rolled-section", match.index, match[0].trim());
+    });
   }
 
   if (!COLOR_AUTHORITIES.has(path)) {
@@ -555,6 +586,38 @@ function runSelfTests() {
     "export const SyntheticSharedConsumer = () => <><Button>Go</Button><SelectField /></>;\n",
   );
   assert.equal(sharedConsumer.counts["raw-native-control"], 0);
+
+  // `hand-rolled-section`. Both spellings of the defect, and both shapes that must stay silent: a
+  // panel consuming the shared section, and the authority that DEFINES the heading.
+  const ownHeading = analyse(
+    "src/panels/SyntheticGroup.tsx",
+    "export const SyntheticGroup = () => (\n  <section>\n    <h3>Roles</h3>\n    <h4>Orders</h4>\n  </section>\n);\n",
+  );
+  assert.equal(ownHeading.counts["hand-rolled-section"], 2);
+
+  // `SectionHeader` is a shared authority in its own right — the non-folding label above a list — so
+  // it must stay SILENT. This fixture is the mutation that pins the rule to headings a panel WROTE,
+  // rather than to every group label in the tree.
+  const legacyHeader = analyse(
+    "src/panels/SyntheticLegacy.tsx",
+    "export const SyntheticLegacy = () => <SectionHeader>Layers</SectionHeader>;\n",
+  );
+  assert.equal(legacyHeader.counts["hand-rolled-section"], 0);
+
+  const sharedSection = analyse(
+    "src/panels/SyntheticShared.tsx",
+    'export const SyntheticShared = () => <DisclosureSection title="Roles" summary="2 assigned">x</DisclosureSection>;\n',
+  );
+  assert.equal(sharedSection.counts["hand-rolled-section"], 0);
+
+  // The component that RENDERS the heading is `theme/workspace.tsx`, and it must not be flagged for
+  // doing its job. It builds the element through `createElement`, which is also why this rule can be
+  // JSX-only: the authority never writes the tag.
+  const sectionAuthority = analyse(
+    "src/theme/workspace.tsx",
+    'export const heading = createElement("h3", null, <h3>x</h3>);\n',
+  );
+  assert.equal(sectionAuthority.counts["hand-rolled-section"], 0);
 
   const authority = analyse(
     "src/theme/tokens.ts",

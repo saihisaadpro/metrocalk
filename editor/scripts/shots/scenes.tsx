@@ -35,7 +35,9 @@ import { Reveal } from "../../src/panels/Reveal";
 import { RigPanel, type RigDocument } from "../../src/panels/RigPanel";
 import RIG_MIXAMO from "../../src/panels/__fixtures__/rig-characterization.json";
 import RIG_BLOCKED from "../../src/panels/__fixtures__/rig-not-retargetable.json";
+import { MatchPanel } from "../../src/panels/MatchPanel";
 import { PhysicsPanel } from "../../src/panels/PhysicsPanel";
+import { TerrainPanel } from "../../src/panels/TerrainPanel";
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { assetShelfStore } from "../../src/store/assetShelf";
@@ -1662,8 +1664,285 @@ export const SCENES: Scene[] = [
   ...inspectorScenes(),
   ...assetScenes(),
   ...modelScenes(),
+  ...gameplayScenes(),
+  ...terrainScenes(),
   ...shellScenes(),
 ];
+
+// ── the Terrain sub-engine's way in ───────────────────────────────────────────────────────────────
+
+/** THE PANEL THAT EXPLAINED ITSELF IN PROSE WHERE THE REFERENCES SHOW A GRID.
+ *
+ *  `shell-terrain` has photographed this column inside the editor since ADR-124, and its caption names
+ *  the width problem — "the widest workspace in the dock, and the one that has already overflowed it
+ *  once" — but no claim has ever been attached to what is INSIDE it before a terrain exists, which is
+ *  the first thing every author sees. What the capture shows: a 43-word paragraph about what a recipe
+ *  is; a description box; a status line whose two long sentences ended in the same two examples printed
+ *  again directly below it; five of those examples as full-width rows of body copy; then a heading
+ *  indented 12px past the choices it labels, over six presets drawn as a name and a sentence each, with
+ *  no tile, no preview and no affordance. Six choices, and only three of them existed — the browser
+ *  mock published half the engine's catalogue, so the grid that wraps at six had never been seen.
+ *
+ *  Written as the claims the panel must satisfy, and added BEFORE the change so they went red first —
+ *  the same discipline `gameplayScenes` records. The claim that matters most is `max_height`: prose is
+ *  cheap to write and expensive to scroll, and the only honest way to say "this stopped being an essay"
+ *  is to measure it. */
+function terrainScenes(): Scene[] {
+  const terrain = () => <TerrainPanel client={createMockSession()} statsIntervalMs={0} />;
+  return [
+    {
+      id: "terrain-start",
+      looking_for:
+        "the two ways into the Terrain sub-engine, at the 300px the left dock really is between 980 " +
+        "and 1199. A description box with its examples as a WRAPPED ROW OF PILLS, and every one of " +
+        "the engine's six presets as a tile whose drawing says which shape of ground it makes before " +
+        "its name is read. What a reader is checking: no paragraph anywhere; the two group headings " +
+        "flush with the content they label, not indented past it; the status line and Build it " +
+        "sharing one line; and six tiles in a grid rather than six sentences in a column",
+      width: 300,
+      expect: {
+        // Every preset the engine publishes, each with a drawing in it. The `svg path` count is the
+        // part that cannot be satisfied by an empty well — a tile with no mark photographs as a tile.
+        present: [
+          ["[data-testid^='terrain-preset-']", 6],
+          ["[data-testid^='terrain-preset-'] svg path", 6],
+          // TWO, not five. The other three describe CHANGES to a world, and this is the surface whose
+          // whole condition is that there is no world — they belong to the compact box, which is what
+          // `terrain-authored` photographs.
+          ["[data-testid='terrain-example']", 2],
+        ],
+        // `Icon` draws an empty, still-sized box for a name the set lacks, so a blank control
+        // photographs like a working one.
+        absent: ["[data-icon-missing]"],
+        text_present: ["Describe it", "Or start from a preset", "Desert Dunes", "Canyon Mesa"],
+        // The paragraph this pass deleted, by its most distinctive phrase. A prose block is the one
+        // thing that grows back by accident, because writing one always feels like helping.
+        text_absent: ["null", "undefined", "NaN", "Nothing is baked in", "raise this mountain”, “widen the river"],
+        // THE MEASUREMENT, and the reason this scene exists rather than a `text_absent` alone. The
+        // whole way in has to fit the dock without scrolling: 6 tiles + 5 pills + a box + two
+        // headings. The old surface needed 1,180px of column for the same two choices.
+        max_height: [["[data-testid='terrain-panel']", 620]],
+        // A heading indented past its own content reads as belonging to something else. Both group
+        // headings start on the same x as the things they label.
+        stacked: [
+          ["[data-testid='terrain-describe']", "[data-testid='terrain-presets']"],
+        ],
+        // The status line and its button share a row — the defect the shortened status fixes is that
+        // it wrapped to three lines and shoved the "Try one" heading into itself.
+        same_line: [["[data-testid='terrain-describe-status']", "[data-testid='terrain-describe-build']"]],
+        // Nothing may be cut at the width the dock really is. The tiles are the new thing and the
+        // pills are the new thing; both are claimed.
+        unclipped: [
+          "[data-testid='terrain-presets']",
+          "[data-testid='terrain-example']",
+          "[data-testid='terrain-describe-build']",
+        ],
+      },
+      render: terrain,
+    },
+    {
+      id: "terrain-start-wide",
+      looking_for:
+        "the SAME surface in the 340px track the dock takes above 1200px. The grid's column count is " +
+        "the browser's decision from a minimum tile width, so what is being checked is that the extra " +
+        "40px goes into the tiles rather than into a ragged row: still six tiles, still nothing cut, " +
+        "and the pills still on a row rather than a column",
+      width: 340,
+      expect: {
+        present: [["[data-testid^='terrain-preset-']", 6], ["[data-testid='terrain-example']", 2]],
+        absent: ["[data-icon-missing]"],
+        text_absent: ["null", "undefined", "NaN", "Nothing is baked in"],
+        max_height: [["[data-testid='terrain-panel']", 620]],
+        same_line: [
+          ["[data-testid='terrain-describe-status']", "[data-testid='terrain-describe-build']"],
+          // Three columns at 340 as at 300 — the tiles absorb the width. A row that broke to two
+          // would mean the grid's minimum is doing the deciding, not the design.
+          ["[data-testid='terrain-preset-flat']", "[data-testid='terrain-preset-alpine']"],
+        ],
+        unclipped: ["[data-testid='terrain-presets']", "[data-testid='terrain-example']"],
+      },
+      render: terrain,
+    },
+    {
+      id: "terrain-authored",
+      looking_for:
+        "the surface a preset leads to, reached by pressing one — the folding sections, and the " +
+        "compact describe box at the top of them. What a reader is checking is the half of " +
+        "describe-to-build that used to be invisible: the three examples about CHANGING a world are " +
+        "offered here, on a wrapped row, where they are the only ones that can work — and were shown " +
+        "only on the empty surface, where none of them could",
+      width: 300,
+      // Pressing a tile is the way an author reaches this state, so the scene reaches it that way too
+      // rather than by handing the panel a fixture no gesture produces.
+      click: ["[data-testid='terrain-preset-rolling-hills']"],
+      expect: {
+        present: [
+          ["[data-testid='terrain-section-describe']", 1],
+          ["[data-testid='terrain-example']", 3],
+        ],
+        absent: ["[data-icon-missing]", "[data-testid='terrain-presets']"],
+        text_present: ["Raise a mountain", "Widen the river", "Rebuild"],
+        // The create-side examples are for the other box. Seeing one here means the filter is gone.
+        text_absent: ["null", "undefined", "NaN", "Alpine valley", "Tropical islands"],
+        same_line: [["[data-testid='terrain-describe-status']", "[data-testid='terrain-describe-build']"]],
+        unclipped: ["[data-testid='terrain-example']", "[data-testid='terrain-describe-build']"],
+      },
+      render: terrain,
+    },
+  ];
+}
+
+// ── the Gameplay sub-engine workspace ──────────────────────────────────────────────────────────────
+
+/** THE WORKSPACE THAT WAS A DOCUMENT.
+ *
+ *  `shell-gameplay` photographs this column inside the whole editor, and its own caption already
+ *  names what it found — "roles, cinema and VFX stacked in a column narrower than any of them" — but
+ *  nothing has ever photographed the panel ITSELF, at the width of the dock it ships in, with a claim
+ *  attached. So what the capture shows had never been anyone's defect: three headings, each followed
+ *  by a sentence telling the reader to go and do something somewhere else, then a centred empty state
+ *  with a 43-word paragraph, then the primary button, then ONE MORE paragraph below the button. Six
+ *  blocks of prose and one control, in a 340px column — while `PhysicsPanel`, its neighbour in the
+ *  same dock, folds its groups and reports each one's state in its own header.
+ *
+ *  These three scenes are written as the claim the panel must satisfy, not as a description of what
+ *  it does: they were added BEFORE the change and went red, which is what turns a restyle into a
+ *  defect list. */
+function gameplayScenes(): Scene[] {
+  /** The dev mock, not a fixture — the same client the Gameplay dock is wired to in the dev build, so
+   *  a role card, a shot card and an effect card here are the ones the product can actually offer. */
+  const gameplay = () => <MatchPanel client={createMockSession()} />;
+
+  /** Put an object in the document and select it. Roles/Cinematics/Effects each key off the selection,
+   *  and their unselected branch is the one that had become a paragraph. */
+  const selectSubject = () => {
+    const s = projectionStore.getState();
+    s.bulkLoad([{ id: "crystal", name: "Crystal", parentId: null, components: { Transform: {} } }] as never);
+    s.select("crystal");
+  };
+
+  const clearSelection = () => {
+    const s = projectionStore.getState();
+    s.bulkLoad([{ id: "crystal", name: "Crystal", parentId: null, components: { Transform: {} } }] as never);
+    s.select(null as never);
+  };
+
+  /** Every scene here shares the same three structural claims, because they are the whole point:
+   *  the workspace's groups are the SHARED section, there is no hand-rolled heading left in it, and
+   *  each group states its own condition in its own header rather than in a sentence underneath. */
+  const structure = (extra: Expect): Expect => ({
+    ...extra,
+    present: [
+      ["[data-testid='match-panel']", 1],
+      // Roles · Cinematics · Effects, each one `DisclosureSection` — the component `PhysicsPanel`,
+      // `AssetBrowser`, `ShapeStudio` and the inspector already share.
+      ["[data-testid='match-panel'] .mtk-disclosure", 3],
+      // …and each one carrying a summary, which is where its condition belongs: a header that says
+      // "3 assigned" or "needs a selection" is the sentence, in the place a reader is already looking.
+      //
+      // COUNTED HERE AND MEASURED BELOW, because counting alone is the blind spot this harness's own
+      // notes warn about and this claim walked straight into it: `present` reads the DOM, and the
+      // three summaries were in the DOM and `display: none` at exactly this width — a window media
+      // query hid them under 760px while the dock they live in is 340px at every width above 980.
+      // Green claim, invisible condition, and the capture is what showed it.
+      ["[data-testid='match-panel'] .mtk-disclosure__summary", 3],
+      ...(extra.present ?? []),
+    ],
+    absent: [
+      // The defect, stated as a selector. `DisclosureSection` renders its own `h3` INSIDE
+      // `.mtk-disclosure__heading-wrap`; a heading anywhere else in this panel is a group that drew
+      // its own header, which is exactly what made four groups look like four different products.
+      "[data-testid='match-panel'] h3:not(.mtk-disclosure__heading-wrap)",
+      "[data-testid='match-panel'] h4",
+      // `Icon` paints an empty, still-sized box for a name the set lacks, so a blank control
+      // photographs like a working one.
+      "[data-icon-missing]",
+      ...(extra.absent ?? []),
+    ],
+    text_absent: ["null", "undefined", "NaN", ...(extra.text_absent ?? [])],
+  });
+
+  return [
+    {
+      id: "gameplay-nothing-selected",
+      looking_for:
+        "the state a user opens this workspace in, at the 340px the left dock really is. Roles, " +
+        "Cinematics and Effects must be three folded sections whose HEADERS say what each one needs " +
+        "— not three headings each trailed by a sentence sending the reader elsewhere — and the one " +
+        "action the panel can offer with nothing selected has to be reachable without scrolling past " +
+        "them. The shipped version answered a 620px column with 1,000px of prose",
+      viewport: { width: 340, height: 620 },
+      setup: clearSelection,
+      expect: structure({
+        present: [["[data-testid='match-create']", 1]],
+        // THE MEASUREMENT THE PROSE COSTS. Six paragraphs and a centred empty state in a column that
+        // is 620px tall: the primary action was below the fold of its own dock. A ceiling is the only
+        // claim that can fail for that reason — `present` cannot, and `unclipped` cannot either,
+        // because a bare panel in this harness has no scroll parent to be clipped by.
+        max_height: [["[data-testid='match-panel']", 620]],
+        // A section with nothing to act on is FOLDED, not deleted: the index of what this sub-engine
+        // can do must survive the empty state, or the workspace teaches nothing about itself.
+        text_present: ["Roles", "Cinematics", "Effects"],
+        // The measurement that a count cannot make. Re-add `display: none` to
+        // `.mtk-disclosure__summary` and this goes red; `present` above stays green.
+        min_height: [["[data-testid='match-panel'] .mtk-disclosure__summary", 10]],
+      }),
+      render: gameplay,
+    },
+    {
+      id: "gameplay-object-selected",
+      looking_for:
+        "the same workspace with an object selected — the gesture all three groups are waiting for. " +
+        "Roles opens on its four cards, and the claim is that they are the SAME control family the " +
+        "rest of the editor uses at the same width: four role cards in a 340px column, none of them " +
+        "cut, each still naming what it adds. The sections' summaries must have changed with the " +
+        "selection, which is the whole argument for putting the condition in the header",
+      // NO `click`. The section opening is the BEHAVIOUR being photographed — a group whose subject is
+      // the selection opens when the selection arrives — so scripting the toggle here would have
+      // photographed the harness pressing a button rather than the panel answering a gesture. The
+      // first version of this scene did exactly that and went red for it: the click landed on a
+      // section `useSubjectDisclosure` had already opened, closed it, and the four role cards
+      // measured 140×0 with every `present` claim still green.
+      width: 340,
+      setup: selectSubject,
+      expect: structure({
+        present: [["[data-testid='role-collectible']", 1], ["[data-testid='role-spinner']", 1]],
+        text_present: ["Crystal", "Collectible", "Spinner"],
+        // Four cards in one column at 340px: the failure this is written against is a grid that keeps
+        // two columns until the labels are cut in half.
+        unclipped: ["[data-testid='role-collectible']", "[data-testid='role-spinner']"],
+      }),
+      render: gameplay,
+    },
+    {
+      id: "gameplay-authored",
+      looking_for:
+        "the authored state, reached the way a user reaches it — by pressing the panel's own primary " +
+        "button. `Your match` is a fourth group and it must be the same section as the other three, " +
+        "with its four read-outs inside it rather than a bare heading over a tile grid. This is the " +
+        "state the panel is FOR, and no capture in the repository has ever contained it",
+      width: 340,
+      setup: clearSelection,
+      click: ["[data-testid='match-create']"],
+      expect: {
+        present: [
+          ["[data-testid='match-panel']", 1],
+          // Four now: Roles · Cinematics · Effects · Your match.
+          ["[data-testid='match-panel'] .mtk-disclosure", 4],
+          ["[data-testid='match-summary']", 1],
+        ],
+        absent: [
+          "[data-testid='match-panel'] h3:not(.mtk-disclosure__heading-wrap)",
+          "[data-testid='match-panel'] h4",
+          "[data-icon-missing]",
+        ],
+        text_present: ["Actors", "Waves", "Lane"],
+        text_absent: ["null", "undefined", "NaN"],
+      },
+      render: gameplay,
+    },
+  ];
+}
 
 // ── the inspector ─────────────────────────────────────────────────────────────────────────────────
 
@@ -1729,6 +2008,41 @@ function dockTrack(children: ReactNode) {
       {children}
     </div>
   );
+}
+
+/** THE SAME TRACK, WITH THE PANEL'S REAL HEIGHT CHAIN UNDER IT.
+ *
+ *  `dockTrack` above photographs a panel at the dock's WIDTH; it has no height, so a component that
+ *  fills the column it is given — which is what an empty state does — photographs at its natural size
+ *  in it and the arrangement being claimed is not in the frame. The chain reproduced here is the one
+ *  `EditorDocks` builds: a bounded column -> `.mtk-dock-panel.mtk-scroll` (whose `> * { flex: none }`
+ *  is exactly what `InspectorEmpty` has to override) -> the panel. 300px, not 320: that is the width
+ *  the Inspector track actually ships at. */
+function inspectorColumn(children: ReactNode) {
+  return (
+    <div
+      data-testid="inspector-track"
+      style={{ width: 300, height: "100vh", display: "flex", flexDirection: "column", boxSizing: "border-box", borderLeft: "1px solid var(--mtk-border)", background: "var(--mtk-bg-panel)" }}
+    >
+      <div className="mtk-dock-panel mtk-scroll">{children}</div>
+    </div>
+  );
+}
+
+/** A scene with objects in it and NOTHING SELECTED — the state the Inspector is in most of the time
+ *  and the one it had never been photographed in. `HealthBar` is what makes an entity a requirer
+ *  (`deriveRel`), so this seeds the real signal rather than a hand-set flag. */
+function idleScene(withRequirer: boolean) {
+  return () => {
+    projectionStore.getState().bulkLoad([
+      { id: "e-player", name: "Player", parentId: null, components: { Transform: { px: 0, py: 0, pz: 0 } } },
+      { id: "e-ground", name: "Ground", parentId: null, components: { Transform: { px: 0, py: -1, pz: 0 } } },
+      ...(withRequirer
+        ? [{ id: "e-health", name: "Health Bar", parentId: null, components: { HealthBar: { width: 1 } } }]
+        : []),
+    ] as never);
+    // No `select()`. That is the whole point of the scene.
+  };
 }
 
 function inspectorScenes(): Scene[] {
@@ -1889,7 +2203,7 @@ function inspectorScenes(): Scene[] {
         // defaults are the ones a validator would inject.
         text_absent: [
           "1 transaction", "2 transactions", "3 transactions", "undefined", "NaN",
-          "No applicable renderer found", "No editable properties yet",
+          "No applicable renderer found", "No editable properties",
         ],
       },
       render: () => <EditProbe />,
@@ -1917,6 +2231,91 @@ function inspectorScenes(): Scene[] {
         text_absent: ["2 transactions", "Transform.py", "Transform.ry", "undefined", "NaN"],
       },
       render: () => <EditProbe />,
+    },
+
+    // -- the three absences (ADR-170) -------------------------------------------------------------
+    //
+    // The Inspector has three states in which it has nothing to show, and until this pass they were
+    // three different things: a grey sentence in the top-left corner, a second grey sentence, and —
+    // one tab over, in the same dock — a properly composed `EmptyPanelState`. None of the three had
+    // ever been photographed, which is how two of them stayed sentences through four UI milestones.
+    {
+      id: "inspector-nothing-selected",
+      looking_for:
+        "THE STATE THIS PANEL IS IN MOST OF THE TIME. Nothing is selected, and instead of `Select an " +
+        "entity to inspect.` pinned to the top-left of a 300x900 column, the panel says what will " +
+        "appear here and how to get there — centred in the column, in the same `EmptyPanelState` " +
+        "anatomy the Relations tab next door has always used. Under it, and ONLY when there is one, " +
+        "the one list that is useful with no selection and is not a second copy of something already " +
+        "on screen: the objects waiting for a binding. Clicking one makes the selection the panel is " +
+        "missing. The column is not filled — it is composed",
+      viewport: { width: 320, height: 900 },
+      setup: idleScene(true),
+      expect: {
+        present: [
+          ["[data-testid='inspectorNoSelection']", 1],
+          // The SHARED anatomy, asserted as the class and not as the testid — a bare `<div>` carrying
+          // the same hook would satisfy a testid-only claim, and a bare `<div>` is what was there.
+          ["[data-testid='inspectorEmpty'].mtk-empty-panel", 1],
+          ["[data-testid='requirer']", 1],
+          // The shared card surface. `Requirers` used to spell `.mtk-card` out by hand on a raw
+          // `<button>` because `Card` could not carry its `cand` hook.
+          ["button.mtk-card.cand", 1],
+        ],
+        absent: ["[data-testid='inspectorNoFields']", "[data-icon-missing]"],
+        text_present: ["Select an object to edit its properties", "Needs binding", "Health Bar"],
+        text_absent: ["Select an entity to inspect", "none found", "undefined", "NaN"],
+        unclipped: ["[data-testid='inspectorEmpty']", "[data-testid='requirer']"],
+        // THE CENTRING, MEASURED. `.mtk-dock-panel.mtk-scroll > *` sets `flex: none` on this element,
+        // so without the inline `flex: 1 0 auto` the composition is ~250px tall at the top of a 900px
+        // column with 650px of nothing under it — which is the defect, and it photographs as "a small
+        // tidy block" unless the height is claimed.
+        min_height: [["[data-testid='inspectorNoSelection']", 700]],
+      },
+      render: () => inspectorColumn(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-nothing-selected-quiet",
+      looking_for:
+        "THE SAME STATE WITH NOTHING WAITING — the common one, and the reason the list below the " +
+        "empty state is a guest rather than a fixture. No heading, no `none found`, no hairline: a " +
+        "section that renders `none found` into a column that is already empty is noise added to " +
+        "answer noise. One centred statement, and quiet",
+      viewport: { width: 320, height: 900 },
+      setup: idleScene(false),
+      expect: {
+        present: [["[data-testid='inspectorEmpty'].mtk-empty-panel", 1]],
+        absent: ["[data-testid='requirers']", "[data-testid='requirer']", "[data-icon-missing]"],
+        text_present: ["Select an object to edit its properties"],
+        text_absent: ["Needs binding", "none found", "Select an entity to inspect", "undefined", "NaN"],
+        unclipped: ["[data-testid='inspectorEmpty']"],
+      },
+      render: () => inspectorColumn(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-no-editable-fields",
+      looking_for:
+        "THE PANEL'S OTHER ABSENCE: an object IS selected — it is named in the header, with its id " +
+        "under it — and nothing on it exposes an editable field. Same anatomy as the state above, and " +
+        "the sentence no longer names a control that does not exist. `add a component to this object` " +
+        "instructed the reader to press something no surface in this editor offers and no `/core` op " +
+        "stands behind; the entity's own action list, which is a right-click away, is what can " +
+        "actually give it fields",
+      viewport: { width: 320, height: 900 },
+      setup: () => {
+        projectionStore.getState().bulkLoad([
+          { id: "e-marker", name: "Marker", parentId: null, components: {} },
+        ] as never);
+        projectionStore.getState().select("e-marker");
+      },
+      expect: {
+        present: [["[data-testid='inspectorNoFields'].mtk-empty-panel", 1]],
+        absent: ["[data-testid='inspectorNoSelection']", "[data-icon-missing]"],
+        text_present: ["Marker", "No editable properties", "Right-click it"],
+        text_absent: ["add a component", "undefined", "NaN"],
+        unclipped: ["[data-testid='inspectorNoFields']"],
+      },
+      render: () => inspectorColumn(<Inspector client={recordingClient(() => {})} />),
     },
   ];
 }
@@ -2215,16 +2614,35 @@ function shellScenes(): Scene[] {
     1440,
     "the whole editor at a desktop width: Engines rail · left dock · stage · Inspector, all four " +
       "tracks open at once. This is the first capture in the repository that contains two panels, " +
-      "so it is the first one where a panel can be caught colliding with its neighbour",
+      "so it is the first one where a panel can be caught colliding with its neighbour. AND EACH " +
+      "DOCK FILLS THE CARD IT IS IN — the Inspector's empty state is centred in the column rather " +
+      "than sitting at the top of it, which is only possible because the panel owns the column",
     {
       present: [
         ["[data-testid='engine-rail']", 1],
         ["[data-testid='hierarchy']", 1],
         ["[data-testid='editor-header']", 1],
+        // The Inspector's no-selection state, in the shell, at the width it ships at (ADR-170).
+        ["[data-testid='inspectorNoSelection']", 1],
       ],
       // Wide open: the docks are panels, not rails. If this ever flips, the layout collapsed at a
       // width where it had room — the opposite defect to the stage being squeezed.
       absent: ["[data-testid='rail-left']"],
+      // A PANEL FILLS THE CARD IT IS DOCKED IN, MEASURED (ADR-170). Both shell docks were
+      // shrink-wrapped to their content inside a full-height card — 369px and 409px inside 804px,
+      // ~400px of blank card under each — and nothing here could see it, because every claim in this
+      // suite is about a panel's own box and both panels were perfectly well-formed. `fills` is the
+      // one claim that compares a child to the container it was given: the panel accounts for the
+      // whole card or it does not.
+      //
+      // It is the gate on the ROOT-CAUSE fix (`.mtk-workspace-panel { flex: 1 1 auto; height: 100% }`),
+      // and it is what everything downstream needs — the Hierarchy's virtualised tree gets its height
+      // from `.mtk-dock-panel__fill`, `.mtk-dock-panel.mtk-scroll` can only scroll a panel that is
+      // bounded, and an empty state can only be centred in a column that exists.
+      fills: [
+        [".mtk-shell-track--left > .mtk-shell-card", ["[data-testid='left-dock']"]],
+        [".mtk-shell-track--right > .mtk-shell-card", ["[data-testid='inspector-dock']"]],
+      ],
     },
   ),
   shell(
@@ -2437,18 +2855,24 @@ function shellScenes(): Scene[] {
   // the Inspector, and the repair was to widen the track by hand after a human noticed.
   ...(
     [
-      ["build", "Build — place and create: the toolbar, the asset browser and the describe bar stacked in one 300 px column", "[data-testid='authbar']"],
+      // TWO MARKERS, and the second one is the asset library rather than a second reading of the
+      // toolbar. `authbar` mounts the instant the workspace does; the library's tiles arrive from a
+      // `catalog()` promise afterwards and take the frame from 35 controls to 104. A claim satisfied
+      // by the first of those photographs the second one arriving — which is exactly what the
+      // post-capture drift check kept reporting. The caption already named three things in this
+      // column; now it can only pass with two of them on screen.
+      ["build", "Build — place and create: the toolbar, the asset browser and the describe bar stacked in one 300 px column", "[data-testid='authbar']", "[data-testid='asset-item']"],
       ["terrain", "Terrain — the widest workspace in the dock, and the one that has already overflowed it once", "[data-testid='terrain-presets']"],
       ["physics", "Physics — numeric read-outs and a contact list, the shape most likely to demand width", "[data-testid='dropBall']"],
       ["gameplay", "Gameplay — roles, cinema and VFX stacked in a column narrower than any of them", "[data-testid='match-panel']"],
     ] as const
-  ).map(([engine, blurb, marker]) =>
+  ).map(([engine, blurb, ...markers]) =>
     shell(
       `shell-${engine}`,
       1000,
       `${blurb}. Photographed at 1000 px, where the dock is at its narrowest that is still open`,
       {
-        present: [[marker, 1]],
+        present: markers.map((m) => [m, 1] as [string, number]),
         // The stage floor is the point: a dock that will not yield takes the difference out of the
         // viewport, and this is the width where it has the least room to hide.
         min_width: [["[data-testid='left-dock']", 1]],

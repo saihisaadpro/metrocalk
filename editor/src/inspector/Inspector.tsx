@@ -36,6 +36,9 @@ import {
   verticalLayoutTester,
 } from "./renderers";
 import { TypeIcon } from "../theme/primitives";
+import { Icon } from "../theme/icons";
+import { EmptyPanelState } from "../theme/workspace";
+import { InspectorEmpty } from "./InspectorEmpty";
 import { color, font, fontSize, space } from "../theme/tokens";
 
 /** **`vanillaRenderers` IS DELIBERATELY NOT HERE (ADR-136).** It used to be spread in as the fallback,
@@ -80,13 +83,9 @@ export function Inspector({ client }: { client: EditorClient }) {
   const id = useSelectedId();
   const entity = useDisplayedEntity(id ?? "");
   const summary = useSummary(id ?? "");
-  if (!id || !entity) {
-    return (
-      <div id="inspector" style={{ padding: space.lg, color: color.text.muted, fontSize: fontSize.body }}>
-        Select an entity to inspect.
-      </div>
-    );
-  }
+  // The state this panel is in most often, and the one it had never been designed for — see
+  // `InspectorEmpty` for what replaced the one grey sentence that used to be here.
+  if (!id || !entity) return <InspectorEmpty />;
   const schema = buildEntitySchema(entity.components);
   // A real empty-state (C6) — never a blank pane: when the entity carries no *editable* (schema-backed)
   // properties, say so + name the next step, rather than rendering nothing beside the header.
@@ -114,9 +113,20 @@ export function Inspector({ client }: { client: EditorClient }) {
           onChange={({ data }) => emitChanges(client, id, entity.components, data as Components)}
         />
       ) : (
-        <div data-testid="inspectorEmpty" style={{ color: color.text.muted, fontSize: fontSize.body, padding: `${space.md}px 0` }}>
-          No editable properties yet — add a component to this object.
-        </div>
+        // THE OTHER EMPTY STATE, AND THE SENTENCE THAT NAMED A CONTROL THAT DOES NOT EXIST. "add a
+        // component to this object" instructed the reader to press something no surface in this editor
+        // offers: `/core` has a `RemoveComponent` op and no `AddComponent` one, and nothing in
+        // `editor/src` has ever been able to emit one. What CAN add fields to an object is the entity's
+        // own action list (`entityActions` → the context menu: make dynamic, add a joint, give it a
+        // role), so that is what it points at now — the same anatomy as the no-selection state one
+        // branch up, because two empty states in one panel that look different is how this began.
+        <EmptyPanelState
+          data-testid="inspectorNoFields"
+          compact
+          icon={<Icon name="properties" size="xl" />}
+          title="No editable properties"
+          description="Nothing on this object exposes an editable field yet. Right-click it for what can be added."
+        />
       )}
     </div>
   );
