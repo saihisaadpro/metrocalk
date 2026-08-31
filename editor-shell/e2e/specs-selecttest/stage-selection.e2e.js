@@ -198,6 +198,45 @@ async function objectPixel() {
   return found;
 }
 
+/** A ray that meets TWO objects, hunted across the camera presets.
+ *
+ *  The seeded scene is a golden-angle scatter of separated cubes on a plane, and from the default
+ *  three-quarter view almost nothing occludes anything: a 441-ray scan measured a depth histogram of
+ *  `{0: 432, 1: 7, 2: 2}` on the packaged `.exe`. A front or side view lays the same cubes along the
+ *  line of sight and produces the property. `view_preset` arranges the fixture; it is not the
+ *  capability under test and nothing asserts anything about it. */
+async function scanForOcclusion() {
+  let scanned = 0;
+  for (const preset of ["persp", "front", "side"]) {
+    // eslint-disable-next-line no-await-in-loop
+    await browser.execute(async (p) => window.__TAURI__.core.invoke("view_preset", { preset: p }), preset);
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(400);
+    // eslint-disable-next-line no-await-in-loop
+    const found = await browser.execute(async () => {
+      let best = null;
+      let seen = 0;
+      for (let gy = 4; gy <= 76 && (!best || best.hits.length < 3); gy += 3) {
+        for (let gx = 4; gx <= 76 && (!best || best.hits.length < 3); gx += 3) {
+          const fx = gx / 80;
+          const fy = gy / 80;
+          seen += 1;
+          // eslint-disable-next-line no-await-in-loop
+          const d = await window.__TAURI__.core.invoke("pick_diagnostics", { x: fx, y: fy });
+          const hits = d?.hits ?? [];
+          if (hits.length >= 2 && (!best || hits.length > best.hits.length)) {
+            best = { fx, fy, hits: hits.map((h) => ({ entity: h.entity, distance: h.distance, kind: h.kind })) };
+          }
+        }
+      }
+      return { best, seen };
+    });
+    scanned += found.seen;
+    if (found.best) return { ...found.best, scanned, preset };
+  }
+  return { scanned, hits: null };
+}
+
 describe("the stage can select more than one thing", () => {
   before(async () => {
     await browser.waitUntil(
@@ -407,34 +446,19 @@ describe("the stage can select more than one thing", () => {
     // PASS VACUOUSLY, and it is why the one run where it failed could not be diagnosed and the one
     // where it passed could not be trusted. `pick_diagnostics` answers the full ORDERED hit list for a
     // ray without touching the selection, so the pixel is now chosen for the property under test.
-    const deep = await browser.execute(async () => {
-      // A 7x7 grid found NOTHING on the seeded scene: 24 separated cubes, and no ray anywhere on it
-      // met two of them. That is why this test flipped between runs without a line of code changing —
-      // it was never exercising the cycle. 24x24 over the middle of the stage is ~576 rays at well
-      // under a millisecond each, and it early-exits as soon as it finds a deep enough one.
-      let best = null;
-      let scanned = 0;
-      for (let gy = 4; gy <= 76 && (!best || best.hits.length < 3); gy += 3) {
-        for (let gx = 4; gx <= 76 && (!best || best.hits.length < 3); gx += 3) {
-          const fx = gx / 80;
-          const fy = gy / 80;
-          scanned += 1;
-          // eslint-disable-next-line no-await-in-loop
-          const d = await window.__TAURI__.core.invoke("pick_diagnostics", { x: fx, y: fy });
-          const hits = d?.hits ?? [];
-          if (hits.length >= 2 && (!best || hits.length > best.hits.length)) {
-            best = { fx, fy, scanned, hits: hits.map((h) => ({ entity: h.entity, distance: h.distance, kind: h.kind })) };
-          }
-        }
-      }
-      return best ? { ...best, scanned } : { scanned, hits: null };
-    });
-    console.log(`  scanned ${deep.scanned} rays for one that meets two objects`);
+    // AND ON THIS SCENE THAT NEEDS A CAMERA ANGLE. Measured on the packaged `.exe`: a 441-ray scan at
+    // the DEFAULT camera finds a depth histogram of `{0: 432, 1: 7, 2: 2}` — 98% of the stage is empty
+    // sky and two pixels in four hundred have anything behind anything. At some angles there are none
+    // at all. So the scan is allowed to try the camera presets before declaring the property absent;
+    // `view_preset` is fixture arrangement, not the capability under test, and nothing here asserts
+    // anything about it.
+    const deep = await scanForOcclusion();
+    console.log(`  scanned ${deep.scanned} rays${deep.preset ? ` (camera: ${deep.preset})` : ""} for one that meets two objects`);
 
     if (!deep.hits) {
       // Not a silent skip: a scene where no ray meets two objects cannot exercise the cycle, and a
       // run that says nothing about that is indistinguishable from a run that verified it.
-      throw new Error(`none of ${deep.scanned} rays across the stage meets two objects — the cycle is untestable on this scene`);
+      throw new Error(`none of ${deep.scanned} rays across three camera presets meets two objects — the cycle is untestable on this scene`);
     }
     const size = await browser.execute(() => ({ w: window.innerWidth, h: window.innerHeight }));
     const cx = Math.round(deep.fx * size.w);
@@ -476,18 +500,31 @@ describe("the stage can select more than one thing", () => {
     const first = (await engineSelection())[0];
     if (!first) throw new Error("the first click selected nothing — the scene is not under that pixel");
     if (first !== peekAtFraction) {
-      // WHICH SIDE OF THE BOUNDARY. `viewport_pick` at the SAME fraction the probe used is the engine's
-      // own answer to a click; if it agrees with the probe, the front end sent a different point, and
-      // if it agrees with the click, the engine's click path and its hover path have diverged. This is
-      // the one direct invocation of a WRITE in this file and it exists only on the failure path.
-      const enginePick = await browser.execute(
-        async (fx, fy) => window.__TAURI__.core.invoke("viewport_pick", { x: fx, y: fy, shift: false, ctrl: false, cycle: false }),
+      // WHICH SIDE OF THE BOUNDARY — AND THE PREVIOUS VERSION OF THIS BRANCH GOT IT WRONG.
+      //
+      // It invoked `viewport_pick` here and concluded, when that agreed with the click, that "the
+      // engine's click path and its hover path have diverged". `viewport_pick` is a WRITE, and by the
+      // time this line runs the click has already changed the selection and bumped the revision — so
+      // its answer is not comparable to a probe taken before the click. ADR-191 measured the two
+      // directly, on the packaged `.exe`, at occluding pixels under three camera presets:
+      // `pick_diagnostics[0]`, `viewport_peek` and `viewport_pick` returned the SAME entity every
+      // time. They share one `pick_all`; they cannot diverge without one of them being rewritten.
+      //
+      // So the question this branch has to answer is which of the two REMAINING causes it is, and a
+      // non-mutating re-read answers it: if the peek NOW says what the click selected, the scene
+      // changed under both of them between the probe and the click; if the peek still says what it
+      // said, the front end sent a different point than the probe looked at.
+      const peekAfter = await browser.execute(
+        async (fx, fy) => window.__TAURI__.core.invoke("viewport_peek", { x: fx, y: fy }),
         deep.fx,
         deep.fy,
       );
       throw new Error(
-        `hover and click are two different answers to one question: the probe says ${peekAtFraction}, ` +
-          `the click selected ${first}, and viewport_pick at the same fraction returns ${enginePick}`,
+        `the click did not take what the probe named: the probe said ${peekAtFraction}, the click ` +
+          `selected ${first}, and re-reading the same fraction now says ${peekAfter} — ` +
+          (peekAfter === first
+            ? "so the scene changed between the probe and the click"
+            : "so the front end sent a different point than the probe looked at"),
       );
     }
 
