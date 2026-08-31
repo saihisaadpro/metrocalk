@@ -2196,6 +2196,41 @@ function contextMenuScenes(): Scene[] {
       ),
     },
     {
+      id: "ctxmenu-under-nothing-selected",
+      looking_for:
+        "the menu a right-click opens when NOTHING is selected — a state the product could not reach " +
+        "before ADR-191, because the stage refused to open a menu without a selection. It is two rows " +
+        "and a heading: the objects under the pointer, and nothing else. The first `.exe` capture of " +
+        "this state showed these two above SEVEN greyed verbs all reading `nothing is selected`, " +
+        "which is why the verbs are absent here. What a reader checks: the surface reads as a short " +
+        "answer to a question rather than as a menu with most of it disabled; the focus ring on the " +
+        "first row is drawn WHOLE and not clipped by the list's own scroll box; and nothing on it " +
+        "looks inert",
+      viewport: { width: 900, height: 400 },
+      expect: {
+        present: [
+          ["[data-testid='ctxmenu-under']", 1],
+          ["[data-testid='ctxcandidate']", 2],
+        ],
+        text_present: ["Under the pointer · 2", "1 of 2", "2 of 2"],
+        // The vocabulary of a SELECTION is what must not appear: there is no selection to talk about.
+        text_absent: ["nothing is selected", "No actions available", "Select similar", "null", "undefined"],
+        unclipped: ["[data-testid='ctxmenu']", "[data-testid='ctxcandidate']"],
+      },
+      setup: seedAssembly,
+      render: () => (
+        <ContextMenu
+          client={actionsClient(0, [])}
+          ids={[]}
+          candidates={[
+            { id: "girder", kind: "Mesh", distance: 25.7, selected: false },
+            { id: "bolt-0", kind: "Mesh", distance: 28.2, selected: false },
+          ]}
+          onClose={() => {}}
+        />
+      ),
+    },
+    {
       id: "ctxmenu-under-pointer-many",
       looking_for:
         "the same section where a ray meets 23 objects — a bolt pattern seen edge-on, which is what " +

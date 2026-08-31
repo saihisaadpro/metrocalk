@@ -380,7 +380,17 @@ export function ContextMenu({
           </div>
           <div
             data-testid="ctxmenu-under-list"
-            style={{ maxHeight: CANDIDATE_LIST_MAX_PX, overflowY: "auto", overscrollBehavior: "contain" }}
+            // THE PADDING IS FOR THE FOCUS RING. `overflow: auto` clips its own children, and the
+            // ring is drawn OUTSIDE a row's border box — so without this the first row's ring is cut
+            // along the top edge of the scroll box, which the `.exe` capture of the no-selection menu
+            // showed as a thin line above a row that is in fact focused. A focus indicator that is
+            // partly missing is an accessibility signal degraded, not a cosmetic one.
+            style={{
+              maxHeight: CANDIDATE_LIST_MAX_PX,
+              overflowY: "auto",
+              overscrollBehavior: "contain",
+              padding: 3,
+            }}
           >
             {shownCandidates.map((candidate, index) => (
               <PopupMenuItem
