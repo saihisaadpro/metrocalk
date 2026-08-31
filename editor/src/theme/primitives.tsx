@@ -12,6 +12,7 @@ import type {
   LabelHTMLAttributes,
   AriaRole,
   ReactNode,
+  Ref,
   SelectHTMLAttributes,
   TextareaHTMLAttributes,
 } from "react";
@@ -369,14 +370,20 @@ export function TextArea({
 
 /** A small, neutral pill/badge (for live readouts — view label, counts). Not a button. The `title`
  *  carries the plain-language explanation (a requirer's needed cap, a price) — never colour-alone. */
-/** Search is a first-class editor interaction with one shared focus, density and clearing contract. */
+/** Search is a first-class editor interaction with one shared focus, density and clearing contract.
+ *
+ *  `ref` is part of that contract, not an escape hatch: a panel with a "press / to search" shortcut
+ *  has to be able to focus its own field, and the alternative — a raw `<input type="search">` beside
+ *  the shared one — is exactly the second control family the constitution forbids. */
 export function SearchField({
   className,
   style,
+  ref,
   ...rest
-}: Omit<InputHTMLAttributes<HTMLInputElement>, "type">) {
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "type"> & { ref?: Ref<HTMLInputElement> }) {
   return (
     <input
+      ref={ref}
       type="search"
       className={["mtk-input", "mtk-search", className].filter(Boolean).join(" ")}
       style={style}

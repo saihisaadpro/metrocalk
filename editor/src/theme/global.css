@@ -2771,76 +2771,80 @@ body > [role="dialog"][aria-modal="true"] {
   grid-template-columns: minmax(0, 1fr);
   grid-template-areas: "toolbar" "canvas" "parameters";
 }
-.animation-graph-toolbar {
-  grid-area: toolbar;
-  display: flex;
-  align-items: center;
-  gap: 8px;
+/* The row itself is `Toolbar` (`.mtk-toolbar`) — the shared rhythm, which WRAPS rather than scrolls,
+   so the actions at its right end can no longer be pushed out of a strip with no scrollbar. All this
+   rule owns is where the row sits in the editor's grid. */
+.animation-graph-toolbar { grid-area: toolbar; min-width: 0; border-radius: 0; }
+/* The graph's own name is the only long string in the row, so it is the only one allowed to shrink —
+   and it ellipsises and carries its full text as a `title` rather than being cut mid-word by an
+   `overflow: hidden` box that offered neither. */
+.animation-graph-name {
   min-width: 0;
-  overflow-x: auto;
-  padding: 7px 9px;
-  border-bottom: 1px solid var(--mtk-border-subtle);
-  background: var(--mtk-bg-raised);
-  box-shadow: var(--mtk-shadow-1);
+  max-width: 26ch;
+  overflow: hidden;
+  color: var(--mtk-text);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -.1px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.animation-graph-toolbar-identity { flex: 0 0 min(230px, 32vw); min-width: 110px; overflow: hidden; white-space: nowrap; }
-.animation-graph-toolbar-name { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
-.animation-graph-toolbar-status,
-.animation-graph-toolbar-view-actions,
-.animation-graph-toolbar-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 8px; }
-.animation-graph-toolbar-status { min-width: 0; }
-.animation-graph-toolbar-spacer { flex: 1 1 auto; min-width: 0; }
-.animation-graph-stale { color: var(--mtk-warn); font-size: 11px; }
+/* A FLEX COLUMN, NOT A GRID, and the reason is `.mtk-disclosure`. A section is `overflow: hidden`
+   for its open/close transition, which makes it a scroll container — and a scroll container's
+   automatic minimum size is ZERO, so as a GRID item it is compressible to nothing. Measured: the
+   Operators section reported 524px of its own content cut away with no scrollbar, inside a pane that
+   was itself scrolling perfectly well. `.mtk-disclosure` already declares `flex: none` for exactly
+   this, and it can only be honoured in a flex column. */
 .animation-graph-palette,
 .animation-graph-inspector {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   min-height: 0;
   overflow: auto;
-  padding: 10px;
+  padding: 12px;
   background: var(--mtk-bg-panel);
 }
 .animation-graph-palette { grid-area: palette; border-right: 1px solid var(--mtk-border-subtle); }
 .animation-graph-inspector { grid-area: inspector; border-left: 1px solid var(--mtk-border-subtle); }
-.animation-graph-inspector section + section { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--mtk-border-subtle); }
-.animation-graph-inspector h3 { margin: 0 0 8px; font-size: 12px; }
-.animation-graph-inspector p,
-.animation-graph-inspector li { color: var(--mtk-text-secondary); font-size: 11px; line-height: 1.45; }
-.animation-graph-canvas { grid-area: canvas; position: relative; min-width: 0; min-height: 0; overflow: hidden; }
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow { background: var(--mtk-bg-canvas); }
+.animation-graph-canvas { grid-area: canvas; position: relative; display: grid; min-width: 0; min-height: 0; padding: 10px; overflow: hidden; }
+.mtk-graph-surface .react-flow { background: var(--mtk-bg-canvas); }
 
-/* ONE graph chrome, not two. Every rule below used to be scoped to `.animation-graph-canvas` alone —
-   which is how the binding and state graphs ended up with React Flow's vendored appearance while the
-   animation graph wore the design system's. The `:is()` group IS the "no subsystem invents its own
-   graph styling" clause of the constitution, expressed where a stylesheet can enforce it. */
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls {
+/* ONE graph chrome, and now ONE selector for it. These rules were once scoped to the animation
+   graph's own canvas class, then to an `:is()` group naming both — a group that only existed because
+   that editor still drove its own `<ReactFlow>`. It consumes `GraphSurface` now, so `.mtk-graph-surface`
+   is the whole of the "no subsystem invents its own graph styling" clause, with nothing to keep in
+   step. */
+.mtk-graph-surface .react-flow__controls {
   overflow: hidden;
   border: 1px solid var(--mtk-border);
   border-radius: var(--mtk-radius-lg);
   box-shadow: var(--mtk-shadow-2);
 }
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls-button {
+.mtk-graph-surface .react-flow__controls-button {
   border: 0;
   border-bottom: 1px solid var(--mtk-border-subtle);
   color: var(--mtk-text-secondary);
   background: var(--mtk-bg-raised);
 }
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls-button:last-child { border-bottom: 0; }
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls-button svg { fill: currentColor; }
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls-button:hover { color: var(--mtk-text); background: var(--mtk-bg-hover); }
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__controls-button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--mtk-ring); outline-offset: -2px; }
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__edge-path {
+.mtk-graph-surface .react-flow__controls-button:last-child { border-bottom: 0; }
+.mtk-graph-surface .react-flow__controls-button svg { fill: currentColor; }
+.mtk-graph-surface .react-flow__controls-button:hover { color: var(--mtk-text); background: var(--mtk-bg-hover); }
+.mtk-graph-surface .react-flow__controls-button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--mtk-ring); outline-offset: -2px; }
+.mtk-graph-surface .react-flow__edge-path {
   stroke: var(--mtk-border-strong);
   stroke-width: 1.5;
 }
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__edge.selected .react-flow__edge-path,
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__connection-path {
+.mtk-graph-surface .react-flow__edge.selected .react-flow__edge-path,
+.mtk-graph-surface .react-flow__connection-path {
   stroke: var(--mtk-accent);
   stroke-width: 2;
 }
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__handle {
+.mtk-graph-surface .react-flow__handle {
   background: var(--mtk-bg-raised);
   border: 2px solid var(--mtk-accent-border);
 }
-:is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__minimap {
+.mtk-graph-surface .react-flow__minimap {
   overflow: hidden;
   background: var(--mtk-bg-raised);
   border: 1px solid var(--mtk-border);
@@ -2939,6 +2943,9 @@ body > [role="dialog"][aria-modal="true"] {
   font-size: 11px;
   line-height: 1.3;
 }
+/* Several readings stack rather than run together: a weight, a state and a cost are three facts, and
+   a card that prints them as one sentence makes the reader parse where each one ends. */
+.mtk-graph-card__meta-line { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mtk-graph-card__chip {
   flex: none;
   padding: 1px 6px;
@@ -3051,98 +3058,181 @@ body > [role="dialog"][aria-modal="true"] {
   font-size: 11px;
   white-space: nowrap;
 }
-.animation-graph-canvas .react-flow__node:focus-visible,
-.animation-graph-palette button:focus-visible,
-.animation-graph-inspector button:focus-visible,
-.animation-graph-accessible-list button:focus-visible {
+/* WHAT IS LEFT OF THIS EDITOR'S OWN STYLESHEET, AND WHY IT IS SHORT NOW.
+   Everything that used to be here — a palette button, a field label, a checkbox row, a diagnostics
+   button, a preview control, a node card — was a private re-statement of something the design system
+   already owns, drawn at 10 and 11px, below the bottom of the type scale. The controls are
+   `ChoiceCard`, `Field`, `Checkbox`, `SelectField`, `NumericField`, `Callout` and `DisclosureSection`
+   now, and the node card is `theme/graph`'s. What remains is LAYOUT: where a thing sits in this
+   editor's grid, and how a repeated row arranges the shared controls inside it. */
+.animation-graph-palette .mtk-btn:focus-visible,
+.animation-graph-inspector .mtk-btn:focus-visible {
   outline: 2px solid var(--mtk-ring);
   outline-offset: 2px;
 }
-.animation-graph-node[data-readiness="blocked"] { opacity: .64; }
-.animation-graph-node[data-active="true"] { transition: box-shadow var(--mtk-motion-instant) linear; }
-.animation-graph-palette-list,
-.animation-graph-future { display: grid; gap: 5px; margin-top: 10px; }
-.animation-graph-palette-list button,
-.animation-graph-future button {
+
+/* A row of actions under the thing they act on. Wraps, so the last button is never orphaned on a
+   line of its own — which is exactly what the state rows did before the entry radio moved out. */
+.animation-graph-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* Stable identity: the id a bug report quotes, and what kind of thing it names. Mono, quiet, and
+   never the widest thing in the pane. */
+.animation-graph-identity {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: var(--mtk-text-muted);
+  font-family: var(--mtk-font-mono, monospace);
+  font-size: 12px;
+}
+.animation-graph-identity code { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* The keyboard alternative to the canvas. One button per node, full width, so it reads as a list of
+   the graph rather than a paragraph of buttons. */
+.animation-graph-node-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.animation-graph-node-list__item { width: 100%; justify-content: flex-start; text-align: left; }
+.animation-graph-connect { display: grid; gap: 8px; margin-top: 10px; }
+.animation-graph-connection-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.animation-graph-connection-list .mtk-select { min-width: 0; }
+/* `auto-fit` rather than six fixed tracks: at 230px of palette the six controls of a connection
+   stack, and at 400px they share two rows — never six columns of 38px each. */
+.animation-graph-connection-list li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 4px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-md);
+  background: var(--mtk-bg-raised);
+}
+
+/* One state of a machine: its name and its removal on the first line, then what it plays and whether
+   it restarts. A CARD, not a six-column row — the row is what wrapped. */
+.animation-graph-state-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.animation-graph-state {
+  display: grid;
+  gap: 6px;
+  /* A grid/flex item's automatic minimum is its CONTENT's minimum, so one `min-width` deep inside a
+     select made the whole card wider than the 234px pane it sits in and the pane clipped it. */
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-lg);
+  background: var(--mtk-bg-raised);
+}
+.animation-graph-state[data-entry] { border-color: var(--mtk-accent-border); background: var(--mtk-accent-subtle); }
+.animation-graph-state__head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.animation-graph-state__head .mtk-input { flex: 1 1 auto; min-width: 0; }
+.animation-graph-state .mtk-select { min-width: 0; width: 100%; }
+
+.animation-graph-samples { display: grid; gap: 6px; }
+.animation-graph-samples h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.animation-graph-sample { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.animation-graph-sample code {
+  flex: 1 1 96px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--mtk-text-secondary);
+  font-family: var(--mtk-font-mono, monospace);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.animation-graph-condition {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-md);
+  background: var(--mtk-bg-raised);
+}
+.animation-graph-condition { min-width: 0; }
+.animation-graph-condition .mtk-select { flex: 1 1 108px; min-width: 0; }
+
+.animation-graph-parameter {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-lg);
+  background: var(--mtk-bg-raised);
+}
+.animation-graph-parameter__head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.animation-graph-parameter__head .mtk-input { flex: 1 1 84px; min-width: 0; }
+.animation-graph-parameter__head .mtk-select { flex: 1 1 96px; min-width: 0; }
+.animation-graph-parameter__row { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.animation-graph-parameter__note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: var(--mtk-text-muted);
+  font-size: 12px;
+}
+
+.animation-graph-diagnostics { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.animation-graph-diagnostic {
   display: grid;
   gap: 2px;
   width: 100%;
-  padding: 7px 8px;
+  height: auto;
+  padding: 8px 10px;
   border: 1px solid var(--mtk-border-subtle);
+  border-left-width: 3px;
   border-radius: var(--mtk-radius-md);
-  color: var(--mtk-text);
-  background: var(--mtk-bg-raised);
-  box-shadow: var(--mtk-shadow-1);
+  background: var(--mtk-bg-inset);
   text-align: left;
 }
-.animation-graph-palette-list button:not(:disabled) { cursor: pointer; }
-.animation-graph-palette-list button:not(:disabled):hover {
-  border-color: var(--mtk-border-strong);
-  background: var(--mtk-bg-hover);
-}
-.animation-graph-palette-list small,
-.animation-graph-future small,
-.animation-graph-field small { color: var(--mtk-text-muted); font-size: 10px; line-height: 1.4; }
-.animation-graph-future { margin-top: 14px; }
-.animation-graph-future button { opacity: .58; }
-.animation-graph-field { display: grid; gap: 4px; margin-top: 7px; color: var(--mtk-text-secondary); font-size: 11px; }
-.animation-graph-field select,
-.animation-graph-field textarea,
-.animation-graph-parameters select {
-  min-width: 0;
-  border: 1px solid var(--mtk-border);
-  border-radius: var(--mtk-radius-md);
-  min-height: var(--mtk-control-default);
-  padding: 6px 8px;
-  color: var(--mtk-text);
-  background: var(--mtk-bg-input);
-}
-.animation-graph-field textarea { min-height: 62px; resize: vertical; }
-.animation-graph-check { display: flex; gap: 5px; margin-top: 8px; font-size: 11px; }
-.animation-graph-node-identity { display: grid; gap: 3px; margin-top: 8px; color: var(--mtk-text-muted); font-size: 10px; }
-.animation-graph-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
-.animation-graph-transition-grid { display: grid; gap: 6px; margin-top: 8px; }
-.animation-graph-condition { display: grid; grid-template-columns: minmax(70px, 1fr) minmax(78px, auto) minmax(52px, auto) auto; gap: 5px; padding: 6px; border: 1px solid var(--mtk-border-subtle); border-radius: var(--mtk-radius-md); background: var(--mtk-bg-raised); font-size: 10px; }
-.animation-graph-state-list { display: grid; gap: 5px; margin-top: 7px; }
-.animation-graph-state-row { display: grid; grid-template-columns: auto minmax(70px, 1fr) minmax(80px, 1fr) auto; align-items: center; gap: 4px; font-size: 10px; }
-.animation-graph-authored-parameter { display: grid; grid-template-columns: minmax(70px, 1fr) auto; gap: 4px; margin-top: 6px; padding: 7px; border: 1px solid var(--mtk-border-subtle); border-radius: var(--mtk-radius-md); background: var(--mtk-bg-raised); font-size: 10px; }
-.animation-graph-authored-parameter > span,
-.animation-graph-authored-parameter > label { grid-column: 1 / -1; }
-.animation-graph-parameter-range { display: grid; grid-template-columns: repeat(3, minmax(45px, 1fr)); gap: 4px; }
-.animation-graph-diagnostics { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
-.animation-graph-diagnostics button { display: grid; gap: 2px; width: 100%; padding: 6px; border: 1px solid var(--mtk-border-subtle); color: inherit; background: var(--mtk-bg-inset); text-align: left; cursor: pointer; }
-.animation-graph-diagnostics li[data-severity="error"] button { border-left: 3px solid var(--mtk-danger); }
-.animation-graph-diagnostics li[data-severity="warning"] button { border-left: 3px solid var(--mtk-warn); }
-.animation-graph-accessible-list { display: grid; gap: 3px; padding-left: 20px; }
-.animation-graph-accessible-list button { width: 100%; border: 1px solid var(--mtk-border-subtle); color: var(--mtk-text); background: var(--mtk-bg-inset); text-align: left; }
-.animation-graph-list-connections { display: grid; gap: 5px; margin-top: 9px; }
-.animation-graph-list-connections label { display: grid; gap: 2px; color: var(--mtk-text-secondary); font-size: 10px; }
-.animation-graph-list-connections ul { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
-.animation-graph-list-connections li { display: grid; grid-template-columns: minmax(70px, 1fr) minmax(54px, auto) auto minmax(70px, 1fr) minmax(54px, auto) auto; align-items: center; gap: 3px; }
-.animation-graph-runtime-summary { position: absolute; left: 8px; bottom: 8px; z-index: 5; padding: 6px 8px; border: 1px solid var(--mtk-border-subtle); border-radius: var(--mtk-radius-md); color: var(--mtk-text-secondary); background: color-mix(in srgb, var(--mtk-bg-raised) 94%, transparent); box-shadow: var(--mtk-shadow-1); font: 10px/1.4 var(--mtk-font-mono, monospace); pointer-events: none; }
+.animation-graph-diagnostics li[data-severity="error"] .animation-graph-diagnostic { border-left-color: var(--mtk-danger); }
+.animation-graph-diagnostics li[data-severity="warning"] .animation-graph-diagnostic { border-left-color: var(--mtk-warn); }
+.animation-graph-diagnostic__code { color: var(--mtk-text); font-weight: 600; }
+.animation-graph-diagnostic__message { color: var(--mtk-text-secondary); font-weight: 400; white-space: normal; }
+.animation-graph-diagnostic__fix { color: var(--mtk-text-muted); font-size: 12px; font-weight: 400; white-space: normal; }
+.animation-graph-watch { color: var(--mtk-text-secondary); font-family: var(--mtk-font-mono, monospace); font-size: 12px; }
+
+/* The read-out sits in `GraphSurface`'s own toolbar slot, which already draws the raised chrome
+   pill; all this rule says is that a measurement is mono and quiet. */
+.animation-graph-runtime-summary { color: var(--mtk-text-secondary); font: 12px/1.4 var(--mtk-font-mono, monospace); }
+
+/* The transient strip. It WRAPS: it used to be `overflow-x: auto` with no visible scrollbar, so a
+   graph with five parameters put "+ Parameter" and "Reset preview" off the end of a bar with nothing
+   on screen saying they were there. */
 .animation-graph-parameters {
   grid-area: parameters;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
   min-width: 0;
-  overflow-x: auto;
-  padding: 7px 9px;
+  padding: 8px 12px;
   border-top: 1px solid var(--mtk-border-subtle);
   background: var(--mtk-bg-raised);
 }
-.animation-graph-preview-heading { flex: 0 0 auto; white-space: nowrap; }
-.animation-graph-preview-parameter { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; font-size: 10px; }
-.animation-graph-preview-parameter input[type="number"] { width: 58px; }
-.animation-graph-preview-wrap { display: inline-flex; align-items: center; gap: 3px; }
-.animation-graph-preview-wrap > button { min-height: var(--mtk-control-compact); border: 1px solid var(--mtk-border-subtle); border-radius: var(--mtk-radius-sm); color: var(--mtk-text-muted); background: var(--mtk-bg-raised); font-size: 10px; }
-.animation-graph-preview-wrap > button[aria-pressed="true"] { color: var(--mtk-success); border-color: var(--mtk-success-border); }
+.animation-graph-parameters__title { display: flex; flex: 0 0 auto; align-items: baseline; gap: 6px; }
+.animation-graph-parameters__title strong { font-size: 13px; }
+.animation-graph-parameters__title span { color: var(--mtk-text-muted); font-size: 12px; }
+.animation-graph-parameters .mtk-input { flex: 0 1 150px; min-width: 0; }
+.animation-graph-preview { display: inline-flex; align-items: center; gap: 4px; }
+.animation-graph-preview__vector { display: inline-flex; align-items: center; gap: 4px; }
+.animation-graph-preview__name { color: var(--mtk-text-secondary); font-size: 12px; white-space: nowrap; }
+
 .animation-graph-empty { grid-area: 2 / 1 / 4 / 4; display: grid; place-items: center; }
-.animation-graph-loading { display: grid; height: 100%; place-items: center; color: var(--mtk-text-secondary); }
-.animation-graph-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-.animation-graph-error { position: absolute; right: 8px; bottom: 50px; z-index: 8; max-width: 420px; padding: 8px 10px; border: 1px solid var(--mtk-danger-border); border-radius: var(--mtk-radius-lg); color: var(--mtk-danger); background: var(--mtk-danger-bg); box-shadow: var(--mtk-shadow-2); font-size: 11px; }
-.animation-graph-conflict { position: absolute; top: 48px; left: 50%; z-index: 12; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; width: min(680px, calc(100% - 20px)); padding: 10px; border: 1px solid var(--mtk-warn-border); border-radius: var(--mtk-radius-lg); color: var(--mtk-text); background: var(--mtk-warn-bg); box-shadow: var(--mtk-shadow-3); transform: translateX(-50%); font-size: 11px; }
-.animation-graph-conflict span { flex: 1 1 300px; color: var(--mtk-text-secondary); }
+.animation-graph-error { position: absolute; right: 12px; bottom: 60px; z-index: 8; max-width: 420px; box-shadow: var(--mtk-shadow-2); }
+.animation-graph-conflict {
+  position: absolute;
+  top: 52px;
+  left: 50%;
+  z-index: 12;
+  width: min(680px, calc(100% - 20px));
+  box-shadow: var(--mtk-shadow-3);
+  transform: translateX(-50%);
+}
 
 @container animationWorkspace (max-width: 920px) {
   /* THE TIMELINE IS THIS WORKSPACE'S STAGE, AND STACKED IT WAS THE SMALLEST THING IN IT. Three auto
@@ -3192,16 +3282,10 @@ body > [role="dialog"][aria-modal="true"] {
     grid-template-areas: "toolbar" "canvas" "parameters";
     overflow: hidden;
   }
-  .animation-graph-toolbar { gap: 4px; overflow-x: hidden; padding-right: 6px; padding-left: 6px; }
-  .animation-graph-toolbar-identity { flex: 1 1 110px; min-width: 92px; max-width: 132px; }
-  .animation-graph-toolbar-meta { display: none; }
-  .animation-graph-stale,
-  .animation-graph-toolbar-view-actions,
-  .animation-graph-toolbar-spacer { display: none; }
-  .animation-graph-toolbar-status,
-  .animation-graph-toolbar-actions { gap: 2px; }
-  .animation-graph-toolbar-actions .mtk-btn--compact { padding-right: 5px; padding-left: 5px; font-size: 11px; }
-  .animation-graph-toolbar-delete-suffix { display: none; }
+  /* NARROW MEANS FEWER WORDS, NOT SMALLER ONES. The old rules here shrank the toolbar's own type to
+     11px and hid the spacer so the row could stay one line; `Toolbar` wraps instead, and all this
+     needs to do is stop the graph's name from taking a third of a 320px dock. */
+  .animation-graph-name { max-width: 14ch; }
   .animation-graph-palette,
   .animation-graph-inspector {
     position: absolute;
@@ -3218,8 +3302,7 @@ body > [role="dialog"][aria-modal="true"] {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .animation-graph-node[data-active="true"] { transition: none; }
-  .animation-graph-canvas .react-flow__edge-path { animation: none !important; }
+  .mtk-graph-surface .react-flow__edge-path { animation: none !important; }
 }
 
 /* Accessibility modes are architectural, not subsystem opt-ins. */
@@ -3373,8 +3456,8 @@ body > [role="dialog"][aria-modal="true"] {
   .mtk-timeline__playhead,
   .mtk-timeline__playhead--handled::before { background: Highlight; }
   .mtk-timeline__head { box-shadow: 1px 0 0 ButtonText; }
-  :is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__edge-path { stroke: CanvasText; }
-  :is(.mtk-graph-surface, .animation-graph-canvas) .react-flow__edge.selected .react-flow__edge-path { stroke: Highlight; }
+  .mtk-graph-surface .react-flow__edge-path { stroke: CanvasText; }
+  .mtk-graph-surface .react-flow__edge.selected .react-flow__edge-path { stroke: Highlight; }
 }
 
 @media (prefers-reduced-motion: reduce) {

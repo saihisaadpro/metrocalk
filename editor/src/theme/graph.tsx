@@ -57,7 +57,7 @@ import "@xyflow/react/dist/style.css";
 import { color, elevation, font, fontSize, lineHeight, radius, space, text } from "./tokens";
 import { TypeIcon } from "./primitives";
 
-export type GraphNodeEmphasis = "default" | "selected" | "initial" | "live" | "blocked";
+export type GraphNodeEmphasis = "default" | "selected" | "initial" | "live" | "warning" | "blocked";
 export type GraphEdgeState = "default" | "selected" | "confirmed" | "pending" | "rejected" | "active" | "disabled";
 
 export const graphTheme = {
@@ -85,6 +85,7 @@ const EMPHASIS: Record<GraphNodeEmphasis, { border: string; ring: string; chip?:
   selected: { border: color.accent.border, ring: `0 0 0 3px ${color.accent.subtle}` },
   initial: { border: color.info.border, ring: `0 0 0 3px ${color.info.bg}`, chip: "start" },
   live: { border: color.success.border, ring: `0 0 0 3px ${color.success.bg}`, chip: "live" },
+  warning: { border: color.warn.border, ring: `0 0 0 3px ${color.warn.bg}` },
   blocked: { border: color.danger.border, ring: `0 0 0 3px ${color.danger.bg}` },
 };
 
@@ -206,16 +207,24 @@ export interface GraphEdgeSpec {
    *  — never for "this one is important", because motion on a static diagram is the "never
    *  distracting" clause of the constitution being broken. */
   animated?: boolean;
+  /** Which named port each end lands on, for a graph whose cards have more than one of each. */
+  sourceHandle?: string;
+  targetHandle?: string;
+  /** The wire itself can be the selection, not merely the things it joins — an editor selects edges. */
+  selected?: boolean;
 }
 
 /** The one place a graph edge is built. A subsystem that assembled its own object would be free to
  *  forget the type, the style or the dim class, which is how the two thin editors ended up with
  *  React Flow's vendored appearance in the first place. */
-export function graphEdge({ id, source, target, state = "default", label, animated }: GraphEdgeSpec): RfEdge {
+export function graphEdge({ id, source, target, state = "default", label, animated, sourceHandle, targetHandle, selected }: GraphEdgeSpec): RfEdge {
   return {
     id,
     source,
     target,
+    sourceHandle,
+    targetHandle,
+    selected,
     type: "mtkRelation",
     label,
     animated: animated ?? false,
@@ -329,6 +338,15 @@ export function rankByDistance(
 
 // ── the node card ─────────────────────────────────────────────────────────────────────────────────
 
+/** One named connection point on a card — the id a domain edge names, and the word the user reads
+ *  when they hover it. Compatibility stays with the domain: the framework draws the bead and reports
+ *  the drag, it has never needed to know what a "pose" is. */
+export interface GraphCardPort {
+  id: string;
+  label: string;
+  direction: "input" | "output";
+}
+
 /** What a graph node SAYS, in the one vocabulary every graph in the engine uses.
  *
  *  A stock React Flow node carries one string. The reference screens carry four things — a small-caps
@@ -338,8 +356,10 @@ export interface GraphCardData extends Record<string, unknown> {
   title: string;
   /** The small-caps role line above the title (`"provides PowerSource"`, `"state"`). */
   eyebrow?: string;
-  /** A second, quieter line under the title — mono, for ids/values/counts. */
-  meta?: string;
+  /** The quieter line(s) under the title — mono, for ids/values/counts. An ARRAY when a node reports
+   *  several readings at once (a weight, a state, a cost): each becomes its own line, so a reading is
+   *  a thing a test or a reader can point at rather than a substring of one run-on sentence. */
+  meta?: string | readonly string[];
   /** `TypeIcon` kind; omitted means no icon. */
   kind?: string;
   emphasis?: GraphNodeEmphasis;
@@ -347,6 +367,13 @@ export interface GraphCardData extends Record<string, unknown> {
    *  neighbourhood view — a handle the user cannot drag from is an affordance that lies. */
   targetPort?: boolean;
   sourcePort?: boolean;
+  /** NAMED ports, for an editor whose nodes have more than one of each.
+   *
+   *  A blend takes pose inputs, a layer takes a base AND a layer, an output takes one final pose —
+   *  and until this existed the only editor with typed ports drew its own card to get them, which is
+   *  how the engine ended up with two node anatomies. Each port becomes one labelled handle, spaced
+   *  down the card's edge; `targetPort`/`sourcePort` remain the one-of-each shorthand. */
+  ports?: readonly GraphCardPort[];
   /** Faded because something ELSE is being traced. Not a state of the node — a state of the view. */
   dimmed?: boolean;
   /** The narrow card, for graphs whose titles are single words (a state machine). One card, two
@@ -360,6 +387,14 @@ const CHIP_TONE: Record<string, { fg: string; bg: string; bd: string }> = {
   start: { fg: color.info.text, bg: color.info.bg, bd: color.info.border },
   live: { fg: color.success.text, bg: color.success.bg, bd: color.success.border },
 };
+
+/** Where down its own side of the card a port sits, as a fraction — nth of the ports that share that
+ *  side, never nth of the whole list (an input and an output would then chase each other's index). */
+function portOffset(ports: readonly GraphCardPort[], port: GraphCardPort): number {
+  const side = ports.filter((candidate) => candidate.direction === port.direction);
+  const index = side.findIndex((candidate) => candidate.id === port.id);
+  return (index + 1) / (side.length + 1);
+}
 
 /** The shared node renderer. Registered once as `mtkCard`, consumed by every graph. */
 function GraphNodeCard({ data, selected }: NodeProps<GraphCardNode>) {
@@ -379,12 +414,37 @@ function GraphNodeCard({ data, selected }: NodeProps<GraphCardNode>) {
       }}
     >
       {data.targetPort && <Handle type="target" position={Position.Left} className="mtk-graph-port" />}
+      {data.ports?.map((port) => {
+        const side = portOffset(data.ports!, port);
+        return (
+          <Handle
+            key={`${port.direction}:${port.id}`}
+            id={port.id}
+            type={port.direction === "input" ? "target" : "source"}
+            position={port.direction === "input" ? Position.Left : Position.Right}
+            className="mtk-graph-port"
+            /* Spaced down the card's own edge as a FRACTION of it, not from a magic pixel offset:
+               the card's height depends on whether the title wrapped and on how many meta lines the
+               domain gave it, so a `top: 34 + i * 18` written beside a card of one height puts the
+               third port outside a card of another. */
+            style={{ top: `${side * 100}%` }}
+            aria-label={`${port.label} ${port.direction}`}
+            title={port.label}
+          />
+        );
+      })}
       <div className="mtk-graph-card__head">
         {data.kind != null && <TypeIcon kind={data.kind} size={22} style={{ borderRadius: radius.md }} />}
         <div className="mtk-graph-card__text">
           {data.eyebrow != null && <div className="mtk-graph-card__eyebrow" style={text.eyebrow}>{data.eyebrow}</div>}
           <div className="mtk-graph-card__title">{data.title}</div>
-          {data.meta != null && <div className="mtk-graph-card__meta">{data.meta}</div>}
+          {data.meta != null && (
+            <div className="mtk-graph-card__meta">
+              {typeof data.meta === "string"
+                ? data.meta
+                : data.meta.map((line) => <span key={line} className="mtk-graph-card__meta-line">{line}</span>)}
+            </div>
+          )}
         </div>
         {chip != null && (
           <span
@@ -403,7 +463,7 @@ function GraphNodeCard({ data, selected }: NodeProps<GraphCardNode>) {
 /** The registry every graph passes to `nodeTypes`. Frozen at module scope on purpose: React Flow
  *  re-creates every node when this object's identity changes, and an inline `{{ mtkCard: … }}` in a
  *  render body changes identity on every render. */
-const GRAPH_NODE_TYPES = { mtkCard: GraphNodeCard } as const;
+export const GRAPH_NODE_TYPES = { mtkCard: GraphNodeCard } as const;
 
 // ── the canvas ────────────────────────────────────────────────────────────────────────────────────
 
@@ -642,6 +702,15 @@ export interface GraphSurfaceProps {
   height?: number | string;
   minHeight?: number;
   onNodeHover?: (id: string | null) => void;
+  /** AN EDITOR DOES NOT GET RE-FRAMED WHILE IT IS BEING EDITED.
+   *
+   *  The automatic fit re-runs whenever the graph's SHAPE changes, which is exactly right for a
+   *  read-only neighbourhood a selection swaps out under you, and exactly wrong for an authoring
+   *  canvas: dragging a node changes its position, the shape signature changes, and the view would
+   *  jump out from under the pointer mid-drag. An editor turns it off and owns its own viewport
+   *  (persisting it, offering Fit as a command) — the same canvas, one decision inverted, rather
+   *  than a second canvas built to avoid this one. */
+  autoFit?: boolean;
   flowProps?: Partial<ReactFlowProps>;
 }
 
@@ -660,6 +729,7 @@ export function GraphSurface({
   height = "100%",
   minHeight = 240,
   onNodeHover,
+  autoFit = true,
   flowProps,
   ...rest
 }: GraphSurfaceProps) {
@@ -714,15 +784,32 @@ export function GraphSurface({
    *  numbers. Height is the part that genuinely depends on how many lines a title wraps to, so it is
    *  the part that waits for the browser; until it arrives, `GRAPH_CARD_HEIGHT_ESTIMATE` keeps the node
    *  dimensioned so the mini map has something to draw and the first fit is not wild. */
-  const sized = useMemo(
-    () =>
-      nodes.map((n) => ({
-        ...n,
-        width: n.data.compact ? GRAPH_CARD_WIDTH_COMPACT : GRAPH_CARD_WIDTH,
-        height: measured[n.id]?.height ?? GRAPH_CARD_HEIGHT_ESTIMATE,
-      })),
-    [nodes, measured],
-  );
+  /** AND THE SIZED NODE KEEPS ITS IDENTITY WHEN NOTHING ABOUT IT CHANGED.
+   *
+   *  `{...n, width, height}` mints a new object on every render of this component, and React Flow
+   *  re-derives a node's internals — including the handle bounds an EDGE needs at both ends — when
+   *  the object it was given is not the one it saw last. A graph sitting still with a measurement
+   *  arriving, or a parent re-rendering for its own reasons, could therefore have its wires
+   *  momentarily unresolvable: measured on the animation graph as `.react-flow__edge` counting 0 in
+   *  a DOM whose screenshot, taken moments later, showed five. Returning the previous object when
+   *  the caller's node and both derived sizes are unchanged makes that unrepresentable. */
+  const sizedCache = useRef(new Map<string, { source: GraphCardNode; out: GraphCardNode }>());
+  const sized = useMemo(() => {
+    const next = nodes.map((n) => {
+      const width = n.data.compact ? GRAPH_CARD_WIDTH_COMPACT : GRAPH_CARD_WIDTH;
+      const height = measured[n.id]?.height ?? GRAPH_CARD_HEIGHT_ESTIMATE;
+      const prev = sizedCache.current.get(n.id);
+      if (prev && prev.source === n && prev.out.width === width && prev.out.height === height) return prev.out;
+      const out = { ...n, width, height };
+      sizedCache.current.set(n.id, { source: n, out });
+      return out;
+    });
+    // A node that left the graph must not keep a slot: the cache is per-surface and lives as long as
+    // the mount, and a bind neighbourhood swaps its whole node set every selection.
+    const live = new Set(nodes.map((n) => n.id));
+    for (const id of [...sizedCache.current.keys()]) if (!live.has(id)) sizedCache.current.delete(id);
+    return next;
+  }, [nodes, measured]);
 
   /** What the automatic fit re-runs on. Node identity churns whenever a hover dims a card, and
    *  re-fitting then would move the graph under the pointer — so the signature is the SHAPE (which
@@ -735,11 +822,14 @@ export function GraphSurface({
     [sized, legend, toolbar],
   );
 
-  const [minimap, setMinimap] = useState(false);
-  const onDecide = useCallback((d: GraphFitDecision) => setMinimap(d.minimap), []);
+  const [fitMinimap, setFitMinimap] = useState(false);
+  const onDecide = useCallback((d: GraphFitDecision) => setFitMinimap(d.minimap), []);
   // Reset when the graph itself changes: "this graph did not fit" is a fact about a shape, and
   // carrying it across a new selection would leave a mini map hanging over a graph of three nodes.
-  useEffect(() => setMinimap(false), [signature]);
+  useEffect(() => setFitMinimap(false), [signature]);
+  // With no automatic fit there is no fit DECISION to ask, so the count threshold is the whole rule:
+  // a graph big enough to get lost in gets a thumbnail, and one that is not does not.
+  const minimap = autoFit ? fitMinimap : sized.length >= minimapFrom;
 
   return (
     <div className="mtk-graph-surface" ref={surface} style={{ height, minHeight }} {...rest}>
@@ -757,7 +847,7 @@ export function GraphSurface({
             nodeTypes={GRAPH_NODE_TYPES}
             edgeTypes={GRAPH_EDGE_TYPES}
             onNodesChange={onNodesChange}
-            fitView
+            fitView={autoFit}
             minZoom={0.2}
             maxZoom={2.5}
             nodesDraggable={false}
@@ -769,14 +859,16 @@ export function GraphSurface({
             {...flowProps}
           >
             <Background variant={BackgroundVariant.Dots} gap={18} size={1} color={graphTheme.grid} />
-            <GraphAutoFit
-              surface={surface}
-              nodes={sized}
-              signature={signature}
-              reserve={minimap}
-              minimapFrom={minimapFrom}
-              onDecide={onDecide}
-            />
+            {autoFit && (
+              <GraphAutoFit
+                surface={surface}
+                nodes={sized}
+                signature={signature}
+                reserve={minimap}
+                minimapFrom={minimapFrom}
+                onDecide={onDecide}
+              />
+            )}
             {minimap && (
               <MiniMap
                 pannable
@@ -822,7 +914,8 @@ export function useGraphSearch(nodes: readonly GraphCardNode[]) {
     if (q === "") return null;
     const hit = new Set<string>();
     for (const n of nodes) {
-      const hay = `${n.data.title} ${n.data.eyebrow ?? ""} ${n.data.meta ?? ""}`.toLowerCase();
+      const meta = Array.isArray(n.data.meta) ? n.data.meta.join(" ") : n.data.meta ?? "";
+      const hay = `${n.data.title} ${n.data.eyebrow ?? ""} ${meta}`.toLowerCase();
       if (hay.includes(q)) hit.add(n.id);
     }
     return hit;

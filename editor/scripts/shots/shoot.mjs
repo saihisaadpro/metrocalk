@@ -380,7 +380,26 @@ function layoutInvariants(windowIsTheSubject) {
     left: box.left + parseFloat(fs.paddingLeft || 0) + parseFloat(fs.borderLeftWidth || 0),
     right: box.right - parseFloat(fs.paddingRight || 0) - parseFloat(fs.borderRightWidth || 0),
   };
-  const els = [...frame.querySelectorAll("*")];
+  /** A SCREEN-READER-ONLY REGION IS NOT "CONTENT THE READER CANNOT REACH".
+   *
+   *  The design system's `VisuallyHidden` / `.mtk-visually-hidden` idiom is a 1x1 box with a
+   *  `clip-path`, holding text addressed to assistive technology and to nobody else — a graph
+   *  editor's `aria-live` status line, a table's "after" annotation. Every invariant below reads
+   *  geometry, so each one sees a 94px sentence inside a 1px box and reports the finding it was
+   *  written for: cut, clipped, painted outside its own box. All three are true and none of them is
+   *  a defect, and the alternative to saying so here is a panel that stops announcing its state.
+   *
+   *  It is a MEASUREMENT, not a class name: the ancestor must actually be collapsed to a pixel AND
+   *  actually be clipped. Nothing that a reader is meant to see has that shape, so this cannot
+   *  quietly excuse a real one. */
+  const srOnly = (el) => {
+    for (let p = el; p && p !== frame; p = p.parentElement) {
+      const cs = getComputedStyle(p);
+      if (cs.clipPath !== "none" && p.clientWidth <= 1 && p.clientHeight <= 1) return true;
+    }
+    return false;
+  };
+  const els = [...frame.querySelectorAll("*")].filter((el) => !srOnly(el));
 
   // R1 — CONTENT ESCAPES ITS PANEL. An element painted outside the frame's content box has left the
   // surface it belongs to: at best it is clipped by whatever is downstream, at worst it lands on a

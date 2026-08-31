@@ -115,7 +115,7 @@
       "unitless-length": 0
     },
     "src/graph/AnimationGraphEditor.tsx": {
-      "raw-native-control": 53,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
@@ -472,6 +472,13 @@
       "unitless-length": 0
     },
     "src/theme/assets.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
+    "src/theme/fields.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,

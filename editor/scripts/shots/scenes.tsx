@@ -26,6 +26,9 @@ import { BindingGraph } from "../../src/graph/BindingGraph";
 import { Icon, iconTokens } from "../../src/theme/icons";
 import { Inspector } from "../../src/inspector/Inspector";
 import { StateGraph } from "../../src/graph/StateGraph";
+import { AnimationGraphEditor } from "../../src/graph/AnimationGraphEditor";
+import { animationGraphPorts, createLocomotionGraphPreset } from "../../src/graph/animation-graph-model";
+import { animationEditorStore, animationWorkspaceKey } from "../../src/store/animation";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
 import { Diagnostics } from "../../src/panels/Diagnostics";
 import { ImportReport } from "../../src/panels/ImportReport";
@@ -40,6 +43,8 @@ import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { assetShelfStore } from "../../src/store/assetShelf";
 import { projectionStore } from "../../src/store/projection";
 import type {
+  AnimationGraphDebugInfo,
+  AnimationGraphStateInfo,
   AnimationPropertyInfo,
   AnimationTrackInfo,
   AnimationWorkspaceInfo,
@@ -708,6 +713,172 @@ function graphScenes(): Scene[] {
         unclipped: [".mtk-graph-controls button", ".mtk-graph-legend"],
       },
       render: () => graphFrame(588, <BindingGraph />),
+    },
+    ...animationGraphScenes(),
+  ];
+}
+
+// ── the animation graph editor ────────────────────────────────────────────────────────────────────
+
+/** THE ENGINE'S LARGEST GRAPH EDITOR, NEVER ONCE PHOTOGRAPHED. `AnimationGraphEditor` is a three-pane
+ *  authoring surface — palette, canvas, inspector — and the single densest concentration of
+ *  constitution debt in the editor: raw `<select>`/`<input>`/`<textarea>` controls outside the shared
+ *  field family, a bespoke node card, and an inspector drawn at 10-11px, below the bottom of the type
+ *  scale. Like the binding graph, its populated state is unreachable in jsdom (React Flow measures the
+ *  pane with `getBoundingClientRect`), so a browser capture is the only thing that can see it. */
+const GRAPH_SEQUENCE = "walk-cycle";
+const GRAPH_WORKSPACE = animationWorkspaceKey({
+  projectId: "shots",
+  scope: { kind: "entity", id: "rig" },
+});
+
+const GRAPH_PRESET = createLocomotionGraphPreset(GRAPH_SEQUENCE);
+
+const GRAPH_STATE = {
+  schemaVersion: 2,
+  sequenceId: GRAPH_SEQUENCE,
+  revision: "rev-42",
+  graph: GRAPH_PRESET,
+  nodePresentation: GRAPH_PRESET.nodes.map((node) => ({
+    nodeId: node.id,
+    ports: animationGraphPorts(node.kind),
+    readiness: node.id === "node-run" ? "warning" : "ready",
+    readinessReason: node.id === "node-run"
+      ? "Run clip is shorter than the blend it feeds; the tail is held."
+      : "Compiled and bound.",
+  })),
+  sources: [
+    { id: "walk-cycle", name: "Walk cycle", kind: "authored_sequence", logicalAssetId: null, revisionId: "r7", durationTick: 9_000, readiness: "ready", reason: "Authored in this project.", action: null },
+    { id: "run-cycle", name: "Run cycle (imported)", kind: "imported_clip", logicalAssetId: "clip-run", revisionId: "r2", durationTick: 6_000, readiness: "ready", reason: "Imported clip, retargeted.", action: null },
+    { id: "idle-breathe", name: "Idle breathing", kind: "clip_instance", logicalAssetId: "clip-idle", revisionId: "r1", durationTick: 12_000, readiness: "blocked", reason: "The source rig has no bind pose.", action: "Characterize the rig, then reimport." },
+  ],
+  compile: {
+    state: "ready",
+    authoredRevision: "rev-42",
+    compiledRevision: "rev-42",
+    compiledHash: "9f2c41",
+    lastGoodRevision: "rev-42",
+    lastGoodHash: "9f2c41",
+    message: "Graph compiled.",
+  },
+  diagnostics: [
+    {
+      id: "diag-run-tail",
+      severity: "warning",
+      code: "sample_outside_hull",
+      message: "Run sits at 1.0 with no sample beyond it, so the blend clamps instead of extrapolating.",
+      fix: "Add a sample past 1.0, or lower the Run sample position.",
+      nodeId: "node-locomotion-blend",
+      edgeId: null,
+      portId: null,
+    },
+  ],
+} as unknown as AnimationGraphStateInfo;
+
+const GRAPH_DEBUG = {
+  graphId: GRAPH_PRESET.id,
+  graphRevision: "rev-42",
+  compiledHash: "9f2c41",
+  instanceId: "instance-1",
+  rawTick: 4_500,
+  localTick: 4_500,
+  activeNodes: [
+    { nodeId: "node-locomotion-machine", weight: 1, localTick: 4_500, stateId: "state-moving", costMicros: 41 },
+    { nodeId: "node-locomotion-blend", weight: 1, localTick: 4_500, stateId: null, costMicros: 26 },
+    { nodeId: "node-walk", weight: 0.62, localTick: 4_500, stateId: null, costMicros: 11 },
+    { nodeId: "node-run", weight: 0.38, localTick: 4_500, stateId: null, costMicros: 9 },
+  ],
+  activeEdges: [
+    { edgeId: "edge-walk-blend", weight: 0.62 },
+    { edgeId: "edge-run-blend", weight: 0.38 },
+  ],
+  transition: null,
+  parameterValues: {},
+  watches: [],
+  eventsTruncated: false,
+  evaluationCostMicros: 87,
+  truncated: false,
+} as unknown as AnimationGraphDebugInfo;
+
+const animationGraphClient = () =>
+  ({
+    animationGraphState: () => Promise.resolve(GRAPH_STATE),
+    animationGraphDebug: () => Promise.resolve(GRAPH_DEBUG),
+    animationGraphSetPreviewParameters: () => Promise.resolve({ ok: true, message: "", accepted: {} }),
+    animationGraphClearPreviewParameters: () => Promise.resolve({ ok: true, message: "", accepted: {} }),
+  }) as unknown as EditorClient;
+
+/** Palette and inspector are BOTH closed by default, so the scene opens them the way a user does —
+ *  through the toolbar's own toggles — and then selects the state-machine node, which is the one that
+ *  reveals the deepest inspector this editor has (states, transitions, conditions). */
+const openGraphPanes = () => {
+  const store = animationEditorStore.getState();
+  store.ensure(GRAPH_WORKSPACE);
+  store.updateGraph(GRAPH_WORKSPACE, (current) => ({
+    ...current,
+    paletteOpen: true,
+    inspectorOpen: true,
+    listAlternativeOpen: false,
+  }));
+  store.setGraphSelection(GRAPH_WORKSPACE, ["node-locomotion-machine"], []);
+};
+
+/** A DEFINITE HEIGHT, because that is what the editor actually gets. `AnimationWorkspace` puts this
+ *  surface in a `minmax(0, 1fr)` row of a `height: 100%` grid, so its own `overflow: hidden` and its
+ *  panes' `overflow: auto` are load-bearing. Rendered into the harness frame's `min-height: 100vh`
+ *  instead, the grid would resolve `1fr` against max-content, no pane would ever scroll, and the
+ *  capture would report a clipping failure the dock does not have. */
+function animationGraphEditor(height: number) {
+  return (
+    <div style={{ display: "grid", height, minHeight: 0, background: "var(--mtk-bg-panel)" }}>
+      <AnimationGraphEditor
+        client={animationGraphClient()}
+        sequenceId={GRAPH_SEQUENCE}
+        workspaceKey={GRAPH_WORKSPACE}
+      />
+    </div>
+  );
+}
+
+function animationGraphScenes(): Scene[] {
+  return [
+    {
+      id: "animation-graph-authoring",
+      looking_for:
+        "the three-pane authoring surface at the width the Animate dock actually gives it: a node " +
+        "palette that reads as a set of pickable cards rather than a wall of underlined links, a " +
+        "canvas whose node cards carry the SAME anatomy as every other graph in the engine (a " +
+        "small-caps role over the name, a quiet mono line under it), and an inspector built from the " +
+        "shared field family at the shared type scale. Nothing here may be smaller than the body " +
+        "size the type scale bottoms out at, and no control may be a raw browser widget",
+      viewport: { width: 1280, height: 860 },
+      setup: openGraphPanes,
+      expect: {
+        present: [
+          [".react-flow__node", 7],
+          [".react-flow__edge", 5],
+          // THE CARD'S ANATOMY, ASSERTED RATHER THAN DESCRIBED. A small-caps role line above the
+          // name is the whole difference between this graph and the anonymous white boxes it drew
+          // before — and it is exactly what `text_present` cannot see, because the words were always
+          // in the DOM, just under the name and at the same weight as it.
+          [".mtk-graph-card", 7],
+          [".mtk-graph-card__eyebrow", 7],
+          // TWO live chips, not three: the state machine is ALSO running, and its selected ring
+          // takes precedence over its live one — one card cannot wear two emphases, and "the one you
+          // are editing" is the one the reader is looking for.
+          [".mtk-graph-card__chip", 2],
+          // Every refusal the palette can express at once — a blocked source, the operator this
+          // graph already has, and the four gates that are not built. A card that is dead and says
+          // nothing about why is the defect; `ChoiceCard`'s `disabledReason` is the answer, and R9
+          // in the driver checks that each of these carries one.
+          [".animation-graph-palette .mtk-choice[disabled]", 5],
+          ["[data-testid='animation-graph-editor']", 1],
+        ],
+        text_present: ["Speed blend", "Locomotion states", "Final output"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='animation-graph-toolbar-actions'] button", ".mtk-graph-legend", ".mtk-graph-controls button"],
+      },
+      render: () => animationGraphEditor(800),
     },
   ];
 }
