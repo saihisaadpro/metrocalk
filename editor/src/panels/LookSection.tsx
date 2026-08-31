@@ -35,6 +35,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { projectionStore } from "../store/projection";
+import { useProjectSessionId } from "../store/project";
 import { useStore } from "zustand";
 import { environmentOutcome } from "../app/environmentOutcome";
 import { Icon } from "../theme/icons";
@@ -136,6 +137,12 @@ export function LookSection({ client }: { client: EditorClient }) {
     [order, summaries],
   );
 
+  // OPENING A PROJECT CHANGES THE SKY, and this panel is the only thing on screen that says which one
+  // is in force. `sessionId` advances exactly on New/Open — it is the store's own signal for "editor
+  // caches must not bleed across documents" — so re-reading on it is the difference between a panel
+  // that reports the scene and a panel that reports the scene it was mounted for.
+  const sessionId = useProjectSessionId();
+
   const readState = useCallback(() => {
     void client
       .environmentState()
@@ -150,7 +157,8 @@ export function LookSection({ client }: { client: EditorClient }) {
         setWeights(status.working.luminanceWeights);
       })
       .catch((e: unknown) => console.error("colour_status failed", e));
-  }, [client]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `sessionId` is a re-read TRIGGER, not an input
+  }, [client, sessionId]);
 
   useEffect(readState, [readState]);
 

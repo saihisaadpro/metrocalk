@@ -7,13 +7,15 @@
 //! be silently lost by a refactor and would look fine on screen until someone relied on it.
 
 import { afterEach, expect, test, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { LookSection, brightnessSentence, EXPOSURE_STOPS, nearestStop, stopsFromDefault } from "./LookSection";
 import { projectionStore } from "../store/projection";
+import { projectStore } from "../store/project";
 import { fakeClient } from "../transport/test-client";
 
 afterEach(() => {
   projectionStore.getState().reset();
+  projectStore.getState().reset();
 });
 
 const STUDIO = {
@@ -144,4 +146,22 @@ test("stopsFromDefault names the renderer's default as 'default', not as '0.0 st
   expect(stopsFromDefault(0.45)).toBe("default");
   expect(stopsFromDefault(0.9)).toBe("+1.0 stops");
   expect(stopsFromDefault(0.225)).toBe("−1.0 stops");
+});
+
+test("opening a PROJECT re-reads the sky — the panel reports the scene, not the one it mounted for", async () => {
+  // The sky is not document state, so no projection delta announces it. `sessionId` is the store's own
+  // "this is a different document now" signal, and without keying the read to it the panel keeps
+  // reporting the previous project's panorama with the renderer showing the new one.
+  let lit = { ...STUDIO };
+  const environmentState = vi.fn(() => Promise.resolve(lit));
+  render(<LookSection client={fakeClient({ environmentState })} />);
+  await waitFor(() => expect(screen.getByTestId("look-env-label").textContent).toBe("Studio (built in)"));
+
+  lit = { ...STUDIO, applied: true, label: "overcast_soho", width: 2048, height: 1024, meanRadiance: [0.3, 0.3, 0.3] };
+  act(() => {
+    projectStore.getState().switchProject({ path: "C:/work/other.mtk", dirty: false, recents: [], error: null });
+  });
+
+  await waitFor(() => expect(screen.getByTestId("look-env-label").textContent).toBe("overcast_soho"));
+  expect(environmentState).toHaveBeenCalledTimes(2);
 });
