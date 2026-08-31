@@ -118,7 +118,14 @@ export function DockTabs({
             aria-controls={panelId}
             disabled={tab.disabled}
             tabIndex={selected || (activeId === "" && tab.id === fallbackId) ? 0 : -1}
-            title={tab.tooltip}
+            // THE NAME AND THE TOOLTIP BOTH SURVIVE A LABEL THAT IS NOT DRAWN. Below the width where
+            // seven labelled tabs fit, the stylesheet hides the label on every tab but the selected
+            // one — so a tab's accessible name would have gone with it, and the only thing left to
+            // identify it by would have been an icon with `aria-hidden` on it. The label is carried
+            // explicitly here instead, and `title` falls back to it so a hover still names an
+            // icon-only tab even when the caller supplied no separate tooltip.
+            aria-label={typeof tab.label === "string" ? tab.label : undefined}
+            title={tab.tooltip ?? (typeof tab.label === "string" ? tab.label : undefined)}
             onClick={() => activate(tab)}
             onKeyDown={(event) => onKeyDown(event, tab.id)}
           >

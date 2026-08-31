@@ -2058,7 +2058,45 @@ body > [role="dialog"][aria-modal="true"] {
    than clipping the parent is deliberate: `overflow: hidden` on `.mtk-bottom-dock` would be a
    second clipping ancestor over every workspace in it, and R1/R2/R7 all reason about the first
    one they meet. */
-.mtk-bottom-dock__bar { display: flex; flex: none; align-items: center; justify-content: space-between; gap: var(--mtk-space-2); min-height: var(--mtk-bottom-bar-height); padding: 0 var(--mtk-space-2); border-radius: var(--mtk-shell-radius) var(--mtk-shell-radius) 0 0; background: var(--mtk-bg-raised); }
+.mtk-bottom-dock__bar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--mtk-space-2);
+  min-height: var(--mtk-bottom-bar-height);
+  padding: 0 var(--mtk-space-2);
+  border-radius: var(--mtk-shell-radius) var(--mtk-shell-radius) 0 0;
+  background: var(--mtk-bg-raised);
+  /* The container the rule below asks about. It is the BAR and not the strip: `container-type:
+     inline-size` makes an element's own inline size independent of its contents, which is exactly
+     wrong for a `flex: 0 1 auto` strip that is supposed to be sized by the tabs inside it. The bar's
+     width is the dock's, decided a level up, so containing it changes nothing about the layout. */
+  container-type: inline-size;
+  container-name: dockBar;
+}
+
+/* SEVEN TABS THAT SHRINK IN STEP ALL THE WAY DOWN ARE SEVEN TABS THAT SAY NOTHING. Yielding was the
+   right repair for tabs that used to VANISH past a scroll edge — but yielding has no floor, and the
+   floor it needed is legibility, not clickability. Measured in the packaged layout at a 1280 window,
+   where the dock is 508px and its strip 460: the seven workspaces want ~600px with their labels, so
+   every one of them shrank to ~64 and the strip read `M… I… Fo… An… L… Pro… Ru…`. Every ellipsis is
+   honest, `unclipped` passes, `min-width` passes, and there is no way to tell Model from Import.
+
+   Below the width where the labels fit, the unselected tabs become their icons and the CURRENT one
+   keeps its name. Seven icon tabs are 7x44 = 308px against 460, so nothing is squeezed at all any
+   more; the strip stops being over-full instead of degrading inside it, which is what the references
+   do with a many-item toolbar. The name is not lost — `DockTabs` puts the label on `aria-label` and
+   in `title`, so hover and assistive technology both still say Model.
+
+   640px is measured, not chosen: 7 labelled tabs need ~600 in the strip, and the strip is the bar
+   less the collapse chevron (~34) and the margins (~6). */
+@container dockBar (max-width: 640px) {
+  .mtk-dock-tab:not([aria-selected="true"]) .mtk-dock-tab__label { display: none; }
+  /* A tab with no label is a square, and its icon should sit in the middle of it rather than at the
+     start of a row that has nothing else in it. */
+  .mtk-dock-tab:not([aria-selected="true"]) { gap: 0; }
+}
 /* AND THE DOCK'S OWN CONTENT HAS TO FIT IN THE DOCK. Making the dock yield vertically exposed the
    same shape one level in, and it is the shape this whole session is about: `.mtk-workspace-panel__
    header` is `flex: none` with `min-height: 52px`, so in a short dock the CHROME takes everything and
@@ -2677,8 +2715,21 @@ body > [role="dialog"][aria-modal="true"] {
    the one item on that row allowed to be cut short, because its full text is its own `title` and
    the timeline below names the same sequence. */
 .animation-sequence {
-  flex: 1 1 auto;
-  margin-left: auto;
+  /* BASIS ZERO IS WHAT MAKES "IT YIELDS FIRST" TRUE, and `1 1 auto` only made it true at ONE width.
+     Flexbox distributes a deficit in proportion to shrink × BASIS, so a caption whose basis is its
+     own 215px of text was taking 39% of the shortfall and leaving the rest to the two tab strips
+     beside it. Measured in the Animate dock at a 1280 window, where the workspace is 500px:
+     `Timeline`, `Curves` and `Graph` all sat at the 44px `min-width` floor and rendered `Ti…`,
+     `Cu…`, `Gr…` — six characters where three words should be, and no invariant fires, because
+     every one of those ellipses is honest.
+     At basis 0 the caption contributes nothing to the row's natural width, so the strips are never
+     squeezed while the caption still has pixels to give: it grows into whatever is left over and
+     ellipsises there. Below the width where the two strips alone fill the row it is already at
+     zero, and they resume yielding in step exactly as before.
+     `margin-left: auto` had to go with it, and it is not decoration: an auto margin absorbs ALL the
+     free space before `flex-grow` sees any, so a `0`-basis caption under one is a caption that is
+     permanently zero pixels wide. */
+  flex: 1 1 0;
   padding-inline: 8px;
   min-width: 0;
   overflow: hidden;

@@ -204,11 +204,17 @@ function draftString(value: AnimationDraftValue | undefined): string {
  *  The full sentence is NOT lost and was never carried here: the tab's `title` is
  *  `readiness.reason`, and the readiness box directly below the tabs prints the state as a Badge
  *  WITH the reason and the next action in full. This is the annotation; that is the explanation. */
-const READINESS_BADGE: Record<AnimationBindingState, string> = {
+/** A BADGE READING "none" IS A BADGE ANNOTATING NOTHING. `unsupported` used to render the word
+ *  beside a two-character label, so the strip read `2D none · 3D 4 · UI none` — three tabs where two
+ *  of them spend their annotation slot saying they have nothing to annotate, and a reader has to
+ *  work out that "none" is a count and not a state. The absence IS the annotation: no badge, and the
+ *  sentence that explains it is already the tab's `title` (`readiness.reason`) and is printed in
+ *  full by the readiness box directly below the strip. */
+const READINESS_BADGE: Record<AnimationBindingState, string | undefined> = {
   ready: "ready",
   preview_only: "preview",
   read_only: "read-only",
-  unsupported: "none",
+  unsupported: undefined,
   invalid: "error",
 };
 

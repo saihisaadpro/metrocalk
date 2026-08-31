@@ -1267,6 +1267,37 @@ for (const scene of scenes) {
         }
       }
     }
+    // AN ELLIPSIS IS HONEST AND IT IS STILL A DEFECT PAST A POINT, AND NOTHING HERE COULD SAY SO.
+    //
+    // `unclipped` catches a control an ancestor cut away; `min_width` catches one squeezed below a
+    // click target. Neither can see a control that is exactly the size it decided to be, painting a
+    // word that has been reduced to a letter. Both defects this claim was written for measured
+    // clean under every other rule in this file: the bottom dock's seven workspace tabs at a 1280
+    // window read `M… I… Fo… An… L… Pro… Ru…` (each tab a legal 64px target, none clipped), and the
+    // Animate workspace's surface tabs read `Ti… Cu… Gr…` at their 44px floor. There is no way to
+    // tell Model from Import in the first, and the second names three different editors.
+    //
+    // `scrollWidth > clientWidth` is the browser's own answer to "did this element have to hide some
+    // of its content", which is the question, and it costs two property reads. Per scene rather than
+    // universal for the same reason `unclipped` is: a truncated row in a long list of names is
+    // ordinary, and an invariant that fires on those is one that gets waived.
+    for (const sel of e.untruncated ?? []) {
+      const els = [...frame.querySelectorAll(sel)];
+      if (!els.length) {
+        out.push(`untruncated needs \`${sel}\`, which matches nothing`);
+        continue;
+      }
+      for (const el of els) {
+        const hidden = el.scrollWidth - el.clientWidth;
+        if (hidden <= 1) continue;
+        const label = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 24) || sel;
+        out.push(
+          `\`${sel}\` "${label}" needs ${el.scrollWidth}px and has ${el.clientWidth}px, so ` +
+            `${hidden}px of its text is an ellipsis — every character of a shortened word is honest ` +
+            "and the word is still unreadable",
+        );
+      }
+    }
     // CONSERVATION, WHERE A FLOOR IS ARITHMETICALLY UNREACHABLE. See `Expect.fills` for why this
     // exists rather than a waiver on `min_height`. The children must tile the container's content
     // box: measured on screen (so a child clipped away is a child that did not tile), summed, and

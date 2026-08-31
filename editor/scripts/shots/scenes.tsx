@@ -132,6 +132,14 @@ export type Expect = {
    *  edge is in the DOM, in the accessibility tree, focusable by keyboard — and invisible, with
    *  nothing on screen suggesting it is there. */
   unclipped?: string[];
+  /** EVERY element matching each selector shows all of its text — none of it replaced by an ellipsis.
+   *
+   *  The claim `unclipped` and `min_width` between them cannot make. A control that is exactly the
+   *  size it chose to be, at a legal click target, with nothing cut away by an ancestor, painting
+   *  `M…` where `Model` should be, satisfies both. The bottom dock read `M… I… Fo… An… L… Pro… Ru…`
+   *  at a 1280 window and the Animate strip read `Ti… Cu… Gr…` at 508px of dock, and every rule in
+   *  the driver agreed with both. */
+  untruncated?: string[];
   /** The named children TILE their container's content box on screen: their measured heights add up
    *  to its, with no gap, no overlap and nothing cut away.
    *
@@ -937,6 +945,12 @@ export const SCENES: Scene[] = [
         "#animation-contexts .mtk-dock-tab",
         "#animation-surfaces .mtk-dock-tab",
       ],
+      // AND THEY NAME THREE DIFFERENT EDITORS, so shrinking them in step is not a yield. `Timeline`,
+      // `Curves` and `Graph` sat at the strip's 44px `min-width` floor reading `Ti… Cu… Gr…` in the
+      // dock at a 1280 window — every rule above green, because a tab at its floor with nothing
+      // clipped is what those rules are about. The caption beside them is the one thing on the row
+      // that may be cut, and it is excluded here by selector rather than by exemption.
+      untruncated: ["#animation-contexts .mtk-dock-tab__label", "#animation-surfaces .mtk-dock-tab__label"],
       // The time read-out sits ON the transport row rather than above or below it — a timecode that
       // wraps to its own line is the row having run out of width.
       same_line: [
@@ -1709,6 +1723,14 @@ function shellScenes(): Scene[] {
     {
       present: [["[data-testid='bottom-dock']", 1], [".mtk-dock-tab", 7]],
       unclipped: [".mtk-dock-tab"],
+      // AND EVERY LABEL THAT IS DRAWN IS DRAWN WHOLE. `unclipped` proved the tabs were REACHABLE and
+      // stopped there, so the strip was free to shrink all seven in step until they read
+      // `M… I… Fo… An… L… Pro… Ru…` — legal targets, none clipped, and no way to tell Model from
+      // Import. A hidden label measures 0 against 0 and passes, which is the point: below the width
+      // where the labels fit, the unselected tabs become icons and the current one keeps its name.
+      untruncated: [".mtk-dock-tab__label"],
+      // The current workspace is NAMED at every width — the one tab that may not become a square.
+      min_width: [[".mtk-dock-tab[aria-selected='true']", 70]],
       text_present: ["Runtime"],
     },
     [
