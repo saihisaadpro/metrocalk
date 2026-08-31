@@ -1859,12 +1859,18 @@ body > [role="dialog"][aria-modal="true"] {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* PROSE, IN THE PROSE FACE. This was `10px/1.2 var(--mtk-font-mono)`, and every summary in the editor
+ * is a sentence: "Selection health and quick fixes", "Draw a shape · Sketch an outline, get a solid".
+ * `tokens.ts` reserves the mono face for ids, values and diagnostics — things a reader compares
+ * character by character — and a monospaced sentence is both slower to read and ~15% wider, which is
+ * why the Build column's summary was truncating mid-word in the first place. 10px was under the
+ * legibility floor the constitution asks for besides. */
 .mtk-disclosure__summary {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   color: var(--mtk-text-muted);
-  font: 10px/1.2 var(--mtk-font-mono);
+  font: 11px/1.3 var(--mtk-font-ui);
   text-overflow: ellipsis;
   white-space: nowrap;
 }

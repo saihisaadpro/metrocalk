@@ -265,6 +265,14 @@
       "unitless-length": 0,
       "hand-rolled-section": 0
     },
+    "src/panels/CutscenePanel.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
     "src/panels/DescribeBar.tsx": {
       "raw-native-control": 1,
       "literal-ui-color": 0,
@@ -353,6 +361,14 @@
       "unitless-length": 0,
       "hand-rolled-section": 0
     },
+    "src/panels/MaterialPanel.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
     "src/panels/Onboarding.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
@@ -417,6 +433,14 @@
       "unitless-length": 0,
       "hand-rolled-section": 0
     },
+    "src/panels/RenderDialog.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
     "src/panels/Requirers.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
@@ -473,6 +497,14 @@
       "unitless-length": 0,
       "hand-rolled-section": 0
     },
+    "src/panels/ShotCatalogue.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
     "src/panels/StateGraphPanel.tsx": {
       "raw-native-control": 25,
       "literal-ui-color": 0,
@@ -482,6 +514,22 @@
       "hand-rolled-section": 0
     },
     "src/panels/StatusBar.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/panels/SubjectAimBadge.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/panels/SubjectPicker.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
@@ -578,6 +626,14 @@
       "hand-rolled-section": 0
     },
     "src/theme/icons.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/theme/materials.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
