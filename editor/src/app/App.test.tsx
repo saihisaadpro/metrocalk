@@ -172,6 +172,36 @@ describe("editor app — end-to-end wiring", () => {
     expect(window.localStorage.getItem("metrocalk:shell-layout:v1:right-collapsed")).toBe("false");
   });
 
+  it("routes viewport clicks to the ground sketch, and the solid stands where it was drawn", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Draw" }));
+    await screen.findByTestId("ground-sketch", {}, LAZY_CHUNK);
+
+    // Four corners of a 12 x 8 m rectangle, placed by clicking the STAGE — the same seam a hand uses.
+    const viewport = screen.getByTestId("viewport");
+    for (let i = 0; i < 4; i++) fireEvent.click(viewport, { clientX: 100 + i * 40, clientY: 100 + i * 30 });
+    await waitFor(() => expect(screen.getByTestId("ground-sketch-dims").textContent).toContain("12.00 × 8.00 m"));
+    expect(screen.getByTestId("ground-sketch-dims").textContent).toContain("96.00 m²");
+
+    // A fifth click lands on the first corner: that FINISHES the outline rather than adding a corner.
+    fireEvent.click(viewport, { clientX: 100, clientY: 100 });
+    await waitFor(() => expect(screen.getByTestId("ground-sketch-message").textContent).toContain("Outline closed"));
+    expect(screen.getByTestId("ground-sketch-dims").textContent).toContain("4 corners");
+
+    fireEvent.click(screen.getByTestId("ground-sketch-raise"));
+    const selected = await waitFor(() => {
+      const id = projectionStore.getState().selectedId;
+      expect(id).toBeTruthy();
+      return id as string;
+    });
+    const entity = projectionStore.getState().displayed[selected];
+    expect(entity?.components.ShapeRecipe).toBeTruthy();
+    // THE POINT OF THE WHOLE FEATURE: the solid stands at the outline's own centre, not on the
+    // scatter spot a sketch pad in a panel has to invent because it has no world to point at.
+    expect(entity?.components.Transform?.x).toBe(6);
+    expect(entity?.components.Transform?.z).toBe(4);
+  });
+
   it("routes viewport clicks to Pipe Forge, then bakes a selectable asset", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Pipe" }));

@@ -4020,6 +4020,53 @@ function shellScenes(): Scene[] {
     },
   ),
 
+  // THE DRAWING SURFACE IS THE STAGE, so the only honest capture of it is the whole shell with the
+  // tool armed and an outline actually drawn — a panel photographed on its own would show the numbers
+  // and hide the thing they measure. Two scenes, because the empty state is the one a first-time user
+  // is in and it is the one where every control refuses (R9 reads exactly this frame).
+  shell(
+    // 1720 WIDE, AND THE NUMBER IS A MEASUREMENT. The drawing panel floats over the LEFT of the stage
+    // and the harness clicks an element's CENTRE, so at 1440 the stage's midpoint lands six pixels
+    // inside the panel and every corner-placing click is correctly ignored by `onStageSurface` — a
+    // scene that photographs an empty outline under a caption about a rectangle. It is also the honest
+    // window for this tool: a surface you draw on and a panel that measures the drawing both need room.
+    "shell-ground-sketch",
+    [1720, 900],
+    "the ground sketch with a 12 x 8 m rectangle drawn on the stage. What a reader is checking: the " +
+      "MEASUREMENT is the largest thing in the panel and reads in metres, not in clicks; the corner " +
+      "count, the area and the perimeter agree with each other; the live line names what the snap " +
+      "decided; and the panel sits beside the tool rail without covering the stage it is drawing on",
+    {
+      present: [["[data-testid='ground-sketch']", 1]],
+      // The dimensions are the claim. A panel that mounts and shows 0.00 x 0.00 is the empty-box
+      // defect wearing a drawing tool's name.
+      text_present: ["12.00 × 8.00 m", "96.00 m²", "4 corners"],
+      unclipped: ["[data-testid='ground-sketch']"],
+      text_absent: ["undefined", "NaN"],
+    },
+    [
+      "#vpDraw",
+      "[data-testid='viewport']",
+      "[data-testid='viewport']",
+      "[data-testid='viewport']",
+      "[data-testid='viewport']",
+    ],
+  ),
+  shell(
+    "shell-ground-sketch-empty",
+    [1440, 900],
+    "the ground sketch the instant it is armed, with nothing drawn — the state a first-time user is " +
+      "in. Every control here is refusing, so every one of them has to SAY WHY in words before it is " +
+      "pressed, and the panel has to give one instruction rather than an essay",
+    {
+      present: [["[data-testid='ground-sketch']", 1], ["[data-testid='ground-sketch-raise']", 1]],
+      text_present: ["Draw on the ground", "click on the ground to place the first corner"],
+      unclipped: ["[data-testid='ground-sketch']"],
+      text_absent: ["undefined", "NaN"],
+    },
+    ["#vpDraw"],
+  ),
+
   // THE FOUR OTHER THINGS THE LEFT DOCK CAN BE. The dock is a 300 px track between 980 and 1199 —
   // the narrowest it ever gets while still open — and which workspace is inside it is a click. The
   // scenes above photograph the default one, so on their own they would gate a fifth of the surface

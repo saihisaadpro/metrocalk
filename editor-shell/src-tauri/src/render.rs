@@ -687,6 +687,7 @@ enum ViewportLayer {
     MarkerGlyphs,
     PhysicsDebugOverlay,
     TerrainToolOverlay,
+    GroundSketchOverlay,
     GizmoAndSnapChrome,
 }
 
@@ -707,6 +708,7 @@ impl ViewportVisibility {
             | ViewportLayer::MarkerGlyphs
             | ViewportLayer::PhysicsDebugOverlay
             | ViewportLayer::TerrainToolOverlay
+            | ViewportLayer::GroundSketchOverlay
             | ViewportLayer::GizmoAndSnapChrome => matches!(self, Self::Editor),
         }
     }
@@ -1686,6 +1688,33 @@ pub struct SceneState {
     /// — the identical trick `gizmo_test_cursor` plays for the transform gizmo. `None` ⇒ the live cursor
     /// drives, which is the production path.
     pub terrain_test_cursor: Option<(f32, f32)>,
+
+    // ── Ground sketch (the Build sub-engine's in-viewport outline) ────────────────────────────────
+    /// The ground-sketch tool is armed: the render loop aims it every frame, and a left click on the
+    /// stage places a corner instead of picking. Render-only state, like `terrain_tool`.
+    pub sketch_active: bool,
+    /// Snap pitch in metres; `0` is freehand. Set when the author changes it, never per frame.
+    pub sketch_grid_m: f32,
+    /// Lock a new segment's direction to a multiple of 15° when the cursor is close to one.
+    pub sketch_angle_snap: bool,
+    /// The height of the horizontal construction plane the outline is drawn on. The FIRST corner sets
+    /// it (from the terrain, or from this value when there is no terrain); every later corner inherits
+    /// it, which is what keeps a sketch planar and therefore extrudable.
+    pub sketch_plane_y: f32,
+    /// Corners placed so far, in world metres, awaiting a commit.
+    pub sketch_points: Vec<[f32; 3]>,
+    /// Where the next corner would land — the snapped cursor, republished every frame for the overlay
+    /// and read by `sketch_point` so a click is ONE command rather than a screen-to-world round trip.
+    pub sketch_cursor: Option<[f32; 3]>,
+    /// What decided [`Self::sketch_cursor`] ([`metrocalk_editor_shell::sketch::SnapKind`]), and whether
+    /// taking it would close the loop. Published for the readout so a snap is a claim, not a surprise.
+    pub sketch_snap: Option<(metrocalk_editor_shell::sketch::SnapKind, bool)>,
+    /// A test-injected normalized cursor for the ground sketch — the same trick `terrain_test_cursor`
+    /// plays, so an end-to-end test drives the SAME native aiming path a hand does.
+    pub sketch_test_cursor: Option<(f32, f32)>,
+    /// The outline has been closed by clicking its first corner: finished, waiting to be raised.
+    /// Distinct from "has three corners" — an author who has not said they are done is still drawing.
+    pub sketch_closed: bool,
 }
 
 /// Which terrain tool the pointer drives.
@@ -4051,6 +4080,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // buffer rather than the contact debugger's, so a debugger toggle cannot erase the brush.
     let mut terrain_overlay = InstanceBuf::new(&device, &inst_bgl, 256);
     let mut terrain_overlay_pts: Vec<Instance> = Vec::new();
+    let mut sketch_overlay = InstanceBuf::new(&device, &inst_bgl, 256);
+    let mut sketch_overlay_pts: Vec<Instance> = Vec::new();
     // M19 — how many entries of each per-slot instance list belong to real entities. Scattered vegetation is
     // appended after that mark every frame and trimmed back to it before the next append, so the entity
     // partition is computed once per scene revision while the foliage follows the camera.
@@ -4565,6 +4596,71 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             } else if st.terrain_cursor_hit.is_some() {
                 st.terrain_cursor_hit = None;
             }
+            // The ground sketch aims from HERE, on the render thread, for the same reason the terrain
+            // brush does: the rubber band, the snap marker and the closing hint must follow the cursor
+            // at frame rate, and a JS mouse-move would put an IPC round trip between the hand and the
+            // line (invariant 4). Only a click crosses the boundary, and it crosses once.
+            if st.sketch_active {
+                let cursor = st
+                    .sketch_test_cursor
+                    .or_else(|| surface_fraction(cursor_pos, client_origin, w, h));
+                // The plane the outline is drawn on. With no corner placed yet and a terrain live, the
+                // ground itself proposes the height — so an outline drawn on a hillside starts ON the
+                // hillside rather than at sea level. The first corner then LOCKS it (`sketch_point`),
+                // and every later corner inherits it, which is what keeps the outline planar.
+                let plane_y = st.sketch_points.first().map_or(st.sketch_plane_y, |p| p[1]);
+                let raw = cursor.and_then(|cur| {
+                    let (ro, rd) = cursor_ray(
+                        cur,
+                        st.orbit,
+                        st.elevation,
+                        st.distance,
+                        st.view_frame(aspect_hint),
+                        st.cam_target,
+                        st.projection,
+                    );
+                    if st.sketch_points.is_empty() && st.terrain.is_active() {
+                        if let Some(hit) = st
+                            .terrain
+                            .terrain()
+                            .and_then(|t| t.raycast(ro, rd, st.distance * 8.0 + 4000.0))
+                        {
+                            return Some(hit);
+                        }
+                    }
+                    // A parallel ray can run along the plane; a perspective one can point away from it.
+                    // Both are "the cursor is not over the ground", and both must say so rather than
+                    // divide by a near-zero and place a corner at infinity.
+                    if rd[1].abs() < 1.0e-5 {
+                        return None;
+                    }
+                    let t = (plane_y - ro[1]) / rd[1];
+                    (t > 0.0).then(|| [ro[0] + rd[0] * t, plane_y, ro[2] + rd[2] * t])
+                });
+                // A tolerance measured in WORLD metres but derived from the camera distance, so the
+                // snap stays the same size on screen whether the outline is a doorway or a runway.
+                let tol = (st.distance * 0.02).clamp(0.05, 5.0);
+                match raw {
+                    Some(raw) => {
+                        let s = metrocalk_editor_shell::sketch::snap_cursor(
+                            raw,
+                            &st.sketch_points,
+                            st.sketch_grid_m,
+                            st.sketch_angle_snap,
+                            tol,
+                        );
+                        st.sketch_cursor = Some(s.point);
+                        st.sketch_snap = Some((s.kind, s.closes));
+                    }
+                    None => {
+                        st.sketch_cursor = None;
+                        st.sketch_snap = None;
+                    }
+                }
+            } else if st.sketch_cursor.is_some() {
+                st.sketch_cursor = None;
+                st.sketch_snap = None;
+            }
             // Rebuild the tool overlay each frame: a ring under the cursor, and the route so far.
             terrain_overlay_pts.clear();
             if st.terrain_tool == TerrainTool::Sculpt {
@@ -4585,6 +4681,20 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 );
             }
             terrain_overlay.upload(&device, &queue, &inst_bgl, &terrain_overlay_pts);
+            // The ground sketch's own overlay. A separate buffer from the terrain tools' because the
+            // two are different sub-engines that can be armed independently, and sharing one vector
+            // would make "what is on screen" depend on the order two unrelated tools were armed in.
+            sketch_overlay_pts.clear();
+            if st.sketch_active {
+                push_sketch_preview(
+                    &mut sketch_overlay_pts,
+                    &st.sketch_points,
+                    st.sketch_cursor,
+                    st.sketch_snap.is_some_and(|(_, closes)| closes),
+                    (st.distance * 0.0016).clamp(0.01, 0.6),
+                );
+            }
+            sketch_overlay.upload(&device, &queue, &inst_bgl, &sketch_overlay_pts);
             // Read here, used by the ground-plane decision in the pass below.
             let terrain_active = st.terrain.is_active();
 
@@ -5427,6 +5537,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.set_pipeline(&overlay_pipeline);
                 rp.set_bind_group(1, &terrain_overlay.bg, &[]);
                 rp.draw(0..terrain_overlay.n, 0..1);
+            }
+            // The ground sketch's outline, rubber band and snap marker. Same always-pass overlay
+            // pipeline; empty unless the tool is armed, so it costs nothing otherwise.
+            if visibility.allows(ViewportLayer::GroundSketchOverlay) && sketch_overlay.n > 0 {
+                rp.set_pipeline(&overlay_pipeline);
+                rp.set_bind_group(1, &sketch_overlay.bg, &[]);
+                rp.draw(0..sketch_overlay.n, 0..1);
             }
             // M9.1 transform gizmo, drawn LAST (over everything), per-segment X/Y/Z colour, always-pass
             // depth. Skipped when nothing is selected (`gizmo_buf.n == 0`) — zero per-frame cost.
@@ -7088,6 +7205,113 @@ fn push_route_preview(out: &mut Vec<Instance>, points: &[[f32; 3]], cursor: Opti
     }
 }
 
+/// Build the ground-sketch overlay as line-list endpoint pairs: the outline placed so far, the rubber
+/// band out to the cursor, the edge that would close the loop, and a mark on every corner.
+///
+/// Kept pure and small so the *interaction* is testable without a GPU. Two things it deliberately
+/// draws that a naive preview would not:
+///
+/// * **The closing edge, before the loop is closed.** From two corners on, the shape the author is
+///   about to make is drawn dashed back to the first corner. Without it the outline reads as a path
+///   and the enclosed area — the thing being extruded — is invisible until the last click.
+/// * **A different colour when the next click will close it.** "Snapped to the first corner" and
+///   "near the first corner" look identical in geometry and mean opposite things.
+fn push_sketch_preview(
+    out: &mut Vec<Instance>,
+    points: &[[f32; 3]],
+    cursor: Option<[f32; 3]>,
+    closes: bool,
+    stroke_m: f32,
+) {
+    const EDGE: [f32; 3] = [0.30, 0.80, 1.00]; // placed outline — the confident colour
+    const BAND: [f32; 3] = [0.55, 0.62, 0.70]; // the segment not committed yet
+    const SHUT: [f32; 3] = [0.35, 1.00, 0.55]; // "this click finishes the shape"
+    const MARK: [f32; 3] = [1.00, 0.95, 0.40];
+    // Lift the overlay a few centimetres so it is not z-fighting the ground it describes.
+    const LIFT: f32 = 0.03;
+    let vertex = |p: [f32; 3], c: [f32; 3]| Instance {
+        center: [p[0], p[1] + LIFT, p[2]],
+        scale: 0.0,
+        color: c,
+        highlight: 0.0,
+        rotation: IDENTITY_QUAT,
+        material: [0.0; 4],
+    };
+    // A LINE LIST DRAWS ONE-PIXEL LINES, AND ONE PIXEL IS NOT A DRAWING. Measured on the packaged
+    // `.exe`: a 35 x 56 m outline over the editor grid was a hairline the corner marks had to be found
+    // by. There is no line-width in this pipeline, so an edge is drawn as a RIBBON — three parallel
+    // segments a fraction of the camera distance apart — which is legible at any zoom because
+    // `stroke_m` comes from the same place the snap tolerance does.
+    let mut edge = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+        let (dx, dz) = (b[0] - a[0], b[2] - a[2]);
+        let len = dx.hypot(dz);
+        let (nx, nz) = if len > 1.0e-5 {
+            (-dz / len * stroke_m, dx / len * stroke_m)
+        } else {
+            (0.0, 0.0)
+        };
+        for k in [-1.0_f32, 0.0, 1.0] {
+            out.push(vertex([a[0] + nx * k, a[1], a[2] + nz * k], c));
+            out.push(vertex([b[0] + nx * k, b[1], b[2] + nz * k], c));
+        }
+    };
+    for w in points.windows(2) {
+        edge(w[0], w[1], EDGE);
+    }
+    if let (Some(last), Some(c)) = (points.last(), cursor) {
+        edge(*last, c, if closes { SHUT } else { BAND });
+    }
+    // The edge back to the start: solid once it can actually close, dashed while it is a projection.
+    if let Some(first) = points.first() {
+        let tip = if closes { None } else { cursor };
+        if let Some(end) = tip.or_else(|| (points.len() >= 3).then(|| points[points.len() - 1])) {
+            if points.len() >= 2 {
+                let dashes = 9;
+                for i in 0..dashes {
+                    if i % 2 == 1 {
+                        continue;
+                    }
+                    let t0 = i as f32 / dashes as f32;
+                    let t1 = (i + 1) as f32 / dashes as f32;
+                    let at = |t: f32| {
+                        [
+                            end[0] + (first[0] - end[0]) * t,
+                            end[1] + (first[1] - end[1]) * t,
+                            end[2] + (first[2] - end[2]) * t,
+                        ]
+                    };
+                    edge(at(t0), at(t1), SHUT);
+                }
+            }
+        }
+    }
+    // A cross on every corner, and a bigger one under the cursor so the snapped point is visible
+    // against a busy scene. Sized from the outline so it stays legible at any zoom.
+    let span = points
+        .iter()
+        .chain(cursor.iter())
+        .fold(0.0_f32, |acc, p| {
+            let first = points.first().copied().unwrap_or(*p);
+            acc.max((p[0] - first[0]).hypot(p[2] - first[2]))
+        })
+        .max(1.0);
+    let m = (span * 0.03).clamp(0.08, 1.5);
+    for p in points {
+        for (dx, dz) in [(m, 0.0), (0.0, m)] {
+            out.push(vertex([p[0] - dx, p[1], p[2] - dz], MARK));
+            out.push(vertex([p[0] + dx, p[1], p[2] + dz], MARK));
+        }
+    }
+    if let Some(c) = cursor {
+        let k = m * 1.8;
+        let col = if closes { SHUT } else { MARK };
+        for (dx, dz) in [(k, 0.0), (0.0, k), (k * 0.7, k * 0.7), (k * 0.7, -k * 0.7)] {
+            out.push(vertex([c[0] - dx, c[1], c[2] - dz], col));
+            out.push(vertex([c[0] + dx, c[1], c[2] + dz], col));
+        }
+    }
+}
+
 /// Build the Pipe Forge route overlay as line-list endpoint pairs. Kept pure for interaction regression
 /// tests: N points produce N-1 route segments and three small axis marks at every control point.
 fn pipe_graph_preview_vertices(
@@ -7207,6 +7431,7 @@ mod viewport_visibility_tests {
             ViewportLayer::MarkerGlyphs,
             ViewportLayer::PhysicsDebugOverlay,
             ViewportLayer::TerrainToolOverlay,
+            ViewportLayer::GroundSketchOverlay,
             ViewportLayer::GizmoAndSnapChrome,
         ];
         let cinematic = ViewportVisibility::from_cinematic(true);
@@ -9677,6 +9902,57 @@ mod tests {
         assert_eq!(v[4].center, [1.0, 0.0, 0.0]);
         assert_eq!(v[5].center, [2.0, 0.0, 0.0]);
         assert!(v.iter().all(|p| p.scale == 0.0));
+    }
+
+    #[test]
+    fn the_ground_sketch_preview_draws_the_shape_the_next_click_would_make() {
+        // Two corners down and a cursor: the outline so far, the rubber band, AND the dashed edge
+        // back to the start. That third one is the whole point — without it the drawing reads as a
+        // path and the enclosed area, which is the thing being extruded, is invisible until the end.
+        let pts = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]];
+        let mut out = Vec::new();
+        push_sketch_preview(&mut out, &pts, Some([4.0, 0.0, 3.0]), false, 0.05);
+        assert!(out.len() % 2 == 0, "a line list is endpoint PAIRS");
+        assert!(out.iter().all(|p| p.scale == 0.0));
+        // Every vertex is lifted off the ground it describes, or it z-fights the floor.
+        assert!(
+            out.iter().all(|p| p.center[1] > 0.0),
+            "the overlay floats above the plane"
+        );
+        let closing = [0.35_f32, 1.00, 0.55];
+        assert!(
+            out.iter().any(|p| p.color == closing),
+            "the edge back to the first corner is drawn"
+        );
+    }
+
+    #[test]
+    fn an_empty_ground_sketch_draws_nothing_at_all() {
+        // Armed with nothing placed and the cursor off the ground: the tool costs zero vertices, so
+        // arming it cannot dirty a frame that has nothing to show.
+        let mut out = Vec::new();
+        push_sketch_preview(&mut out, &[], None, false, 0.05);
+        assert!(
+            out.is_empty(),
+            "{} vertices for an empty outline",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn the_ground_sketch_marks_a_closing_click_differently_from_a_near_miss() {
+        // "Snapped to the first corner" and "near the first corner" are identical in geometry and
+        // opposite in meaning, so they must not be identical on screen.
+        let pts = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 0.0, 3.0]];
+        let mut near = Vec::new();
+        push_sketch_preview(&mut near, &pts, Some([0.2, 0.0, 0.1]), false, 0.05);
+        let mut shut = Vec::new();
+        push_sketch_preview(&mut shut, &pts, Some([0.0, 0.0, 0.0]), true, 0.05);
+        assert_ne!(
+            near.iter().map(|p| p.color).collect::<Vec<_>>(),
+            shut.iter().map(|p| p.color).collect::<Vec<_>>(),
+            "the closing state must be visible, not merely true"
+        );
     }
 
     /// A bare scene of `n` unit-scale cubes on a line — enough to exercise the focus state transition

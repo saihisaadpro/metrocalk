@@ -9,11 +9,14 @@ test("exposes a controlled vertical toolbar with live selection and real shortcu
   expect(screen.getByRole("navigation", { name: "Viewport tools" })).toBeTruthy();
   const toolbar = screen.getByRole("toolbar", { name: "Primary viewport tools" });
   expect(toolbar.getAttribute("aria-orientation")).toBe("vertical");
-  expect(screen.getAllByRole("button").filter((button) => button.hasAttribute("data-tool"))).toHaveLength(5);
+  expect(screen.getAllByRole("button").filter((button) => button.hasAttribute("data-tool"))).toHaveLength(6);
   expect(screen.getByRole("button", { name: "Move" }).getAttribute("aria-pressed")).toBe("true");
   expect(screen.getByRole("button", { name: "Move" }).id).toBe("vpMove");
   expect(screen.getByRole("button", { name: "Move" }).title).toContain("(W)");
   expect(screen.getByRole("button", { name: "Pipe" }).title).not.toMatch(/\([A-Z]\)/);
+  // The ground sketch is a primary tool with a primary tool's shortcut, beside W/E/R.
+  expect(screen.getByRole("button", { name: "Draw" }).id).toBe("vpDraw");
+  expect(screen.getByRole("button", { name: "Draw" }).title).toContain("(D)");
 
   fireEvent.click(screen.getByRole("button", { name: "Rotate" }));
   expect(onToolChange).toHaveBeenCalledWith("rotate");

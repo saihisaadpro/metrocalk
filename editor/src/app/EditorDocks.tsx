@@ -51,6 +51,8 @@ export interface LeftDockProps {
   active: LeftWorkspace;
   onContextMenu: (id: string, x: number, y: number) => void;
   onStartPipe: () => void;
+  /** Arm the ground sketch: draw an outline in the viewport at world scale, then raise it. */
+  onStartDraw: () => void;
   onImport: () => void;
   onCollapse?: () => void;
   onPin?: () => void;
@@ -134,7 +136,7 @@ function sideEngineChrome(active: LeftWorkspace, entities: number, selected: str
   }
 }
 
-export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport, onCollapse, onPin, onOpenCutscene }: LeftDockProps) {
+export function LeftDock({ client, active, onContextMenu, onStartPipe, onStartDraw, onImport, onCollapse, onPin, onOpenCutscene }: LeftDockProps) {
   const entities = useEntityOrder();
   const selected = useSelectedId();
   const chrome = sideEngineChrome(active, entities.length, selected);
@@ -176,6 +178,9 @@ export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport,
             <ShapeStudio client={client} />
             <div className="mtk-dock-section-heading">Other tools</div>
             <div className="mtk-quick-create" role="group" aria-label="Quick creation tools">
+              <Button data-testid="create-draw" variant="secondary" onClick={onStartDraw} title="Trace an outline on the ground in the viewport, at real size, then raise it into a solid">
+                <Icon name="draw" size="md" /> Draw on the ground
+              </Button>
               <Button data-testid="create-pipe" variant="secondary" onClick={onStartPipe} title="Draw a production pipe asset directly in the viewport">
                 <Icon name="pipe" size="md" /> Draw pipe
               </Button>

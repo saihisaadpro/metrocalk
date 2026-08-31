@@ -4,7 +4,7 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type ImportDialogResponse, type MatchStatus, type RenderReply, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type GroundSketchState, type ImportDialogResponse, type MatchStatus, type RenderReply, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
 
 /** The render a test drives. MUTABLE and module-scoped on purpose: a render is the one thing in this
  *  client with a life longer than a single call — start, poll, poll, done — and a stub that answered
@@ -195,6 +195,30 @@ function emptyMatchStatus(): MatchStatus {
 
 /** The gizmo's space and pivot, per `fakeClient()` call — see the comment on `gizmoDebug` below for
  *  why these are state and not two more constants. */
+/** One ground-sketch read-model, overridable field by field — so a test states only the part it is
+ *  about and cannot drift from the reply's real shape. */
+function groundSketch(over: Partial<GroundSketchState> = {}): GroundSketchState {
+  return {
+    active: false,
+    points: [],
+    cursor: null,
+    snap: "",
+    closes: false,
+    closed: false,
+    segmentM: 0,
+    perimeterM: 0,
+    areaM2: 0,
+    widthM: 0,
+    depthM: 0,
+    planeY: 0,
+    gridM: 0.25,
+    angleSnap: true,
+    canBuild: false,
+    message: "nothing is drawn yet \u2014 click on the ground to place the first corner",
+    ...over,
+  };
+}
+
 export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
   const gizmoState = { space: "world", pivot: "origin" };
   return {
@@ -309,6 +333,13 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
       ? { created: null, handle: null, triangles: 0, ms: 0, message: "pick two different objects", reason: "pick two different objects" }
       : { created: `combined-${op}`, handle: "mtkasset:test-combined", triangles: 960, ms: 4, message: `Union · 960 triangles`, reason: null })),
     shapeMeld: vi.fn(() => Promise.resolve({ created: "melded-1", handle: "mtkasset:test-meld", triangles: 1400, ms: 6, message: "Melded into one shape · 1400 triangles", reason: null })),
+    sketchTool: vi.fn((on: boolean) => Promise.resolve(groundSketch({ active: on }))),
+    sketchPoint: vi.fn(() => Promise.resolve(groundSketch({ active: true, points: [[0, 0, 0]], cursor: [4, 0, 0], snap: "grid", segmentM: 4, message: "one corner is a point, not a shape \u2014 place at least two more" }))),
+    sketchPointExact: vi.fn(() => Promise.resolve(groundSketch({ active: true, points: [[0, 0, 0], [7.5, 0, 0]], cursor: [7.5, 0, 3], snap: "locked angle", perimeterM: 7.5, widthM: 7.5, message: "two corners are a line, not a shape \u2014 place at least one more" }))),
+    sketchUndo: vi.fn(() => Promise.resolve(groundSketch({ active: true }))),
+    sketchClear: vi.fn(() => Promise.resolve(groundSketch({ active: true }))),
+    sketchState: vi.fn(() => Promise.resolve(groundSketch({ active: true }))),
+    sketchCommit: vi.fn(() => Promise.resolve({ created: "sketched-1", handle: "mtkasset:test-sketch", triangles: 48, ms: 4, message: "Raised your drawing into a solid \u00b7 48 triangles", reason: null })),
     roleCatalog: vi.fn(() => Promise.resolve([
       { kind: "collectible", label: "Collectible", blurb: "Spins; vanishes and scores when something touches it", adds: "spin animation · touch trigger · pickup rule · +1 on the Score counter" },
       { kind: "solid", label: "Solid obstacle", blurb: "An immovable body other things collide with", adds: "fixed physics body · auto-fit collider" },

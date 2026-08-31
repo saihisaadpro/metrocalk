@@ -268,9 +268,9 @@ export function DescribeBar({ client, form = "inline", onImport, onBrowseAssets,
               {onDrawShape && (
                 <PopupMenuItem
                   data-testid="describeAddDraw"
-                  leading={<Icon name="pipe" size="md" />}
+                  leading={<Icon name="draw" size="md" />}
                   label="Draw it in the viewport"
-                  description="Procedural geometry you route by hand"
+                  description="Trace an outline on the ground, at real size, and raise it into a solid"
                   onSelect={onDrawShape}
                   onRequestClose={close}
                 />

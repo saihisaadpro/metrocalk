@@ -1824,6 +1824,40 @@ export interface ShapeReply {
   reason: string | null;
 }
 
+/** The ground sketch's whole live read-model (mirrors the Rust `sketch::State`).
+ *
+ *  One reply carries everything the drawing panel shows, so a click closes its own loop rather than
+ *  asking a second time what it just did. Every length is metres; every point is world space. */
+export interface GroundSketchState {
+  /** The tool is armed and the stage is taking clicks. */
+  active: boolean;
+  /** Corners placed so far, world space. */
+  points: [number, number, number][];
+  /** Where the next corner would land, or `null` when the cursor is not over the ground. */
+  cursor: [number, number, number] | null;
+  /** What decided `cursor`, in plain words ("grid", "locked angle", "closes the shape"). */
+  snap: string;
+  /** Taking the cursor's point right now would close the outline. */
+  closes: boolean;
+  /** The author already closed it: finished, waiting to be raised. */
+  closed: boolean;
+  /** Length of the segment being drawn (last corner → cursor). */
+  segmentM: number;
+  perimeterM: number;
+  areaM2: number;
+  widthM: number;
+  depthM: number;
+  /** The construction plane's height. */
+  planeY: number;
+  /** Snap pitch; `0` is freehand. */
+  gridM: number;
+  angleSnap: boolean;
+  /** The outline could become a solid right now. */
+  canBuild: boolean;
+  /** One sentence: what to do next, or why it cannot be built yet. Never empty. */
+  message: string;
+}
+
 /** The editable recipe a shape entity's `ShapeRecipe.source` field stores (canonical JSON). */
 export interface ShapeRecipeSource {
   v: number;

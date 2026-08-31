@@ -39,7 +39,7 @@ import { FocusBanner } from "../panels/FocusBanner";
 import { SubjectAimBadge } from "../panels/SubjectAimBadge";
 import type { EditorCommand } from "../panels/CommandPalette";
 import { ViewportToolRail, type ViewportTool } from "../panels/ViewportToolRail";
-import type { PipeForgeStatus } from "../transport/protocol";
+import type { GroundSketchState, PipeForgeStatus } from "../transport/protocol";
 import { EditorHeader } from "./EditorHeader";
 import { LeftDock, InspectorDock, type LeftWorkspace, type InspectorWorkspace } from "./EditorDocks";
 import { EngineRail, ENGINES, engineById, type EngineId } from "./EngineRail";
@@ -56,6 +56,7 @@ import { normalizeSurfacePoint } from "./viewportCoordinates";
 // `scripts/first-paint.json` and ADR-130. The bundle budget only ever said "smaller", and a rule that
 // only says smaller, followed exactly, deletes the product; the counter-rule is declared, not inferred.
 const PipeForge = lazy(() => import("../panels/PipeForge").then((module) => ({ default: module.PipeForge })));
+const GroundSketch = lazy(() => import("../panels/GroundSketch").then((module) => ({ default: module.GroundSketch })));
 const CommandPalette = lazy(() => import("../panels/CommandPalette").then((module) => ({ default: module.CommandPalette })));
 const ContextMenu = lazy(() => import("../panels/ContextMenu").then((module) => ({ default: module.ContextMenu })));
 // The export dialog reads the format catalogue and holds the fidelity ledger; a session that never
@@ -246,6 +247,11 @@ export function App() {
   const gizmoHit = useRef(false);
   const [pipeStatus, setPipeStatus] = useState<PipeForgeStatus | null>(null);
   const pipeActive = pipeStatus?.active === true;
+  // The ground sketch is armed by the TOOL, not by a session the engine owns: the corners survive a
+  // trip to another tool on purpose (a half-drawn outline is work), so "is it armed" is the rail's
+  // answer and the read-model is only what the outline currently measures.
+  const [sketch, setSketch] = useState<GroundSketchState | null>(null);
+  const [sketchBusy, setSketchBusy] = useState(false);
   // AIMING A SHOT BY POINTING AT THE THING (`store/subjectAim`). Started from a shot's Frames picker
   // in the bottom dock, lived here: while it is on, a left click on the stage names an object for a
   // shot to film instead of selecting it — which it MUST NOT do, because the Cutscene panel is bound
@@ -417,6 +423,9 @@ export function App() {
   // The stage is under a sheet: the dock is in its floating form AND open. Read by the stage's own
   // overlays, which withdraw rather than sit underneath it (see the tool rail below).
   const stageSheet = dockShape === "sheet" && bottomOpen;
+  // The stage is the drawing surface only while it IS the stage: in Play, or under a dock sheet, the
+  // tool rail is withdrawn and a click means whatever that mode means.
+  const drawActive = activeTool === "draw" && !playing && !stageSheet;
   useEffect(() => {
     if (!layout.collapsed) setDrawer(null); // widening back out closes the responsive drawer
     if (layout.collapsed || layout.overlay) setDockFlyout(null);
@@ -491,6 +500,23 @@ export function App() {
         setPipeStatus(status);
         setStatus(status.message);
       });
+    }
+    // Arming is the tool's job, and DISARMING keeps the corners: an author who steps away to move
+    // something and comes back has not thrown their outline away. `Start over` is how you do that,
+    // and it says so.
+    if (tool === "draw") {
+      void client
+        .sketchTool(true, sketch?.gridM, sketch?.angleSnap ?? true)
+        .then((next) => {
+          setSketch(next);
+          setStatus(next.message);
+        })
+        .catch((err) => console.error("sketch_tool failed", err));
+    } else if (activeTool === "draw") {
+      void client
+        .sketchTool(false)
+        .then(setSketch)
+        .catch((err) => console.error("sketch_tool failed", err));
     }
     setActiveTool(tool);
     if (tool === "move" || tool === "rotate" || tool === "scale") {
@@ -637,6 +663,11 @@ export function App() {
         chooseTool(k === "w" ? "move" : k === "e" ? "rotate" : "scale");
         setStatus(k === "w" ? "move (W)" : k === "e" ? "rotate (E)" : "scale (R)");
       }
+      // D for draw, beside W/E/R: the ground sketch is a primary tool, not a panel setting.
+      if (k === "d" && !e.ctrlKey && !e.metaKey && !e.altKey && !editing && !pipeActive && !pipeBusy) {
+        chooseTool(activeTool === "draw" ? "select" : "draw");
+        setStatus(activeTool === "draw" ? "select (D)" : "Draw on the ground (D) — click to place a corner");
+      }
       if (k === "f" && !e.ctrlKey && !e.metaKey && !e.altKey && !editing && !pipeActive && !pipeBusy) {
         e.preventDefault();
         void client.gizmoSelected().then((id) => {
@@ -663,6 +694,13 @@ export function App() {
           });
           return;
         }
+        if (drawActive) {
+          // Leaves the TOOL, not the work: the corners are still there when the tool comes back, and
+          // `Start over` is the control that throws them away.
+          chooseTool("select");
+          setStatus("Left the drawing tool — the outline is kept");
+          return;
+        }
         if (ctx) {
           setCtx(null);
           return;
@@ -684,7 +722,7 @@ export function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, ctx, drawer, playing, focused, pipeActive, pipeBusy]);
+  }, [client, ctx, drawer, playing, focused, pipeActive, pipeBusy, activeTool, drawActive]);
 
   function stopPlay() {
     void client
@@ -761,6 +799,7 @@ export function App() {
     { id: "tool-move", label: "Move tool", category: "Viewport tools", shortcut: "W", disabled: !selectedId, disabledReason: "Select an object first", execute: () => chooseTool("move") },
     { id: "tool-rotate", label: "Rotate tool", category: "Viewport tools", shortcut: "E", disabled: !selectedId, disabledReason: "Select an object first", execute: () => chooseTool("rotate") },
     { id: "tool-scale", label: "Scale tool", category: "Viewport tools", shortcut: "R", disabled: !selectedId, disabledReason: "Select an object first", execute: () => chooseTool("scale") },
+    { id: "tool-draw", label: "Draw on the ground", category: "Create", description: "Trace an outline in the viewport at real size, then raise it into a solid", keywords: ["sketch", "outline", "footprint", "extrude", "plan", "building", "floor"], shortcut: "D", disabled: playing, disabledReason: "Stop Play before drawing", execute: () => chooseTool("draw") },
     { id: "tool-pipe", label: "Draw pipe", category: "Create", description: "Author and bake a routed PBR asset in the viewport", keywords: ["pipe forge", "procedural"], disabled: playing, disabledReason: "Stop Play before authoring", execute: () => chooseTool("pipe") },
     { id: "create-entity", label: "Create empty entity", category: "Create", description: "Add a named object at the origin", execute: async () => selectCreated(await client.createEntity(0, 1, 0, "Entity")) },
     { id: "create-light", label: "Add point light", category: "Create", description: "Add a warm point light above the origin", execute: async () => selectCreated(await client.addLight("point", 0, 4, 0, 1, 0.96, 0.9, 60)) },
@@ -794,6 +833,13 @@ export function App() {
       active={leftWorkspace}
       onStartPipe={() => {
         setActiveTool("pipe");
+        setDrawer(null);
+        setDockFlyout(null);
+      }}
+      onStartDraw={() => {
+        // Through `chooseTool`, not `setActiveTool`: arming the native tool is part of what choosing
+        // it MEANS, and a second way in that skipped it would arm the panel and not the stage.
+        chooseTool("draw");
         setDrawer(null);
         setDockFlyout(null);
       }}
@@ -930,6 +976,7 @@ export function App() {
             if (e.button === 0) {
               if (aimActive) return; // aiming owns the click; do not grab a gizmo handle underneath it
               if (pipeActive) return; // drawing owns the click; do not start a gizmo drag underneath it
+              if (drawActive) return; // the ground sketch owns the click for the same reason
               // M9 gizmo handle-grab: only when an entity is selected; if a handle is HIT the render loop
               // drags it natively (0 IPC/frame, like orbit) and the release commits. A miss falls through to
               // the normal pick. The hit flag resolves async, so a WebDriver synthetic click (which fires
@@ -947,7 +994,7 @@ export function App() {
           onClick={(e) => {
             if (!onStageSurface(e)) return;
             // A left-press that grabbed a gizmo handle is a DRAG, not a pick — don't re-select.
-            if (gizmoHit.current && !pipeActive) {
+            if (gizmoHit.current && !pipeActive && !drawActive) {
               gizmoHit.current = false;
               return;
             }
@@ -973,6 +1020,19 @@ export function App() {
                   subjectAimStore.getState().pick(id, rungs?.[0]?.name ?? id);
                 })
                 .catch((err) => console.error("viewport_peek failed", err));
+              return;
+            }
+            if (drawActive) {
+              // The point is the one the render thread already snapped and DREW — read, not re-derived
+              // from these coordinates, so the corner the author saw is the corner they get.
+              if (sketchBusy) return;
+              void client
+                .sketchPoint()
+                .then((next) => {
+                  setSketch(next);
+                  setStatus(next.message);
+                })
+                .catch((err) => console.error("sketch_point failed", err));
               return;
             }
             if (pipeActive) {
@@ -1100,6 +1160,26 @@ export function App() {
             />
           )}
           {!playing && !stageSheet && <ViewportToolbar client={client} showTransformTools={false} />}
+          {drawActive && (
+            <Suspense
+              fallback={
+                <div role="status" aria-live="polite" style={{ position: "absolute", top: 76, left: toolRailMinimized ? 54 : 138, zIndex: z.chrome, width: 220, padding: space.md, borderRadius: radius.lg, color: color.text.secondary, background: color.bg.raised, border: `1px solid ${color.border.default}`, boxShadow: elevation.e2 }}>
+                  Loading the drawing tools…
+                </div>
+              }
+            >
+              <GroundSketch
+                client={client}
+                state={sketch}
+                onState={setSketch}
+                onPendingChange={setSketchBusy}
+                // NEVER WIDER THAN THE STAGE. The panel floats over the surface it is drawing on, so
+                // its width is capped by what is there — `<ux_quality>` 5, and the reason the minimized
+                // form already said this: a fixed 288 on a 508px stage is a tool covering its own work.
+                style={{ left: toolRailMinimized ? 54 : 138, width: toolRailMinimized ? "min(288px, calc(100% - 62px))" : "min(288px, calc(100% - 146px))" }}
+              />
+            </Suspense>
+          )}
           {!playing && !stageSheet && activeTool === "pipe" && (
             <Suspense
               fallback={
@@ -1221,7 +1301,11 @@ export function App() {
               left dock). A stack cannot collide with itself. */}
           {!playing && !stageSheet && (
             <div className="mtk-stage-footer" data-testid="stage-footer">
-              <Onboarding show={!sceneEmpty && !aimActive} onStart={() => openEngine("build")} />
+              {/* AND IT YIELDS TO DRAWING FOR THE SAME REASON IT YIELDS TO AN AIM. A card advising an
+                  author how to fill an empty scene, painted over the outline they are filling it with,
+                  is advice covering its own outcome — measured on the live `.exe`, where it sat across
+                  the middle of a 35 x 56 m footprint being drawn. */}
+              <Onboarding show={!sceneEmpty && !aimActive && !drawActive} onStart={() => openEngine("build")} />
               {/* NORTH STAR #2, ON THE STAGE. It used to be three clicks and a scroll inside a
                   collapsed disclosure headed "Optional assisted creation" — see `DescribeBar`'s own
                   header for why that was a defect and not a placement. It yields to an aim for the same
@@ -1233,12 +1317,15 @@ export function App() {
                   form="floating"
                   onImport={importAsset}
                   onBrowseAssets={() => openEngine("build")}
-                  onDrawShape={() => setActiveTool("pipe")}
+                  // "Draw it in the viewport" now means the general gesture it has always named. It
+                  // armed PIPE FORGE, because a pipe router was the only thing that could draw in the
+                  // viewport when the label was written — a promise the product has since kept.
+                  onDrawShape={() => chooseTool("draw")}
                 />
               )}
             </div>
           )}
-          {sceneEmpty && !playing && !stageSheet && (
+          {sceneEmpty && !playing && !stageSheet && !drawActive && (
             <EmptyState
               onDescribe={() => document.getElementById("describe")?.focus()}
               onDrawPipe={() => setActiveTool("pipe")}

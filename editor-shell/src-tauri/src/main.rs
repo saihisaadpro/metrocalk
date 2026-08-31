@@ -3053,6 +3053,10 @@ enum EngineCmd {
         height: f64,
         segments: f64,
         taper: f64,
+        /// Where the solid stands, world metres. `None` = the deterministic scatter spot, which is
+        /// the only answer a sketch pad in a panel can give. The ground sketch draws in the world and
+        /// therefore knows: it passes the outline's own position, and the solid lands there.
+        origin: Option<[f32; 3]>,
         reply: Sender<ShapeReply>,
     },
     /// Shape Studio — exact-predicate boolean of two entities' world-space meshes (union | carve |
@@ -11255,6 +11259,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 height,
                 segments,
                 taper,
+                origin,
                 reply,
             } => {
                 let t0 = std::time::Instant::now();
@@ -11294,8 +11299,14 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     let _ = reply.send(ShapeReply::refusal(reason));
                     continue;
                 }
-                let spot = spawn_spot(shape_seq);
-                shape_seq = shape_seq.wrapping_add(1);
+                // A drawn-in-the-world outline names its own place; only the panel sketch pad has to
+                // be scattered. The counter advances only when the scatter is actually used, so the
+                // spiral stays the sequence of scattered shapes rather than of all of them.
+                let spot = origin.unwrap_or_else(|| {
+                    let s = spawn_spot(shape_seq);
+                    shape_seq = shape_seq.wrapping_add(1);
+                    s
+                });
                 match land_shape_asset(&mut engine, &scene, &built.landing(), name, spot) {
                     Ok(id) => {
                         log.append(&Record::ShapeAsset {
@@ -24681,6 +24692,7 @@ fn shape_draw(
             height: height.unwrap_or(1.0),
             segments: segments.unwrap_or(48.0),
             taper: taper.unwrap_or(1.0),
+            origin: None,
             reply,
         })
         .is_err()
@@ -24727,6 +24739,244 @@ fn shape_meld(state: State<AppState>, a: String, b: String, k: Option<f64>) -> S
     }
     recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT)
         .unwrap_or_else(|_| ShapeReply::refusal("The meld did not finish in time"))
+}
+
+// ------------------------------------------------------------------------------------------------
+// Ground sketch - the Build sub-engine's outline, drawn IN THE VIEWPORT at world scale.
+//
+// The panel sketch pad (`shape_draw`) can only describe a 10 m x 7 m drawing and can only put the
+// result on a scatter spot, because a canvas in a panel has no world and no place. These commands are
+// the other surface: the outline is world points, so a 120 m footprint is expressible and the solid
+// stands exactly where it was drawn. The aiming, the snapping and the preview all happen natively on
+// the render thread (`render.rs`); a click crosses the boundary ONCE (invariant 4), and every command
+// here answers with the WHOLE read-model so the gesture closes its own loop.
+// ------------------------------------------------------------------------------------------------
+
+/// The whole live read-model, assembled from the render state under one lock.
+fn sketch_state_of(st: &render::SceneState) -> metrocalk_editor_shell::sketch::State {
+    let mut s = metrocalk_editor_shell::sketch::State::build(
+        st.sketch_active,
+        st.sketch_points.clone(),
+        st.sketch_cursor,
+        st.sketch_snap,
+        st.sketch_points.first().map_or(st.sketch_plane_y, |p| p[1]),
+        st.sketch_grid_m,
+        st.sketch_angle_snap,
+    );
+    s.closed = st.sketch_closed;
+    if s.closed && s.can_build {
+        s.message = format!(
+            "Outline closed — {:.2} × {:.2} m, {:.1} m². Set a height and raise it.",
+            s.width_m, s.depth_m, s.area_m2
+        );
+    }
+    s
+}
+
+/// Arm or disarm the ground-sketch tool, and set what it snaps to.
+///
+/// Disarming KEEPS the corners: switching to the move tool to look at something and coming back is a
+/// normal thing to do, and losing the outline for it would be a trap. `sketch_clear` is the way to
+/// throw one away, and it is a button that says so.
+#[tauri::command]
+fn sketch_tool(
+    state: State<AppState>,
+    on: bool,
+    grid_m: Option<f32>,
+    angle_snap: Option<bool>,
+    plane_y: Option<f32>,
+) -> metrocalk_editor_shell::sketch::State {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.sketch_active = on;
+    if let Some(g) = grid_m {
+        // Clamped, not rejected: a grid finer than a millimetre is not a grid, and one coarser than
+        // the world is a refusal the author cannot see.
+        st.sketch_grid_m = if g <= 0.0 { 0.0 } else { g.clamp(0.001, 100.0) };
+    } else if st.sketch_grid_m <= 0.0 && st.sketch_points.is_empty() {
+        st.sketch_grid_m = metrocalk_editor_shell::sketch::DEFAULT_GRID_M;
+    }
+    if let Some(a) = angle_snap {
+        st.sketch_angle_snap = a;
+    }
+    if let Some(y) = plane_y {
+        if y.is_finite() {
+            st.sketch_plane_y = y.clamp(-10_000.0, 10_000.0);
+        }
+    }
+    if !on {
+        st.sketch_cursor = None;
+        st.sketch_snap = None;
+    }
+    sketch_state_of(&st)
+}
+
+/// Place a corner where the cursor is.
+///
+/// Reads the point the render thread published this frame rather than re-deriving one from screen
+/// coordinates: the snapped point the author can SEE is the point they get, which is the only version
+/// of this that can be trusted.
+#[tauri::command]
+fn sketch_point(state: State<AppState>) -> metrocalk_editor_shell::sketch::State {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    if !st.sketch_active {
+        return sketch_state_of(&st);
+    }
+    let Some(p) = st.sketch_cursor else {
+        let mut s = sketch_state_of(&st);
+        s.message = "point at the ground — the outline is drawn where the cursor meets it".into();
+        return s;
+    };
+    if st.sketch_snap.is_some_and(|(_, closes)| closes) {
+        // Clicking the first corner FINISHES the outline; it does not add a duplicate of it. The
+        // extruder closes the loop itself, so the corner list stays exactly what was drawn.
+        st.sketch_closed = true;
+        return sketch_state_of(&st);
+    }
+    if st.sketch_closed {
+        let mut s = sketch_state_of(&st);
+        s.message =
+            "this outline is finished — raise it, or undo the last corner to keep drawing".into();
+        return s;
+    }
+    if st.sketch_points.is_empty() {
+        // The first corner LOCKS the plane: on terrain it is the ground under the cursor, elsewhere
+        // the height the author set. Every later corner inherits it, which is what makes the outline
+        // planar and therefore extrudable.
+        st.sketch_plane_y = p[1];
+    }
+    st.sketch_points.push(p);
+    sketch_state_of(&st)
+}
+
+/// Place a corner at exactly `length_m` from the last one, along the direction the cursor indicates.
+///
+/// The typed half of precision drawing: aim roughly, type 7.5, get a wall 7.5 m long to the
+/// millimetre. A length with no direction does not describe a wall, so the cursor still chooses which
+/// way - angle-locked when that is on.
+#[tauri::command]
+fn sketch_point_exact(
+    state: State<AppState>,
+    length_m: f32,
+) -> metrocalk_editor_shell::sketch::State {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    let placed = st.sketch_cursor.and_then(|c| {
+        metrocalk_editor_shell::sketch::point_at_length(
+            &st.sketch_points,
+            c,
+            length_m,
+            st.sketch_angle_snap,
+        )
+    });
+    match placed {
+        Some(p) if st.sketch_active && !st.sketch_closed => {
+            st.sketch_points.push(p);
+            sketch_state_of(&st)
+        }
+        _ => {
+            let mut s = sketch_state_of(&st);
+            s.message = if st.sketch_points.is_empty() {
+                "place the first corner by clicking, then a typed length measures from it".into()
+            } else if st.sketch_closed {
+                "this outline is finished — undo the last corner to keep drawing".into()
+            } else {
+                "aim at the ground and give a length greater than zero".into()
+            };
+            s
+        }
+    }
+}
+
+/// Take back the last corner. Re-opens a finished outline, so an over-eager closing click is one
+/// keystroke to recover from rather than a redraw.
+#[tauri::command]
+fn sketch_undo(state: State<AppState>) -> metrocalk_editor_shell::sketch::State {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    if st.sketch_closed {
+        st.sketch_closed = false;
+    } else {
+        st.sketch_points.pop();
+    }
+    sketch_state_of(&st)
+}
+
+/// Throw the whole outline away.
+#[tauri::command]
+fn sketch_clear(state: State<AppState>) -> metrocalk_editor_shell::sketch::State {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.sketch_points.clear();
+    st.sketch_closed = false;
+    sketch_state_of(&st)
+}
+
+/// The live read-model - polled by the panel while the tool is armed so the numbers follow the
+/// cursor. The aiming itself is native and per-frame; this is a readout, not the hot path.
+#[tauri::command]
+fn sketch_state(state: State<AppState>) -> metrocalk_editor_shell::sketch::State {
+    ipc();
+    sketch_state_of(&state.shared.lock().unwrap())
+}
+
+/// Aim the ground sketch from an injected cursor instead of the OS one, so an end-to-end test drives
+/// the SAME native snapping path a hand does. `null` hands control back to the live cursor.
+#[tauri::command]
+fn sketch_test_cursor(state: State<AppState>, x: Option<f32>, y: Option<f32>) {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.sketch_test_cursor = match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    };
+}
+
+/// Raise the drawn outline into a solid, standing where it was drawn - ONE undoable transaction,
+/// through the same baker, persistence and landing path as every other shape.
+#[tauri::command(async)]
+fn sketch_commit(state: State<AppState>, height: f32, taper: Option<f32>) -> ShapeReply {
+    ipc();
+    let (points, why) = {
+        let st = state.shared.lock().unwrap();
+        (
+            st.sketch_points.clone(),
+            metrocalk_editor_shell::sketch::refusal(&st.sketch_points),
+        )
+    };
+    if let Some(reason) = why {
+        return ShapeReply::refusal(reason);
+    }
+    let Some((profile, origin)) = metrocalk_editor_shell::sketch::profile_and_origin(&points)
+    else {
+        return ShapeReply::refusal("the outline could not be turned into a solid");
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ShapeDraw {
+            mode: "extrude".to_string(),
+            profile,
+            height: f64::from(height),
+            segments: 48.0,
+            taper: f64::from(taper.unwrap_or(1.0)),
+            origin: Some(origin),
+            reply,
+        })
+        .is_err()
+    {
+        return ShapeReply::refusal("The shape engine is unavailable");
+    }
+    let out = recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT)
+        .unwrap_or_else(|_| ShapeReply::refusal("The drawn shape did not finish in time"));
+    if out.created.is_some() {
+        // The outline became the thing; leaving it on screen would invite raising it twice.
+        let mut st = state.shared.lock().unwrap();
+        st.sketch_points.clear();
+        st.sketch_closed = false;
+    }
+    out
 }
 
 /// M11.3 (ADR-042) — author a Light entity (kind = directional|point|spot) at a position with a linear RGB
@@ -25042,7 +25292,10 @@ fn import_asset_dialog(
             .iter()
             .find(|f| f.extensions.iter().any(|x| asked.contains(x)))
             .map(|f| f.label.to_string());
-        (named.unwrap_or_else(|| "Selected format".to_string()), asked)
+        (
+            named.unwrap_or_else(|| "Selected format".to_string()),
+            asked,
+        )
     };
     let Some(chosen) = app
         .dialog()
@@ -27671,6 +27924,14 @@ fn main() {
             shape_draw,
             shape_combine,
             shape_meld,
+            sketch_tool,
+            sketch_point,
+            sketch_point_exact,
+            sketch_undo,
+            sketch_clear,
+            sketch_state,
+            sketch_test_cursor,
+            sketch_commit,
             pipe_forge_status,
             add_light,
             lighting_debug,

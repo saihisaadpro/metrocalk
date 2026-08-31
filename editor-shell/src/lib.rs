@@ -53,6 +53,7 @@ pub mod scene_capture;
 pub mod sdf_intent;
 pub mod semantic;
 pub mod shape_forge;
+pub mod sketch;
 pub mod step_export;
 pub mod terrain_intent;
 pub mod transform_solver;

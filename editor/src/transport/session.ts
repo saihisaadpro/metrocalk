@@ -108,6 +108,7 @@ import type {
   TerrainReply,
   TerrainPathResult,
   TerrainStats,
+  GroundSketchState,
   ShapeSpec,
   ShapeReply,
   RoleSpec,
@@ -268,6 +269,18 @@ export interface EditorClient {
   /** Turn a drawn outline into a solid: extrude a ground plan up (optionally tapered toward the
    *  centroid), or revolve a side profile around the vertical axis. */
   shapeDraw(mode: "extrude" | "revolve", profile: [number, number][], height?: number, segments?: number, taper?: number): Promise<ShapeReply>;
+  /** Arm/disarm the ground sketch — outline drawing IN the viewport, at world scale. */
+  sketchTool(on: boolean, gridM?: number, angleSnap?: boolean, planeY?: number): Promise<GroundSketchState>;
+  /** Place a corner where the cursor meets the ground (one command per click — invariant 4). */
+  sketchPoint(): Promise<GroundSketchState>;
+  /** Place a corner exactly `lengthM` from the last one, along the aimed direction. */
+  sketchPointExact(lengthM: number): Promise<GroundSketchState>;
+  sketchUndo(): Promise<GroundSketchState>;
+  sketchClear(): Promise<GroundSketchState>;
+  /** The live read-model, polled while the tool is armed. */
+  sketchState(): Promise<GroundSketchState>;
+  /** Raise the drawn outline into a solid standing where it was drawn. */
+  sketchCommit(height: number, taper?: number): Promise<ShapeReply>;
   /** Exact boolean of two objects (union|carve|intersect): result replaces both sources, one undo step. */
   shapeCombine(a: string, b: string, op: "union" | "carve" | "intersect"): Promise<ShapeReply>;
   /** Meld two shapes into one smooth blob (blend radius `k` metres), same replace semantics. */
@@ -989,6 +1002,27 @@ export class TauriClient implements EditorClient {
   }
   shapeDraw(mode: "extrude" | "revolve", profile: [number, number][], height?: number, segments?: number, taper?: number): Promise<ShapeReply> {
     return this.core.invoke<ShapeReply>("shape_draw", { mode, profile, height: height ?? null, segments: segments ?? null, taper: taper ?? null }).catch((e: unknown) => { console.error("shape_draw failed", e); throw e; });
+  }
+  sketchTool(on: boolean, gridM?: number, angleSnap?: boolean, planeY?: number): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_tool", { on, gridM: gridM ?? null, angleSnap: angleSnap ?? null, planeY: planeY ?? null }).catch((e: unknown) => { console.error("sketch_tool failed", e); throw e; });
+  }
+  sketchPoint(): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_point").catch((e: unknown) => { console.error("sketch_point failed", e); throw e; });
+  }
+  sketchPointExact(lengthM: number): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_point_exact", { lengthM }).catch((e: unknown) => { console.error("sketch_point_exact failed", e); throw e; });
+  }
+  sketchUndo(): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_undo").catch((e: unknown) => { console.error("sketch_undo failed", e); throw e; });
+  }
+  sketchClear(): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_clear").catch((e: unknown) => { console.error("sketch_clear failed", e); throw e; });
+  }
+  sketchState(): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_state").catch((e: unknown) => { console.error("sketch_state failed", e); throw e; });
+  }
+  sketchCommit(height: number, taper?: number): Promise<ShapeReply> {
+    return this.core.invoke<ShapeReply>("sketch_commit", { height, taper: taper ?? null }).catch((e: unknown) => { console.error("sketch_commit failed", e); throw e; });
   }
   shapeCombine(a: string, b: string, op: "union" | "carve" | "intersect"): Promise<ShapeReply> {
     return this.core.invoke<ShapeReply>("shape_combine", { a, b, op }).catch((e: unknown) => { console.error("shape_combine failed", e); throw e; });
@@ -2963,6 +2997,154 @@ class MockClient implements EditorClient {
     });
     return Promise.resolve({ created: id, handle: `mtkasset:mock-shape-${kind}`, triangles: profile.length * 4, ms: 3, message: mode === "extrude" ? `Raised your drawing into a solid · ${profile.length * 4} triangles` : `Spun your drawing into a solid · ${profile.length * 4} triangles`, reason: null });
   }
+  // ── Ground sketch ─────────────────────────────────────────────────────────────────────────────
+  // The real tool aims from the render thread's cursor ray; there is no render thread here, so the
+  // mock walks a FIXED 12 x 8 m rectangle — four corners and then the first one again. That makes the
+  // whole workflow (draw · close · raise) reachable in the browser dev build and in the screenshot
+  // scenes, and it makes the panel's numbers deterministic instead of absent.
+  private sketchPath: [number, number, number][] = [
+    [0, 0, 0],
+    [12, 0, 0],
+    [12, 0, 8],
+    [0, 0, 8],
+  ];
+  private sketchPoints: [number, number, number][] = [];
+  private sketchClosed = false;
+  private sketchGridM = 0.25;
+  private sketchAngle = true;
+  private sketchArmed = false;
+
+  /** Where the mock's next corner would land: along the rectangle, then back onto the first corner. */
+  private sketchCursor(): [number, number, number] {
+    return this.sketchPoints.length >= this.sketchPath.length
+      ? this.sketchPath[0]
+      : this.sketchPath[this.sketchPoints.length];
+  }
+
+  private sketchRead(message?: string): GroundSketchState {
+    const pts = this.sketchPoints;
+    const cursor = this.sketchArmed ? this.sketchCursor() : null;
+    const closes = this.sketchArmed && pts.length >= 3 && cursor !== null
+      && Math.hypot(cursor[0] - pts[0][0], cursor[2] - pts[0][2]) < 1e-6;
+    const xs = pts.map((q) => q[0]);
+    const zs = pts.map((q) => q[2]);
+    const widthM = pts.length ? Math.max(...xs) - Math.min(...xs) : 0;
+    const depthM = pts.length ? Math.max(...zs) - Math.min(...zs) : 0;
+    let perimeterM = 0;
+    for (let i = 1; i < pts.length; i++) perimeterM += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][2] - pts[i - 1][2]);
+    let areaM2 = 0;
+    if (pts.length >= 3) {
+      perimeterM += Math.hypot(pts[pts.length - 1][0] - pts[0][0], pts[pts.length - 1][2] - pts[0][2]);
+      let twice = 0;
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i];
+        const b = pts[(i + 1) % pts.length];
+        twice += a[0] * b[2] - b[0] * a[2];
+      }
+      areaM2 = Math.abs(twice) * 0.5;
+    }
+    const canBuild = pts.length >= 3 && areaM2 > 1e-4;
+    const why =
+      pts.length === 0 ? "nothing is drawn yet — click on the ground to place the first corner"
+      : pts.length === 1 ? "one corner is a point, not a shape — place at least two more"
+      : pts.length === 2 ? "two corners are a line, not a shape — place at least one more"
+      : !canBuild ? "the corners are all on one line, so the outline encloses nothing"
+      : null;
+    return {
+      active: this.sketchArmed,
+      points: pts.map((q) => [...q] as [number, number, number]),
+      cursor: cursor === null ? null : ([...cursor] as [number, number, number]),
+      snap: cursor === null ? "" : closes ? "closes the shape" : this.sketchGridM > 0 ? "grid" : "free",
+      closes,
+      closed: this.sketchClosed,
+      segmentM: pts.length && cursor ? Math.hypot(cursor[0] - pts[pts.length - 1][0], cursor[2] - pts[pts.length - 1][2]) : 0,
+      perimeterM,
+      areaM2,
+      widthM,
+      depthM,
+      planeY: 0,
+      gridM: this.sketchGridM,
+      angleSnap: this.sketchAngle,
+      canBuild,
+      message:
+        message ??
+        (this.sketchClosed && canBuild
+          ? `Outline closed — ${widthM.toFixed(2)} × ${depthM.toFixed(2)} m, ${areaM2.toFixed(1)} m². Set a height and raise it.`
+          : why ??
+            `${pts.length} corners · ${widthM.toFixed(2)} × ${depthM.toFixed(2)} m · ${areaM2.toFixed(1)} m² — click the first corner again to finish, or raise it now`),
+    };
+  }
+
+  sketchTool(on: boolean, gridM?: number, angleSnap?: boolean): Promise<GroundSketchState> {
+    this.sketchArmed = on;
+    if (gridM !== undefined && gridM !== null) this.sketchGridM = gridM <= 0 ? 0 : gridM;
+    if (angleSnap !== undefined && angleSnap !== null) this.sketchAngle = angleSnap;
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchPoint(): Promise<GroundSketchState> {
+    if (!this.sketchArmed) return Promise.resolve(this.sketchRead());
+    const read = this.sketchRead();
+    if (read.closes) {
+      this.sketchClosed = true;
+      return Promise.resolve(this.sketchRead());
+    }
+    if (this.sketchClosed) {
+      return Promise.resolve(this.sketchRead("this outline is finished — raise it, or undo the last corner to keep drawing"));
+    }
+    this.sketchPoints.push(this.sketchCursor());
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchPointExact(lengthM: number): Promise<GroundSketchState> {
+    if (!this.sketchArmed || this.sketchClosed || this.sketchPoints.length === 0 || !(lengthM > 0)) {
+      return Promise.resolve(this.sketchRead(
+        this.sketchPoints.length === 0
+          ? "place the first corner by clicking, then a typed length measures from it"
+          : "aim at the ground and give a length greater than zero",
+      ));
+    }
+    const last = this.sketchPoints[this.sketchPoints.length - 1];
+    const c = this.sketchCursor();
+    const dx = c[0] - last[0];
+    const dz = c[2] - last[2];
+    const len = Math.hypot(dx, dz) || 1;
+    this.sketchPoints.push([last[0] + (dx / len) * lengthM, last[1], last[2] + (dz / len) * lengthM]);
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchUndo(): Promise<GroundSketchState> {
+    if (this.sketchClosed) this.sketchClosed = false;
+    else this.sketchPoints.pop();
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchClear(): Promise<GroundSketchState> {
+    this.sketchPoints = [];
+    this.sketchClosed = false;
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchState(): Promise<GroundSketchState> {
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchCommit(height: number, taper?: number): Promise<ShapeReply> {
+    const read = this.sketchRead();
+    if (!read.canBuild) return Promise.resolve(shapeRefusal(read.message));
+    const cx = (Math.min(...this.sketchPoints.map((q) => q[0])) + Math.max(...this.sketchPoints.map((q) => q[0]))) / 2;
+    const cz = (Math.min(...this.sketchPoints.map((q) => q[2])) + Math.max(...this.sketchPoints.map((q) => q[2]))) / 2;
+    const profile = this.sketchPoints.map((q) => [q[0] - cx, q[2] - cz] as [number, number]);
+    const triangles = profile.length * 4;
+    const id = this.place("Drawn shape", {
+      Transform: { x: cx, y: this.sketchPoints[0][1], z: cz, scale: 1 },
+      MeshRenderer: { mesh: "mtkasset:mock-shape-extrude" },
+      ShapeRecipe: {
+        source: JSON.stringify({ v: 1, kind: "extrude", params: { height, taper: taper ?? 1 }, profile }),
+        version: 1,
+        kind: "extrude",
+        triangles,
+      },
+    });
+    this.sketchPoints = [];
+    this.sketchClosed = false;
+    return Promise.resolve({ created: id, handle: "mtkasset:mock-shape-extrude", triangles, ms: 3, message: `Raised your drawing into a solid · ${triangles} triangles`, reason: null });
+  }
+
   shapeCombine(a: string, b: string, op: "union" | "carve" | "intersect"): Promise<ShapeReply> {
     if (a === b) return Promise.resolve(shapeRefusal("pick two different objects"));
     if (!this.core.entity(a) || !this.core.entity(b)) return Promise.resolve(shapeRefusal("one of the two objects is no longer in the scene"));
