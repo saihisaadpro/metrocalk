@@ -490,6 +490,27 @@ jobs:
           node scripts/check-registry-vocab.mjs --self-test
           node scripts/check-registry-vocab.mjs
 
+      # THE SAME RULE, ON THE MATERIAL VOCABULARY (ADR-164). `material_preset()` in
+      # `editor-shell/src-tauri/src/main.rs` maps a name written into `MeshRenderer.material` to
+      # `(base_color, metallic, roughness)` and returns `None` — render unchanged, no error — for
+      # anything it does not know. The editor's picker now states that same table a second time,
+      # because a swatch has to SHADE ITSELF and the shading has to be the surface the viewport will
+      # draw. Two statements, two languages, each self-consistent: `tsc` checks the TypeScript against
+      # an interface (a shape, not a vocabulary) and `cargo` checks a match arm against nothing, so the
+      # first comparison would otherwise be a user clicking a swatch in the packaged `.exe` and seeing
+      # a picture that does not change.
+      #
+      # Five drift kinds, and the quiet one is `value-drift`: same name, different numbers, so the
+      # swatch previews a material the renderer will not draw — which is the failure a PICTURE is for.
+      # The gate prints its own reach (arms parsed vs presets compared) and fails when it parses fewer
+      # arms than the renderer ships, because a run that compared nothing and a run that agreed about
+      # everything otherwise print the same verdict.
+      - name: material presets — the picker's finishes are the ones the renderer draws
+        working-directory: editor
+        run: |
+          node scripts/check-material-presets.mjs --self-test
+          node scripts/check-material-presets.mjs
+
       - name: Install (frozen lockfile)
         working-directory: editor
         run: pnpm install --frozen-lockfile

@@ -1293,8 +1293,11 @@ body > [role="dialog"][aria-modal="true"] {
 /* A preview that is a drawing fills the well; one that is a glyph centres in it. Stated here rather
  * than by a class the caller has to remember, so a preview cannot be half-sized by omission — and so
  * the rule reads the same for a shaded sphere, a landform silhouette or a gradient ramp. The tick is
- * inside its own span and is therefore not a direct child. */
+ * inside its own span and is therefore not a direct child. The `__sphere` rule beside it is the same
+ * statement made by the material lane before the two met; it stays because `MaterialSphere` declares
+ * a width and height in px and needs the override at every size the grid gives it. */
 .mtk-swatch__preview > svg { display: block; width: 100%; height: 100%; }
+.mtk-swatch__sphere { display: block; width: 100%; height: 100%; }
 /* The tick is what makes "which one is set" survive a greyscale print, a colour-blind reader and the
  * accent being the same hue as a swatch. The ring alone was not enough on the metals. */
 .mtk-swatch__tick {
@@ -1321,6 +1324,86 @@ body > [role="dialog"][aria-modal="true"] {
   color: var(--mtk-text-secondary);
 }
 .mtk-swatch.is-selected .mtk-swatch__label { color: var(--mtk-text); font-weight: 500; }
+/* The cleared option's mark. Not a sphere: "no override" has no colour, and drawing a grey ball for it
+ * would claim the object is grey — which is the one thing it is definitely not. */
+.mtk-swatch__none {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--mtk-text-muted);
+}
+
+/* ── Material picker (panels/MaterialPanel.tsx) ── */
+.mtk-material {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mtk-space-3);
+}
+.mtk-material__handle {
+  font-family: var(--mtk-font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.mtk-material__note {
+  margin: 0;
+  font-family: var(--mtk-font-ui);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--mtk-text-muted);
+}
+
+/* ── AI suggestion (panels/AiEditPanel.tsx) ── */
+.mtk-ai-edit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mtk-space-2);
+  padding-block-start: var(--mtk-space-3);
+  border-block-start: 1px solid var(--mtk-border-subtle);
+}
+.mtk-ai-edit__head { display: flex; align-items: center; gap: var(--mtk-space-2); }
+.mtk-ai-edit__label {
+  font-family: var(--mtk-font-ui);
+  font-size: 11px;
+  color: var(--mtk-text-muted);
+}
+/* One accent, and it is a tint rather than a fill: the assisted row is optional and priced, so it must
+ * read as available without competing with the primary action of whatever panel hosts it.
+ *
+ * AND IT WRAPS. `.mtk-btn` is `white-space: nowrap`, which is right for a toolbar and wrong for a
+ * full-width row whose label is a sentence with a price on the end: at the Inspector's real 234px
+ * content box this button needed 242px and painted its own text outside its box. That was true of the
+ * shipped panel too and no capture had ever contained it, because the Material section was collapsed
+ * by default and no scene photographed it — the `material-picker` scene found it on its first run.
+ * The price stays ON the control rather than moving to the note below it: `<ux_quality>` 3 wants the
+ * cost legible at the thing that spends it. */
+.mtk-ai-edit__trigger {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: start;
+  white-space: normal;
+  line-height: 1.35;
+  color: var(--mtk-accent);
+  border-color: var(--mtk-accent-border);
+  background: var(--mtk-accent-subtle);
+}
+/* The mark must not shrink when the label beside it takes two lines, and it belongs on the FIRST one. */
+.mtk-ai-edit__trigger > svg { flex: none; align-self: flex-start; margin-block-start: 1px; }
+.mtk-ai-edit__note {
+  margin: 0;
+  font-family: var(--mtk-font-ui);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--mtk-text-muted);
+}
+.mtk-ai-edit__question { margin-block-end: var(--mtk-space-2); color: var(--mtk-text); }
+.mtk-ai-edit__diff {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--mtk-space-2);
+  margin-block-end: var(--mtk-space-3);
+}
+.mtk-ai-edit__actions { display: flex; gap: var(--mtk-space-2); justify-content: flex-end; }
 
 
 /* ── Keyframes ── */

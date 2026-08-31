@@ -40,11 +40,10 @@ describe("editor app — end-to-end wiring", () => {
     // selecting it renders the schema-driven inspector header (≥2: the hierarchy row + the inspector)
     act(() => projectionStore.getState().select("player"));
     fireEvent.click(screen.getByTestId("rail-right-properties"));
-    await waitFor(
-      () => expect(document.getElementById("inspector")?.textContent).toContain("Player"),
-      { timeout: 10_000 },
-    );
-  }, 10_000);
+    // No local timeout: the deadline for "a lazy workspace has resolved" is stated once, in
+    // `test-setup.ts`. This wait carried its own 10 s and still crossed it in a full-suite run.
+    await waitFor(() => expect(document.getElementById("inspector")?.textContent).toContain("Player"));
+  });
 
   it("Play is unmistakable ON THE STAGE: a persistent badge appears only while playing (C2)", () => {
     render(<App />);

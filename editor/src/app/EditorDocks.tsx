@@ -31,7 +31,7 @@ const DescribeBar = lazy(() => import("../panels/DescribeBar").then((module) => 
 const ShapeStudio = lazy(() => import("../panels/ShapeStudio").then((module) => ({ default: module.ShapeStudio })));
 const TerrainPanel = lazy(() => import("../panels/TerrainPanel").then((module) => ({ default: module.TerrainPanel })));
 const Diagnostics = lazy(() => import("../panels/Diagnostics").then((module) => ({ default: module.Diagnostics })));
-const AiEditPanel = lazy(() => import("../panels/AiEditPanel").then((module) => ({ default: module.AiEditPanel })));
+const MaterialPanel = lazy(() => import("../panels/MaterialPanel").then((module) => ({ default: module.MaterialPanel })));
 const JointPanel = lazy(() => import("../panels/JointPanel").then((module) => ({ default: module.JointPanel })));
 const PhysicsPanel = lazy(() => import("../panels/PhysicsPanel").then((module) => ({ default: module.PhysicsPanel })));
 const MatchPanel = lazy(() => import("../panels/MatchPanel").then((module) => ({ default: module.MatchPanel })));
@@ -265,8 +265,13 @@ export function InspectorDock({ client, active, onChange, onCollapse, onPin, onJ
                 <DisclosureSection title="Diagnostics" summary="Selection health and quick fixes" defaultOpen storageKey="inspect-diagnostics">
                   <Diagnostics client={client} />
                 </DisclosureSection>
-                <DisclosureSection title="Material" summary="Local presets and surface appearance" defaultOpen={false} storageKey="inspect-material">
-                  <AiEditPanel client={client} />
+                {/* OPEN BY DEFAULT (ADR-164). "What is this made of" is answered by looking, and the
+                    answer is a grid of shaded spheres that takes one glance — the reference sheet's
+                    Materials block is the first thing in its right column for the same reason. It was
+                    collapsed while it held six text buttons that spent tokens, which was the correct
+                    default for what it was and the wrong one for what it is. */}
+                <DisclosureSection title="Material" summary="Surface finish" defaultOpen storageKey="inspect-material">
+                  <MaterialPanel client={client} />
                 </DisclosureSection>
                 <DisclosureSection title="Object actions" summary="Reuse, hierarchy and placement" defaultOpen={false} storageKey="inspect-object-actions">
                   <TransformPanel client={client} />

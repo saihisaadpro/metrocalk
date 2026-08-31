@@ -4,6 +4,10 @@
 //! balance + the change land (debit-on-success), surfaced as a toast (feedback at the gesture). A
 //! refuse-when-broke is EXPLAINED and leaves the balance UNCHANGED. Asserts real behaviour (the client
 //! called, the store balance, the toast/status), not "it rendered".
+//!
+//! ADR-164 narrowed this panel to the ONE action that needs a model. The six-finish palette it used to
+//! carry — two tokens per click for a field write the core does for free — is `MaterialPanel`, and its
+//! ABSENCE from here is asserted below.
 
 import { afterEach, expect, test, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
@@ -23,8 +27,13 @@ afterEach(() => {
   toastStore.getState().reset();
 });
 
+/** An object the AI-edit can actually land on. `MeshRenderer` has to be THERE: the patch this panel
+ *  applies is a `SetField` on that component, so an entity with no components at all — which is what
+ *  this fixture used to be — is one the button now correctly refuses (ADR-164). */
 function selectAnEntity() {
-  projectionStore.getState().bulkLoad([{ id: "e1", name: "Rover", parentId: null, components: {} }]);
+  projectionStore.getState().bulkLoad([
+    { id: "e1", name: "Rover", parentId: null, components: { MeshRenderer: { mesh: "rover" } } },
+  ]);
   projectionStore.getState().select("e1");
 }
 
@@ -63,18 +72,15 @@ test("legible + deliberate spend: click → confirm (price + before/after) → A
   expect(toastStore.getState().toasts.some((t) => /applied/i.test(t.text))).toBe(true);
 });
 
-test("M11.2 material palette: a chip assigns the chosen PBR preset through the metered AI-edit", async () => {
+test("ADR-164: the free material palette is NOT here — this panel spends, and only the suggestion does", () => {
   selectAnEntity();
-  setBalance(100);
-  const aiEdit = vi.fn(() => Promise.resolve<EconResponse>({ ok: true, balance: 98, cost: 2, message: null }));
-  render(<AiEditPanel client={fakeClient({ aiEdit })} />);
-
-  // The palette states the cost up-front; a labelled chip is a deliberate pick → applies that preset.
-  expect(screen.getByTestId("materialPalette").textContent).toMatch(/~2 tokens/);
-  fireEvent.click(screen.getByTestId("material-chrome"));
-  await waitFor(() => expect(aiEdit).toHaveBeenCalledWith("e1", "chrome"));
-  await waitFor(() => expect(walletStore.getState().balance).toBe(98));
-  expect(toastStore.getState().toasts.some((t) => /chrome/i.test(t.text))).toBe(true);
+  render(<AiEditPanel client={fakeClient()} />);
+  // The six-finish palette moved to `MaterialPanel`, where a pick is one free `setField`. Leaving a
+  // copy behind would put two controls for the same field in the same section at two different prices.
+  expect(screen.queryByTestId("materialPalette")).toBeNull();
+  expect(screen.queryByTestId("material-chrome")).toBeNull();
+  // What remains states its price before it is pressed.
+  expect(screen.getByTestId("rustier").textContent).toMatch(/~2 tokens/);
 });
 
 test("the confirm shows an explicit before → after (the entity's CURRENT material → weathered metal)", () => {
@@ -86,8 +92,27 @@ test("the confirm shows an explicit before → after (the entity's CURRENT mater
   render(<AiEditPanel client={fakeClient()} />);
   fireEvent.click(screen.getByTestId("rustier"));
   const confirm = screen.getByTestId("rustierConfirm");
-  expect(confirm.textContent).toMatch(/gold/); // the BEFORE = the real current material
+  // The BEFORE is the real current material, in the SAME words the picker above uses for it —
+  // "Gold", not "gold" — so one material is never described two ways in one section (ADR-164).
+  expect(confirm.textContent).toMatch(/Gold/);
   expect(confirm.textContent).toMatch(/weathered metal/i); // the AFTER
+});
+
+test("an object with no mesh REFUSES BEFORE the click — never a priced button that cannot land", () => {
+  // The patch is a `SetField` on `MeshRenderer`, so `apply_ai_patch` rejects when the component is
+  // absent. Offering to spend two tokens on that is `<ux_quality>` 6, and it was live until the
+  // `material-no-mesh` capture put a greyed free grid directly above an enabled priced button.
+  projectionStore.getState().bulkLoad([{ id: "e1", name: "Trigger", parentId: null, components: { Transform: { px: 0 } } }]);
+  projectionStore.getState().select("e1");
+  const aiEdit = vi.fn();
+  render(<AiEditPanel client={fakeClient({ aiEdit })} />);
+
+  const trigger = screen.getByTestId("rustier") as HTMLButtonElement;
+  expect(trigger.disabled).toBe(true);
+  expect(trigger.getAttribute("title")).toMatch(/no mesh to shade/i);
+  fireEvent.click(trigger);
+  expect(screen.queryByTestId("rustierConfirm")).toBeNull();
+  expect(aiEdit).not.toHaveBeenCalled();
 });
 
 test("Cancel aborts the confirm — no spend", () => {

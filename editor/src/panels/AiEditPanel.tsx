@@ -1,48 +1,61 @@
-//! AiEditPanel (M10.10 C3·C4 → M14.3 / ADR-059) — the AI-edit suggestion as a first-class **validated-patch**
-//! surface. Off the top-bar wallet, inline near the SELECTED ENTITY (the right pane), in PLAIN language
-//! ("Add weathered-metal look", not the "rustier" in-joke). The spend is LEGIBLE + DELIBERATE: the **real
-//! token cost** shows up-front, a click opens a confirm with an explicit **before → after** (the entity's
-//! current material → the chosen one), and only Apply charges (debit-on-success, the M7 ledger); the result
-//! is VISIBLE (the material change lands in the inspector + a toast). A refusal-when-broke is EXPLAINED and
-//! leaves the balance untouched (M7 / ADR-016/017 — the patch is a **validated, undoable transaction**).
-//! Keeps the `#rustier`/`#rustierApply` ids (prompt-40). Restyled with the M14.1 primitives (one accent —
-//! never the purple-SaaS the owner rejected).
+//! AiEditPanel (M10.10 C3·C4 → M14.3 / ADR-059 → ADR-164) — the AI-edit suggestion as a first-class
+//! **validated-patch** surface. Off the top-bar wallet, inline near the SELECTED ENTITY (the right pane),
+//! in PLAIN language ("Add weathered-metal look", not the "rustier" in-joke). The spend is LEGIBLE +
+//! DELIBERATE: the **real token cost** shows up-front, a click opens a confirm with an explicit
+//! **before → after** (the entity's current material → the chosen one), and only Apply charges
+//! (debit-on-success, the M7 ledger); the result is VISIBLE (the material change lands in the inspector +
+//! a toast). A refusal-when-broke is EXPLAINED and leaves the balance untouched (M7 / ADR-016/017 — the
+//! patch is a **validated, undoable transaction**). Keeps the `#rustier`/`#rustierApply` ids (prompt-40).
+//!
+//! **ADR-164 — WHAT THIS PANEL IS NO LONGER.** It used to carry a six-button material palette, and every
+//! button on it spent two tokens to write a string that `client.setField` writes for nothing. That
+//! palette is now `MaterialPanel`, free and deterministic, and this is what was always left over: the
+//! ONE action here that genuinely needs a model, priced, deliberate, and optional. The invariant it
+//! restores is the project's own — the deterministic core works with no LLM, and the AI is a guest.
+//!
+//! Its own layout is gone with it. Twenty inline style objects and a private `textMeta` have become the
+//! shared `Callout`, `Badge` and `Button`, so the one assisted row in the Inspector is built out of the
+//! same parts as every unassisted one.
 
 import { useState } from "react";
-import { useSelectedId, useFieldValue, projectionStore } from "../store/projection";
+import { useSelectedId, useDisplayedEntity, projectionStore } from "../store/projection";
 import { setStatus } from "../store/ui";
 import { setBalance } from "../store/wallet";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
 import { Button, Badge } from "../theme/primitives";
-import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { Callout } from "../theme/fields";
+import { materialPresetFor } from "../theme/materials";
 import type { EditorClient } from "../transport/session";
 
 const AI_EDIT_COST = 2;
-
-// The M11.2 (ADR-041) PBR material presets — a small palette of named looks, each assigned through the same
-// metered, schema-validated AI-edit (apply_ai_patch → MeshRenderer.material → a per-entity render override).
-const MATERIALS: { preset: string; label: string }[] = [
-  { preset: "metal", label: "Metal" },
-  { preset: "chrome", label: "Chrome" },
-  { preset: "gold", label: "Gold" },
-  { preset: "copper", label: "Copper" },
-  { preset: "rusty", label: "Rust" },
-  { preset: "plastic", label: "Plastic" },
-];
+/** The preset the suggestion applies. Named here so the confirm's "after" and the request agree. */
+const SUGGESTED = "rusty";
 
 export function AiEditPanel({ client }: { client: EditorClient }) {
   const selectedId = useSelectedId();
-  const currentMaterial = useFieldValue(selectedId ?? "", "MeshRenderer", "material");
+  const entity = useDisplayedEntity(selectedId ?? "");
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
 
   // Nothing selected → nothing to edit (the AI-edit only makes sense on an entity).
   if (!selectedId) return null;
 
-  const before = typeof currentMaterial === "string" && currentMaterial ? currentMaterial : "default";
+  // THE SAME REFUSAL THE FREE PICKER STATES, AND FOR THE SAME REASON. `ai_edit` applies its patch
+  // through `apply_ai_patch`, which needs `MeshRenderer` to exist — so on an object without one this
+  // button offers to spend two tokens on an edit that cannot land. It was live in every such case
+  // before ADR-164, and the `material-no-mesh` capture is what showed it: a greyed grid of free
+  // swatches with an enabled priced button underneath. `<ux_quality>` 6 — an enabled control does
+  // something or says why it can't.
+  const currentMaterial = entity?.components.MeshRenderer?.material;
+  const shadeable = entity?.components.MeshRenderer !== undefined;
+  const refusal = shadeable ? undefined : "This object has no mesh to shade — add a MeshRenderer first.";
+  // The BEFORE, in the same words the picker above uses for the same value — "Rust", not "rusty" — so
+  // the confirm and the swatch cannot describe one material two ways.
+  const preset = materialPresetFor(currentMaterial);
+  const before = preset?.label ?? (typeof currentMaterial === "string" && currentMaterial ? currentMaterial : "default");
 
-  async function apply(material = "rusty", label = "Weathered-metal look") {
+  async function apply(material = SUGGESTED, label = "Weathered-metal look") {
     if (!selectedId || busy) return;
     const target = selectedId; // capture: the selection may change during the await (don't mis-attribute)
     setBusy(true);
@@ -73,13 +86,9 @@ export function AiEditPanel({ client }: { client: EditorClient }) {
   }
 
   return (
-    <div
-      id="aiEdit"
-      data-testid="aiEdit"
-      style={{ padding: space.lg, fontSize: fontSize.body, borderTop: `1px solid ${color.border.subtle}` }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: space.sm, marginBottom: space.sm }}>
-        <span style={{ ...textMeta }}>AI suggestion</span>
+    <div id="aiEdit" data-testid="aiEdit" className="mtk-ai-edit">
+      <div className="mtk-ai-edit__head">
+        <span className="mtk-ai-edit__label">AI suggestion</span>
         <Badge tone="accent"><Icon name="sparkle" size="sm" /> validated patch</Badge>
       </div>
       {!confirming ? (
@@ -88,30 +97,37 @@ export function AiEditPanel({ client }: { client: EditorClient }) {
             id="rustier"
             data-testid="rustier"
             variant="secondary"
+            className="mtk-ai-edit__trigger"
+            disabled={!shadeable}
+            disabledReason={refusal}
             onClick={() => setConfirming(true)}
-            title="Use AI to restyle the selected object — an undoable, validated patch (about 2 tokens)"
-            style={{ width: "100%", justifyContent: "flex-start", color: color.accent.base, borderColor: color.accent.border, background: color.accent.subtle }}
+            // CONDITIONAL on the same predicate as `disabled`. `Button` resolves
+            // `title ?? (refusing && disabledReason)`, so an unconditional title permanently blocks
+            // the refusal from ever being spoken.
+            title={shadeable ? "Use AI to restyle the selected object — an undoable, validated patch (about 2 tokens)" : undefined}
           >
             <Icon name="sparkle" size="sm" /> Add weathered-metal look · ~{AI_EDIT_COST} tokens
           </Button>
-          <div style={{ ...textMeta, marginTop: space.xs }}>Changes this object’s material to a weathered metal finish — applied as an undoable patch.</div>
+          {/* Only when it can act. The refusal is already on screen once — the picker states it above
+              this row — and the button carries it as its own accessible description, so repeating the
+              sentence a third time in a 234px column is noise rather than help. */}
+          {shadeable && (
+            <p className="mtk-ai-edit__note">
+              Changes this object’s material to a weathered metal finish — applied as an undoable patch.
+            </p>
+          )}
         </>
       ) : (
-        <div
-          data-testid="rustierConfirm"
-          style={{ padding: space.md, background: color.accent.subtle, border: `1px solid ${color.accent.border}`, borderRadius: radius.lg }}
-        >
-          <div style={{ color: color.text.primary, marginBottom: space.sm }}>
-            Apply the weathered-metal look for ~{AI_EDIT_COST} tokens?
-          </div>
+        <Callout tone="info" data-testid="rustierConfirm" icon={<Icon name="sparkle" size="sm" />}>
+          <div className="mtk-ai-edit__question">Apply the weathered-metal look for ~{AI_EDIT_COST} tokens?</div>
           {/* The explicit before → after (C3/C7 — show what changes). */}
-          <div style={{ display: "flex", alignItems: "center", gap: space.sm, marginBottom: space.md, ...textMeta }}>
-            <span>Material</span>
+          <div className="mtk-ai-edit__diff">
+            <span className="mtk-ai-edit__label">Material</span>
             <Badge tone="neutral">{before}</Badge>
             <Icon name="arrow-right" size="sm" />
             <Badge tone="accent">weathered metal</Badge>
           </div>
-          <div style={{ display: "flex", gap: space.sm, justifyContent: "flex-end" }}>
+          <div className="mtk-ai-edit__actions">
             <Button data-testid="rustierCancel" variant="secondary" compact onClick={() => setConfirming(false)}>
               Cancel
             </Button>
@@ -119,30 +135,8 @@ export function AiEditPanel({ client }: { client: EditorClient }) {
               {busy ? "Applying…" : `Apply · ~${AI_EDIT_COST} tokens`}
             </Button>
           </div>
-        </div>
+        </Callout>
       )}
-      {/* M11.2 material palette — a deliberate, labelled pick (the cost is stated); each applies the same
-          metered, validated AI-edit with the chosen PBR preset, with a before/after toast. */}
-      <div id="materialPalette" data-testid="materialPalette" style={{ marginTop: space.md }}>
-        <div style={{ ...textMeta, marginBottom: space.xs }}>Materials · ~{AI_EDIT_COST} tokens each</div>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: space.xs }}>
-          {MATERIALS.map((m) => (
-            <Button
-              key={m.preset}
-              data-testid={`material-${m.preset}`}
-              variant="secondary"
-              compact
-              disabled={busy}
-              onClick={() => void apply(m.preset, `${m.label} material`)}
-              title={`Give this object a ${m.label.toLowerCase()} PBR finish (${before} → ${m.label.toLowerCase()}) — an undoable patch, about ${AI_EDIT_COST} tokens`}
-            >
-              {m.label}
-            </Button>
-          ))}
-        </div>
-      </div>
     </div>
   );
 }
-
-const textMeta: React.CSSProperties = { font: font.ui, fontSize: fontSize.meta, color: color.text.muted };
