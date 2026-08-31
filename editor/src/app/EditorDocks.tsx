@@ -27,7 +27,6 @@ import { LazyWorkspace } from "./LazyWorkspace";
 // shared workspace boundary as the other engines protects the stage's initial bundle while preserving
 // a named, polite loading state when an author actually opens either workspace.
 const AssetBrowser = lazy(() => import("../panels/AssetBrowser").then((module) => ({ default: module.AssetBrowser })));
-const DescribeBar = lazy(() => import("../panels/DescribeBar").then((module) => ({ default: module.DescribeBar })));
 const ShapeStudio = lazy(() => import("../panels/ShapeStudio").then((module) => ({ default: module.ShapeStudio })));
 const TerrainPanel = lazy(() => import("../panels/TerrainPanel").then((module) => ({ default: module.TerrainPanel })));
 const Diagnostics = lazy(() => import("../panels/Diagnostics").then((module) => ({ default: module.Diagnostics })));
@@ -184,9 +183,11 @@ export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport,
                 <Icon name="import" size="md" /> Import
               </Button>
             </div>
-            <DisclosureSection title="Describe" summary="Optional assisted creation" defaultOpen={false} storageKey="create-describe">
-              <DescribeBar client={client} />
-            </DisclosureSection>
+            {/* WHERE `Describe` WENT. It was a collapsed `DisclosureSection` here, summarised "Optional
+                assisted creation", below Shape Studio and Other tools — three clicks and a scroll from
+                the stage for north star #2, under a label telling you not to bother. It is the stage
+                composer now (`.mtk-stage-footer`), always present, and this column keeps the two things
+                a Build workspace is actually for: making a shape, and finding one. */}
             <div className="mtk-dock-section-heading">Asset library</div>
             <AssetBrowser client={client} />
           </LazyWorkspace>

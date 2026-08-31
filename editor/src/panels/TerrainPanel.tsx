@@ -38,10 +38,10 @@ import {
   ScrollArea,
   SectionHeader,
   SelectField,
-  TextArea,
   TextField,
 } from "../theme/primitives";
 import { AssetChip, SwatchGrid, SwatchTile } from "../theme/assets";
+import { Composer, ComposerHint, ComposerRow, ComposerTextArea } from "../theme/composer";
 import { Icon } from "../theme/icons";
 import { color, font, fontSize, radius, space, text as textRole } from "../theme/tokens";
 import { DisclosureSection } from "../theme/workspace";
@@ -791,7 +791,14 @@ function DescribeBox({
 
   return (
     <div style={{ display: "grid", gap: space.sm, minWidth: 0 }} data-testid="terrain-describe">
-      <TextArea
+      {/* THE SHARED COMPOSER (ADR-184), NOT A SECOND STATEMENT OF ONE. This box and the stage's
+          describe-to-create box are the same act — a field, a reading of what the sentence will do, and
+          the commit — and they were drawn twice, with different paddings, different type sizes and the
+          reading in different places. `theme/composer.tsx` is that anatomy once. The COMMIT stays a
+          labelled verb here rather than the round mark the stage uses: in a 276px column beside a
+          three-line field, an arrow does not say "rebuild this world". */}
+      <Composer form="inline" aria-label="Describe the terrain">
+      <ComposerTextArea
         value={text}
         rows={compact ? 2 : 3}
         // AN EMPTY BOX THAT LOOKS FULL, BESIDE A LINE SAYING IT IS EMPTY. The placeholder was a bare
@@ -830,8 +837,8 @@ function DescribeBox({
           is, that made a 79-character sentence wrap to three lines beside the button and shove the "Try
           one" heading into it. The refusal itself is unchanged and still reaches a screen reader through
           `aria-describedby`; the button's `disabledReason` still carries the longer form on hover. */}
-      <div style={{ display: "flex", gap: space.sm, alignItems: "center" }}>
-        <span id={DESCRIBE_STATUS_ID} data-testid="terrain-describe-status" style={{ flex: 1, minWidth: 0, fontSize: fontSize.meta, color: color.text.secondary }}>
+      <ComposerRow>
+        <ComposerHint id={DESCRIBE_STATUS_ID} data-testid="terrain-describe-status">
           {plan
             ? plan.kind === "create"
               ? "builds a new world"
@@ -841,7 +848,7 @@ function DescribeBox({
               : text.trim()
                 ? "Builds a new world, or changes this one."
                 : "Type a description first."}
-        </span>
+        </ComposerHint>
         <Button
           variant="primary"
           disabled={busy || !text.trim()}
@@ -856,7 +863,8 @@ function DescribeBox({
         >
           {compact ? "Rebuild" : "Build it"}
         </Button>
-      </div>
+      </ComposerRow>
+      </Composer>
 
       {plan ? (
         <div

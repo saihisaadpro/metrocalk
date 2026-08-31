@@ -31,6 +31,7 @@ import { CutscenePanel } from "../../src/panels/CutscenePanel";
 import { SubjectAimBadge } from "../../src/panels/SubjectAimBadge";
 import { Diagnostics } from "../../src/panels/Diagnostics";
 import { MaterialPanel } from "../../src/panels/MaterialPanel";
+import { DescribeBar } from "../../src/panels/DescribeBar";
 import { MATERIAL_PRESETS, MaterialSphere } from "../../src/theme/materials";
 import { ExportDialog } from "../../src/panels/ExportDialog";
 import { ImportDialog } from "../../src/panels/ImportDialog";
@@ -2057,6 +2058,7 @@ export const SCENES: Scene[] = [
   ...graphScenes(),
   ...inspectorScenes(),
   ...materialScenes(),
+  ...composerScenes(),
   ...assetScenes(),
   ...modelScenes(),
   ...gameplayScenes(),
@@ -3027,6 +3029,221 @@ function materialSetup(material?: string) {
   };
 }
 
+// ── the stage composer (north star #2) ────────────────────────────────────────────────────────────
+
+function composerScenes(): Scene[] {
+  /** THE WIDTH THE COMPOSER ACTUALLY SHIPS AT. `.mtk-stage-footer` is `min(680px, stage − 32)`, so 680
+   *  is the widest it is ever drawn and the width at which its row either fits or does not. A composer
+   *  photographed at 900 would prove nothing about the label that has to sit between a leading + and a round commit —
+   *  and the one thing this row can do wrong is run out of horizontal space. */
+  const COMPOSER_WIDTH = 680;
+
+  /** The client the composer really talks to, stated once. Every field here mirrors `protocol.ts`
+   *  (`CatalogSearch.items[]` is `CatalogItem`, `describe` returns `DescribeResponse`) rather than
+   *  being invented beside the scene — the terrain-preset lesson: a capture of a catalogue is only
+   *  evidence if the catalogue is shaped like the real one. */
+  function composerClient(over: Partial<Record<string, unknown>> = {}): EditorClient {
+    return {
+      catalogSearch: () => Promise.resolve({ items: [] }),
+      describe: () =>
+        Promise.resolve({ created: null, kind: null, source: null, price: null, seam: "generate", balance: 100 }),
+      // Never settles: the scenes that photograph a generation want its PROGRESS state held still.
+      generate: () => new Promise(() => {}),
+      gizmoSelect: () => Promise.resolve(),
+      ...over,
+    } as unknown as EditorClient;
+  }
+
+  const COMPOSER_DOORS = {
+    onImport: () => {},
+    onBrowseAssets: () => {},
+    onDrawShape: () => {},
+  } as const;
+
+  /** A composer on the ground it is drawn on, AT THE END OF THE STAGE IT LIVES AT. The card is
+   *  near-white and the stage behind it is a pale grey; photographed on a white frame the elevation
+   *  that separates them is invisible, and the whole argument for a floating surface is that it reads
+   *  as one.
+   *
+   *  The BOTTOM alignment is not decoration either, and the first version of these scenes got it wrong
+   *  in a way only the PNG showed: with the composer at the top of a short frame, the `+` menu — which
+   *  asks for `top-start` — had nowhere above it to go, so the edge-aware placement put it straight
+   *  over the composer, under a caption claiming it opened upward. `.mtk-stage-footer` anchors this
+   *  card to the bottom of the stage; a scene that photographs it anywhere else is photographing a
+   *  geometry no user is ever in. */
+  function OnStage({ children }: { children: ReactNode }) {
+    return (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "flex-end",
+          minHeight: 420,
+          padding: 24,
+          background: "var(--mtk-bg-inset)",
+          width: COMPOSER_WIDTH + 48,
+          boxSizing: "border-box",
+        }}
+      >
+        <div style={{ width: "100%", minWidth: 0 }}>{children}</div>
+      </div>
+    );
+  }
+
+  return [
+    {
+      id: "describe-composer",
+      looking_for:
+        "NORTH STAR #2 AS ONE CONTROL. A lifted card: a round + on the left, the field, and a ROUND " +
+        "commit on the right — the only circular control in the engine, which is what says 'this row " +
+        "commits a sentence' before a word has been read. The two round marks must be the SAME size " +
+        "and sit on the same centre line as the field's text, or the row reads as three unrelated " +
+        "things that happen to be adjacent. The commit is off, because the field is empty, and " +
+        "hovering it says why",
+      viewport: { width: COMPOSER_WIDTH + 80, height: 560 },
+      expect: {
+        present: [
+          ["[data-testid='describebar']", 1],
+          ["[data-testid='describe']", 1],
+          ["[data-testid='describeBtn']", 1],
+          ["[data-testid='describeAddBtn']", 1],
+        ],
+        // The empty state is EMPTY: no reading, no outcome, no leftover panel. A composer that shows
+        // a cost line before anything is typed is quoting a price for nothing.
+        absent: ["[data-testid='describePreview']", "[data-testid='describePanel']", "[data-icon-missing]"],
+        text_absent: ["null", "undefined", "NaN"],
+        same_line: [
+          ["[data-testid='describeAddBtn']", "[data-testid='describe']"],
+          ["[data-testid='describe']", "[data-testid='describeBtn']"],
+        ],
+        unclipped: ["[data-testid='describebar']", "[data-testid='describe']", "[data-testid='describeBtn']"],
+        // A commit small enough to miss is not a commit. 40px is `--mtk-control-comfortable` — the
+        // constitution's "large hit targets", and the size both reference sheets draw this control at
+        // — and the circle has to hold it on BOTH axes or it is a lozenge.
+        min_height: [["[data-testid='describeBtn']", 40]],
+        min_width: [["[data-testid='describeBtn']", 40]],
+        max_width: [["[data-testid='describeBtn']", 40]],
+      },
+      render: () => (
+        <OnStage>
+          <DescribeBar client={composerClient()} form="floating" {...COMPOSER_DOORS} />
+        </OnStage>
+      ),
+    },
+    {
+      id: "describe-composer-preview",
+      looking_for:
+        "WHAT IT WILL DO AND WHAT IT WILL COST, BEFORE THE COMMIT. One quiet line under the field: a " +
+        "tick, the real catalogue item the typed words resolve to, its source, and the price as a " +
+        "badge. This is the legible-cost contract at the gesture rather than in a receipt — a reader " +
+        "must be able to tell a free local hit from a paid marketplace one WITHOUT reading the " +
+        "number, which is why the badge is toned and not just worded",
+      viewport: { width: COMPOSER_WIDTH + 80, height: 560 },
+      type: [["[data-testid='describe']", "steel sword"]],
+      expect: {
+        present: [["[data-testid='describePreview']", 1], ["[data-testid='previewCost']", 1]],
+        absent: ["[data-testid='describePanel']", "[data-icon-missing]"],
+        text_present: ["Will place", "Steel Sword", "marketplace", "3 tokens"],
+        text_absent: ["null", "undefined", "NaN"],
+        // The reading sits UNDER the row it explains, never beside the commit it is qualifying.
+        stacked: [["[data-testid='describe']", "[data-testid='describePreview']"]],
+        same_line: [["[data-testid='describePreview']", "[data-testid='previewCost']"]],
+        unclipped: ["[data-testid='describePreview']", "[data-testid='previewCost']"],
+      },
+      render: () => (
+        <OnStage>
+          <DescribeBar
+            client={composerClient({
+              catalogSearch: () =>
+                Promise.resolve({
+                  items: [
+                    {
+                      id: "c2",
+                      label: "Steel Sword",
+                      bucket: "props",
+                      category: "weapon",
+                      source: "marketplace",
+                      provides: [],
+                      requires: [],
+                      price: 3,
+                    },
+                  ],
+                }),
+            })}
+            form="floating"
+            {...COMPOSER_DOORS}
+          />
+        </OnStage>
+      ),
+    },
+    {
+      id: "describe-composer-offer",
+      looking_for:
+        "NO MATCH IS AN OFFER, NOT A DEAD END. Nothing in the catalogue answers the sentence, so the " +
+        "composer states that and hands over three real ways forward — generate (priced, in the " +
+        "words of the price), browse, or build it yourself. What is being checked is that the three " +
+        "buttons sit on ONE line under the sentence at this width, and that the priced one is " +
+        "unmistakably the priced one",
+      viewport: { width: COMPOSER_WIDTH + 80, height: 560 },
+      // Typed with a trailing newline, which puppeteer sends as Enter — the driver types AFTER every
+      // click, so a type-then-click gesture is not expressible and Enter is the real one anyway: it
+      // is how this field is committed by anyone who did not reach for the mouse.
+      type: [["[data-testid='describe']", "a flying dragon\n"]],
+      expect: {
+        present: [
+          ["[data-testid='describePanel']", 1],
+          ["#genBtn", 1],
+          ["#browseMarket", 1],
+          ["#buildManual", 1],
+        ],
+        // The reading is withdrawn while the OUTCOME is up: two statements about one sentence, one of
+        // which is now stale, is the C11 defect this panel was built against.
+        absent: ["[data-testid='describePreview']", "[data-icon-missing]"],
+        text_present: ["No match", "Generate with AI", "tokens"],
+        text_absent: ["null", "undefined", "NaN"],
+        same_line: [["#genBtn", "#browseMarket"], ["#browseMarket", "#buildManual"]],
+        stacked: [["[data-testid='describe']", "[data-testid='describePanel']"]],
+        unclipped: ["#genBtn", "#browseMarket", "#buildManual"],
+      },
+      render: () => (
+        <OnStage>
+          <DescribeBar client={composerClient()} form="floating" {...COMPOSER_DOORS} />
+        </OnStage>
+      ),
+    },
+    {
+      id: "describe-composer-add-menu",
+      looking_for:
+        "THE OTHER HALF OF THE SAME QUESTION. 'Describe it', 'import it' and 'browse for it' are three " +
+        "answers to *get something into my scene*, and only one of them used to be on the stage. The " +
+        "+ opens the other two beside a third — each row a mark, a verb and one line saying what it " +
+        "is for. The menu opens UPWARD, because the composer sits at the bottom of the stage and a " +
+        "menu that drops off the edge is a menu nobody can read",
+      viewport: { width: COMPOSER_WIDTH + 80, height: 560 },
+      click: ["[data-testid='describeAddBtn']"],
+      expect: {
+        present: [
+          ["[data-testid='describeAddImport']", 1],
+          ["[data-testid='describeAddBrowse']", 1],
+          ["[data-testid='describeAddDraw']", 1],
+        ],
+        absent: ["[data-icon-missing]"],
+        text_present: ["Import a file", "Browse the asset library", "Draw it in the viewport"],
+        text_absent: ["null", "undefined", "NaN"],
+        stacked: [
+          ["[data-testid='describeAddImport']", "[data-testid='describeAddBrowse']"],
+          ["[data-testid='describeAddBrowse']", "[data-testid='describeAddDraw']"],
+        ],
+        unclipped: ["[data-testid='describeAddImport']", "[data-testid='describeAddBrowse']", "[data-testid='describeAddDraw']"],
+      },
+      render: () => (
+        <OnStage>
+          <DescribeBar client={composerClient()} form="floating" {...COMPOSER_DOORS} />
+        </OnStage>
+      ),
+    },
+  ];
+}
+
 function materialScenes(): Scene[] {
   /** THE WIDTH THESE ARE READ AT, AND WHY IT IS NOT A COMFORTABLE ONE. The Inspector track is 300px
    *  and a section inside it has ~234px of content box, measured in the packaged `.exe`. A swatch
@@ -3452,6 +3669,9 @@ function shell(
   looking_for: string,
   expect: Expect,
   click?: string[],
+  /** The projection the shell is photographed over. Without it every shell scene is the sample scene,
+   *  so the whole EMPTY regime — the state a first-run user is actually in — had never been in frame. */
+  setup?: () => void,
 ): Scene {
   const [width, height] = typeof size === "number" ? [size, 900] : size;
   return {
@@ -3459,6 +3679,7 @@ function shell(
     looking_for,
     viewport: { width, height },
     click,
+    setup,
     expect: {
       ...expect,
       present: [["[data-testid='viewport']", 1], ...(expect.present ?? [])],
@@ -3519,6 +3740,12 @@ function shellScenes(): Scene[] {
         ["[data-testid='editor-header']", 1],
         // The Inspector's no-selection state, in the shell, at the width it ships at (ADR-170).
         ["[data-testid='inspectorNoSelection']", 1],
+        // NORTH STAR #2, ON THE STAGE, IN THE SHELL. It used to be three clicks and a scroll inside a
+        // collapsed disclosure in the Build workspace, which means no shell capture had ever contained
+        // it: a surface you must navigate to cannot be photographed beside its neighbours, and beside
+        // its neighbours is the only place a collision exists.
+        ["[data-testid='describebar']", 1],
+        ["[data-testid='stage-footer']", 1],
       ],
       // Wide open: the docks are panels, not rails. If this ever flips, the layout collapsed at a
       // width where it had room — the opposite defect to the stage being squeezed.
@@ -3538,6 +3765,57 @@ function shellScenes(): Scene[] {
         [".mtk-shell-track--left > .mtk-shell-card", ["[data-testid='left-dock']"]],
         [".mtk-shell-track--right > .mtk-shell-card", ["[data-testid='inspector-dock']"]],
       ],
+      // THE STACK, PHOTOGRAPHED. The first-run card and the composer both want the bottom-centre of
+      // the stage, and both used to write their own `position: absolute; left: 50%`. They are one
+      // column now, in this order, and this is the claim that says so — R3 would catch them ON TOP of
+      // each other, but only `stacked` catches them in the wrong order.
+      stacked: [["[data-testid='onboarding']", "[data-testid='describebar']"]],
+      unclipped: ["[data-testid='describebar']", "[data-testid='describeBtn']"],
+    },
+  ),
+  // THE STATE A FIRST-RUN USER IS ACTUALLY IN, WHICH NO SHELL CAPTURE HAD EVER BEEN. Every scene above
+  // is the sample project; the empty one is the regime where the stage's two invitations — the centred
+  // card and the composer under it — are on screen together, and the only regime where they can
+  // collide. R3 decides that, not a reading of the layout.
+  shell(
+    "shell-empty-stage",
+    1440,
+    "THE EMPTY STAGE, WITH BOTH INVITATIONS ON IT. A centred card naming the ways in, and — under it, " +
+      "at the bottom of the stage — the composer that is the way in. They must not touch, and the " +
+      "card's primary action must be the one that leads to the composer: the header of `EmptyState` " +
+      "has promised a CTA that focuses the describe field since the day it was written, and until the " +
+      "composer reached the stage there was no field for it to focus",
+    {
+      present: [
+        ["[data-testid='emptyState']", 1],
+        ["[data-testid='emptyDescribe']", 1],
+        ["[data-testid='describebar']", 1],
+      ],
+      // The first-run card is the NON-empty scene's invitation; both at once would be two cards
+      // saying "start here" on one stage.
+      absent: ["[data-testid='onboarding']"],
+      text_present: ["Start with something tangible", "Describe it"],
+      // THE CARD, NOT THE WRAPPER. `emptyState` is `position: absolute; inset: 0` — a full-stage box
+      // that centres a card inside itself — so a claim on it says the STAGE is above the composer,
+      // which is both true and meaningless, and it reported a shared line (56–834 vs 774–822) on a
+      // layout with a 200px gap in it. The visible card is the thing a reader sees, so it is the
+      // thing the claim is about.
+      stacked: [["[data-testid='emptyStateCard']", "[data-testid='describebar']"]],
+      unclipped: ["[data-testid='describebar']", "[data-testid='emptyDescribe']"],
+    },
+    undefined,
+    // A PLAIN `reset()` HERE IS UNDONE A TICK LATER. `createMockSession` emits the sample scene
+    // asynchronously, after `setup` has run, so the obvious version of this photographs the sample
+    // under a caption about an empty stage — the exact class of lie this harness exists to stop
+    // (it failed that way first: `emptyState` found 0, `onboarding` found 1). Reset on the FIRST
+    // projection instead: one shot, and nothing re-emits after it, so the empty stage is the state
+    // the settle converges on. This is the state a user is in after File → New.
+    () => {
+      const stop = projectionStore.subscribe((state) => {
+        if (state.order.length === 0) return;
+        stop();
+        projectionStore.getState().reset();
+      });
     },
   ),
   shell(

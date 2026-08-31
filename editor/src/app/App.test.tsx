@@ -79,9 +79,35 @@ describe("editor app — end-to-end wiring", () => {
     act(() => projectionStore.getState().reset());
     expect(screen.getByTestId("emptyState").textContent).toMatch(/start with something tangible/i);
     expect(screen.queryByTestId("onboarding")).toBeNull();
+    expect(screen.getByTestId("emptyDescribe")).toBeTruthy(); // the CTA this card's header always promised
     expect(screen.getByTestId("emptyPipe")).toBeTruthy();
     expect(screen.getByTestId("emptyAssets")).toBeTruthy();
     expect(screen.getByTestId("emptyImport")).toBeTruthy();
+  });
+
+  it("north star #2 is ON THE STAGE at first paint — no workspace to open, no chunk to wait for", () => {
+    render(<App />);
+    // No rail click, no `findBy`, no lazy boundary: the composer is in the first render. It used to take
+    // Build → scroll → open a collapsed disclosure headed "Optional assisted creation".
+    const composer = screen.getByTestId("describebar");
+    expect(composer).toBeTruthy();
+    expect(screen.getByTestId("describe")).toBeTruthy();
+    // And it is a CHILD of the one stage-footer anchor rather than a fourth surface writing its own
+    // `position: absolute; left: 50%`. That containment is the thing that makes a collision impossible;
+    // asserting the two elements' rects would assert nothing in jsdom, which lays nothing out.
+    const footer = screen.getByTestId("stage-footer");
+    expect(footer.contains(composer)).toBe(true);
+    expect(footer.contains(screen.getByTestId("onboarding"))).toBe(true);
+  });
+
+  it("Play owns the stage: the composer withdraws with the rest of the stage's authoring surfaces", () => {
+    render(<App />);
+    expect(screen.getByTestId("describebar")).toBeTruthy();
+    act(() => playStore.getState().refresh({ playing: true, paused: false }));
+    // One statement, one anchor: withdrawing the footer withdraws everything anchored to it, which is
+    // what stops a future stage surface being added and forgotten in the `!playing` guard.
+    expect(screen.queryByTestId("stage-footer")).toBeNull();
+    expect(screen.queryByTestId("describebar")).toBeNull();
   });
 
   it("a spend in one panel updates the displayed balance EVERYWHERE (single source of truth — C7)", async () => {
@@ -89,13 +115,10 @@ describe("editor app — end-to-end wiring", () => {
     const bal = await screen.findByTestId("balance");
     await waitFor(() => expect(bal.textContent).toBe("100"));
 
-    // Describe lives in the Build workspace, which is an on-demand rail destination: it is MOUNTED WHEN
-    // OPENED now, not rendered-and-hidden behind every other engine. So the test opens it, exactly as a
-    // user must. (It used to be reachable without this click because the dock rendered all six engines
-    // at once and hid five — a testid you can query from a workspace you are not in is not evidence that
-    // a user can reach it.)
-    fireEvent.click(screen.getByTestId("engine-build"));
-    fireEvent.change(await screen.findByTestId("describe", {}, LAZY_CHUNK), { target: { value: "a nonexistent thingamajig" } });
+    // Describe is ON THE STAGE — no rail click, no workspace to open, no lazy chunk to wait for. It used
+    // to be a collapsed disclosure inside the Build workspace, and this test had to open Build to reach
+    // north star #2 at all; that click was the measurement of the defect and its absence here is the fix.
+    fireEvent.change(screen.getByTestId("describe"), { target: { value: "a nonexistent thingamajig" } });
     fireEvent.click(screen.getByTestId("describeBtn"));
     fireEvent.click(await screen.findByTestId("genBtn", {}, LAZY_CHUNK));
 

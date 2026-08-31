@@ -161,54 +161,11 @@ export function Checkbox({
   );
 }
 
-export type CalloutTone = "neutral" | "info" | "success" | "warn" | "danger";
-
-const CALLOUT_ICON: Record<CalloutTone, string> = {
-  neutral: "info",
-  info: "info",
-  success: "check",
-  warn: "warning",
-  danger: "error",
-};
-
-export interface CalloutProps {
-  children: ReactNode;
-  tone?: CalloutTone;
-  title?: ReactNode;
-  /** Overrides the tone's default mark. */
-  icon?: ReactNode;
-  role?: AriaRole;
-  id?: string;
-  className?: string;
-  style?: CSSProperties;
-  "data-testid"?: string;
-}
-
-/**
- * The one inline note. Guidance, a warning, an all-clear and a "why this is refusing" were four
- * bespoke boxes inside a single panel, each with its own border colour, padding and type size.
- *
- * The mark is never optional: colour alone must not carry the meaning, which is the same rule
- * `Badge`'s `title` and the palette gate's contrast floor exist to keep.
- */
-export function Callout({ children, tone = "neutral", title, icon, role, className, style, ...rest }: CalloutProps) {
-  return (
-    <div
-      className={["mtk-callout", `mtk-callout--${tone}`, className].filter(Boolean).join(" ")}
-      role={role}
-      style={style}
-      {...rest}
-    >
-      <span className="mtk-callout__icon" aria-hidden="true">
-        {icon ?? <Icon name={CALLOUT_ICON[tone]} size="sm" />}
-      </span>
-      <div className="mtk-callout__body">
-        {title != null && <strong className="mtk-callout__title">{title}</strong>}
-        {children}
-      </div>
-    </div>
-  );
-}
+/** The one inline note. It lives in [`theme/callout.tsx`] because a FIRST-PAINT surface uses it — the
+ *  stage composer states its outcomes as callouts — and this module exists precisely so its contents
+ *  stay out of the entry chunk. Re-exported so there is one import site for the settings-sheet family
+ *  and one `Callout` in the engine. */
+export { Callout, type CalloutProps, type CalloutTone } from "./callout";
 
 /** A measurement grid: as many tiles as fit, down to one. */
 export function MetricGrid({ children, minColumn, className, style, ...rest }: {

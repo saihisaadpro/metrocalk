@@ -2136,6 +2136,14 @@ body > [role="dialog"][aria-modal="true"] {
   border-top-width: 0;
 }
 
+/* `width: auto`, NOT `100%` — and the difference is 16px of a panel nobody could reach.
+   `100%` resolves against the CONTAINING BLOCK and then a margin is added OUTSIDE it, so an empty
+   state a caller insets (`Hierarchy` passes `style={{ margin: 8 }}` to both of its) is 16px wider
+   than the column it sits in, inside a `.mtk-dock-panel__fill` that is `overflow: hidden auto` —
+   cut on both sides, no scrollbar, nothing on screen saying anything is missing. Measured on the
+   empty Scene panel at 1440: fill `clientWidth` 328, empty panel 328 at x+8, `scrollWidth` 336.
+   `auto` fills the containing block MINUS its own margins, and the `flex: 1 1 auto` above already
+   fills a flex row's main axis and a flex column's cross axis, so every parent kind is covered. */
 .mtk-empty-panel {
   display: flex;
   flex: 1 1 auto;
@@ -2143,7 +2151,7 @@ body > [role="dialog"][aria-modal="true"] {
   align-items: center;
   justify-content: center;
   box-sizing: border-box;
-  width: 100%;
+  width: auto;
   min-height: 160px;
   padding: 32px 24px;
   color: var(--mtk-text-muted);
@@ -2615,6 +2623,136 @@ body > [role="dialog"][aria-modal="true"] {
 @media (forced-colors: active) {
   .mtk-command-palette__command[data-active="true"] { outline: 1px solid Highlight; outline-offset: -2px; }
   .mtk-viewport-tool-rail { border: 1px solid ButtonText !important; }
+}
+
+/* ── The stage footer: ONE anchor at the bottom of the stage (app/App.tsx) ─────────────────────────
+   Three surfaces have wanted this position and each one took it by writing `position: absolute;
+   left: 50%; bottom: …` for itself — which is not a layout, it is three elements agreeing to occupy
+   the same pixels. The repository has already paid for that twice: the aim badge landed on the
+   first-run card's headline, and the card before it was centred on the WINDOW and sat 192px inside
+   the left dock. A stack cannot collide with itself, so the anchor is declared once here and the
+   surfaces are ordinary children of it in the order they should read, bottom-most last.
+
+   `pointer-events: none` on the stack, `auto` on the children: the gaps between two floating cards
+   are stage, and an orbit drag started in one of them must reach the viewport. */
+.mtk-stage-footer {
+  position: absolute;
+  z-index: 130; /* = `z.menu` in tokens.ts — the layer the first-run card already floated on. */
+  right: 0;
+  bottom: var(--mtk-space-5);
+  left: 0;
+  display: flex;
+  max-height: calc(100% - var(--mtk-space-8));
+  box-sizing: border-box;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--mtk-space-5);
+  /* THE COLUMN THE STAGE'S OWN CHROME OCCUPIES, KEPT CLEAR. The tool rail floats at the stage's left
+     edge (42px + a 6px offset) and runs 237px down it, and this stack grows UPWARD from the bottom —
+     so on a short stage (any window with the bottom dock open) a centred, full-width stack walks
+     straight into the rail's last button. Measured on `shell-dock-tabs` at 1280x900: a 508px stage,
+     the rail's minimise chevron at y 261..297, and the first-run card's own header overlapping it by
+     25x30px. An inset is the fix rather than a z-order, because whichever of the two is on top the
+     other one's clicks are gone. Symmetric, so the composer stays centred on the stage. */
+  padding-inline: 64px;
+  pointer-events: none;
+}
+/* One width for everything anchored here, so the first-run card and the composer read as one column
+   rather than two floating cards that happen to be near each other. */
+.mtk-stage-footer > * { width: min(680px, 100%); flex: 0 1 auto; min-height: 0; pointer-events: auto; }
+/* AND THE COMPOSER IS THE ONE THAT DOES NOT YIELD. On a stage too short for both, the first-run card
+   scrolls inside itself (it already carries `overflow-y: auto`); squeezing the control instead would
+   withdraw north star #2 to make room for a card explaining it. */
+.mtk-stage-footer > .mtk-composer { flex: none; }
+
+/* ── The composer (theme/composer.tsx) ─────────────────────────────────────────────────────────────
+   A lifted card holding a leading action, the field, the reading, and a round commit — the shape both
+   reference sheets use for "type a sentence, the engine acts on it". The field carries no frame of its
+   own: the card IS the frame, and the focus ring moves to the card so a field with no outline is still
+   unmistakably focused. */
+.mtk-composer {
+  display: flex;
+  min-width: 0;
+  box-sizing: border-box;
+  flex-direction: column;
+  gap: var(--mtk-space-3);
+  padding: var(--mtk-space-4);
+  border: 1px solid transparent;
+  border-radius: var(--mtk-radius-xxl);
+  background: var(--mtk-bg-raised);
+  transition:
+    border-color var(--mtk-motion-fast) var(--mtk-ease-standard),
+    box-shadow var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-composer--floating { border-color: var(--mtk-border-subtle); box-shadow: var(--mtk-shadow-3); }
+.mtk-composer--inline { border-color: var(--mtk-border); background: var(--mtk-bg-input); border-radius: var(--mtk-radius-xl); }
+.mtk-composer:focus-within { border-color: var(--mtk-ring); box-shadow: 0 0 0 3px var(--mtk-ring-soft); }
+.mtk-composer--floating:focus-within { box-shadow: var(--mtk-shadow-3), 0 0 0 3px var(--mtk-ring-soft); }
+
+.mtk-composer__row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--mtk-space-3);
+}
+.mtk-composer__field {
+  min-width: 0;
+  flex: 1;
+  box-sizing: border-box;
+  padding: var(--mtk-space-3) var(--mtk-space-2);
+  border: 0;
+  margin: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--mtk-text);
+  font: 13px/1.45 var(--mtk-font-ui);
+}
+.mtk-composer__field::placeholder { color: var(--mtk-text-muted); opacity: 1; }
+.mtk-composer__field:focus { outline: none; }
+.mtk-composer__field:disabled { color: var(--mtk-text-faint); cursor: not-allowed; }
+.mtk-composer__field--multiline { resize: vertical; min-height: 46px; }
+
+/* The round commit. `border-radius: 999px` on a square box is what makes it a circle, and the fixed
+   width stops a wide glyph turning it into a lozenge. */
+.mtk-composer__submit {
+  width: var(--mtk-control-comfortable);
+  min-width: var(--mtk-control-comfortable);
+  height: var(--mtk-control-comfortable);
+  flex: none;
+  padding: 0;
+  border-radius: 999px;
+}
+/* The leading action sits at the same size on the other end of the row, so the field is centred
+   between two equal marks rather than between a control and a corner. */
+.mtk-composer__lead {
+  width: var(--mtk-control-comfortable);
+  min-width: var(--mtk-control-comfortable);
+  height: var(--mtk-control-comfortable);
+  flex: none;
+  padding: 0;
+  border-radius: 999px;
+}
+
+.mtk-composer__hint {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--mtk-space-3);
+  padding: 0 var(--mtk-space-2) var(--mtk-space-1);
+  margin: 0;
+  color: var(--mtk-text-muted);
+  font: 12px/1.45 var(--mtk-font-ui);
+}
+.mtk-composer__hint > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A hint sharing a ROW with its commit — the panel form, where the verb is a labelled button rather
+   than the stage's round mark. It takes the slack so the button keeps its own width. */
+.mtk-composer__row > .mtk-composer__hint { flex: 1; min-width: 0; padding: 0; }
+.mtk-composer__outcome { display: flex; min-width: 0; flex-direction: column; gap: var(--mtk-space-3); }
+.mtk-composer__actions { display: flex; flex-wrap: wrap; gap: var(--mtk-space-4); margin-top: var(--mtk-space-3); }
+
+@media (forced-colors: active) {
+  .mtk-composer { border: 1px solid ButtonText; box-shadow: none; }
+  .mtk-composer__field { color: CanvasText; }
 }
 
 /* Dynamic workspace feedback: visible, compact, and exposed through status/alert semantics. */

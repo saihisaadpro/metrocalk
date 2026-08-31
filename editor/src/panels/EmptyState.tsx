@@ -8,12 +8,14 @@ import { Button } from "../theme/primitives";
 import { color, elevation, font, fontSize, lineHeight, radius, space } from "../theme/tokens";
 
 export interface EmptyStateProps {
+  /** Aims the caret at the stage composer — the CTA this file's own header has always described. */
+  onDescribe?: () => void;
   onBrowseAssets?: () => void;
   onDrawPipe?: () => void;
   onImport?: () => void;
 }
 
-export function EmptyState({ onBrowseAssets, onDrawPipe, onImport }: EmptyStateProps = {}) {
+export function EmptyState({ onDescribe, onBrowseAssets, onDrawPipe, onImport }: EmptyStateProps = {}) {
   return (
     <div
       id="emptyState"
@@ -36,6 +38,7 @@ export function EmptyState({ onBrowseAssets, onDrawPipe, onImport }: EmptyStateP
           sky, a dark scene, a busy grid — so text tuned for a panel is a coin toss out there. The card makes
           the first thing a new author reads legible regardless of what is being rendered. */}
       <div
+        data-testid="emptyStateCard"
         style={{
           display: "flex",
           flexDirection: "column",
@@ -53,7 +56,15 @@ export function EmptyState({ onBrowseAssets, onDrawPipe, onImport }: EmptyStateP
         <div style={{ fontSize: fontSize.heading, color: color.text.primary, fontWeight: 650, letterSpacing: "-0.2px" }}>Start with something tangible</div>
         <div style={{ color: color.text.muted, lineHeight: lineHeight.body }}>Draw procedural geometry, choose a local asset, or import your own file. Every result remains editable and undoable.</div>
         <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: space.sm, pointerEvents: "auto", marginTop: space.xs }}>
-          <Button data-testid="emptyPipe" variant="primary" onClick={onDrawPipe}><Icon name="pipe" size="sm" /> Draw a pipe</Button>
+          {/* THE HEADER OF THIS FILE HAS ALWAYS SAID "the CTA focuses the describe field", AND NO CTA
+              DID. It could not: the describe field was inside a collapsed disclosure in a workspace
+              this card cannot open. It is on the stage now (`.mtk-stage-footer`), directly below this
+              card, so the promise is finally keepable — and it leads, because describing is north
+              star #2 and the other three are the ways you reach for something that already exists. */}
+          {onDescribe && (
+            <Button data-testid="emptyDescribe" variant="primary" onClick={onDescribe}><Icon name="sparkle" size="sm" /> Describe it</Button>
+          )}
+          <Button data-testid="emptyPipe" variant="secondary" onClick={onDrawPipe}><Icon name="pipe" size="sm" /> Draw a pipe</Button>
           <Button data-testid="emptyAssets" variant="secondary" onClick={onBrowseAssets}>Browse assets</Button>
           <Button data-testid="emptyImport" variant="secondary" onClick={onImport}>Import file…</Button>
         </div>

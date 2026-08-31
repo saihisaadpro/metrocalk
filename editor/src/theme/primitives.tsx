@@ -570,7 +570,7 @@ export function Surface({
   );
 }
 
-export function Badge({ children, tone = "neutral", style, title }: { children: ReactNode; tone?: "neutral" | "accent" | "warn" | "success"; style?: CSSProperties; title?: string }) {
+export function Badge({ children, tone = "neutral", style, title, ...rest }: { children: ReactNode; tone?: "neutral" | "accent" | "warn" | "success"; style?: CSSProperties; title?: string } & DataAttrs) {
   const tones: Record<string, CSSProperties> = {
     neutral: { background: color.bg.inset, color: color.text.secondary, borderColor: color.border.default },
     accent: { background: color.accent.subtle, color: color.accent.base, borderColor: color.accent.border },
@@ -581,6 +581,7 @@ export function Badge({ children, tone = "neutral", style, title }: { children: 
     <span
       className="mtk-badge"
       title={title}
+      {...rest}
       style={{
         display: "inline-flex",
         alignItems: "center",

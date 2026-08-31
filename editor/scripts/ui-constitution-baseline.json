@@ -169,8 +169,40 @@
       "unitless-length": 0,
       "hand-rolled-section": 0
     },
+    "src/inspector/MultiInspector.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
     "src/inspector/renderers.tsx": {
       "raw-native-control": 1,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/inspector/shared.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/inspector/transform.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/inspector/TransformSection.tsx": {
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
@@ -274,7 +306,7 @@
       "hand-rolled-section": 0
     },
     "src/panels/DescribeBar.tsx": {
-      "raw-native-control": 1,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
@@ -290,6 +322,14 @@
       "hand-rolled-section": 0
     },
     "src/panels/EmptyState.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/panels/ExportDialog.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
@@ -321,6 +361,14 @@
       "unitless-length": 0,
       "hand-rolled-section": 2
     },
+    "src/panels/formatVocabulary.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
     "src/panels/Hierarchy.tsx": {
       "raw-native-control": 1,
       "literal-ui-color": 0,
@@ -330,6 +378,14 @@
       "hand-rolled-section": 1
     },
     "src/panels/HoverTooltip.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/panels/ImportDialog.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
@@ -594,6 +650,14 @@
       "hand-rolled-section": 0
     },
     "src/theme/assets.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0,
+      "hand-rolled-section": 0
+    },
+    "src/theme/composer.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,

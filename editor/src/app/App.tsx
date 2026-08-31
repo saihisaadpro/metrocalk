@@ -30,6 +30,10 @@ import { StatusBar } from "../panels/StatusBar";
 import { ToastHost } from "../panels/ToastHost";
 import { EmptyState } from "../panels/EmptyState";
 import { Onboarding } from "../panels/Onboarding";
+// NOT deferred, for the reason stated beside `Onboarding` below: this is north-star #2's control and it
+// is on the stage from the first frame. A front door that arrives after the first paint is a front door
+// the user has already walked past.
+import { DescribeBar } from "../panels/DescribeBar";
 import { ImportDropOverlay } from "./ImportDropOverlay";
 import { FocusBanner } from "../panels/FocusBanner";
 import { SubjectAimBadge } from "../panels/SubjectAimBadge";
@@ -1209,9 +1213,34 @@ export function App() {
               `bottom: space.lg, left: 50%` — the SAME anchor the aim badge takes — so with both up
               the badge sits on the card's headline, which is `<ux_quality>` 4's overlap exactly.
               Caught on the `.exe` capture, where a fresh project had brought the card back. */}
-          <Onboarding show={!sceneEmpty && !playing && !stageSheet && !aimActive} onStart={() => openEngine("build")} />
+          {/* ONE ANCHOR AT THE BOTTOM OF THE STAGE, and everything that wants to be there is a child of
+              it in reading order. Three surfaces had each written `position: absolute; left: 50%;
+              bottom: …` for themselves, which is not a layout — it is three elements agreeing to occupy
+              the same pixels, and this repository has twice paid for the disagreement (the aim badge on
+              the first-run card's headline; the card itself centred on the WINDOW and 192px inside the
+              left dock). A stack cannot collide with itself. */}
+          {!playing && !stageSheet && (
+            <div className="mtk-stage-footer" data-testid="stage-footer">
+              <Onboarding show={!sceneEmpty && !aimActive} onStart={() => openEngine("build")} />
+              {/* NORTH STAR #2, ON THE STAGE. It used to be three clicks and a scroll inside a
+                  collapsed disclosure headed "Optional assisted creation" — see `DescribeBar`'s own
+                  header for why that was a defect and not a placement. It yields to an aim for the same
+                  reason the first-run card does: a mode that owns the stage owns what is painted on it,
+                  and the aim badge takes this anchor. */}
+              {!aimActive && (
+                <DescribeBar
+                  client={client}
+                  form="floating"
+                  onImport={importAsset}
+                  onBrowseAssets={() => openEngine("build")}
+                  onDrawShape={() => setActiveTool("pipe")}
+                />
+              )}
+            </div>
+          )}
           {sceneEmpty && !playing && !stageSheet && (
             <EmptyState
+              onDescribe={() => document.getElementById("describe")?.focus()}
               onDrawPipe={() => setActiveTool("pipe")}
               onBrowseAssets={() => openEngine("build")}
               onImport={importAsset}
