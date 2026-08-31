@@ -22,6 +22,8 @@ import {
   type AssetLabStage,
 } from "../../src/panels/AssetLabPanel";
 import { STAGE_MIN } from "../../src/app/layout";
+import { CommandPalette } from "../../src/panels/CommandPalette";
+import { selectionCommands } from "../../src/app/selectionCommands";
 import { StageMarquee } from "../../src/app/StageMarquee";
 import { BindingGraph } from "../../src/graph/BindingGraph";
 import { Icon, iconTokens } from "../../src/theme/icons";
@@ -179,6 +181,13 @@ export type Scene = {
    *  did nothing would photograph the default state under a caption claiming another, which is worse
    *  than no capture at all. */
   click?: string[];
+  /** Text typed into a control the clicks reached, as `[selector, value]` pairs, after every click.
+   *
+   *  `page.$` searches the whole document rather than the frame, so this reaches a field inside a
+   *  PORTALLED dialog — which is where a command palette's query and a dialog's search have always
+   *  lived. The driver selects the field's existing contents first, so two scenes typing into the
+   *  same selector cannot depend on which ran before. */
+  type?: [selector: string, value: string][];
   setup?: () => void;
   render: () => ReactNode;
 };
@@ -1017,6 +1026,7 @@ export const SCENES: Scene[] = [
   ...inspectorScenes(),
   ...assetScenes(),
   ...modelScenes(),
+  ...selectionVerbScenes(),
   ...shellScenes(),
   ...selectionScenes(),
 ];
@@ -1607,6 +1617,68 @@ function shell(
     },
     render: () => <App />,
   };
+}
+
+/** THE PALETTE IS WHERE A CAPABILITY WITH NO GESTURE IS FOUND (ADR-176).
+ *
+ *  Three of the four selection verbs have no gesture and none could be invented — "everything",
+ *  "nothing", "the rest" are not shapes you can draw on a stage — and the fourth asks a question about
+ *  what the objects ARE rather than where they are, which a rectangle cannot ask either. So the
+ *  palette is not a convenience route to these; it is the only route, and whether the group reads as a
+ *  group is the whole of whether they are discoverable.
+ *
+ *  The rows come from `selectionCommands`, the same exported function `App` spreads into its own list,
+ *  so this photographs the SHIPPED rows rather than a copy of them that agrees with the product today.
+ *  A vitest case can assert the four rows exist; only a capture answers whether a person scanning the
+ *  palette sees them as one group, with descriptions that fit and a refusal that is readable. */
+function selectionVerbScenes(): Scene[] {
+  return [
+    {
+      id: "palette-selection",
+      looking_for:
+        "the Selection group as a user meets it: four verbs under one heading, each with a " +
+        "plain-language description; `Select all` printing its own Ctrl A on the row, which is where a " +
+        "chord is learned; and the two that need a selection DISABLED with their reasons in words — " +
+        "`Nothing is selected`, `Select an object first` — rather than silently inert. What a reader " +
+        "checks: the four labels are distinguishable at a glance, no description wraps into its " +
+        "neighbour, and the disabled rows are legible rather than merely faded",
+      viewport: { width: 900, height: 560 },
+      expect: {
+        present: [
+          ["[data-testid='command-palette']", 1],
+          ["[data-testid='command-palette'] [role='option']", 4],
+        ],
+        text_present: [
+          "Selection",
+          "Select all",
+          "Select none",
+          "Invert selection",
+          "Select similar",
+          // The two refusals, in words. A disabled row that does not say why is `<ux_quality>` 4 and 6.
+          "Nothing is selected",
+          "Select an object first",
+        ],
+        text_absent: ["null", "undefined", "NaN"],
+        // A description that ran off the dialog would still satisfy `text_present`, because
+        // `textContent` does not know where anything is.
+        unclipped: ["[data-testid='command-palette']"],
+      },
+      render: () => (
+        <CommandPalette
+          open
+          onClose={() => {}}
+          commands={selectionCommands({
+            apply: () => {},
+            say: () => {},
+            // The state a fresh shell is in, which is when a user is most likely to be looking for
+            // these — and therefore the state whose refusals have to be readable.
+            hasSelection: false,
+            sceneEmpty: false,
+          })}
+        />
+      ),
+    },
+  ];
 }
 
 /** A function, not a `const`, purely so the shell scenes can be *read* after the panel scenes while
