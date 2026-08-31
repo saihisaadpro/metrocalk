@@ -259,3 +259,103 @@ fn an_incompatible_fingerprint_log_is_discarded() {
     );
     log_b.clear();
 }
+
+#[test]
+fn a_placed_camera_survives_a_fresh_process_via_replay_log() {
+    // ADR-192, and the half `pillar_persistence` cannot reach. That test proves a `.mtk` written to
+    // disk and reopened; THIS one proves the editor-SESSION restore, which is a different mechanism
+    // entirely — a deterministic re-seed plus a replay of the append-only log through the same commit
+    // pipeline. The two are the only two ways a placed camera can come back, and until this test the
+    // replay arm was a code path nothing executed.
+    //
+    // THE POSE IS IN THE RECORD ON PURPOSE. "The camera the viewport was at" is render state: the
+    // orbit is not in the document, so a record carrying the GESTURE would replay "shoot from this
+    // view" against wherever the camera happens to be during a replay and film a different shot every
+    // time. This test would pass on that design too, which is why it also asserts the exact numbers.
+    let log = Log::open(tmp("persist-placed-camera"), fp());
+    log.clear();
+
+    let placed = metrocalk_animation::shot::ShotCamera {
+        eye: [7.4, 2.9, -5.1],
+        look_at: [0.2, 1.35, 0.4],
+        fov_deg: 38.5,
+    };
+
+    // "Run A": author a two-shot cut and place a camera on the second one.
+    let (mut a, _scene_a, bar, _provider) = make();
+    for kind in ["establish", "hero"] {
+        let (ops, _) = metrocalk_editor_shell::add_shot_ops(&a, bar, kind, bar).expect("shot");
+        a.commit("cinema-shot", ops).expect("shot commits");
+        log.append(&Record::CinemaShot {
+            id: bar.to_loro_key(),
+            shot: kind.to_string(),
+            subject: Some(bar.to_loro_key()),
+        });
+    }
+    let (ops, _) = metrocalk_editor_shell::set_shot_camera_ops(&a, bar, 1, placed).expect("places");
+    a.commit("cinema-camera", ops).expect("camera commits");
+    log.append(&Record::CinemaShotCamera {
+        id: bar.to_loro_key(),
+        index: 1,
+        camera: Some(placed),
+    });
+    drop(a);
+
+    // "Run B": a fresh process.
+    let (b, applied, skipped) = relaunch(&log);
+    assert_eq!(
+        (applied, skipped),
+        (3, 0),
+        "two shots and one camera replayed"
+    );
+    let cut = metrocalk_editor_shell::cutscene_of(&b, bar);
+    assert_eq!(cut.shots.len(), 2, "the cut itself came back");
+    assert_eq!(
+        cut.shots[1].camera,
+        Some(placed),
+        "the placed camera came back"
+    );
+    assert_eq!(
+        cut.shots[0].camera, None,
+        "the shot beside it is still on its card"
+    );
+    log.clear();
+
+    // ...and the CLEAR replays too, netting the pose back out — the undo of the gesture is as durable
+    // as the gesture.
+    let log = Log::open(tmp("persist-cleared-camera"), fp());
+    log.clear();
+    let (mut a, _scene_a, bar, _provider) = make();
+    let (ops, _) = metrocalk_editor_shell::add_shot_ops(&a, bar, "hero", bar).expect("shot");
+    a.commit("cinema-shot", ops).expect("shot commits");
+    log.append(&Record::CinemaShot {
+        id: bar.to_loro_key(),
+        shot: "hero".to_string(),
+        subject: Some(bar.to_loro_key()),
+    });
+    let (ops, _) = metrocalk_editor_shell::set_shot_camera_ops(&a, bar, 0, placed).expect("places");
+    a.commit("cinema-camera", ops).expect("camera commits");
+    log.append(&Record::CinemaShotCamera {
+        id: bar.to_loro_key(),
+        index: 0,
+        camera: Some(placed),
+    });
+    let (ops, _) = metrocalk_editor_shell::clear_shot_camera_ops(&a, bar, 0).expect("clears");
+    a.commit("cinema-camera", ops).expect("clear commits");
+    log.append(&Record::CinemaShotCamera {
+        id: bar.to_loro_key(),
+        index: 0,
+        camera: None,
+    });
+    drop(a);
+
+    let (b, applied, skipped) = relaunch(&log);
+    assert_eq!(
+        (applied, skipped),
+        (3, 0),
+        "shot, place and clear all replayed"
+    );
+    let cut = metrocalk_editor_shell::cutscene_of(&b, bar);
+    assert_eq!(cut.shots[0].camera, None, "the clear replayed too");
+    log.clear();
+}

@@ -14,8 +14,33 @@
 //
 // The claim is `P == V` and `P` far from `C`. A feature that stored a pose, captioned a row and
 // changed no pixels would pass a DOM assertion and fail this one.
+//
+// EVERY CAMERA MEASUREMENT HERE IS TAKEN WITH THE SAME STAGE RECTANGLE, and that is a correctness
+// requirement rather than tidiness. A cut delivered `viewport` is composed for the visible stage
+// (ADR-166), so `fit_distance` reads `composition_aspect()` — and OPENING THE BOTTOM DOCK CHANGES IT.
+// The first version of this spec measured the card before opening the dock and compared it with a
+// measurement taken after, then reported that clearing a placed camera came back 0.53 units off. The
+// engine was right and the test was comparing two different frames; the dock is opened before the
+// first probe now, and this is the `<window-scope-image-metrics>` "wrong rectangle" trap arriving
+// from the camera side.
 
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { invoke } from "../pages/scaffold.js";
+
+const dir = path.dirname(fileURLToPath(import.meta.url));
+/** Where the two real frames land. Not a screenshot of the DOM — `viewport_capture` asks the RENDER
+ *  thread for its next frame, so what is written is the wgpu composite the author is looking at. */
+const evidence = path.resolve(dir, "../.shots-placedcamera");
+mkdirSync(evidence, { recursive: true });
+
+/** Ask the renderer for the frame that is on the stage right now. */
+const captureFrame = async (name) => {
+  const reply = await invoke("viewport_capture", { path: path.join(evidence, name) });
+  expect(reply.reason).toBeFalsy();
+  return reply;
+};
 
 const click = (selector) =>
   browser.execute((sel) => {
@@ -94,12 +119,27 @@ describe("ADR-192 · shoot from this view", () => {
       timeoutMsg: "the shot never landed",
     });
 
+    // THE STAGE REACHES ITS FINAL SHAPE BEFORE THE FIRST PROBE — see the note at the top of this
+    // file. Everything below compares camera positions, and a `viewport` delivery is composed for
+    // whatever rectangle the docks have left.
+    if (!(await browser.execute(() => !!document.querySelector("#bottom-workspaces-animation-tab")))) {
+      await click('[data-testid="bottom-dock-toggle"]');
+      await browser.pause(400);
+    }
+    expect(await click("#bottom-workspaces-animation-tab")).toBe(true);
+    await browser.pause(600);
+    expect(await clickTabNamed("#bottom-workspaces-animation-panel", "Cutscene")).toBe(true);
+    await (await $('[data-testid="cutscene-timeline"]')).waitForExist({ timeout: 15000 });
+
     // The card's pose, from the runtime that films it — `cinema_preview` is the SAME solver Play
     // uses, which is the only reason this number is evidence about the film and not about a preview.
     await invoke("cinema_preview", { id: subject, seconds: 0, active: true });
     await browser.pause(400);
     card = (await invoke("camera_probe")).eye;
     note(`[card] the hero card films from ${card.map((n) => n.toFixed(2)).join(", ")}`);
+    // THE REAL PIXELS, from the card. Half of the before/after this whole pass exists to produce —
+    // a camera number is a claim about a pose and a frame is the picture it makes.
+    await captureFrame("1-from-the-card.png");
     await invoke("cinema_preview", { id: subject, seconds: 0, active: false });
     await browser.pause(300);
   });
@@ -130,14 +170,6 @@ describe("ADR-192 · shoot from this view", () => {
     note(`[view] the stage is standing at ${view.map((n) => n.toFixed(2)).join(", ")}, ${probe.fovDeg}deg lens`);
 
     // ── the gesture, through the panel's own button ──────────────────────────────────────────────
-    if (!(await browser.execute(() => !!document.querySelector("#bottom-workspaces-animation-tab")))) {
-      await click('[data-testid="bottom-dock-toggle"]');
-      await browser.pause(400);
-    }
-    expect(await click("#bottom-workspaces-animation-tab")).toBe(true);
-    await browser.pause(600);
-    expect(await clickTabNamed("#bottom-workspaces-animation-panel", "Cutscene")).toBe(true);
-    await (await $('[data-testid="cutscene-timeline"]')).waitForExist({ timeout: 15000 });
     expect(await click('[data-testid="cutscene-clip"]')).toBe(true);
     await (await $('[data-testid="cutscene-shoot-here"]')).waitForExist({ timeout: 10000 });
     expect(await click('[data-testid="cutscene-shoot-here"]')).toBe(true);
@@ -168,6 +200,9 @@ describe("ADR-192 · shoot from this view", () => {
     const moved = dist(filmed.eye, card);
     note(`[delta] the placed shot films ${moved.toFixed(2)} units from where its card would`);
     expect(moved).toBeGreaterThan(1.0);
+
+    // ...and the other half of the before/after: the picture from the placed camera.
+    await captureFrame("2-from-the-placed-camera.png");
 
     await invoke("cinema_preview", { id: subject, seconds: 0, active: false });
     await browser.pause(300);
@@ -225,7 +260,8 @@ describe("ADR-192 · shoot from this view", () => {
     await browser.pause(500);
     const back = (await invoke("camera_probe")).eye;
     note(`[cleared] back to ${back.map((n) => n.toFixed(2)).join(", ")}, card was ${card.map((n) => n.toFixed(2)).join(", ")}`);
-    expect(dist(back, card)).toBeLessThan(0.5);
+    // The card's own pose, to a centimetre — the same rectangle, the same solver, the same shot.
+    expect(dist(back, card)).toBeLessThan(0.01);
     expect(dist(back, view)).toBeGreaterThan(1.0);
     await invoke("cinema_preview", { id: subject, seconds: 0, active: false });
   });
