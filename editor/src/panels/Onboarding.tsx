@@ -8,13 +8,21 @@ import { color, elevation, space, z } from "../theme/tokens";
 
 const FLAG = "mtk.onboarded.v1";
 
-function readDismissed(): boolean {
+/** Has this person already put the first-run card away?
+ *
+ *  Exported because the card is a STAGE OCCUPANT, not only a card: it is `position: absolute; bottom`
+ *  inside the viewport, so anything else that wants the bottom of the stage has to know whether it is
+ *  there. ADR-193's frame-guide badge is the first such thing, and it found out the way these are
+ *  always found out - an `.exe` composite with two pills painted over each other. */
+export function onboardingDismissed(): boolean {
   try {
     return localStorage.getItem(FLAG) === "1";
   } catch {
     return false;
   }
 }
+
+const readDismissed = onboardingDismissed;
 
 export interface OnboardingProps {
   /** Workspace-level progressive disclosure. Defaults to true so existing integrations remain compatible. */
@@ -37,6 +45,14 @@ export function Onboarding({ show = true, onStart, onSkip }: OnboardingProps = {
       // Storage may be unavailable in private mode; local state still dismisses for this session.
     }
     setDismissed(true);
+    // The card is a stage occupant, and what yields to it has to learn that it has gone. Announced on
+    // `window` rather than through a store, because `dismissed` is this component's own state and a
+    // store would be a second place it lives - which is how two answers to "is the card up" start.
+    try {
+      window.dispatchEvent(new CustomEvent("mtk:onboarding-dismissed"));
+    } catch {
+      // A DOM that cannot dispatch is a DOM with no stage to occupy.
+    }
     callback?.();
   }
 

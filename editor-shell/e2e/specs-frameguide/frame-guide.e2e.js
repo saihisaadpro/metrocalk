@@ -19,7 +19,8 @@
 // rectangle, to four decimal places. A feature that painted two black bars over the viewport and
 // left the projection alone would pass a screenshot and fail every line below.
 
-import { mkdirSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { invoke } from "../pages/scaffold.js";
@@ -37,6 +38,36 @@ const captureFrame = async (name) => {
   expect(reply.reason).toBeFalsy();
   expect(statSync(file).size).toBeGreaterThan(2000);
   return reply;
+};
+
+/** THE WHOLE COMPOSITE, from the operating system - the only instrument that can see a frame GUIDE.
+ *
+ *  `viewport_capture` crops to the composed rectangle, which is exactly the region a guide leaves
+ *  untouched, so the dim and the hairline are outside every frame it can return. That is a property
+ *  worth having - a still is bit-identical with the guide on - and it means the guide's own pixels
+ *  need the window.
+ *
+ *  `scripts/capture-composited-window.ps1`, not the `.uxtest` foreground helper: it uses
+ *  `PrintWindow` with `PW_RENDERFULLCONTENT`, so it reads THIS window's presentation rather than
+ *  whatever holds the foreground - which on an unattended box has silently produced five PNGs of
+ *  somebody else's application while every functional assertion stayed green. It verifies its own
+ *  output too (the dimensions match the window, and a uniform frame is rejected), and this reads the
+ *  numbers back out so they land in the run's log rather than only in a file nobody opens.
+ */
+const captureWindow = (name) => {
+  const file = path.join(evidence, name);
+  const script = path.resolve(dir, "../scripts/capture-composited-window.ps1");
+  const said = execFileSync(
+    "powershell.exe",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Out", file, "-PreserveWindow"],
+    { encoding: "utf8" },
+  ).trim();
+  const size = /CAPTURED (\d+)x(\d+)/.exec(said);
+  expect(size).toBeTruthy();
+  expect(Number(size[1])).toBeGreaterThan(900);
+  expect(Number(size[2])).toBeGreaterThan(600);
+  expect(statSync(file).size).toBeGreaterThan(20000);
+  return { said };
 };
 
 const click = (selector) =>
@@ -99,7 +130,18 @@ const isDisabled = (selector) =>
 
 const SCOPE = 2.39;
 const VERTICAL = 9 / 16;
-const note = (line) => console.log(line);
+/** Every measurement this file takes, on stdout AND in a file beside the captures.
+ *
+ *  `wdio`'s spec reporter does not surface `console.log` at `logLevel: "error"`, so a run's numbers
+ *  were visible only while it was passing - which is the wrong way round, since a failing run is
+ *  exactly when the numbers are wanted. */
+const log = path.join(evidence, "measurements.txt");
+writeFileSync(log, "", "utf8");
+const note = (line) => {
+  console.log(line);
+  appendFileSync(log, `${line}
+`, "utf8");
+};
 
 describe("ADR-193 · the frame guide", () => {
   let subject;
@@ -111,15 +153,10 @@ describe("ADR-193 · the frame guide", () => {
       async () => browser.execute(() => !!(window.__TAURI__ && window.__TAURI__.core)),
       { timeout: 30000 },
     );
-    await click('[data-testid="stop"]');
-    await browser.pause(500);
-    await browser.execute(() => {
-      document.querySelector('[data-testid="onboardSkip"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
     // THE PREFERENCE PERSISTS BY DESIGN, and the WebView2 profile outlives this process - so a run
     // that ended with the guide hidden would decide whether the next one draws anything at all.
-    // Cleared here rather than in `onPrepare`, which can only reach files beside the executable.
-    // (`<test_and_ci_discipline>` 4: a test resets the persisted state it touches.)
+    // Cleared BEFORE the reload rather than in `onPrepare`, which can only reach files beside the
+    // executable. (`<test_and_ci_discipline>` 4: a test resets the persisted state it touches.)
     await browser.execute(() => {
       try {
         window.localStorage.removeItem("mtk.frameGuide");
@@ -133,6 +170,12 @@ describe("ADR-193 · the frame guide", () => {
       { timeout: 30000 },
     );
     await browser.pause(800);
+    await click('[data-testid="stop"]');
+    await browser.pause(500);
+    await browser.execute(() => {
+      document.querySelector('[data-testid="onboardSkip"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await browser.pause(300);
   });
 
   it("composes for the STAGE while the author frames, which is the defect", async () => {
@@ -140,6 +183,23 @@ describe("ADR-193 · the frame guide", () => {
     await invoke("shape_spawn", { kind: "cylinder", pos: [6, 0.2, -4] });
     await invoke("frame_all");
     expect(subject).toBeTruthy();
+
+    // THE FIRST-RUN CARD ONLY APPEARS ONCE THERE IS A SCENE (`show={!sceneEmpty && …}`), so the Skip
+    // in `before()` above ran against a card that had not been rendered yet. It is dismissed HERE,
+    // after the spawn, because it is the other occupant of the bottom of the stage and the frame
+    // guide's badge deliberately yields to it - leaving it up would make every badge assertion below
+    // a test of the yield rather than of the guide.
+    await browser.waitUntil(
+      async () => {
+        await browser.execute(() => {
+          document
+            .querySelector('[data-testid="onboardSkip"]')
+            ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        });
+        return !(await exists('[data-testid="onboardSkip"]'));
+      },
+      { timeout: 15000, timeoutMsg: "the first-run card never went away" },
+    );
 
     await click('[data-testid="engine-gameplay"]');
     await browser.pause(500);
@@ -171,8 +231,12 @@ describe("ADR-193 · the frame guide", () => {
     expect(probe.frameGuide).toBe(null);
     expect(Math.abs(probe.frameAspect - stage)).toBeLessThan(1e-4);
     expect(probe.frame).toEqual(probe.visibleRect);
-    // And it is nowhere near scope, which is what makes the next test worth running.
-    expect(Math.abs(stage - SCOPE)).toBeGreaterThan(0.3);
+    // AND IT IS NOWHERE NEAR THE FRAME THIS RUN ENDS ON. Measured rather than assumed: this window's
+    // stage is about 2.3:1 with the dock open, which is *nearly* scope - so scope alone would be a
+    // 4% demonstration and a reader could not tell it from noise. 9:16 on a landscape stage is the
+    // case that removes two thirds of the width, and it is the one the last two tests use.
+    expect(Math.abs(stage - VERTICAL)).toBeGreaterThan(0.3);
+    expect(Math.abs(stage - SCOPE)).toBeGreaterThan(2e-3);
   });
 
   it("draws nothing for a cut delivered to the stage's own shape, and says why", async () => {
@@ -211,7 +275,16 @@ describe("ADR-193 · the frame guide", () => {
     expect(fy).toBeGreaterThan(vy + 1e-4);
     // Equal bars, top and bottom — the difference between a frame and a crop.
     expect(Math.abs(fy - vy - (vy + vh - fy - fh))).toBeLessThan(2e-3);
-    note(`[bars]   ${((fy - vy) * 100).toFixed(2)}% above, ${((vy + vh - fy - fh) * 100).toFixed(2)}% below`);
+    // As a fraction of THE STAGE, not of the surface. Both rectangles are surface fractions, and a
+    // bar quoted against the whole window is a number about the docks rather than about the frame.
+    note(`[bars]   ${(((fy - vy) / vh) * 100).toFixed(2)}% above, ${(((vy + vh - fy - fh) / vh) * 100).toFixed(2)}% below, of the stage`);
+
+    // THE GUIDE'S OWN PIXELS. The composite, from the operating system: the delivered picture bright
+    // inside its rectangle, the world above and below it DIMMED rather than cut, a hairline on the
+    // boundary, and the FRAME GUIDE badge on the stage. This is the capture that shows a guide is a
+    // gate and not a crop — no rectangle `viewport_capture` can return contains any of it.
+    const guided = captureWindow("3-the-stage-while-framing-scope.png");
+    note(`[window] ${guided.said}`);
 
     // The way OUT is on the stage, where the bars are — not only in a dock the author may close.
     expect(await exists('[data-testid="frameGuideBadge"]')).toBe(true);
@@ -234,8 +307,17 @@ describe("ADR-193 · the frame guide", () => {
       { timeout: 15000, timeoutMsg: "the pose never reached the document" },
     );
 
-    await invoke("cinema_preview", { id: subject, seconds: 0, active: true });
-    await browser.pause(500);
+    // THE PREVIEW IS ALREADY RUNNING: "Shoot from this view" starts one at the shot's own opening
+    // instant (ADR-192), which is what puts the delivery-framed result on the stage AT the gesture.
+    // Driven through the panel and not by an `invoke`, because the panel owns the preview STORE as
+    // well as the camera — an `invoke` moves the camera and leaves the panel believing it is still
+    // previewing, which is a state no click can produce and which then suppresses the guide for the
+    // rest of the file. (This spec learned that the expensive way: three later tests failed on it.)
+    await browser.waitUntil(async () => (await invoke("camera_probe")).cinematic === true, {
+      timeout: 15000,
+      timeoutMsg: "shooting from this view did not put the shot on the stage",
+    });
+    await browser.pause(400);
     const delivered = await invoke("camera_probe");
     expect(delivered.cinematic).toBe(true);
     note(`[framed] composed in ${framing.frameAspect.toFixed(4)}:1 · [delivered] filmed in ${delivered.frameAspect.toFixed(4)}:1`);
@@ -251,8 +333,16 @@ describe("ADR-193 · the frame guide", () => {
     note(`[file]   the delivered frame is ${shot.width}x${shot.height} (${(shot.width / shot.height).toFixed(3)}:1)`);
     expect(Math.abs(shot.width / shot.height - SCOPE)).toBeLessThan(0.02);
 
-    await invoke("cinema_preview", { id: subject, seconds: 0, active: false });
-    await browser.pause(300);
+    // ...and out through the panel's own toggle, so the store and the camera agree on the way back.
+    expect(await click('[data-testid="cutscene-preview"]')).toBe(true);
+    await browser.waitUntil(async () => (await invoke("camera_probe")).cinematic === false, {
+      timeout: 15000,
+      timeoutMsg: "the preview never handed the camera back",
+    });
+    await browser.waitUntil(async () => (await invoke("camera_probe")).frameGuide === "scope", {
+      timeout: 10000,
+      timeoutMsg: "the guide never came back after the preview",
+    });
   });
 
   it("follows the delivery frame, because the frame is the document's and the guide is not", async () => {
@@ -274,6 +364,13 @@ describe("ADR-193 · the frame guide", () => {
     expect(Math.abs(fy - vy)).toBeLessThan(1e-4);
     expect(fw).toBeLessThan(vw - 1e-3);
     expect(fx).toBeGreaterThan(vx + 1e-4);
+    note(`[bars]   ${(((fx - vx) / vw) * 100).toFixed(2)}% left, ${(((vx + vw - fx - fw) / vw) * 100).toFixed(2)}% right, of the stage`);
+
+    // THE CAPTURE THAT SHOWS A GUIDE AT ALL. Scope on this window's 2.2:1 stage is a 1.5% bar, which
+    // is a correct measurement and an invisible picture; 9:16 on the same stage keeps a quarter of
+    // the width, so this is the frame where a reader can SEE that what is outside the rectangle is
+    // dimmed rather than cut, with a hairline on the boundary.
+    note(`[window] ${captureWindow("5-the-stage-while-framing-vertical.png").said}`);
   });
 
   it("hands the whole stage back from the stage itself, in one click", async () => {
@@ -297,6 +394,10 @@ describe("ADR-193 · the frame guide", () => {
     // landscape window. Same eye, two different pictures.
     const cut = await invoke("cinema_list", { id: subject });
     expect(cut.delivery).toBe("vertical");
+    // The before, from the same instrument as `3-`: the same camera on the same stage with nothing
+    // dimmed, nothing framed and no badge — the state every shot in this engine was composed in
+    // until this pass.
+    note(`[window] ${captureWindow("4-the-stage-with-no-guide.png").said}`);
     const before = await captureFrame("1-composed-without-a-guide.png");
     note(`[unguided] the author is composing a ${(before.width / before.height).toFixed(3)}:1 picture of a 0.563:1 film`);
     expect(Math.abs(before.width / before.height - stage)).toBeLessThan(0.02);

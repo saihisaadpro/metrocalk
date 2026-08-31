@@ -30,7 +30,7 @@ import { Rejections } from "../panels/Rejections";
 import { StatusBar } from "../panels/StatusBar";
 import { ToastHost } from "../panels/ToastHost";
 import { EmptyState } from "../panels/EmptyState";
-import { Onboarding } from "../panels/Onboarding";
+import { Onboarding, onboardingDismissed } from "../panels/Onboarding";
 import { ImportDropOverlay } from "./ImportDropOverlay";
 import { FocusBanner } from "../panels/FocusBanner";
 import { SubjectAimBadge } from "../panels/SubjectAimBadge";
@@ -224,8 +224,12 @@ function PreviewBadge({
  *  dim. Without this, the one control that turns it off lives in the bottom dock, which the author
  *  may have closed; with it, "letterboxed with no way out" is unreachable rather than avoided.
  *
- *  Bottom-centre, unlike Play and Preview: a letterbox guide's own bar is the natural place for it,
- *  and it must not fight the preview badge for the top of the stage. */
+ *  BOTTOM-LEFT, and the position was chosen by a capture rather than by taste. The bottom CENTRE of
+ *  the stage already has two occupants — the first-run card (`Onboarding`, `position: absolute;
+ *  bottom: space.lg`) and the subject-aim badge — and the first real `.exe` composite of this badge
+ *  showed it sitting across the onboarding card, which is `<ux_quality>` 4's overlap exactly. The top
+ *  belongs to Play and Preview. Bottom-left is free, it is still inside the lower bar the guide
+ *  draws, and it is out of the way of a stage the author is actively orbiting. */
 function FrameGuideBadge({ label, onHide }: { label: string; onHide: () => void }) {
   return (
     <div
@@ -236,8 +240,7 @@ function FrameGuideBadge({ label, onHide }: { label: string; onHide: () => void 
       style={{
         position: "absolute",
         bottom: space.lg,
-        left: "50%",
-        transform: "translateX(-50%)",
+        left: space.lg,
         zIndex: z.badge,
         display: "flex",
         alignItems: "center",
@@ -280,6 +283,13 @@ export function App() {
   // Read here, not inside the badge, for the reason the preview state is: the badge stays a pure
   // presentation component a test can render with any state, including states the store cannot reach.
   const frameGuide = useFrameGuide();
+  // Whether the first-run card is still holding the bottom of the stage — see the frame-guide badge.
+  const [onboarded, setOnboarded] = useState(onboardingDismissed);
+  useEffect(() => {
+    const done = () => setOnboarded(true);
+    window.addEventListener("mtk:onboarding-dismissed", done);
+    return () => window.removeEventListener("mtk:onboarding-dismissed", done);
+  }, []);
   // The M3.3 right-click context menu, opened for an entity at a cursor position.
   const [ctx, setCtx] = useState<{ id: string; x: number; y: number } | null>(null);
   // M3.3 focus mode — the framed entity + its camera distance (read from `focus_debug`); drives the banner.
@@ -1217,8 +1227,15 @@ export function App() {
           {/* ADR-193 — the stage is drawing a delivery frame. `drawn` and not `wanted`: the preference
               is the author's standing answer, this is what the stage is ACTUALLY showing, and a badge
               driven by the preference would claim a guide on a stage with no cutscene selected. Never
-              while Play holds the camera — the guide is not drawn then either. */}
-          {!playing && frameGuide.drawn && (
+              while Play holds the camera — the guide is not drawn then either.
+
+              AND NEVER UNDER ANOTHER OCCUPANT OF THE BOTTOM OF THE STAGE. There are two — the aim
+              badge and the first-run card — and a 520px card leaves no room for a 230px pill beside
+              it on a stage this narrow, so position alone cannot separate them. Both are transient
+              and both are asking a question; a guide is standing state whose control is two clicks
+              away, so the guide is the one that waits. Not a hypothetical: the first `.exe`
+              composite of this badge had it painted across the onboarding card. */}
+          {!playing && !aimActive && onboarded && frameGuide.drawn && (
             <FrameGuideBadge
               label={frameGuide.drawn.label}
               onHide={() => {
