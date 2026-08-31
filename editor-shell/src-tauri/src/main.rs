@@ -20286,6 +20286,61 @@ fn focus_entity(state: State<AppState>, id: String) {
     }
 }
 
+/// What framing the selection actually did — enough for the caller to report it without asking again.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct FocusOutcome {
+    /// How many of the selection were live enough to frame. `0` ⇒ nothing happened.
+    framed: usize,
+    /// The orbit distance the camera settled at — the number `focus_debug` used to be asked for.
+    distance: f32,
+    /// The primary, so a banner naming one object still has a name to use.
+    primary: Option<String>,
+}
+
+/// **Frame the WHOLE selection** (ADR-194) — the `F` key, the viewport toolbar's frame button and the
+/// context menu's *Focus* row, all of which said "the selection" and framed one member of it.
+///
+/// Each of the three used to resolve an id through `gizmo_selected()` — which returns the PRIMARY —
+/// and hand it to `focus_entity`. Select fourteen bolts, press `F`, and the camera dived onto whichever
+/// one was primary while the other thirteen stayed lit outside the frame. The engine has held the whole
+/// selection since ADR-176; only the camera was single-valued.
+///
+/// Takes no argument for the reason `selection_ids` takes none: the engine owns the selection, and a
+/// front end restating it would be a second answer to a question that already has one. That also makes
+/// this **one** IPC where the callers spent two or three (a `gizmo_selected` read, the framing, and in
+/// the menu's case a `focus_debug` read for the banner) — the outcome carries what they asked for.
+#[tauri::command]
+fn focus_selection(state: State<AppState>) -> FocusOutcome {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    let mut selection = state.selection.lock().unwrap();
+    // Reconcile first for the same reason `selection_ids` does: a caller must never be framed onto an
+    // id the scene has already lost.
+    scene_pick::reconcile(&mut st, &mut selection);
+    let ids = scene_pick::selected_ids(&selection);
+    let slots: Vec<usize> = ids
+        .iter()
+        .filter_map(|id| scene_pick::slot_of_id(&st, id))
+        .collect();
+    let primary = slots
+        .first()
+        .and_then(|i| st.ids.get(*i).cloned())
+        .or_else(|| ids.first().cloned());
+    if !st.focus_on_slots(&slots) {
+        return FocusOutcome {
+            framed: 0,
+            distance: st.distance,
+            primary: None,
+        };
+    }
+    FocusOutcome {
+        framed: slots.len(),
+        distance: st.distance,
+        primary,
+    }
+}
+
 /// Tell the renderer which part of the window the viewer can actually SEE, in window fractions.
 ///
 /// The wgpu surface is the whole window and the editor UI is composited over it, showing the 3D through
@@ -25619,6 +25674,7 @@ fn main() {
             delete_deactivate_many,
             pick_diagnostics,
             focus_entity,
+            focus_selection,
             set_viewport_rect,
             unfocus,
             focus_debug,

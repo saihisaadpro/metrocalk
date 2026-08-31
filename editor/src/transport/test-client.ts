@@ -135,6 +135,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     removeEntity: vi.fn(),
     duplicateEntity: () => Promise.resolve(null),
     focusEntity: vi.fn(),
+    focusSelection: vi.fn(() => Promise.resolve({ framed: 1, distance: 4, primary: "e1" })),
     reportViewportRect: vi.fn(),
     makeDynamic: () => Promise.resolve(true),
     makeStatic: () => Promise.resolve(true),

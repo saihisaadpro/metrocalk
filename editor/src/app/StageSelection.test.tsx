@@ -36,6 +36,12 @@ interface Spies {
   peek: ReturnType<typeof vi.fn>;
   /** The gizmo-handle probe. A HIT suppresses the click, so WHEN it is armed is a selection question. */
   gizmoPickDrag: ReturnType<typeof vi.fn>;
+  /** Framing the WHOLE selection (ADR-194) — one command where three surfaces used to spend two or
+   *  three, each of them framing the primary under copy that said "the selection". */
+  focusSelection: ReturnType<typeof vi.fn>;
+  /** The read that used to be spent finding a single id to frame. Watched because NOT calling it is
+   *  half the improvement. */
+  gizmoSelected: ReturnType<typeof vi.fn>;
   /** The release that COMMITS a gizmo move as one transaction. Watched because a click that never
    *  dragged must not write one, and a drag started by a late probe must not be left without one. */
   gizmoDragEnd: ReturnType<typeof vi.fn>;
@@ -67,13 +73,17 @@ vi.mock("../transport/session", async (importOriginal) => {
       client.gizmoPickDrag = gizmoPickDrag as unknown as typeof client.gizmoPickDrag;
       const gizmoDragEnd = vi.fn();
       client.gizmoDragEnd = gizmoDragEnd as unknown as typeof client.gizmoDragEnd;
+      const focusSelection = vi.fn(() => Promise.resolve({ framed: 4, distance: 22.5, primary: "hit-1" }));
+      client.focusSelection = focusSelection as unknown as typeof client.focusSelection;
+      const gizmoSelected = vi.fn(() => Promise.resolve("hit-1" as string | null));
+      client.gizmoSelected = gizmoSelected as unknown as typeof client.gizmoSelected;
       client.selectEntities = select as unknown as typeof client.selectEntities;
       client.deleteDeactivateMany = del as unknown as typeof client.deleteDeactivateMany;
       client.undo = undo as unknown as typeof client.undo;
       client.viewportPick = pick as unknown as typeof client.viewportPick;
       client.viewportPickRegion = region as unknown as typeof client.viewportPickRegion;
       client.selectionIds = selectionIds as unknown as typeof client.selectionIds;
-      sessions.push({ pick, region, selectionIds, undo, select, del, candidates, peek, gizmoPickDrag, gizmoDragEnd });
+      sessions.push({ pick, region, selectionIds, undo, select, del, candidates, peek, gizmoPickDrag, gizmoDragEnd, focusSelection, gizmoSelected });
       return client;
     },
   };
@@ -791,5 +801,55 @@ describe("the press that is still a click", () => {
       fireEvent.click(viewport, { clientX: 560, clientY: 440 });
     });
     expect(s.pick).not.toHaveBeenCalled();
+  });
+});
+
+/** **F frames the SELECTION, and shows the way back out** (ADR-194). */
+describe("framing what is selected", () => {
+  it("frames the whole set in one command and names the count", async () => {
+    render(<App />);
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: "f" });
+      await Promise.resolve();
+    });
+
+    expect(spies().focusSelection).toHaveBeenCalledTimes(1);
+    // The read this replaced: `gizmo_selected()` returned the PRIMARY, and the camera dived onto that
+    // one while the rest of the selection stayed lit outside the frame.
+    expect(spies().gizmoSelected).not.toHaveBeenCalled();
+    await waitFor(() => expect(uiStore.getState().status).toBe("framed all 4 selected objects"));
+  });
+
+  it("raises the banner F used to enter focus mode without", async () => {
+    render(<App />);
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: "f" });
+      await Promise.resolve();
+    });
+    // Focus greys every unselected object. Without a banner the shell's own Escape branch — which is
+    // gated on this state — never fired, so the dim had no advertised exit at all.
+    const banner = await screen.findByTestId("focusbanner");
+    expect(banner.getAttribute("data-dist")).toBe("22.5");
+    expect(banner.textContent).toContain("4 objects");
+
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      await Promise.resolve();
+    });
+    expect(screen.queryByTestId("focusbanner")).toBeNull();
+    expect(uiStore.getState().status).toBe("focus cleared");
+  });
+
+  it("frames nothing without claiming it did", async () => {
+    render(<App />);
+    spies().focusSelection.mockImplementation(() =>
+      Promise.resolve({ framed: 0, distance: 60, primary: null }),
+    );
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: "f" });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(uiStore.getState().status).toBe("select something to frame"));
+    expect(screen.queryByTestId("focusbanner")).toBeNull();
   });
 });

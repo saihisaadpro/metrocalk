@@ -14,6 +14,7 @@ import type {
   SelectionActions,
   AddResponse,
   PickCandidate,
+  FocusOutcome,
   AuthoredMatch,
   CatalogItem,
   CookedMatch,
@@ -229,6 +230,13 @@ export interface EditorClient {
   duplicateEntity(id: string): Promise<string | null>;
   /** Frame the camera on an entity (M3.3) — no mutation. */
   focusEntity(id: string): void;
+  /** Frame the camera on the WHOLE selection (ADR-194) — no mutation, no argument.
+   *
+   *  The engine has held the selection since ADR-176, so restating it here would be a second answer to
+   *  a question that already has one — and the three callers that used to spend a `gizmoSelected()`
+   *  read to find a single id then framed only that one. The outcome carries the count and the
+   *  distance, so a caller reports what happened without asking again. */
+  focusSelection(): Promise<FocusOutcome>;
   /**
    * Tell the renderer which fraction of the window the 3D is actually visible through.
    *
@@ -885,6 +893,12 @@ export class TauriClient implements EditorClient {
   }
   focusEntity(id: string): void {
     void this.core.invoke("focus_entity", { id }).catch((e: unknown) => console.error("focus_entity failed", e));
+  }
+  focusSelection(): Promise<FocusOutcome> {
+    return this.core.invoke<FocusOutcome>("focus_selection").catch((e: unknown) => {
+      console.error("focus_selection failed", e);
+      return { framed: 0, distance: 0, primary: null };
+    });
   }
   reportViewportRect(rect: { x: number; y: number; width: number; height: number }): void {
     void this.core.invoke("set_viewport_rect", rect)
@@ -2549,6 +2563,9 @@ class MockClient implements EditorClient {
     return Promise.resolve(null);
   }
   focusEntity(_id: string): void {}
+  focusSelection(): Promise<FocusOutcome> {
+    return Promise.resolve({ framed: 0, distance: 0, primary: null });
+  }
   reportViewportRect(_rect: { x: number; y: number; width: number; height: number }): void {}
   makeDynamic(_id: string): Promise<boolean> {
     return Promise.resolve(true);

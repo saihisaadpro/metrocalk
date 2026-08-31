@@ -27,3 +27,29 @@ export function selectionSentence(count: number, ids?: readonly string[]): strin
   if (count === 1) return ids?.[0] ? entityLabel(ids[0]) : "1 object selected";
   return `${count} objects selected`;
 }
+
+/** What framing the selection did, said the same way in all three places it can be asked for
+ *  (ADR-194): the `F` key, the viewport toolbar's frame button, the context menu's *Focus* row.
+ *
+ *  All three used to say "framed the selection" while framing the primary — a sentence that was
+ *  literally true of a single-object selection and false of every other, with nothing on screen to
+ *  tell the two apart. The count is now the sentence, because the count is exactly the fact that was
+ *  being hidden. Nothing framed says what to do about it rather than reporting a framing that did not
+ *  happen (`<ux_quality>` 6). */
+export function focusSentence(outcome: { framed: number; primary?: string | null }): string {
+  if (outcome.framed <= 0) return "select something to frame";
+  if (outcome.framed === 1) {
+    return outcome.primary ? `framed ${entityLabel(outcome.primary)}` : "framed 1 object";
+  }
+  return `framed all ${outcome.framed} selected objects`;
+}
+
+/** What the focus banner calls what it is focused on — the noun phrase, without the verb.
+ *
+ *  Split from [`focusSentence`] rather than parsed out of it: the status line reports an EVENT that
+ *  just happened and the banner names a STATE that is still true, and a banner reading "framed all 14
+ *  selected objects" for as long as focus lasts is a report stuck in the past tense. */
+export function focusSubject(outcome: { framed: number; primary?: string | null }): string {
+  if (outcome.framed === 1 && outcome.primary) return entityLabel(outcome.primary);
+  return `${outcome.framed} objects`;
+}

@@ -28,6 +28,7 @@ import { Hierarchy } from "../../src/panels/Hierarchy";
 import { LookSection } from "../../src/panels/LookSection";
 import { selectionCommands } from "../../src/app/selectionCommands";
 import { StageMarquee } from "../../src/app/StageMarquee";
+import { FocusBanner } from "../../src/panels/FocusBanner";
 import { BindingGraph } from "../../src/graph/BindingGraph";
 import { Icon, iconTokens } from "../../src/theme/icons";
 import { Inspector } from "../../src/inspector/Inspector";
@@ -1099,6 +1100,43 @@ function selectionScenes(): Scene[] {
             origin={{ left: 0, top: 0 }}
             mode="touch"
           />
+        </div>
+      ),
+    },
+    {
+      id: "focus-banner-subject",
+      looking_for:
+        "THE ONE SURFACE THAT SAYS WHAT FOCUS IS ON (ADR-194), in its two states. Above: focus on a " +
+        "set — `Focused: 14 objects`, because framing takes the whole selection now and there is no " +
+        "single entity to name. Below: focus on one thing, named the way every other surface names " +
+        "it. What a reader checks: neither banner prints a raw loro key (`1_4a3f`), which is what " +
+        "this control did in every previous capture of the shell and is exactly what `selectionText` " +
+        "exists to prevent; the exit affordance (`· Esc to exit`) is legible as secondary rather " +
+        "than competing with the subject; and a long real assembly name is truncated with an " +
+        "ellipsis inside the pill rather than pushing `Esc to exit` off the end of it",
+      viewport: { width: 760, height: 240 },
+      expect: {
+        present: [["[data-testid='focusbanner']", 2]],
+        text_present: ["14 objects", "Overhead Crane Assembly Rev C", "Esc to exit"],
+        // The id vocabulary is what must NOT be here — the banner used to print `id` verbatim.
+        text_absent: ["1_4a3f", "null", "undefined", "NaN"],
+        unclipped: ["[data-testid='focusbanner']"],
+      },
+      render: () => (
+        <div style={{ width: 760, height: 240, display: "grid", gridTemplateRows: "1fr 1fr" }}>
+          {/* The banner is `position: fixed` — it pins itself under the header of the real shell. A
+              `transform` makes each cell its own containing block, so two of them can be photographed
+              in one frame without landing on top of each other. */}
+          <div style={{ transform: "translate(0)", position: "relative" }}>
+            <FocusBanner subject="14 objects" dist={62.5} onClear={() => {}} />
+          </div>
+          <div style={{ transform: "translate(0)", position: "relative" }}>
+            <FocusBanner
+              subject="Overhead Crane Assembly Rev C — Long Travel Girder"
+              dist={8.25}
+              onClear={() => {}}
+            />
+          </div>
         </div>
       ),
     },

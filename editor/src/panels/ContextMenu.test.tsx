@@ -8,10 +8,14 @@ import { afterEach, expect, test, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ContextMenu } from "./ContextMenu";
 import { projectionStore } from "../store/projection";
+import { toastStore } from "../store/toasts";
 import { fakeClient } from "../transport/test-client";
 import type { ActionItem, EntityProjection, SelectionActions } from "../transport/protocol";
 
-afterEach(() => projectionStore.getState().reset());
+afterEach(() => {
+  projectionStore.getState().reset();
+  toastStore.getState().reset();
+});
 
 /** An action the way the engine states it — `appliesTo` IS the availability (ADR-183). */
 const act = (action: string, label: string, appliesTo: number, mutates: boolean, reason?: string): ActionItem => ({
@@ -161,20 +165,49 @@ test("Select similar refuses WITH a reason when the object has nothing to match 
   expect(selectEntities).not.toHaveBeenCalled();
 });
 
-test("focus action routes to client.focusEntity(primary) and closes", async () => {
+test("focus frames the WHOLE selection, in one command, and closes", async () => {
+  // The row used to call `focusEntity(primary)` and then `focusDebug()` for the banner's number — a set
+  // of three framed one of them, in three round trips, under the word "focused" (ADR-194). It now asks
+  // the engine to frame what the engine already knows is selected, and the reply carries the number.
+  const focusSelection = vi.fn(() => Promise.resolve({ framed: 3, distance: 18.5, primary: "e7" }));
   const focusEntity = vi.fn();
+  const focusDebug = vi.fn(() => Promise.resolve([0, false] as [number, boolean]));
   const onClose = vi.fn();
+  const onFocus = vi.fn();
   const client = fakeClient({
-    entityActionsFor: () => Promise.resolve(answer(1, [act("focus", "Focus", 1, false)])),
+    entityActionsFor: () => Promise.resolve(answer(3, [act("focus", "Focus", 3, false)])),
+    focusSelection,
     focusEntity,
+    focusDebug,
   });
 
-  render(<ContextMenu client={client} ids={["e7"]} onClose={onClose} />);
+  render(<ContextMenu client={client} ids={["e7", "e8", "e9"]} onClose={onClose} onFocus={onFocus} />);
   const rows = await screen.findAllByTestId("ctxitem");
   fireEvent.click(rows.find((r) => r.dataset.action === "focus")!);
 
-  expect(focusEntity).toHaveBeenCalledWith("e7");
+  expect(focusSelection).toHaveBeenCalledTimes(1);
+  expect(focusEntity).not.toHaveBeenCalled();
+  expect(focusDebug).not.toHaveBeenCalled();
   expect(onClose).toHaveBeenCalledTimes(1);
+  // The banner names the SET and gets the distance the framing itself chose.
+  await waitFor(() => expect(onFocus).toHaveBeenCalledWith("3 objects", 18.5));
+});
+
+test("focus that frames nothing says so instead of raising a banner over an unchanged camera", async () => {
+  // A stale list can name rows the render state has already lost. `framed: 0` means the camera did not
+  // move, and a banner claiming a focus the engine did not enter is the `<ux_quality>` 6 defect.
+  const onFocus = vi.fn();
+  const client = fakeClient({
+    entityActionsFor: () => Promise.resolve(answer(1, [act("focus", "Focus", 1, false)])),
+    focusSelection: vi.fn(() => Promise.resolve({ framed: 0, distance: 60, primary: null })),
+  });
+
+  render(<ContextMenu client={client} ids={["gone"]} onClose={() => {}} onFocus={onFocus} />);
+  const rows = await screen.findAllByTestId("ctxitem");
+  fireEvent.click(rows.find((r) => r.dataset.action === "focus")!);
+
+  await waitFor(() => expect(toastStore.getState().toasts.at(-1)?.text).toBe("select something to frame"));
+  expect(onFocus).not.toHaveBeenCalled();
 });
 
 test("arrow keys rove focus across all explained actions; Home, End, and Escape follow the menu pattern", async () => {

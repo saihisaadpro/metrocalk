@@ -44,7 +44,7 @@ import type { PickCandidate } from "../transport/protocol";
 import { isMarqueeDrag, marqueeBox, marqueeMode, marqueeResult } from "./marquee";
 import { armsGizmoDrag, beganDrag, lateProbeNeedsDragEnd, type GizmoProbe } from "./stageGesture";
 import { StageMarquee } from "./StageMarquee";
-import { selectionSentence, entityLabel } from "../store/selectionText";
+import { selectionSentence, entityLabel, focusSentence, focusSubject } from "../store/selectionText";
 import { deleteSelection } from "./deleteSelection";
 import { selectAllWith, selectionCommands } from "./selectionCommands";
 import { environmentOutcome } from "./environmentOutcome";
@@ -168,8 +168,13 @@ export function App() {
   // `candidates` is what `pick_candidates` answered for the point the menu was opened at (ADR-191) —
   // the one fact a right-click carries that no other surface has.
   const [ctx, setCtx] = useState<{ ids: string[]; x: number; y: number; candidates: PickCandidate[] } | null>(null);
-  // M3.3 focus mode — the framed entity + its camera distance (read from `focus_debug`); drives the banner.
-  const [focused, setFocused] = useState<{ id: string; dist: number } | null>(null);
+  // M3.3 focus mode — WHAT was framed and how near the camera got; drives the banner.
+  //
+  // A subject rather than an id (ADR-194): focus frames the whole selection, so there may be no single
+  // entity to name, and `focusSentence`/`entityLabel` are the one place the editor decides what to call
+  // what it is acting on. The distance comes back on the framing reply now, so the banner no longer
+  // costs a second `focus_debug` read to learn a number the command already returned.
+  const [focused, setFocused] = useState<{ subject: string; dist: number } | null>(null);
   // Tracks a right-press for the orbit-vs-context-menu movement threshold (the scaffold's disambiguation).
   const rightDrag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   // M9 gizmo handle-drag: set by a left-press that HIT a gizmo handle (so the click doesn't re-pick + the
@@ -559,13 +564,18 @@ export function App() {
       }
       if (k === "f" && !e.ctrlKey && !e.metaKey && !e.altKey && !editing && !pipeActive && !pipeBusy) {
         e.preventDefault();
-        void client.gizmoSelected().then((id) => {
-          if (id) {
-            client.focusEntity(id);
-            setStatus("Framed the selection (F)");
-          } else {
-            setStatus("Select something to frame");
-          }
+        // THE WHOLE SELECTION, AND IN ONE READ (ADR-194). This used to ask `gizmo_selected()` for the
+        // PRIMARY and frame that — so on a marquee of fourteen the camera dived onto one of them while
+        // the other thirteen stayed lit outside the frame, under a status line that said "the
+        // selection". The engine owns the set, so it needs no argument, and the reply says how many it
+        // framed: two IPC become one, and the sentence can name a number instead of a category.
+        void client.focusSelection().then((outcome) => {
+          setStatus(focusSentence(outcome));
+          // AND THE WAY BACK OUT (ADR-194). `F` raised the engine's dim and left no banner, so the
+          // `Escape` branch below — which is gated on this state — never fired: the scene stayed
+          // greyed with the only exit being a menu row the user had no reason to open. Two of the
+          // three routes to Focus were in that state; only the context menu raised the banner.
+          if (outcome.framed > 0) setFocused({ subject: focusSubject(outcome), dist: outcome.distance });
         });
       }
       if (e.key === "Escape") {
@@ -1270,7 +1280,13 @@ export function App() {
               }}
             />
           )}
-          {!playing && !stageSheet && <ViewportToolbar client={client} showTransformTools={false} />}
+          {!playing && !stageSheet && (
+            <ViewportToolbar
+              client={client}
+              showTransformTools={false}
+              onFocus={(subject, dist) => setFocused({ subject, dist })}
+            />
+          )}
           {!playing && !stageSheet && activeTool === "pipe" && (
             <Suspense
               fallback={
@@ -1468,14 +1484,14 @@ export function App() {
               ids={ctx.ids}
               candidates={ctx.candidates}
               onClose={() => setCtx(null)}
-              onFocus={(id, dist) => setFocused({ id, dist })}
+              onFocus={(subject, dist) => setFocused({ subject, dist })}
             />
           </Popover>
         </Suspense>
       )}
       {focused && (
         <FocusBanner
-          id={focused.id}
+          subject={focused.subject}
           dist={focused.dist}
           onClear={() => {
             client.unfocus();

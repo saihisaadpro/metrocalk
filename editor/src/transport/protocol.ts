@@ -197,6 +197,20 @@ export interface PickCandidate {
   selected: boolean;
 }
 
+/** `focus_selection()` — what framing the WHOLE selection actually did (ADR-194).
+ *
+ *  The three routes to Focus each spent an extra read to find one id and then framed only that one,
+ *  while their own copy said "the selection". The engine already holds the set, so the command takes no
+ *  argument; the reply carries what the callers went looking for — how many were framed (`0` means
+ *  nothing was, and the caller must say so rather than claim a framing) and the distance the camera
+ *  settled at, which the context menu used to ask `focus_debug` for in a second round trip. */
+export interface FocusOutcome {
+  framed: number;
+  distance: number;
+  /** The primary, so a banner naming one object still has a name. `null` when nothing was framed. */
+  primary: string | null;
+}
+
 /** `entity_details(id)` — the hover tooltip read (M3.3): name + component names + provided/required caps
  *  + the entities it's bound to. */
 export interface EntityDetails {

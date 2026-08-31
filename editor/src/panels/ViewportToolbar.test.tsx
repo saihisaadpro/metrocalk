@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { fakeClient } from "../transport/test-client";
+import { uiStore } from "../store/ui";
 import { ViewportToolbar } from "./ViewportToolbar";
 
 afterEach(() => vi.useRealTimers());
@@ -172,4 +173,57 @@ test("starts independent live reads together and schedules the next poll only af
 
   unmount();
   vi.useRealTimers();
+});
+
+test("Frame selected frames the WHOLE selection and raises the way back out", async () => {
+  // Two defects in one control (ADR-194). It asked `gizmo_selected()` for the PRIMARY and framed that
+  // one under a status line reading "framed the selection" — and it raised no banner, so the `Escape`
+  // that exits focus (gated on the banner's state in the shell) never fired: framing greyed the scene
+  // and left the only way back inside a context menu.
+  const focusSelection = vi.fn(() => Promise.resolve({ framed: 6, distance: 31.5, primary: "e2" }));
+  const onFocus = vi.fn();
+  render(
+    <ViewportToolbar
+      client={fakeClient({ focusSelection, gizmoDebug: () => Promise.resolve(["translate", true, false, "world", "origin"]) })}
+      showTransformTools={false}
+      onFocus={onFocus}
+    />,
+  );
+  await settleToolbar();
+
+  fireEvent.click(screen.getByTestId("vpView"));
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("vpFrameSel"));
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(focusSelection).toHaveBeenCalledTimes(1);
+  expect(onFocus).toHaveBeenCalledWith("6 objects", 31.5);
+  expect(uiStore.getState().status).toBe("framed all 6 selected objects");
+});
+
+test("Frame selected that frames nothing keeps the banner down and says what to do", async () => {
+  const onFocus = vi.fn();
+  render(
+    <ViewportToolbar
+      client={fakeClient({
+        focusSelection: vi.fn(() => Promise.resolve({ framed: 0, distance: 60, primary: null })),
+        gizmoDebug: () => Promise.resolve(["translate", true, false, "world", "origin"]),
+      })}
+      showTransformTools={false}
+      onFocus={onFocus}
+    />,
+  );
+  await settleToolbar();
+
+  fireEvent.click(screen.getByTestId("vpView"));
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("vpFrameSel"));
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(onFocus).not.toHaveBeenCalled();
+  expect(uiStore.getState().status).toBe("select something to frame (F)");
 });

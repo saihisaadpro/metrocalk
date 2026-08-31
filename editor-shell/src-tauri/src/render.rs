@@ -1581,17 +1581,62 @@ impl SceneState {
         }
         self.selected = Some(i);
         self.instances[i].selected = 1.0;
+        self.focus_on_slots(&[i]);
+    }
+
+    /// **Frame a SET, by the union of what it contains** (ADR-194) — the camera half of Focus, with no
+    /// opinion about what is selected.
+    ///
+    /// `focus_on` used to be the only way in, and it takes ONE index. Every route to Focus — the `F`
+    /// key, the viewport toolbar's frame button, the context menu's *Focus* row — resolved that index
+    /// through `gizmo_selected()`, which returns the PRIMARY. So all three said "framed the selection"
+    /// in their own copy and framed one member of it: select fourteen bolts, press `F`, and the camera
+    /// dives onto whichever one happened to be primary while the other thirteen — still lit, because
+    /// the shader's dim is per-instance and already correct for a set — sit outside the frame. Same
+    /// shape as ADR-183's menu, which named a set and deleted one of it.
+    ///
+    /// The dim needs no change: `reconcile` writes `selected = 1.0` on every member, and the shader
+    /// keeps every lit instance out of the dim. Only the CAMERA was single-valued.
+    ///
+    /// The fit is deliberately the same arithmetic a single entity has always used, applied to the
+    /// union box rather than to one member's — so focusing one thing is unchanged to the last float,
+    /// and focusing many cannot be framed by a rule the one-object case does not obey. It is
+    /// conservative for a long, thin set seen end-on (it fits the largest half-extent against the
+    /// vertical rather than resolving the box against the camera basis the way
+    /// `fit_distance_in_viewport` does): the error is always "too far", never a crop.
+    ///
+    /// Returns `false` — and changes nothing at all — when the set names no live instance, so a
+    /// caller can say "select something to frame" rather than reporting a framing that did not happen.
+    pub fn focus_on_slots(&mut self, slots: &[usize]) -> bool {
         // Center and size come from the real authored geometry. This is essential for offset meshes and for
         // CAD whose vertices are in millimetres while its instance scale is 0.001.
-        let local_bounds = self
-            .mesh_slots
-            .get(i)
-            .and_then(|slot| usize::try_from(*slot).ok())
-            .and_then(|slot| self.local_bounds_for_slot(slot))
-            .unwrap_or(LocalBounds::UNIT_CUBE);
-        let (world_lo, world_hi) = instance_world_bounds(&self.instances[i], local_bounds);
-        // Get nearby: save the framing once, then zoom to ~4× the entity's half-extent, clamped to the
-        // orbit range so a huge or tiny entity still lands at a sensible, in-bounds distance.
+        let mut union: Option<(Vec3, Vec3)> = None;
+        for &i in slots {
+            if i >= self.instances.len() {
+                continue;
+            }
+            let local_bounds = self
+                .mesh_slots
+                .get(i)
+                .and_then(|slot| usize::try_from(*slot).ok())
+                .and_then(|slot| self.local_bounds_for_slot(slot))
+                .unwrap_or(LocalBounds::UNIT_CUBE);
+            let (lo, hi) = instance_world_bounds(&self.instances[i], local_bounds);
+            union = Some(match union {
+                None => (lo, hi),
+                Some((u_lo, u_hi)) => (u_lo.min(lo), u_hi.max(hi)),
+            });
+        }
+        let Some((world_lo, world_hi)) = union else {
+            return false;
+        };
+        let primary = slots
+            .iter()
+            .copied()
+            .find(|&i| i < self.instances.len())
+            .unwrap_or(0);
+        // Get nearby: save the framing once, then zoom to ~4× the set's half-extent, clamped to the
+        // orbit range so a huge or tiny subject still lands at a sensible, in-bounds distance.
         if self.pre_focus_distance.is_none() {
             self.pre_focus_distance = Some(if self.distance == 0.0 {
                 60.0
@@ -1617,8 +1662,9 @@ impl SceneState {
         };
         self.cam_target =
             self.target_centred_in_viewport((world_lo + world_hi) * 0.5, self.distance, aspect);
-        self.focused = Some(i);
+        self.focused = Some(primary);
         self.revision = self.revision.wrapping_add(1);
+        true
     }
 
     /// Exit Focus mode ("everything comes back to normal"): clear the focus flag (the shader un-dims
@@ -8759,5 +8805,55 @@ mod tests {
         st.focus_on(9);
         assert_eq!(st.focused, None);
         assert_eq!(st.selected, None);
+    }
+
+    #[test]
+    fn focusing_a_set_frames_all_of_it_not_the_primary() {
+        // Four unit cubes on a 2 m pitch: 0 at x=0 … 3 at x=6. Focusing the outer pair has to frame a
+        // box six metres wide, and its centre is at x=3 — a point where NEITHER member sits.
+        let mut st = scene(4);
+        assert!(st.focus_on_slots(&[0, 3]));
+        assert_eq!(st.cam_target, [3.0, 1.0, 0.0], "the union's centre, not a member's");
+        // half-extent of the union is (3+1) = 4 on x, so 4 × 4 = 16 — four times the distance a single
+        // cube gets, which is the whole difference between seeing the set and diving onto one of it.
+        assert_eq!(st.distance, 16.0);
+        assert_eq!(st.focused, Some(0), "the flag names the first live member");
+    }
+
+    #[test]
+    fn focusing_one_thing_is_unchanged_by_the_set_path() {
+        // The generalization must not move the single-entity case by a float: `focus_on` delegates, so
+        // this is the assertion that the two rules stayed one rule.
+        let mut a = scene(4);
+        a.focus_on(2);
+        let mut b = scene(4);
+        assert!(b.focus_on_slots(&[2]));
+        assert_eq!(a.cam_target, b.cam_target);
+        assert_eq!(a.distance, b.distance);
+        assert_eq!(a.distance, 4.0);
+    }
+
+    #[test]
+    fn focusing_a_set_of_nothing_live_changes_nothing() {
+        // A stale list can name rows the render state has already lost. Framing "the selection" when
+        // none of it is drawable must not move the camera and must SAY so, or the caller reports a
+        // framing that did not happen.
+        let mut st = scene(2);
+        let before = (st.cam_target, st.distance, st.revision);
+        assert!(!st.focus_on_slots(&[7, 9]));
+        assert!(!st.focus_on_slots(&[]));
+        assert_eq!((st.cam_target, st.distance, st.revision), before);
+        assert_eq!(st.focused, None);
+        assert_eq!(st.pre_focus_distance, None, "and nothing was saved to restore");
+    }
+
+    #[test]
+    fn unfocusing_a_set_restores_the_framing_the_set_replaced() {
+        let mut st = scene(4);
+        st.focus_on_slots(&[0, 1, 2, 3]);
+        assert!(st.focused.is_some() && st.distance != 60.0);
+        st.clear_focus();
+        assert_eq!(st.distance, 60.0);
+        assert_eq!(st.cam_target, [0.0, 0.0, 0.0]);
     }
 }

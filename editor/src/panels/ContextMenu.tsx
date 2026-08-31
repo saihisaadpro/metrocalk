@@ -19,7 +19,7 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { projectionStore } from "../store/projection";
-import { entityLabel, selectionSentence } from "../store/selectionText";
+import { entityLabel, selectionSentence, focusSentence, focusSubject } from "../store/selectionText";
 import { setStatus } from "../store/ui";
 import { pushToast, type ToastKind } from "../store/toasts";
 import { PopoverSurface } from "../theme/Popover";
@@ -97,7 +97,9 @@ export function ContextMenu({
   candidates?: PickCandidate[];
   onClose: () => void;
   /** After framing the entity, hand the live camera distance up so App can raise the focus banner. */
-  onFocus?: (id: string, dist: number) => void;
+  /** Raise the focus banner. The SUBJECT, not an id: focus frames the whole selection (ADR-194), so
+   *  there may be no single entity to name. */
+  onFocus?: (subject: string, dist: number) => void;
 }) {
   const [answer, setAnswer] = useState<SelectionActions>(EMPTY);
   const [loadState, setLoadState] = useState<LoadState>("loading");
@@ -247,12 +249,14 @@ export function ContextMenu({
           });
         break;
       case "focus":
-        client.focusEntity(primary);
-        void client
-          .focusDebug()
-          .then(([distance]) => onFocus?.(primary, distance))
-          .catch(() => onFocus?.(primary, 0));
-        feedback(`focused ${entityLabel(primary)}`, "info");
+        // THE WHOLE SELECTION, exactly as `remove` above (ADR-183) and for the same reason (ADR-194).
+        // This row sat in a menu built from a set and framed the primary — through `focus_entity`, and
+        // then spent a THIRD round trip on `focus_debug` to learn the distance the framing had just
+        // chosen. One command now: it frames the union and returns both.
+        void client.focusSelection().then((outcome) => {
+          feedback(focusSentence(outcome), outcome.framed > 0 ? "info" : "error");
+          if (outcome.framed > 0) onFocus?.(focusSubject(outcome), outcome.distance);
+        });
         break;
       case "inspect":
         projectionStore.getState().setSelection(all);

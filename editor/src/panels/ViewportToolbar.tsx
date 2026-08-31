@@ -10,6 +10,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { setStatus } from "../store/ui";
+import { focusSentence, focusSubject } from "../store/selectionText";
 import { Icon } from "../theme/icons";
 import { MenuPopup, PopupMenuGroup, PopupMenuItem } from "../theme/workspace";
 import { color, elevation, font, fontSize, radius, space as sp, z } from "../theme/tokens";
@@ -33,9 +34,13 @@ export interface ViewportToolbarProps {
   client: EditorClient;
   /** Standalone embeds may keep gizmo modes here; the full editor owns them in the primary tool rail. */
   showTransformTools?: boolean;
+  /** Raise the shell's focus banner (ADR-194). Optional because a standalone embed has no banner to
+   *  raise — but without it in the full editor, framing greyed the scene and left no way back: the
+   *  `Escape` handler is gated on the banner's own state. */
+  onFocus?: (subject: string, dist: number) => void;
 }
 
-export function ViewportToolbar({ client, showTransformTools = true }: ViewportToolbarProps) {
+export function ViewportToolbar({ client, showTransformTools = true, onFocus }: ViewportToolbarProps) {
   const [mode, setMode] = useState<Mode>("translate");
   const [hasSel, setHasSel] = useState(false);
   const [space, setSpace] = useState("world");
@@ -105,13 +110,14 @@ export function ViewportToolbar({ client, showTransformTools = true }: ViewportT
     setMode(m);
   };
   const frameSelected = async () => {
-    const sel = await client.gizmoSelected().catch(() => null);
-    if (sel) {
-      client.focusEntity(sel);
-      setStatus("framed the selection");
+    // THE WHOLE SELECTION, IN ONE READ (ADR-194). This asked `gizmo_selected()` for the PRIMARY and
+    // framed that one, under a status line that said "framed the selection" — literally true of a
+    // single-object selection and false of every other, with nothing on screen to tell them apart.
+    const outcome = await client.focusSelection();
+    setStatus(outcome.framed > 0 ? focusSentence(outcome) : "select something to frame (F)");
+    if (outcome.framed > 0) {
+      onFocus?.(focusSubject(outcome), outcome.distance);
       void refresh();
-    } else {
-      setStatus("select something to frame (F)");
     }
   };
   const preset = (p: string) => {
@@ -274,7 +280,7 @@ export function ViewportToolbar({ client, showTransformTools = true }: ViewportT
                 id="vpFrameSel"
                 data-testid="vpFrameSel"
                 label="Frame selected"
-                description="Center the camera on the current object"
+                description="Fit everything selected in the viewport"
                 meta="F"
                 disabled={!hasSel}
                 disabledReason="Select an object to frame it"
