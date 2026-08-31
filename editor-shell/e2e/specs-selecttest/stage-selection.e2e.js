@@ -198,6 +198,26 @@ async function objectPixel() {
   return found;
 }
 
+/** Click a pixel with NOTHING under it, so the selection clears through the same seam a user uses.
+ *
+ *  `viewport_peek` is a read, so this stays inside the file's own rule: every GESTURE goes through the
+ *  UI, and only reads are invoked. The corners are searched because the seeded fixture is a tight
+ *  cluster in the middle — ADR-191's depth histogram measured 98% of it empty. */
+async function clickEmptyPixel() {
+  const size = await browser.execute(() => ({ w: window.innerWidth, h: window.innerHeight }));
+  const found = await browser.execute(async (w, h) => {
+    for (const [fx, fy] of [[0.04, 0.06], [0.96, 0.06], [0.04, 0.94], [0.96, 0.94], [0.5, 0.04]]) {
+      // eslint-disable-next-line no-await-in-loop
+      const hit = await window.__TAURI__.core.invoke("viewport_peek", { x: fx, y: fy });
+      if (!hit) return { x: Math.round(fx * w), y: Math.round(fy * h) };
+    }
+    return null;
+  }, size.w, size.h);
+  if (!found) throw new Error("every probed corner has an object under it — nowhere to click to deselect");
+  await stageClick(found.x, found.y);
+  return found;
+}
+
 /** A ray that meets TWO objects, hunted across the camera presets.
  *
  *  The seeded scene is a golden-angle scatter of separated cubes on a plane, and from the default
@@ -416,11 +436,12 @@ describe("the stage can select more than one thing", () => {
 
     // Ctrl removes — the toggle, and the case whose result the hit alone cannot report.
     //
-    // On object A, not on B, and the reason is the GIZMO: shift-clicking B made it the primary, so
-    // the gizmo is now drawn ON B and a press there hits a handle, which the shell correctly treats
-    // as the start of a drag rather than a pick. Clicking the object the gizmo is standing on is a
-    // different test (it is `gizmoPickDrag`'s), and conflating the two would make this one fail for a
-    // reason that has nothing to do with the toggle.
+    // ON OBJECT A, AND THIS COMMENT USED TO EXPLAIN WHY B WAS UNTESTABLE (ADR-194). Shift-clicking B
+    // made it the primary, so the gizmo is drawn ON B — and a press there hit a handle, which the
+    // shell treated as the start of a drag and swallowed the click. That was not a property of the
+    // gesture, it was the defect: the probe fired on `pointerdown`, before anything could know whether
+    // the press would become a drag. B is now asserted directly, in `the gizmo no longer eats a click`
+    // below; A stays here as the plain case.
     await stageClick(a.x, a.y, { ctrlKey: true });
     await sleep(500);
     const toggled = await engineSelection();
@@ -665,5 +686,109 @@ describe("the stage can select more than one thing", () => {
     }
     if (afterUndo.restored < 2) throw new Error("no mounted row shows the restore at all");
     await shot("08_after_one_undo");
+  });
+  // ── ADR-194: the press that is still a click, and framing the whole selection ────────────────────
+  it("the gizmo no longer eats a click on the object it is standing on", async () => {
+    // THE ASSERTION THE SPEC ABOVE USED TO ROUTE AROUND IN A COMMENT. The gizmo is drawn AT the
+    // selection, so a ctrl-click meant to deselect the selected object lands on a handle — and until
+    // ADR-194 the handle probe fired on `pointerdown`, hit, and made `onClick` return early. Nothing
+    // reached the engine: not a wrong selection, no selection change at all.
+    // Cleared THROUGH THE UI, like everything else here — a click on bare stage deselects, and this
+    // file's own rule is that the only commands it invokes are reads. 98% of the seeded stage is
+    // empty (measured in ADR-191), so a corner is bare; `viewport_peek` confirms it rather than
+    // assuming.
+    await clickEmptyPixel();
+    await sleep(400);
+    const a = await objectPixel();
+    await stageClick(a.x, a.y);
+    await sleep(600);
+    const one = await engineSelection();
+    if (one.length !== 1) throw new Error(`setup: a plain click must select one, got ${JSON.stringify(one)}`);
+    console.log(`  selected ${one[0]}; the gizmo is now drawn on it, at (${a.x}, ${a.y})`);
+
+    // The SAME PIXEL, now with the gizmo on it, ctrl held. Before: nothing happened.
+    await stageClick(a.x, a.y, { ctrlKey: true });
+    await sleep(600);
+    const toggled = await engineSelection();
+    console.log("  ctrl-click on the gizmo's own object ->", toggled.length, JSON.stringify(toggled));
+    if (toggled.length !== 0) {
+      throw new Error(
+        `ctrl-click on the selected object must deselect it; the engine still holds ` +
+          `${JSON.stringify(toggled)} — the handle probe ate the click`,
+      );
+    }
+    await shot("09_ctrl_click_through_the_gizmo");
+  });
+
+  it("F frames the WHOLE selection and shows the way back out", async () => {
+    // Three routes to Focus each framed the PRIMARY under copy that said "the selection", and two of
+    // them raised no banner at all — so the focus dim had no advertised exit, because the shell's
+    // Escape branch is gated on the banner's own state (ADR-194).
+    // The SET is made by a marquee, through the UI — not by invoking `select_entities`, which would
+    // prove a command exists and say nothing about the gesture.
+    const size = await browser.execute(() => ({ w: window.innerWidth, h: window.innerHeight }));
+    await dragBox([Math.round(size.w * 0.2), Math.round(size.h * 0.2)], [Math.round(size.w * 0.8), Math.round(size.h * 0.8)]);
+    await sleep(900);
+    const many = await engineSelection();
+    console.log(`  marquee selected ${many.length}`);
+    if (many.length < 2) throw new Error(`need a SET to prove the union framing, got ${many.length}`);
+
+    // The camera before, so "it framed something" is a measurement rather than a claim.
+    const before = await browser.execute(() => window.__TAURI__.core.invoke("focus_debug"));
+    await browser.execute(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", bubbles: true }));
+    });
+    await sleep(1200);
+
+    const after = await browser.execute(() => window.__TAURI__.core.invoke("focus_debug"));
+    const banner = await browser.execute(() => {
+      const el = document.querySelector('[data-testid="focusbanner"]');
+      return el ? { text: el.textContent, dist: el.getAttribute("data-dist"), focused: el.getAttribute("data-focused") } : null;
+    });
+    const status = await browser.execute(() => document.querySelector('[data-testid="status"]')?.textContent ?? null);
+    console.log(`  focus_debug ${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
+    console.log("  banner:", JSON.stringify(banner), "status:", JSON.stringify(status));
+
+    if (!after[1]) throw new Error("F did not put the engine into focus mode at all");
+    if (!banner) throw new Error("F entered focus mode and raised NO banner — the dim has no advertised exit");
+    if (banner.focused !== "true") throw new Error(`banner is up but does not claim focus: ${JSON.stringify(banner)}`);
+    // The subject is the SET, said in plain language — not a loro key, which is what it printed before.
+    //
+    // The count is read OUT of the banner rather than compared to `selection_ids().length`, and the
+    // difference matters: a selection can hold a marker (a light, a camera glyph) that has no instance
+    // to frame, so the two numbers are allowed to differ by design. What must be true is that it is a
+    // SET (> 1), that it is said in objects rather than in ids, and that the status line and the
+    // banner report the SAME number — they come from one reply, and disagreeing would mean they do not.
+    const named = /(\d+) objects/.exec(banner.text);
+    if (!named) throw new Error(`banner must name a count of objects, got ${JSON.stringify(banner.text)}`);
+    if (Number(named[1]) < 2) {
+      throw new Error(`banner named ${named[1]} — F framed one of a set of ${many.length}`);
+    }
+    if (/\d+_[0-9a-f]+/.test(banner.text)) {
+      throw new Error(`banner is printing a raw entity id: ${JSON.stringify(banner.text)}`);
+    }
+    if (!status || !status.includes(`all ${named[1]}`)) {
+      throw new Error(
+        `the status line must say how many were framed, and agree with the banner's ${named[1]}: ` +
+          `got ${JSON.stringify(status)}`,
+      );
+    }
+    // The distance the banner shows is the one the engine settled at — one command, one answer.
+    if (Math.abs(Number(banner.dist) - Number(after[0])) > 0.01) {
+      throw new Error(`banner distance ${banner.dist} disagrees with focus_debug ${after[0]}`);
+    }
+    await shot("10_F_framed_the_whole_selection");
+
+    // And Escape gets back out, which is only reachable BECAUSE the banner is up.
+    await browser.execute(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    await sleep(900);
+    const out = await browser.execute(() => window.__TAURI__.core.invoke("focus_debug"));
+    const gone = await browser.execute(() => !document.querySelector('[data-testid="focusbanner"]'));
+    console.log(`  after Escape: focus_debug ${JSON.stringify(out)}, banner gone ${gone}`);
+    if (out[1]) throw new Error("Escape did not leave focus mode");
+    if (!gone) throw new Error("Escape left the banner standing over a scene that is no longer focused");
+    await shot("11_escape_left_focus");
   });
 });
