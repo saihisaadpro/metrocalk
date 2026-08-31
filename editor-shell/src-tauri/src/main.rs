@@ -20043,6 +20043,82 @@ fn viewport_peek(
     hit.as_ref().and_then(|h| scene_pick::entity_of(&st, h))
 }
 
+/// One object under the pointer, named — an entry in [`pick_candidates`].
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PickCandidate {
+    /// The entity this hit resolves to. Never empty: a hit the scene cannot name is dropped here for
+    /// the same reason `apply_click` treats it as a click on empty space — an id nothing can resolve
+    /// is a row that selects nothing.
+    id: String,
+    /// What kind of thing it is (`Mesh`, `Light`, `Camera`, …), from the picker's own hit kind. The
+    /// front end has a `classify_kind` of its own for outliner icons; this is the PICKER's answer, so
+    /// a row can say "Light" about a glyph that has no mesh to classify.
+    kind: String,
+    /// Distance along the ray in world units — the depth order made legible, so "the one behind" is a
+    /// visible fact rather than a position in a list.
+    distance: f64,
+    /// Already in the selection. The nearest hit is usually what a plain click just took, and a list
+    /// that does not say so reads as four equally likely options.
+    selected: bool,
+}
+
+/// **Everything under one point on the stage, in the order a click would take them** (ADR-191).
+///
+/// The engine has been able to answer this since picking was rebuilt — `pick_all` returns the whole
+/// ordered list precisely because "what else is under here" is what click-through needs — and the
+/// only two commands that asked it, `viewport_peek` and `pick_diagnostics`, had **no caller in
+/// `editor/src`**. So the second object under a pixel was reachable only by alt-click: a gesture that
+/// cycles blind, names nothing, and cannot tell you whether there is anything to cycle to.
+///
+/// A READ, and deliberately the same read a click performs — same `nearest`/`hits` pipeline, same
+/// `click_filter`, same `entity_of` resolution at the boundary — so a row in this list and the click
+/// that would take it cannot answer differently. A separate "what is under the cursor" for a menu is
+/// exactly the divergence `viewport_peek`'s own doc comment exists to forbid.
+///
+/// Ordered nearest-first, which is the order `cycle` walks. Empty when the pointer is over nothing,
+/// which is most of the stage and is a fact the caller has to be able to act on rather than guess.
+#[tauri::command]
+fn pick_candidates(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    x: f32,
+    y: f32,
+) -> Vec<PickCandidate> {
+    ipc();
+    let dpi = window.scale_factor().unwrap_or(1.0);
+    let st = state.shared.lock().unwrap();
+    let camera = scene_pick::camera_for(&st);
+    let viewport = scene_pick::viewport_for(&st, dpi);
+    let ray = camera.ray_through_fraction(&viewport, f64::from(x), f64::from(y));
+    let mut cache = state.picking.lock().unwrap();
+    cache.sync(&st);
+    let selected: std::collections::HashSet<String> = {
+        let selection = state.selection.lock().unwrap();
+        scene_pick::selected_ids(&selection).into_iter().collect()
+    };
+    let mut seen = std::collections::HashSet::new();
+    cache
+        .hits(&camera, &viewport, &ray, &scene_pick::click_filter())
+        .iter()
+        .filter_map(|h| {
+            let id = scene_pick::entity_of(&st, h)?;
+            // ONE ROW PER OBJECT. The hit list is per pick object, so a duplicate id would mean two
+            // objects resolving to one entity — a defect elsewhere, and one that must not print the
+            // same name twice in a menu a person is choosing from.
+            if !seen.insert(id.clone()) {
+                return None;
+            }
+            Some(PickCandidate {
+                selected: selected.contains(&id),
+                id,
+                kind: format!("{:?}", h.kind),
+                distance: h.distance,
+            })
+        })
+        .collect()
+}
+
 /// Marquee (box) selection. The two corners are normalized `[0,1]` surface fractions, **in the order
 /// they were dragged** — the direction is the policy: left-to-right takes only objects fully enclosed,
 /// right-to-left takes everything the rectangle touches. Returns the selected entity ids.
@@ -25536,6 +25612,7 @@ fn main() {
             thumbnail,
             viewport_pick,
             viewport_peek,
+            pick_candidates,
             viewport_pick_region,
             select_entities,
             selection_ids,

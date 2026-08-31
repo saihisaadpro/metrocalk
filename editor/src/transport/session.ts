@@ -13,6 +13,7 @@ import type { PlayInfo } from "../store/play";
 import type {
   SelectionActions,
   AddResponse,
+  PickCandidate,
   AuthoredMatch,
   CatalogItem,
   CookedMatch,
@@ -470,6 +471,16 @@ export interface EditorClient {
    *  after a modified click the resulting SET is `selectionIds()`, because a toggle that deselected
    *  still hit something and the hit alone cannot say what is selected now. */
   viewportPick(x: number, y: number, mods?: PickModifiers): Promise<string | null>;
+  /** **Everything under one point, in the order a click would take it** (ADR-191) — a READ.
+   *
+   *  The same pipeline `viewportPick` uses, so a row in the list and the click that would take it
+   *  cannot answer differently. Empty over empty stage, which is most of it. Off the hot path: called
+   *  once per right-click and once per alt-click, never per frame. */
+  pickCandidates(x: number, y: number): Promise<PickCandidate[]>;
+  /** Non-mutating "what is under this point" (M3.3) — the hover read. Returns the entity id or `null`.
+   *  Debounced on hover-settle and re-fetched only when the answer CHANGES, so the boundary is crossed
+   *  on hovered-entity change and never per frame (invariant 4). */
+  viewportPeek(x: number, y: number): Promise<string | null>;
   /** Marquee (box) selection over the native region. The two corners are normalized `[0,1]` surface
    *  fractions **in the order they were dragged**, because the direction IS the policy: left-to-right
    *  takes only what the rectangle encloses, right-to-left takes everything it touches. `extend` keeps
@@ -1201,6 +1212,16 @@ export class TauriClient implements EditorClient {
     return this.core
       .invoke<string | null>("viewport_pick", { x, y, shift: !!mods?.extend, ctrl: !!mods?.toggle, cycle: !!mods?.cycle })
       .catch((e: unknown) => { console.error("viewport_pick failed", e); throw e; });
+  }
+  pickCandidates(x: number, y: number): Promise<PickCandidate[]> {
+    return this.core
+      .invoke<PickCandidate[]>("pick_candidates", { x, y })
+      .catch((e: unknown) => { console.error("pick_candidates failed", e); throw e; });
+  }
+  viewportPeek(x: number, y: number): Promise<string | null> {
+    return this.core
+      .invoke<string | null>("viewport_peek", { x, y })
+      .catch((e: unknown) => { console.error("viewport_peek failed", e); throw e; });
   }
   viewportPickRegion(x0: number, y0: number, x1: number, y1: number, extend?: boolean): Promise<string[]> {
     return this.core
@@ -3147,6 +3168,12 @@ class MockClient implements EditorClient {
   }
   viewportPickRegion(_x0: number, _y0: number, _x1: number, _y1: number, _extend?: boolean): Promise<string[]> {
     return Promise.resolve([]);
+  }
+  pickCandidates(_x: number, _y: number): Promise<PickCandidate[]> {
+    return Promise.resolve([]);
+  }
+  viewportPeek(_x: number, _y: number): Promise<string | null> {
+    return Promise.resolve(null);
   }
   // …but the SELECTION is not a viewport fact, so the mock keeps a real one: the dev build's outliner,
   // palette and toolbar all read it back, and a mock that always answered `[]` would make every

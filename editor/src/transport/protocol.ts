@@ -181,6 +181,22 @@ export interface SelectionActions {
   items: ActionItem[];
 }
 
+/** `pick_candidates(x, y)` — one object under the pointer (ADR-191), in the order a click takes them.
+ *
+ *  The engine has always been able to answer this; nothing asked. `label` is NOT here on purpose — the
+ *  projection already carries a name for every entity and `entityLabel` is the one place the editor
+ *  decides what to call something, so a second name arriving over the wire would be a second answer to
+ *  a question that already has one. */
+export interface PickCandidate {
+  id: string;
+  /** The PICKER's kind (`Mesh`, `Light`, `Camera`, …) — a glyph with no mesh still says what it is. */
+  kind: string;
+  /** Distance along the ray, world units. The depth order, made legible. */
+  distance: number;
+  /** Already in the selection — usually true of the nearest, which is what a plain click just took. */
+  selected: boolean;
+}
+
 /** `entity_details(id)` — the hover tooltip read (M3.3): name + component names + provided/required caps
  *  + the entities it's bound to. */
 export interface EntityDetails {
