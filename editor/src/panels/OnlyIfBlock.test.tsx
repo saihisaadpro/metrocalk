@@ -40,9 +40,13 @@ test("the role's own clause is shown with provenance, and the rule reads as a se
   select("coin", "Coin");
   render(<OnlyIfBlock client={client} roster={ROSTER} />);
 
+  // WAIT FOR THE CONTENT, NOT FOR THE CONTAINER. `onlyif-block` renders on the first frame with its
+  // empty prompt inside it, so `findByTestId` resolves before `conditionList()` has resolved and a
+  // `textContent` assertion taken straight after it is racing that promise. It won on an idle machine
+  // and lost under a loaded one, which is a flake with a cause rather than noise.
   const block = await screen.findByTestId("onlyif-block");
   // Reading the clause your ROLE already wrote is the first exposure to conditionals.
-  expect(block.textContent).toContain("it hasn't been collected yet (from the role)");
+  await waitFor(() => expect(block.textContent).toContain("it hasn't been collected yet (from the role)"));
   expect(block.textContent).toContain("the Score is at least 3");
   const sentence = await screen.findByTestId("onlyif-sentence");
   expect(sentence.textContent).toContain("only if");

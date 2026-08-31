@@ -193,7 +193,10 @@ function emptyMatchStatus(): MatchStatus {
   };
 }
 
+/** The gizmo's space and pivot, per `fakeClient()` call — see the comment on `gizmoDebug` below for
+ *  why these are state and not two more constants. */
 export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
+  const gizmoState = { space: "world", pivot: "origin" };
   return {
     setField: vi.fn(() => "op"),
     bind: vi.fn(() => "op"),
@@ -554,9 +557,21 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     gizmoMode: vi.fn(),
     gizmoSelect: () => Promise.resolve(true),
     gizmoSelected: () => Promise.resolve(null),
-    gizmoDebug: () => Promise.resolve(["translate", false, false, "world", "origin"]),
-    gizmoSpaceToggle: () => Promise.resolve("local"),
-    gizmoPivotToggle: () => Promise.resolve("center"),
+    // THE THREE OF THESE ARE ONE PIECE OF STATE, AND THEY USED TO BE THREE CONSTANTS THAT
+    // CONTRADICTED EACH OTHER. `gizmoSpaceToggle` answered "local" for ever while `gizmoDebug` kept
+    // answering "world", so any refresh landing AFTER a toggle reverted the toolbar's label to the
+    // value it had just been told to leave. Whether the assertion or the refresh won was decided by
+    // how loaded the machine was — a real product would answer both reads from one place, and a fake
+    // that does not is a flake generator, not a simplification.
+    gizmoDebug: () => Promise.resolve(["translate", false, false, gizmoState.space, gizmoState.pivot]),
+    gizmoSpaceToggle: () => {
+      gizmoState.space = gizmoState.space === "world" ? "local" : "world";
+      return Promise.resolve(gizmoState.space);
+    },
+    gizmoPivotToggle: () => {
+      gizmoState.pivot = gizmoState.pivot === "origin" ? "center" : "origin";
+      return Promise.resolve(gizmoState.pivot);
+    },
     gizmoPickDrag: () => Promise.resolve(false),
     gizmoDragEnd: vi.fn(),
     readTransform: () => Promise.resolve([0, 0, 0, 0, 0, 0, 1, 1]),

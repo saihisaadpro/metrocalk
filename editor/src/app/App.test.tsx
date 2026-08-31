@@ -15,7 +15,25 @@ import { toastStore } from "../store/toasts";
 // contention rather than of a hang. Raising the GLOBAL timeout would hide every real hang in
 // the suite; these are the files that need the room, so this is where the number lives. 20s is
 // ~5.5x this file's own worst case and still nothing like the forever a deadlock takes.
-vi.setConfig({ testTimeout: 20_000 });
+//
+// 2026-08-31: BOTH NUMBERS HAVE TO MOVE, AND ONLY ONE OF THEM EVER DID. The per-test budget above was
+// 20s while Testing Library's `asyncUtilTimeout` (`src/test-setup.ts`) is 15s, so a `findBy` waiting
+// on a lazily-imported workspace gave up at 15s inside a 20s test and the extra 5s bought nothing.
+// The suite has meanwhile grown 77 -> 89 files as three lanes merged, and the four failures were all
+// the same shape: a chunk Vite transforms on demand, under a parallel runner.
+//
+// AND THE OBVIOUS FIX IS THE WRONG ONE, MEASURED: raising `asyncUtilTimeout` with a file-level
+// `configure()` made the run WORSE, 4 failures -> 13 and 219s -> 685s. `configure()` is global to the
+// worker, vitest reuses a worker across files, and a 30s async budget therefore leaked into every
+// later file in that worker — so `AnimationGraphEditor`, which had been green all evening, started
+// holding a slot for 30s per failed query and starving everything behind it. A budget is scoped to
+// the CALL that needs it or it is not scoped at all: the three waits below name their own, and the
+// per-test number only has to be larger than the largest of them.
+vi.setConfig({ testTimeout: 40_000 });
+
+/** The wait for a workspace Vite has not transformed yet. Named once so the three sites that need it
+ *  cannot drift apart, and so the number is attached to its reason. */
+const LAZY_CHUNK = { timeout: 25_000 } as const;
 
 afterEach(() => {
   projectionStore.getState().reset();
@@ -77,9 +95,9 @@ describe("editor app — end-to-end wiring", () => {
     // at once and hid five — a testid you can query from a workspace you are not in is not evidence that
     // a user can reach it.)
     fireEvent.click(screen.getByTestId("engine-build"));
-    fireEvent.change(await screen.findByTestId("describe"), { target: { value: "a nonexistent thingamajig" } });
+    fireEvent.change(await screen.findByTestId("describe", {}, LAZY_CHUNK), { target: { value: "a nonexistent thingamajig" } });
     fireEvent.click(screen.getByTestId("describeBtn"));
-    fireEvent.click(await screen.findByTestId("genBtn"));
+    fireEvent.click(await screen.findByTestId("genBtn", {}, LAZY_CHUNK));
 
     // the top-bar Wallet's displayed balance dropped — it reads the SAME store the DescribeBar wrote to
     await waitFor(() => expect(bal.textContent).toBe("90"));
@@ -135,7 +153,7 @@ describe("editor app — end-to-end wiring", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Pipe" }));
     // Pipe Forge is intentionally a production code-split workspace; allow its test transform to resolve.
-    await screen.findByTestId("pipe-forge-start", {}, { timeout: 5_000 });
+    await screen.findByTestId("pipe-forge-start", {}, LAZY_CHUNK);
     fireEvent.click(screen.getByTestId("pipe-forge-start"));
     await waitFor(() => expect(screen.getByTestId("pipe-forge").getAttribute("data-active")).toBe("true"));
 
@@ -174,7 +192,7 @@ describe("editor app — end-to-end wiring", () => {
     // click. The rail's `aria-selected` is synchronous and stays so — where you are must never wait on
     // a network — and the gap between the two is what `LazyWorkspace`'s named "Loading build workspace…"
     // is for.
-    expect(await screen.findByTestId("assetbrowser")).toBeTruthy();
+    expect(await screen.findByTestId("assetbrowser", {}, LAZY_CHUNK)).toBeTruthy();
 
     // A bottom engine opens the bottom dock — same rail, different surface, because a timeline needs width.
     fireEvent.click(screen.getByTestId("engine-logic"));
@@ -227,7 +245,7 @@ describe("editor app — end-to-end wiring", () => {
   it("opens the searchable command palette from Ctrl/Cmd+K", async () => {
     render(<App />);
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
-    expect(await screen.findByTestId("command-palette")).toBeTruthy();
+    expect(await screen.findByTestId("command-palette", {}, LAZY_CHUNK)).toBeTruthy();
     expect(await screen.findByRole("combobox", { name: /search commands/i })).toBeTruthy();
   });
 

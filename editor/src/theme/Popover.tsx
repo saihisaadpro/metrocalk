@@ -368,8 +368,15 @@ export function Modal({
       element.setAttribute("aria-hidden", "true");
     }
     if (dialog) {
+      // A PREFERRED TARGET THAT CANNOT TAKE FOCUS IS NOT A TARGET. Every task dialog in this editor
+      // points `initialFocusRef` at its primary action, and every one of them opens with that action
+      // DISABLED while the catalogue it needs is still being read — the import dialog's is disabled
+      // on its first frame by construction. `focus()` on a disabled button is a silent no-op, and the
+      // element it would have left focus on has just been made `inert` two statements above, so the
+      // keyboard user starts outside a dialog that has trapped nothing.
       const preferred = initialFocusRef?.current;
-      if (preferred && dialog.contains(preferred)) preferred.focus();
+      const reachable = preferred != null && dialog.contains(preferred) && preferred.matches(FOCUSABLE_SELECTOR);
+      if (reachable) preferred.focus();
       else (focusableElements(dialog)[0] ?? dialog).focus();
     }
     return () => {

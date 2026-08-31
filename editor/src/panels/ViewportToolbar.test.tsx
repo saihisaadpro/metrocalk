@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { fakeClient } from "../transport/test-client";
 import { ViewportToolbar } from "./ViewportToolbar";
@@ -63,12 +63,14 @@ test("centres two persistent triggers and can defer transform modes to the prima
   expect(screen.getByTestId("vpPivot")).toBeTruthy();
   expect(screen.getByTestId("vpSnap")).toBeTruthy();
 
+  // COUNTING MICROTASKS IS NOT WAITING. `vpSpace` sends the change through the client and re-renders
+  // when its promise settles, so "two `await Promise.resolve()`" is an assertion about how many ticks
+  // that chain happens to take — true on an idle machine, false under a loaded parallel runner, and
+  // the same class of defect as an assertion on a container that has not been filled yet.
   await act(async () => {
     fireEvent.click(screen.getByTestId("vpSpace"));
-    await Promise.resolve();
-    await Promise.resolve();
   });
-  expect(screen.getByTestId("vpTransform").textContent).toContain("Local");
+  await waitFor(() => expect(screen.getByTestId("vpTransform").textContent).toContain("Local"));
 });
 
 test("progressively discloses framing, camera, and rendering controls", async () => {
