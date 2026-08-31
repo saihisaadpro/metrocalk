@@ -59,7 +59,7 @@ use metrocalk_editor_shell::transform_solver::{
     Constraint, ConstraintIntent, SnapKind, SnapTarget,
 };
 use metrocalk_editor_shell::{
-    actions_for, ai_edit_material, apply_ai_patch, apply_edit, audit_asset, bake_meld,
+    actions_for_selection, ai_edit_material, apply_ai_patch, apply_edit, audit_asset, bake_meld,
     bake_mesh_result, bake_pipe, bake_shape, buy_marketplace, capscene, capture_scene,
     cleanup_asset, decode_pipe_artifact, decode_shape_artifact, enrich_relational,
     land_combined_asset, land_pipe_asset, land_shape_asset, meld_field, optimize_asset,
@@ -69,7 +69,7 @@ use metrocalk_editor_shell::{
     CapScene, CapturedMesh, CleanupConfig, EditIntent, EditTx, Log, MeshCatalog, NormalRepairMode,
     OptimizationConfig, OptimizationPreset, Outcome, PatchOp, PipeBakeReport, PipeBuild,
     PipeFittingKind, PipeForgeOptions, PipeForgeStatus, PipeRecipe, PipeToolSession,
-    ProjectionDelta, ProjectionOp, Record, ShapeBuild, ShapeRecipe, ShapeReply,
+    ProjectionDelta, ProjectionOp, Record, SelectionActions, ShapeBuild, ShapeRecipe, ShapeReply,
     UserFittingCatalogEntry, UvGenerationMode, Wallet, SHAPE_COMPONENT,
 };
 use metrocalk_gizmo::{
@@ -2326,8 +2326,8 @@ enum EngineCmd {
     },
     /// The action model for an entity (M3.3) — valid actions + every-"no"-explained (a read).
     Actions {
-        id: String,
-        reply: Sender<Vec<ActionItem>>,
+        ids: Vec<String>,
+        reply: Sender<SelectionActions>,
     },
     /// Remove an entity + its edges (M3.3) — one undoable transaction.
     Remove {
@@ -9015,11 +9015,21 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 let _ = reply.send(resp);
             }
-            EngineCmd::Actions { id, reply } => {
-                let items = EntityId::from_loro_key(&id)
-                    .map(|e| actions_for(&engine, &scene, e))
-                    .unwrap_or_default();
-                let _ = reply.send(items);
+            EngineCmd::Actions { ids, reply } => {
+                // An id the document cannot parse is a MISSING object, not an absent one: dropping it
+                // silently would make `count` disagree with what the user has highlighted, and the
+                // menu's whole job here is to state the scope it is about to act on.
+                let mut entities = Vec::with_capacity(ids.len());
+                let mut unparsable = 0usize;
+                for key in &ids {
+                    match EntityId::from_loro_key(key) {
+                        Some(e) => entities.push(e),
+                        None => unparsable += 1,
+                    }
+                }
+                let mut answer = actions_for_selection(&engine, &scene, &entities);
+                answer.missing += unparsable;
+                let _ = reply.send(answer);
             }
             EngineCmd::Remove { id } => {
                 if let Some(e) = EntityId::from_loro_key(&id) {
@@ -20513,12 +20523,31 @@ fn camera_debug(state: State<AppState>) -> [f32; 6] {
 /// briefly on the engine thread.
 #[tauri::command(async)]
 fn entity_actions(state: State<AppState>, id: String) -> Vec<ActionItem> {
+    entity_actions_selection(state, vec![id]).items
+}
+
+/// **The action model for the whole selection** (ADR-183) — what right-click is actually about.
+///
+/// The editor selects sets (a marquee, Ctrl+A, `Select similar` over 378 identical bolts) and the
+/// menu that opens on them was asking about one id. Every `applies_to` in the reply is measured
+/// against `count`, so a caller can print the scope beside the verb instead of guessing it from the
+/// list it happened to send.
+#[tauri::command]
+fn entity_actions_selection(state: State<AppState>, ids: Vec<String>) -> SelectionActions {
     ipc();
     let (reply, rx) = mpsc::channel();
-    if state.tx.send(EngineCmd::Actions { id, reply }).is_err() {
-        return Vec::new();
+    if state.tx.send(EngineCmd::Actions { ids, reply }).is_err() {
+        return SelectionActions {
+            count: 0,
+            missing: 0,
+            items: Vec::new(),
+        };
     }
-    recv_reply(&rx).unwrap_or_default()
+    recv_reply(&rx).unwrap_or(SelectionActions {
+        count: 0,
+        missing: 0,
+        items: Vec::new(),
+    })
 }
 
 /// Remove an entity + its edges (M3.3) — one undoable transaction (Ctrl-Z restores).
@@ -25412,6 +25441,7 @@ fn main() {
             moba_stop,
             camera_debug,
             entity_actions,
+            entity_actions_selection,
             remove_entity,
             duplicate_entity,
             entity_details,
