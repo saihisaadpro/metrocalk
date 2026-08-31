@@ -36,6 +36,9 @@ interface Spies {
   peek: ReturnType<typeof vi.fn>;
   /** The gizmo-handle probe. A HIT suppresses the click, so WHEN it is armed is a selection question. */
   gizmoPickDrag: ReturnType<typeof vi.fn>;
+  /** The release that COMMITS a gizmo move as one transaction. Watched because a click that never
+   *  dragged must not write one, and a drag started by a late probe must not be left without one. */
+  gizmoDragEnd: ReturnType<typeof vi.fn>;
 }
 const sessions: Spies[] = [];
 
@@ -62,13 +65,15 @@ vi.mock("../transport/session", async (importOriginal) => {
       client.viewportPeek = peek as unknown as typeof client.viewportPeek;
       const gizmoPickDrag = vi.fn(() => Promise.resolve(false));
       client.gizmoPickDrag = gizmoPickDrag as unknown as typeof client.gizmoPickDrag;
+      const gizmoDragEnd = vi.fn();
+      client.gizmoDragEnd = gizmoDragEnd as unknown as typeof client.gizmoDragEnd;
       client.selectEntities = select as unknown as typeof client.selectEntities;
       client.deleteDeactivateMany = del as unknown as typeof client.deleteDeactivateMany;
       client.undo = undo as unknown as typeof client.undo;
       client.viewportPick = pick as unknown as typeof client.viewportPick;
       client.viewportPickRegion = region as unknown as typeof client.viewportPickRegion;
       client.selectionIds = selectionIds as unknown as typeof client.selectionIds;
-      sessions.push({ pick, region, selectionIds, undo, select, del, candidates, peek, gizmoPickDrag });
+      sessions.push({ pick, region, selectionIds, undo, select, del, candidates, peek, gizmoPickDrag, gizmoDragEnd });
       return client;
     },
   };
@@ -111,6 +116,26 @@ function dragBox(from: { x: number; y: number }, to: { x: number; y: number }, i
   return {
     viewport,
     release: () => pointer(viewport, "pointerup", { button: 0, clientX: to.x, clientY: to.y, ...init }),
+  };
+}
+
+/** A press that TRAVELS, with the keyboard state carried on the press itself.
+ *
+ *  `dragBox` puts its modifiers on the release, which is where the marquee reads them. The gizmo fork
+ *  reads them on the PRESS — that is the gesture's own declaration of intent — so a test about arming
+ *  needs a helper that says so. Returns the release, because half these assertions are about what does
+ *  *not* happen when the button comes back up. */
+function dragWithModifiers(
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  mods: MouseEventInit = {},
+) {
+  const viewport = screen.getByTestId("viewport");
+  pointer(viewport, "pointerdown", { button: 0, clientX: from.x, clientY: from.y, ...mods });
+  pointer(viewport, "pointermove", { clientX: to.x, clientY: to.y, ...mods });
+  return {
+    viewport,
+    release: () => pointer(viewport, "pointerup", { button: 0, clientX: to.x, clientY: to.y, ...mods }),
   };
 }
 
@@ -339,17 +364,21 @@ describe("modified clicks on the stage", () => {
 
     const gizmo = spies().gizmoPickDrag;
     gizmo.mockClear();
-    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400, altKey: true });
-    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400, shiftKey: true });
+    // A DRAG, not a press — the probe now waits for the threshold (ADR-194), so a press alone would
+    // prove nothing about arming. Alt and shift must not ask even when the pointer travels.
+    dragWithModifiers({ x: 500, y: 400 }, { x: 560, y: 440 }, { altKey: true }).release();
+    dragWithModifiers({ x: 500, y: 400 }, { x: 560, y: 440 }, { shiftKey: true }).release();
     // The gizmo is drawn AT the selection, so alt-clicking the object you just selected — to reach the
     // one BEHIND it — lands on the gizmo. A hit suppresses the click, and the cycle never runs:
     // measured on the packaged `.exe` as "alt-click stayed on 1_16" with two objects along the ray.
     expect(gizmo).not.toHaveBeenCalled();
 
     // Ctrl still arms it, deliberately: ctrl is the gizmo's own SNAP modifier, and that ambiguity is
-    // resolved by whether the pointer moves, not by the key.
-    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400, ctrlKey: true });
+    // resolved by whether the pointer moves, not by the key — so a ctrl DRAG asks, and asks with the
+    // snap flag set.
+    dragWithModifiers({ x: 500, y: 400 }, { x: 560, y: 440 }, { ctrlKey: true });
     expect(gizmo).toHaveBeenCalledTimes(1);
+    expect(gizmo.mock.calls[0]?.[2]).toBe(true);
   });
 
   it("alt-click says WHERE IN THE STACK it landed, instead of nothing at all", async () => {
@@ -632,5 +661,135 @@ describe("the pointer names what it rests on", () => {
     await waitFor(() => expect(screen.getByTestId("stage-hover")).toBeTruthy());
     pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400 });
     expect(screen.queryByTestId("stage-hover")).toBeNull();
+  });
+});
+
+/** **A press is a CLICK until the pointer moves** (ADR-194).
+ *
+ *  The gizmo is drawn AT the selection, so its handles sit over the object you are most likely to
+ *  click next — and a handle HIT eats the click, starts a native drag and commits a transaction on
+ *  release. Firing that probe on `pointerdown` therefore made three separate things go wrong at once,
+ *  and all three are asserted here. The probe is mocked to HIT throughout, because a probe that misses
+ *  cannot demonstrate any of them.
+ *
+ *  Ctrl is the one modifier that cannot be excluded from the probe the way ADR-191 excluded alt and
+ *  shift: it is the gizmo's snap flag as well as the selection's toggle. So the threshold is not a
+ *  refinement of the arming rule, it is the only thing that can separate the two readings. */
+describe("the press that is still a click", () => {
+  /** Select something (which arms the gizmo fork) and make the handle probe HIT from then on. */
+  async function selectedWithHandleUnderCursor() {
+    render(<App />);
+    const viewport = screen.getByTestId("viewport");
+    await act(async () => {
+      fireEvent.click(viewport, { clientX: 500, clientY: 400 });
+    });
+    expect(projectionStore.getState().selectedId).toBe("hit-1");
+    const s = spies();
+    s.gizmoPickDrag.mockImplementation(() => Promise.resolve(true));
+    s.gizmoPickDrag.mockClear();
+    s.gizmoDragEnd.mockClear();
+    s.pick.mockClear();
+    return { viewport, s };
+  }
+
+  it("ctrl-click on the selected object TOGGLES it — the handle under the cursor does not eat the click", async () => {
+    const { viewport, s } = await selectedWithHandleUnderCursor();
+
+    // The exact gesture: press, no travel, release, click — all with ctrl held, all on the object whose
+    // gizmo is drawn on top of it. Before the threshold rule this fired `gizmo_pick_drag`, the probe hit
+    // a handle, and `onClick` returned early: the toggle never reached the engine.
+    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400, ctrlKey: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    pointer(viewport, "pointerup", { button: 0, clientX: 500, clientY: 400, ctrlKey: true });
+    await act(async () => {
+      fireEvent.click(viewport, { clientX: 500, clientY: 400, ctrlKey: true });
+    });
+
+    expect(s.gizmoPickDrag).not.toHaveBeenCalled();
+    expect(s.pick).toHaveBeenCalledTimes(1);
+    expect(s.pick.mock.calls[0]?.[2]).toMatchObject({ toggle: true, extend: false, cycle: false });
+  });
+
+  it("a click on the selected object writes NO transaction — nothing was dragged", async () => {
+    const { viewport, s } = await selectedWithHandleUnderCursor();
+
+    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400 });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    pointer(viewport, "pointerup", { button: 0, clientX: 500, clientY: 400 });
+
+    // `gizmo_drag_end` commits `GizmoCommit` unconditionally when a drag is open, so a press that
+    // opened one on contact wrote one undo entry per click that moved nothing at all.
+    expect(s.gizmoDragEnd).not.toHaveBeenCalled();
+  });
+
+  it("a probe answered after the release ends the drag it started, instead of leaving it running", async () => {
+    const { viewport, s } = await selectedWithHandleUnderCursor();
+    // The probe is async and the release is not. Hold the answer until after the button is up.
+    let answer: (hit: boolean) => void = () => {};
+    s.gizmoPickDrag.mockImplementation(() => new Promise<boolean>((r) => (answer = r)));
+
+    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400 });
+    pointer(viewport, "pointermove", { clientX: 560, clientY: 440 });
+    expect(s.gizmoPickDrag).toHaveBeenCalledTimes(1);
+    pointer(viewport, "pointerup", { button: 0, clientX: 560, clientY: 440 });
+    // Released with the answer still in flight: at this point the engine believes nothing is dragging.
+    expect(s.gizmoDragEnd).not.toHaveBeenCalled();
+
+    await act(async () => {
+      answer(true);
+      await Promise.resolve();
+    });
+    // The HIT started `gizmo_dragging` in the render loop as a side effect of answering, and that loop
+    // drags the selection from the OS cursor with NO BUTTON HELD. The release has already gone by, so
+    // the late answer has to end it itself or the object stays glued to the pointer.
+    expect(s.gizmoDragEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("the box does not flash while the handle probe is still deciding", async () => {
+    const { viewport, s } = await selectedWithHandleUnderCursor();
+    let answer: (hit: boolean) => void = () => {};
+    s.gizmoPickDrag.mockImplementation(() => new Promise<boolean>((r) => (answer = r)));
+
+    pointer(viewport, "pointerdown", { button: 0, clientX: 100, clientY: 100 });
+    pointer(viewport, "pointermove", { clientX: 400, clientY: 300 });
+    // A rectangle drawn now would be withdrawn a round trip later on a hit — a flash on the stage
+    // saying a box selection is happening when a handle drag is.
+    expect(screen.queryByTestId("stage-marquee")).toBeNull();
+
+    await act(async () => {
+      answer(false);
+      await Promise.resolve();
+    });
+    // A miss releases the gesture to the box, at the point the pointer had already reached — not at
+    // the next move, which may never come if the drag paused exactly here.
+    expect(screen.getByTestId("stage-marquee")).toBeTruthy();
+  });
+
+  it("a real drag onto a handle still drags it, and asks at the point the press happened", async () => {
+    const { viewport, s } = await selectedWithHandleUnderCursor();
+
+    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400 });
+    await act(async () => {
+      pointer(viewport, "pointermove", { clientX: 560, clientY: 440 });
+      await Promise.resolve();
+    });
+    // The handle was under the PRESS, not under wherever the pointer has reached — asking at the
+    // current point would test the ray against a place the user never aimed at.
+    expect(s.gizmoPickDrag).toHaveBeenCalledTimes(1);
+    const [nx, ny] = s.gizmoPickDrag.mock.calls[0] as unknown as [number, number, boolean];
+    expect(nx).toBeCloseTo(500 / window.innerWidth, 6);
+    expect(ny).toBeCloseTo(400 / window.innerHeight, 6);
+
+    pointer(viewport, "pointerup", { button: 0, clientX: 560, clientY: 440 });
+    expect(s.gizmoDragEnd).toHaveBeenCalledTimes(1);
+    // And the drag is not also a pick: the click that follows a drag must not re-select.
+    await act(async () => {
+      fireEvent.click(viewport, { clientX: 560, clientY: 440 });
+    });
+    expect(s.pick).not.toHaveBeenCalled();
   });
 });

@@ -42,6 +42,7 @@ import { normalizeSurfacePoint } from "./viewportCoordinates";
 import { StageHoverTooltip, useStageHover } from "./StageHover";
 import type { PickCandidate } from "../transport/protocol";
 import { isMarqueeDrag, marqueeBox, marqueeMode, marqueeResult } from "./marquee";
+import { armsGizmoDrag, beganDrag, lateProbeNeedsDragEnd, type GizmoProbe } from "./stageGesture";
 import { StageMarquee } from "./StageMarquee";
 import { selectionSentence, entityLabel } from "../store/selectionText";
 import { deleteSelection } from "./deleteSelection";
@@ -174,6 +175,19 @@ export function App() {
   // M9 gizmo handle-drag: set by a left-press that HIT a gizmo handle (so the click doesn't re-pick + the
   // release commits). A ref (not state) so the click/up guards read it synchronously off the hot path.
   const gizmoHit = useRef(false);
+  // ADR-194 — the press that has not decided yet. A left-press over a selection is a CANDIDATE handle
+  // drag and nothing more; the probe that would start one is deferred until the pointer travels
+  // `DRAG_THRESHOLD_PX`. See `stageGesture.ts` for the three defects that firing it on contact caused.
+  const gizmoPress = useRef<{ x: number; y: number; snap: boolean } | null>(null);
+  const gizmoProbe = useRef<GizmoProbe>("idle");
+  // Which gesture the in-flight probe belongs to. A probe that answers HIT after its own release has
+  // already started a native drag in the render loop, and nothing is coming to end it — the release is
+  // gone. Bumped on every press/cancel so a late answer can tell it is late.
+  const gizmoGesture = useRef(0);
+  // The last point the pointer reached, so a probe that answers MISS can start the box where the drag
+  // actually is rather than waiting for a move that may never come (the pointer can stop exactly at the
+  // threshold). One ref write per move — no state, no IPC.
+  const lastMove = useRef<{ x: number; y: number } | null>(null);
   // Box selection. The PRESS is a ref (read synchronously in the move handler, off the hot path) and only
   // the drawn rectangle is state — so a press that turns out to be a click costs no render at all, and a
   // real marquee re-renders one absolutely-positioned div and nothing else.
@@ -877,43 +891,39 @@ export function App() {
               // suppressing this one's click.
               marqueeConsumedClick.current = false;
               if (pipeActive) return; // drawing owns the click; do not start a gizmo drag underneath it
-              // M9 gizmo handle-grab: only when an entity is selected; if a handle is HIT the render loop
-              // drags it natively (0 IPC/frame, like orbit) and the release commits. A miss falls through to
-              // the normal pick. The hit flag resolves async, so a WebDriver synthetic click (which fires
-              // immediately) still picks normally — the suppression is for real human-timed drags.
               gizmoHit.current = false;
+              // A NEW GESTURE, so any probe still in flight from the last one is now late (ADR-194).
+              gizmoGesture.current += 1;
+              gizmoProbe.current = "idle";
+              gizmoPress.current = null;
+              lastMove.current = null;
               // A left-press on bare stage is the start of a box selection until it turns out to be a
-              // click. Recorded even when a gizmo probe is in flight: if the probe comes back HIT, the
-              // press is withdrawn below, because dragging a handle and dragging a box are the same
-              // gesture until the engine answers which one it was.
+              // click.
               if (!playing) marqueePress.current = { x: e.clientX, y: e.clientY };
-              // ALT AND SHIFT SAY THIS IS A SELECTION GESTURE, AND THE GIZMO HAS NO MEANING FOR EITHER.
+              // M9 gizmo handle-grab: only when an entity is selected; if a handle is HIT the render
+              // loop drags it natively (0 IPC/frame, like orbit) and the release commits.
               //
-              // The probe used to fire on every left press with something selected, whatever the
-              // keyboard was doing — and a HIT suppresses the click entirely. The gizmo is drawn AT the
-              // selection, so alt-clicking the very object you just selected, to reach the one behind
-              // it, lands on the gizmo and the cycle never runs. Measured on the packaged `.exe`: with
-              // two objects along the ray, alt-click "stayed on 1_16" — not a wrong pick, no pick at
-              // all, because `viewport_pick` was never called.
+              // NOTHING IS ASKED HERE, AND THAT IS THE POINT (ADR-194). The probe used to fire on
+              // `pointerdown`, and a HIT does not merely answer — it STARTS a native drag and eats the
+              // click. The gizmo is drawn AT the selection, so its handles cover the object you are
+              // most likely to click next, and the consequences were three at once: a ctrl-click on
+              // the selected object never reached the engine, every plain click on it wrote a no-op
+              // undo entry, and a click faster than the async answer left the object glued to the
+              // cursor with no button held. `stageGesture.ts` states the rule and the evidence.
               //
-              // Ctrl is deliberately NOT in this list. It is the gizmo's own snap modifier
-              // (`gizmoPickDrag(..., ctrl)`), so a ctrl-press on a handle is a snapped drag and a
-              // ctrl-press elsewhere is a toggle — an ambiguity that has to be resolved by whether the
-              // pointer MOVES, not by the modifier. Tracked in ADR-191; alt and shift are unambiguous
-              // and are the two the documented gestures need.
-              const selectionModifier = e.altKey || e.shiftKey;
-              if (!selectionModifier && projectionStore.getState().selectedId) {
-                const { x: nx, y: ny } = normalizeSurfacePoint(e.clientX, e.clientY);
-                void client
-                  .gizmoPickDrag(nx, ny, e.ctrlKey || e.metaKey)
-                  .then((hit) => {
-                    gizmoHit.current = hit;
-                    if (hit) {
-                      marqueePress.current = null;
-                      setMarqueeDrag(null);
-                    }
-                  })
-                  .catch(() => {});
+              // ALT AND SHIFT SAY THIS IS A SELECTION GESTURE, AND THE GIZMO HAS NO MEANING FOR EITHER
+              // (ADR-191) — measured on the packaged `.exe`: with two objects along the ray, alt-click
+              // "stayed on 1_16", no pick at all. Ctrl is deliberately NOT in that list: it is the
+              // gizmo's own snap modifier (`gizmoPickDrag(..., ctrl)`) as well as the selection's
+              // toggle, so it is the threshold below — not the keyboard — that separates the two.
+              if (
+                armsGizmoDrag({
+                  hasSelection: !!projectionStore.getState().selectedId,
+                  altKey: e.altKey,
+                  shiftKey: e.shiftKey,
+                })
+              ) {
+                gizmoPress.current = { x: e.clientX, y: e.clientY, snap: e.ctrlKey || e.metaKey };
               }
             }
           }}
@@ -1017,6 +1027,7 @@ export function App() {
             const rd = rightDrag.current;
             if (rd && (Math.abs(e.clientX - rd.x) > 6 || Math.abs(e.clientY - rd.y) > 6)) rd.moved = true;
             const press = marqueePress.current;
+            lastMove.current = { x: e.clientX, y: e.clientY };
             // The hover probe is fed from the move that is already happening, and costs a ref write
             // here — no state, no IPC. It is skipped outright while a button is down: a press means a
             // gesture, and `useStageHover` is gated on the same facts.
@@ -1026,11 +1037,58 @@ export function App() {
             // inside the viewport, and without this, resting on the "Import file…" button would name
             // whatever object happens to be behind it. Moving onto chrome DISMISSES rather than
             // merely not-updating, or the tooltip stays put describing something the pointer left.
-            if (!press && !rd && !gizmoHit.current) {
+            if (!press && !rd && !gizmoHit.current && !gizmoPress.current) {
               if (onStageSurface(e)) onHoverMove(e.clientX, e.clientY);
               else clearHover();
             }
+            // THE PRESS BECOMES A DRAG HERE, AND NOWHERE ELSE (ADR-194). Until the pointer has
+            // travelled, a press over the selection is still a click and nothing has been started in
+            // the native layer — so there is nothing to cancel if it turns out to be one. The ray is
+            // cast at the point the press HAPPENED: a handle the user aimed at is under that pixel,
+            // not under wherever the pointer has since reached, and anchoring the drag there is also
+            // what makes the object follow the cursor by the exact distance it moved.
+            const gp = gizmoPress.current;
+            if (gp && gizmoProbe.current === "idle" && beganDrag(gp, { x: e.clientX, y: e.clientY })) {
+              gizmoProbe.current = "pending";
+              const gen = gizmoGesture.current;
+              const { x: gx, y: gy } = normalizeSurfacePoint(gp.x, gp.y);
+              void client
+                .gizmoPickDrag(gx, gy, gp.snap)
+                .then((hit) => {
+                  // A LATE ANSWER IS NOT A NOTE ABOUT THE PAST. A hit started a native drag as a side
+                  // effect of answering, and the render loop moves the selection from the OS cursor
+                  // for as long as that flag is set — button or no button. Its release has already
+                  // gone by, so the answer has to end the drag itself.
+                  if (gen !== gizmoGesture.current) {
+                    if (lateProbeNeedsDragEnd(hit)) client.gizmoDragEnd();
+                    return;
+                  }
+                  gizmoProbe.current = hit ? "hit" : "miss";
+                  gizmoHit.current = hit;
+                  if (hit) {
+                    marqueePress.current = null;
+                    setMarqueeDrag(null);
+                    return;
+                  }
+                  // A miss releases the gesture to the box — at the point the pointer has already
+                  // reached, because a drag can stop exactly on the threshold and then no further move
+                  // arrives to start it.
+                  const start = marqueePress.current;
+                  const at = lastMove.current;
+                  const stage = viewportRef.current;
+                  if (!start || !at || !stage || pipeActive || !beganDrag(start, at)) return;
+                  const { left, top } = stage.getBoundingClientRect();
+                  setMarqueeDrag({ start, current: at, origin: { left, top } });
+                })
+                .catch(() => {
+                  gizmoProbe.current = "miss";
+                });
+            }
             if (!press || gizmoHit.current || pipeActive) return;
+            // While the probe is deciding, the box must not draw: a rectangle withdrawn one round trip
+            // later is a flash on the stage claiming a box selection is happening when a handle drag
+            // is. The `miss` branch above starts it the moment the answer says it is a box.
+            if (gizmoProbe.current === "pending") return;
             const current = { x: e.clientX, y: e.clientY };
             if (!marqueeDrag && !isMarqueeDrag(press, current)) return;
             // Capture on the FIRST move that qualifies, not on the press: a plain click must not
@@ -1053,6 +1111,15 @@ export function App() {
           onPointerUp={(e) => {
             if (e.button === 2 && rightDrag.current) client.dragEnd();
             if (e.button === 0 && gizmoHit.current) client.gizmoDragEnd(); // commit the gizmo move (one tx)
+            if (e.button === 0) {
+              // The gesture is over. A probe still in flight is now late, and the generation bump is
+              // what tells its own `.then` so — the release it needed has just gone by (ADR-194).
+              // `gizmoHit` is deliberately NOT cleared: the click that follows reads it to know not to
+              // re-pick, and the next press clears it.
+              gizmoGesture.current += 1;
+              gizmoPress.current = null;
+              gizmoProbe.current = "idle";
+            }
             const drag = marqueeDrag;
             marqueePress.current = null;
             if (!drag || e.button !== 0) {
@@ -1087,9 +1154,17 @@ export function App() {
           }}
           onPointerCancel={() => {
             // A cancelled pointer (the OS took it, a touch was interrupted) must not leave a rectangle
-            // painted over the stage with no release coming to clear it.
+            // painted over the stage with no release coming to clear it — nor a handle drag, which is
+            // the same problem one layer down: no release is coming for that either (ADR-194).
             marqueePress.current = null;
             setMarqueeDrag(null);
+            if (gizmoHit.current) {
+              gizmoHit.current = false;
+              client.gizmoDragEnd();
+            }
+            gizmoGesture.current += 1;
+            gizmoPress.current = null;
+            gizmoProbe.current = "idle";
             clearHover();
           }}
           // The pointer leaving the stage is the one signal that the question stopped being asked. A
