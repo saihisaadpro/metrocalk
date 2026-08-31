@@ -1111,19 +1111,25 @@ function selectionScenes(): Scene[] {
         "single entity to name. Below: focus on one thing, named the way every other surface names " +
         "it. What a reader checks: neither banner prints a raw loro key (`1_4a3f`), which is what " +
         "this control did in every previous capture of the shell and is exactly what `selectionText` " +
-        "exists to prevent; the exit affordance (`· Esc to exit`) is legible as secondary rather " +
-        "than competing with the subject; and a long real assembly name is truncated with an " +
-        "ellipsis inside the pill rather than pushing `Esc to exit` off the end of it",
-      viewport: { width: 760, height: 240 },
+        "exists to prevent; the exit affordance (`· Esc to exit`) reads as secondary to the subject " +
+        "rather than competing with it; and — the reason the frame is deliberately NARROW — a long " +
+        "real assembly name gives up its own tail to an ellipsis rather than pushing `Esc to exit` " +
+        "out of the pill, because the way out of a mode must not be the thing that falls off the end",
+      // 560, not a comfortable width. The banner is `max-width: calc(100vw - 96px)` and centred, so a
+      // wide frame photographs the one case that was never in doubt: a real assembly name needs about
+      // 600px and does not get it here, which is what makes the ellipsis assertable at all.
+      viewport: { width: 560, height: 240 },
       expect: {
         present: [["[data-testid='focusbanner']", 2]],
+        // `text_present` reads textContent, so it proves the subject REACHED the banner, not that it
+        // fits. What must be SEEN is measured instead: the pill unclipped inside the window.
         text_present: ["14 objects", "Overhead Crane Assembly Rev C", "Esc to exit"],
         // The id vocabulary is what must NOT be here — the banner used to print `id` verbatim.
         text_absent: ["1_4a3f", "null", "undefined", "NaN"],
         unclipped: ["[data-testid='focusbanner']"],
       },
       render: () => (
-        <div style={{ width: 760, height: 240, display: "grid", gridTemplateRows: "1fr 1fr" }}>
+        <div style={{ width: 560, height: 240, display: "grid", gridTemplateRows: "1fr 1fr" }}>
           {/* The banner is `position: fixed` — it pins itself under the header of the real shell. A
               `transform` makes each cell its own containing block, so two of them can be photographed
               in one frame without landing on top of each other. */}
