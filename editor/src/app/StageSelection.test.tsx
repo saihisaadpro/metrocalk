@@ -30,6 +30,10 @@ interface Spies {
   select: ReturnType<typeof vi.fn>;
   /** The one batched delete all three routes go through (ADR-183). */
   del: ReturnType<typeof vi.fn>;
+  /** What is under the point a gesture happened at (ADR-191) — the right-click's own question. */
+  candidates: ReturnType<typeof vi.fn>;
+  /** The hover read (ADR-191). Watched because the CADENCE is the design: it must not fire per move. */
+  peek: ReturnType<typeof vi.fn>;
 }
 const sessions: Spies[] = [];
 
@@ -45,13 +49,22 @@ vi.mock("../transport/session", async (importOriginal) => {
       const undo = vi.fn(() => Promise.resolve(true));
       const select = vi.fn(client.selectEntities.bind(client));
       const del = vi.fn(client.deleteDeactivateMany.bind(client));
+      const candidates = vi.fn(() =>
+        Promise.resolve([
+          { id: "hit-1", kind: "Mesh", distance: 25.7, selected: false },
+          { id: "hit-2", kind: "Mesh", distance: 28.2, selected: false },
+        ]),
+      );
+      client.pickCandidates = candidates as unknown as typeof client.pickCandidates;
+      const peek = vi.fn(() => Promise.resolve("hit-1" as string | null));
+      client.viewportPeek = peek as unknown as typeof client.viewportPeek;
       client.selectEntities = select as unknown as typeof client.selectEntities;
       client.deleteDeactivateMany = del as unknown as typeof client.deleteDeactivateMany;
       client.undo = undo as unknown as typeof client.undo;
       client.viewportPick = pick as unknown as typeof client.viewportPick;
       client.viewportPickRegion = region as unknown as typeof client.viewportPickRegion;
       client.selectionIds = selectionIds as unknown as typeof client.selectionIds;
-      sessions.push({ pick, region, selectionIds, undo, select, del });
+      sessions.push({ pick, region, selectionIds, undo, select, del, candidates, peek });
       return client;
     },
   };
@@ -285,8 +298,54 @@ describe("modified clicks on the stage", () => {
       fireEvent.click(viewport, { clientX: 500, clientY: 400, altKey: true });
     });
     expect(spies().pick.mock.calls[1]?.[2]).toMatchObject({ cycle: true, extend: false, toggle: false });
-    // Alt is not a selection mode: it moves the HIT, so it must NOT cost a second round trip.
+    // Alt is not a selection MODE: it moves the HIT, so it must NOT re-read the whole set.
     expect(spies().selectionIds.mock.calls.length).toBe(afterToggle);
+  });
+
+  it("alt-click says WHERE IN THE STACK it landed, instead of nothing at all", async () => {
+    render(<App />);
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("viewport"), { clientX: 500, clientY: 400, altKey: true });
+    });
+    // The gesture reaches the object behind the one you can see and used to report nothing — not what
+    // it took, not how many there were, not whether there was anything to cycle to. A person cannot
+    // learn a gesture whose effect is invisible.
+    await waitFor(() => expect(uiStore.getState().status).toContain("1 of 2 under the pointer"));
+    expect(toastStore.getState().toasts.at(-1)?.text).toContain("under the pointer");
+    // One extra read, on the modified click only — a plain click must not pay for it.
+    expect(spies().candidates).toHaveBeenCalledTimes(1);
+  });
+
+  it("a PLAIN click never asks what else is under the cursor", async () => {
+    render(<App />);
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("viewport"), { clientX: 500, clientY: 400 });
+    });
+    expect(spies().candidates).not.toHaveBeenCalled();
+  });
+});
+
+describe("right-click asks where it happened", () => {
+  it("opens on an object you have NOT selected, and offers the one behind it", async () => {
+    render(<App />);
+    expect(projectionStore.getState().multiSelect).toEqual([]);
+    await act(async () => {
+      fireEvent.contextMenu(screen.getByTestId("viewport"), { clientX: 500, clientY: 400 });
+    });
+    // `if (sel.length)` alone meant a right-click on an object you had not selected did NOTHING —
+    // the state every other 3D tool treats as the primary way in.
+    const rows = await screen.findAllByTestId("ctxcandidate");
+    expect(rows.map((r) => r.dataset.id)).toEqual(["hit-1", "hit-2"]);
+    expect(spies().candidates.mock.calls[0]).toEqual([500 / window.innerWidth, 400 / window.innerHeight]);
+  });
+
+  it("stays shut over empty stage with nothing selected — a menu with nothing in it is not a menu", async () => {
+    render(<App />);
+    spies().candidates.mockResolvedValueOnce([]);
+    await act(async () => {
+      fireEvent.contextMenu(screen.getByTestId("viewport"), { clientX: 500, clientY: 400 });
+    });
+    expect(screen.queryByTestId("ctxmenu")).toBeNull();
   });
 });
 
@@ -469,5 +528,59 @@ describe("the key every editor binds", () => {
       fireEvent.keyDown(document.body, { key: "Delete" });
     });
     expect(spies().del).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the pointer names what it rests on", () => {
+  it("asks once the pointer STOPS, and never per move", async () => {
+    render(<App />);
+    const viewport = screen.getByTestId("viewport");
+    for (let i = 0; i < 5; i += 1) pointer(viewport, "pointermove", { clientX: 400 + i * 20, clientY: 300 });
+    // Invariant 4: the hot path never crosses the boundary. Five moves, nothing asked.
+    expect(spies().peek).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 260));
+    });
+    expect(spies().peek).toHaveBeenCalledTimes(1);
+    expect(spies().peek.mock.calls[0]).toEqual([480 / window.innerWidth, 300 / window.innerHeight]);
+    // And it NAMES it — the tooltip is the whole point of the read having a caller at last.
+    await waitFor(() => expect(screen.getByTestId("stage-hover")).toBeTruthy());
+  });
+
+  it("asks about the STAGE, not about the controls floating on it", async () => {
+    render(<App />);
+    const viewport = screen.getByTestId("viewport");
+    pointer(viewport, "pointermove", { clientX: 500, clientY: 400 });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 260));
+    });
+    await waitFor(() => expect(screen.getByTestId("stage-hover")).toBeTruthy());
+    const asked = spies().peek.mock.calls.length;
+
+    // The shell paints ~35 controls INSIDE the viewport. Without the `onStageSurface` gate, resting on
+    // one of them names whatever object happens to be behind it — the same class of defect as a wheel
+    // over a floating panel zooming the camera.
+    const chrome = viewport.querySelector("button");
+    if (!chrome) throw new Error("no control floats over the stage in this state — the gate is untestable here");
+    pointer(chrome, "pointermove", { clientX: 12, clientY: 12 });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 260));
+    });
+    expect(spies().peek.mock.calls.length).toBe(asked);
+    // DISMISSED, not merely not-updated: a tooltip left standing describes something the pointer left.
+    expect(screen.queryByTestId("stage-hover")).toBeNull();
+  });
+
+  it("a press is a gesture, not a question", async () => {
+    render(<App />);
+    const viewport = screen.getByTestId("viewport");
+    pointer(viewport, "pointermove", { clientX: 500, clientY: 400 });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 260));
+    });
+    await waitFor(() => expect(screen.getByTestId("stage-hover")).toBeTruthy());
+    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400 });
+    expect(screen.queryByTestId("stage-hover")).toBeNull();
   });
 });

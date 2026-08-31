@@ -39,6 +39,8 @@ import { EngineRail, ENGINES, engineById, type EngineId } from "./EngineRail";
 import { BottomDock, type BottomWorkspace } from "./BottomDock";
 import { onStageSurface } from "./stageInput";
 import { normalizeSurfacePoint } from "./viewportCoordinates";
+import { StageHoverTooltip, useStageHover } from "./StageHover";
+import type { PickCandidate } from "../transport/protocol";
 import { isMarqueeDrag, marqueeBox, marqueeMode, marqueeResult } from "./marquee";
 import { StageMarquee } from "./StageMarquee";
 import { selectionSentence, entityLabel } from "../store/selectionText";
@@ -162,7 +164,9 @@ export function App() {
   // The M3.3 right-click context menu, opened for an entity at a cursor position.
   // The right-click menu acts on the SELECTION (ADR-183), so what is stored here is the set, not the
   // one id under the cursor. The primary is the last element, matching the projection store.
-  const [ctx, setCtx] = useState<{ ids: string[]; x: number; y: number } | null>(null);
+  // `candidates` is what `pick_candidates` answered for the point the menu was opened at (ADR-191) —
+  // the one fact a right-click carries that no other surface has.
+  const [ctx, setCtx] = useState<{ ids: string[]; x: number; y: number; candidates: PickCandidate[] } | null>(null);
   // M3.3 focus mode — the framed entity + its camera distance (read from `focus_debug`); drives the banner.
   const [focused, setFocused] = useState<{ id: string; dist: number } | null>(null);
   // Tracks a right-press for the orbit-vs-context-menu movement threshold (the scaffold's disambiguation).
@@ -212,6 +216,15 @@ export function App() {
 
   const playing = usePlaying();
   const paused = usePaused();
+  // WHAT IS UNDER THE POINTER, ASKED ONLY WHEN SOMEBODY IS ASKING (ADR-191). Gated off whenever another
+  // gesture owns the pointer — a box being dragged, a gizmo handle held, the pipe tool armed, an open
+  // menu, or Play — because a tooltip that follows a marquee across the stage is describing an object
+  // nobody is looking at, and because `viewport_peek` must never be asked during a drag.
+  const {
+    hover,
+    onMove: onHoverMove,
+    clear: clearHover,
+  } = useStageHover(client, !playing && !pipeActive && !marqueeDrag && ctx === null);
   const order = useEntityOrder();
   const selectedId = useSelectedId();
   const multiSelect = useMultiSelect();
@@ -728,7 +741,10 @@ export function App() {
       }}
       onImport={importAsset}
       onContextMenu={(ids, x, y) => {
-        if (!playing) setCtx({ ids, x, y });
+        // NO CANDIDATES FROM A LIST. A row in the outliner is not a point in the scene, so there is
+        // nothing under the pointer to offer and the section is correctly absent — rather than
+        // showing whatever happens to be behind the panel.
+        if (!playing) setCtx({ ids, x, y, candidates: [] });
       }}
       onCollapse={!layout.collapsed && !leftDockCollapsed ? () => {
         setLeftDockCollapsed(true);
@@ -848,6 +864,9 @@ export function App() {
             // question and not each overlay's. Without it, a right-press on the "Import file…" button
             // starts a native ORBIT underneath it (measured: 3 of 3 empty-state buttons, in Chromium).
             if (!onStageSurface(e)) return;
+            // A press is a gesture, and a gesture is not a question. Dismissed here rather than left
+            // to the `enabled` gate, which cannot see a press that has not moved yet.
+            clearHover();
             if (e.button === 2) {
               rightDrag.current = { x: e.clientX, y: e.clientY, moved: false };
               client.dragStart(); // native orbit begins; the render loop polls the cursor (0 IPC/frame)
@@ -938,6 +957,29 @@ export function App() {
                 } else {
                   setStatus("nothing here");
                 }
+                // ALT-CLICK STOPS BEING BLIND (ADR-191). The gesture reaches the object behind the one
+                // you can see, and until now it said nothing at all — not what it took, not how many
+                // there were, not whether there was anything to cycle to. A person cannot learn a
+                // gesture whose effect is invisible, and on the 98%-empty seeded scene most alt-clicks
+                // land on a single object, where the cycle correctly returns to it and looks broken.
+                // One extra IPC, on a deliberate modified click only.
+                if (mods.cycle) {
+                  void client
+                    .pickCandidates(nx, ny)
+                    .then((candidates) => {
+                      if (candidates.length === 0) return;
+                      const at = picked ? candidates.findIndex((c) => c.id === picked) : -1;
+                      const message =
+                        candidates.length === 1
+                          ? `${entityLabel(candidates[0].id)} — the only thing under the pointer`
+                          : `${entityLabel(picked ?? candidates[0].id)} — ${at >= 0 ? at + 1 : 1} of ${candidates.length} under the pointer`;
+                      setStatus(message);
+                      pushToast(message, "info");
+                    })
+                    .catch(() => {
+                      /* the pick itself already reported; the count is an extra, not a promise */
+                    });
+                }
               })
               .catch((err) => console.error("viewport_pick failed", err));
           }}
@@ -951,6 +993,19 @@ export function App() {
             const rd = rightDrag.current;
             if (rd && (Math.abs(e.clientX - rd.x) > 6 || Math.abs(e.clientY - rd.y) > 6)) rd.moved = true;
             const press = marqueePress.current;
+            // The hover probe is fed from the move that is already happening, and costs a ref write
+            // here — no state, no IPC. It is skipped outright while a button is down: a press means a
+            // gesture, and `useStageHover` is gated on the same facts.
+            //
+            // AND IT ASKS ABOUT THE STAGE, NOT ABOUT THE CHROME FLOATING ON IT. `onStageSurface` is
+            // the seam for exactly this question (`stageInput.ts`): the shell paints 35 controls
+            // inside the viewport, and without this, resting on the "Import file…" button would name
+            // whatever object happens to be behind it. Moving onto chrome DISMISSES rather than
+            // merely not-updating, or the tooltip stays put describing something the pointer left.
+            if (!press && !rd && !gizmoHit.current) {
+              if (onStageSurface(e)) onHoverMove(e.clientX, e.clientY);
+              else clearHover();
+            }
             if (!press || gizmoHit.current || pipeActive) return;
             const current = { x: e.clientX, y: e.clientY };
             if (!marqueeDrag && !isMarqueeDrag(press, current)) return;
@@ -1011,7 +1066,11 @@ export function App() {
             // painted over the stage with no release coming to clear it.
             marqueePress.current = null;
             setMarqueeDrag(null);
+            clearHover();
           }}
+          // The pointer leaving the stage is the one signal that the question stopped being asked. A
+          // tooltip left behind over a panel describes an object that is no longer under anything.
+          onPointerLeave={() => clearHover()}
           onWheel={(e) => {
             // A wheel over a panel floating on the stage scrolls THAT PANEL. Before this line every
             // one of the 35 controls the shell paints inside the viewport turned a scroll into a
@@ -1048,7 +1107,21 @@ export function App() {
             // objects; a menu built from it offered `Delete` over a picture of 378 and removed one.
             const { multiSelect, selectedId } = projectionStore.getState();
             const sel = multiSelect.length ? multiSelect : selectedId ? [selectedId] : [];
-            if (sel.length) setCtx({ ids: sel, x: e.clientX, y: e.clientY });
+            // AND WHERE IT HAPPENED (ADR-191). One IPC per right-click — a deliberate, low-frequency
+            // gesture, nowhere near the hot path — and the answer decides whether the menu opens at
+            // all: `if (sel.length)` alone meant a right-click on an object you had not selected did
+            // NOTHING, which is the state every other 3D tool treats as the primary way in.
+            const at = { x: e.clientX, y: e.clientY };
+            const { x: nx, y: ny } = normalizeSurfacePoint(at.x, at.y);
+            void client
+              .pickCandidates(nx, ny)
+              .catch(() => [] as PickCandidate[])
+              .then((candidates) => {
+                // Nothing selected and nothing under the cursor is a menu with nothing in it. Opening
+                // it and then discovering that is a flash; deciding first is not.
+                if (!sel.length && candidates.length === 0) return;
+                setCtx({ ids: sel, x: at.x, y: at.y, candidates });
+              });
           }}
           style={{
             position: "relative",
@@ -1281,6 +1354,11 @@ export function App() {
         </Modal>
       )}
 
+      {/* The pointer's own answer, floating over the stage and inert (`pointerEvents: none`). Rendered
+          at the shell's top level rather than inside the viewport so a dock's `overflow` cannot clip
+          it — the same reason the context menu is portalled. */}
+      <StageHoverTooltip client={client} hover={hover} />
+
       {ctx && (
         <Suspense fallback={null}>
           {/* Portaled + edge-aware (Popover): the right-click menu can no longer be clipped by a panel's
@@ -1289,6 +1367,7 @@ export function App() {
             <ContextMenu
               client={client}
               ids={ctx.ids}
+              candidates={ctx.candidates}
               onClose={() => setCtx(null)}
               onFocus={(id, dist) => setFocused({ id, dist })}
             />

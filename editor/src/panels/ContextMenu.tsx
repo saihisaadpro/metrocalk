@@ -9,6 +9,13 @@
 //! surface in the product offered the weakest verbs in it. It now states its scope in a header, and
 //! every row carries `appliesTo` from the engine — the whole set, a partial count for a mixed
 //! selection, or `1` for the two verbs that are honestly primary-only.
+//!
+//! **AND IT NOW ALSO SAYS WHERE IT WAS OPENED** (ADR-191). Those two are not in tension: the verbs act
+//! on the selection, and `Under the pointer` is a labelled section that acts on the POINT, which is
+//! the one fact a right-click carries that nothing else does. Before it, the second object under a
+//! pixel was reachable only by alt-click — a gesture that cycles blind, names nothing, and cannot say
+//! whether there is anything to cycle to — and a right-click with an empty selection opened no menu at
+//! all.
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { projectionStore } from "../store/projection";
@@ -21,7 +28,7 @@ import { color, font, fontSize, space } from "../theme/tokens";
 import { deleteSelection } from "../app/deleteSelection";
 import { similarTo } from "../app/selectSimilar";
 import type { EditorClient } from "../transport/session";
-import type { ActionItem, SelectionActions } from "../transport/protocol";
+import type { ActionItem, PickCandidate, SelectionActions } from "../transport/protocol";
 
 /** Soften engine-internal rejection language into concise user-facing guidance. */
 function plainReason(reason: string): string {
@@ -45,17 +52,49 @@ function scopeNote(action: ActionItem, count: number): string | null {
 
 type LoadState = "loading" | "ready" | "error";
 
+/** How many objects under the pointer the menu will list.
+ *
+ *  A ray through a dense assembly meets far more than a person can choose between, and the menu is
+ *  edge-aware but not scrollable — an unbounded list is a menu taller than the window with its verbs
+ *  off the bottom of the screen. Eight is the point past which a list stops being read and starts
+ *  being scanned; the rest are not hidden, they are COUNTED and handed to the gesture that walks them
+ *  (`<benchmark_discipline>`'s "no silent caps" applied to a UI: a truncation nobody is told about
+ *  reads as "that is everything"). */
+const MAX_CANDIDATE_ROWS = 8;
+
+/** How tall the list of objects is allowed to get before it scrolls.
+ *
+ *  **THE VERBS MUST ALWAYS BE ON SCREEN.** `Popover` clamps the menu into the window, so a menu taller
+ *  than the window does not shrink — its bottom goes off the screen, and the bottom is where `Delete`
+ *  and `Focus` live. The capture that found this had eight candidate rows above seven verbs in a
+ *  760px window and the list simply ran off both ends. So the OBJECT list scrolls and the verb list
+ *  never does, with a row cut by the edge as the affordance — a partial row says "there is more" in a
+ *  way a flush boundary does not.
+ *
+ *  **THE NUMBER IS A MEASUREMENT, NOT A PREFERENCE.** At 232px the shots gate still failed, with
+ *  `Select similar` measuring `310×0px on screen`. A 1366×768 laptop is a supported target (product
+ *  principle 3), so the whole menu — this list, a subject line, seven verbs and two wrapped
+ *  explanations — has to fit in roughly 700px of usable height. 180 is what leaves room for them. */
+const CANDIDATE_LIST_MAX_PX = 180;
+
 const EMPTY: SelectionActions = { count: 0, missing: 0, items: [] };
 
 export function ContextMenu({
   client,
   ids,
+  candidates = [],
   onClose,
   onFocus,
 }: {
   client: EditorClient;
   /** The whole selection this menu acts on, in selection order — the primary is the LAST id. */
   ids: string[];
+  /** Everything under the point the menu was opened at, nearest first (`pick_candidates`).
+   *
+   *  Passed in rather than fetched here, because the OPEN decision needs it: a right-click on empty
+   *  stage with an empty selection has nothing to show, and a menu that opens and then discovers it is
+   *  empty has already flashed. */
+  candidates?: PickCandidate[];
   onClose: () => void;
   /** After framing the entity, hand the live camera distance up so App can raise the focus banner. */
   onFocus?: (id: string, dist: number) => void;
@@ -72,6 +111,8 @@ export function ContextMenu({
   // `actions_for_selection` reads for the two primary-only verbs. Said once here so the rows and the
   // header cannot disagree about which object `Duplicate` and `Bind…` are about.
   const primary = ids[ids.length - 1] ?? "";
+  const shownCandidates = candidates.slice(0, MAX_CANDIDATE_ROWS);
+  const hiddenCandidates = candidates.length - shownCandidates.length;
   // A stable key for the selection, so the effect below refetches when the SET changes rather than on
   // every re-render that hands it a fresh array with the same contents.
   const key = ids.join(",");
@@ -125,6 +166,12 @@ export function ContextMenu({
   }, [primary]);
   const canSelectSimilar = (similar?.ids.length ?? 0) > 1;
 
+  // ONE RING OVER BOTH SECTIONS. `Under the pointer` leads it, the registry's actions follow, and the
+  // similar row sits last — so the keyboard contract does not change shape depending on whether the
+  // object has something to match on, or whether the click landed on anything.
+  const hasSimilarRow = loadState === "ready" && actions.length > 0;
+  const rowCount = shownCandidates.length + actions.length + (hasSimilarRow ? 1 : 0);
+
   // `Popover` already supplies the menu role in the integrated app. Render this surface as its labelled
   // action group there, while retaining a complete standalone menu contract for direct embedding/tests.
   useLayoutEffect(() => {
@@ -141,12 +188,16 @@ export function ContextMenu({
   // is available (a stale selection, everything gone), row 0 is right again — there is no better
   // answer, and the reason is on it.
   useLayoutEffect(() => {
-    if (loadState !== "ready" || actions.length === 0) return;
-    const first = actions.findIndex((a) => a.available);
-    const start = first >= 0 ? first : 0;
+    if (loadState !== "ready" || rowCount === 0) return;
+    // The first row a person can USE. A verb outranks a candidate — the menu was opened to DO
+    // something — but with nothing selected there are no verbs, and then the pointer's own list is
+    // the menu, so focus has to reach it rather than stopping at an empty action list.
+    const available = actions.findIndex((item) => item.available);
+    const start = available >= 0 ? shownCandidates.length + available : actions.length > 0 ? shownCandidates.length : 0;
     setActiveIndex(start);
     itemRefs.current[start]?.focus();
-  }, [actions, loadState]);
+    // `candidates` is a fresh array identity per open; its LENGTH is what the arithmetic reads.
+  }, [actions, loadState, rowCount, shownCandidates.length]);
 
   function feedback(message: string, kind: ToastKind = "info") {
     setStatus(message);
@@ -212,6 +263,19 @@ export function ContextMenu({
     }
   }
 
+  /** Take one of the objects under the pointer — the whole point of the section.
+   *
+   *  A plain replace, deliberately: this row exists because the click took the wrong object, and the
+   *  fix for that is the right object selected, not a set of two. Extending is what Shift-click on the
+   *  stage is for, and it still is. */
+  function selectCandidate(candidate: PickCandidate) {
+    projectionStore.getState().setSelection([candidate.id]);
+    void client
+      .selectEntities([candidate.id])
+      .catch((error) => console.error("selectEntities failed (engine selection may be out of sync)", error));
+    feedback(`selected ${entityLabel(candidate.id)}`, "info");
+  }
+
   function selectSimilar() {
     if (!similar || similar.ids.length <= 1) return;
     projectionStore.getState().setSelection(similar.ids);
@@ -219,9 +283,6 @@ export function ContextMenu({
     feedback(`Selected ${similar.ids.length} objects ${similar.reason}`, "info");
   }
 
-  // The similar row sits after the registry's actions and shares their roving-tabindex ring, so the
-  // keyboard contract does not change shape depending on whether the object has something to match on.
-  const rowCount = actions.length + (loadState === "ready" && actions.length > 0 ? 1 : 0);
 
   function focusItem(index: number) {
     if (rowCount === 0) return;
@@ -258,18 +319,106 @@ export function ContextMenu({
       id="ctxmenu"
       data-testid="ctxmenu"
       role={insideMenu ? "group" : "menu"}
-      aria-label={`Actions for ${selectionSentence(ids.length, ids)}`}
+      aria-label={ids.length ? `Actions for ${selectionSentence(ids.length, ids)}` : "What is under the pointer"}
       aria-busy={loadState === "loading"}
       onKeyDown={onMenuKeyDown}
       style={{
         minWidth: 220,
         maxWidth: `min(320px, calc(100vw - ${space.xxl}px))`,
+        // THE MENU CAN BE TALLER THAN THE WINDOW, AND `Popover` CLAMPS RATHER THAN SHRINKS. Seven
+        // verbs, two of them carrying a wrapped explanation, already came close on a 768px laptop;
+        // the pointer's own list made it reachable. Without this the overflow goes off the BOTTOM,
+        // which is where `Delete`, `Make dynamic` and `Select similar` live — a menu that silently
+        // drops its last verbs at one window height. The pointer list has its own, tighter scroll box
+        // above; this is the floor under the whole surface at any window size.
+        maxHeight: `calc(100vh - ${space.xxl}px)`,
+        overflowY: "auto",
         padding: space.xs,
         color: color.text.secondary,
         fontFamily: font.ui,
         fontSize: fontSize.label,
       }}
     >
+      {/* UNDER THE POINTER (ADR-191). The engine has always been able to answer this — `pick_all`
+          returns the whole ordered list, and `viewport_peek` / `pick_diagnostics` are the two commands
+          that asked it, neither with a caller. The list leads the menu because it is about the point
+          the menu was opened at, and because with an empty selection it IS the menu.
+
+          Nearest first, which is the order alt-click walks, so the gesture and the list agree about
+          what "the next one" means. The row a plain click already took is marked rather than hidden:
+          a list of four where one is the current answer reads very differently from a list of four. */}
+      {candidates.length > 0 && (
+        <>
+          <div
+            data-testid="ctxmenu-under"
+            style={{
+              padding: `${space.xs}px ${space.md}px ${space.sm}px`,
+              color: color.text.muted,
+              fontSize: fontSize.meta,
+            }}
+          >
+            {candidates.length === 1 ? "Under the pointer" : `Under the pointer · ${candidates.length}`}
+          </div>
+          <div
+            data-testid="ctxmenu-under-list"
+            style={{ maxHeight: CANDIDATE_LIST_MAX_PX, overflowY: "auto", overscrollBehavior: "contain" }}
+          >
+            {shownCandidates.map((candidate, index) => (
+              <PopupMenuItem
+                key={candidate.id}
+                ref={(node: HTMLButtonElement | null) => {
+                  itemRefs.current[index] = node;
+                }}
+                className="ctxitem"
+                data-action="selectunder"
+                data-testid="ctxcandidate"
+                data-id={candidate.id}
+                data-selected={candidate.selected ? "true" : "false"}
+                label={entityLabel(candidate.id)}
+                // THE ORDINAL, BECAUSE THE NAMES REPEAT. The first capture of this section showed three
+                // rows all reading `Bolt M12 — Hex Head, Zinc`, which is not a corner case — it is the
+                // assembly case, and a list of three indistinguishable rows cannot be chosen from. The
+                // position is also the word alt-click now uses ("2 of 4 under the pointer"), so the
+                // gesture and the list are one vocabulary rather than two descriptions of one stack.
+                // Said only when it is NEWS: over a single candidate "1 of 1" is noise, the same rule
+                // `scopeNote` applies to the verbs below.
+                description={
+                  [candidates.length > 1 ? `${index + 1} of ${candidates.length}` : null, candidate.selected ? "selected" : null]
+                    .filter(Boolean)
+                    .join(" · ") || undefined
+                }
+                // Depth, in the units the scene is authored in. It is the reason the list has an order,
+                // so saying it is what makes "the one behind" a fact rather than a position.
+                meta={`${candidate.distance.toFixed(1)} m`}
+                tabIndex={index === activeIndex ? 0 : -1}
+                onFocus={() => setActiveIndex(index)}
+                onSelect={() => selectCandidate(candidate)}
+                onRequestClose={onClose}
+              />
+            ))}
+          </div>
+          {/* OUTSIDE the scroll box on purpose: the count of what is not shown is the one line that
+              must not itself need scrolling to. */}
+          {hiddenCandidates > 0 && (
+            <div
+              data-testid="ctxmenu-under-more"
+              style={{
+                padding: `${space.xs}px ${space.md}px ${space.sm}px`,
+                color: color.text.muted,
+                fontSize: fontSize.meta,
+              }}
+            >
+              {`${hiddenCandidates} more behind · Alt-click the stage to walk all ${candidates.length}`}
+            </div>
+          )}
+          {ids.length > 0 && (
+            <div
+              aria-hidden="true"
+              style={{ borderTop: `1px solid ${color.border.subtle}`, margin: `${space.xs}px 0` }}
+            />
+          )}
+        </>
+      )}
       {/* THE SUBJECT LINE. A menu whose verbs act on 378 objects has to say so before the first verb,
           not after it — `<ux_quality>` 2, feedback at the gesture. Over a single object it names the
           object, because the name is the useful fact and the count is obvious. */}
@@ -288,7 +437,7 @@ export function ContextMenu({
           {answer.missing > 0 && ` · ${answer.missing} no longer exist`}
         </div>
       )}
-      {loadState === "loading" && (
+      {loadState === "loading" && ids.length > 0 && (
         <div
           data-testid="ctxmenu-loading"
           role="status"
@@ -308,7 +457,10 @@ export function ContextMenu({
           Actions could not be loaded. Close the menu and try again.
         </div>
       )}
-      {loadState === "ready" && actions.length === 0 && (
+      {/* Only when there IS a selection. With nothing selected the verbs are absent for a reason the
+          user already knows, and "No actions available." under a live list of objects reads as a
+          failure of the list. */}
+      {loadState === "ready" && actions.length === 0 && ids.length > 0 && (
         <div role="status" aria-live="polite" style={{ padding: `${space.md}px ${space.lg}px`, color: color.text.muted }}>
           No actions available.
         </div>
@@ -320,7 +472,8 @@ export function ContextMenu({
           `nowrap` with an ellipsis, and `__meta` is a right-hand column, so a scope can never be
           mistaken for a refusal and a verb can never wrap. `onRequestClose` is the menu's own close, so
           a REFUSED row does not fire it — `PopupMenuItem` returns before both. */}
-      {actions.map((action, index) => {
+      {actions.map((action, actionIndex) => {
+        const index = shownCandidates.length + actionIndex;
         const reason = !action.available && action.reason ? plainReason(action.reason) : undefined;
         const scope = scopeNote(action, answer.count);
         return (
@@ -344,10 +497,10 @@ export function ContextMenu({
           />
         );
       })}
-      {loadState === "ready" && actions.length > 0 && (
+      {hasSimilarRow && (
         <PopupMenuItem
           ref={(node: HTMLButtonElement | null) => {
-            itemRefs.current[actions.length] = node;
+            itemRefs.current[shownCandidates.length + actions.length] = node;
           }}
           className={`ctxitem${canSelectSimilar ? "" : " disabled"}`}
           data-action="selectsimilar"
@@ -358,8 +511,8 @@ export function ContextMenu({
           meta={canSelectSimilar ? String(similar!.ids.length) : undefined}
           disabled={!canSelectSimilar}
           disabledReason={similar?.reason ?? "this object has nothing to match on"}
-          tabIndex={actions.length === activeIndex ? 0 : -1}
-          onFocus={() => setActiveIndex(actions.length)}
+          tabIndex={shownCandidates.length + actions.length === activeIndex ? 0 : -1}
+          onFocus={() => setActiveIndex(shownCandidates.length + actions.length)}
           onSelect={selectSimilar}
           onRequestClose={onClose}
         />

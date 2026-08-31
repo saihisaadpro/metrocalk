@@ -277,3 +277,133 @@ test("loading and failed action queries expose explicit live feedback", async ()
   expect(error.getAttribute("role")).toBe("alert");
   expect(error.getAttribute("aria-live")).toBe("assertive");
 });
+
+// ── Under the pointer (ADR-191) ────────────────────────────────────────────────────────────────────
+//
+// The menu now also answers the one question a right-click can ask that nothing else can: what is at
+// the point it was opened at. These assert the two halves that make it worth having — the SECOND
+// object under a pixel is reachable, and the row does not lie about which one the click already took.
+
+/** Candidates the way `pick_candidates` answers them: nearest first, with the depth that ordered them. */
+const under = (id: string, distance: number, selected = false) => ({ id, kind: "Mesh", distance, selected });
+
+test("the objects under the pointer are listed nearest-first, and the one already selected says so", async () => {
+  loadScene([{ id: "e1", name: "Bracket" }, { id: "e2", name: "Weld Gun" }]);
+  render(
+    <ContextMenu
+      client={fakeClient({ entityActionsFor: () => Promise.resolve(ACTIONS) })}
+      ids={["e1"]}
+      candidates={[under("e1", 25.7, true), under("e2", 28.2)]}
+      onClose={vi.fn()}
+    />,
+  );
+
+  const rows = await screen.findAllByTestId("ctxcandidate");
+  expect(rows.map((r) => r.dataset.id)).toEqual(["e1", "e2"]);
+  // NAMED, not keyed. A row reading `1_4a3f` is the exact failure `selectionText` exists to prevent.
+  expect(rows[0].textContent).toContain("Bracket");
+  expect(rows[1].textContent).toContain("Weld Gun");
+  // The depth is why the list has an order; saying it is what makes "the one behind" a fact.
+  expect(rows[1].textContent).toContain("28.2 m");
+  // A list of two where one is the current answer reads very differently from a list of two.
+  expect(rows[0].dataset.selected).toBe("true");
+  expect(rows[0].textContent).toContain("selected");
+  expect(rows[1].dataset.selected).toBe("false");
+  expect(screen.getByTestId("ctxmenu-under").textContent).toContain("2");
+});
+
+test("choosing the one BEHIND selects it — the whole point of the section", async () => {
+  loadScene([{ id: "e1", name: "Bracket" }, { id: "e2", name: "Weld Gun" }]);
+  const selectEntities = vi.fn((ids: string[]) => Promise.resolve(ids));
+  const onClose = vi.fn();
+  render(
+    <ContextMenu
+      client={fakeClient({ entityActionsFor: () => Promise.resolve(ACTIONS), selectEntities })}
+      ids={["e1"]}
+      candidates={[under("e1", 25.7, true), under("e2", 28.2)]}
+      onClose={onClose}
+    />,
+  );
+
+  const rows = await screen.findAllByTestId("ctxcandidate");
+  fireEvent.click(rows[1]);
+  // THE ENGINE IS TOLD, and it is told a REPLACE: this row exists because the click took the wrong
+  // object, and the fix for that is the right object selected — not a set of two.
+  await waitFor(() => expect(selectEntities).toHaveBeenCalledWith(["e2"]));
+  expect(projectionStore.getState().multiSelect).toEqual(["e2"]);
+  expect(onClose).toHaveBeenCalled();
+});
+
+test("with NOTHING selected the list is the menu — no verbs, no 'No actions available'", async () => {
+  loadScene([{ id: "e2", name: "Weld Gun" }]);
+  render(
+    <ContextMenu
+      client={fakeClient({ entityActionsFor: () => Promise.resolve(answer(0, [])) })}
+      ids={[]}
+      candidates={[under("e2", 12)]}
+      onClose={vi.fn()}
+    />,
+  );
+
+  const rows = await screen.findAllByTestId("ctxcandidate");
+  expect(rows).toHaveLength(1);
+  // "No actions available." under a live list of objects reads as a failure OF THE LIST.
+  expect(screen.queryByText("No actions available.")).toBeNull();
+  expect(screen.getByRole("menu").getAttribute("aria-label")).toBe("What is under the pointer");
+  // ONE ARROW-KEY RING over both sections: with no verbs, focus has to reach the candidate rather
+  // than stopping at an empty action list.
+  await waitFor(() => expect(document.activeElement).toBe(rows[0]));
+});
+
+test("a candidate row joins the SAME ring as the verbs — the keyboard contract does not change shape", async () => {
+  loadScene([{ id: "e1", name: "Bracket" }, { id: "e2", name: "Weld Gun" }]);
+  render(
+    <ContextMenu
+      client={fakeClient({ entityActionsFor: () => Promise.resolve(ACTIONS) })}
+      ids={["e1"]}
+      candidates={[under("e1", 25.7, true), under("e2", 28.2)]}
+      onClose={vi.fn()}
+    />,
+  );
+
+  const rows = await screen.findAllByTestId("ctxitem");
+  // Focus opens on the first row a person can USE — the first AVAILABLE verb, which is now two rows
+  // further down the ring than it used to be. An off-by-`candidates.length` here would put the ring's
+  // origin on a candidate while `tabIndex=0` sat on a verb.
+  const removeRow = rows.find((r) => r.dataset.action === "remove")!;
+  await waitFor(() => expect(document.activeElement).toBe(removeRow));
+  expect(removeRow.getAttribute("tabindex")).toBe("0");
+
+  const menu = screen.getByRole("menu");
+  fireEvent.keyDown(menu, { key: "Home" });
+  // Home is the top of the WHOLE menu, which is now the nearest object under the pointer.
+  expect(document.activeElement).toBe(screen.getAllByTestId("ctxcandidate")[0]);
+  fireEvent.keyDown(menu, { key: "End" });
+  expect((document.activeElement as HTMLElement).dataset.action).toBe("selectsimilar");
+});
+
+test("a ray through a dense assembly is CAPPED, and says how many it did not show", async () => {
+  const many = Array.from({ length: 23 }, (_, i) => under(`e${i}`, 10 + i));
+  loadScene(many.map((c, i) => ({ id: c.id, name: `Bolt ${i}` })));
+  render(
+    <ContextMenu
+      client={fakeClient({ entityActionsFor: () => Promise.resolve(answer(0, [])) })}
+      ids={[]}
+      candidates={many}
+      onClose={vi.fn()}
+    />,
+  );
+
+  const rows = await screen.findAllByTestId("ctxcandidate");
+  // A menu is edge-aware but not scrollable: 23 rows is a menu taller than the window with its verbs
+  // off the bottom of the screen.
+  expect(rows).toHaveLength(8);
+  // NOT A SILENT CAP. A truncation nobody is told about reads as "that is everything" — and the line
+  // hands the rest to the gesture that can still reach them, rather than stranding them.
+  const more = screen.getByTestId("ctxmenu-under-more");
+  expect(more.textContent).toContain("15 more behind");
+  expect(more.textContent).toContain("Alt-click");
+  // The ordinals count positions in the WHOLE stack, not in the shown window — the same numbers
+  // alt-click reports, or the two surfaces would disagree about where you are.
+  expect(rows[7].textContent).toContain("8 of 23");
+});

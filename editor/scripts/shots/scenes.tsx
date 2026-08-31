@@ -2130,6 +2130,119 @@ function contextMenuScenes(): Scene[] {
         />
       ),
     },
+    {
+      id: "ctxmenu-under-pointer",
+      looking_for:
+        "the SAME menu with the section that says where it was opened (ADR-191). Four objects lie " +
+        "along the ray under the pointer; the nearest is the one the click already took and is marked " +
+        "`selected`, and the three behind it are reachable in one more click each. Until this existed " +
+        "the second object under a pixel was reachable only by alt-click, which cycles blind and says " +
+        "nothing. What a reader checks: the two sections are unmistakably different questions — a " +
+        "list of OBJECTS above, a list of VERBS below — the rule is separated rather than run " +
+        "together, the depths line up in their own column so the order is legible as depth rather " +
+        "than as an arbitrary sort, and — the thing the first capture of this scene got wrong — the " +
+        "three rows that carry the SAME name are still distinguishable from one another, because 378 " +
+        "identical bolts is the assembly case and not a corner one. A long name is truncated by a " +
+        "320px menu and that is expected; what must not be lost is the part that tells two rows apart",
+      // 620 CLIPPED `Make dynamic`, and the first capture of this scene is where that was seen: the
+      // section adds four rows and a rule to a menu that already had seven. The window has to be tall
+      // enough for the WHOLE menu, or the picture cannot answer whether the two sections read as two
+      // questions — the second one is off the bottom.
+      viewport: { width: 900, height: 820 },
+      expect: {
+        present: [
+          ["[data-testid='ctxmenu-under']", 1],
+          ["[data-testid='ctxcandidate']", 4],
+          ["[data-testid='ctxcandidate'][data-selected='true']", 1],
+          ["[data-testid='ctxmenu-subject']", 1],
+          ["[data-testid='ctxitem']", 6],
+        ],
+        text_present: [
+          "Under the pointer",
+          "Overhead Crane Assembly Rev C — Long Travel Girder",
+          "Bolt M12 — Hex Head, Zinc",
+          "selected",
+          // The depth is the reason the list has an order.
+          "25.7 m",
+          "41.8 m",
+          // Three rows read `Bolt M12 — Hex Head, Zinc`; the ordinal is what tells them apart, and it
+          // is the same word alt-click uses for the same stack.
+          "2 of 4",
+          "4 of 4",
+        ],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='ctxmenu']"],
+      },
+      setup: seedAssembly,
+      render: () => (
+        <ContextMenu
+          client={actionsClient(1, [
+            act("bind", "Bind…", 0, false, "requires no capabilities, so there is nothing to bind"),
+            act("remove", "Delete", 1, true),
+            act("duplicate", "Duplicate", 1, true),
+            act("focus", "Focus", 1, false),
+            act("inspect", "Inspect", 1, false),
+            act("makedynamic", "Make dynamic", 1, true),
+          ])}
+          ids={["girder"]}
+          candidates={[
+            { id: "girder", kind: "Mesh", distance: 25.7, selected: true },
+            { id: "bolt-0", kind: "Mesh", distance: 28.2, selected: false },
+            { id: "bolt-1", kind: "Mesh", distance: 33.05, selected: false },
+            { id: "bolt-2", kind: "Mesh", distance: 41.84, selected: false },
+          ]}
+          onClose={() => {}}
+        />
+      ),
+    },
+    {
+      id: "ctxmenu-under-pointer-many",
+      looking_for:
+        "the same section where a ray meets 23 objects — a bolt pattern seen edge-on, which is what " +
+        "a real assembly does to a pick. Eight rows, then a line saying `15 more behind` and naming " +
+        "the gesture that reaches them. What a reader checks: the cap is VISIBLY a cap rather than " +
+        "looking like the whole answer (the failure mode a silent truncation produces), the overflow " +
+        "line is legible as a statement and not mistakable for a ninth row, and — the thing the first " +
+        "capture of this scene got wrong — the whole menu FITS THE WINDOW with every verb on screen, " +
+        "because `Popover` clamps a too-tall menu rather than shrinking it and the bottom is where " +
+        "`Delete` lives. The object list scrolls; the verb list never does. The window here is a real " +
+        "editor's, because the question is whether the DESIGN fits one — the surface also caps itself " +
+        "at the viewport and scrolls, which is the floor under a window shorter than this",
+      viewport: { width: 900, height: 900 },
+      expect: {
+        present: [
+          ["[data-testid='ctxcandidate']", 8],
+          ["[data-testid='ctxmenu-under-more']", 1],
+          ["[data-testid='ctxitem']", 6],
+        ],
+        text_present: ["Under the pointer · 23", "8 of 23", "15 more behind", "Alt-click"],
+        text_absent: ["9 of 23", "null", "undefined", "NaN"],
+        // The menu itself, and the two rows that must survive a long list: the first verb below the
+        // section, and the last row in the menu.
+        unclipped: ["[data-testid='ctxmenu']", "[data-action='remove']", "[data-action='selectsimilar']"],
+      },
+      setup: seedAssembly,
+      render: () => (
+        <ContextMenu
+          client={actionsClient(1, [
+            act("bind", "Bind…", 0, false, "requires no capabilities, so there is nothing to bind"),
+            act("remove", "Delete", 1, true),
+            act("duplicate", "Duplicate", 1, true),
+            act("focus", "Focus", 1, false),
+            act("inspect", "Inspect", 1, false),
+            act("makedynamic", "Make dynamic", 1, true),
+          ])}
+          ids={["girder"]}
+          candidates={Array.from({ length: 23 }, (_, i) => ({
+            id: i === 0 ? "girder" : `bolt-${i}`,
+            kind: "Mesh",
+            distance: 25.7 + i * 3.4,
+            selected: i === 0,
+          }))}
+          onClose={() => {}}
+        />
+      ),
+    },
   ];
 }
 
