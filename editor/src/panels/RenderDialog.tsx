@@ -12,6 +12,14 @@
 //! `Movie`, writes one H.264 MP4 through the encoder Windows already has, and still offers the lossless
 //! sequence — which is what a compositor wants and the only thing that has no size ceiling.
 //!
+//! ADR-190 — AND THEN IT REMEMBERED. Every one of the four answers below was a `useState` seeded
+//! from a constant on every open: a person who had decided their cut delivers a 1440 scope sequence
+//! called `weld-line-master` re-decided it, four controls at a time, on every single render, and none
+//! of the four survived closing the dialog — let alone closing the editor. They now live on the
+//! cutscene beside its delivery frame, written by `cinema_set_render` as an ordinary undoable commit
+//! and saved by the same code path that saves everything else. This component's state is a DRAFT of
+//! the document's answer, seeded from it on open and written back as it changes.
+//!
 //! THE THREE MOMENTS, IN ONE PLACE (`<ux_quality>` 1-3). What will be written, said before the click;
 //! how far it has got, while it runs; and what was actually written and where, after. The last one is
 //! the part a status-bar toast could never carry: a sequence is 600 files in a folder, and "done" is
@@ -23,7 +31,7 @@ import { Button, SelectField, TextField } from "../theme/primitives";
 import { Callout, Field, FieldGrid, Metric, MetricGrid, ProgressBar } from "../theme/fields";
 import { Icon } from "../theme/icons";
 import { color, elevation, font, fontSize, radius, space } from "../theme/tokens";
-import type { CinemaReply, RenderFormat, RenderReply } from "../transport/protocol";
+import type { CinemaReply, RenderFormat, RenderReply, RenderSettings } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 
 /** The rates the engine renders at, in the order a picker should offer them.
@@ -62,27 +70,32 @@ const FORMATS = [
   { value: "sequence", label: "PNG sequence — one file per frame" },
 ] as const;
 
-/** What a render starts as.
- *
- *  THE MOVIE, for the reason 1080 is the default height and not "as on screen": a render is the thing
- *  that LEAVES the editor, and what leaves it should be watchable. The sequence is still one click
- *  away and is still the right answer for a compositor — it is lossless, and it is the only one of
- *  the two with no encoder ceiling over it. */
-const DEFAULT_FORMAT: RenderFormat = "movie";
 
 /** Bits per second, in the unit a person would say out loud. */
 function rateLabel(bitsPerSecond: number): string {
   return `${(bitsPerSecond / 1_000_000).toFixed(1)} Mbit/s`;
 }
 
-/** The height a render starts on.
+/** ADR-190 — the size picker's value for the height a stored setting names.
  *
- *  1080 AND NOT "AS ON SCREEN", which is what this dialog shipped with. A render is a DELIVERY — the
- *  thing that leaves the editor — and the size a stage happens to be after the author opened a dock is
- *  not a delivery format. The old default silently made every sequence as tall as the window, which on
- *  a laptop with both docks open is around 400 lines: a film nobody can use, produced by a dialog that
- *  never asked. */
-const DEFAULT_HEIGHT = "1080";
+ *  A `<select>` carries a string and the document carries `number | null`, so exactly one function
+ *  crosses between them, in each direction ([`heightOf`] is the other). `null` is the engine's own
+ *  word for "as on screen" and it is a different KIND of answer from a number, which is why it is not
+ *  a sentinel `0`: everywhere it is read, it behaves differently rather than numerically.
+ *
+ *  THE `movie` COERCION IS HERE and not in an effect. A movie has one size for its whole length, so
+ *  "as on screen" is not a size it can have — the engine refuses to store the pair. A document that
+ *  somehow holds it (hand-edited, or written before this rule) is shown the default height rather
+ *  than a `<select>` sitting on a value it does not offer. */
+function sizeValueOf(settings: RenderSettings): string {
+  if (settings.height === null) return settings.format === "movie" ? "1080" : "viewport";
+  return String(settings.height);
+}
+
+/** The height a size-picker value means, in the document's vocabulary. */
+function heightOf(sizeChoice: string): number | null {
+  return sizeChoice === "viewport" ? null : Number(sizeChoice);
+}
 
 /** How long a render's own progress is polled for, in ms.
  *
@@ -118,6 +131,13 @@ export interface RenderDialogProps {
   activeShotIndex: number | null;
   /** What the delivery frame is CALLED, from the engine's own catalogue — never a word chosen here. */
   deliveryLabel: string;
+  /** ADR-190 — a successful `cinema_set_render`, handed up so the panel that owns `cut` can adopt it.
+   *
+   *  THE DIALOG DOES NOT OWN THE DOCUMENT. It sends the change and shows any refusal in place, next
+   *  to the control that caused it; the panel above it holds the cutscene, raises the "Ctrl-Z to
+   *  undo" toast every other cinematics edit raises, and is the thing that would otherwise hand this
+   *  dialog a stale `cut` the next time it opened. */
+  onSettingsSaved: (reply: CinemaReply, announce: boolean) => void;
 }
 
 export function RenderDialog({
@@ -129,17 +149,27 @@ export function RenderDialog({
   cut,
   activeShotIndex,
   deliveryLabel,
+  onSettingsSaved,
 }: RenderDialogProps) {
-  const [fps, setFps] = useState<number>(24);
+  const [fps, setFps] = useState<number>(cut.render.fps);
   /** `"viewport"`, or one of `HEIGHTS`. A string because that is what a `<select>` carries; the number
    *  it means is `height` below, and `null` is the engine's own word for "as on screen". */
-  const [sizeChoice, setSizeChoice] = useState<string>(DEFAULT_HEIGHT);
+  const [sizeChoice, setSizeChoice] = useState<string>(() => sizeValueOf(cut.render));
   const [scope, setScope] = useState<"cut" | "shot">("cut");
-  const [format, setFormat] = useState<RenderFormat>(DEFAULT_FORMAT);
-  const [stem, setStem] = useState(() => name);
+  const [format, setFormat] = useState<RenderFormat>(cut.render.format);
+  /** The file name as the author is typing it. EMPTY IS A REAL ANSWER — it means "call it after the
+   *  object" — so this is seeded from the stored name and not from `name`, and the object's name is
+   *  the field's PLACEHOLDER rather than its value. Seeding it with the object's name instead would
+   *  freeze that name into the document the first time anybody touched the field. */
+  const [stem, setStem] = useState<string>(cut.render.name);
   const [plan, setPlan] = useState<RenderReply | null>(null);
   const [job, setJob] = useState<RenderReply | null>(null);
   const [starting, setStarting] = useState(false);
+  /** ADR-190 — why the last settings write did not land, said beside the controls that made it.
+   *
+   *  IN THE DIALOG AND NOT IN A TOAST BEHIND IT. A modal covers the status bar, and "stop Play first"
+   *  is an answer about the control the reader is looking at. */
+  const [settingsRefusal, setSettingsRefusal] = useState<string | null>(null);
   const startButton = useRef<HTMLButtonElement>(null);
 
   // The shot index this render would film, or `null` for the whole cut. One expression, because three
@@ -161,13 +191,22 @@ export function RenderDialog({
   useEffect(() => {
     if (!open) return;
     setStarting(false);
-    setStem(name);
+    setSettingsRefusal(null);
     // ALWAYS the whole cut, even with a shot open. The headline offer is the film; rendering one shot
     // is the narrower second choice, and a dialog that opened on it would quietly make "Render" mean
     // two seconds of a thirteen-second cut for anybody who had clicked a clip first.
+    //
+    // AND IT IS THE ONE ANSWER THAT IS STILL NOT REMEMBERED (ADR-190), deliberately: the other four
+    // describe the DELIVERABLE and belong to the cut, while this one describes what the author is
+    // looking at right now. A dialog that reopened on "shot 3 only" a week later would render two
+    // seconds of a film and say it had rendered the film.
     setScope("cut");
-    setSizeChoice(DEFAULT_HEIGHT);
-    setFormat(DEFAULT_FORMAT);
+    // ADR-190 — THE DOCUMENT'S ANSWERS, not four constants. `cut` is the reply the panel above is
+    // already holding, so these are settled before the first paint rather than arriving after it.
+    setFps(cut.render.fps);
+    setSizeChoice(sizeValueOf(cut.render));
+    setFormat(cut.render.format);
+    setStem(cut.render.name);
     let live = true;
     void client
       .cinemaRenderStatus()
@@ -180,7 +219,10 @@ export function RenderDialog({
     return () => {
       live = false;
     };
-  }, [open, name, client]);
+    // `cut.render` and not `cut`: this effect SEEDS the draft, and re-running it on every reply would
+    // reset the author's half-made choice each time an unrelated cinematics edit refreshed the cut.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, client, cut.render]);
 
   // THE COST, FROM THE ENGINE. Asked again whenever the choice changes, because the frame count is
   // `plan_render`'s answer and not this component's arithmetic — the same function the job runs, so
@@ -214,25 +256,116 @@ export function RenderDialog({
     return () => window.clearInterval(timer);
   }, [open, running, client]);
 
-  // ADR-182 — A MOVIE HAS ONE SIZE FOR ITS WHOLE LENGTH, so "as on screen" is not one it can have: a
-  // stream declares its frame size in a header written before the first sample, and the stage's size
-  // is a measurement that changes while you work. The engine refuses the pair in a sentence — but
-  // LEAVING the author on it and then explaining is worse than not offering it: the option disappears
-  // from the picker while a movie is selected, and choosing a movie while on it moves to the default
-  // height rather than to a refusal the author has to read and then undo.
-  useEffect(() => {
-    if (format === "movie" && sizeChoice === "viewport") setSizeChoice(DEFAULT_HEIGHT);
-  }, [format, sizeChoice]);
+  // ADR-190 — WRITE THE FOUR ANSWERS TO THE DOCUMENT.
+  //
+  // THE WHOLE BLOCK, EVERY TIME, and never one field. The four are validated together on the engine —
+  // `(movie, "as on screen")` is the one pair it refuses — so sending one of them alone would ask it
+  // to judge a combination half of which it has to read out of the document. `cinema_set_render`
+  // writes the same serialised cutscene whatever changed, so a four-field write costs exactly what a
+  // one-field write costs.
+  //
+  // AND THE CONTROLS SNAP BACK ON A REFUSAL. The document is the truth; a picker left showing 1440
+  // after the engine declined to store 1440 is a control lying about the state of the thing it edits.
+  const commit = useCallback(
+    async (
+      next: {
+        format: RenderFormat;
+        fps: number;
+        sizeChoice: string;
+        stem: string;
+        folder?: string;
+      },
+      announce = true,
+    ) => {
+      setFormat(next.format);
+      setFps(next.fps);
+      setSizeChoice(next.sizeChoice);
+      setStem(next.stem);
+      try {
+        const reply = await client.cinemaSetRender(
+          entity,
+          next.format,
+          next.fps,
+          heightOf(next.sizeChoice),
+          next.stem,
+          // NEVER TYPED, AND NEVER FROM A DRAFT. A destination only ever arrives from a picker, so
+          // the default here is the one the document already holds — changing a rate cannot clear a
+          // folder — and the only caller that overrides it is the one holding a path a picker just
+          // returned.
+          next.folder ?? cut.render.folder,
+        );
+        if (reply.reason) {
+          setSettingsRefusal(reply.reason);
+          setFormat(cut.render.format);
+          setFps(cut.render.fps);
+          setSizeChoice(sizeValueOf(cut.render));
+          setStem(cut.render.name);
+          return;
+        }
+        setSettingsRefusal(null);
+        onSettingsSaved(reply, announce);
+      } catch (e) {
+        console.error("cinema_set_render failed", e);
+        setSettingsRefusal("The render settings could not be saved — please try again.");
+      }
+    },
+    [client, entity, cut.render, onSettingsSaved],
+  );
+
+  // ADR-190 — ASK FOR A FOLDER, AND REMEMBER IT.
+  //
+  // A CANCELLED PICKER IS NOT A REFUSAL. It comes back with no entity and no reason, because a
+  // decision not to decide is not an error and nothing changed; treating it as one is how a surface
+  // ends up scolding somebody for pressing Escape.
+  const chooseFolder = useCallback(async () => {
+    try {
+      const reply = await client.cinemaPickRenderFolder(entity);
+      if (reply.entity === null) return;
+      if (reply.reason) {
+        setSettingsRefusal(reply.reason);
+        return;
+      }
+      setSettingsRefusal(null);
+      onSettingsSaved(reply, true);
+    } catch (e) {
+      console.error("cinema_pick_render_folder failed", e);
+      setSettingsRefusal("The destination could not be saved — please try again.");
+    }
+  }, [client, entity, onSettingsSaved]);
+
+  // The draft as it stands, so each handler names only the one answer it changes.
+  const draft = { format, fps, sizeChoice, stem };
 
   const start = useCallback(async () => {
     setStarting(true);
     try {
-      const reply = await client.cinemaRenderStart(entity, fps, shotIndex, stem, null, height, format);
+      // AN EMPTY NAME MEANS THE OBJECT'S OWN, resolved here the same way `RenderSettings::stem_for`
+      // resolves it on the engine — the document stores what was typed, and blank is a real answer.
+      const reply = await client.cinemaRenderStart(
+        entity,
+        fps,
+        shotIndex,
+        stem.trim() || name,
+        // THE REMEMBERED DESTINATION, or `null` to be asked. The engine treats a folder that is no
+        // longer on this machine exactly like `null`, so a project that travelled asks rather than
+        // failing.
+        cut.render.folder || null,
+        height,
+        format,
+      );
       setJob(reply);
+      // AND WHAT THE PICKER RETURNED IS REMEMBERED. Clicking Render with nothing stored opens a
+      // picker titled "Choose a folder for the rendered frames"; the author has just answered the
+      // question, and asking it again on the next take would be forgetting an answer given ten
+      // seconds ago. Announced quietly — the author came here to render, not to edit settings, so
+      // this rides in without a toast of its own.
+      if (!reply.reason && reply.folder && reply.folder !== cut.render.folder) {
+        await commit({ format, fps, sizeChoice, stem, folder: reply.folder }, false);
+      }
     } finally {
       setStarting(false);
     }
-  }, [client, entity, fps, shotIndex, stem, height, format]);
+  }, [client, entity, fps, shotIndex, stem, name, height, format, sizeChoice, cut.render.folder, commit]);
 
   const stop = useCallback(async () => {
     setJob(await client.cinemaRenderCancel());
@@ -240,6 +373,9 @@ export function RenderDialog({
 
   if (!open) return null;
 
+  // A SETTINGS REFUSAL IS NOT A PLAN REFUSAL, so it is not folded into `refusal`: `refusal` disables
+  // the Render button and captions it, and "stop Play first — render settings are authored" is a
+  // reason the SETTING did not land, not a reason there is nothing to render.
   const refusal = job?.reason ?? plan?.reason ?? null;
   const frames = plan?.frames ?? 0;
   // The size the files will be, from the plan — never multiplied here. `0` while the first plan is in
@@ -481,7 +617,16 @@ export function RenderDialog({
                   id="render-format"
                   data-testid="render-format"
                   value={format}
-                  onChange={(event) => setFormat(event.currentTarget.value as RenderFormat)}
+                  onChange={(event) => {
+                    // ADR-182's coercion, moved out of an effect and into the gesture that needs it.
+                    // A movie has one size for its whole length, so "as on screen" is not a size it
+                    // can have; choosing a movie while on it moves to the default height in the SAME
+                    // commit rather than writing a pair the engine refuses and then correcting it.
+                    const next = event.currentTarget.value as RenderFormat;
+                    const sizeChoice =
+                      next === "movie" && draft.sizeChoice === "viewport" ? "1080" : draft.sizeChoice;
+                    void commit({ ...draft, format: next, sizeChoice });
+                  }}
                 >
                   {FORMATS.map((f) => (
                     <option key={f.value} value={f.value}>
@@ -500,7 +645,9 @@ export function RenderDialog({
                   id="render-fps"
                   data-testid="render-fps"
                   value={String(fps)}
-                  onChange={(event) => setFps(Number(event.currentTarget.value))}
+                  onChange={(event) =>
+                    void commit({ ...draft, fps: Number(event.currentTarget.value) })
+                  }
                 >
                   {RATES.map((rate) => (
                     <option key={rate} value={rate}>
@@ -524,7 +671,9 @@ export function RenderDialog({
                   id="render-size"
                   data-testid="render-size"
                   value={sizeChoice}
-                  onChange={(event) => setSizeChoice(event.currentTarget.value)}
+                  onChange={(event) =>
+                    void commit({ ...draft, sizeChoice: event.currentTarget.value })
+                  }
                 >
                   {/* THE OLD BEHAVIOUR, STILL OFFERED AND NO LONGER THE DEFAULT. Rendering the stage
                       at whatever size the docks have left it is the right answer for a quick look at
@@ -550,14 +699,82 @@ export function RenderDialog({
                     : "Frames are numbered after it — name.0000.png, name.0001.png."
                 }
               >
+                {/* ADR-190 — TYPED LOCALLY, COMMITTED ON BLUR OR ENTER. The three pickers above
+                    write on change because a `<select>` change IS the decision; a text field's every
+                    keystroke is not, and committing each one would put fourteen undoable entries and
+                    fourteen round trips behind one nine-letter name. Same shape as the rename session
+                    in ADR-153, for the same reason. */}
                 <TextField
                   id="render-stem"
                   data-testid="render-stem"
                   value={stem}
+                  placeholder={name}
                   onChange={(event) => setStem(event.currentTarget.value)}
+                  onBlur={(event) => {
+                    if (event.currentTarget.value !== cut.render.name) {
+                      void commit({ ...draft, stem: event.currentTarget.value });
+                    }
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
                 />
               </Field>
             </FieldGrid>
+
+            {/* ADR-190 — WHERE, SAID BEFORE THE CLICK. This dialog's whole argument is that what will
+                be written is stated before the button that writes it (`<ux_quality>` 1), and until
+                now the one thing it never said was the destination: the folder was asked for AFTER
+                the click, by the operating system, and the only surface that ever named it was the
+                ledger at the end. It is a field like the other five now, and the answer is
+                remembered on the cut. */}
+            <Field
+              label="Where"
+              htmlFor="render-folder"
+              help={
+                cut.render.folder
+                  ? "Remembered on this cut. If the folder is gone, the next render asks again."
+                  : "Choose one now, or be asked when you click Render — either way it is remembered."
+              }
+            >
+              <div style={{ display: "flex", gap: space.sm, alignItems: "center" }}>
+                <span
+                  id="render-folder"
+                  data-testid="render-folder"
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    font: font.mono,
+                    fontSize: fontSize.meta,
+                    color: cut.render.folder ? color.text.primary : color.text.muted,
+                    // A PATH IS READ FROM ITS END. `direction: rtl` keeps the folder — the part that
+                    // identifies it — visible when the path is longer than the row, instead of eight
+                    // characters of drive letter and an ellipsis.
+                    direction: "rtl",
+                    textAlign: "left",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                  title={cut.render.folder || undefined}
+                >
+                  {cut.render.folder || "You'll be asked when you render"}
+                </span>
+                <Button
+                  data-testid="render-folder-choose"
+                  variant="secondary"
+                  onClick={() => void chooseFolder()}
+                >
+                  Choose…
+                </Button>
+              </div>
+            </Field>
+
+            {settingsRefusal !== null && (
+              <Callout tone="warn" title="That setting was not saved">
+                {settingsRefusal}
+              </Callout>
+            )}
 
             {/* THE COST, ABOVE THE BUTTON THAT PAYS IT. The frame count is the engine's own plan, not
                 a multiplication done here — so what this says and what appears in the folder are the

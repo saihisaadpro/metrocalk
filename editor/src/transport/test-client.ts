@@ -4,7 +4,7 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type MatchStatus, type RenderFormat, type RenderReply, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, DEFAULT_RENDER_SETTINGS, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type MatchStatus, type RenderFormat, type RenderReply, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
 
 /** The render a test drives. MUTABLE and module-scoped on purpose: a render is the one thing in this
  *  client with a life longer than a single call — start, poll, poll, done — and a stub that answered
@@ -409,13 +409,20 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
       { kind: "hero", label: "Hero shot", blurb: "The workhorse - three-quarters on, pushing in", adds: "a full-body three-quarter shot that creeps closer" },
       { kind: "closeup", label: "Close-up", blurb: "Tight and still - for the moment that matters", adds: "a close, locked-off shot in profile" },
     ])),
-    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: "Added a hero shot", reason: null })),
-    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, reads: [], rows: [], problems: [], message: "Shot removed", reason: null })),
-    cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, delivery: "viewport" as const, reads: [], rows: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
-    cinemaSetDelivery: vi.fn((id: string, delivery: DeliveryFrame) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Composing for ${delivery}`, reason: null })),
-    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, reads: [], rows: [], problems: [], message: "", reason: null })),
+    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: "Added a hero shot", reason: null })),
+    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "Shot removed", reason: null })),
+    cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
+    cinemaSetDelivery: vi.fn((id: string, delivery: DeliveryFrame) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Composing for ${delivery}`, reason: null })),
+    // ADR-190 — the stub ECHOES the four answers back, rather than returning a fixed block: a dialog
+    // that seeds itself from the reply would otherwise pass every "it remembered" assertion while
+    // remembering nothing.
+    cinemaSetRender: vi.fn((id: string, format: RenderFormat, fps: number, height: number | null, name: string, folder: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: { format, fps, height, name: name.trim(), folder }, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Delivering ${format} at ${height ?? "as on screen"}, ${fps} fps`, reason: null })),
+    // A picker that always returns the same folder. The CANCELLED case is what the dialog has to get
+    // right, and it is asserted by overriding this with one that returns an empty reply.
+    cinemaPickRenderFolder: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: { ...DEFAULT_RENDER_SETTINGS, folder: "X:\\Renders" }, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: "Rendering into X:\\Renders", reason: null })),
+    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: null })),
     cinemaFramingCatalog: vi.fn(() => Promise.resolve(FRAMING_CATALOG)),
-    cinemaSetShotSubject: vi.fn((id: string, index: number, subject: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, subject, subjectName: SUBJECTS.candidates.find((c) => c.id === subject)?.name ?? subject }], problems: [], message: `Shot ${index + 1} now frames ${subject}`, reason: null })),
+    cinemaSetShotSubject: vi.fn((id: string, index: number, subject: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, subject, subjectName: SUBJECTS.candidates.find((c) => c.id === subject)?.name ?? subject }], problems: [], message: `Shot ${index + 1} now frames ${subject}`, reason: null })),
     // The stub SEARCHES, rather than returning the same four rows to every query: a picker that
     // ignored its own search box would otherwise pass every assertion about having one.
     cinemaSubjectCatalog: vi.fn((_id: string, _index: number | null, query: string) => {
@@ -436,9 +443,9 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
         : [];
       return Promise.resolve({ ...SUBJECTS, owner: id, ownerName: self?.name ?? "", current: null, candidates: chain, matches: chain.length });
     }),
-    cinemaSetShotSeconds: vi.fn((id: string, index: number, seconds: number) => Promise.resolve({ entity: id, shots: 1, seconds, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, seconds, effectiveSeconds: seconds }], problems: [], message: `Shot ${index + 1} now runs ${seconds.toFixed(1)}s`, reason: null })),
-    cinemaMoveShot: vi.fn((id: string, _from: number, to: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Shot moved to position ${to + 1}`, reason: null })),
-    cinemaSetShotFraming: vi.fn((id: string, index: number, edit: FramingEdit) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, size: (edit.size as ShotRow["size"]) ?? HERO_ROW.size, angle: (edit.angle as ShotRow["angle"]) ?? HERO_ROW.angle, motion: (edit.motion as ShotRow["motion"]) ?? HERO_ROW.motion, amount: edit.amount ?? HERO_ROW.amount }], problems: [], message: `Shot ${index + 1} is now re-framed`, reason: null })),
+    cinemaSetShotSeconds: vi.fn((id: string, index: number, seconds: number) => Promise.resolve({ entity: id, shots: 1, seconds, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, seconds, effectiveSeconds: seconds }], problems: [], message: `Shot ${index + 1} now runs ${seconds.toFixed(1)}s`, reason: null })),
+    cinemaMoveShot: vi.fn((id: string, _from: number, to: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Shot moved to position ${to + 1}`, reason: null })),
+    cinemaSetShotFraming: vi.fn((id: string, index: number, edit: FramingEdit) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, size: (edit.size as ShotRow["size"]) ?? HERO_ROW.size, angle: (edit.angle as ShotRow["angle"]) ?? HERO_ROW.angle, motion: (edit.motion as ShotRow["motion"]) ?? HERO_ROW.motion, amount: edit.amount ?? HERO_ROW.amount }], problems: [], message: `Shot ${index + 1} is now re-framed`, reason: null })),
     // A pose that MOVES WITH THE CLOCK. A stub returning one fixed camera would let a panel that
     // ignored `seconds` entirely pass every assertion about previewing, which is the one thing these
     // tests exist to catch; the push-in here is the same shape `push_in` solves for, at fixture scale.
@@ -503,7 +510,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
       const bitrate = chosen === "movie" ? plannedBitrate(w, h, fps) : 0;
       return Promise.resolve({ ...RENDER_FIXTURE, entity: id, fps, frames, seconds, width: w, height: h, format: chosen, bitrate, message: `${frames} frames · ${seconds.toFixed(1)}s at ${fps} fps · ${w}x${h}` });
     }),
-    cinemaRenderStart: vi.fn((id: string, fps: number, shot: number | null, stem: string, _folder: string | null = null, height: number | null = null, format: RenderFormat | null = null) => {
+    cinemaRenderStart: vi.fn((id: string, fps: number, shot: number | null, stem: string, folder: string | null = null, height: number | null = null, format: RenderFormat | null = null) => {
       RENDER_FIXTURE.format = format ?? "movie";
       RENDER_FIXTURE.running = true;
       RENDER_FIXTURE.done = false;
@@ -520,7 +527,10 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
       const [planW, planH] = plannedSize(height);
       RENDER_FIXTURE.width = height === null ? 0 : planW;
       RENDER_FIXTURE.height = height === null ? 0 : planH;
-      RENDER_FIXTURE.folder = "C:/renders/skid-weld-line";
+      // ADR-190 — the engine's rule, mirrored: a remembered folder is used as given, and a `null`
+      // one means the picker ran. A stub that always answered with the same path would let a dialog
+      // that ignored the remembered folder pass every assertion about using it.
+      RENDER_FIXTURE.folder = folder ?? "C:/renders/skid-weld-line";
       RENDER_FIXTURE.bitrate = RENDER_FIXTURE.format === "movie" ? plannedBitrate(planW, planH, fps) : 0;
       RENDER_FIXTURE.failures = [];
       RENDER_FIXTURE.message = `Rendering frame 1 of ${RENDER_FIXTURE.frames}`;

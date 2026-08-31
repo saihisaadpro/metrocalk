@@ -11,9 +11,13 @@
 //! rule — which is why the closed action vocabulary never had to grow to gain cutscenes.
 
 use metrocalk_animation::shot::{
-    Cutscene, Delivery, Mood, ShotAngle, ShotMove, ShotRecipe, ShotSize, MAX_SECONDS, MAX_SHOTS,
-    MIN_SECONDS,
+    Cutscene, Delivery, Mood, RenderSettings, ShotAngle, ShotMove, ShotRecipe, ShotSize,
+    MAX_SECONDS, MAX_SHOTS, MIN_SECONDS,
 };
+// ADR-190 moved these three into the document crate when `RenderSettings` put them in the cutscene.
+// Re-exported from here, where every caller already looks for them, so moving the definition did not
+// move the name anybody imports.
+pub use metrocalk_animation::shot::{RenderFormat, DEFAULT_RENDER_FPS, DEFAULT_RENDER_HEIGHT};
 use metrocalk_core::{Engine, EntityId, FieldValue, Op};
 use metrocalk_ecs::World;
 use serde::{Deserialize, Serialize};
@@ -360,6 +364,8 @@ pub enum CinemaError {
     UnknownMood(String),
     /// No such delivery frame.
     UnknownDelivery(String),
+    /// No such render format.
+    UnknownFormat(String),
     /// The object is gone.
     MissingEntity,
     /// The shot list is full.
@@ -388,6 +394,9 @@ impl std::fmt::Display for CinemaError {
             }
             Self::UnknownDelivery(frame) => {
                 write!(f, "there is no delivery frame called \"{frame}\"")
+            }
+            Self::UnknownFormat(format) => {
+                write!(f, "there is no render format called \"{format}\"")
             }
             Self::MissingEntity => write!(f, "that object is no longer in the scene"),
             Self::NoSuchShot => write!(f, "that shot is already gone"),
@@ -466,6 +475,13 @@ pub struct CinemaReply {
     pub mood: Mood,
     /// The frame this cutscene is composed and delivered in.
     pub delivery: Delivery,
+    /// ADR-190 — how this cutscene renders: format, rate, size and name, as last authored.
+    ///
+    /// ON EVERY CINEMA REPLY and not on a read of its own, for the reason `delivery` is: the render
+    /// dialog opens on a cutscene the panel beside it has already read, and a second round trip to
+    /// learn four small numbers the first reply could have carried is a round trip that can arrive
+    /// after the dialog has painted — which is a form that fills itself in under the reader's cursor.
+    pub render: RenderSettings,
     /// The whole cutscene read back as sentences — one line per shot.
     ///
     /// Derived from `rows` at construction, in one place, so the two cannot disagree. It stays on the
@@ -1205,6 +1221,110 @@ pub fn set_delivery_ops<W: World>(
     Ok((write_ops(entity, &cut, false), cut))
 }
 
+/// The longest render name the engine will store.
+///
+/// A BOUND AND NOT A REFUSAL ABOUT PATHS. The stem becomes a file name, and Windows still stops a
+/// path at 260 characters by default; refusing at the point the name is TYPED, with the number said,
+/// is a sentence the author can act on, where refusing at the point the file is written is a render
+/// that ran for four minutes and then could not land. 120 leaves room for a deep output folder and a
+/// `.0119.png` suffix, and is longer than any name anybody types.
+pub const MAX_RENDER_NAME: usize = 120;
+
+/// The longest destination path the engine will store.
+///
+/// Windows stops an extended path at 32,767 and an ordinary one at 260; this is a bound on the
+/// DOCUMENT, so it is set where a stored value stops being a path somebody typed and starts being a
+/// way to make a saved file large. The render itself still refuses what the file system refuses.
+pub const MAX_RENDER_FOLDER: usize = 4_096;
+
+/// ADR-190 — set how this cutscene renders (one undoable commit).
+///
+/// THE WHOLE BLOCK AND NOT ONE FIELD. Four setters would be four commands, four records in the replay
+/// log and four ways for the pair `(format, height)` to be left inconsistent between two of them —
+/// and the write is the same size either way, because [`write_ops`] serialises the entire cutscene
+/// whatever changed. The caller sends the four answers it is showing; this validates them together.
+///
+/// Refused on an empty cutscene for the reason pacing and the delivery frame are: there is nothing to
+/// render, so the only thing the write could accomplish is a `Cinematic` husk holding no shots.
+///
+/// # Errors
+/// [`CinemaError::UnknownFormat`] for a format nobody offers, and [`CinemaError::OutOfRange`] for a
+/// rate, a height or a name outside the bounds the engine states — each said WITH the bounds.
+pub fn set_render_ops<W: World>(
+    engine: &Engine<W>,
+    entity: EntityId,
+    format: &str,
+    fps: u32,
+    height: Option<u32>,
+    name: &str,
+    folder: &str,
+) -> Result<(Vec<Op>, Cutscene), CinemaError> {
+    let mut cut = cutscene_of(engine, entity);
+    if cut.shots.is_empty() {
+        return Err(CinemaError::OutOfRange(
+            "render settings describe what this cut delivers, and this object has no shots yet — add one first".into(),
+        ));
+    }
+    let format =
+        RenderFormat::from_key(format).ok_or_else(|| CinemaError::UnknownFormat(format.into()))?;
+    if !RENDER_RATES.contains(&fps) {
+        return Err(CinemaError::OutOfRange(format!(
+            "{fps} fps is not one of the rates this engine renders at ({})",
+            RENDER_RATES
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if let Some(height) = height {
+        if !RENDER_HEIGHTS.contains(&height) {
+            return Err(CinemaError::OutOfRange(format!(
+                "{height} is not one of the output heights this engine renders at ({})",
+                RENDER_HEIGHTS
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    } else if format == RenderFormat::Movie {
+        // THE ONE PAIR THAT CANNOT BE STORED. `plan_render` refuses it too — a movie declares its
+        // frame size once, before its first sample, and "as on screen" is a measurement that moves
+        // while you work. Refusing it HERE as well keeps the document from holding a pair that every
+        // later read has to refuse: a stored setting that can only ever produce a refusal is a
+        // setting the author will find again tomorrow, still broken, with nothing said at the time.
+        return Err(CinemaError::OutOfRange(
+            "a movie is one size for its whole length, so it cannot be rendered \"as on screen\" — choose an output height, or deliver a PNG sequence".into(),
+        ));
+    }
+    if name.chars().count() > MAX_RENDER_NAME {
+        return Err(CinemaError::OutOfRange(format!(
+            "a render name is at most {MAX_RENDER_NAME} characters, and that one is {}",
+            name.chars().count()
+        )));
+    }
+    if folder.chars().count() > MAX_RENDER_FOLDER {
+        return Err(CinemaError::OutOfRange(format!(
+            "a destination path is at most {MAX_RENDER_FOLDER} characters, and that one is {}",
+            folder.chars().count()
+        )));
+    }
+    cut.render = RenderSettings {
+        format,
+        fps,
+        height,
+        // WHAT THEY TYPED, TRIMMED. `sanitise_stem` runs where the file is named, not here: storing
+        // the sanitised form would show the author `weld-gun-7` in a field they typed `weld:gun*7`
+        // into, which is the document quietly editing their words.
+        name: name.trim().to_string(),
+        // NOT TRIMMED THE SAME WAY. A path's own separators and spaces are its business; only the
+        // ends are stripped, and only because a picker never returns one with them.
+        folder: folder.trim().to_string(),
+    };
+    Ok((write_ops(entity, &cut, false), cut))
+}
+
 /// Write the cutscene back.
 ///
 /// `arm` says whether this write should also set `playing = true`. Only ADDING a shot arms a cutscene:
@@ -1335,6 +1455,7 @@ pub fn reply_with_names(
         seconds: cut.seconds(),
         mood: cut.mood,
         delivery: cut.delivery,
+        render: cut.render.clone(),
         // One producer. `reads` is the flattened projection of `rows`, never a second computation of
         // the same sentences.
         reads: rows.iter().map(|row| row.reads.clone()).collect(),
@@ -1434,10 +1555,6 @@ pub fn preview_time(cut: &Cutscene, seconds: f32) -> f32 {
 /// nobody needed to read.
 pub const RENDER_RATES: [u32; 4] = [24, 25, 30, 60];
 
-/// The default: the rate the rest of the world calls "film", and the one the mood's blend seconds were
-/// chosen against.
-pub const DEFAULT_RENDER_FPS: u32 = 24;
-
 /// The output heights a render offers, on top of "whatever the window makes it".
 ///
 /// A LIST AND NOT A NUMBER BOX, for the reason [`RENDER_RATES`] is one: these four are what delivery
@@ -1447,62 +1564,6 @@ pub const DEFAULT_RENDER_FPS: u32 = 24;
 /// and a vertical one is 608, with nobody doing that arithmetic by hand and nobody able to ask for a
 /// size that is the wrong shape for the shot.
 pub const RENDER_HEIGHTS: [u32; 4] = [720, 1080, 1440, 2160];
-
-/// ADR-182 — what a render DELIVERS.
-///
-/// TWO AND NOT FIVE. A movie is the thing a person can double-click; a sequence is the thing a
-/// compositor can take. Every other container anybody would name is one of those two wearing a
-/// different extension, and offering five would be four ways to ask the same question.
-///
-/// [`Self::Movie`] IS THE DEFAULT, for the reason 1080 is the default height and "as on screen" is
-/// not: a render is the thing that leaves the editor, and what leaves it should be watchable without
-/// a second program. Until this existed the answer to "render my cut" was 120 numbered PNGs and an
-/// unstated instruction to go and install `ffmpeg` — the last hop of the whole cinematics chain,
-/// left to the user, in a tool nobody named.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RenderFormat {
-    /// One H.264 MP4, encoded by the platform's own encoder.
-    #[default]
-    Movie,
-    /// One lossless PNG per frame — ADR-175's delivery, and still the right one for a compositor.
-    Sequence,
-}
-
-impl RenderFormat {
-    /// The wire name, matching the serde representation. One list, so a catalogue a UI renders and the
-    /// value it sends back cannot drift apart.
-    #[must_use]
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Movie => "movie",
-            Self::Sequence => "sequence",
-        }
-    }
-
-    /// What a user calls it.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Movie => "Movie — one MP4 file",
-            Self::Sequence => "PNG sequence — one file per frame",
-        }
-    }
-
-    /// Both, in the order a picker should offer them.
-    #[must_use]
-    pub fn all() -> [Self; 2] {
-        [Self::Movie, Self::Sequence]
-    }
-
-    /// Read a wire name. Unknown names are refused rather than silently defaulted, for the reason
-    /// [`Delivery::from_key`] refuses one: a render that quietly became a sequence when the author
-    /// asked for a movie would deliver the wrong thing and say nothing.
-    #[must_use]
-    pub fn from_key(key: &str) -> Option<Self> {
-        Self::all().into_iter().find(|f| f.key() == key)
-    }
-}
 
 /// ADR-182 — the largest either side of a MOVIE frame may be.
 ///
@@ -3536,6 +3597,273 @@ mod tests {
         for f in RenderFormat::all() {
             assert_eq!(RenderFormat::from_key(f.key()), Some(f));
         }
+    }
+
+    // ── ADR-190: the render settings live on the cutscene ────────────────────────────────────
+
+    #[test]
+    fn a_fresh_cutscene_already_answers_the_four_render_questions() {
+        // THE DEFAULTS ARE THE DOCUMENT'S, not four constants in a dialog. Before ADR-190 a reader
+        // asking "what does this cut deliver" had to open the render dialog and read its `useState`
+        // initialisers; now the cutscene itself says, and says the same thing to every surface.
+        let settings = RenderSettings::default();
+        assert_eq!(settings.format, RenderFormat::Movie);
+        assert_eq!(settings.fps, DEFAULT_RENDER_FPS);
+        assert_eq!(settings.height, Some(DEFAULT_RENDER_HEIGHT));
+        assert_eq!(settings.name, "");
+        assert_eq!(Cutscene::default().render, settings);
+    }
+
+    #[test]
+    fn the_four_answers_survive_a_write_and_a_read_of_the_document() {
+        // THE WHOLE POINT, in one test. The settings are written by the same `SetField` every other
+        // cinematics edit uses, into the same `source` blob the project saves — so "does it survive a
+        // restart" is the same question as "does it survive a serialise and a read back", and this is
+        // it.
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+
+        let (ops, cut) = set_render_ops(
+            &engine,
+            owner,
+            "sequence",
+            30,
+            Some(1440),
+            "weld-line-master",
+            r"X:\Renders",
+        )
+        .expect("the five answers are all offered ones");
+        engine.commit("cinema-render", ops).expect("commits");
+        assert_eq!(cut.render.format, RenderFormat::Sequence);
+
+        // Read back through the document, not from the value the setter returned.
+        let stored = cutscene_of(&engine, owner);
+        assert_eq!(stored.render.format, RenderFormat::Sequence);
+        assert_eq!(stored.render.fps, 30);
+        assert_eq!(stored.render.height, Some(1440));
+        assert_eq!(stored.render.name, "weld-line-master");
+        assert_eq!(stored.render.folder, r"X:\Renders");
+
+        // And through JSON, which is what actually lands in the saved file.
+        let json = serde_json::to_string(&stored).expect("serialises");
+        let back: Cutscene = serde_json::from_str(&json).expect("reads back");
+        assert_eq!(back.render, stored.render);
+        // The wire names are the ones a UI sends, so a saved file is readable rather than numeric.
+        assert!(json.contains(SEQUENCE_ON_THE_WIRE), "{json}");
+    }
+
+    /// What a stored sequence delivery looks like in the saved blob.
+    const SEQUENCE_ON_THE_WIRE: &str = "\"format\":\"sequence\"";
+
+    #[test]
+    fn a_cutscene_saved_before_render_settings_existed_still_reads() {
+        // `#[serde(default)]` on the field AND on the struct: a document written by ADR-182 has no
+        // `render` key at all, and one written by a future version may carry only some of its keys.
+        // Neither may fail to load — a cutscene that will not read is a cut the author cannot open.
+        let old: Cutscene =
+            serde_json::from_str(OLD_DOCUMENT).expect("a document from before this");
+        assert_eq!(old.delivery, Delivery::Scope);
+        assert_eq!(old.render, RenderSettings::default());
+
+        let partial: Cutscene =
+            serde_json::from_str(PARTIAL_DOCUMENT).expect("only one of the four");
+        assert_eq!(partial.render.fps, 60);
+        assert_eq!(partial.render.format, RenderFormat::Movie);
+        assert_eq!(partial.render.height, Some(DEFAULT_RENDER_HEIGHT));
+    }
+
+    /// A cutscene as ADR-182 wrote them — no `render` key at all.
+    const OLD_DOCUMENT: &str = "{\"version\":1,\"shots\":[],\"delivery\":\"scope\"}";
+    /// A cutscene carrying one of the four answers and none of the others.
+    const PARTIAL_DOCUMENT: &str = "{\"version\":1,\"render\":{\"fps\":60}}";
+
+    #[test]
+    fn every_answer_the_pickers_offer_is_one_the_engine_stores() {
+        // THE GATE AGAINST A CONTROL THAT CANNOT ACT. The dialog's three pickers are rendered from
+        // these same lists; if the setter refused any member of one, that option would be a menu item
+        // whose only outcome is a sentence.
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+        for fps in RENDER_RATES {
+            for height in RENDER_HEIGHTS {
+                for format in RenderFormat::all() {
+                    set_render_ops(&engine, owner, format.key(), fps, Some(height), "take", "")
+                        .unwrap_or_else(|e| {
+                            panic!("{} at {fps} fps, {height} lines: {e}", format.key())
+                        });
+                }
+            }
+            // "As on screen" is offered for a sequence and for nothing else.
+            set_render_ops(&engine, owner, "sequence", fps, None, "take", "")
+                .expect("a sequence may follow the window");
+        }
+    }
+
+    #[test]
+    fn a_movie_cannot_be_stored_as_as_on_screen() {
+        // The one pair the picker never offers, refused at the point it would be STORED as well as at
+        // the point it would be planned. A stored setting that can only ever produce a refusal is one
+        // the author finds again tomorrow, still broken, with nothing said at the time.
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+        let said = set_render_ops(&engine, owner, "movie", 24, None, "take", "")
+            .expect_err("a movie has one size for its whole length")
+            .to_string();
+        assert!(said.contains("one size for its whole length"), "{said}");
+        // AND IT NAMES BOTH WAYS OUT, rather than only the thing that is wrong.
+        assert!(said.contains("output height"), "{said}");
+        assert!(said.contains("PNG sequence"), "{said}");
+    }
+
+    #[test]
+    fn a_rate_or_a_size_the_engine_does_not_offer_is_refused_with_the_list() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+
+        let why = set_render_ops(&engine, owner, "movie", 23, Some(1080), "take", "")
+            .expect_err("23 is not offered")
+            .to_string();
+        assert!(why.contains("23 fps"), "{why}");
+        assert!(why.contains("24, 25, 30, 60"), "{why}");
+
+        let why = set_render_ops(&engine, owner, "movie", 24, Some(900), "take", "")
+            .expect_err("900 is not offered")
+            .to_string();
+        assert!(why.contains("900"), "{why}");
+        assert!(why.contains("720, 1080, 1440, 2160"), "{why}");
+
+        let why = set_render_ops(&engine, owner, "mp4", 24, Some(1080), "take", "")
+            .expect_err("there is no format called mp4")
+            .to_string();
+        assert!(why.contains("mp4"), "{why}");
+    }
+
+    #[test]
+    fn a_name_is_stored_as_typed_and_bounded_where_it_is_typed() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+
+        // STORED AS TYPED. Sanitising here would show the author `weld-gun-7` in a field they typed
+        // `weld:gun*7` into — the document editing their words. The sanitiser runs where the file is
+        // named, and both deliveries share it.
+        let (ops, cut) = set_render_ops(
+            &engine,
+            owner,
+            "movie",
+            24,
+            Some(1080),
+            "  weld:gun*7  ",
+            "",
+        )
+        .expect("a name a file system would not take is still a name");
+        engine.commit("cinema-render", ops).expect("commits");
+        assert_eq!(cut.render.name, "weld:gun*7");
+        assert_eq!(render_movie_name(&cut.render.name), "weld-gun-7.mp4");
+
+        // BOUNDED WHERE IT IS TYPED, not where the file is written: a render that ran for four
+        // minutes and then could not land is the failure this refusal exists to move earlier.
+        let long = "a".repeat(MAX_RENDER_NAME + 1);
+        let why = set_render_ops(&engine, owner, "movie", 24, Some(1080), &long, "")
+            .expect_err("past the bound")
+            .to_string();
+        assert!(why.contains(&MAX_RENDER_NAME.to_string()), "{why}");
+    }
+
+    #[test]
+    fn an_empty_name_means_the_objects_own_name() {
+        // EMPTY IS A REAL ANSWER and it is what a fresh cutscene carries. Storing the resolved name
+        // instead would freeze the object's name at the instant the cutscene was first rendered, so
+        // renaming the assembly would leave last month's name on every future file.
+        let settings = RenderSettings::default();
+        assert_eq!(settings.stem_for("Skid Weld Line"), "Skid Weld Line");
+        let named = RenderSettings {
+            name: "weld-line-master".into(),
+            ..RenderSettings::default()
+        };
+        assert_eq!(named.stem_for("Skid Weld Line"), "weld-line-master");
+        // Whitespace is not a name.
+        let blank = RenderSettings {
+            name: "   ".into(),
+            ..RenderSettings::default()
+        };
+        assert_eq!(blank.stem_for("Skid Weld Line"), "Skid Weld Line");
+    }
+
+    #[test]
+    fn the_destination_is_remembered_and_an_empty_one_means_ask() {
+        // THE FIFTH QUESTION, and the one that was never even counted: before this, every render
+        // opened the operating system's folder picker, so re-rendering a cut you had already
+        // rendered meant walking a file tree again for a folder you chose ten minutes ago.
+        //
+        // EMPTY MEANS ASK, and empty is what a fresh cutscene carries — so nothing changes for a cut
+        // that has never been rendered, and the picker is still where a first folder comes from.
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+        assert_eq!(cutscene_of(&engine, owner).render.folder, "");
+
+        let (ops, cut) = set_render_ops(
+            &engine,
+            owner,
+            "movie",
+            24,
+            Some(1080),
+            "take",
+            r"X:\Renders\Skid Weld Line",
+        )
+        .expect("a path is stored as given");
+        engine.commit("cinema-render", ops).expect("commits");
+        assert_eq!(cut.render.folder, r"X:\Renders\Skid Weld Line");
+        assert_eq!(
+            cutscene_of(&engine, owner).render.folder,
+            r"X:\Renders\Skid Weld Line"
+        );
+
+        // ...and it can be given back, which is the only way to return to being asked.
+        let (ops, cut) =
+            set_render_ops(&engine, owner, "movie", 24, Some(1080), "take", "  ").expect("clears");
+        engine.commit("cinema-render", ops).expect("commits");
+        assert_eq!(cut.render.folder, "");
+    }
+
+    #[test]
+    fn render_settings_are_refused_on_a_cutscene_with_no_shots() {
+        // Same rule as pacing and the delivery frame, for the same reason: the only thing this write
+        // could accomplish on an empty object is a `Cinematic` husk holding no shots, and an undoable
+        // commit that changes nothing a user can see.
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        let why = set_render_ops(&engine, owner, "movie", 24, Some(1080), "take", "")
+            .expect_err("nothing to render")
+            .to_string();
+        assert!(why.contains("no shots yet"), "{why}");
+    }
+
+    #[test]
+    fn every_cinema_reply_carries_the_settings_a_render_dialog_needs() {
+        // ON THE REPLY THE PANEL ALREADY HOLDS, so the dialog opens knowing the four answers rather
+        // than fetching them after it has painted — a form that fills itself in under the cursor.
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        let cut = three_shot_cut(&mut engine, owner);
+        assert_eq!(
+            reply_for(owner, &cut, "Skid Weld Line", String::new()).render,
+            RenderSettings::default()
+        );
+
+        let (ops, _) =
+            set_render_ops(&engine, owner, "sequence", 60, Some(720), "take", "").expect("stores");
+        engine.commit("cinema-render", ops).expect("commits");
+        let stored = cutscene_of(&engine, owner);
+        let reply = reply_for(owner, &stored, "Skid Weld Line", String::new());
+        assert_eq!(reply.render.fps, 60);
+        assert_eq!(reply.render.height, Some(720));
+        assert_eq!(reply.render.format, RenderFormat::Sequence);
     }
 
     #[test]

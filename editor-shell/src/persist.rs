@@ -105,6 +105,22 @@ pub enum Record {
     CinemaMood { id: String, mood: String },
     /// Cinematics - the frame the cutscene is composed and delivered in changed.
     CinemaDelivery { id: String, delivery: String },
+    /// ADR-190 — Cinematics: how an object's cutscene renders (format, rate, size, name).
+    ///
+    /// `height` is `Option<u32>` on the wire for the same reason it is one in the document: "as on
+    /// screen" is a different KIND of answer from a number, and a sentinel `0` would be a height the
+    /// replayer had to know to translate.
+    CinemaRender {
+        id: String,
+        format: String,
+        fps: u32,
+        #[serde(default)]
+        height: Option<u32>,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        folder: String,
+    },
     /// VFX - one effect layer added to an object.
     VfxAdd {
         id: String,
@@ -532,6 +548,21 @@ impl Log {
                                 .is_ok_and(|(ops, _)| engine.commit("cinema-delivery", ops).is_ok())
                         })
                 }
+                Record::CinemaRender {
+                    id,
+                    format,
+                    fps,
+                    height,
+                    name,
+                    folder,
+                } => metrocalk_core::EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .is_some_and(|e| {
+                        crate::cinema_intent::set_render_ops(
+                            engine, e, &format, fps, height, &name, &folder,
+                        )
+                        .is_ok_and(|(ops, _)| engine.commit("cinema-render", ops).is_ok())
+                    }),
                 Record::VfxAdd {
                     id,
                     effect,

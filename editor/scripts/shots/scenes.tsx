@@ -60,6 +60,7 @@ import type {
   SubjectCatalog,
   TimelineTuple,
 } from "../../src/transport/protocol";
+import { DEFAULT_RENDER_SETTINGS } from "../../src/transport/protocol";
 import { createMockSession, type EditorClient } from "../../src/transport/session";
 
 /** What must be true of the rendered scene, checked by `shoot.mjs` in the page before it captures.
@@ -503,6 +504,7 @@ const CUTSCENE: CinemaReply = (() => {
     seconds: start,
     mood: "normal",
     delivery: "viewport",
+    render: DEFAULT_RENDER_SETTINGS,
     reads: rows.map((row) => row.reads),
     rows,
     problems: [

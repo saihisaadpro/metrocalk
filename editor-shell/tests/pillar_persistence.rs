@@ -272,6 +272,123 @@ fn clearing_an_or_group_persists_as_cleared_rather_than_leaving_a_stale_slot() {
 }
 
 #[test]
+fn what_a_cut_delivers_survives_save_and_open() {
+    // ADR-190's closing gate, and the half of it a unit test cannot reach. "The rate, the size and
+    // the name surviving a reopen AND a restart" was owed by ADR-177 and then by ADR-182, which
+    // stated the reason plainly: session-scoped memory satisfies "reopen the dialog" and fails the
+    // thing that matters. This is the failing half — a real `.mtk` written to disk, a SECOND engine
+    // built from nothing, and the four answers read back out of it.
+    //
+    // Before this pass every one of them was a `useState` in the render dialog seeded from a
+    // constant, so the correct expectation for this test on the old code is four defaults.
+    let path = temp_mtk("cinema-render-settings");
+    let _ = std::fs::remove_file(&path);
+
+    let (mut a, _scene) = engine_with_resolver();
+    let rig = spawn(&mut a, 2.0);
+    for kind in ["establish", "hero"] {
+        let (ops, _) =
+            metrocalk_editor_shell::add_shot_ops(&a, rig, kind, rig).expect("shot lands");
+        a.commit("shot", ops).expect("shot commits");
+    }
+
+    // NOT THE DEFAULTS, in all four: a test that stored `movie / 24 / 1080 / ""` would pass on an
+    // engine that had thrown the settings away and re-derived them.
+    let (ops, _) = metrocalk_editor_shell::set_render_ops(
+        &a,
+        rig,
+        "sequence",
+        60,
+        Some(2160),
+        "weld-master",
+        r"X:\Renders\Skid Weld Line",
+    )
+    .expect("five answers the engine offers");
+    a.commit("cinema-render", ops).expect("settings commit");
+    // ...and the delivery frame beside them, because the whole claim is that these live where
+    // `delivery` already did.
+    let (ops, _) =
+        metrocalk_editor_shell::set_delivery_ops(&a, rig, "scope").expect("a real frame");
+    a.commit("cinema-delivery", ops).expect("delivery commits");
+
+    let before = metrocalk_editor_shell::cutscene_of(&a, rig);
+    project::save(&a, &path).expect("save");
+
+    let (mut b, _scene_b) = engine_with_resolver();
+    project::open_into(&mut b, &path).expect("open");
+    let after = metrocalk_editor_shell::cutscene_of(&b, rig);
+
+    assert_eq!(after, before, "a cutscene changed across a reload");
+    assert_eq!(
+        after.render.format,
+        metrocalk_animation::shot::RenderFormat::Sequence,
+        "what the cut delivers"
+    );
+    assert_eq!(after.render.fps, 60, "the rate");
+    assert_eq!(after.render.height, Some(2160), "the size");
+    assert_eq!(after.render.name, "weld-master", "the name");
+    assert_eq!(
+        after.render.folder, r"X:\Renders\Skid Weld Line",
+        "the destination"
+    );
+    assert_eq!(
+        after.delivery,
+        metrocalk_animation::shot::Delivery::Scope,
+        "the delivery frame these were stored beside"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_cutscene_authored_before_render_settings_existed_opens_on_the_defaults() {
+    // THE MIGRATION, on a real file. Every `.mtk` written before this pass carries a `Cinematic`
+    // whose `source` blob has no `render` key; `#[serde(default)]` is what makes those open, and a
+    // test that only ever reads documents this build wrote would never exercise it. Here the blob is
+    // written BY HAND into the same field the intent commands write, so it is the old shape rather
+    // than a new one with a field removed.
+    let path = temp_mtk("cinema-render-legacy");
+    let _ = std::fs::remove_file(&path);
+
+    let (mut a, _scene) = engine_with_resolver();
+    let rig = spawn(&mut a, 2.0);
+    let (ops, _) = metrocalk_editor_shell::add_shot_ops(&a, rig, "hero", rig).expect("shot lands");
+    a.commit("shot", ops).expect("shot commits");
+
+    let legacy = {
+        let cut = metrocalk_editor_shell::cutscene_of(&a, rig);
+        let mut json: serde_json::Value = serde_json::to_value(&cut).expect("serialises");
+        json.as_object_mut().expect("an object").remove("render");
+        serde_json::to_string(&json).expect("re-serialises")
+    };
+    assert!(!legacy.contains("render"), "the old shape has no such key");
+    a.commit(
+        "legacy-cutscene",
+        vec![Op::SetField {
+            entity: rig,
+            component: metrocalk_editor_shell::CINEMA_COMPONENT.into(),
+            field: "source".into(),
+            value: FieldValue::Str(legacy),
+        }],
+    )
+    .expect("the old blob commits");
+
+    project::save(&a, &path).expect("save");
+    let (mut b, _scene_b) = engine_with_resolver();
+    project::open_into(&mut b, &path).expect("open");
+    let after = metrocalk_editor_shell::cutscene_of(&b, rig);
+
+    assert_eq!(after.shots.len(), 1, "the cut itself still reads");
+    assert_eq!(
+        after.render,
+        metrocalk_animation::shot::RenderSettings::default(),
+        "a document from before the field opens on the engine's own answers"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn an_edited_cutscene_survives_save_and_open_down_to_the_second() {
     // The sibling test above proves a cutscene AUTHORED FROM CARDS comes back. Everything a user can
     // now change about one afterwards — a shot's length, its place in the sequence, its framing, and

@@ -112,7 +112,7 @@ import type {
   RoleReply,
   RoleStatusInfo,
 } from "./protocol";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, GENERATE_COST } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, DEFAULT_RENDER_SETTINGS, GENERATE_COST } from "./protocol";
 import { DeltaClient } from "./client";
 import { MockCore } from "./mock-core";
 import { inProcessPair } from "./transport";
@@ -320,6 +320,26 @@ export interface EditorClient {
   cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply>;
   /** Set the frame the cutscene is composed and delivered in (one undoable commit). */
   cinemaSetDelivery(id: string, delivery: DeliveryFrame): Promise<CinemaReply>;
+  /** ADR-190 — set how this cutscene renders: format, rate, size and name (one undoable commit).
+   *
+   *  THE WHOLE BLOCK, never one field. The four answers move together, they are validated together,
+   *  and sending one of them alone would let `(movie, "as on screen")` — the one pair the engine
+   *  refuses — exist for a round trip between two calls. */
+  cinemaSetRender(
+    id: string,
+    format: RenderFormat,
+    fps: number,
+    height: number | null,
+    name: string,
+    folder: string,
+  ): Promise<CinemaReply>;
+  /** ADR-190 — ask for a destination folder and remember it on the cutscene (one undoable commit).
+   *
+   *  THE PICKER IS THE ONLY WAY A PATH GETS IN, so there is no argument for one: a text box for a
+   *  directory is a box that has to refuse, and the operating system's own picker never does. A
+   *  cancelled picker comes back with `entity: null` and no `reason` — nothing changed, and nothing
+   *  went wrong. */
+  cinemaPickRenderFolder(id: string): Promise<CinemaReply>;
   /** The object's cutscene, read back as sentences plus continuity warnings. */
   cinemaList(id: string): Promise<CinemaReply>;
   /** The framing vocabulary the shot inspector offers + the bounds it must respect (static data). */
@@ -1040,6 +1060,12 @@ export class TauriClient implements EditorClient {
   }
   cinemaSetDelivery(id: string, delivery: DeliveryFrame): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_set_delivery", { id, delivery }).catch((e: unknown) => { console.error("cinema_set_delivery failed", e); throw e; });
+  }
+  cinemaSetRender(id: string, format: RenderFormat, fps: number, height: number | null, name: string, folder: string): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_render", { id, format, fps, height, name, folder }).catch((e: unknown) => { console.error("cinema_set_render failed", e); throw e; });
+  }
+  cinemaPickRenderFolder(id: string): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_pick_render_folder", { id }).catch((e: unknown) => { console.error("cinema_pick_render_folder failed", e); throw e; });
   }
   cinemaList(id: string): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_list", { id }).catch((e: unknown) => { console.error("cinema_list failed", e); throw e; });
@@ -2951,19 +2977,25 @@ class MockClient implements EditorClient {
     return Promise.resolve([]);
   }
   cinemaAddShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaRemoveShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetMood(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetDelivery(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetRender(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaPickRenderFolder(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaList(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: null });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: null });
   }
   /** Empty, like every other cinematics reply here. The vocabulary lives in ONE place — the Rust
    *  catalogue that also validates it — and a copy of it in this file would be the same
@@ -2973,16 +3005,16 @@ class MockClient implements EditorClient {
     return Promise.resolve({ sizes: [], angles: [], motions: [], minSeconds: 0.2, maxSeconds: 20, maxShots: 12, stillMotions: [], deliveries: [] });
   }
   cinemaSetShotSeconds(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaMoveShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetShotFraming(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetShotSubject(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   /** An EMPTY list, not an invented one. The picker's whole value is the two facts only the native
    *  scene can answer — what each object is called and how many drawn parts are under it — and a

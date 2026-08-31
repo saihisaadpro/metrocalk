@@ -211,6 +211,12 @@ pub struct Cutscene {
     /// pins the composition to a delivery frame and lets the stage draw the bars around it.
     #[serde(default)]
     pub delivery: Delivery,
+    /// ADR-190 -- how this cutscene is rendered: what it delivers, at what rate, at what size, called
+    /// what. Beside [`Cutscene::delivery`] for the reason `delivery` is here at all -- these are the
+    /// author's answers about the DELIVERABLE, and a deliverable is a property of the cut and not of
+    /// the dialog that last happened to be open.
+    #[serde(default)]
+    pub render: RenderSettings,
 }
 
 /// The frame a cutscene is composed and delivered in.
@@ -300,6 +306,155 @@ impl Delivery {
     }
 }
 
+/// ADR-182 -- what a render DELIVERS.
+///
+/// TWO AND NOT FIVE. A movie is the thing a person can double-click; a sequence is the thing a
+/// compositor can take. Every other container anybody would name is one of those two wearing a
+/// different extension, and offering five would be four ways to ask the same question.
+///
+/// [`Self::Movie`] IS THE DEFAULT, for the reason 1080 is the default height and "as on screen" is
+/// not: a render is the thing that leaves the editor, and what leaves it should be watchable without
+/// a second program.
+///
+/// ADR-190 MOVED IT HERE, beside [`Delivery`]. It began life in the shell next to the code that
+/// validates it, which was right while it was an argument to one command; once [`RenderSettings`]
+/// put it in the document it became part of the cutscene's own vocabulary, and a document type that
+/// lives in the layer above the document is a type the document cannot be serialised without.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RenderFormat {
+    /// One H.264 MP4, encoded by the platform's own encoder.
+    #[default]
+    Movie,
+    /// One lossless PNG per frame -- ADR-175's delivery, and still the right one for a compositor.
+    Sequence,
+}
+
+impl RenderFormat {
+    /// The wire name, matching the serde representation. One list, so a catalogue a UI renders and the
+    /// value it sends back cannot drift apart.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Movie => "movie",
+            Self::Sequence => "sequence",
+        }
+    }
+
+    /// What a user calls it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Movie => "Movie -- one MP4 file",
+            Self::Sequence => "PNG sequence -- one file per frame",
+        }
+    }
+
+    /// Both, in the order a picker should offer them.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::Movie, Self::Sequence]
+    }
+
+    /// Read a wire name. Unknown names are refused rather than silently defaulted, for the reason
+    /// [`Delivery::from_key`] refuses one: a render that quietly became a sequence when the author
+    /// asked for a movie would deliver the wrong thing and say nothing.
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::all().into_iter().find(|f| f.key() == key)
+    }
+}
+
+/// The default rate: the one the rest of the world calls "film", and the one the mood's blend seconds
+/// were chosen against.
+pub const DEFAULT_RENDER_FPS: u32 = 24;
+
+/// The default output height.
+///
+/// 1080 AND NOT "AS ON SCREEN", which is what the render dialog shipped with. A render is a DELIVERY --
+/// the thing that leaves the editor -- and the size a stage happens to be after the author opened a
+/// dock is not a delivery format. The old default silently made every sequence as tall as the window,
+/// which on a laptop with both docks open is around 400 lines: a film nobody can use, produced by a
+/// dialog that never asked.
+pub const DEFAULT_RENDER_HEIGHT: u32 = 1080;
+
+/// ADR-190 -- the answers a render needs, remembered on the cutscene it renders.
+///
+/// WHY THE DOCUMENT AND NOT THE DIALOG. Before this, every one of these was a `useState` seeded from a
+/// constant on every open, so a person who had decided their cut delivers a 1440 scope sequence called
+/// `weld-line-master` re-decided it, four controls at a time, every single render -- and none of the
+/// four survived closing the dialog, let alone closing the editor. They are not preferences about the
+/// tool; they are statements about the deliverable, exactly like [`Cutscene::delivery`], which has
+/// lived in the document since ADR-166 for the same reason.
+///
+/// SESSION-SCOPED MEMORY WOULD NOT DO. It satisfies "reopen the dialog" and fails the thing that
+/// matters: a cut is authored across days, and the answer to "what does this deliver" has to still be
+/// there tomorrow. Being in the document also makes each change undoable and each one saved by the
+/// same code path that saves everything else -- no second persistence mechanism, no new file.
+///
+/// EVERY FIELD IS RE-VALIDATED WHERE IT IS USED, not trusted from here. A hand-edited document can
+/// carry `fps: 7`; `plan_render` refuses it by name, the same way it refuses one that arrived from a
+/// UI. The document remembers an answer -- it does not get to authorise one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RenderSettings {
+    /// What the render delivers.
+    pub format: RenderFormat,
+    /// Frames per second.
+    pub fps: u32,
+    /// The output height, or `None` for "as on screen" -- whatever the stage currently measures.
+    /// `None` and not a sentinel `0`, because "the window decides" is a different KIND of answer from
+    /// a number and the two behave differently everywhere they are read.
+    pub height: Option<u32>,
+    /// The file name, without an extension and before [`sanitise`](crate::shot) -- what the author
+    /// typed, kept as they typed it.
+    ///
+    /// EMPTY MEANS "THE OBJECT'S NAME", and empty is what a fresh cutscene starts as. Storing the
+    /// resolved name instead would freeze the object's name at the instant the cutscene was first
+    /// rendered, so renaming the assembly would leave last month's name on every future file -- a
+    /// stale copy of a fact that already lives somewhere else.
+    pub name: String,
+    /// Where the files go. Empty means "ask me", which is what every render did before ADR-190.
+    ///
+    /// A PATH IS THE ONE ANSWER HERE THAT IS ABOUT THE MACHINE and not about the film, and it is
+    /// still stored beside the other four rather than in a preferences file, because "render this cut
+    /// again" means "render it where it went last time" and the cut is the thing being rendered. The
+    /// consequence is stated rather than hidden: a project opened on another machine carries a path
+    /// that is not there, so the side that USES this treats a folder that does not exist exactly like
+    /// an empty one -- it asks. Nothing fails, and nothing silently writes somewhere unexpected.
+    #[serde(default)]
+    pub folder: String,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            format: RenderFormat::Movie,
+            fps: DEFAULT_RENDER_FPS,
+            height: Some(DEFAULT_RENDER_HEIGHT),
+            name: String::new(),
+            folder: String::new(),
+        }
+    }
+}
+
+impl RenderSettings {
+    /// The file stem to use for `owner_name`'s cut: what the author typed, or the object's own name
+    /// when they have typed nothing.
+    ///
+    /// One function, because the dialog's field, the plan's read-out and the writer all need the same
+    /// answer and a second copy of "…or the object name if blank" is how a file lands called `""`.
+    #[must_use]
+    pub fn stem_for(&self, owner_name: &str) -> String {
+        let typed = self.name.trim();
+        if typed.is_empty() {
+            owner_name.to_string()
+        } else {
+            typed.to_string()
+        }
+    }
+}
+
 /// One stable playback lookup: the live shot, its local progress, and an optional transition from the
 /// preceding shot in this same cutscene. A first shot never carries `blend_from`, which keeps separately
 /// directed cutscenes as hard cuts.
@@ -328,6 +483,7 @@ impl Default for Cutscene {
             shots: Vec::new(),
             mood: Mood::default(),
             delivery: Delivery::default(),
+            render: RenderSettings::default(),
         }
     }
 }
@@ -1378,6 +1534,7 @@ mod tests {
             ],
             mood: Mood::Normal,
             delivery: Delivery::Scope,
+            render: RenderSettings::default(),
         };
         assert!((cut.seconds() - 5.0).abs() < 1.0e-6);
         assert_eq!(cut.shot_at(0.0).map(|(i, _)| i), Some(0));
@@ -1403,6 +1560,7 @@ mod tests {
                 .collect(),
             mood,
             delivery: Delivery::Scope,
+            render: RenderSettings::default(),
         };
         let normal = ten_shot_act(Mood::Normal);
         let calm = ten_shot_act(Mood::Calm);
@@ -1431,6 +1589,7 @@ mod tests {
             ],
             mood: Mood::Normal,
             delivery: Delivery::Scope,
+            render: RenderSettings::default(),
         };
         assert_eq!(cut.playback_at(0.0).unwrap().blend_from, None);
         let boundary = cut.playback_at(2.0).expect("second shot starts");
@@ -1474,6 +1633,7 @@ mod tests {
             ],
             mood: Mood::Normal,
             delivery: Delivery::Scope,
+            render: RenderSettings::default(),
         };
         let camera_at = |time| {
             let playback = cut.playback_at(time).expect("inside cutscene");
@@ -1524,6 +1684,7 @@ mod tests {
             ],
             mood: Mood::Normal,
             delivery: Delivery::Viewport,
+            render: RenderSettings::default(),
         };
         let problems = jump.problems();
         assert!(
@@ -1550,6 +1711,7 @@ mod tests {
             ],
             mood: Mood::Normal,
             delivery: Delivery::Scope,
+            render: RenderSettings::default(),
         };
         assert!(good.problems().is_empty(), "{:?}", good.problems());
     }

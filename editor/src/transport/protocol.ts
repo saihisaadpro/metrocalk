@@ -2092,6 +2092,39 @@ export interface SubjectCatalog {
   truncated: boolean;
 }
 
+/** ADR-190 — how a cutscene renders, stored in the document beside its delivery frame.
+ *
+ *  NOT A UI PREFERENCE. These are the author's answers about the DELIVERABLE, so they belong to the
+ *  cut and not to whichever dialog was last open: they are undoable, they are saved with the project,
+ *  and they are still there after a restart. Every one of them was a `useState` seeded from a constant
+ *  before this, re-answered on every single render. */
+export interface RenderSettings {
+  /** What the render delivers. */
+  format: RenderFormat;
+  /** Frames per second. */
+  fps: number;
+  /** The output height, or `null` for "as on screen". */
+  height: number | null;
+  /** The file name, as the author typed it. Empty means "use the object's name". */
+  name: string;
+  /** Where the files go. Empty means "ask me", which is what every render did before ADR-190 — and
+   *  what a remembered folder that is no longer on this machine falls back to. */
+  folder: string;
+}
+
+/** What a cutscene renders as before anyone has said otherwise — the engine's own `RenderSettings`
+ *  default, restated once here for the placeholder replies a client hands out before the engine has
+ *  answered. ONE copy, and it is a placeholder: every reply that came from the engine carries the
+ *  engine's answer, and nothing reads this except a stub standing in for a reply that has not
+ *  arrived. */
+export const DEFAULT_RENDER_SETTINGS: RenderSettings = {
+  format: "movie",
+  fps: 24,
+  height: 1080,
+  name: "",
+  folder: "",
+};
+
 /** A change to one shot's framing. An absent axis means "leave it alone", never "reset it". */
 export interface FramingEdit {
   size?: string;
@@ -2109,6 +2142,9 @@ export interface CinemaReply {
   mood: "calm" | "normal" | "tense";
   /** The frame this cutscene is composed and delivered in. */
   delivery: DeliveryFrame;
+  /** ADR-190 — how this cutscene renders, as last authored. On EVERY cinema reply, so the render
+   *  dialog opens already knowing the four answers rather than fetching them after it has painted. */
+  render: RenderSettings;
   /** The cutscene read back as sentences, one line per shot. Flattened from `rows`. */
   reads: string[];
   /** The same shots with their numbers. */

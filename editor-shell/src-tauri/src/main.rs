@@ -2862,6 +2862,24 @@ enum EngineCmd {
         delivery: String,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
     },
+    /// ADR-190 - Cinematics: set how the cutscene renders - format, rate, size and name - as one
+    /// undoable commit.
+    CinemaSetRender {
+        id: String,
+        format: String,
+        fps: u32,
+        height: Option<u32>,
+        name: String,
+        folder: String,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// ADR-190 - Cinematics: remember one destination folder, leaving the other four answers as the
+    /// cutscene already has them (one undoable commit).
+    CinemaSetRenderFolder {
+        id: String,
+        folder: String,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
     /// Cinematics - set one shot's authored length (one undoable commit).
     CinemaSetShotSeconds {
         id: String,
@@ -10191,6 +10209,138 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             &cut,
                             &name,
                             format!("Composing for {}", cut.delivery.label()),
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSetRender {
+                id,
+                format,
+                fps,
+                height,
+                name,
+                folder,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - render settings are authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::set_render_ops(
+                    &engine, entity, &format, fps, height, &name, &folder,
+                ) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-render", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the render settings were refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaRender {
+                            id: id.clone(),
+                            format: format.clone(),
+                            fps,
+                            height,
+                            name: name.clone(),
+                            folder: folder.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let display = entity_display_name(&engine, entity);
+                        // THE SENTENCE SAYS ALL FOUR, because all four just moved together and a
+                        // toast naming one of them would describe a quarter of what was committed.
+                        let size = match cut.render.height {
+                            Some(height) => format!("{height}"),
+                            None => "as on screen".to_string(),
+                        };
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &display,
+                            format!(
+                                "Delivering {} at {size}, {} fps, as \"{}\"",
+                                cut.render.format.label(),
+                                cut.render.fps,
+                                cut.render.stem_for(&display),
+                            ),
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSetRenderFolder { id, folder, reply } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - render settings are authored, not live-edited",
+                    ));
+                    continue;
+                }
+                // THE OTHER FOUR COME OUT OF THE DOCUMENT, not off the wire. This command changes one
+                // answer, so it re-states the four it is not changing from the only place that knows
+                // them - which is also what makes it safe to call from a picker that has no idea what
+                // the cutscene currently delivers.
+                let current = metrocalk_editor_shell::cutscene_of(&engine, entity).render;
+                match metrocalk_editor_shell::set_render_ops(
+                    &engine,
+                    entity,
+                    current.format.key(),
+                    current.fps,
+                    current.height,
+                    &current.name,
+                    &folder,
+                ) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-render", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the destination was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaRender {
+                            id: id.clone(),
+                            format: current.format.key().to_string(),
+                            fps: current.fps,
+                            height: current.height,
+                            name: current.name.clone(),
+                            folder: folder.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let display = entity_display_name(&engine, entity);
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &display,
+                            format!("Rendering into {folder}"),
                             &|key| shot_subject_name(&engine, key),
                         ));
                     }
@@ -24213,6 +24363,82 @@ fn cinema_set_delivery(
     })
 }
 
+/// ADR-190 - set how this cutscene renders: format, rate, size and name (one undoable commit).
+///
+/// THE WHOLE BLOCK IN ONE CALL. Four commands would be four records in the replay log for one
+/// authoring gesture, and would let the pair `(movie, "as on screen")` exist for one round trip
+/// between two of them. The write is the same size either way - `write_ops` serialises the whole
+/// cutscene whatever changed.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+fn cinema_set_render(
+    state: State<AppState>,
+    id: String,
+    format: String,
+    fps: u32,
+    height: Option<u32>,
+    name: String,
+    folder: String,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetRender {
+            id,
+            format,
+            fps,
+            height,
+            name,
+            folder,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The render settings did not finish in time")
+    })
+}
+
+/// ADR-190 - ask for a destination folder and remember it on the cutscene (one undoable commit).
+///
+/// THE PICKER IS THE ONLY WAY A PATH GETS IN. A text box for a directory is a box that has to refuse
+/// - it does not exist, it is a file, it is not writable - and every one of those refusals is a
+/// sentence the operating system's own picker never has to say. So the editor never types a path; it
+/// asks for one, and stores what came back.
+///
+/// The other four answers come from the cutscene rather than from the caller: this command changes
+/// exactly one of the five, and re-sending the other four through the UI would let a stale draft
+/// overwrite them.
+#[tauri::command(async)]
+fn cinema_pick_render_folder(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let Some(folder) = pick_render_folder(&app) else {
+        // NOT A REFUSAL WITH A `reason`. Cancelling a picker is not an error and nothing changed;
+        // saying "that was refused" about a decision not to decide is how a surface ends up shouting
+        // at somebody for pressing Escape. `entity: None` and an empty message is the caller's cue
+        // to leave the settings exactly as they were.
+        return metrocalk_editor_shell::CinemaReply::default();
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetRenderFolder { id, folder, reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The destination did not finish in time")
+    })
+}
+
 /// The framing vocabulary and the bounds a shot must respect. Static data.
 ///
 /// Published by the side that VALIDATES it, so the shot inspector's three dropdowns cannot offer a
@@ -24500,7 +24726,14 @@ fn cinema_render_start(
     let Some(delivery) = render_format(format.as_deref()) else {
         return RenderReply::refusal(unknown_format(format.as_deref()));
     };
-    let Some(folder) = folder.or_else(|| pick_render_folder(&app)) else {
+    // ADR-190 — A REMEMBERED FOLDER THAT IS NOT THERE IS THE SAME AS NO FOLDER: it asks.
+    //
+    // The destination is stored on the cutscene, and a cutscene travels — a `.mtk` opened on another
+    // machine, or on this one after the drive was reorganised, carries a path that is not there. The
+    // two alternatives are both worse than asking: refusing names a folder the author never chose on
+    // this machine, and creating it writes a tree somewhere they did not look at.
+    let remembered = folder.filter(|f| !f.trim().is_empty() && std::path::Path::new(f).is_dir());
+    let Some(folder) = remembered.or_else(|| pick_render_folder(&app)) else {
         return RenderReply::refusal("Render canceled — no folder was chosen.");
     };
     let (reply, rx) = mpsc::channel();
@@ -27657,6 +27890,8 @@ fn main() {
             cinema_subject_chain,
             cinema_set_mood,
             cinema_set_delivery,
+            cinema_set_render,
+            cinema_pick_render_folder,
             cinema_list,
             cinema_preview,
             cinema_render_plan,

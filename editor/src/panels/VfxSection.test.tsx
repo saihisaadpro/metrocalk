@@ -7,6 +7,7 @@ import { CinemaSection } from "./CinemaSection";
 import { fakeClient } from "../transport/test-client";
 import { projectionStore } from "../store/projection";
 import { playStore } from "../store/play";
+import { DEFAULT_RENDER_SETTINGS } from "../transport/protocol";
 import type { ShotRow } from "../transport/protocol";
 
 function selectSomething() {
@@ -213,7 +214,7 @@ describe("CinemaSection", () => {
       shots: 1,
       seconds: mood === "calm" ? 6.25 : 2.5,
       mood,
-      delivery: "viewport" as const,
+      delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS,
       reads: [shot(2.5).reads],
       rows: [shot(mood === "calm" ? 6.25 : 2.5)],
       problems: [],
@@ -226,7 +227,7 @@ describe("CinemaSection", () => {
         entity: id,
         shots: 1,
         seconds: next === "calm" ? 6.25 : 2.5,
-        delivery: "viewport" as const,
+        delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS,
         mood: next,
         reads: [shot(2.5).reads],
         rows: [shot(next === "calm" ? 6.25 : 2.5)],

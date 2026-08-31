@@ -14,6 +14,7 @@ import { cinemaPreviewStore } from "../store/cinemaPreview";
 import { subjectAimStore } from "../store/subjectAim";
 import { stageHighlightStore } from "../store/stageHighlight";
 import { toastStore } from "../store/toasts";
+import { DEFAULT_RENDER_SETTINGS } from "../transport/protocol";
 import type { CinemaReply, ShotRow } from "../transport/protocol";
 
 function row(over: Partial<ShotRow> & Pick<ShotRow, "id" | "index" | "startSeconds">): ShotRow {
@@ -42,7 +43,7 @@ const FOUR_SHOTS: CinemaReply = {
   shots: 4,
   seconds: 10,
   mood: "normal",
-  delivery: "viewport",
+  delivery: "viewport", render: DEFAULT_RENDER_SETTINGS,
   reads: [],
   rows: [
     row({ id: "s1", index: 0, startSeconds: 0, seconds: 2, effectiveSeconds: 2, size: "wide", motion: "pull_out", reads: "a wide shot of Weld Gun 7 from three-quarters, pulling out — 2.0s" }),

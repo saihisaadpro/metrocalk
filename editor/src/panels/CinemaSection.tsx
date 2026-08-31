@@ -18,6 +18,7 @@ import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
 import { ChoiceCard, ChoiceGrid, DisclosureSection } from "../theme/workspace";
 import { color, fontSize, space } from "../theme/tokens";
+import { DEFAULT_RENDER_SETTINGS } from "../transport/protocol";
 import type { CinemaReply, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 
@@ -32,6 +33,7 @@ const EMPTY: CinemaReply = {
   seconds: 0,
   mood: "normal",
   delivery: "viewport",
+  render: DEFAULT_RENDER_SETTINGS,
   reads: [],
   rows: [],
   problems: [],

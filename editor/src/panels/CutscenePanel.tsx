@@ -50,6 +50,7 @@ import {
   timelineTicks,
 } from "../theme/timeline";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { DEFAULT_RENDER_SETTINGS } from "../transport/protocol";
 import type { CinemaPreviewReply, CinemaReply, DeliveryFrame, FramingCatalog, FramingEdit, ShotRow, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 import { RenderDialog } from "./RenderDialog";
@@ -62,6 +63,7 @@ const EMPTY: CinemaReply = {
   seconds: 0,
   mood: "normal",
   delivery: "viewport",
+  render: DEFAULT_RENDER_SETTINGS,
   reads: [],
   rows: [],
   problems: [],
@@ -541,6 +543,21 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
           cut={cut}
           activeShotIndex={active?.index ?? null}
           deliveryLabel={labelOf(catalog?.deliveries ?? [], cut.delivery)}
+          // ADR-190 — the dialog sends the settings change and shows any refusal in place; the cut it
+          // changed lives here. Adopting the reply is what keeps the NEXT open seeded from what was
+          // actually stored, and the toast is the same "Ctrl-Z to undo" every other cinematics edit
+          // raises — these are document edits, and a form control that quietly makes one without
+          // saying it is undoable is a form control the author will not trust with a decision.
+          onSettingsSaved={(reply, announce) => {
+            setCut(reply);
+            // ANNOUNCED FOR AN EDIT, SILENT FOR AN ADOPTION. Changing a picker is an authoring
+            // gesture and gets the same undo-able toast every other cinematics edit gets; the dialog
+            // remembering the folder the author just chose in a picker, as a render starts, is not a
+            // second decision and a toast about it would arrive on top of the progress bar.
+            if (announce) pushToast(`${reply.message} · Ctrl-Z to undo`, "success");
+            setStatus(reply.message);
+            setRevision((r) => r + 1);
+          }}
         />
       )}
 
