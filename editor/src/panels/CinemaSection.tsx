@@ -14,8 +14,9 @@ import { usePlaying } from "../store/play";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
-import { Button, SectionHeader } from "../theme/primitives";
+import { Button } from "../theme/primitives";
 import { color, fontSize, radius, space } from "../theme/tokens";
+import { DisclosureSection, useSubjectDisclosure } from "../theme/workspace";
 import type { CinemaReply, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 import { ShotCatalogue } from "./ShotCatalogue";
@@ -139,9 +140,30 @@ export function CinemaSection({ client, onOpenTimeline }: CinemaSectionProps) {
     }
   }
 
+  // THE THIRD SECTION OF THE GAMEPLAY WORKSPACE, AND IT WAS THE ONE THAT WAS NOT ONE. Roles and
+  // Effects are `DisclosureSection`s that state their condition in the header (ADR-161); this block was
+  // rewritten by the cinematics lane, on a branch that had never seen that decision, as a bare
+  // `<section>` with a heading — so the workspace folded two groups of three and the shots gate said so
+  // the moment the two lanes met. Same anatomy as its siblings, including the forced open during Play:
+  // `cinema-live` is the read-out saying which cutscene owns the camera, and a folded section is a
+  // read-out nobody can see in the one state where it is being read.
+  const condition = !selected
+    ? "needs a selection"
+    : cut.shots > 0
+      ? `${cut.shots} shot${cut.shots === 1 ? "" : "s"} · ${cut.seconds.toFixed(1)}s`
+      : "no shots yet";
+  const disclosure = useSubjectDisclosure(selected);
+
   return (
-    <section data-testid="cinema-section">
-      <SectionHeader>Cinematics</SectionHeader>
+    <DisclosureSection
+      data-testid="cinema-section"
+      title="Cinematics"
+      summary={condition}
+      density="compact"
+      landmark={false}
+      open={playing || disclosure.open}
+      onOpenChange={disclosure.onOpenChange}
+    >
 
       {playing && (
         <div
@@ -334,7 +356,7 @@ export function CinemaSection({ client, onOpenTimeline }: CinemaSectionProps) {
           {refusal}
         </div>
       )}
-    </section>
+    </DisclosureSection>
   );
 }
 
