@@ -29,6 +29,7 @@ function row(index: number, startSeconds: number, seconds: number): ShotRow {
     amount: 0.35,
     subject: "e1",
     subjectName: "Weld Gun 7",
+    camera: null,
   };
 }
 

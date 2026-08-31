@@ -93,6 +93,24 @@ export type Expect = {
    *  thing this harness was built to stop, and "did it wrap" is the one question a capture answers
    *  and a DOM assertion cannot. */
   same_line?: [a: string, b: string][];
+  /** Controls that must be DISABLED, read from the element the browser refuses input on.
+   *
+   *  Every other claim in this type measures a rectangle or reads text, and both are satisfied by a
+   *  control that is present, legible, correctly placed and fully live when it should be dead —
+   *  which `<ux_quality>` 6 forbids in exactly those words ("no inert controls") and which a
+   *  screenshot cannot distinguish from one that works. The case that needed it: a shot filmed from
+   *  a camera the author placed leaves its Size and Angle pickers deciding nothing, and a picker
+   *  that still turns while the picture does not move is a control lying about what it edits.
+   *
+   *  Read from `el.disabled` (or `aria-disabled` for a control that is not a form element), never
+   *  from a class name — a styling hook that has drifted from the real state is the drift worth
+   *  catching. */
+  disabled?: string[];
+  /** The dual, and it is not redundant: it pins the controls a feature must NOT have switched off.
+   *
+   *  Without it, "disable what a placed camera decides" is satisfiable by disabling the whole grid,
+   *  and the scene would photograph a shot inspector with more dead in it than the ADR claims. */
+  enabled?: string[];
   /** The exact dual: `a` and `b` are separate sentences, on separate lines, `a` above `b`.
    *
    *  `same_line` could only ever assert the defect it was written against here. The rig panel's
@@ -494,6 +512,7 @@ const CUTSCENE: CinemaReply = (() => {
       amount: shot.amount,
       subject: shot.subject,
       subjectName: shot.subjectName,
+      camera: null,
     };
     start += shot.seconds;
     return row;
@@ -654,6 +673,51 @@ const cutsceneClient = () =>
         reason: null,
       }),
   }) as unknown as EditorClient;
+
+/** ADR-192 — the same five-shot cut with its OPENING shot filmed from a camera the author placed.
+ *
+ *  The opener on purpose, and not only because it is the clip this scene's one click lands on: it is
+ *  the establishing wide of a 262 m hall, which is the shot the card vocabulary is least able to
+ *  give — every size solves a stand-off from a bounding sphere, and there is no distance at which a
+ *  262 m assembly shot broadside fills a 16:9 frame. Standing the camera where the author can see
+ *  the line receding is the answer, and it is not expressible as a size crossed with an angle.
+ *
+ *  Its card (`wide` / `three_quarter`) stays on the row, disabled, because that is the framing "Use
+ *  the card again" restores — and the sentence it used to read is what the scene asserts is gone. */
+const PLACED_CAMERA = {
+  eye: [7.4, 2.9, -5.1] as [number, number, number],
+  lookAt: [0.2, 1.35, 0.4] as [number, number, number],
+  // `CAMERA_FOV_DEG` — the lens the viewport actually draws through, and what `camera_probe` now
+  // reports. It answered a bare 45 until this session, for a projection that has never used one.
+  fovDeg: 55,
+};
+
+const placedCameraClient = () => {
+  const rows = CUTSCENE.rows.map((row) =>
+    row.index === 0
+      ? {
+          ...row,
+          camera: PLACED_CAMERA,
+          reads: "a placed shot of Assembly Hall, pulling out — 2.5s",
+        }
+      : row,
+  );
+  const cut: CinemaReply = {
+    ...CUTSCENE,
+    rows,
+    reads: rows.map((row) => row.reads),
+    // The jump cut between shots 4 and 5 is still real; the placed shot simply is not part of it.
+    problems: CUTSCENE.problems,
+  };
+  return {
+    ...cutsceneClient(),
+    cinemaList: () => Promise.resolve(cut),
+    cinemaSetShotCamera: (id: string, index: number) =>
+      Promise.resolve({ ...cut, entity: id, message: `Shot ${index + 1} is now ${rows[index]?.reads ?? "placed"}` }),
+    cinemaClearShotCamera: (id: string, index: number) =>
+      Promise.resolve({ ...CUTSCENE, entity: id, message: `Shot ${index + 1} is now ${CUTSCENE.rows[index]?.reads ?? "back on its card"}` }),
+  } as unknown as EditorClient;
+};
 
 /** Nothing rendered yet - the zero row every render answer in this file is built from. */
 const RENDER_IDLE = {
@@ -1369,6 +1433,63 @@ export const SCENES: Scene[] = [
       same_line: [["[data-testid='cutscene-earlier']", "[data-testid='cutscene-remove']"]],
     },
     render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-placed-camera",
+    looking_for:
+      "A SHOT THE AUTHOR PLACED BY EYE. Every shot before this one was a CARD — one of six sizes " +
+      "crossed with one of six angles, solved relative to the subject's own facing — and the " +
+      "vocabulary is why the first click looks good, but it could not express the most basic " +
+      "gesture in cinematography: orbit until the frame is the one you want, then shoot THAT. The " +
+      "renderer has taken an arbitrary eye/look-at/lens since ADR-168; nothing in the editor could " +
+      "hand it one. Check three things, and they are the whole decision. First, the camera row sits " +
+      "ABOVE the framing grid and says 'Re-shoot from this view' beside 'Use the card again', " +
+      "because a placed camera is not one more axis of the card — it REPLACES two of them. Second, " +
+      "Size and Angle are visibly DISABLED and their help lines say why in plain words ('Set by the " +
+      "camera you placed'), rather than sitting there enabled and deciding nothing; the values are " +
+      "not cleared, because they are the framing 'Use the card again' restores. Third, the eye, the " +
+      "aim and the lens are on screen as NUMBERS the author can read against the preview's own " +
+      "read-out — a 'Placed' badge would be a claim, and three coordinates are evidence. The " +
+      "sentence under the heading reads 'a placed shot of ...', not 'a very close shot ... in " +
+      "profile': captioning a hand-framed wide with the leftover card is this list's one job done " +
+      "wrong. Move and Move strength stay LIVE, which is the difference between an escape hatch and " +
+      "a first-class shot — 'put the camera here and push in' is a sentence this engine can film",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-clip']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-shot-editor']", 1],
+        ["[data-testid='cutscene-shoot-here']", 1],
+        ["[data-testid='cutscene-use-card']", 1],
+        ["[data-testid='cutscene-placed-pose']", 1],
+      ],
+      text_present: [
+        "Re-shoot from this view",
+        "Use the card again",
+        "a placed shot of",
+        "Set by the camera you placed",
+        // The lens the viewport actually draws through — `CAMERA_FOV_DEG`, not the probe's old 45.
+        "55",
+      ],
+      // The caption a placed shot must NOT be wearing — its own leftover card, read back as if it
+      // still decided the frame.
+      text_absent: ["a wide shot of Assembly Hall", "null", "undefined", "NaN"],
+      disabled: ["[data-testid='cutscene-size']", "[data-testid='cutscene-angle']"],
+      // ...while the two controls a placed camera does NOT take over stay usable.
+      enabled: ["[data-testid='cutscene-motion']", "[data-testid='cutscene-amount']"],
+      unclipped: [
+        "[data-testid='cutscene-shoot-here']",
+        "[data-testid='cutscene-use-card']",
+        "[data-testid='cutscene-placed-pose']",
+      ],
+      // The camera row is above the grid whose two controls it disables.
+      stacked: [
+        ["[data-testid='cutscene-shoot-here']", "[data-testid='cutscene-size']"],
+      ],
+      same_line: [["[data-testid='cutscene-shoot-here']", "[data-testid='cutscene-use-card']"]],
+    },
+    render: () => <CutscenePanel client={placedCameraClient()} />,
   },
   {
     id: "cutscene-render",

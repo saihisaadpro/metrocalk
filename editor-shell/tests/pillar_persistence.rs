@@ -341,6 +341,84 @@ fn what_a_cut_delivers_survives_save_and_open() {
 }
 
 #[test]
+fn a_camera_the_author_placed_survives_save_and_open() {
+    // ADR-192's closing gate. The gesture's whole promise is "film what I am looking at", and a pose
+    // that came back one metre off — or came back as the card it replaced — would break that promise
+    // silently: the project opens, the shot is there, and only the picture is somebody else's.
+    //
+    // A REAL `.mtk` and a SECOND engine built from nothing, for the reason ADR-190 gave: an
+    // in-memory struct handed back to its own author proves nothing about the wire format, and the
+    // pose crosses JSON on the way to disk.
+    let path = temp_mtk("cinema-placed-camera");
+    let _ = std::fs::remove_file(&path);
+
+    let (mut a, _scene) = engine_with_resolver();
+    let rig = spawn(&mut a, 2.0);
+    for kind in ["establish", "hero"] {
+        let (ops, _) =
+            metrocalk_editor_shell::add_shot_ops(&a, rig, kind, rig).expect("shot lands");
+        a.commit("shot", ops).expect("shot commits");
+    }
+
+    // Deliberately not round numbers and deliberately not the viewport's own default lens: a test
+    // whose pose was `[0,0,0]` at 55 degrees would pass on an engine that had stored nothing and
+    // re-derived a camera from scratch.
+    let placed = metrocalk_animation::shot::ShotCamera {
+        eye: [7.4, 2.9, -5.1],
+        look_at: [0.2, 1.35, 0.4],
+        fov_deg: 38.5,
+    };
+    let (ops, _) =
+        metrocalk_editor_shell::set_shot_camera_ops(&a, rig, 1, placed).expect("the pose stores");
+    a.commit("cinema-camera", ops).expect("camera commits");
+
+    let before = metrocalk_editor_shell::cutscene_of(&a, rig);
+    project::save(&a, &path).expect("save");
+
+    let (mut b, _scene_b) = engine_with_resolver();
+    project::open_into(&mut b, &path).expect("open");
+    let after = metrocalk_editor_shell::cutscene_of(&b, rig);
+
+    assert_eq!(after, before, "a cutscene changed across a reload");
+    assert_eq!(after.shots[1].camera, Some(placed), "the placed camera");
+    assert_eq!(
+        after.shots[0].camera, None,
+        "the shot beside it is unplaced"
+    );
+    // AND THE POSE IS WHAT GETS FILMED. Reading the field back is not the claim; the claim is that
+    // the solver in the reopened project stands the camera exactly there.
+    let filmed = metrocalk_animation::shot::solve_shot(
+        &after.shots[1],
+        metrocalk_animation::shot::SubjectSample {
+            center: [0.0, 0.0, 0.0],
+            half_extent: [1.0, 1.0, 1.0],
+            forward: [0.0, 0.0, 1.0],
+            stage: metrocalk_animation::shot::Stage::OPEN,
+        },
+        0.0,
+        16.0 / 9.0,
+        50.0,
+    );
+    // BITS, not `==` on the arrays: the claim is that nothing was recomputed on the way through the
+    // document, so an epsilon here would accept a pose that had been re-derived and landed close.
+    assert_eq!(
+        filmed.eye.map(f32::to_bits),
+        placed.eye.map(f32::to_bits),
+        "the reopened shot films from somewhere else"
+    );
+    assert_eq!(
+        filmed.look_at.map(f32::to_bits),
+        placed.look_at.map(f32::to_bits)
+    );
+    assert!(
+        (filmed.fov_deg - 38.5).abs() < f32::EPSILON,
+        "the lens they framed through"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn a_cutscene_authored_before_render_settings_existed_opens_on_the_defaults() {
     // THE MIGRATION, on a real file. Every `.mtk` written before this pass carries a `Cinematic`
     // whose `source` blob has no `render` key; `#[serde(default)]` is what makes those open, and a

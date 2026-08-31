@@ -353,6 +353,15 @@ export interface EditorClient {
   /** Point one shot at a different object, keeping its place, its length and its framing
    *  (one undoable commit). */
   cinemaSetShotSubject(id: string, index: number, subject: string): Promise<CinemaReply>;
+  /** ADR-192 — SHOOT FROM THIS VIEW: make one shot film from the camera that is on screen right
+   *  now (one undoable commit).
+   *
+   *  NO POSE ARGUMENT, deliberately. The only thing that knows what "this view" is, is the
+   *  renderer, so the engine reads its own camera; an editor that sent coordinates could store a
+   *  camera the engine was never standing at. */
+  cinemaSetShotCamera(id: string, index: number): Promise<CinemaReply>;
+  /** Give one shot back to its card, restoring exactly the framing it was authored with. */
+  cinemaClearShotCamera(id: string, index: number): Promise<CinemaReply>;
   /** The objects a shot could frame — ranked by the scene's own hierarchy, or searched by name.
    *  A read. `index` marks the shot being edited so its current subject comes back ticked. */
   cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog>;
@@ -1084,6 +1093,12 @@ export class TauriClient implements EditorClient {
   }
   cinemaSetShotSubject(id: string, index: number, subject: string): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_set_shot_subject", { id, index, subject }).catch((e: unknown) => { console.error("cinema_set_shot_subject failed", e); throw e; });
+  }
+  cinemaSetShotCamera(id: string, index: number): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_camera", { id, index }).catch((e: unknown) => { console.error("cinema_set_shot_camera failed", e); throw e; });
+  }
+  cinemaClearShotCamera(id: string, index: number): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_clear_shot_camera", { id, index }).catch((e: unknown) => { console.error("cinema_clear_shot_camera failed", e); throw e; });
   }
   cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog> {
     return this.core.invoke<SubjectCatalog>("cinema_subject_catalog", { id, index, query }).catch((e: unknown) => { console.error("cinema_subject_catalog failed", e); throw e; });
@@ -3014,6 +3029,16 @@ class MockClient implements EditorClient {
     return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetShotSubject(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  /** A REFUSAL, not a stored pose. There is no wgpu camera behind a browser build, so "shoot from
+   *  this view" has no view to shoot from — and a stub that returned a plausible one would store a
+   *  camera the renderer has never stood at, which is the exact failure the native command is
+   *  shaped to make impossible. */
+  cinemaSetShotCamera(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaClearShotCamera(): Promise<CinemaReply> {
     return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   /** An EMPTY list, not an invented one. The picker's whole value is the two facts only the native

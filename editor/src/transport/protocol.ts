@@ -2053,6 +2053,23 @@ export interface ShotRow {
   subject: string;
   /** That object's display name. */
   subjectName: string;
+  /** ADR-192 — the camera the author placed, or `null` while the card decides.
+   *
+   *  When this is set, `size` and `angle` above are LEFTOVERS of whatever card the shot was created
+   *  from and decide nothing: the panel disables those two controls and captions the row from the
+   *  pose instead. They stay on the row so "use the card again" restores the exact framing the shot
+   *  was authored with rather than a default the author has to re-choose. */
+  camera: ShotCamera | null;
+}
+
+/** A camera pose the author placed, in world units — what "shoot from this view" stored. */
+export interface ShotCamera {
+  /** Where it stands. */
+  eye: [number, number, number];
+  /** The point it aims at. */
+  lookAt: [number, number, number];
+  /** Vertical field of view, degrees — the lens they framed through. */
+  fovDeg: number;
 }
 
 /** One object a shot could be pointed at, with the two facts that decide whether it is the right one. */

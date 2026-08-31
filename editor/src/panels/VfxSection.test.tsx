@@ -208,6 +208,7 @@ describe("CinemaSection", () => {
       amount: 0.35,
       subject: "e1",
       subjectName: "e1",
+      camera: null,
     });
     client.cinemaList = vi.fn((id: string) => Promise.resolve({
       entity: id,

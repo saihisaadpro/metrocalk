@@ -11,8 +11,8 @@
 //! rule — which is why the closed action vocabulary never had to grow to gain cutscenes.
 
 use metrocalk_animation::shot::{
-    Cutscene, Delivery, Mood, RenderSettings, ShotAngle, ShotMove, ShotRecipe, ShotSize,
-    MAX_SECONDS, MAX_SHOTS, MIN_SECONDS,
+    Cutscene, Delivery, Mood, RenderSettings, ShotAngle, ShotCamera, ShotMove, ShotRecipe,
+    ShotSize, MAX_SECONDS, MAX_SHOTS, MIN_SECONDS,
 };
 // ADR-190 moved these three into the document crate when `RenderSettings` put them in the cutscene.
 // Re-exported from here, where every caller already looks for them, so moving the definition did not
@@ -381,6 +381,12 @@ pub enum CinemaError {
         /// What the caller sent.
         value: String,
     },
+    /// The viewport is not standing anywhere a shot could be filmed from.
+    UnusableCamera,
+    /// The stage is in an axis view, which is parallel and therefore has no lens to store.
+    NoLensToStore,
+    /// The shot already films from a card, so there is nothing to clear.
+    NoPlacedCamera,
     /// The write failed.
     Blocked(String),
 }
@@ -403,6 +409,17 @@ impl std::fmt::Display for CinemaError {
             Self::UnknownFraming { axis, value } => {
                 write!(f, "there is no {axis} called \"{value}\"")
             }
+            Self::UnusableCamera => write!(
+                f,
+                "the view is not somewhere a camera can film from — orbit until you can see the \
+                 subject, then shoot again"
+            ),
+            Self::NoPlacedCamera => write!(f, "this shot is already framed by its card"),
+            Self::NoLensToStore => write!(
+                f,
+                "the stage is showing a top, front or side view, which has no lens — a shot is \
+                 filmed through one, so switch back to the 3D view and shoot again"
+            ),
             Self::TooMany(m) | Self::OutOfRange(m) | Self::Blocked(m) => write!(f, "{m}"),
         }
     }
@@ -459,6 +476,12 @@ pub struct ShotRow {
     /// something other than its owner, and before this every line in the list was captioned with the
     /// OWNER's name, so an establishing wide of the whole assembly read as a wide of the one part.
     pub subject_name: String,
+    /// ADR-192 — the camera the author placed, or `None` while the card decides.
+    ///
+    /// ON THE ROW because `size` and `angle` are still on it and are inert whenever this is `Some`:
+    /// a panel drawing three controls from one reply has to be told which two of them have stopped
+    /// meaning anything, or it draws a "close-up, from below" caption over a hand-framed wide.
+    pub camera: Option<ShotCamera>,
 }
 
 /// What a completed cinematics command answers with.
@@ -654,6 +677,7 @@ fn recipe_for(kind: &str, subject: &str, index: usize) -> Option<ShotRecipe> {
         motion,
         amount,
         seconds,
+        camera: None,
     })
 }
 
@@ -886,6 +910,66 @@ pub fn set_shot_framing_ops<W: World>(
     if let Some(amount) = edit.amount {
         shot.amount = (amount * 100.0).round() / 100.0;
     }
+    Ok((write_ops(entity, &cut, false), cut))
+}
+
+/// The ops that make ONE shot film from a camera the author placed.
+///
+/// WHY THE POSE IS AN ARGUMENT AND THE EDITOR NEVER SENDS ONE. The gesture is "shoot from this view",
+/// and the only thing that knows what "this view" is, is the renderer. The command the editor calls
+/// carries an entity and an index; the shell reads the live camera out of its own render state and
+/// hands it here. So there is no round trip in which the author's view and the stored pose can
+/// disagree, and no way for a caller to store a camera the engine was never standing at — the class
+/// of bug that makes a preview a picture of a shot the engine does not film.
+///
+/// The pose is checked HERE, where it is stored, and not where it is filmed: a shot carrying a
+/// degenerate camera renders a black frame weeks later with nothing said at the time.
+///
+/// # Errors
+/// [`CinemaError::MissingEntity`] when the object is gone, [`CinemaError::NoSuchShot`] for an index
+/// that is not there, and [`CinemaError::UnusableCamera`] for a pose no camera can be built from.
+pub fn set_shot_camera_ops<W: World>(
+    engine: &Engine<W>,
+    entity: EntityId,
+    index: usize,
+    camera: ShotCamera,
+) -> Result<(Vec<Op>, Cutscene), CinemaError> {
+    if !engine.entity_exists(entity) {
+        return Err(CinemaError::MissingEntity);
+    }
+    if !camera.is_usable() {
+        return Err(CinemaError::UnusableCamera);
+    }
+    let mut cut = cutscene_of(engine, entity);
+    let shot = cut.shots.get_mut(index).ok_or(CinemaError::NoSuchShot)?;
+    shot.camera = Some(camera);
+    Ok((write_ops(entity, &cut, false), cut))
+}
+
+/// The ops that give ONE shot back to its card.
+///
+/// The undo of the gesture above, and the reason `size` and `angle` are left untouched while a camera
+/// is placed: this restores exactly the framing the shot was authored with, rather than a default
+/// somebody would have to re-choose.
+///
+/// # Errors
+/// [`CinemaError::MissingEntity`], [`CinemaError::NoSuchShot`], or [`CinemaError::NoPlacedCamera`]
+/// when the shot is already framed by its card — refused rather than written, because an edit that
+/// changes nothing is an undo step the author has to press twice to get past.
+pub fn clear_shot_camera_ops<W: World>(
+    engine: &Engine<W>,
+    entity: EntityId,
+    index: usize,
+) -> Result<(Vec<Op>, Cutscene), CinemaError> {
+    if !engine.entity_exists(entity) {
+        return Err(CinemaError::MissingEntity);
+    }
+    let mut cut = cutscene_of(engine, entity);
+    let shot = cut.shots.get_mut(index).ok_or(CinemaError::NoSuchShot)?;
+    if shot.camera.is_none() {
+        return Err(CinemaError::NoPlacedCamera);
+    }
+    shot.camera = None;
     Ok((write_ops(entity, &cut, false), cut))
 }
 
@@ -1392,6 +1476,13 @@ fn describe_shot_with_seconds(
         ShotMove::CraneUp => "craning up",
         ShotMove::CraneDown => "craning down",
     };
+    // ADR-192 — the sentence describes what DECIDES the frame. A placed camera makes `size` and
+    // `angle` leftovers of whatever card the shot was created from, and reading them back would be
+    // this list's one job done wrong: "a close shot from below" over a hand-framed wide is a caption
+    // that survives every test there is and is simply untrue.
+    if shot.camera.is_some_and(|camera| camera.is_usable()) {
+        return format!("a placed shot of {subject_name}, {motion} — {effective_seconds:.1}s");
+    }
     format!("{size} shot of {subject_name} {angle}, {motion} — {effective_seconds:.1}s")
 }
 
@@ -1424,6 +1515,7 @@ fn rows_of(
             amount: shot.amount,
             subject: shot.subject.clone(),
             subject_name: who,
+            camera: shot.camera,
         });
         start += effective;
     }
@@ -3248,6 +3340,7 @@ mod tests {
                     motion: ShotMove::Hold,
                     amount: 0.0,
                     seconds: MAX_SECONDS,
+                    camera: None,
                 })
                 .collect(),
             mood: Mood::Calm,
@@ -3901,5 +3994,154 @@ mod tests {
         assert_eq!(sanitise_stem("///"), "frame");
         assert_eq!(sanitise_stem(""), "frame");
         assert!(!render_frame_name("///", 3).starts_with('.'));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-192 — a camera the author placed.
+    // ---------------------------------------------------------------------------------------------
+
+    fn a_camera() -> ShotCamera {
+        ShotCamera {
+            eye: [7.4, 2.9, -5.1],
+            look_at: [0.2, 1.35, 0.4],
+            fov_deg: 55.0,
+        }
+    }
+
+    #[test]
+    fn placing_a_camera_keeps_the_shot_and_leaves_its_card_where_it_was() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        let before = three_shot_cut(&mut engine, owner);
+
+        let (ops, cut) = set_shot_camera_ops(&engine, owner, 1, a_camera()).expect("places");
+        engine.commit("cinema-camera", ops).expect("commits");
+        let stored = cutscene_of(&engine, owner);
+
+        assert_eq!(cut.shots[1].camera, Some(a_camera()));
+        assert_eq!(stored.shots[1].camera, Some(a_camera()));
+        // ITS ID, ITS PLACE, ITS LENGTH AND ITS CARD. Everything a placed camera does not decide is
+        // exactly what "Use the card again" restores, so none of it may be cleared here.
+        assert_eq!(stored.shots[1].id, before.shots[1].id);
+        assert_eq!(stored.shots[1].size, before.shots[1].size);
+        assert_eq!(stored.shots[1].angle, before.shots[1].angle);
+        assert!(exactly(stored.shots[1].seconds, before.shots[1].seconds));
+        // ...and the neighbours are untouched.
+        assert_eq!(stored.shots[0].camera, None);
+        assert_eq!(stored.shots[2].camera, None);
+    }
+
+    #[test]
+    fn a_pose_no_camera_could_be_built_from_is_refused_where_it_would_be_stored() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+        for bad in [
+            ShotCamera {
+                eye: [1.0, 1.0, 1.0],
+                look_at: [1.0, 1.0, 1.0],
+                fov_deg: 55.0,
+            },
+            ShotCamera {
+                eye: [f32::INFINITY, 0.0, 0.0],
+                look_at: [0.0, 0.0, 0.0],
+                fov_deg: 55.0,
+            },
+            ShotCamera {
+                eye: [3.0, 0.0, 0.0],
+                look_at: [0.0, 0.0, 0.0],
+                fov_deg: 200.0,
+            },
+        ] {
+            let error = set_shot_camera_ops(&engine, owner, 0, bad).expect_err("refuses");
+            assert_eq!(error, CinemaError::UnusableCamera);
+            // The refusal names the way out rather than the field it disliked.
+            assert!(error.to_string().contains("shoot again"), "{error}");
+        }
+        assert_eq!(cutscene_of(&engine, owner).shots[0].camera, None);
+    }
+
+    #[test]
+    fn giving_a_shot_back_to_its_card_restores_exactly_what_it_was_authored_with() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        let before = three_shot_cut(&mut engine, owner);
+        let (ops, _) = set_shot_camera_ops(&engine, owner, 0, a_camera()).expect("places");
+        engine.commit("cinema-camera", ops).expect("commits");
+
+        let (ops, cut) = clear_shot_camera_ops(&engine, owner, 0).expect("clears");
+        engine.commit("cinema-camera", ops).expect("commits");
+        assert_eq!(cut.shots[0], before.shots[0]);
+
+        // AND A SECOND CLEAR IS A REFUSAL, not an empty undo step the author has to press twice past.
+        assert_eq!(
+            clear_shot_camera_ops(&engine, owner, 0).expect_err("nothing to clear"),
+            CinemaError::NoPlacedCamera
+        );
+    }
+
+    #[test]
+    fn both_commands_refuse_an_index_that_is_not_there_and_an_object_that_is_gone() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+        assert_eq!(
+            set_shot_camera_ops(&engine, owner, 9, a_camera()).expect_err("no such shot"),
+            CinemaError::NoSuchShot
+        );
+        assert_eq!(
+            clear_shot_camera_ops(&engine, owner, 9).expect_err("no such shot"),
+            CinemaError::NoSuchShot
+        );
+        let ghost = EntityId {
+            peer: 9_999,
+            counter: 7,
+        };
+        assert_eq!(
+            set_shot_camera_ops(&engine, ghost, 0, a_camera()).expect_err("gone"),
+            CinemaError::MissingEntity
+        );
+    }
+
+    #[test]
+    fn the_sentence_and_the_row_read_the_pose_rather_than_the_leftover_card() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+        let (ops, _) = set_shot_camera_ops(&engine, owner, 0, a_camera()).expect("places");
+        engine.commit("cinema-camera", ops).expect("commits");
+        let cut = cutscene_of(&engine, owner);
+
+        let sentence = describe_shot(&cut.shots[0], "Weld Gun 7");
+        assert!(
+            sentence.starts_with("a placed shot of Weld Gun 7"),
+            "{sentence}"
+        );
+        // The two words a hand-framed shot must not be captioned with — they describe a card that no
+        // longer decides anything.
+        assert!(!sentence.contains("from three-quarters"), "{sentence}");
+
+        let reply = reply_for(owner, &cut, "Weld Gun 7", String::new());
+        assert_eq!(reply.rows[0].camera, Some(a_camera()));
+        assert_eq!(reply.rows[1].camera, None);
+        // The row still CARRIES the card, because the panel draws the disabled pickers from it.
+        assert_eq!(reply.rows[0].size, cut.shots[0].size);
+        assert_eq!(reply.reads[0], reply.rows[0].reads);
+    }
+
+    #[test]
+    fn a_placed_camera_survives_the_document_it_is_written_into() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+        let (ops, _) = set_shot_camera_ops(&engine, owner, 2, a_camera()).expect("places");
+        engine.commit("cinema-camera", ops).expect("commits");
+        // Read back through the component blob, which is the round trip a save-and-open makes: the
+        // ops wrote JSON and `cutscene_of` parses it, so this is the wire format under test and not
+        // an in-memory struct handed back to its own author.
+        let stored = cutscene_of(&engine, owner).shots[2].camera.expect("stored");
+        assert!(exactly(stored.eye[0], 7.4));
+        assert!(exactly(stored.look_at[1], 1.35));
+        assert!(exactly(stored.fov_deg, 55.0));
     }
 }

@@ -30,6 +30,7 @@ function row(over: Partial<ShotRow> & Pick<ShotRow, "id" | "index" | "startSecon
     angle: "three_quarter",
     motion: "push_in",
     amount: 0.35,
+    camera: null,
     subject: "e1",
     subjectName: "Weld Gun 7",
     ...over,
@@ -604,6 +605,117 @@ describe("CutscenePanel", () => {
       const trigger = await screen.findByTestId("cutscene-subject");
       await waitFor(() => expect(trigger.hasAttribute("disabled")).toBe(true));
       expect(trigger.getAttribute("title")).toMatch(/Stop Play first/i);
+    });
+  });
+
+  // -----------------------------------------------------------------------------------------------
+  // ADR-192 — a camera the author placed. The card vocabulary could not express "shoot from here",
+  // which is the most basic gesture there is.
+  // -----------------------------------------------------------------------------------------------
+  describe("shooting from the view on the stage", () => {
+    const PLACED = {
+      eye: [7.4, 2.9, -5.1] as [number, number, number],
+      lookAt: [0.2, 1.35, 0.4] as [number, number, number],
+      fovDeg: 55,
+    };
+
+    /** The same four shots with the opener placed — what the engine sends back after the gesture. */
+    const withPlacedOpener: CinemaReply = {
+      ...FOUR_SHOTS,
+      rows: FOUR_SHOTS.rows.map((r) =>
+        r.index === 0
+          ? { ...r, camera: PLACED, reads: "a placed shot of Weld Gun 7, pulling out — 2.0s" }
+          : r,
+      ),
+    };
+
+    it("sends NO POSE — the engine reads its own camera, so the stored shot cannot be a view it never stood at", async () => {
+      const client = loaded();
+      client.cinemaSetShotCamera = vi.fn(() => Promise.resolve({ ...withPlacedOpener, entity: "e1", message: "Shot 1 is now a placed shot of Weld Gun 7, pulling out — 2.0s" }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-shoot-here"));
+      await waitFor(() => expect(client.cinemaSetShotCamera).toHaveBeenCalledWith("e1", 0));
+      // Two arguments and no third: an editor that sent coordinates would be a second opinion about
+      // where the camera is.
+      expect(vi.mocked(client.cinemaSetShotCamera).mock.calls[0]).toHaveLength(2);
+    });
+
+    it("puts the DELIVERY-FRAMED result on the stage at the gesture, not a toast about it", async () => {
+      const client = loaded();
+      client.cinemaSetShotCamera = vi.fn(() => Promise.resolve({ ...withPlacedOpener, entity: "e1", message: "placed" }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-shoot-here"));
+      // The author was ORBITING, not previewing, so nothing would have moved without this: the panel
+      // starts the preview itself, at the instant that shot is on screen alone.
+      await waitFor(() =>
+        expect(client.cinemaPreview).toHaveBeenCalledWith("e1", withPlacedOpener.rows[0].openSeconds, true),
+      );
+    });
+
+    it("stops the size and the angle deciding anything, and says why in plain words", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve(withPlacedOpener));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      const size = (await screen.findByTestId("cutscene-size")) as HTMLSelectElement;
+      const angle = screen.getByTestId("cutscene-angle") as HTMLSelectElement;
+      expect(size.disabled).toBe(true);
+      expect(angle.disabled).toBe(true);
+      expect(size.getAttribute("title")).toMatch(/camera you placed/i);
+      // NOT CLEARED. They are the framing "Use the card again" restores.
+      expect(size.value).toBe("wide");
+      expect(angle.value).toBe("three_quarter");
+      // ...and the two controls a placed camera does NOT take over stay live, which is the whole
+      // difference between a first-class shot and an escape hatch.
+      expect((screen.getByTestId("cutscene-motion") as HTMLSelectElement).disabled).toBe(false);
+      expect((screen.getByTestId("cutscene-amount") as HTMLInputElement).disabled).toBe(false);
+    });
+
+    it("captions the shot from the pose, never from the card it no longer uses", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve(withPlacedOpener));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      expect((await screen.findByTestId("cutscene-shot-reads")).textContent).toMatch(/a placed shot of/);
+      // The lane too: "Wide pulling out" over a hand-framed shot is the same untruth one line up.
+      expect((await screen.findAllByTestId("cutscene-clip"))[0].textContent).toMatch(/Placed/);
+      // The numbers, not a badge — the author reads them against the preview's own read-out.
+      expect(screen.getByTestId("cutscene-placed-pose").textContent).toMatch(/7\.40, 2\.90, -5\.10/);
+      expect(screen.getByTestId("cutscene-placed-pose").textContent).toMatch(/55°/);
+    });
+
+    it("gives the shot back to its card through the one command, and offers that only when there is one", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve(withPlacedOpener));
+      client.cinemaClearShotCamera = vi.fn(() => Promise.resolve({ ...FOUR_SHOTS, entity: "e1", message: "back on its card" }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      const clips = await screen.findAllByTestId("cutscene-clip");
+      fireEvent.click(clips[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-use-card"));
+      await waitFor(() => expect(client.cinemaClearShotCamera).toHaveBeenCalledWith("e1", 0));
+      // Shot 2 is an ordinary card shot: there is nothing to give back, so the control is not there
+      // at all rather than sitting disabled with nothing to say.
+      fireEvent.click(clips[1]);
+      await waitFor(() => expect(screen.getByTestId("cutscene-shot-editor").textContent).toMatch(/Shot 2 of 4/));
+      expect(screen.queryByTestId("cutscene-use-card")).toBeNull();
+      expect(screen.queryByTestId("cutscene-placed-pose")).toBeNull();
+    });
+
+    it("refuses to re-place a camera during Play, and says why", async () => {
+      selectSomething();
+      render(<CutscenePanel client={loaded()} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      act(() => playStore.getState().refresh({ playing: true, paused: false }));
+      const shoot = await screen.findByTestId("cutscene-shoot-here");
+      await waitFor(() => expect(shoot.hasAttribute("disabled")).toBe(true));
+      expect(shoot.getAttribute("title")).toMatch(/Stop Play first/i);
     });
   });
 

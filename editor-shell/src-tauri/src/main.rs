@@ -2909,6 +2909,17 @@ enum EngineCmd {
         subject: String,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
     },
+    /// Cinematics — ADR-192: give one shot a camera the author placed, or give it back to its card.
+    ///
+    /// The POSE is already resolved by the time this is sent: the command reads it out of the live
+    /// render state, so the engine loop never has to ask where the viewport is and there is no window
+    /// in which the author's view and the stored camera can be two different things. `None` clears.
+    CinemaSetShotCamera {
+        id: String,
+        index: usize,
+        camera: Option<metrocalk_animation::shot::ShotCamera>,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
     /// Cinematics - the ranked, bounded list of objects a shot could frame. A read; changes nothing.
     CinemaSubjectCatalog {
         id: String,
@@ -10577,6 +10588,78 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 )
                             })
                             .unwrap_or_else(|| "Shot re-aimed".to_string());
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            done,
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSetShotCamera {
+                id,
+                index,
+                camera,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - where a shot films from is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                let outcome = match camera {
+                    Some(camera) => {
+                        metrocalk_editor_shell::set_shot_camera_ops(&engine, entity, index, camera)
+                    }
+                    None => metrocalk_editor_shell::clear_shot_camera_ops(&engine, entity, index),
+                };
+                match outcome {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-camera", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the change was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaShotCamera {
+                            id: id.clone(),
+                            index,
+                            camera,
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        // The SENTENCE, not "done". A placed shot reads differently from a card one,
+                        // and this is the moment the author finds that out.
+                        let done = cut
+                            .shots
+                            .get(index)
+                            .map(|shot| {
+                                let who = shot_subject_name(&engine, &shot.subject)
+                                    .unwrap_or_else(|| name.clone());
+                                format!(
+                                    "Shot {} is now {}",
+                                    index + 1,
+                                    metrocalk_editor_shell::describe_shot(shot, &who)
+                                )
+                            })
+                            .unwrap_or_else(|| "Shot re-framed".to_string());
                         let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
                             entity,
                             &cut,
@@ -24193,20 +24276,11 @@ fn vfx_probe(state: State<AppState>) -> serde_json::Value {
 fn camera_probe(state: State<AppState>) -> serde_json::Value {
     ipc();
     let st = state.shared.lock().unwrap();
-    let (eye, look, fov, cinematic) = match st.cam_override {
-        Some(ov) => (
-            ov.pos,
-            ov.look_at.unwrap_or(st.cam_target),
-            ov.fov_deg,
-            ov.look_at.is_some(),
-        ),
-        None => (
-            render::camera_eye(st.orbit, st.elevation, st.distance, st.cam_target),
-            st.cam_target,
-            45.0,
-            false,
-        ),
-    };
+    // ONE ANSWER TO "WHERE IS THE CAMERA", shared with `cinema_set_shot_camera` — see
+    // `SceneState::live_camera`. This used to assemble its own, and reported a 45-degree lens the
+    // renderer has never drawn through.
+    let (eye, look, fov) = st.live_camera();
+    let cinematic = st.cam_override.is_some_and(|ov| ov.look_at.is_some());
     let d = [eye[0] - look[0], eye[1] - look[1], eye[2] - look[2]];
     let distance = d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt();
     serde_json::json!({
@@ -24559,6 +24633,82 @@ fn cinema_set_shot_subject(
     }
     recv_reply(&rx).unwrap_or_else(|_| {
         metrocalk_editor_shell::CinemaReply::refusal("The subject change did not finish in time")
+    })
+}
+
+/// ADR-192 — **shoot from this view**: store the camera that is on screen right now as this shot's.
+///
+/// THE EDITOR SENDS NO POSE. The gesture is "film what I am looking at", and the only thing that
+/// knows what that is, is the renderer — so the pose is read here, out of `SceneState::live_camera`,
+/// the same answer `camera_probe` publishes. A caller cannot store a camera the engine was never
+/// standing at, which is the whole class of bug that makes a preview a picture of a shot the engine
+/// does not film.
+///
+/// Works while a preview is holding the camera too, and deliberately so: previewing a card shot and
+/// then freezing that exact pose is how an author takes the solver's answer as a starting point.
+#[tauri::command(async)]
+fn cinema_set_shot_camera(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    // AN AXIS VIEW HAS NO LENS. `view_preset` switches the stage to a PARALLEL projection for top,
+    // front and side, and a cutscene camera is perspective by construction — it carries a field of
+    // view. Storing an eye and a 55-degree lens from a view that has neither would hand back a
+    // picture with vanishing points where the author was looking at a diagram, which is the one thing
+    // this gesture promises never to do. Refused here rather than in `cinema_intent`, because whether
+    // the stage is parallel is a fact about the renderer and not about the document.
+    let camera = {
+        let st = state.shared.lock().unwrap();
+        if st.projection == render::Projection::Orthographic {
+            return metrocalk_editor_shell::CinemaReply::refusal(
+                metrocalk_editor_shell::CinemaError::NoLensToStore.to_string(),
+            );
+        }
+        let (eye, look_at, fov_deg) = st.live_camera();
+        metrocalk_animation::shot::ShotCamera {
+            eye,
+            look_at,
+            fov_deg,
+        }
+    };
+    cinema_shot_camera(&state, id, index, Some(camera))
+}
+
+/// ADR-192 — give one shot back to its card, restoring exactly the framing it was authored with.
+#[tauri::command(async)]
+fn cinema_clear_shot_camera(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    cinema_shot_camera(&state, id, index, None)
+}
+
+/// The half both of the two above share: send it, wait for it, and say so honestly if it never came.
+fn cinema_shot_camera(
+    state: &State<AppState>,
+    id: String,
+    index: usize,
+    camera: Option<metrocalk_animation::shot::ShotCamera>,
+) -> metrocalk_editor_shell::CinemaReply {
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetShotCamera {
+            id,
+            index,
+            camera,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The camera change did not finish in time")
     })
 }
 
@@ -27886,6 +28036,8 @@ fn main() {
             cinema_move_shot,
             cinema_set_shot_framing,
             cinema_set_shot_subject,
+            cinema_set_shot_camera,
+            cinema_clear_shot_camera,
             cinema_subject_catalog,
             cinema_subject_chain,
             cinema_set_mood,
@@ -28303,6 +28455,7 @@ mod cinematic_subject_tests {
             motion: ShotMove::Hold,
             amount: 0.0,
             seconds: 2.0,
+            camera: None,
         };
         let pose = solve_shot(&shot, sample, 0.0, 16.0 / 9.0, 50.0);
         let camera_distance = pose
@@ -31130,6 +31283,7 @@ mod imported_assembly_pose_publication_tests {
             motion: ShotMove::PullOut,
             amount: 0.3,
             seconds: 2.5,
+            camera: None,
         };
         // Read the published placements BEFORE taking the render lock: `published_instance` takes it
         // too, and the mutex is not reentrant.

@@ -294,7 +294,14 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
   useEffect(() => () => void endPreview(null), [selected, endPreview]);
 
   const run = useCallback(
-    async (action: () => Promise<CinemaReply>, label: string) => {
+    async (
+      action: () => Promise<CinemaReply>,
+      label: string,
+      // ADR-192 — what to do INSTEAD of the ordinary re-pose, for the one edit whose whole point is
+      // to change where the camera is: "shoot from this view" has to start a preview the author was
+      // not already running, at the moment that shot opens.
+      after?: (reply: CinemaReply) => void,
+    ) => {
       setBusy(true);
       setRefusal(null);
       try {
@@ -310,7 +317,8 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
           // THE LOOP. An edit that does not move the picture is an edit the author has to imagine.
           // Re-solving at the same moment is what makes changing an angle feel like turning a
           // camera rather than filling in a form and pressing Play to find out.
-          if (previewingRef.current && reply.entity) {
+          if (after) after(reply);
+          else if (previewingRef.current && reply.entity) {
             void poseAt(reply.entity, playheadRef.current);
           }
         }
@@ -339,6 +347,36 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
   const editSubject = (row: ShotRow, subject: string) => {
     if (!selected || subject === row.subject) return;
     void run(() => client.cinemaSetShotSubject(selected, row.index, subject), "What the shot frames");
+  };
+
+  // ADR-192 — SHOOT FROM THIS VIEW. The one gesture in this panel that does not name a value: the
+  // author orbits until the frame is the one they want and says *that one*. No pose crosses the
+  // boundary — the engine reads its own camera — so the stored shot cannot be a view the renderer
+  // was never standing at.
+  //
+  // AND THE ANSWER COMES BACK ON THE STAGE. The author was orbiting, not previewing, so the
+  // ordinary re-pose in `run` would do nothing and the only evidence of the gesture would be a
+  // toast. Previewing at the shot's own opening instant puts the DELIVERY-FRAMED result up
+  // immediately, inside the bars — which is the difference between "we stored something" and "here
+  // is your shot", and the only way the author finds out that a 16:9 stage is not a 2.39:1 frame
+  // while there is still something they can do about it.
+  const shootFromView = (row: ShotRow) => {
+    if (!selected) return;
+    void run(
+      () => client.cinemaSetShotCamera(selected, row.index),
+      "Shoot from this view",
+      (reply) => {
+        if (!reply.entity) return;
+        const at = reply.rows.find((shot) => shot.index === row.index)?.openSeconds ?? row.openSeconds;
+        setPlayhead(at);
+        void poseAt(reply.entity, at);
+      },
+    );
+  };
+
+  const useTheCardAgain = (row: ShotRow) => {
+    if (!selected) return;
+    void run(() => client.cinemaClearShotCamera(selected, row.index), "Use the card again");
   };
 
   // AND POINTING AT IT IS THE SAME EDIT. `store/subjectAim` carries only the CHOICE a click on the
@@ -610,7 +648,10 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
                   start={row.startSeconds}
                   length={row.effectiveSeconds}
                   duration={duration}
-                  label={`${row.index + 1} · ${labelOf(catalog?.sizes ?? [], row.size)} ${labelOf(catalog?.motions ?? [], row.motion).toLowerCase()}`}
+                  // ADR-192 — "Placed" where the size would be, for a shot the author framed by eye.
+                  // The size is a leftover card there, and a lane reading "Wide pulling out" over a
+                  // hand-framed close-up is the same untruth `describe_shot` stopped telling.
+                  label={`${row.index + 1} · ${row.camera ? "Placed" : labelOf(catalog?.sizes ?? [], row.size)} ${labelOf(catalog?.motions ?? [], row.motion).toLowerCase()}`}
                   title={row.reads}
                   // ONLY WHEN IT IS NOT THE OWNER. Every clip in an ordinary cutscene films the
                   // object the cutscene hangs on, and captioning all five of them with the same
@@ -734,6 +775,64 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
             {active.reads}
           </p>
 
+          {/* ADR-192 — WHERE THIS SHOT FILMS FROM. Above the framing grid, because it decides whether
+              two of the controls in it mean anything: a placed camera is not one more axis of the
+              card, it is the answer that replaces two of them. */}
+          <Toolbar aria-label="Where this shot films from" tight raised={false}>
+            <ToolbarGroup attached aria-label="Camera placement">
+              <Button
+                data-testid="cutscene-shoot-here"
+                variant={active.camera ? "secondary" : "primary"}
+                compact
+                disabled={locked}
+                disabledReason={lockReason}
+                title={
+                  locked
+                    ? lockReason
+                    : active.camera
+                      ? "Replace this shot's camera with the view on the stage right now"
+                      : "Film this shot from exactly the view on the stage right now, instead of from its card"
+                }
+                onClick={() => shootFromView(active)}
+              >
+                <Icon name="camera" size="md" />{" "}
+                {active.camera ? "Re-shoot from this view" : "Shoot from this view"}
+              </Button>
+              {active.camera && (
+                <Button
+                  data-testid="cutscene-use-card"
+                  variant="secondary"
+                  compact
+                  disabled={locked}
+                  disabledReason={lockReason}
+                  title={
+                    locked
+                      ? lockReason
+                      : `Go back to the card: ${labelOf(catalog.sizes, active.size).toLowerCase()}, ${labelOf(catalog.angles, active.angle).toLowerCase()}`
+                  }
+                  onClick={() => useTheCardAgain(active)}
+                >
+                  <Icon name="undo" size="md" /> Use the card again
+                </Button>
+              )}
+            </ToolbarGroup>
+            {active.camera && (
+              <>
+                <ToolbarSeparator />
+                {/* The NUMBERS, not a badge. "Placed" is a claim; an eye and an aim the author can
+                    read against the preview's own read-out above is evidence. */}
+                <ReadOut
+                  data-testid="cutscene-placed-pose"
+                  title="Where this shot's camera stands, the point it aims at, and the lens it was framed through"
+                >
+                  eye <span style={{ font: font.mono }}>{xyz(active.camera.eye)}</span>
+                  {" · "}looking at <span style={{ font: font.mono }}>{xyz(active.camera.lookAt)}</span>
+                  {" · "}<span style={{ font: font.mono }}>{active.camera.fovDeg.toFixed(0)}°</span> lens
+                </ReadOut>
+              </>
+            )}
+          </Toolbar>
+
           {/* Capped rather than spanning the dock. `FieldGrid` is `auto-fit` + `1fr`, so five fields in
               a 2000px dock become five 400px tracks holding a select that reads "Wide" — the same
               stretched-control shape ADR-147 found in the Model workspace, arriving from the other
@@ -819,18 +918,33 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
               />
             </Field>
 
+            {/* ADR-192 — SIZE AND ANGLE STOP DECIDING ANYTHING once a camera is placed, so they say
+                so and stop accepting input. They are not cleared: they are the framing the shot goes
+                back to, and "Use the card again" is right there. A control that still turned while
+                the picture did not move is `<ux_quality>` 6's inert control, and the reason a
+                disabled one has to say WHY in plain words. */}
             <Field
               label="Size"
               htmlFor={`${fieldId}-size`}
-              help="How much of the frame the subject fills."
-              disabled={locked}
+              help={
+                active.camera
+                  ? "Set by the camera you placed. Use the card again to choose a size."
+                  : "How much of the frame the subject fills."
+              }
+              disabled={locked || Boolean(active.camera)}
             >
               <SelectField
                 id={`${fieldId}-size`}
                 data-testid="cutscene-size"
                 value={active.size}
-                disabled={locked}
-                title={locked ? lockReason : undefined}
+                disabled={locked || Boolean(active.camera)}
+                title={
+                  active.camera
+                    ? "This shot films from a camera you placed, so how much of the frame the subject fills is decided by where that camera stands."
+                    : locked
+                      ? lockReason
+                      : undefined
+                }
                 onChange={(event) => editFraming(active, { size: event.currentTarget.value }, "Shot size")}
               >
                 {catalog.sizes.map((option) => (
@@ -844,15 +958,25 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
             <Field
               label="Angle"
               htmlFor={`${fieldId}-angle`}
-              help="Where the camera stands, relative to the subject's own facing."
-              disabled={locked}
+              help={
+                active.camera
+                  ? "Set by the camera you placed. Use the card again to choose an angle."
+                  : "Where the camera stands, relative to the subject's own facing."
+              }
+              disabled={locked || Boolean(active.camera)}
             >
               <SelectField
                 id={`${fieldId}-angle`}
                 data-testid="cutscene-angle"
                 value={active.angle}
-                disabled={locked}
-                title={locked ? lockReason : undefined}
+                disabled={locked || Boolean(active.camera)}
+                title={
+                  active.camera
+                    ? "This shot films from a camera you placed, so the angle is wherever you put it."
+                    : locked
+                      ? lockReason
+                      : undefined
+                }
                 onChange={(event) => editFraming(active, { angle: event.currentTarget.value }, "Camera angle")}
               >
                 {catalog.angles.map((option) => (

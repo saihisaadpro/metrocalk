@@ -168,6 +168,17 @@ pub enum Record {
         index: usize,
         subject: String,
     },
+    /// Cinematics — ADR-192: one shot given a camera the author placed, or given back to its card.
+    ///
+    /// The POSE is in the record and not the gesture that produced it, because "the camera the
+    /// viewport was at" is not a fact a replay can re-derive: the orbit is render state, it is not in
+    /// the document, and replaying "shoot from this view" against wherever the camera happens to be
+    /// during a replay would film a different shot every time. `None` is the clear.
+    CinemaShotCamera {
+        id: String,
+        index: usize,
+        camera: Option<metrocalk_animation::shot::ShotCamera>,
+    },
     /// Conditionals — one "only if" clause added to an object.
     ConditionAdd {
         id: String,
@@ -630,6 +641,20 @@ impl Log {
                         .is_some_and(|(e, s)| {
                             crate::cinema_intent::set_shot_subject_ops(engine, e, index, s)
                                 .is_ok_and(|(ops, _)| engine.commit("cinema-subject", ops).is_ok())
+                        })
+                }
+                Record::CinemaShotCamera { id, index, camera } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| match camera {
+                            Some(camera) => {
+                                crate::cinema_intent::set_shot_camera_ops(engine, e, index, camera)
+                                    .is_ok_and(|(ops, _)| {
+                                        engine.commit("cinema-camera", ops).is_ok()
+                                    })
+                            }
+                            None => crate::cinema_intent::clear_shot_camera_ops(engine, e, index)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-camera", ops).is_ok()),
                         })
                 }
                 Record::ConditionAdd { id, request } => {

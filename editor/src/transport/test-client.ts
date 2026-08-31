@@ -97,6 +97,7 @@ const HERO_ROW: ShotRow = {
   amount: 0.35,
   subject: "e1",
   subjectName: "Crate",
+  camera: null,
 };
 
 /** A subject catalogue shaped like the one `cinema_subject_catalog` really sends: the owner under
@@ -423,6 +424,11 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: null })),
     cinemaFramingCatalog: vi.fn(() => Promise.resolve(FRAMING_CATALOG)),
     cinemaSetShotSubject: vi.fn((id: string, index: number, subject: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, subject, subjectName: SUBJECTS.candidates.find((c) => c.id === subject)?.name ?? subject }], problems: [], message: `Shot ${index + 1} now frames ${subject}`, reason: null })),
+    // ADR-192 — the fake ENGINE stores a pose, because the real command reads one out of the
+    // renderer rather than taking it from the caller. The row that comes back is what the panel
+    // draws its disabled pickers and its pose read-out from.
+    cinemaSetShotCamera: vi.fn((id: string, index: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: ["a placed shot of Crate, pushing in — 2.5s"], rows: [{ ...HERO_ROW, index, camera: { eye: [6, 3, 8] as [number, number, number], lookAt: [0, 0.5, 0] as [number, number, number], fovDeg: 55 }, reads: `a placed shot of Crate, pushing in — 2.5s` }], problems: [], message: `Shot ${index + 1} is now a placed shot of Crate, pushing in — 2.5s`, reason: null })),
+    cinemaClearShotCamera: vi.fn((id: string, index: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index }], problems: [], message: `Shot ${index + 1} is now ${HERO_ROW.reads}`, reason: null })),
     // The stub SEARCHES, rather than returning the same four rows to every query: a picker that
     // ignored its own search box would otherwise pass every assertion about having one.
     cinemaSubjectCatalog: vi.fn((_id: string, _index: number | null, query: string) => {

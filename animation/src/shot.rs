@@ -112,6 +112,122 @@ pub enum ShotMove {
     CraneDown,
 }
 
+/// A camera the author PLACED, in world space — the pose the viewport was standing at when they said
+/// "shoot from here".
+///
+/// A different KIND of answer from a size and an angle, which is why it is a separate field and not a
+/// seventh [`ShotAngle`]. The card vocabulary describes a placement *relative to the subject's facing*
+/// and re-solves it every tick, so it survives the subject moving; this is an absolute pose in the
+/// world, and it is absolute on purpose — the author looked at a frame and said *that one*. The moment
+/// a solver were allowed to reinterpret it, the promise the gesture makes would be false.
+///
+/// The `fov_deg` travels with it for the same reason: it is the lens they framed through, and a shot
+/// filmed at the cutscene runtime's 50° when it was composed at the viewport's 45° is a different
+/// picture.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShotCamera {
+    /// Where the camera stands, world units.
+    pub eye: [f32; 3],
+    /// The point it is aimed at, world units.
+    pub look_at: [f32; 3],
+    /// Vertical field of view, degrees.
+    pub fov_deg: f32,
+}
+
+/// The shortest stand-off an authored camera may be stored at. Below this the eye and the aim are the
+/// same point to a renderer, and the look direction is undefined.
+pub const MIN_AUTHORED_RANGE: f32 = 1.0e-3;
+
+impl ShotCamera {
+    /// True when this pose describes a camera that can actually be built.
+    ///
+    /// Checked where the pose is STORED, not where it is filmed: a shot carrying a degenerate camera
+    /// is a shot that renders a black frame weeks later with nothing said at the time.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        if !self
+            .eye
+            .iter()
+            .chain(self.look_at.iter())
+            .chain(std::iter::once(&self.fov_deg))
+            .all(|v| v.is_finite())
+        {
+            return false;
+        }
+        if !(1.0..=179.0).contains(&self.fov_deg) {
+            return false;
+        }
+        self.range() >= MIN_AUTHORED_RANGE
+    }
+
+    /// The stand-off: how far the eye is from what it aims at.
+    #[must_use]
+    pub fn range(&self) -> f32 {
+        let d = [
+            self.eye[0] - self.look_at[0],
+            self.eye[1] - self.look_at[1],
+            self.eye[2] - self.look_at[2],
+        ];
+        d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt()
+    }
+}
+
+/// The 30-degree rule, which is the actual grammar the card check approximates: cutting between two
+/// views of one subject that differ by less than this reads as a jolt rather than a cut.
+pub const JUMP_CUT_MIN_DEGREES: f32 = 30.0;
+/// ...unless the camera also moved substantially closer or further away. A straight punch-in on the
+/// same axis is a deliberate, legible cut, so a stand-off that changed by this factor excuses the
+/// angle. Set at the ratio between two neighbouring shot cards, so the two paths agree about what
+/// counts as a different framing.
+pub const JUMP_CUT_MIN_RANGE_RATIO: f32 = 1.5;
+/// How far two aims may drift apart, as a fraction of the nearer stand-off, before the two shots are
+/// simply looking at different things and no continuity question arises.
+const JUMP_CUT_AIM_TOLERANCE: f32 = 0.2;
+
+/// Do two placed cameras cut together flatly — the 30-degree rule, asked of poses instead of cards.
+#[must_use]
+fn placed_cut_is_flat(a: ShotCamera, b: ShotCamera) -> bool {
+    let (ra, rb) = (a.range(), b.range());
+    let near = ra.min(rb);
+    if near < MIN_AUTHORED_RANGE {
+        return false;
+    }
+    let aim_drift = {
+        let d = [
+            a.look_at[0] - b.look_at[0],
+            a.look_at[1] - b.look_at[1],
+            a.look_at[2] - b.look_at[2],
+        ];
+        d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt()
+    };
+    if aim_drift > near * JUMP_CUT_AIM_TOLERANCE {
+        return false;
+    }
+    if ra.max(rb) / near >= JUMP_CUT_MIN_RANGE_RATIO {
+        return false;
+    }
+    // The angle the two eyes subtend at the shared aim — measured from `a`'s aim for both, so a small
+    // permitted drift cannot flip the verdict by changing which origin each vector is taken from.
+    let to = |camera: ShotCamera| {
+        let d = [
+            camera.eye[0] - a.look_at[0],
+            camera.eye[1] - a.look_at[1],
+            camera.eye[2] - a.look_at[2],
+        ];
+        let len = d[0]
+            .mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2]))
+            .sqrt()
+            .max(MIN_AUTHORED_RANGE);
+        [d[0] / len, d[1] / len, d[2] / len]
+    };
+    let (u, v) = (to(a), to(b));
+    let dot = u[0]
+        .mul_add(v[0], u[1].mul_add(v[1], u[2] * v[2]))
+        .clamp(-1.0, 1.0);
+    dot.acos().to_degrees() < JUMP_CUT_MIN_DEGREES
+}
+
 /// One shot: who it is about, how it is framed, what it does, and for how long.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,6 +248,17 @@ pub struct ShotRecipe {
     pub amount: f32,
     /// Length in seconds.
     pub seconds: f32,
+    /// A camera the author placed by eye, or `None` to solve the placement from `size` and `angle`.
+    ///
+    /// `Option` and not a sentinel pose, because "the card decides" is a different KIND of answer from
+    /// a set of coordinates — the same reasoning that makes [`RenderSettings::height`] an `Option`.
+    /// `#[serde(default)]` so every cutscene authored before this field existed opens on the cards.
+    ///
+    /// `size` and `angle` stay on the recipe while this is `Some`, untouched and inert: clearing the
+    /// camera returns the shot to exactly the framing it was authored with, and a gesture that
+    /// destroyed the card would be one the author cannot undo by pressing the other button.
+    #[serde(default)]
+    pub camera: Option<ShotCamera>,
 }
 
 fn hold() -> ShotMove {
@@ -638,9 +765,23 @@ impl Cutscene {
             }
         }
         // A jump cut: the same subject, nearly the same framing, cut together. The classic amateur tell.
+        //
+        // ASKED OF WHATEVER DECIDES THE FRAME. For a card that is the size and the angle; for a placed
+        // camera those two fields are inert, so comparing them would report a jump cut between two
+        // completely different hand-framed views and stay silent about two identical ones. The
+        // continuity check has to read the same thing the camera does or it is checking a decoration.
         for pair in self.shots.windows(2) {
             let (a, b) = (&pair[0], &pair[1]);
-            if a.subject == b.subject && a.size == b.size && a.angle == b.angle {
+            if a.subject != b.subject {
+                continue;
+            }
+            let identical = match (a.camera, b.camera) {
+                (Some(x), Some(y)) => x.is_usable() && y.is_usable() && placed_cut_is_flat(x, y),
+                (None, None) => a.size == b.size && a.angle == b.angle,
+                // One placed, one from a card: never the same frame by construction.
+                _ => false,
+            };
+            if identical {
                 out.push(format!(
                     "shots on \"{}\" are framed identically back to back — that reads as a jump cut; \
                      change the size or the angle",
@@ -648,9 +789,12 @@ impl Cutscene {
                 ));
             }
         }
-        // No establishing shot: opening tight leaves the viewer lost.
+        // No establishing shot: opening tight leaves the viewer lost. A placed opener is exempt for
+        // the reason above — its `size` is a leftover card, and warning about it would be advice about
+        // a control the author cannot even reach while the camera is theirs.
         if let Some(first) = self.shots.first() {
-            if matches!(first.size, ShotSize::Close | ShotSize::ExtremeClose)
+            if first.camera.is_none()
+                && matches!(first.size, ShotSize::Close | ShotSize::ExtremeClose)
                 && self.shots.len() > 1
             {
                 out.push(
@@ -787,6 +931,9 @@ pub fn solve_shot(
     aspect: f32,
     fov_deg: f32,
 ) -> CameraSample {
+    if let Some(camera) = shot.camera.filter(ShotCamera::is_usable) {
+        return solve_placed_shot(shot, camera, progress);
+    }
     let p = progress.clamp(0.0, 1.0);
     let amount = shot.amount.clamp(0.0, 1.0);
     let radius = subject.radius();
@@ -830,6 +977,73 @@ pub fn solve_shot(
         look_at,
         fov_deg,
     }
+}
+
+/// Solve a shot whose camera the author placed: the stored pose, with the move applied around it.
+///
+/// THE MOVE IS THE WHOLE POINT OF DOING IT THIS WAY. A placed camera could have been a pose and
+/// nothing else — an escape hatch, one static frame, the card vocabulary switched off. Instead the
+/// same six verbs keep working, measured against the shot's OWN stand-off rather than the subject's
+/// radius, so "place the camera here and push in" is a sentence the engine can film. That is the
+/// difference between an override and a first-class shot.
+///
+/// The aim is held fixed through every verb. A crane that re-aimed as it rose would be a camera on a
+/// boom with nobody operating the head, and the author's frame is the one thing this must preserve.
+fn solve_placed_shot(shot: &ShotRecipe, camera: ShotCamera, progress: f32) -> CameraSample {
+    // THE MOVE SCALES OFF THE SHOT'S OWN STAND-OFF, not off the subject. On the card path a crane
+    // rises `radius * 4.0` from a distance of roughly `radius * 4.9`, and falls `radius * 2.0` — so
+    // the verbs are really "about eight tenths of the stand-off up" and "about four tenths down".
+    // Re-derived here against `range` rather than re-tuned by eye, so a placed crane feels like the
+    // crane the author already knows.
+    const CRANE_UP_FRACTION: f32 = 0.8;
+    const CRANE_DOWN_FRACTION: f32 = 0.4;
+    /// The closest a push-in may bring a placed camera, as a fraction of its authored stand-off.
+    /// A card's full-strength push-in floors at `radius * 1.05` out of a base of roughly
+    /// `radius * 4.9`, so it keeps about a fifth of its distance; this keeps the same fifth.
+    const MIN_PLACED_PUSH_FRACTION: f32 = 0.2;
+
+    let p = progress.clamp(0.0, 1.0);
+    let amount = shot.amount.clamp(0.0, 1.0);
+    let range = camera.range();
+    let look_at = camera.look_at;
+
+    let (dist_scale, height_extra, yaw_extra) = match shot.motion {
+        ShotMove::Hold => (1.0, 0.0, 0.0),
+        ShotMove::PushIn => (1.0 - amount * p, 0.0, 0.0),
+        ShotMove::PullOut => (1.0 + amount * p, 0.0, 0.0),
+        ShotMove::Orbit => (1.0, 0.0, amount * p * 90.0),
+        ShotMove::CraneUp => (1.0, amount * p * range * CRANE_UP_FRACTION, 0.0),
+        ShotMove::CraneDown => (1.0, -amount * p * range * CRANE_DOWN_FRACTION, 0.0),
+    };
+
+    // Slide along the placed sight line. Floored so a full-strength push-in stops at a distance a
+    // camera could still be, rather than arriving at the point it aims at — the same job `radius *
+    // 1.05` does on the card path, expressed against the only length this shot has. The number is
+    // read OFF the card path rather than chosen: a full-strength card push-in ends at about a fifth
+    // of the distance it started from, so a placed one does too.
+    let mut eye = camera.eye;
+    #[allow(
+        clippy::float_cmp,
+        reason = "the identity scale must leave the authored pose BIT-IDENTICAL, which is the question"
+    )]
+    if dist_scale != 1.0 {
+        let scale = dist_scale.max(MIN_PLACED_PUSH_FRACTION);
+        eye = [
+            look_at[0] + (camera.eye[0] - look_at[0]) * scale,
+            look_at[1] + (camera.eye[1] - look_at[1]) * scale,
+            look_at[2] + (camera.eye[2] - look_at[2]) * scale,
+        ];
+    }
+    let mut pose = CameraSample {
+        eye,
+        look_at,
+        fov_deg: camera.fov_deg,
+    };
+    if yaw_extra != 0.0 {
+        pose = rotate_eye_about_subject(pose, look_at, yaw_extra);
+    }
+    pose.eye[1] += height_extra;
+    pose
 }
 
 /// Solve a production camera shot with cinematic ease applied to its within-shot progress.
@@ -1128,6 +1342,15 @@ pub fn solve_shot_adjusted(
     aspect: f32,
     fov_deg: f32,
 ) -> CameraSample {
+    // A PLACED CAMERA IS NOT NEGOTIATED. Every correction below — the widening, the yaw detour, the
+    // floor, the room — exists because a card is a description the solver turns into a position, and
+    // the solver cannot see the other 15,710 parts of a factory. An author who framed the shot by eye
+    // has already looked at the result: the obstruction, the height and the wall are all things they
+    // were staring at when they pressed the button. Correcting that is not help, it is the engine
+    // quietly filming a different shot from the one on screen.
+    if shot.camera.is_some_and(|camera| camera.is_usable()) {
+        return solve_shot_eased(shot, subject, progress, aspect, fov_deg);
+    }
     let adjusted = ShotRecipe {
         size: adjustment.size,
         ..shot.clone()
@@ -1187,6 +1410,12 @@ pub fn plan_shot(
     fov_deg: f32,
     mut look: impl FnMut(&CameraSample, f32) -> Vantage,
 ) -> ShotAdjustment {
+    // The ladder walks framings and yaws, and a placed camera has neither: its size is inert and its
+    // yaw is the author's. Returning the identity here is the same decision `solve_shot_adjusted`
+    // makes, stated once at the top so no candidate is ever scored against a shot that cannot move.
+    if shot.camera.is_some_and(|camera| camera.is_usable()) {
+        return ShotAdjustment::authored(shot);
+    }
     let mut sizes = Vec::with_capacity(6);
     let mut size = shot.size;
     loop {
@@ -1331,6 +1560,7 @@ mod tests {
             motion,
             amount: 0.35,
             seconds: 2.0,
+            camera: None,
         }
     }
 
@@ -2235,5 +2465,375 @@ mod tests {
                 "yaw {yaw} changed the aim"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-192 — a camera the author PLACED. Every test here asks the same question a different way:
+    // is the pose that gets filmed the pose that was on screen when they pressed the button?
+    // ---------------------------------------------------------------------------------------------
+
+    fn placed(motion: ShotMove, amount: f32) -> ShotRecipe {
+        ShotRecipe {
+            motion,
+            amount,
+            camera: Some(ShotCamera {
+                eye: [6.0, 3.0, 8.0],
+                look_at: [0.0, 0.5, 0.0],
+                fov_deg: 45.0,
+            }),
+            ..shot(ShotSize::Close, ShotAngle::Profile, ShotMove::Hold)
+        }
+    }
+
+    #[test]
+    fn a_placed_camera_is_filmed_exactly_where_it_was_put() {
+        let s = placed(ShotMove::Hold, 0.35);
+        let stored = s.camera.unwrap();
+        // Every progress, and every aspect a delivery frame can hand it: a held placement is not a
+        // function of any of them, and the day it becomes one the gesture's promise is false.
+        for progress in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for aspect in [16.0 / 9.0, 2.39, 1.0] {
+                let pose = solve_shot(&s, cube(), progress, aspect, 50.0);
+                assert_eq!(pose.eye.map(f32::to_bits), stored.eye.map(f32::to_bits));
+                assert_eq!(
+                    pose.look_at.map(f32::to_bits),
+                    stored.look_at.map(f32::to_bits)
+                );
+                // The LENS THEY FRAMED THROUGH, not the cutscene runtime's 50 degrees.
+                assert_eq!(pose.fov_deg.to_bits(), 45.0_f32.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn the_size_and_the_angle_stop_deciding_anything_once_a_camera_is_placed() {
+        let stored = ShotCamera {
+            eye: [6.0, 3.0, 8.0],
+            look_at: [0.0, 0.5, 0.0],
+            fov_deg: 45.0,
+        };
+        let mut poses = Vec::new();
+        for size in [
+            ShotSize::ExtremeWide,
+            ShotSize::Medium,
+            ShotSize::ExtremeClose,
+        ] {
+            for angle in [ShotAngle::Front, ShotAngle::Low, ShotAngle::High] {
+                let s = ShotRecipe {
+                    camera: Some(stored),
+                    ..shot(size, angle, ShotMove::Hold)
+                };
+                poses.push(solve_shot(&s, cube(), 0.5, 16.0 / 9.0, 50.0));
+            }
+        }
+        assert!(
+            poses.windows(2).all(|p| p[0] == p[1]),
+            "a card still moved a placed camera: {poses:?}"
+        );
+    }
+
+    #[test]
+    fn a_placed_camera_still_pushes_in_along_its_own_sight_line() {
+        let s = placed(ShotMove::PushIn, 0.5);
+        let stored = s.camera.unwrap();
+        let start = solve_shot(&s, cube(), 0.0, 16.0 / 9.0, 50.0);
+        let end = solve_shot(&s, cube(), 1.0, 16.0 / 9.0, 50.0);
+        assert_eq!(start.eye.map(f32::to_bits), stored.eye.map(f32::to_bits));
+        // Half the stand-off closed, and the aim never moved: that is what a push-in IS.
+        assert!(
+            (dist(end.eye, stored.look_at) - stored.range() * 0.5).abs() < 1.0e-3,
+            "a 0.5 push-in should halve the {}m stand-off; it ended at {}m",
+            stored.range(),
+            dist(end.eye, stored.look_at)
+        );
+        assert_eq!(
+            end.look_at.map(f32::to_bits),
+            stored.look_at.map(f32::to_bits)
+        );
+    }
+
+    #[test]
+    fn a_full_strength_push_in_on_a_placed_camera_stops_where_a_card_would() {
+        let s = placed(ShotMove::PushIn, 1.0);
+        let stored = s.camera.unwrap();
+        let end = solve_shot(&s, cube(), 1.0, 16.0 / 9.0, 50.0);
+        let left = dist(end.eye, stored.look_at) / stored.range();
+        assert!(
+            (0.15..=0.25).contains(&left),
+            "a full-strength placed push-in kept {left} of its stand-off; a card keeps about a fifth"
+        );
+    }
+
+    #[test]
+    fn a_placed_camera_orbits_about_its_own_aim_and_keeps_its_stand_off() {
+        let s = placed(ShotMove::Orbit, 1.0);
+        let stored = s.camera.unwrap();
+        let end = solve_shot(&s, cube(), 1.0, 16.0 / 9.0, 50.0);
+        assert!((dist(end.eye, stored.look_at) - stored.range()).abs() < 1.0e-3);
+        assert!(
+            (end.eye[1] - stored.eye[1]).abs() < 1.0e-4,
+            "an orbit changed the camera height"
+        );
+        assert!(
+            !placed_cut_is_flat(
+                stored,
+                ShotCamera {
+                    eye: end.eye,
+                    ..stored
+                }
+            ),
+            "a full-strength orbit is a 90-degree move and cannot read as a flat cut"
+        );
+    }
+
+    #[test]
+    fn a_placed_crane_holds_its_aim_while_it_rises() {
+        let up = solve_shot(
+            &placed(ShotMove::CraneUp, 1.0),
+            cube(),
+            1.0,
+            16.0 / 9.0,
+            50.0,
+        );
+        let down = solve_shot(
+            &placed(ShotMove::CraneDown, 1.0),
+            cube(),
+            1.0,
+            16.0 / 9.0,
+            50.0,
+        );
+        let stored = placed(ShotMove::Hold, 0.0).camera.unwrap();
+        assert!(up.eye[1] > stored.eye[1] + 1.0);
+        assert!(down.eye[1] < stored.eye[1] - 1.0);
+        for pose in [up, down] {
+            assert_eq!(
+                pose.look_at.map(f32::to_bits),
+                stored.look_at.map(f32::to_bits),
+                "a crane re-aimed itself; the author's frame is the one thing it must hold"
+            );
+        }
+    }
+
+    #[test]
+    fn the_planner_does_not_negotiate_a_placed_camera() {
+        // A world with a wall around the subject: anything standing closer than twelve units is
+        // buried in it. On the card path that drives the ladder — a close card has to widen until it
+        // is far enough out — and a placed camera has already been judged, by eye, by the author.
+        //
+        // Deliberately NOT a constant refusal. A `look` that objects to every candidate equally
+        // scores them all the same, and the least-bad tie-break then hands back the authored
+        // placement anyway: the negative control would pass while proving nothing.
+        let hostile = |pose: &CameraSample, _: f32| {
+            let far = dist(pose.eye, [0.0, 0.0, 0.0]) > 12.0;
+            Vantage {
+                eye_inside: !far,
+                clear: if far { 1.0 } else { 0.0 },
+                backing: 1.0,
+                crowded: 0.0,
+            }
+        };
+        let s = placed(ShotMove::Hold, 0.35);
+        let plan = plan_shot(&s, cube(), 16.0 / 9.0, 50.0, hostile);
+        assert!(plan.is_authored(&s));
+        assert_eq!(plan.steps, 0);
+
+        let card = shot(ShotSize::ExtremeClose, ShotAngle::Low, ShotMove::Hold);
+        let card_plan = plan_shot(&card, cube(), 16.0 / 9.0, 50.0, hostile);
+        assert!(
+            !card_plan.is_authored(&card),
+            "the negative control failed: the ladder did not move a CARD in a hostile world, so \
+             the placed-camera result above proves nothing"
+        );
+    }
+
+    #[test]
+    fn neither_the_floor_nor_the_room_moves_a_placed_camera() {
+        let underground = ShotCamera {
+            eye: [4.0, -3.0, 4.0],
+            look_at: [0.0, 0.0, 0.0],
+            fov_deg: 40.0,
+        };
+        let s = ShotRecipe {
+            camera: Some(underground),
+            ..shot(ShotSize::Medium, ShotAngle::Front, ShotMove::Hold)
+        };
+        let boxed_in = SubjectSample {
+            stage: Stage {
+                room: Some(([-6.0, 0.2, -6.0], [6.0, 4.0, 6.0])),
+            },
+            ..cube()
+        };
+        let pose = solve_shot_adjusted(
+            &s,
+            ShotAdjustment::authored(&s),
+            boxed_in,
+            0.0,
+            16.0 / 9.0,
+            50.0,
+        );
+        assert_eq!(
+            pose.eye.map(f32::to_bits),
+            underground.eye.map(f32::to_bits)
+        );
+
+        // The negative control: the same room DOES move a card, so the assertion above is about the
+        // placement and not about a room that never confines anything.
+        let card = shot(ShotSize::ExtremeWide, ShotAngle::Low, ShotMove::Hold);
+        let card_pose = solve_shot_adjusted(
+            &card,
+            ShotAdjustment::authored(&card),
+            boxed_in,
+            0.0,
+            16.0 / 9.0,
+            50.0,
+        );
+        let unconfined = solve_shot(&card, cube(), 0.0, 16.0 / 9.0, 50.0);
+        assert!(
+            dist(card_pose.eye, unconfined.eye) > 1.0e-3,
+            "the negative control failed: the room did not move a card either"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_placed_camera_falls_back_to_the_card_rather_than_filming_nothing() {
+        for bad in [
+            ShotCamera {
+                eye: [1.0, 1.0, 1.0],
+                look_at: [1.0, 1.0, 1.0],
+                fov_deg: 45.0,
+            },
+            ShotCamera {
+                eye: [f32::NAN, 0.0, 0.0],
+                look_at: [0.0, 0.0, 0.0],
+                fov_deg: 45.0,
+            },
+            ShotCamera {
+                eye: [3.0, 0.0, 0.0],
+                look_at: [0.0, 0.0, 0.0],
+                fov_deg: 0.0,
+            },
+        ] {
+            assert!(!bad.is_usable());
+            let s = ShotRecipe {
+                camera: Some(bad),
+                ..shot(ShotSize::Medium, ShotAngle::Front, ShotMove::Hold)
+            };
+            let card = shot(ShotSize::Medium, ShotAngle::Front, ShotMove::Hold);
+            assert_eq!(
+                solve_shot(&s, cube(), 0.5, 16.0 / 9.0, 50.0),
+                solve_shot(&card, cube(), 0.5, 16.0 / 9.0, 50.0),
+            );
+        }
+    }
+
+    #[test]
+    fn the_jump_cut_warning_reads_the_poses_once_the_cameras_are_placed() {
+        let base = ShotCamera {
+            eye: [0.0, 2.0, 10.0],
+            look_at: [0.0, 0.0, 0.0],
+            fov_deg: 45.0,
+        };
+        let swung = |degrees: f32| {
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            ShotCamera {
+                eye: [10.0 * sin, 2.0, 10.0 * cos],
+                ..base
+            }
+        };
+        let cut_of = |a: Option<ShotCamera>, b: Option<ShotCamera>| Cutscene {
+            version: 1,
+            shots: vec![
+                ShotRecipe {
+                    camera: a,
+                    ..shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold)
+                },
+                ShotRecipe {
+                    id: "shot-2".into(),
+                    camera: b,
+                    ..shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold)
+                },
+            ],
+            mood: Mood::Normal,
+            delivery: Delivery::Widescreen,
+            render: RenderSettings::default(),
+        };
+        let flags = |c: &Cutscene| c.problems().iter().any(|p| p.contains("jump cut"));
+
+        // Ten degrees apart: two frames a viewer reads as one jolt — and BOTH carry the same card,
+        // which is exactly the case the old size-and-angle check could not see.
+        assert!(flags(&cut_of(Some(base), Some(swung(10.0)))));
+        // Past the thirty-degree rule: a real cut.
+        assert!(!flags(&cut_of(Some(base), Some(swung(40.0)))));
+        // The same axis, but a genuine punch-in.
+        assert!(!flags(&cut_of(
+            Some(base),
+            Some(ShotCamera {
+                eye: [0.0, 0.8, 4.0],
+                ..base
+            })
+        )));
+        // One placed, one from a card: never the same frame by construction.
+        assert!(!flags(&cut_of(None, Some(base))));
+        // ...and the card path is untouched.
+        assert!(flags(&cut_of(None, None)));
+    }
+
+    #[test]
+    fn a_placed_opener_is_not_told_it_opened_tight() {
+        let tight = shot(ShotSize::ExtremeClose, ShotAngle::Front, ShotMove::Hold);
+        let two = |first: ShotRecipe| Cutscene {
+            version: 1,
+            shots: vec![
+                first,
+                ShotRecipe {
+                    id: "shot-2".into(),
+                    ..shot(ShotSize::Wide, ShotAngle::Profile, ShotMove::Hold)
+                },
+            ],
+            mood: Mood::Normal,
+            delivery: Delivery::Widescreen,
+            render: RenderSettings::default(),
+        };
+        let opens_tight = |c: &Cutscene| c.problems().iter().any(|p| p.contains("opens tight"));
+        assert!(opens_tight(&two(tight.clone())));
+        assert!(!opens_tight(&two(ShotRecipe {
+            camera: Some(ShotCamera {
+                eye: [0.0, 2.0, 40.0],
+                look_at: [0.0, 0.0, 0.0],
+                fov_deg: 45.0,
+            }),
+            ..tight
+        })));
+    }
+
+    #[test]
+    fn a_cutscene_authored_before_placed_cameras_opens_on_its_cards() {
+        let blob = r#"{"version":1,"shots":[{"id":"shot-1","subject":"1_0","size":"wide",
+            "angle":"front","motion":"hold","amount":0.35,"seconds":2.0}],"mood":"normal",
+            "delivery":"widescreen"}"#;
+        let cut: Cutscene = serde_json::from_str(blob).expect("an older cutscene still opens");
+        assert_eq!(cut.shots[0].camera, None);
+        assert_eq!(
+            solve_shot(&cut.shots[0], cube(), 0.5, 16.0 / 9.0, 50.0),
+            solve_shot(
+                &shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold),
+                cube(),
+                0.5,
+                16.0 / 9.0,
+                50.0
+            )
+        );
+    }
+
+    #[test]
+    fn a_placed_camera_survives_a_round_trip_through_the_document() {
+        let s = placed(ShotMove::Orbit, 0.6);
+        let json = serde_json::to_string(&s).expect("serialise");
+        assert!(
+            json.contains("\"lookAt\""),
+            "wire names stay camelCase: {json}"
+        );
+        let back: ShotRecipe = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back, s);
     }
 }

@@ -2027,6 +2027,33 @@ impl SceneState {
             .map(|_| frame_pixels(frame.rect(), w, h))
     }
 
+    /// ADR-192 — where the camera IS, right now: `(eye, look_at, fov_deg)`.
+    ///
+    /// The single answer to "what view is on the stage", whether that is the author's orbit or a
+    /// cutscene holding the camera. `camera_probe` reports it and `cinema_set_shot_camera` stores it,
+    /// and they read it from HERE rather than each assembling it from `cam_override` / `orbit` /
+    /// `cam_target`: a gesture whose whole promise is *film what I am looking at* cannot afford a
+    /// second opinion about what that is.
+    #[must_use]
+    pub fn live_camera(&self) -> ([f32; 3], [f32; 3], f32) {
+        match self.cam_override {
+            Some(over) => (
+                over.pos,
+                over.look_at.unwrap_or(self.cam_target),
+                over.fov_deg,
+            ),
+            None => (
+                camera_eye(self.orbit, self.elevation, self.distance, self.cam_target),
+                self.cam_target,
+                // THE LENS THE VIEWPORT ACTUALLY DRAWS THROUGH. `camera_probe` used to report a bare
+                // `45.0` here while `framed_projection` built the frame at `CAMERA_FOV_DEG` (55) —
+                // the probe reported a lens the renderer has never used, which mattered to nobody
+                // until a shot could be stored FROM this pose.
+                CAMERA_FOV_DEG,
+            ),
+        }
+    }
+
     /// The aspect ratio of the rectangle the picture is composed for -- the number a shot solver needs
     /// to decide how far back the camera stands.
     #[must_use]
@@ -9264,6 +9291,7 @@ mod tests {
             motion: ShotMove::Hold,
             amount: 0.35,
             seconds: 2.0,
+            camera: None,
         };
         let directed =
             metrocalk_animation::shot::solve_shot_eased(&shot, subject, 0.0, 16.0 / 9.0, 50.0);

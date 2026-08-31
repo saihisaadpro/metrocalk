@@ -1448,6 +1448,45 @@ for (const scene of scenes) {
         );
       }
     }
+    // ADR-192 — A CONTROL'S DISABLED STATE, WHICH NOTHING HERE COULD SAY.
+    //
+    // Every claim above measures a rectangle or reads text, and both are satisfied by a control that
+    // is present, legible, correctly placed and fully live when it should be dead. `<ux_quality>` 6
+    // forbids exactly that ("no inert controls"), and the case that needed it is a `<select>` whose
+    // options still turn while the picture no longer moves — indistinguishable in a screenshot from
+    // one that works, and indistinguishable in a `present` claim from one that is disabled.
+    //
+    // Read from the ELEMENT, not from a class: `disabled` is what the browser refuses input on, and a
+    // styling hook that drifted from it is precisely the drift worth catching. `aria-disabled` counts
+    // too, because a control that is not a form element says it that way.
+    const isDisabled = (el) =>
+      el.disabled === true || el.getAttribute?.("aria-disabled") === "true";
+    for (const sel of e.disabled ?? []) {
+      const el = qs(sel);
+      if (!el) {
+        out.push(`disabled needs \`${sel}\`, which matches nothing`);
+        continue;
+      }
+      if (!isDisabled(el)) {
+        out.push(
+          `\`${sel}\` is claimed disabled and is LIVE — a control that still turns while it decides ` +
+            `nothing is the inert control ux_quality 6 forbids`,
+        );
+      }
+    }
+    for (const sel of e.enabled ?? []) {
+      const el = qs(sel);
+      if (!el) {
+        out.push(`enabled needs \`${sel}\`, which matches nothing`);
+        continue;
+      }
+      if (isDisabled(el)) {
+        out.push(
+          `\`${sel}\` is claimed enabled and is DISABLED — the scene is photographing a surface with ` +
+            `more switched off than it says`,
+        );
+      }
+    }
     for (const [sa, sb] of e.same_line ?? []) {
       const a = qs(sa);
       const b = qs(sb);
