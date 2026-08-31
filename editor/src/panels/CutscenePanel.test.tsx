@@ -13,6 +13,7 @@ import { playStore } from "../store/play";
 import { cinemaPreviewStore } from "../store/cinemaPreview";
 import { subjectAimStore } from "../store/subjectAim";
 import { stageHighlightStore } from "../store/stageHighlight";
+import { frameGuideStore } from "../store/frameGuide";
 import { toastStore } from "../store/toasts";
 import { DEFAULT_RENDER_SETTINGS } from "../transport/protocol";
 import type { CinemaReply, ShotRow } from "../transport/protocol";
@@ -74,6 +75,10 @@ beforeEach(() => {
   act(() => cinemaPreviewStore.getState().reset());
   // An aim left in flight by one test decides whether the next one's click aims or selects.
   act(() => subjectAimStore.getState().cancel());
+  // The frame-guide preference PERSISTS by design, so one test turning it off would decide whether
+  // the next one draws a guide at all — the shared-state trap, in the one store that has storage.
+  act(() => frameGuideStore.getState().setWanted(true));
+  act(() => frameGuideStore.getState().setDrawn(null));
   act(() => toastStore.getState().reset());
 });
 
@@ -337,6 +342,78 @@ describe("CutscenePanel", () => {
 
     fireEvent.change(picker, { target: { value: "scope" } });
     await waitFor(() => expect(client.cinemaSetDelivery).toHaveBeenCalledWith("e1", "scope"));
+  });
+
+  describe("the frame guide", () => {
+    /** A cut delivered to scope — the case a guide exists for. `viewport` is the absence of one. */
+    function scopeClient() {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve({ ...FOUR_SHOTS, delivery: "scope" as const }));
+      return client;
+    }
+
+    it("asks the stage to draw the frame this cut is delivered in, and names it the ENGINE's way", async () => {
+      const client = scopeClient();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      await waitFor(() => expect(client.setFrameGuide).toHaveBeenCalledWith("scope"));
+      // The badge on the stage reads the engine's own label, carried with the key — never a second
+      // table of names in the front end, which would drift silently.
+      const catalogue = await client.cinemaFramingCatalog();
+      const label = catalogue.deliveries.find((d) => d.value === "scope")?.label;
+      await waitFor(() => expect(frameGuideStore.getState().drawn).toEqual({ key: "scope", label }));
+    });
+
+    it("draws nothing for a cut delivered to the stage's own shape, and says why the control is dead", async () => {
+      // NEGATIVE CONTROL for the test above: "Match viewport" IS a delivery frame in the picker, and
+      // it is the one with no bars — so an implementation that guided to everything would pass there
+      // and fail here.
+      const client = loaded(); // FOUR_SHOTS delivers "viewport"
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      const toggle = await screen.findByTestId("cutscene-frame-guide");
+      await waitFor(() => expect(toggle.hasAttribute("disabled")).toBe(true));
+      expect(toggle.getAttribute("title")).toMatch(/already is the stage/i);
+      expect(client.setFrameGuide).not.toHaveBeenCalledWith("viewport");
+      expect(frameGuideStore.getState().drawn).toBeNull();
+    });
+
+    it("turns the guide off from the panel, and tells the stage to stop drawing it", async () => {
+      const client = scopeClient();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      const toggle = await screen.findByTestId("cutscene-frame-guide");
+      await waitFor(() => expect(toggle.getAttribute("aria-pressed")).toBe("true"));
+
+      fireEvent.click(toggle);
+      await waitFor(() => expect(client.setFrameGuide).toHaveBeenLastCalledWith(null));
+      expect(frameGuideStore.getState().drawn).toBeNull();
+      expect(toggle.getAttribute("aria-pressed")).toBe("false");
+
+      // And back on again, which is the half that proves the toggle is a toggle and not an off switch.
+      fireEvent.click(toggle);
+      await waitFor(() => expect(client.setFrameGuide).toHaveBeenLastCalledWith("scope"));
+    });
+
+    it("stops guiding while a preview holds the camera, because the shot itself is the frame then", async () => {
+      const client = scopeClient();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      await waitFor(() => expect(client.setFrameGuide).toHaveBeenLastCalledWith("scope"));
+      fireEvent.click(await screen.findByTestId("cutscene-preview"));
+      await waitFor(() => expect(client.setFrameGuide).toHaveBeenLastCalledWith(null));
+      expect(frameGuideStore.getState().drawn).toBeNull();
+    });
+
+    it("clears the guide when the panel closes, so the stage is never left letterboxed by an unmounted control", async () => {
+      const client = scopeClient();
+      selectSomething();
+      const view = render(<CutscenePanel client={client} />);
+      await waitFor(() => expect(client.setFrameGuide).toHaveBeenLastCalledWith("scope"));
+      view.unmount();
+      await waitFor(() => expect(client.setFrameGuide).toHaveBeenLastCalledWith(null));
+      expect(frameGuideStore.getState().drawn).toBeNull();
+    });
   });
 
   it("names the frame the previewed pose was solved for, and only when it is not the stage", async () => {

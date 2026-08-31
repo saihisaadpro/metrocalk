@@ -413,6 +413,9 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: "Added a hero shot", reason: null })),
     cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "Shot removed", reason: null })),
     cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
+    // ADR-193 - the stage's frame guide. Replies the key it was asked for, exactly as the shell does,
+    // so a test can assert WHICH frame the panel asked the stage to draw and not merely that it asked.
+    setFrameGuide: vi.fn((delivery: DeliveryFrame | null) => Promise.resolve(delivery ?? "off")),
     cinemaSetDelivery: vi.fn((id: string, delivery: DeliveryFrame) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Composing for ${delivery}`, reason: null })),
     // ADR-190 — the stub ECHOES the four answers back, rather than returning a fixed block: a dialog
     // that seeds itself from the reply would otherwise pass every "it remembered" assertion while

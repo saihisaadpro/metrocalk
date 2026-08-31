@@ -628,6 +628,11 @@ const cutsceneClient = () =>
           : SUBJECT_CATALOG,
       ),
     cinemaList: () => Promise.resolve(CUTSCENE),
+    // ADR-193 - the stage's frame guide. On the BASE fixture and not only on the scene that
+    // photographs it: the panel asks the stage what to draw the moment it mounts, whatever the
+    // delivery frame is, so a fixture missing this method throws inside an effect and takes the
+    // whole scene down - including nine scenes that have nothing to do with the guide.
+    setFrameGuide: (delivery: string | null) => Promise.resolve(delivery ?? "off"),
     // ADR-190 - the render settings are a DOCUMENT EDIT, so a fixture that answers `cinemaList` and
     // not this one is a client the dialog can read from and not write to. It reached the harness as a
     // `console.error` on the LEDGER scene, which never touches a picker: starting a render adopts the
@@ -1492,6 +1497,40 @@ export const SCENES: Scene[] = [
     render: () => <CutscenePanel client={placedCameraClient()} />,
   },
   {
+    id: "cutscene-frame-guide",
+    looking_for:
+      "THE FRAME AN AUTHOR IS COMPOSING FOR, WHILE THEY COMPOSE FOR IT. The gesture beside this one " +
+      "— 'Shoot from this view' — films exactly what is on the stage, and until this control existed " +
+      "what was on the stage was composed for whatever shape the docks had left: an author framing a " +
+      "2.39:1 shot on a 1.55 stage was composing a picture nothing would ever deliver, and met the " +
+      "real frame for the first time in the render. Check three things. First, 'Frame guide' sits " +
+      "BESIDE the delivery picker and on the same line as it, because it is the same fact seen from " +
+      "the stage — the select says what the film is, the button draws it — and it is visibly PRESSED " +
+      "(aria-pressed), not merely present. Second, it is ENABLED here, where the cut delivers scope, " +
+      "and its help line describes the effect in plain words rather than naming a mechanism. Third, " +
+      "the delivery read-out still names the frame, so the button and the picker cannot disagree " +
+      "about which frame is being guided to. The control is a TOGGLE, not an off switch: the author " +
+      "turns the bars off to see the whole stage and back on to compose, which is why its pressed " +
+      "state has to be legible at a glance rather than inferable from the viewport",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    expect: {
+      present: [
+        ["[data-testid='cutscene-frame-guide']", 1],
+        ["[data-testid='cutscene-delivery']", 1],
+      ],
+      text_present: ["Frame guide"],
+      text_absent: ["null", "undefined", "NaN"],
+      // A guide the author can actually turn off, on a cut that has a frame to guide to. Without
+      // this claim the whole scene is satisfied by a button that is present, legible, correctly
+      // placed and completely dead.
+      enabled: ["[data-testid='cutscene-frame-guide']", "[data-testid='cutscene-delivery']"],
+      unclipped: ["[data-testid='cutscene-frame-guide']"],
+      same_line: [["[data-testid='cutscene-delivery']", "[data-testid='cutscene-frame-guide']"]],
+    },
+    render: () => <CutscenePanel client={deliveredCutsceneClient()} />,
+  },
+  {
     id: "cutscene-render",
     looking_for:
       "THE WAY A PICTURE GETS OUT OF THIS ENGINE. Until this dialog existed there was none: the " +
@@ -1918,12 +1957,17 @@ export const SCENES: Scene[] = [
       text_absent: ["null", "undefined", "NaN", "0.0s"],
       unclipped: ["[data-testid='shot-catalogue'] .mtk-btn"],
     },
+    // The SHARED fixture with one field overridden, not a hand-built client. This scene used to
+    // assemble its own three methods, which meant every method the panel learned to call was a
+    // method this one scene alone did not have - and the failure is not a missing assertion, it is a
+    // `TypeError` inside an effect that leaves the layout moving until the settle gate gives up
+    // 5,000 ms later, five scenes after the one that changed. `as unknown as EditorClient` is why
+    // the compiler cannot say so.
     render: () => (
       <CutscenePanel
         client={
           ({
-            cinemaCatalog: () => Promise.resolve(CUTSCENE_CARDS),
-            cinemaFramingCatalog: () => Promise.resolve(FRAMING),
+            ...cutsceneClient(),
             cinemaList: () =>
               Promise.resolve({ ...CUTSCENE, shots: 0, seconds: 0, reads: [], rows: [], problems: [] }),
           }) as unknown as EditorClient
