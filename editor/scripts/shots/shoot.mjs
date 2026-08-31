@@ -1056,6 +1056,31 @@ for (const scene of scenes) {
     await new Promise((r) => setTimeout(r, 300)); // the results are re-ranked on the next render
   }
 
+  // A cheap, stable fingerprint of the layout that was just judged: how wide the frame is, and where
+  // every visible control sits inside it. Compared against the same reading taken after the capture.
+  const fingerprint = () => {
+    const frame = document.querySelector('[data-testid="shot-frame"]');
+    if (!frame) return "no frame";
+    const box = frame.getBoundingClientRect();
+    const sel = 'button, a[href], input, select, textarea, [role="button"]';
+    const rows = [...frame.querySelectorAll(sel)].map((el) => {
+      const r = el.getBoundingClientRect();
+      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
+    });
+    return `${Math.round(box.width)}×${Math.round(box.height)}|${rows.length}|${rows.join(" ")}`;
+  };
+  // SETTLE BEFORE MEASURING. A scene that opens a dock opens it through a CSS transition, and the
+  // fixed 300 ms after a click is a guess about a machine that is not busy. `shell-dock-tabs` failed a
+  // full run on a loaded box with its tab strip in a box `0px` tall and passed three times in
+  // isolation on the same tree — a flake is a failure, so the wait is now on the LAYOUT rather than on
+  // the clock: two consecutive identical fingerprints, or a second and a half, whichever comes first.
+  // Cheap when nothing is moving (two reads) and self-limiting when something animates forever.
+  for (let i = 0; i < 15; i += 1) {
+    const a = await page.evaluate(fingerprint);
+    await new Promise((r) => setTimeout(r, 100));
+    if (a === (await page.evaluate(fingerprint))) break;
+  }
+
   // MEASURE BEFORE CAPTURING, because capturing MOVES THINGS. `screenshot({ fullPage: true })`
   // resizes the page to the content box and puts it back, and a shell that lays itself out from
   // `window.innerWidth` reacts: `shell-wide` rendered its docks open at 1440, the capture briefly
@@ -1390,19 +1415,6 @@ for (const scene of scenes) {
   const notes = evaluated.filter((l) => l.startsWith("NOTE "));
   const layout = evaluated.filter((l) => !l.startsWith("NOTE "));
 
-  // A cheap, stable fingerprint of the layout that was just judged: how wide the frame is, and where
-  // every visible control sits inside it. Compared against the same reading taken after the capture.
-  const fingerprint = () => {
-    const frame = document.querySelector('[data-testid="shot-frame"]');
-    if (!frame) return "no frame";
-    const box = frame.getBoundingClientRect();
-    const sel = 'button, a[href], input, select, textarea, [role="button"]';
-    const rows = [...frame.querySelectorAll(sel)].map((el) => {
-      const r = el.getBoundingClientRect();
-      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
-    });
-    return `${Math.round(box.width)}×${Math.round(box.height)}|${rows.length}|${rows.join(" ")}`;
-  };
   const before = await page.evaluate(fingerprint);
 
   // `fullPage` exists so a panel taller than the window is captured whole. A scene that set its own
