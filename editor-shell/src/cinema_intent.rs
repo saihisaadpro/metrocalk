@@ -1485,7 +1485,16 @@ impl RenderPlan {
     /// filming the closing instant as well would play the cut back one frame long.
     #[must_use]
     pub fn instant(&self, index: u32) -> f32 {
-        self.start_seconds + index as f32 / self.fps.max(1) as f32
+        // `f64::from`, not `as`: a frame index and a frame rate are small counts, and the whole
+        // point of this arithmetic is that the instant it names is exact enough to film. Doing it in
+        // f64 and narrowing ONCE also silences `cast_precision_loss` truthfully rather than by
+        // permission — the conversion in is lossless, and the one out is the f32 the caller wants.
+        let elapsed = f64::from(index) / f64::from(self.fps.max(1));
+        // The narrowing is the RESULT, and it is the type the caller films with. Everything above it
+        // is exact; this is the single stated place the precision is spent.
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed = elapsed as f32;
+        self.start_seconds + elapsed
     }
 }
 
@@ -1529,7 +1538,18 @@ pub fn plan_render(cut: &Cutscene, fps: u32, scope: RenderScope) -> Result<Rende
     // Round rather than truncate: a 2.5 s shot at 24 fps is 60 frames, and `as u32` on 59.999994 is 59
     // — one frame of the shot silently missing, which is exactly the kind of arithmetic that is only
     // ever noticed when somebody counts the files.
-    let frames = (seconds * fps as f32).round().max(1.0) as u32;
+    // Computed in f64 and converted with a stated saturation rather than `as`, which is silent on
+    // both a NaN and a value past `u32::MAX`. `MAX_RENDER_FRAMES` below is the real ceiling; this is
+    // only about not lying on the way to it.
+    let exact = (f64::from(seconds) * f64::from(fps)).round().max(1.0);
+    // `exact` is `>= 1.0` and below `u32::MAX` on this branch — both bounds are enforced above, which
+    // is what makes the conversion sound and the lint's two objections (truncation, sign) untrue here.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let frames = if exact >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        exact as u32
+    };
     if frames > MAX_RENDER_FRAMES {
         return Err(format!(
             "That is {frames} frames — more than the {MAX_RENDER_FRAMES} one render writes at once. Render a single shot, or choose a lower frame rate."
@@ -2741,7 +2761,9 @@ mod tests {
         );
         // ROUNDED, not truncated. The count is the one number a user can check by listing a folder,
         // and `as u32` on 179.99999 writes 179 files for a 180-frame cut with nothing saying so.
-        assert_eq!(plan.frames, (cut.seconds() * 24.0).round() as u32);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let expected = (f64::from(cut.seconds()) * 24.0).round() as u32;
+        assert_eq!(plan.frames, expected);
         // The LAST frame lands inside the cut, a frame short of its end — a frame is an interval, and
         // filming the closing instant as well plays back one frame long.
         let last = plan.instant(plan.frames - 1);
