@@ -25341,7 +25341,11 @@ fn restore_presentation(state: &State<AppState>, project: &str) {
     };
     match serde_json::from_str::<ViewSidecar>(&text) {
         Ok(p) => {
-            state.shared.lock().unwrap().set_presentation(p.presentation);
+            state
+                .shared
+                .lock()
+                .unwrap()
+                .set_presentation(p.presentation);
             // The sky is restored SECOND and reported when it cannot be: choosing a panorama used to
             // be something a person did again every session, and the failure mode of fixing that is a
             // moved file — which must read as "your sky is gone and here is why", never as a scene
@@ -29114,7 +29118,8 @@ mod view_sidecar_tests {
 
     #[test]
     fn a_sidecar_written_before_the_environment_existed_still_restores_the_presentation() {
-        let read: ViewSidecar = serde_json::from_str(OLD_SIDECAR).expect("old sidecars stay readable");
+        let read: ViewSidecar =
+            serde_json::from_str(OLD_SIDECAR).expect("old sidecars stay readable");
         assert_eq!(read.presentation.exposure, 1.25);
         // Absent is the built-in sky, which is also what `restore_presentation` acts on.
         assert!(read.environment.is_none());
@@ -29123,16 +29128,23 @@ mod view_sidecar_tests {
     #[test]
     fn the_presentation_keys_stay_at_the_top_level_so_an_older_build_can_still_read_ours() {
         let written = serde_json::to_string(&ViewSidecar {
-            presentation: PresentationState { exposure: 2.5, ..PresentationState::default() },
+            presentation: PresentationState {
+                exposure: 2.5,
+                ..PresentationState::default()
+            },
             environment: Some("C:/skies/sunset_4k.hdr".into()),
         })
         .expect("serialisable");
         // Read back through the OLD reader — `PresentationState` on its own, which is what a build
         // that predates this change runs. Nesting the presentation under a key would break this and
         // would still look correct in every test that used the new reader.
-        let old: PresentationState = serde_json::from_str(&written).expect("older readers still work");
+        let old: PresentationState =
+            serde_json::from_str(&written).expect("older readers still work");
         assert_eq!(old.exposure, 2.5);
-        assert!(written.contains("sunset_4k"), "the sky has to survive the round trip: {written}");
+        assert!(
+            written.contains("sunset_4k"),
+            "the sky has to survive the round trip: {written}"
+        );
     }
 
     #[test]

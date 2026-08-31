@@ -8813,7 +8813,11 @@ mod tests {
         // box six metres wide, and its centre is at x=3 — a point where NEITHER member sits.
         let mut st = scene(4);
         assert!(st.focus_on_slots(&[0, 3]));
-        assert_eq!(st.cam_target, [3.0, 1.0, 0.0], "the union's centre, not a member's");
+        assert_eq!(
+            st.cam_target,
+            [3.0, 1.0, 0.0],
+            "the union's centre, not a member's"
+        );
         // half-extent of the union is (3+1) = 4 on x, so 4 × 4 = 16 — four times the distance a single
         // cube gets, which is the whole difference between seeing the set and diving onto one of it.
         assert_eq!(st.distance, 16.0);
@@ -8844,7 +8848,10 @@ mod tests {
         assert!(!st.focus_on_slots(&[]));
         assert_eq!((st.cam_target, st.distance, st.revision), before);
         assert_eq!(st.focused, None);
-        assert_eq!(st.pre_focus_distance, None, "and nothing was saved to restore");
+        assert_eq!(
+            st.pre_focus_distance, None,
+            "and nothing was saved to restore"
+        );
     }
 
     #[test]
